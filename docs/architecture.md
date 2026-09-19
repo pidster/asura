@@ -181,6 +181,13 @@ established merely by naming an OS facility.
 Permission checks must be authoritative at the execution boundary. Distributed
 hosts must enforce their own grants; a UI or model decision cannot bypass them.
 
+Asura must support a documented, versioned policy format or standard for command
+invocation, sandbox access control, and other security controls. One canonical
+authorization contract must apply across all clients and agent hosts, with host
+enforcement of the resulting limits. Policy evaluation and OS enforcement are
+distinct responsibilities. The [security policy brief](designs/security-policy-brief.md)
+defines the required scope and evaluation work; the format and engine remain open.
+
 ## User experience
 
 The experience must be elegant, intuitive, configurable, and controllable.

@@ -193,7 +193,7 @@ be fixed in their canonical document, including D0 or D1 where necessary.
 | D0: product scenarios and terminology | Existing requirements | `product-workflows.md`, `domain-model.md`, requirements/validation matrix | Define task, conversation, agent, host, action, observation, context, and decision; specify initial workflows and measurable UX/reliability/performance objectives |
 | D1: platform and threat model | D0 | `platform-capabilities.md`, `threat-model.md` | Verify installed/public API evidence; identify adversaries, data flows, protected assets, entitlements/distribution constraints, and OS mechanisms needing live proof |
 | D2: ownership and topology | D0, D1 | `system-architecture.md`, `swift-rust-boundary.md`, `repository-layout.md` | Assign each behavior exactly one owner; select process/module boundaries, IPC/FFI, toolchain and packaging approach; draw dependencies and deployment views |
-| D3: control and durable state | D2 | `control-api.md`, `task-lifecycle.md`, `persistence-recovery.md` | Command/event schemas, versioning, state transitions, transactions, retry/replay semantics, caller/host identities and authorization; no unexplained ambiguous effects |
+| D3: control, policy and durable state | D2 | `control-api.md`, `security-policy.md`, `task-lifecycle.md`, `persistence-recovery.md` | Command/event schemas, policy format/evaluator selection, source authority and composition, activation/revocation, state transitions, transactions, retry/replay semantics, caller/host identities and authorization; no unexplained ambiguous effects |
 | D4: core cognition and execution | D2, D3 | `agent-loop.md`, `context-graph.md`, `model-decisions.md`, `tools-execution.md` | Resolve the core brief; specify selection algorithms, state machines, graph consistency, authority checks, context budgets, bounded model interactions and evaluations |
 | D5: remote boundaries | D1-D4 | `remote-inference.md`, `remote-hosts.md` | Separate inference from host execution; define data egress, trust enrollment/revocation, lease/partition behavior, result provenance and compatibility |
 | D6: interaction and operations | D3-D5 | `cli-tui.md`, `configuration.md`, `observability-audit.md` | Walk through happy/failure journeys; define controls, configuration precedence, redaction, audit durability, telemetry correlation and bounded export |
@@ -204,6 +204,16 @@ Draft the validation matrix in D0 and evolve it in every stage; D7 consolidates
 infrastructure and execution gates. Security, observability, and UX apply throughout.
 Write decision records as choices arise, linking to specifications rather than
 copying them. Revisit earlier contracts when later design exposes an inconsistency.
+
+### Security policy format and enforcement
+
+Use the [security policy brief](../designs/security-policy-brief.md) to define D1's
+resource and administrator trust boundaries, select the format/evaluator and
+versioned contract in D3, and specify host enforcement in D4. Resolve command,
+sandbox, credential, egress and delegation controls before their implementation
+packets. D5 must preserve host authority across remote boundaries. D6 must make
+validation, policy decisions and bounded approval requests understandable through
+every supported client. Selecting a policy language does not prove OS confinement.
 
 ### Context storage candidate evaluation
 
@@ -225,7 +235,7 @@ designs refine them and become the canonical source for selected behavior.
 | --- | --- |
 | D0-D1 | User journeys, domain relationships, data flows and threat boundaries |
 | D2 | Component/dependency, process/deployment, and Swift/Rust request/cancellation/shutdown sequences |
-| D3 | Command/event sequences, task/action state machines, transaction boundaries, reconnect and crash recovery |
+| D3 | Command/event sequences, policy schema and activation/revocation states, authorization/launch races, task/action state machines, transaction boundaries, reconnect and crash recovery |
 | D4 | Agent-step flow, decision branches, graph schema/cardinalities, retrieval/invalidation flow, tool authorization and failure sequences |
 | D5 | Separate remote-inference and remote-host sequences; enrollment, revocation, partition, lease/fencing and reconciliation states |
 | D6 | Interactive and non-interactive workflows, multi-client decisions, configuration precedence, telemetry and audit pipelines |

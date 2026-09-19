@@ -17,5 +17,6 @@ Implementation has not started.
 - [Design process](docs/design-process.md)
 - [Architecture and design plan](docs/plans/architecture-and-design.md)
 - [Core harness design brief](docs/designs/core-harness-brief.md)
+- [Security policy design brief](docs/designs/security-policy-brief.md)
 - [Implementation plan](docs/plans/implementation.md)
 - [Repository agent configuration](docs/designs/repository-agent-configuration.md)

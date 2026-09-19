@@ -51,8 +51,8 @@ environment. Those gates apply even where the graph only shows delivery ordering
 | Increment | Depends on | Deliver | Exit demonstration |
 | --- | --- | --- | --- |
 | I0: repository and contracts | D8; ready build/layout/contract designs | Minimal Cargo/Swift package structure, pinned toolchains, generated bindings, CI and test runners; initial telemetry setup | Clean build on supported macOS; cross-language contract round trip, compatibility rejection and bounded cancellation through a test composition |
-| I1: local control and durable lifecycle | I0 | Host entry point, control API, client library, non-interactive CLI; task IDs, event stream, configuration, local caller authentication and authorization | Submit a no-effect diagnostic task, inspect it, attach a second client, disconnect/reconnect, cancel and recover state after restart; reject unauthorized callers |
-| I2: context and bounded host execution | I1 | Initial graph/storage, workspace observations, canonical tool registry, grants, constrained read/process tools and action recovery | CLI runs a permitted fixture inspection/build with graph-linked evidence; denied access, output bounds, timeout, crash ambiguity and stale files are handled |
+| I1: local control and durable lifecycle | I0 | Host entry point, control API, client library, non-interactive CLI; task IDs, event stream, configuration, local caller authentication and authorization; selected policy format validation, evaluator and atomic activation | Submit a no-effect diagnostic task, inspect it, attach a second client, disconnect/reconnect, cancel and recover state after restart; reject unauthorized callers and invalid policy updates |
+| I2: context and bounded host execution | I1 | Initial graph/storage, workspace observations, canonical tool registry, grants, policy-to-sandbox enforcement, constrained read/process tools and action recovery | CLI runs a permitted fixture inspection/build with graph-linked evidence; denied access, unsupported restrictions, policy revocation/launch races, output bounds, timeout, crash ambiguity and stale files are handled |
 | I3: on-device harness loop | I2 | Swift model adapter/service, core loop, structured decisions, context assembly, progress/budget rules and evaluation suite | Real on-device decisions complete a bounded local task; invalid proposals are rejected; stalled/unavailable model does not block control; graph and loop resume consistently |
 | I4: interactive chat/TUI | I3 | Streaming chat, task/agent views, explainable decisions, pause/resume/cancel/redirect and pending user decisions | Reattach without state loss, resolve a decision from either client, steer active work, navigate by keyboard, and recover from errors clearly |
 | I5: remote AI assistance | I3, I4 | One selected remote inference provider behind canonical contracts, egress context views, credential handling and budgets | Local decision requests bounded remote help; authorized context is sent; rate limits, failure, denial and ambiguous provider outcomes remain visible and bounded |
@@ -80,6 +80,10 @@ feature shipped because its interface was reserved.
   equivalent support for all three OpenTelemetry signals.
 - Add capability enforcement before exposing an effect, including local-only
   operations. Remote transports start with authenticated/authorized test requests.
+- Apply the selected policy contract through its canonical owner. Include policy
+  conformance and actual host-enforcement evidence for every new protected effect;
+  follow the [security policy brief](../designs/security-policy-brief.md) and its
+  successor detailed designs. Do not add client-specific permission engines.
 - Deliver meaningful unit, integration and e2e assertions with the feature.
   Include failure injection and recovery tests as durable boundaries are introduced.
 - Update the requirements/test matrix, public contract compatibility fixtures,
