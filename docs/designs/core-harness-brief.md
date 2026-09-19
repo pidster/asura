@@ -32,15 +32,17 @@ field. Normal progression and interruption are split into complementary views.
 
 ```mermaid
 stateDiagram-v2
+    direction LR
     [*] --> Queued: Authorized acceptance persisted
     Queued --> Running: Valid assignment and grant
-    Running --> WaitingUser: User decision required
-    WaitingUser --> Running: Authorized current-revision response
+    Running --> WaitingUser: Decision required
+    WaitingUser --> Running: Timely authorized response
     Running --> WaitingExternal: Bounded dispatch
     WaitingExternal --> Running: Outcome reconciled
     Running --> Succeeded: Acceptance criteria verified
     Running --> Failed: Fatal error or task budget exhausted
-    WaitingUser --> Failed: Decision deadline expires
+    WaitingUser --> Failed: Decision expires and effects accounted for
+    WaitingUser --> Reconciling: Decision expires with unresolved effects
     Succeeded --> [*]
     Failed --> [*]
 ```
@@ -50,6 +52,12 @@ stateDiagram-v2
 Companion proposal for D3. `ActiveWork` is a diagram entry representing the
 current running or waiting state, not a new stored task state. Queued and paused
 tasks may also be cancelled. Pending control intent survives reconciliation.
+The orchestrator accepts and durably records new pause/cancel intent while
+reconciliation continues, acknowledging acceptance only after persistence. Cancel
+supersedes pause and any pending failure outcome; pause cannot clear cancellation
+or a pending failure. Updating intent does not imply an outstanding effect stopped.
+No new task work is dispatched while reconciling. Reconciliation observations and
+bounded cleanup retain their own authorization and cannot restart task work.
 
 ```mermaid
 stateDiagram-v2
@@ -65,18 +73,56 @@ stateDiagram-v2
     ActiveWork --> Reconciling: Unknown outcome or recovery required
     PausePending --> Reconciling: Effect uncertain
     CancelPending --> Reconciling: Effect uncertain
-    Reconciling --> ActiveWork: Resolved and no pending control intent
-    Reconciling --> Paused: Resolved and pause remains
-    Reconciling --> Cancelled: Accounted for and cancel remains
-    Reconciling --> Failed: Recovery contract cannot be satisfied
     Cancelled --> [*]
-    Failed --> [*]
+```
+
+### Reconciliation control and exit
+
+Companion proposal for D3. Arrows name durable intent updates or guarded exits
+from reconciliation. `ActiveWork` again denotes running or waiting work. The
+terminal failure contract below distinguishes accounted failure from irrecoverable
+uncertainty; neither exit permits new task dispatch.
+
+```mermaid
+flowchart TD
+    Control["New authorized pause or cancel"] --> Persist["Persist intent with cancel precedence, retain reconciling state"]
+    Persist --> Reconciling["Reconciling: no new task dispatch"]
+    Reconciling -->|Effects accounted for| Intent{"Pending intent in current revision?"}
+    Reconciling -->|Recovery impossible| Uncertain["Failed with uncertainty and recorded control intent"]
+    Intent -->|Cancel| Cancelled["Cancelled"]
+    Intent -->|Failure without cancel| Failed["Failed with accounted effects"]
+    Intent -->|Pause only| Paused["Paused"]
+    Intent -->|None| ActiveWork["Running or waiting work"]
 ```
 
 On startup, persisted nonterminal work with potentially outstanding effects enters
 reconciliation before redispatch. Cancellation cannot undo an already-completed
 effect; its terminal report must identify residual effects. Terminal states are
 not reopened by late results, which are retained as evidence for investigation.
+Serialize intent updates, recovery completion and dispatch eligibility against the
+same authoritative task revision. A cancellation accepted during reconciliation
+must prevent the recovery path from resuming or dispatching task work, including
+after restart. With accounted effects, pending failure and no cancellation,
+persist `Failed`. If recovery fails with unknown effects, persist `Failed` with
+their uncertainty and any cancellation intent in the terminal report rather than
+claiming they stopped.
+
+### User-decision expiry contract
+
+Resolved brief-level behavior for D3-D4: expiry of a required user decision fails
+the task, rather than asking again or returning to model inference. Persist the
+expired decision and failure intent, disable further task dispatch, and account
+for outstanding effects before reporting failure. With unresolved effects, remain
+in reconciliation until they are accounted for or the recovery contract produces
+an explicit terminal failure with uncertainty. A subsequently accepted cancellation
+supersedes the pending failure outcome as described above.
+
+The orchestrator serializes response acceptance, deadline expiry and control intent
+against the pending decision/task revision. Accept a response only while that
+decision is pending and before its authoritative deadline; late or duplicate
+responses cannot resume work. An already accepted cancellation cannot be replaced
+by timeout failure. D3 must specify the authoritative clock, restart handling and
+atomic update mechanism. A timer wakeup alone is not permission to infer or dispatch.
 
 ## Proposed agent step
 
@@ -112,7 +158,9 @@ flowchart TD
     Retry -->|No| Stop
     Valid -->|Yes| Kind{"Proposed next step"}
     Kind -->|Ask user| User["Persist decision request and wait"]
-    User -->|Authorized response or deadline| Observe
+    User -->|Authorized response accepted before deadline| Observe
+    User -->|Decision expired| Expired["Persist expiry and failure intent, stop task dispatch"]
+    Expired --> ExpiryRecovery["Account for effects through lifecycle recovery, never resume task work"]
     Kind -->|Finish| Verify{"Acceptance evidence sufficient?"}
     Verify -->|Yes| Success["Persist success with validation evidence"]
     Verify -->|No| Progress
@@ -373,16 +421,21 @@ flowchart TD
     Enough -->|Yes| Manifest
     Fit -->|Yes| Manifest["Record ordered selections, versions, transformations and omissions"]
     Manifest --> Destination{"Remote destination?"}
-    Destination -->|No| Local["Supply view to on-device model"]
+    Destination -->|No| Local["Model session admission with full effective context"]
     Destination -->|Yes| Egress{"Current egress policy permits exact view and destination?"}
     Egress -->|No| Denied["Record denial; no transmission"]
-    Egress -->|Yes| Remote["Send bounded request with manifest reference"]
+    Egress -->|Yes| Remote["Model session admission with full effective context"]
     Local --> Proposal["Decision references task and context revisions"]
     Remote --> Proposal
     Proposal --> Fresh{"Sources and authorization still valid before action?"}
     Fresh -->|Yes| Validate["Continue action validation"]
     Fresh -->|No| Rebuild["Reject stale proposal and re-enter bounded agent loop"]
 ```
+
+The local and remote admission nodes use the session contract below. They cannot
+dispatch inference with unaccounted history. For a retained remote conversation,
+the exact view checked for egress includes the retained inputs as well as new
+content; admission must reject any mismatch and rebuild/re-authorize the view.
 
 ## Model decision contracts
 
@@ -401,6 +454,63 @@ Measure routing quality, inappropriate delegation, missed delegation, unnecessar
 context, invalid tool selections, and latency/cost tradeoffs. Calibrate any
 confidence or uncertainty threshold on evidence rather than trusting a generated score.
 
+### Model session ownership and effective context
+
+Required contract for D4-D5. Select either stateless requests built from each
+authorized context view or explicitly managed stateful sessions. Do not infer
+permission to reuse a session from its presence in the Foundation Models API or
+a provider adapter. The requirements apply to transcripts, retained tool results,
+summaries, application-managed prompt caches and remote conversation references
+that can affect a later model response.
+
+- The orchestrator supplies task/principal/workspace identity, current authority
+  scope and a session generation tied to the task revision. The model adapter
+  owns session resources; the context subsystem owns the effective input manifest.
+  The adapter must account for every retained input before inference. Session
+  identity or a cache hit cannot act as a grant or a second context authority.
+- Never reuse conversation state across tasks or principals. Any authorized
+  cross-task evidence reuse must re-enter through the context subsystem and a new
+  session. Within a task, account for retained history, instructions, tool schemas,
+  tool results and new selections in provenance, sensitivity and total input/output
+  budget calculations. The recorded manifest must describe the effective input,
+  not just the latest appended message. No hidden reasoning transcript is required.
+- Revalidate retained inputs against current authority, deletion and source
+  invalidation before reuse. If the adapter cannot enumerate and bound their
+  contribution, retire the session and rebuild from authorized evidence. If it
+  cannot establish an isolated fresh session, report a bounded failure without
+  inference or remote disclosure.
+- Revocation, relevant deletion, cancellation, task completion or a scope change
+  invalidates affected session generations. The adapter stops reuse and attempts
+  cancellation/cleanup under the designed lifecycle. Reject late results and tool
+  callbacks from invalidated generations. Continuing permitted work requires a
+  fresh generation and a rebuilt, authorized manifest; cancellation never restarts
+  work. Provider-side deletion guarantees and cleanup failures must be explicit,
+  not inferred from retiring a local reference.
+
+Proposed admission flow. Arrows identify checks before either local or remote
+inference. Admission and result acceptance use current authority and generation
+fencing; D4 must specify their concurrency protocol rather than assuming that a
+check alone prevents invalidation races.
+
+```mermaid
+flowchart TD
+    Request["Task identity, authority and candidate context view"] --> Mode{"Retain session state?"}
+    Mode -->|No| Fresh["Create isolated session from authorized view"]
+    Mode -->|Yes| Inspect["Inspect identity, generation and retained input inventory"]
+    Inspect --> Valid{"All retained inputs current and accounted for?"}
+    Valid -->|No| Retire["Retire generation and rebuild authorized view"]
+    Retire --> Fresh
+    Valid -->|Yes| Manifest["Bind full effective manifest and budget"]
+    Fresh -->|Isolation established| Manifest
+    Fresh -->|Unavailable| Fail["Bounded failure with no inference"]
+    Manifest --> Admit{"Current authority, budget and destination permit?"}
+    Admit -->|No| Reject["Reject without inference or disclosure"]
+    Admit -->|Yes| Infer["Dispatch inference bound to manifest and generation"]
+    Infer --> Current{"Generation and task still current at result acceptance?"}
+    Current -->|No| Discard["Reject stale result or callback"]
+    Current -->|Yes| Result["Return proposal with full context provenance"]
+```
+
 ## Validation required for the detailed designs
 
 | Concern | Unit | Integration | End-to-end |
@@ -409,6 +519,21 @@ confidence or uncertainty threshold on evidence rather than trusting a generated
 | Graph | Retrieval/invalidation/authorization properties and budget limits | Concurrent storage, projection recovery, migrations and deletion | Changed source invalidates a proposal; retrieved evidence explains the final result |
 | Decisions | Schema and deterministic policy tests with controlled outputs | Real Swift model adapter with cancellation and unavailable-model cases | Actual on-device decisions in local and remote-assisted workflows |
 | Tools | Registry contracts and capability decisions | Actual constrained processes and denied resource access | Malicious content cannot induce unauthorized execution or egress |
+
+The following regression scenarios are required design acceptance cases, not
+implemented tests. D3-D5 must assign concrete fixtures, commands and environments
+before the corresponding implementation packets become ready.
+
+| Case | Unit | Integration | End-to-end |
+| --- | --- | --- | --- |
+| Control during reconciliation | Generate pause/cancel/recovery orderings and prove cancel precedence with no resume | Persist cancel after entering reconciliation, restart, then deliver a late outcome and assert no new task dispatch | Disconnect an executing host, enter reconciliation, cancel from another client, reconnect and report accounted or explicitly uncertain effects |
+| User-decision expiry | Race response, timeout and cancellation against one revision and assert a single winner with no inference after expiry | Restart with an expired pending decision and unresolved action, reject late/duplicate responses and preserve failure/cancel intent | Let a required decision expire through CLI/TUI, observe failure or reconciliation and no re-prompt or new task work |
+| Model session isolation | Reject identity/generation mismatch and account for full retained-input budgets and provenance | Exercise the real adapter with task A then B, revocation/deletion during inference, and stale tool callbacks; prove retirement or isolated reconstruction | Run tasks with distinct access scopes and revoke access within a task; verify excluded evidence never enters a later effective input, and invalidated outputs are not accepted |
+
+Session tests must inspect admitted effective inputs, manifests and generation
+acceptance at the adapter boundary. Absence of a secret in one stochastic model
+answer alone does not prove isolation. Exercise both stateless and retained-state
+paths if both are shipped, including remote conversations when I5 is delivered.
 
 Also define model evaluation datasets, protocol fuzzing, multi-client race tests,
 context poisoning cases, token-boundary cases, graph growth/retrieval benchmarks,

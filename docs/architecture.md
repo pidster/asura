@@ -166,6 +166,12 @@ Model decisions operate within independently enforced permissions and budgets.
 Repository content, tool output, and remote responses cannot grant authority.
 Task state must remain understandable without reconstructing it from model prose.
 
+Model session history and application-managed caches are part of the effective
+context whenever they can influence a later response. They must obey the same
+scope, provenance, budget and invalidation rules as newly selected evidence.
+The [model session contract](designs/core-harness-brief.md#model-session-ownership-and-effective-context)
+assigns ownership and requires stateless calls or explicitly isolated sessions.
+
 ## Security boundaries
 
 Protection is bidirectional: protect Asura from external interference and protect

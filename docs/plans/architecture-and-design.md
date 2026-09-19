@@ -193,8 +193,8 @@ be fixed in their canonical document, including D0 or D1 where necessary.
 | D0: product scenarios and terminology | Existing requirements | `product-workflows.md`, `domain-model.md`, requirements/validation matrix | Define task, conversation, agent, host, action, observation, context, and decision; specify initial workflows and measurable UX/reliability/performance objectives |
 | D1: platform and threat model | D0 | `platform-capabilities.md`, `threat-model.md` | Verify installed/public API evidence; identify adversaries, data flows, protected assets, entitlements/distribution constraints, and OS mechanisms needing live proof |
 | D2: ownership and topology | D0, D1 | `system-architecture.md`, `swift-rust-boundary.md`, `repository-layout.md` | Assign each behavior exactly one owner; select process/module boundaries, IPC/FFI, toolchain and packaging approach; draw dependencies and deployment views |
-| D3: control, policy and durable state | D2 | `control-api.md`, `security-policy.md`, `task-lifecycle.md`, `persistence-recovery.md` | Command/event schemas, policy format/evaluator selection, source authority and composition, activation/revocation, state transitions, transactions, retry/replay semantics, caller/host identities and authorization; no unexplained ambiguous effects |
-| D4: core cognition and execution | D2, D3 | `agent-loop.md`, `context-graph.md`, `model-decisions.md`, `tools-execution.md` | Resolve the core brief; specify selection algorithms, state machines, graph consistency, authority checks, context budgets, bounded model interactions and evaluations |
+| D3: control, policy and durable state | D2 | `control-api.md`, `security-policy.md`, `task-lifecycle.md`, `persistence-recovery.md` | Command/event schemas, policy format/evaluator selection, source authority and composition, activation/revocation, state transitions, transactions, retry/replay semantics, caller/host identities and authorization; durable control intent during reconciliation and response/deadline/cancel arbitration; no unexplained ambiguous effects |
+| D4: core cognition and execution | D2, D3 | `agent-loop.md`, `context-graph.md`, `model-decisions.md`, `tools-execution.md` | Resolve the core brief; specify selection algorithms, state machines, graph consistency, authority checks, effective-context budgets and provenance including model-session state, invalidation and stale-result rejection, bounded model interactions and evaluations; enforce separate source and generated-output write authority |
 | D5: remote boundaries | D1-D4 | `remote-inference.md`, `remote-hosts.md` | Separate inference from host execution; define data egress, trust enrollment/revocation, lease/partition behavior, result provenance and compatibility |
 | D6: interaction and operations | D3-D5 | `cli-tui.md`, `configuration.md`, `observability-audit.md` | Walk through happy/failure journeys; define controls, configuration precedence, redaction, audit durability, telemetry correlation and bounded export |
 | D7: validation and delivery | D2-D6 | `validation-strategy.md`, `build-release.md` | Unit/integration/e2e mapping, model datasets, fuzz/property tests, actual macOS/multi-host runners, performance budgets, signing/update plan and check commands |
@@ -204,6 +204,35 @@ Draft the validation matrix in D0 and evolve it in every stage; D7 consolidates
 infrastructure and execution gates. Security, observability, and UX apply throughout.
 Write decision records as choices arise, linking to specifications rather than
 copying them. Revisit earlier contracts when later design exposes an inconsistency.
+
+### Lifecycle, model-state and execution design gates
+
+Use the [core harness brief](../designs/core-harness-brief.md) as the canonical
+starting contract for control intent, decision deadlines and effective context.
+D3 must specify durable receipt of pause/cancel while reconciling, cancellation
+precedence that prevents resumption, and arbitration of user responses, deadline
+expiry and cancellation. A winning decision timeout means terminal failure after
+necessary settlement/reconciliation of existing effects, with no new model or
+work dispatch. Define the persistence point that chooses the outcome and test
+restart/replay around it; client timing alone cannot decide the winner.
+
+D4 must select explicitly stateless model interactions or scoped retained state.
+Any retained state must be included in effective-context provenance and budget
+accounting, with lifecycle rules for retirement/rebuilding after revocation,
+deletion or cancellation and rejection of stale outputs. Under the proposed
+allocation, Rust owns task authority and context eligibility while Swift owns
+Foundation Models session mechanics. D2/D4 must define the cross-language
+scope/generation identity, invalidation acknowledgement, cancellation, restart and
+late-result contracts for either IPC or FFI. Neither an isolated process nor a
+fresh request payload alone proves absence of retained session history.
+
+D4's execution design must distinguish source-write authority from grants for
+task-local scratch and generated build outputs. Host enforcement covers build
+scripts and their descendants, including indirect access through filesystem
+aliases. I2 requires source access to remain read-only; I6 introduces source edits
+only through its ready editing contract. If required confinement is unsupported,
+reject the affected tool or operation. D7 must map these boundaries to the unit,
+integration and e2e gates in the [implementation plan](implementation.md#early-increment-acceptance-gates).
 
 ### Security policy format and enforcement
 
@@ -235,8 +264,8 @@ designs refine them and become the canonical source for selected behavior.
 | --- | --- |
 | D0-D1 | User journeys, domain relationships, data flows and threat boundaries |
 | D2 | Component/dependency, process/deployment, and Swift/Rust request/cancellation/shutdown sequences |
-| D3 | Command/event sequences, policy schema and activation/revocation states, authorization/launch races, task/action state machines, transaction boundaries, reconnect and crash recovery |
-| D4 | Agent-step flow, decision branches, graph schema/cardinalities, retrieval/invalidation flow, tool authorization and failure sequences |
+| D3 | Command/event sequences, policy schema and activation/revocation states, authorization/launch races, task/action state machines including control received during reconciliation, durable response/deadline/cancel arbitration, transaction boundaries, reconnect and crash recovery |
+| D4 | Agent-step flow, decision branches, graph schema/cardinalities, effective-context and model-session scope/invalidation flow, tool authorization and failure sequences including source/output confinement |
 | D5 | Separate remote-inference and remote-host sequences; enrollment, revocation, partition, lease/fencing and reconciliation states |
 | D6 | Interactive and non-interactive workflows, multi-client decisions, configuration precedence, telemetry and audit pipelines |
 | D7-D8 | Test/evidence mapping, packaging/update/migration flows and packet dependency/readiness gates |
@@ -260,6 +289,16 @@ designs refine them and become the canonical source for selected behavior.
    expired grants, and eventual reconciliation remain well-defined.
 9. Malicious workspace text, a compromised tool result, or an unauthorized client
    cannot expand capabilities; collector failure cannot block control operations.
+10. A pause or cancel first arrives while reconciling uncertain work; restart and
+    reconnect preserve it, and cancellation prevents subsequent dispatch.
+11. A user response races decision expiry and cancellation; one durable outcome
+    wins, and a winning timeout ends the task after settling existing effects.
+12. A model session contains evidence whose access is revoked or whose source is
+    deleted during inference; subsequent requests and late responses cannot use
+    that state, and another task cannot inherit it outside its authorized context.
+13. A permitted build attempts a source write through a script, child process or
+    filesystem alias; host enforcement denies it while allowing only explicitly
+    granted scratch/generated outputs.
 
 ## Evidence and decision discipline
 
