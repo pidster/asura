@@ -30,16 +30,27 @@ accommodate a GUI and remote machines running Asura agents from day one.
 | Component | Owns |
 | --- | --- |
 | Control clients | Input, presentation, interaction, and delivery of user decisions through the control contract |
-| Orchestrator | Task state, scheduling, delegation, coordination and shared budget reservations |
+| Orchestrator | User-service lifecycle, project context registry, task state, scheduling, delegation and shared budget reservations |
+| Configuration resolver | Directory discovery, schema-based composition, source provenance and configuration snapshots |
 | On-device decision subsystem | Model-assisted classification, routing, tool selection, and structured decision results |
 | Agent runtime | Execution of assigned work and reporting progress and outcomes |
 | Host services | Local process and workspace access, credentials, capability enforcement, and resource limits |
 | Remote AI adapters | Provider-specific inference requests and response translation |
 | Remote host adapters | Communication with and control of Asura execution on other machines |
 
-These are logical boundaries. Process topology, deployment, and package structure
-must be designed before implementation. A local deployment must exercise the
-same semantic control contract that future interfaces will use.
+On a user device, the backend runs once per OS user and manages multiple project
+and repository contexts. All local clients connect to that service. Agent and
+platform helpers may use separate processes. The service supervisor, helper
+boundaries, transport and package structure remain detailed design decisions.
+A local deployment must exercise the same semantic control contract that future
+interfaces will use.
+
+The backend discovers configuration in a command's directory and its parents.
+One resolver combines applicable sources from root to leaf, with explicit schema
+rules and inspectable provenance. Project settings cannot change service-owned
+settings or expand security permissions. The
+[service and configuration brief](designs/user-service-configuration.md) defines
+context identity, composition, change handling and validation requirements.
 
 Remote AI inference and execution on a remote Asura machine are distinct
 capabilities. Each requires its own authorization, lifecycle, and failure model.
@@ -69,38 +80,24 @@ flowchart TB
         TUI["Interactive chat / TUI"]
         GUI["Future GUI"]
     end
-    subgraph Local["Local Asura host"]
+    subgraph Local["User device: one backend owner per OS user"]
         API["Control API: authenticate and authorize"]
         Orch["Orchestrator: lifecycle and scheduling"]
+        Registry["Project context registry"]
+        Config["Configuration resolver"]
         Agent["Agent runtime: bounded steps"]
-        Model["On-device decision subsystem"]
-        Context["Context subsystem: evidence and selected views"]
-        Policy["Canonical capability policy"]
-        Host["Host services: enforce grants at execution"]
-        AIAdapter["Remote inference adapter"]
         HostAdapter["Remote host adapter"]
         State[("Durable task and action state")]
     end
-    subgraph External["External data and service boundaries"]
-        Workspace["Workspace and tool output"]
-        Provider["Remote AI provider"]
-        Remote["Remote Asura host: independent grant enforcement"]
-    end
+    Remote["Remote Asura host: independent grant enforcement"]
     CLI -->|Commands and subscriptions| API
     TUI -->|Commands and user decisions| API
     GUI -->|Same semantic contract| API
     API <-->|Authorized commands / task events| Orch
+    Orch -->|Own context identities| Registry
+    Orch -->|Resolve scoped snapshots| Config
     Orch -->|Assign bounded work| Agent
     Orch -->|Commit lifecycle changes| State
-    Agent -->|Retrieve scoped evidence| Context
-    Agent <-->|Decision request / typed proposal| Model
-    Agent -->|Check action and egress scope| Policy
-    Agent -->|Action with grant and preconditions| Host
-    Host -->|Revalidate current grant| Policy
-    Host -->|Constrained operations| Workspace
-    Workspace -->|Untrusted observations| Context
-    Agent -->|Authorized inference request| AIAdapter
-    AIAdapter <-->|Bounded disclosure / untrusted result| Provider
     Orch -->|Authorized placement and control| HostAdapter
     HostAdapter <-->|Authenticated control / outcome evidence| Remote
 ```
@@ -109,12 +106,31 @@ Every client receives the orchestrator's events through the API; return arrows
 are condensed here to keep the ownership view legible. Remote results re-enter
 the same validation and reconciliation path as local observations.
 
+### Execution and data boundaries
+
+Requirements view for the agent assigned work above. Arrows show requests,
+validation and evidence flow. Logical components do not imply separate processes.
+Workspace content and provider results cross untrusted-input boundaries.
+
+```mermaid
+flowchart TD
+    Agent["Agent runtime: bounded steps"] -->|Retrieve scoped evidence| Context["Context subsystem"]
+    Agent <-->|Decision request / typed proposal| Model["On-device decision subsystem"]
+    Agent -->|Check action and egress scope| Policy["Canonical capability policy"]
+    Agent -->|Action with grant and preconditions| Host["Host services"]
+    Host -->|Revalidate current grant| Policy
+    Host -->|Constrained operations| Workspace["Workspace and tool output"]
+    Workspace -->|Untrusted observations| Context
+    Agent -->|Authorized inference request| AIAdapter["Remote inference adapter"]
+    AIAdapter <-->|Bounded disclosure / untrusted result| Provider["Remote AI provider"]
+```
+
 ## Control API requirements
 
 The orchestrator API must be modern, asynchronous, highly reliable, very high
 performance, and secure. Its design must define:
 
-- Typed, versioned commands and structured events with stable task and agent identities.
+- Typed, versioned commands and structured events with stable context, task and agent identities.
 - Progress streaming, deadlines, cancellation semantics, and bounded backpressure.
 - Durable state and reconnect behavior, including event ordering, replay, and retention.
 - Idempotency and retry semantics, including how a caller resolves an ambiguous
@@ -275,7 +291,7 @@ shared contracts and host-local enforcement remain consistent across deployments
 ## Decisions required before implementation
 
 1. Initial workflows, task/agent lifecycle, and UX acceptance criteria.
-2. Module ownership, process topology, and local/remote deployment contracts.
+2. Module ownership, user-service supervision, helper topology and remote deployment contracts.
 3. Control protocol, compatibility rules, persistence, and recovery semantics.
 4. Threat model, host isolation mechanisms, identity, and capability grants.
 5. Decision subsystem responsibilities and model evaluation criteria.

@@ -22,11 +22,16 @@ The [core harness brief](../designs/core-harness-brief.md) supplies proposed loo
 and context-graph semantics for investigation. This plan owns sequencing and
 deliverables rather than duplicating their specifications.
 
+The [user-service brief](../designs/user-service-configuration.md) fixes one backend
+per device user, multiple project contexts and hierarchical configuration.
+D2-D3 must resolve its mechanisms before D4 consumes those contracts.
+
 ## Proposed language ownership
 
 | Owner | Language | Responsibility |
 | --- | --- | --- |
 | Orchestrator | Rust | Scheduling, task lifecycle, durable transitions, shared budget reservations and usage records, agent coordination, control API |
+| Configuration resolver | Rust | Directory discovery, field composition, source provenance and immutable snapshots within the backend |
 | Agent core | Rust | Bounded step semantics, action proposals and lifecycle coordination, budget requests, progress and termination rules |
 | Context subsystem | Rust | Graph semantics, provenance, retrieval, context assembly, invalidation |
 | Policy and execution | Rust | Canonical capability evaluation, execution coordination, tool registry and contracts |
@@ -173,10 +178,10 @@ omitted for readability; the stage table records the full dependency sets.
 flowchart TD
     D0["D0: workflows, terminology and measurable objectives"] --> D1["D1: platform evidence and threat model"]
     D1 --> D2["D2: ownership, topology and Swift/Rust boundary"]
-    D2 --> D3["D3: control API, lifecycle and recovery"]
+    D2 --> D3["D3: control, configuration, lifecycle and recovery"]
     D3 --> D4["D4: loop, graph, decisions and tools"]
     D4 --> D5["D5: remote inference and remote hosts"]
-    D5 --> D6["D6: interaction, configuration and observability"]
+    D5 --> D6["D6: user workflows and observability"]
     D6 --> D7["D7: validation, build and release designs"]
     D7 --> D8{"D8: coherent contracts and first-slice readiness?"}
     D8 -->|Yes| Packets["Scoped implementation packets with design references"]
@@ -198,7 +203,7 @@ be fixed in their canonical document, including D0 or D1 where necessary.
 | [D0](#d0-product-scenarios-and-terminology) | Workflows and terms | Existing requirements |
 | [D1](#d1-platform-and-threat-model) | Platform and threats | D0 |
 | [D2](#d2-ownership-and-topology) | Components and processes | D0, D1 |
-| [D3](#d3-control-policy-and-durable-state) | Control, policy and recovery | D2 |
+| [D3](#d3-control-policy-and-durable-state) | Control, policy, configuration and recovery | D2 |
 | [D4](#d4-core-cognition-and-execution) | Agent loop, context and tools | D2, D3 |
 | [D5](#d5-remote-boundaries) | Remote inference and hosts | D1–D4 |
 | [D6](#d6-interaction-and-operations) | Interaction and operations | D3–D5 |
@@ -212,7 +217,9 @@ validation matrix.
 
 **Exit checks:**
 
-- Define task, conversation, agent, host, action, observation, context, and decision.
+- Define task, conversation, agent, host, action, observation and decision.
+- Distinguish project contexts, repositories, worktrees and model context; define
+  overlapping registrations and working-location identity.
 - Specify the initial user workflows.
 - Set measurable UX, reliability, and performance objectives.
 
@@ -236,17 +243,24 @@ validation matrix.
 
 - Assign each behavior to one component.
 - Select module and process boundaries, including IPC or FFI between Swift and Rust.
+- Preserve one backend owner per OS user on a user device. Select supervision,
+  authenticated service discovery, concurrent-start arbitration and helper boundaries.
 - Select the toolchain and packaging approach.
 - Draw component dependencies and deployment views.
 
 ### D3: Control, policy and durable state
 
-**Outputs:** `control-api.md`, `security-policy.md`, `task-lifecycle.md`, and
-`persistence-recovery.md`.
+**Outputs:** `control-api.md`, `security-policy.md`, `task-lifecycle.md`,
+`persistence-recovery.md`, and `configuration.md`.
 
 **Exit checks:**
 
 - Define command and event schemas.
+- Define durable service/context identities, owner replacement and context-scoped
+  commands, event subscriptions, configuration revisions and restart recovery.
+- Specify hierarchy discovery, field schemas, scope restrictions, source provenance,
+  snapshot consistency and parent-change activation under the
+  [configuration contract](../designs/user-service-configuration.md).
 - Select the policy format and evaluator. Define trusted policy sources,
   composition rules, activation, and revocation.
 - Define caller and host identities, and authorization checks.
@@ -285,12 +299,14 @@ The lifecycle and storage gates below add required detail to these checks.
 
 ### D6: Interaction and operations
 
-**Outputs:** `cli-tui.md`, `configuration.md`, and `observability-audit.md`.
+**Outputs:** `cli-tui.md`, configuration workflows in D3's `configuration.md`, and
+`observability-audit.md`.
 
 **Exit checks:**
 
 - Walk through successful and failed user workflows.
-- Define controls and configuration precedence.
+- Define controls and configuration editing, inspection and repair workflows.
+  Use D3's canonical precedence and activation contract.
 - Specify redaction, audit durability, telemetry correlation, and export limits.
 
 ### D7: Validation and delivery
@@ -411,7 +427,8 @@ The evaluation must cover:
 - Network failures and commits whose outcome is unknown.
 - Schema and migration ownership.
 
-D6 defines configuration and diagnostics. For a new installation, use embedded
+D3 defines the service-level storage configuration contract; D6 defines its
+editing and diagnostics. For a new installation, use embedded
 storage when no external connection is configured. Use external storage when one
 is configured. Before reopening an installation, verify its persisted store binding,
 as required by [ADR-0001](../decisions/0001-context-store-binding.md).

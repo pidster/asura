@@ -84,8 +84,10 @@ bindings, CI, test runners, and initial telemetry setup.
 
 **Deliver:**
 
-- Host entry point, control API, client library, and non-interactive CLI.
-- Task identities, event stream, configuration, and local caller authentication and authorization.
+- One backend service per device user, control API, client library and non-interactive CLI.
+- Persistent project context registry, scoped task identities and event stream.
+- Hierarchical configuration resolver and inspectable snapshots under D3's design.
+- Local caller authentication and authorization.
 - Validation, evaluation, and atomic activation for the selected policy format.
 - Durable control requests and rules for concurrent user responses and decision deadlines.
 
@@ -96,6 +98,15 @@ bindings, CI, test runners, and initial telemetry setup.
 - Recover state after restart, including control requests received during reconciliation.
 - Reject unauthorized callers and invalid policy updates.
 - Replay concurrent response, deadline, and cancellation events with one durable outcome.
+- Meet [C1-C4](../designs/user-service-configuration.md#validation-required-before-delivery)
+  for the delivered boundaries: concurrent startup, multiple contexts, parent
+  configuration changes, stale revisions and service recovery. I2 adds scoped
+  graph and real tool-enforcement evidence; I3 adds model-session evidence.
+
+Configuration semantics are a prerequisite, not work deferred until the TUI.
+Unit rules, real filesystem/service integration and CLI end-to-end checks must
+cover the delivered service and configuration behavior. Later increments add
+their boundaries to the same C1-C4 cases.
 
 ### I2: Context and bounded host execution
 

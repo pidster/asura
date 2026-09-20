@@ -565,6 +565,12 @@ erDiagram
     }
 ```
 
+Tasks also carry the stable project context and validated working location from
+the [user-service contract](user-service-configuration.md#project-context-identity).
+The single user service does not make evidence, permissions or model history
+shared across projects. A task pins its configuration snapshot; current policy
+still governs each action. D3-D4 must refine these identities in the concrete schema.
+
 This initial view scopes each evidence version to a task. Cross-task reuse,
 permission inheritance, payload storage and deletion need explicit D4 decisions;
 they must not be inferred from shared identifiers. The optional producing action

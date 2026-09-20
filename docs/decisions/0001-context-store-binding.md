@@ -26,8 +26,9 @@ no embedded graph.
 The orchestrator owns the binding lifecycle. The storage adapter persists binding
 metadata and verifies database identity. The context subsystem owns graph rules
 and reference validation. These responsibilities follow the proposed Rust
-allocation. Swift adapters and interface clients do not duplicate store selection. Process topology
-and physical persistence remain D2-D3 decisions.
+allocation. Swift adapters and interface clients do not duplicate store selection.
+[ADR-0004](0004-user-service-contexts.md) fixes one backend owner per OS user on a
+user device. Helper process topology and physical persistence remain D2-D3 decisions.
 
 Changing mode or graph identity requires an authorized operation with a recovery
 procedure. That operation must preserve existing references or explicitly resolve

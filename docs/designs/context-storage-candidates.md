@@ -39,6 +39,12 @@ procedure. Asura must not silently create an empty replacement, write to both
 stores, replicate between them, or fall back to embedded storage after an external
 failure.
 
+On a user device, the installation is the persistent state scope of the
+[per-user service](user-service-configuration.md). Its graph holds evidence for
+multiple project contexts with explicit scope isolation. Directory configuration
+cannot select or replace that shared graph; graph settings require service
+administration authority. Context registration does not create another installation.
+
 D3 must separately decide where the task/action ledger resides. An external graph
 does not require remote storage of policy, credentials or other installation state.
 
@@ -55,7 +61,8 @@ reference validation. Swift model/platform adapters and control clients must not
 select a store independently or repair a binding.
 
 Platform adapters may provide protected-file and credential operations after
-D1-D2 defines those contracts. Process boundaries and IPC/FFI remain open. The
+D1-D2 defines those contracts. One backend owner per device user is required;
+helper process boundaries and IPC/FFI remain open. The
 external database is a separate server and trust boundary. It does not coordinate
 Asura tasks.
 
@@ -88,7 +95,9 @@ first binding. Missing files during reopen require recovery.
 
 Initialization must detect existing installation, ledger and store references.
 It must reject accidental reuse. A deliberately separate installation needs a
-separate identity and state scope. Missing embedded data also requires recovery;
+separate identity and state scope, such as another host or isolated validation
+environment. A state-directory option cannot bypass the one-backend-per-user rule.
+Missing embedded data also requires recovery;
 it must not cause creation of an empty replacement. Diagnostics must show the
 resolved mode, binding generation and repair action without exposing secrets.
 
@@ -365,8 +374,8 @@ Two embedded engines must not open the same data directory.
 
 ## External connection and failure contract to design
 
-Required behavior. D6 must define the configuration schema. D3-D4 must define
-security and persistence before I2.
+Required behavior. D3 must define the configuration schema; D6 defines its user
+workflows. D3-D4 must define security and persistence before I2.
 
 The orchestrator must show the resolved mode in effective configuration and
 diagnostics. External settings must identify the endpoint, namespace, database,

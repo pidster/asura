@@ -8,6 +8,8 @@ schemas and runtime mechanisms remain with their governing designs.
 | Term | Meaning |
 | --- | --- |
 | Orchestrator | Component that controls task state, schedules work and manages shared budgets |
+| User service | One active backend owner for an OS user on a device; it can supervise separate agent and helper processes |
+| Installation | Persistent backend state scope; on a user device it belongs to the user service, not to an individual project |
 | Agent core | Component that determines the steps needed to perform assigned work |
 | Agent runtime | Component that executes assigned work and reports its progress and results |
 | Host | Machine that runs an Asura instance or performs an operation |
@@ -69,6 +71,9 @@ defines binding changes.
 | Term | Meaning |
 | --- | --- |
 | Provenance | Records of an item's source, version and transformations |
+| Project context | Registered project or repository scope with stable identity and working locations; distinct from model input |
+| Working location | Validated filesystem location associated with a project context, including an individual repository worktree |
+| Configuration snapshot | Immutable effective settings and source provenance for a context and working directory at a revision |
 | Context view | Selected evidence and instructions prepared for a particular task and destination |
 | Effective context | All input that can affect a model response, including retained session history and caches |
 | Manifest | Record of selected inputs, their versions, order, transformations and omissions |
@@ -81,3 +86,8 @@ defines binding changes.
 The [visual reading map](decisions/README.md#visual-reading-path) connects the
 architecture overview to the detailed contracts. This glossary explains terms;
 it does not replace those contracts.
+
+The [user-service brief](designs/user-service-configuration.md) defines project
+contexts and directory configuration. Existing workspace-scoped contracts must
+carry that project context and validated location; “workspace” is not a global
+current directory for the service. D0 must refine their exact identity schema.

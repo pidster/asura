@@ -12,6 +12,25 @@ project terms.
 | F2: some failures could bypass effect accounting | [ADR-0002: use one failure procedure](0002-failure-settlement.md) | [Failure contract](../designs/core-harness-brief.md#common-failure-and-deadline-contract) |
 | F3: parallel children could spend the same allowance | [ADR-0003: reserve shared budgets](0003-aggregate-budget-admission.md) | [Budget contract](../designs/core-harness-brief.md#aggregate-budget-ownership-and-admission) |
 
+## User-service requirement on 2026-09-20
+
+[ADR-0004](0004-user-service-contexts.md) records one backend per device user,
+multiple project contexts and configuration discovery through parent directories.
+The [service and configuration brief](../designs/user-service-configuration.md)
+owns the scope, composition and change rules. Its C1-C4 cases require service,
+filesystem, context-isolation and recovery evidence. D3 now owns configuration
+semantics; D6 develops their editing and inspection workflows.
+
+Validation: an independent read-only review checked service ownership, source
+trust, scope isolation and reload behavior. Its three findings were corrected and
+rechecked. Mermaid CLI 11.16.0 rendered all 14 diagrams in the five documents with
+changed diagram sources. All 11 new or changed diagrams were visually inspected;
+large ownership and lifecycle views were split for readability. All 150 local
+links and anchors passed, as did `git diff --check`. These are documentation
+checks, not implementation or runtime evidence.
+
+## Delivery evidence for the review findings
+
 I2 must test F1 in both storage modes: initialization, reopen, identity mismatch
 and interrupted migration. I1–I2 must test F2 across failure, deadline and
 cancellation races, including restart and unknown effects. Later increments add
@@ -32,9 +51,11 @@ flowchart TD
     A["Architecture: components and trust boundaries"] --> S["Storage: startup, binding and migration"]
     A --> L["Harness: task lifecycle and failure settlement"]
     A --> B["Harness: action admission and budget hierarchy"]
+    A --> C["User service: contexts and directory configuration"]
     S --> D["D3-D6: concrete schemas, mechanisms and failure contracts"]
     L --> D
     B --> D
+    C --> D
     D --> V["D7-D8: acceptance matrix and adversarial consistency review"]
     V --> Review["Repo owner review of design and implementation plan"]
     Review --> Authorize["Explicit authorization to start implementation"]

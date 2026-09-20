@@ -42,6 +42,12 @@ listed restriction is supported by macOS.
 
 ## Proposed authorization contract
 
+The [user-service configuration contract](user-service-configuration.md#directory-discovery-and-composition)
+defines source discovery and ordinary-setting precedence. It does not grant
+authority. The policy component owns evaluation of security controls for each
+project context, and current policy constrains tasks with older configuration
+snapshots. Service administration settings cannot be replaced by directory files.
+
 The following are proposed invariants to resolve into `security-policy.md` and
 the threat model before implementation:
 
