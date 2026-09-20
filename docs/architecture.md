@@ -29,7 +29,7 @@ accommodate a GUI and remote machines running Asura agents from day one.
 | Component | Owns |
 | --- | --- |
 | Control clients | Input, presentation, interaction, and delivery of user decisions through the control contract |
-| Orchestrator | Task lifecycle, scheduling, delegation, coordination, and control state |
+| Orchestrator | Task lifecycle, scheduling, delegation, coordination, control state and durable aggregate budget admission |
 | On-device decision subsystem | Model-assisted classification, routing, tool selection, and structured decision results |
 | Agent runtime | Execution of assigned work and reporting progress and outcomes |
 | Host services | Local process and workspace access, credentials, capability enforcement, and resource limits |
@@ -42,6 +42,18 @@ same semantic control contract that future interfaces will use.
 
 Remote AI inference and execution on a remote Asura machine are distinct
 capabilities. Each requires its own authorization, lifecycle, and failure model.
+
+Context storage must support optional embedded SurrealDB or a configured external
+SurrealDB connection through one canonical storage contract. Use embedded storage
+by default for a new installation when no external connection is configured; use
+the external connection when configured. Reopening an installation first verifies
+its persisted store binding. Missing settings cannot select a different graph;
+mode or logical database changes require explicit migration/rebinding.
+External connection failure must not silently change that choice.
+External database access has its own trust, data-egress and availability boundary,
+independent of
+remote AI and remote agent control. See the [storage brief](designs/context-storage-candidates.md)
+for deployment requirements and the remaining engine/connection design work.
 
 ### Logical component and trust boundaries
 
@@ -165,6 +177,12 @@ uncertainty, invalid output, timeouts, and failed remote calls.
 Model decisions operate within independently enforced permissions and budgets.
 Repository content, tool output, and remote responses cannot grant authority.
 Task state must remain understandable without reconstructing it from model prose.
+
+The orchestrator reserves aggregate budgets durably before dispatch, including
+concurrent children and model operations. Unknown usage is not refunded on timeout
+or restart. Every terminal failure trigger stops new work and accounts for effects
+through the same settlement procedure. The [decision map](decisions/README.md)
+links rationale, detailed lifecycle/admission diagrams and delivery evidence.
 
 Model session history and application-managed caches are part of the effective
 context whenever they can influence a later response. They must obey the same

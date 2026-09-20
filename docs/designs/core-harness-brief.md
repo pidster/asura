@@ -5,10 +5,15 @@ Status: proposed semantics and open questions. This is an input to D3-D4 in the
 specification. Detailed algorithms, schemas, thresholds, and test cases remain
 to be resolved there.
 
+Selected constraints within this proposal are recorded in the
+[decision index](../decisions/README.md). They bind later designs but do not
+authorize implementation.
+
 ## Ownership and execution model
 
 Propose one durable orchestration state machine coordinating bounded agent steps.
-The orchestrator owns scheduling and task/agent lifecycle; the agent core owns
+The orchestrator owns scheduling, task/agent lifecycle and aggregate budget
+accounting; the agent core owns
 step semantics; the context subsystem owns evidence retrieval and assembly;
 host execution enforces action grants. Avoid a second scheduler or competing
 task state machine inside a model adapter or UI.
@@ -40,9 +45,12 @@ stateDiagram-v2
     Running --> WaitingExternal: Bounded dispatch
     WaitingExternal --> Running: Outcome reconciled
     Running --> Succeeded: Acceptance criteria verified
-    Running --> Failed: Fatal error or task budget exhausted
-    WaitingUser --> Failed: Decision expires and effects accounted for
-    WaitingUser --> Reconciling: Decision expires with unresolved effects
+    Running --> FailurePending: Fatal error or exhausted task budget
+    WaitingUser --> FailurePending: Decision or task deadline expires
+    WaitingExternal --> FailurePending: Fatal error or task deadline expires
+    Queued --> FailurePending: Task deadline expires
+    FailurePending --> Failed: Effects accounted for and no cancel intent
+    FailurePending --> Reconciling: Unresolved effects
     Succeeded --> [*]
     Failed --> [*]
 ```
@@ -107,10 +115,81 @@ persist `Failed`. If recovery fails with unknown effects, persist `Failed` with
 their uncertainty and any cancellation intent in the terminal report rather than
 claiming they stopped.
 
+Throughout these lifecycle views, **accounted** means operation effects are known
+and each usage obligation is either settled from evidence or conservatively held
+by an explicit durable reservation. Exact provider billing need not delay a
+terminal outcome once effects are known. Such an outcome must disclose unresolved
+usage and retained allowance. Unknown operation effects still require bounded
+reconciliation and cannot produce a successful cancellation claim.
+
+### Common failure and deadline contract
+
+Selected constraint for D3-D4; rationale in
+[ADR-0002](../decisions/0002-failure-settlement.md). `FailurePending` is the
+logical combination of failure intent and stopped dispatch, not a commitment to
+a separate stored enum. Fatal errors, exhausted task budgets, task deadline expiry
+and required user-decision expiry all enter this procedure from **every
+nonterminal state**, including queued, paused, waiting and reconciling states.
+Recoverable per-operation failures may retry only while this procedure has not
+started and current authorization and budgets permit it.
+
+1. Serialize the trigger against the authoritative task revision. Persist its
+   cause and pending failure intent, fence further task dispatch, and invalidate
+   planning/model generations. A previously accepted cancel retains precedence.
+2. Request bounded stopping of outstanding work and reconcile every admitted
+   operation, including model calls and delegated descendants. Admission records
+   must distinguish proven non-dispatch from an unknown outcome. Do not interpret
+   timeout, process death or a disconnected provider as proof of no effect or cost.
+3. Once effects are accounted for, persist `Failed`, or `Cancelled` if cancellation
+   won. If reconciliation cannot establish the outcome within its designed bound,
+   persist `Failed` with explicit uncertain effects, unresolved usage reservations
+   and recorded control intent. Never claim cancellation completed in that case.
+
+Failure intent forbids resume and fresh task/model work. Reconciliation and cleanup
+use separately authorized, bounded recovery resources, reserved outside the task's
+spendable allowance; they cannot borrow permission for new task work. D3/D4 must
+specify recovery bounds, allowed operations and exhaustion reporting before code.
+An authority-store outage cannot produce a false durable acknowledgement: locally
+stop new dispatch and use only existing bounded stop/cleanup authority until the
+selected persistence contract can record the transition. Remote owners remain
+subject to their lease and host limits. D3/D5 must define that outage protocol.
+
+The task deadline covers queueing, waiting, pause and reconciliation; pausing does
+not extend it. Deadline expiry during reconciliation records failure intent but
+does not skip settlement or reset the recovery bound. Terminalization, failure,
+cancel and dispatch admission are serialized: if success was already durably
+committed, a later timer cannot reopen it. Success requires no outstanding task
+operations and reconciled budget accounting. D3 defines clock representation,
+restart/clock-jump handling and the atomic mechanism. Clock uncertainty must not
+extend work authority. Late observations may append evidence and settle usage
+without reopening terminal state or triggering new work.
+
+#### Failure settlement flow
+
+Selected logical ordering. Edges are triggers or guarded outcomes; persistence
+technology and numerical recovery limits remain D3/D4 design work.
+
+```mermaid
+flowchart TD
+    Trigger["Fatal error, exhausted budget, task or decision expiry"] --> Fence["Serialize failure intent and dispatch fence against task revision"]
+    Fence --> Durable{"Authority store acknowledged?"}
+    Durable -->|No| Outage["Stop local dispatch, no durable acknowledgement, bounded outage recovery"]
+    Outage -->|Authority restored| Fence
+    Durable -->|Yes| Stop["Stop outstanding operations and descendants under recovery authority"]
+    Stop --> Known{"Effects and usage accounted for?"}
+    Known -->|Effects known and usage settled or reserved| Intent{"Cancel intent accepted?"}
+    Intent -->|Yes| Cancelled["Persist Cancelled with residual effects"]
+    Intent -->|No| Failed["Persist Failed with cause and effects"]
+    Known -->|No| Recover["Reconciling with bounded cleanup and retained reservations"]
+    Recover -->|New evidence| Known
+    Recover -->|Recovery bound exhausted| Unknown["Persist Failed with uncertainty and retained obligations"]
+```
+
 ### User-decision expiry contract
 
 Resolved brief-level behavior for D3-D4: expiry of a required user decision fails
-the task, rather than asking again or returning to model inference. Persist the
+the task, rather than asking again or returning to model inference. Apply the
+[common failure procedure](#common-failure-and-deadline-contract): persist the
 expired decision and failure intent, disable further task dispatch, and account
 for outstanding effects before reporting failure. With unresolved effects, remain
 in reconciliation until they are accounted for or the recovery contract produces
@@ -132,7 +211,7 @@ atomic update mechanism. A timer wakeup alone is not permission to infer or disp
 | 2. Assemble | Select a versioned context view with provenance, freshness and bounded size; include current task constraints |
 | 3. Decide | Ask the on-device subsystem for a typed proposal: gather context, perform a tool action, delegate, ask the user, wait, or finish |
 | 4. Validate | Validate schema, task relevance, context revision, capabilities, data egress, resource limits and preconditions; reject or request clarification |
-| 5. Record intent | Durably bind action identity, task revision, selected inputs and grant scope before dispatch; define expiry and recovery behavior |
+| 5. Admit and record intent | Atomically reserve aggregate budgets and durably bind action identity, task revision, selected inputs and grant scope before dispatch |
 | 6. Execute or wait | Dispatch to the local agent/tool, remote inference adapter, or remote host; stream bounded progress and honor deadlines |
 | 7. Reconcile | Record actual outcome, artifacts, evidence, and unknown effects; update durable state and graph consistently |
 | 8. Evaluate progress | Check acceptance criteria and independent validation results; continue, replan, ask, or terminate with an explicit reason |
@@ -149,7 +228,8 @@ flowchart TD
     Control -->|Yes| Settle["Stop new dispatch and reconcile outstanding effects"]
     Settle --> Controlled["Report paused, cancelled or reconciling"]
     Control -->|No| Budget{"Authority and remaining budgets valid?"}
-    Budget -->|No| Stop["Explain blocked or failed outcome"]
+    Budget -->|No| Stop["Enter common failure procedure and stop task dispatch"]
+    Stop --> FailureRecovery["Settle effects and usage, then report accounted or uncertain terminal outcome"]
     Budget -->|Yes| Context["Assemble scoped versioned context"]
     Context --> Decision["Request bounded on-device decision"]
     Decision --> Valid{"Schema, evidence and task revision valid?"}
@@ -159,27 +239,26 @@ flowchart TD
     Valid -->|Yes| Kind{"Proposed next step"}
     Kind -->|Ask user| User["Persist decision request and wait"]
     User -->|Authorized response accepted before deadline| Observe
-    User -->|Decision expired| Expired["Persist expiry and failure intent, stop task dispatch"]
-    Expired --> ExpiryRecovery["Account for effects through lifecycle recovery, never resume task work"]
+    User -->|Decision expired| Stop
     Kind -->|Finish| Verify{"Acceptance evidence sufficient?"}
     Verify -->|Yes| Success["Persist success with validation evidence"]
     Verify -->|No| Progress
-    Kind -->|Gather, tool or delegate| Gate{"Action, egress and preconditions permitted?"}
-    Gate -->|No| Rejection["Record denial or request authorized decision"]
-    Rejection --> Progress
-    Gate -->|Yes| Intent["Persist action identity, grant reference and input versions"]
-    Intent --> Execute["Dispatch after execution-boundary revalidation"]
-    Execute --> Result{"Outcome known?"}
-    Result -->|No| Reconcile["Reconcile; do not blindly repeat an effect"]
-    Reconcile -->|Resolved with recorded evidence| Progress
-    Reconcile -->|Still unknown| Unknown["Remain reconciling or report terminal failure with uncertainty; no dependent dispatch"]
-    Result -->|Yes| Record["Record result and graph update consistently"]
-    Record --> Progress{"Progress and retry budgets permit continuation?"}
+    Kind -->|Gather, tool or delegate| Action["Action lifecycle below: authorize, reserve, execute and reconcile"]
+    Action -->|Accounted result or definitive admission rejection| Progress{"Progress and retry budgets permit continuation?"}
+    Action -->|Unknown admission or effect| Unknown["Reconcile original ID without fresh dispatch"]
+    Unknown -->|Accounted| Progress
+    Unknown -->|Recovery bound exhausted| Stop
     Progress -->|Yes| Observe
     Progress -->|No| Stop
     Kind -->|Wait| Wait["Persist wake condition and deadline"]
     Wait -->|Event or deadline| Observe
 ```
+
+The on-device decision request itself also passes budget admission and the action
+lifecycle; the diagram delegates those details to the action sequence below. Admission
+rejections must yield a bounded wait, replan or failure decision; returning to
+Observe is not permission for a busy retry loop. Task deadline and common failure
+checks apply while waiting and before success.
 
 An unavailable, timed-out, or invalid model response follows the bounded
 retry/fallback policy; it cannot authorize a remote fallback on its own.
@@ -192,7 +271,7 @@ The detailed loop design must address:
 
 - Task revisions, concurrent user steering, stale proposals and late results.
 - Agent ownership/leases and fencing so an old owner cannot continue dispatching.
-- Step, time, cost, context and tool-call budgets, plus repeated-action and
+- The aggregate budget contract below, plus repeated-action and
   no-progress detection. Model-reported confidence alone is not a routing policy.
 - Separating permission to contact a remote model from permission to execute its
   suggestions, and bounding any recursively delegated work.
@@ -212,6 +291,7 @@ or updated through a recoverable projection; that choice remains open.
 sequenceDiagram
     autonumber
     participant A as Agent core
+    participant O as Orchestrator
     participant P as Capability policy
     participant S as Durable action ledger
     participant H as Host execution
@@ -221,13 +301,18 @@ sequenceDiagram
     alt Denied
         A->>S: Record rejected proposal
     else Authorized
-        A->>S: Persist action ID, input versions and grant reference
-        S-->>A: Durable intent acknowledgement
-        A->>H: Dispatch action ID and preconditions
-        H->>P: Revalidate current grant, lease and limits
+        A->>O: Admit action ID, task revision, input versions, grant and upper bounds
+        O->>S: Atomically reserve ancestor budgets and persist action intent
+        S-->>O: Durable admission or rejection
+        O-->>A: Admission reference or no-dispatch result
+        alt Rejected or ambiguous admission
+            Note over A,O: No dispatch, reconcile ambiguous admission by original ID before retry
+        else Durable admission
+        A->>H: Dispatch action ID, reservation and preconditions
+        H->>P: Revalidate current grant, lease, reservation fence and limits
         alt Revoked, expired or stale
             H-->>A: Rejected before effect
-            A->>S: Persist rejection
+            A->>O: Record proven non-execution and release unused reservation
         else Execution allowed
             H->>T: Execute bounded operation
             alt Result available
@@ -235,16 +320,97 @@ sequenceDiagram
                 H-->>A: Outcome for action ID
                 A->>S: Commit outcome and graph update or projection checkpoint
                 S-->>A: Durable result acknowledgement
+                A->>O: Settle reservation from durable usage evidence exactly once
             else Crash or connection loss after dispatch
                 Note over S,T: Persisted intent does not prove whether the effect occurred
                 A->>S: On recovery, find action with unknown outcome
                 A->>H: Reconcile original action ID and external evidence
                 H-->>A: Completed, proven not executed, or still unknown
                 A->>S: Persist reconciliation evidence
+                A->>O: Settle proven usage or retain uncertain reservation
                 Note over A,H: Retry only under the designed effect semantics and renewed authorization
             end
         end
+        end
     end
+```
+
+### Aggregate budget ownership and admission
+
+Selected constraints for D3-D5, with alternatives and consequences in
+[ADR-0003](../decisions/0003-aggregate-budget-admission.md). The orchestrator owns
+one durable budget authority. Agent core proposes bounds and consumes admission
+results; model/provider adapters report usage; hosts enforce operation limits.
+Neither a context graph value nor telemetry is spend authority.
+
+| Dimension | Accounting rule |
+| --- | --- |
+| Consumable steps, tool calls, model tokens and monetary cost | Typed units, cumulative charged usage plus outstanding reservations may not exceed the configured cap at admission. Money records currency and pricing revision; unlike units are never added together. |
+| Concurrent operations or resource occupancy | Reserve capacity while occupied; release only on evidence of completion/non-execution. A lost connection does not free the slot. |
+| Context capacity | Check the entire effective context per invocation, including retained history, with its model-specific limit. This is distinct from cumulative inference-token allowance. |
+| Elapsed task time | Check the authoritative task deadline; it is not replenished by retries, restart, waiting or pausing. |
+
+Budgets form a hierarchy: configured installation/workspace scopes where applicable,
+root task, child tasks and operations. Every operation is charged once against
+every applicable ancestor cap. A child cap can only narrow its inherited allowance.
+Creating children cannot multiply the root budget. The atomic admission decision
+checks all applicable dimensions and ancestors, current task revision and dispatch
+eligibility, then durably binds an operation ID to its reservation and action intent.
+Competing admissions cannot both consume the same remaining allowance. Duplicate
+admission requests return the same reservation/outcome, never another allocation.
+
+Each model call, retry, framework tool callback and delegated operation requires
+admission. Reserve a defensible upper bound on consumption before dispatch and
+enforce it at the execution/provider boundary. An operation without an enforceable
+bound cannot be admitted under a hard cap. Estimates alone do not establish hard
+cost guarantees. A provider-specific design must address billable input, maximum
+output, pricing and retries before claiming bounded monetary cost.
+
+Settle actual usage exactly once using durable operation evidence; release only
+the proven unused portion. Proven non-execution may release the full reservation.
+Unknown execution or billing retains the conservative reservation through timeout,
+cancel, terminal failure and restart. An expired reservation lease prevents new
+dispatch but does not prove old work stopped or refund consumption. Late usage
+evidence may settle it without reviving the task. If observed usage exceeds its
+bound, record all usage and the breach, stop further affected admissions, and enter
+failure handling; never truncate accounting to preserve the nominal invariant.
+
+For remote delegation, the root reserves a bounded child allocation before handoff;
+the child subdivides that allocation under a fenced owner epoch. Parent accounting
+counts the allocated envelope once, while child accounting counts its operations
+within it. Parent cannot spend or reassign the outstanding envelope during a
+partition. Release requires evidence that the old owner cannot continue consuming
+it and final usage is accounted for. Lost authority permits only already admitted
+bounded work, never new unallocated spending. D5 must specify the delegation
+protocol, expiry enforcement, epoch fencing and settlement evidence.
+
+D3/D4 must select reservation schemas, transaction/serialization primitives,
+durability location, configuration scopes, numeric precision/overflow behavior and
+recovery checkpoints. No network/model work runs inside the admission transaction.
+Admission unavailable or ambiguous means no fresh dispatch until the original
+operation ID is reconciled. Retrying a provider request is a new attempt with its
+own reservation unless the provider contract proves it is the same operation.
+
+#### Reservation lifecycle
+
+Selected logical states; arrows name evidence or admission outcomes. Unknown
+usage remains committed against the cap, including after a task becomes terminal.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Requested
+    Requested --> Rejected: Invalid authority or insufficient allowance
+    Requested --> Reserved: Atomic durable intent and ancestor reservation
+    Reserved --> InFlight: Current dispatch fence accepted
+    Reserved --> Settled: Proven non-dispatch releases allowance
+    InFlight --> Settled: Durable actual usage and unused portion recorded
+    Reserved --> Uncertain: Crash with dispatch status unknown
+    InFlight --> Uncertain: Effect or billing outcome unknown
+    note right of Uncertain: Timeout and task termination retain allowance
+    Uncertain --> Settled: Authoritative non-execution or usage evidence
+    Rejected --> [*]
+    Settled --> [*]
 ```
 
 ## Context graph purpose
@@ -259,11 +425,17 @@ Start with typed relationships and concrete queries. A graph data model does not
 require a graph database, embeddings, or a general autonomous memory system.
 Choose storage and indexes from workload evidence.
 
-Embedded SurrealDB is a candidate for evaluation; see the
-[context storage assessment](context-storage-candidates.md). Keep graph semantics
-owned by the context subsystem and database-specific persistence in the storage
-adapter. Database selection must not dictate the agent loop or expose raw query
-access to models and interface clients.
+SurrealDB support must allow optional embedded operation or a configured external
+connection; see the [context storage assessment](context-storage-candidates.md).
+Embedded is the initialization default when no external connection is configured;
+a configured external connection selects external initialization. On reopen,
+verify the persisted binding before opening either mode; missing configuration
+cannot silently select a different graph. The storage brief owns binding and
+migration semantics, including external failure behavior.
+Concrete engine, SDK/server versions and failure contracts remain under evaluation.
+Keep graph semantics owned by the context subsystem and database-specific
+persistence in the storage adapter. Database selection must not dictate the agent
+loop or expose raw query access to models and interface clients.
 
 Candidate node types:
 
@@ -526,6 +698,8 @@ before the corresponding implementation packets become ready.
 
 | Case | Unit | Integration | End-to-end |
 | --- | --- | --- | --- |
+| Common failure settlement | Generate fatal/deadline/budget triggers in every nonterminal state and success/cancel orderings; assert dispatch fencing, pause does not extend deadlines, and bounded recovery is separate from task work | Crash at intent, stopping and terminal commits; expire deadline during external work, inject authority-store outage and unknown effects/usage; recover without dispatch or budget reset | Expire a CLI task during an actual operation, restart, and show accounted failure or explicit uncertainty with its original cause and residual effects |
+| Aggregate budgets | Concurrent child and parent admissions share ancestor caps; duplicate operation IDs and settlement cannot allocate/refund twice; exercise typed units, overflow and bound violations | Real persistence races at the last allowance, crash before/after admission and settlement, unknown provider usage, partitioned child envelope and stale epochs | Parallel delegated work reaches a shared cap without overspend; cancel/restart retains unknown usage, late evidence settles it without reopening task; I5/I7 add actual provider and two-host evidence |
 | Control during reconciliation | Generate pause/cancel/recovery orderings and prove cancel precedence with no resume | Persist cancel after entering reconciliation, restart, then deliver a late outcome and assert no new task dispatch | Disconnect an executing host, enter reconciliation, cancel from another client, reconnect and report accounted or explicitly uncertain effects |
 | User-decision expiry | Race response, timeout and cancellation against one revision and assert a single winner with no inference after expiry | Restart with an expired pending decision and unresolved action, reject late/duplicate responses and preserve failure/cancel intent | Let a required decision expire through CLI/TUI, observe failure or reconciliation and no re-prompt or new task work |
 | Model session isolation | Reject identity/generation mismatch and account for full retained-input budgets and provenance | Exercise the real adapter with task A then B, revocation/deletion during inference, and stale tool callbacks; prove retirement or isolated reconstruction | Run tasks with distinct access scopes and revoke access within a task; verify excluded evidence never enters a later effective input, and invalidated outputs are not accepted |

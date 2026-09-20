@@ -7,8 +7,10 @@ plan's proposed layout until D2 resolves them.
 
 ## Entry gate
 
-Begin I0 only after D8 establishes coherent system boundaries and the initial
-implementation designs are ready. Each later increment requires its own ready
+Implementation is not currently authorized. Begin I0 only after repo owners have
+reviewed both the design and this plan, explicitly authorized implementation, and
+D8 establishes coherent system boundaries with ready initial implementation
+designs. Each later increment requires its own ready
 design and completed dependencies. A later feature may retain detailed open
 questions only if they do not undermine an earlier contract or security boundary.
 
@@ -27,7 +29,9 @@ decided at D0, not that every release must contain the GUI and remote hosts.
 
 ```mermaid
 flowchart TD
-    D8["D8: architecture consistent and first designs ready"] --> I0["I0: repository, contracts and quality infrastructure"]
+    D8["D8: architecture consistent and first designs ready"] --> Review["Owner review of design and implementation plan"]
+    Review --> Authorized["Explicit implementation authorization"]
+    Authorized --> I0["I0: repository, contracts and quality infrastructure"]
     I0 --> I1["I1: local control and durable lifecycle"]
     I1 --> I2["I2: context and bounded execution"]
     I2 --> I3["I3: on-device harness loop"]
@@ -73,6 +77,21 @@ and enforcement tests are ready. Generic command execution cannot bypass that ga
 
 ### Early-increment acceptance gates
 
+I2's context storage delivery includes both optional embedded SurrealDB and a
+configured external connection, following the [storage brief](../designs/context-storage-candidates.md).
+Verify embedded initialization when no external connection is configured and
+external initialization when one is configured; reject partial settings without
+falling back. Reopening must honor the persisted binding, reject missing or
+mismatched identity/configuration, and recover interrupted migration/rebinding.
+Include the storage brief's B1-B5 cases and ensure bootstrap metadata does not
+require an embedded graph in external mode.
+Require configuration/security unit cases, real embedded/server integration and
+CLI workflows for both modes. External-mode validation must cover authenticated
+connection setup, incompatible schemas, partitions and unknown commits, responsive
+status/cancellation, and operation without an embedded graph store. Do not defer
+this capability to remote inference (I5) or remote Asura hosts (I7); those are
+different boundaries. The exact engine, transport and schema require ready designs.
+
 These cases refine delivery evidence, not the canonical lifecycle or context
 contracts in the [core harness brief](../designs/core-harness-brief.md). Detailed
 designs must retain the cases when resolving implementation mechanisms. Under the
@@ -84,6 +103,8 @@ placing them in one process cannot remove the checks.
 
 | Gate | Unit acceptance | Integration acceptance | End-to-end acceptance |
 | --- | --- | --- | --- |
+| I1-I2: common failure settlement | Exercise fatal error, task deadline and budget exhaustion in every nonterminal state, including paused/waiting, racing success/cancel; no new dispatch after winning failure intent | Crash before/after failure persistence and during stopping; recover unresolved effects and usage without deadline reset or refunded reservations; exercise authority-store outage and bounded recovery exhaustion | CLI reports failure or reconciliation during an active fixture action, restart preserves the cause, and terminal output distinguishes accounted effects from uncertainty |
+| I2: aggregate admission and recovery | Competing children cannot exceed an ancestor cap; duplicate admission and settlement are idempotent; typed limits, context capacity and occupancy remain distinct | Race real durable admissions for the last allowance, crash around reservation/dispatch/settlement, inject unknown usage and store outage; no double spend or unearned refund | Concurrent fixture operations consume one shared task allowance; cancel/restart with uncertain usage leaves that allowance reserved and explains why further work cannot be admitted |
 | I1-I2: control during reconciliation and decision expiry | Exercise pause/cancel received during reconciliation, cancellation precedence, and each response/deadline/cancel ordering; terminal decision expiry forbids new model/work dispatch while existing effects settle | Restart between durable control-intent receipt and effect settlement; replay the winning decision outcome; deliver late results and ensure they cannot resume work after cancellation or timeout | CLI disconnects during an uncertain action, accepts cancel while reconciling, then reconnects without new dispatch; pending decision expires with a visible terminal failure after required reconciliation, not another decision loop |
 | I2: scratch/output writes with read-only source | Reject grants and path resolutions that exceed authorized output roots, including attempts to alias source files through links or traversal; distinguish generated-output authority from source-edit authority | On supported macOS, execute actual fixture builds and hostile build scripts/descendants that attempt direct and indirect source writes or output-root escape; verify allowed outputs succeed and source contents remain unchanged | Through the CLI, a permitted out-of-source fixture build produces evidence and bounded artifacts; a fixture requiring source mutation is denied with an explanation and no source change |
 | I3: model-state isolation and invalidation | Verify scope/generation matching, retained-context budget accounting, and invalidation on revocation, deletion or cancellation; reject stale results and cross-task state reuse | Across the selected Rust/Swift boundary, retire/rebuild affected model state, inject late completions and adapter restart, and confirm no invalidated contribution or untracked history can enter accepted context | With the real on-device model, interleave tasks containing distinguishable private fixtures, invalidate one task's context during inference, and verify only current scoped results can drive actions; inspect provenance and state-use evidence in addition to generated text |
@@ -95,6 +116,14 @@ not an acceptable substitute. I3 similarly cannot pass by checking model respons
 alone: the evidence must establish what state was eligible for each invocation.
 Two-host reconciliation evidence is added in I7; early local fault injection does
 not establish remote-host guarantees.
+
+I3 extends budget admission to real local inference and framework callbacks. I5
+requires real provider evidence for billable bounds, ambiguous responses and late
+usage settlement; mock billing alone cannot prove a hard monetary cap. I7 requires
+two-host envelope/fencing tests through partition, restart and stale-owner handoff.
+These extend the canonical I2 budget authority rather than introducing independent
+provider or child-task accounts. Common failure settlement applies at each new
+boundary. [ADRs 0002 and 0003](../decisions/README.md) record the rationale.
 
 The first useful terminal milestone is I4: both non-interactive and interactive
 local workflows. I6 adds the remote-assisted coding workflow. Remote-host and GUI
@@ -151,7 +180,9 @@ flowchart TD
     Conflict -->|No| Ready{"Design ready and prerequisites evidenced?"}
     Ready -->|No| Design["Resolve design or dependency gap before coding"]
     Design --> Packet
-    Ready -->|Yes| Reuse["Locate canonical implementations and contracts"]
+    Ready -->|Yes| Authority{"Design and plan reviewed and implementation authorized?"}
+    Authority -->|No| Hold["Remain in design and planning"]
+    Authority -->|Yes| Reuse["Locate canonical implementations and contracts"]
     Reuse --> Implement["Implement only the packet's owned scope"]
     Implement --> Changed{"Requires a contract or design change?"}
     Changed -->|Yes| Design

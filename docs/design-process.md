@@ -4,6 +4,11 @@ Never write code without a design. The architecture baseline establishes project
 direction; a scoped design makes a change concrete enough to implement and test.
 This rule covers production code, test code, scaffolding, build scripts, and spikes.
 
+Current project phase: design and implementation planning only. Repo owners must
+review both thoroughly, and explicitly authorize starting implementation, before
+any product code, tests, scaffolding or build scripts are written. A ready design,
+ADR or packet alone does not open that gate.
+
 ## Workflow
 
 1. Read the architecture, engineering standards, relevant designs, and existing
@@ -93,11 +98,12 @@ the lifecycle applies to each scoped design and its implementation packet.
 
 ```mermaid
 stateDiagram-v2
+    direction LR
     [*] --> Proposed
     Proposed --> Investigating: Identify owners and unresolved contracts
     Investigating --> Proposed: Evidence requires revision
     Investigating --> Ready: Contracts consistent and scope blockers resolved
-    Ready --> Implementing: Packet prerequisites and validation environment available
+    Ready --> Implementing: Design and plan reviewed, implementation authorized, packet prerequisites available
     Implementing --> Investigating: Behavioral or architectural change required
     Implementing --> Validating: Implementation and required tests delivered
     Validating --> Implementing: Failure within the governing design

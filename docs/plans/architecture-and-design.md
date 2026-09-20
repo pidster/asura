@@ -4,6 +4,11 @@ Status: proposed work plan. Swift and Rust are selected; component allocation,
 repository layout, protocols, and runtime mechanisms below are proposals to
 resolve through design. No implementation work is authorized by a plan alone.
 
+Current scope is design and planning only. Repo owners must review the design and
+implementation plan thoroughly before explicitly authorizing implementation.
+Selected constraints and their rationale are tracked in the
+[decision index and visual map](../decisions/README.md).
+
 ## Outcome
 
 Produce a coherent architecture, scoped implementation designs, decision records,
@@ -21,8 +26,8 @@ deliverables rather than duplicating their specifications.
 
 | Owner | Language | Responsibility |
 | --- | --- | --- |
-| Orchestrator | Rust | Scheduling, task lifecycle, durable transitions, agent coordination, control API |
-| Agent core | Rust | Harness state machine, action lifecycle, budgets, progress and termination rules |
+| Orchestrator | Rust | Scheduling, task lifecycle, durable transitions, aggregate budget admission/settlement, agent coordination, control API |
+| Agent core | Rust | Bounded step semantics, action proposals and lifecycle coordination, budget requests, progress and termination rules |
 | Context subsystem | Rust | Graph semantics, provenance, retrieval, context assembly, invalidation |
 | Policy and execution | Rust | Canonical capability evaluation, execution coordination, tool registry and contracts |
 | Model service | Swift | Foundation Models sessions, typed decisions, availability and model-specific limits |
@@ -216,6 +221,21 @@ necessary settlement/reconciliation of existing effects, with no new model or
 work dispatch. Define the persistence point that chooses the outcome and test
 restart/replay around it; client timing alone cannot decide the winner.
 
+[ADR-0002](../decisions/0002-failure-settlement.md) extends the common procedure
+to fatal errors, task deadlines and exhausted budgets in every nonterminal state.
+D3 must define deadline behavior across pause/restart, dispatch fencing, effect and
+usage settlement, authority-store outage behavior, and terminal uncertainty.
+D4 defines separately bounded cleanup authority/resources. No direct terminal
+failure path may bypass this contract.
+
+[ADR-0003](../decisions/0003-aggregate-budget-admission.md) assigns aggregate
+budget authority to the orchestrator. D3/D4 must define typed dimensions, hierarchy,
+atomic reservation with action intent, idempotent settlement, conservative unknown
+usage and admission recovery. D5 must define reserved remote envelopes, stale-owner
+fencing and release evidence; provider designs must establish enforceable cost
+bounds. Core loop checks and host limits consume this contract, not competing
+budget accounts. Include model decisions, framework callbacks and retries.
+
 D4 must select explicitly stateless model interactions or scoped retained state.
 Any retained state must be included in effective-context provenance and budget
 accounting, with lifecycle rules for retirement/rebuilding after revocation,
@@ -246,13 +266,24 @@ every supported client. Selecting a policy language does not prove OS confinemen
 
 ### Context storage candidate evaluation
 
-During D3-D4, evaluate embedded SurrealDB for the context graph using the
-[candidate assessment](../designs/context-storage-candidates.md). Coordinate the
-decision with persistence/recovery design: decide whether graph and action-ledger
+During D3-D4, design and evaluate optional embedded and configured external
+SurrealDB modes using the [storage brief](../designs/context-storage-candidates.md).
+Include endpoint/namespace/database identity, credentials and server trust,
+authorized data egress, network failures, unknown commits and schema/migration
+ownership. D6 defines the user-facing configuration and diagnostics: embedded is
+the initialization default when no external connection is configured, and external
+is selected when one is configured. Reopening verifies the persisted binding first,
+as required by [ADR-0001](../decisions/0001-context-store-binding.md). D3/D6 must
+specify independent bootstrap identity, authenticated logical graph identity,
+authorized migration/rebinding and interrupted-cutover recovery. Missing existing
+settings, invalid settings or connection failure must not trigger
+fallback. Coordinate the decision with persistence/recovery design: decide whether graph and action-ledger
 updates share transactions or use an explicitly recoverable projection. Produce
 a storage decision record backed by representative queries, correctness evidence,
 resource measurements, and pinned-version dependency/license inspection. The
-candidate is not selected and no dependency should be added before this work.
+concrete SDK/server/engine choices remain open and no dependency should be added
+before this work. External operation must not require an embedded graph database
+or silently fall back to one. Validate both modes before their I2 delivery gate.
 
 ### Diagram deliverables by design stage
 
@@ -264,7 +295,7 @@ designs refine them and become the canonical source for selected behavior.
 | --- | --- |
 | D0-D1 | User journeys, domain relationships, data flows and threat boundaries |
 | D2 | Component/dependency, process/deployment, and Swift/Rust request/cancellation/shutdown sequences |
-| D3 | Command/event sequences, policy schema and activation/revocation states, authorization/launch races, task/action state machines including control received during reconciliation, durable response/deadline/cancel arbitration, transaction boundaries, reconnect and crash recovery |
+| D3 | Command/event sequences, policy schema and activation/revocation states, authorization/launch races, task/action state machines including common failure settlement and control received during reconciliation, durable response/deadline/cancel arbitration, aggregate reservation/settlement, store binding and migration cutover, transaction boundaries, reconnect and crash recovery |
 | D4 | Agent-step flow, decision branches, graph schema/cardinalities, effective-context and model-session scope/invalidation flow, tool authorization and failure sequences including source/output confinement |
 | D5 | Separate remote-inference and remote-host sequences; enrollment, revocation, partition, lease/fencing and reconciliation states |
 | D6 | Interactive and non-interactive workflows, multi-client decisions, configuration precedence, telemetry and audit pipelines |
