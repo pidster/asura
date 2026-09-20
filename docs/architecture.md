@@ -1,15 +1,16 @@
 # Architecture baseline
 
-Status: requirements and responsibility boundaries established; detailed designs
-and technology selections remain open. This document does not establish runtime
-security or performance guarantees.
+Status: required behavior and component responsibilities. Detailed mechanisms
+remain open. Runtime behavior is not implemented or verified.
+
+Read the [glossary](glossary.md) for project terms and the
+[decision map](decisions/README.md) for selected decisions and detailed models.
 
 ## Purpose and platform
 
-Asura is a coding AI harness targeting macOS 27 and later. It uses Apple's
-Foundation Models API and on-device AI within orchestration for classification,
-decision making, tool management, and more sophisticated logic. The on-device
-capability determines when remote AI functionality is needed.
+Asura is a coding AI harness for macOS 27 and later. It uses Apple's Foundation
+Models API for on-device classification, decisions and tool management. The local
+model helps the orchestrator determine when a task needs remote AI.
 
 Swift and Rust are the selected implementation languages. Their proposed
 responsibilities and repository layout are recorded in the
@@ -29,7 +30,7 @@ accommodate a GUI and remote machines running Asura agents from day one.
 | Component | Owns |
 | --- | --- |
 | Control clients | Input, presentation, interaction, and delivery of user decisions through the control contract |
-| Orchestrator | Task lifecycle, scheduling, delegation, coordination, control state and durable aggregate budget admission |
+| Orchestrator | Task state, scheduling, delegation, coordination and shared budget reservations |
 | On-device decision subsystem | Model-assisted classification, routing, tool selection, and structured decision results |
 | Agent runtime | Execution of assigned work and reporting progress and outcomes |
 | Host services | Local process and workspace access, credentials, capability enforcement, and resource limits |
@@ -43,17 +44,17 @@ same semantic control contract that future interfaces will use.
 Remote AI inference and execution on a remote Asura machine are distinct
 capabilities. Each requires its own authorization, lifecycle, and failure model.
 
-Context storage must support optional embedded SurrealDB or a configured external
-SurrealDB connection through one canonical storage contract. Use embedded storage
-by default for a new installation when no external connection is configured; use
-the external connection when configured. Reopening an installation first verifies
-its persisted store binding. Missing settings cannot select a different graph;
-mode or logical database changes require explicit migration/rebinding.
-External connection failure must not silently change that choice.
-External database access has its own trust, data-egress and availability boundary,
-independent of
-remote AI and remote agent control. See the [storage brief](designs/context-storage-candidates.md)
-for deployment requirements and the remaining engine/connection design work.
+Context storage must support embedded SurrealDB and a configured external SurrealDB
+connection through one storage contract. A new installation uses embedded storage
+unless an external connection is configured. On restart, the orchestrator verifies
+the saved association between the installation and its graph. Missing settings or
+connection failure must not select another graph. A change of mode or database
+requires an authorized migration or binding change.
+
+External database access needs its own trust, data-transfer and outage rules.
+These rules are separate from remote AI and remote agent control. The
+[storage brief](designs/context-storage-candidates.md) defines the required behavior
+and the remaining engine and connection decisions.
 
 ### Logical component and trust boundaries
 

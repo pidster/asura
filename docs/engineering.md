@@ -8,6 +8,10 @@ contracts and one owner for each behavior. Search for existing implementations
 before adding capabilities. Reuse through the owning component; do not copy
 business logic across clients, agents, or adapters.
 
+Use the [writing standard](writing-standard.md) for specifications and test
+descriptions. Each acceptance case must state the initial state, trigger and
+observable result. Give independently testable failures and races stable IDs.
+
 Keep dependencies directional and document them in the design. Separate model
 inference, I/O, time, persistence, and transport from logic that can be evaluated
 deterministically. This separation must support testing without creating a

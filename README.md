@@ -16,6 +16,8 @@ reviewed before implementation is authorized.
 - [Architecture baseline](docs/architecture.md)
 - [Engineering and testing standards](docs/engineering.md)
 - [Design process](docs/design-process.md)
+- [Technical writing standard](docs/writing-standard.md)
+- [Project glossary](docs/glossary.md)
 - [Architecture decisions and visual review map](docs/decisions/README.md)
 - [Architecture and design plan](docs/plans/architecture-and-design.md)
 - [Core harness design brief](docs/designs/core-harness-brief.md)

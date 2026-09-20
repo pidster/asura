@@ -1,24 +1,25 @@
 # Context storage: embedded and external SurrealDB
 
-Status: SurrealDB deployment requirements established; exact SDK/server versions,
-embedded engine, transport and persistence contracts remain under evaluation.
-Embedded documentation checked on 2026-09-19; external SDK support on 2026-09-20.
-No dependency, benchmark, executable probe, or runtime validation has been added.
-This assessment feeds D3-D4 in the
+Status: required deployment behavior, with proposed mechanisms.
+Remaining decisions: SDK/server versions, embedded engine, transport and
+persistence contracts.
+
+Evidence: embedded documentation checked on 2026-09-19; external SDK support
+checked on 2026-09-20. No runtime validation exists. This assessment feeds D3-D4 in the
 [architecture and design plan](../plans/architecture-and-design.md).
 
 ## Required deployment choices
 
-Asura must support configuring an external SurrealDB connection as an alternative
-to embedded SurrealDB for the context graph. Embedded operation is optional:
-external mode must not require opening or initializing an embedded graph database.
-Both modes use the same logical context/storage contract and conformance fixtures.
-When initializing a new installation, use the configured external connection when
-present; otherwise use embedded SurrealDB by default. Reopening an installation
-must first honor its persisted graph binding. Selection is based on validated
-effective configuration and installation identity, not network discovery or a
-connection-health probe. The physical embedded engine and external protocol
-remain open; dependencies still require a detailed design.
+Asura must support embedded SurrealDB and a configured external SurrealDB
+connection for the context graph. External mode must not require opening or
+initializing an embedded graph database. Both modes use the same graph and storage contract,
+with the same conformance fixtures.
+
+For a new installation, the orchestrator selects the configured external
+connection if one exists. Otherwise, it selects embedded SurrealDB. When reopening
+an installation, it first checks the persisted graph binding. The binding records
+which graph belongs to the installation. Network discovery or a connection-health
+probe must not select the store.
 
 | Installation state and effective configuration | Required behavior |
 | --- | --- |
@@ -32,51 +33,64 @@ remain open; dependencies still require a detailed design.
 | Partial, invalid or conflicting external settings | Reject configuration with an actionable error, do not treat it as absent |
 | Configured external database unavailable or authentication fails | Report the external-mode failure, do not switch to embedded storage |
 
-Choose one active graph store for a configured Asura installation. Switching mode
-or database identity must be an explicit, validated operation with a designed
-data-migration/rebinding procedure. Do not silently create an empty replacement,
-dual-write, replicate, or fall back from an unavailable external database to an
-embedded store. The task/action ledger's location remains a separate D3 decision;
-an external graph does not imply remote storage of policy, credentials or all state.
+Each installation has one active graph store. A mode or graph identity change
+requires an explicit, validated operation with a designed migration or rebinding
+procedure. Asura must not silently create an empty replacement, write to both
+stores, replicate between them, or fall back to embedded storage after an external
+failure.
+
+D3 must separately decide where the task/action ledger resides. An external graph
+does not require remote storage of policy, credentials or other installation state.
 
 ## Selected installation binding and change contract
 
-Selected behavioral constraint, recorded in [ADR 0001](../decisions/0001-context-store-binding.md).
-This section owns the startup and rebinding semantics; it is not a ready storage
-implementation design. The orchestrator owns installation lifecycle and the
-active binding. Under the proposed language allocation it is Rust, using the Rust
-storage adapter for durable metadata and identity checks. The context subsystem
-owns graph semantics and reference validation. Swift model/platform adapters and
-all control clients neither select a store independently nor repair a binding.
-Platform adapters may implement narrow protected-file/credential operations after
-D1-D2 selects their contract. Exact processes and IPC/FFI remain open; the external
-database is a separate server and trust boundary, never a coordination authority.
+Required behavior, selected in [ADR 0001](../decisions/0001-context-store-binding.md).
+This section defines startup and binding changes. See the [glossary](../glossary.md)
+for binding, generation, admission and fencing.
 
-Persist a protected bootstrap record independently of the context graph so an
-external graph outage cannot erase the fact that the installation uses it. This
-host-local metadata does not require an embedded graph database. Logically it
-contains installation identity, active graph identity, deployment mode, binding
-generation and any pending change identity/phase. It contains credential references
-where needed, never credentials. D3 selects its durable representation, atomic
-update and recovery mechanism; D1 defines tamper/rollback and local-administrator
-trust limits. A filename or connection URL alone is not graph identity.
+The orchestrator owns the installation lifecycle and active binding. The proposed
+language allocation places it in Rust. It uses the Rust storage adapter to persist
+metadata and verify graph identity. The context subsystem owns graph rules and
+reference validation. Swift model/platform adapters and control clients must not
+select a store independently or repair a binding.
 
-The binding includes the logical graph identity and its namespace/database or
-embedded-store identity. Endpoint addresses locate an external graph; changing an
-address for the same verified graph is distinct from changing graphs and remains
-subject to server trust and egress policy. Recreating a database under the same
-name must not make it the same graph. D3 must define durable graph identity and
-how the adapter verifies it without implicitly creating a graph during reopen.
-Credential rotation may preserve binding identity but requires current authority.
+Platform adapters may provide protected-file and credential operations after
+D1-D2 defines those contracts. Process boundaries and IPC/FFI remain open. The
+external database is a separate server and trust boundary. It does not coordinate
+Asura tasks.
 
-Normal startup reads and validates bootstrap state before applying initialization
-defaults. Only a new-installation initialization operation may establish a first
-binding; missing files during reopen are a recovery condition. Initialization must
-detect existing installation/ledger/store references and reject accidental reuse.
-Creating a deliberately separate installation must use a separate identity and
-state scope. Existing embedded data missing from its bound location is likewise a
-recovery error, not permission to create an empty replacement. Diagnostics expose
-the resolved mode, binding generation and repair action without secrets.
+The storage adapter must persist a protected bootstrap record independently of
+the graph. An external graph outage must not erase the installation's binding.
+This local record does not require an embedded graph database. It contains:
+
+- Installation identity and active graph identity.
+- Deployment mode and binding generation.
+- The identity and phase of any pending binding change.
+- Credential references where needed, but never credentials.
+
+D3 must select the record format, atomic update mechanism and recovery procedure.
+D1 must define protection against tampering and rollback, including trust limits
+for local administrators. A filename or connection URL alone is not graph identity.
+
+The binding includes the graph identity and its namespace/database or embedded
+store identity. An endpoint address locates an external graph. Changing that
+address may retain the binding if the adapter verifies the same graph. Server
+trust and egress policy still apply. Recreating a database under the same name
+must not give it the same graph identity.
+
+D3 must define durable graph identity and verification during reopen. Verification
+must not implicitly create a graph. Credential rotation may preserve the binding,
+but still requires current authority.
+
+On normal startup, the orchestrator reads and validates bootstrap state before
+applying initialization defaults. Only explicit initialization may establish the
+first binding. Missing files during reopen require recovery.
+
+Initialization must detect existing installation, ledger and store references.
+It must reject accidental reuse. A deliberately separate installation needs a
+separate identity and state scope. Missing embedded data also requires recovery;
+it must not cause creation of an empty replacement. Diagnostics must show the
+resolved mode, binding generation and repair action without exposing secrets.
 
 ### Startup binding admission
 
@@ -108,35 +122,48 @@ flowchart TD
 
 ### Explicit migration and rebinding
 
-An authorized administrative control operation names its stable operation ID,
-expected current binding generation, destination identity and intended semantics:
-either migrate the existing graph or bind an independently prepared graph. Merely
-editing configuration cannot authorize either. The orchestrator serializes changes,
-gates new graph-dependent work and fences stale owners before validation/cutover.
-Settle or explicitly reconcile in-flight actions and graph/ledger writes before
-validating the destination snapshot and its references; an unresolved effect
-blocks cutover. Late results remain evidence for the recorded source generation
-and cannot mutate whichever graph happens to be active after a switch.
-Canonical policy authorizes the change and any data egress; clients present its
-impact and result through the control contract. No model proposal grants authority.
+An authorized control caller requests an administrative binding change. The
+request includes a stable operation ID, expected current binding generation and
+destination graph. It also selects one of two actions: migrate the existing graph,
+or bind a graph that has already been prepared. Editing configuration alone
+cannot authorize either action. A model proposal cannot grant authority.
 
-Migration preserves graph references needed by task/action state. Rebinding to a
-different graph requires an explicit disposition for every existing reference:
-verified remapping/preserved identity, or a designed archived installation boundary
-that prevents old tasks from resuming against the new graph. Reject a switch with
-unresolved references. An empty replacement is never presented as recovered history.
-Do not assume atomic transactions span bootstrap metadata, ledger and graph.
+The orchestrator coordinates changes in this order:
 
-Persist the change intent and recovery phase before mutations, prepare/validate
-the destination while it is inactive, and durably commit a single binding
-generation before admitting work there. Until the recovery protocol proves which
-generation is active, neither graph admits task work. Retain the source until
-cutover and validation are confirmed; deletion is a separate authorized operation.
-Before committed cutover, an abort may restore source admission only after proving
-that no destination generation became active and source/reference consistency
-still holds. After committed cutover, recover forward to the destination; an
-automatic rollback could split history and is forbidden. A later reverse migration
-is a new authorized operation. Timeouts and client disconnects do not imply abort.
+1. Authorize the change and any data egress through the canonical policy.
+2. Serialize the change against other binding changes. Persist the change intent
+   before mutations. Prevent new work that needs the graph, and prevent stale
+   owners from writing before validation or cutover.
+3. Settle or reconcile outstanding actions and graph/ledger writes. An unresolved
+   effect blocks cutover.
+4. Prepare and validate the destination snapshot and references while it remains
+   inactive. Persist each recovery phase before the mutations it governs.
+5. Durably commit one binding generation before allowing work on that generation.
+
+These steps require a recovery protocol. They do not assume one transaction can
+span bootstrap metadata, the ledger and the graph. Clients show the impact and
+result through the control contract.
+
+Late results remain evidence for their recorded source generation. They must not
+mutate the graph that happens to be active after a switch.
+
+Migration must preserve graph references needed by task and action state. A change
+to a different graph requires a disposition for every existing reference. The
+operation must either verify preserved or remapped references, or use a designed
+archive boundary that prevents old tasks from resuming against the new graph.
+The orchestrator rejects switches with unresolved references. It must not present
+an empty replacement as recovered history.
+
+Until recovery proves which generation is active, neither graph may accept task
+work. Retain the source until cutover and validation are confirmed. Deleting the
+source requires a separate authorized operation.
+
+Before committed cutover, an abort may restore work on the source only if two
+conditions hold. No destination generation became active, and source/reference
+consistency still holds. After committed cutover, recovery must continue towards
+the destination. Automatic rollback is forbidden because it could split task
+history across two graphs. A reverse migration requires a new authorized
+operation. A timeout or client disconnect does not mean the change was aborted.
 
 ### Binding change recovery states
 
@@ -165,16 +192,83 @@ stateDiagram-v2
 
 ### Binding acceptance cases
 
-Required future evidence, not tests already executed. All failure cases assert
-that no unrelated empty graph is initialized and no stale binding admits work.
+Required acceptance cases. Every failure case must check that no unrelated empty
+graph is created and no stale binding permits work. These tests are not yet
+implemented.
 
-| Case | Unit acceptance | Integration acceptance | End-to-end acceptance |
-| --- | --- | --- | --- |
-| B1: first initialization and reopen | Selection table distinguishes initialization, reopen and malformed settings | Persistent embedded and real external stores keep identity across restart; external mode needs no embedded graph | CLI initializes embedded by default and reopens its history; configured external workflow creates no embedded graph |
-| B2: configuration or graph identity loss | Missing external config and identity mismatch reject reopen; absence alone cannot mean new installation | Remove profile/environment settings, corrupt bootstrap metadata, remove embedded data and recreate external database under the same name; admission fails safely | Restart reports recovery/configuration action and retained mode instead of a new empty task history |
-| B3: authorized change and reference safety | Expected-generation conflicts, unauthorized destinations and unresolved task references reject change | Migrate between modes with real stores and ledger references, verify preserved/remapped references and one active generation | Explicit change preserves inspectable prior task evidence, while config-only switches are rejected |
-| B4: interrupted change and stale owners | Every recovery state has bounded retry or blocked outcome; committed cutover cannot auto-abort | Terminate before/after intent, preparation, binding commit and admission; race two owners and lost acknowledgements; recover one generation | Reconnect/restart shows the same operation and either completed change or actionable recovery, never duplicate writable histories |
-| B5: compatible connection maintenance | Credential/endpoint change preserves binding only when graph identity, trust and policy match | Exercise credential rotation and endpoint relocation with identity checks, including an impersonating or empty destination | User sees stable graph history on authorized maintenance and a typed failure on identity substitution |
+| Case | Behavior |
+| --- | --- |
+| [B1](#b1-first-initialization-and-reopen) | Initialize and reopen the selected store |
+| [B2](#b2-configuration-or-graph-identity-loss) | Reject missing or mismatched identity |
+| [B3](#b3-authorized-change-and-reference-safety) | Change stores without breaking references |
+| [B4](#b4-interrupted-change-and-stale-owners) | Recover one active generation after interruption |
+| [B5](#b5-compatible-connection-maintenance) | Maintain a connection without substituting a graph |
+
+#### B1: first initialization and reopen
+
+- **Initial state:** A new installation, or an installation with a valid binding.
+- **Trigger:** Initialize or restart using embedded or complete external settings.
+- **Required result:** Apply the selection table. Reopen the same graph after
+  restart. External mode must not initialize an embedded graph.
+- **Unit:** Distinguish initialization, reopen and malformed settings.
+- **Integration:** Verify persistent identity across restart with embedded storage
+  and a real external server. Verify that external mode needs no embedded graph.
+- **End-to-end:** Use the CLI to initialize the embedded default and reopen its
+  history. Run the configured external workflow and check for no embedded graph.
+
+#### B2: configuration or graph identity loss
+
+- **Initial state:** An installation has an existing graph binding.
+- **Trigger:** Remove external settings or embedded data. Corrupt bootstrap
+  metadata, or recreate the external database under its existing name.
+- **Required result:** Reject reopen with configuration or recovery guidance.
+  Missing state must not cause initialization of a new installation.
+- **Unit:** Reject missing external settings and mismatched graph identity.
+- **Integration:** Inject each trigger using real persistent stores. Check that
+  graph-dependent work cannot start.
+- **End-to-end:** Restart through the CLI. Show the retained mode and required
+  repair, rather than a new empty task history.
+
+#### B3: authorized change and reference safety
+
+- **Initial state:** A bound graph contains evidence referenced by task/action state.
+- **Trigger:** Request a mode or graph change, or change configuration alone.
+- **Required result:** An authorized operation preserves or verifies remapped
+  references. Only one generation accepts work. Configuration alone cannot switch
+  the graph.
+- **Unit:** Reject a conflicting expected generation, an unauthorized destination,
+  or unresolved task references.
+- **Integration:** Migrate between real embedded and external stores with ledger
+  references. Verify those references and the single active generation.
+- **End-to-end:** Complete an explicit change and inspect prior task evidence.
+  Verify that configuration-only switches are rejected.
+
+#### B4: interrupted change and stale owners
+
+- **Initial state:** A binding change is in progress.
+- **Trigger:** Crash at each phase, lose acknowledgements, or race two owners.
+- **Required result:** Recover one generation using the recorded operation.
+  Recovery has bounded retry or a blocked outcome. Committed cutover cannot
+  automatically abort.
+- **Unit:** Exercise every recovery state and reject rollback after commit.
+- **Integration:** Terminate before and after intent persistence, preparation,
+  binding commit and work admission. Race owners and lose acknowledgements.
+  Verify one active generation after recovery.
+- **End-to-end:** Reconnect or restart. Show the same operation, with either a
+  completed change or an actionable recovery state. No duplicate writable history
+  may appear.
+
+#### B5: compatible connection maintenance
+
+- **Initial state:** An installation uses a verified external graph.
+- **Trigger:** Rotate credentials or change the endpoint address.
+- **Required result:** Preserve the binding only if graph identity, trust and
+  policy checks pass.
+- **Unit:** Verify the identity, trust and policy conditions for maintenance.
+- **Integration:** Rotate credentials and relocate the endpoint. Include a server
+  that impersonates the destination and a destination with an empty graph.
+- **End-to-end:** Show the same graph history after authorized maintenance.
+  Report a typed failure if the destination substitutes a different identity.
 
 Before implementation, D3 must define the identity schema, reference disposition,
 atomic binding commit, fencing, bootstrap backup/restore and rollback detection,
@@ -230,11 +324,13 @@ and bind data parameters. Authorization remains with Asura's canonical policy.
 
 For embedded mode, propose one storage-owning Asura process per database directory.
 For external mode, the storage adapter owns the connection and verifies the
-logical graph identity requested by the orchestrator's active binding. Establish actual locking, transactions and concurrency
-semantics during evaluation. Connecting to a shared server does not authorize
-multiple orchestrators to own one graph: D3 must define isolation and enforce
-single-owner fencing, or design explicit multi-writer coordination before allowing
-that topology. Remote Asura hosts still use host/control protocols; a shared
+graph identity in the orchestrator's active binding. The evaluation must establish
+locking, transactions and concurrency behavior.
+
+Connecting to a shared server does not authorize multiple orchestrators to own
+one graph. D3 must define isolation, allow only one owner to write, and reject
+writes from stale owners. Multiple writers require an explicit coordination design before that topology
+is allowed. Remote Asura hosts still use host/control protocols; a shared
 database is not a control plane or permission to bypass host authorization.
 
 ### Candidate storage boundary and alternatives
@@ -269,39 +365,51 @@ Two embedded engines must not open the same data directory.
 
 ## External connection and failure contract to design
 
-The final configuration schema belongs to D6, with its security and persistence
-contract established in D3-D4 before I2. Expose the resolved mode in effective
-configuration and diagnostics. External connection settings include endpoint,
-namespace, database, credential reference, server trust settings, connection/query
-deadlines and bounded reconnect limits. External settings are not required for
-the embedded default. Reject ambiguous or incompatible settings rather than
-silently choosing another mode. Credentials belong in the selected credential facility;
-do not put passwords/tokens in committed config, connection URLs, model context,
-telemetry or client-visible errors. Use scoped runtime database authority and
-separate authorization for provisioning or migrations.
+Required behavior. D6 must define the configuration schema. D3-D4 must define
+security and persistence before I2.
 
-External storage is its own disclosure destination, including a server on another
-local process or machine. Authorize the destination and allowed data before any
-transmission, require authenticated encrypted connections and verified server
-identity, and preserve graph sensitivity/deletion requirements across server-side
-retention and backups. Selecting a namespace/database is not proof of isolation.
-Neither remote-inference permission nor endpoint configuration alone grants data
-egress authority. D1 must identify the server/operator trust assumptions.
+The orchestrator must show the resolved mode in effective configuration and
+diagnostics. External settings must identify the endpoint, namespace, database,
+credential reference and server trust configuration. They must also set connection
+and query deadlines, with bounded reconnect attempts. Embedded mode does not
+require these external settings.
 
-Define startup checks for server compatibility, authentication, logical database
-identity, schema revision and migration ownership. Do not automatically provision
-or migrate a database merely because a connection succeeds. Unknown commit outcomes
-after network loss must be reconciled using stable operation identities and the
-selected transaction/idempotency contract, not blindly retried. D3 must establish
-how graph updates coordinate with the action ledger when they occupy different
-stores; a shared transaction must not be assumed across that boundary.
+The orchestrator must reject ambiguous or incompatible settings. It must not
+silently select another mode. Credentials belong in the selected credential
+facility. Passwords and tokens must not appear in committed configuration,
+connection URLs, model context, telemetry or client-visible errors. Runtime
+database access must use scoped authority. Provisioning and migration require
+separate authorization.
 
-During an outage, stop operations whose required evidence or durability is
-unavailable. Keep status and cancellation processing independent of database
-waits, report degraded capability, and acknowledge durable control acceptance only
-when the chosen authority store has persisted it. Define authorized reconciliation
-and cleanup during failure, including the case where that store is also remote.
-No stale cache may silently substitute for current authority or evidence.
+An external database is a separate disclosure destination, even in another process
+on the same machine. Asura must authorize the destination and data before
+transmission. The storage adapter must use an authenticated, encrypted connection
+and verify server identity. The design must preserve sensitivity and deletion
+requirements in server retention and backups.
+
+Selecting a namespace/database does not establish isolation. Neither permission
+for remote inference nor endpoint configuration authorizes database egress. D1 must
+define the trust assumptions for the server and its operators.
+
+At startup, the storage adapter must check server compatibility, authentication,
+graph identity and schema revision. The design must identify who can perform
+migrations. A successful connection must not automatically provision or migrate
+a database.
+
+After network loss, the storage adapter must reconcile an unknown commit using
+its stable operation ID and the selected transaction/idempotency contract.
+It must not blindly retry. D3 must define how graph updates coordinate with the
+action ledger when the two use different stores. The design must not assume a
+transaction spans both stores.
+
+During an outage, the orchestrator must stop operations that lack required evidence
+or persistence. Status and cancellation handling must not wait for database calls.
+Clients must report which capabilities are unavailable. The orchestrator may
+acknowledge durable control acceptance only after the authority store persists it.
+
+D3 must define authorized reconciliation and cleanup during failure. This includes
+failure of a remote authority store. A stale cache must not silently replace
+current authority or required evidence.
 
 ### External write with an ambiguous outcome
 
@@ -353,15 +461,18 @@ acceptance thresholds in a scoped evaluation design before writing probe code.
 Use the same logical fixtures and requirements for each candidate. In-memory
 success cannot establish persistent-engine crash recovery or durability.
 
-Unit cases must cover the selection table above, configuration rejection, secret
-redaction, bounded retries and unknown-outcome state transitions. Integration must
-exercise both a persistent embedded database and an actual authenticated external server, including commits
-whose acknowledgements are lost, schema mismatch, invalid identity and outage.
-E2E must run the same CLI context/restart workflow in each mode, demonstrate the
-embedded default with no external configuration and external mode without an
-embedded graph store, and prove that outages do not cause fallback
-or loss of control responsiveness. Add dedicated-host network evidence before
-claiming off-machine support; an in-process mock does not exercise this boundary.
+Unit cases must cover the selection table, configuration rejection, secret
+redaction, bounded retries and unknown-outcome state transitions.
+
+Integration tests must use persistent embedded storage and an authenticated
+external server. They must cover lost commit acknowledgements, schema mismatch,
+invalid identity and outage.
+
+End-to-end tests must run the same CLI context/restart workflow in both modes.
+They must verify the embedded default and external operation without an embedded
+graph. They must also verify no fallback and responsive controls during outages.
+Add dedicated-host network evidence before claiming off-machine support.
+An in-process mock does not exercise this boundary.
 
 ### Storage decision gate
 

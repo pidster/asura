@@ -1,16 +1,26 @@
 # Architecture decisions and review map
 
-The project remains in design. A selected ADR records an architectural constraint;
-it does not make a subsystem implementation-ready. Both design and implementation
-plan must be reviewed before implementation is authorized.
+Status: index of selected design decisions. Implementation remains on hold under
+the [design process](../design-process.md). The [glossary](../glossary.md) explains
+project terms.
 
 ## Decisions from the 2026-09-20 review
 
-| Finding | Decision and reason | Canonical specification | Delivery evidence |
-| --- | --- | --- | --- |
-| F1: missing external settings could select a fresh graph on restart | [ADR-0001: store binding](0001-context-store-binding.md) preserves installation identity before applying initialization defaults | [Storage brief](../designs/context-storage-candidates.md) | I2: fresh startup, reopen, identity mismatch and interrupted migration in both storage modes |
-| F2: fatal errors and task deadlines bypass effect accounting | [ADR-0002: failure settlement](0002-failure-settlement.md) applies one procedure in every nonterminal state | [Failure contract](../designs/core-harness-brief.md#common-failure-and-deadline-contract) | I1-I2: deadline/fatal/budget races, restart and explicit uncertain effects; later increments extend real boundary evidence |
-| F3: parallel children can spend the same allowance | [ADR-0003: aggregate admission](0003-aggregate-budget-admission.md) reserves hierarchically before dispatch and retains unknown usage | [Budget contract](../designs/core-harness-brief.md#aggregate-budget-ownership-and-admission) | I2: concurrent admission/recovery; I3 model calls; I5 provider billing; I7 remote envelopes |
+| Finding | Decision | Detailed contract |
+| --- | --- | --- |
+| F1: restart could select an empty replacement graph | [ADR-0001: preserve the graph binding](0001-context-store-binding.md) | [Storage brief](../designs/context-storage-candidates.md) |
+| F2: some failures could bypass effect accounting | [ADR-0002: use one failure procedure](0002-failure-settlement.md) | [Failure contract](../designs/core-harness-brief.md#common-failure-and-deadline-contract) |
+| F3: parallel children could spend the same allowance | [ADR-0003: reserve shared budgets](0003-aggregate-budget-admission.md) | [Budget contract](../designs/core-harness-brief.md#aggregate-budget-ownership-and-admission) |
+
+I2 must test F1 in both storage modes: initialization, reopen, identity mismatch
+and interrupted migration. I1–I2 must test F2 across failure, deadline and
+cancellation races, including restart and unknown effects. Later increments add
+evidence at each new execution boundary.
+
+For F3, I2 must test concurrent reservations and recovery. I3 adds model calls;
+I5 adds provider billing; I7 adds reserved budgets on remote hosts. The
+[implementation plan](../plans/implementation.md#early-increment-acceptance-gates)
+defines the delivery checks.
 
 ## Visual reading path
 
@@ -48,16 +58,35 @@ protocols; configuration/audit behavior; and toolchain/CI/validation environment
 Those are recorded design deliverables, not claims of completed or verified
 runtime behavior. The architecture plan remains the authority for their ordering.
 
-## Documentation validation on 2026-09-20
+## Contract review validation on 2026-09-20
 
 The corrective contracts received a follow-up read-only adversarial review. Its
 remaining ambiguity about unknown billing was resolved: known effects may reach
 a terminal outcome while usage remains explicitly reserved and disclosed; unknown
 effects require bounded reconciliation. The reviewer checked that resolution.
 
-Mermaid CLI 11.16.0 rendered all 24 diagrams in the affected diagram-bearing
+Before the later clarity rewrite, Mermaid CLI 11.16.0 rendered all 24 diagrams in the affected diagram-bearing
 documents. Changed diagrams were visually inspected and overlapping labels were
 corrected. All 69 local Markdown links/anchors and `git diff --check` passed.
 Previews stayed outside the repository. These checks establish documentation
 consistency and rendering only. No product implementation or runtime tests were
 performed; the acceptance matrices specify future evidence.
+
+## Clarity review on 2026-09-20
+
+The review found unexplained terms, dense acceptance tables and large diagrams.
+It also found a missing implementation-authorization check in the development-agent
+workflow. The rewrite adds a [writing standard](../writing-standard.md), glossary,
+numbered acceptance cases and smaller loop views. The workflow now includes the
+existing owner-review and authorization requirements.
+
+These are documentation corrections. They preserve the architecture decisions,
+required test layers and implementation hold. Concrete runtime mechanisms remain
+with the design stages listed above.
+
+Validation: a read-only review compared the rewrite with the previous contracts.
+It found two unintended changes to storage and budget requirements; both were
+corrected. Mermaid CLI 11.16.0 rendered all 17 diagrams in the three documents
+with changed diagram sources. Changed diagrams were visually inspected. All 133
+local Markdown links and anchors passed, as did `git diff --check`.
+No runtime tests were run. This review does not establish full ASD-STE-100 compliance.

@@ -17,6 +17,10 @@ Read [architecture.md](docs/architecture.md),
 [design-process.md](docs/design-process.md), plus the design governing the task.
 These documents are the canonical locations for their respective subjects.
 
+For documentation changes, follow [writing-standard.md](docs/writing-standard.md).
+Use [glossary.md](docs/glossary.md) for project terms. Preserve the technical
+conditions and required test coverage when simplifying text.
+
 ## Mandatory design gate
 
 - Never write code without a design. This includes implementation, tests,

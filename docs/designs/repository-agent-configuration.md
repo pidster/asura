@@ -1,8 +1,11 @@
 # Repository agent configuration
 
-Status: ready configuration design for development agents working on Asura.
-This configures Codex as a development tool; it does not implement Asura's own
-orchestrator or select its runtime dependencies.
+**Status: Selected design.** This document governs the existing Codex development
+configuration. Its recorded validation is in [Initial verification](#initial-verification).
+
+**Required behavior:** Product work remains limited to design and planning until
+repo owners review the design and plan, then explicitly authorize implementation.
+This configuration does not select Asura's runtime dependencies.
 
 ## Scope and ownership
 
@@ -32,8 +35,11 @@ is not set in this repository. See [configuration precedence](https://learn.chat
 | `implementer.toml` | Deliver a ready design packet using canonical owners and all required test layers | Only assigned packet paths |
 | `reviewer.toml` | Review correctness, security, recovery, duplication, diagrams and validation evidence | None |
 
-Selected coordination flow. Arrows name assignments and evidence delivery; the
-primary agent remains responsible for reconciling findings and integrating edits.
+### Development-agent workflow
+
+Selected coordination flow. Arrows show assignments and evidence delivery.
+The primary agent inspects delegated work and integrates accepted edits.
+Design readiness, owner review, and implementation authorization are separate checks.
 
 ```mermaid
 flowchart TD
@@ -43,9 +49,9 @@ flowchart TD
     Gate -->|Yes, within three-thread limit| Assign["Assign design revision, paths, evidence and non-goals"]
     Assign --> Research["Researcher: read-only facts and alternatives"]
     Assign --> Architect["Architect: assigned design documents and diagrams"]
-    Assign --> Ready{"Implementation design ready?"}
-    Ready -->|No| Architect
-    Ready -->|Yes| Implementer["Implementer: disjoint packet paths and tests"]
+    Assign --> Check["Use implementation assignment checks below"]
+    Check -->|Not ready or not authorized| Architect
+    Check -->|All checks pass| Implementer["Implementer: assigned packet paths and tests"]
     Research --> Evidence["Primary inspects evidence and resolves dependencies"]
     Architect --> Evidence
     Implementer --> Evidence
@@ -58,8 +64,22 @@ flowchart TD
     Git --> Handoff
 ```
 
-Roles are available for useful bounded work, not an instruction to spawn every
-role for every task. Their TOML structure follows the
+### Implementation assignment checks
+
+Required behavior. Arrows show whether the primary agent may assign product
+implementation. These checks also apply when the primary agent works alone.
+
+```mermaid
+flowchart TD
+    Ready{"Implementation design ready?"} -->|No| Hold["Continue design and planning"]
+    Ready -->|Yes| Review{"Owners reviewed design and plan?"}
+    Review -->|No| Hold
+    Review -->|Yes| Authority{"Implementation explicitly authorized?"}
+    Authority -->|No| Hold
+    Authority -->|Yes| Assign["Assign the scoped implementation packet"]
+```
+
+Use a role when independent work will help complete the task. Their TOML structure follows the
 [official subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
 No model overrides or external endpoints are bundled with these roles.
 

@@ -1,7 +1,10 @@
 # Security policy design brief
 
-Status: requirements and design proposal. The policy format, evaluator and macOS
-enforcement mechanisms are not selected. This brief does not authorize code.
+Status: required capabilities with a proposed authorization contract.
+
+Open decisions: policy format, evaluator and macOS enforcement mechanisms.
+Runtime behavior is not implemented or verified. Terms are defined in the
+[glossary](../glossary.md).
 
 ## Required capability
 
@@ -52,10 +55,12 @@ the threat model before implementation:
 - Separate a denial from a request that policy permits a user to approve. User
   approval must bind to the exact action, limits and expiry; it cannot override a
   hard deny. An authorized policy change is a separate operation.
-- Bind decisions and grants to action identity, principal, host, policy revision
-  and enforced constraints. Revalidate current authority at the effect boundary.
-  Define the atomicity/fencing boundary between activation, revocation and launch
-  so a check immediately before launch does not conceal a race.
+- Each decision and grant must identify the action, principal, host, policy
+  revision and enforced limits. Before the host starts an action, it must check
+  the current grant. The design must coordinate policy activation, revocation and
+  action start. It must prevent a concurrent policy change from allowing work
+  under a grant that is no longer valid. A check immediately before launch does
+  not, by itself, prevent this race.
 - Remote hosts retain their own authority. Effective permission is constrained
   by both delegated authority and the executing host's policy. A remote permit
   cannot override a host denial or an unsupported enforcement requirement.
@@ -92,12 +97,15 @@ flowchart TB
 
 ### Policy lifecycle and active work
 
-Policy management requires its own authorization, provenance/integrity validation
-and audit trail. Specify bounded parsing/evaluation, schema/version validation,
-test and explanation tooling, atomic activation, restart recovery, and authorized
-rollback. Invalid updates must not partially activate; whether to retain a still
-valid previous revision or suspend affected work must be explicit. Startup with
-no valid applicable policy must deny effects.
+Policy changes require separate authorization and an audit record. The policy
+component must verify the source and integrity of each change. The detailed design
+must define parsing and evaluation limits, schema checks, and version checks.
+It must also define test tools, decision explanations, atomic activation, restart
+recovery and authorized rollback.
+
+An invalid update must not activate in part. The design must choose whether to
+retain a valid previous revision or suspend affected work. If no valid policy
+applies at startup, the host must deny actions that can produce effects.
 
 ```mermaid
 stateDiagram-v2

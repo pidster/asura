@@ -1,9 +1,12 @@
 # Implementation delivery plan
 
-Status: proposed sequence, gated by the
-[architecture and design plan](architecture-and-design.md). No code is to be
-written from this plan alone. Swift/Rust allocation and paths refer to that
-plan's proposed layout until D2 resolves them.
+**Status: Proposed mechanism.** This plan defines delivery order and required
+acceptance evidence. It depends on the
+[architecture and design plan](architecture-and-design.md).
+
+**Open decisions:** D2 must select the Swift/Rust allocation and repository layout.
+Each increment needs a detailed design before its implementation can start.
+Use the [writing standard](../writing-standard.md) and [glossary](../glossary.md).
 
 ## Entry gate
 
@@ -52,18 +55,136 @@ flowchart TD
 Every milestone also depends on its own ready design and the required validation
 environment. Those gates apply even where the graph only shows delivery ordering.
 
-| Increment | Depends on | Deliver | Exit demonstration |
-| --- | --- | --- | --- |
-| I0: repository and contracts | D8; ready build/layout/contract designs | Minimal Cargo/Swift package structure, pinned toolchains, generated bindings, CI and test runners; initial telemetry setup | Clean build on supported macOS; cross-language contract round trip, compatibility rejection and bounded cancellation through a test composition |
-| I1: local control and durable lifecycle | I0 | Host entry point, control API, client library, non-interactive CLI; task IDs, event stream, configuration, local caller authentication and authorization; selected policy format validation, evaluator and atomic activation; durable control intent and user-decision deadline arbitration | Submit a no-effect diagnostic task, inspect it, attach a second client, disconnect/reconnect, cancel and recover state after restart; preserve control intent received during reconciliation; reject unauthorized callers and invalid policy updates; replay response/deadline/cancel races with one durable outcome |
-| I2: context and bounded host execution | I1 | Initial graph/storage, workspace observations, canonical tool registry, grants, policy-to-sandbox enforcement, constrained read/process tools and action recovery; explicit task-local scratch/output grants with read-only source access | CLI runs a permitted fixture inspection/build with graph-linked evidence; source-write attempts by commands and descendants are denied; unsupported restrictions, policy revocation/launch races, output bounds, timeout, crash ambiguity and stale files are handled; cancellation during reconciliation cannot resume work |
-| I3: on-device harness loop | I2 | Swift model adapter/service, core loop, structured decisions, effective context manifests, model-state isolation and invalidation, progress/budget rules and evaluation suite | Real on-device decisions complete a bounded local task; invalid or stale proposals are rejected; stalled/unavailable model does not block control; session state cannot cross task/authority scope or bypass provenance and budgets; terminal decision timeout cannot start another model call or action |
-| I4: interactive chat/TUI | I3 | Streaming chat, task/agent views, explainable decisions, pause/resume/cancel/redirect and pending user decisions | Reattach without state loss, resolve a decision from either client, steer active work, navigate by keyboard, and recover from errors clearly |
-| I5: remote AI assistance | I3, I4 | One selected remote inference provider behind canonical contracts, egress context views, credential handling and budgets | Local decision requests bounded remote help; authorized context is sent; rate limits, failure, denial and ambiguous provider outcomes remain visible and bounded |
-| I6: coding task completion | I2-I5 | Designed change/patch application and validation workflow, workspace concurrency controls and reviewable artifacts | Reproduce a failing fixture test, investigate, make a scoped change, run validation and present evidence; handle stale edits, failures and cancellation without claiming unverified success |
-| I7: remote Asura hosts | I6 | Host enrollment and identity, task placement, remote execution control, grant expiry/revocation, reconciliation and compatibility handling | On two actual supported machines, disconnect during execution, revoke authority, reconnect and reconcile; prevent duplicate dispatch by stale owners |
-| I8: GUI | I4; user's GUI requirements and ready GUI design | Native Swift client over the established control contract | GUI and terminal observe/control the same task without duplicated orchestration rules; pass accessibility and usability scenarios |
-| I9: release qualification | Required release increments | Signed/distributable artifacts, install/upgrade/recovery guidance, compatibility and performance evidence | Fresh supported host installation, upgrade/migration recovery, security regressions, collector outage, sustained workload and usability acceptance all meet the design |
+| Increment | Prerequisites |
+| --- | --- |
+| [I0: Repository and contracts](#i0-repository-and-contracts) | D8; ready build/layout/contract designs |
+| [I1: Local control and durable lifecycle](#i1-local-control-and-durable-lifecycle) | I0 |
+| [I2: Context and bounded host execution](#i2-context-and-bounded-host-execution) | I1 |
+| [I3: On-device harness loop](#i3-on-device-harness-loop) | I2 |
+| [I4: Interactive chat/TUI](#i4-interactive-chattui) | I3 |
+| [I5: Remote AI assistance](#i5-remote-ai-assistance) | I3, I4 |
+| [I6: Coding task completion](#i6-coding-task-completion) | I2-I5 |
+| [I7: Remote Asura hosts](#i7-remote-asura-hosts) | I6 |
+| [I8: GUI](#i8-gui) | I4; user's GUI requirements and ready GUI design |
+| [I9: Release qualification](#i9-release-qualification) | Required release increments |
+
+### I0: Repository and contracts
+
+**Deliver:** Minimal Cargo and Swift packages, pinned toolchains, generated
+bindings, CI, test runners, and initial telemetry setup.
+
+**Exit checks:**
+
+- Build from a clean checkout on supported macOS.
+- Test a cross-language contract request and response.
+- Reject incompatible contracts.
+- Demonstrate bounded cancellation through connected test components.
+
+### I1: Local control and durable lifecycle
+
+**Deliver:**
+
+- Host entry point, control API, client library, and non-interactive CLI.
+- Task identities, event stream, configuration, and local caller authentication and authorization.
+- Validation, evaluation, and atomic activation for the selected policy format.
+- Durable control requests and rules for concurrent user responses and decision deadlines.
+
+**Exit checks:**
+
+- Submit and inspect a diagnostic task that causes no external effects.
+- Attach a second client, disconnect, reconnect, and cancel the task.
+- Recover state after restart, including control requests received during reconciliation.
+- Reject unauthorized callers and invalid policy updates.
+- Replay concurrent response, deadline, and cancellation events with one durable outcome.
+
+### I2: Context and bounded host execution
+
+**Deliver:**
+
+- Initial graph, storage, and workspace observations.
+- Canonical tool registry, grants, constrained read and process tools, and action recovery.
+- Host sandbox enforcement of policy decisions.
+- Explicit task-local scratch and output permissions, with read-only source access.
+
+**Exit checks:**
+
+- Run a permitted fixture inspection or build through the CLI. Link its evidence to the graph.
+- Deny source writes from commands and their descendants.
+- Handle unsupported restrictions and concurrent policy revocation and process launch.
+- Enforce output limits and timeouts.
+- Detect stale files and account for unknown outcomes after crashes.
+- Verify that cancellation during reconciliation prevents work from resuming.
+
+### I3: On-device harness loop
+
+**Deliver:** Swift model adapter or service, core loop, structured decisions,
+context manifests, model-state isolation and invalidation, progress and budget
+rules, and the model evaluation suite.
+
+**Exit checks:**
+
+- Use real on-device decisions to complete a bounded local task.
+- Reject invalid or stale proposals.
+- Keep control responsive when the model stalls or is unavailable.
+- Prevent session state from crossing task or authority scope.
+- Include session state in provenance and budget checks.
+- Verify that terminal decision timeout prevents another model call or action.
+
+### I4: Interactive chat/TUI
+
+**Deliver:** Streaming chat, task and agent views, explanations for decisions,
+pause, resume, cancellation, redirection, and pending user decisions.
+
+**Exit checks:** Reattach without state loss. Resolve a decision from either client.
+Steer active work and navigate by keyboard. Verify clear recovery from errors.
+
+### I5: Remote AI assistance
+
+**Deliver:** One selected remote inference provider through the canonical contracts.
+Include context views approved for disclosure, credential handling, and budgets.
+
+**Exit checks:** A local decision requests remote help within defined limits.
+Only authorized context is sent. Rate limits, failures, denial, and unknown
+provider outcomes remain visible to the user and within those limits.
+
+### I6: Coding task completion
+
+**Deliver:** The designed patch and validation workflow, controls for concurrent
+workspace changes, and reviewable artifacts.
+
+**Exit checks:** Reproduce and investigate a failing fixture test. Make a scoped
+change, run validation, and present evidence. Handle stale edits, failures, and
+cancellation without claiming unverified success.
+
+### I7: Remote Asura hosts
+
+**Deliver:** Host enrollment and identity, task placement, remote execution control,
+grant expiry and revocation, outcome reconciliation, and compatibility checks.
+
+**Exit checks:** Use two real supported machines. Disconnect during execution,
+revoke authority, reconnect, and reconcile outcomes. Prevent duplicate dispatch
+by owners whose authority is no longer current.
+
+### I8: GUI
+
+**Deliver:** A native Swift client that uses the established control contract.
+
+**Exit checks:** Observe and control the same task from the GUI and terminal.
+Keep orchestration rules in their canonical owner. Pass accessibility and usability scenarios.
+
+### I9: Release qualification
+
+**Deliver:** Signed distribution artifacts, installation, upgrade and recovery
+guidance, and compatibility and performance evidence.
+
+**Exit checks:** Verify each of the following against its design:
+
+- Fresh installation on a supported host.
+- Recovery during upgrade and migration.
+- Security regression tests and collector outage.
+- Sustained workloads and usability acceptance.
+
+### I2 source protection boundary
 
 I2 uses deterministic fixture requests to verify execution before connecting the
 model loop. Such fixtures are test drivers of the production interfaces, not an
@@ -101,13 +222,155 @@ owns model-session mechanics, and host execution owns confinement of the full
 process tree. D2 must select their process and Swift/Rust boundary contracts;
 placing them in one process cannot remove the checks.
 
-| Gate | Unit acceptance | Integration acceptance | End-to-end acceptance |
-| --- | --- | --- | --- |
-| I1-I2: common failure settlement | Exercise fatal error, task deadline and budget exhaustion in every nonterminal state, including paused/waiting, racing success/cancel; no new dispatch after winning failure intent | Crash before/after failure persistence and during stopping; recover unresolved effects and usage without deadline reset or refunded reservations; exercise authority-store outage and bounded recovery exhaustion | CLI reports failure or reconciliation during an active fixture action, restart preserves the cause, and terminal output distinguishes accounted effects from uncertainty |
-| I2: aggregate admission and recovery | Competing children cannot exceed an ancestor cap; duplicate admission and settlement are idempotent; typed limits, context capacity and occupancy remain distinct | Race real durable admissions for the last allowance, crash around reservation/dispatch/settlement, inject unknown usage and store outage; no double spend or unearned refund | Concurrent fixture operations consume one shared task allowance; cancel/restart with uncertain usage leaves that allowance reserved and explains why further work cannot be admitted |
-| I1-I2: control during reconciliation and decision expiry | Exercise pause/cancel received during reconciliation, cancellation precedence, and each response/deadline/cancel ordering; terminal decision expiry forbids new model/work dispatch while existing effects settle | Restart between durable control-intent receipt and effect settlement; replay the winning decision outcome; deliver late results and ensure they cannot resume work after cancellation or timeout | CLI disconnects during an uncertain action, accepts cancel while reconciling, then reconnects without new dispatch; pending decision expires with a visible terminal failure after required reconciliation, not another decision loop |
-| I2: scratch/output writes with read-only source | Reject grants and path resolutions that exceed authorized output roots, including attempts to alias source files through links or traversal; distinguish generated-output authority from source-edit authority | On supported macOS, execute actual fixture builds and hostile build scripts/descendants that attempt direct and indirect source writes or output-root escape; verify allowed outputs succeed and source contents remain unchanged | Through the CLI, a permitted out-of-source fixture build produces evidence and bounded artifacts; a fixture requiring source mutation is denied with an explanation and no source change |
-| I3: model-state isolation and invalidation | Verify scope/generation matching, retained-context budget accounting, and invalidation on revocation, deletion or cancellation; reject stale results and cross-task state reuse | Across the selected Rust/Swift boundary, retire/rebuild affected model state, inject late completions and adapter restart, and confirm no invalidated contribution or untracked history can enter accepted context | With the real on-device model, interleave tasks containing distinguishable private fixtures, invalidate one task's context during inference, and verify only current scoped results can drive actions; inspect provenance and state-use evidence in addition to generated text |
+| Case | Increment | Subject |
+| --- | --- | --- |
+| [A1](#a1-common-failure-settlement) | I1–I2 | Stop and account for failed work |
+| [A2](#a2-shared-budget-reservations-and-recovery) | I2 | Reserve and account for shared budgets |
+| [A3](#a3-control-during-reconciliation-and-decision-expiry) | I1–I2 | Preserve control requests and decision deadlines |
+| [A4](#a4-output-writes-with-read-only-source) | I2 | Permit output writes while protecting source |
+| [A5](#a5-model-state-isolation-and-invalidation) | I3 | Isolate and invalidate model state |
+
+### A1: Common failure settlement
+
+**Initial state:** A task is in any nonterminal state, including paused or waiting.
+An action can still have effects or usage whose outcome is unknown.
+
+**Trigger:** A fatal error occurs, the task deadline expires, or a budget is exhausted.
+Success or cancellation can occur concurrently.
+
+**Required result:** The orchestrator records one outcome for concurrent requests.
+After a failure intent wins, it dispatches no new task work. It accounts for
+existing effects and usage before reporting a terminal result. The result states
+whether effects are accounted for or remain uncertain.
+
+**Unit tests:**
+
+- Exercise each failure trigger in every nonterminal state.
+- Race each trigger against success and cancellation.
+- Verify that a winning failure intent prevents new dispatch.
+
+**Integration tests:**
+
+- Crash before and after failure persistence, and while stopping actions.
+- Recover unresolved effects and usage without resetting deadlines or refunding reservations.
+- Make the authority store unavailable.
+- Exhaust the permitted recovery attempts and check the uncertainty record.
+
+**End-to-end tests:** Fail a task while a fixture action is active. Check that the
+CLI reports failure or reconciliation. Restart and verify that the cause persists.
+Check that terminal output distinguishes accounted effects from uncertainty.
+
+### A2: Shared budget reservations and recovery
+
+**Initial state:** Concurrent child operations use one shared task allowance.
+Only enough allowance for one operation remains.
+
+**Trigger:** The operations request reservations concurrently. A duplicate request,
+crash, cancellation, store outage, or unknown usage can interrupt the procedure.
+
+**Required result:** Admission must not reserve more than the remaining allowance
+at any applicable parent limit. If actual usage exceeds a limit, record all usage
+and the breach; do not reduce the recorded amount. The orchestrator does not
+release allowance without supporting evidence. The [core budget contract](../designs/core-harness-brief.md#aggregate-budget-ownership-and-admission)
+owns the rules; adapters and child tasks do not maintain competing accounts.
+
+**Unit tests:**
+
+- Verify that concurrent admissions cannot reserve more than a parent budget permits.
+- Verify that actual usage above a limit remains recorded as a breach.
+- Repeat reservation and usage-settlement requests; verify no duplicate charge or release.
+- Keep budget units, context capacity, and concurrent occupancy distinct.
+
+**Integration tests:**
+
+- Use the real durable store to race requests for the last allowance.
+- Crash around reservation, dispatch, and settlement persistence points.
+- Inject unknown usage and store outages.
+- Verify no double spending and no release of allowance without evidence.
+
+**End-to-end tests:** Run concurrent fixture operations against one task allowance.
+Cancel and restart while usage is uncertain. Verify that the allowance remains
+reserved and the CLI explains why further work cannot start.
+
+### A3: Control during reconciliation and decision expiry
+
+**Initial state:** A task has uncertain action effects or a pending user decision.
+
+**Trigger:** Pause, cancellation, a user response, or a decision deadline occurs.
+The client can disconnect and reconnect while the orchestrator resolves effects.
+
+**Required result:** The orchestrator preserves the winning control or decision
+outcome across restart. Cancellation prevents resumption. A winning decision timeout
+stops new model calls and task work while existing effects are accounted for.
+
+**Unit tests:**
+
+- Submit pause and cancellation while reconciliation is active.
+- Verify cancellation precedence.
+- Exercise every ordering of user response, deadline expiry, and cancellation.
+- Verify that terminal decision expiry prevents new model calls and task work.
+
+**Integration tests:**
+
+- Restart after control intent is persisted but before effects are accounted for.
+- Replay the winning decision outcome.
+- Deliver late results after cancellation or timeout; verify that work cannot resume.
+
+**End-to-end tests:** Disconnect the CLI during an uncertain action. Accept
+cancellation while reconciling, then reconnect and verify no new dispatch.
+Separately, let a pending decision expire. Verify a visible terminal failure after
+required reconciliation, with no new decision loop.
+
+### A4: Output writes with read-only source
+
+**Initial state:** A tool has permission to write to specified task-local output
+roots. Source files remain read-only.
+
+**Trigger:** A fixture build, build script, or child process attempts an allowed
+output write, a source write, or a write outside those roots.
+
+**Required result:** Host enforcement permits only the granted writes. Source files
+remain unchanged. A build that needs source modification is rejected with an explanation.
+
+**Unit tests:**
+
+- Reject grants and resolved paths outside the authorized output roots.
+- Check source aliases through links and path traversal.
+- Distinguish generated-output permission from source-edit permission.
+
+**Integration tests:** On supported macOS, run real fixture builds and hostile
+scripts with child processes. Attempt direct and indirect source writes and
+output-root escapes. Verify that allowed outputs succeed and source contents remain unchanged.
+
+**End-to-end tests:** Run an allowed out-of-source build through the CLI. Check its
+evidence and bounded artifacts. Run a fixture that requires source mutation.
+Verify denial, a useful explanation, and unchanged source files.
+
+### A5: Model-state isolation and invalidation
+
+**Initial state:** Model sessions contain scoped evidence for separate tasks.
+Retained history contributes to each task's context and budget.
+
+**Trigger:** Access is revoked, a source is deleted, or a task is cancelled during
+inference. An old inference result can arrive after invalidation or adapter restart.
+
+**Required result:** Only current, permitted context can contribute to an accepted
+result. No task inherits another task's model state outside its authorized scope.
+
+**Unit tests:**
+
+- Check scope and generation identity, and account for retained-context budgets.
+- Invalidate state after revocation, deletion, and cancellation.
+- Reject stale results and cross-task state reuse.
+
+**Integration tests:** Across the selected Rust/Swift boundary, retire and rebuild
+affected model state. Inject late completions and restart the adapter. Verify that
+invalidated evidence and untracked history cannot enter accepted context.
+
+**End-to-end tests:** Use the real on-device model with interleaved tasks containing
+distinguishable private fixtures. Invalidate one task's context during inference.
+Verify that only current scoped results can drive actions. Inspect provenance and
+records of state use, as well as generated text.
 
 I2 cannot pass without real host-confinement evidence for every process capability
 it exposes. If the selected macOS mechanism cannot enforce the required boundary,
@@ -117,13 +380,16 @@ alone: the evidence must establish what state was eligible for each invocation.
 Two-host reconciliation evidence is added in I7; early local fault injection does
 not establish remote-host guarantees.
 
-I3 extends budget admission to real local inference and framework callbacks. I5
-requires real provider evidence for billable bounds, ambiguous responses and late
-usage settlement; mock billing alone cannot prove a hard monetary cap. I7 requires
-two-host envelope/fencing tests through partition, restart and stale-owner handoff.
-These extend the canonical I2 budget authority rather than introducing independent
-provider or child-task accounts. Common failure settlement applies at each new
-boundary. [ADRs 0002 and 0003](../decisions/README.md) record the rationale.
+I3 applies the same reservation checks to real local inference and framework
+callbacks. I5 must test billable limits, unknown provider outcomes, and delayed
+usage reports with the real provider. Mock billing cannot prove a monetary limit.
+
+I7 must test reserved remote allowances on two hosts. Tests must cover network
+partition, restart, and handoff from an owner whose authority has expired.
+The old owner must be unable to dispatch work. These checks use the I2 budget
+records; providers and child tasks do not create independent accounts.
+The common failure procedure applies at each new boundary.
+[ADRs 0002 and 0003](../decisions/README.md) record the rationale.
 
 The first useful terminal milestone is I4: both non-interactive and interactive
 local workflows. I6 adds the remote-assisted coding workflow. Remote-host and GUI

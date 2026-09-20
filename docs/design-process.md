@@ -29,6 +29,10 @@ stating its question, boundaries, and validation before its code is written.
 
 ## Required design contents
 
+Follow the [writing standard](writing-standard.md). Use the [glossary](glossary.md)
+for project terms. Label required behavior, proposed mechanisms and open decisions
+separately when they occur in one document.
+
 Keep designs proportionate to the change. A small correction may update an
 existing design; a substantial feature needs its own document under `docs/designs/`.
 Every governing design must address:
@@ -93,21 +97,37 @@ engines, OS mechanisms, atomicity guarantees, or timing thresholds.
 
 ### Design readiness lifecycle
 
-Required process. Arrows name the evidence or event that permits the transition;
-the lifecycle applies to each scoped design and its implementation packet.
+Required process. The first view shows the conditions for starting implementation.
+Arrows name the review result. “Ready” means the scoped design is complete; the
+owner must still review both the design and implementation plan and authorize work.
+
+```mermaid
+flowchart TD
+    Proposed["Proposed design"] --> Investigating["Identify owners and resolve open decisions"]
+    Investigating --> Check{"Scoped design complete and consistent?"}
+    Check -->|No: revise proposal| Proposed
+    Check -->|Yes| Ready["Ready design"]
+    Ready --> Review{"Owner reviewed design and plan, and authorized implementation?"}
+    Review -->|No| Hold["Remain in design and planning"]
+    Review -->|Yes| Prereq{"Packet dependencies and validation environment available?"}
+    Prereq -->|No| Wait["Resolve missing prerequisites"]
+    Prereq -->|Yes| Implementing["Start the implementation packet"]
+```
+
+### Implementation and revision
+
+Required process after the approval conditions above are met. Arrows show progress
+or the kind of correction needed. A return to design must use the readiness and
+approval conditions again before implementation resumes.
 
 ```mermaid
 stateDiagram-v2
-    direction LR
-    [*] --> Proposed
-    Proposed --> Investigating: Identify owners and unresolved contracts
-    Investigating --> Proposed: Evidence requires revision
-    Investigating --> Ready: Contracts consistent and scope blockers resolved
-    Ready --> Implementing: Design and plan reviewed, implementation authorized, packet prerequisites available
+    [*] --> Implementing
     Implementing --> Investigating: Behavioral or architectural change required
     Implementing --> Validating: Implementation and required tests delivered
     Validating --> Implementing: Failure within the governing design
     Validating --> Investigating: Failure exposes a design defect
+    Investigating --> [*]: Return to design readiness review
     Validating --> Implemented: Required evidence passes and docs agree
     Implemented --> Superseded: Replacement design identifies migration
     Superseded --> [*]
@@ -119,6 +139,10 @@ Before delivery, render every changed Mermaid block and check the output for
 syntax errors, missing labels, clipped content, and unreadable layout. Check
 state transitions and dependency edges against the governing prose as well as
 rendering them. Report the renderer/version and any verification limits.
+
+Inspect each diagram at normal document width. If labels require repeated zooming,
+split the diagram into an overview and linked detail views. Keep all required
+transitions and guards in the combined views.
 
 For documentation work, an available local Mermaid CLI may read Markdown files
 and render all their diagrams into an isolated temporary directory. Inputs are

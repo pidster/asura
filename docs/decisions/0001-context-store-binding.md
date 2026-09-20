@@ -1,7 +1,7 @@
 # ADR 0001: Bind each installation to one context graph
 
-Status: selected design constraint, 2026-09-20. Detailed persistence and migration
-mechanisms remain unselected; this ADR does not authorize implementation.
+Date: 2026-09-20. Status: required behavior.
+Remaining decisions: persistence and migration mechanisms. No runtime implementation exists.
 
 ## Context
 
@@ -13,22 +13,27 @@ The same risk arises when a database is recreated under an unchanged name.
 
 ## Decision
 
-Apply the embedded default only when initializing a new installation. Persist
-its graph binding independently of the graph, then require subsequent startup to
-verify that binding before graph-dependent work. Missing external configuration,
-identity mismatch or unavailable data must produce a repairable failure without
-creating or selecting another store. External mode requires no embedded graph.
+The orchestrator applies the embedded default only when it initializes a new
+installation. It records which graph belongs to that installation. This record
+is the graph binding, and it persists independently of the graph.
 
-The orchestrator owns binding lifecycle; the storage adapter persists its metadata
-and verifies database identity; the context subsystem owns graph/reference
-semantics. These responsibilities follow the proposed Rust allocation. Swift
-adapters and interface clients do not duplicate store selection. Process topology
+On each subsequent startup, the orchestrator verifies the binding before work
+that needs the graph can start. Missing external configuration, a mismatched
+identity, or unavailable data must produce an error with a repair path.
+The orchestrator must not create or select another store. External mode requires
+no embedded graph.
+
+The orchestrator owns the binding lifecycle. The storage adapter persists binding
+metadata and verifies database identity. The context subsystem owns graph rules
+and reference validation. These responsibilities follow the proposed Rust
+allocation. Swift adapters and interface clients do not duplicate store selection. Process topology
 and physical persistence remain D2-D3 decisions.
 
-Changing mode or logical graph identity requires an authorized, recoverable
-migration/rebinding operation. It must preserve or explicitly dispose of existing
-references and admit exactly one binding generation. A committed cutover recovers
-forward; it does not silently roll back or fall back during an outage.
+Changing mode or graph identity requires an authorized operation with a recovery
+procedure. That operation must preserve existing references or explicitly resolve
+their disposition. Only one binding generation may accept work. After the binding
+change is committed, recovery continues towards the destination graph. An outage
+must not cause an automatic rollback or fallback.
 
 The [storage brief](../designs/context-storage-candidates.md#selected-installation-binding-and-change-contract)
 is the canonical behavioral contract, including startup/recovery diagrams and

@@ -1,13 +1,13 @@
 # Architecture and design production plan
 
-Status: proposed work plan. Swift and Rust are selected; component allocation,
-repository layout, protocols, and runtime mechanisms below are proposals to
-resolve through design. No implementation work is authorized by a plan alone.
+**Status: Proposed mechanism.** This plan sets the order of design work.
+Swift and Rust are selected. Component allocation, repository layout, protocols,
+and runtime mechanisms remain open.
 
-Current scope is design and planning only. Repo owners must review the design and
-implementation plan thoroughly before explicitly authorizing implementation.
-Selected constraints and their rationale are tracked in the
-[decision index and visual map](../decisions/README.md).
+**Required behavior:** Keep work within design and planning. Repo owners must
+review the design and implementation plan, then explicitly authorize implementation.
+The [decision index](../decisions/README.md) records selected behavior and its rationale.
+Use the [writing standard](../writing-standard.md) and [glossary](../glossary.md).
 
 ## Outcome
 
@@ -26,7 +26,7 @@ deliverables rather than duplicating their specifications.
 
 | Owner | Language | Responsibility |
 | --- | --- | --- |
-| Orchestrator | Rust | Scheduling, task lifecycle, durable transitions, aggregate budget admission/settlement, agent coordination, control API |
+| Orchestrator | Rust | Scheduling, task lifecycle, durable transitions, shared budget reservations and usage records, agent coordination, control API |
 | Agent core | Rust | Bounded step semantics, action proposals and lifecycle coordination, budget requests, progress and termination rules |
 | Context subsystem | Rust | Graph semantics, provenance, retrieval, context assembly, invalidation |
 | Policy and execution | Rust | Canonical capability evaluation, execution coordination, tool registry and contracts |
@@ -193,17 +193,131 @@ flowchart TD
 The revision arrow returns to architecture coordination; individual issues must
 be fixed in their canonical document, including D0 or D1 where necessary.
 
-| Stage | Depends on | Produce under `docs/designs/` | Exit evidence |
-| --- | --- | --- | --- |
-| D0: product scenarios and terminology | Existing requirements | `product-workflows.md`, `domain-model.md`, requirements/validation matrix | Define task, conversation, agent, host, action, observation, context, and decision; specify initial workflows and measurable UX/reliability/performance objectives |
-| D1: platform and threat model | D0 | `platform-capabilities.md`, `threat-model.md` | Verify installed/public API evidence; identify adversaries, data flows, protected assets, entitlements/distribution constraints, and OS mechanisms needing live proof |
-| D2: ownership and topology | D0, D1 | `system-architecture.md`, `swift-rust-boundary.md`, `repository-layout.md` | Assign each behavior exactly one owner; select process/module boundaries, IPC/FFI, toolchain and packaging approach; draw dependencies and deployment views |
-| D3: control, policy and durable state | D2 | `control-api.md`, `security-policy.md`, `task-lifecycle.md`, `persistence-recovery.md` | Command/event schemas, policy format/evaluator selection, source authority and composition, activation/revocation, state transitions, transactions, retry/replay semantics, caller/host identities and authorization; durable control intent during reconciliation and response/deadline/cancel arbitration; no unexplained ambiguous effects |
-| D4: core cognition and execution | D2, D3 | `agent-loop.md`, `context-graph.md`, `model-decisions.md`, `tools-execution.md` | Resolve the core brief; specify selection algorithms, state machines, graph consistency, authority checks, effective-context budgets and provenance including model-session state, invalidation and stale-result rejection, bounded model interactions and evaluations; enforce separate source and generated-output write authority |
-| D5: remote boundaries | D1-D4 | `remote-inference.md`, `remote-hosts.md` | Separate inference from host execution; define data egress, trust enrollment/revocation, lease/partition behavior, result provenance and compatibility |
-| D6: interaction and operations | D3-D5 | `cli-tui.md`, `configuration.md`, `observability-audit.md` | Walk through happy/failure journeys; define controls, configuration precedence, redaction, audit durability, telemetry correlation and bounded export |
-| D7: validation and delivery | D2-D6 | `validation-strategy.md`, `build-release.md` | Unit/integration/e2e mapping, model datasets, fuzz/property tests, actual macOS/multi-host runners, performance budgets, signing/update plan and check commands |
-| D8: consistency and implementation readiness | D0-D7 | Requirements matrix completed; scoped packet backlog | Walk representative scenarios across all contracts; resolve conflicting ownership and first-slice blockers; identify later feature gates explicitly |
+| Stage | Subject | Prerequisites |
+| --- | --- | --- |
+| [D0](#d0-product-scenarios-and-terminology) | Workflows and terms | Existing requirements |
+| [D1](#d1-platform-and-threat-model) | Platform and threats | D0 |
+| [D2](#d2-ownership-and-topology) | Components and processes | D0, D1 |
+| [D3](#d3-control-policy-and-durable-state) | Control, policy and recovery | D2 |
+| [D4](#d4-core-cognition-and-execution) | Agent loop, context and tools | D2, D3 |
+| [D5](#d5-remote-boundaries) | Remote inference and hosts | D1–D4 |
+| [D6](#d6-interaction-and-operations) | Interaction and operations | D3–D5 |
+| [D7](#d7-validation-and-delivery) | Validation and delivery | D2–D6 |
+| [D8](#d8-consistency-and-implementation-readiness) | Design review and packets | D0–D7 |
+
+### D0: Product scenarios and terminology
+
+**Outputs:** `product-workflows.md`, `domain-model.md`, and the requirements and
+validation matrix.
+
+**Exit checks:**
+
+- Define task, conversation, agent, host, action, observation, context, and decision.
+- Specify the initial user workflows.
+- Set measurable UX, reliability, and performance objectives.
+
+### D1: Platform and threat model
+
+**Outputs:** `platform-capabilities.md` and `threat-model.md`.
+
+**Exit checks:**
+
+- Verify API support from installed SDKs and public documentation.
+- Identify adversaries, protected assets, data flows, and trust boundaries.
+- Record entitlement and distribution constraints.
+- Identify OS mechanisms that require tests on a real supported host.
+
+### D2: Ownership and topology
+
+**Outputs:** `system-architecture.md`, `swift-rust-boundary.md`, and
+`repository-layout.md`.
+
+**Exit checks:**
+
+- Assign each behavior to one component.
+- Select module and process boundaries, including IPC or FFI between Swift and Rust.
+- Select the toolchain and packaging approach.
+- Draw component dependencies and deployment views.
+
+### D3: Control, policy and durable state
+
+**Outputs:** `control-api.md`, `security-policy.md`, `task-lifecycle.md`, and
+`persistence-recovery.md`.
+
+**Exit checks:**
+
+- Define command and event schemas.
+- Select the policy format and evaluator. Define trusted policy sources,
+  composition rules, activation, and revocation.
+- Define caller and host identities, and authorization checks.
+- Specify state transitions, transaction boundaries, retries, and event replay.
+- Persist control requests received during reconciliation.
+- Define how the orchestrator chooses one outcome when a user response, deadline,
+  and cancellation occur concurrently.
+- Explain how to record and resolve effects whose outcome is unknown.
+
+The lifecycle and storage gates below add required detail to these checks.
+
+### D4: Core cognition and execution
+
+**Outputs:** `agent-loop.md`, `context-graph.md`, `model-decisions.md`, and
+`tools-execution.md`.
+
+**Exit checks:**
+
+- Resolve the open mechanisms in the core harness brief.
+- Specify selection algorithms, state machines, graph consistency, and authority checks.
+- Define context budgets and provenance, including retained model-session state.
+- Define invalidation rules and rejection of stale model results.
+- Bound model interactions and specify their evaluations.
+- Enforce separate permissions for source writes and generated-output writes.
+
+### D5: Remote boundaries
+
+**Outputs:** `remote-inference.md` and `remote-hosts.md`.
+
+**Exit checks:**
+
+- Keep remote inference separate from remote host execution.
+- Define permitted data disclosure, host enrollment, and trust revocation.
+- Define behavior for expired leases and network partitions.
+- Specify result provenance and compatibility checks.
+
+### D6: Interaction and operations
+
+**Outputs:** `cli-tui.md`, `configuration.md`, and `observability-audit.md`.
+
+**Exit checks:**
+
+- Walk through successful and failed user workflows.
+- Define controls and configuration precedence.
+- Specify redaction, audit durability, telemetry correlation, and export limits.
+
+### D7: Validation and delivery
+
+**Outputs:** `validation-strategy.md` and `build-release.md`.
+
+**Exit checks:**
+
+- Map behavior to unit, integration, and end-to-end tests.
+- Define model datasets, fuzz tests, and property tests.
+- Specify supported-macOS and multi-host test environments.
+- Set performance budgets and canonical check commands.
+- Define signing and update procedures.
+
+### D8: Consistency and implementation readiness
+
+**Outputs:** Completed requirements matrix and a backlog of scoped implementation packets.
+
+**Exit checks:**
+
+- Walk representative scenarios through all contracts.
+- Resolve conflicting ownership and blockers for the first implementation scope.
+- Identify the gates that apply to later features.
+- Prepare the design and implementation plan for owner review.
+
+Passing D8 does not authorize implementation. The owner review and explicit
+authorization required by the [implementation entry gate](implementation.md#entry-gate) still apply.
 
 Draft the validation matrix in D0 and evolve it in every stage; D7 consolidates
 infrastructure and execution gates. Security, observability, and UX apply throughout.
@@ -212,78 +326,109 @@ copying them. Revisit earlier contracts when later design exposes an inconsisten
 
 ### Lifecycle, model-state and execution design gates
 
-Use the [core harness brief](../designs/core-harness-brief.md) as the canonical
-starting contract for control intent, decision deadlines and effective context.
-D3 must specify durable receipt of pause/cancel while reconciling, cancellation
-precedence that prevents resumption, and arbitration of user responses, deadline
-expiry and cancellation. A winning decision timeout means terminal failure after
-necessary settlement/reconciliation of existing effects, with no new model or
-work dispatch. Define the persistence point that chooses the outcome and test
-restart/replay around it; client timing alone cannot decide the winner.
+The [core harness brief](../designs/core-harness-brief.md) owns the rules for control
+requests, decision deadlines, and effective context.
 
-[ADR-0002](../decisions/0002-failure-settlement.md) extends the common procedure
-to fatal errors, task deadlines and exhausted budgets in every nonterminal state.
-D3 must define deadline behavior across pause/restart, dispatch fencing, effect and
-usage settlement, authority-store outage behavior, and terminal uncertainty.
-D4 defines separately bounded cleanup authority/resources. No direct terminal
-failure path may bypass this contract.
+D3 must define how the orchestrator persists pause and cancellation requests during
+reconciliation. Cancellation must prevent work from resuming. D3 must also define
+how concurrent user responses, deadline expiry, and cancellation produce one outcome.
+The persistence point determines the winner. Client timing alone cannot determine it.
+Test restart and replay on both sides of that persistence point.
 
-[ADR-0003](../decisions/0003-aggregate-budget-admission.md) assigns aggregate
-budget authority to the orchestrator. D3/D4 must define typed dimensions, hierarchy,
-atomic reservation with action intent, idempotent settlement, conservative unknown
-usage and admission recovery. D5 must define reserved remote envelopes, stale-owner
-fencing and release evidence; provider designs must establish enforceable cost
-bounds. Core loop checks and host limits consume this contract, not competing
-budget accounts. Include model decisions, framework callbacks and retries.
+A winning decision timeout stops new model calls and task work. The orchestrator
+accounts for existing effects before reporting terminal failure.
+[ADR-0002](../decisions/0002-failure-settlement.md) applies this procedure to fatal
+errors, task deadlines, and budget exhaustion in every nonterminal state.
 
-D4 must select explicitly stateless model interactions or scoped retained state.
-Any retained state must be included in effective-context provenance and budget
-accounting, with lifecycle rules for retirement/rebuilding after revocation,
-deletion or cancellation and rejection of stale outputs. Under the proposed
-allocation, Rust owns task authority and context eligibility while Swift owns
-Foundation Models session mechanics. D2/D4 must define the cross-language
-scope/generation identity, invalidation acknowledgement, cancellation, restart and
-late-result contracts for either IPC or FFI. Neither an isolated process nor a
-fresh request payload alone proves absence of retained session history.
+D3 must specify:
 
-D4's execution design must distinguish source-write authority from grants for
-task-local scratch and generated build outputs. Host enforcement covers build
-scripts and their descendants, including indirect access through filesystem
-aliases. I2 requires source access to remain read-only; I6 introduces source edits
-only through its ready editing contract. If required confinement is unsupported,
-reject the affected tool or operation. D7 must map these boundaries to the unit,
-integration and e2e gates in the [implementation plan](implementation.md#early-increment-acceptance-gates).
+- Deadline behavior during pause and restart.
+- How to prevent dispatch after a failure intent wins.
+- How to account for effects and resource usage.
+- Behavior when the authoritative state store is unavailable.
+- How terminal results report unresolved uncertainty.
+
+D4 must define separate permissions and resource limits for cleanup.
+Every terminal failure path must use this procedure.
+
+The orchestrator owns shared budgets, as selected in
+[ADR-0003](../decisions/0003-aggregate-budget-admission.md). Before work starts,
+it reserves the required amount against each applicable limit. See the
+[core budget contract](../designs/core-harness-brief.md#aggregate-budget-ownership-and-admission).
+
+D3 and D4 must define budget units and parent/child limits. They must specify how
+to save a reservation and its action intent atomically. Repeated requests must
+not reserve or charge twice. Unknown usage must remain accounted for after failure
+or restart.
+
+D5 must define the allowance reserved for remote work. It must prevent a replaced
+owner from dispatching work, and require evidence before releasing an allowance.
+Provider designs must establish enforceable cost limits. Loop checks and host
+limits use the same budget records. Model decisions, framework callbacks, and
+retries must all use this contract.
+
+D4 must choose stateless model interactions or explicitly scoped retained state.
+If a session retains state, include it in context provenance and budget accounting.
+Define when to retire or rebuild state after revocation, deletion, or cancellation.
+Reject results that refer to invalidated state.
+
+Under the proposed allocation, Rust owns task authority and context eligibility.
+Swift owns Foundation Models session mechanics. D2 and D4 must define the same
+cross-language contract for either IPC or FFI. It must carry scope and generation
+identity, acknowledge invalidation, and cover cancellation, restart, and late results.
+A separate process or fresh request payload does not establish that session history is absent.
+
+D4 must distinguish source-write permission from permission to write scratch files
+and generated build outputs. Host enforcement covers scripts, child processes,
+and indirect access through filesystem aliases. I2 keeps source files read-only.
+I6 permits source edits only under its ready editing contract.
+Reject a tool or operation if the required confinement is unsupported.
+D7 must map these boundaries to the
+[implementation acceptance gates](implementation.md#early-increment-acceptance-gates).
 
 ### Security policy format and enforcement
 
-Use the [security policy brief](../designs/security-policy-brief.md) to define D1's
-resource and administrator trust boundaries, select the format/evaluator and
-versioned contract in D3, and specify host enforcement in D4. Resolve command,
-sandbox, credential, egress and delegation controls before their implementation
-packets. D5 must preserve host authority across remote boundaries. D6 must make
-validation, policy decisions and bounded approval requests understandable through
-every supported client. Selecting a policy language does not prove OS confinement.
+The [security policy brief](../designs/security-policy-brief.md) governs this work.
+Each design stage has a separate responsibility:
+
+- D1 defines resource and administrator trust boundaries.
+- D3 selects the policy format and evaluator, and defines the versioned contract.
+- D4 specifies host enforcement.
+- D5 preserves each host's authority across remote connections.
+- D6 makes validation, policy decisions, and bounded approval requests understandable in every client.
+
+Resolve command, sandbox, credential, data-disclosure, and delegation controls
+before their implementation packets. A selected policy language does not prove OS confinement.
 
 ### Context storage candidate evaluation
 
-During D3-D4, design and evaluate optional embedded and configured external
-SurrealDB modes using the [storage brief](../designs/context-storage-candidates.md).
-Include endpoint/namespace/database identity, credentials and server trust,
-authorized data egress, network failures, unknown commits and schema/migration
-ownership. D6 defines the user-facing configuration and diagnostics: embedded is
-the initialization default when no external connection is configured, and external
-is selected when one is configured. Reopening verifies the persisted binding first,
-as required by [ADR-0001](../decisions/0001-context-store-binding.md). D3/D6 must
-specify independent bootstrap identity, authenticated logical graph identity,
-authorized migration/rebinding and interrupted-cutover recovery. Missing existing
-settings, invalid settings or connection failure must not trigger
-fallback. Coordinate the decision with persistence/recovery design: decide whether graph and action-ledger
-updates share transactions or use an explicitly recoverable projection. Produce
-a storage decision record backed by representative queries, correctness evidence,
-resource measurements, and pinned-version dependency/license inspection. The
-concrete SDK/server/engine choices remain open and no dependency should be added
-before this work. External operation must not require an embedded graph database
-or silently fall back to one. Validate both modes before their I2 delivery gate.
+D3 and D4 must evaluate optional embedded and configured external SurrealDB modes.
+Use the [storage brief](../designs/context-storage-candidates.md) for the required behavior.
+The evaluation must cover:
+
+- Endpoint, namespace, and database identity.
+- Credentials, server trust, and permitted data disclosure.
+- Network failures and commits whose outcome is unknown.
+- Schema and migration ownership.
+
+D6 defines configuration and diagnostics. For a new installation, use embedded
+storage when no external connection is configured. Use external storage when one
+is configured. Before reopening an installation, verify its persisted store binding,
+as required by [ADR-0001](../decisions/0001-context-store-binding.md).
+Missing existing settings, invalid settings, and connection failure must not cause fallback.
+
+D3 and D6 must define bootstrap identity independent of the graph store. They must
+also define authenticated graph identity, authorized migration or rebinding, and
+recovery if the process stops while switching stores.
+
+Coordinate this work with persistence and recovery design. Decide whether graph
+and action-ledger updates share transactions or use a recoverable projection.
+Record the decision with representative queries, correctness results, resource
+measurements, and dependency and license inspection for pinned versions.
+
+**Open decision:** Select the SDK, server version, and embedded engine before adding
+a dependency. External operation must neither require an embedded graph database
+nor silently fall back to one. Validate both modes at the I2 delivery gate.
 
 ### Diagram deliverables by design stage
 
@@ -291,15 +436,36 @@ Each artifact must follow the [Mermaid standard](../design-process.md#mermaid-di
 The diagrams already in the baseline and briefs provide starting views; detailed
 designs refine them and become the canonical source for selected behavior.
 
-| Stage | Required detailed views before its exit gate |
-| --- | --- |
-| D0-D1 | User journeys, domain relationships, data flows and threat boundaries |
-| D2 | Component/dependency, process/deployment, and Swift/Rust request/cancellation/shutdown sequences |
-| D3 | Command/event sequences, policy schema and activation/revocation states, authorization/launch races, task/action state machines including common failure settlement and control received during reconciliation, durable response/deadline/cancel arbitration, aggregate reservation/settlement, store binding and migration cutover, transaction boundaries, reconnect and crash recovery |
-| D4 | Agent-step flow, decision branches, graph schema/cardinalities, effective-context and model-session scope/invalidation flow, tool authorization and failure sequences including source/output confinement |
-| D5 | Separate remote-inference and remote-host sequences; enrollment, revocation, partition, lease/fencing and reconciliation states |
-| D6 | Interactive and non-interactive workflows, multi-client decisions, configuration precedence, telemetry and audit pipelines |
-| D7-D8 | Test/evidence mapping, packaging/update/migration flows and packet dependency/readiness gates |
+Use these checklists when reviewing each stage's diagrams.
+
+**D0–D1:** Show user workflows, domain relationships, data flows, and threat boundaries.
+
+**D2:** Show component dependencies and process deployment. Add Swift/Rust sequences
+for requests, cancellation, and shutdown.
+
+**D3:** Provide separate detailed views for:
+
+- Commands, events, and policy schema.
+- Policy activation and revocation states, including concurrent authorization and launch.
+- Task and action states, including the common failure procedure.
+- Control requests received during reconciliation.
+- Durable resolution of concurrent responses, deadline expiry, and cancellation.
+- Budget reservation and usage settlement.
+- Store binding and the switch between stores during migration.
+- Transaction boundaries, reconnect, and crash recovery.
+
+**D4:** Show the agent step and its decision branches. Show graph entities and
+relationship cardinalities. Add context and session scope, invalidation, tool
+authorization, and failure sequences. Include source and output confinement.
+
+**D5:** Separate remote-inference and remote-host sequences. Show enrollment,
+revocation, network partitions, leases, stale-owner rejection, and reconciliation states.
+
+**D6:** Show interactive and non-interactive workflows, multi-client decisions,
+configuration precedence, telemetry flow, and audit persistence.
+
+**D7–D8:** Map tests to required evidence. Show packaging, update and migration
+flows, packet dependencies, and readiness gates.
 
 ## Scenarios that must survive the design review
 
