@@ -8,6 +8,13 @@ acceptance evidence. It depends on the
 Each increment needs a detailed design before its implementation can start.
 Use the [writing standard](../writing-standard.md) and [glossary](../glossary.md).
 
+**Selected release scope:** The owner selected local CLI/TUI with on-device
+assistance on 2026-09-22. The
+[D0 scope](../designs/product-workflows.md#selected-first-release-scope) selects
+I0-I4 functionality and I9 release qualification. I5-I8 remain later capabilities;
+their architectural boundaries still require design. Both I2 storage modes remain
+required. This selection does not authorize implementation.
+
 ## Entry gate
 
 Implementation is not currently authorized. Begin I0 only after repo owners have

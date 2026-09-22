@@ -164,8 +164,8 @@ collapse purely organizational splits before scaffolding.
 
 ## Design sequence and exit gates
 
-Artifact names below are planned outputs, not existing files. D0-D8 establish
-the architecture baseline for implementation. Work can be investigated concurrently
+Artifact names below are planned outputs unless linked as existing drafts.
+D0-D8 establish the architecture baseline for implementation. Work can be investigated concurrently
 only where dependencies permit; reconcile it into one consistent design set.
 
 ### Design-stage dependency graph
@@ -212,8 +212,13 @@ be fixed in their canonical document, including D0 or D1 where necessary.
 
 ### D0: Product scenarios and terminology
 
-**Outputs:** `product-workflows.md`, `domain-model.md`, and the requirements and
-validation matrix.
+**Outputs:** [Product workflows](../designs/product-workflows.md),
+[domain model](../designs/domain-model.md), and the
+[requirements and validation matrix](../designs/requirements-validation.md).
+These are initial D0 drafts. The owner selected local CLI/TUI with on-device
+assistance for the first release on 2026-09-22. Domain refinements, workflow details
+and numerical targets await review; D0 is not yet complete. The matrix records
+each exit item.
 
 **Exit checks:**
 

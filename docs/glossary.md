@@ -16,13 +16,16 @@ schemas and runtime mechanisms remain with their governing designs.
 | Host services | Components that start processes, access local resources and enforce permissions and limits |
 | Control client | CLI, TUI or GUI that sends commands and presents task events |
 | Task | A unit of user-requested work with goals, limits and completion criteria |
+| Conversation | User-visible grouping of messages and task references; distinct from a retained model session |
+| Agent instance | Runtime participant assigned bounded work under orchestrator control |
 | Action | A proposed or admitted operation, tracked by a stable identity through execution and recovery |
 | Operation | An individual activity, such as a model call, tool call or remote request |
 | Dispatch | Sending admitted work to the component that will perform it |
 | Effect | A change or external consequence of an operation, such as a file write or data disclosure; usage is also tracked in budget records |
 
-These are reading definitions. D0 must refine the full domain model, including
-the exact relationship between an action and an operation.
+These are reading definitions. The proposed [D0 domain model](designs/domain-model.md)
+refines their relationships, including actions and individual execution attempts.
+Those refinements await review; concrete schemas remain D3-D4 work.
 
 ## Identity and permission
 
@@ -73,6 +76,9 @@ defines binding changes.
 | Provenance | Records of an item's source, version and transformations |
 | Project context | Registered project or repository scope with stable identity and working locations; distinct from model input |
 | Working location | Validated filesystem location associated with a project context, including an individual repository worktree |
+| Repository | Version-control history associated with local checkouts; a remote URL does not uniquely identify a working location |
+| Worktree | Individual checkout with its own working location, even when it shares repository history |
+| Registration | Proposed association between a project context and a validated working location; it grants no access |
 | Configuration snapshot | Immutable effective settings and source provenance for a context and working directory at a revision |
 | Context view | Selected evidence and instructions prepared for a particular task and destination |
 | Effective context | All input that can affect a model response, including retained session history and caches |
@@ -90,4 +96,5 @@ it does not replace those contracts.
 The [user-service brief](designs/user-service-configuration.md) defines project
 contexts and directory configuration. Existing workspace-scoped contracts must
 carry that project context and validated location; “workspace” is not a global
-current directory for the service. D0 must refine their exact identity schema.
+current directory for the service. The [D0 model](designs/domain-model.md) proposes
+their semantic relationships; D3 must define concrete identity schemas.
