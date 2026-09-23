@@ -4,7 +4,9 @@ Asura is a coding AI harness for macOS 27 and later. It uses Apple's Foundation
 Models API and on-device AI to guide orchestration and decide when to call remote
 AI capabilities.
 
-The first interfaces will be a non-interactive CLI and interactive chat/TUI.
+The default launch mode will be Ratatui chat with a Rust backend. Explicit
+non-interactive CLI commands will also be available. Asura will use a fully
+asynchronous, event-driven architecture with input and signal processing pipelines.
 The architecture must also accommodate a GUI and control of remote machines
 running Asura agent instances.
 

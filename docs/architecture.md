@@ -12,10 +12,10 @@ Asura is a coding AI harness for macOS 27 and later. It uses Apple's Foundation
 Models API for on-device classification, decisions and tool management. The local
 model helps the orchestrator determine when a task needs remote AI.
 
-Swift and Rust are the selected implementation languages. Their proposed
-responsibilities and repository layout are recorded in the
-[architecture and design plan](plans/architecture-and-design.md). Allocation and
-interoperation require a detailed design before scaffolding.
+Swift and Rust are the selected implementation languages. Ratatui and Rust are
+selected for the chat client and backend under [ADR-0005](decisions/0005-default-ratatui-chat.md).
+Remaining allocation, repository layout and interoperation require detailed design
+under the [architecture and design plan](plans/architecture-and-design.md) before scaffolding.
 
 Asura inverts the delegation relationship of sibling project Daimon's MCP role:
 the local system coordinates work and calls remote AI when appropriate. Daimon
@@ -26,6 +26,10 @@ is a reference, not an inherited architecture or dependency.
 The initial non-interactive CLI and interactive chat/TUI are control clients of
 an orchestrator managing local agent instances. The same architecture must
 accommodate a GUI and remote machines running Asura agents from day one.
+Launching without an explicit command selects the Ratatui chat client. Its Rust
+backend is part of the shared per-user service; client presentation does not own
+task lifecycle or authorization. The [launch workflow](designs/product-workflows.md#w0-launch-chat-by-default)
+defines acceptance criteria and the remaining terminal-handling decisions.
 
 | Component | Owns |
 | --- | --- |
@@ -126,6 +130,13 @@ flowchart TD
 ```
 
 ## Control API requirements
+
+Asura's full architecture is asynchronous and event-driven, with explicit input
+and signal processing pipelines. [ADR-0006](decisions/0006-async-event-pipelines.md)
+defines their responsibilities, authority boundaries and validation requirements.
+Each boundary must define bounded processing, backpressure, ordering and recovery;
+control and rendering cannot wait synchronously for inference or slow I/O.
+Runtime, scheduler, queue and durable event-delivery mechanisms remain open.
 
 The orchestrator API must be modern, asynchronous, highly reliable, very high
 performance, and secure. Its design must define:

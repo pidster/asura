@@ -1,8 +1,11 @@
 # Architecture and design production plan
 
 **Status: Proposed mechanism.** This plan sets the order of design work.
-Swift and Rust are selected. Component allocation, repository layout, protocols,
-and runtime mechanisms remain open.
+Swift and Rust are selected. Ratatui and the Rust chat backend are selected in
+[ADR-0005](../decisions/0005-default-ratatui-chat.md). Remaining component allocation,
+repository layout, protocols and runtime mechanisms remain open.
+The asynchronous, event-driven architecture and input/signal pipelines are
+required by [ADR-0006](../decisions/0006-async-event-pipelines.md).
 
 **Required behavior:** Keep work within design and planning. Repo owners must
 review the design and implementation plan, then explicitly authorize implementation.
@@ -28,6 +31,10 @@ D2-D3 must resolve its mechanisms before D4 consumes those contracts.
 
 ## Proposed language ownership
 
+The table remains a proposed full-system allocation. The Rust chat client/backend
+choice is selected; D2 must refine its module boundaries within the existing
+per-user service. Ratatui owns terminal presentation, not backend orchestration.
+
 | Owner | Language | Responsibility |
 | --- | --- | --- |
 | Orchestrator | Rust | Scheduling, task lifecycle, durable transitions, shared budget reservations and usage records, agent coordination, control API |
@@ -37,7 +44,7 @@ D2-D3 must resolve its mechanisms before D4 consumes those contracts.
 | Policy and execution | Rust | Canonical capability evaluation, execution coordination, tool registry and contracts |
 | Model service | Swift | Foundation Models sessions, typed decisions, availability and model-specific limits |
 | Native platform services | Swift | Narrow adapters to selected macOS security, identity, and lifecycle facilities |
-| CLI/TUI | Rust | Control-client interactions and presentation through a reusable client library |
+| CLI/TUI | Rust | Ratatui chat presentation and control-client interactions through a reusable client library |
 | GUI | Swift | Future native interface using the same semantic control contract |
 | Remote integrations | Rust | Remote AI adapters and remote Asura host coordination as separate modules |
 
@@ -251,6 +258,8 @@ each exit item.
 - Preserve one backend owner per OS user on a user device. Select supervision,
   authenticated service discovery, concurrent-start arbitration and helper boundaries.
 - Select the toolchain and packaging approach.
+- Define asynchronous execution contexts and isolation for blocking APIs under
+  ADR-0006; preserve responsive control, input and signal processing.
 - Draw component dependencies and deployment views.
 
 ### D3: Control, policy and durable state
@@ -261,6 +270,8 @@ each exit item.
 **Exit checks:**
 
 - Define command and event schemas.
+- Specify input/signal routing, ordering domains, bounded queues, backpressure,
+  duplicate/stale-event handling, durable publication and shutdown/restart rules.
 - Define durable service/context identities, owner replacement and context-scoped
   commands, event subscriptions, configuration revisions and restart recovery.
 - Specify hierarchy discovery, field schemas, scope restrictions, source provenance,

@@ -4,7 +4,8 @@
 acceptance evidence. It depends on the
 [architecture and design plan](architecture-and-design.md).
 
-**Open decisions:** D2 must select the Swift/Rust allocation and repository layout.
+**Open decisions:** D2 must refine the selected Rust chat client/backend ownership
+and select the remaining Swift/Rust allocation and repository layout.
 Each increment needs a detailed design before its implementation can start.
 Use the [writing standard](../writing-standard.md) and [glossary](../glossary.md).
 
@@ -25,6 +26,9 @@ design and completed dependencies. A later feature may retain detailed open
 questions only if they do not undermine an earlier contract or security boundary.
 
 Do not defer testing, observability, or security to a final hardening phase.
+All increments follow [ADR-0006's asynchronous pipelines](../decisions/0006-async-event-pipelines.md).
+Validate overload, slow consumers, signal handling and recovery at each introduced
+boundary; I4 adds real-terminal input/rendering evidence.
 Every increment includes its unit, integration, and end-to-end coverage, relevant
 model evaluations and operational documentation. Hardware/provider-dependent
 checks require the real environment before claiming those behaviors work.
@@ -150,11 +154,15 @@ rules, and the model evaluation suite.
 
 ### I4: Interactive chat/TUI
 
-**Deliver:** Streaming chat, task and agent views, explanations for decisions,
-pause, resume, cancellation, redirection, and pending user decisions.
+**Deliver:** Ratatui chat as the default launch mode, using the shared Rust backend
+under [ADR-0005](../decisions/0005-default-ratatui-chat.md). Include streaming chat,
+task and agent views, explanations for decisions, pause, resume, cancellation,
+redirection, and pending user decisions.
 
 **Exit checks:** Reattach without state loss. Resolve a decision from either client.
 Steer active work and navigate by keyboard. Verify clear recovery from errors.
+Pass [W0 launch checks](../designs/product-workflows.md#w0-launch-chat-by-default),
+including explicit non-interactive commands and terminal restoration after exit/failure.
 
 ### I5: Remote AI assistance
 

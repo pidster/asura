@@ -1,6 +1,7 @@
 # D0 product workflows and objectives
 
 Status: first-release capability scope selected by the owner on 2026-09-22.
+Ratatui, the Rust chat backend and default chat launch were selected on 2026-09-23.
 Workflow refinements and numerical acceptance targets remain proposals for review.
 Existing required behavior is linked to its canonical contract.
 No implementation or performance evidence exists.
@@ -46,6 +47,35 @@ flowchart TD
     Track -->|Unknown effects| Recover["Reconcile or report terminal uncertainty"]
     Recover --> Report
 ```
+
+## W0: Launch chat by default
+
+**Required behavior:** [ADR-0005](../decisions/0005-default-ratatui-chat.md) selects
+Ratatui chat as the default launch mode, backed by the shared Rust user service.
+
+**Initial state:** The user has a supported interactive terminal. The service may
+already be running or require startup through the selected service mechanism.
+
+**Trigger:** Launch `asura` without an explicit command. Repeat with an explicit
+non-interactive command, a second terminal, and an unavailable service.
+
+**Required result:** The no-command launch enters chat. Explicit non-interactive
+commands retain their own output contract. All clients use the same backend owner
+and authoritative task state. Opening chat does not submit a task or grant access.
+Connection failure must remain visible; the client cannot claim service readiness
+or successful task acceptance without evidence. Closing chat detaches that client;
+task cancellation requires an explicit control request.
+
+**Open decisions:** D3/D6 must define argument grammar, service startup feedback,
+non-TTY/unsupported-terminal behavior, help/version precedence, terminal restoration
+and event-loop limits before implementation. Framework and backend selection do
+not resolve these contracts.
+
+**Checks:** Unit launch-mode selection and errors; integration with the actual
+Ratatui client, shared service and concurrent attachment; end-to-end default launch,
+explicit commands, keyboard interaction, resize, reconnect and terminal restoration
+after exit/failure. Repeat with redirected input/output under D6's selected rules.
+Environment: supported macOS, real terminal sessions and the actual Rust backend.
 
 ## W1: Select and inspect a project
 

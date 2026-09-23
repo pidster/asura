@@ -22,10 +22,16 @@ schemas and runtime mechanisms remain with their governing designs.
 | Operation | An individual activity, such as a model call, tool call or remote request |
 | Dispatch | Sending admitted work to the component that will perform it |
 | Effect | A change or external consequence of an operation, such as a file write or data disclosure; usage is also tracked in budget records |
+| Input pipeline | Processing that validates and translates user input or control requests into typed commands for their owner |
+| Signal | Notification whose meaning belongs to a specific component, such as a deadline, process exit or operation completion |
+| Signal pipeline | Processing that normalizes, validates and routes signals to their responsible component |
 
 These are reading definitions. The proposed [D0 domain model](designs/domain-model.md)
 refines their relationships, including actions and individual execution attempts.
 Those refinements await review; concrete schemas remain D3-D4 work.
+The selected [asynchronous architecture](decisions/0006-async-event-pipelines.md)
+defines input/signal processing boundaries. A signal does not itself grant authority
+or prove an operation completed.
 
 ## Identity and permission
 

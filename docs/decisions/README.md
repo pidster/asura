@@ -4,6 +4,21 @@ Status: index of selected design decisions. Implementation remains on hold under
 the [design process](../design-process.md). The [glossary](../glossary.md) explains
 project terms.
 
+## Chat and asynchronous architecture decisions on 2026-09-23
+
+[ADR-0005](0005-default-ratatui-chat.md) selects Ratatui chat as the default launch
+mode with a Rust backend in the existing per-user service.
+[ADR-0006](0006-async-event-pipelines.md) selects a fully asynchronous, event-driven
+architecture with input and signal processing pipelines. Detailed launch,
+scheduling, queue and recovery mechanisms remain design work.
+
+Validation: a read-only review found ambiguous handling of obsolete model
+callbacks. ADR-0006 now distinguishes rejected model output from execution/usage
+evidence retained for reconciliation; the correction was rechecked. Mermaid CLI
+11.16.0 rendered all three new diagrams, and each output was visually inspected.
+All 205 local links/anchors and whitespace checks passed. These checks establish
+documentation consistency only; no product implementation or runtime tests ran.
+
 ## Decisions from the 2026-09-20 review
 
 | Finding | Decision | Detailed contract |

@@ -9,7 +9,7 @@ test or an implementation authorization.
 ## Ownership and use
 
 This matrix owns coverage tracking, not duplicate behavioral contracts. The
-[workflows](product-workflows.md) define W1-W5 and proposed P0-P9 objectives.
+[workflows](product-workflows.md) define W0-W5 and proposed P0-P9 objectives.
 The [domain model](domain-model.md) defines proposed relationships. Existing
 briefs retain their lifecycle, storage, configuration and security contracts.
 
@@ -110,6 +110,8 @@ include the initial state, trigger, result and required layers.
 | R17 | [Budget A2](../plans/implementation.md#a2-shared-budget-reservations-and-recovery) | W2-W5; I2, extended I3/I5/I7 | Concurrent admission, real store, provider/host usage where claimed |
 | R18 | [Security policy deliverables](security-policy-brief.md#required-design-and-validation-deliverables) | W1-W5; I1 onward | Selected evaluator and actual macOS enforcement |
 | R19 | [P0-P9 objectives](product-workflows.md#proposed-measurable-objectives) | W1-W5; I1-I4 | Frozen workload, supported hardware, real clients/models/stores |
+| R20 | [Default Ratatui chat launch W0](product-workflows.md#w0-launch-chat-by-default) | W0; I4 | Actual Rust backend, concurrent clients, real terminals and redirected input/output |
+| R21 | [Async input/signal pipeline validation](../decisions/0006-async-event-pipelines.md#design-handoff-and-validation) | W0-W5; I1 onward, terminal input in I4 | Actual queues, stores, adapters, OS signals and slow consumers |
 
 R18 preserves the distinction between required security capabilities and proposed
 policy mechanisms. D1/D3 must resolve policy composition, approval semantics,
@@ -183,10 +185,12 @@ separately. An unavailable environment leaves its evidence pending.
 | D0 exit item | Current state | Resolution needed |
 | --- | --- | --- |
 | First-release scope | Selected by owner on 2026-09-22: local CLI/TUI with on-device assistance, through I4 plus I9 qualification | Resolved; both storage modes remain required |
-| Workflows | Draft W1-W5 | Review workflow refinements and unsupported-capability behavior |
+| Chat technology and default mode | Ratatui, Rust chat backend and default chat selected on 2026-09-23 | Resolve W0 terminal/startup details in D3/D6 |
+| Processing architecture | Fully asynchronous and event-driven, with input/signal pipelines, selected on 2026-09-23 | Resolve ADR-0006 mechanisms and limits in D2-D6 |
+| Workflows | W0 selected launch behavior; draft W1-W5 | Review workflow refinements and unsupported-capability behavior |
 | Domain and identity semantics | Draft relationships and N1-N3 | Review conversation, overlap, relocation and attempt semantics |
 | Measurable objectives | Proposed P0-P9; no measured baseline | Accept targets or revise from D1-D2 feasibility evidence |
-| Traceability | R01-R19 and N1-N3 specified | Review completeness; D7 expands concrete tests and environments |
+| Traceability | R01-R21 and N1-N3 specified | Review completeness; D7 expands concrete tests and environments |
 
 D0 is not marked complete while these decisions await review. D1 may gather
 read-only platform evidence, but must not treat an unreviewed target as a proven
