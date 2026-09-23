@@ -26,6 +26,7 @@ reviewed before implementation is authorized.
 - [Project glossary](docs/glossary.md)
 - [Architecture decisions and visual review map](docs/decisions/README.md)
 - [Architecture and design plan](docs/plans/architecture-and-design.md)
+- [Runtime and asynchronous processing sketch](docs/designs/runtime-architecture.md)
 - [D0 product workflows and objectives](docs/designs/product-workflows.md)
 - [D0 domain model](docs/designs/domain-model.md)
 - [Requirements and validation matrix](docs/designs/requirements-validation.md)

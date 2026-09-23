@@ -122,6 +122,10 @@ resource policies. Integration evidence runs the profile through real boundaries
 End-to-end evidence measures client-observed results and completes usability and
 accessibility review. P6/P7 are invariants across fault tests, not percentile goals.
 
+The [runtime sketch](runtime-architecture.md#validation-and-open-decisions) refines
+R20-R21 with proposed RT1-RT5 cases for scheduling, publication, cancellation,
+slow consumers and recovery. Its process/queue mechanisms remain proposals.
+
 ## D0 refinement acceptance cases
 
 These proposed cases make the new domain relationships reviewable. They extend

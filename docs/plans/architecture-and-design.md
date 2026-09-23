@@ -248,6 +248,10 @@ each exit item.
 
 ### D2: Ownership and topology
 
+The [runtime sketch](../designs/runtime-architecture.md) proposes process boundaries,
+async task groups and input/signal pipelines for D2-D6 review. It does not satisfy
+this stage's exit checks or select its open mechanisms.
+
 **Outputs:** `system-architecture.md`, `swift-rust-boundary.md`, and
 `repository-layout.md`.
 
