@@ -1,6 +1,7 @@
 # Context storage: embedded and external SurrealDB
 
-Status: required deployment behavior, with proposed mechanisms.
+Status: required deployment behavior, including files plus SurrealDB under the
+owner's 2026-09-24 home-directory requirement, with proposed mechanisms.
 Remaining decisions: SDK/server versions, embedded engine, transport and
 persistence contracts.
 
@@ -48,6 +49,163 @@ administration authority. Context registration does not create another installat
 D3 must separately decide where the task/action ledger resides. An external graph
 does not require remote storage of policy, credentials or other installation state.
 
+## Hybrid data ownership and recovery
+
+Required behavior. Asura combines files with SurrealDB. The
+[per-user home contract](user-service-configuration.md#per-user-home-and-hybrid-persistence)
+defines `$HOME/.asura/` as the local state root. The existing embedded default,
+configured external option and fail-closed graph binding remain unchanged.
+An external database is not physically contained in that local directory.
+
+Logical ownership does not change with physical placement. The storage adapter
+implements persistence on behalf of each owner; it does not acquire task, policy
+or context semantics. The table records existing canonical owners and leaves
+unselected record placement explicit.
+
+| Data or behavior | Canonical semantic owner | Placement contract |
+| --- | --- | --- |
+| Installation identity, graph binding and binding-change state | Orchestrator | Protected local bootstrap independent of the graph; exact file/record format remains D3 work |
+| Project registry, tasks, conversations, accepted controls and action ledger | Orchestrator | D3 must choose authority stores and durability boundaries; client transcripts cannot become another authority |
+| Effective configuration and immutable source snapshots | Configuration resolver | User-managed file sources and retained snapshots have distinct roles; exact source/snapshot placement remains D3 work |
+| Evidence graph, provenance and reference validation | Context subsystem | One active SurrealDB graph; retained file payloads, if selected, need verified references and lifecycle rules |
+| Permissions and policy revisions | Canonical policy component | D3 selects trusted sources and authority storage; ordinary settings cannot replace policy authority |
+| Secret material and credential use | Host services | Selected credential facility; files and graph records contain permitted references, not an implied plaintext secret copy |
+| Audit persistence and diagnostic exports | Audit writer and telemetry exporter, respectively | Separate contracts and retention; diagnostic files are not authoritative task or security records |
+
+The backend owners and storage adapter follow D2's proposed Rust allocation;
+their detailed module allocation remains open. Swift platform adapters provide
+selected OS facilities through narrow contracts. The Swift model
+service and control clients must not open managed stores or perform migrations.
+Modules do not imply separate processes; D2 must select helper boundaries. The
+external SurrealDB server remains a separate process and trust boundary.
+
+Each record must have one authoritative store. Another store may hold a derived
+projection only when its authority, source revision, rebuild and invalidation
+rules are explicit. File sources and resolved snapshots are distinct versioned
+records, not two independently writable copies of the same setting. A cache,
+export or transcript cannot repair missing authority by silently replacing it.
+
+### Cross-store durability obligations
+
+Required D3-D4 design work before hybrid persistence implementation:
+
+1. Assign each record's identity, schema version, authoritative store and owning
+   component. Define references between files, graph records and ledger entries.
+2. Define a stable operation identity, ordered persistence points, admission and
+   publication boundary for every change spanning stores. Do not assume a file
+   update and database transaction commit atomically together.
+3. Define recovery for crashes, disk-full, permission loss, corruption and unknown
+   database commits at every persistence point. Reconcile the original operation;
+   do not infer failure from a timeout or replay an effect blindly.
+4. Reject publication or dependent work while required records or references are
+   missing, incompatible or uncertain. Preserve independently available status
+   and cancellation paths under their existing durability contracts.
+5. Define retention and deletion order for referenced file payloads, graph data
+   and ledger records. Cleanup must not erase evidence needed by admitted work,
+   unresolved effects, recovery or retained audit obligations.
+
+The [binding state machine](#binding-change-recovery-states) governs graph changes.
+The [external write sequence](#external-write-with-an-ambiguous-outcome) governs
+unknown database outcomes. D3 must apply equivalent evidence-based recovery to
+the selected file/database split without creating another lifecycle owner.
+
+### Backup, restore and version compatibility
+
+Required behavior. The orchestrator coordinates installation backup and restore;
+the storage adapter performs physical operations under each data owner's contract.
+Copying `.asura/` alone must not be described as a complete backup when required
+records reside in an external database or another protected facility.
+
+D3 must define a backup consistency boundary and record the installation identity,
+binding generation, required stores, component schema versions and verified record
+references. It must define treatment of in-flight work and unknown effects.
+An arbitrary live directory copy is not evidence of a consistent embedded backup.
+The selected engine and external server need tested backup mechanisms.
+
+Restore must validate the complete required set before admitting dependent work.
+Missing members, mismatched identities, unsupported versions or unresolved effects
+require recovery with actionable diagnostics. Restore must not silently bind an
+empty graph or treat older permissions as current authority. D1-D3 must specify
+rollback detection and current authorization checks, including revocation.
+Credential references must be revalidated through the credential facility;
+this requirement does not select secret export or backup encryption mechanisms.
+
+File formats, bootstrap metadata and database schemas need explicit compatibility
+versions. D3 must select authorized migration steps, checkpoints, supported upgrade
+paths and rollback limits. Interrupted migration must resume or block using its
+recorded operation identity. Successful database connection cannot authorize an
+upgrade, and changing a file cannot bypass graph-binding migration rules.
+
+### Restore admission across stores
+
+Required logical states. Arrows name verification evidence and failure outcomes;
+snapshot format, restore order and atomic activation mechanism remain D3 decisions.
+No restored task may dispatch while the installation is under validation.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Gated: Authorized restore with work admission stopped
+    Gated --> Validating: Required backup members located
+    Gated --> RecoveryRequired: Missing member or uncertain identity
+    Validating --> RecoveryRequired: Incompatible version or broken reference
+    Validating --> Reconciling: Identities, versions and references verified
+    Reconciling --> RecoveryRequired: Effects or active generation unresolved
+    Reconciling --> Ready: Current authority and one active generation verified
+    RecoveryRequired --> Validating: Authorized repair supplies missing evidence
+    Ready --> [*]: Admit only eligible recovered work
+```
+
+### Hybrid storage acceptance cases
+
+Required acceptance cases. These extend B1-B5; no runtime tests or storage
+implementation exist. D7 must assign separate IDs to each fault and race.
+
+#### H1: Authoritative records and partial persistence
+
+- **Initial state:** One installation has authoritative records and cross-store
+  references in the selected file/database layout.
+- **Trigger:** Mutate a projection, lose a commit acknowledgement, or terminate
+  the backend at each persistence point of a cross-store operation.
+- **Required result:** Recover the same operation or report it unresolved. No
+  duplicate effect, stale-authority dispatch or unverified reference is published.
+- **Unit:** Authority routing, projection invalidation, revision checks and all
+  recovery transitions.
+- **Integration:** Real filesystem and persistent embedded/external stores with
+  crash, disk-full, permission-loss, corruption and lost-acknowledgement injection.
+- **End-to-end:** Submit work through a real client, interrupt persistence and
+  restart. Observe the same request and history, or an actionable recovery state.
+- **Environment:** Supported macOS and both qualified storage modes.
+
+#### H2: Complete and incomplete restore
+
+- **Initial state:** A backup contains referenced file and database records, task
+  history, an unresolved effect and credential references.
+- **Trigger:** Restore the complete set, omit each required member, substitute a
+  different graph, or restore a snapshot from before a policy revocation.
+- **Required result:** Only a verified, authorized set admits eligible work.
+  Preserve unresolved effects and reject missing, substituted or stale authority.
+- **Unit:** Backup membership, identity, generation and reference checks.
+- **Integration:** Real backup/restore in both modes; include external database
+  outage, missing credentials and mixed snapshots from different generations.
+- **End-to-end:** Recover history through the client and inspect repair guidance
+  for rejected restores. A directory-only external restore must not claim success.
+- **Environment:** Supported macOS, selected credential facility and real stores.
+
+#### H3: File and database version migration
+
+- **Initial state:** A supported installation contains versioned files, bootstrap
+  metadata and database records with an existing binding.
+- **Trigger:** Perform an authorized upgrade; crash at each migration checkpoint,
+  supply an unsupported version, or try an incompatible downgrade.
+- **Required result:** Preserve identity and references, resume the recorded
+  migration or block with repair guidance. Never silently reset or fall back.
+- **Unit:** Version compatibility and migration-state decisions.
+- **Integration:** Test every supported upgrade path and interrupted phase with
+  real files and persistent embedded/external databases.
+- **End-to-end:** Upgrade, restart and inspect retained history through a client;
+  verify explicit failure for unsupported input and unauthorized migration.
+- **Environment:** Supported macOS and the pinned old/new engine and server pairs.
+
 ## Selected installation binding and change contract
 
 Required behavior, selected in [ADR 0001](../decisions/0001-context-store-binding.md).
@@ -66,16 +224,18 @@ helper process boundaries and IPC/FFI remain open. The
 external database is a separate server and trust boundary. It does not coordinate
 Asura tasks.
 
-The storage adapter must persist a protected bootstrap record independently of
-the graph. An external graph outage must not erase the installation's binding.
-This local record does not require an embedded graph database. It contains:
+The storage adapter must persist protected bootstrap fields independently of
+the graph. For I1, the [ordinary-file authority journal](persistence-recovery.md)
+holds these fields in PendingInit and ActiveBinding frames; no separate local
+authority file owns them. An external graph outage must not erase the
+installation's binding. The logical bootstrap record contains:
 
 - Installation identity and active graph identity.
 - Deployment mode and binding generation.
 - The identity and phase of any pending binding change.
 - Credential references where needed, but never credentials.
 
-D3 must select the record format, atomic update mechanism and recovery procedure.
+D3 must fix the frame format, durability mechanism and recovery procedure.
 D1 must define protection against tampering and rollback, including trust limits
 for local administrators. A filename or connection URL alone is not graph identity.
 

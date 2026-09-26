@@ -46,8 +46,32 @@ On a user device, the backend runs once per OS user and manages multiple project
 and repository contexts. All local clients connect to that service. Agent and
 platform helpers may use separate processes. The service supervisor, helper
 boundaries, transport and package structure remain detailed design decisions.
+The first macOS Foundation Models implementation uses a
+[supervised Swift process](decisions/0009-supervised-local-model-helper.md);
+its transport and package layout remain D2/D7 work.
 A local deployment must exercise the same semantic control contract that future
 interfaces will use.
+
+Asura uses `$HOME/.asura/` for user-level local state, with some data in files and
+other data in SurrealDB. The [home and hybrid persistence contract](designs/user-service-configuration.md#per-user-home-and-hybrid-persistence)
+defines the required root and ownership boundaries. Detailed placement and recovery
+mechanisms remain D3 work; an external database's physical data stays external.
+
+One interactive control client must support navigation among authorized projects,
+conversations, tasks and agent instances. The launch directory may provide an
+initial selection hint; it must not bind the interface's lifetime to one project.
+Changing the visible selection does not change task scope, stop background work
+or grant access. Commands retain explicit targets through the shared control API.
+[ADR-0007](decisions/0007-multi-project-control-interface.md) records this requirement;
+[W6](designs/product-workflows.md#w6-navigate-projects-and-concurrent-activities)
+defines its user-visible contract and validation.
+One conversation belongs to one project context. The same installation may
+reuse linked evidence across contexts only under the selected
+[project visibility boundary](designs/domain-model.md#project-visibility-and-linked-evidence)
+and current per-use authorization. Open visibility is limited to this
+installation; group membership limits eligibility; closed contexts do not
+share evidence across contexts. New contexts start closed. Navigation and graph
+storage grant no access.
 
 The backend discovers configuration in a command's directory and its parents.
 One resolver combines applicable sources from root to leaf, with explicit schema
@@ -58,6 +82,16 @@ context identity, composition, change handling and validation requirements.
 
 Remote AI inference and execution on a remote Asura machine are distinct
 capabilities. Each requires its own authorization, lifecycle, and failure model.
+
+Asura must support AGENTS.md, Agent Skills, MCP and LSP, with Agent Plugins later.
+In-chat commands have three categories: built-ins, extensions and Skill-based
+commands. Their [command boundaries](designs/interaction-and-extension-boundaries.md#in-chat-commands)
+preserve existing admission and execution ownership; the extension prefix is
+`/ext:`, while remaining production syntax needs D3/D6 decisions.
+The [interaction and extension brief](designs/interaction-and-extension-boundaries.md)
+records their ownership constraints and unresolved delivery/conformance scope.
+It also explores separating input interpretation from orchestration and agent
+execution. That separation remains a proposal, not a selected runtime mechanism.
 
 Context storage must support embedded SurrealDB and a configured external SurrealDB
 connection through one storage contract. A new installation uses embedded storage
@@ -242,11 +276,18 @@ defines the required scope and evaluation work; the format and engine remain ope
 
 ## User experience
 
-The experience must be elegant, intuitive, configurable, and controllable.
-Clients should explain what is happening, why, and what the user can do next.
+The experience must follow how the user intuitively wants to work. Users must
+be able to express objectives, follow progress, correct misunderstandings and
+stop work without learning the internal orchestration or agent topology.
+The experience must remain elegant, configurable and controllable.
+Clients must explain what is happening, why, and what the user can do next.
+The [interaction goals](designs/interaction-and-extension-boundaries.md#interaction-goals-for-d6)
+guide the forthcoming detailed chat design and usability evaluation.
 Design workflows for:
 
 - Useful defaults with advanced settings exposed when needed.
+- Navigating projects and concurrent activities within one interface, with clear
+  command targets and discoverable background progress and pending decisions.
 - Inspecting, pausing, cancelling, and redirecting work with explicit effect semantics.
 - Understanding remote AI use, delegation, permission requests, and failures.
 - Reconnecting and switching interfaces without losing task state or pending decisions.
@@ -295,6 +336,11 @@ Each capability and contract has one canonical owner. Control clients do not
 reimplement scheduling or authorization. Adapters translate protocols and
 provider formats while shared behavior stays with its owner. Model selection
 and tool metadata must have canonical definitions rather than client-specific copies.
+The [local-model boundary](designs/swift-rust-boundary.md) must accept alternative
+implementations and capabilities without moving selection, policy, task state or
+tool-effect authority into a platform helper. The first release still targets
+macOS 27 and Foundation Models; portability of the contract does not establish
+support for another operating system.
 
 Logical ownership does not require a single process. Designs must describe how
 shared contracts and host-local enforcement remain consistent across deployments.

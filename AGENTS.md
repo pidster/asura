@@ -20,6 +20,25 @@ These documents are the canonical locations for their respective subjects.
 For documentation changes, follow [writing-standard.md](docs/writing-standard.md).
 Use [glossary.md](docs/glossary.md) for project terms. Preserve the technical
 conditions and required test coverage when simplifying text.
+Keep documentation directory READMEs current under the
+[index maintenance rule](docs/writing-standard.md#directory-readmes).
+
+## Directory-scoped instructions
+
+- Before editing a path, inspect its ancestor directories from the repository
+  root to the target's parent. Read each applicable `AGENTS.md`; where a non-empty
+  `AGENTS.override.md` exists, read it as that directory's instruction file.
+  Do not assume session startup loaded instructions below the working directory.
+- Nested instructions apply to their directory and descendants. For work spanning
+  multiple subtrees, inspect each applicable chain; do not apply sibling guidance.
+- Use nested `AGENTS.md` files for language and component specifics. Keep shared
+  requirements here and detailed rules in their canonical documents; link to them
+  instead of copying them into each instruction file.
+- Directory guidance must preserve shared design, authorization and testing gates.
+  If instructions conflict, stop and report the discrepancy to the user.
+- Add language-specific instruction files when their authorized code trees are
+  introduced. Directory instructions do not authorize scaffolding or select open
+  toolchain, runtime or component-design decisions.
 
 ## Mandatory design gate
 

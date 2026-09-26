@@ -15,6 +15,9 @@ schemas and runtime mechanisms remain with their governing designs.
 | Host | Machine that runs an Asura instance or performs an operation |
 | Host services | Components that start processes, access local resources and enforce permissions and limits |
 | Control client | CLI, TUI or GUI that sends commands and presents task events |
+| Composer | Chat editor together with its adjacent destination, information, status and control areas |
+| Status bar | Compact row below the input showing project/Git context, draft count, running activity and model/context status |
+| Message tray | Bounded area above the input showing submitted messages and their observed states, with access to full text |
 | Task | A unit of user-requested work with goals, limits and completion criteria |
 | Conversation | User-visible grouping of messages and task references; distinct from a retained model session |
 | Agent instance | Runtime participant assigned bounded work under orchestrator control |
@@ -81,12 +84,17 @@ defines binding changes.
 | --- | --- |
 | Provenance | Records of an item's source, version and transformations |
 | Project context | Registered project or repository scope with stable identity and working locations; distinct from model input |
+| Project parent | Explicit installation-local discovery container for candidate child projects; it is not a project context, working location or permission grant |
+| Project group | Installation-local grouping that can make member contexts eligible to reuse linked evidence after per-use authorization; a context belongs to at most one group at a time, while membership authority remains D3 work |
+| Project visibility | Closed, group or open eligibility for linked-evidence reuse within one installation; closed is the default and no label grants access by itself |
 | Working location | Validated filesystem location associated with a project context, including an individual repository worktree |
 | Repository | Version-control history associated with local checkouts; a remote URL does not uniquely identify a working location |
 | Worktree | Individual checkout with its own working location, even when it shares repository history |
 | Registration | Proposed association between a project context and a validated working location; it grants no access |
 | Configuration snapshot | Immutable effective settings and source provenance for a context and working directory at a revision |
 | Context view | Selected evidence and instructions prepared for a particular task and destination |
+| Input context, proposed | Scoped evidence and instructions available to interpret a particular user submission; distinct from its project context or an execution model session |
+| Input processor, proposed | Component that transforms a submitted input and its context into a proposed intent or clarification; it does not grant authority |
 | Effective context | All input that can affect a model response, including retained session history and caches |
 | Manifest | Record of selected inputs, their versions, order, transformations and omissions |
 | Canonical owner | The one component or document responsible for a behavior or rule |
@@ -104,3 +112,7 @@ contexts and directory configuration. Existing workspace-scoped contracts must
 carry that project context and validated location; “workspace” is not a global
 current directory for the service. The [D0 model](designs/domain-model.md) proposes
 their semantic relationships; D3 must define concrete identity schemas.
+
+The [interaction brief](designs/interaction-and-extension-boundaries.md) explores
+input context and processor boundaries. These terms do not select an additional
+process, model or lifecycle owner.

@@ -23,7 +23,9 @@ exchange work; it does not create new domain authorities.
 ## 1. Runtime topology
 
 Propose a separate terminal client process and one Rust backend service per OS
-user/device. Explore a supervised Swift model helper to isolate inference failure.
+user/device. The [D2 local-model boundary](swift-rust-boundary.md) defines a
+portable semantic port. [ADR-0009](../decisions/0009-supervised-local-model-helper.md)
+selects a supervised Swift process for the first macOS implementation.
 Host execution may use a separately constrained helper; D1-D2 must prove its
 enforcement and identity boundaries. Separate processes alone do not establish
 confinement. Platform adapters may require a different placement after SDK review.
@@ -40,12 +42,12 @@ flowchart TD
     CLI["Explicit CLI client"] -->|Same contract| API
     subgraph Service["One Rust backend service per OS user"]
         API["Control ingress and subscriptions"] --> O["Orchestrator and canonical domain owners"]
-        O --> Adapters["Bounded model and execution adapters"]
+        O --> Adapters["Bounded local-model port and execution adapters"]
         O --> Context["Context and storage contracts"]
     end
     O --> Ledger["Authority store: tasks, actions, budgets"]
     Context --> Graph["Bound graph: embedded or external SurrealDB"]
-    Adapters --> Swift["Proposed Swift model helper"]
+    Adapters --> Swift["Selected first macOS Swift helper process"]
     Adapters --> Host["Proposed constrained execution helper"]
     API -.->|State and progress| TUI
 ```
@@ -145,6 +147,14 @@ Typing text does not submit work. Explicit submission distinguishes a new task,
 task revision and response to a pending decision. The client associates outcomes
 with request identities; reconnect or a timed-out send cannot turn uncertainty
 into a new task. An accepted command is not dependent on the client's queue surviving.
+
+The required [W6 navigation contract](product-workflows.md#w6-navigate-projects-and-concurrent-activities)
+adds multiple scoped projections within one client. Capture the command target
+before enqueueing; the send path must not read the client's later selection to
+determine its destination. Route acknowledgements and events by their identities
+to the appropriate projection. D3/D6 must design authorized discovery, subscription
+changes and resynchronization; closing a view cannot cancel its task or lose a
+durable decision. The navigation sequence in W6 governs delayed-command behavior.
 
 Command syntax, shortcuts, paste rules and non-TTY behavior remain D6 work.
 Local validation improves feedback; the backend independently validates every

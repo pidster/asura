@@ -1,7 +1,8 @@
 # ADR-0005: Default to Ratatui chat with a Rust backend
 
 Date: 2026-09-23. Status: selected by the owner.
-No implementation or runtime validation exists.
+Production default launch and backend behavior are not implemented or runtime-validated.
+The isolated TUI experiment has its own qualification scope.
 
 ## Decision and rationale
 

@@ -1,8 +1,47 @@
 # Architecture decisions and review map
 
-Status: index of selected design decisions. Implementation remains on hold under
-the [design process](../design-process.md). The [glossary](../glossary.md) explains
-project terms.
+This directory records significant architecture choices and their rationale.
+Decision records link to the designs that own detailed behavior. The dated
+reviews below preserve the evidence and limitations recorded for those decisions.
+
+Status: index of selected design decisions. Selection does not establish
+implementation or runtime verification. The [design process](../design-process.md)
+governs implementation readiness and authority. The [glossary](../glossary.md)
+explains project terms.
+
+## Files
+
+| Decision | Selected behavior |
+| --- | --- |
+| [ADR-0001: Context-store binding](0001-context-store-binding.md) | Preserve the installation's graph identity across restart and authorized storage changes. |
+| [ADR-0002: Failure settlement](0002-failure-settlement.md) | Apply one failure procedure that accounts for effects and usage. |
+| [ADR-0003: Aggregate budget admission](0003-aggregate-budget-admission.md) | Reserve shared allowance before concurrent work can spend it. |
+| [ADR-0004: User service and contexts](0004-user-service-contexts.md) | Use one backend per device user, with multiple project contexts and hierarchical configuration. |
+| [ADR-0005: Default Ratatui chat](0005-default-ratatui-chat.md) | Launch Ratatui chat by default, with its Rust backend in the shared user service. |
+| [ADR-0006: Asynchronous event pipelines](0006-async-event-pipelines.md) | Use asynchronous, event-driven coordination with explicit input and signal pipelines. |
+| [ADR-0007: Multi-project control interface](0007-multi-project-control-interface.md) | Navigate authorized projects and concurrent activities within one interactive client. |
+| [ADR-0008: Homebrew tap distribution](0008-homebrew-tap-distribution.md) | Distribute prebuilt Asura releases through the existing `pidster/homebrew-tap`. |
+| [ADR-0009: Supervised local-model helper](0009-supervised-local-model-helper.md) | Run the first macOS Foundation Models implementation in a supervised Swift process. |
+| [ADR-0010: Protobuf model channel](0010-protobuf-model-channel.md) | Generate bindings at build time; use fixed-prefix chunk frames, bounded credit and an exact packaged-helper build match. |
+
+Return to the [documentation index](../README.md).
+
+## Multi-project interface requirement on 2026-09-24
+
+[ADR-0007](0007-multi-project-control-interface.md) requires one interactive client
+to navigate authorized projects, conversations, tasks and agents. The launch
+directory does not bind the interface to one project. The canonical
+[W6 workflow](../designs/product-workflows.md#w6-navigate-projects-and-concurrent-activities)
+defines selection, explicit command destinations, background activity and recovery.
+R22 maps its unit, integration and end-to-end evidence; I4 delivers the workflow.
+Presentation controls and concrete subscription mechanisms remain design work.
+
+Validation: an independent read-only review found no conflicts or actionable
+findings in the added ownership, scope, recovery and validation contracts.
+Mermaid CLI 11.16.0 rendered the three new or changed diagrams after a sequence-label
+syntax correction; each output was visually inspected. All 252 local links/anchors
+and whitespace checks passed, as did `git diff --check`. This is documentation
+evidence only; no product code or runtime checks were implemented or executed.
 
 ## Chat and asynchronous architecture decisions on 2026-09-23
 

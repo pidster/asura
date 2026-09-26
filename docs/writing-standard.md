@@ -84,6 +84,18 @@ During an editorial change, compare the old and new text for lost conditions,
 limits, owners and test cases. Document any intended change to behavior separately.
 Writing rules must not remove a security condition to meet a word-count target.
 
+## Directory READMEs
+
+Every documentation directory must contain a `README.md` that explains its purpose
+and indexes its immediate files and child directories. Exclude the index itself.
+Give each entry a relative link and a concise description. Preserve distinctions
+between requirements, proposals, selected designs and recorded evidence.
+
+Update the affected indexes whenever a document is added, renamed, moved or
+removed. A new documentation directory needs its README in the same change.
+Check link targets and index completeness before delivery. Keep detailed contracts
+in their canonical files; an index explains where to read rather than copying them.
+
 ## Adoption decision
 
 The 2026-09-20 clarity review found unexplained terms, overloaded acceptance tables

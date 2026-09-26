@@ -33,13 +33,62 @@ Every increment includes its unit, integration, and end-to-end coverage, relevan
 model evaluations and operational documentation. Hardware/provider-dependent
 checks require the real environment before claiming those behaviors work.
 
+The [production bootstrap and status proposal](../designs/production-bootstrap-status.md)
+maps the path from the isolated TUI to a real installation, project registration
+and scoped status. The owner subsequently selected an
+[early production status slice](../designs/early-production-status-slice.md) for
+practical evaluation. Its scoped D8 and owner-review gate is defined in the
+[design plan](architecture-and-design.md#early-status-slice-readiness). This
+reorders a bounded Rust status client ahead of agent chat; it does not complete
+I0-I4, remove their exit checks or permit code while its own design remains open.
+I1 supplies the service, installation and registry. I2 supplies workspace
+observations. I3 supplies measured model-context usage. I4 connects the TUI to
+those owners. Until a source exists, the client reports an explicit unknown
+value instead of a fixture value.
+
+### Early production status trial
+
+Selected learning milestone, proposed implementation packet. The trial reuses
+the intended Rust service, registry, workspace observer and TUI presentation
+owners. It exposes real installation/project/Git status and keeps draft text
+local; agent submission and model telemetry remain unavailable. It can begin
+only after the scoped D8 review and explicit owner authorization above. Its
+implementation must use production-owned modules and contracts, not extend the
+synthetic experiment with filesystem or network access.
+
+The packet must sequence: minimal Rust workspace and checks; bounded local
+control channel and single service owner; durable installation, binding and
+registry; read-only Git observer; then the status TUI and first-use/navigation
+journeys. A predecessor's interface and failure tests must pass before the next
+stage consumes it. The exact module paths, schema, limits, check commands and
+fault matrix remain D2-D3/D7 work. No stage can be marked complete from a mock
+or a screenshot alone.
+
+Selected dependency view. A solid arrow means the next stage consumes real,
+validated output from its predecessor. The dotted arrow marks a later full
+increment that reuses the slice without inheriting an unverified completion
+claim.
+
+```mermaid
+flowchart TD
+    Review["Scoped D8, owner review and explicit authorization"] --> R["Rust production layout and checks"]
+    R --> S["One bounded per-user service and control channel"]
+    S --> P["Durable installation, graph binding and project registry"]
+    P --> G["Read-only Git observation and scoped status"]
+    G --> T["Ratatui status, directory choice and navigation"]
+    T --> Proof["Unit, integration, CLI and both-terminal evidence"]
+    Proof -.-> I0["Later full I0-I4 exit gates"]
+```
+
 ## Increment sequence
 
 ### Delivery dependencies
 
-Proposed delivery graph. Solid arrows are prerequisite milestones; transitive
-edges are omitted. Dashed arrows into release scope mean feature inclusion is
-decided at D0, not that every release must contain the GUI and remote hosts.
+Proposed full-increment delivery graph. Solid arrows are prerequisite milestones;
+transitive edges are omitted. The earlier status trial follows its separate scoped
+gate above and does not satisfy an increment exit check. Dashed arrows into
+release scope mean feature inclusion is decided at D0, not that every release
+must contain the GUI and remote hosts.
 
 ```mermaid
 flowchart TD
@@ -81,12 +130,30 @@ environment. Those gates apply even where the graph only shows delivery ordering
 
 ### I0: Repository and contracts
 
-**Deliver:** Minimal Cargo and Swift packages, pinned toolchains, generated
-bindings, CI, test runners, and initial telemetry setup.
+**Deliver:** Minimal Cargo and Swift packages, pinned toolchains, build-time
+generated bindings from one Protobuf schema, CI, test runners, and initial
+telemetry setup.
+The [I0 Protobuf bootstrap design](../designs/protobuf-toolchain-bootstrap.md)
+defines the tool lock, verified first download, offline cache, generated-output
+ownership and BT1-BT8 evidence. Its first packet uses a test-only smoke schema
+and fixture exchange, before the real channel schema and process probe. It is
+a scoped part of I0 and remains behind this plan's entry gate. The first build
+entry point must prepare the cache and generate both smoke bindings. It must
+not use ambient generators or checked-in binding output. The later complete
+`check-i0 --offline` must rebuild and run the real probe without network access.
+The owner deferred remote CI for the first bootstrap packet. Record its local
+BT1-BT8 evidence now; repeat the required checks in CI before claiming I0's
+exit gate. Local success does not substitute for the planned CI evidence.
+The [D2 bridge-probe slice](../designs/swift-rust-boundary.md#i0-contract-probe-boundary)
+defines the cross-language test boundary. It has no per-user service, durable
+task admission or Foundation Models quality claim; those arrive in later
+increments under their own ready designs.
 
 **Exit checks:**
 
 - Build from a clean checkout on supported macOS.
+- Regenerate both Rust and Swift model-channel bindings with pinned local tools;
+  missing or mismatched tools fail before stale output can compile.
 - Test a cross-language contract request and response.
 - Reject incompatible contracts.
 - Demonstrate bounded cancellation through connected test components.
@@ -101,6 +168,9 @@ bindings, CI, test runners, and initial telemetry setup.
 - Local caller authentication and authorization.
 - Validation, evaluation, and atomic activation for the selected policy format.
 - Durable control requests and rules for concurrent user responses and decision deadlines.
+- Minimal embedded and external graph-binding adapters, bootstrap identity and
+  verification. I1 establishes or reopens the bound installation before it claims
+  graph readiness; I2 adds graph semantics and workspace observations.
 
 **Exit checks:**
 
@@ -109,6 +179,8 @@ bindings, CI, test runners, and initial telemetry setup.
 - Recover state after restart, including control requests received during reconciliation.
 - Reject unauthorized callers and invalid policy updates.
 - Replay concurrent response, deadline, and cancellation events with one durable outcome.
+- Verify the saved graph identity in both modes before graph-dependent work;
+  preserve the external binding through outage and reject missing embedded data.
 - Meet [C1-C4](../designs/user-service-configuration.md#validation-required-before-delivery)
   for the delivered boundaries: concurrent startup, multiple contexts, parent
   configuration changes, stale revisions and service recovery. I2 adds scoped
@@ -123,7 +195,14 @@ their boundaries to the same C1-C4 cases.
 
 **Deliver:**
 
-- Initial graph, storage, and workspace observations.
+- Context graph semantics, storage queries, and workspace observations over I1's
+  verified binding.
+- Runtime AGENTS.md discovery and nested instruction resolution for validated
+  task working locations, with source provenance and change invalidation.
+- Language-server lifecycle and versioned, scoped navigation results for Rust
+  and Swift through explicitly configured, identity-checked installed
+  toolchains. Language servers remain within I2's source-read-only
+  host boundary and cannot authorize edits.
 - Canonical tool registry, grants, constrained read and process tools, and action recovery.
 - Host sandbox enforcement of policy decisions.
 - Explicit task-local scratch and output permissions, with read-only source access.
@@ -135,13 +214,23 @@ their boundaries to the same C1-C4 cases.
 - Handle unsupported restrictions and concurrent policy revocation and process launch.
 - Enforce output limits and timeouts.
 - Detect stale files and account for unknown outcomes after crashes.
+- Reject unreadable or conflicting instruction sources rather than silently
+  omitting them; verify nested applicability and change invalidation before
+  context is supplied to I3.
+- Start selected language servers under the actual host restrictions. Reject
+  stale document results and attempted source writes, including descendant
+  effects, while preserving versioned navigation evidence. Report a missing or
+  mismatched toolchain as unavailable without an ambient or project-selected
+  executable fallback.
 - Verify that cancellation during reconciliation prevents work from resuming.
 
 ### I3: On-device harness loop
 
 **Deliver:** Swift model adapter or service, core loop, structured decisions,
 context manifests, model-state isolation and invalidation, progress and budget
-rules, and the model evaluation suite.
+rules, and the model evaluation suite. Include Agent Skill discovery,
+provenance, scoped activation and invalidation. Optional skill scripts must use
+I2's ordinary admitted tool path.
 
 **Exit checks:**
 
@@ -151,6 +240,8 @@ rules, and the model evaluation suite.
 - Prevent session state from crossing task or authority scope.
 - Include session state in provenance and budget checks.
 - Verify that terminal decision timeout prevents another model call or action.
+- Reject unavailable or stale skills and show their provenance in the context
+  manifest; verify that activation never grants tool authority.
 
 ### I4: Interactive chat/TUI
 
@@ -159,10 +250,23 @@ under [ADR-0005](../decisions/0005-default-ratatui-chat.md). Include streaming c
 task and agent views, explanations for decisions, pause, resume, cancellation,
 redirection, and pending user decisions.
 
+Include navigation among authorized projects and concurrent activities within the
+same client under [W6](../designs/product-workflows.md#w6-navigate-projects-and-concurrent-activities).
+The launch directory must not bind the interface to one project.
+
+Deliver multiline composition and changing controls/status around the input pane
+under the [interaction goals](../designs/interaction-and-extension-boundaries.md#interaction-goals-for-d6).
+The separate [prototype](../designs/tui-interaction-prototype.md) can inform this
+design; fixture-based prototype checks do not satisfy I4 delivery dependencies
+or its real-service validation.
+
 **Exit checks:** Reattach without state loss. Resolve a decision from either client.
 Steer active work and navigate by keyboard. Verify clear recovery from errors.
 Pass [W0 launch checks](../designs/product-workflows.md#w0-launch-chat-by-default),
 including explicit non-interactive commands and terminal restoration after exit/failure.
+Pass W6-A through W6-C: retain scoped drafts and command targets while switching;
+keep background work discoverable; recover authorized views without repeating effects.
+Measure navigation under concurrent work against D6/D7's selected limits.
 
 ### I5: Remote AI assistance
 
@@ -176,11 +280,23 @@ provider outcomes remain visible to the user and within those limits.
 ### I6: Coding task completion
 
 **Deliver:** The designed patch and validation workflow, controls for concurrent
-workspace changes, and reviewable artifacts.
+workspace changes, and reviewable artifacts. Add MCP adapters through the
+canonical tool registry and context subsystem, with server lifecycle,
+permissions and recovery under their existing owners. I6's first MCP transport
+is local stdio. Remote HTTP, its authorization and network-evidence contract
+need a later profile. This I6 profile includes tools, resources and prompts.
+Resource and prompt inputs need explicit context provenance; a prompt cannot
+silently become a chat command or confer tool authority.
 
 **Exit checks:** Reproduce and investigate a failing fixture test. Make a scoped
 change, run validation, and present evidence. Handle stale edits, failures, and
 cancellation without claiming unverified success.
+Exercise permitted and denied MCP operations through real local server processes.
+An MCP definition or result must not bypass tool admission, source-write
+protection, provenance or outcome reconciliation.
+Verify explicit prompt activation, stale or changed resource rejection, and
+that discovered prompts do not appear as executable commands without a
+separate authorized definition.
 
 ### I7: Remote Asura hosts
 
@@ -200,13 +316,18 @@ Keep orchestration rules in their canonical owner. Pass accessibility and usabil
 
 ### I9: Release qualification
 
-**Deliver:** Signed distribution artifacts, installation, upgrade and recovery
-guidance, and compatibility and performance evidence.
+**Deliver:** Signed distribution artifacts and an `asura` formula in the existing
+`pidster/homebrew-tap`, plus installation, upgrade and recovery guidance and
+compatibility and performance evidence. Follow the
+[release distribution design](../designs/release-distribution.md).
 
 **Exit checks:** Verify each of the following against its design:
 
 - Fresh installation on a supported host.
+- Formula audit and installation from the exact qualified prebuilt release asset.
 - Recovery during upgrade and migration.
+- Upgrade with a live per-user service, uninstall with user data retained, and
+  rejection of an unsupported binary or authority schema.
 - Security regression tests and collector outage.
 - Sustained workloads and usability acceptance.
 

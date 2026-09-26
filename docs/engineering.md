@@ -1,5 +1,10 @@
 # Engineering and testing standards
 
+Status: required engineering and testing practice. The proposed
+[coding standards and enforcement rules](coding-standards.md) add detailed coding
+discipline and a rule-to-check contract. That draft awaits owner review; it does
+not change the active design gate or claim that automated checks exist.
+
 ## Design and ownership
 
 Every code change must follow a governing design under the
@@ -78,7 +83,9 @@ executed or an authorization boundary held.
 ## Test execution and evidence
 
 Define the test runner, canonical check commands, required environments, and CI
-gates in a design before implementation begins. No such commands exist yet.
+gates in a design before implementation begins. The
+[isolated TUI packet](plans/tui-prototype-implementation.md#validation-and-completion)
+defines experiment checks; production validation commands remain to be designed.
 Required tests must be available and runnable as part of the delivery process;
 missing hardware, credentials, or runners are validation gaps, not passing results.
 

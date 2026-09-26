@@ -7,8 +7,10 @@ repository layout, protocols and runtime mechanisms remain open.
 The asynchronous, event-driven architecture and input/signal pipelines are
 required by [ADR-0006](../decisions/0006-async-event-pipelines.md).
 
-**Required behavior:** Keep work within design and planning. Repo owners must
+**Required behavior:** Production work remains within design and planning. Repo owners must
 review the design and implementation plan, then explicitly authorize implementation.
+The owner separately authorized the [isolated TUI experiment](tui-prototype-implementation.md)
+after preflight on 2026-09-24.
 The [decision index](../decisions/README.md) records selected behavior and its rationale.
 Use the [writing standard](../writing-standard.md) and [glossary](../glossary.md).
 
@@ -16,7 +18,7 @@ Use the [writing standard](../writing-standard.md) and [glossary](../glossary.md
 
 Produce a coherent architecture, scoped implementation designs, decision records,
 test specifications, and bounded implementation packets. Establish the whole
-system's boundaries before any implementation, then finish each feature's
+system's boundaries before production implementation, then finish each feature's
 detailed design before coding it. GUI-specific behavior awaits the user's
 additional requirements; its client boundary must be supported from the start.
 
@@ -42,7 +44,8 @@ per-user service. Ratatui owns terminal presentation, not backend orchestration.
 | Agent core | Rust | Bounded step semantics, action proposals and lifecycle coordination, budget requests, progress and termination rules |
 | Context subsystem | Rust | Graph semantics, provenance, retrieval, context assembly, invalidation |
 | Policy and execution | Rust | Canonical capability evaluation, execution coordination, tool registry and contracts |
-| Model service | Swift | Foundation Models sessions, typed decisions, availability and model-specific limits |
+| Local-model port and selection | Rust | Semantic operation and capability contract, eligible implementation selection, task and context identity |
+| First local-model implementation | Swift | macOS Foundation Models sessions, availability and model-specific limits |
 | Native platform services | Swift | Narrow adapters to selected macOS security, identity, and lifecycle facilities |
 | CLI/TUI | Rust | Ratatui chat presentation and control-client interactions through a reusable client library |
 | GUI | Swift | Future native interface using the same semantic control contract |
@@ -95,23 +98,27 @@ flowchart TB
     Bridge --> WireR
 ```
 
-The model/platform boundary connects implementations through the selected IPC or
-FFI mechanism; it is not a second model or policy implementation. Cross-cutting
+The [local-model boundary](../designs/swift-rust-boundary.md#capability-selection-and-portability)
+admits alternative platform implementations through one Rust-owned semantic port.
+The [selected supervised Swift process](../decisions/0009-supervised-local-model-helper.md)
+connects the first macOS implementation through a private IPC binding. It is
+not a second model or policy implementation. Cross-cutting
 telemetry consumes boundary events and must not create reverse domain dependencies.
 
-Compare a separately supervised Swift model service with an in-process bridge.
-Prefer exploring process isolation first to separate model-service failure from
-control-state ownership, but measure its cost. If FFI is chosen, specify buffer
-ownership, lifetimes, cancellation, callback isolation, panic/error translation,
-and shutdown. If IPC is chosen, specify peer identity, framing, versioning,
-backpressure, restart, and outstanding-request recovery. Neither boundary grants
-security automatically. Avoid per-token or per-node language crossings unless
-measurements justify them.
+The rejected in-process FFI alternative would share crash fate and require
+explicit buffer, executor, callback and cancellation contracts. D2 must still
+specify IPC identity, framing, versioning, backpressure, restart and outstanding
+request recovery. A separate process does not grant security automatically.
+Avoid per-token or per-node language crossings unless measurements justify them.
 
 ## Proposed repository layout
 
 This tree is a design proposal, not a scaffolding task. Create members only when
 their governing design and implementation packet are ready.
+
+[Nested instruction files](../designs/repository-agent-configuration.md#directory-scoped-instructions)
+are selected for directory-specific guidance. Include each language's `AGENTS.md`
+when its code tree is introduced; the remaining layout below is still proposed.
 
 ```text
 asura/
@@ -126,6 +133,7 @@ asura/
     decisions/                  # rationale and alternatives
   contracts/                    # authoritative cross-language wire/bridge schemas
   rust/
+    AGENTS.md                   # Rust-specific instructions and canonical rule links
     Cargo.toml                  # Cargo workspace
     crates/
       asura-domain/             # IDs, task/action states, domain invariants
@@ -143,9 +151,9 @@ asura/
       asura-cli/                # CLI and TUI presentation
       asura-host/               # host composition and process entry points
   swift/
-    Package.swift
+    AGENTS.md                   # Swift-specific instructions and canonical rule links
     Sources/
-      AsuraContracts/           # generated contracts/adapters, no domain policy
+      AsuraContracts/           # thin adapters; generated model bindings are build outputs
       AsuraFoundationModels/   # model session adapter
       AsuraPlatform/           # native macOS adapters
       AsuraModelService/       # entry point if process boundary is selected
@@ -159,6 +167,7 @@ asura/
     e2e/                       # user workflows
     security/                  # adversarial host/control scenarios
     performance/               # reproducible benchmark workloads
+  Package.swift                # root SwiftPM package; Swift targets remain under swift/
   evals/                       # versioned model-decision cases and scoring
   scripts/                     # designed build and quality entry points
 ```
@@ -168,6 +177,11 @@ tests use the root suites. Shared schemas produce bindings; handwritten competin
 definitions are prohibited. Protocol schemas do not become a second domain-policy
 implementation. Decide in D2 which boundaries warrant separate crates or targets;
 collapse purely organizational splits before scaffolding.
+The first private Rust–Swift model-channel bindings are generated during the
+build from one schema with pinned local tools. Neither language checks those
+generated files into its source tree. A Swift target may keep thin handwritten
+adapters under `AsuraContracts`; its generated model bindings live in derived
+build output, as do Rust's generated model bindings.
 
 ## Design sequence and exit gates
 
@@ -184,7 +198,7 @@ omitted for readability; the stage table records the full dependency sets.
 ```mermaid
 flowchart TD
     D0["D0: workflows, terminology and measurable objectives"] --> D1["D1: platform evidence and threat model"]
-    D1 --> D2["D2: ownership, topology and Swift/Rust boundary"]
+    D1 --> D2["D2: ownership, topology and local-model boundary"]
     D2 --> D3["D3: control, configuration, lifecycle and recovery"]
     D3 --> D4["D4: loop, graph, decisions and tools"]
     D4 --> D5["D5: remote inference and remote hosts"]
@@ -233,11 +247,17 @@ each exit item.
 - Distinguish project contexts, repositories, worktrees and model context; define
   overlapping registrations and working-location identity.
 - Specify the initial user workflows.
+- Assign delivery scope for AGENTS.md, Agent Skills, MCP and LSP support from the
+  [interaction and extension brief](../designs/interaction-and-extension-boundaries.md).
+  Agent Plugins are later work; do not infer other integration increments.
 - Set measurable UX, reliability, and performance objectives.
 
 ### D1: Platform and threat model
 
-**Outputs:** `platform-capabilities.md` and `threat-model.md`.
+**Outputs:** [Platform capabilities](../designs/platform-capabilities.md) and
+[threat model](../designs/threat-model.md). Both now contain scoped D1 proposals
+for the first local service; their open security and runtime decisions remain
+before D1 can pass its exit checks.
 
 **Exit checks:**
 
@@ -252,7 +272,8 @@ The [runtime sketch](../designs/runtime-architecture.md) proposes process bounda
 async task groups and input/signal pipelines for D2-D6 review. It does not satisfy
 this stage's exit checks or select its open mechanisms.
 
-**Outputs:** `system-architecture.md`, `swift-rust-boundary.md`, and
+**Outputs:** [system-architecture.md](../designs/system-architecture.md),
+[swift-rust-boundary.md](../designs/swift-rust-boundary.md), and
 `repository-layout.md`.
 
 **Exit checks:**
@@ -269,11 +290,16 @@ this stage's exit checks or select its open mechanisms.
 ### D3: Control, policy and durable state
 
 **Outputs:** `control-api.md`, `security-policy.md`, `task-lifecycle.md`,
-`persistence-recovery.md`, and `configuration.md`.
+[persistence-recovery.md](../designs/persistence-recovery.md), and
+`configuration.md`. The persistence document now contains an I1 proposal;
+the remaining D3 contracts and mechanisms are still open.
 
 **Exit checks:**
 
 - Define command and event schemas.
+- Resolve catalogue identity, scoped resolution, invocation capture and replay in
+  the [command-system proposal](../designs/command-system.md). Do not infer a
+  command's authority from its displayed name or the client catalogue.
 - Specify input/signal routing, ordering domains, bounded queues, backpressure,
   duplicate/stale-event handling, durable publication and shutdown/restart rules.
 - Define durable service/context identities, owner replacement and context-scoped
@@ -281,10 +307,19 @@ this stage's exit checks or select its open mechanisms.
 - Specify hierarchy discovery, field schemas, scope restrictions, source provenance,
   snapshot consistency and parent-change activation under the
   [configuration contract](../designs/user-service-configuration.md).
+- Define `$HOME/.asura/` initialization and record placement under the
+  [home contract](../designs/user-service-configuration.md#per-user-home-and-hybrid-persistence).
+  Specify cross-store commit, backup, restore and migration under the
+  [hybrid persistence requirements](../designs/context-storage-candidates.md#hybrid-data-ownership-and-recovery).
+  Use the [production bootstrap and status proposal](../designs/production-bootstrap-status.md)
+  to resolve the I1 registry and graph-binding sequence without treating TUI
+  fixture values as live data.
 - Select the policy format and evaluator. Define trusted policy sources,
   composition rules, activation, and revocation.
 - Define caller and host identities, and authorization checks.
 - Specify state transitions, transaction boundaries, retries, and event replay.
+- Resolve lifecycle, budget and recovery ownership for input interpretation before
+  a task exists if the proposed processor separation is selected.
 - Persist control requests received during reconciliation.
 - Define how the orchestrator chooses one outcome when a user response, deadline,
   and cancellation occur concurrently.
@@ -305,6 +340,19 @@ The lifecycle and storage gates below add required detail to these checks.
 - Define invalidation rules and rejection of stale model results.
 - Bound model interactions and specify their evaluations.
 - Enforce separate permissions for source writes and generated-output writes.
+- Design instruction/skill discovery, composition and provenance through canonical
+  context ownership. Pin MCP/LSP conformance, server lifecycle and capability
+  registration under the [extension boundaries](../designs/interaction-and-extension-boundaries.md#required-integrations-and-ownership).
+  Evaluate input processor contracts without duplicating context or tool owners.
+  Decide how Asura-shipped optional work features contribute through the same
+  extension contract as integrations, while reserved controls stay with their
+  existing owners.
+  Reserve the `asura`, `core` and `internal` extension source handles for trusted
+  Asura contributions. Define the trusted registration provenance and fail-closed
+  rejection of integration claims without changing an internal source.
+- Define explicit extension contributions and Skill command activation against the
+  [command-system proposal](../designs/command-system.md), including invalidation
+  and ordinary tool admission.
 
 ### D5: Remote boundaries
 
@@ -322,16 +370,42 @@ The lifecycle and storage gates below add required detail to these checks.
 **Outputs:** `cli-tui.md`, configuration workflows in D3's `configuration.md`, and
 `observability-audit.md`.
 
+The [TUI prototype plan](../designs/tui-interaction-prototype.md) defines the early
+interaction experiment based on Wisp's layout lessons. Its
+[scoped packet](tui-prototype-implementation.md) records the owner's authorization
+and required qualification. Its fixture evidence informs D6; it does not satisfy earlier system-design
+or production-delivery gates.
+
 **Exit checks:**
 
 - Walk through successful and failed user workflows.
+- Design chat around user intent and correction using the
+  [interaction goals](../designs/interaction-and-extension-boundaries.md#interaction-goals-for-d6).
+  Define when a message discusses, creates or revises work. Resolve whether
+  conversations span projects before changing the proposed domain model.
+- Resolve [W6 multi-project navigation](../designs/product-workflows.md#w6-navigate-projects-and-concurrent-activities),
+  including scoped drafts, background decisions, keyboard access and view recovery.
+  Use D3's authorized discovery, subscription and explicit command-target contracts.
 - Define controls and configuration editing, inspection and repair workflows.
   Use D3's canonical precedence and activation contract.
+- Resolve the [TUI command proposal](../designs/tui-command-discovery.md), including
+  syntax, literal escape, completion, mode presentation and native key behavior.
 - Specify redaction, audit durability, telemetry correlation, and export limits.
 
 ### D7: Validation and delivery
 
-**Outputs:** `validation-strategy.md` and `build-release.md`.
+**Outputs:** [validation-strategy.md](../designs/validation-strategy.md), `build-release.md`, and the
+[release distribution proposal](../designs/release-distribution.md). The
+[Homebrew tap decision](../decisions/0008-homebrew-tap-distribution.md) selects
+the release channel; the procedure and qualification remain open.
+The validation strategy currently covers only the first Protobuf bootstrap
+packet. It does not satisfy the wider D7 exit checks or the missing build and
+release design.
+
+The [draft coding standard](../coding-standards.md#adoption-and-delivery-work)
+proposes a rule-to-check registry and enforcement qualification cases for D7/I0.
+Owner adoption remains pending. Include accepted rules in these designs before
+their dependent implementation begins.
 
 **Exit checks:**
 
@@ -354,6 +428,38 @@ The lifecycle and storage gates below add required detail to these checks.
 
 Passing D8 does not authorize implementation. The owner review and explicit
 authorization required by the [implementation entry gate](implementation.md#entry-gate) still apply.
+
+### Early status-slice readiness
+
+The owner selected a faster, reusable [production status slice](../designs/early-production-status-slice.md)
+on 2026-09-25. D8 may review a bounded slice before the full D0-D7 design set is
+finished only when every contract exercised by that slice is ready and the
+review records later capability gates. D0 project identity/onboarding, D1 host
+boundaries, D2 service/control ownership, D3 durable registration and status,
+D4 Git observation, D6 trial interaction and D7 executable validation are in
+scope. D5 remote execution and D4 model/agent behavior are outside this slice;
+their absence must be visible in the client, not replaced by fixtures.
+
+Scoped D8 does not declare full-system D8 complete or authorize implementation.
+The owner must review the ready slice design and packet, then explicitly
+authorize the packet. The full D8 review remains required before claiming the
+I0-I4 increments or first release complete.
+
+Selected gate sequence. Arrows indicate prerequisites rather than permission to
+code. The later full review retains its original dependency graph above.
+
+```mermaid
+flowchart TD
+    Scope["Selected status-only production scope"] --> Contracts["Ready D0-D4, D6-D7 contracts used by slice"]
+    Contracts --> ScopedD8{"Scoped D8 consistency and threat review"}
+    ScopedD8 -->|Gap| Revise["Revise canonical design owner"]
+    Revise --> Contracts
+    ScopedD8 -->|Pass| Owner["Owner reviews design and implementation packet"]
+    Owner -->|Explicit authorization| Build["Build and validate bounded status slice"]
+    Owner -->|Not authorized| Hold["Remain in design"]
+    Build --> Evidence["Record real service, Git and terminal evidence"]
+    Evidence --> Full["Continue full D0-D8 and I0-I4 gates"]
+```
 
 Draft the validation matrix in D0 and evolve it in every stage; D7 consolidates
 infrastructure and execution gates. Security, observability, and UX apply throughout.

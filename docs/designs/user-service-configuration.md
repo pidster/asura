@@ -1,6 +1,7 @@
 # Per-user service, project contexts and configuration
 
-Status: required behavior selected in [ADR-0004](../decisions/0004-user-service-contexts.md).
+Status: required behavior selected in [ADR-0004](../decisions/0004-user-service-contexts.md),
+with the per-user `$HOME/.asura/` root selected by the owner on 2026-09-24.
 This brief defines ownership and composition rules. It is not implementation-ready.
 Service supervision, schemas and filesystem consistency mechanisms remain open.
 No runtime behavior is implemented or verified.
@@ -62,7 +63,8 @@ Required behavior:
 - The backend schedules all contexts under applicable shared resource limits.
   A busy context must not prevent bounded status and cancellation processing.
 
-D2 must select supervision, endpoint discovery and duplicate-start prevention.
+D2's [standalone service design](system-architecture.md) proposes supervision,
+endpoint discovery and duplicate-start prevention for I1; qualification remains.
 D3 must define owner generations, durable registry recovery, shutdown semantics
 and authentication. D0 must set responsiveness and concurrency targets.
 Login, logout, sleep and upgrade behavior require explicit D2-D3 contracts.
@@ -110,6 +112,86 @@ user's backend. Its one active graph binding can contain evidence for multiple
 project contexts. A context switch must not select another database. Separate
 installation identities remain relevant to other hosts and isolated validation
 environments; they are not a way to run competing backends for one device user.
+
+## Per-user home and hybrid persistence
+
+Required behavior. Asura uses `$HOME/.asura/` as its per-user local state root.
+Here, `$HOME` denotes the service user's validated home directory. An attaching
+client's environment or working directory cannot redirect the backend's state.
+Home-directory resolution and access checks remain D1-D3 mechanisms to design.
+
+Asura stores some data as files and other data in SurrealDB. The directory root
+does not select a file format, database schema or second source of authority.
+The [hybrid storage contract](context-storage-candidates.md#hybrid-data-ownership-and-recovery)
+owns the data split, cross-store consistency and recovery obligations.
+
+Local Asura-managed persistent files belong under this root. Embedded SurrealDB's
+engine files also belong under it, at a subpath that D3 must select. Those engine
+files are the database's representation, not a separately editable copy of graph
+records. An external SurrealDB's physical data remains at its configured server.
+External mode still needs local bootstrap state; it must not initialize an
+embedded graph merely to populate this directory.
+
+Project source trees and repository instruction files remain at their working
+locations. Credentials remain under the selected credential facility's contract;
+the home directory requirement does not authorize plaintext secret files.
+Clients and agents use owning backend contracts to access managed state. Knowing
+the directory path grants no additional filesystem, credential or database access.
+
+The orchestrator owns installation identity, initialization and recovery. The
+configuration resolver owns effective settings and their provenance. The storage
+adapter owns physical access under these owners' typed contracts. These backend
+responsibilities follow D2's proposed Rust allocation; only the Rust chat client
+and backend allocation is selected. Swift platform adapters may provide narrow
+protected-file or credential operations after D1-D2 defines them. Swift
+model services and control clients do not independently select the root or stores.
+No new process boundary or Swift/Rust IPC mechanism is selected here.
+
+### Local root and database boundary
+
+Required placement and ownership view. Arrows show storage access through the
+canonical adapter; dotted arrows identify mutually exclusive graph modes.
+Subdirectory names, file schemas and helper process placement remain open.
+
+```mermaid
+flowchart TD
+    Client["Control clients and agents"] -->|Typed requests| Backend["Backend owners"]
+    Backend -->|Authorized persistence operations| Storage["Canonical storage adapter"]
+    subgraph Home["Service user's validated $HOME/.asura/"]
+        Files[("Managed local files and independent bootstrap state")]
+        Embedded[("Embedded SurrealDB engine files")]
+    end
+    Storage -->|Local file access| Files
+    Storage -.->|Embedded graph mode| Embedded
+    Storage -.->|External graph mode with authorized egress| External[("External SurrealDB server")]
+```
+
+### Proposed directory areas
+
+Proposed mechanism for D3 review. These names organize the design discussion;
+they are not a selected layout or instructions to create directories.
+
+| Proposed area under `.asura/` | Intended role and unresolved placement |
+| --- | --- |
+| `config/` | Human-managed service settings and preferences; filenames and schemas remain open |
+| `state/` | Protected local bootstrap and recovery metadata; exact records and atomic update mechanism remain open |
+| `data/` | Embedded database engine files; engine choice and subdirectory remain open |
+| `artifacts/` | Retained file payloads if D3-D4 selects file-backed artifacts; database references and retention require a contract |
+| `cache/` | Rebuildable data only; eviction must not erase authoritative history or unresolved effects |
+| `logs/` | Bounded redacted diagnostics if file logging is selected; required audit persistence is a separate contract |
+
+D3 must select a physical home for each record before implementation. Task state,
+conversation history, configuration snapshots and audit records are not assigned
+to files or database tables by this proposal. D3 must also select format versions,
+retention and compatibility rules. The same record must not have independently
+writable authoritative copies in both stores.
+
+Root override support, alternate installation roots, service socket/runtime paths,
+numeric permission modes and the exact backup layout remain open. An override,
+if later authorized and designed, cannot create another active owner for one user.
+The root requirement does not select a socket location or a credential backend.
+D1-D3 must specify private access, tamper and symlink/replacement handling before
+any directory creation or state access is implemented.
 
 ## Project context identity
 
@@ -212,8 +294,8 @@ error; it must not be treated as absent. Resource-limit failures have the same
 result. Reject new affected work and explain the source and repair action with
 redacted diagnostics. Status, cancellation and repair remain available.
 
-Exact filenames, file encoding, schema grammar, user-preference location and
-numeric limits remain D3 decisions. Source locations must be unambiguous; the
+Exact filenames, file encoding, schema grammar, user-preference placement within
+the local state root and numeric limits remain D3 decisions. Source locations must be unambiguous; the
 same file must not be applied twice as both user preferences and a directory layer.
 Relative filesystem values are resolved against the declaring file's directory;
 explicit request values use the validated request working directory. The schema
@@ -376,12 +458,36 @@ an individual test ID. No tests have been implemented.
   verify deterministic task settings, current permissions and available cancellation.
 - **Environment:** Supported macOS with real persistence and enforcement.
 
+### C5: Per-user root and storage ownership
+
+- **Initial state:** Two clients attach to one service; their working directories
+  and environment values differ. A separate OS user has a separate installation.
+- **Trigger:** Initialize or reopen in each graph mode, alter a client's `HOME`
+  value, substitute an unsafe state path, or remove existing bootstrap data.
+- **Required result:** Both clients use the service user's validated `.asura`
+  root and the same installation. Reject unsafe or missing existing state with
+  repair guidance. Preserve the graph binding and separate users' state.
+  External mode creates no embedded graph. No client writes managed state directly.
+- **Unit:** Root-source validation, source-scope rejection, record ownership and
+  initialization versus recovery decisions.
+- **Integration:** Real filesystem ownership/access checks, path replacement and
+  concurrent startup; persistent embedded storage and an authenticated external
+  server. Verify no local graph creation in external mode.
+- **End-to-end:** Attach two real clients from different projects, restart the
+  service and recover the same history. Repeat under a separate OS user and
+  verify denied access. Exercise missing-bootstrap recovery without empty history.
+- **Environment:** Supported macOS with real identities, service lifecycle and
+  both storage modes. D7 must give each fault and race a separate test ID.
+
 ## Remaining detailed design work
 
 D0 defines context relationships and service workload targets. D1 defines source
 trust, service endpoint protection, file-access authority and same-user adversary
 limits. D2 selects service supervision and helper boundaries. D3 owns the detailed
 configuration contract, durable identities, concurrency and recovery mechanisms.
+D3 must resolve the proposed directory areas, exact record placement and any
+root override before implementation. Coordinate hybrid backup and restore with
+the [storage acceptance cases](context-storage-candidates.md#hybrid-storage-acceptance-cases).
 D4 binds snapshots to graph retrieval, model sessions and tool execution. D5
 defines remote context mapping and host-local configuration checks; local paths
 must not be interpreted as paths on another host. D6 owns editing and explanation

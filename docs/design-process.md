@@ -4,10 +4,12 @@ Never write code without a design. The architecture baseline establishes project
 direction; a scoped design makes a change concrete enough to implement and test.
 This rule covers production code, test code, scaffolding, build scripts, and spikes.
 
-Current project phase: design and implementation planning only. Repo owners must
-review both thoroughly, and explicitly authorize starting implementation, before
-any product code, tests, scaffolding or build scripts are written. A ready design,
-ADR or packet alone does not open that gate.
+Current production phase: design and implementation planning. The owner authorized
+the [isolated TUI experiment](plans/tui-prototype-implementation.md) on 2026-09-24
+after its preflight; that authorization is limited to the packet's scope.
+Repo owners must review the governing design and plan, then explicitly authorize
+implementation before any product code, tests, scaffolding or build scripts are
+written. A ready design, ADR or packet alone does not open that gate.
 
 ## Workflow
 
@@ -153,8 +155,10 @@ be corrected or reported; rendering alone does not validate architectural semant
 
 ## Initial state
 
-Swift and Rust are selected. No implementation-ready scoped design or validation
-toolchain exists yet. Follow the [architecture and design plan](plans/architecture-and-design.md)
+Swift and Rust are selected. The initial baseline had no implementation-ready
+scoped design or validation toolchain. The isolated experiment now defines its own
+scoped checks; production toolchains and contracts remain open. Follow the
+[architecture and design plan](plans/architecture-and-design.md)
 to establish the initial workflows and governing contracts, then the
 [implementation plan](plans/implementation.md). The core harness brief is a
 design input, not permission to begin its implementation.

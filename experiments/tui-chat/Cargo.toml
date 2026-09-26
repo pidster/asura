@@ -1,0 +1,25 @@
+[package]
+name = "asura-tui-chat"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "Isolated, synthetic Asura chat interaction experiment"
+
+[dependencies]
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "=0.29.0"
+rat-text = { version = "=3.1.0", default-features = false }
+unicode-segmentation = "=1.12.0"
+unicode-display-width = "=0.3.0"
+signal-hook = "=0.3.18"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+complexity = "warn"
+perf = "warn"
+style = "warn"

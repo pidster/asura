@@ -1,0 +1,46 @@
+# Development tooling; see docs/designs/repository-agent-configuration.md.
+project_name: asura
+language_servers:
+- rust
+- swift
+encoding: utf-8
+read_only: true
+ignore_all_files_in_gitignore: true
+ignored_paths:
+- '**/target/**'
+- '**/.venv/**'
+- '**/.build/**'
+- '**/.swiftpm/**'
+ls_workspace_folders:
+- experiments/tui-chat
+ls_additional_workspace_folders: []
+activation_command: null
+ignored_memory_patterns:
+- .*
+fixed_tools:
+- activate_project
+- get_current_config
+- initial_instructions
+- get_symbols_overview
+- find_symbol
+- find_referencing_symbols
+- get_diagnostics_for_file
+ls_specific_settings:
+  rust:
+    ls_path: rust-analyzer
+    initializationOptions:
+      linkedProjects:
+      - experiments/tui-chat/Cargo.toml
+default_modes: null
+added_modes: null
+included_apis: []
+excluded_apis: []
+excluded_tools: []
+included_optional_tools: []
+symbol_info_budget: null
+language_backend: null
+agent_interface: null
+line_ending: null
+read_only_memory_patterns: []
+initial_prompt: ''
+activation_command_timeout: 180.0

@@ -9,7 +9,7 @@ test or an implementation authorization.
 ## Ownership and use
 
 This matrix owns coverage tracking, not duplicate behavioral contracts. The
-[workflows](product-workflows.md) define W0-W5 and proposed P0-P9 objectives.
+[workflows](product-workflows.md) define W0-W6 and proposed P0-P9 objectives.
 The [domain model](domain-model.md) defines proposed relationships. Existing
 briefs retain their lifecycle, storage, configuration and security contracts.
 
@@ -104,14 +104,18 @@ include the initial state, trigger, result and required layers.
 
 | ID | Existing acceptance source | Workflows and delivery | Required environment |
 | --- | --- | --- | --- |
-| R14 | [Service C1-C4](user-service-configuration.md#validation-required-before-delivery) | W1, W4-W5; I1-I2 | macOS service, separate OS users, filesystem, both graph modes |
-| R15 | [Storage B1-B5](context-storage-candidates.md#binding-acceptance-cases) | W5; I2 | Actual embedded store and external SurrealDB, interrupted rebinding |
+| R14 | [Service C1-C5](user-service-configuration.md#validation-required-before-delivery), including the per-user `.asura` root | W1, W4-W5; I1-I2 | macOS service, separate OS users, filesystem, both graph modes |
+| R15 | [Storage B1-B5](context-storage-candidates.md#binding-acceptance-cases) and [hybrid H1-H3](context-storage-candidates.md#hybrid-storage-acceptance-cases) | W5; I2 | Actual embedded/external store, managed files, interrupted rebinding and cross-store recovery/restore |
 | R16 | [Failure A1](../plans/implementation.md#a1-common-failure-settlement) | W3-W5; I1-I2 | Real durable state and process failures |
 | R17 | [Budget A2](../plans/implementation.md#a2-shared-budget-reservations-and-recovery) | W2-W5; I2, extended I3/I5/I7 | Concurrent admission, real store, provider/host usage where claimed |
 | R18 | [Security policy deliverables](security-policy-brief.md#required-design-and-validation-deliverables) | W1-W5; I1 onward | Selected evaluator and actual macOS enforcement |
 | R19 | [P0-P9 objectives](product-workflows.md#proposed-measurable-objectives) | W1-W5; I1-I4 | Frozen workload, supported hardware, real clients/models/stores |
 | R20 | [Default Ratatui chat launch W0](product-workflows.md#w0-launch-chat-by-default) | W0; I4 | Actual Rust backend, concurrent clients, real terminals and redirected input/output |
 | R21 | [Async input/signal pipeline validation](../decisions/0006-async-event-pipelines.md#design-handoff-and-validation) | W0-W5; I1 onward, terminal input in I4 | Actual queues, stores, adapters, OS signals and slow consumers |
+| R22 | [Multi-project navigation W6-A through W6-D](product-workflows.md#w6-navigate-projects-and-concurrent-activities) | W6; I1 scoped control, I4 single-client navigation | Real TUI and shared service, initial selection, concurrent scoped tasks/agents, second-client races and both graph modes |
+| R23 | [Instruction, skill and protocol support IX2-IX3](interaction-and-extension-boundaries.md#validation-obligations) | Delivery assignments open in D0/D4; Agent Plugins later | Real filesystem, supported servers, host enforcement and canonical context/tool paths |
+| R24 | [Intuitive interaction goals](interaction-and-extension-boundaries.md#interaction-goals-for-d6) | D6 chat design, I4 interaction; processor separation unselected | Real chat journeys, representative users, accessibility and model evaluation where applicable |
+| R25 | [Three in-chat command categories IX4](interaction-and-extension-boundaries.md#ix4-in-chat-command-categories-and-admission) | [Command system](command-system.md) and [TUI discovery](tui-command-discovery.md) proposals; D3-D4/D6 and delivery scope open | Client-only controls, real service admission, extension and skill fixtures, identity/collision/revocation cases |
 
 R18 preserves the distinction between required security capabilities and proposed
 policy mechanisms. D1/D3 must resolve policy composition, approval semantics,
@@ -126,10 +130,42 @@ The [runtime sketch](runtime-architecture.md#validation-and-open-decisions) refi
 R20-R21 with proposed RT1-RT5 cases for scheduling, publication, cancellation,
 slow consumers and recovery. Its process/queue mechanisms remain proposals.
 
+R22 adds one-client navigation to the existing multi-client coverage. W6-A requires
+unit selection/draft rules, real service integration and real-terminal navigation.
+W6-B adds delayed commands, decision races and scope-safe retries. W6-C adds
+authorized discovery, background event routing, overload and reconnect. D7 must
+give every independent fault variant an executable case ID. D6/D7 must also set
+and verify navigation latency under load; no numeric navigation target is selected.
+W6-D adds service-resolved launch matching and explicit choice for overlap or an
+unmatched directory, including stale and unauthorized candidates.
+
+The proposed [status race cases PBS12-PBS14](production-bootstrap-status.md#detailed-status-race-cases)
+refine R22 for the early production status slice. They cover scope loss before
+disclosure, old responses after reconnect and older observations that finish last.
+Each case requires unit rules, real service/transport and Git fault tests, and
+draft-preserving journeys in Ghostty and Terminal.app. D3 must resolve publication
+ordering and identity semantics before D7 can qualify these cases.
+
+R23 adds required product integration support, not conformance or an implicit I4
+scope expansion. IX2/IX3 require unit format/scope/protocol rules, actual integration
+boundaries and end-to-end permitted/denied capability use. D0/D4 must select each
+delivery profile before implementation.
+
+R24 requires D6/D7 to define observable interaction criteria and usability measures.
+Unit message/decision rules, real client/control integration and end-to-end user
+journeys remain cumulative requirements. The input processor separation and IX1
+are proposals; if selected, its lifecycle and invalidation cases join that coverage.
+
+R24 also covers multiline composition and dynamic information/controls around
+the input pane. The [TUI prototype TP1-TP5](tui-interaction-prototype.md#validation-and-owner-trial)
+proposes geometry, editing, focus, navigation and terminal trials. Its scripted
+driver provides experiment evidence only; production service/agent integration,
+end-to-end checks and owner usability evaluation remain required.
+
 ## D0 refinement acceptance cases
 
 These proposed cases make the new domain relationships reviewable. They extend
-existing coverage and must not replace C1-C4 or the harness regression cases.
+existing coverage and must not replace C1-C5 or the harness regression cases.
 
 ### N1: Alias and overlap selection
 
@@ -179,6 +215,30 @@ existing coverage and must not replace C1-C4 or the harness regression cases.
 - **Environment:** Real control clients and stores; actual provider or remote-host
   evidence is additionally required when those boundaries become available.
 
+### N4: Project visibility and linked evidence
+
+- **Initial state:** A newly registered closed context, an open context and two
+  contexts in one project group have versioned evidence in the same installation.
+- **Trigger:** Select linked evidence for a destination task, then change source
+  visibility, group membership or source content before a later model operation.
+- **Required result:** Closed data cannot cross contexts. Open and group data
+  are only eligible within the same installation and still require per-use
+  authorization. A context cannot belong to two project groups at once, and
+  group selection requires the source and destination to share their current
+  group. Every selected item retains origin and derivation provenance.
+  Revocation or source change invalidates affected views and retained input.
+  Instructions, task authority and model sessions do not transfer.
+- **Unit:** Visibility eligibility, one-group cardinality, current shared
+  membership and per-use policy checks; provenance and derived-data invalidation
+  decisions.
+- **Integration:** Real graph and authority stores, concurrent membership changes,
+  rejected second-group membership, stale query results and two clients with
+  different project selections.
+- **End-to-end:** Request linked evidence, inspect its cited origin, revoke
+  sharing and verify that later work cannot reuse it or reveal a closed project.
+- **Environment:** Supported macOS service and clients, both SurrealDB modes,
+  multiple contexts and a versioned evidence fixture.
+
 ## Evidence records and D0 readiness
 
 Each future evidence record must name requirement/case IDs, design and code
@@ -191,10 +251,12 @@ separately. An unavailable environment leaves its evidence pending.
 | First-release scope | Selected by owner on 2026-09-22: local CLI/TUI with on-device assistance, through I4 plus I9 qualification | Resolved; both storage modes remain required |
 | Chat technology and default mode | Ratatui, Rust chat backend and default chat selected on 2026-09-23 | Resolve W0 terminal/startup details in D3/D6 |
 | Processing architecture | Fully asynchronous and event-driven, with input/signal pipelines, selected on 2026-09-23 | Resolve ADR-0006 mechanisms and limits in D2-D6 |
+| Multi-project interface | One client navigates projects and concurrent activities; ADR-0007, 2026-09-24 | Resolve W6 presentation, discovery, revocation and navigation-latency details in D3/D6/D7 |
+| Interaction and integrations | Intuitive chat and AGENTS.md, Agent Skills, MCP/LSP support required; plugins later. AGENTS.md and Rust/Swift LSP enter I2, Skills I3 in the first release; MCP local stdio with tools, resources and prompts enters I6. LSP uses configured, identity-checked installed toolchains | Detailed UX deferred to D6; define MCP prompt activation and LSP identity/conformance details in D4; input processor separation remains proposed |
 | Workflows | W0 selected launch behavior; draft W1-W5 | Review workflow refinements and unsupported-capability behavior |
-| Domain and identity semantics | Draft relationships and N1-N3 | Review conversation, overlap, relocation and attempt semantics |
+| Domain and identity semantics | One-context conversations, closed-default local visibility, at-most-one group membership and project-parent discovery selected; other relationships remain draft. N1-N4 specify validation | Review overlap, relocation, attempt, parent discovery, membership transitions and revocation semantics |
 | Measurable objectives | Proposed P0-P9; no measured baseline | Accept targets or revise from D1-D2 feasibility evidence |
-| Traceability | R01-R21 and N1-N3 specified | Review completeness; D7 expands concrete tests and environments |
+| Traceability | R01-R25 and N1-N4 specified; IX1 proposed, IX2-IX3 await detailed profiles | Review completeness; D7 expands concrete tests and environments |
 
 D0 is not marked complete while these decisions await review. D1 may gather
 read-only platform evidence, but must not treat an unreviewed target as a proven

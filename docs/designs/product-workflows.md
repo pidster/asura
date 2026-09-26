@@ -2,9 +2,12 @@
 
 Status: first-release capability scope selected by the owner on 2026-09-22.
 Ratatui, the Rust chat backend and default chat launch were selected on 2026-09-23.
+Navigation across projects and concurrent activities in one interface is required
+by [ADR-0007](../decisions/0007-multi-project-control-interface.md), recorded on 2026-09-24.
 Workflow refinements and numerical acceptance targets remain proposals for review.
 Existing required behavior is linked to its canonical contract.
-No implementation or performance evidence exists.
+No production workflow implementation or performance evidence exists. The isolated
+TUI experiment qualifies only its synthetic editor and presentation scope.
 
 ## Selected first-release scope
 
@@ -12,6 +15,14 @@ Required behavior: the first release targets local CLI/TUI with on-device
 assistance. This selects functionality through I4: a non-interactive CLI and
 interactive chat/TUI for bounded local investigation using the on-device decision subsystem.
 Both embedded and configured external SurrealDB modes remain required at I2.
+Runtime AGENTS.md support enters I2 and is part of this first release.
+Agent Skills enter I3 and are also part of this release. Skill scripts use the
+ordinary admitted I2 tool path; a skill does not grant permission.
+LSP support also enters I2, with source files remaining read-only under that
+increment's host boundary. Rust and Swift are the first qualified languages;
+their servers come from explicitly configured, identity-checked installed
+toolchains. An absent or mismatched toolchain produces an explicit unavailable
+capability. D4 must define the conformance profile.
 “Local” describes task execution and inference, not the database deployment.
 I9 release qualification remains mandatory for this scope, including installation,
 upgrade, recovery, security, sustained workloads and distribution evidence.
@@ -26,6 +37,10 @@ Remote inference (I5), validated source changes (I6), remote hosts (I7) and the
 GUI (I8) remain later delivery scopes. Their boundaries remain part of D1-D8
 architecture work. Excluding them from the first release does not waive
 their designs or permit implementations to bypass the shared control contract.
+MCP support starts in I6 with local stdio servers. Remote HTTP transport is a
+later profile. The first profile includes tools, resources and prompts. MCP
+prompts require explicit activation and provenance; discovery alone does not
+make them chat commands.
 
 The owner's scope selection resolves the release-capability decision only.
 Domain refinements, workflow details and numerical targets still require review.
@@ -46,6 +61,8 @@ flowchart TD
     Track -->|Accounted outcome| Report["Result, evidence, effects and usage"]
     Track -->|Unknown effects| Recover["Reconcile or report terminal uncertainty"]
     Recover --> Report
+    Track -->|Navigate; existing work continues| Other["Select another project or activity"]
+    Other --> Inspect
 ```
 
 ## W0: Launch chat by default
@@ -180,6 +197,209 @@ See [storage B1-B5](context-storage-candidates.md#binding-acceptance-cases) and
 and external stores, authentication failure, partitions and interrupted cutover;
 CLI/TUI repair and reopen. Environment: supported macOS plus a real external
 SurrealDB server. No remote AI credentials are needed to prove external storage.
+
+## W6: Navigate projects and concurrent activities
+
+**Required behavior:** One interactive client must let the user discover and
+navigate authorized projects and their conversations, tasks and agent instances.
+The same interface must support different activities concurrently. Here,
+“activity” describes a user-visible view of those existing entities; it does not
+introduce a second task lifecycle or execution owner.
+
+The validated launch directory selects a unique authorized context/location
+association for the initial visible project. If no association matches, the
+client offers an explicit choice about the directory and any known projects;
+it does not silently restore the last viewed project. Overlap also requires
+explicit choice. The user may explicitly mark an unmatched directory as a
+[project parent](domain-model.md#service-project-and-location-identity) for
+discovery; this does not register its children or create task scope.
+This initial view creates no task or
+authority; the [production selection flow](production-bootstrap-status.md#initial-visible-selection)
+defines the priority. A user must be able to open
+the interface outside a project directory, select an existing authorized context
+and switch projects without restarting or launching another client. Last-viewed
+persistence and empty-registry onboarding remain D3/D6 decisions. Non-interactive
+CLI commands retain their explicit context/location-resolution contract.
+
+### Navigation and command scope
+
+The client owns its visible selection. The orchestrator retains task identities,
+agent assignments and lifecycle. Navigation alone must not create, pause, cancel,
+restart, migrate or revise work. Different clients can view the same or different
+activities independently. A busy or failed background task must not force a view
+change or prevent navigation to another authorized context.
+Switching to a known project restores that client's last valid logical working
+location and directory for the project. If no such selection exists and the
+project has one current location, use its validated root; if several locations
+remain possible, require explicit location choice. The TUI process's OS working
+directory does not change. A command captures the chosen directory with its
+project target before navigation can occur.
+Each conversation stays in one project context. Navigating to another project
+selects another conversation or task; it does not change the first one's scope.
+The [linked-evidence rule](domain-model.md#project-visibility-and-linked-evidence)
+may permit selected data from an open or group-visible project to inform a
+different task in the same installation. Navigation alone never grants that use.
+New project contexts start closed, so cross-context selection requires an
+explicit visibility change before a source can become eligible.
+
+Before submission or control, the interface must identify the destination project,
+working location and task, conversation or agent where applicable. Each command
+must carry that explicit scope and the revisions required by its owning contract.
+Commands directed at an agent still pass through the orchestrator; selecting an
+agent is not a direct execution channel or an authorization grant.
+
+A composed draft retains its intended destination when the user navigates away
+and returns. Moving draft content to another destination requires an explicit
+user action and current authorization. Pending submissions, retries, cancellation
+requests and decision responses must retain their captured target. A delayed
+command must never resolve its target from the newly visible project.
+
+Pending decisions must show their originating scope when opened or answered.
+The service must validate target identity, current authority and decision/task
+revision before acceptance. Navigation must not make an expired or stale approval
+valid, nor turn an old cancellation into cancellation of the newly selected task.
+
+### Background activity and reconnect
+
+The interface must make authorized background progress, failures and pending
+decisions discoverable without requiring the user to visit every project.
+Summaries must identify their scope and distinguish current, stale and unavailable
+state. They must not expose unauthorized names, counts, content or actions.
+
+Events must update only the projection for their identified scope. A late event
+from project A must not overwrite project B's visible conversation or command
+target. Events and notifications cannot silently change selection or submit work.
+Changing selection must not release task budgets or reuse another task's model
+session, configuration snapshot or effective context.
+
+Reconnect must recover authorized activity from the service through replay or an
+explicit resynchronization. The client must not resubmit work to reconstruct a
+view. A removed, replaced or inaccessible location must show an unavailable scope;
+it must not redirect an existing task or draft to a different project. Current
+authorization governs refreshed summaries and controls. D3/D6 must define how
+revocation invalidates cached views, retained drafts and queued commands.
+
+### Selection and delayed command sequence
+
+Required semantic ordering. Arrows show local navigation, scoped control and
+result delivery; they do not select a transport or concurrency mechanism.
+The command retains its original target even after the visible selection changes.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant C as Control client
+    participant O as Control API / owner
+    U->>C: Request command for project A, task A1
+    C->>C: Capture explicit target, working directory and revision
+    U->>C: Navigate to project B, task B1
+    C->>C: Restore B logical directory and retain A command target
+    C->>O: Submit previously requested command for A1
+    O->>O: Validate scope, authority and revision
+    alt Invalid or stale
+        O-->>C: Scoped rejection for A1
+        C-->>U: Show A1 rejection without retargeting
+    else Valid
+        O->>O: Apply durable acceptance contract
+        O-->>C: A1 acknowledgement with request identity
+        C->>C: Update A projection and preserve B selection
+        C-->>U: Make A status discoverable
+    end
+```
+
+The sequence describes an explicit submission already requested by the user;
+typing or navigating alone never submits it. D3 must preserve the authorization
+and revision checks through acceptance, including concurrent revocation.
+
+### W6-A: Navigation preserves concurrent work
+
+- **Initial state:** One client observes tasks in projects A and B, with distinct
+  agent assignments and different selected working directories. A second client
+  observes A. A has a scoped draft.
+- **Trigger:** Navigate between projects, conversations, tasks and agents; return
+  to A. Repeat from a launch directory outside both projects.
+- **Required result:** The user can operate both projects in one client. Existing
+  tasks continue with unchanged identities, scopes and assignments. The second
+  client's selection is unaffected. Each project restores its logical directory;
+  the draft retains its A destination and the process cwd does not change.
+- **Unit:** Selection transitions, per-project directory restoration, draft
+  binding and absence of lifecycle commands.
+- **Integration:** Actual concurrent clients, service, scoped tasks and agent events.
+- **End-to-end:** Real-terminal navigation, distinct activity submission and control,
+  returning to the original draft without task restart or cross-project effects.
+- **Environment:** Supported macOS, real TUI/backend, distinct project fixtures and
+  both storage modes; actual model/host boundaries for activity execution claims.
+
+### W6-B: Commands retain their destination
+
+- **Initial state:** A command for A1 is pending while B1 becomes visible.
+- **Trigger:** Deliver the command after navigation. Separately repeat with a
+  submission retry, cancellation and response to an A1 decision. Race a stale
+  revision or authority revocation against acceptance.
+- **Required result:** Only A1 can receive the command. Invalid scope, authority
+  or revision produces a scoped rejection. B1 receives no effect. Reconnect or
+  retry cannot create duplicate work or revive an expired decision.
+- **Unit:** Immutable target capture, request identity and revision validation.
+- **Integration:** Delay messages through the actual control boundary; inject
+  navigation, revocation and reconnect before and during acceptance.
+- **End-to-end:** Switch while submission, cancellation or a decision response is
+  pending; inspect both activities and their observed effects afterward.
+- **Environment:** Supported macOS, real TUI/service and durable control records.
+  D7 must assign a separate test ID to each command and race variant.
+
+### W6-C: Scoped background events and recovery
+
+- **Initial state:** B is visible; A has progress and a pending decision. One
+  project is unauthorized, and one authorized location can become unavailable.
+- **Trigger:** Deliver late A events, saturate background output, disconnect and
+  reconnect. Separately revoke access, remove a location or expire an event cursor.
+- **Required result:** Authorized background work remains discoverable and B stays
+  usable. A events cannot overwrite B or alter its target. Hidden projects remain
+  undisclosed. Recovery shows scoped current or unavailable state without replaying
+  effects or silently selecting a replacement location.
+- **Unit:** Scoped projection routing, status freshness and filtering rules.
+- **Integration:** Actual subscriptions, bounded delivery, missed events, access
+  changes and resynchronization under background load.
+- **End-to-end:** Observe a background decision, navigate to its originating task,
+  reconnect and recover the same activity; verify keyboard control and scope clarity.
+- **Environment:** Supported macOS, real terminal/backend and both graph modes.
+  D7 must separate late-event, overload, revocation and recovery variants.
+
+### W6-D: Initial selection from the launch directory
+
+- **Initial state:** The installation has authorized registrations for a directory,
+  an overlapping pair and another project. The client may have a last-viewed
+  project from an earlier session.
+- **Trigger:** Launch inside the uniquely registered directory, inside the overlap,
+  and from an unregistered directory. Repeat after revocation or replacement.
+- **Required result:** A unique current match becomes the visible project and
+  location. An overlap or no match opens an explicit choice. The unmatched path
+  does not silently become a new project, project parent or the last-viewed
+  project. Marking it as a parent creates only a validated discovery container;
+  child projects still need registration. No initial selection creates work or
+  grants access.
+- **Unit:** Selection priority, ambiguity, stale-reference and no-action rules.
+- **Integration:** Service-side matching against real aliases, overlap,
+  replacement and authorization changes; client view updates by identity.
+- **End-to-end:** Inspect initial project, status and choice in Ghostty and
+  Terminal.app, then navigate to another known project without losing its draft.
+- **Environment:** Supported macOS, real TUI/service and filesystem, both graph
+  modes and registered/unregistered directory fixtures.
+
+### Open presentation and mechanism decisions
+
+D3 must define authorized listing/subscriptions, target schemas, replay and
+revocation semantics. D6 must select the navigation controls, overview layout,
+draft retention, per-client restoration and keyboard/accessibility behavior.
+Tabs, panes and a particular dashboard layout are not selected by this requirement.
+
+D2/D3 must specify bounded work and event scheduling so one project cannot starve
+another's control traffic. D6/D7 must set and measure selection-to-usable-view
+latency under concurrent model work and background output, with cold and warm
+views distinguished. The existing control objectives alone do not prove smooth
+navigation. All W6 behavior remains subject to the first release's source-write
+and remote-capability boundaries.
 
 ## Proposed measurable objectives
 
