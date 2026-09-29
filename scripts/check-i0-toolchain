@@ -1,0 +1,163 @@
+#!/bin/sh
+# PB0.1: no rustup invocation, downloads, Cargo or cache access before the driver.
+set -u
+umask 077
+report_wait() {
+    report_pid=$1
+    report_until=$(( $(/bin/date +%s) + 2 ))
+    while kill -0 "$report_pid" 2>/dev/null && [ "$(/bin/date +%s)" -lt "$report_until" ]; do /bin/sleep 0.05; done
+    kill -KILL "$report_pid" 2>/dev/null || :
+    report_until=$(( $(/bin/date +%s) + 2 ))
+    while kill -0 "$report_pid" 2>/dev/null && [ "$(/bin/date +%s)" -lt "$report_until" ]; do /bin/sleep 0.05; done
+    if kill -0 "$report_pid" 2>/dev/null; then exit 1; fi
+    wait "$report_pid" 2>/dev/null || :
+}
+report() { /usr/bin/printf '%s\n' "$*" >&2 & report_wait "$!"; }
+report_file() { /usr/bin/head -c 16777216 "$1" >&2 & report_wait "$!"; }
+fail() { report "check-i0-toolchain: $*"; exit 1; }
+case "$*" in
+    '--check driver'|'--check bootstrap'|'--check preparation'|'--check preparation-offline') [ "$#" -eq 2 ] || fail invalid_arguments ;;
+    ''|'--offline'|'--prepare-only'|'--check unit'|'--check integration'|'--check e2e'|'--check all') fail 'not_implemented: only scoped driver, bootstrap and preparation checks are available' ;;
+    *) fail 'invalid_arguments: expected a fixed --check selector' ;;
+esac
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P) || fail invalid_root
+[ "$(/usr/bin/uname -s)" = Darwin ] || fail unsupported_host
+[ "$(/usr/bin/uname -m)" = arm64 ] || fail unsupported_architecture
+[ "$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d . -f 1)" = 27 ] || fail unsupported_os
+pin=$(/usr/bin/sed -n 's/^channel = "\([^"]*\)"$/\1/p' "$root/rust-toolchain.toml")
+[ "$pin" = 1.98.0 ] || fail invalid_toolchain_pin
+set -m 2>/dev/null || fail 'supervision_unavailable: shell has no monitor mode'
+tmp=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/asura-driver.XXXXXXXX") || fail temporary_directory
+child= watcher= group_verified=0 interrupted=0
+# The watchdog is itself a separate job. Cancel it before releasing compiler state.
+stop_watchdog() {
+    [ -n "$watcher" ] || return 0
+    kill -TERM -- "-$watcher" 2>/dev/null || :
+    wd_until=$(( $(/bin/date +%s) + 2 ))
+    while { kill -0 "$watcher" 2>/dev/null || kill -0 -- "-$watcher" 2>/dev/null; } && [ "$(/bin/date +%s)" -lt "$wd_until" ]; do /bin/sleep 0.05; done
+    kill -KILL -- "-$watcher" 2>/dev/null || :
+    wd_until=$(( $(/bin/date +%s) + 2 ))
+    while { kill -0 "$watcher" 2>/dev/null || kill -0 -- "-$watcher" 2>/dev/null; } && [ "$(/bin/date +%s)" -lt "$wd_until" ]; do /bin/sleep 0.05; done
+    if kill -0 "$watcher" 2>/dev/null || kill -0 -- "-$watcher" 2>/dev/null; then
+        fail "cleanup_required: watchdog settlement unproved; evidence retained at $tmp"
+    fi
+    # Its PID and group are gone. Bash has reaped the child; wait only reads status.
+    wait "$watcher" 2>/dev/null || :
+    watcher=
+}
+settle_group() {
+    [ -n "$child" ] || return 0
+    if [ "$group_verified" -eq 1 ]; then sg_target=-$child; else sg_target=$child; fi
+    kill -TERM -- "$sg_target" 2>/dev/null || :
+    sg_until=$(( $(/bin/date +%s) + 2 ))
+    while { kill -0 "$child" 2>/dev/null || kill -0 -- "$sg_target" 2>/dev/null; } && [ "$(/bin/date +%s)" -lt "$sg_until" ]; do /bin/sleep 0.05; done
+    kill -KILL -- "$sg_target" 2>/dev/null || :
+    sg_until=$(( $(/bin/date +%s) + 2 ))
+    while { kill -0 "$child" 2>/dev/null || kill -0 -- "$sg_target" 2>/dev/null; } && [ "$(/bin/date +%s)" -lt "$sg_until" ]; do /bin/sleep 0.05; done
+    if kill -0 "$child" 2>/dev/null || kill -0 -- "$sg_target" 2>/dev/null; then
+        fail "cleanup_required: compiler settlement unproved; evidence retained at $tmp"
+    fi
+    wait "$child" 2>/dev/null || :
+    child=
+}
+
+interrupt() { interrupted=1; [ -z "$child" ] || kill -TERM "$child" 2>/dev/null || :; }
+trap interrupt HUP INT TERM
+# Fixed internal compiler commands only. The child cannot exec before PGID proof.
+compiler_step() {
+    budget=$1; shift
+    [ "$interrupted" -eq 0 ] || return 1
+    /bin/rm -f "$tmp/go" "$tmp/expired"
+    (
+        trap 'exit 143' HUP INT TERM
+        while [ ! -f "$tmp/go" ]; do /bin/sleep 0.01; done
+        # POSIX sh file limits are 512-byte blocks: a hard disk-output backstop.
+        ulimit -f 32768 || exit 125
+        exec "$@"
+    ) >"$tmp/compiler.log" 2>&1 &
+    child=$!; group_verified=0
+    pgid=$(/bin/ps -o pgid= -p "$child" | /usr/bin/tr -d ' ') || pgid=
+    if [ "$pgid" != "$child" ]; then
+        settle_group || :
+        report 'supervision_unavailable: compiler process group not established'
+        return 1
+    fi
+    group_verified=1
+    (
+        /bin/sleep "$budget"
+        : >"$tmp/expired"
+        kill -TERM -- "-$child" 2>/dev/null || :
+        /bin/sleep 2
+        kill -KILL -- "-$child" 2>/dev/null || :
+    ) &
+    watcher=$!
+    : >"$tmp/go"
+    # Do not block in wait while the watchdog is the only actor that can wake us.
+    while kill -0 "$child" 2>/dev/null; do
+        [ "$interrupted" -eq 0 ] && [ ! -f "$tmp/expired" ] || break
+        /bin/sleep 0.05
+    done
+    result=1
+    if ! kill -0 "$child" 2>/dev/null; then wait "$child" 2>/dev/null; result=$?; fi
+    stop_watchdog
+    if [ "$interrupted" -eq 1 ] || [ -f "$tmp/expired" ]; then
+        settle_group || { report cleanup_required; return 1; }
+        report 'compiler_timeout_or_interrupted'
+        return 1
+    fi
+    # Success is not sufficient if a descendant retains the process group.
+    if kill -0 -- "-$child" 2>/dev/null; then
+        settle_group || { report cleanup_required; return 1; }
+        report 'compiler_descendant_outlived_parent'
+        return 1
+    fi
+    child=
+    bytes=$(/usr/bin/wc -c <"$tmp/compiler.log" | /usr/bin/tr -d ' ')
+    if [ "$bytes" -gt 16777216 ]; then report compiler_output_limit; return 1; fi
+    return "$result"
+}
+compiler=
+rustup_base=${RUSTUP_HOME-"$HOME/.rustup"}
+[ -n "$rustup_base" ] || { /bin/rm -rf "$tmp"; fail "toolchain_unavailable: RUSTUP_HOME is empty"; }
+# Inspect installed physical binaries only. An explicit empty RUSTUP_HOME fails closed.
+for candidate in "$rustup_base"/toolchains/*/bin/rustc; do
+    [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ] || continue
+    # Reject proxy executables even if a custom toolchain uses a hard link.
+    [ ! "$candidate" -ef "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ] || continue
+    if [ "$2" != driver ]; then
+        tool_bin=${candidate%/rustc}
+        complete=1
+        for tool in cargo rustdoc cargo-clippy clippy-driver; do
+            [ -f "$tool_bin/$tool" ] && [ -x "$tool_bin/$tool" ] && [ ! -L "$tool_bin/$tool" ] &&
+                [ ! "$tool_bin/$tool" -ef "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ] || complete=0
+        done
+        [ "$complete" -eq 1 ] || continue
+    fi
+    if compiler_step 5 "$candidate" --version; then
+        IFS=' ' read -r tool version rest <"$tmp/compiler.log" || :
+        if [ "${tool:-}" = rustc ] && [ "${version:-}" = "$pin" ]; then compiler=$candidate; break; fi
+    fi
+    [ "$interrupted" -eq 0 ] || break
+done
+if [ -z "$compiler" ]; then
+    /bin/rm -rf "$tmp"
+    fail 'toolchain_unavailable: installed Rust 1.98.0 required; no download attempted'
+fi
+if ! compiler_step 120 "$compiler" --edition=2024 -D warnings "$root/rust/check-i0-driver.rs" -o "$tmp/driver"; then
+    report_file "$tmp/compiler.log"
+    /bin/rm -rf "$tmp"
+    fail compiler_failed
+fi
+[ "$interrupted" -eq 0 ] || { /bin/rm -rf "$tmp"; fail interrupted; }
+# Forward handled signals to the driver, which owns descendant cleanup and marker.
+ASURA_DRIVER_ROOT="$root" ASURA_DRIVER_RUSTC="$compiler" "$tmp/driver" "$@" &
+child=$!; group_verified=1
+[ "$interrupted" -eq 0 ] || kill -TERM "$child" 2>/dev/null || :
+while :; do
+    wait "$child"; result=$?
+    kill -0 "$child" 2>/dev/null || break
+done
+child=
+trap - HUP INT TERM
+/bin/rm -rf "$tmp"
+exit "$result"

@@ -31,6 +31,11 @@ proposals. The policy component evaluates authority. The orchestrator accepts
 user responses against pending task/decision revisions. Host services enforce
 current grants. These records must remain distinguishable in inspection and audit.
 
+The [memory ontology](hybrid-memory-ontology.md) extends this model with plan
+graphs, work dependencies and task-linked partial progress reports. Its tracking
+records reference these canonical task, agent and operation identities. The
+orchestrator retains ownership of admission and accepted lifecycle transitions.
+
 ### Task, action and evidence relationships
 
 Proposed logical cardinalities. Edges describe references and ownership, not

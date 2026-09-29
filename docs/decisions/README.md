@@ -22,7 +22,7 @@ explains project terms.
 | [ADR-0007: Multi-project control interface](0007-multi-project-control-interface.md) | Navigate authorized projects and concurrent activities within one interactive client. |
 | [ADR-0008: Homebrew tap distribution](0008-homebrew-tap-distribution.md) | Distribute prebuilt Asura releases through the existing `pidster/homebrew-tap`. |
 | [ADR-0009: Supervised local-model helper](0009-supervised-local-model-helper.md) | Run the first macOS Foundation Models implementation in a supervised Swift process. |
-| [ADR-0010: Protobuf model channel](0010-protobuf-model-channel.md) | Generate bindings at build time; use fixed-prefix chunk frames, bounded credit and an exact packaged-helper build match. |
+| [ADR-0010: Protobuf model and control channels](0010-protobuf-model-channel.md) | Shared pinned generation with separate contracts; model channel uses chunk frames, bounded credit and an exact helper match. |
 
 Return to the [documentation index](../README.md).
 

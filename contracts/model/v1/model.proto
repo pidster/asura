@@ -1,0 +1,89 @@
+syntax = "proto3";
+package asura.model.v1;
+
+enum Availability { AVAILABILITY_UNSPECIFIED = 0; AVAILABILITY_AVAILABLE = 1; AVAILABILITY_UNAVAILABLE = 2; AVAILABILITY_UNKNOWN = 3; }
+enum TransferDirection { TRANSFER_DIRECTION_UNSPECIFIED = 0; TRANSFER_DIRECTION_INPUT = 1; TRANSFER_DIRECTION_OUTPUT = 2; }
+enum CancelReason { CANCEL_REASON_UNSPECIFIED = 0; CANCEL_REASON_USER = 1; CANCEL_REASON_TIMEOUT = 2; CANCEL_REASON_SHUTDOWN = 3; CANCEL_REASON_RESOURCE_LIMIT = 4; }
+enum Outcome { OUTCOME_UNSPECIFIED = 0; OUTCOME_COMPLETE = 1; OUTCOME_FAILED = 2; OUTCOME_CANCELLED = 3; }
+enum Reason { REASON_NONE = 0; REASON_MODEL_UNAVAILABLE = 1; REASON_INPUT_LIMIT = 2; REASON_OUTPUT_LIMIT = 3; REASON_CONTEXT_LIMIT = 4; REASON_TIMEOUT = 5; REASON_REFUSAL = 6; REASON_CANCELLED = 7; REASON_PROTOCOL_FAULT = 8; REASON_HELPER_FAILED = 9; REASON_INTERNAL_ERROR = 10; REASON_INTERRUPTED = 11; REASON_RESULT_EXPIRED = 12; }
+enum Role { ROLE_UNSPECIFIED = 0; ROLE_USER = 1; ROLE_ASSISTANT = 2; }
+message Envelope {
+  optional bytes operation_id = 1;
+  optional uint64 generation = 2;
+  oneof body {
+    Hello hello = 10;
+    Begin begin = 11;
+    Chunk chunk = 12;
+    Credit credit = 13;
+    InputEnd input_end = 14;
+    Ready ready = 15;
+    Start start = 16;
+    Cancel cancel = 17;
+    SnapshotEnd snapshot_end = 18;
+    Terminal terminal = 19;
+    ToolCall tool_call = 20;
+    ToolResult tool_result = 21;
+    ContextMeasured context_measured = 22;
+  }
+}
+message Hello {
+  optional bytes build_id = 1;
+  optional bytes schema_digest = 2;
+  optional uint32 max_frame_bytes = 3;
+  optional Availability availability = 4;
+  optional uint32 capabilities = 5;
+  optional uint32 context_tokens = 6;
+  optional Reason reason = 7;
+  optional string model_name = 8;
+  optional string selected_model = 9;
+  optional string asset_root = 10;
+  optional string endpoint = 11;
+  optional bool inventory_only = 12;
+  repeated ModelInventoryEntry models = 13;
+  repeated ModelInventoryIssue issues = 14;
+  optional bool local_tool_destination = 15;
+  optional uint32 model_capabilities = 16;
+  optional uint32 supported_capabilities = 17;
+  optional uint32 capability_source = 18;
+  optional bool reasoning_disabled = 19;
+}
+message Begin { optional string model = 1; optional uint64 input_bytes = 2; optional uint32 deadline_remaining_ms = 3; optional uint32 max_response_tokens = 4; optional bool enable_project_tools = 5; }
+message Chunk { optional uint64 transfer_id = 1; optional TransferDirection direction = 2; optional uint64 ordinal = 3; optional bytes data = 4; optional uint64 revision = 5; }
+message Credit { optional uint64 transfer_id = 1; optional TransferDirection direction = 2; optional uint64 accepted_bytes = 3; optional uint64 granted_bytes = 4; }
+message InputEnd { optional uint64 count = 1; optional uint64 total_bytes = 2; }
+message Ready {}
+message Start {}
+message Cancel { optional CancelReason reason = 1; }
+message SnapshotEnd { optional uint64 revision = 1; optional uint64 count = 2; optional uint64 total_bytes = 3; }
+message Terminal { optional Outcome outcome = 1; optional uint64 last_revision = 2; optional uint64 count = 3; optional uint64 total_bytes = 4; optional uint64 usage_tokens = 5; optional bool usage_known = 6; optional Reason reason = 7; }
+message ModelInput { optional string instructions = 1; repeated HistoryTurn history = 2; optional string prompt = 3; }
+message HistoryTurn { optional Role role = 1; optional string text = 2; }
+
+// Typed proposals only. The service owns grants, host execution and durable outcomes.
+enum ToolStatus { TOOL_STATUS_UNSPECIFIED = 0; TOOL_STATUS_SUCCESS = 1; TOOL_STATUS_DENIED = 2; TOOL_STATUS_INVALID_ARGUMENTS = 3; TOOL_STATUS_UNAVAILABLE = 4; TOOL_STATUS_TIMEOUT = 5; TOOL_STATUS_CANCELLED = 6; TOOL_STATUS_LIMIT = 7; }
+message ProjectReadFile { optional string path = 1; optional uint64 offset = 2; optional uint32 limit = 3; }
+message ProjectListDirectory { optional string path = 1; }
+message ObserveStatus {}
+message ListTools {}
+message AuditRead { optional uint32 limit = 1; }
+message Shell { optional string command = 1; optional string cwd = 2; optional uint32 timeout_seconds = 3; }
+message MemoryListNotes { optional string after = 1; optional uint32 limit = 2; }
+message MemoryGetNote { optional string version = 1; optional uint64 offset = 2; optional uint32 limit = 3; }
+message MemoryNoteSources { optional string version = 1; }
+message MemoryCreateNote { optional string body = 1; optional string source_version = 2; }
+message ToolCall {
+  optional uint32 ordinal = 1;
+  oneof arguments { ProjectReadFile read_file = 10; ProjectListDirectory list_directory = 11; ObserveStatus observe_status = 12; MemoryListNotes memory_list_notes = 13; MemoryGetNote memory_get_note = 14; MemoryNoteSources memory_note_sources = 15; MemoryCreateNote memory_create_note = 16; ListTools list_tools = 17; AuditRead read_audit = 18; Shell shell = 19; }
+}
+message ToolResult { optional uint32 ordinal = 1; optional ToolStatus status = 2; optional string text = 3; optional uint64 next_offset = 4; optional bool truncated = 5; }
+
+message ContextMeasured { optional uint32 input_tokens = 1; optional uint32 capacity_tokens = 2; }
+
+// Read-only metadata inventory; never establishes permission or native qualification.
+message ModelInventoryEntry {
+  optional string selector = 1;
+  optional string provider = 2;
+  optional uint32 status = 3;
+  optional string detail = 4;
+}
+message ModelInventoryIssue { optional string provider = 1; optional string reason = 2; }

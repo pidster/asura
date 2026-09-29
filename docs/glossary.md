@@ -19,6 +19,10 @@ schemas and runtime mechanisms remain with their governing designs.
 | Status bar | Compact row below the input showing project/Git context, draft count, running activity and model/context status |
 | Message tray | Bounded area above the input showing submitted messages and their observed states, with access to full text |
 | Task | A unit of user-requested work with goals, limits and completion criteria |
+| Plan | A versioned graph of intended work, dependencies and completion criteria |
+| Plan work item, proposed | An identified piece of planned work; it may link to an accepted task after admission |
+| Work dependency, proposed | A prerequisite and explicit satisfaction condition that controls readiness of planned work |
+| Partial progress report | A task-linked account of completed work, remaining work, blockers and evidence; it does not establish task completion |
 | Conversation | User-visible grouping of messages and task references; distinct from a retained model session |
 | Agent instance | Runtime participant assigned bounded work under orchestrator control |
 | Action | A proposed or admitted operation, tracked by a stable identity through execution and recovery |
@@ -32,6 +36,8 @@ schemas and runtime mechanisms remain with their governing designs.
 These are reading definitions. The proposed [D0 domain model](designs/domain-model.md)
 refines their relationships, including actions and individual execution attempts.
 Those refinements await review; concrete schemas remain D3-D4 work.
+The [memory ontology](designs/hybrid-memory-ontology.md) defines proposed plan
+graphs and task tracking records, including their relationship to control authority.
 The selected [asynchronous architecture](decisions/0006-async-event-pipelines.md)
 defines input/signal processing boundaries. A signal does not itself grant authority
 or prove an operation completed.
@@ -83,6 +89,8 @@ defines binding changes.
 | Term | Meaning |
 | --- | --- |
 | Provenance | Records of an item's source, version and transformations |
+| Memory version, proposed | Immutable record of content and provenance under the hybrid memory ontology |
+| Artifact set, proposed | Scoped storage grouping for retained payloads; distinct from a conversation or model session |
 | Project context | Registered project or repository scope with stable identity and working locations; distinct from model input |
 | Project parent | Explicit installation-local discovery container for candidate child projects; it is not a project context, working location or permission grant |
 | Project group | Installation-local grouping that can make member contexts eligible to reuse linked evidence after per-use authorization; a context belongs to at most one group at a time, while membership authority remains D3 work |

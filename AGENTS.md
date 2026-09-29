@@ -4,9 +4,13 @@
 
 - Be helpful and candid. Do not agree without examining the evidence.
 - Act as an expert software engineer and apply architecture and testing best practices.
-- If user instructions conflict with existing project guidance, rules, or
-  instructions, stop work immediately and bring the discrepancy to the user.
-  Do not silently choose an interpretation or change guidance to remove the conflict.
+- Report instruction conflicts immediately. If the user has explicitly resolved
+  the conflict or authorized the rule change, apply that decision and continue.
+  Otherwise, stop the affected work and ask for the missing decision. Continue
+  independent authorized work. Do not silently reinterpret unresolved instructions.
+- The user authorizes iterative Asura development. Routine design refinements,
+  fixes and tests within the requested scope do not need repeated approval.
+  Follow the [iteration rules](docs/design-process.md#iteration-and-escalation).
 - Distinguish requirements, proposed designs, implemented behavior, and verified
   behavior. Do not present a proposal or passing mock test as runtime proof.
 
@@ -35,7 +39,7 @@ Keep documentation directory READMEs current under the
   requirements here and detailed rules in their canonical documents; link to them
   instead of copying them into each instruction file.
 - Directory guidance must preserve shared design, authorization and testing gates.
-  If instructions conflict, stop and report the discrepancy to the user.
+  Handle conflicts under the conduct and authority rules above.
 - Add language-specific instruction files when their authorized code trees are
   introduced. Directory instructions do not authorize scaffolding or select open
   toolchain, runtime or component-design decisions.
@@ -58,6 +62,21 @@ Keep documentation directory READMEs current under the
 
 ## Mandatory implementation practices
 
+- The wire protocol stays at 0.1 and the journal format stays at 1. Do not change
+  format, API or protocol version numbers without explicit owner instruction.
+  Schemas may evolve for authorized feature work; follow
+  [numbering authority](docs/engineering.md#wire-protocol-change-authority).
+
+- Asura's entire architecture must be asynchronous, nonblocking, reliable,
+  recoverable and scalable. Apply [ADR-0006](docs/decisions/0006-async-event-pipelines.md)
+  and the [mandatory execution rules](docs/engineering.md#asynchronous-execution-and-recovery).
+  This applies to clients, services, storage, models, tools and adapters, including
+  startup, idle operation, failure, recovery and shutdown. An `async` declaration
+  or a background thread alone does not satisfy this rule.
+- Before implementation, identify potentially blocking calls and specify their
+  isolation, numeric resource limits, deadlines, cancellation and recovery.
+  Verify responsiveness under stalled dependencies and overload. Do not treat
+  these requirements as optional hardening after a feature works.
 - Search for an existing owner of a capability before adding one. Extend the
   canonical implementation rather than creating another copy in an interface,
   agent, or transport adapter.
@@ -103,8 +122,8 @@ are not implementation-ready designs.
   or native UI tooling when a designed user workflow requires interactive proof.
   Do not claim visual correctness from syntax checks alone.
 - Ask concise questions early when a missing decision changes the result; keep
-  independent authorized work moving while awaiting an answer. Stop immediately
-  for instruction conflicts as required above.
+  independent authorized work moving while awaiting an answer. Handle instruction
+  conflicts under the conduct and authority rules above.
 - Prefer narrow, evidence-backed review findings with file references, failure
   scenarios and affected contracts. Check authority, races, recovery, context
   provenance, data egress and missing test layers before cosmetic concerns.

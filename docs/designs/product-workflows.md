@@ -83,6 +83,13 @@ Connection failure must remain visible; the client cannot claim service readines
 or successful task acceptance without evidence. Closing chat detaches that client;
 task cancellation requires an explicit control request.
 
+Startup may create the validated `$HOME/.asura/run/` runtime area selected by the
+owner. This creates neither an installation identity nor a graph. A validated
+runtime-only root remains uninitialized until an explicit user action; partial,
+unknown or conflicting installation state requires repair. The
+[bootstrap contract](production-bootstrap-status.md#runtime-only-root-and-explicit-installation)
+owns the classification. The launch must not overwrite remnants to show first use.
+
 **Open decisions:** D3/D6 must define argument grammar, service startup feedback,
 non-TTY/unsupported-terminal behavior, help/version precedence, terminal restoration
 and event-loop limits before implementation. Framework and backend selection do
@@ -93,6 +100,9 @@ Ratatui client, shared service and concurrent attachment; end-to-end default lau
 explicit commands, keyboard interaction, resize, reconnect and terminal restoration
 after exit/failure. Repeat with redirected input/output under D6's selected rules.
 Environment: supported macOS, real terminal sessions and the actual Rust backend.
+Include [PBS15](production-bootstrap-status.md#pbs15-runtime-directory-does-not-initialize-an-installation)
+for absent, runtime-only, partial, unknown-content and conflicting-graph states.
+Verify explicit initialization independently from runtime directory setup.
 
 ## W1: Select and inspect a project
 

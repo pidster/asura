@@ -1,7 +1,8 @@
 # Architecture baseline
 
-Status: required behavior and component responsibilities. Detailed mechanisms
-remain open. Runtime behavior is not implemented or verified.
+Status: required behavior and component responsibilities. The local service and
+TUI implement part of this baseline. Component designs record implemented scope,
+validation evidence and remaining decisions; this baseline is not runtime proof.
 
 Read the [glossary](glossary.md) for project terms and the
 [decision map](decisions/README.md) for selected decisions and detailed models.
@@ -44,11 +45,12 @@ defines acceptance criteria and the remaining terminal-handling decisions.
 
 On a user device, the backend runs once per OS user and manages multiple project
 and repository contexts. All local clients connect to that service. Agent and
-platform helpers may use separate processes. The service supervisor, helper
-boundaries, transport and package structure remain detailed design decisions.
-The first macOS Foundation Models implementation uses a
-[supervised Swift process](decisions/0009-supervised-local-model-helper.md);
-its transport and package layout remain D2/D7 work.
+platform helpers may use separate processes. The macOS Foundation Models
+implementation uses a [supervised Swift process](decisions/0009-supervised-local-model-helper.md).
+The [Swift/Rust boundary](designs/swift-rust-boundary.md) defines its private
+Protobuf transport, lifecycle and package identity. The
+[provider design](designs/model-provider-integration.md) defines selected adapters
+and their qualification limits.
 A local deployment must exercise the same semantic control contract that future
 interfaces will use.
 
@@ -163,14 +165,21 @@ flowchart TD
     AIAdapter <-->|Bounded disclosure / untrusted result| Provider["Remote AI provider"]
 ```
 
-## Control API requirements
+## Asynchronous system requirements
 
 Asura's full architecture is asynchronous and event-driven, with explicit input
 and signal processing pipelines. [ADR-0006](decisions/0006-async-event-pipelines.md)
 defines their responsibilities, authority boundaries and validation requirements.
 Each boundary must define bounded processing, backpressure, ordering and recovery;
 control and rendering cannot wait synchronously for inference or slow I/O.
-Runtime, scheduler, queue and durable event-delivery mechanisms remain open.
+The whole system must be nonblocking, highly reliable, recoverable and scalable,
+including startup, idle operation and shutdown. The active
+[execution and recovery rules](engineering.md#asynchronous-execution-and-recovery)
+make this decision an implementation and validation obligation for every component.
+Runtime, scheduler, queue and durable event-delivery mechanisms remain open where
+not already selected by a governing component design.
+
+## Control API requirements
 
 The orchestrator API must be modern, asynchronous, highly reliable, very high
 performance, and secure. Its design must define:

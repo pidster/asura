@@ -1,12 +1,16 @@
 # Production bootstrap, project registration and status
 
-Status: proposed D2-D3-D6 design for review. The per-user root, one backend
+Status: original D2-D3-D6 proposal with selected production amendments below.
+The per-user root, one backend
 owner, multi-project control interface and status presentation are required by
 the linked contracts. The owner selected registration of an existing directory
 as the first initiation flow on 2026-09-24 and selected a live, service-backed
-production status bar on 2026-09-25. This document does not authorize
-code, directory creation or use of the isolated TUI experiment as a production
-client. D1-D4 and D6 decisions listed below prevent implementation readiness.
+production status bar on 2026-09-25. Current implementation authority follows the
+[iteration rules](../design-process.md#iteration-and-escalation). On
+2026-09-26, the owner selected `$HOME/.asura/run/` for the runtime lock and
+socket, with validated runtime-directory creation permitted before initialization.
+Open D1-D4 and D6 decisions apply to their unresolved scope. Later selected
+amendments govern automatic setup and project registration.
 
 This design connects the [per-user service contract](user-service-configuration.md),
 [project identity model](domain-model.md#service-project-and-location-identity),
@@ -19,7 +23,8 @@ retains the I0-I4 dependencies.
 
 The first production path starts or attaches to one per-user service. The service
 reports an uninitialized state or recovers the installation under the validated
-user's `$HOME/.asura/`. New initialization requires an explicit user action.
+user's `$HOME/.asura/`. A verified fresh installation initializes automatically,
+under the setup contract below. Repair requires its own explicit action.
 The user explicitly registers a working location as a project context. A client
 can then select that context and receive a status snapshot for the selected
 location and conversation. The TUI renders the snapshot with the proven compact
@@ -35,18 +40,50 @@ outside this scope. Multiple clients and projects use the same service and graph
 binding. A launch directory may suggest a location, but does not register it or
 bind work to it without an explicit user action.
 
+### Runtime-only root and explicit installation
+
+Required behavior updated on 2026-09-27: the owner requests automatic setup for
+verified fresh installations. This supersedes the earlier separate initialization
+action. The service may create the validated
+`$HOME/.asura/` root and its `run/` child during startup. The
+[service design](system-architecture.md) owns runtime permissions, lock and
+socket validation. Runtime creation writes no installation identity, authority
+journal, graph marker or registration. A directory's existence is not evidence
+that initialization succeeded.
+
+The installation owner distinguishes these cases after obtaining sole ownership:
+
+| Observed state | Installation result |
+| --- | --- |
+| Root absent before permitted runtime setup, with no detected conflict | Initialize automatically after validating fresh state |
+| Validated root containing only runtime/log areas and a safe user config file, with no installation remnants | Retain the runtime owner and initialize automatically through the canonical writer |
+| Valid authority record | Recover that installation and verify its saved graph binding |
+| Installation area present without valid authority, damaged authority, unknown content or conflicting graph evidence | RepairRequired; preserve evidence and reject fresh initialization |
+
+D1-D3 must specify the exact allowlist and how external configuration is checked
+for conflicting graph evidence. An arbitrary pre-existing directory cannot pass
+as runtime-only because it happens to contain `run/`. The service must not delete,
+rename or overwrite unknown content to establish a fresh-install state. Loss of
+all prior state can still be undetectable. Automatic setup cannot detect complete
+deletion of all prior installation evidence. The
+[conversation admission contract](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow)
+defines the selected startup sequence and failure handling.
+
 ### First-use interaction proposal
 
-When no installation exists, the TUI offers an explicit Initialize Asura action
-with the resolved account-home destination. The service must explain that a
-missing root does not prove no prior installation existed. If it finds partial
-state or a conflicting graph identity, it enters recovery instead of initializing.
+When only verified fresh state exists, the service initializes automatically and
+the TUI displays progress and readiness. Runtime directory creation alone does
+not establish an initialized installation. If the service finds partial
+state, unknown installation content or conflicting graph identity, it enters
+recovery instead of initializing.
 When initialization succeeds and the registry is empty, the TUI offers one
 relevant choice near the composer about the launch directory. Registration as a
 new project is available only after the service validates it; continuing without
 a selected project or marking the directory as a project parent also remains
 possible after validation. The user sees the
-resolved path and proposed project name before confirming registration. D6 must
+resolved path and proposed project name before confirming registration. The
+[project-name contract](project-names.md) now defines derivation, capitalization
+and later rename. D6 must
 define keyboard focus, dismissal and the result of declining the candidate.
 The client remains usable for help and service inspection without registration.
 
@@ -147,8 +184,8 @@ Proposed behavior for D3/D6 review:
    identity and locates its own home directory. Client environment values cannot
    redirect the installation.
 2. The service establishes exclusive active ownership. It recovers an existing
-   installation or reports an uninitialized state. A new installation requires
-   an explicit initialization request after checking for conflicting state.
+   installation or initializes verified fresh state through the canonical writer.
+   It does not initialize while conflicting state exists.
    Damaged or ambiguous bootstrap enters recovery. The service verifies its
    saved graph binding before claiming graph readiness.
 3. The client requests authorized context discovery. An empty registry produces
@@ -301,7 +338,7 @@ sole ownership. A valid pending frame resumes its original operation ID.
 ```mermaid
 stateDiagram-v2
     [*] --> Recovering
-    Recovering --> Uninitialized: Root absent without detected conflict
+    Recovering --> Uninitialized: Runtime-only root and no detected conflict
     Recovering --> PendingBinding: Valid PendingInit
     Recovering --> ControlReady: ActiveBinding and registry verified
     Recovering --> RepairRequired: Partial or invalid authority
@@ -443,6 +480,48 @@ no registry write. D3 must select observation ordering and its reset semantics;
 D7 must qualify those semantics across restart. The wire schema, counter format,
 clock choice and numeric freshness bounds remain open.
 
+#### Proposed first status delivery mechanism
+
+Proposed D3 mechanism for review. This narrows the earlier publication contract;
+it does not select a wire encoding or claim qualified runtime behavior.
+
+The projection owner assigns each collection an increasing observation sequence
+within its service owner generation. The sequence does not change registry
+revision. The client accepts a response only when its attachment, view, scope
+and outstanding request still match. A completed or expired request cannot
+later become outstanding again. Sequences never wrap; exhaustion makes collection
+unavailable until an authorized owner restart establishes a new generation.
+
+Propose one outstanding status request per attachment and one coalesced refresh
+flag. A selection change retires the old request immediately. A late unavailable
+response is rejected by the same routing checks as a successful response.
+Otherwise, an old error could clear a newer valid view. Disconnect retires all
+outstanding requests before a new attachment is negotiated.
+
+Propose a one-second refresh interval, a two-second request deadline, and a
+five-second visible validity limit measured from the client's request start.
+The initial response must use a collection started for that request; it cannot
+reuse an older cached observation. Client monotonic time controls request expiry
+and visible validity. Wall-clock timestamps are diagnostic only. Navigation,
+revocation and disconnect invalidate the view immediately regardless of its age.
+On sleep/resume or uncertain clock continuity, the client clears current claims
+and requests a new snapshot. D7 must qualify the platform clock and responsiveness
+with the real service before these proposed limits become selected defaults.
+
+The service admits at most two concurrent Git collections in this proposal.
+A full collection slot returns unavailable with a retry hint; it does not queue
+unbounded requests. Each attachment retains at most one pending refresh flag.
+The timer and hints use the same coalescing path. API status and service shutdown
+use the foundation's reserved control capacity; they never wait for a Git slot.
+D4 still must bound the observer's input, memory, output and process cleanup.
+
+The control API must serialize scope invalidation with its final disclosure
+permit. A permit covers one candidate, attachment and scope revision. Losing
+owner authority closes the permit path. The exact queue drain, socket handoff
+and path-replacement ordering remain with D1-D3; this proposal does not make
+the check and filesystem state atomic. No packet may implement a check followed
+by an unguarded enqueue and call PBS12 passed.
+
 #### Observation publication race
 
 Proposed interaction view. Arrows show candidate collection, a final disclosure
@@ -497,6 +576,37 @@ erDiagram
     }
 ```
 
+### Git collection safety decision
+
+Required read-only boundary, unresolved collection backend. D4 must qualify the
+collector before exposing it to a registered repository. A command named
+`status` is not evidence that it has no effects. Git documents that ordinary
+status may update the index; the optional-lock control avoids that particular
+write. [Git status documentation](https://git-scm.com/docs/git-status) describes
+this behavior.
+
+Git also supports filesystem-monitor helpers and content-conversion filters.
+Those facilities make inherited repository configuration part of the execution
+boundary. [Git configuration](https://git-scm.com/docs/git-config/2.54.0) and
+[attribute documentation](https://git-scm.com/docs/gitattributes) describe them.
+Disabling optional locks does not prove helper, network or source-write denial.
+
+The review host reports Git 2.54.0 (Apple Git-157). Its installed status and diff
+manuals describe optional locks, monitor commands and external text conversion.
+This is documentation evidence, not a tested collector. D4 must compare a
+constrained Git process with a Rust library that disables external execution.
+The comparison must cover filters, monitor hooks, submodules, alternate object
+stores, worktree metadata outside the selected directory, and resource limits.
+An unsupported repository returns unknown Git status without weakening access
+bounds. The packet cannot silently read other worktrees to make status available.
+
+D4 must also define untracked files, unborn HEAD, conflicts, binary changes and
+submodule line-count semantics. The existing HEAD comparison, no staged double
+counting and no invented binary line counts remain required. A collection is an
+observation interval, not an atomic filesystem snapshot. If detected source
+changes invalidate its comparison, discard the result or report unknown fields.
+D4 must state the remaining consistency limit before the UI calls a result current.
+
 ## Failure, security and operations
 
 The D1 threat model must define home resolution, private permissions, symlink
@@ -525,10 +635,10 @@ Backups must preserve installation identity, graph binding, registry and any
 authority records as one recoverable set. D3 must define a consistent backup
 point and restore validation before this feature is implemented. Neither a
 copied directory nor a changed external URL may silently rebind an installation.
-An absent root alone cannot distinguish first use from complete deletion of a
-prior installation. D3 must define the limits of conflict detection and the
-warning before explicit reinitialization. Automatic launch must not create a
-new identity or graph merely because `.asura/` is absent.
+An absent root or a validated runtime-only root cannot distinguish first use
+from complete deletion of a prior installation. Fresh-state validation must
+reject conflicting remnants before automatic initialization. Missing records
+alone never authorize a replacement identity for a partially retained installation.
 
 For the I1 slice, the [ordinary-file authority journal](persistence-recovery.md)
 is the single local authority for installation identity, binding, project
@@ -559,8 +669,8 @@ supported terminals, timing targets and fixtures.
 
 | Case | Initial state and trigger | Required result and evidence |
 | --- | --- | --- |
-| PBS1 | No installation; two clients launch concurrently | One installation and owner; both attach to the same registry. Test arbitration in-process and across real processes, with CLI E2E at I1 and TUI E2E at I4. |
-| PBS2 | Missing root, or existing root with missing or corrupt bootstrap; launch or restart | Missing root presents explicit initialization with data-loss warning; partial or ambiguous state requires repair. No automatic new identity or embedded fallback. Inject faults at each initialization commit point and reopen through CLI. |
+| PBS1 | No installation; two clients launch concurrently | One runtime owner; automatic initialization yields one installation and registry after fresh-state validation. Test arbitration in-process and across real processes, with CLI E2E at I1 and TUI E2E at I4. |
+| PBS2 | Missing or runtime-only root, or installation remnants with missing or corrupt bootstrap; launch or restart | Only validated runtime-only state permits automatic initialization; partial or ambiguous installation requires repair. No replacement identity for retained state or embedded fallback. Inject faults at each initialization commit point and reopen through CLI. |
 | PBS3 | Valid directory, alias, repeated registration and overlap; replace the path before, during or after the commit interval | Stable identity for the same association and explicit selection for overlap. Reject a prewrite mismatch; if a replacement crosses the commit, preserve the recorded identity but report it stale. No status or work may follow the replacement. Exercise aliases, swap races and two clients. |
 | PBS4 | Location replaced, removed or denied after registration | Stale or unavailable scope; no silent redirect or leaked metadata. Exercise a real filesystem and TUI status. |
 | PBS5 | Git clean, dirty, detached, merge, rebase, non-repo and observer failure | Typed observations, correct counts, explicit unknown state. Compare real Git fixtures and rendered TUI cells. |
@@ -646,6 +756,31 @@ without changing the registry; verify bounded refresh behavior.
 **End-to-end checks:** Edit a draft while repository status changes; inspect the
 bar for regression and expiry in both terminals.
 
+### PBS15: Runtime directory does not initialize an installation
+
+**Initial state:** No active owner; authority and graph state vary by case.
+
+**Trigger:** PBS15-A launches with no root; PBS15-B restarts with only validated
+runtime entries; PBS15-C encounters a partial installation area; PBS15-D encounters
+unknown root content; PBS15-E finds conflicting graph evidence with no local
+authority. Two clients race startup in each applicable case.
+
+**Required result:** A and B establish at most one runtime owner and report
+Recovering while the writer initializes, then GraphReady after verification. C, D and E preserve
+evidence and report RepairRequired. Explicit initialization cannot overwrite
+those remnants. Merely observing `run/` never proves installation readiness.
+
+**Unit checks:** Classify every allowlisted and unknown entry set, preserving
+conflict precedence over an apparently empty registry.
+
+**Integration checks:** Use real private directories, aliases, unexpected files
+and competing processes. Kill the service at initialization boundaries. Reopen
+recorded state without creating a replacement identity or overwriting remnants.
+
+**End-to-end checks:** Launch and inspect each state through the CLI; repeat first
+use through the TUI in Ghostty and Terminal.app. Confirm that initialization
+needs no separate user action for verified fresh state and errors preserve existing files.
+
 ## Decisions required before implementation
 
 ### Decision register
@@ -660,8 +795,8 @@ review. An open entry blocks only the packet whose behavior depends on it.
 | PBS-D3 | Selected storage boundary; mechanism proposed | I1 uses only ordinary files and SurrealDB. The [authority recovery design](persistence-recovery.md) proposes a framed ordinary-file journal; D3 must fix its format and recovery. |
 | PBS-D4 | Proposed | I1 contains minimal embedded/external graph-binding verification; I2 adds graph semantics. Qualify both modes before I1 graph-ready claims. |
 | PBS-D5 | Principal, installation and Unix socket selected; remaining mechanism proposed | I1 uses a standalone command, per-user service and one macOS-user principal. The [service design](system-architecture.md) proposes peer-UID checks and owner fencing over the selected Unix socket; D1-D2 must qualify homes and mechanism. |
-| PBS-D6 | Open | D3 chooses conflict detection for absent roots, atomic explicit initialization, authority-store schema, commit-time location identity checks, migrations and cross-store backup/restore. |
-| PBS-D7 | Initial selection and parent role selected; other UX open | D6 uses a unique authorized launch-directory match first. Overlap or no match requires explicit choice; no automatic last-viewed fallback. A marked project parent is a discovery container only. Project naming, exact first-use controls, unavailable-status wording and measurable responsiveness remain open. |
+| PBS-D6 | Open | D3 chooses conflict detection for absent roots, atomic initialization, authority-store schema, commit-time location identity checks, migrations and cross-store backup/restore. |
+| PBS-D7 | Initial selection and parent role selected; other UX open | D6 uses a unique authorized launch-directory match first. Overlap or no match requires explicit choice; no automatic last-viewed fallback. A marked project parent is a discovery container only. [Project naming](project-names.md) is selected; exact first-use controls, unavailable-status wording and measurable responsiveness remain open. |
 | PBS-D8 | Open by later increment | D4 defines Git observation and actual model-context accounting; I4 consumes their typed results. |
 
 The design spans four delivery increments. Readiness is assessed per bounded
@@ -682,7 +817,7 @@ they do not skip other deliverables or acceptance gates in those increments.
 
 | Stage | Decision needed |
 | --- | --- |
-| D0 | First initiation is registration of an existing directory; a project parent is a discovery container only (selected). Review project naming and numerical status responsiveness targets. |
+| D0 | First initiation is registration of an existing directory; a project parent is a discovery container only (selected). [Project naming](project-names.md) was selected later; review numerical status responsiveness targets. |
 | D1 | Select macOS identity, home and working-location validation, filesystem race defenses and Git read boundary. |
 | D2 | Select repository layout, service supervision, process topology, authentication bootstrap and one-owner fencing; complete the selected Unix-socket control contract. |
 | D3 | Specify installation files and schema, graph/registry placement, atomicity, migration, backup/restore, request IDs, revisions, status API, disclosure ordering, attachment identity, observation ordering, freshness and error codes. |
@@ -717,3 +852,9 @@ PBS12-PBS14 as acceptance specifications; none has runtime evidence. Local-link,
 whitespace and baseline-scope checks passed for the two status design documents.
 Publication ordering, protocol identity encoding and numerical bounds remain
 open D3/D7 decisions.
+
+The subsequent stages 3–5 review added the selected runtime-only root distinction
+and PBS15. Mermaid CLI 11.16.0 rendered the changed restart-recovery diagram,
+which was visually inspected. The staged packet records the combined document
+checks. Proposed polling limits and the Git collection analysis remain design
+inputs; neither is runtime validation or implementation authorization.

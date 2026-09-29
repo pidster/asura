@@ -14,6 +14,9 @@ authorization. The TUI packet authorizes only its isolated experiment.
 | --- | --- |
 | [Architecture and design plan](architecture-and-design.md) | Proposed D0-D8 sequence for workflows, contracts, validation design and consistency review. |
 | [Implementation plan](implementation.md) | Proposed I0-I9 delivery sequence and acceptance gates for the selected release scope and later capabilities. |
+| [Production foundation packet](production-foundation-implementation.md) | Proposed stages 1–2: root workspace, shared bootstrap handoff, Protobuf control and local service qualification. |
+| [Protobuf bootstrap packet](protobuf-bootstrap-implementation.md) | Proposed PB0: shared pinned tools, smoke generation and clean online/offline qualification. |
+| [Production status packet](production-status-implementation.md) | Proposed stages 3–5: installation, registry, Git observations and real status TUI, with explicit readiness dependencies. |
 | [TUI prototype implementation packet](tui-prototype-implementation.md) | Authorized isolated experiment scope, file ownership, dependencies, limits and required checks. |
 | [Command interaction trial packet](command-interaction-trial.md) | Validated offline command-discovery trial, file ownership, implementation order and recorded checks. |
 

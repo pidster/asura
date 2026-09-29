@@ -1,14 +1,23 @@
-# Protobuf toolchain bootstrap before the I0 model-channel probe
+# Shared Protobuf toolchain bootstrap
 
 Status: scoped D2/D7 design ready for owner review. The owner selected a
 repository-owned, locked bootstrap and a bootstrap-first packet on 2026-09-25.
 On 2026-09-26, the owner selected one active build per worktree. Separate
-worktrees may build independently. This document defines tool preparation and
-test-schema generation before the
-real I0 channel schema and probe. D8, design/plan owner review and explicit
+worktrees may build independently. The owner also selected Protobuf for both
+local CLI/TUI–service control and the Rust–Swift model connection on that date.
+This document defines their shared tool preparation and the first smoke check.
+It does not define either production protocol. D8, design/plan owner review and explicit
 authorization still gate implementation. This status does not claim that the
 selected tools build together. The [model-channel design](swift-rust-boundary.md)
-owns message semantics, framing and the later test-only process probe.
+owns message semantics, framing and the later test-only process probe. The
+[PB0 implementation packet](../plans/protobuf-bootstrap-implementation.md)
+defines exact files, delivery order, fixed check selectors and scoped readiness.
+Foundation metadata and PB0.0–PB0.2 are implemented and locally verified. The
+owner authorized PB0.3 on 2026-09-26. Its detailed cache contracts were approved on that date. Later steps retain their authorization gates.
+
+The [cache preparation detail](protobuf-cache-preparation.md) defines the
+remaining PB0.3 manifests and process handoff. The owner approved its decisions
+on 2026-09-26, including the initial Cargo verification order.
 
 ## Scope and ownership
 
@@ -27,8 +36,9 @@ bootstrap crate owns archive verification, extraction and cache publication.
 Cargo's build script owns Rust generation through `prost-build`. An Asura SwiftPM build
 tool plugin owns Swift generation. `tests/contracts/` owns the test-only
 `proto3` smoke schema. Neither generated binding is checked in. This packet
-does not create the production `contracts/` channel schema. The model-channel
-owner, not either generator, will validate decoded semantic fields and authority.
+does not create either production protocol schema. The control-contract and
+model-channel owners validate their respective semantic fields and authority.
+The generators do not own protocol admission or compatibility rules.
 
 The first slice targets macOS 27 or later on Apple silicon. It does not package
 generators for end users, introduce a service or model call, or choose I0's
@@ -38,10 +48,27 @@ qualified lock entry and runner before they can claim this bootstrap works.
 The scoped file ownership is `tools/protobuf/lock.json` for archive identities,
 `rust/crates/asura-toolchain-bootstrap/` for the Rust bootstrap,
 `rust/check-i0-driver.rs` for the standalone Rust check driver,
-`scripts/check-i0-toolchain` for the thin POSIX launcher,
-`tests/contracts/` for the smoke schema and fixtures,
-`rust/` for Cargo generation, repository-root `Package.swift` for SwiftPM, and
-`swift/` for Swift targets and the Asura plugin.
+`scripts/check-i0-toolchain` for the thin POSIX launcher, and
+`tests/contracts/toolchain_smoke.proto` for the one smoke schema.
+`rust/crates/asura-toolchain-smoke/` owns the Rust build script and fixture.
+Repository-root `Package.swift`, `swift/Plugins/AsuraProtobufPlugin/` and
+`swift/Tests/ToolchainSmoke/` own Swift generation and its test-only executable.
+
+The coordinated PB0/foundation proposal assigns root `Cargo.toml`, `Cargo.lock`,
+`rust-toolchain.toml`, `rust/AGENTS.md`, `.gitignore` and `scripts/check` to the
+foundation integration owner. That owner supplies the minimal workspace metadata
+before PB0, registers each PB0 member and reviews the locked dependency graph.
+There is one root workspace; PB0 does not create `rust/Cargo.toml`. The
+architecture layout and foundation metadata now use that root workspace.
+
+The later foundation check entry point reuses this driver as its canonical
+lock and process supervisor. Its control build must prepare or verify the same
+pinned `protoc` and locked `prost-build` before Rust generation. It cannot
+bypass tool checks merely because both control endpoints use Rust. It does not
+generate Swift control bindings or depend on a Swift model implementation.
+PB0 does not create a second supervisor or implement the foundation profile.
+The implementation packet records the writer handoff before that extension.
+
 The tool cache is `.build/asura-protobuf/`; the Cargo dependency cache is
 `.build/asura-deps/cargo/`, with separate `snapshot/` and disposable `work/`
 subdirectories. Both are ignored by Git. Each worktree owns its physical caches
@@ -79,6 +106,50 @@ most two more seconds for exit. Failure to reap fails the check. The fixture
 does not use the private model-channel framing or claim channel compatibility.
 The schema and fixture are test-only and never appear in a release artifact.
 
+### Shared tools and separate schema owners
+
+Required behavior. Both selected production connections reuse this toolchain.
+Sharing Protobuf does not make their messages, framing or versions interchangeable.
+
+| Schema | Canonical owner | Generated consumers and proof boundary |
+| --- | --- | --- |
+| `tests/contracts/toolchain_smoke.proto`, package `asura.toolchain.v1` | PB0 smoke fixture | Test-only Rust and Swift executables. BT1-BT8 qualify the tools and fixture exchange only. |
+| `contracts/control/v1/control.proto`, package `asura.control.v1` | Foundation control contract in [system architecture](system-architecture.md) | `asura-control/build.rs` generates Rust into `OUT_DIR` for local CLI/TUI and service. The control owner validates framing, fields, compatibility and authority. No Swift control binding is required. |
+| Later private model-channel schema | [Model-channel design](swift-rust-boundary.md) | Rust model boundary and Swift helper. D2 owns its exact schema path, semantic contract and BP1-BP31 probe. PB0 does not select its remaining fields or limits. |
+
+Each Rust build script is a thin schema adapter to the same locked `prost-build`
+and verified compiler path. It declares its own schema and lock inputs and
+writes only its derived output. It cannot download tools, choose another version,
+repair caches or duplicate verification policy. The driver and bootstrap retain
+those responsibilities. Neither production schema imports the smoke schema.
+
+The foundation metadata handoff precedes PB0. Local PB0 qualification then
+precedes the first control generation. Service implementation does not wait for
+the real model schema, helper, Foundation Models integration or later full I0
+probe. The Swift smoke fixture remains part of PB0's toolchain qualification;
+it is not a Swift service or model integration requirement.
+
+Adding the control crate changes the root Cargo lock and snapshot identity.
+The foundation owner reviews that lock change and uses the same snapshot owner
+to prepare its dependencies. A PB0 snapshot alone cannot prove offline service
+builds. The foundation packet must add unit tool-selection checks, integration
+regeneration/rejection checks and a clean offline control build using the
+extended snapshot. It cannot inherit service protocol proof from BT8.
+
+### Shared-tool dependency view
+
+Required reuse with proposed implementation adapters. Arrows mean shared-tool
+dependencies. Each adapter consumes only the schema named in its own box;
+there is no message or schema dependency between protocols.
+
+```mermaid
+flowchart TD
+    Driver["One driver: lock and verified paths"] --> Tools["Pinned protoc, prost-build and Swift tools"]
+    Tools --> Smoke["Smoke schema adapters: Rust and Swift test output"]
+    Tools --> Control["Control schema adapter: Rust output only"]
+    Tools --> Model["Later model schema adapters: Rust and Swift output"]
+```
+
 ### Tool and source identities
 
 The repository lock records the exact URL, archive SHA-256, version, platform,
@@ -113,8 +184,9 @@ and only `deflate-flate2` enabled; `tar` 0.4.46; `flate2` 1.1.10;
 call; Rust's standard library supplies process-group creation and file locks.
 The manifest must pin each exact version; the committed `Cargo.lock` must pin
 the full transitive graph. These selections were inspected in the local
-Cargo registry, but no Asura lockfile or combined clean build exists yet.
-Online preparation must first produce and review the complete lockfile.
+Cargo registry. PB0.2 subsequently produced and reviewed the Asura lockfile,
+then passed its scoped offline library build. Any dependency change needs a new
+complete lock review before execution. Full clean tool preparation remains unverified.
 
 The Swift target depends on the same verified SwiftProtobuf source version as the
 generator. A different runtime version is a build error. The official `protoc`
@@ -131,6 +203,133 @@ A mismatch fails the check instead of silently changing the qualified
 environment. The same checks and BT4-BT8 cases must run in remote CI before I0
 can meet the
 [implementation plan's exit gate](../plans/implementation.md#i0-repository-and-contracts).
+
+### Selected Swift launch correction
+
+The [Swift launch correction](protobuf-cache-preparation.md#swift-command-launch-correction)
+was approved by the owner on 2026-09-26. It validates the canonical executable inside selected Xcode,
+then invokes the original validated `swift` path to preserve command dispatch.
+The driver rechecks target identity before each invocation under the existing
+trusted-toolchain and same-user threat boundary. Fixed arguments, process supervision,
+network denial and deadlines remain required. This selection does not establish
+native SwiftPM settlement or generator-build qualification.
+
+### PB0.2 lock-validation library
+
+Selected scoped contract for the approved PB0.2 source. The library provides
+`parse_lock(&[u8]) -> Result<ToolchainLock, LockError>`. It performs no filesystem,
+network or process operation. Validated fields have read-only accessors.
+`ToolchainLock::validate_host(&HostToolchain)` compares the observed host with
+every declared host field. A mismatch returns a typed rejection.
+
+The input limit is 16 KiB. Reject invalid UTF-8, duplicate, unknown or missing
+fields, trailing input and wrong JSON types. Errors contain a stable category
+and static field name, never the supplied input. The lock identity is SHA-256
+of the exact accepted input bytes. Whitespace changes therefore change identity.
+
+| Object | Fields |
+| --- | --- |
+| Root | `format_version` (1), `host`, `protoc`, `swift_protobuf` |
+| Host | `os`, `os_major`, `arch`, `xcode_build`, `swift_version`, `rust_version`, `cargo_version` |
+| protoc | `version`, `url`, `sha256`, `archive_kind`, `allowed_top_level`, `required_member`, `expected_tool_version`, `redirect_hosts` |
+| SwiftProtobuf | `version`, `url`, `sha256`, `archive_kind`, `top_level`, `source_commit`, `expected_tool_version`, `redirect_hosts` |
+
+Format 1 supports macOS 27 and `aarch64`. The initial fixture uses the selected
+host and archive identities above. Versions have one to four numeric components,
+each with one to nine digits, separated by dots, with a total limit of 32 bytes.
+Xcode build identity has one to 32 ASCII alphanumeric bytes.
+URLs have at most 2048 bytes and the exact prefix `https://github.com/`.
+Path components contain ASCII letters, digits, dot, underscore or hyphen.
+Reject empty, `.` and `..` components. This excludes credentials, percent
+escapes, query strings, fragments and ambiguous host syntax. Digests contain 64 lowercase
+hexadecimal characters; source commits contain 40. Archive kinds and member
+shapes must match the ZIP and tar.gz policies above. Redirect hosts are unique
+and use the archive-specific allowlists above. Declared and expected tool
+versions must agree.
+
+The lock remains the sole owner of tool versions, URLs, digests and commits.
+Do not duplicate those pins in compiled code. Structural validation does not
+verify archive contents, upstream identity or the observed redirect chain.
+PB0.3 performs those checks before a tool can be used.
+
+Unit tests cover each rejection rule and exact-byte identity. Integration tests
+use the public API with a complete fixture and host mismatches. A test-only
+executable reads a lock file and invokes that same API under network denial.
+This end-to-end check qualifies file-to-validation behavior only. It creates
+no product command and makes no tool-preparation claim.
+
+The scoped fixed command `scripts/check-i0-toolchain --check bootstrap` builds
+and tests only this crate. The driver owns the worktree lock, prepared local
+Cargo work cache, fixed Cargo arguments, deadlines, output limits and cleanup.
+It runs Cargo with `--locked --offline`, using the installed physical compiler
+and Cargo binaries. An absent cache fails; this command does not import or
+prepare one. PB0.2 validation may seed an isolated work cache from locally
+verified registry metadata and checksum-matched archives under the same lock.
+That validation setup does not create or qualify a portable PB0 snapshot.
+The command must report its limited scope. It cannot report PB0.3–PB0.6 complete.
+
+### PB0.3 archive verification and extraction
+
+Selected scoped contract on 2026-09-26. The owner approved a narrow global PAX
+metadata exception after inspection of the exact pinned Swift archive. Remaining
+cache and driver detail proposals do not block this independent archive module.
+
+The library exposes `archive::extract_archive(bytes, selection, destination)`.
+`selection` is either a validated `ProtocLock` or `SwiftProtobufLock` reference.
+The result reports the private staging path, regular-file count and payload bytes.
+Errors contain typed categories and static diagnostics, with a separate cleanup
+failure flag. The module performs no download, subprocess or cache publication.
+The caller holds the existing driver lock and exclusively owns the staging parent.
+
+Verify the 32 MiB compressed limit and the selected SHA-256 before filesystem
+mutation. The destination must not exist; its parent and ancestors must be real
+existing directories. Create a private destination with mode 0700. Files use
+exclusive creation and mode 0600, adding owner execute only when a regular archive
+member has an execute bit. Directories use 0700. Never preserve ownership, setuid,
+setgid or other permissions. Reject links and special filesystem entries.
+This protects cooperating worktree tools; hostile same-user parent replacement
+remains outside this packet's threat boundary.
+
+Inspect the original UTF-8 path. Reject NUL, backslash, absolute paths, empty
+interior components, `.` and `..`. Permit one trailing slash for a directory.
+Reject duplicate normalized paths, file/directory prefix conflicts and aliases
+on the actual destination filesystem. Implicit parent directories may later have
+one explicit directory entry; they cannot become regular files. Apply the locked
+top-level rules and require `bin/protoc` to be a regular executable file.
+
+Accept single-disk ZIP32 only. Reject encryption and ZIP64. Validate the end record,
+central-directory boundaries and declared entry count against `ZipArchive` before
+writing. A bounded walk of raw central records must exhaust that exact region;
+its physical count must equal the declared count and library inventory length.
+The pinned ZIP library hides exact duplicate names in its indexed map;
+count disagreement must reject those archives. Decompression remains with the
+pinned library. Count actual payload bytes with checked arithmetic; the aggregate
+limit is 256 MiB. Reject malformed/truncated input and CRC failures.
+
+For Swift tar.gz, iterate raw tar entries. Accept regular files and directories,
+plus at most one first global PAX header named `pax_global_header`. Its payload
+must be exactly `52 comment=<locked 40-character source commit>\n`, where `\n` is
+one LF. Discard the header without creating a filesystem entry. Reject every
+other PAX/GNU extension or special record. The commit comes from the tool lock,
+not a compiled pin. Count the complete decompressed tar stream, including headers
+and padding, against 256 MiB; also bound actual file payload totals. Validate the
+gzip trailer and reject another gzip member or trailing compressed bytes.
+Require at least one regular source file under the locked Swift tree. Empty or
+metadata-only archives reject. Require two 512-byte zero records as the tar
+terminator; after it, permit only zero padding.
+
+On failure after creation, remove only this invocation's staging directory.
+Preserve the original error and report cleanup failure separately. Never overwrite
+an existing destination, modify the caller's other files or publish partial output.
+
+Archive validation cases extend BT2. Unit cases cover original-path rejection,
+member kinds, counts, metadata and limits. Integration cases use real ZIP/tar.gz
+fixtures for duplicate entries, collisions, CRC/trailer corruption, oversized
+expansion, invalid top-level members, missing executable, symlink ancestors and
+pre-existing destinations. A public-API file workflow runs under real network
+denial and verifies accepted output bytes and rejected output absence. The existing
+`--check bootstrap` supervises these tests. Pinned archive inspection alone does
+not prove extraction or generator execution.
 
 ### Ownership and dependency view
 
@@ -171,7 +370,8 @@ The lock is source-controlled data. It names only HTTPS upstream archives and
 their exact digest. The entry point accepts preparation and offline modes.
 Before the Rust bootstrap runs, the launcher compiles the standalone check
 driver directly from `rust/check-i0-driver.rs`. After acquiring the worktree
-lock, the driver copies the retained
+lock, the driver follows the approved [initial verification order](protobuf-cache-preparation.md#cargo-lock-parsing-and-initial-bootstrap)
+and copies the retained
 Cargo snapshot into a fresh disposable work cache and sets `CARGO_HOME` to that
 work cache. It copies only registry index metadata and compressed crate
 archives, never extracted source trees or build output. In online mode, an
@@ -270,6 +470,30 @@ run marker under the lock. It clears that marker only after its children have
 stopped and cache state has been reconciled. A handled timeout or interruption
 uses the existing termination and reap deadlines before releasing the lock.
 Failure to prove cleanup leaves the marker and fails the check.
+
+The owner selected a qualified-toolchain cleanup contract on 2026-09-26 after
+reviewing the measured descendant-discovery limitation. The supported scope is
+the locked tools, reviewed dependency graph, fixed commands and qualified macOS
+host. Supported build descendants must remain in their launch session; changing
+process groups within that session is permitted. Changes to these inputs require
+requalification. This is operational assurance for those tools, not an unconditional
+proof that every possible descendant has stopped.
+
+The driver tracks the dedicated session and retained process identities. It must
+settle every observed owned process, including processes in separate groups,
+before accepting cleanup. An observed session escape, failed identity check,
+unavailable inspection or signal operation, exceeded bound, or missing required
+delegated receipt returns `cleanup_required` and retains the marker. A descendant
+that changes session between scans and loses its ancestry can remain undiscovered;
+the owner explicitly accepted this residual discovery risk. Empty scans, pipe
+closure and parent exit must not be described as unconditional descendant proof.
+The [cleanup detail](protobuf-process-settlement.md) defines the selected mechanism,
+identity and lifetime rules, limits and required native qualification.
+
+A nested supervisor must still supply its required settlement receipt. Its death
+or pipe closure cannot replace that receipt. The initial compiler launcher retains
+its separate process-group watchdog and requires qualification against the selected
+compiler; the driver's session mechanism does not extend that launcher's guarantee.
 
 An abruptly killed driver can release its OS lock while a child still runs.
 A later driver that finds the incomplete marker returns `cleanup_required`.

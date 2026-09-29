@@ -11,6 +11,18 @@ No generated binding or process exchange has been implemented or verified.
 
 ## Context and decision
 
+### Extension to local control on 2026-09-26
+
+The owner also selected Protobuf for the CLI/TUI connection to the local service.
+Both connections use the [shared pinned toolchain](../designs/protobuf-toolchain-bootstrap.md#shared-tools-and-separate-schema-owners).
+The [service design](../designs/system-architecture.md) owns local control
+framing, compatibility, authentication and message validation. Its schema is
+`contracts/control/v1/control.proto`; the smoke and model schemas remain separate.
+Model chunking, credit and helper identity rules do not automatically apply to
+local control. The linked shared-toolchain diagram defines generation ownership.
+
+### Model-helper contract
+
 [ADR-0009](0009-supervised-local-model-helper.md) selects a supervised Swift
 process for the first macOS Foundation Models implementation. The Rust-owned
 semantic [local-model port](../designs/swift-rust-boundary.md) remains independent

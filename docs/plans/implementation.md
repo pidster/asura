@@ -18,7 +18,9 @@ required. This selection does not authorize implementation.
 
 ## Entry gate
 
-Implementation is not currently authorized. Begin I0 only after repo owners have
+The owner authorized foundation metadata and PB0.0–PB0.2 on 2026-09-26 under the
+[scoped bootstrap packet](protobuf-bootstrap-implementation.md). This does not
+authorize the remaining I0 scope or later increments. Begin that work only after repo owners have
 reviewed both the design and this plan, explicitly authorized implementation, and
 D8 establishes coherent system boundaries with ready initial implementation
 designs. Each later increment requires its own ready
@@ -47,6 +49,15 @@ those owners. Until a source exists, the client reports an explicit unknown
 value instead of a fixture value.
 
 ### Early production status trial
+
+The proposed packets make the first stages independently testable:
+[foundation](production-foundation-implementation.md),
+[shared Protobuf bootstrap](protobuf-bootstrap-implementation.md), and
+[installation through status TUI](production-status-implementation.md).
+Foundation metadata precedes bootstrap qualification. The local service then
+uses the qualified Protobuf toolchain. Installation, registry, Git observations
+and the status TUI follow the service. Each packet retains its own review and
+validation gate; this sequence does not authorize new code.
 
 Selected learning milestone, proposed implementation packet. The trial reuses
 the intended Rust service, registry, workspace observer and TUI presentation

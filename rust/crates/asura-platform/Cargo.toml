@@ -1,0 +1,19 @@
+[package]
+name = "asura-platform"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+test-support = []
+
+[dependencies]
+libc = "=0.2.189"
+sha2 = "=0.10.9"
+
+[[test]]
+name = "shell_process"
+path = "tests/shell_process.rs"
+harness = false
+required-features = ["test-support"]

@@ -683,6 +683,34 @@ Measure routing quality, inappropriate delegation, missed delegation, unnecessar
 context, invalid tool selections, and latency/cost tradeoffs. Calibrate any
 confidence or uncertainty threshold on evidence rather than trusting a generated score.
 
+### Wisp finding: classifiers trained from audit logs
+
+**Reported finding, 2026-09-26:** The owner reports that Wisp trained a custom
+classifier from its audit log cheaply, quickly and accurately. Asura has not yet
+reviewed the training setup, dataset, measured cost, elapsed time or accuracy results.
+This is a design input from Wisp, not verified Asura behavior.
+
+**Selected storage, 2026-09-26:** Custom classifier model files belong under
+`$HOME/.asura/data/classifiers/`. Other locally managed model files belong under
+`$HOME/.asura/data/models/`, with `coreai/` for Core AI files and `mlx/` for MLX
+files. These paths select storage locations; they do not qualify model formats
+or runtime support. The [home contract](user-service-configuration.md#per-user-home-and-hybrid-persistence)
+records these placements. Model format, version layout, integrity checks and
+activation/rollback remain D4 design decisions. Selecting this path does not
+create directories or authorize training or deployment.
+
+**Candidate for D4 evaluation:** Evaluate audit-log examples as training data for
+Asura's task classification and routing. Compare a custom classifier with the
+existing model-assisted baseline. Record dataset and label provenance, model
+version, training cost/time, inference latency and held-out per-class accuracy.
+Separate related sessions/tasks across training and evaluation to avoid leakage.
+Review label quality and failure cases; logged model choices are not automatically
+correct labels. Use only data authorized for this training purpose.
+
+Any classifier remains within the model-decision contract above. Its output is
+a proposal and cannot grant permissions. Training, audit-schema changes and
+deployment require a scoped design and implementation authorization.
+
 ### Model session ownership and effective context
 
 Required contract for D4-D5. Select either stateless requests built from each

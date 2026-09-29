@@ -1,0 +1,494 @@
+syntax = "proto3";
+package asura.control.v1;
+
+message Envelope {
+  optional bytes service_epoch = 1;
+  optional bytes attachment_id = 2;
+  optional uint64 request_counter = 3;
+  oneof body {
+    Hello hello = 10;
+    HelloReply hello_reply = 11;
+    Inspect inspect = 12;
+    InspectReply inspect_reply = 13;
+    Stop stop = 14;
+    StopAccepted stop_accepted = 15;
+    Error error = 16;
+    InspectInstallation inspect_installation = 17;
+    InspectInstallationReply inspect_installation_reply = 18;
+    ConfigGet config_get = 19;
+    ConfigSet config_set = 20;
+    ConfigReply config_reply = 21;
+    ConversationSubmit conversation_submit = 22;
+    ConversationAccepted conversation_accepted = 23;
+    ConversationObserve conversation_observe = 24;
+    ConversationEvent conversation_event = 25;
+    ConversationCancel conversation_cancel = 26;
+    ConversationCancelAccepted conversation_cancel_accepted = 27;
+    InitializeInstallation initialize_installation = 28;
+    InitializationReply initialization_reply = 29;
+    ResolveInitialization resolve_initialization = 30;
+    ProjectRegister project_register = 31;
+    ProjectReply project_reply = 32;
+    ProjectList project_list = 33;
+    ProjectsReply projects_reply = 34;
+    ConversationEnqueue conversation_enqueue = 35;
+    ConversationQueueList conversation_queue_list = 36;
+    ConversationQueueDecision conversation_queue_decision = 37;
+    ConversationQueueReply conversation_queue_reply = 38;
+    ObserveContext observe_context = 39;
+    ContextObservation context_observation = 40;
+    ObserveService observe_service = 41;
+    ServiceObservation service_observation = 42;
+    ModelsList models_list = 43;
+    ModelsReply models_reply = 44;
+    SensorsInspect sensors_inspect = 45;
+    SensorsReply sensors_reply = 46;
+    AuditRead audit_read = 47;
+    AuditReply audit_reply = 48;
+    ConversationHistory conversation_history = 49;
+    ConversationHistoryReply conversation_history_reply = 50;
+    ConversationReadPrompt conversation_read_prompt = 51;
+    ConversationPromptReply conversation_prompt_reply = 52;
+    ConversationQueueSubmit conversation_queue_submit = 53;
+    ConversationQueueReorder conversation_queue_reorder = 54;
+    ProjectRename project_rename = 55;
+    ProjectRenameReply project_rename_reply = 56;
+  }
+}
+message ObserveService { optional uint64 after_revision = 1; }
+message ServiceObservation {
+  optional uint64 revision = 1;
+  optional bool pending = 2;
+  optional InspectReply status = 3;
+  optional string configured_model = 4;
+  optional uint64 uptime_ms = 5;
+  optional StoredMemoryStatus stored_memory = 6;
+}
+message StoredMemoryStatus {
+  optional bool available = 1;
+  optional uint64 size_bytes = 2;
+  optional uint64 sampled_uptime_ms = 3;
+  optional bool stale = 4;
+  optional uint32 size_reason = 5;
+}
+message ConfigGet { optional string key = 1; }
+message ObserveContext {
+  optional bytes project_id = 1;
+  optional string working_directory = 2;
+  optional bytes after_subscription = 3;
+  optional uint64 after_revision = 4;
+}
+message ContextObservation {
+  optional bytes project_id = 1;
+  optional string working_directory = 2;
+  optional bytes subscription_id = 3;
+  optional uint64 revision = 4;
+  optional bool pending = 5;
+  optional uint32 git_state = 6; // 0 unknown, 1 nonrepository, 2 clean, 3 dirty
+  optional string branch = 7;
+  optional bool detached = 8;
+  optional bool unborn = 9;
+  optional bool conflicts = 10;
+  optional string reason = 11;
+  optional uint64 files_changed = 12;
+  optional uint64 added = 13;
+  optional uint64 deleted = 14;
+}
+message ConfigSet { optional string key = 1; optional string value_yaml = 2; }
+message ConfigReply { optional string value_yaml = 1; optional string error = 2; }
+message Hello { optional string client_build = 1; }
+message HelloReply {
+  optional string service_build = 1;
+  repeated Capability capabilities = 2 [packed = true];
+  optional uint32 max_frame_bytes = 3;
+}
+message Inspect {}
+message InspectReply {
+  optional Lifecycle lifecycle = 1;
+  optional InstallationState installation = 2;
+  optional UnavailableReason unavailable_reason = 3;
+  optional InstallationInspectionReason reason = 4;
+}
+message InspectInstallation {}
+message InspectInstallationReply {
+  optional InstallationState installation = 1;
+  optional InstallationInspectionReason reason = 2;
+  optional bytes installation_id = 3;
+  optional uint64 authority_revision = 4;
+  optional uint64 recorded_owner_generation = 5;
+  optional uint64 binding_generation = 6;
+  optional uint32 authority_format = 7;
+}
+message Stop { optional bytes expected_epoch = 1; }
+message StopAccepted {}
+message Error {
+  optional ErrorCode code = 1;
+  optional string message = 2;
+}
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_INSPECT = 1;
+  CAPABILITY_STOP = 2;
+  CAPABILITY_INSPECT_INSTALLATION = 3;
+  CAPABILITY_CONFIG = 4;
+  CAPABILITY_CONVERSATION = 5;
+  CAPABILITY_SETUP = 6;
+}
+enum Lifecycle {
+  LIFECYCLE_UNSPECIFIED = 0;
+  LIFECYCLE_STARTING = 1;
+  LIFECYCLE_SERVING = 2;
+  LIFECYCLE_DRAINING = 3;
+  LIFECYCLE_FAULTED = 4;
+  LIFECYCLE_REPAIR_ONLY = 5;
+}
+enum InstallationState {
+  INSTALLATION_STATE_UNSPECIFIED = 0;
+  INSTALLATION_STATE_UNAVAILABLE = 1;
+  INSTALLATION_STATE_UNINITIALIZED = 2;
+  INSTALLATION_STATE_RECOVERING = 3;
+  INSTALLATION_STATE_GRAPH_UNAVAILABLE = 4;
+  INSTALLATION_STATE_REPAIR_REQUIRED = 5;
+  INSTALLATION_STATE_GRAPH_READY = 6;
+}
+enum UnavailableReason {
+  UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  UNAVAILABLE_REASON_AUTHORITY_NOT_INSTALLED = 1;
+}
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_UNSUPPORTED_OPERATION = 1;
+  ERROR_CODE_INVALID_SEQUENCE = 2;
+  ERROR_CODE_STALE_OWNER = 3;
+  ERROR_CODE_DRAINING = 4;
+  ERROR_CODE_TIMEOUT = 5;
+  ERROR_CODE_INVALID_REQUEST = 6;
+  ERROR_CODE_INTERNAL_UNAVAILABLE = 7;
+}
+
+enum InstallationInspectionReason {
+  INSTALLATION_INSPECTION_REASON_UNSPECIFIED = 0;
+  INSTALLATION_INSPECTION_REASON_INSPECTION_PENDING = 1;
+  INSTALLATION_INSPECTION_REASON_RUNTIME_ONLY = 2;
+  INSTALLATION_INSPECTION_REASON_INITIALIZATION_PENDING = 3;
+  INSTALLATION_INSPECTION_REASON_GRAPH_VERIFICATION_UNAVAILABLE = 4;
+  INSTALLATION_INSPECTION_REASON_INSTALLATION_REMNANTS = 5;
+  INSTALLATION_INSPECTION_REASON_UNKNOWN_CONTENT = 6;
+  INSTALLATION_INSPECTION_REASON_UNSUPPORTED_LAYOUT = 7;
+  INSTALLATION_INSPECTION_REASON_UNSUPPORTED_FORMAT = 8;
+  INSTALLATION_INSPECTION_REASON_INCOMPLETE_TAIL = 9;
+  INSTALLATION_INSPECTION_REASON_CORRUPT_AUTHORITY = 10;
+  INSTALLATION_INSPECTION_REASON_INSPECTION_LIMIT = 11;
+  INSTALLATION_INSPECTION_REASON_INSPECTION_TIMEOUT = 12;
+  INSTALLATION_INSPECTION_REASON_UNSAFE_AUTHORITY = 13;
+  INSTALLATION_INSPECTION_REASON_AUTHORITY_CHANGED = 14;
+  INSTALLATION_INSPECTION_REASON_INSPECTION_IO = 15;
+  INSTALLATION_INSPECTION_REASON_GRAPH_VERIFIED = 16;
+}
+
+message ConversationSubmit {
+  optional bytes request_id = 1;
+  optional bytes project_id = 2;
+  optional bytes conversation_id = 3;
+  optional uint64 expected_generation = 4;
+  optional string prompt = 5;
+}
+message ConversationAccepted {
+  optional bytes operation_id = 1;
+  optional bytes conversation_id = 2;
+  optional uint64 generation = 3;
+  optional uint64 cursor = 4;
+}
+message ConversationObserve {
+  optional bytes operation_id = 1;
+  optional uint64 after_cursor = 2;
+  optional uint32 wait_ms = 3;
+}
+message ConversationHistory {
+  optional bytes project_id = 1;
+  optional bytes conversation_id = 2;
+  optional uint64 before_accepted_frame = 3;
+  optional uint32 limit = 4;
+}
+message ConversationHistoryEntry {
+  optional bytes operation_id = 1;
+  optional uint64 generation = 2;
+  optional uint64 accepted_frame = 3;
+  optional ConversationEventKind kind = 4;
+}
+message ConversationHistoryReply {
+  optional bytes project_id = 1;
+  optional bytes conversation_id = 2;
+  optional uint64 generation = 3;
+  optional uint64 authority_revision = 4;
+  optional bool has_more = 5;
+  repeated ConversationHistoryEntry entries = 6;
+}
+message ConversationReadPrompt {
+  optional bytes project_id = 1;
+  optional bytes operation_id = 2;
+}
+message ConversationPromptReply {
+  optional bytes project_id = 1;
+  optional bytes operation_id = 2;
+  optional bytes conversation_id = 3;
+  optional uint64 generation = 4;
+  optional string prompt = 5;
+}
+message ConversationEvent {
+  optional bytes operation_id = 1;
+  optional uint64 cursor = 2;
+  optional uint64 generation = 3;
+  optional ConversationEventKind kind = 4;
+  optional string text = 5;
+  optional ConversationReason reason = 6;
+  optional uint64 usage_tokens = 7;
+  optional bool usage_known = 8;
+  repeated ToolProgress tools = 9;
+  optional ModelContext model_context = 10;
+}
+message ConversationCancel { optional bytes operation_id = 1; optional uint64 generation = 2; }
+message ConversationCancelAccepted { optional bytes operation_id = 1; optional bool terminal = 2; }
+enum ConversationEventKind {
+  CONVERSATION_EVENT_KIND_UNSPECIFIED = 0;
+  CONVERSATION_EVENT_KIND_PENDING = 1;
+  CONVERSATION_EVENT_KIND_SNAPSHOT = 2;
+  CONVERSATION_EVENT_KIND_COMPLETE = 3;
+  CONVERSATION_EVENT_KIND_FAILED = 4;
+  CONVERSATION_EVENT_KIND_CANCELLED = 5;
+  CONVERSATION_EVENT_KIND_INTERRUPTED = 6;
+}
+enum ConversationReason {
+  CONVERSATION_REASON_NONE = 0;
+  CONVERSATION_REASON_MODEL_UNAVAILABLE = 1;
+  CONVERSATION_REASON_INPUT_LIMIT = 2;
+  CONVERSATION_REASON_OUTPUT_LIMIT = 3;
+  CONVERSATION_REASON_CONTEXT_LIMIT = 4;
+  CONVERSATION_REASON_TIMEOUT = 5;
+  CONVERSATION_REASON_REFUSAL = 6;
+  CONVERSATION_REASON_CANCELLED = 7;
+  CONVERSATION_REASON_PROTOCOL_FAULT = 8;
+  CONVERSATION_REASON_HELPER_FAILED = 9;
+  CONVERSATION_REASON_INTERNAL_ERROR = 10;
+  CONVERSATION_REASON_INTERRUPTED = 11;
+  CONVERSATION_REASON_RESULT_EXPIRED = 12;
+}
+
+message InitializeInstallation {
+  optional bytes request_id = 1;
+  optional string mode = 2;
+  optional uint64 expected_authority_revision = 3;
+}
+message ResolveInitialization { optional bytes request_id = 1; optional bytes request_digest = 2; }
+message InitializationReply {
+  optional bytes installation_id = 1;
+  optional bytes graph_id = 2;
+  optional InitializationPhase phase = 3;
+  optional uint64 authority_revision = 4;
+  optional string error = 5;
+}
+enum InitializationPhase {
+  INITIALIZATION_PHASE_UNSPECIFIED = 0;
+  INITIALIZATION_PHASE_PENDING = 1;
+  INITIALIZATION_PHASE_COMPLETED = 2;
+}
+message ProjectRegister { optional bytes request_id = 1; optional string location = 2; }
+message ProjectReply {
+  optional bytes project_id = 1;
+  optional string location = 2;
+  optional uint64 registry_revision = 3;
+  optional bool current = 4;
+  optional string error = 5;
+  optional string name = 6;
+  optional uint64 name_revision = 7;
+}
+message ProjectRename {
+  optional bytes request_id = 1;
+  optional bytes project_id = 2;
+  optional uint64 expected_name_revision = 3;
+  optional string name = 4;
+}
+message ProjectRenameReply {
+  optional ProjectReply project = 1;
+  optional bool changed = 2;
+  optional string error = 3;
+  optional ProjectReply current_project = 4;
+}
+message ProjectList { optional bytes after_project_id = 1; optional uint32 limit = 2; }
+message ProjectsReply { repeated ProjectReply projects = 1; optional bytes next_cursor = 2; optional string error = 3; }
+
+// Durable service-owned input queue. Values evolve within protocol 0.1.
+message ConversationEnqueue {
+  optional bytes request_id = 1;
+  optional bytes project_id = 2;
+  optional bytes conversation_id = 3;
+  optional bytes target_operation_id = 4;
+  optional uint64 target_generation = 5;
+  optional uint32 kind = 6; // 1 Queue, 2 cancel-and-replace Steer
+  optional string prompt = 7;
+}
+// Queue a prompt before model admission. A new conversation has no ID yet and
+// must explicitly carry generation zero and new_conversation=true.
+message ConversationQueueSubmit {
+  optional bytes request_id = 1;
+  optional bytes project_id = 2;
+  optional bytes conversation_id = 3;
+  optional uint64 expected_generation = 4;
+  optional bool new_conversation = 5;
+  optional string prompt = 6;
+}
+message ConversationQueueReorder {
+  optional bytes request_id = 1;
+  optional bytes input_id = 2;
+  optional bytes after_input_id = 3; // absent means front of movable lane
+  optional uint64 expected_order_revision = 4;
+}
+message ConversationQueueList {
+  optional bytes project_id = 1;
+  optional bytes input_id = 2; // exact inspection includes full prompt
+  optional uint64 after_revision = 3;
+}
+message ConversationQueueDecision {
+  optional bytes request_id = 1;
+  optional bytes input_id = 2;
+  optional uint32 action = 3; // 1 Resume, 2 Drop, 3 promote existing Queue to Steer
+  optional bytes target_operation_id = 4; // required only for promotion
+  optional uint64 target_generation = 5; // required only for promotion
+}
+message ConversationQueueEntry {
+  optional bytes input_id = 1;
+  optional bytes project_id = 2;
+  optional bytes conversation_id = 3;
+  optional bytes target_operation_id = 4;
+  optional uint64 target_generation = 5;
+  optional uint32 kind = 6;
+  optional uint32 state = 7; // 1 Queued, 2 Held, 3 Running, 4 Complete, 5 Failed, 6 Dropped
+  optional string text = 8;
+  optional bytes operation_id = 9;
+  optional uint64 generation = 10;
+  optional uint64 sequence = 11;
+  optional bool new_conversation = 12; // V2 lane; target_generation is expected generation
+  optional uint32 order_position = 13; // V2 pending order, independent of immutable sequence
+}
+message ConversationQueueReply {
+  repeated ConversationQueueEntry entries = 1;
+  optional bytes request_id = 2; // mutation acknowledgement
+  optional bool full_text = 3;
+  optional uint64 revision = 4;
+  optional bool pending = 5;
+  optional uint64 order_revision = 6; // independent of authority revision
+  optional bool stale_order = 7; // reorder CAS lost; entries contain current projection
+  optional bytes accepted_input_id = 8; // new Submit receipt within the bounded projection
+}
+
+message ToolProgress { optional uint32 ordinal = 1; optional string name = 2; optional ToolProgressState state = 3; optional uint32 status = 4; }
+enum ToolProgressState { TOOL_PROGRESS_STATE_UNSPECIFIED = 0; TOOL_PROGRESS_STATE_RUNNING = 1; TOOL_PROGRESS_STATE_COMPLETE = 2; TOOL_PROGRESS_STATE_FAILED = 3; TOOL_PROGRESS_STATE_INTERRUPTED = 4; }
+
+// basis 1 means the measured input at generation start, not current occupancy.
+message ModelContext { optional string model_name = 1; optional uint32 input_tokens = 2; optional uint32 capacity_tokens = 3; optional uint32 basis = 4; }
+
+// Inventory states: 1 available, 2 installed, 3 listed, 4 unavailable, 5 unchecked.
+message ModelsList {}
+message ModelInventoryEntry {
+  optional string selector = 1;
+  optional string provider = 2;
+  optional uint32 status = 3;
+  optional string detail = 4;
+}
+message ModelInventoryIssue { optional string provider = 1; optional string reason = 2; }
+message ModelsReply {
+  optional string configured_model = 1;
+  repeated ModelInventoryEntry models = 2;
+  repeated ModelInventoryIssue issues = 3;
+  optional string error = 4;
+}
+
+// Inspection returns committed evidence only; it never admits sensor work.
+message SensorsInspect {
+  optional bytes project_id = 1;
+  optional uint64 revision = 2;
+  optional uint32 offset = 3;
+  optional uint32 limit = 4;
+}
+message SensorObservation {
+  optional bytes id = 1;
+  optional uint32 source = 2; // 1 activity, 2 idle, 3 status
+  optional bytes source_epoch = 3;
+  optional uint64 sequence = 4;
+  optional uint64 observed_ms = 5;
+  optional uint64 received_ms = 6;
+  optional uint64 expires_ms = 7;
+  optional bytes operation = 8;
+  optional uint64 generation = 9;
+  optional uint32 phase = 10; // activity: 1 accepted, 2 settled
+  optional uint32 active_foreground = 11;
+  optional uint64 since_ms = 12;
+  optional uint32 lifecycle = 13;
+  optional uint32 installation = 14;
+  optional uint32 status_reason = 15;
+  optional uint32 ordinal = 16;
+  optional bytes causal_root = 17;
+  optional bool background = 18;
+  optional uint32 causal_hops = 19;
+}
+message SensorReference { optional bytes id = 1; }
+message SensorProposal {
+  optional bytes id = 1;
+  optional uint32 purpose = 2; // 1 consolidation, 2 reflection
+  optional uint32 state = 3; // 1 held, 2 expired, 3 invalidated
+  optional uint32 reason = 4; // 1 admission unavailable, 2 clock uncertain, 3 activity resumed, 4 expired
+  repeated SensorReference observations = 5;
+  optional uint64 omitted = 6;
+  optional uint64 created_ms = 7;
+  optional uint64 expires_ms = 8;
+}
+message SensorsReply {
+  optional bytes project_id = 1;
+  optional uint64 revision = 2;
+  optional uint32 total_observations = 3;
+  optional uint32 next_offset = 4;
+  optional bool pending_persistence = 5;
+  optional bool intake_unavailable = 6;
+  optional bool clock_uncertain = 7;
+  repeated SensorObservation observations = 8;
+  repeated SensorProposal proposals = 9;
+  optional string error = 10;
+  optional uint32 offset = 11;
+}
+
+// Project-filtered committed recent audit metadata; no raw log text.
+message AuditRead { optional bytes project_id = 1; optional uint32 limit = 2; }
+message AuditHealth {
+  optional uint32 state = 1;
+  optional bool enabled = 2;
+  optional uint32 keep_files = 3;
+  optional uint64 max_file_bytes = 4;
+  optional uint64 dropped = 5;
+  optional uint32 window_capacity = 6;
+  optional bool hydrated = 7;
+  optional bool older_omitted = 8;
+  optional uint32 reason = 9;
+}
+message AuditEntry {
+  optional bytes service_epoch = 1;
+  optional uint64 sequence = 2;
+  optional uint64 unix_time_ms = 3;
+  optional uint32 kind = 4;
+  optional bytes project = 5;
+  optional bytes request = 6;
+  optional bytes conversation = 7;
+  optional bytes operation = 8;
+  optional uint64 requested_generation = 9;
+  optional uint64 current_generation = 10;
+  optional uint64 generation = 11;
+  optional uint32 ordinal = 12;
+  optional uint32 tool = 13;
+  optional uint32 outcome = 14;
+  optional uint32 reason = 15;
+}
+message AuditReply {
+  optional bytes project_id = 1;
+  optional AuditHealth health = 2;
+  repeated AuditEntry entries = 3;
+  optional string error = 4;
+}

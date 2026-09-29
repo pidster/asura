@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "rust/crates/asura-toolchain-bootstrap",
+    "rust/crates/asura-platform",
+    "rust/crates/asura-control",
+    "rust/crates/asura-client",
+    "rust/crates/asura-service",
+    "rust/crates/asura-storage",
+    "rust/crates/asura-cli",
+]
+default-members = ["rust/crates/asura-cli"]
+exclude = ["experiments/tui-chat"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+
+# Verified helper copies hash large binaries under a fixed preparation deadline.
+[profile.dev.package.sha2]
+opt-level = 3

@@ -1,0 +1,13 @@
+[package]
+name = "asura-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+asura-control = { path = "../asura-control" }
+asura-platform = { path = "../asura-platform" }
+
+[dev-dependencies]
+asura-platform = { path = "../asura-platform", features = ["test-support"] }

@@ -4,8 +4,17 @@ Status: proposed I1 D3 design. The owner selected ordinary files plus the bound
 SurrealDB graph on 2026-09-25 and ruled out SQLite. This document proposes one
 append-only ordinary-file authority journal. Frame format, durability behavior,
 compaction, schema versions and fault limits still need review and qualification.
-It does not authorize implementation or claim runtime evidence. Later D3-D4 work
+The read-only stage 3A contract below is selected for scoped implementation under
+the current implicit authorization. It has no runtime evidence. Later D3-D4 work
 must extend the same authority contract to the full task/action ledger.
+
+The [first conversation amendment](conversation-admission.md) extends format 1
+for installation request outcomes, project registration, conversation admission,
+token reservation and terminal recovery. Root selected its CA-A pure codec/replay
+packet after review. All journal frames remain format 1; its diagnostic records
+retain their original payloads and are never silently converted.
+Writer, production graph binding and service integration retain that amendment's
+separate validation gates. This extends the same authority owner and file.
 
 The [installation binding contract](context-storage-candidates.md#selected-installation-binding-and-change-contract)
 owns graph selection and cutover requirements. The
@@ -38,8 +47,9 @@ is committed.
 | SurrealDB for all authority | External outage would block local durable controls, or require a second local database in external mode. That weakens the required independent bootstrap and control path. |
 
 The journal and its derived checkpoints are **ordinary files**, not an additional
-database engine. Propose `state/control/` for the two slots, with
-`data/graph/` for the embedded graph. D3 must finalize paths and retention.
+database engine. Propose `state/control/` for the two slots. The owner selected
+`db/` for the embedded graph on 2026-09-26, replacing the earlier `data/graph/`
+proposal. D3 must finalize the journal path and retention.
 No embedded graph directory is created in external mode.
 
 ### Authority and storage view
@@ -123,23 +133,229 @@ stateDiagram-v2
     RecoveryRequired --> [*]: Restart and replay original operation
 ```
 
+## Stage 3A: bounded read-only authority inspection
+
+Selected scoped contract. Stage 3A reads existing authority and classifies absent
+or damaged state. It creates no journal, installation ID, owner-generation record,
+checkpoint or graph connection. It never repairs, truncates or migrates files.
+The existing service retains its runtime lock and installation mutations remain
+unavailable. A replayed owner generation is historical; it grants no dispatch.
+The append and compaction sections remain later writer requirements.
+
+### Ownership and supported state
+
+The Rust storage adapter owns byte validation and replay. The Rust service owns
+installation classification and publication. The platform owns descriptor-relative
+filesystem access and account checks. The control/client owners transport typed
+results; the CLI renders them. No Swift helper or separate process is added.
+Reuse the foundation's supported local APFS home and runtime ownership contract.
+Do not treat its local checkpoint evidence as complete filesystem qualification.
+
+Select `state/control/slot-0.log` for the initial authority stream. Stage 3A supports
+format 1 with slot 0 only. Any `slot-1.log`, checkpoint, switch record or other
+control-area entry returns `unsupported_layout` without choosing a newer slot.
+Later compaction must version and qualify its layout before enabling it. The
+read-only adapter needs no compaction writer or retention worker.
+
+Open existing directories without creation, through validated held descriptors.
+Require current-user ownership, directory mode 0700 and ordinary-file mode 0600;
+reject symlinks, extra hard links, ACL access beyond the supported foundation
+profile and nonregular journal files. Retain device/inode identities. Recheck the
+root, directory chain, journal identity, length and modification metadata before
+publishing replay. A change makes the snapshot unavailable; never follow a
+replacement. A malicious process with the same UID remains outside the supported
+threat boundary. Checksums detect damage, not hostile rewriting.
+
+The service classifies at most 64 immediate root entries. Validated root `.DS_Store`
+metadata is excluded from authority evidence under the
+[Finder metadata contract](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow).
+Its regular-file permission exception permits read access but never group/world
+write access. All other file and directory rules remain applicable.
+`run/` and `logs/` are
+non-authoritative: validate their directory type, ownership and safe permissions,
+with no group/world write permission; existing log directories need not be exactly
+0700. Do not replay diagnostic log contents. Their presence alone cannot initialize
+an installation. `config.yaml`, `db/`, `data/`, `sessions/`, `tmp/`, `state/` or any unknown
+entry without a valid journal is installation evidence requiring inspection;
+report `installation_remnants`, never silently call it fresh. A root containing
+only validated `run/` and optional `logs/` is `Uninitialized`. This classification
+permits no initialization action in 3A. Missing records cannot prove first-ever use.
+If a valid journal exists, preserve the named areas without interpreting contents.
+This includes the selected `data/` classifier/model areas, including Core AI and
+MLX artifacts; their presence is not unknown root content. An unlisted root entry
+still produces `unknown_content`. Configuration and graph
+validation remain unavailable until their owners are implemented.
+
+### Format 1 byte contract
+
+All integers are unsigned big-endian; there is no native padding. Each frame is
+one contiguous header, payload and trailer. The table order is byte order.
+
+| Header field | Bytes | Validation |
+| --- | --- | --- |
+| Magic | 8 | ASCII `ASURAJ01` |
+| Format version; record kind | 2 each | Version 1; diagnostic kinds 1–3 below; conversation kinds in the amendment |
+| Total frame length | 4 | Includes 144-byte header, payload and 40-byte trailer |
+| Sequence | 8 | Starts at 1, increases by 1, never wraps |
+| Previous frame digest | 32 | All zero for sequence 1; otherwise preceding digest |
+| Installation ID | 16 | Nonzero; unchanged throughout stream |
+| Operation ID | 16 | Nonzero; unique in this format |
+| Command digest | 32 | SHA-256 of the two-byte kind followed by exact payload bytes |
+| Expected revision; resulting revision | 8 each | Starts at 0 to 1; each frame advances exactly once |
+| Owner generation | 8 | Nonzero; validated by transition rules below |
+
+The trailer contains SHA-256 of the exact header and payload, followed by the
+8-byte ASCII commit boundary `ASURAC01`. Hash the encoded bytes; do not decode and
+re-encode before comparison. No unknown fields, trailing payload bytes or lossy
+integer conversions are accepted. Reuse one reviewed SHA-256 implementation;
+this design introduces no handwritten digest implementation or dependency change.
+
+| Kind | Exact payload, in order | Replay effect |
+| --- | --- | --- |
+| 1 PendingInit | Mode u8 (1 embedded, 2 external); configuration revision u64; configuration digest 32 bytes; intended graph ID 16 bytes | Only sequence 1, owner generation 1; records pending initialization |
+| 2 ActiveBinding | Binding generation u64; graph ID 16 bytes; configuration digest 32 bytes | Once after PendingInit; generation 1; graph ID and digest must match pending intent |
+| 3 OwnerGeneration | Empty | Previous owner generation plus 1; no binding or operation completion effect |
+
+Configuration revision and graph ID must be nonzero. Kind 2 retains the current
+owner generation; kind 3 may follow either initialization state. Revision, sequence
+or generation exhaustion rejects rather than wrapping. Unknown kinds reject. Adding an authorized record kind does not change the
+format number. Only the owner can authorize a format-number change. The adapter rejects repeated operation IDs, including
+identical bytes at a new sequence. The same initialization intent is correlated
+by its installation/graph/configuration identity; each committed transition has
+its own operation ID. Future durable request/outcome schemas must distinguish
+that transition identity from the user's initialization request before a writer
+is implemented. Stage 3A cannot answer `ResolveRequest` or claim a user request
+completed from these diagnostic bootstrap records.
+
+The [conversation amendment](conversation-admission.md#format-1-and-record-compatibility)
+adds request-bearing initialization kinds 10 and 11, plus kinds 4 through 9.
+Kind 3 remains shared. The first record selects diagnostic or request-bearing
+initialization rules. Public inspection validates the complete corresponding
+stream before returning its summary. A diagnostic stream cannot acquire request
+outcomes by mixing these initialization records. Their payloads and numbers are
+distinct; none changes the format-1 envelope or existing diagnostic fixtures.
+
+A complete valid frame is a replayed commit boundary even if its acknowledgement
+was lost. That does not establish successful graph verification now. Stage 3A
+reports PendingInit as `Recovering` with `initialization_pending`; ActiveBinding
+as `GraphUnavailable` with `graph_verification_unavailable`. It never reports
+`ControlReady` or `GraphReady`, resumes initialization or increments a generation.
+
+### Bounds, interruption and preservation
+
+Maximum journal size is 8 MiB, frame size 64 KiB and frame count 32,768. Maximum
+replay allocation is 16 MiB, including the bounded operation-ID index. Read in
+chunks no larger than 64 KiB. Inspect frame lengths before allocation. Exceeding
+any bound returns `inspection_limit`; it cannot authorize partial-state use.
+
+One bounded storage worker performs one startup scan. The reactor remains able
+to serve Inspect and Stop while the state is `Recovering`/`inspection_pending`.
+The worker posts one typed result with the current service epoch and scan ID.
+A result from a stopped or obsolete scan cannot publish. Use a five-second
+monotonic deadline and cancellation checks between reads and frames. The timer
+marks the view unavailable on expiry; it does not prove a blocked syscall ended.
+Stop cancels the scan and retains ownership until the worker settles. The reactor
+checks worker completion without a blocking join; join only after completion is
+reported. If the existing stop deadline expires first, keep the owner and serve
+responsive `RepairOnly` inspection while settlement remains unknown. A subsequent
+Stop may complete after the worker exits. Never claim timeout killed a blocked
+read. Unknown settlement follows the existing drain failure contract. No periodic scan,
+filesystem watcher or unbounded retry is introduced. Restart requests a new scan.
+
+EOF exactly at a valid frame boundary permits replay. An empty journal is a
+partial installation, not an empty initialized installation. A short header,
+payload or trailer is `incomplete_tail`; preserve the entire file and expose
+`RepairRequired`. Complete checksum/chain/revision damage is `corrupt_authority`.
+Unsupported version/layout is distinct from corruption. Stage 3A may retain a
+verified prefix for diagnostics internally, but exposes no installation identity
+or usable revision from a failed scan. It writes no quarantine file and performs
+no truncation. Its stricter read-only response preserves the later PR7 repair
+requirement; it does not redefine an incomplete tail as a committed transition.
+
+The future writer must flush complete frames before acknowledgement and qualify
+first-file and directory-entry durability. No write API ships in 3A, so short-write,
+flush-error, slot-switch and power-loss qualification stay writer prerequisites.
+Read-only replay tests exercise their resulting bytes without claiming to qualify
+the missing writer. Process-death tests establish only process-crash behavior.
+
+### Read-only inspection state
+
+Selected stage 3A view. Arrows denote classification and publication decisions;
+no transition writes installation state. Service shutdown remains independently
+owned by the foundation lifecycle.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Recovering: Startup scan
+    Recovering --> Uninitialized: Valid runtime-only root
+    Recovering --> RepairRequired: Remnants or invalid authority
+    Recovering --> Recovering: Valid pending initialization
+    Recovering --> GraphUnavailable: Valid active binding, graph unchecked
+    Recovering --> Unavailable: Deadline, access or identity change
+    Uninitialized --> [*]: Stop
+    RepairRequired --> [*]: Stop
+    GraphUnavailable --> [*]: Stop
+    Unavailable --> [*]: Stop
+```
+
+### Inspection publication
+
+Selected interaction view. Arrows carry requests and bounded snapshots, never
+journal writes. A pending scan does not block control traffic.
+
+```mermaid
+sequenceDiagram
+    participant CLI as CLI and reusable client
+    participant S as Rust service reactor
+    participant W as Storage scan worker
+    participant P as Platform filesystem owner
+    S->>W: Scan with epoch, scan ID and deadline
+    W->>P: Open existing validated authority
+    CLI->>S: InspectInstallation on authenticated attachment
+    S-->>CLI: Recovering, inspection_pending
+    P-->>W: Bounded bytes or typed failure
+    W-->>S: Candidate classification and retained identities
+    S->>S: Check active scan and current ownership
+    alt Current and valid
+        S->>S: Publish bounded installation snapshot
+    else Cancelled, replaced or expired
+        S->>S: Discard candidate, preserve unavailable state
+    end
+    CLI->>S: InspectInstallation
+    S-->>CLI: Current typed snapshot without raw paths
+```
+
 ## Initialization and graph binding
 
-Normal startup opens existing authority files without creating replacements.
-An existing root with a missing journal, damaged authoritative slot or
-incompatible required format enters RepairRequired. An entirely absent root
-shows Uninitialized and warns that absence cannot prove first-ever use. Only an
-explicit authorized initialization request may create the root and first frame.
-The service must establish exclusive per-user ownership before that creation;
-the D2 runtime socket/guard location cannot depend on `.asura/` already existing.
+Normal startup may create the validated `.asura/run/` runtime area under the
+[service ownership contract](system-architecture.md). This selected placement
+includes permitted creation of the validated `.asura/` parent. Runtime setup
+creates no journal, installation identity or graph binding. Existing authority
+files are opened without creating replacements.
+
+After obtaining sole ownership, the installation owner classifies the state.
+A validated runtime-only root with no installation remnants or detected conflict
+is Uninitialized. It still requires explicit initialization and the warning that
+missing records cannot prove first-ever use. An installation area with a missing
+journal, a damaged slot, an incompatible format, unknown content or conflicting
+graph evidence enters RepairRequired. The service preserves those files; it does
+not overwrite them to establish an empty installation.
+
+The [runtime-only root contract](production-bootstrap-status.md#runtime-only-root-and-explicit-installation)
+owns the user-visible distinction. D1-D3 must define the exact runtime allowlist
+and conflict checks. The presence of `run/` alone cannot establish that a root
+is safe for initialization. Only an explicit authorized initialization request
+may create the journal and first installation frame. The runtime owner lock must
+remain held throughout initialization and authority recovery.
 
 1. Validate the account home, requested graph mode, service configuration and
    credential references. Partial external settings reject; they do not select
    the embedded default.
-2. Create the protected root and journal area. Append and flush a PendingInit
+2. Revalidate the protected root and create only the installation journal area.
+   Append and flush a PendingInit
    frame with one installation ID, graph identity intent, mode, configuration
    revision and stable operation ID. If creation stops before this frame is
-   durable, preserve the partial root and require repair.
+   durable, preserve the partial installation area and require repair.
 3. Prepare or open only the selected graph. Write or read its identity marker
    under the same graph operation ID. An unknown database commit is reconciled
    by marker identity, not retried as a new installation.
@@ -193,7 +409,7 @@ presentation through the TUI.
 
 | ID | Fault point | Required result |
 | --- | --- | --- |
-| PR1 | Root or journal created before first durable PendingInit frame | Partial root requires repair; no automatic new installation or graph. |
+| PR1 | Installation journal area created before first durable PendingInit frame | Partial installation requires repair; no automatic new installation or graph. A validated runtime-only root is covered separately by PBS15. |
 | PR2 | PendingInit durable before graph operation | Resume the same installation and graph operation after revalidation. |
 | PR3 | Graph marker may commit but acknowledgement is lost | Query the selected graph by original identity; no blind second create or fallback. |
 | PR4 | Marker verified before ActiveBinding flush | No GraphReady claim; resume the original pending operation. |
@@ -201,6 +417,11 @@ presentation through the TUI.
 | PR6 | External graph disappears after binding | Preserve binding and registry; return GraphUnavailable and allow independently durable control. |
 | PR7 | Journal has incomplete final frame after interrupted write | Preserve evidence; quarantine only a proved uncommitted tail, and resolve request ID before another write. |
 | PR8 | Journal has interior damage, complete-frame mismatch or version gap | RepairRequired with no dispatch or guessed replay. |
+
+The [PBS15 runtime-root cases](production-bootstrap-status.md#pbs15-runtime-directory-does-not-initialize-an-installation)
+add absent, runtime-only, partial, unknown-content and conflicting-graph startup
+fixtures. They require unit classification, real-process/filesystem integration
+and CLI/TUI checks. They do not replace PR1's interrupted initialization case.
 
 ## Registration, events and projection
 

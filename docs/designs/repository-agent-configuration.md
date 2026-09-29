@@ -3,9 +3,9 @@
 **Status: Selected design.** This document governs the existing Codex development
 configuration. Its recorded validation is in [Initial verification](#initial-verification).
 
-**Required behavior:** Product work remains limited to design and planning until
-repo owners review the design and plan, then explicitly authorize implementation.
-This configuration does not select Asura's runtime dependencies.
+**Required behavior:** The owner authorizes iterative Asura implementation under
+a sufficient governing design. Follow the current [iteration rules](../design-process.md#iteration-and-escalation)
+without repeated approval requests. This configuration does not select runtime dependencies.
 
 ## Scope and ownership
 

@@ -120,13 +120,43 @@ Here, `$HOME` denotes the service user's validated home directory. An attaching
 client's environment or working directory cannot redirect the backend's state.
 Home-directory resolution and access checks remain D1-D3 mechanisms to design.
 
+The owner selected `$HOME/.asura/run/` for the service lock and socket on
+2026-09-26. Startup may create the validated root and runtime child before
+installation initialization. The [service design](system-architecture.md)
+owns runtime validation and exclusive ownership. Directory existence grants no
+installation identity. The service automatically initializes a validated runtime-only root;
+partial, unknown or conflicting installation state requires repair. The
+[bootstrap contract](production-bootstrap-status.md#runtime-only-root-and-explicit-installation)
+defines this distinction and the boundary for automatic initialization.
+
 Asura stores some data as files and other data in SurrealDB. The directory root
 does not select a file format, database schema or second source of authority.
 The [hybrid storage contract](context-storage-candidates.md#hybrid-data-ownership-and-recovery)
 owns the data split, cross-store consistency and recovery obligations.
 
+On 2026-09-26, the owner selected these local paths:
+
+| Path under `$HOME/.asura/` | Purpose |
+| --- | --- |
+| `db/` | Embedded SurrealDB engine files; absent in external-only mode |
+| `logs/` | Local diagnostic logs; audit authority needs its separate contract |
+| `config.yaml` | User-managed service configuration; secret references only |
+| `sessions/` | Retained session files; exact contents and authority require D3 design |
+| `data/classifiers/` | Custom classifier model files; selected by the owner on 2026-09-26; version layout and activation require D4 design |
+| `data/models/` | Other locally managed model files; selected by the owner on 2026-09-26; format, version layout and activation require D4 design |
+| `data/models/coreai/` | Locally managed Core AI model files; selected by the owner on 2026-09-26 |
+| `data/models/mlx/` | Locally managed MLX model files; selected by the owner on 2026-09-26 |
+| `tmp/` | Disposable temporary files; never the only copy of durable state |
+| `run/` | Previously selected service lock and socket |
+
+The [config command contract](config-commands.md) now selects the initial YAML
+model and audit schema and its get/set operations. The
+[storage contract](storage-adapters.md) defines current database bindings; the
+[conversation contract](conversation-admission.md) defines the format-1 journal.
+Broader memory schemas remain scoped by the [ontology](hybrid-memory-ontology.md).
+Audit rotation is not implemented by the config command packet.
 Local Asura-managed persistent files belong under this root. Embedded SurrealDB's
-engine files also belong under it, at a subpath that D3 must select. Those engine
+engine files belong under `db/`. Those engine
 files are the database's representation, not a separately editable copy of graph
 records. An external SurrealDB's physical data remains at its configured server.
 External mode still needs local bootstrap state; it must not initialize an
@@ -151,16 +181,19 @@ No new process boundary or Swift/Rust IPC mechanism is selected here.
 
 Required placement and ownership view. Arrows show storage access through the
 canonical adapter; dotted arrows identify mutually exclusive graph modes.
-Subdirectory names, file schemas and helper process placement remain open.
+The runtime and listed storage paths are selected; file schemas, remaining
+storage paths and helper process placement remain open.
 
 ```mermaid
 flowchart TD
     Client["Control clients and agents"] -->|Typed requests| Backend["Backend owners"]
     Backend -->|Authorized persistence operations| Storage["Canonical storage adapter"]
     subgraph Home["Service user's validated $HOME/.asura/"]
+        Runtime["run: service lock and socket"]
         Files[("Managed local files and independent bootstrap state")]
         Embedded[("Embedded SurrealDB engine files")]
     end
+    Lifecycle["Canonical service lifecycle owner"] -->|Validated runtime setup| Runtime
     Storage -->|Local file access| Files
     Storage -.->|Embedded graph mode| Embedded
     Storage -.->|External graph mode with authorized egress| External[("External SurrealDB server")]
@@ -168,12 +201,13 @@ flowchart TD
 
 ### Proposed directory areas
 
-Proposed mechanism for D3 review. These names organize the design discussion;
-they are not a selected layout or instructions to create directories.
+The `run/` placement is selected. Other areas remain a proposed mechanism for
+D3 review. This table does not authorize implementation or directory creation.
 
-| Proposed area under `.asura/` | Intended role and unresolved placement |
+| Area under `.asura/` | Status and intended role |
 | --- | --- |
-| `config/` | Human-managed service settings and preferences; filenames and schemas remain open |
+| `run/` | Selected runtime lock/socket area; not installation identity or durable history |
+| `config/` | Proposed human-managed service settings and preferences; filenames and schemas remain open |
 | `state/` | Protected local bootstrap and recovery metadata; exact records and atomic update mechanism remain open |
 | `data/` | Embedded database engine files; engine choice and subdirectory remain open |
 | `artifacts/` | Retained file payloads if D3-D4 selects file-backed artifacts; database references and retention require a contract |
@@ -186,10 +220,11 @@ to files or database tables by this proposal. D3 must also select format version
 retention and compatibility rules. The same record must not have independently
 writable authoritative copies in both stores.
 
-Root override support, alternate installation roots, service socket/runtime paths,
-numeric permission modes and the exact backup layout remain open. An override,
+Root override support, alternate installation roots, numeric permission modes
+and the exact backup layout remain open. Runtime lock and socket placement is
+selected under `run/`; the service design owns their detailed names. An override,
 if later authorized and designed, cannot create another active owner for one user.
-The root requirement does not select a socket location or a credential backend.
+The runtime placement does not select a credential backend.
 D1-D3 must specify private access, tamper and symlink/replacement handling before
 any directory creation or state access is implemented.
 
@@ -469,13 +504,15 @@ an individual test ID. No tests have been implemented.
   repair guidance. Preserve the graph binding and separate users' state.
   External mode creates no embedded graph. No client writes managed state directly.
 - **Unit:** Root-source validation, source-scope rejection, record ownership and
-  initialization versus recovery decisions.
+  initialization versus recovery decisions, including validated runtime-only state.
 - **Integration:** Real filesystem ownership/access checks, path replacement and
   concurrent startup; persistent embedded storage and an authenticated external
   server. Verify no local graph creation in external mode.
 - **End-to-end:** Attach two real clients from different projects, restart the
   service and recover the same history. Repeat under a separate OS user and
   verify denied access. Exercise missing-bootstrap recovery without empty history.
+  Repeat the [PBS15 cases](production-bootstrap-status.md#pbs15-runtime-directory-does-not-initialize-an-installation)
+  to prove that runtime setup neither initializes nor overwrites installation state.
 - **Environment:** Supported macOS with real identities, service lifecycle and
   both storage modes. D7 must give each fault and race a separate test ID.
 

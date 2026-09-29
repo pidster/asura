@@ -1,7 +1,8 @@
 # ADR-0006: Asynchronous architecture with input and signal pipelines
 
 Date: 2026-09-23. Status: required architecture selected by the owner.
-Pipeline mechanisms and schemas need detailed design. No runtime proof exists.
+Pipeline mechanisms and schemas need detailed design. Component verification
+records do not establish compliance of the whole architecture.
 
 ## Decision and scope
 
@@ -9,6 +10,10 @@ Asura uses a fully asynchronous, event-driven architecture with explicit input
 and signal processing pipelines. This applies to control clients, the Rust
 backend, agent execution and model/platform/remote adapters. Control and rendering
 must remain responsive while inference, storage or external work is pending.
+The owner's 2026-09-26 clarification requires nonblocking, highly reliable,
+recoverable and scalable behavior across the whole lifecycle. The active
+[AE-01–AE-07 engineering rules](../engineering.md#asynchronous-execution-and-recovery)
+are the canonical implementation obligations for this decision.
 
 An **input pipeline** receives user interaction or a control request, validates
 and translates it, and routes a typed command to its owner. A **signal pipeline**

@@ -1,0 +1,15 @@
+[package]
+name = "asura-control"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+prost = "=0.14.3"
+
+[build-dependencies]
+prost = "=0.14.3"
+prost-build = "=0.14.3"
+prost-types = "=0.14.3"
+serde_json = "=1.0.151"

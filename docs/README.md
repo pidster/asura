@@ -13,10 +13,10 @@ does not establish implemented or verified behavior. The
 
 | Document | Purpose |
 | --- | --- |
-| [Architecture](architecture.md) | Required behavior, component ownership and trust boundaries; detailed mechanisms remain open. |
+| [Architecture](architecture.md) | Required behavior, component ownership and trust boundaries; component designs record selected mechanisms and remaining decisions. |
 | [Coding standards](coding-standards.md) | Draft coding rules and enforcement mapping for owner review. |
 | [Design process](design-process.md) | Required design contents, review and implementation gates, and diagram validation. |
-| [Engineering standards](engineering.md) | Required testing layers, evidence and completion criteria. |
+| [Engineering standards](engineering.md) | Mandatory asynchronous execution and recovery rules, testing layers, evidence and completion criteria. |
 | [Glossary](glossary.md) | Shared project terms and links to their governing contracts. |
 | [Writing standard](writing-standard.md) | Required practice for clear, precise technical documentation. |
 
@@ -25,7 +25,7 @@ does not establish implemented or verified behavior. The
 | Directory | Contents |
 | --- | --- |
 | [Decisions](decisions/README.md) | Selected architecture decisions, rationale and recorded contract reviews. |
-| [Designs](designs/README.md) | Workflows, component contracts, proposals and the isolated TUI experiment. |
+| [Designs](designs/README.md) | Workflows, implemented component contracts, validation limits, proposals and the isolated TUI experiment. |
 | [Plans](plans/README.md) | Design stages, delivery dependencies and scoped implementation packets. |
 
 The [visual reading path](decisions/README.md#visual-reading-path) connects the

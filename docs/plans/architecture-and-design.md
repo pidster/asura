@@ -124,6 +124,9 @@ when its code tree is introduced; the remaining layout below is still proposed.
 asura/
   AGENTS.md
   README.md
+  Cargo.toml                    # one production Cargo workspace, foundation-owned
+  Cargo.lock                    # one production dependency graph
+  rust-toolchain.toml            # pinned production Rust toolchain
   docs/
     architecture.md
     engineering.md
@@ -134,7 +137,6 @@ asura/
   contracts/                    # authoritative cross-language wire/bridge schemas
   rust/
     AGENTS.md                   # Rust-specific instructions and canonical rule links
-    Cargo.toml                  # Cargo workspace
     crates/
       asura-domain/             # IDs, task/action states, domain invariants
       asura-orchestrator/       # scheduling, lifecycle and durable coordination
@@ -143,7 +145,11 @@ asura/
       asura-storage/            # persistence adapters and migrations
       asura-policy/             # canonical authorization rules
       asura-execution/          # tool lifecycle and host enforcement coordination
-      asura-control/            # server protocol adapter
+      asura-control/            # generated control bindings and strict codec
+      asura-platform/           # foundation macOS handles and FFI owner
+      asura-service/            # foundation service reactor and lifecycle
+      asura-toolchain-bootstrap/ # shared pinned generator preparation
+      asura-toolchain-smoke/    # test-only Rust Protobuf fixture
       asura-client/             # shared Rust control client
       asura-providers/          # remote inference adapters
       asura-remote/             # remote host protocol adapter
@@ -177,6 +183,12 @@ tests use the root suites. Shared schemas produce bindings; handwritten competin
 definitions are prohibited. Protocol schemas do not become a second domain-policy
 implementation. Decide in D2 which boundaries warrant separate crates or targets;
 collapse purely organizational splits before scaffolding.
+The [foundation packet](production-foundation-implementation.md) owns the root
+workspace metadata. The [bootstrap packet](protobuf-bootstrap-implementation.md)
+adds its members through that owner. The root workspace excludes the isolated
+TUI experiment. Foundation service modules and later orchestrator composition
+must retain one owner per behavior; the broader tree does not authorize duplicate
+entry points or a second service.
 The first private Rust–Swift model-channel bindings are generated during the
 build from one schema with pinned local tools. Neither language checks those
 generated files into its source tree. A Swift target may keep thin handwritten

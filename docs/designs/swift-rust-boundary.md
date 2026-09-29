@@ -1,5 +1,11 @@
 # D2 local-model boundary and Swift implementation
 
+Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
+supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
+New admissions reserve 2,048 tokens with tool passes of 1,024/512/512. Historical
+512-token journal records retain their recorded accounting. Earlier numerical
+examples and validation evidence below describe that earlier packet.
+
 Status: proposed D2 design for I0 and I3. Rust and Swift are selected languages;
 Ratatui and the Rust chat backend are selected. The Rust-owned local-model
 contract must admit alternative implementations on other platforms or with
@@ -714,3 +720,326 @@ numeric frame/queue/deadline limits, session invalidation contract, signed
 package layout and real packaged-runtime tests. D2/D4 must specify the second
 conformance binding without confusing a test substitute with platform support.
 The owner must review the resulting ready design and plan before any code.
+
+## Reviewed incremental model implementation
+
+The [conversation-model packet](platform-capabilities.md#next-conversation-model-packet-2026-09-27)
+defines proposed numeric/helper/control contracts. Its reviewed identifier and
+provider-registry component may be implemented independently of inference. The
+service owns it; it cannot grant admission or claim helper availability. Full
+helper deployment and model dispatch retain this document's authority boundaries
+and require the journal/admission prerequisites named by that packet.
+
+## First conversation helper: scoped D2 contract, 2026-09-27
+
+Status: selected after root review for codec and helper implementation. This section reconciles the
+[first conversation packet](platform-capabilities.md#next-conversation-model-packet-2026-09-27)
+for the first text-only `system` implementation. Within this scope, the decisions
+below replace earlier open D2 questions about numeric bounds, session lifetime,
+development packaging and model framing. They do not select production sandbox
+confinement or authorize dispatch before durable admission. Version remains 0.1;
+message additions do not require a version-number change.
+
+### Canonical processing pipeline
+
+Every conversation input follows the existing service pipeline: decode, validate,
+normalize, route, admit, execute, and publish. The existing lifecycle reactor
+continues to dispatch validated control messages. One conversation owner supplies
+admitted model operations to this adapter. It retains project/context identity,
+configuration revision, token reservation, cancellation intent and durable outcome.
+There is no client-to-helper route and no second lifecycle dispatcher.
+
+The adapter receives an already admitted operation, never raw TUI syntax. It owns
+transport validation and process observations. Only the conversation owner can
+settle those observations into a durable user-visible result. A helper terminal
+message is evidence, not a durable acknowledgement. In particular, a model refusal,
+crash or cancellation cannot silently release an unknown token charge.
+
+### Helper session and input contract
+
+One helper serves one admitted model operation and then exits. It creates one
+`LanguageModelSession(model: SystemLanguageModel.default, tools: [], ...)`.
+The service supplies the full permitted history each time; the helper retains no
+cross-operation transcript or implicit context. This is the initial supported
+case of one helper per session generation. Tools, images, custom models, private
+cloud and remote inference are unsupported in this packet.
+
+Add `ModelInput` to `contracts/model/v1/model.proto`. Its fields are instructions
+string 1, repeated `HistoryTurn` history 2, and prompt string 3. `HistoryTurn`
+contains role enum 1 and text string 2; roles are 1 user and 2 assistant. Instructions
+come only from the service's reviewed context builder. Prior assistant turns must
+be durably completed, not provisional prefixes. Maximum history is 32 turns.
+Prompt is nonempty and at most 32 KiB UTF-8. The encoded ModelInput and all decoded
+text together are each limited to 64 KiB. The helper validates these bounds after
+assembling the input transfer and before requesting the start permit.
+
+Use the SDK's structured transcript/prompt representation to preserve roles;
+never concatenate history with invented role delimiters. Token counting and
+context preparation occur after the serialized start permit, inside the admitted
+operation budget. Reject input when measured context plus 512 reserved output
+tokens exceeds the model's reported capacity. An unavailable counter or context
+size is explicit unavailability, not permission to send unchecked history.
+
+### Private wire completion and capability report
+
+The packet's private message/field tables are the canonical initial schema
+inventory under this D2 section. Preserve its 64 KiB frames, 16 KiB chunks,
+64 KiB per-direction credit windows and monotonic transfer identities. Add these
+fields to `Hello`: availability enum 4, capabilities uint32 5, context_tokens
+uint32 6, and reason enum 7. Availability is 1 available, 2 unavailable, 3 unknown.
+Capability bit 0 denotes text generation; all other bits are reserved and zero.
+A helper never advertises tools or structured generation in this first adapter.
+The service keeps registry availability unknown until identity and this report
+have been verified. `context_tokens` is required and positive only when available.
+
+The service Hello sets availability unknown, capabilities zero, reason none and
+omits context capacity. An available helper sets text capability, positive context
+capacity and reason none. An unavailable or unknown helper omits context capacity
+and supplies reason model_unavailable; its capability bits remain zero. All Hello
+scalar fields except conditional context capacity require presence. Terminal
+`usage_known` requires presence; when false, `usage_tokens` must be absent. When
+true, `usage_tokens` must be present and zero is valid. Unknown usage retains the
+reservation under the admission contract.
+`usage_tokens` means measured generated output tokens, excluding input tokens.
+Its wire bound is 512; the operation owner also checks the admitted Begin limit.
+Tokenization estimates must not be reported as measured generation usage.
+
+Both peers send Hello before any Begin. Hello alone uses absent operation identity;
+all later envelopes require the admitted nonzero 16-byte operation ID and positive
+generation. Build ID and schema digest are exactly 32 bytes. The schema digest
+covers exact source bytes. Every required scalar uses explicit proto3 presence.
+Reject unknown critical enums, wrong direction, repeated start, wrong generation,
+late terminal data and bounds violations. No diagnostics or prompts enter argv.
+
+Input is the encoded ModelInput in the ordered input transfer. Output remains
+UTF-8 replacement snapshots: a completed SnapshotEnd permits replacement of the
+previous provisional content. Never append an SDK snapshot as though it were a
+delta. The adapter may coalesce complete revisions before publication. Final
+success requires the final revision and a valid Terminal with matching cumulative
+chunk and byte counts. A failed or interrupted prefix is never committed history.
+
+### Numeric execution and settlement
+
+The numeric table in the first-conversation packet governs this binding: one
+active helper, no waiting admission queue, five-second handshake, 60-second
+absolute operation deadline, 512 response tokens and 60 KiB response text.
+Output transmission is additionally capped at 4 MiB and 1,024 revisions. Retain
+at most two 60 KiB output snapshots plus the bounded transport staging. Reserve
+eight control frames of at most 4 KiB each so cancellation cannot wait on credit.
+The receiver rejects an envelope larger than its frame bound before allocation.
+
+Swift uses a private serial IO queue with nonblocking descriptor reads/writes and
+readiness sources. It stores one partial input frame and bounded outbound frames.
+A separate cancellable Swift Task awaits token counting and the SDK AsyncSequence.
+Neither the IO queue nor the Rust reactor waits synchronously for that Task.
+No detached task may outlive the helper's channel/session shutdown contract.
+SDK internal buffers are outside these application caps; live qualification must
+record memory high-water usage and cannot claim a total process bound from queue
+sizes alone. A slow receiver stops iteration/coalesces bounded snapshots and
+cannot extend the absolute deadline.
+
+Rust serializes cancellation against Start under the admission owner. Before
+Start, cancellation prevents any model-session inference. After Start, send Cancel
+and invalidate the generation. Allow 250 ms for cooperative completion, then
+SIGTERM, then 250 ms before SIGKILL. Observe reaping for one second. If still
+unsettled, retain the exact child handle and ownership slot; reject replacement
+admission and continue nonblocking settlement. Never signal a looked-up PID.
+Channel EOF cancels helper work and starts helper exit. Service shutdown uses the
+same canonical drain and child cleanup, not an adapter-specific stop service.
+
+### Development package and identity
+
+Use `swift/model-helper/Package.swift`, target `AsuraModelHelper`, executable
+`asura-model`. SwiftProtobuf 1.38.1 at locked commit
+`55d7a1cc5666b85c13464aea1c4b4a90feccb4c8` was the initial package dependency.
+The [provider integration](model-provider-integration.md#dependency-graph-review)
+adds pinned CoreAI, MLX and tokenizer dependencies with a reviewed lock graph.
+Use installed Swift 6.4, macOS 27 SDK, locked protoc 36.2 and that release's
+`protoc-gen-swift`. Generate both languages from `contracts/model/v1/model.proto`;
+keep generated Swift in ignored package build inputs and Rust in Cargo OUT_DIR.
+Missing or mismatched tools fail generation before compilation.
+
+Standard SwiftPM builds the generator and helper. Ordinary Cargo builds the Rust
+adapter. Assemble a private development directory with `asura`, `asura-model` and
+`model-package.json`. No development command depends on publishing the deferred
+bootstrap cache. The manifest/embedded build and helper/schema digest construction
+in the first-conversation packet governs exact matching. Retain separate source
+schema identity and helper executable identity; matching version 0.1 is insufficient.
+
+Extend the existing platform process owner for socketpair, verified-copy spawn,
+private descriptor 3 and bounded cleanup. The helper has no named listener.
+Retain the verified executable copy in the service's private runtime until its
+child is reaped, then remove only the owned copy. The same-UID principal limitation
+continues to apply. Never discover or download a helper during user input handling.
+
+The selected development qualification runs with the service user's OS principal,
+without an added helper sandbox profile. The initial text checkpoint exposes no
+host tools or storage API. Later [tool activation](model-tool-execution.md) uses
+typed service callbacks; the helper does not execute host operations itself.
+This is explicitly not OS filesystem or network confinement. Retain any outer
+harness sandbox; its refusal is an actionable qualification failure. Production
+sandbox and signed release qualification remain separate D2/D7 work and cannot
+be claimed from a successful development chat.
+
+### Installed-tool evidence and implementation paths
+
+Read-only checks on 2026-09-27 found Swift 6.4 (swiftlang-6.4.0.34.1), protoc 36.2
+and the Foundation Models interfaces recorded in the platform packet. The ignored
+`.build/asura-protobuf/` staging tree contains SwiftProtobuf 1.38.1 source and its
+`protoc-gen-swift` SwiftPM target. No built generator was found in that inspected
+tree. Root verified the staged Swift archive SHA-256 against the locked archive digest
+and all 2,511 regular extracted source files against that archive. If necessary, obtain the
+already pinned source through the existing toolchain preparation mechanism.
+Do not invent another cache, downloader or generator-version policy.
+
+After root review, assign disjoint implementation ownership:
+
+1. `contracts/model/v1/model.proto` and the existing Rust generation owner:
+   generate and validate the scoped message contract without changing version 0.1.
+2. `rust/crates/asura-platform/src/`: extend owned process/descriptor operations.
+3. `swift/model-helper/`: add language instructions, package, bounded IO,
+   Foundation Models adapter and a scripted SDK substitute for deterministic tests.
+4. `rust/crates/asura-service/src/`: model-channel adapter and its integration
+   with the existing conversation/admission pipeline. The durable writer remains
+   owned by storage and the conversation lifecycle by the service owner.
+5. Existing client/TUI observation pipeline: render revision replacements and
+   terminal outcomes; never synthesize a completed model result.
+
+The authority/admission packet runs independently. Pure framing, helper fixtures
+and SDK wrapper tests can proceed after review. Real model dispatch and TUI chat
+wait for that owner to provide durable admission and recovery. They need no new
+user decision when those contracts are implemented as selected.
+
+### D2 acceptance checkpoints
+
+Run model-free Swift unit tests for malformed frames, partial IO, duplicate fields,
+role validation, snapshot replacement, queue limits and cancellation races. Run
+Rust unit tests for credit arithmetic, identity checks and generation invalidation.
+Then exchange generated messages between real Rust and Swift processes with a
+scripted SDK substitute. Cover wrong identity, a blocked reader, hung inference,
+EOF, missing terminal, SIGTERM refusal, reaping delay and bounded diagnostics.
+These are MC01–MC08 and the applicable BP/SR cases above, not live model proof.
+
+After durable admission is connected, run the real TUI journey: submit a local
+text prompt, observe provisional replacement and completion, cancel another
+operation, disconnect/reconnect and recover after service restart. In parallel,
+status/cancel and input handling must remain responsive under a stalled helper.
+Live qualification records the host/SDK/helper identities, model availability,
+context limit, latency, memory high-water and exact incomplete evidence. No
+external inference or user-home mutation belongs to deterministic tests.
+
+### Reviewed codec allocation and pre-admission availability
+
+Place the private Rust codec in `asura-control::model`; keep local control in its
+existing module. These transports share only framing/descriptor validation
+mechanisms, not message authority or operation semantics. Extend the existing
+`asura-control/build.rs` to generate both schema outputs and descriptor validation
+tables. Parameterize the root envelope and reuse the current validation emitter.
+Do not introduce a model crate or a second handwritten Rust protobuf parser.
+Extend that emitter to validate protobuf bool fields, including `usage_known`;
+reject invalid wire values rather than treating any nonzero integer as true.
+
+Swift uses generated SwiftProtobuf messages and its runtime decoder. The private
+channel admits only canonical generated serialization: decode, validate semantic
+presence/bounds, then compare generated serialized bytes with the original frame.
+Reject mismatches, including duplicated singular fields. Swift must also require
+empty `unknownFields.data` on every decoded message, including nested input/history
+messages; canonical reserialization alone does not reject preserved unknown fields.
+Apply the same canonical check on Rust's model channel, without changing the
+existing public control codec. This profile has no maps or floating-point fields.
+Cross-language tests must prove identical bytes for all message variants, repeated
+history entries, Unicode, empty optional values and scalar boundary values before
+model content is sent. No handwritten Swift protobuf decoder is needed.
+
+Before admission, the platform owner may spawn one helper for identity and
+availability discovery. It sends no user content and opens no LanguageModelSession.
+The helper reads `SystemLanguageModel.default.availability`, capabilities and
+context capacity for Hello only. An unavailable report closes the channel and
+settles this exact helper without admitting inference. A verified available helper
+waits at most five seconds for Begin. The service obtains durable admission during
+that interval, then binds the waiting helper to the admitted operation/generation.
+If admission fails or times out, close and reap the helper; no inference starts.
+The single-helper slot includes this discovery phase, preventing duplicate spawn
+when several clients submit together. There is no independent discovery daemon.
+
+Readiness may change after Hello. Check it again before Start/SDK use and return
+a typed unavailable terminal through the admitted operation if it changed.
+Hello is an observation, not a permanent guarantee of model assets or entitlement.
+EOF, shutdown or cancellation during discovery follow the same owned-child cleanup.
+
+### First conversation pipeline and authority gate
+
+Scoped implementation view. Solid arrows are typed pipeline stages; the helper
+reports observations to the same owner that admitted the operation.
+
+```mermaid
+flowchart TD
+    Input["Client input"] --> Decode["Decode and validate control envelope"]
+    Decode --> Route["Normalize and route to conversation owner"]
+    Route --> Discover["Owned helper identity and availability"]
+    Discover --> Ready{"Available and matching?"}
+    Ready -->|No| Reject["Typed unavailable and owned cleanup"]
+    Ready -->|Yes| Admit["Durable context and budget admission"]
+    Admit --> Permit{"Admission and start permit valid?"}
+    Permit -->|No| Reject
+    Permit -->|Yes| Model["Swift session with no tools"]
+    Model --> Evidence["Validate snapshots and terminal evidence"]
+    Evidence -->|Validated snapshot| Preview["Publish provisional replacement"]
+    Evidence -->|Terminal evidence| Settle["Conversation owner settles durable outcome"]
+    Settle --> Publish["Publish terminal state"]
+    Route --> Cancel["Existing cancellation pipeline"]
+    Cancel --> Cleanup["Invalidate and settle owned helper"]
+    Cleanup --> Settle
+```
+
+D2 amendment validation: Mermaid CLI 12.0.0 rendered the new pipeline diagram;
+visual inspection found legible labels and distinct provisional/terminal paths.
+The scoped whitespace check passed on 2026-09-27. This validates documentation,
+not generated-code compatibility, SDK execution or live conversation behavior.
+
+#### Final-drain input quiescence
+
+Root selected this race correction on 2026-09-27. After enqueueing Terminal, the
+helper stops admitting input and drains its already ordered output. Previously
+in-flight peer credit is discarded from the bounded input buffer, not treated as
+an instruction to revive work or a reason to truncate the terminal response.
+The helper disables read readiness during this drain. Its 250 ms final-drain
+deadline and the service's owned-child cleanup remain in force; EOF/write failure
+also ends the transport. The receiver rejects any data actually emitted after
+Terminal. SnapshotEnd and Terminal must remain ordered behind all preceding
+Chunk frames; reserved control capacity never reorders these dependent messages.
+
+### Rust preparation and poll boundary
+
+The service model owner starts one preparation thread and retains that slot until
+its join and exact child reaping. Preparation validates and copies at most 128 MiB
+of executable bytes with a two-second cooperative deadline. Cancellation is
+checked between 64 KiB reads and immediately before spawn. A stalled filesystem
+call retains the slot; it cannot block the reactor or permit replacement work.
+The preparation result transfers one owned child to the reactor. The reactor
+polls at most 64 KiB of channel and diagnostic input per pass, with at most eight
+published observations. Only complete snapshots replace provisional output.
+The diagnostic ring retains the most recent 64 KiB and records discarded bytes.
+A channel fault starts the same bounded child settlement as cancellation. The
+service must retain this owner through drain until preparation and reaping finish.
+After reaping, one cleanup worker removes the owned executable copy. Its slot is
+retained until it finishes; unlink and metadata calls never run on the reactor.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Preparing
+  Preparing --> Hello: validated copy and owned spawn
+  Preparing --> Settled: cancelled before spawn or preparation failure
+  Hello --> Available: matching identity and available report
+  Available --> Input: durable admission and Begin
+  Input --> Ready: complete input and helper Ready
+  Ready --> Running: durable StartAuthorized and Start
+  Running --> Draining: terminal or cancellation or channel failure
+  Hello --> Draining: unavailable or deadline or channel failure
+  Available --> Draining: cancellation or deadline
+  Input --> Draining: cancellation or deadline
+  Ready --> Draining: cancellation or deadline
+  Draining --> Cleanup: exact child reaped
+  Cleanup --> Settled: owned copy removed and worker joined
+  Settled --> [*]
+```

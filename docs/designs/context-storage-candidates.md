@@ -57,6 +57,12 @@ defines `$HOME/.asura/` as the local state root. The existing embedded default,
 configured external option and fail-closed graph binding remain unchanged.
 An external database is not physically contained in that local directory.
 
+The owner selected local storage paths on 2026-09-26 in the
+[home contract](user-service-configuration.md#per-user-home-and-hybrid-persistence).
+The [hybrid memory ontology](hybrid-memory-ontology.md) proposes concrete document,
+edge and file-reference shapes, with separate authority and recovery boundaries.
+It does not yet select physical schemas or qualify a database engine.
+
 Logical ownership does not change with physical placement. The storage adapter
 implements persistence on behalf of each owner; it does not acquire task, policy
 or context semantics. The table records existing canonical owners and leaves

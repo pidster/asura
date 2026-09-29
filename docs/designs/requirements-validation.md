@@ -44,6 +44,14 @@ flowchart TD
 
 ## Preserved architecture scenarios
 
+The proposed [memory cases HM1-HM12](hybrid-memory-ontology.md#acceptance-cases)
+refine existing requirements: HM1-HM3, HM5 and HM8 cover R06/R15; HM4 covers
+R12/R18; HM6 and HM7 cover R15/R18. HM9 covers plan adoption and dependency
+admission under R06/R15/R17/R18. HM10 covers replanning and assignment recovery
+under R05/R10/R16/R17. HM11 covers task-linked partial reports under R03/R15/R18.
+HM12 covers typed tool validation, authorized persistence and recovery under
+R09/R15/R18. These cases have no runtime evidence yet.
+
 R01-R13 preserve the numbered
 [architecture review scenarios](../plans/architecture-and-design.md#scenarios-that-must-survive-the-design-review).
 An increment is the first delivery boundary for the stated behavior, not a reason
@@ -105,7 +113,7 @@ include the initial state, trigger, result and required layers.
 | ID | Existing acceptance source | Workflows and delivery | Required environment |
 | --- | --- | --- | --- |
 | R14 | [Service C1-C5](user-service-configuration.md#validation-required-before-delivery), including the per-user `.asura` root | W1, W4-W5; I1-I2 | macOS service, separate OS users, filesystem, both graph modes |
-| R15 | [Storage B1-B5](context-storage-candidates.md#binding-acceptance-cases) and [hybrid H1-H3](context-storage-candidates.md#hybrid-storage-acceptance-cases) | W5; I2 | Actual embedded/external store, managed files, interrupted rebinding and cross-store recovery/restore |
+| R15 | [Storage B1-B5](context-storage-candidates.md#binding-acceptance-cases), [hybrid H1-H3](context-storage-candidates.md#hybrid-storage-acceptance-cases) and proposed [memory HM1-HM12](hybrid-memory-ontology.md#acceptance-cases) | W5; I2 | Actual embedded/external store, managed files, immutable versions, provenance, plan/task/report tracking, typed built-in tools, interrupted rebinding, deletion races and cross-store recovery/restore |
 | R16 | [Failure A1](../plans/implementation.md#a1-common-failure-settlement) | W3-W5; I1-I2 | Real durable state and process failures |
 | R17 | [Budget A2](../plans/implementation.md#a2-shared-budget-reservations-and-recovery) | W2-W5; I2, extended I3/I5/I7 | Concurrent admission, real store, provider/host usage where claimed |
 | R18 | [Security policy deliverables](security-policy-brief.md#required-design-and-validation-deliverables) | W1-W5; I1 onward | Selected evaluator and actual macOS enforcement |
@@ -145,6 +153,15 @@ disclosure, old responses after reconnect and older observations that finish las
 Each case requires unit rules, real service/transport and Git fault tests, and
 draft-preserving journeys in Ghostty and Terminal.app. D3 must resolve publication
 ordering and identity semantics before D7 can qualify these cases.
+
+The selected runtime-before-initialization behavior adds
+[PBS15](production-bootstrap-status.md#pbs15-runtime-directory-does-not-initialize-an-installation)
+to R14 and W0/C5. Its five variants distinguish absent and validated runtime-only
+roots from partial, unknown-content and conflicting-graph states. Unit checks
+classify these states; real filesystem/process checks race startup and preserve
+remnants; CLI and both-terminal journeys require a separate initialization action.
+Runtime-directory existence cannot prove installation readiness. PR1 still covers
+interrupted installation creation after the runtime area already exists.
 
 R23 adds required product integration support, not conformance or an implicit I4
 scope expansion. IX2/IX3 require unit format/scope/protocol rules, actual integration

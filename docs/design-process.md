@@ -4,17 +4,25 @@ Never write code without a design. The architecture baseline establishes project
 direction; a scoped design makes a change concrete enough to implement and test.
 This rule covers production code, test code, scaffolding, build scripts, and spikes.
 
-Current production phase: design and implementation planning. The owner authorized
-the [isolated TUI experiment](plans/tui-prototype-implementation.md) on 2026-09-24
-after its preflight; that authorization is limited to the packet's scope.
-Repo owners must review the governing design and plan, then explicitly authorize
-implementation before any product code, tests, scaffolding or build scripts are
-written. A ready design, ADR or packet alone does not open that gate.
+Current production phase: the owner's latest instruction makes Asura
+implementation approval implicit and selects service-first delivery. Proceed
+under a sufficient governing design without repeatedly requesting implementation
+approval. Resolve actual design gaps before their code; an existing ready contract
+is sufficient to continue the authorized task.
+
+The [foundation packet](plans/production-foundation-implementation.md) starts the
+real manual service checkpoint with standard Cargo, installed tools, verified
+pinned protoc and locked prost generation. Complete PB0 cache publication, Swift
+smoke, portable-cache proof and custom-driver extension are deferred qualification,
+not prerequisites for that checkpoint. The
+[bootstrap packet](plans/protobuf-bootstrap-implementation.md) retains that work.
+Manual-preview evidence remains distinct from full host and release qualification.
+The earlier isolated TUI experiment remains a separately scoped synthetic artifact.
 
 ## Workflow
 
 1. Read the architecture, engineering standards, relevant designs, and existing
-   contracts. Identify conflicts and stop for the user if instructions disagree.
+   contracts. Resolve discrepancies under the iteration and escalation rules below.
 2. Identify the existing owner of each affected capability. For a new capability,
    assign its ownership and explain how it fits the dependency structure.
 3. Write or update the scoped design. Resolve the decisions needed to implement
@@ -28,6 +36,36 @@ written. A ready design, ADR or packet alone does not open that gate.
 Design work can use read-only investigation of existing code, installed APIs,
 documentation, and runtime capabilities. An executable experiment needs a design
 stating its question, boundaries, and validation before its code is written.
+
+## Iteration and escalation
+
+Status: required workflow under the owner's authorization for iterative development.
+Implementation authorization covers the design refinements, fixes and tests needed
+to deliver the requested feature. Do not request approval again for each packet,
+internal interface change or correction within that scope.
+
+Update the governing design before changing behavior in code. Keep the update
+proportionate to the change. Resolve scoped decisions through engineering judgment
+when user requirements and existing authority provide enough direction. Review the
+result against ownership, async execution, failure handling and required tests.
+Use independent review when the risk warrants it; routine revisions do not require
+an owner review meeting or another approval prompt.
+
+Report instruction discrepancies promptly. An explicit user correction or authorized
+rule change resolves the corresponding conflict; record it and continue. If the
+instructions remain incompatible, stop the affected work and ask for a decision.
+Continue independent authorized work while waiting.
+
+Ask before a material product or authority decision that the available instructions
+do not settle, or an irreversible action outside existing authorization. State the
+specific missing decision and its consequence. Difficulty, an ordinary design
+revision or a recoverable test failure does not itself require user approval.
+
+Preserve design and code quality during iteration. Required security boundaries,
+resource limits, recovery behavior and meaningful validation remain mandatory.
+Report incomplete evidence explicitly. A manual testing checkpoint may precede full
+qualification when its scope and remaining gaps are clear; it is not proof of release
+readiness. Do not weaken tests or acceptance criteria merely to obtain a pass.
 
 ## Required design contents
 
@@ -52,6 +90,10 @@ Every governing design must address:
   threat assumptions.
 - **Operations:** configuration, resource bounds, telemetry, audit, and
   performance objectives.
+- **Asynchronous execution:** map the change to [AE-01–AE-07](engineering.md#asynchronous-execution-and-recovery).
+  Name blocking APIs, isolation owners, numeric work/queue/concurrency limits,
+  deadline and cancellation behavior, and startup/shutdown settlement.
+  Define overload, stalled-dependency and recovery acceptance cases before coding.
 - **Validation:** mapping from requirements and behaviors to unit, integration,
   and end-to-end cases, plus relevant model, security, performance, and usability
   evidence; name the required environments and acceptance criteria.
@@ -101,7 +143,8 @@ engines, OS mechanisms, atomicity guarantees, or timing thresholds.
 
 Required process. The first view shows the conditions for starting implementation.
 Arrows name the review result. “Ready” means the scoped design is complete; the
-owner must still review both the design and implementation plan and authorize work.
+current owner instruction supplies implementation authorization; scoped design
+review and validation requirements still apply.
 
 ```mermaid
 flowchart TD
@@ -109,8 +152,8 @@ flowchart TD
     Investigating --> Check{"Scoped design complete and consistent?"}
     Check -->|No: revise proposal| Proposed
     Check -->|Yes| Ready["Ready design"]
-    Ready --> Review{"Owner reviewed design and plan, and authorized implementation?"}
-    Review -->|No| Hold["Remain in design and planning"]
+    Ready --> Review{"Work within the owner-directed scope?"}
+    Review -->|No| Hold["Resolve scope before unrelated work"]
     Review -->|Yes| Prereq{"Packet dependencies and validation environment available?"}
     Prereq -->|No| Wait["Resolve missing prerequisites"]
     Prereq -->|Yes| Implementing["Start the implementation packet"]
@@ -118,9 +161,9 @@ flowchart TD
 
 ### Implementation and revision
 
-Required process after the approval conditions above are met. Arrows show progress
-or the kind of correction needed. A return to design must use the readiness and
-approval conditions again before implementation resumes.
+Required process under the scoped design and current owner instruction. Arrows show progress
+or the kind of correction needed. Review the revised design for readiness before
+implementation resumes. Existing authorization continues within the requested scope.
 
 ```mermaid
 stateDiagram-v2
@@ -153,12 +196,20 @@ Do not overwrite Markdown sources, install project dependencies, or upload proje
 documents to a remote rendering service for this check. Renderer failures must
 be corrected or reported; rendering alone does not validate architectural semantics.
 
-## Initial state
+## Initial baseline and current implementation
 
 Swift and Rust are selected. The initial baseline had no implementation-ready
-scoped design or validation toolchain. The isolated experiment now defines its own
-scoped checks; production toolchains and contracts remain open. Follow the
-[architecture and design plan](plans/architecture-and-design.md)
-to establish the initial workflows and governing contracts, then the
-[implementation plan](plans/implementation.md). The core harness brief is a
-design input, not permission to begin its implementation.
+scoped design or validation toolchain. Production now includes the local service,
+TUI, storage, model channel and selected providers. Their
+[component designs](designs/README.md) define the delivered scope and validation
+limits. The isolated experiment retains its own scoped checks.
+
+Use the [architecture and design plan](plans/architecture-and-design.md) for
+remaining design decisions and the [implementation plan](plans/implementation.md)
+for delivery dependencies. The core harness brief remains design input; it does
+not replace a scoped implementation design.
+
+The service-first authorization update changes the readiness diagram wording.
+Its current visual inspection is pending because the installed local Mermaid
+browser launches stall. Record this gap separately; it does not reinstate a
+repeated approval or bootstrap gate for the owner-directed implementation.
