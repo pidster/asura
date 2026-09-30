@@ -914,11 +914,11 @@ def queue_history_admission(fixture, source):
         try:
             trial.until("project · ".encode(), plain=True, limit=15)
             trial.until(f"Restored {count + 3} conversation turns".encode(), plain=True, limit=20)
-            trial.send(b"\x1b[A")  # Up enters the scrollable conversation pane.
+            trial.send(b"\x1b[1;2A")  # Shift+Up enters the scrollable conversation pane.
             trial.until(b"scroll history", plain=True, limit=5)
             focus_offset = len(trial.output)
             trial.send(b"\x1b[5~\x1b")  # Page up, then return to the editor.
-            trial.until(b"^P/^N recall", focus_offset, plain=True, limit=5)
+            trial.until("↑↓ recall".encode(), focus_offset, plain=True, limit=5)
             # Wait for actual historical ingestion; elapsed time is not evidence.
             trial.send(b"/queue\r")
             trial.until(b"Input queue", plain=True, limit=12)
@@ -963,7 +963,7 @@ def queue_history_admission(fixture, source):
 
 
 def managed_queue_reorder(fixture):
-    # These messages are durably accepted but held behind a failed predecessor.
+    # These messages are durably accepted but held by an owner-generation transition.
     # The owner cannot dispatch them before the TUI move is observed.
     result = fixture.command("--seed-queue-reorder")
     assert result[0] == 0, result
@@ -978,7 +978,7 @@ def managed_queue_reorder(fixture):
                 break
             assert time.monotonic() < end, screen
             trial.read(0.025)
-        trial.send(b"\x1b[A")  # From empty editor, focus the last accepted row.
+        trial.send(b"\x1b[1;5A")  # Ctrl+Up focuses the last accepted row.
         trial.until(b"[ move up", plain=True, limit=5)
         offset = len(trial.output)
         trial.send(b"[")
@@ -987,7 +987,7 @@ def managed_queue_reorder(fixture):
         screen = trial.screen.text()
         assert screen.index("queue-reorder-second") < screen.index("queue-reorder-first"), screen
         trial.send(b"\x1b")
-        trial.until(b"^P/^N recall", plain=True, limit=5)
+        trial.until("↑↓ recall".encode(), plain=True, limit=5)
         trial.send(b"/quit\r")
         trial.finish()
     finally:
@@ -1135,16 +1135,23 @@ def composer_interactions(fixture, source):
             trial.send(b"preserved draft")
             trial.until(b"preserved draft", plain=True)
             offset = len(trial.output)
-            trial.send(b"\x1b[B")
+            trial.send(b"\x1b[B")  # Plain Down on the final input row enters status focus.
             trial.until(b"Enter open", offset, plain=True)
             offset = len(trial.output)
             trial.send(b"\r")
             trial.until("↑↓ select".encode(), offset, plain=True)
             trial.until(b"Composer-two", plain=True)
+            # Registry order follows stable identities, not project names.
+            # Select the named row rather than assuming it is last.
+            picker_rows = [line for line in trial.screen.text().splitlines()
+                           if ("Composer-one" in line or "Composer-two" in line)
+                           and "chars" not in line]
+            selected = next(i for i, line in enumerate(picker_rows) if "Composer-two" in line)
             offset = len(trial.output)
-            trial.send(b"\x1b[F\r")
-            trial.until(b"Project selected", offset, plain=True)
+            trial.send(b"\x1b[H" + b"\x1b[B" * selected + b"\r")
             trial.until(b"Enter open", offset, plain=True)
+            trial.until(b"Composer-two", offset, plain=True)
+            assert "Composer-two" in trial.screen.text(), trial.screen.text()
             assert "preserved draft" in trial.screen.text(), trial.screen.text()
             offset = len(trial.output)
             trial.send(b"\t\r")
@@ -1164,9 +1171,9 @@ def composer_interactions(fixture, source):
             assert "Configuration · Esc closes" not in trial.screen.text()
             trial.send(b"\x1b")
             trial.idle(0.1)
-            trial.send(b"\x10")
+            trial.send(b"\x1b[A")  # Plain Up recalls submitted input.
             trial.until(b"/project list", plain=True)
-            trial.send(b"\x0e")
+            trial.send(b"\x1b[B")  # Plain Down restores the unsent draft.
             trial.until(b"preserved draft", plain=True)
             trial.send(b"\x01/quit\r")
             trial.finish()
@@ -1174,6 +1181,121 @@ def composer_interactions(fixture, source):
             trial.close()
             fixture.stop()
         print("PASS composer project/model selectors, acknowledged model save, preserved draft, history and cleanup")
+
+
+def long_observation(fixture, source):
+    import threading
+
+    helper = source.parent / "asura-model"
+    shutil.copyfile(helper, fixture.root / "asura-model")
+    (fixture.root / "asura-model").chmod(0o700)
+    project = fixture.root / "project"
+    project.mkdir(mode=0o700)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(0.1)
+    endpoint = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    stopped = threading.Event()
+    chatting = threading.Event()
+    errors = []
+
+    def serve():
+        end = time.monotonic() + 120
+        try:
+            for _ in range(8):
+                while not stopped.is_set() and time.monotonic() < end:
+                    try:
+                        peer, _ = listener.accept()
+                        break
+                    except socket.timeout:
+                        continue
+                else:
+                    return
+                with peer:
+                    peer.settimeout(2)
+                    request = bytearray()
+                    while True:
+                        data = peer.recv(4096)
+                        assert data, "incomplete fixture request"
+                        request.extend(data)
+                        assert len(request) <= 65536, "fixture request limit"
+                        if b"\r\n\r\n" in request:
+                            header, body = request.split(b"\r\n\r\n", 1)
+                            length = next((int(line.split(b":", 1)[1]) for line in header.split(b"\r\n")
+                                           if line.lower().startswith(b"content-length:")), 0)
+                            assert length <= 65536
+                            if len(body) >= length:
+                                break
+                    if request.startswith(b"POST /api/show "):
+                        body = b'{"capabilities":["completion"],"model_info":{"fixture.context_length":8192}}'
+                        peer.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+                    elif request.startswith(b"POST /api/chat "):
+                        chatting.set()
+                        peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                        for _ in range(18):
+                            peer.sendall(b'{"message":{"role":"assistant","content":"progress "},"done":false}\n')
+                            until = time.monotonic() + 4
+                            while time.monotonic() < until:
+                                assert time.monotonic() < end, "fixture server deadline"
+                                if stopped.wait(0.1):
+                                    return
+                        peer.sendall(b'{"message":{"role":"assistant","content":"COMPLETE"},"done":true,"done_reason":"stop","prompt_eval_count":1024,"eval_count":19}\n')
+                        return
+                    else:
+                        raise AssertionError("unexpected fixture request")
+        except Exception as error:
+            if not stopped.is_set():
+                errors.append(error)
+
+    server = threading.Thread(target=serve, name="asura-long-observation")
+    server.start()
+    trial = None
+    try:
+        trial = fixture.launch()
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        for key, value in [("providers.ollama.endpoint", endpoint), ("model", "ollama:fixture")]:
+            trial.send(f"/config set {key} {value}\r".encode())
+            trial.until(f"Saved {key}".encode(), plain=True)
+            trial.send(b"\x1b")
+            trial.idle(0.1)
+        trial.send(b"Reply when ready.\r")
+        end = time.monotonic() + remaining(110)
+        while not chatting.is_set():
+            assert not errors, errors
+            assert time.monotonic() < end, trial.screen.text()
+            trial.read(0.025)
+        started = time.monotonic()
+        typed = False
+        while "COMPLETE" not in trial.screen.text():
+            screen = trial.screen.text()
+            assert "Observation deadline" not in screen, screen
+            assert "Incomplete response" not in screen, screen
+            assert not errors, errors
+            assert time.monotonic() < end, screen
+            if time.monotonic() - started >= 66 and not typed:
+                trial.send(b"still-responsive")
+                trial.until(b"still-responsive", plain=True, limit=2)
+                typed = True
+            trial.read(0.025)
+        assert typed and time.monotonic() - started > 65
+        trial.until(b"12% input", plain=True)
+        assert "still-responsive" in trial.screen.text()
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        assert not list((fixture.root / "home/.asura/run").glob("model-*"))
+        print("PASS real TUI observation beyond 65 seconds, responsive typing, full response, measured context and owned cleanup")
+    finally:
+        if trial is not None:
+            trial.close()
+        stopped.set()
+        server.join(timeout=3)
+        listener.close()
+        assert not server.is_alive(), "fixture server cleanup unconfirmed"
 
 
 def main():
@@ -1185,12 +1307,25 @@ def main():
     composer = len(sys.argv) == 3 and sys.argv[2] == "--composer"
     queue_history = len(sys.argv) == 3 and sys.argv[2] == "--queue-history"
     queue_reorder = len(sys.argv) == 3 and sys.argv[2] == "--queue-reorder"
-    assert len(sys.argv) == 2 or native or setup or models or composer or queue_history or queue_reorder, __doc__
+    long = len(sys.argv) == 3 and sys.argv[2] == "--long-observation"
+    assert len(sys.argv) == 2 or native or setup or models or composer or queue_history or queue_reorder or long, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
+    if long:
+        DEADLINE = time.monotonic() + 160
     source = Path(sys.argv[1]).resolve(strict=True)
+    probe = subprocess.run(
+        [str(source), "--asura-lifecycle-fixture-probe"],
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=3,
+    )
+    assert (probe.returncode == 0
+            and probe.stdout == b"ASURA_ISOLATED_LIFECYCLE_FIXTURE_V1\n"
+            and not probe.stderr), "PTY journey requires the isolated lifecycle fixture"
     fixture = Fixture(source)
     try:
+        if long:
+            long_observation(fixture, source)
+            return
         if queue_reorder:
             managed_queue_reorder(fixture)
             return
@@ -1224,7 +1359,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

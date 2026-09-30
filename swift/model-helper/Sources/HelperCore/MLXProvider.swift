@@ -46,7 +46,7 @@ enum MLXProvider {
         let model = MLXLanguageModel(configuration: configuration,
             capabilities: profile.native,
             weightsLocation: { _ in directory }, load: { _, _ in container })
-        return FoundationBackend(model: model, contextTokens: capacity,
+        return FoundationBackend(model: model, contextTokens: capacity, contextSource: .mlx,
             modelName: "mlx:\(name)", supportsTools: supportsTools, capabilityProfile: profile)
     }
 }

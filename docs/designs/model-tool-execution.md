@@ -110,7 +110,8 @@ policy design; MT1 does not silently authorize project egress.
 
 Initial service limits are one active tool worker, one pending call, eight calls
 per logical turn, 16 KiB per read result and 64 KiB aggregate result bytes per turn.
-Each tool has a two-second deadline within the existing 60-second turn deadline.
+Each ordinary tool has its own two-second deadline at admission. The turn has
+no elapsed-time expiry under the cancellation-driven policy.
 A requested read limit must be 1 through 16,384 bytes. Offset plus limit must not
 overflow. Paths, arguments and result bytes remain out of diagnostic logs.
 
@@ -631,7 +632,7 @@ the verified local route described below. Numeric loopback alone is not proof of
 local inference because a daemon can forward.
 
 No additional work queue or blocking call is introduced. Existing provider load
-workers, five-second Hello, 60-second turn, one pending callback, eight tool calls,
+workers, five-second Hello, cancellation-driven turn, one pending callback, eight tool calls,
 two-second host workers, retained cancellation and cleanup rules apply. Three native
 inference allocations of 256, 128 and 128 tokens preserve the 512-token reservation.
 
@@ -880,3 +881,15 @@ The selected [shell design](shell-tool.md) adds one noninteractive command tool.
 It requires a separate execution grant for an admitted foreground turn.
 The existing read grant does not authorize commands. The service retains execution,
 cleanup and durable result ownership through the same conversation pipeline.
+
+
+### Cancellation-driven turns — selected 2026-09-30
+
+The [turn lifetime policy](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
+removes the fixed whole-turn expiry. The tool budget retains call count, total
+result bytes, one pending call, identity, generation and cancellation checks.
+Ordinary tool work receives its existing two-second deadline at tool admission.
+Shell receives its validated requested duration. Cached results revalidate exact
+call identity and current authority; elapsed turn time does not invalidate them.
+An expired live-tool deadline still prevents delivery. Tests must cover a late
+admission and cached result, plus cancellation and expired-tool rejection.

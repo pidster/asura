@@ -263,14 +263,9 @@ fn validate_cached_tool(
     call: &tools::Call,
     turn: &journal::TurnAccepted,
     foreground_user: bool,
-    deadline: Instant,
-    now: Instant,
 ) -> Result<(), tools::Rejection> {
     if prior != call {
         return Err(tools::Rejection::IdentityConflict);
-    }
-    if now >= deadline {
-        return Err(tools::Rejection::Expired);
     }
     tools::validate_authority(
         prior,
@@ -415,12 +410,12 @@ struct Active {
     cancel: Option<journal::Cause>,
     cancel_replies: Vec<pb::Envelope>,
     terminal: Option<journal::TurnTerminal>,
+    failure_reason: Option<&'static str>,
     tool: Option<LiveTool>,
     tool_budget: tools::Budget,
     tool_executor: tools::Executor,
     shell_worker: crate::shell_worker::Worker,
     tool_cache: Vec<(tools::Call, mp::ToolResult)>,
-    deadline: Instant,
 }
 impl Active {
     /// Revoke pending database submission at the lifecycle event's entry point.
@@ -523,6 +518,7 @@ pub(crate) struct Owner {
     started: bool,
     automatic_initialization: AutomaticInitialization,
     model_context: VecDeque<(journal::Id, pb::ModelContext)>,
+    hold_reasons: BTreeMap<journal::Id, &'static str>,
     wake: Option<asura_platform::events::WakeSender>,
     observations: Vec<(pb::Envelope, Instant)>,
 }
@@ -559,9 +555,18 @@ impl Owner {
             started: false,
             automatic_initialization: AutomaticInitialization::NotAttempted,
             model_context: VecDeque::new(),
+            hold_reasons: BTreeMap::new(),
             wake: None,
             observations: Vec::new(),
         }
+    }
+    fn note_hold(&mut self, input: journal::Id, reason: &'static str) {
+        if self.hold_reasons.len() == 16 {
+            if let Some(key) = self.hold_reasons.keys().next().copied() {
+                self.hold_reasons.remove(&key);
+            }
+        }
+        self.hold_reasons.insert(input, reason);
     }
     pub(crate) fn sensor_status(&mut self, epoch: journal::Id, status: pb::InspectReply) {
         let status = sensors::StatusSnapshot {
@@ -1660,7 +1665,9 @@ impl Owner {
                         .iter()
                         .find(|(id, _)| *id == operation)
                         .filter(|(_, value)| {
-                            value.model_name.is_some() || value.input_tokens.is_some()
+                            value.model_name.is_some()
+                                || value.input_tokens.is_some()
+                                || value.capacity_tokens.is_some()
                         })
                         .map(|(_, value)| value.clone()),
                 }),
@@ -1835,8 +1842,9 @@ impl Owner {
             cancel: None,
             cancel_replies: Vec::new(),
             terminal: None,
+            failure_reason: None,
             tool: None,
-            tool_budget: tools::Budget::new(now + std::time::Duration::from_secs(60)),
+            tool_budget: tools::Budget::cancellation_driven(),
             tool_executor,
             shell_worker: {
                 let mut worker = crate::shell_worker::Worker::default();
@@ -1846,7 +1854,6 @@ impl Owner {
                 worker
             },
             tool_cache: Vec::new(),
-            deadline: now + std::time::Duration::from_secs(60),
         });
         Ok(())
     }
@@ -1911,6 +1918,7 @@ impl Owner {
                         self.out.push_back(error(request, message));
                     }
                     Job::QueuePrepare(input) => {
+                        self.note_hold(input, message);
                         if let Err(e) = self.submit(
                             writer::Command::InputDecision {
                                 request: asura_platform::random_id(),
@@ -2225,7 +2233,7 @@ impl Owner {
                 let tool = active.tool.as_mut().expect("pending tool");
                 tool.intent_committed = true;
                 if !matches!(tool.call.arguments, tools::Arguments::Shell { .. }) {
-                    tool.deadline = active.deadline.min(now + std::time::Duration::from_secs(2));
+                    tool.deadline = now + std::time::Duration::from_secs(2);
                 }
                 active.cursor += 1;
             }
@@ -2250,7 +2258,7 @@ impl Owner {
                     let wire = tool_wire_result(&result);
                     active.tool_cache.push((tool.call.clone(), wire.clone()));
                     active.cursor += 1;
-                    if now >= active.deadline || self.closing {
+                    if now >= tool.deadline || self.closing {
                         Self::failed(active, "model_timeout", now);
                     }
                     if tool.call.arguments.is_memory()
@@ -2307,6 +2315,11 @@ impl Owner {
                     .inputs
                     .into_iter()
                     .map(|v| {
+                        // Exact decision replay returns current state. Preserve a
+                        // newer Hold reason if a resumed preparation failed again.
+                        if v.status != journal::InputStatus::Held {
+                            self.hold_reasons.remove(&v.input.request);
+                        }
                         let new_conversation = v.v2.as_ref().map(|input| input.new_conversation);
                         pb::ConversationQueueEntry {
                             input_id: Some(v.input.request.to_vec()),
@@ -2325,6 +2338,10 @@ impl Owner {
                             generation: v.operation.map(|(_, generation)| generation),
                             new_conversation,
                             order_position: v.order_position,
+                            hold_reason: (v.status == journal::InputStatus::Held)
+                                .then(|| self.hold_reasons.get(&v.input.request).copied())
+                                .flatten()
+                                .map(str::to_owned),
                         }
                     })
                     .collect();
@@ -2343,6 +2360,7 @@ impl Owner {
                 ));
             }
             Job::QueuePrepare(input) => {
+                self.hold_reasons.remove(&input);
                 let queued = value.queued.expect("queued preparation");
                 let submit = pb::ConversationSubmit {
                     request_id: Some(queued.request.to_vec()),
@@ -2351,16 +2369,18 @@ impl Owner {
                     expected_generation: Some(queued.generation),
                     prompt: Some(queued.prompt),
                 };
-                if self.closing
-                    || self
-                        .prepared(
-                            None,
-                            submit,
-                            value.prepared.expect("queue prepare result"),
-                            now,
-                        )
-                        .is_err()
-                {
+                let result = if self.closing {
+                    Err("service_closing")
+                } else {
+                    self.prepared(
+                        None,
+                        submit,
+                        value.prepared.expect("queue prepare result"),
+                        now,
+                    )
+                };
+                if let Err(reason) = result {
+                    self.note_hold(input, reason);
                     if let Err(e) = self.submit(
                         writer::Command::InputDecision {
                             request: asura_platform::random_id(),
@@ -2443,7 +2463,9 @@ impl Owner {
                             .iter()
                             .find(|(id, _)| *id == terminal.operation)
                             .filter(|(_, value)| {
-                                value.model_name.is_some() || value.input_tokens.is_some()
+                                value.model_name.is_some()
+                                    || value.input_tokens.is_some()
+                                    || value.capacity_tokens.is_some()
                             })
                             .map(|(_, value)| value.clone());
                         event.tools = self.tool_progress(terminal.operation);
@@ -2502,8 +2524,9 @@ impl Owner {
         });
     }
     #[track_caller]
-    fn failed(active: &mut Active, message: &str, now: Instant) {
+    fn failed(active: &mut Active, message: &'static str, now: Instant) {
         active.revoke_create();
+        active.failure_reason.get_or_insert(message);
         tracing::warn!(
             stage = "service_failure",
             site_line = std::panic::Location::caller().line(),
@@ -2682,6 +2705,8 @@ impl Owner {
             match event {
                 ModelEvent::Available {
                     context_tokens,
+                    reported_context_tokens,
+                    context_source,
                     model_name,
                     tools_available,
                     capabilities,
@@ -2694,6 +2719,9 @@ impl Owner {
                         active.turn.operation,
                         pb::ModelContext {
                             model_name,
+                            capacity_tokens: Some(context_tokens),
+                            reported_max_tokens: Some(reported_context_tokens),
+                            capacity_source: Some(context_source),
                             ..Default::default()
                         },
                     ));
@@ -2774,8 +2802,6 @@ impl Owner {
                                         &call,
                                         &active.turn,
                                         active.foreground_user,
-                                        active.deadline,
-                                        now,
                                     )
                                     .is_err()
                                         || active.model.tool_result(result.clone()).is_err()
@@ -2822,18 +2848,9 @@ impl Owner {
                                             ..
                                         } = &call.arguments
                                         {
-                                            let available = active
-                                                .deadline
-                                                .saturating_duration_since(now)
-                                                .saturating_sub(std::time::Duration::from_secs(3));
-                                            let duration =
-                                                available.min(std::time::Duration::from_secs(
-                                                    u64::from(*timeout_seconds),
-                                                ));
-                                            if duration.as_millis() == 0 {
-                                                Self::failed(active, "model_timeout", now);
-                                                continue;
-                                            }
+                                            let duration = std::time::Duration::from_secs(
+                                                u64::from(*timeout_seconds),
+                                            );
                                             deadline = now
                                                 + std::time::Duration::from_millis(
                                                     duration.as_millis() as u64,
@@ -3082,18 +3099,20 @@ impl Owner {
                         self.out.push_back(error(request, "model_unavailable"));
                     }
                     let queued = active.queue_input;
+                    let reason = active.failure_reason.unwrap_or("model_start_failed");
                     self.active = None;
-                    if let Some(input) = queued
-                        && let Err(e) = self.submit(
+                    if let Some(input) = queued {
+                        self.note_hold(input, reason);
+                        if let Err(e) = self.submit(
                             writer::Command::InputDecision {
                                 request: asura_platform::random_id(),
                                 input,
                                 action: journal::InputAction::Hold,
                             },
                             Job::QueueHold,
-                        )
-                    {
-                        self.unavailable = Some(storage_error(e));
+                        ) {
+                            self.unavailable = Some(storage_error(e));
+                        }
                     }
                 }
                 return;
@@ -3327,7 +3346,7 @@ impl Owner {
                                         device: project.device,
                                         inode: project.inode,
                                     },
-                                    active.deadline,
+                                    tool.deadline,
                                 )
                             });
                         if let Err(error) = outcome {

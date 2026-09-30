@@ -30,7 +30,9 @@ replaced them. The old IQ1 predecessor chain based on immutable enqueue order
 also cannot define the new reorderable order. New records use this contract;
 replay of old records retains their original dependency meaning. IQ2's atomic
 promotion, exact target validation, cancel-and-replace behavior and prompt size
-limit remain in force.
+limit remain in force. IQ2's automatic hold of ordinary follow-ups after a
+settled steering cancellation applies to legacy kind-12 inputs. Kind-18 Queue
+successors keep their durable order behind the promoted replacement.
 
 ## Ownership and process boundaries
 
@@ -187,12 +189,36 @@ No operation from a lane runs concurrently with another operation from that
 conversation. Model reservation, current configuration and complete-turn history
 are checked only at dispatch. A queued input has no reserved model budget.
 
-If the preceding operation in the same conversation fails, is cancelled or has
-unknown settlement, queued successors become `Held`. Reordering does not erase
-that hold cause. Explicit Resume clears the selected hold through IQ1's durable
-decision. Dropping a held head lets the next item become selectable only when
-its dependency is safe; otherwise it remains Held and needs its own Resume.
-These rules prevent a move from silently treating failed work as completed.
+For kind-18 Queue inputs, a committed terminal `Failed` or `Cancelled` outcome
+settles the preceding operation. Queued successors and inputs submitted after
+that terminal remain `Queued`; the service dispatches them in durable lane order.
+The next prompt uses the normal history policy. A failed response is not reported
+as a successful response or retried by this transition. This rule replaces IQ1's
+successful-predecessor requirement only for kind-18 Queue inputs. Legacy kind-12
+inputs keep their original dependency rule. An interrupted operation after owner
+restart does not grant dispatch authority. Owner-generation replay, explicit Hold,
+and uncertain journal settlement keep undispatched inputs `Held` until Resume or
+Drop. Reordering does not erase an explicit or recovery hold. A held head blocks
+later inputs in its lane; another lane can run.
+A preparation failure may also hold an input before model admission. The service
+publishes a bounded reason code with a Hold that it caused during the current
+owner lifetime. The queue entry carries optional `hold_reason`; the client shows
+it beside `Held`. The reason is diagnostic, not authority. It clears when Resume or Drop moves the input out of Held, or dispatch begins.
+An exact decision replay preserves a newer Hold reason. An older Held entry after restart has no recorded cause and is
+shown as `Held (reason unavailable)`; the client must not guess that a prior
+model failure caused it. This adds no journal record or format change. The
+service keeps at most 16 reason entries in memory and never logs prompt text.
+`Input accepted by service` means only that the queue write committed. The UI
+must not present it as model admission. A Held row explains that the worker
+will not dispatch it until the user resumes or drops it.
+The storage authority derives this status from existing format-1 terminal and
+input records. The service scheduler consumes that status; the TUI does not
+infer or override it. The terminal-eligibility change adds no blocking call,
+worker, queue, or journal record.
+The existing 16-input capacity, eight-slot journal worker, two-second writer
+deadline and cancellation-driven model lifetime still apply. An uncertain append fences
+scheduling until the canonical writer resolves it. Replay and dispatch remain
+idempotent under the existing request and owner-generation checks.
 
 The existing IQ2 `Send now` action may select a `Queued` or `Held` input only
 while an exact operation in the same conversation is active. The service
@@ -256,7 +282,9 @@ stateDiagram-v2
     Unconfirmed --> RejectedLocal: Exact request resolves rejected
     RejectedLocal --> EditorRestored: Enter restores exact text to empty editor
     Queued --> Queued: Durable reorder
-    Queued --> Held: Dependency failure or owner restart
+    Queued --> Queued: Earlier turn fails or is cancelled with committed terminal
+    Queued --> Held: Owner restart or explicit Hold
+    Queued --> Held: Preparation failure and publish current owner reason
     Held --> Queued: Durable Resume
     Queued --> Steering: Send now with exact active target
     Held --> Steering: Send now with exact active target
@@ -292,11 +320,19 @@ and is never dispatched twice. A missing journal or graph binding does not
 create a replacement queue. A queue subscription gives a bounded projection;
 the TUI fences it by project, service epoch and order revision.
 
+The PTY journey must verify that its executable is the isolated lifecycle
+fixture before it launches a TUI or issues any service command. The fixture
+must return a fixed probe response without accessing a runtime. If the probe
+fails, the journey stops before fixture creation. This prevents a mistaken
+production-binary argument from reaching the account's live service. The
+positive probe and a production-binary rejection are required checks.
+
 For fairness, the scheduler selects each continuously ready lane once before
 selecting any ready lane a second time. A lane leaves this set when its project
 becomes unavailable or its head becomes Held. This is a scheduling invariant,
 not a latency promise:
-one model call may occupy the service for its existing 60-second deadline.
+one model call may occupy the service until it completes or is cancelled.
+Controls and cancellation must remain responsive during that work.
 The queue panel shows at most four unresolved rows and an overflow count. It
 uses the existing padded grey-blue panel style, bounded 256-byte excerpts and
 explicit local, queued, held, steering, rejected and unconfirmed labels. Up
@@ -358,8 +394,10 @@ anchors. Existing IQ2 promotion of a kind-12 input keeps its original contract.
 | MQ03 | Two accepted pending inputs; move second to front | One kind-19 mutation; new revision and dispatch order persist after restart | Replay unit; real journal integration; service and PTY end to end |
 | MQ04 | Concurrent reorder clients use same order revision | Exactly one wins; loser gets stale revision without losing text | Unit CAS; service process integration; two-client end to end |
 | MQ05 | Same reorder request retried after lost reply | Original position/result returned; no second move or dispatch | Codec/replay unit; fault-injected journal integration; control-client end to end |
-| MQ06 | Operation active; select same-conversation queued item to send now | IQ2 promotion commits before cancellation; one replacement; other affected items Held | Unit target/bounds; real service/helper integration; PTY end to end |
-| MQ07 | Failed predecessor, restart, or uncertain append | Successors Held; unrelated lanes progress; explicit Resume needed | Scheduler unit; restart journal integration; PTY end to end |
+| MQ06 | Operation active; select same-conversation queued item to send now | IQ2 promotion commits before cancellation; one replacement; kind-18 successors stay ordered behind it unless explicitly held | Unit target/bounds; real service/helper integration; PTY end to end |
+| MQ07 | A turn fails or is cancelled with a committed terminal; one kind-18 successor is already queued; then one new input arrives | Existing and new inputs stay Queued and dispatch in durable lane order, without duplicating the failed turn | Replay and scheduler unit; real journal/service integration; PTY end to end |
+| MQ07R | Owner restarts with undispatched inputs or journal settlement is uncertain | Inputs remain Held; no automatic retry; unrelated lanes progress; explicit Resume or Drop is needed | Replay unit; restart journal integration; PTY end to end |
+| MQ07H | Provider preparation fails before admission | Input becomes Held with a reason code; queue pane explains required Resume; no model turn is fabricated | Service unit and queue reply integration; PTY held-row rendering |
 | MQ08 | 16 unresolved inputs, local outbox full, or 8 MiB journal full | Definite rejection preserves draft and existing queue; controls remain responsive | Bounds unit; fault-injected service integration; PTY end to end |
 | MQ09 | Two ready lanes across projects, one busy model | Scheduler rotates after each terminal; no lane starves under the stated invariant | Scheduler unit; two-project service integration; control-client end to end |
 | MQ10 | Reconnect after dispatch and owner crash | Exact input maps to one operation; historical queue rows do not lower restored cursor | Replay unit; restart integration; relaunch PTY end to end |
@@ -372,3 +410,13 @@ add client outbox, serial sender, compact panel, move interaction and terminal
 tests. Run the mandatory CLI lifecycle gate and the native service process suite.
 Use a real macOS terminal for final layout and stalled-backend checks. Record
 which cases ran; mock success does not prove service durability or model results.
+
+
+### Recorded queue and navigation checks — 2026-09-29
+
+The isolated process journey verified the preparation Hold reason, a second Hold
+following Resume, and retention of that reason on exact Resume replay. Restart
+retained the input and omitted the transient reason. The full CLI lifecycle and
+PTY suite passed with a matching client/helper package. It covered input recall,
+Shift+Up/Down history navigation, two restored-history admissions, queue reorder,
+durable replay and owned-process cleanup. The account's live backend was unchanged.

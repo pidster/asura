@@ -730,8 +730,8 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
     result
 }
 
-// Seed two accepted but held inputs in the fixture's private journal. A failed
-// predecessor keeps the scheduler from racing the TUI's reorder interaction.
+// Seed two accepted inputs in the fixture's private journal. An owner-generation
+// transition holds them so the scheduler cannot race the TUI reorder interaction.
 fn queue_reorder_fixture(verify: bool) -> Result<()> {
     use asura_storage::authority::{conversation as j, writer as w};
     fn execute(writer: &w::WriterHandle, command: w::Command) -> Result<w::Reply> {
@@ -905,9 +905,26 @@ fn queue_reorder_fixture(verify: bool) -> Result<()> {
             )?;
             input_ids.push(reply.accepted_input_id.ok_or("missing accepted input ID")?);
         }
-        let state = execute(&writer, w::Command::Open)?
+        let before_restart = execute(&writer, w::Command::Open)?
             .replay
             .ok_or("missing seeded replay")?;
+        require(
+            before_restart.input_status(input_ids[0]) == Some(j::InputStatus::Queued)
+                && before_restart.input_status(input_ids[1]) == Some(j::InputStatus::Queued),
+            "committed failure stranded new inputs",
+        )?;
+        let revision = before_restart.revision;
+        drop(before_restart);
+        let state = execute(
+            &writer,
+            w::Command::Append {
+                expected_revision: revision,
+                record: j::Record::OwnerGeneration,
+                admission: None,
+            },
+        )?
+        .replay
+        .ok_or("missing owner transition")?;
         require(
             state.input_status(input_ids[0]) == Some(j::InputStatus::Held)
                 && state.input_status(input_ids[1]) == Some(j::InputStatus::Held),
@@ -924,6 +941,10 @@ fn queue_reorder_fixture(verify: bool) -> Result<()> {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--asura-lifecycle-fixture-probe") {
+        println!("ASURA_ISOLATED_LIFECYCLE_FIXTURE_V1");
+        return;
+    }
     if matches!(
         std::env::args().nth(1).as_deref(),
         Some("--seed-queue-reorder" | "--verify-queue-reorder")

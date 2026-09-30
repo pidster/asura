@@ -484,7 +484,8 @@ sync behavior returns unavailable and blocks writes. Ordinary process-kill tests
 do not qualify physical power-loss durability.
 
 Deadlines: five seconds for startup replay, two seconds for append/flush observation,
-and 60 seconds from admission preparation through terminal generation observation.
+and the separately bounded preparation, handshake and admission stages in
+[provider integration](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30). Generation and client observation are cancellation-driven.
 Worker deadlines do not cancel a blocked syscall. Keep its writer slot, file handle
 and owner claim until settlement. Inspect and signal processing remain responsive.
 After the existing stop budget, retain RepairOnly ownership if work is unsettled.
@@ -675,9 +676,10 @@ Tests retain old generations to prove this backpressure and release them to resu
 
 Status: selected legacy kind-12 input contract, 2026-09-27. The service owns
 its durable records and existing replay. The [managed input queue](managed-input-queue.md)
-supersedes this section's busy-only and direct-idle submission rules for new
+supersedes this section's submission and successful-predecessor rules for new
 conversational input. New input uses kind-18 `InputQueuedV2`, including when the
-service is idle. Existing kind-12 records retain their original dependency and
+service is idle. A committed failed or cancelled turn does not hold kind-18 Queue
+successors. Existing kind-12 records retain their original dependency and
 steering meaning; they are not converted into reorderable records. The
 [composer interaction](composer-interactions.md) covers the current client.
 Wire stays 0.1 and journal format stays 1.
@@ -733,8 +735,9 @@ The replacement prompt includes the original user prompt and the new instruction
 it excludes incomplete assistant output. Their combined UTF-8 size must fit 32 KiB,
 or steering rejects before cancellation. A Steer is eligible only after its exact
 target is durably Cancelled by that steering request. Restart, unrelated user
-cancellation, service shutdown or failed settlement holds it instead. Ordinary
-follow-ups affected by that cancellation remain Held for explicit review.
+cancellation, service shutdown or failed settlement holds it instead. Legacy
+kind-12 follow-ups affected by that cancellation remain Held for explicit review.
+Kind-18 Queue successors follow the managed queue design.
 
 The journal records InputDecision with Hold for preparation failure, or Resume/Drop
 for explicit recovery. Decisions have unique request IDs and canonical digests; exact retries
@@ -789,7 +792,8 @@ flowchart TD
     Persist -->|Durable| Ack
 ```
 
-Selected scheduler flow. Durable queue records supply work; clients do not dispatch.
+Selected legacy kind-12 scheduler flow. Durable queue records supply work;
+clients do not dispatch. Kind-18 Queue inputs follow the managed queue design.
 
 ```mermaid
 flowchart TD

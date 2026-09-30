@@ -214,10 +214,38 @@ impl App {
         true
     }
     pub(super) fn history_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers == KeyModifiers::SHIFT
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && self.focus == Focus::Editor
+        {
+            if self.transcript.is_empty() {
+                return true;
+            }
+            if !self.history_focus {
+                self.history_focus = true;
+                self.history_scroll = self.history_scroll_max;
+            }
+            self.history_scroll = if key.code == KeyCode::Up {
+                self.history_scroll.saturating_sub(1)
+            } else {
+                self.history_scroll
+                    .saturating_add(1)
+                    .min(self.history_scroll_max)
+            };
+            return true;
+        }
         if !self.history_focus {
             return false;
         }
-        if key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('p' | 'n')) {
+        if (key.modifiers == KeyModifiers::CONTROL
+            && matches!(
+                key.code,
+                KeyCode::Char('p' | 'n') | KeyCode::Up | KeyCode::Down
+            ))
+            || (key.modifiers.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down))
+            || (key.modifiers == KeyModifiers::SHIFT
+                && matches!(key.code, KeyCode::Left | KeyCode::Right))
+        {
             self.history_focus = false;
             return false;
         }
@@ -226,13 +254,6 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.history_focus = false,
-            KeyCode::Up => self.history_scroll = self.history_scroll.saturating_sub(1),
-            KeyCode::Down if self.history_scroll >= self.history_scroll_max => {
-                self.history_focus = false;
-            }
-            KeyCode::Down => {
-                self.history_scroll = (self.history_scroll + 1).min(self.history_scroll_max)
-            }
             KeyCode::PageUp => {
                 self.history_scroll = self.history_scroll.saturating_sub(self.history_page)
             }

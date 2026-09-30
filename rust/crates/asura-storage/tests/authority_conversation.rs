@@ -682,6 +682,72 @@ fn v2_rejects_revision_gap_and_holds_after_owner_restart() {
     assert_eq!(state.input_status(id(45)), Some(InputStatus::Held));
     assert_eq!(state.ready_input(), None);
 }
+
+#[test]
+fn v2_committed_failure_or_cancellation_keeps_successors_eligible() {
+    for (kind, cause) in [
+        (TerminalKind::Failed, Cause::ProviderFailure),
+        (TerminalKind::Failed, Cause::Deadline),
+        (TerminalKind::Cancelled, Cause::UserCancel),
+    ] {
+        let mut j = Journal::started();
+        let first = queued_v2(40, 41, 42, 8, false, 1);
+        let second = queued_v2(44, 45, 46, 8, false, 2);
+        j.append(Record::InputQueuedV2(first.clone()));
+        if kind == TerminalKind::Cancelled {
+            j.append(Record::CancelRequested(CancelRequested {
+                operation: id(10),
+                generation: 1,
+                cause,
+            }));
+        }
+        j.append(Record::TurnTerminal(terminal(kind, cause, false)));
+        j.append(Record::InputQueuedV2(second.clone()));
+        let state = inspect(&j.bytes).unwrap();
+        assert_eq!(state.input_status(first.input), Some(InputStatus::Queued));
+        assert_eq!(state.input_status(second.input), Some(InputStatus::Queued));
+        assert_eq!(state.ready_input(), Some(first.input));
+
+        let mut next = turn();
+        next.request = first.dispatch_request;
+        next.original_conversation = Some(id(8));
+        next.expected_generation = 1;
+        next.generation = 2;
+        next.operation = id(30);
+        next.task = id(31);
+        next.prompt = first.prompt;
+        next.digest = request_digest(Request::Submit {
+            project: id(6),
+            conversation: Some(id(8)),
+            expected_generation: 1,
+            prompt: &next.prompt,
+        })
+        .unwrap();
+        j.append(Record::TurnAccepted(Box::new(next)));
+        assert_eq!(
+            inspect(&j.bytes).unwrap().input_status(first.input),
+            Some(InputStatus::Running)
+        );
+        j.append(Record::TurnTerminal(TurnTerminal {
+            operation: id(30),
+            generation: 2,
+            kind: TerminalKind::Failed,
+            cause: Cause::ProviderFailure,
+            final_cursor: u64::MAX,
+            usage_known: true,
+            output_tokens: 0,
+            charged_tokens: 0,
+            text: String::new(),
+        }));
+        let state = inspect(&j.bytes).unwrap();
+        assert_eq!(state.input_status(first.input), Some(InputStatus::Failed));
+        assert_eq!(state.ready_input(), Some(second.input));
+        j.append(Record::OwnerGeneration);
+        let state = inspect(&j.bytes).unwrap();
+        assert_eq!(state.input_status(second.input), Some(InputStatus::Held));
+        assert_eq!(state.ready_input(), None);
+    }
+}
 #[test]
 fn input_queue_is_durable_offset_backed_and_fifo_dispatch_is_atomic() {
     let mut j = Journal::started();

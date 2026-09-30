@@ -20,7 +20,7 @@ enum CoreAIProvider {
         let capacity = try AssetLocation.capacity(bundle.maxContextLength)
         try Task.checkCancellation()
         let model = try await CoreAILanguageModel(resourcesAt: directory)
-        return FoundationBackend(model: model, contextTokens: capacity,
+        return FoundationBackend(model: model, contextTokens: capacity, contextSource: .coreai,
             modelName: "coreai:\(name)", supportsTools: model.capabilities.contains(.toolCalling))
     }
 }

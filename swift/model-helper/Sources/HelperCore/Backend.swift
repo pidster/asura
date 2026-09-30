@@ -80,13 +80,27 @@ func reportModelFailure(_ error: any Error) {
     _ = bytes.withUnsafeBytes { Darwin.write(STDERR_FILENO, $0.baseAddress, $0.count) }
 }
 
+public enum ContextCapacitySource: UInt32, Sendable {
+    case system = 1, coreai = 2, mlx = 3, ollama = 4
+}
+
 public struct BackendStatus: Sendable {
     public let contextTokens: UInt32?
+    public let reportedContextTokens: UInt32?
+    public let contextSource: ContextCapacitySource?
     public let modelName: String?
     public let supportsTools: Bool
     public let localToolDestination: Bool
     public let capabilityProfile: CapabilityProfile?
-    public init(contextTokens: UInt32?, modelName: String? = nil, supportsTools: Bool = false, localToolDestination: Bool = false, capabilityProfile: CapabilityProfile? = nil) { self.contextTokens = contextTokens; self.modelName = modelName; self.supportsTools = supportsTools; self.localToolDestination = localToolDestination; self.capabilityProfile = capabilityProfile }
+    public init(contextTokens: UInt32?, reportedContextTokens: UInt32? = nil,
+        contextSource: ContextCapacitySource? = nil, modelName: String? = nil,
+        supportsTools: Bool = false, localToolDestination: Bool = false,
+        capabilityProfile: CapabilityProfile? = nil) {
+        self.contextTokens = contextTokens; self.reportedContextTokens = reportedContextTokens
+        self.contextSource = contextSource; self.modelName = modelName
+        self.supportsTools = supportsTools; self.localToolDestination = localToolDestination
+        self.capabilityProfile = capabilityProfile
+    }
 }
 public struct Snapshot: Sendable {
     public let text: String
@@ -123,7 +137,10 @@ public struct SystemBackend: ToolModelBackend {
             let capacity = UInt32(exactly: model.contextSize), capacity > 512 else {
             return BackendStatus(contextTokens: nil)
         }
-        return BackendStatus(contextTokens: capacity, modelName: model.variant.displayName, supportsTools: model.capabilities.contains(.toolCalling), capabilityProfile: CapabilityProfile(native: model.capabilities, provenance: .framework))
+        return BackendStatus(contextTokens: capacity, reportedContextTokens: capacity,
+            contextSource: .system, modelName: model.variant.displayName,
+            supportsTools: model.capabilities.contains(.toolCalling),
+            capabilityProfile: CapabilityProfile(native: model.capabilities, provenance: .framework))
     }
 
     public static func history(_ input: ModelInput) -> [Transcript.Entry] {
@@ -145,6 +162,7 @@ public struct SystemBackend: ToolModelBackend {
         let model = SystemLanguageModel.default
         guard case .available = model.availability else { throw BackendFailure(.modelUnavailable) }
         return FoundationBackend(model: model, contextTokens: UInt32(exactly: model.contextSize),
+            contextSource: .system,
             modelName: model.variant.displayName, supportsTools: true, reportsUsage: true,
             capabilityProfile: CapabilityProfile(native: model.capabilities, provenance: .framework),
             tokenCounter: { entries, tools in
@@ -169,22 +187,33 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
     public let model: Model
     public let capabilityProfile: CapabilityProfile
     private let contextTokens: UInt32?
+    private let reportedContextTokens: UInt32?
+    private let contextSource: ContextCapacitySource?
     private let modelName: String
     private let supportsTools: Bool
     private let localToolDestination: Bool
     private let reportsUsage: Bool
     private let tokenCounter: NativeTokenCounter?
-    public init(model: Model, contextTokens: UInt32?, modelName: String, supportsTools: Bool,
-        reportsUsage: Bool = false, localToolDestination: Bool = false, capabilityProfile: CapabilityProfile? = nil, tokenCounter: NativeTokenCounter? = nil) {
-        self.model = model; self.contextTokens = contextTokens; self.modelName = modelName
+    private let instrumentationFactory: (@Sendable (@escaping @Sendable (Snapshot) async throws -> Void) -> Model)?
+    public init(model: Model, contextTokens: UInt32?,
+        reportedContextTokens: UInt32? = nil, contextSource: ContextCapacitySource? = nil,
+        modelName: String, supportsTools: Bool,
+        reportsUsage: Bool = false, localToolDestination: Bool = false, capabilityProfile: CapabilityProfile? = nil, tokenCounter: NativeTokenCounter? = nil,
+        instrumentationFactory: (@Sendable (@escaping @Sendable (Snapshot) async throws -> Void) -> Model)? = nil) {
+        self.model = model; self.contextTokens = contextTokens
+        self.reportedContextTokens = reportedContextTokens ?? contextTokens
+        self.contextSource = contextSource; self.modelName = modelName
         let profile = capabilityProfile ?? CapabilityProfile(native: model.capabilities, provenance: .runtime)
         self.capabilityProfile = profile
         self.supportsTools = supportsTools && model.capabilities.contains(.toolCalling) && profile.support(.toolCalling) == .supported
         self.localToolDestination = localToolDestination
         self.reportsUsage = reportsUsage; self.tokenCounter = tokenCounter
+        self.instrumentationFactory = instrumentationFactory
     }
     public func status() async -> BackendStatus {
-        BackendStatus(contextTokens: contextTokens, modelName: modelName, supportsTools: supportsTools, localToolDestination: localToolDestination, capabilityProfile: capabilityProfile)
+        BackendStatus(contextTokens: contextTokens, reportedContextTokens: reportedContextTokens,
+            contextSource: contextSource, modelName: modelName, supportsTools: supportsTools,
+            localToolDestination: localToolDestination, capabilityProfile: capabilityProfile)
     }
     public func generate(_ input: ModelInput, maximumTokens: UInt32, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await generateSession(input, maximumTokens: maximumTokens, handler: nil, snapshot: snapshot)
@@ -200,7 +229,8 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
         try Task.checkCancellation()
         let entries = SystemBackend.history(input)
         let current = Transcript.Entry.prompt(.init(segments: [.text(.init(content: input.prompt))]))
-        let boundedModel = BoundedToolModel(base: model, maximumTokens: Int(maximumTokens), toolsEnabled: handler != nil)
+        let generationModel = instrumentationFactory?(snapshot) ?? model
+        let boundedModel = BoundedToolModel(base: generationModel, maximumTokens: Int(maximumTokens), toolsEnabled: handler != nil)
         do {
             let guardedHandler: ToolHandler?
             if let handler {

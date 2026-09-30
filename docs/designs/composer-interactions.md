@@ -24,8 +24,8 @@ Focused status items and selected list or queue rows use a lighter grey-blue
 background (RGB 70, 82, 94) and brighter text (RGB 245, 248, 250).
 Do not invert foreground and background colours for selection.
 
-An unmodified Down press on the final visual row of the draft enters status focus.
-Wrapped input rows count as rows. Down within the draft continues normal navigation.
+Down from the final visual input row enters status focus when input recall is
+not active. Ctrl+Down remains a shortcut from any input row.
 Project is the initial status item. Left, Right and Tab move between project and
 model. Up or Escape returns to the editor without changing the draft. Enter opens
 the selected list. Project displays its name alone, without a Project prefix.
@@ -51,13 +51,19 @@ after success. Failure preserves selection and draft. This affects future admiss
 it does not change a running model. The picker never loads weights or starts inference.
 Picker-origin requests must not clear drafts or open command-result overlays.
 
-Ctrl+P/Ctrl+N recall previously submitted commands and inputs. Up on the first
-visual draft row enters the queue when unresolved items exist. Otherwise, if the
-conversation has visible turns, Up enters the history pane and scrolls it upward.
-Up, Down, Page Up, Page Down, Home and End scroll that pane by visual rows.
-Down at the bottom and Escape return to the editor without changing the draft.
-The history pane retains its scroll position while focused and follows the latest
-turn again when focus returns to the editor. Command recall remains on Ctrl+P/N.
+Plain Up recalls previously submitted commands and inputs. While browsing input
+history, Down selects newer input and finally restores the exact unsent draft.
+The next Down on the final visual input row enters status focus. With no active
+recall, Down above the final row leaves focus in the editor. Ctrl+P/Ctrl+N remain recall aliases. Ctrl+Up
+enters the queue when unresolved items exist. Shift+Up/Down scroll the conversation
+history by visual rows without editing or submitting the draft. Shift+Up enters
+history focus even when the queue has items. At the top or bottom, further Shift
+arrows clamp and keep focus; Escape returns to the editor. Plain Up/Down while
+history is focused return to the editor and perform input recall. Page Up,
+Page Down, Home and End continue scrolling the focused pane. The history pane
+retains its scroll position while focused and follows the latest turn again when
+focus returns to the editor. A Shift+Up/Down event with no visible conversation
+is ignored; it must not select draft text. These local operations perform no I/O.
 Hints expose these interactions. Rendering and key handling perform no I/O.
 The hint row uses `^` for Control chords and `↵` for Return. On macOS it
 uses `⌥` for Option; on other systems it writes `Alt+`. It shows the newline
@@ -83,7 +89,7 @@ sending, unconfirmed and rejected rows explicitly. Display at most four rows
 and an overflow count; scroll the selected item into view. Running and terminal
 rows leave this panel.
 
-Up from the first editor row enters queue focus at the last unresolved input.
+Ctrl+Up from the editor enters queue focus at the last unresolved input.
 Up/Down traverse the queue; Down past its last item returns to the editor. Escape
 also returns. `[` and `]` move a selected unsent local row one position in the
 local outbox. For an accepted kind-18 row, they request a same-lane durable move
@@ -109,7 +115,7 @@ Selected design. Arrows describe key events and completed worker outcomes.
 ```mermaid
 stateDiagram-v2
   [*] --> Editor
-  Editor --> Status: Down on final visual row
+  Editor --> Status: Down on final input row after recall ends, or Ctrl+Down
   Status --> Editor: Up or Escape
   Status --> ProjectList: Enter on project
   Status --> ModelList: Enter on model
@@ -119,10 +125,11 @@ stateDiagram-v2
   Saving --> ModelList: Rejection or timeout
   ProjectList --> ProjectList: Stale or busy selection rejected
   ModelList --> Status: Escape cancels discovery
-  Editor --> Queue: Up on first row with queued inputs
-  Editor --> History: Up on first row with no queue and visible turns
-  History --> History: Arrows, Page keys, Home or End scroll
-  History --> Editor: Escape or Down at bottom
+  Editor --> Editor: Up/Down or Ctrl+P/N recall input
+  Editor --> Queue: Ctrl+Up with queued inputs
+  Editor --> History: Shift+Up/Down with visible turns
+  History --> History: Shift+Up/Down, Page keys, Home or End scroll
+  History --> Editor: Escape or plain Up/Down recalls input
   Queue --> Editor: Escape or Down past last row
   Queue --> Queue: Move, send now, acknowledge or reject
 ```
@@ -153,7 +160,7 @@ flowchart TD
 
 ## Limits, recovery and tests
 
-Reuse model inventory's 12-second client budget, configuration's existing bounded
+Reuse model inventory's 35-second client budget, configuration's existing bounded
 worker, and queue's five-second observation budget. Each retains its worker slot
 until settlement. Escape suppresses late picker results. Quit uses existing bounded
 worker cancellation and owned-service cleanup. No new polling or timer is added.
@@ -162,9 +169,9 @@ by existing 64-project, 65-model and 16-unresolved-input service limits. The loc
 outbox has its separate 16-input cap. Exit warns when local rows lack a durable
 receipt; an accepted service input survives client exit.
 
-Unit checks cover visual row boundaries, focus transitions, narrow layouts, hint
+Unit checks cover modifier routing, history boundaries, focus transitions, narrow layouts, hint
 states, list scrolling, stale selection, draft preservation, model save rejection,
-history pane scrolling, command recall and default queue admission. Backend checks cover durable promotion,
+history pane scrolling, exact unsent draft restoration, command recall and default queue admission. Backend checks cover durable promotion,
 exact retry, stale targets, duplicate steering, size rejection and restart hold.
 Integration and real terminal checks exercise project and model selectors, local
 staging, serial delivery, durable reorder, promotion and history while requests

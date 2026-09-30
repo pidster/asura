@@ -119,21 +119,21 @@ flowchart TD
 
 MP1 runs only inside the existing supervised helper. No network call runs on the
 service reactor or UI. One generation and one network request are active per helper.
-The outer service owns its 60-second absolute operation deadline and owned-child
+The outer service owns cancellation-driven generation and owned-child
 termination/reap. Adapter retries are disabled; cancellation invalidates its session.
 
 | Resource | Bound |
 | --- | --- |
 | Model name | 1 to 1,024 UTF-8 bytes, no whitespace/control |
 | Discovery request | 5 seconds total and 64 KiB response |
-| Generation request | 60 seconds total, never extending the outer deadline |
+| Generation request | No Asura whole-turn expiry;60 seconds network inactivity, SDK default resource bound |
 | Encoded request | 256 KiB including transcript and tool schemas |
 | NDJSON record | 64 KiB before decoding |
 | Total response | 4 MiB |
 | Response text | 60 KiB per generation |
 | Tool calls | 8 per generation; shared turn budget may be stricter |
 | Tool arguments | 16 KiB per call |
-| Context request | 8,192 tokens; not proof of the runtime's actual context capacity |
+| Ollama context request | At most 8,192 tokens, selected after `/api/show` discovery; reported maximum and effective request capacity are separate observations |
 | Output request | At most 512 tokens |
 
 Read network bytes incrementally and reject before growing the record buffer beyond
@@ -195,8 +195,9 @@ can cause failure. This validation is not a sandbox against another same-user pr
 Filesystem inspection and vendor initialization run in one detached helper task.
 The service remains the deadline and process-settlement owner. Cancellation stops
 admission; a stalled loader is terminated with its helper. The operation retains
-the existing deadlines: two seconds for helper preparation, five seconds for
-Hello and provider loading, then 60 seconds for the started operation. There are
+the boundary deadlines: twenty seconds for helper preparation and five seconds for
+Hello and provider loading. Started generation follows the cancellation-driven
+turn lifetime below. There are
 no retries or additional helper slots. A model that cannot load within five
 seconds fails availability; larger assets require explicit runtime qualification. Neither
 filesystem reads nor model loading runs on the service reactor or terminal renderer.
@@ -221,7 +222,8 @@ Tokenizer sentinel lengths do not establish capacity. Models without a supported
 capacity field fail explicitly until their format receives a specific adapter.
 
 Both providers use `FoundationBackend` and the same service-owned tool bridge.
-They report the selected model name and known capacity. They leave input counts and
+They report the selected model name, effective capacity, reported maximum and
+discovery source under the [context telemetry contract](model-context-telemetry.md#capacity-discovery-and-collection). They leave input counts and
 usage unknown when the adapter cannot establish an actual measurement. The common
 engine enforces response and tool budgets. Vendor generation honors the passed
 maximum response tokens. No capability declaration grants host access.
@@ -273,8 +275,8 @@ its native path. The recorded checks below are the current runtime evidence.
 ### MP2 Ollama limits
 
 Discovery must return a positive integer model-info key ending in `.context_length`.
-Conflicting values use the smallest capacity. The request context is the smaller
-of that capacity and 8,192 tokens; Hello reports this effective request capacity.
+Conflicting values use the smallest reported maximum. The request context is the smaller
+of that maximum and 8,192 tokens; Hello reports both values and the discovery source.
 Missing capacity fails unavailable. `num_predict` comes from the common engine's
 current request, between 1 and 512, so tool continuations preserve remaining budget.
 Stream usage above that request limit fails. Discovery keeps its resource bounds;
@@ -518,7 +520,7 @@ roots are empty; inaccessible roots and invalid metadata produce explicit issues
 
 The service reuses the canonical configuration snapshot reader on one isolated
 worker, with a two-second deadline. It then uses the verified `ModelOwner` helper
-lifecycle for metadata discovery: two-second preparation, five-second Hello and
+lifecycle for metadata discovery: twenty-second preparation, five-second Hello and
 existing cancellation, kill, reap and private-path cleanup. A dedicated Hello flag
 selects inventory-only execution. The helper returns inventory in Hello and exits;
 Begin, tool grants and generation are forbidden on this path. The helper executes
@@ -701,3 +703,191 @@ once, across the SDK loop; repeated correction cannot exceed three inference
 passes or eight proposals; failed inference and cancellation cannot return a
 correction or invoke the host; and rejected fields remain rejected without their
 values appearing in feedback. All four public tool names and schemas stay intact.
+
+
+## Cancellation-driven turn lifetime — selected 2026-09-30
+
+The owner's instruction removes the fixed 60-second whole-turn expiry. Generation
+has no automatic elapsed-time deadline. The canonical conversation owner retains
+its one active operation until completion, failure, explicit cancellation, helper
+exit, channel loss or service shutdown. No client or adapter owns another scheduler.
+A slow or stalled inference remains visibly pending and cancellable; silence alone
+is not proof of failure. Cancellation stops tool admission and settles owned work.
+
+This section supersedes earlier whole-turn deadlines in this design, the first
+conversation packet and context telemetry. Numeric response, tool-call, byte and
+queue limits remain unchanged. Startup preparation allows twenty seconds. Hello,
+input transfer and Ready-to-Start handoffs each have five-second deadlines. Existing
+250 ms helper cancellation and exact-child cleanup stages remain unchanged.
+Tools receive a fresh deadline at admission: ordinary reads and mutations use the
+existing two-second bound; shell uses its validated requested duration, at most
+60 seconds. A later tool does not inherit a deadline from turn startup.
+
+The optional Begin `deadline_remaining_ms` field is omitted by the service. Absence
+means cancellation-driven generation. A supplied positive legacy value up to
+60,000 ms remains a supported explicit generation deadline. Field and numeric acceptance stay
+compatible, but the duration now starts at Start rather than Begin. Old elapsed
+semantics are not preserved across this schema-digest boundary.
+The helper separately bounds input transfer and cancels that timer on Start; only
+an explicitly supplied generation deadline arms a running timer. Schema comments
+change, but the protocol remains 0.1 and journal format remains 1.
+
+Ollama retains its five-second discovery deadline and 60-second network inactivity
+bound. Its generation URLSession has no Asura-imposed total resource timeout.
+Foundation retains its default seven-day resource cap; this is an SDK limit. Incoming bytes
+keep the transport active; those bytes do not claim model-level progress. SDK-owned
+timeouts and actual provider failures remain reported failures. Async dispatch
+alone is not proof of dependency health. The service controls and client event
+loop remain responsive while inference is pending.
+
+### Turn lifetime — selected design
+
+```mermaid
+stateDiagram-v2
+    [*] --> Preparing
+    Preparing --> Hello: verified child
+    Preparing --> Failed: twenty second deadline or spawn failure
+    Hello --> Transfer: available metadata
+    Hello --> Failed: five second deadline or unavailable
+    Transfer --> Ready: complete input
+    Transfer --> Failed: five second deadline or protocol fault
+    Ready --> Running: durable Start
+    Ready --> Failed: five second handoff deadline
+    Running --> Running: output or admitted bounded tool
+    Running --> Running: elapsed time alone causes no expiry
+    Running --> Settling: completion or provider failure
+    Running --> Settling: user cancellation or shutdown
+    Running --> Settling: channel loss or helper exit
+    Settling --> Terminal: owned work settled and outcome committed
+    Failed --> Settling: cancel and clean owned resources
+```
+
+Validation: unit checks advance a running model beyond the old deadline and verify
+no timeout, while transfer and cancellation deadlines still fire. Tool-budget tests
+admit a later tool beyond 60 seconds while retaining call/byte and cancellation
+limits. Helper tests use an injected clock/timer boundary to verify omitted versus
+explicit generation deadlines. Process/PTY checks retain cancellation, disconnect,
+shutdown and responsiveness coverage under stalled inference. Native qualification
+must demonstrate a turn exceeding 60 seconds without an elapsed-time failure.
+Mocks and metadata fixtures do not establish that native result.
+
+
+The deterministic long-turn process check uses one private loopback Ollama-format
+fixture. It sends bounded response chunks over 64 seconds. The real service and
+packaged Swift helper must complete that turn, answer Inspect within 100 ms after
+60 seconds while inference is still active, and clean up their children. An exact
+PID/start-time witness must be absent after shutdown, and private model directories
+must be removed. The fixture uses at most four HTTP
+connections, 64 KiB request frames, a 120-second server lifetime, one server thread,
+nonblocking accept, two-second socket IO deadlines, and cancellable 100 ms waits.
+This proves the real transport and owner lifetime, not native model quality.
+
+Terminal diagnostics may record only numeric outcome, reason, revision, chunk and
+byte totals, and expected versus received accounting. They must not include text,
+prompts, arguments or model responses. Failed fixture runs retain at most 64 KiB
+of the isolated service log in a temporary diagnostic artifact.
+
+### Recorded lifetime checks — 2026-09-30
+
+The matching isolated package passed the 64-second loopback-provider process
+journey. The real service and Swift helper completed the full response. Inspect
+completed within 100 ms while inference was still active after 61 seconds. The
+service exited cleanly; the exact helper PID/start-time witness was absent and
+private model directories were removed. The model-free conversation process
+journey also passed initialization, project registration, restart, queue and audit
+checks, with owned service cleanup.
+
+Swift tests passed 86 cases, including cross-language fixtures, omitted and
+explicit generation deadlines, stalled handoffs, cancellation and timer fencing.
+Rust control tests passed 29 cases with one optional fixture-export test ignored;
+service tests passed 127 cases. Formatting and diff checks passed.
+
+Earlier process attempts exposed an invalid fixture completion record, then an SDK
+startup failure and a bounded startup timeout. The corrected fixture passed on a
+later run; this does not establish reliable native-provider startup. Installed
+native model generation beyond 60 seconds was not requalified. The running account
+backend was not restarted or replaced. The matching built package is an isolated
+development preview; it is not the active backend.
+
+### Preparation allowance correction — selected 2026-09-30
+
+Actual-package qualification repeatedly expired in Preparing, before any Ollama
+request, under the former two-second copy/verification allowance. The owner
+retains the same single cancellable preparation worker and private verified
+artifacts, with a twenty-second deadline for this boundary. No service handler
+waits for preparation. Cancellation checks, retained ownership of stalled filesystem
+calls, exact-child settlement and cleanup remain unchanged. This is a startup
+boundary; it does not impose a generation lifetime. Unit tests verify preparation
+expiry and cancellation; process checks use the full development helper package
+and verify successful admission and owned shutdown.
+
+The long-turn fixture has a 120-second total test allowance, accounting for the
+separate preparation and handoff bounds. Its server enforces the same total
+lifetime during streaming. The 61-second control check and 60-second minimum
+generation age are measured after admission, so preparation time cannot satisfy
+those inference assertions.
+
+### Client observation and startup budgets — selected 2026-09-30
+
+A TUI conversation subscriber has no whole-turn expiry. It stays on the existing
+isolated, cancellable observation worker until terminal, explicit cancellation,
+client shutdown or a transport/provider failure. Its individual socket requests,
+mailbox bounds, slot retention and shutdown deadlines remain unchanged. In
+particular, removing its former 65-second loop condition does not make a stalled
+transport call unbounded or introduce another subscriber or service scheduler.
+
+Model inventory needs up to two seconds configuration, twenty seconds preparation
+and five seconds Hello. Its typed client request allows thirty seconds; its TUI
+worker allows thirty-five, including two-second attachment and settlement margin.
+Direct conversation admission allows forty seconds for configuration/history,
+preparation, Hello, input transfer and journal acknowledgement. This does not change
+the separate five-second durable input-queue receipt or generation lifetime.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Attaching
+    Attaching --> Observing: bounded attachment succeeds
+    Attaching --> Stopped: failure or cancellation
+    Observing --> Observing: bounded response or heartbeat
+    Observing --> Observing: elapsed turn time alone
+    Observing --> Stopped: terminal result
+    Observing --> Stopped: transport failure or cancellation
+    Stopped --> [*]: owned worker settled
+```
+
+Validation includes existing worker cancellation, deadline, slot-retention and
+late-result tests, plus a real socket subscriber test lasting beyond the former
+loop deadline (with an injected clock boundary where available). Process checks
+use the full verified helper package; inventory waits must allow the complete
+preparation allowance rather than expire at the former eight-second test budget.
+CLI lifecycle and PTY checks retain input, history, queue and shutdown coverage.
+
+The explicit long-observation PTY regression uses the existing isolated lifecycle
+fixture and one private numeric-loopback server. It streams eighteen bounded
+records at four-second intervals (72 seconds) and a valid final stop record with
+1024 input tokens and 8192 capacity. The real TUI must remain subscribed after
+65 seconds, accept a draft during generation, receive COMPLETE and display 12%
+input. The server has one thread, at most eight connections, 64 KiB requests,
+two-second socket IO deadlines, 120-second lifetime and 100 ms cancellation
+checks. The test has a 160-second work budget plus the existing fresh cleanup
+budget. All service, helper, PTY supervisor and server resources are owned and
+settled; the account runtime is never used. This synthetic provider proves the
+real UI event route and response preservation, not native model quality.
+
+### Actual development package validation — recorded 2026-09-30
+
+The matching CLI, model helper, model resources and package identity are installed
+in `target/debug`. Validation passed: 91 Swift tests; 295 Rust CLI, client and
+service unit tests; the CLI lifecycle suite; native Ollama completion with nonzero
+input measurement and explicit context overflow rejection; a 64-second real
+service/helper streaming journey with responsive Inspect; and a 72-second real
+TUI journey with responsive typing, full response and measured input context.
+The long journeys use a synthetic provider, not a native model quality test.
+Each process journey stopped and reaped its owned backend and helper. Tests used
+private runtime roots and did not change the account runtime or its held inputs.
+
+Repeat the focused process checks with `target/debug/conversation_flow
+--native-ollama`, `target/debug/conversation_flow --long-inference`, and
+`python3 rust/crates/asura-cli/tests/tui_pty.py target/debug/lifecycle
+--long-observation`. The latter two checks verify generation and observation
+beyond the former lifetime caps; bounded preparation and transport remain enforced.

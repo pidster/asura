@@ -433,7 +433,7 @@ impl Client {
     pub fn models(&mut self) -> Result<pb::ModelsReply> {
         match self.request(
             pb::envelope::Body::ModelsList(pb::ModelsList {}),
-            Instant::now() + Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(30),
         )? {
             pb::envelope::Body::ModelsReply(reply) => Ok(reply),
             _ => Err(Error::Protocol),
@@ -638,7 +638,7 @@ impl Client {
         let expected_conversation = request.conversation_id.clone();
         match self.request(
             pb::envelope::Body::ConversationSubmit(request),
-            Instant::now() + Duration::from_secs(3),
+            Instant::now() + Duration::from_secs(40),
         )? {
             pb::envelope::Body::ConversationAccepted(reply)
                 if reply.generation == expected_generation

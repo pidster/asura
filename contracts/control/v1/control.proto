@@ -369,6 +369,7 @@ message ConversationQueueEntry {
   optional uint64 sequence = 11;
   optional bool new_conversation = 12; // V2 lane; target_generation is expected generation
   optional uint32 order_position = 13; // V2 pending order, independent of immutable sequence
+  optional string hold_reason = 14; // Current-owner diagnostic only; absent after restart
 }
 message ConversationQueueReply {
   repeated ConversationQueueEntry entries = 1;
@@ -385,7 +386,9 @@ message ToolProgress { optional uint32 ordinal = 1; optional string name = 2; op
 enum ToolProgressState { TOOL_PROGRESS_STATE_UNSPECIFIED = 0; TOOL_PROGRESS_STATE_RUNNING = 1; TOOL_PROGRESS_STATE_COMPLETE = 2; TOOL_PROGRESS_STATE_FAILED = 3; TOOL_PROGRESS_STATE_INTERRUPTED = 4; }
 
 // basis 1 means the measured input at generation start, not current occupancy.
-message ModelContext { optional string model_name = 1; optional uint32 input_tokens = 2; optional uint32 capacity_tokens = 3; optional uint32 basis = 4; }
+// capacity_tokens is the selected effective request window. Input counts are optional.
+// capacity_source: 1 system runtime, 2 CoreAI bundle, 3 MLX config, 4 Ollama show.
+message ModelContext { optional string model_name = 1; optional uint32 input_tokens = 2; optional uint32 capacity_tokens = 3; optional uint32 basis = 4; optional uint32 reported_max_tokens = 5; optional uint32 capacity_source = 6; }
 
 // Inventory states: 1 available, 2 installed, 3 listed, 4 unavailable, 5 unchecked.
 message ModelsList {}

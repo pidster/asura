@@ -28,6 +28,8 @@ fn hello(service: bool) -> pb::Envelope {
         availability: Some(if service { 3 } else { 1 }),
         capabilities: Some(if service { 0 } else { 1 }),
         context_tokens: (!service).then_some(4096),
+        reported_context_tokens: (!service).then_some(4096),
+        context_source: (!service).then_some(1),
         reason: Some(0),
     }))
 }
@@ -338,6 +340,7 @@ fn export_cross_language_fixtures() {
     if let Some(Body::Hello(value)) = &mut reasoning.body {
         value.selected_model = Some("mlx:fixture".into());
         value.reasoning_disabled = Some(true);
+        value.context_source = Some(3);
     }
     write(
         "mlx_reasoning_disabled.pb",
@@ -579,6 +582,8 @@ fn export_cross_language_fixtures() {
         value.availability = Some(availability);
         value.capabilities = Some(0);
         value.context_tokens = None;
+        value.reported_context_tokens = None;
+        value.context_source = None;
         value.reason = Some(1);
         write(
             &format!("helper_hello_availability_{availability}.pb"),
@@ -812,6 +817,28 @@ fn context_measurement_is_bounded_and_helper_only() {
 }
 
 #[test]
+fn discovered_context_requires_source_and_consistent_window() {
+    let mut message = hello(false);
+    assert!(encode_frame(&message, Direction::HelperToService).is_ok());
+    let Some(Body::Hello(value)) = message.body.as_mut() else {
+        panic!()
+    };
+    value.reported_context_tokens = None;
+    assert!(encode_frame(&message, Direction::HelperToService).is_err());
+    let Some(Body::Hello(value)) = message.body.as_mut() else {
+        panic!()
+    };
+    value.reported_context_tokens = Some(2048);
+    assert!(encode_frame(&message, Direction::HelperToService).is_err());
+    let Some(Body::Hello(value)) = message.body.as_mut() else {
+        panic!()
+    };
+    value.reported_context_tokens = Some(4096);
+    value.context_source = Some(9);
+    assert!(encode_frame(&message, Direction::HelperToService).is_err());
+}
+
+#[test]
 fn provider_selection_is_bounded_and_asset_paths_never_come_from_helper() {
     let mut request = hello(true);
     if let Some(Body::Hello(v)) = &mut request.body {
@@ -827,6 +854,11 @@ fn provider_selection_is_bounded_and_asset_paths_never_come_from_helper() {
     if let Some(Body::Hello(v)) = &mut response.body {
         v.capabilities = Some(3);
         v.selected_model = Some("coreai:fixture".into());
+        v.context_source = Some(2);
+    }
+    assert!(encode_frame(&response, Direction::HelperToService).is_ok());
+    if let Some(Body::Hello(v)) = &mut response.body {
+        v.selected_model = Some("COREAI:fixture".into());
     }
     assert!(encode_frame(&response, Direction::HelperToService).is_ok());
     if let Some(Body::Hello(v)) = &mut response.body {
@@ -853,6 +885,8 @@ fn inventory_hello_is_metadata_only_and_has_its_own_row_bounds() {
     reply.availability = Some(3);
     reply.capabilities = Some(0);
     reply.context_tokens = None;
+    reply.reported_context_tokens = None;
+    reply.context_source = None;
     reply.models.push(pb::ModelInventoryEntry {
         selector: Some("system".into()),
         provider: Some("system".into()),
@@ -1296,5 +1330,23 @@ fn failed_shell_wire_result_preserves_bounded_output_but_never_cursor() {
         assert!(
             encode_frame(&envelope(Body::ToolResult(bad)), Direction::ServiceToHelper).is_err()
         );
+    }
+}
+
+#[test]
+fn begin_deadline_is_optional_but_explicit_values_remain_bounded() {
+    let mut message = envelope(Body::Begin(pb::Begin {
+        model: Some("system".into()),
+        input_bytes: Some(1),
+        deadline_remaining_ms: None,
+        max_response_tokens: Some(512),
+        enable_project_tools: None,
+    }));
+    assert!(encode_frame(&message, Direction::ServiceToHelper).is_ok());
+    for deadline in [0, 60001] {
+        if let Some(Body::Begin(value)) = &mut message.body {
+            value.deadline_remaining_ms = Some(deadline);
+        }
+        assert!(encode_frame(&message, Direction::ServiceToHelper).is_err());
     }
 }

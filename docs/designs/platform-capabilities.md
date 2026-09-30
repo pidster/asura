@@ -245,7 +245,7 @@ They use explicit messages in the evolving 0.1 schemas.
 | Private model-channel frame / chunk payload | 64 KiB / 16 KiB | Reject excessive lengths before allocation. |
 | Input and output credit windows | 64 KiB each | Pause data transfer at zero credit; continue control processing. |
 | Helper startup and identity handshake | 5 seconds absolute | Close channel, terminate and reap only the owned child. |
-| Admission through terminal generation result | 60 seconds absolute | Cancel; retain timeout as the cause even if cleanup is delayed. |
+| Admission through terminal generation result | [Cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30), no fixed whole-turn expiry | Explicit cancel, provider failure, EOF or shutdown settles owned work. |
 | Grace after cancellation / SIGTERM | 250 ms / 250 ms | Escalate to SIGKILL of the owned child if necessary. |
 | Child reap observation | 1 second after SIGKILL | Retain the child handle and block replacement admission until reaped. |
 | Reserved private control capacity | 8 frames, at most 4 KiB each | Never queue cancellation behind data credit. |
@@ -383,7 +383,7 @@ The identity and credit rules in the canonical D2 design continue to apply.
 | Body field | Message and numbered fields | Meaning |
 | --- | --- | --- |
 | 10 | Hello: build_id bytes 1; schema_digest bytes 2; max_frame_bytes uint32 3 | Build and schema identities are exactly 32 bytes and must match before input. |
-| 11 | Begin: model string 1; input_bytes uint64 2; deadline_remaining_ms uint32 3; max_response_tokens uint32 4 | Only system, at most 64 KiB input, 60,000 ms and 512 tokens. |
+| 11 | Begin: model string 1; input_bytes uint64 2; deadline_remaining_ms uint32 3; max_response_tokens uint32 4 | Selected provider, at most 64 KiB input; absent deadline selects cancellation-driven generation, present1–60,000 ms is explicit legacy timing. |
 | 12 | Chunk: transfer_id uint64 1; direction enum 2; ordinal uint64 3; data bytes 4; revision uint64 5 | Directions 1 input and 2 output. Nonempty payload at most 16 KiB. |
 | 13 | Credit: transfer_id uint64 1; direction enum 2; accepted_bytes uint64 3; granted_bytes uint64 4 | Cumulative credit under the existing D2 ledger, never over the 64 KiB window. |
 | 14 | InputEnd: count uint64 1; total_bytes uint64 2 | Exact match to accepted input chunks. |

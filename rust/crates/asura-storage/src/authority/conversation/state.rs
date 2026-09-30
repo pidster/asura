@@ -971,7 +971,9 @@ impl Replay {
                 .filter(|op| op.conversation == input.conversation)
                 .max_by_key(|op| op.generation);
             return Some(match latest.and_then(|op| op.terminal.as_ref()) {
-                Some(t) if t.kind != TerminalKind::Complete => InputStatus::Held,
+                // A committed failure or cancellation settles the old turn.
+                // Owner restart and explicit holds remain separate recovery gates.
+                Some(t) if t.kind == TerminalKind::Interrupted => InputStatus::Held,
                 _ => InputStatus::Queued,
             });
         }

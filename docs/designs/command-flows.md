@@ -468,7 +468,7 @@ from this rendering check.
 
 Selected command path under [MP3](model-provider-integration.md#mp3-model-inventory-command).
 The client has one inventory worker slot. Attachment has a two-second deadline;
-the typed inventory request has ten seconds. The UI deadline is twelve seconds.
+the typed inventory request has thirty seconds. The UI deadline is thirty-five seconds.
 Only this worker accesses the socket. Cancellation shuts down a cloned socket
 handle and sets a cancellation flag. The worker checks cancellation before and
 after attachment. A timed-out slot stays occupied until its thread settles.

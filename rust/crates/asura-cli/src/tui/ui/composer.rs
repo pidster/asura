@@ -290,26 +290,35 @@ impl App {
             }
             return true;
         }
+        if key.modifiers == KeyModifiers::CONTROL && self.focus == Focus::Editor {
+            match key.code {
+                KeyCode::Up => {
+                    let ids = self.queue_focus_ids();
+                    if let Some(id) = ids.last() {
+                        self.queue_focused_id = Some(id.clone());
+                        self.focus = Focus::Queue(ids.len() - 1);
+                    }
+                    return true;
+                }
+                KeyCode::Down => {
+                    self.focus = Focus::Project;
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if !key.modifiers.is_empty() {
             return self.focus != Focus::Editor;
         }
         match self.focus {
             Focus::Editor => match key.code {
-                KeyCode::Down if self.editor.at_visual_bottom() => {
-                    if !self.recall(false) {
-                        self.focus = Focus::Project;
-                    }
+                KeyCode::Up => {
+                    self.recall(true);
                     true
                 }
-                KeyCode::Up if self.editor.at_visual_top() => {
-                    let ids = self.queue_focus_ids();
-                    let count = ids.len();
-                    if count > 0 {
-                        self.queue_focused_id = Some(ids[count - 1].clone());
-                        self.focus = Focus::Queue(count - 1);
-                    } else if !self.transcript.is_empty() {
-                        self.history_focus = true;
-                        self.history_scroll = self.history_scroll_max.saturating_sub(1);
+                KeyCode::Down => {
+                    if !self.recall(false) && self.editor.on_final_visual_row() {
+                        self.focus = Focus::Project;
                     }
                     true
                 }
@@ -472,7 +481,7 @@ impl App {
             return "↑↓ responses · Enter activity · PgUp/PgDn scroll · Esc input".into();
         }
         if self.history_focus {
-            return "↑↓ scroll history · PgUp/PgDn page · Home/End · Esc input".into();
+            return "⇧↑/⇧↓ scroll history · ↑↓ recall · PgUp/PgDn page · Esc input".into();
         }
         if self.picker_model_save.is_some() {
             return "Saving model selection · draft preserved".into();
@@ -482,10 +491,12 @@ impl App {
         }
         match self.focus {
             Focus::Editor if self.conversation_busy => format!(
-                "↵ queue · {newline_chord} newline · ↑ queue/history · F6 responses · ↓ status"
+                "↵ queue · {newline_chord} newline · ↑↓ recall · ⇧↑/⇧↓ scroll · ^↑ queue · ↓ status"
             ),
             Focus::Editor => {
-                format!("↵ send · {newline_chord} newline · ↑ history · ^P/^N recall · ↓ status")
+                format!(
+                    "↵ send · {newline_chord} newline · ↑↓ recall · ⇧↑/⇧↓ scroll · ^↑ queue · ↓ status"
+                )
             }
             Focus::Project | Focus::Model => {
                 "←→ / Tab select item · Enter open · ↑ / Esc input".into()
@@ -638,9 +649,16 @@ impl App {
                     format!(
                         ">> {}{}",
                         if entry.state == Some(2) {
-                            "Held · "
+                            format!(
+                                "Held ({}) · ",
+                                entry
+                                    .hold_reason
+                                    .as_deref()
+                                    .unwrap_or("reason unavailable")
+                                    .replace('_', " ")
+                            )
                         } else {
-                            ""
+                            String::new()
                         },
                         literal(entry.text.as_deref().unwrap_or_default(), 256)
                     ),
@@ -748,6 +766,9 @@ mod tests {
     fn key(app: &mut App, code: KeyCode) {
         app.handle(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
     }
+    fn modified_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        app.handle(Event::Key(KeyEvent::new(code, modifiers)));
+    }
     fn project(id: u8, current: bool) -> asura_control::pb::ProjectReply {
         asura_control::pb::ProjectReply {
             project_id: Some(vec![id; 16]),
@@ -783,7 +804,8 @@ mod tests {
             "Alt+↵"
         };
         let idle = app.hints();
-        assert!(idle.contains("^P/^N recall"));
+        assert!(idle.contains("↑↓ recall"));
+        assert!(idle.contains("⇧↑/⇧↓ scroll"));
         assert!(idle.contains(&format!("{newline} newline")));
         assert!(!idle.contains("Ctrl+"));
         assert!(draw(&mut app, "key-hints", 110, 26).contains(newline));
@@ -800,7 +822,7 @@ mod tests {
         app.selected_project = Some([1; 16]);
         app.insert("draft");
         draw(&mut app, "editor", 100, 26);
-        key(&mut app, KeyCode::Down);
+        modified_key(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
         assert_eq!(app.focus, Focus::Project);
         assert!(draw(&mut app, "status", 100, 26).contains("Enter open"));
         key(&mut app, KeyCode::Enter);
@@ -886,13 +908,109 @@ mod tests {
         )));
         assert_eq!(app.draft(), "unsent");
         assert_eq!(app.focus, Focus::Editor);
-        key(&mut app, KeyCode::Down);
+        modified_key(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
         assert_eq!(app.focus, Focus::Project);
         key(&mut app, KeyCode::Esc);
         assert_eq!(app.focus, Focus::Editor);
     }
     #[test]
-    fn up_from_editor_scrolls_conversation_without_changing_draft() {
+    fn plain_down_enters_status_only_from_final_visual_input_row() {
+        let mut app = App::new();
+        draw(&mut app, "empty-status-boundary", 80, 24);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, Focus::Project);
+        key(&mut app, KeyCode::Up);
+        app.insert("first line\nsecond line with 🦀 and enough text to wrap at narrow width");
+        draw(&mut app, "multiline-status-boundary", 24, 24);
+        modified_key(&mut app, KeyCode::Home, KeyModifiers::CONTROL);
+        draw(&mut app, "multiline-start", 24, 24);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, Focus::Editor);
+        modified_key(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+        draw(&mut app, "multiline-end", 24, 24);
+        let draft = app.draft();
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, Focus::Project);
+        assert_eq!(app.draft(), draft);
+        key(&mut app, KeyCode::Esc);
+        draw(&mut app, "resized-status-boundary", 100, 24);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, Focus::Project);
+        assert_eq!(app.draft(), draft);
+    }
+    #[test]
+    fn plain_down_restores_recall_before_entering_status() {
+        let mut app = App::new();
+        app.history.record("first");
+        app.history.record("second\nline");
+        app.insert("unsent\n🦀 draft");
+        draw(&mut app, "recall", 80, 24);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.draft(), "second\nline");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.draft(), "first");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.draft(), "first");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.draft(), "second\nline");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.draft(), "unsent\n🦀 draft");
+        assert_eq!(app.focus, Focus::Editor);
+        draw(&mut app, "restored-recall", 80, 24);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.draft(), "unsent\n🦀 draft");
+        assert_eq!(app.focus, Focus::Project);
+        assert!(!app.history_focus);
+    }
+    #[test]
+    fn shift_horizontal_selection_does_not_scroll_history() {
+        let mut app = App::new();
+        app.append_response("prompt".into(), None);
+        app.insert("draft");
+        draw(&mut app, "selection", 80, 24);
+        modified_key(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+        assert!(!app.history_focus);
+        assert_eq!(app.draft(), "draft");
+        app.insert("X");
+        assert_eq!(
+            app.draft(),
+            "drafX",
+            "Shift+Left must select the last character"
+        );
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(app.history_focus);
+        modified_key(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+        assert!(!app.history_focus);
+        assert_eq!(app.draft(), "drafX");
+    }
+    #[test]
+    fn shift_scroll_takes_precedence_over_queue_and_empty_transcript_keeps_draft() {
+        let mut app = App::new();
+        app.insert("draft");
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(!app.history_focus);
+        assert_eq!(app.draft(), "draft");
+        app.history.record("submitted");
+        app.queue_entries
+            .push(asura_control::pb::ConversationQueueEntry {
+                input_id: Some(vec![7; 16]),
+                state: Some(1),
+                text: Some("queued".into()),
+                ..Default::default()
+            });
+        app.append_response("prompt".into(), None);
+        draw(&mut app, "queue-and-history", 80, 24);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(app.history_focus);
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.draft(), "draft");
+        key(&mut app, KeyCode::Up);
+        assert!(!app.history_focus);
+        assert_eq!(app.draft(), "submitted");
+        assert_eq!(app.focus, Focus::Editor);
+    }
+    #[test]
+    fn shift_arrows_scroll_conversation_without_changing_draft() {
         let mut app = App::new();
         for index in 0..8 {
             app.append_response(format!("prompt {index}"), None);
@@ -902,18 +1020,47 @@ mod tests {
         app.insert("unsent draft");
         draw(&mut app, "history-bottom", 80, 20);
         assert!(app.history_scroll_max > 0);
-        key(&mut app, KeyCode::Up);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
         assert!(app.history_focus);
         assert_eq!(app.history_scroll, app.history_scroll_max - 1);
         assert_eq!(app.draft(), "unsent draft");
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(app.history_scroll, app.history_scroll_max - 2);
         key(&mut app, KeyCode::Home);
+        assert_eq!(app.history_scroll, 0);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
         assert_eq!(app.history_scroll, 0);
         assert!(draw(&mut app, "history-top", 80, 20).contains("prompt 0"));
         key(&mut app, KeyCode::End);
         assert_eq!(app.history_scroll, app.history_scroll_max);
+        modified_key(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert!(app.history_focus);
+        assert_eq!(app.history_scroll, app.history_scroll_max);
         key(&mut app, KeyCode::Down);
         assert!(!app.history_focus);
         assert_eq!(app.draft(), "unsent draft");
+    }
+    #[test]
+    fn held_queue_row_explains_known_and_unknown_causes() {
+        let mut app = App::new();
+        app.queue_entries = vec![
+            asura_control::pb::ConversationQueueEntry {
+                input_id: Some(vec![1; 16]),
+                state: Some(2),
+                text: Some("first".into()),
+                hold_reason: Some("model_unavailable".into()),
+                ..Default::default()
+            },
+            asura_control::pb::ConversationQueueEntry {
+                input_id: Some(vec![2; 16]),
+                state: Some(2),
+                text: Some("second".into()),
+                ..Default::default()
+            },
+        ];
+        let screen = draw(&mut app, "held", 100, 26);
+        assert!(screen.contains("Held (model unavailable) · first"));
+        assert!(screen.contains("Held (reason unavailable) · second"));
     }
     #[test]
     fn queue_promotion_names_same_input_and_never_clears_unrelated_draft() {
@@ -936,7 +1083,7 @@ mod tests {
             .collect();
         app.insert("unrelated draft");
         draw(&mut app, "queue", 100, 26);
-        key(&mut app, KeyCode::Up);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
         assert_eq!(app.focus, Focus::Queue(6));
         assert!(draw(&mut app, "queue-focus", 100, 26).contains(">> queued input 6"));
         key(&mut app, KeyCode::Enter);
@@ -1042,7 +1189,7 @@ mod tests {
             })
             .collect();
         draw(&mut app, "queue-stable", 100, 26);
-        key(&mut app, KeyCode::Up);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
         app.queue_entries.remove(0);
         key(&mut app, KeyCode::Enter);
         let super::super::super::queue::Request::Decision(decision) =

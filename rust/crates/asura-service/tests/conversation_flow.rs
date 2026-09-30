@@ -2,6 +2,8 @@
 //! Every spawned service is owned by a guard that stops, kills if needed, and reaps.
 #[path = "support/audit_journey.rs"]
 mod audit_journey;
+#[path = "support/cancellation_driven_journey.rs"]
+mod cancellation_driven_journey;
 #[path = "support/memory_create_journey.rs"]
 mod memory_create_journey;
 #[path = "support/memory_tools_journey.rs"]
@@ -385,7 +387,7 @@ fn journey(native: bool) -> Result<()> {
             project_id: Some(project.to_vec()),
             conversation_id: None,
             expected_generation: Some(0),
-            prompt: Some("Remember the word ORCHARD. Reply with just ORCHARD.".into()),
+            prompt: Some("For this conversation only, remember the word ORCHARD. Reply with just ORCHARD. Do not call tools.".into()),
         };
         let accepted = fixture.attach()?.submit_conversation(original.clone())?;
         let operation = checked_id(accepted.operation_id.clone())?;
@@ -419,6 +421,7 @@ fn journey(native: bool) -> Result<()> {
         );
         let event = observe(&fixture, operation)?;
         if event.kind != Some(3) {
+            fixture.print_model_diagnostics();
             return Err(format!(
                 "native inference not complete: kind {:?}, reason {:?}",
                 event.kind, event.reason
@@ -442,6 +445,8 @@ fn journey(native: bool) -> Result<()> {
         let input = context.input_tokens.expect("measured input tokens");
         let capacity = context.capacity_tokens.expect("native context capacity");
         assert!(input > 0 && input <= capacity);
+        assert_eq!(context.reported_max_tokens, Some(capacity));
+        assert_eq!(context.capacity_source, Some(1));
         let second = submit(
             &fixture,
             project,
@@ -576,6 +581,10 @@ fn managed_queue_journey(
     project: [u8; 16],
     installation: Option<Vec<u8>>,
 ) -> Result<()> {
+    let unavailable = fixture
+        .attach()?
+        .config("model", Some("unknown:queue-fixture"))?;
+    assert!(unavailable.error.is_none());
     let first_request = pb::ConversationQueueSubmit {
         request_id: Some(asura_platform::random_id().to_vec()),
         project_id: Some(project.to_vec()),
@@ -611,6 +620,41 @@ fn managed_queue_journey(
     let second_id = checked_id(second.accepted_input_id.clone())?;
     let third = managed_submit_call(fixture, enqueue("Third queued turn"))?;
     let third_id = checked_id(third.accepted_input_id.clone())?;
+    let held = queue_settled(fixture, project, first_id)?;
+    assert_eq!(held.state, Some(2));
+    assert_eq!(held.hold_reason.as_deref(), Some("model_unavailable"));
+    let resume = pb::ConversationQueueDecision {
+        request_id: Some(asura_platform::random_id().to_vec()),
+        input_id: Some(first_id.to_vec()),
+        action: Some(1),
+        ..Default::default()
+    };
+    let decide = |request: pb::ConversationQueueDecision| -> Result<pb::ConversationQueueReply> {
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            match fixture.attach()?.decide_conversation_input(request.clone()) {
+                Ok(reply) => return Ok(reply),
+                Err(asura_client::Error::Remote(_, message))
+                    if message == "conversation_busy" && Instant::now() < end =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+    decide(resume.clone())?;
+    let held_again = queue_settled(fixture, project, first_id)?;
+    assert_eq!(held_again.state, Some(2));
+    assert_eq!(held_again.hold_reason.as_deref(), Some("model_unavailable"));
+    let replayed_resume = decide(resume)?;
+    let still_held = replayed_resume
+        .entries
+        .iter()
+        .find(|entry| entry.input_id.as_deref() == Some(first_id.as_slice()))
+        .ok_or("replayed Resume lost input")?;
+    assert_eq!(still_held.state, Some(2));
+    assert_eq!(still_held.hold_reason.as_deref(), Some("model_unavailable"));
     let before = fixture.attach()?.conversation_queue(project, None)?;
     let before_revision = before.order_revision.ok_or("missing order revision")?;
     let move_request = pb::ConversationQueueReorder {
@@ -668,6 +712,10 @@ fn managed_queue_journey(
         assert_eq!(entry.entries.len(), 1);
         assert_eq!(entry.entries[0].input_id, Some(id.to_vec()));
         assert!(entry.entries[0].text.is_some(), "restart retained prompt");
+        assert!(
+            entry.entries[0].hold_reason.is_none(),
+            "restart cannot invent a hold cause"
+        );
     }
     let retry_after_restart = managed_submit_call(
         fixture,
@@ -1797,7 +1845,15 @@ fn native_ollama() -> Result<()> {
             None,
             0,
             "Say hello in one short sentence.",
-        )?;
+        )
+        .map_err(|error| {
+            fixture.print_model_diagnostics();
+            let _ = fs::copy(
+                fixture.home.join("service.log"),
+                "/private/tmp/asura-native-ollama-startup.log",
+            );
+            error
+        })?;
         stage = "native completion";
         let terminal = observe(&fixture, checked_id(accepted.operation_id)?)?;
         assert_eq!(
@@ -1810,15 +1866,18 @@ fn native_ollama() -> Result<()> {
             terminal.tools.is_empty(),
             "endpoint-dependent model must not receive project tools"
         );
-        if let Some(context) = &terminal.model_context {
+        {
+            let context = terminal
+                .model_context
+                .as_ref()
+                .ok_or("Ollama context measurement missing")?;
             assert_eq!(
                 context.model_name.as_deref(),
                 Some(format!("ollama:{name}").as_str())
             );
-            assert!(
-                context.input_tokens.is_none(),
-                "Ollama must not invent measured input tokens"
-            );
+            assert!(context.input_tokens.is_some_and(|count| count > 0));
+            assert!(context.input_tokens <= context.capacity_tokens);
+            assert_eq!(context.basis, Some(1));
         }
         let oversized = "x ".repeat(15_000);
         stage = "overflow submit";
@@ -1971,7 +2030,7 @@ fn inventory_journey() -> Result<()> {
     );
     let mut query_client = fixture.attach()?;
     let query = thread::spawn(move || query_client.models());
-    server.accepted.recv_timeout(Duration::from_secs(8))?;
+    server.accepted.recv_timeout(Duration::from_secs(30))?;
     let started = Instant::now();
     assert_eq!(
         fixture.attach()?.inspect()?.lifecycle,
@@ -2070,6 +2129,8 @@ fn main() {
     }
     let result = if args.get(1).map(String::as_str) == Some("--conversation-child") {
         child(Path::new(args.get(2).expect("scratch home")))
+    } else if args.iter().any(|a| a == "--long-inference") {
+        cancellation_driven_journey::run()
     } else if args.iter().any(|a| a == "--native-shell-tools") {
         shell_journey::run("system")
     } else if args.iter().any(|a| a == "--native-ollama-shell-tools") {

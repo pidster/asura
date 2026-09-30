@@ -5,7 +5,10 @@ import Testing
 
 private struct ToolScript: ToolModelBackend {
     let arguments: ToolArguments
-    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, supportsTools: true, capabilityProfile: try! CapabilityProfile(mask: 1, provenance: .runtime)) }
+    let source: ContextCapacitySource
+    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096,
+        reportedContextTokens: 4096, contextSource: source, supportsTools: true,
+        capabilityProfile: try! CapabilityProfile(mask: 1, provenance: .runtime)) }
     func generate(_ input: ModelInput, maximumTokens: UInt32,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         throw HelperError.unavailable
@@ -46,7 +49,12 @@ private func toolCallbackJourney(cancel: Bool, selector: String, arguments: Tool
     let identity = Data(repeating: 1, count: 32)
     let session = HelperSession(transport: helper, factory: { selected, assets, endpoint, capabilities in
         #expect(selected == selector && assets == "/tmp/model-fixture" && endpoint == nil && capabilities == nil)
-        return ToolScript(arguments: arguments)
+        let source: ContextCapacitySource
+        if selected.hasPrefix("coreai:") { source = .coreai }
+        else if selected.hasPrefix("mlx:") { source = .mlx }
+        else if selected.hasPrefix("ollama:") { source = .ollama }
+        else { source = .system }
+        return ToolScript(arguments: arguments, source: source)
     }, buildID: identity, schemaDigest: identity)
     let running = Task { await session.run() }
     defer { running.cancel() }

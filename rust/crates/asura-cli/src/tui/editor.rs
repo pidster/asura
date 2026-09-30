@@ -350,24 +350,21 @@ impl Editor {
         self.screen_cursor
     }
 
-    /// Compare draft rows, not viewport edges. Offscreen endpoints cannot match.
-    pub fn at_visual_top(&self) -> bool {
-        self.same_visual_row(TextPosition::new(0, 0))
-    }
-
-    pub fn at_visual_bottom(&self) -> bool {
-        self.same_visual_row(end_position(&self.text()))
-    }
-
-    fn same_visual_row(&self, position: TextPosition) -> bool {
-        if self.state.rendered.width == 0 || self.state.rendered.height == 0 {
-            return false;
+    pub fn on_final_visual_row(&self) -> bool {
+        let end = end_position(&self.text());
+        // The endpoint is always on the final row, even when a narrow viewport
+        // cannot map it immediately after a document-end cursor move.
+        if self.state.cursor() == end {
+            return true;
+        }
+        if self.state.rendered.width == 0 {
+            return self.state.cursor().y == end.y;
         }
         match (
             self.state.pos_to_relative_screen(self.state.cursor()),
-            self.state.pos_to_relative_screen(position),
+            self.state.pos_to_relative_screen(end),
         ) {
-            (Some((_, cursor)), Some((_, boundary))) => cursor == boundary,
+            (Some((_, cursor_row)), Some((_, end_row))) => cursor_row == end_row,
             _ => false,
         }
     }
@@ -436,51 +433,24 @@ mod tests {
     }
 
     #[test]
-    fn visual_boundaries_follow_wrap_scroll_and_resize_without_editing() {
+    fn final_visual_row_tracks_wrapping_unicode_and_resize() {
         let mut editor = Editor::new();
-        editor.insert("abcdefghij\nlast").unwrap();
-        assert!(!editor.at_visual_bottom());
-        draw(&mut editor, 5, 2);
-        assert!(editor.at_visual_bottom());
-        assert!(!editor.at_visual_top());
-        editor.state.set_cursor((2, 0), false);
-        draw(&mut editor, 5, 2);
-        assert!(editor.at_visual_top());
-        assert!(!editor.at_visual_bottom());
-        editor.state.set_cursor((7, 0), false);
-        draw(&mut editor, 5, 2);
-        assert!(!editor.at_visual_top());
-        assert!(!editor.at_visual_bottom());
-        draw(&mut editor, 20, 2);
-        assert!(editor.at_visual_top());
-        assert!(!editor.at_visual_bottom());
-        let text = editor.text();
-        let selection = editor.state.selection();
-        let cursor = editor.cursor();
-        let undo = editor.state.undo_buffer().unwrap().open_undo();
-        editor.at_visual_top();
-        editor.at_visual_bottom();
-        assert_eq!(editor.text(), text);
-        assert_eq!(editor.state.selection(), selection);
-        assert_eq!(editor.cursor(), cursor);
-        assert_eq!(editor.state.undo_buffer().unwrap().open_undo(), undo);
+        editor.insert("abcdefghij\n界🦀last").unwrap();
+        draw(&mut editor, 5, 3);
+        assert!(editor.on_final_visual_row());
+        editor.state.set_cursor((1, 0), false);
+        draw(&mut editor, 5, 3);
+        assert!(!editor.on_final_visual_row());
+        editor.state.set_cursor((3, 1), false);
+        draw(&mut editor, 5, 3);
+        assert!(editor.on_final_visual_row());
+        editor.state.set_cursor((0, 1), false);
+        draw(&mut editor, 5, 3);
+        assert!(!editor.on_final_visual_row());
+        draw(&mut editor, 20, 3);
+        assert!(editor.on_final_visual_row());
+        assert_eq!(editor.text(), "abcdefghij\n界🦀last");
     }
-
-    #[test]
-    fn visual_boundaries_handle_empty_and_unicode_rows() {
-        let mut editor = Editor::new();
-        draw(&mut editor, 8, 3);
-        assert!(editor.at_visual_top() && editor.at_visual_bottom());
-        editor.insert("界界e\u{301}\n👩‍💻").unwrap();
-        draw(&mut editor, 4, 3);
-        assert!(editor.at_visual_bottom());
-        assert!(!editor.at_visual_top());
-        editor.state.set_cursor((0, 0), false);
-        draw(&mut editor, 4, 3);
-        assert!(editor.at_visual_top());
-        assert!(!editor.at_visual_bottom());
-    }
-
     #[test]
     fn completion_preserves_unicode_tail_and_rejects_stale_or_oversized_edits() {
         let mut editor = Editor::new();

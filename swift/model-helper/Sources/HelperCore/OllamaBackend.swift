@@ -1,7 +1,7 @@
 import Foundation
 import FoundationModels
 
-/// Provider translation only. The service owns admission, tools and the outer deadline.
+/// Provider translation only. The service owns admission, tools and cancellation.
 public struct OllamaLanguageModel: LanguageModel, Sendable {
     public enum Failure: Error, Equatable, Sendable {
         case invalidConfiguration, unsupported, unavailable, invalidResponse, limit, incomplete
@@ -26,8 +26,10 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
     public let settings: Settings
     public let supportsTools: Bool
     public let contextTokens: UInt32
+    public let reportedContextTokens: UInt32
     public var localToolModel: String? = nil
     public var supportsReasoning = false
+    var inputObserver: OllamaInputObserver? = nil
     public var capabilities: LanguageModelCapabilities {
         .init((supportsTools ? [.toolCalling] : []) + (supportsReasoning ? [.reasoning] : []))
     }
@@ -35,7 +37,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
 
     /// Only a checked runtime response can create a model; no implicit network discovery.
     public static func discover(_ settings: Settings) async throws -> Self {
-        let session = session(seconds: 5)
+        let session = session(seconds: 5, resourceSeconds: 5)
         defer { session.invalidateAndCancel() }
         return try await withTaskCancellationHandler {
             var request = URLRequest(url: settings.endpoint.appending(path: "api/show"))
@@ -124,7 +126,8 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
         }
         guard let capacity = capacities.min() else { throw Failure.unavailable }
         return Self(settings: settings, supportsTools: shown.capabilities.contains("tools"),
-            contextTokens: min(capacity, 8192), supportsReasoning: shown.capabilities.contains("thinking"))
+            contextTokens: min(capacity, 8192), reportedContextTokens: capacity,
+            supportsReasoning: shown.capabilities.contains("thinking"))
     }
 
     private final class RedirectGuard: NSObject, URLSessionTaskDelegate, Sendable {
@@ -132,10 +135,12 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                         willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                         completionHandler: @escaping @Sendable (URLRequest?) -> Void) { completionHandler(nil) }
     }
-    static func session(seconds: TimeInterval) -> URLSession {
+    static func session(seconds: TimeInterval, resourceSeconds: TimeInterval? = nil) -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = seconds
-        config.timeoutIntervalForResource = seconds
+        // Preserve Foundation's default resource limit for generation (currently seven days).
+        // Only discovery adds an Asura-selected total transport deadline.
+        if let resourceSeconds { config.timeoutIntervalForResource = resourceSeconds }
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
         config.urlCredentialStorage = nil
@@ -299,6 +304,18 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
         catch Failure.invalidResponse { throw BackendFailure(.protocolFault) }
     }
 
+    /// A recognized completion can measure input even when output hit its limit.
+    static func deliverMeasuredToExecutor(_ chunk: Chunk, maximumTokens: Int,
+        requestID: UUID, capacity: UInt32, observer: OllamaInputObserver?,
+        emit: (Chunk) async throws -> Void) async throws {
+        try await deliverToExecutor(chunk, maximumTokens: maximumTokens) { value in
+            try await emit(value)
+            if value.done == true, value.done_reason == "stop" || value.done_reason == "length" {
+                try await observer?.complete(requestID, inputTokens: value.prompt_eval_count, capacity: capacity)
+            }
+        }
+    }
+
     public struct Executor: LanguageModelExecutor {
         public typealias Configuration = Settings
         public typealias Model = OllamaLanguageModel
@@ -324,6 +341,8 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
             guard body.count <= 262_144 else { throw Failure.limit }
             let session = session(seconds: 60)
             defer { session.invalidateAndCancel() }
+            try Task.checkCancellation()
+            await model.inputObserver?.begin(request.id, capacity: model.contextTokens)
             try await withTaskCancellationHandler {
                 var http = URLRequest(url: settings.endpoint.appending(path: "api/chat"))
                 http.httpMethod = "POST"; http.httpBody = body
@@ -353,13 +372,43 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                             output: .init(totalTokenCount: output, reasoningTokenCount: 0))))
                     }
                 }
+                func deliverMeasured(_ chunk: Chunk) async throws {
+                    try await deliverMeasuredToExecutor(chunk, maximumTokens: maximumTokens,
+                        requestID: request.id, capacity: model.contextTokens, observer: model.inputObserver,
+                        emit: emit)
+                }
                 for try await byte in bytes {
                     try Task.checkCancellation()
-                    if let chunk = try state.consume(byte) { try await deliverToExecutor(chunk, maximumTokens: maximumTokens, emit: emit) }
+                    if let chunk = try state.consume(byte) { try await deliverMeasured(chunk) }
                     if state.done { break }
                 }
-                if let final = try state.finish() { try await deliverToExecutor(final, maximumTokens: maximumTokens, emit: emit) }
+                if let final = try state.finish() { try await deliverMeasured(final) }
             } onCancel: { session.invalidateAndCancel() }
         }
+    }
+}
+
+/// One bounded observation per generation; later tool passes cannot replace missing data.
+actor OllamaInputObserver {
+    private var firstRequest: UUID?
+    private var firstCapacity: UInt32?
+    private var completed = false
+    private let snapshot: @Sendable (Snapshot) async throws -> Void
+
+    init(snapshot: @escaping @Sendable (Snapshot) async throws -> Void) { self.snapshot = snapshot }
+
+    func begin(_ request: UUID, capacity: UInt32) {
+        guard !Task.isCancelled, firstRequest == nil else { return }
+        firstRequest = request; firstCapacity = capacity
+    }
+
+    func complete(_ request: UUID, inputTokens: Int?, capacity: UInt32) async throws {
+        try Task.checkCancellation()
+        guard request == firstRequest, !completed else { return }
+        completed = true
+        guard capacity == firstCapacity, capacity > 0,
+            let inputTokens, let count = UInt32(exactly: inputTokens), count <= capacity else { return }
+        try Task.checkCancellation()
+        try await snapshot(Snapshot(text: "", inputContext: (count, capacity)))
     }
 }

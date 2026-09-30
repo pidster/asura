@@ -36,8 +36,14 @@ public enum ProviderFactory {
             } else { settings = try .init(name: name) }
             let model = try await OllamaLanguageModel.discover(settings)
             return FoundationBackend(model: model, contextTokens: model.contextTokens,
+                reportedContextTokens: model.reportedContextTokens, contextSource: .ollama,
                 modelName: "ollama:\(name)", supportsTools: model.supportsTools,
-                localToolDestination: model.localToolModel != nil)
+                localToolDestination: model.localToolModel != nil,
+                instrumentationFactory: { callback in
+                    var instrumented = model
+                    instrumented.inputObserver = OllamaInputObserver(snapshot: callback)
+                    return instrumented
+                })
         default: throw Failure.unsupportedProvider
         }
     }

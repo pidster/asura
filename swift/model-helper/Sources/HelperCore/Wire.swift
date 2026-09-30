@@ -91,6 +91,17 @@ public enum Wire {
             try check(!service && v.hasInputTokens && v.hasCapacityTokens && v.capacityTokens > 0 && v.inputTokens <= v.capacityTokens)
         case .hello(let v):
             try check(!v.hasSelectedModel || selector(v.selectedModel))
+            let expectedContextSource: UInt32? = {
+                if !v.hasSelectedModel || v.selectedModel == "system" { return ContextCapacitySource.system.rawValue }
+                let selector = v.selectedModel.lowercased()
+                if selector.hasPrefix("coreai:") { return ContextCapacitySource.coreai.rawValue }
+                if selector.hasPrefix("mlx:") { return ContextCapacitySource.mlx.rawValue }
+                if selector.hasPrefix("ollama:") { return ContextCapacitySource.ollama.rawValue }
+                return nil
+            }()
+            try check(!v.hasReportedContextTokens || (!service && !v.inventoryOnly))
+            try check(!v.hasContextSource || (!service && !v.inventoryOnly))
+            try check(v.hasReportedContextTokens == v.hasContextSource)
             try check(!v.hasAssetRoot || (service && v.assetRoot.hasPrefix("/") && v.assetRoot.utf8.count <= 4096 && !v.assetRoot.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })))
             try check(!v.hasEndpoint || (service && !v.endpoint.isEmpty && v.endpoint.utf8.count <= 2048 && !v.endpoint.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })))
             try check(!v.hasModelName || (!service && !v.modelName.isEmpty && v.modelName.utf8.count <= 256 && !v.modelName.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })))
@@ -113,7 +124,8 @@ public enum Wire {
             try check(v.inventoryOnly || (v.models.isEmpty && v.issues.isEmpty))
             if v.inventoryOnly {
                 try check(v.hasSelectedModel && v.selectedModel == "system" && !v.hasModelName
-                    && v.availability == .unknown && v.capabilities == 0 && !v.hasContextTokens && v.reason == .none)
+                    && v.availability == .unknown && v.capabilities == 0 && !v.hasContextTokens
+                    && !v.hasReportedContextTokens && !v.hasContextSource && v.reason == .none)
                 if service { try check(v.models.isEmpty && v.issues.isEmpty) }
                 else {
                     try check(!v.models.isEmpty && v.models.count <= 64 && v.issues.count <= 4
@@ -140,16 +152,23 @@ public enum Wire {
                     }
                 }
             } else if service {
-                try check(v.availability == .unknown && v.capabilities == 0 && !v.hasContextTokens && v.reason == .none)
+                try check(v.availability == .unknown && v.capabilities == 0 && !v.hasContextTokens
+                    && !v.hasReportedContextTokens && !v.hasContextSource && v.reason == .none)
             } else if v.availability == .available {
-                try check((v.capabilities == 1 || v.capabilities == 3) && v.hasContextTokens && v.contextTokens > 0 && v.reason == .none)
+                try check((v.capabilities == 1 || v.capabilities == 3) && v.hasContextTokens
+                    && v.contextTokens > 512 && v.hasReportedContextTokens
+                    && v.reportedContextTokens >= v.contextTokens
+                    && v.hasContextSource && expectedContextSource == v.contextSource
+                    && v.reason == .none)
             } else {
                 try check((v.availability == .unknown || v.availability == .unavailable)
-                    && v.capabilities == 0 && !v.hasContextTokens && v.reason == .modelUnavailable)
+                    && v.capabilities == 0 && !v.hasContextTokens
+                    && !v.hasReportedContextTokens && !v.hasContextSource
+                    && v.reason == .modelUnavailable)
             }
         case .begin(let v):
             try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...65_536).contains(v.inputBytes)
-                && v.hasDeadlineRemainingMs && (1...60_000).contains(v.deadlineRemainingMs)
+                && (!v.hasDeadlineRemainingMs || (1...60_000).contains(v.deadlineRemainingMs))
                 && v.hasMaxResponseTokens && (1...2048).contains(v.maxResponseTokens))
         case .chunk(let v):
             try check(v.hasTransferID && v.hasDirection && transfer(v.transferID, v.direction)

@@ -130,6 +130,35 @@ fn restore(
         turns,
     })
 }
+// Each transport call remains bounded by Client. Turn age does not terminate
+// subscription; the existing owner keeps the worker slot until it settles.
+fn observe_until_terminal(
+    stopped: &AtomicBool,
+    cancellation: &AtomicBool,
+    mut generation: u64,
+    mut observe: impl FnMut(u64, u64, bool) -> Result<Option<pb::ConversationEvent>, String>,
+    mut publish: impl FnMut(Update),
+) -> Result<(), String> {
+    let mut cursor = 0;
+    while !stopped.load(Ordering::Acquire) {
+        let cancel = generation > 0 && cancellation.swap(false, Ordering::AcqRel);
+        if let Some(event) = observe(cursor, generation, cancel)? {
+            generation = event.generation.unwrap_or(generation);
+            cursor = event.cursor.unwrap_or(cursor);
+            let done = matches!(event.kind, Some(3..=6));
+            publish(Update {
+                event: Some(event),
+                success: true,
+                done,
+                ..Default::default()
+            });
+            if done {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
 struct Job {
     handle: JoinHandle<()>,
     updates: Arc<Mutex<Option<Update>>>,
@@ -189,7 +218,7 @@ impl Worker {
                 };
                 let run = || -> Result<(), String> {
                     let mut client = attach().map_err(|e| e.to_string())?;
-                    let (operation, mut generation) = match request {
+                    let (operation, generation) = match request {
                         Request::Restore { project, epoch } => {
                             let result = restore(&mut client, project, epoch, &stopped);
                             publish(Update {
@@ -246,27 +275,24 @@ impl Worker {
                             return Ok(());
                         }
                     };
-                    let deadline = Instant::now() + Duration::from_secs(65);
-                    let mut cursor = 0;
-                    while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
-                        if generation > 0 && cancellation.swap(false, Ordering::AcqRel) {
-                            client.cancel_conversation(operation, generation).map_err(|e| format!("Cancel outcome unconfirmed: {e}"))?;
-                        }
-                        match client.observe_conversation(operation, cursor) {
-                            Ok(event) => {
-                                generation = event.generation.unwrap_or(generation);
-                                cursor = event.cursor.unwrap_or(cursor);
-                                let done = matches!(event.kind, Some(3..=6));
-                                publish(Update { event: Some(event), success: true, done, ..Default::default() });
-                                if done { return Ok(()); }
+                    observe_until_terminal(
+                        &stopped,
+                        &cancellation,
+                        generation,
+                        |cursor, generation, cancel| {
+                            if cancel {
+                                client.cancel_conversation(operation, generation).map_err(|e| format!("Cancel outcome unconfirmed: {e}"))?;
                             }
-                            Err(_) => {
-                                client = attach().map_err(|e| format!("Disconnected: {e}. Use /observe {}", crate::conversation::hex(&operation)))?;
+                            match client.observe_conversation(operation, cursor) {
+                                Ok(event) => Ok(Some(event)),
+                                Err(_) => {
+                                    client = attach().map_err(|e| format!("Disconnected: {e}. Use /observe {}", crate::conversation::hex(&operation)))?;
+                                    Ok(None)
+                                }
                             }
-                        }
-                    }
-                    if stopped.load(Ordering::Acquire) { Ok(()) }
-                    else { Err(format!("Observation deadline. Use /observe {}", crate::conversation::hex(&operation))) }
+                        },
+                        publish,
+                    )
                 };
                 if let Err(message) = run() {
                     if let Some((project, epoch)) = restore_scope {
@@ -342,6 +368,72 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_subscription_delivers_terminal_and_preserves_cursor() {
+        let stopped = AtomicBool::new(false);
+        let cancellation = AtomicBool::new(false);
+        let mut updates = Vec::new();
+        observe_until_terminal(
+            &stopped,
+            &cancellation,
+            0,
+            |cursor, generation, cancel| {
+                assert!(!cancel);
+                assert_eq!(generation, if cursor == 0 { 0 } else { 7 });
+                Ok(Some(pb::ConversationEvent {
+                    generation: Some(7),
+                    cursor: Some(cursor + 1),
+                    kind: Some(if cursor == 2 { 3 } else { 2 }),
+                    text: Some(if cursor == 2 { "complete" } else { "pending" }.into()),
+                    ..Default::default()
+                }))
+            },
+            |update| updates.push(update),
+        )
+        .unwrap();
+        assert_eq!(updates.len(), 3);
+        assert!(!updates[1].done);
+        assert!(updates[2].done);
+        assert_eq!(
+            updates[2].event.as_ref().unwrap().text.as_deref(),
+            Some("complete")
+        );
+    }
+
+    #[test]
+    fn cancellation_waits_for_generation_and_disconnect_stops_subscription() {
+        let stopped = AtomicBool::new(false);
+        let cancellation = AtomicBool::new(true);
+        let mut calls = 0;
+        observe_until_terminal(
+            &stopped,
+            &cancellation,
+            0,
+            |cursor, generation, cancel| {
+                calls += 1;
+                if calls == 1 {
+                    assert_eq!(generation, 0);
+                    assert!(!cancel);
+                    assert!(cancellation.load(Ordering::Acquire));
+                } else {
+                    assert_eq!(generation, 7);
+                    assert!(cancel);
+                    assert!(!cancellation.load(Ordering::Acquire));
+                    stopped.store(true, Ordering::Release);
+                }
+                Ok(Some(pb::ConversationEvent {
+                    generation: Some(7),
+                    cursor: Some(cursor + 1),
+                    kind: Some(2),
+                    ..Default::default()
+                }))
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+    }
 
     #[test]
     fn contended_mailbox_defers_without_waiting_or_losing_the_result() {

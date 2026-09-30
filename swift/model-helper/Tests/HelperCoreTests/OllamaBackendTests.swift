@@ -28,6 +28,8 @@ import Testing
     }
     let text = try OllamaLanguageModel.checked(settings, data: Data(#"{"capabilities":["completion"],"model_info":{"test.context_length":32768}}"#.utf8))
     #expect(!text.supportsTools)
+    #expect(text.reportedContextTokens == 32768)
+    #expect(text.contextTokens == 8192)
     let tools = try OllamaLanguageModel.checked(settings, data: Data(#"{"capabilities":["completion","tools"],"model_info":{"test.context_length":8192}}"#.utf8))
     #expect(tools.supportsTools)
     #expect(!tools.capabilities.contains(.guidedGeneration))
@@ -102,6 +104,7 @@ private func consume(_ text: String, state: inout OllamaLanguageModel.StreamStat
     let model = try OllamaLanguageModel.checked(settings,
         data: Data(#"{"capabilities":["completion"],"model_info":{"a.context_length":4096,"b.context_length":32768}}"#.utf8))
     #expect(model.contextTokens == 4096)
+    #expect(model.reportedContextTokens == 4096)
     var state = OllamaLanguageModel.StreamState(maximumTokens: 7)
     #expect(throws: OllamaLanguageModel.Failure.invalidResponse) {
         try consume(#"{"done":true,"eval_count":8}"# + "\n", state: &state)
@@ -182,4 +185,90 @@ private func consume(_ text: String, state: inout OllamaLanguageModel.StreamStat
         Issue.record("ambiguous response completed")
     } catch let error as BackendFailure { #expect(error.reason == .protocolFault) }
     #expect(emitted == "partial")
+}
+
+@Test func ollamaGenerationKeepsInactivityBoundWithoutAsuraTotalExpiry() {
+    let generation = OllamaLanguageModel.session(seconds: 60)
+    let discovery = OllamaLanguageModel.session(seconds: 5, resourceSeconds: 5)
+    defer { generation.invalidateAndCancel(); discovery.invalidateAndCancel() }
+    let sdkDefault = URLSessionConfiguration.ephemeral.timeoutIntervalForResource
+    #expect(generation.configuration.timeoutIntervalForRequest == 60)
+    #expect(generation.configuration.timeoutIntervalForResource == sdkDefault)
+    #expect(sdkDefault > 60)
+    #expect(discovery.configuration.timeoutIntervalForRequest == 5)
+    #expect(discovery.configuration.timeoutIntervalForResource == 5)
+    #expect(generation.configuration.httpMaximumConnectionsPerHost == 1)
+    #expect(generation.configuration.urlCredentialStorage == nil)
+    #expect(generation.configuration.urlCache == nil)
+}
+
+private actor InputMeasurements {
+    var values: [(UInt32, UInt32)] = []
+    func record(_ value: Snapshot) { if let context = value.inputContext { values.append((context.tokens, context.capacity)) } }
+}
+
+@Test(arguments: [0, 700, 8192])
+func ollamaInputMeasurementUsesOnlyFirstRequest(_ count: Int) async throws {
+    let measurements = InputMeasurements()
+    let observer = OllamaInputObserver { await measurements.record($0) }
+    let first = UUID(), later = UUID()
+    await observer.begin(first, capacity: 8192)
+    await observer.begin(later, capacity: 8192)
+    try await observer.complete(later, inputTokens: 100, capacity: 8192)
+    try await observer.complete(first, inputTokens: count, capacity: 8192)
+    try await observer.complete(first, inputTokens: 5, capacity: 8192)
+    #expect(await measurements.values.count == 1)
+    #expect(await measurements.values.first?.0 == UInt32(count))
+}
+
+@Test(arguments: [nil, -1, 8193, Int.max] as [Int?])
+func ollamaMissingOrInvalidFirstMeasurementNeverUsesLaterToolPass(_ count: Int?) async throws {
+    let measurements = InputMeasurements()
+    let observer = OllamaInputObserver { await measurements.record($0) }
+    let first = UUID(), later = UUID()
+    await observer.begin(first, capacity: 8192)
+    try await observer.complete(first, inputTokens: count, capacity: 8192)
+    await observer.begin(later, capacity: 8192)
+    try await observer.complete(later, inputTokens: 100, capacity: 8192)
+    #expect(await measurements.values.isEmpty)
+}
+
+@Test func ollamaMeasurementRequiresMatchingCapacityAndSuppressesCancellation() async throws {
+    let measurements = InputMeasurements()
+    let observer = OllamaInputObserver { await measurements.record($0) }
+    let first = UUID()
+    await observer.begin(first, capacity: 8192)
+    try await observer.complete(first, inputTokens: 10, capacity: 4096)
+    #expect(await measurements.values.isEmpty)
+    let cancelledObserver = OllamaInputObserver { await measurements.record($0) }
+    await cancelledObserver.begin(first, capacity: 8192)
+    let task = Task {
+        withUnsafeCurrentTask { $0?.cancel() }
+        try await cancelledObserver.complete(first, inputTokens: 10, capacity: 8192)
+    }
+    do { try await task.value; Issue.record("cancelled measurement admitted") }
+    catch is CancellationError {}
+    #expect(await measurements.values.isEmpty)
+}
+
+@Test(arguments: ["length", "unknown", "", "missing"])
+func ollamaFinalMeasurementRetainsOutputLimitAndRejectsUnverifiedReasons(_ reason: String) async throws {
+    let measurements = InputMeasurements()
+    let observer = OllamaInputObserver { await measurements.record($0) }
+    let request = UUID()
+    await observer.begin(request, capacity: 8192)
+    let chunk = OllamaLanguageModel.Chunk(message: .init(role: "assistant", content: "final partial"),
+        done: true, done_reason: reason == "missing" ? nil : reason,
+        prompt_eval_count: 700, eval_count: 2048)
+    var text = ""
+    do {
+        try await OllamaLanguageModel.deliverMeasuredToExecutor(chunk, maximumTokens: 2048,
+            requestID: request, capacity: 8192, observer: observer) { text += $0.message?.content ?? "" }
+        Issue.record("final record incorrectly completed")
+    } catch let failure as BackendFailure {
+        #expect(failure.reason == (reason == "unknown" ? .protocolFault : .outputLimit))
+    }
+    #expect(text == "final partial")
+    #expect(await measurements.values.count == (reason == "length" ? 1 : 0))
+    if reason == "length" { #expect(await measurements.values.first?.0 == 700) }
 }

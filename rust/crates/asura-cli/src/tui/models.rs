@@ -97,7 +97,7 @@ impl Worker {
         self.job = Some(Job {
             handle,
             cancel,
-            deadline: Instant::now() + Duration::from_secs(12),
+            deadline: Instant::now() + Duration::from_secs(35),
             reported: false,
         });
         Ok(())

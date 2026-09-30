@@ -51,7 +51,7 @@ import Testing
 
 private actor Scripted: ModelBackend {
     var calls = 0
-    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096) }
+    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
     func generate(_ input: ModelInput, maximumTokens: UInt32, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         calls += 1
         try await snapshot(Snapshot(text: "first"))
@@ -71,6 +71,43 @@ private func hello(_ identity: Data) -> Envelope {
     value.buildID = identity; value.schemaDigest = identity; value.maxFrameBytes = 65_536
     value.availability = .unknown; value.capabilities = 0; value.reason = .none
     var frame = Envelope(); frame.body = .hello(value); return frame
+}
+private func availableHello(selector: String, capacity: UInt32, reported: UInt32,
+    source: ContextCapacitySource) -> Envelope {
+    var value = Asura_Model_V1_Hello()
+    value.buildID = Data(repeating: 1, count: 32)
+    value.schemaDigest = Data(repeating: 1, count: 32)
+    value.maxFrameBytes = 65_536
+    value.selectedModel = selector
+    value.availability = .available
+    value.capabilities = 1
+    value.reason = .none
+    value.contextTokens = capacity
+    value.reportedContextTokens = reported
+    value.contextSource = source.rawValue
+    var frame = Envelope(); frame.body = .hello(value); return frame
+}
+
+@Test func contextCapacityRequiresCompleteProviderMatchedEvidence() throws {
+    let valid = availableHello(selector: "ollama:example", capacity: 8192,
+        reported: 32768, source: .ollama)
+    try Wire.validate(valid, from: .helper)
+    var missingReported = valid
+    missingReported.hello.clearReportedContextTokens()
+    #expect(throws: HelperError.protocolFault) { try Wire.validate(missingReported, from: .helper) }
+    var missingSource = valid
+    missingSource.hello.clearContextSource()
+    #expect(throws: HelperError.protocolFault) { try Wire.validate(missingSource, from: .helper) }
+    var tooSmall = valid
+    tooSmall.hello.reportedContextTokens = 4096
+    #expect(throws: HelperError.protocolFault) { try Wire.validate(tooSmall, from: .helper) }
+    var wrongSource = valid
+    wrongSource.hello.contextSource = ContextCapacitySource.system.rawValue
+    #expect(throws: HelperError.protocolFault) { try Wire.validate(wrongSource, from: .helper) }
+    var request = hello(Data(repeating: 1, count: 32))
+    request.hello.reportedContextTokens = 8192
+    request.hello.contextSource = ContextCapacitySource.system.rawValue
+    #expect(throws: HelperError.protocolFault) { try Wire.validate(request, from: .service) }
 }
 private func scoped(_ body: Envelope.OneOf_Body) -> Envelope {
     var frame = Envelope(); frame.operationID = Data(repeating: 7, count: 16)
@@ -95,6 +132,8 @@ private func outputCredit(_ id: UInt64) -> Envelope {
     let reply = try Wire.decode(#require(try await replies.next()))
     #expect(reply.hello.availability == .available)
     #expect(reply.hello.contextTokens == 4096)
+    #expect(reply.hello.reportedContextTokens == 4096)
+    #expect(reply.hello.contextSource == ContextCapacitySource.system.rawValue)
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
@@ -203,7 +242,7 @@ private func outputCredit(_ id: UInt64) -> Envelope {
 
 private actor Burst: ModelBackend {
     var produced = 0
-    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096) }
+    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
     func generate(_ input: ModelInput, maximumTokens: UInt32,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         for index in 0..<100 {
@@ -261,7 +300,7 @@ private actor Burst: ModelBackend {
 }
 
 private struct SleepingBackend: ModelBackend {
-    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096) }
+    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
     func generate(_ input: ModelInput, maximumTokens: UInt32,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await Task.sleep(for: .seconds(30))
@@ -297,7 +336,7 @@ private struct SleepingBackend: ModelBackend {
 }
 
 private struct UnsolicitedCancellationBackend: ModelBackend {
-    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096) }
+    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
     func generate(_ input: ModelInput, maximumTokens: UInt32,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         #expect(!Task.isCancelled)
@@ -334,7 +373,7 @@ private struct UnsolicitedCancellationBackend: ModelBackend {
 }
 
 private struct PartialFailureBackend: ModelBackend {
-    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096) }
+    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
     func generate(_ input: ModelInput, maximumTokens: UInt32,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await snapshot(Snapshot(text: "first partial"))
@@ -409,5 +448,207 @@ func backendFailureDrainsBoundedSnapshotsOrStopsAtExistingBoundary(_ action: Str
         #expect(result.reason == (action == "cancel" ? .cancelled : .timeout))
         #expect(started.duration(to: clock.now) < .seconds(2))
     }
+    await running.value
+}
+
+private actor ManualSessionTimer {
+    private var pending: [CheckedContinuation<Void, Never>] = []
+    func sleep(_ milliseconds: UInt32) async {
+        // Deliberately deliver cancelled timers too: the session revision must reject them.
+        await withCheckedContinuation { pending.append($0) }
+    }
+    func count() -> Int { pending.count }
+    func fireAll() {
+        let batch = pending; pending.removeAll()
+        for continuation in batch { continuation.resume() }
+    }
+}
+
+private actor CancellableGeneration: ModelBackend {
+    private(set) var started = false
+    private(set) var cancelled = false
+    func status() async -> BackendStatus {
+        BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system)
+    }
+    func generate(_ input: ModelInput, maximumTokens: UInt32,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        started = true
+        do { try await Task.sleep(for: .seconds(30)) }
+        catch { cancelled = true; throw error }
+    }
+}
+
+@Test func omittedGenerationDeadlineRejectsStaleHandoffExpiryAndRemainsCancellable() async throws {
+    let (helper, service) = try pair()
+    defer { helper.close(); service.close() }
+    let identity = Data(repeating: 1, count: 32)
+    let timers = ManualSessionTimer()
+    let backend = CancellableGeneration()
+    let session = HelperSession(transport: helper, backend: backend, buildID: identity,
+        schemaDigest: identity, timerSleep: { await timers.sleep($0) })
+    let running = Task { await session.run() }
+    var replies = service.frames.makeAsyncIterator()
+    try await service.send(hello(identity)); _ = try await replies.next()
+    var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
+    let bytes = try input.serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    begin.inputBytes = UInt64(bytes.count); begin.maxResponseTokens = 512
+    try await service.send(scoped(.begin(begin))); _ = try await replies.next()
+    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+    chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
+    try await service.send(scoped(.chunk(chunk)), control: false)
+    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(bytes.count)
+    try await service.send(scoped(.inputEnd(end)), control: false); _ = try await replies.next()
+    try await service.send(scoped(.start(.init())))
+    let limit = ContinuousClock.now.advanced(by: .seconds(1))
+    while !(await backend.started) {
+        guard ContinuousClock.now < limit else { throw HelperError.timeout }
+        await Task.yield()
+    }
+    // Advance every handshake expiry beyond its fixture threshold while inference is pending.
+    while await timers.count() < 4 {
+        guard ContinuousClock.now < limit else { throw HelperError.timeout }
+        await Task.yield()
+    }
+    await timers.fireAll()
+    try await Task.sleep(for: .milliseconds(20))
+    #expect(!(await backend.cancelled))
+    var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
+    try await service.send(scoped(.cancel(cancel)))
+    let terminal = try Wire.decode(#require(try await replies.next())).terminal
+    #expect(terminal.outcome == .cancelled)
+    #expect(terminal.reason == .cancelled)
+    await running.value
+    await timers.fireAll()
+    let settlementLimit = ContinuousClock.now.advanced(by: .seconds(1))
+    while !(await backend.cancelled) && ContinuousClock.now < settlementLimit { await Task.yield() }
+    #expect(await backend.cancelled)
+}
+
+@Test func beginDeadlineIsOptionalButExplicitValuesRemainBounded() throws {
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    begin.inputBytes = 10; begin.maxResponseTokens = 512
+    try Wire.validate(scoped(.begin(begin)), from: .service)
+    for valid in [UInt32(1), 60_000] {
+        begin.deadlineRemainingMs = valid
+        try Wire.validate(scoped(.begin(begin)), from: .service)
+    }
+    for invalid in [UInt32(0), 60_001] {
+        begin.deadlineRemainingMs = invalid
+        #expect(throws: HelperError.self) { try Wire.validate(scoped(.begin(begin)), from: .service) }
+    }
+}
+
+@Test(arguments: [false, true])
+func omittedGenerationDeadlineStillBoundsTransferAndReadyHandoff(ready: Bool) async throws {
+    let (helper, service) = try pair()
+    defer { helper.close(); service.close() }
+    let identity = Data(repeating: 1, count: 32)
+    let timers = ManualSessionTimer()
+    let backend = CancellableGeneration()
+    let session = HelperSession(transport: helper, backend: backend, buildID: identity,
+        schemaDigest: identity, timerSleep: { await timers.sleep($0) })
+    let running = Task { await session.run() }
+    var replies = service.frames.makeAsyncIterator()
+    try await service.send(hello(identity)); _ = try await replies.next()
+    var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
+    let bytes = try input.serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    begin.inputBytes = UInt64(bytes.count); begin.maxResponseTokens = 512
+    try await service.send(scoped(.begin(begin))); _ = try await replies.next()
+    if ready {
+        var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+        chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
+        try await service.send(scoped(.chunk(chunk)), control: false)
+        var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(bytes.count)
+        try await service.send(scoped(.inputEnd(end)), control: false); _ = try await replies.next()
+    }
+    let limit = ContinuousClock.now.advanced(by: .seconds(1))
+    while await timers.count() < (ready ? 4 : 3) {
+        guard ContinuousClock.now < limit else { throw HelperError.timeout }
+        await Task.yield()
+    }
+    await timers.fireAll()
+    let terminal = try Wire.decode(#require(try await replies.next())).terminal
+    #expect(terminal.outcome == .failed)
+    #expect(terminal.reason == .timeout)
+    #expect(!(await backend.started))
+    await running.value
+    await timers.fireAll()
+}
+
+private struct LateMeasured: ModelBackend {
+    let duplicate: Bool
+    func status() async -> BackendStatus {
+        BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system)
+    }
+    func generate(_ input: ModelInput, maximumTokens: UInt32,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await snapshot(Snapshot(text: "preserved response"))
+        try await snapshot(Snapshot(text: "", inputContext: (700, 4096)))
+        if duplicate { try await snapshot(Snapshot(text: "", inputContext: (700, 4096))) }
+    }
+}
+
+@Test(arguments: [false, true])
+func lateInputMeasurementPreservesOutputAndRejectsDuplicate(_ duplicate: Bool) async throws {
+    let (helper, service) = try pair()
+    defer { helper.close(); service.close() }
+    let identity = Data(repeating: 1, count: 32)
+    let backend = LateMeasured(duplicate: duplicate)
+    let session = HelperSession(transport: helper, backend: backend, buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    defer { running.cancel() }
+    var replies = service.frames.makeAsyncIterator()
+    try await service.send(hello(identity))
+    let reply = try Wire.decode(#require(try await replies.next()))
+    #expect(reply.hello.availability == .available)
+    #expect(reply.hello.contextTokens == 4096)
+    #expect(reply.hello.reportedContextTokens == 4096)
+    #expect(reply.hello.contextSource == ContextCapacitySource.system.rawValue)
+    var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
+    let data = try input.serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    begin.inputBytes = UInt64(data.count); begin.deadlineRemainingMs = 2_000; begin.maxResponseTokens = 512
+    try await service.send(scoped(.begin(begin)))
+    #expect(try Wire.decode(#require(try await replies.next())).credit.transferID == 1)
+    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+    chunk.ordinal = 0; chunk.revision = 0; chunk.data = data
+    try await service.send(scoped(.chunk(chunk)), control: false)
+    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(data.count)
+    try await service.send(scoped(.inputEnd(end)), control: false)
+    let ready = try Wire.decode(#require(try await replies.next()))
+    if case .ready = ready.body {} else { Issue.record("missing ready") }
+    try await service.send(scoped(.start(.init())))
+    try await service.send(outputCredit(2))
+    var text = Data()
+    var finalText = ""
+    var measurementCount = 0
+    var terminal: Asura_Model_V1_Terminal?
+    while let raw = try await replies.next() {
+        let frame = try Wire.decode(raw)
+        switch frame.body {
+        case .chunk(let v): text.append(v.data)
+        case .snapshotEnd(let v):
+            finalText = String(decoding: text, as: UTF8.self); text.removeAll()
+            do { try await service.send(outputCredit(v.revision + 2)) }
+            catch HelperError.closed {
+                // The final snapshot may be followed by Terminal and EOF already buffered.
+                // Continue decoding those observations; write closure is not a lost result.
+            }
+        case .contextMeasured(let v):
+            measurementCount += 1
+            #expect(v.inputTokens == 700)
+            #expect(v.capacityTokens == 4096)
+        case .terminal(let v): terminal = v
+        default: Issue.record("unexpected output")
+        }
+        if terminal != nil { break }
+    }
+    #expect(finalText == "preserved response")
+    #expect(measurementCount == 1)
+    #expect(terminal?.outcome == (duplicate ? .failed : .complete))
+
+    service.close()
     await running.value
 }

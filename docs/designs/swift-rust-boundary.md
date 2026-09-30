@@ -821,8 +821,9 @@ chunk and byte counts. A failed or interrupted prefix is never committed history
 ### Numeric execution and settlement
 
 The numeric table in the first-conversation packet governs this binding: one
-active helper, no waiting admission queue, five-second handshake, 60-second
-absolute operation deadline, 512 response tokens and 60 KiB response text.
+active helper, five-second handshake and input transfer. The
+[cancellation-driven policy](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
+replaces the fixed whole-turn deadline. Existing response and byte budgets remain.
 Output transmission is additionally capped at 4 MiB and 1,024 revisions. Retain
 at most two 60 KiB output snapshots plus the bounded transport staging. Reserve
 eight control frames of at most 4 KiB each so cancellation cannot wait on credit.
@@ -1013,7 +1014,7 @@ Chunk frames; reserved control capacity never reorders these dependent messages.
 
 The service model owner starts one preparation thread and retains that slot until
 its join and exact child reaping. Preparation validates and copies at most 128 MiB
-of executable bytes with a two-second cooperative deadline. Cancellation is
+of executable bytes with a twenty-second cooperative deadline. Cancellation is
 checked between 64 KiB reads and immediately before spawn. A stalled filesystem
 call retains the slot; it cannot block the reactor or permit replacement work.
 The preparation result transfers one owned child to the reactor. The reactor

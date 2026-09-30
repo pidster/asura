@@ -242,6 +242,37 @@ pub fn validate_semantics(
                 && v.local_tool_destination.is_none_or(|local| {
                     !service && v.inventory_only != Some(true) && v.availability == Some(1) && local
                 })
+                && match (
+                    v.context_tokens,
+                    v.reported_context_tokens,
+                    v.context_source,
+                ) {
+                    (Some(effective), Some(reported), Some(source @ 1..=4)) => {
+                        !service
+                            && v.inventory_only != Some(true)
+                            && effective > 512
+                            && reported >= effective
+                            && match v
+                                .selected_model
+                                .as_deref()
+                                .unwrap_or("system")
+                                .to_lowercase()
+                                .split_once(':')
+                            {
+                                None => {
+                                    source == 1
+                                        && v.selected_model.as_deref().unwrap_or("system")
+                                            == "system"
+                                }
+                                Some(("coreai", _)) => source == 2,
+                                Some(("mlx", _)) => source == 3,
+                                Some(("ollama", _)) => source == 4,
+                                _ => false,
+                            }
+                    }
+                    (None, None, None) => true,
+                    _ => false,
+                }
                 && v.inventory_only != Some(false)
                 && inventory
                 && v.selected_model.as_deref().is_none_or(selector)
@@ -266,11 +297,15 @@ pub fn validate_semantics(
                     v.availability == Some(3)
                         && v.capabilities == Some(0)
                         && v.context_tokens.is_none()
+                        && v.reported_context_tokens.is_none()
+                        && v.context_source.is_none()
                         && v.reason == Some(0)
                 } else if v.inventory_only == Some(true) {
                     v.availability == Some(3)
                         && v.capabilities == Some(0)
                         && v.context_tokens.is_none()
+                        && v.reported_context_tokens.is_none()
+                        && v.context_source.is_none()
                         && v.model_name.is_none()
                         && v.reason == Some(0)
                 } else {
@@ -278,11 +313,15 @@ pub fn validate_semantics(
                         Some(1) => {
                             matches!(v.capabilities, Some(1 | 3))
                                 && v.context_tokens.is_some_and(|n| n > 0)
+                                && v.reported_context_tokens.is_some()
+                                && v.context_source.is_some()
                                 && v.reason == Some(0)
                         }
                         Some(2 | 3) => {
                             v.capabilities == Some(0)
                                 && v.context_tokens.is_none()
+                                && v.reported_context_tokens.is_none()
+                                && v.context_source.is_none()
                                 && v.reason == Some(1)
                         }
                         _ => false,
@@ -296,7 +335,7 @@ pub fn validate_semantics(
             v.model.as_deref().is_some_and(selector)
                 && positive(v.input_bytes, MAX_INPUT_BYTES as u64)
                 && v.deadline_remaining_ms
-                    .is_some_and(|n| (1..=60_000).contains(&n))
+                    .is_none_or(|n| (1..=60_000).contains(&n))
                 && v.max_response_tokens
                     .is_some_and(|n| (1..=2048).contains(&n))
         }

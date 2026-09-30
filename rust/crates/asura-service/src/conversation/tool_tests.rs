@@ -80,6 +80,7 @@ impl Fixture {
             cancel: None,
             cancel_replies: vec![],
             terminal: None,
+            failure_reason: None,
             tool: Some(LiveTool {
                 create: None,
                 shell_intent: None,
@@ -95,7 +96,6 @@ impl Fixture {
             tool_executor: tools::Executor::default(),
             shell_worker: crate::shell_worker::Worker::default(),
             tool_cache: vec![],
-            deadline: now + Duration::from_secs(60),
         };
         Self {
             path,
@@ -126,6 +126,7 @@ impl Fixture {
                 started: true,
                 automatic_initialization: AutomaticInitialization::Complete,
                 model_context: VecDeque::new(),
+                hold_reasons: BTreeMap::new(),
                 wake: None,
                 observations: vec![],
                 foreground: VecDeque::new(),
@@ -209,7 +210,7 @@ fn result_acknowledgement_after_cancel_or_deadline_never_delivers() {
         let result = fixture.stage_result();
         let active = fixture.owner.active.as_mut().unwrap();
         if expired {
-            active.deadline = Instant::now();
+            active.tool.as_mut().unwrap().deadline = Instant::now();
         } else {
             active.cancel = Some(journal::Cause::UserCancel);
         }
@@ -547,7 +548,6 @@ fn invalid_semantic_path_is_durable_rejection_not_host_dispatch() {
 fn cached_rejection_replays_only_exact_current_proposal() {
     let fixture = Fixture::new();
     let turn = &fixture.owner.active.as_ref().unwrap().turn;
-    let now = Instant::now();
     let call = tools::Call {
         operation: turn.operation,
         generation: turn.generation,
@@ -560,37 +560,17 @@ fn cached_rejection_replays_only_exact_current_proposal() {
         call.arguments.validate(),
         Err(tools::Rejection::InvalidArguments)
     );
-    assert!(
-        validate_cached_tool(&call, &call, turn, true, now + Duration::from_secs(1), now).is_ok()
-    );
+    assert!(validate_cached_tool(&call, &call, turn, true).is_ok());
     let mut changed = call.clone();
     changed.arguments = tools::Arguments::ListDirectory { path: "..".into() };
     assert_eq!(
-        validate_cached_tool(
-            &call,
-            &changed,
-            turn,
-            true,
-            now + Duration::from_secs(1),
-            now
-        ),
+        validate_cached_tool(&call, &changed, turn, true,),
         Err(tools::Rejection::IdentityConflict)
-    );
-    assert_eq!(
-        validate_cached_tool(&call, &call, turn, true, now, now),
-        Err(tools::Rejection::Expired)
     );
     let mut stale = turn.clone();
     stale.generation += 1;
     assert_eq!(
-        validate_cached_tool(
-            &call,
-            &call,
-            &stale,
-            true,
-            now + Duration::from_secs(1),
-            now
-        ),
+        validate_cached_tool(&call, &call, &stale, true,),
         Err(tools::Rejection::Stale)
     );
 }
@@ -767,7 +747,7 @@ fn memory_response_does_not_release_slot_before_worker_settles() {
     tool.intent_committed = true;
     tool.dispatched = true;
     tool.memory_ticket = Some(ticket);
-    active.tool_budget = tools::Budget::new(active.deadline);
+    active.tool_budget = tools::Budget::cancellation_driven();
     active
         .tool_budget
         .reserve(
@@ -931,7 +911,7 @@ fn inventory_fixture() -> Fixture {
     let active = fixture.owner.active.as_mut().unwrap();
     let tool = active.tool.as_mut().unwrap();
     tool.call.arguments = tools::Arguments::ListTools;
-    active.tool_budget = tools::Budget::new(active.deadline);
+    active.tool_budget = tools::Budget::cancellation_driven();
     active
         .tool_budget
         .reserve(

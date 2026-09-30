@@ -160,6 +160,12 @@ pub(super) fn valid(body: &Body) -> bool {
                         }
                         && matches!(e.kind, Some(1 | 2))
                         && e.state.is_some_and(|n| (1..=6).contains(&n))
+                        && e.hold_reason.as_ref().is_none_or(|reason| {
+                            e.state == Some(2)
+                                && !reason.is_empty()
+                                && reason.len() <= 64
+                                && reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                        })
                         && e.sequence.is_some_and(|n| n > 0)
                         && e.text
                             .as_ref()
@@ -242,9 +248,17 @@ pub(super) fn valid(body: &Body) -> bool {
                 && v.model_context.as_ref().is_none_or(|m| {
                     m.model_name.as_ref().is_none_or(|n| {
                         !n.is_empty() && n.len() <= 256 && !n.chars().any(char::is_control)
-                    }) && match (m.input_tokens, m.capacity_tokens, m.basis) {
-                        (None, None, None) => m.model_name.is_some(),
-                        (Some(n), Some(c), Some(1)) => c > 0 && n <= c,
+                    }) && match (m.capacity_tokens, m.reported_max_tokens, m.capacity_source) {
+                        (None, None, None) => {
+                            m.model_name.is_some() && m.input_tokens.is_none() && m.basis.is_none()
+                        }
+                        (Some(c), Some(max), Some(1..=4)) if c > 512 && max >= c => {
+                            match (m.input_tokens, m.basis) {
+                                (None, None) => true,
+                                (Some(n), Some(1)) => n <= c,
+                                _ => false,
+                            }
+                        }
                         _ => false,
                     }
                 })
@@ -626,14 +640,60 @@ mod tests {
                 input_tokens: Some(123),
                 capacity_tokens: Some(4096),
                 basis: Some(1),
+                reported_max_tokens: Some(4096),
+                capacity_source: Some(1),
             }),
             ..Default::default()
         };
         assert!(valid(&Body::ConversationEvent(event.clone())));
+        let context = event.model_context.as_mut().unwrap();
+        context.input_tokens = None;
+        context.basis = None;
+        assert!(valid(&Body::ConversationEvent(event.clone())));
+        let context = event.model_context.as_mut().unwrap();
+        context.input_tokens = Some(123);
+        context.basis = Some(1);
         event.model_context.as_mut().unwrap().basis = None;
         assert!(!valid(&Body::ConversationEvent(event.clone())));
         event.model_context.as_mut().unwrap().basis = Some(1);
         event.model_context.as_mut().unwrap().input_tokens = Some(4097);
+        assert!(!valid(&Body::ConversationEvent(event.clone())));
+        event.model_context.as_mut().unwrap().input_tokens = Some(123);
+        event.model_context.as_mut().unwrap().reported_max_tokens = Some(100);
+        assert!(!valid(&Body::ConversationEvent(event.clone())));
+        event.model_context.as_mut().unwrap().reported_max_tokens = Some(4096);
+        event.model_context.as_mut().unwrap().capacity_source = Some(9);
         assert!(!valid(&Body::ConversationEvent(event)));
+    }
+    #[test]
+    fn held_queue_reason_is_bounded_and_only_for_held_state() {
+        let mut reply = pb::ConversationQueueReply {
+            entries: vec![pb::ConversationQueueEntry {
+                input_id: Some(vec![3; 16]),
+                project_id: Some(vec![4; 16]),
+                conversation_id: Some(vec![5; 16]),
+                target_generation: Some(1),
+                kind: Some(1),
+                state: Some(2),
+                text: Some("prompt".into()),
+                sequence: Some(1),
+                new_conversation: Some(false),
+                order_position: Some(1),
+                hold_reason: Some("model_unavailable".into()),
+                ..Default::default()
+            }],
+            full_text: Some(false),
+            revision: Some(1),
+            pending: Some(false),
+            order_revision: Some(1),
+            stale_order: Some(false),
+            ..Default::default()
+        };
+        assert!(valid(&Body::ConversationQueueReply(reply.clone())));
+        reply.entries[0].state = Some(1);
+        assert!(!valid(&Body::ConversationQueueReply(reply.clone())));
+        reply.entries[0].state = Some(2);
+        reply.entries[0].hold_reason = Some("bad reason".into());
+        assert!(!valid(&Body::ConversationQueueReply(reply)));
     }
 }

@@ -27,6 +27,8 @@ public actor HelperSession {
     private var modelTask: Task<Void, Never>?
     private var timer: Task<Void, Never>?
     private var timerRevision: UInt64 = 0
+    private let timerSleep: @Sendable (UInt32) async throws -> Void
+    private var generationDeadlineMilliseconds: UInt32?
     private var measuredContext = false
     private var latest: Snapshot?
     private var transmitting: Data?
@@ -43,14 +45,24 @@ public actor HelperSession {
     private var ledgers: [UInt64: Ledger] = [2: Ledger()]
 
     public init(transport: Transport, backend: any ModelBackend, buildID: Data, schemaDigest: Data) {
+        self.init(transport: transport, backend: backend, buildID: buildID, schemaDigest: schemaDigest,
+            timerSleep: Self.sleep)
+    }
+
+    // Inject only the timer boundary; production protocol phases and expiry decisions stay canonical.
+    init(transport: Transport, backend: any ModelBackend, buildID: Data, schemaDigest: Data,
+        timerSleep: @escaping @Sendable (UInt32) async throws -> Void) {
         self.transport = transport; self.backend = backend; self.factory = nil
-        self.buildID = buildID; self.schemaDigest = schemaDigest
+        self.buildID = buildID; self.schemaDigest = schemaDigest; self.timerSleep = timerSleep
+    }
+    private static func sleep(milliseconds: UInt32) async throws {
+        try await Task.sleep(for: .milliseconds(Int(milliseconds)))
     }
 
     public typealias BackendFactory = @Sendable (String, String?, String?, UInt32?) async throws -> any ModelBackend
     public init(transport: Transport, factory: @escaping BackendFactory, buildID: Data, schemaDigest: Data) {
         self.transport = transport; self.factory = factory; self.backend = nil
-        self.buildID = buildID; self.schemaDigest = schemaDigest
+        self.buildID = buildID; self.schemaDigest = schemaDigest; self.timerSleep = Self.sleep
     }
 
     public func run() async {
@@ -71,11 +83,15 @@ public actor HelperSession {
         phase = .terminal
     }
 
+    private func disarm() {
+        timer?.cancel(); timer = nil; timerRevision += 1
+    }
     private func arm(milliseconds: UInt32) {
-        timer?.cancel(); timerRevision += 1
+        disarm()
         let current = timerRevision
+        let sleep = timerSleep
         timer = Task { [weak self] in
-            do { try await Task.sleep(for: .milliseconds(Int(milliseconds))) }
+            do { try await sleep(milliseconds) }
             catch { return }
             await self?.expired(current)
         }
@@ -115,6 +131,7 @@ public actor HelperSession {
                 hello.hasMaxFrameBytes, hello.maxFrameBytes == UInt32(Limits.frame),
                 hello.hasAvailability, hello.availability == .unknown,
                 hello.hasCapabilities, hello.capabilities == 0, !hello.hasContextTokens,
+                !hello.hasReportedContextTokens, !hello.hasContextSource,
                 hello.hasReason, hello.reason == .none else { throw HelperError.protocolFault }
             selectedModel = hello.hasSelectedModel ? hello.selectedModel : "system"
             if hello.inventoryOnly {
@@ -145,9 +162,13 @@ public actor HelperSession {
             response.buildID = buildID; response.schemaDigest = schemaDigest
             response.maxFrameBytes = UInt32(Limits.frame)
             response.selectedModel = selectedModel
-            if let context = status.contextTokens, context > 512 {
+            if let context = status.contextTokens, context > 512,
+                let reported = status.reportedContextTokens, reported >= context,
+                let source = status.contextSource {
                 response.availability = .available; response.capabilities = status.supportsTools ? 3 : 1
                 response.contextTokens = context; response.reason = .none
+                response.reportedContextTokens = reported
+                response.contextSource = source.rawValue
                 if status.localToolDestination { response.localToolDestination = true }
                 if let profile = status.capabilityProfile {
                     response.capabilitySource = profile.provenance.rawValue
@@ -172,7 +193,7 @@ public actor HelperSession {
         if phase == .begin {
             guard case .begin(let begin) = body, begin.hasModel, begin.model == selectedModel,
                 begin.hasInputBytes, begin.inputBytes > 0, begin.inputBytes <= UInt64(Limits.input),
-                begin.hasDeadlineRemainingMs, (1...60_000).contains(begin.deadlineRemainingMs),
+                (!begin.hasDeadlineRemainingMs || (1...60_000).contains(begin.deadlineRemainingMs)),
                 begin.hasMaxResponseTokens, (1...2048).contains(begin.maxResponseTokens) else { throw HelperError.protocolFault }
             operation = message.operationID; generation = message.generation
             expectedInput = begin.inputBytes
@@ -184,7 +205,8 @@ public actor HelperSession {
                 })
             }
             if projectToolsEnabled && (!supportsTools || !(backend is any ToolModelBackend)) { throw HelperError.unavailable }
-            arm(milliseconds: begin.deadlineRemainingMs)
+            generationDeadlineMilliseconds = begin.hasDeadlineRemainingMs ? begin.deadlineRemainingMs : nil
+            arm(milliseconds: 5_000)
             phase = .input
             var credit = Asura_Model_V1_Credit()
             credit.transferID = 1; credit.direction = .input; credit.acceptedBytes = 0
@@ -213,10 +235,13 @@ public actor HelperSession {
             decodedInput = try Wire.input(inputData)
             inputData.removeAll()
             phase = .ready
+            arm(milliseconds: 5_000)
             try await transport.send(envelope(.ready(.init())))
         case .start:
             guard phase == .ready, let input = decodedInput else { throw HelperError.protocolFault }
             decodedInput = nil; phase = .running
+            disarm()
+            if let deadline = generationDeadlineMilliseconds { arm(milliseconds: deadline) }
             guard let backend = self.backend else { throw HelperError.unavailable }
             let maximumTokens = self.maximumTokens
             let owner = self
@@ -333,7 +358,7 @@ public actor HelperSession {
     private func snapshot(_ value: Snapshot) async throws {
         guard phase == .running, pendingFailure == nil else { throw CancellationError() }
         if let context = value.inputContext {
-            guard !measuredContext, revision == 0, latest == nil, value.text.isEmpty,
+            guard !measuredContext, value.text.isEmpty, value.usageTokens == nil,
                 context.capacity > 0, context.tokens <= context.capacity else { throw HelperError.protocolFault }
             measuredContext = true
             var measured = Asura_Model_V1_ContextMeasured()
@@ -420,7 +445,7 @@ public actor HelperSession {
         end.count = totalChunks; end.totalBytes = totalBytes; end.reason = reason
         end.usageKnown = outcome == .complete && usage != nil
         if end.usageKnown, let usage { end.usageTokens = usage }
-        // Drain previously queued chunks first. The service independently enforces its deadline.
+        // Drain previously queued chunks first. The service independently owns cancellation.
         try await transport.send(envelope(.terminal(end)), control: false)
         transport.finish()
         arm(milliseconds: 250)

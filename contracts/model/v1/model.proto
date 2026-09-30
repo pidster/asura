@@ -46,8 +46,17 @@ message Hello {
   optional uint32 supported_capabilities = 17;
   optional uint32 capability_source = 18;
   optional bool reasoning_disabled = 19;
+  optional uint32 reported_context_tokens = 20;
+  optional uint32 context_source = 21;
 }
-message Begin { optional string model = 1; optional uint64 input_bytes = 2; optional uint32 deadline_remaining_ms = 3; optional uint32 max_response_tokens = 4; optional bool enable_project_tools = 5; }
+message Begin {
+  optional string model = 1;
+  optional uint64 input_bytes = 2;
+  // Absent: cancellation-driven generation. Present: explicit duration from Start.
+  optional uint32 deadline_remaining_ms = 3;
+  optional uint32 max_response_tokens = 4;
+  optional bool enable_project_tools = 5;
+}
 message Chunk { optional uint64 transfer_id = 1; optional TransferDirection direction = 2; optional uint64 ordinal = 3; optional bytes data = 4; optional uint64 revision = 5; }
 message Credit { optional uint64 transfer_id = 1; optional TransferDirection direction = 2; optional uint64 accepted_bytes = 3; optional uint64 granted_bytes = 4; }
 message InputEnd { optional uint64 count = 1; optional uint64 total_bytes = 2; }

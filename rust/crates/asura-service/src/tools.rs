@@ -388,7 +388,7 @@ pub fn validate_authority(
 /// Cancellation deliberately retains pending work until its worker settles.
 #[derive(Debug)]
 pub struct Budget {
-    deadline: Instant,
+    deadline: Option<Instant>,
     admitted: u32,
     result_bytes: usize,
     pending: Option<Call>,
@@ -397,7 +397,16 @@ pub struct Budget {
 impl Budget {
     pub fn new(deadline: Instant) -> Self {
         Self {
-            deadline,
+            deadline: Some(deadline),
+            admitted: 0,
+            result_bytes: 0,
+            pending: None,
+            cancelled: false,
+        }
+    }
+    pub fn cancellation_driven() -> Self {
+        Self {
+            deadline: None,
             admitted: 0,
             result_bytes: 0,
             pending: None,
@@ -452,7 +461,7 @@ impl Budget {
         if self.cancelled {
             return Err(Rejection::Cancelled);
         }
-        if now >= self.deadline {
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
             return Err(Rejection::Expired);
         }
         if let Some(pending) = &self.pending {
@@ -842,6 +851,24 @@ mod tests {
             Err(Rejection::Denied)
         );
     }
+    #[test]
+    fn cancellation_driven_budget_admits_late_tools_but_enforces_cancel() {
+        let (call, grant) = fixture();
+        let later = Instant::now() + std::time::Duration::from_secs(120);
+        let mut budget = Budget::cancellation_driven();
+        budget
+            .reserve(call.clone(), &grant, &Destination::Local, later)
+            .unwrap();
+        budget.settle(&call, 0).unwrap();
+        budget.cancel();
+        let mut next = call;
+        next.ordinal = 2;
+        assert_eq!(
+            budget.reserve(next, &grant, &Destination::Local, later),
+            Err(Rejection::Cancelled)
+        );
+    }
+
     #[test]
     fn cancellation_and_invalid_results_retain_pending_slot() {
         let (call, grant) = fixture();

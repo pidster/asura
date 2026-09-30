@@ -34,6 +34,8 @@ pub(crate) enum ModelEvent {
     },
     Available {
         context_tokens: u32,
+        reported_context_tokens: u32,
+        context_source: u32,
         model_name: Option<String>,
         tools_available: bool,
         capabilities: crate::model::CapabilityProfile,
@@ -97,6 +99,7 @@ pub(crate) struct ModelOwner {
     tools_enabled: bool,
     pending_tool: Option<u32>,
     measured_context: bool,
+    effective_context: Option<u32>,
     completion: crate::completion::Completion,
     cleanup_completion: crate::completion::Completion,
     wake: Option<asura_platform::events::WakeSender>,
@@ -147,7 +150,7 @@ impl ModelOwner {
             .cleanup
             .as_ref()
             .and_then(|_| self.cleanup_completion.settlement_deadline(now));
-        (self.child.is_some() || self.phase != Phase::Draining)
+        (self.phase != Phase::Running && (self.child.is_some() || self.phase != Phase::Draining))
             .then_some(self.deadline)
             .into_iter()
             .chain(settlement)
@@ -187,7 +190,7 @@ impl ModelOwner {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let token = cancelled.clone();
-        let deadline = now + Duration::from_secs(2);
+        let deadline = now + Duration::from_secs(20);
         let completion = crate::completion::Completion::default();
         let signal = completion.clone();
         let task = thread::Builder::new()
@@ -239,6 +242,7 @@ impl ModelOwner {
             tools_enabled: false,
             pending_tool: None,
             measured_context: false,
+            effective_context: None,
             completion,
             cleanup_completion: Default::default(),
             wake: None,
@@ -269,18 +273,17 @@ impl ModelOwner {
         self.queue(Body::Begin(pb::Begin {
             model: Some(self.selection.model.clone()),
             input_bytes: Some(input.len() as u64),
-            deadline_remaining_ms: Some(60000),
+            deadline_remaining_ms: None,
             max_response_tokens: Some(asura_storage::authority::conversation::OUTPUT_RESERVATION),
             enable_project_tools: enable_tools.then_some(true),
         }))?;
         self.input = Some(input);
         self.phase = Phase::Input;
-        self.deadline = now + Duration::from_secs(60);
+        self.deadline = now + Duration::from_secs(5);
         Ok(())
     }
     pub(crate) fn tool_result(&mut self, result: pb::ToolResult) -> Result<(), &'static str> {
         if self.phase != Phase::Running
-            || Instant::now() >= self.deadline
             || !self.tools_enabled
             || self.pending_tool != result.ordinal
         {
@@ -393,6 +396,8 @@ impl ModelOwner {
                             availability: Some(3),
                             capabilities: Some(0),
                             context_tokens: None,
+                            reported_context_tokens: None,
+                            context_source: None,
                             model_name: None,
                             reason: Some(0),
                             inventory_only: self.inventory_only.then_some(true),
@@ -429,7 +434,12 @@ impl ModelOwner {
                 }
             }
         }
-        if now >= self.deadline && self.phase != Phase::Settled && self.phase != Phase::Draining {
+        if now >= self.deadline
+            && !matches!(
+                self.phase,
+                Phase::Running | Phase::Settled | Phase::Draining
+            )
+        {
             self.fail("model_timeout", now, &mut events);
         }
         if self.child.is_some() {
@@ -624,6 +634,9 @@ impl ModelOwner {
             if hello.selected_model.as_deref().unwrap_or("system") != self.selection.model {
                 return Err("model_protocol_identity_mismatch");
             }
+            // The canonical codec validates the source against the selector,
+            // including case-insensitive provider prefixes. Identity stays exact.
+            self.effective_context = hello.context_tokens;
             self.tools_available = hello.capabilities == Some(3)
                 && hello
                     .supported_capabilities
@@ -637,6 +650,8 @@ impl ModelOwner {
             self.deadline = Instant::now() + Duration::from_secs(5);
             events.push(ModelEvent::Available {
                 context_tokens: hello.context_tokens.unwrap(),
+                reported_context_tokens: hello.reported_context_tokens.unwrap(),
+                context_source: hello.context_source.unwrap(),
                 model_name: hello.model_name,
                 tools_available: self.tools_available,
                 capabilities: crate::model::CapabilityProfile {
@@ -675,6 +690,7 @@ impl ModelOwner {
             }
             Body::Ready(_) if self.phase == Phase::Input && self.input.is_none() => {
                 self.phase = Phase::Ready;
+                self.deadline = Instant::now() + Duration::from_secs(5);
                 events.push(ModelEvent::Ready);
             }
             Body::ToolCall(call) if self.phase == Phase::Running && self.tools_enabled => {
@@ -687,7 +703,7 @@ impl ModelOwner {
             Body::ContextMeasured(value)
                 if self.phase == Phase::Running
                     && !self.measured_context
-                    && self.total_chunks == 0 =>
+                    && value.capacity_tokens == self.effective_context =>
             {
                 self.measured_context = true;
                 events.push(ModelEvent::ContextMeasured {
@@ -742,6 +758,16 @@ impl ModelOwner {
                     Phase::Running | Phase::Ready | Phase::Input | Phase::Draining
                 ) =>
             {
+                tracing::debug!(
+                    stage = "terminal",
+                    class = "terminal_received",
+                    outcome = ?terminal.outcome,
+                    reason = ?terminal.reason,
+                    revision = ?terminal.last_revision,
+                    chunks = ?terminal.count,
+                    bytes = ?terminal.total_bytes,
+                    "model_helper_diagnostic"
+                );
                 // A successful response cannot precede the service's durable tool result.
                 // Failure/cancellation may end a suspended callback; its host worker still settles.
                 if terminal.outcome == Some(1) && self.pending_tool.is_some() {
@@ -759,6 +785,18 @@ impl ModelOwner {
                     || terminal.outcome == Some(1)
                         && (!self.snapshot.is_empty() || self.revision == 0)
                 {
+                    tracing::warn!(
+                        stage = "terminal",
+                        class = "terminal_accounting",
+                        received_revision = ?terminal.last_revision,
+                        expected_revision,
+                        received_chunks = ?terminal.count,
+                        expected_chunks = self.total_chunks,
+                        received_bytes = ?terminal.total_bytes,
+                        expected_bytes = self.total_bytes,
+                        partial_bytes = self.snapshot.len(),
+                        "model_helper_diagnostic"
+                    );
                     return Err("model_protocol_fault");
                 }
                 self.terminal_seen = true;
@@ -874,6 +912,7 @@ mod tests {
             tools_enabled: false,
             pending_tool: None,
             measured_context: false,
+            effective_context: (phase != Phase::Hello).then_some(4096),
             completion: Default::default(),
             cleanup_completion: Default::default(),
             wake: None,
@@ -913,6 +952,8 @@ mod tests {
                     selected_model: Some("system".into()),
                     availability: Some(1),
                     context_tokens: Some(4096),
+                    reported_context_tokens: Some(4096),
+                    context_source: Some(1),
                     capabilities: Some(3),
                     supported_capabilities: supported,
                     capability_source: supported.map(|_| 1),
@@ -988,6 +1029,37 @@ mod tests {
     }
 
     #[test]
+    fn running_generation_does_not_expire_with_elapsed_time() {
+        let mut owner = owner(Phase::Running);
+        let now = Instant::now();
+        owner.deadline = now - Duration::from_secs(120);
+        assert_eq!(owner.next_deadline(now), None);
+        assert!(owner.poll(now).is_empty());
+        assert_eq!(owner.phase, Phase::Running);
+        owner.cancel(1, now);
+        assert_eq!(owner.phase, Phase::Draining);
+        assert_eq!(owner.deadline, now + Duration::from_millis(250));
+        assert_eq!(
+            owner.next_deadline(now),
+            None,
+            "no child remains in this unit fixture"
+        );
+    }
+
+    #[test]
+    fn preparation_remains_bounded_and_cancellable() {
+        let mut owner = owner(Phase::Preparing);
+        let now = Instant::now();
+        owner.deadline = now + Duration::from_secs(20);
+        assert!(owner.poll(now + Duration::from_secs(19)).is_empty());
+        assert!(matches!(
+            owner.poll(now + Duration::from_secs(20)).first(),
+            Some(ModelEvent::Failed("model_timeout"))
+        ));
+        assert!(owner.cancel_preparation.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn snapshot_replaces_and_terminal_reconciles_cumulative_bytes() {
         let mut owner = owner(Phase::Running);
         let mut events = Vec::new();
@@ -1044,11 +1116,12 @@ mod tests {
         assert!(events.is_empty());
     }
     #[test]
-    fn expired_tool_result_never_enters_output_queue() {
+    fn cancelled_tool_result_never_enters_output_queue() {
         let mut owner = owner(Phase::Running);
         owner.tools_enabled = true;
         owner.pending_tool = Some(1);
-        owner.deadline = Instant::now();
+        owner.cancel(1, Instant::now());
+        owner.outgoing.clear();
         assert!(
             owner
                 .tool_result(pb::ToolResult {
@@ -1119,9 +1192,12 @@ mod tests {
         }));
         owner.receive(credit.clone(), &mut events).unwrap();
         assert!(owner.receive(credit, &mut events).is_err());
+        owner.deadline = Instant::now() + Duration::from_millis(100);
+        let ready_received = Instant::now();
         owner
             .receive(message(Body::Ready(pb::Ready {})), &mut events)
             .unwrap();
+        assert!(owner.deadline >= ready_received + Duration::from_secs(5));
         owner.start().unwrap();
         assert!(owner.start().is_err());
     }
@@ -1230,6 +1306,8 @@ mod tests {
                 availability: Some(1),
                 capabilities: Some(1),
                 context_tokens: Some(4096),
+                reported_context_tokens: Some(4096),
+                context_source: Some(1),
                 model_name: None,
                 reason: Some(0),
             })),
@@ -1335,6 +1413,51 @@ mod tests {
             }]
         ));
         assert!(owner.receive(message(body), &mut events).is_err());
+    }
+    #[test]
+    fn measured_capacity_must_match_discovered_effective_window() {
+        let mut owner = owner(Phase::Running);
+        let events = &mut Vec::new();
+        assert!(
+            owner
+                .receive(
+                    message(Body::ContextMeasured(pb::ContextMeasured {
+                        input_tokens: Some(120),
+                        capacity_tokens: Some(8192),
+                    })),
+                    events
+                )
+                .is_err()
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn measured_context_after_output_preserves_response_and_rejects_duplicates() {
+        let mut owner = owner(Phase::Running);
+        let mut events = Vec::new();
+        owner
+            .receive(message(chunk("text", 1, 0)), &mut events)
+            .unwrap();
+        owner
+            .receive(message(end("text", 1, 1)), &mut events)
+            .unwrap();
+        let measured = Body::ContextMeasured(pb::ContextMeasured {
+            input_tokens: Some(120),
+            capacity_tokens: Some(4096),
+        });
+        owner
+            .receive(message(measured.clone()), &mut events)
+            .unwrap();
+        assert!(matches!(&events[0], ModelEvent::Snapshot { text, .. } if text == "text"));
+        assert!(matches!(
+            &events[1],
+            ModelEvent::ContextMeasured {
+                input_tokens: 120,
+                capacity_tokens: 4096
+            }
+        ));
+        assert!(owner.receive(message(measured), &mut events).is_err());
     }
     #[test]
     fn coalesced_frames_rearm_until_terminal_consumed() {

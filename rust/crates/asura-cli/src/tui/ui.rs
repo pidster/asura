@@ -394,6 +394,18 @@ impl App {
                 self.queue_follow_inputs.push(id.clone());
             }
         }
+        if self.notice.starts_with("Input queued;")
+            || self.notice.starts_with("Input held (")
+            || self.notice == "Input running"
+        {
+            if let Some(entry) = entries
+                .iter()
+                .filter(|entry| matches!(entry.state, Some(1..=3)))
+                .min_by_key(|entry| entry.sequence)
+            {
+                self.notice = queue_input_notice(entry);
+            }
+        }
         if full || acknowledged {
             self.queue_watermark = Some(
                 entries
@@ -510,7 +522,7 @@ impl App {
                 self.queue_projection.advance_revision(reply.revision);
                 if reply.request_id.is_some() {
                     self.queue_retained = None;
-                    self.notice = "Input accepted by service".into();
+                    self.notice = "Input queued; waiting for model admission".into();
                 }
                 if self.queue_editor.take().as_deref() == Some(self.editor.text().as_str()) {
                     self.editor = Editor::new();
@@ -644,7 +656,7 @@ impl App {
                 self.new_conversation_intent = None;
                 self.restoration_ready = true;
                 self.local_outbox.remove(index);
-                self.notice = "Input accepted by service".into();
+                self.notice = queue_input_notice(entry);
             } else {
                 self.local_outbox[index].state = LocalInputState::Unconfirmed;
                 self.queue_retained = Some(update.request.clone());
@@ -2668,14 +2680,9 @@ fn help_table(width: usize) -> String {
         ("/observe ID", "Observe a recorded operation"),
         ("/retry", "Retry with the original request ID"),
         ("Enter", "Submit; queue automatically during active work"),
-        (
-            "Down at final input row",
-            "Focus project/model status; Enter opens selector",
-        ),
-        (
-            "Up at first input row",
-            "Focus queued inputs, or scroll conversation history",
-        ),
+        ("Up / Down", "Recall submitted input; restore unsent draft"),
+        ("Shift+Up / Shift+Down", "Scroll conversation history"),
+        ("Ctrl+Up / Ctrl+Down", "Focus queue / project-model status"),
         ("[ / ] in queue", "Move an undispatched input up / down"),
         (
             "Enter in queue",
@@ -2689,7 +2696,10 @@ fn help_table(width: usize) -> String {
         ("Ctrl+S / Ctrl+T", "Steer / queue input"),
         ("Alt+Enter", "Insert a newline"),
         ("Tab", "Complete commands or insert spaces"),
-        ("Arrows / Shift+arrows", "Move cursor / select text"),
+        (
+            "Left / Right; Shift+Left / Right",
+            "Move cursor / select text",
+        ),
         ("Ctrl+A", "Select all text"),
         ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
         ("Ctrl+V", "Start or finish paste capture"),
@@ -2729,6 +2739,20 @@ fn help_table(width: usize) -> String {
         }
     }
     lines.join("\n")
+}
+fn queue_input_notice(entry: &asura_control::pb::ConversationQueueEntry) -> String {
+    match entry.state {
+        Some(1) => "Input queued; waiting for model admission".into(),
+        Some(2) => format!(
+            "Input held ({}); Resume or Drop required",
+            literal(
+                entry.hold_reason.as_deref().unwrap_or("reason unavailable"),
+                128
+            )
+        ),
+        Some(3) => "Input running".into(),
+        _ => format!("Input {}", queue_state(entry.state).to_lowercase()),
+    }
 }
 fn queue_state(state: Option<u32>) -> &'static str {
     match state {
@@ -3944,6 +3968,8 @@ mod tests {
             input_tokens: Some(1024),
             capacity_tokens: Some(4096),
             basis: Some(1),
+            reported_max_tokens: Some(4096),
+            capacity_source: Some(1),
         };
         let (_, _, model) = status_groups(
             0,
@@ -4730,6 +4756,15 @@ mod tests {
         request: super::super::queue::Request,
         conversation: [u8; 16],
     ) {
+        acknowledge_local_input_state(app, request, conversation, 1, None);
+    }
+    fn acknowledge_local_input_state(
+        app: &mut App,
+        request: super::super::queue::Request,
+        conversation: [u8; 16],
+        state: u32,
+        hold_reason: Option<&str>,
+    ) {
         let super::super::queue::Request::Submit(sent) = &request else {
             panic!("managed queue submit expected")
         };
@@ -4744,7 +4779,8 @@ mod tests {
                     target_generation: sent.expected_generation,
                     new_conversation: sent.new_conversation,
                     kind: Some(1),
-                    state: Some(1),
+                    state: Some(state),
+                    hold_reason: hold_reason.map(str::to_owned),
                     text: sent.prompt.clone(),
                     sequence: Some(1),
                     order_position: Some(0),
@@ -4776,6 +4812,51 @@ mod tests {
             sequence: Some(7),
             ..Default::default()
         }
+    }
+    #[test]
+    fn accepted_held_input_explains_required_action_and_keeps_reported_reason() {
+        for reason in [None, Some("model_unavailable")] {
+            let mut app = working_queue_app();
+            app.submit();
+            let request = app.take_queue_request(std::time::Instant::now()).unwrap();
+            acknowledge_local_input_state(&mut app, request, [2; 16], 2, reason);
+            assert!(app.local_outbox.is_empty());
+            assert_eq!(
+                app.notice,
+                format!(
+                    "Input held ({}); Resume or Drop required",
+                    reason.unwrap_or("reason unavailable")
+                )
+            );
+            assert!(!app.notice.contains("waiting for model admission"));
+        }
+    }
+    #[test]
+    fn queued_notice_tracks_later_hold_and_resume_without_replacing_other_notices() {
+        let mut app = working_queue_app();
+        app.submit();
+        let request = app.take_queue_request(std::time::Instant::now()).unwrap();
+        acknowledge_local_input(&mut app, request, [2; 16]);
+        assert_eq!(app.notice, "Input queued; waiting for model admission");
+        let mut entry = app.queue_entries[0].clone();
+        entry.state = Some(2);
+        entry.hold_reason = Some("provider_unavailable".into());
+        queue_snapshot(&mut app, vec![entry.clone()], 2);
+        assert_eq!(
+            app.notice,
+            "Input held (provider_unavailable); Resume or Drop required"
+        );
+        entry.state = Some(1);
+        entry.hold_reason = None;
+        queue_snapshot(&mut app, vec![entry.clone()], 3);
+        assert_eq!(app.notice, "Input queued; waiting for model admission");
+        entry.state = Some(3);
+        queue_snapshot(&mut app, vec![entry.clone()], 4);
+        assert_eq!(app.notice, "Input running");
+        app.notice = "Configuration saved".into();
+        entry.state = Some(2);
+        queue_snapshot(&mut app, vec![entry], 5);
+        assert_eq!(app.notice, "Configuration saved");
     }
     #[test]
     fn active_enter_stages_multiple_local_inputs_without_waiting_for_ack() {

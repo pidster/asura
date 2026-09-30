@@ -36,7 +36,7 @@ a shell guardian. Do not copy a complete model owner or add a generic orchestrat
 | --- | --- |
 | `command` | Required string, 1–8192 UTF-8 bytes, no NUL; exact bytes passed as the single argument after `-c` |
 | `cwd` | Optional project-relative directory, at most 1024 UTF-8 bytes; absent or `.` means project root; reject absolute paths, NUL and parent traversal |
-| `timeout_seconds` | Optional integer 1–60, default 30; effective runtime is reduced by the remaining admitted turn budget |
+| `timeout_seconds` | Optional integer 1–60, default 30; fresh per-command deadline independent of elapsed turn time |
 
 Preserve command bytes without quoting, interpolation or rewriting by another
 shell. The shell itself interprets them. Reject invalid native arguments before
@@ -51,12 +51,11 @@ setup, execution and cleanup; a second proposal gets Busy. No unbounded pending
 shell queue is introduced.
 
 The shell replaces the ordinary two-second execution allowance with this explicit
-budget: setup has at most 2 seconds; command runtime is at most the selected timeout
-and remaining turn deadline minus 3 seconds; cleanup has at most 2.5 seconds before
-it becomes unconfirmed. If no positive runtime remains after setup/cleanup reserve,
-reject before spawn. The inference/effect deadline remains at most 60 seconds. Unsettled cleanup may
-remain retained beyond that deadline; it cannot authorize new effects. Authority
-journal work retains its existing deadlines and may reduce available runtime.
+budget: setup has at most 2 seconds; command runtime is at most the selected
+timeout, independent of turn age; cleanup has at most 2.5 seconds before it becomes
+unconfirmed. Unsettled cleanup may remain retained beyond the command deadline;
+it cannot authorize new effects. Authority journal work retains its existing
+deadlines.
 A timeout is not evidence that execution did not occur.
 
 Capture raw stdout and stderr in separate 8 KiB tail rings,16 KiB total. Track
@@ -560,3 +559,11 @@ waits for its deliberately escaped process to exit. It does not prove that the
 cleanup helper can find arbitrary escaped descendants. Native shell inference is
 qualified for the system model only. Other local adapters remain separately
 unqualified for this new tool. No cloud execution is enabled.
+
+
+### Turn expiry removal — selected 2026-09-30
+
+The [cancellation-driven turn policy](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
+replaces reduction by a remaining whole-turn duration. A validated shell request
+retains its own 1–60 second duration, default 30. Shell cancellation, cleanup,
+process-group enforcement and recovery contracts remain unchanged.

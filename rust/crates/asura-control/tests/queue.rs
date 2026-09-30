@@ -69,6 +69,7 @@ fn queue_projection_requires_bounded_text_and_truthful_operation_state() {
         sequence: Some(5),
         new_conversation: None,
         order_position: None,
+        hold_reason: None,
     };
     let valid = |entries, full| {
         validate_semantics(
@@ -242,6 +243,7 @@ fn queue_v2_projection_and_stale_order_are_strict() {
         sequence: Some(1),
         new_conversation: Some(true),
         order_position: Some(1),
+        hold_reason: None,
     };
     let reply = pb::ConversationQueueReply {
         entries: vec![entry.clone()],
