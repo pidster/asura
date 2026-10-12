@@ -2,8 +2,11 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens. The selected [per-request usage and budget correction](turn-usage-helper.md#turn-budget-and-request-admission) removes the independent three-pass cap: first request at most 1,024 tokens, later requests at most 512, with refunds only from verified successful output counts and at most 64 requests. Historical
-512-token journal records retain their recorded accounting. Earlier numerical
+New admissions reserve 2,048 tokens. The implemented
+[per-request usage and budget correction](turn-usage-helper.md#turn-budget-and-request-admission)
+removes the independent three-pass cap: first request at most 1,024 tokens, later
+requests at most 512, refunds only from verified successful output counts and at
+most 64 requests. Historical 512-token journal records retain their recorded accounting. Earlier numerical
 examples and validation evidence below describe that earlier packet.
 
 Status: implemented and activated for the `system` model selection. On 2026-09-28,
@@ -13,7 +16,8 @@ record below states the limits of this evidence.
 
 MT3 below extends activation to CoreAI, declared MLX models and verified local
 Ollama models. System, MLX and verified-local Ollama passed the HM2 native Memory
-journeys recorded in the linked packet. CoreAI native qualification remains open.
+journeys recorded in the linked packet. CoreAI `qwen3_4b_4bit_dynamic` later passed
+the HM3 native Memory journey; other CoreAI bundles remain unqualified.
 Remote Ollama project disclosure remains disabled. A provider declaration or passing adapter unit
 test does not establish native tool support.
 
@@ -40,7 +44,7 @@ records. The TUI displays service events and sends control requests only.
 | Model class | Current implementation | Tool integration contract |
 | --- | --- | --- |
 | Apple system | Shared bridge activated; native file-read and status journey passed | Native Foundation Models callbacks use the service grant, executor and durable results |
-| Custom Core AI local | Adapter compiled; native qualification blocked by generated-content parsing failure | Same native callback contract; passing adapter tests do not qualify the model |
+| Custom Core AI local | Adapter compiled; `qwen3_4b_4bit_dynamic` passed the HM3 native Memory journey; other bundles unqualified | Same native callback contract; passing adapter tests do not qualify the model |
 | MLX local | Native project-file and Memory journeys passed with the qualified Qwen3 model | Explicit configured capabilities intersect native support; service permission controls activation |
 | Verified-local Ollama | Native project-file and Memory journeys passed with granite4.1:8b | Runtime capability and local-only routing checks remain mandatory |
 | Remote conversation model | Cloud tool activation remains later work | Explicit destination and data-disclosure policy required |
@@ -274,8 +278,9 @@ The images were inspected for readable labels and distinct failure exits. Root
 owns compilation and runtime checks; their results are recorded in the delivery
 plan. The private bridge and host primitives do not alone complete MT2.
 
-One remaining MT2 accounting issue is native continuation usage. The existing
-conversation reserves 512 output tokens. Apple documents `maximumResponseTokens`
+Historical MT2 note, resolved by the aggregate bound below and later by the turn
+usage helper. One remaining MT2 accounting issue was native continuation usage.
+The conversation then reserved 512 output tokens. Apple documents `maximumResponseTokens`
 as a response limit, but current evidence does not establish an aggregate cap
 across internally repeated inference after tool results. Activation must resolve
 that bound and durable accounting; a terminal snapshot count is insufficient proof
@@ -285,7 +290,9 @@ and the installed macOS 27 `GenerationOptions` declarations.
 
 ### Aggregate inference bound for MT2
 
-Selected implementation refinement. Wrap each provider's `LanguageModelExecutor`
+Superseded: the current budget is defined by the
+[turn usage helper](turn-usage-helper.md#turn-budget-and-request-admission).
+This section records the earlier MT2 refinement. Wrap each provider's `LanguageModelExecutor`
 with a per-turn dispatch counter. The wrapper delegates to the existing executor;
 it does not run another model loop. The installed macOS 27 SDK exposes both
 `SystemLanguageModel.Executor.respond` and mutable request generation options.
@@ -338,9 +345,10 @@ below. Additional provider activations require their own native evidence.
 
 The service must enforce conservative accounting itself: after any tool-enabled
 inference starts, per-step helper usage is ignored and the turn charges its full
-512-token reservation with aggregate usage marked unknown. This applies even if
+recorded reservation (2,048 for new turns) with aggregate usage marked unknown. This applies even if
 no tool is selected. Before Start the charge remains zero. The executor wrapper
-admits only the three allocations specified above. Each supported provider must
+admits requests under the turn budget: 1,024 tokens first, 512 later and at most
+64 requests. Each supported provider must
 implement the same structured tool callbacks and enforce the passed output cap;
 provider inventory alone never enables tools.
 
@@ -633,8 +641,9 @@ local inference because a daemon can forward.
 
 No additional work queue or blocking call is introduced. Existing provider load
 workers, five-second Hello, cancellation-driven turn, one pending callback, eight tool calls,
-two-second host workers, retained cancellation and cleanup rules apply. Three native
-inference allocations of 256, 128 and 128 tokens preserve the 512-token reservation.
+two-second host workers, retained cancellation and cleanup rules apply. Native
+inference requests are capped at 1,024 tokens first and 512 later, at most 64 per
+turn, within the 2,048-token reservation.
 
 ### MT3 activation decision
 
@@ -818,9 +827,9 @@ arguments retain the draft. Escape closes the panel; repeated use is harmless.
 
 Model calls use the existing grant, local destination, ordinal, deadline,
 cancellation, eight-call and result-byte limits. Add an empty `ListTools` argument
-at model ToolCall field 17, reserving field 16 for the planned Memory create tool.
+at model ToolCall field 17; field 16 is `MemoryCreateNote`.
 Durable ToolIntent kind 14 represents inventory with empty path, offset zero and
-limit zero; kinds 12 and 13 remain reserved for the planned Memory create packet.
+limit zero; kinds 12 and 13 belong to Memory create.
 The service forms the result from the registry only after durable intent and
 publishes it only after durable result. No filesystem, database read, external
 request, model recursion or new thread is involved. Existing journal work retains

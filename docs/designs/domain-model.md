@@ -185,8 +185,9 @@ which filesystem races and adversaries the platform can resist.
 Overlapping registrations cannot bypass filesystem limits or configured ancestor
 budgets. Distinct context IDs do not isolate physical writes to a shared location.
 D3-D4 must define conflict detection and coordination before operations can race
-there; I6 additionally requires an edit-conflict contract. Until then, the proposed
-initial workflows retain the existing source-read-only boundary.
+there; I6 additionally requires an edit-conflict contract. Until then, file tools
+remain read-only; the shell tool may write only within the selected project and
+private scratch.
 
 ## Conversations, tasks and model input
 

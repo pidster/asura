@@ -78,9 +78,9 @@ request starts. No additional inference runs to collect missing statistics.
 
 ## Turn budget and request admission
 
-The existing three fixed allocations prevent a fourth request even when earlier
-requests used few tokens. The request wrapper must remove that independent pass
-cap. It must retain the 2048-token turn budget and eight native tool proposals.
+The former three fixed allocations prevented a fourth request even when earlier
+requests used few tokens. The request wrapper removes that independent pass cap.
+It retains the 2048-token turn budget and eight native tool proposals.
 One turn can produce at most 64 request reports; a 65th request fails with the
 existing output-limit result before provider dispatch.
 

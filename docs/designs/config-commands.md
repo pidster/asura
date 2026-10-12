@@ -155,7 +155,7 @@ The isolated TUI journey displayed the saved model and audit values, including
 defaults; lifecycle and terminal-restoration journeys also passed. The normal
 debug binary was rebuilt. This does not activate model or audit consumers.
 
-## Proposed audit setting consumption and event journal
+## Audit setting consumption and event journal
 
 **Status: recording base selected on 2026-09-27; recent-inspection extension
 accepted for scoped implementation on 2026-09-28. Integration and validation
@@ -199,7 +199,8 @@ shared closed Event, Record and Health types; the service constructs those types
 and does not define a schema on which storage would depend. Reuse existing runtime
 validation and schema parsing; do not add a second config parser or launcher.
 
-Proposed path: account `.asura/logs/audit.jsonl`, with sealed archives named
+Selected and implemented path: account `.asura/logs/audit.jsonl`, with sealed
+archives named
 `audit.<32-hex-service-epoch>.<20-digit-sequence>.jsonl`. The directory is 0700;
 files are 0600. `--logs` continues to select diagnostics only. The hybrid memory ontology includes this nonauthoritative journal under `logs/`.
 The journal remains nonauthoritative and may have recorded gaps; authoritative
@@ -362,9 +363,11 @@ sequenceDiagram
 
 ### Recent project inspection: selected review packet
 
-This packet adds recording and read-only inspection together. The implementation
-packets are in progress; no live audit availability is claimed. Integrate recording before
-advertising `service_read_audit`. Preserve the recording, rotation, recovery and
+This packet adds recording and read-only inspection together. Recording, the
+`/audit [limit]` panel and `service_read_audit` are integrated; see the
+[implementation evidence](#recent-inspection-implementation-evidence-2026-09-28).
+Recording must remain integrated before `service_read_audit` is advertised.
+Preserve the recording, rotation, recovery and
 restart-activation contracts above. The feed is diagnostic evidence with possible
 gaps, not authoritative security audit or a classifier training dataset.
 
@@ -612,7 +615,7 @@ authoritative audit durability or OS-stall cancellation from these checks.
 
 ## Per-model MLX capability declarations
 
-Status: selected design, implementation in progress. The storage configuration
+Status: selected design, implemented. The storage configuration
 owner validates declarations. The model owner uses the selected declaration to
 filter advertised capabilities; configuration does not prove runtime support.
 

@@ -175,10 +175,17 @@ D1-D2 still decide whether narrow native identity or filesystem adapters require
 Swift. Such an adapter would return evidence to the Rust owner, not own policy,
 registration or publication. The Git observer's module, language and any helper
 process remain D2/D4 decisions; this document does not select a new process.
+[Context observations](context-observations.md) later selected
+`asura-platform::git_observer` with confined Git processes.
 
 ## First-use and project-registration contract
 
-Proposed behavior for D3/D6 review:
+Partly implemented. Steps 1–4 are implemented through automatic setup and
+explicit registration. Steps 5–6 are not implemented as written: the TUI
+selects the deepest current registration that contains the launch directory,
+and status arrives through `ObserveContext` subscriptions.
+
+Original proposed behavior for D3/D6 review:
 
 1. The client asks the service to attach. The service validates its OS-user
    identity and locates its own home directory. Client environment values cannot
@@ -209,7 +216,8 @@ Proposed behavior for D3/D6 review:
 
 The initial CLI command spelling and TUI onboarding controls belong to D6.
 `asura project register <path>` is a proposed CLI spelling, not a selected
-command. In-chat command integration must follow the
+command. The implemented spellings are `asura project add <path>` and
+`/project add <path>`. In-chat command integration must follow the
 [command-system design](command-system.md) and cannot create a second registry.
 
 ### Registration sequence
@@ -577,6 +585,10 @@ erDiagram
 ```
 
 ### Git collection safety decision
+
+[Context observations](context-observations.md) later resolved the collector:
+a confined Git process in `asura-platform::git_observer`. Linked worktrees remain
+unsupported and report Unknown.
 
 Required read-only boundary, unresolved collection backend. D4 must qualify the
 collector before exposing it to a registered repository. A command named

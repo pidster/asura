@@ -1213,7 +1213,7 @@ HM0 uses inline note bodies up to 16 KiB, so it writes no session payload files.
 The retained-file protocol remains required before larger content is admitted.
 `config.yaml`, `logs/`, `sessions/`, `tmp/`, classifiers and model directories keep
 their earlier roles. The selected `logs/audit.jsonl` metadata journal follows the
-[config/audit contract](config-commands.md#proposed-audit-setting-consumption-and-event-journal).
+[config/audit contract](config-commands.md#audit-setting-consumption-and-event-journal).
 It cannot repair graph or control authority and does not contain training labels.
 
 Production integration must use the existing initialization order: durable
@@ -1572,7 +1572,7 @@ unexecuted. These gaps prevent full HM0 qualification.
 
 ## HM1: bounded note discovery
 
-Status: selected implementation slice, 2026-09-28. Runtime evidence is pending.
+Status: implemented, 2026-09-28. Runtime evidence is recorded under HM2.
 This extends the existing typed note, source and receipt adapter. It does not
 activate model tools or grant a model access to another project.
 
@@ -1685,8 +1685,9 @@ model disclosure, automatic reconciliation or autonomous task admission.
 
 ### Tool schemas and results
 
-These names join the canonical registry in `asura-service::tools`. Provider
-adapters advertise the same names and translate native structured arguments.
+These are internal operation names in `asura-service::tools`. Providers advertise
+the grouped `memory` tool with commands `list_notes`, `get_note` and
+`note_sources`, and translate native structured arguments.
 No argument accepts a project, graph, binding, filesystem path or SQL expression.
 The service obtains project scope from the admitted turn's grant.
 
@@ -1958,8 +1959,8 @@ with a generated-content parsing error.
 Status: storage and service implementation delivered for validation, 2026-09-28.
 Recorded storage evidence: 46 library tests, 33 replay tests and seven writer tests
 passed before the activation cancellation-token refinement. The service activation
-checkpoint passed 119 library tests; additional startup/fault tests and native
-provider qualification remain pending. This extends HM2 with one bounded mutation,
+checkpoint passed 119 library tests. Later startup tests and native provider
+journeys are recorded under HM3 implementation evidence. This extends HM2 with one bounded mutation,
 public `memory(command: create_note)` and internal `memory_create_note`. It does not add update,
 overwrite, deletion, source-file capture, arbitrary links, background write grants
 or cloud disclosure. Existing immutable notes and schema numbering stay unchanged.
@@ -2350,6 +2351,8 @@ Validation on macOS 27 arm64:
 
 Native model proposals are not deterministic. Earlier attempts supplied invalid
 arguments, which were rejected. Improved field guidance and fixed correction
-feedback use the existing three-pass, 2,048-token and eight-proposal limits.
+feedback used the then-current three-pass, 2,048-token and eight-proposal limits.
+The [turn budget correction](turn-usage-helper.md#turn-budget-and-request-admission)
+has since replaced the three-pass limit.
 The adapter never repairs arguments itself or sends rejected fields to storage.
 These checks qualify the named model/bundle combinations, not every local model.

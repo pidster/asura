@@ -2,7 +2,9 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens with tool passes of 1,024/512/512. Historical
+New admissions reserve 2,048 tokens. Tool requests are capped at 1,024 tokens first
+and 512 thereafter, at most 64 per turn, under the
+[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Historical
 512-token journal records retain their recorded accounting. Earlier numerical
 examples and validation evidence below describe that earlier packet.
 
@@ -195,8 +197,9 @@ remains an I0 qualification check.
 Generation failure, a missing tool or a version mismatch fails the build
 before compiling a stale binding. The release packages compiled outputs and
 does not require generators on the end user's machine.
-The inspected host has `protoc` 36.2 but no `protoc-gen-swift`.
-No binding generation has been verified.
+At the 2026-09-25 inspection the host had `protoc` 36.2 but no `protoc-gen-swift`.
+Swift binding generation is now part of the helper build; see the bootstrap
+sections below.
 
 The private stream carries a 4-byte unsigned big-endian length followed by that
 many Protobuf bytes per message. A zero length, a length above the negotiated
@@ -776,8 +779,8 @@ assembling the input transfer and before requesting the start permit.
 Use the SDK's structured transcript/prompt representation to preserve roles;
 never concatenate history with invented role delimiters. Token counting and
 context preparation occur after the serialized start permit, inside the admitted
-operation budget. Reject input when measured context plus 512 reserved output
-tokens exceeds the model's reported capacity. An unavailable counter or context
+operation budget. Reject input when measured context plus the admitted Begin output
+reservation (2,048 for new turns) exceeds the model's reported capacity. An unavailable counter or context
 size is explicit unavailability, not permission to send unchecked history.
 
 ### Private wire completion and capability report
@@ -789,6 +792,8 @@ fields to `Hello`: availability enum 4, capabilities uint32 5, context_tokens
 uint32 6, and reason enum 7. Availability is 1 available, 2 unavailable, 3 unknown.
 Capability bit 0 denotes text generation; all other bits are reserved and zero.
 A helper never advertises tools or structured generation in this first adapter.
+MT2 and MT3 later assigned bit 1 to tool calling, so a tool-capable helper reports
+capabilities 3; see [model tools](model-tool-execution.md).
 The service keeps registry availability unknown until identity and this report
 have been verified. `context_tokens` is required and positive only when available.
 
@@ -801,7 +806,7 @@ scalar fields except conditional context capacity require presence. Terminal
 true, `usage_tokens` must be present and zero is valid. Unknown usage retains the
 reservation under the admission contract.
 `usage_tokens` means measured generated output tokens, excluding input tokens.
-Its wire bound is 512; the operation owner also checks the admitted Begin limit.
+Its wire bound is 2,048; the operation owner also checks the admitted Begin limit.
 Tokenization estimates must not be reported as measured generation usage.
 
 Both peers send Hello before any Begin. Hello alone uses absent operation identity;

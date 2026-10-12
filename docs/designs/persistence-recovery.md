@@ -4,8 +4,9 @@ Status: proposed I1 D3 design. The owner selected ordinary files plus the bound
 SurrealDB graph on 2026-09-25 and ruled out SQLite. This document proposes one
 append-only ordinary-file authority journal. Frame format, durability behavior,
 compaction, schema versions and fault limits still need review and qualification.
-The read-only stage 3A contract below is selected for scoped implementation under
-the current implicit authorization. It has no runtime evidence. Later D3-D4 work
+The format-1 journal, read-only stage 3A inspection and the single-slot writer are
+implemented; see the [conversation amendment](conversation-admission.md).
+Compaction, slot switching, backup and the qualification items below remain open. Later D3-D4 work
 must extend the same authority contract to the full task/action ledger.
 
 The [first conversation amendment](conversation-admission.md) extends format 1
@@ -92,9 +93,9 @@ D3 must select an exact canonical encoding, checksum algorithm and size bounds.
 
 The active owner serializes candidate transitions, validates the expected
 revision and all affected limits, then appends one complete frame. It performs a
-full durability flush before acknowledging acceptance. The macOS `F_FULLFSYNC`
-mechanism is a candidate; D1/D3/D7 must test support and behavior on the
-selected filesystem and document the power-loss limit. A short write, flush
+full durability flush before acknowledging acceptance. The writer uses macOS
+`F_FULLFSYNC`; D1/D3/D7 must still test behavior on the selected filesystem and
+document the power-loss limit. A short write, flush
 error, disk-full result or uncertain offset stops new admission until recovery.
 The service cannot treat a buffered write as durable acceptance.
 
@@ -229,6 +230,7 @@ completed from these diagnostic bootstrap records.
 
 The [conversation amendment](conversation-admission.md#format-1-and-record-compatibility)
 adds request-bearing initialization kinds 10 and 11, plus kinds 4 through 9.
+Later amendments add kinds 12–20.
 Kind 3 remains shared. The first record selects diagnostic or request-bearing
 initialization rules. Public inspection validates the complete corresponding
 stream before returning its summary. A diagnostic stream cannot acquire request

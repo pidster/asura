@@ -36,6 +36,7 @@ flowchart TD
     Setup -->|"Invalid local path"| Bad["Report error: exit 2"]
     Setup -->|"Owner or transport error"| SE["Report error: exit 3"]
     Setup -->|Success| OK["Print result: exit 0"]
+    Kind -->|"sensors PROJECT_ID [OFFSET REVISION]"| Sensors["Read-only sensor page: CF11"]
     Kind -->|"service start / stop / run"| Life["Lifecycle: CF02"]
     Kind -->|"service status --json"| Status["Read service snapshot: CF02"]
     Kind -->|"installation status with optional --json"| Inspect["Attach and inspect without creation"]
@@ -103,7 +104,8 @@ owner or replacing installation data.
 
 Implemented lifecycle. Network and account lookup run in the status worker.
 The render function consumes display state. Status results use a one-item mailbox.
-The dispatcher checks bounded queues every 16 ms; this is not a push-only loop.
+The dispatcher waits in `asura_platform::poll` on the router and signal
+descriptors. Its timeout is the earliest worker or presentation deadline.
 
 ```mermaid
 flowchart TD
@@ -113,7 +115,7 @@ flowchart TD
     Attach -->|"Other error / already attempted"| Unavailable["Display unavailable and preserve draft"]
     Spawn -->|Ready| Owned["Retain child lease"]
     Spawn -->|Failure| Unavailable
-    Independent --> Inspect["Worker inspects status each second"]
+    Independent --> Inspect["Worker subscribes to status; 1 s heartbeat"]
     Owned --> Inspect
     Unavailable --> Inspect
     Inspect -->|"Valid current generation"| Display["Update local display state"]
@@ -139,13 +141,18 @@ by the current argument parser. This chart records local-service behavior only.
 
 Implemented routing in `tui/ui.rs`. Local syntax errors retain the draft.
 Commands that need the service enter workers through bounded request slots.
+`/project rename NAME` uses the separate project-admin worker. `/new` is local:
+it starts a new conversation only when no request or local input is unresolved.
 
 ```mermaid
-flowchart TD
+flowchart LR
     Enter["Enter on composer"] --> Slash{"Starts with slash?"}
     Slash -->|No| Chat["Conversation input: CF08"]
     Slash -->|Yes| Name{"Command name"}
     Name -->|"/init /project /observe"| Setup["Syntax and busy check: CF05 / CF06 / CF08"]
+    Name -->|"/project rename NAME"| Rename["Project-admin worker; /retry reuses ID"]
+    Name -->|/new| New["Clear conversation if idle; else retain draft"]
+    Name -->|/audit| Audit["Recent audit panel: see below"]
     Name -->|/config| Config["Configuration: CF07"]
     Name -->|/models| Models["Model inventory: CF10"]
     Name -->|/tools| Tools["Static canonical registry inventory; see tool execution design"]
@@ -157,7 +164,9 @@ flowchart TD
     Arity -->|No| Bad["Show argument error and retain draft"]
     Arity -->|Yes| Local{"Local action"}
     Local -->|Help| Help["Clear submitted draft and open help"]
-    Local -->|"Quit or exit"| Exit["Exit through CF03 cleanup"]
+    Local -->|"Quit or exit"| Outbox{"Local outbox empty?"}
+    Outbox -->|Yes| Exit["Exit through CF03 cleanup"]
+    Outbox -->|No| Confirm["Open exit confirmation"]
 ```
 
 ### CF04b: Local command completion
@@ -177,10 +186,11 @@ flowchart TD
 ```
 
 F1 opens help. Escape closes help or a result panel. Result scrolling activates
-only when content exceeds the visible box. Ctrl+Q/Ctrl+C exits with an empty draft;
-a nonempty draft opens the discard confirmation. Ctrl+D exits only with an empty
-draft. Slash `/quit` and `/exit` are explicit exit commands and need no discard
-confirmation. Repeated action key events do not submit twice.
+only when content exceeds the visible box. Ctrl+Q/Ctrl+C exits only when the
+draft and the local outbox are both empty. Otherwise it opens the exit
+confirmation. Ctrl+D exits only with an empty draft. Slash `/quit` and `/exit`
+need no draft-discard confirmation. They open the exit confirmation when the
+local outbox holds unreceipted input. Repeated action key events do not submit twice.
 
 ## CF05: Initialization and authority outcomes
 
@@ -252,7 +262,10 @@ flowchart TD
 
 ### CF06b: Project list and local selection
 
-Implemented read and selection branches. Selection does not establish authority.
+Implemented read, selection and rename branches. Selection does not establish
+authority. Selection requires idle conversation, queue and local-outbox state.
+The ID must name a current registry entry. Success clears the conversation view
+and starts restoration for the new project. Rename sends the listed name revision.
 
 ```mermaid
 flowchart TD
@@ -262,8 +275,13 @@ flowchart TD
     Pages -->|Entries| Rows["Show IDs, locations and stale markers"]
     Choose["/project select ID"] --> ID{"Valid nonzero 32-digit hexadecimal ID?"}
     ID -->|No| Error
-    ID -->|Yes| Local["Select locally and reset conversation generation"]
+    ID -->|Yes| Guard{"Idle and current registry entry?"}
+    Guard -->|No| Error
+    Guard -->|Yes| Local["Select locally; clear view and restore"]
     Local --> Later["Service validates project when submitting"]
+    Rename["/project rename NAME"] --> Known{"Name, selection, listed revision and no pending rename?"}
+    Known -->|No| Error
+    Known -->|Yes| Admin["Project-admin worker sends rename"]
 ```
 
 A busy conversation slot rejects setup commands with the draft retained. Discovery
@@ -316,21 +334,26 @@ or audit-consumer activation. Unsupported keys and an unset model are errors.
 
 ## CF08: Conversation submit and observation
 
-Implemented request/observation pipeline with service-owned admission and durable
-outcomes. The client has one conversation worker and one coalescing result mailbox.
+Implemented outbox, admission and observation pipeline with service-owned
+admission and durable outcomes. Enter stages each valid non-command input in a
+local outbox of at most 16 entries. The serial queue worker submits one waiting
+entry at a time with its original request ID. Its client request has a 3 s
+deadline; the UI marks the outcome unconfirmed after 5 s. The conversation
+worker observes dispatched operations through one coalescing result mailbox.
 
 ```mermaid
 flowchart TD
-    Text["Non-command input"] --> Active{"Acknowledged active conversation?"}
-    Active -->|Yes| Choice["Queue draft directly: IQ1"]
-    Active -->|No| Local{"Empty, over 32 KiB, busy or no project?"}
+    Text["Non-command input"] --> Local{"Local rejection?"}
     Local -->|Empty| Ignore["No action"]
-    Local -->|"Other rejection"| Keep["Explain and retain draft"]
-    Local -->|Valid| Submit["Queue request ID, project, generation and prompt"]
-    Submit --> Admit{"Owner admission and durable acceptance"}
-    Admit -->|"Definite rejection"| Keep
-    Admit -->|"Lost or uncertain reply"| Retry["Retain same request ID for /retry"]
-    Admit -->|Accepted| Accept["Record operation and generation; show transcript entry"]
+    Local -->|"Over 32 KiB, no project, restoration not ready or outbox full"| Keep["Explain and retain draft"]
+    Local -->|Valid| Stage["Stage in local outbox and clear draft"]
+    Stage --> Worker{"Queue worker idle; same project?"}
+    Worker -->|"Project changed"| Rejected["Mark rejected; keep text"]
+    Worker -->|Yes| Submit["Submit request ID, project, conversation and prompt"]
+    Submit --> Admit{"Owner admission and durable receipt"}
+    Admit -->|"Definite rejection"| Rejected
+    Admit -->|"Lost reply or 5 s UI deadline"| Retry["Mark unconfirmed; /retry resends same ID"]
+    Admit -->|Accepted| Accept["Remove entry; adopt conversation and generation"]
 ```
 
 Observation is independent of submitting another input.
@@ -342,14 +365,13 @@ flowchart TD
     Queued["Service queue projection supplies dispatched operation"] --> Observe
     Observe --> Result{"Observation result"}
     Result -->|"Pending / provisional"| Progress["Update current response"]
-    Progress -->|"50 ms poll interval"| Observe
+    Progress -->|"Next long poll: wait_ms 1000"| Observe
     Result -->|Complete| Complete["Show durable complete response"]
     Result -->|"Failed / cancelled / interrupted"| Incomplete["Show incomplete response and reason"]
     Result -->|"Transport error"| Attach{"Reattach succeeds?"}
     Attach -->|Yes| Observe
     Attach -->|No| Later["Show operation ID for /observe"]
-    Observe -->|"65 s observation deadline"| Later
-    Observe -->|"Client disconnect"| Stop["Stop observing without claiming cancellation"]
+    Observe -->|"Worker stop or client disconnect"| Stop["Stop observing without claiming cancellation"]
 ```
 
 [IQ1](conversation-admission.md#durable-input-queue-iq1) supplies the full Queue,
@@ -358,17 +380,22 @@ Steer, list, inspect, resume and drop outcome flowcharts.
 existing input. [Composer interactions](composer-interactions.md) defines focus,
 selectors, history and queue navigation. These commands use a
 separate bounded client worker; they never make the TUI an execution scheduler.
+Ctrl+S and Ctrl+T send explicit steer and follow-up requests through that worker.
 
-Acceptance clears only an unchanged submitted draft. Admission errors do not
-fabricate progress. Observe starts at cursor zero and adopts the owner's returned
-generation. Terminal kinds are complete, failed, cancelled and interrupted.
-The 65-second budget starts after attach/admission, not at queue admission; see G03.
+Staging clears the draft; the outbox keeps the text until the service receipt.
+Admission errors do not fabricate progress. Observe starts at cursor zero and
+adopts the owner's returned generation. Terminal kinds are complete, failed,
+cancelled and interrupted. Observation has no whole-turn deadline. Each long poll
+uses the client's 2 s request deadline and repeats until a terminal kind or a
+worker stop; see G03.
 
 ## CF09: Retry and cancellation
 
 Selected correction under the [client command contract](early-production-status-slice.md#first-conversation-client-integration).
-`/retry` rejects extra arguments. `/cancel` requires an active Submit or Observe
-request. Idle, setup and discovery preserve the draft and queue no cancellation.
+`/retry` rejects extra arguments. `/cancel` first cancels a pending `/audit`
+read, then a pending model inventory or model picker. Otherwise it requires an
+active cancellable conversation request. Idle, setup and discovery preserve the
+draft and queue no cancellation.
 The correction is implemented and 58 CLI unit tests pass. The full lifecycle
 rerun remains integration evidence owned by the primary agent. The chart includes
 these corrections; the audit findings distinguish fixed and remaining gaps.
@@ -392,25 +419,30 @@ flowchart TD
     Send --> Result["Use original setup or submission result path"]
 ```
 
-Cancellation targets the observed operation, including a service-dispatched input.
+Conversation cancellation targets the observed operation, including a
+service-dispatched input.
 
 ```mermaid
 flowchart TD
     Cancel["/cancel"] --> Arity{"No arguments?"}
     Arity -->|No| Usage["Show use /cancel"]
-    Arity -->|Yes| Job{"Active Submit or Observe request?"}
+    Arity -->|Yes| Audit{"Audit read pending?"}
+    Audit -->|Yes| AuditCancel["Clear command; cancel audit read"]
+    Audit -->|No| Models{"Model inventory or picker pending?"}
+    Models -->|Yes| ModelsCancel["Clear command; cancel inventory"]
+    Models -->|No| Job{"Cancellable conversation request?"}
     Job -->|No| Gap["Show no active conversation and retain draft"]
     Job -->|Yes| Flag["Clear command and set cancellation flag"]
     Flag --> Generation{"Operation generation known?"}
     Generation -->|No| Observe["Observe until generation is known"]
     Observe -->|"Nonterminal generation received"| Generation
-    Observe -->|"Terminal / error / expiry"| Before["Use CF08 outcome without sending cancellation"]
+    Observe -->|"Terminal / error"| Before["Use CF08 outcome without sending cancellation"]
     Generation -->|Yes| Owner["Send cancellation with operation and generation"]
     Owner -->|Error| Unknown["Show cancel outcome unconfirmed"]
     Owner -->|Reply| ObserveResult["Continue observing durable terminal result"]
     ObserveResult -->|Complete| Won["Completion won the race"]
     ObserveResult -->|Cancelled| Stopped["Show cancelled incomplete response"]
-    ObserveResult -->|"Failed / interrupted / expired"| Other["Show actual outcome or observation uncertainty"]
+    ObserveResult -->|"Failed / interrupted / disconnected"| Other["Show actual outcome or observation uncertainty"]
 ```
 
 The selected correction prevents cancellation flags during setup or discovery.
@@ -441,10 +473,11 @@ Audit findings and correction status:
   no active conversation without clearing the draft or queuing cancellation.
   Submit and Observe retain their cancellation path. Unit regression passes.
   The full CLI lifecycle gate, including both mandatory terminal journeys, passed.
-- **G03 — Whole-request deadline:** the conversation worker's 65-second observation
-  budget excludes resolution, setup and admission. Socket bounds do not bound a
-  stalled OS lookup. Add admission-time expiry and retained uncertainty without
-  releasing an occupied worker slot or duplicating effects.
+- **G03 — Whole-request deadline, restated:** observation has no whole-turn
+  budget by design; it ends at a terminal kind or a worker stop. The queue worker
+  bounds admission with a 2 s attach and a 3 s client request deadline. The UI
+  marks the outcome unconfirmed after 5 s and keeps the slot until the thread
+  settles. Socket bounds do not bound a stalled OS lookup during resolution.
 - **G04 — Explicit backend selection:** the current CLI parser has no backend
   parameter. The user's broader startup rule remains incomplete for that branch.
 - **G05 — Repair guidance:** `authority_repair_required` is displayed without an
@@ -462,6 +495,10 @@ Visual review checked branch labels, clipping and layout. Dense lifecycle,
 completion and project charts were split into separate views before final review.
 Previews are disposable local artifacts. No runtime correctness claim follows
 from this rendering check.
+
+On 2026-10-12, a code-alignment update changed CF01, CF03, CF04, CF06b, CF08
+and CF09. Mermaid CLI 12.0.0 rendered each changed chart, and the previews were
+visually inspected. CF04 now uses a left-to-right layout for its 13 branches.
 
 
 ## CF10: Model inventory
@@ -560,13 +597,12 @@ Invalid arguments retain the draft. Escape closes the panel; overflow enables
 scrolling. The [inventory flow](model-tool-execution.md#tool-inventory-command-and-model-tool)
 defines command branches, metadata ownership and model-tool behavior separately.
 
-### Recent audit inspection (design only)
+### Recent audit inspection
 
-`/audit [limit]` is a selected review packet, not an implemented command. The
+`/audit [limit]` is implemented in `tui/ui.rs` and `tui/audit.rs`. The
 [recent audit contract](config-commands.md#recent-project-inspection-selected-review-packet)
 owns its typed metadata, limits and read-only native tool. Limit defaults to 16
-and accepts 1 through 16. This planned flow is explicitly outside the implemented
-command inventory above.
+and accepts 1 through 16. `/cancel` cancels a pending read.
 
 ```mermaid
 flowchart TD

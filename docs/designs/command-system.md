@@ -4,6 +4,9 @@ Status: **proposed production design**, prepared with the TUI interaction propos
 on 2026-09-24. The three categories and their authority boundaries are required.
 The logical contracts below need D3, D4 and D6 decisions before production
 implementation. This document authorizes no code, transport or storage schema.
+The client built-ins `/quit`, `/exit` and `/help` are implemented in the
+production TUI ([CF04](command-flows.md#cf04-slash-command-dispatch-and-local-commands)).
+The service command catalogue and extension commands remain proposed.
 
 The [interaction brief](interaction-and-extension-boundaries.md#in-chat-commands)
 owns the category requirement. This design owns service command identity,

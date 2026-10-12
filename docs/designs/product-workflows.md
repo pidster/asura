@@ -6,8 +6,11 @@ Navigation across projects and concurrent activities in one interface is require
 by [ADR-0007](../decisions/0007-multi-project-control-interface.md), recorded on 2026-09-24.
 Workflow refinements and numerical acceptance targets remain proposals for review.
 Existing required behavior is linked to its canonical contract.
-No production workflow implementation or performance evidence exists. The isolated
-TUI experiment qualifies only its synthetic editor and presentation scope.
+Production CLI and TUI slices now implement service lifecycle, setup, project
+registration, configuration, conversation and queue commands; see
+[command flows](command-flows.md). No performance evidence qualifies the numeric
+workflow targets below. The isolated TUI experiment qualifies only its synthetic
+editor and presentation scope.
 
 ## Selected first-release scope
 

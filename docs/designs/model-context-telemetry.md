@@ -93,8 +93,8 @@ The private Hello adds optional model_name (UTF-8, 1–256 bytes, no controls).
 At most one ContextMeasured message follows Start and precedes Terminal, with input_tokens
 and capacity_tokens. Both are UInt32; capacity is positive, input <= capacity.
 Operation and generation fences apply. Duplicates, messages after Terminal and wrong
-channel direction are protocol faults. The system backend supplies this measurement;
-custom backends currently omit it. Counts are optional observations and do
+channel direction are protocol faults. The system backend and the Ollama executor
+(first request only) supply this measurement; CoreAI and MLX omit it. Counts are optional observations and do
 not authorize work or change durable accounting. Discovery remains bounded; SDK counting during generation is cancellation-driven.
 Cancellation keeps priority. No
 post-generation counting delays terminal delivery.

@@ -45,8 +45,8 @@ flowchart TD
    platform operations. Console tracing and subscriber installation remain CLI
    presentation. Move path/filename choices out of platform where practical;
    preserve the account-home trust boundary and test resolver behavior.
-4. Implement HM0-A under an optional `embedded-memory` feature. Production service
-   linkage, initialization and admission remain subsequent reviewed packets.
+4. Implement HM0-A under the `embedded-memory` feature. The service now enables it;
+   production linkage, initialization and Memory tools shipped in HM1–HM3.
 5. Implement audit persistence in storage, with service-owned typed event production
    and bounded scheduling. Do not implement the old platform-owned audit adapter.
 
@@ -68,12 +68,12 @@ or insufficient graph evidence do not authorize a user-home DB or synthetic proo
 
 [HM1](hybrid-memory-ontology.md#hm1-bounded-note-discovery) adds bounded,
 context-scoped note summaries to the existing memory adapter. The service must
-route future note tools through its bound authority worker and the same database
+route note tools through its bound authority worker and the same database
 methods. The scratch `Memory` owner remains a qualification interface. Listing
 never loads file payloads or changes note/source/receipt state.
 
-[HM2](hybrid-memory-ontology.md#hm2-typed-read-only-memory-tools) specifies the
-next model-facing read integration. Its service dispatcher must submit to the
+[HM2](hybrid-memory-ontology.md#hm2-typed-read-only-memory-tools) defines the
+implemented model-facing read integration. Its service dispatcher must submit to the
 existing authority worker, retain a per-job settlement token across deadline expiry,
 and persist tool outcomes before model continuation. Storage remains the sole
 owner of graph reads and durable replay; adapters receive bounded evidence only.

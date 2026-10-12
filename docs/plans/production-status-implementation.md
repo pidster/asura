@@ -1,11 +1,13 @@
 # Production status delivery: stages 3–5
 
-Status: stage 3A read-only inspection is selected for scoped implementation under
-the current implicit authorization. Later deliveries remain proposed. This packet
-divides the selected early status trial into small deliveries.
-Several prerequisite contracts remain open; the readiness register identifies
-the exact owner for each. No production behavior is implemented or verified by
-this document.
+Status: partly implemented under the current implicit authorization. The dated
+checkpoints below record stage 3A inspection, embedded 3B initialization, 3C
+registration, listing and rename, stage-4 Git observation as service
+subscriptions, and the thin TUI. External graph binding, parent discovery,
+the service match operation, full stage-5 acceptance and native-terminal
+qualification remain open. This packet divides the early status trial into small
+deliveries; the readiness register names the owner of each open contract.
+The checkpoints record developer evidence, not release qualification.
 
 ## Scope and prerequisites
 
@@ -27,7 +29,9 @@ The packet exposes no agent execution, model session, remote inference, host too
 source modification, Skill or MCP capability. Agent submission remains unavailable
 and preserves the draft. Model identity is unavailable and context use is `?%`.
 Both embedded and external graph bindings remain required. No external outage
-selects an embedded fallback.
+selects an embedded fallback. The later conversation, model and tool packets
+from 2026-09-27 supersede this exclusion; see
+[later deliveries](#later-deliveries-2026-09-28-to-2026-10-12).
 
 ### Delivery dependencies
 
@@ -81,6 +85,12 @@ owner. Component writers do not edit those shared files concurrently.
 | 4 | Scoped status projection | `rust/crates/asura-service/src/status/` |
 | 5 | Production status TUI | `rust/crates/asura-cli/src/tui/` |
 | Serial integration | Domain types, policy calls, control/client adapters and host composition | Foundation service, platform, control, client and CLI modules; canonical policy owner |
+
+Delivered layout differs from this proposal. The registry lives in
+`rust/crates/asura-storage/src/authority/writer/state.rs`. Git observation uses
+`rust/crates/asura-platform/src/git_observer.rs` and
+`rust/crates/asura-service/src/context_observer.rs`. Service status uses
+`rust/crates/asura-service/src/service_observer.rs`.
 
 These areas require exact filenames in each authorized handoff. That handoff must
 also assign the matching unit, integration and end-to-end test paths. Do not create
@@ -360,6 +370,10 @@ not complete write-enabled stage 3A, stage 3B or the full status TUI.
 
 ## Stage 3B: explicit initialization and binding
 
+Status: embedded mode is implemented through
+[CA-B](../designs/conversation-admission.md), with automatic and explicit setup.
+External graph mode and its S3B acceptance remain open.
+
 **Runnable result:** an explicit CLI action initializes and reopens one installation
 in embedded mode or against a configured external graph. The CLI resolves a lost
 acknowledgement using the original request ID.
@@ -388,6 +402,11 @@ contracts before implementation. This substage does not deliver graph query or
 model-context features.
 
 ## Stage 3C: registration and discovery
+
+Status: registration, listing and [rename](../designs/project-names.md) are
+implemented. Launch-directory matching runs in the client, not the service. The
+parent marker, candidate discovery and the service match operation are not
+implemented; the control schema has no message for them.
 
 **Runnable result:** the CLI registers an existing directory, lists authorized
 projects and asks the service to match a launch directory. The service returns
@@ -418,9 +437,15 @@ limits remain required upstream decisions.
 
 ## Stage 4: real Git observation and status
 
+Status: implemented as `ObserveContext` subscriptions (control tags 39/40) under
+[context observations](../designs/context-observations.md); see the
+[2026-09-27 delivery](#context-path-and-git-observation-delivery-2026-09-27).
+The one-shot CLI status command and linked-worktree support remain open.
+
 **Runnable result:** a scoped CLI status command returns real typed Git observations
 or explicit unavailable fields. The CLI receives the same status contract as the
-later TUI. Model and task activity remain unavailable.
+later TUI. Model and task activity remain unavailable. Later conversation and
+model packets supersede that last sentence.
 
 Use the [Git safety decision](../designs/production-bootstrap-status.md#git-collection-safety-decision)
 and the [delivery mechanism proposal](../designs/production-bootstrap-status.md#proposed-first-status-delivery-mechanism).
@@ -514,7 +539,9 @@ The TUI never reads Git metadata, managed authority files or model telemetry.
 
 The client keeps per-project drafts and valid logical-directory selections.
 Navigation does not change process cwd or retarget a draft. Enter reports agent
-execution unavailable and preserves text. A hidden or stale scope cannot supply
+execution unavailable and preserves text. The conversation and
+[managed queue](../designs/managed-input-queue.md) packets supersede this Enter
+behavior and the matching S5-I check. A hidden or stale scope cannot supply
 the visible bar. Literal metadata rendering must reject terminal control injection.
 
 **Unit acceptance S5-U:** test exact draft preservation, grapheme count, rendering
@@ -565,6 +592,20 @@ The parent owns shared dependency documents and directory indexes.
 | SP6 | 4 | D3/D7: accept proposed polling/deadline/expiry limits and define publication ordering? | Review the one-request mechanism, then qualify its numeric limits and disclosure point. |
 | SP7 | 5 | D6: exact first-use actions, focus, project names, unavailable messages and saved-view lifetime? | Preserve one composer row and the selected launch-match priority; review actual controls before TUI code. |
 | SP8 | Each stage | D7 and foundation owner: freeze module paths, runners and evidence environments? | Add one bounded substage at a time and integrate shared files serially. |
+
+Later resolutions:
+
+- **SP1:** the format-1 authority journal is implemented; see
+  [persistence and recovery](../designs/persistence-recovery.md). Its
+  durability and fault qualification remain incomplete.
+- **SP3:** embedded mode uses SurrealDB 3.2.4 with SurrealKV. External engine
+  versions, trust and credential contracts remain open.
+- **SP5:** [context observations](../designs/context-observations.md) selected
+  a confined Git process in `asura-platform::git_observer`.
+- **SP6:** `ObserveService` and `ObserveContext` subscriptions replace the
+  one-request polling mechanism. Numeric qualification remains open.
+
+SP2, SP4, SP7 and SP8 remain open.
 
 ### Implementation gate
 
@@ -1223,7 +1264,10 @@ were rendered with CLI 12.0.0 and visually inspected.
 
 ## IQ1 service-owned input queue packet
 
-Status: design and implementation in progress. Parent root owns integration and
+Status: implemented. IQ1/IQ2 and the managed queue kinds 18/19 are integrated.
+The [managed input queue](../designs/managed-input-queue.md) records the focused
+checks; its full MQ validation matrix remains open. The original assignment
+follows. Parent root owns integration and
 all serial Cargo builds/tests. `durable_input_queue` owns queue amendments in
 conversation-admission.md, queue storage/control/client/service code and tests,
 and queue TUI code. Root owns separate context observation files, shared lifecycle
@@ -1285,3 +1329,28 @@ export and local tests for E1. Root owns TUI integration. Service integration
 requires explicit file handoff from root and model-tools before E3 edits.
 E1 precedes E2/E3; cursor subscriptions E4 follow owner readiness integration.
 No concurrent Cargo builds: root remains the validation owner.
+
+Delivered: E1–E4 were integrated and validated on 2026-09-27; see the
+[integrated validation](../designs/event-routing.md#integrated-validation-2026-09-27).
+
+## Later deliveries, 2026-09-28 to 2026-10-12
+
+Later packets extend this plan beyond status. Each governing design owns its
+contract and recorded evidence. These records are developer checkpoints; release
+qualification is not claimed.
+
+| Delivery | Evidence owner |
+| --- | --- |
+| Model tool activation and the bounded shell tool | [Model tools](../designs/model-tool-execution.md), [shell tool](../designs/shell-tool.md), [consolidated tools](../designs/consolidated-tools.md) |
+| Local and remote model providers | [Model providers](../designs/model-provider-integration.md) |
+| Managed input queue | [Managed input queue](../designs/managed-input-queue.md) |
+| Conversation restoration | [Conversation restoration](../designs/conversation-restoration.md) |
+| Project names and rename | [Project names](../designs/project-names.md) |
+| Service status pane | [Service status pane](../designs/service-status-pane.md) |
+| Commit `d4baaf4` (2026-09-30): queue recovery, model lifetimes, context telemetry and composer navigation | [Managed input queue](../designs/managed-input-queue.md), [model context telemetry](../designs/model-context-telemetry.md), [composer editor navigation](../designs/composer-editor-navigation.md) |
+| Commit `0bd82d8` (2026-10-12): rich tool activity and per-request inference usage | [Response activity](../designs/response-activity.md#recorded-qualification--2026-09-30), [turn usage helper](../designs/turn-usage-helper.md#turn-budget-and-request-admission) |
+
+Commit `0bd82d8` replaces the three-pass tool limit with a 2,048-token turn
+budget. The first inference request receives at most 1,024 tokens, each later
+request at most 512, and a turn admits at most 64 requests. The same commit
+fixes a writer-admission race for restored history.

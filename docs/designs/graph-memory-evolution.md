@@ -336,7 +336,7 @@ This validates the diagram presentation, not runtime reconstruction.
 ## Physical SurrealDB shape and typed graph operations
 
 **Proposed mechanism:** retain the implemented `graph_marker`, `memory_note`,
-`memory_link` and `memory_receipt` tables. Add schema-full, typed node tables
+`memory_link`, `memory_receipt` and `sensor_state` tables. Add schema-full, typed node tables
 for the families above and the plan/task families in the hybrid ontology. Use
 SurrealDB `TYPE RELATION IN ... OUT ...` tables for each semantic edge family.
 No application caller sends free-form SurrealQL. `asura-storage` owns compiled,

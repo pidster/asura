@@ -2,10 +2,12 @@
 
 Status: production TUI contract with incremental implementation and recorded
 validation. The initial thin checkpoint below predates automatic setup, project
-selection and Git observations. Their later contracts govern current behavior:
-[bootstrap and registration](production-bootstrap-status.md),
-[context observations](context-observations.md), and
-[event routing](event-routing.md). Remaining trial acceptance cases are retained.
+selection, Git observations and conversation submission. Their later contracts
+govern current behavior: [bootstrap and registration](production-bootstrap-status.md),
+[context observations](context-observations.md),
+[event routing](event-routing.md) and
+[conversation admission](conversation-admission.md). Remaining trial acceptance
+cases are retained.
 On 2026-09-25, the owner
 selected a status-first production trial and a Unix-domain socket for its
 standalone per-user service. The trial shows real project and Git status before
@@ -92,14 +94,15 @@ Keep the lower strip, input geometry, and overlay padding unchanged.
 
 The top status pane spans the terminal width with muted blue-grey RGB(55, 66, 76).
 Reserve the composer blue RGB(37, 59, 78) for user input.
-Its first row shows `Asura`, the compiled package version, the observed connection
-status and a project-tab area delimited by `<` and `>`. Use one cell of internal
-padding. Show registered directory names and mark selection with `*`. Before
-discovery completes, show `Projects loading`; only a verified empty registry
-shows `No projects`. Tab navigation is not yet enabled. A full-width `▀` row follows,
-using the band colour as foreground and terminal-default background below it.
-At widths below 60, use a compact name/version, project and connection row.
-Shorten text by display cells if required; preserve the minimum-size behavior.
+Its first row shows `Asura · CONNECTION · uptime U · memory: M · graph: G`.
+Connection is `Connected (process)`, `Connected (local)`, `Connecting` or
+`Disconnected`. Unknown uptime or memory values show `?`. Use one cell of
+internal padding. The header has no version or project tabs. The selected
+project name appears in the bottom status row. Down from the final editor row
+focuses that project field; Enter there opens the project picker. A full-width
+`▀` row follows, using the band colour as foreground and terminal-default
+background below it. Shorten text by display cells if required; preserve the
+minimum-size behavior.
 
 The composer status path identifies the context's working directory, distinct
 from its project root. In this slice, a launch inside a registered project uses
@@ -144,7 +147,8 @@ Rendering checks compare composer and history cells at wide and narrow sizes,
 including multiline input and history overflow. Inspect a rendered terminal image.
 This styling requirement does not add synthetic history or submission behavior.
 There is no permanent keyboard-hint row. F1 owns ordinary key guidance; paste
-capture and action feedback use a temporary notice above the input.
+capture and action feedback use a temporary notice. The notice is right-aligned
+in the top status row and uses at most half its width; the header shortens.
 
 ### Composer top separator
 
@@ -160,12 +164,14 @@ flowchart TD
     Half --> Composer
 ```
 
-The left status group shows cyan `No project`, muted `path ?` and `git ?`
-placeholders, then the local grapheme count (`N chars`) only for a nonempty draft.
-The right group shows `0% · unavailable`. These placeholders do not infer
-project association, repository state, model identity or usage. Unknown Git
-covers both branch and line counts; do not invent a branch or zero counts.
-At widths below 60, omit path/Git and use `Nc` and `0% · ?`.
+The left status group shows the selected project name, or `No project`. It
+then shows the context path, or `path ?` when unknown, and the Git group when a
+report exists. The local grapheme count (`N chars`) follows only for a nonempty
+draft. The right group shows `N% input · MODEL` when a measured context exists,
+otherwise `0% · MODEL`. MODEL is the observed or configured model, or `?`.
+These placeholders do not infer project association, repository state, model
+identity or usage. Do not invent a branch or zero counts.
+At widths below 60, omit path/Git and use `Nc`.
 Keep one-cell outer insets and at least two blank cells between groups. Shorten
 path first, then omit path if needed; retain Git when it fits. Preserve the draft
 count and unknown percentage, shortening project/model identity by grapheme.
@@ -180,11 +186,10 @@ is fabricated. Render all service metadata literally with terminal controls
 escaped. Narrow layouts prioritize service state and editing; below 30×8 show a
 resize message while retaining draft and exit controls.
 
-The client owns one in-memory draft; it is not a project association. Enter
-shows `Agent execution unavailable; draft retained` without clearing text, undo
-history or cursor, and emits no submission request. Repeated Enter is inert
-apart from that same notice. No task, queue, steering, project switch, Skill,
-MCP, model or command-discovery browser action is enabled.
+The client owns one in-memory draft; it is not a project association. In the
+thin checkpoint, Enter showed `Agent execution unavailable; draft retained` and
+emitted no submission request. Current Enter behavior follows the
+[conversation client integration](#first-conversation-client-integration).
 
 Client-local commands now follow the experiment's invocation semantics: a slash
 at the first character reserves the draft for command handling on plain Enter.
@@ -193,11 +198,15 @@ whitespace. `/help` consumes the command draft and its editor history and opens
 the same overlay as F1. Escape or F1 returns to an empty editor. `/quit` and
 `/exit` request normal client cleanup immediately: the command itself is not
 unsaved prose, and pending config requests may have an unconfirmed outcome.
+If the local outbox holds unreceipted input, they open the exit confirmation.
 Unknown names and non-whitespace arguments to these three commands show an error above input and retain
 the entire draft and undo history. Never forward slash commands as chat. Leading
 whitespace remains ordinary draft text. Paste, typing and Option+Return do not
-invoke commands; overlays keep their existing input ownership. Tab completion includes these names and `/config`, whose service-backed
-behavior follows the [configuration command contract](config-commands.md). With no selection and the
+invoke commands; overlays keep their existing input ownership. Tab completion
+covers the 14 fixed `LOCAL_COMMANDS` names: `/help`, `/quit`, `/exit`,
+`/config`, `/init`, `/project`, `/cancel`, `/observe`, `/retry`, `/queue`,
+`/models`, `/tools`, `/audit` and `/new`. `/config` follows the
+[configuration command contract](config-commands.md). With no selection and the
 cursor within the first slash-name span, Tab completes a unique prefix in one
 undo transaction. It replaces only that span, preserving arguments and later
 lines. Exact names are unchanged. Zero matches retain the draft and show
@@ -236,11 +245,13 @@ names and verify restoration without creating a service runtime.
 ```mermaid
 flowchart LR
     Enter[Plain Enter in editor] --> Slash{Starts with slash?}
-    Slash -->|No| Draft[Execution unavailable; retain draft]
+    Slash -->|No| Draft[Conversation input: local outbox]
     Slash -->|Yes| Parse{Exact name and no arguments?}
     Parse -->|No| Error[Notice; retain draft and history]
     Parse -->|help| Help[Consume command; open local help]
-    Parse -->|quit or exit| Exit[Existing terminal cleanup and client exit]
+    Parse -->|quit or exit| Outbox{Local outbox empty?}
+    Outbox -->|Yes| Exit[Existing terminal cleanup and client exit]
+    Outbox -->|No| Confirm[Open exit confirmation]
 ```
 Exiting discards the local draft; no persistent conversation or session file is
 created by this checkpoint.
@@ -254,8 +265,10 @@ fixture and task action bindings. F1 toggles concise help; Escape closes help or
 an exit prompt, otherwise leaves the draft unchanged. Key release/repeat events
 cannot trigger Enter, help or exit actions.
 
-Ctrl+Q or Ctrl+C exits immediately with an empty draft. With text, display
-`Discard draft and exit?` with `Keep editing` initially selected. Tab/arrow changes
+Ctrl+Q or Ctrl+C exits immediately when the draft and local outbox are empty.
+With text, display `Discard draft and exit?` with `Keep editing` initially
+selected. With unreceipted local input, the prompt states how many provisional
+inputs are not yet durable. Tab/arrow changes
 the selection; Enter confirms it. Escape or repeated exit keys preserve text.
 Ctrl+D exits only when the draft is empty and no overlay is open. An OS SIGINT,
 SIGTERM or SIGHUP requests cleanup and exit; the process cannot promise draft
@@ -659,27 +672,35 @@ the production status trial.
 
 The [conversation admission contract](conversation-admission.md) governs setup and
 execution. `/init`, `/project add PATH`, `/project list`, and `/project select ID`
-provide explicit setup and selection. CLI `init` and `project add PATH` use the
-same client methods. Selection stays local; it grants no service authority.
+provide explicit setup and selection. `/project rename NAME` renames the selected
+project through a separate project-admin worker. `/new` starts a new local
+conversation when no request or local input is unresolved. CLI `init` and
+`project add PATH` use the same client methods. Selection stays local; it grants
+no service authority.
 
 The TUI owns one conversation observation worker and one pending conversation
 request. The [IQ1 queue contract](conversation-admission.md#durable-input-queue-iq1)
 adds a separate one-slot worker for queue commands and projections. The service
-alone orders, persists, dispatches and recovers accepted inputs. Enter during
-active work queues the draft directly. The [composer interaction contract](composer-interactions.md)
+alone orders, persists, dispatches and recovers accepted inputs. Enter stages
+each valid input in a local outbox of at most 16 entries and clears the draft.
+The queue worker submits one waiting entry at a time with its original request
+ID. It uses a 2 s attach and 3 s request deadline; the UI reports an
+unconfirmed outcome after 5 s. The [composer interaction contract](composer-interactions.md)
 defines interactive queue promotion, selectors, history and dynamic hints. Ctrl+S requests cancel-and-replace
 steering; Ctrl+T queues a follow-up. `/queue [ID | resume ID | drop ID]` inspects
 or explicitly recovers retained service inputs. The padded tray shows observed
 states; a pending request is not counted as accepted. `/retry` prioritizes a
 retained unconfirmed queue request and reuses its original identity.
 
-The conversation worker retains the
-original request ID and draft until durable acceptance. A worker performs bounded
+The local outbox retains each input's original request ID and text until a
+durable receipt. A worker performs bounded
 attach/request calls outside the terminal loop. Worker notifications wake
 completion handling through the event dispatcher. A mutex mailbox coalesces snapshots into one value, at most 60 KiB. The
-worker has a 65-second observation budget, two-second attach/request bounds,
-three-second mutation bounds, and six-second initialization bound. It never
-joins an unfinished worker on the terminal loop. Cancellation uses a separate
+conversation worker has two-second attach/request bounds, three-second mutation
+bounds, and a six-second initialization bound. Observation has no whole-turn
+budget: each long poll waits at most 1000 ms and repeats until a terminal kind
+or a worker stop. It never joins an unfinished worker on the terminal loop.
+Cancellation uses a separate
 atomic control flag; it requests durable intent through the same client after
 any in-flight bounded exchange. Terminal exit disconnects; it does not silently
 cancel a turn on an independently owned service.
@@ -697,7 +718,9 @@ or discarding the result. Unit tests must hold a producer's mailbox lock and
 prove the consumer returns before release. The stalled-backend PTY journey
 verifies editing and exit during blocked socket work.
 
-`/cancel` requests cancellation of the active operation. `/observe ID` retrieves
+`/cancel` first cancels a pending `/audit` read, then a pending model inventory
+or model picker. Otherwise it requests cancellation of the active conversation
+operation. `/observe ID` retrieves
 an existing operation after a disconnect. Request errors retain the original
 request object. `/retry` explicitly repeats that object with the same request ID;
 it never allocates an automatic replacement ID.
@@ -731,10 +754,11 @@ sequenceDiagram
             W-->>UI: Publish result
             UI->>UI: Select confirmed project on success
         end
-    else Conversation submission
-        S-->>W: Durable acceptance
-        W-->>UI: Publish accepted prompt and operation identity
-        loop Until terminal or observation deadline
+    else Outbox input through queue worker
+        S-->>W: Durable input receipt
+        W-->>UI: Publish receipt and remove outbox entry
+        UI->>W: Observe operation dispatched by service queue
+        loop Until terminal or worker stop
             W->>S: Observe operation after cursor
             S-->>W: Latest snapshot or durable terminal
             W-->>UI: Publish coalesced display update
@@ -816,11 +840,12 @@ flowchart TD
 
 ### Mandatory command regression execution
 
-The existing CLI `lifecycle` Cargo test must run both the default `tui_pty.py`
-journey and its `--setup` journey. Cargo passes the current lifecycle executable
+The existing CLI `lifecycle` Cargo test must run the default `tui_pty.py`
+journey and its `--setup`, `--queue-history` and `--queue-reorder` journeys.
+Cargo passes the current lifecycle executable
 to Python; copied `asura-fixture` executables retain the existing private runtime
 resolver. These tests require Python 3, macOS PTYs and local socket access.
-Missing prerequisites or either failed journey fail the Cargo test; no silent
+Missing prerequisites or any failed journey fail the Cargo test; no silent
 skip or model availability requirement applies to these command checks.
 
 The Rust harness owns and reaps each Python child. Each journey has its existing

@@ -6,6 +6,9 @@ Ratatui, the Rust chat backend and default chat launch are selected in
 processing is required by [ADR-0006](../decisions/0006-async-event-pipelines.md).
 The process layout, task groups and queue mechanisms below are proposals.
 This is not an implementation-ready design or evidence that D0-D8 are complete.
+Implemented mechanisms follow [event routing](event-routing.md),
+[conversation admission](conversation-admission.md) and the
+[managed queue](managed-input-queue.md), which supersede this sketch.
 
 ## Scope and canonical owners
 

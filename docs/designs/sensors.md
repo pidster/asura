@@ -862,8 +862,9 @@ Implementation seams: the common registry and model adapters own public syntax;
 the service sensor owner owns a bounded formatter over its existing projection;
 the authority writer owns additive intent validation and result replay. Exact
 schema field numbers and tool-kind allocation are assigned at integration. Wire
-protocol 0.1 and journal format 1 remain unchanged. This packet is not yet a
-claim that the grouped tool or these seams are implemented.
+protocol 0.1 and journal format 1 remain unchanged. The grouped `service` tool
+exists with `status`, `tools` and `audit`; its `sensors` command and these seams
+are not yet implemented.
 
 ### Autonomous work remains separate
 

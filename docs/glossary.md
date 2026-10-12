@@ -98,7 +98,7 @@ defines binding changes.
 | Working location | Validated filesystem location associated with a project context, including an individual repository worktree |
 | Repository | Version-control history associated with local checkouts; a remote URL does not uniquely identify a working location |
 | Worktree | Individual checkout with its own working location, even when it shares repository history |
-| Registration | Proposed association between a project context and a validated working location; it grants no access |
+| Registration | Association between a project context and a validated working location; it grants no access |
 | Configuration snapshot | Immutable effective settings and source provenance for a context and working directory at a revision |
 | Context view | Selected evidence and instructions prepared for a particular task and destination |
 | Input context, proposed | Scoped evidence and instructions available to interpret a particular user submission; distinct from its project context or an execution model session |

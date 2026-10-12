@@ -115,4 +115,4 @@ The Mermaid flow was rendered and visually inspected.
 
 The shared adapter covers all local model classes. These runs do not establish
 native CoreAI or MLX qualification for the consolidated interface. Memory mutation
-and sensor inspection remain separate implementation packets.
+is now implemented under HM3; sensor inspection remains a separate packet.

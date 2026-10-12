@@ -107,8 +107,9 @@ flowchart TD
 Use macOS FSEvents over the registered root, including nested directories. The
 installed CoreServices header supplies creation, runloop scheduling and lifecycle
 APIs. A root-only vnode watch was rejected because nested edits can be missed.
-No dependency installation is required. One runloop slice lasts at most 100 ms
-so cancellation remains observable. The callback only marks a dirty flag; it does
+No dependency installation is required. The worker waits on the run loop without
+a periodic slice; cancellation signals a custom run-loop source (see
+[event routing](event-routing.md)). The callback only marks a dirty flag; it does
 not parse paths, read files, allocate per event or perform collection.
 
 Any event, including dropped-event and root-change notifications, invalidates the
@@ -180,7 +181,7 @@ Submodules do not contribute nested status in this slice.
 | Output | 1 MiB stdout and 16 KiB stderr; overflow cancels collection |
 | Tool lookup | 2 seconds, 4 KiB output, performed once per worker |
 | Debounce | 250 ms quiet interval, 2 seconds maximum during sustained writes |
-| Shutdown | Watch wakes within 100 ms; owned process killed and reaped; owner never joins an unfinished worker |
+| Shutdown | Watch wakes immediately through its cancellation source; owned process killed and reaped; owner never joins an unfinished worker |
 
 Filesystem calls and process creation remain potentially blocking OS operations.
 They are confined to the two retained workers. A stalled worker consumes its slot

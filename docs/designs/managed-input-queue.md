@@ -409,8 +409,8 @@ file. The Swift helper receives only an admitted prompt under the current
 model and tool authority. New local inputs cannot silently route to a remote
 model; provider selection remains governed by its own policy.
 
-This document specifies intended behavior. No runtime check here proves durable
-enqueue, reorder, fairness, steering or visual quality. Power-loss durability
+Runtime checks recorded in this document cover only their listed cases; the full
+MQ matrix, fairness and visual quality remain unqualified. Power-loss durability
 remains limited by the existing journal qualification evidence. Old IQ1 queued
 records must replay under their original predecessor links; migration must not
 reinterpret them as reorderable records. Reorder rejects kind-12 inputs and

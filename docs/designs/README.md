@@ -18,7 +18,7 @@ own authorization and validation scope; it does not establish product readiness.
 | [Service status pane](service-status-pane.md) | Selected connection ownership, service uptime and bounded stored-memory footprint observations. |
 | [Context observations](context-observations.md) | Service-owned filesystem signals, bounded Git collection and scoped status observations; runtime qualification required. |
 | [Sensors](sensors.md) | Passive and directed observations, durable evidence inspection, held proposals and selected System 1/System 2 direction. |
-| [Turn usage helper](turn-usage-helper.md) | Selected request-correlated counters and conservative budget settlement through existing helper owners. |
+| [Turn usage helper](turn-usage-helper.md) | Reviewed request-correlated counters and conservative budget settlement through existing helper owners; implemented, with final qualification recorded in response activity. |
 | [Result retention and graph packet](result-retention-graph-packet.md) | Proposed complete captured-result storage and typed thread/evidence graph; analysis and review only. |
 | [Conversation projections](conversation-projections.md) | Required separation of evidence, audit, model context and presentation; proposed richer activity, result retention and recomposition packets. |
 | [Model context telemetry](model-context-telemetry.md) | Native model identity and measured input context, with explicit basis and asynchronous event delivery. |
@@ -26,9 +26,9 @@ own authorization and validation scope; it does not establish product readiness.
 | [Model tools](model-tool-execution.md) | Shared service tool execution, task grants, bounded native model callbacks and staged activation. |
 | [Context storage](context-storage-candidates.md) | Required embedded/external SurrealDB and hybrid file/database ownership, recovery and backup boundaries. |
 | [Core harness](core-harness-brief.md) | Required and proposed lifecycle, admission, budget, context and model-session contracts for D3-D4. |
-| [Conversation admission](conversation-admission.md) | Format-1 authority, processing pipeline, durable conversation admission and queued input contracts. |
+| [Conversation admission](conversation-admission.md) | Format-1 authority, processing pipeline, durable conversation admission and queued input contracts; CA-A through CA-D implemented, listed fault qualification open. |
 | [Project names and rename](project-names.md) | Selected capitalized project display names and durable selected-project rename contract; implementation and focused runtime checks recorded, full acceptance matrix open. |
-| [Managed input queue](managed-input-queue.md) | Selected all-input queue, durable reorder, sequential dispatch, steering and compact composer projection; implementation and validation in progress. |
+| [Managed input queue](managed-input-queue.md) | Selected all-input queue, durable reorder, sequential dispatch, steering and compact composer projection; implemented, focused checks recorded, full validation matrix open. |
 | [Conversation restoration](conversation-restoration.md) | Selected project-scoped latest conversation restoration, explicit `/new`, bounded control reads and recovery checks. |
 | [Domain model](domain-model.md) | Proposed D0 identities, relationships and ownership; concrete schemas remain later design work. |
 | [Hybrid memory ontology](hybrid-memory-ontology.md) | Proposed file, document and graph memory, plan/task tracking, dependencies, typed built-in tools, authority boundaries, selected home paths and recovery checks. |
@@ -37,7 +37,7 @@ own authorization and validation scope; it does not establish product readiness.
 | [Interaction and extension boundaries](interaction-and-extension-boundaries.md) | Required interaction goals, three in-chat command categories and integration boundaries; proposed input-processing separation. |
 | [Product workflows](product-workflows.md) | Selected first-release scope, required workflows and proposed acceptance targets. |
 | [Platform capabilities](platform-capabilities.md) | D1 macOS 27 SDK evidence and proposed home, service and local-authentication mechanisms. |
-| [Protobuf toolchain bootstrap](protobuf-toolchain-bootstrap.md) | Shared tools for control and model schemas; verified download, test-only smoke exchange and offline qualification. Implementation remains gated. |
+| [Protobuf toolchain bootstrap](protobuf-toolchain-bootstrap.md) | Shared tools for control and model schemas; verified download, test-only smoke exchange and offline qualification. PB0.0–PB0.2 implemented and locally verified; PB0.3 incomplete; remaining work deferred under service-first delivery. |
 | [Protobuf cache preparation](protobuf-cache-preparation.md) | Approved PB0.3 archive, manifest and driver contracts; live preparation remains blocked on native process settlement. |
 | [Protobuf process settlement](protobuf-process-settlement.md) | Authorized test-only API qualification packet; production cleanup correction and proof limits remain open. |
 | [Persistence and recovery](persistence-recovery.md) | Proposed D3 local control-store, installation, graph-binding, registration and backup protocol for I1. |
@@ -63,16 +63,14 @@ own authorization and validation scope; it does not establish product readiness.
 | [User service and configuration](user-service-configuration.md) | Required user service, `$HOME/.asura/`, project-context and configuration behavior; concrete mechanisms remain open. |
 | [Validation strategy](validation-strategy.md) | Proposed D7 evidence plan for the first Protobuf bootstrap packet; broader I0 and release gates remain open. |
 | [YAML configuration commands](config-commands.md) | Typed YAML configuration display, get/set and scope contracts. |
-| [Bounded shell tool](shell-tool.md) | Selected noninteractive shell contract, separate execution grant, confined process group and truthful cleanup limits. |
+| [Bounded shell tool](shell-tool.md) | Implemented noninteractive shell contract, separate execution grant, confined process group and truthful cleanup limits; scoped native validation recorded 2026-09-28. |
 | [Storage adapter ownership](storage-adapters.md) | File and SurrealDB persistence ownership and migration packets. |
 | [Event routing and readiness](event-routing.md) | Bounded priority inboxes, service readiness and recorded integration evidence. |
+| [Response activity and navigation](response-activity.md) | Implemented live tool activity and expandable response history, with recorded qualification on 2026-09-30. |
+| [Consolidated parameterised tools](consolidated-tools.md) | Implemented typed grouped commands over canonical operation owners; validation recorded 2026-09-28. |
 
 The [architecture and design plan](../plans/architecture-and-design.md) orders
 these artifacts. The [visual reading path](../decisions/README.md#visual-reading-path)
 links the canonical ownership, lifecycle and data diagrams.
 
 Return to the [documentation index](../README.md).
-
-- [Response activity and navigation](response-activity.md): live tool activity and expandable response history.
-
-- [Consolidated parameterised tools](consolidated-tools.md): typed grouped commands over canonical operation owners.

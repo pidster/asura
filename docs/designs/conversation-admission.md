@@ -2,12 +2,14 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens with tool passes of 1,024/512/512. Historical
+New admissions reserve 2,048 tokens. Tool requests are capped at 1,024 tokens first
+and 512 thereafter, at most 64 per turn, under the
+[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Historical
 512-token journal records retain their recorded accounting. Earlier numerical
 examples and validation evidence below describe that earlier packet.
 
-Status: CA-A and CA-B implemented, with the storage validation subset below
-passing on 2026-09-27. The owner authorized conversation execution and the shared
+Status: CA-A through CA-D implemented. The storage validation subset below
+passed on 2026-09-27. The owner authorized conversation execution and the shared
 input pipeline. The implementation extends the canonical ordinary-file authority
 owner and embedded graph adapter. Journal format remains 1. Fault and durability
 qualification remains incomplete where explicitly listed below.
@@ -21,8 +23,9 @@ places persistence in `asura-storage`; platform supplies safe OS primitives.
 
 ## Scope and canonical owners
 
-Deliver one active text generation per service, one project per conversation,
-and no tools. The initial provider is the admitted `system` model. One submitted
+Deliver one active text generation per service and one project per conversation.
+Tools were outside this packet; [model tools](model-tool-execution.md) defines
+current tool behavior. The initial provider is the admitted `system` model. One submitted
 turn creates one task and one model operation. Both have durable identities.
 The task has one operation and a 512-output-token budget. This packet does not
 implement multi-step scheduling, remote providers, conversation branching, history
@@ -233,6 +236,8 @@ Preserve diagnostic initialization kinds 1 and 2 and their exact payloads from t
 [recovery contract](persistence-recovery.md#format-1-byte-contract). Request-bearing
 PendingInit and ActiveBinding use distinct kinds 10 and 11. Kind 3 keeps its existing
 OwnerGeneration meaning; kinds 4 through 9 add the conversation transitions below.
+Later amendments add kinds 12–20 for input, tools, promotion, Memory create,
+the managed queue and project rename.
 Never reinterpret an existing kind based on payload length. A stream starts with
 either diagnostic kind 1 or request-bearing kind 10. The first record selects its
 transition rules; mixing diagnostic and request-bearing initialization records
@@ -698,8 +703,8 @@ prompt before acknowledgement. A stale target rejects without effects. Queue
 order is journal sequence order within the conversation. At most 16 unresolved
 inputs exist across the service, each at most 32 KiB UTF-8. Busy storage rejects
 before acceptance; clients retain text. Existing cancellation capacity remains
-reserved. Each dispatch retains the existing 60-second model deadline, 512-token
-reservation and one active operation limit.
+reserved. Each dispatch retains the existing 60-second model deadline, current
+output reservation and one active operation limit.
 
 InputQueued stores its original request/digest, a fresh internal dispatch request
 ID, project, conversation, target operation/generation, optional previous queued
@@ -872,7 +877,8 @@ flowchart TD
 
 ## Existing input promotion (IQ2)
 
-Status: selected design, implementation in progress. The composer queues new text
+Status: implemented and extended by the [managed queue](managed-input-queue.md).
+The composer queues new text
 without a choice dialog. Selecting an accepted queued input can send it now.
 The service changes that same input to Steer; clients must not copy its prompt or
 combine Drop and Enqueue. IQ1 bounds, transport, ownership and settlement apply.

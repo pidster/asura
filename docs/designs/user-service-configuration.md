@@ -4,7 +4,9 @@ Status: required behavior selected in [ADR-0004](../decisions/0004-user-service-
 with the per-user `$HOME/.asura/` root selected by the owner on 2026-09-24.
 This brief defines ownership and composition rules. It is not implementation-ready.
 Service supervision, schemas and filesystem consistency mechanisms remain open.
-No runtime behavior is implemented or verified.
+Later designs govern the implemented per-user service runtime. That runtime
+uses `run/`, `logs/`, `config.yaml`, `db/` and `state/` under `$HOME/.asura/`.
+This brief does not record verification of that behavior.
 
 ## Scope and ownership
 
@@ -154,7 +156,8 @@ model and audit schema and its get/set operations. The
 [storage contract](storage-adapters.md) defines current database bindings; the
 [conversation contract](conversation-admission.md) defines the format-1 journal.
 Broader memory schemas remain scoped by the [ontology](hybrid-memory-ontology.md).
-Audit rotation is not implemented by the config command packet.
+The [audit journal contract](config-commands.md#audit-setting-consumption-and-event-journal)
+owns `logs/audit.jsonl` recording and rotation, which are implemented.
 Local Asura-managed persistent files belong under this root. Embedded SurrealDB's
 engine files belong under `db/`. Those engine
 files are the database's representation, not a separately editable copy of graph
@@ -199,10 +202,12 @@ flowchart TD
     Storage -.->|External graph mode with authorized egress| External[("External SurrealDB server")]
 ```
 
-### Proposed directory areas
+### Superseded directory proposal
 
-The `run/` placement is selected. Other areas remain a proposed mechanism for
-D3 review. This table does not authorize implementation or directory creation.
+The selected path table above supersedes this earlier proposal. Implemented
+code uses `config.yaml`, not `config/`, and `db/`, not `data/`, for embedded
+engine files. This table is retained as history. It does not authorize
+implementation or directory creation.
 
 | Area under `.asura/` | Status and intended role |
 | --- | --- |
@@ -226,7 +231,7 @@ selected under `run/`; the service design owns their detailed names. An override
 if later authorized and designed, cannot create another active owner for one user.
 The runtime placement does not select a credential backend.
 D1-D3 must specify private access, tamper and symlink/replacement handling before
-any directory creation or state access is implemented.
+any further directory creation or state access is implemented.
 
 ## Project context identity
 

@@ -2,7 +2,9 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens with tool passes of 1,024/512/512. Historical
+New admissions reserve 2,048 tokens. Tool requests are capped at 1,024 tokens first
+and 512 thereafter, at most 64 per turn, under the
+[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Historical
 512-token journal records retain their recorded accounting. Earlier numerical
 examples and validation evidence below describe that earlier packet.
 
@@ -134,7 +136,7 @@ termination/reap. Adapter retries are disabled; cancellation invalidates its ses
 | Tool calls | 8 per generation; shared turn budget may be stricter |
 | Tool arguments | 16 KiB per call |
 | Ollama context request | At most 8,192 tokens, selected after `/api/show` discovery; reported maximum and effective request capacity are separate observations |
-| Output request | At most 512 tokens |
+| Output request | At most 2,048 tokens, the per-request cap from the turn budget |
 
 Read network bytes incrementally and reject before growing the record buffer beyond
 its limit. HTTP error bodies are not logged or retained. Invalid or redirected
@@ -278,7 +280,7 @@ Discovery must return a positive integer model-info key ending in `.context_leng
 Conflicting values use the smallest reported maximum. The request context is the smaller
 of that maximum and 8,192 tokens; Hello reports both values and the discovery source.
 Missing capacity fails unavailable. `num_predict` comes from the common engine's
-current request, between 1 and 512, so tool continuations preserve remaining budget.
+current request, between 1 and 2,048, so tool continuations preserve remaining budget.
 Stream usage above that request limit fails. Discovery keeps its resource bounds;
 the [endpoint configuration contract](#mp2-endpoint-configuration-handoff) governs
 local HTTP and remote HTTPS selection.
@@ -680,8 +682,10 @@ and locally rejected proposals consume this same bound. The service independentl
 retains its eight admitted-operation limit. Exhaustion records output-limit;
 it does not return another correction. The wrapper forwards the original schema,
 name and description. It cannot expose an additional tool or grant authority.
-The existing three inference allocations (1024, 512, 512), 2048 total reservation,
-turn deadline, callback-waiter bound and output bounds remain unchanged. No retry
+The existing inference allocations (1024 first, 512 later, at most 64 requests
+under the [turn budget](turn-usage-helper.md#turn-budget-and-request-admission)),
+2048 total reservation, turn deadline, callback-waiter bound and output bounds
+remain unchanged. No retry
 scheduler or extra model dispatch owner is added; the SDK decides whether to
 correct its proposal within those limits.
 
@@ -699,8 +703,8 @@ flowchart TD
 ```
 
 Tests must prove malformed creation followed by a valid creation reaches the host
-once, across the SDK loop; repeated correction cannot exceed three inference
-passes or eight proposals; failed inference and cancellation cannot return a
+once, across the SDK loop; repeated correction cannot exceed the 2,048-token turn
+budget or eight proposals; failed inference and cancellation cannot return a
 correction or invoke the host; and rejected fields remain rejected without their
 values appearing in feedback. All four public tool names and schemas stay intact.
 

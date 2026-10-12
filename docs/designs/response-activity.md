@@ -1,6 +1,7 @@
 # Response activity and navigation
 
-Status: selected implementation design for live activity and expandable response history.
+Status: implemented for live activity and expandable response history; see the
+[recorded qualification](#recorded-qualification--2026-09-30).
 
 The selected 2026-09-30 extension below adds richer live feedback and turn
 measurements. The [conversation projection direction](conversation-projections.md)
@@ -146,10 +147,11 @@ wrapper retains typed errors for both tool and plain-text inference. Plain-text
 inference uses one dispatch with the admitted maximum, not the tool-pass split.
 
 The turn-local executor budget starts with the actual Begin token reservation.
-Each tool dispatch reserves the smaller of its fixed allocation and remaining
-reservation before provider I/O. A smaller provider request cap does not refund
-that reservation. Zero remaining tokens or a fourth tool dispatch fails before
-provider I/O. Plain-text dispatch reserves its actual admitted maximum once.
+Each tool dispatch reserves the smallest of its pass cap (1,024 first, 512 later),
+the caller's cap and the remaining reservation before provider I/O. Only verified
+measured output from a successful request refunds unused reservation. Zero
+remaining tokens or a 65th tool dispatch fails before provider I/O. Plain-text
+dispatch reserves its actual admitted maximum once.
 The first typed executor failure is retained through SDK error wrapping; cancellation
 still takes priority. Tests cover smaller legacy reservations and separate turns.
 

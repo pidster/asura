@@ -325,7 +325,8 @@ heartbeat retention, reconnect and cancellation under longpoll.
 
 `ObserveService` (envelope tag 41) accepts an optional service-local revision.
 `ServiceObservation` (42) returns revision, pending, the cached inspection status,
-and optional configured model selector. Each attachment retains at most one
+optional configured model selector, and uptime and stored-memory fields
+(see [service status pane](service-status-pane.md)). Each attachment retains at most one
 request. The service permits 32 retained requests. A changed revision returns
 immediately. An unchanged revision waits at most one second and returns a
 liveness heartbeat with the current cached status. Epoch changes invalidate cursors.
