@@ -2,9 +2,10 @@
 
 Status: initial traceability proposal for the selected local CLI/TUI release with
 on-device assistance. Existing requirements remain required; D0 refinements and
-objective values await review. All product implementation,
-runtime verification and release states are **not started**. No row is a passing
-test or an implementation authorization.
+objective values await review. Partial implementation exists: service, CLI/TUI,
+conversation admission, embedded storage and the model helper. Component designs
+record its verified scope. Release states are **not started**. No row is a
+passing test or an implementation authorization.
 
 ## Ownership and use
 

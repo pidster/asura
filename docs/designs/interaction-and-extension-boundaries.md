@@ -125,8 +125,10 @@ part of the shared per-user service. A command category does not create another
 service or grant the client authority over agent execution. The
 [language allocation](../plans/architecture-and-design.md#proposed-language-ownership)
 proposes Rust for the context and execution owners, and Swift for Foundation Models
-and native platform adapters. Those remaining allocations and IPC/FFI boundaries
-require D2 design. Any Swift model operation supplies a bounded result to its
+and native platform adapters. [ADR-0009](../decisions/0009-supervised-local-model-helper.md)
+and [ADR-0010](../decisions/0010-protobuf-model-channel.md) selected a supervised
+Swift model helper over a private Protobuf channel. Other allocations and IPC/FFI
+boundaries require D2 design. Any Swift model operation supplies a bounded result to its
 admitted owner; it cannot interpret a command into an authorization grant.
 
 ### Command routing boundaries

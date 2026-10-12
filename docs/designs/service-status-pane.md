@@ -1,6 +1,8 @@
 # Service status pane
 
-Status: selected implementation packet, 2026-09-28. Protocol remains 0.1.
+Status: selected implementation packet, 2026-09-28; implemented. Source tests
+for each validation layer are listed under [Validation](#validation). This
+document records no test run or runtime evidence. Protocol remains 0.1.
 
 The top pane reports `Asura · Connected (process|local|remote) · uptime · memory:
 status size · graph: state reason`. Process means this TUI launched the current
@@ -135,3 +137,11 @@ size against bounded fixture files while a separate client attaches. SS-E1 check
 TUI owned/local labels, epoch reset, uptime and graph status without render IO.
 Root owns integration, serial builds and runtime qualification; source tests alone
 are not end-to-end evidence.
+
+Implemented test owners. SS-U1 is in `asura-platform/src/journal_io/footprint.rs`.
+SS-U2 is `stored_memory_status_is_bounded_truthful_and_paired_with_service_uptime`
+in `asura-control/tests/protocol.rs`. SS-U3 is in
+`asura-service/src/service_observer.rs`. SS-I1 is `asura-storage/tests/stored_memory.rs`.
+SS-U4 and header rendering are `asura-cli/src/tui/ui.rs` unit tests. SS-E1 and
+SS-E2 assertions are in `asura-cli/tests/tui_pty.py`. This list identifies
+source tests only; it does not claim that they passed.

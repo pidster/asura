@@ -100,8 +100,9 @@ the move succeeded.
 Enter on a queued or held accepted input sends it now. With an exact active
 operation in the same conversation, the canonical service atomically promotes
 the same input to Steer. The hint says this stops and restarts the response.
-Without an active operation, Enter requests a move to the front; a held head
-still needs explicit Resume. Never combine client Drop and Enqueue. If the
+Without an active operation, Enter requests a move of a queued input to the
+front; a held input does not move, and the notice asks for `/queue resume ID`.
+Never combine client Drop and Enqueue. If the
 target is stale or the input was dispatched, show rejection and keep the
 projection. Enter on a rejected local row restores its exact text only when
 the editor is empty. The UI keeps uncertain decisions for `/retry`; success

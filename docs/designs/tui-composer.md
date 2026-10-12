@@ -56,11 +56,11 @@ external I/O or dependency is introduced.
 | Ctrl+B | Inspect this project's message tray |
 | Option+Return (Alt+Enter) | Newline; a distinct Shift+Enter remains an unadvertised compatibility alias |
 
-The currently implemented editor inserts two spaces on Tab. The owner later
-selected a contextual Tab completion action for an eligible slash-command header.
-That [command interaction](tui-command-discovery.md#contextual-tab-completion)
-is proposed for a future trial and is not implemented by this composer build.
-Outside that future header context, Tab retains two-space insertion.
+This composer build inserted two spaces on Tab. The owner later selected a
+contextual Tab completion action for an eligible slash-command header. The
+[command trial](tui-command-discovery.md#contextual-tab-completion) implements
+that action in the isolated prototype; this composer build did not add it.
+Outside that header context, Tab retains two-space insertion.
 
 The owner selected Option+Return as the advertised newline binding after
 [physical-key observations](tui-key-inspection.md#native-observations-and-decoder-investigation-on-2026-09-24)

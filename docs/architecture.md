@@ -15,6 +15,9 @@ model helps the orchestrator determine when a task needs remote AI.
 
 Swift and Rust are the selected implementation languages. Ratatui and Rust are
 selected for the chat client and backend under [ADR-0005](decisions/0005-default-ratatui-chat.md).
+The Rust workspace and the supervised Swift model helper, selected in
+[ADR-0009](decisions/0009-supervised-local-model-helper.md) and
+[ADR-0010](decisions/0010-protobuf-model-channel.md), are implemented.
 Remaining allocation, repository layout and interoperation require detailed design
 under the [architecture and design plan](plans/architecture-and-design.md) before scaffolding.
 
@@ -56,8 +59,9 @@ interfaces will use.
 
 Asura uses `$HOME/.asura/` for user-level local state, with some data in files and
 other data in SurrealDB. The [home and hybrid persistence contract](designs/user-service-configuration.md#per-user-home-and-hybrid-persistence)
-defines the required root and ownership boundaries. Detailed placement and recovery
-mechanisms remain D3 work; an external database's physical data stays external.
+defines the required root and ownership boundaries. Embedded placement under that
+root is implemented; external mode and the remaining recovery mechanisms are D3
+work. An external database's physical data stays external.
 
 One interactive control client must support navigation among authorized projects,
 conversations, tasks and agent instances. The launch directory may provide an
@@ -201,7 +205,9 @@ depend on waiting for model inference.
 
 Proposed interaction contract for D3. The durability acknowledgement and event
 cursor rules need a concrete storage/transport design; the diagram establishes
-their required ordering and distinguishes acceptance from completion.
+their required ordering and distinguishes acceptance from completion. Conversation
+turns implement this ordering under [conversation admission](designs/conversation-admission.md);
+general task submission remains proposed.
 
 ```mermaid
 sequenceDiagram

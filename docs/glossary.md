@@ -32,6 +32,10 @@ schemas and runtime mechanisms remain with their governing designs.
 | Input pipeline | Processing that validates and translates user input or control requests into typed commands for their owner |
 | Signal | Notification whose meaning belongs to a specific component, such as a deadline, process exit or operation completion |
 | Signal pipeline | Processing that normalizes, validates and routes signals to their responsible component |
+| Managed input queue | Durable per-conversation queue that every conversational message enters before model admission; see the [queue design](designs/managed-input-queue.md) |
+| Steer | User input that durably cancels the active operation and replaces it with the original prompt plus a new instruction; it does not modify running inference |
+| Conversation restoration | TUI recovery of the selected project's most recent conversation and queue scope; see the [restoration design](designs/conversation-restoration.md) |
+| Sensor | Scoped source of observations; an observation is evidence, not an instruction, permission or accepted task; see the [sensor design](designs/sensors.md) |
 
 These are reading definitions. The proposed [D0 domain model](designs/domain-model.md)
 refines their relationships, including actions and individual execution attempts.

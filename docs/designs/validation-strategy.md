@@ -52,10 +52,12 @@ flowchart TD
 The first qualification host is macOS 27 on Apple silicon with Xcode 27.0 build
 `27A266a`, Swift 6.4 and Rust/Cargo 1.98.0. The runner records the actual OS
 build and tool identities. A different tuple needs a reviewed lock entry and
-its own qualification. The local runner executes the designed commands
+its own qualification. The designed local runner commands are
 `scripts/check-i0-toolchain --prepare-only`,
 `scripts/check-i0-toolchain`, and
-`scripts/check-i0-toolchain --offline`.
+`scripts/check-i0-toolchain --offline`. They are not implemented; the script
+currently accepts only `--check driver`, `--check bootstrap`,
+`--check preparation` and `--check preparation-offline`.
 
 BT1-BT3 run as unit and integration checks on the supported host. BT4 starts
 from a clean checkout and empty caches with network access available. The

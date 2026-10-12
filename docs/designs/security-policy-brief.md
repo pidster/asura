@@ -3,7 +3,9 @@
 Status: required capabilities with a proposed authorization contract.
 
 Open decisions: policy format, evaluator and macOS enforcement mechanisms.
-Runtime behavior is not implemented or verified. Terms are defined in the
+No policy format or evaluator is implemented. The [shell tool](shell-tool.md)
+and Git observer apply fixed `sandbox-exec` profiles; those profiles are not a
+policy format or a selected general mechanism. Terms are defined in the
 [glossary](../glossary.md).
 
 ## Required capability

@@ -6,8 +6,12 @@ socket for its local control channel on 2026-09-25. The selected I1 principal is
 one macOS account. The owner selected `~/.asura/run/` for runtime files on 2026-09-26.
 Arbitration, fencing and same-UID behavior below remain proposals, not host proof. This slice does not
 select the eventual Swift/Rust boundary, agent helper layout or GUI transport.
-The [local-model boundary proposal](swift-rust-boundary.md) develops the first
-of those choices without changing this service's sole authority.
+[ADR-0009](../decisions/0009-supervised-local-model-helper.md) and
+[ADR-0010](../decisions/0010-protobuf-model-channel.md) later selected the
+supervised model helper and its channel; the [local-model boundary](swift-rust-boundary.md)
+owns them without changing this service's sole authority. The foundation service,
+control codec and client below are implemented in `asura-service`,
+`asura-control` and `asura-client`; GUI transport remains unselected.
 
 The [runtime architecture](runtime-architecture.md) owns the wider execution
 model. The [threat model](threat-model.md) owns adversary scope; the
@@ -35,7 +39,7 @@ before initialization. Their existence does not prove initialization. The
 [conversation admission contract](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow)
 owns automatic initialization of verified fresh state.
 The runtime directory contains no installation identity. Before the authority
-module exists, inspection reports `Unavailable(authority_not_installed)`. Once
+module existed, inspection reported `Unavailable(authority_not_installed)`. Once
 that module exists, it classifies the authority root independently. The service validates every path component and opened descriptor for
 type, owner and private access; it rejects aliases, replacement and a socket
 path too long for `sockaddr_un`. Initial support is limited to local account
@@ -274,9 +278,10 @@ before implementation. Do not claim that polling proves fencing across replaceme
 
 ### Local command and lifecycle contract
 
-Use these explicit commands for the foundation. Bare `asura` remains reserved
-for the production TUI. Until that client exists, it explains that it is unavailable.
-It must not start the synthetic experiment or silently select service mode.
+Use these explicit commands for the foundation. Bare `asura` launches the
+production TUI under [ADR-0005](../decisions/0005-default-ratatui-chat.md). It
+must not start the synthetic experiment or silently select service mode. Later
+slices add further subcommands; `asura --help` lists them.
 
 | Command | Selected behavior |
 | --- | --- |
@@ -504,7 +509,7 @@ remain deferred work in the foundation packet.
 
 The frame header is exactly 12 bytes: ASCII `ASUR`, unsigned big-endian 16-bit
 major, unsigned big-endian 16-bit minor, and unsigned big-endian 32-bit body length.
-Initially accept version 1.0 only. The first frame proposes 1.0; a successful
+Accept version 0.1 only. The first frame proposes 0.1; a successful
 HelloReply accepts it. For another version, the authenticated server sends its
 own supported version in a header with body length zero, then closes. This is
 the sole zero-length form; it is valid only as a server negotiation rejection.
@@ -533,9 +538,10 @@ be reserved. There are no maps, `Any`, opaque command bytes or recursive message
 | `StopAccepted` | Empty message. It acknowledges drain admission only. |
 | `Error` | 1 `code`: optional ErrorCode; 2 `message`: optional string. |
 
-`Capability` values are 0 Unspecified, 1 Inspect and 2 Stop. `Lifecycle` values
+Foundation `Capability` values are 0 Unspecified, 1 Inspect and 2 Stop; later
+slices add values 3–6 in `contracts/control/v1/control.proto`. `Lifecycle` values
 are 0 Unspecified, 1 Starting, 2 Serving, 3 Draining, 4 Faulted and 5 RepairOnly.
-`InstallationState` is 0 Unspecified or 1 Unavailable in foundation v1.0.
+`InstallationState` is 0 Unspecified or 1 Unavailable in the foundation packet.
 `UnavailableReason` is 0 Unspecified or 1 AuthorityNotInstalled.
 `ErrorCode` values are 0 Unspecified, 1 UnsupportedOperation, 2 InvalidSequence,
 3 StaleOwner, 4 Draining, 5 Timeout, 6 InvalidRequest and 7 InternalUnavailable.
@@ -548,8 +554,10 @@ strings are nonempty ASCII printable text, at most 128 bytes. Error messages
 use the same character rule and a 256-byte cap; they never echo a request or path.
 HelloReply advertises exactly the supported capabilities, with no duplicates,
 at most 16 entries. Its frame limit must equal 65,536. Foundation InspectReply
-requires Unavailable with AuthorityNotInstalled. The service never reports a
-ready installation before its later owner exists.
+required Unavailable with AuthorityNotInstalled. The service never reports a
+ready installation before its later owner exists. Stage 3A superseded this
+foundation reply; [production status](../plans/production-status-implementation.md#stage-3a-authority-replay-and-inspection)
+owns the current installation states and reasons.
 
 ### Strict wire and semantic validation
 
@@ -585,9 +593,11 @@ provides explicit compiler selection and descriptor-set output. Documentation
 availability is not proof that the proposed validator or build works.
 
 Stage 3 extends the same schema and dispatcher with durable request identities
-and status scope fields under a reviewed protocol revision, proposed 1.1.
-Its implementation must define version/capability compatibility before serving
-those messages. These identities are not foundation request counters. The same
+and status scope fields. The implementation extends the protocol 0.1 schema
+without a version change, under the
+[numbering authority](../engineering.md#wire-protocol-change-authority).
+Capabilities identify the supported messages.
+These identities are not foundation request counters. The same
 control owner serializes authorization changes with queued-response removal and
 final disclosure. No status module may add a second transport or output queue.
 JSON output from `asura service status --json` is a CLI presentation format only.
@@ -650,10 +660,10 @@ Malformed frames close the connection. A well-formed unsupported operation retur
 payload is admitted. Dropped Stop replies are reconciled by inspection and the
 captured lock; clients never replay Stop against a new epoch.
 
-Foundation inspection reports installation `Unavailable(authority_not_installed)`.
-It does not inspect `.asura/` or infer Uninitialized. Stage 3 supplies
-`Uninitialized`, `Recovering`, `ControlReady`, `GraphReady`, `GraphUnavailable`
-and `RepairRequired` through the same projection owner. Agent/model capabilities
+Foundation inspection reported installation `Unavailable(authority_not_installed)`.
+It did not inspect `.asura/` or infer Uninitialized. Stage 3 supplies
+`Uninitialized`, `Recovering`, `GraphReady`, `GraphUnavailable` and
+`RepairRequired` through the same projection owner. Agent/model capabilities
 are absent. Health of the local channel is not installation readiness.
 
 | Resource | Selected bound and exhaustion result |
@@ -680,10 +690,10 @@ sequenceDiagram
     participant G as Owner guard
     C->>S: Connect and check peer UID
     S->>C: Check peer UID before disclosure
-    C->>S: Protobuf Hello version 1.0
+    C->>S: Protobuf Hello version 0.1
     S-->>C: Protobuf HelloReply with identity
     C->>S: Inspect with identity and counter 1
-    S-->>C: Serving and authority unavailable
+    S-->>C: Serving and installation state
     C->>S: Stop with same epoch and counter 2
     S->>S: Enter serialized Draining
     S-->>C: StopAccepted

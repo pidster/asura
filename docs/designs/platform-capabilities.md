@@ -8,6 +8,28 @@ and 512 thereafter, at most 64 per turn, under the
 512-token journal records retain their recorded accounting. Earlier numerical
 examples and validation evidence below describe that earlier packet.
 
+Implementation update, 2026-10-12: committed code supersedes these parts of the
+dated proposals below; the proposals remain as their record.
+
+- The service writer initializes a verified runtime-only root with no replay
+  once, without `/init`, under [conversation admission](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow).
+  Partial, unknown or conflicting state still requires repair.
+- `asura-platform/src/runtime.rs` implements the managed-root procedure: account
+  home from `getpwuid_r`, no-follow descriptors, `0700` directories, a `flock`
+  owner lock and a `getpeereid` peer check. ACL, network-home and multi-login
+  qualification remain open.
+- The 2026-09-27 conversation packet is implemented. The provider registry in
+  `asura-service/src/model.rs` contains `system`, `ollama`, `coreai` and `mlx`.
+  The helper proposes typed tool calls that the service admits under
+  [model tool execution](model-tool-execution.md). The helper package also pins
+  `coreai-models`, `mlx-swift-lm` and `swift-transformers`.
+- Helper preparation through Hello has a 20-second deadline in
+  `asura-service/src/model_owner.rs`; later pre-start phases use 5 seconds.
+  The package identity has three or four hashes; the optional fourth is the MLX
+  `metallib` digest.
+- The storage writer records conversation, project and tool records as new
+  kinds within journal format 1.
+
 Status: D1 evidence and proposed mechanism for the I1 bootstrap and control
 boundary. The inspected host has Xcode 27.0 (27A266a) with the macOS 27.0 SDK.
 Header availability is verified locally; runtime behavior, packaging and

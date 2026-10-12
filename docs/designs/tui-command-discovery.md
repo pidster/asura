@@ -503,8 +503,9 @@ They do not select production command mechanisms.
 4. During active work, the synthetic extension permits Steer or Queue; the
    synthetic Skill permits Queue only. Unsupported Steer stays visible but inert.
 5. `/quit` and `/exit` share one client-session identity. The extension and Skill
-   fixtures and the limits above are selected for this experiment. `/help` and
-   `/projects` remain outside this packet.
+   fixtures and the limits above are selected for this experiment. A later owner
+   amendment added `/help` (see the status block). `/projects` remains outside
+   this packet.
 
 Qualified names prevent collisions but are verbose; discovery must carry that cost.
 Literal Ctrl+S/T could surprise someone expecting to steer or queue an invocation.

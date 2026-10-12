@@ -72,7 +72,8 @@ flowchart TD
 
 The diagram shows an external graph for the boundary case; embedded mode keeps
 engine files under the local root. Both modes use the same binding checks. The
-observer may run in a helper after D2/D4 selects its process boundary.
+observer runs Git as a sandboxed, deadline-bounded child process
+(`asura-platform/src/git_observer.rs`); D2/D4 may later move it to a helper.
 
 ## Threats and required outcomes
 
@@ -88,6 +89,10 @@ observer may run in a helper after D2/D4 selects its process boundary.
 | TB8 | Old backup restores stale policy, binding or graph references | Restore validation gates work until identity, generation, current authority and references are reconciled. |
 | TB9 | Entire `.asura` root is absent at launch after prior loss | Service cannot infer first-ever use; it requires explicit initialization and warns about possible prior data loss. Known conflicting state enters recovery. |
 | TB10 | A same-UID process calls the control API or launches the signed CLI | I1 treats it as the local principal but applies current scope and policy; no claim of same-UID adversary resistance. Credential-bearing later work needs a separate authority decision. |
+
+TB9 conflicts with the selected [automatic initialization](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow):
+the service initializes a verified runtime-only root without an explicit request,
+and no prior-loss warning is implemented. Owner review must reconcile TB9.
 
 The [installation binding contract](context-storage-candidates.md#selected-installation-binding-and-change-contract)
 owns TB3 and cross-store recovery. The

@@ -293,9 +293,9 @@ and the real per-user Rust service.
 
 ## Integration dependencies and proof limits
 
-The implementation packet must update the control schema, client, service,
+The implementation updated the control schema, client, service,
 authority codec/replay/writer, CLI/TUI command parser, project projections, help,
-and the project-list/display tests. It must update the earlier no-update and
+and the project-list/display tests. It also updated the earlier no-update and
 open-name statements in `conversation-admission.md` and
 `production-bootstrap-status.md`; this document governs the new rename scope.
 The managed input queue remains independent because rename preserves project ID.

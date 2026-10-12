@@ -219,10 +219,12 @@ implementation or directory creation.
 | `cache/` | Rebuildable data only; eviction must not erase authoritative history or unresolved effects |
 | `logs/` | Bounded redacted diagnostics if file logging is selected; required audit persistence is a separate contract |
 
-D3 must select a physical home for each record before implementation. Task state,
-conversation history, configuration snapshots and audit records are not assigned
-to files or database tables by this proposal. D3 must also select format versions,
-retention and compatibility rules. The same record must not have independently
+D3 must select a physical home for each record before implementation. This brief
+does not assign task state, conversation history, configuration snapshots or audit
+records to files or database tables. The contracts linked under the selected path
+table own the records that are implemented. D3 must also select format versions,
+retention and compatibility rules for the remaining records.
+The same record must not have independently
 writable authoritative copies in both stores.
 
 Root override support, alternate installation roots, numeric permission modes

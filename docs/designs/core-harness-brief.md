@@ -5,7 +5,10 @@ proposed mechanisms. Each section identifies its status.
 
 Open decisions: algorithms, schemas, limits, persistence mechanisms and concrete
 test cases. The [design plan](../plans/architecture-and-design.md) assigns this
-work. Runtime behavior is not implemented or verified.
+work. Task lifecycle, budget hierarchy and graph semantics are not implemented.
+Conversation turns implement durable admission, output reservation, restart
+interruption, a canonical tool registry and stateless per-turn model input under
+[conversation admission](conversation-admission.md).
 
 Use the [glossary](../glossary.md) for project terms. The
 [decision index](../decisions/README.md) explains selected decisions. Start with

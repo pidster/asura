@@ -43,7 +43,8 @@ All metadata is synthetic and documented as such in the prototype help, tour and
 README. Do not present the Codex host's current model or repository as application
 telemetry. No filesystem, Git subprocess, provider, network, storage or global
 configuration access is added at runtime. Production observation, token accounting
-and permission boundaries remain later designs.
+and permission boundaries belong to separate production designs, such as
+[context observations](context-observations.md); this prototype stays synthetic.
 
 ## Owners and concrete contracts
 

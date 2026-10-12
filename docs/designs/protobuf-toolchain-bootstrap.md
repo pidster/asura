@@ -6,14 +6,18 @@ On 2026-09-26, the owner selected one active build per worktree. Separate
 worktrees may build independently. The owner also selected Protobuf for both
 local CLI/TUI–service control and the Rust–Swift model connection on that date.
 This document defines their shared tool preparation and the first smoke check.
-It does not define either production protocol. D8, design/plan owner review and explicit
-authorization still gate implementation. This status does not claim that the
-selected tools build together. The [model-channel design](swift-rust-boundary.md)
+It does not define either production protocol. This status does not claim that
+the selected tools build together. The [model-channel design](swift-rust-boundary.md)
 owns message semantics, framing and the later test-only process probe. The
 [PB0 implementation packet](../plans/protobuf-bootstrap-implementation.md)
 defines exact files, delivery order, fixed check selectors and scoped readiness.
 Foundation metadata and PB0.0–PB0.2 are implemented and locally verified. The
-owner authorized PB0.3 on 2026-09-26. Its detailed cache contracts were approved on that date. Later steps retain their authorization gates.
+owner authorized PB0.3 and approved its detailed cache contracts on 2026-09-26.
+PB0.3 is incomplete. On the same date the owner authorized Asura implementation
+and selected service-first delivery. The PB0 packet records that sequencing: the
+service uses standard Cargo, verified pinned protoc and locked prost generation,
+and the remaining PB0 qualification is deferred, not a gate for the first manual
+service trial.
 
 The [cache preparation detail](protobuf-cache-preparation.md) defines the
 remaining PB0.3 manifests and process handoff. The owner approved its decisions

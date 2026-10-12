@@ -15,9 +15,13 @@ different capabilities. The owner selected a supervised Swift helper process
 and a Protocol Buffers wire contract with chunked payloads for the first macOS
 Foundation Models implementation on 2026-09-25. The owner also selected a
 bounded credit window for each chunk transfer and an exact packaged
-helper-build match. Session lifetime, helper resource layout, numeric window
-and framing limits, and deadlines remain open.
-This document does not authorize implementation or claim support for another OS.
+helper-build match. The [first conversation helper](#first-conversation-helper-scoped-d2-contract-2026-09-27)
+section later selected session lifetime, development layout, numeric window and
+framing limits, and deadlines. That scope is implemented in `swift/model-helper`,
+`asura-service` and `asura-platform`; [model providers](model-provider-integration.md)
+and [model tool execution](model-tool-execution.md) record later extensions.
+Production sandboxing, signed packaging and the second conformance binding remain
+open. This document does not claim support for another OS.
 
 The [architecture](../architecture.md) owns logical responsibilities. The
 [runtime sketch](runtime-architecture.md) owns the wider async proposal. The
@@ -723,6 +727,8 @@ numeric frame/queue/deadline limits, session invalidation contract, signed
 package layout and real packaged-runtime tests. D2/D4 must specify the second
 conformance binding without confusing a test substitute with platform support.
 The owner must review the resulting ready design and plan before any code.
+The scoped first-conversation contract below later met this condition for the
+development helper; production packaging remains subject to it.
 
 ## Reviewed incremental model implementation
 
@@ -765,7 +771,9 @@ One helper serves one admitted model operation and then exits. It creates one
 The service supplies the full permitted history each time; the helper retains no
 cross-operation transcript or implicit context. This is the initial supported
 case of one helper per session generation. Tools, images, custom models, private
-cloud and remote inference are unsupported in this packet.
+cloud and remote inference are unsupported in this packet. Later
+[provider](model-provider-integration.md) and [tool](model-tool-execution.md)
+designs add Core AI, MLX and Ollama backends and service-admitted tools.
 
 Add `ModelInput` to `contracts/model/v1/model.proto`. Its fields are instructions
 string 1, repeated `HistoryTurn` history 2, and prompt string 3. `HistoryTurn`
@@ -867,7 +875,10 @@ Missing or mismatched tools fail generation before compilation.
 
 Standard SwiftPM builds the generator and helper. Ordinary Cargo builds the Rust
 adapter. Assemble a private development directory with `asura`, `asura-model` and
-`model-package.json`. No development command depends on publishing the deferred
+`model-package.json`. The implementation instead compiles the package identity
+from `.build/model-tools/package-identity.txt` into the service
+(`asura-service/build.rs`); no committed code reads `model-package.json`.
+No development command depends on publishing the deferred
 bootstrap cache. The manifest/embedded build and helper/schema digest construction
 in the first-conversation packet governs exact matching. Retain separate source
 schema identity and helper executable identity; matching version 0.1 is insufficient.

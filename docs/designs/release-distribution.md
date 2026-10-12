@@ -118,8 +118,10 @@ flowchart TD
 
 Installing the command does not create an Asura installation. First launch
 attaches to an existing service or starts one under the selected per-user
-contract. Explicit Initialize remains the only action that can create the
-authority root. Homebrew itself is not a service supervisor.
+contract. The service writer initializes a verified runtime-only root once
+under [conversation admission](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow);
+partial or conflicting state requires repair. Homebrew itself is not a service
+supervisor.
 
 An upgrade may make a new client executable available while the old service
 continues running. The client and service must exchange a bounded, stable

@@ -172,12 +172,14 @@ flowchart LR
 ### CF04b: Local command completion
 
 Implemented completion. Arrows describe selection or cancellation; no service
-request is sent by completion.
+request is sent by completion. Completion compares the typed header with the
+local command names by prefix. Tab outside a command header is ordinary editor
+input.
 
 ```mermaid
 flowchart TD
     Tab["Tab in command header"] --> Matches{"Matching command names"}
-    Matches -->|None| None["Show no matches"]
+    Matches -->|None| None["Show no matching local command; draft unchanged"]
     Matches -->|One| Complete["Replace matching header only"]
     Matches -->|Several| Menu["Open command chooser"]
     Menu -->|Escape| Keep["Close chooser and keep draft"]
@@ -401,7 +403,10 @@ rerun remains integration evidence owned by the primary agent. The chart include
 these corrections; the audit findings distinguish fixed and remaining gaps.
 
 A retry preserves identity. Client shutdown and user cancellation are different
-operations. The chart below specifies the selected correction.
+operations. The chart below specifies the selected correction. A retained queue
+request or project rename takes precedence over conversation retry. Restoration
+retry applies only when a selected project's conversation restoration has not
+completed, no new-conversation intent exists and no request is retained.
 
 ```mermaid
 flowchart TD
@@ -409,11 +414,17 @@ flowchart TD
     RetryArity -->|No| RetryUsage["Show use /retry and retain draft"]
     RetryArity -->|Yes| QueueRetry{"Unconfirmed queue request retained?"}
     QueueRetry -->|Yes| QueueSlot{"Queue worker settled?"}
-    QueueSlot -->|No| Wait
+    QueueSlot -->|No| QueueWait["Show queue request still settling"]
     QueueSlot -->|Yes| QueueSend["Send original queue request ID and payload"]
-    QueueRetry -->|No| Busy{"Conversation request pending?"}
+    QueueRetry -->|No| RenameRetry{"Unconfirmed project rename retained?"}
+    RenameRetry -->|Yes| RenameSlot{"Project-admin worker settled?"}
+    RenameSlot -->|No| RenameWait["Show project rename still settling"]
+    RenameSlot -->|Yes| RenameSend["Resend rename with original request ID"]
+    RenameRetry -->|No| Busy{"Conversation request pending?"}
     Busy -->|Yes| Wait["Show request still pending"]
-    Busy -->|No| Retained{"Retained request exists?"}
+    Busy -->|No| Restore{"Restoration incomplete and no retained request?"}
+    Restore -->|Yes| RestoreAgain["Clear restoration scope and draft, then restore again"]
+    Restore -->|No| Retained{"Retained request exists?"}
     Retained -->|No| None["Show no unconfirmed request"]
     Retained -->|Yes| Send["Queue identical request and ID"]
     Send --> Result["Use original setup or submission result path"]
@@ -463,7 +474,7 @@ case. A rendered chart is review evidence, not executable proof.
 | CF05 init and repair | storage writer tests, service `tests/conversation_flow.rs`, terminal `--setup` journey | Metadata-triggered repair regression must pass through scanner, real service and terminal, preserving bytes. |
 | CF06 projects and confirmation | `tui/ui.rs`, service conversation journey and terminal setup journey | Discovery failure must never be treated as an empty registry. |
 | CF07 YAML and uncertainty | configuration storage/service tests and terminal config journey | Mock failures alone do not prove post-rename disk-error handling. |
-| CF08–CF09 acceptance, replay and cancel | service conversation journey, native model journey and client unit tests | Add full-admission deadline coverage and no-operation cancellation feedback. |
+| CF08–CF09 acceptance, replay and cancel | service conversation journey, native model journey, client unit tests and `tests/tui_pty.py` | `tui/queue.rs` unit tests cover the 5 s UI deadline with a held worker; add admission-deadline coverage against a stalled real service. |
 
 Audit findings and correction status:
 
@@ -499,6 +510,8 @@ from this rendering check.
 On 2026-10-12, a code-alignment update changed CF01, CF03, CF04, CF06b, CF08
 and CF09. Mermaid CLI 12.0.0 rendered each changed chart, and the previews were
 visually inspected. CF04 now uses a left-to-right layout for its 13 branches.
+A later 2026-10-12 update changed CF04b, the CF09 retry chart and the recent
+audit chart. Each changed chart was rendered with Mermaid CLI and inspected.
 
 
 ## CF10: Model inventory
@@ -602,17 +615,21 @@ defines command branches, metadata ownership and model-tool behavior separately.
 `/audit [limit]` is implemented in `tui/ui.rs` and `tui/audit.rs`. The
 [recent audit contract](config-commands.md#recent-project-inspection-selected-review-packet)
 owns its typed metadata, limits and read-only native tool. Limit defaults to 16
-and accepts 1 through 16. `/cancel` cancels a pending read.
+and accepts 1 through 16. A dedicated single-slot audit worker in `tui/audit.rs`
+performs the read; a second `/audit` while it runs retains the draft. `/cancel`
+cancels a pending read.
 
 ```mermaid
 flowchart TD
     Input[Audit command] --> Syntax{Optional decimal limit 1 through 16?}
     Syntax -->|No| Invalid[Explain syntax and retain draft]
-    Syntax -->|Yes| Project{Selected registered project?}
+    Syntax -->|Yes| Busy{Audit read already pending?}
+    Busy -->|Yes| Pending[Show audit busy and retain draft]
+    Busy -->|No| Project{Selected registered project with connected service?}
     Project -->|No| Missing[Explain project requirement and retain draft]
-    Project -->|Yes| Read[Queue existing client worker with two-second deadline]
+    Project -->|Yes| Read[Dedicated audit worker reads with two-second deadline]
     Read --> Reply{Typed recent-window reply?}
-    Reply -->|Transport failure or timeout| Failure[Show fixed error; keep UI responsive]
+    Reply -->|Transport failure or timeout| Failure[Show error and retain draft; UI stays responsive]
     Reply -->|Success| Panel[Show health and newest-first project table]
     Panel --> Size{More lines than visible area?}
     Size -->|Yes| Scroll[Enable scroll]

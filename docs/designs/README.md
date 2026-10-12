@@ -15,7 +15,7 @@ own authorization and validation scope; it does not establish product readiness.
 | --- | --- |
 | [Composer interactions](composer-interactions.md) | Selected production focus navigation, selectors, history and queue interaction. |
 | [Composer editor navigation](composer-editor-navigation.md) | Selected visual row boundaries and bounded draft history recall. |
-| [Service status pane](service-status-pane.md) | Selected connection ownership, service uptime and bounded stored-memory footprint observations. |
+| [Service status pane](service-status-pane.md) | Selected connection ownership, service uptime and bounded stored-memory footprint observations; implemented, with no runtime evidence recorded. |
 | [Context observations](context-observations.md) | Service-owned filesystem signals, bounded Git collection and scoped status observations; runtime qualification required. |
 | [Sensors](sensors.md) | Passive and directed observations, durable evidence inspection, held proposals and selected System 1/System 2 direction. |
 | [Turn usage helper](turn-usage-helper.md) | Reviewed request-correlated counters and conservative budget settlement through existing helper owners; implemented, with final qualification recorded in response activity. |
@@ -38,8 +38,8 @@ own authorization and validation scope; it does not establish product readiness.
 | [Product workflows](product-workflows.md) | Selected first-release scope, required workflows and proposed acceptance targets. |
 | [Platform capabilities](platform-capabilities.md) | D1 macOS 27 SDK evidence and proposed home, service and local-authentication mechanisms. |
 | [Protobuf toolchain bootstrap](protobuf-toolchain-bootstrap.md) | Shared tools for control and model schemas; verified download, test-only smoke exchange and offline qualification. PB0.0–PB0.2 implemented and locally verified; PB0.3 incomplete; remaining work deferred under service-first delivery. |
-| [Protobuf cache preparation](protobuf-cache-preparation.md) | Approved PB0.3 archive, manifest and driver contracts; live preparation remains blocked on native process settlement. |
-| [Protobuf process settlement](protobuf-process-settlement.md) | Authorized test-only API qualification packet; production cleanup correction and proof limits remain open. |
+| [Protobuf cache preparation](protobuf-cache-preparation.md) | Approved PB0.3 archive, manifest and driver contracts; live preparation is not yet qualified. |
+| [Protobuf process settlement](protobuf-process-settlement.md) | Selected qualified-toolchain cleanup contract and recorded test-only qualification; implementation and native validation incomplete. |
 | [Persistence and recovery](persistence-recovery.md) | Proposed D3 local control-store, installation, graph-binding, registration and backup protocol for I1. |
 | [Production bootstrap and status](production-bootstrap-status.md) | Original bootstrap proposal with selected automatic setup, project registration and scoped status amendments. |
 | [Repository agent configuration](repository-agent-configuration.md) | Selected development-agent configuration, directory-scoped instructions and recorded configuration checks. |
@@ -47,8 +47,8 @@ own authorization and validation scope; it does not establish product readiness.
 | [Requirements and validation](requirements-validation.md) | Proposed D0 traceability from requirements to design owners, delivery increments and required evidence. |
 | [Runtime architecture](runtime-architecture.md) | Proposed process layout, asynchronous pipelines and coordination mechanisms. |
 | [Security policy](security-policy-brief.md) | Required capabilities and proposed authorization contract; policy and OS mechanisms remain open. |
-| [System architecture](system-architecture.md) | Proposed D2 standalone per-user service transport, owner arbitration and fencing for I1. |
-| [Local-model boundary and Swift implementation](swift-rust-boundary.md) | Proposed D2 portable capability contract with selected supervised first macOS Swift helper; cancellation and release details remain open. |
+| [System architecture](system-architecture.md) | Proposed D2 standalone per-user service transport, owner arbitration and fencing for I1; foundation service and control codec implemented, host fencing proof open. |
+| [Local-model boundary and Swift implementation](swift-rust-boundary.md) | Proposed D2 portable capability contract; the selected first-conversation Swift helper is implemented; production sandboxing, packaging and the second binding remain open. |
 | [TUI interaction prototype](tui-interaction-prototype.md) | Interaction behavior, ownership and validation for the authorized isolated experiment. |
 | [TUI composer](tui-composer.md) | Implemented prototype status bar, message tray and direct actions; automated qualification and owner-reported native smoke evidence. |
 | [TUI project status](tui-project-status.md) | Implemented shell-style project/Git and model/context status row, synthetic metadata, compact layouts and recorded automated/visual checks. |

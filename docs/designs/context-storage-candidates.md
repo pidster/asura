@@ -3,10 +3,13 @@
 Status: required deployment behavior, including files plus SurrealDB under the
 owner's 2026-09-24 home-directory requirement, with proposed mechanisms.
 Remaining decisions: SDK/server versions, embedded engine, transport and
-persistence contracts.
+persistence contracts. HM0 pins SurrealDB 3.2.4 with SurrealKV for fixture-scoped
+embedded memory under the [ontology](hybrid-memory-ontology.md); that pin is not
+production engine qualification, and external mode is not implemented.
 
 Evidence: embedded documentation checked on 2026-09-19; external SDK support
-checked on 2026-09-20. No runtime validation exists. This assessment feeds D3-D4 in the
+checked on 2026-09-20. This assessment records no runtime validation; HM0
+evidence belongs to the ontology. This assessment feeds D3-D4 in the
 [architecture and design plan](../plans/architecture-and-design.md).
 
 ## Required deployment choices
@@ -492,7 +495,9 @@ evidence nodes, metadata-bearing provenance edges, and dependency traversal.
 This is an architectural inference, not a measured performance or reliability result.
 
 Keep the logical graph contract in `asura-context` and the database implementation
-in `asura-storage`, following the proposed Rust layout. Clients and the Swift
+in `asura-storage`, following the proposed Rust layout. `asura-context` is a
+proposed crate that does not exist; current context owners are in `asura-service`.
+Clients and the Swift
 model service access graph operations through Asura contracts; they do not open
 the database or supply arbitrary SurrealQL. Storage adapters accept typed requests
 and bind data parameters. Authorization remains with Asura's canonical policy.
