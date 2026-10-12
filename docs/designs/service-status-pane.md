@@ -85,6 +85,43 @@ flowchart TD
     Client --> Pane[Pure top-pane rendering]
 ```
 
+## Client notice placement
+
+The owner's 2026-09-30 correction places the existing transient client notice at
+the top right of this pane. It shares the first row with the backend header; it
+does not reserve a row above the composer. Keep the existing one-cell horizontal
+pane padding, washed blue-grey background and bottom interaction hints. Paste
+capture instructions use this same notice location when no other notice exists.
+
+Rendering remains a pure projection of `App.notice` and the delivered service
+view. Sanitize notices as terminal literals and clip by grapheme display width.
+When a notice is present, reserve no more than half the usable row for it and a
+two-cell separation; clip the left backend header to the remaining cells. Align
+the notice to the right padding. An empty notice leaves the full width available
+to the header. Resizing cannot overwrite the left header or create another row.
+There is no new IO, worker, queue, timer or keyboard route. Draft editing, status
+focus, selectors and the lower hints retain their current behavior. Overlays and
+history use the space released by the removed notice row.
+
+```mermaid
+flowchart LR
+    State[Client notice or paste capture hint] --> Literal[Sanitize bounded literal]
+    View[Delivered backend status] --> Header[Format existing header]
+    Literal --> Layout[Partition one padded row by display width]
+    Header --> Layout
+    Layout --> Left[Clipped backend header at left]
+    Layout --> Right[Clipped notice aligned right]
+    Editor[Editor and interaction state] --> Composer[Composer and bottom hints unchanged]
+```
+
+SS-U4 renders empty, ordinary, long and Unicode/control-bearing notices at wide,
+compact and minimum supported dimensions. Assert top-row alignment and palette,
+left-header preservation, no composer notice row, unchanged draft and bottom
+hints. SS-E2 uses the isolated real PTY composer journey: trigger a notice, assert
+it appears only on the first row, then open selectors and verify draft retention.
+Rendered buffers verify geometry and colors; PTY evidence verifies the actual
+event route and terminal cleanup, without claiming native terminal appearance.
+
 ## Validation
 
 SS-U1 checks footprint byte sums, nested limits, symlink/hardlink/FIFO rejection,

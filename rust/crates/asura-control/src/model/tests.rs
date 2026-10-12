@@ -39,6 +39,16 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
         (hello(true), ServiceToHelper),
         (hello(false), HelperToService),
         (
+            envelope(Body::InferenceUsage(pb::InferenceUsage {
+                request_ordinal: Some(1),
+                input_tokens: Some(0),
+                output_tokens: Some(2),
+                complete: Some(true),
+                ..Default::default()
+            })),
+            HelperToService,
+        ),
+        (
             envelope(Body::Begin(pb::Begin {
                 model: Some("system".into()),
                 input_bytes: Some(10),
@@ -311,6 +321,80 @@ fn export_cross_language_fixtures() {
             if accepted { "accept" } else { "reject" }
         ));
     };
+    for (name, value, accepted) in [
+        (
+            "usage_unknown",
+            pb::InferenceUsage {
+                request_ordinal: Some(1),
+                complete: Some(false),
+                ..Default::default()
+            },
+            true,
+        ),
+        (
+            "usage_zero",
+            pb::InferenceUsage {
+                request_ordinal: Some(1),
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                complete: Some(true),
+                ..Default::default()
+            },
+            true,
+        ),
+        (
+            "usage_bad_ordinal",
+            pb::InferenceUsage {
+                request_ordinal: Some(65),
+                complete: Some(false),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            "usage_bad_count",
+            pb::InferenceUsage {
+                request_ordinal: Some(1),
+                input_tokens: Some(1_000_000_001),
+                complete: Some(false),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            "usage_bad_cached",
+            pb::InferenceUsage {
+                request_ordinal: Some(1),
+                input_tokens: Some(0),
+                cached_input_tokens: Some(1),
+                complete: Some(false),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            "usage_missing_complete",
+            pb::InferenceUsage {
+                request_ordinal: Some(1),
+                ..Default::default()
+            },
+            false,
+        ),
+    ] {
+        let message = envelope(Body::InferenceUsage(value));
+        write(
+            &format!("{name}.pb"),
+            "helper",
+            accepted,
+            message.encode_to_vec(),
+        );
+        write(
+            &format!("{name}_wrong_direction.pb"),
+            "service",
+            false,
+            message.encode_to_vec(),
+        );
+    }
     let mut declared = hello(true);
     if let Some(Body::Hello(value)) = &mut declared.body {
         value.selected_model = Some("mlx:fixture".into());
@@ -508,6 +592,7 @@ fn export_cross_language_fixtures() {
             Body::ToolCall(_) => "tool_call",
             Body::ContextMeasured(_) => "context_measured",
             Body::ToolResult(_) => "tool_result",
+            Body::InferenceUsage(_) => "inference_usage",
         };
         let kind = if direction == Direction::ServiceToHelper {
             "service"
@@ -1349,4 +1434,59 @@ fn begin_deadline_is_optional_but_explicit_values_remain_bounded() {
         }
         assert!(encode_frame(&message, Direction::ServiceToHelper).is_err());
     }
+}
+
+#[test]
+fn inference_usage_preserves_zero_unknown_and_rejects_invalid_counts() {
+    let value = pb::InferenceUsage {
+        request_ordinal: Some(1),
+        input_tokens: Some(0),
+        output_tokens: Some(0),
+        cached_input_tokens: None,
+        complete: Some(true),
+    };
+    let message = envelope(Body::InferenceUsage(value));
+    let frame = encode_frame(&message, Direction::HelperToService).unwrap();
+    assert_eq!(
+        decode_body(&frame[4..], Direction::HelperToService).unwrap(),
+        message
+    );
+    assert!(encode_frame(&message, Direction::ServiceToHelper).is_err());
+    for invalid in [
+        pb::InferenceUsage {
+            request_ordinal: Some(65),
+            ..value
+        },
+        pb::InferenceUsage {
+            input_tokens: None,
+            ..value
+        },
+        pb::InferenceUsage {
+            output_tokens: Some(1_000_000_001),
+            ..value
+        },
+        pb::InferenceUsage {
+            cached_input_tokens: Some(1),
+            ..value
+        },
+    ] {
+        assert!(
+            encode_frame(
+                &envelope(Body::InferenceUsage(invalid)),
+                Direction::HelperToService
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        encode_frame(
+            &envelope(Body::InferenceUsage(pb::InferenceUsage {
+                request_ordinal: Some(1),
+                complete: Some(false),
+                ..Default::default()
+            })),
+            Direction::HelperToService
+        )
+        .is_ok()
+    );
 }

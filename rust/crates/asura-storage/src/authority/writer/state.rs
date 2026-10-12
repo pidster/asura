@@ -478,12 +478,11 @@ impl State {
             )
         });
         if entries.len() > MAX_INPUTS {
-            if let Some(id) = accepted {
-                if let Some(position) = entries.iter().position(|q| q.request == id) {
-                    if position >= MAX_INPUTS {
-                        entries.remove(MAX_INPUTS - 1);
-                    }
-                }
+            if let Some(id) = accepted
+                && let Some(position) = entries.iter().position(|q| q.request == id)
+                && position >= MAX_INPUTS
+            {
+                entries.remove(MAX_INPUTS - 1);
             }
             entries.truncate(MAX_INPUTS);
         }
@@ -882,12 +881,12 @@ impl State {
                 if !state.projects.contains_key(&project) {
                     return Err(Error::Invalid);
                 }
-                if let Some(id) = conversation {
-                    if !state.conversations.get(&id).is_some_and(|c| {
+                if let Some(id) = conversation
+                    && !state.conversations.get(&id).is_some_and(|c| {
                         c.project == project && expected_generation <= c.generation
-                    }) {
-                        return Err(Error::Conflict);
-                    }
+                    })
+                {
+                    return Err(Error::Conflict);
                 }
                 let held = self.project(project)?;
                 held.validate().map_err(|_| Error::StaleProject)?;

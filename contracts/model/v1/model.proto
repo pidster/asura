@@ -24,6 +24,7 @@ message Envelope {
     ToolCall tool_call = 20;
     ToolResult tool_result = 21;
     ContextMeasured context_measured = 22;
+    InferenceUsage inference_usage = 23;
   }
 }
 message Hello {
@@ -96,3 +97,6 @@ message ModelInventoryEntry {
   optional string detail = 4;
 }
 message ModelInventoryIssue { optional string provider = 1; optional string reason = 2; }
+
+// One settled executor request; observed counters are independent of context occupancy.
+message InferenceUsage { optional uint32 request_ordinal = 1; optional uint64 input_tokens = 2; optional uint64 output_tokens = 3; optional uint64 cached_input_tokens = 4; optional bool complete = 5; }

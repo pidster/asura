@@ -18,6 +18,9 @@ own authorization and validation scope; it does not establish product readiness.
 | [Service status pane](service-status-pane.md) | Selected connection ownership, service uptime and bounded stored-memory footprint observations. |
 | [Context observations](context-observations.md) | Service-owned filesystem signals, bounded Git collection and scoped status observations; runtime qualification required. |
 | [Sensors](sensors.md) | Passive and directed observations, durable evidence inspection, held proposals and selected System 1/System 2 direction. |
+| [Turn usage helper](turn-usage-helper.md) | Selected request-correlated counters and conservative budget settlement through existing helper owners. |
+| [Result retention and graph packet](result-retention-graph-packet.md) | Proposed complete captured-result storage and typed thread/evidence graph; analysis and review only. |
+| [Conversation projections](conversation-projections.md) | Required separation of evidence, audit, model context and presentation; proposed richer activity, result retention and recomposition packets. |
 | [Model context telemetry](model-context-telemetry.md) | Native model identity and measured input context, with explicit basis and asynchronous event delivery. |
 | [Model providers](model-provider-integration.md) | Local and remote provider abstraction, endpoint locality and staged Ollama, Core AI and MLX integration. |
 | [Model tools](model-tool-execution.md) | Shared service tool execution, task grants, bounded native model callbacks and staged activation. |

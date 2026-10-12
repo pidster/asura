@@ -30,6 +30,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
     public var localToolModel: String? = nil
     public var supportsReasoning = false
     var inputObserver: OllamaInputObserver? = nil
+    var usageObserver: InferenceUsageObserver? = nil
     public var capabilities: LanguageModelCapabilities {
         .init((supportsTools ? [.toolCalling] : []) + (supportsReasoning ? [.reasoning] : []))
     }
@@ -365,6 +366,9 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                                 id: "\(request.id.uuidString.lowercased())-\(ordinal)", name: call.function.name,
                                 action: .appendArguments(String(decoding: arguments, as: UTF8.self), tokenCount: 0))))
                         }
+                    }
+                    if chunk.done == true, chunk.done_reason == "stop" || chunk.done_reason == "length" {
+                        try await model.usageObserver?.measure(request.id, input: chunk.prompt_eval_count, output: chunk.eval_count)
                     }
                     if chunk.done == true, let input = chunk.prompt_eval_count, let output = chunk.eval_count {
                         await channel.send(.response(action: .updateUsage(

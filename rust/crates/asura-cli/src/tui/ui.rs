@@ -394,17 +394,15 @@ impl App {
                 self.queue_follow_inputs.push(id.clone());
             }
         }
-        if self.notice.starts_with("Input queued;")
+        if (self.notice.starts_with("Input queued;")
             || self.notice.starts_with("Input held (")
-            || self.notice == "Input running"
-        {
-            if let Some(entry) = entries
+            || self.notice == "Input running")
+            && let Some(entry) = entries
                 .iter()
                 .filter(|entry| matches!(entry.state, Some(1..=3)))
                 .min_by_key(|entry| entry.sequence)
-            {
-                self.notice = queue_input_notice(entry);
-            }
+        {
+            self.notice = queue_input_notice(entry);
         }
         if full || acknowledged {
             self.queue_watermark = Some(
@@ -1121,6 +1119,9 @@ impl App {
             self.model_context = None;
         }
         if view.epoch.is_some() && view.epoch != self.view.epoch {
+            for activity in &mut self.activity {
+                activity.clear_statistics();
+            }
             self.project_discovery_started = false;
             self.restoration_scope = None;
             self.restoration_ready = false;
@@ -2008,7 +2009,32 @@ impl App {
             Rect::new(full_area.x, full_area.y, full_area.width, 1),
         );
         let header = self.status_header();
-        line(frame, area, 0, &header, panel);
+        let notice = if self.capture.is_some() && self.notice.is_empty() {
+            "Paste capture · Ctrl+V to finish · draft unchanged"
+        } else {
+            &self.notice
+        };
+        let notice = literal(notice, 1024);
+        if notice.is_empty() {
+            line(frame, area, 0, &header, panel);
+        } else {
+            let notice = shorten(&notice, usize::from(area.width / 2));
+            let notice_width = unicode_display_width::width(&notice) as u16;
+            let header_area = Rect::new(
+                area.x,
+                area.y,
+                area.width.saturating_sub(notice_width + 2),
+                1,
+            );
+            line(frame, header_area, 0, &header, panel);
+            line(
+                frame,
+                Rect::new(area.right() - notice_width, area.y, notice_width, 1),
+                0,
+                &notice,
+                panel,
+            );
+        }
         line(
             frame,
             full_area,
@@ -2093,20 +2119,6 @@ impl App {
             self.history_focus = false;
         }
 
-        let notice = if self.capture.is_some() && self.notice.is_empty() {
-            "Paste capture · Ctrl+V to finish · draft unchanged"
-        } else {
-            &self.notice
-        };
-        if !notice.is_empty() {
-            line(
-                frame,
-                area,
-                editor_y.saturating_sub(area.y + strips + 1),
-                notice,
-                text,
-            );
-        }
         if strips > 0 {
             let top_separator = if self.overlay.is_some() || tray_height > 0 {
                 "█"
@@ -2224,9 +2236,7 @@ impl App {
                 full_area.x,
                 full_area.y + 2,
                 full_area.width,
-                editor_y.saturating_sub(
-                    full_area.y + 2 + strips + u16::from(!notice.is_empty()) + tray_height,
-                ),
+                editor_y.saturating_sub(full_area.y + 2 + strips + tray_height),
             ),
             panel,
         );
@@ -3178,14 +3188,14 @@ mod tests {
         };
         app.project_admin_finished(super::super::project_admin::Update {
             request: retry,
-            outcome: super::super::project_admin::Outcome::Reply(
+            outcome: super::super::project_admin::Outcome::Reply(Box::new(
                 asura_control::pb::ProjectRenameReply {
                     project: Some(changed.clone()),
                     current_project: Some(changed),
                     changed: Some(true),
                     error: None,
                 },
-            ),
+            )),
             service_epoch: Some([9; 16]),
             settled: true,
         });
@@ -3230,14 +3240,14 @@ mod tests {
         app.insert("x");
         app.project_admin_finished(super::super::project_admin::Update {
             request,
-            outcome: super::super::project_admin::Outcome::Reply(
+            outcome: super::super::project_admin::Outcome::Reply(Box::new(
                 asura_control::pb::ProjectRenameReply {
                     project: Some(historical.clone()),
                     current_project: Some(historical),
                     changed: Some(true),
                     error: None,
                 },
-            ),
+            )),
             service_epoch: Some([9; 16]),
             settled: true,
         });
@@ -3274,14 +3284,14 @@ mod tests {
         };
         app.project_admin_finished(super::super::project_admin::Update {
             request,
-            outcome: super::super::project_admin::Outcome::Reply(
+            outcome: super::super::project_admin::Outcome::Reply(Box::new(
                 asura_control::pb::ProjectRenameReply {
                     project: Some(project.clone()),
                     current_project: Some(project),
                     changed: Some(true),
                     error: None,
                 },
-            ),
+            )),
             service_epoch: Some([9; 16]),
             settled: true,
         });
@@ -3356,6 +3366,45 @@ mod tests {
         assert_eq!(displayed.name.as_deref(), Some("New name"));
         assert_eq!(displayed.name_revision, Some(2));
         assert_eq!(app.project_name([1; 16]), "New name");
+    }
+    #[test]
+    fn client_notices_share_top_row_without_interrupting_composer() {
+        for (width, height) in [(160, 40), (80, 24), (40, 12), (30, 8)] {
+            let mut app = App::new();
+            app.insert("preserved draft");
+            app.notice = "Saved".into();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |y| -> String { (0..width).map(|x| buffer[(x, y)].symbol()).collect() };
+            assert!(row(0).starts_with(" Asura"), "{}", row(0));
+            assert!(row(0).ends_with("Saved "), "{}", row(0));
+            for y in 1..height {
+                assert!(!row(y).contains("Saved"), "notice leaked into row {y}");
+            }
+            assert_eq!(buffer[(width - 2, 0)].bg, Color::Rgb(55, 66, 76));
+            assert_eq!(app.draft(), "preserved draft");
+            assert!(row(height - 1).contains("send"));
+        }
+    }
+    #[test]
+    fn long_unicode_notices_are_literal_and_keep_left_header() {
+        let mut app = App::new();
+        app.notice = "界e\u{301}\n\u{1b}[31m".repeat(100);
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let top: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(top.starts_with(" Asura"), "{top}");
+        assert!(top.contains('界'), "{top}");
+        assert!(!top.contains('\u{1b}') && !top.contains('\n'));
+        app.notice.clear();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let top: String = (0..40)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(!top.contains('界'));
+        assert!(top.contains("Asura"));
     }
     #[test]
     fn composer_top_separator_fills_when_status_overlay_opens() {
@@ -4120,7 +4169,8 @@ mod tests {
             assert!(!app.take_cancel_request());
             assert_eq!(app.notice, "No active conversation to cancel");
         }
-        for request in [Request::Setup(Command::Observe([1; 16]))] {
+        {
+            let request = Request::Setup(Command::Observe([1; 16]));
             let mut app = App::new();
             app.start_conversation_request(request, String::new());
             app.insert("/cancel");
@@ -4464,6 +4514,7 @@ mod tests {
                 reason: Some(11),
                 usage_tokens: None,
                 usage_known: Some(false),
+                statistics: None,
                 tools: Vec::new(),
                 model_context: Some(asura_control::pb::ModelContext {
                     model_name: Some("Native variant".into()),

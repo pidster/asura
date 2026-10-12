@@ -40,6 +40,7 @@ pub(crate) enum ModelEvent {
         tools_available: bool,
         capabilities: crate::model::CapabilityProfile,
     },
+    InferenceUsage(pb::InferenceUsage),
     ContextMeasured {
         input_tokens: u32,
         capacity_tokens: u32,
@@ -99,6 +100,7 @@ pub(crate) struct ModelOwner {
     tools_enabled: bool,
     pending_tool: Option<u32>,
     measured_context: bool,
+    usage_reports: u32,
     effective_context: Option<u32>,
     completion: crate::completion::Completion,
     cleanup_completion: crate::completion::Completion,
@@ -242,6 +244,7 @@ impl ModelOwner {
             tools_enabled: false,
             pending_tool: None,
             measured_context: false,
+            usage_reports: 0,
             effective_context: None,
             completion,
             cleanup_completion: Default::default(),
@@ -700,6 +703,16 @@ impl ModelOwner {
                 self.pending_tool = call.ordinal;
                 events.push(ModelEvent::ToolCall(call));
             }
+            Body::InferenceUsage(value)
+                if self.phase == Phase::Running || self.phase == Phase::Draining =>
+            {
+                if value.request_ordinal != Some(self.usage_reports + 1) || self.usage_reports >= 64
+                {
+                    return Err("model_protocol_fault");
+                }
+                self.usage_reports += 1;
+                events.push(ModelEvent::InferenceUsage(value));
+            }
             Body::ContextMeasured(value)
                 if self.phase == Phase::Running
                     && !self.measured_context
@@ -912,6 +925,7 @@ mod tests {
             tools_enabled: false,
             pending_tool: None,
             measured_context: false,
+            usage_reports: 0,
             effective_context: (phase != Phase::Hello).then_some(4096),
             completion: Default::default(),
             cleanup_completion: Default::default(),
@@ -1518,5 +1532,60 @@ mod tests {
         owner.cleanup_retry = Some(now + Duration::from_millis(100));
         owner.deadline = now - Duration::from_secs(1);
         assert_eq!(owner.next_deadline(now), owner.cleanup_retry);
+    }
+    #[test]
+    fn request_usage_is_ordered_once_and_preserves_output_text() {
+        let mut owner = owner(Phase::Running);
+        let mut events = Vec::new();
+        owner
+            .receive(
+                message(Body::InferenceUsage(pb::InferenceUsage {
+                    request_ordinal: Some(1),
+                    input_tokens: Some(0),
+                    output_tokens: Some(3),
+                    complete: Some(true),
+                    ..Default::default()
+                })),
+                &mut events,
+            )
+            .unwrap();
+        assert!(
+            matches!(events.as_slice(), [ModelEvent::InferenceUsage(v)] if v.output_tokens == Some(3))
+        );
+        assert_eq!(owner.revision, 0);
+        assert!(
+            owner
+                .receive(
+                    message(Body::InferenceUsage(pb::InferenceUsage {
+                        request_ordinal: Some(1),
+                        complete: Some(false),
+                        ..Default::default()
+                    })),
+                    &mut events
+                )
+                .is_err()
+        );
+        assert!(
+            owner
+                .receive(
+                    message(Body::InferenceUsage(pb::InferenceUsage {
+                        request_ordinal: Some(3),
+                        complete: Some(false),
+                        ..Default::default()
+                    })),
+                    &mut events
+                )
+                .is_err()
+        );
+        owner
+            .receive(
+                message(Body::InferenceUsage(pb::InferenceUsage {
+                    request_ordinal: Some(2),
+                    complete: Some(false),
+                    ..Default::default()
+                })),
+                &mut events,
+            )
+            .unwrap();
     }
 }

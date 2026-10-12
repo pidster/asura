@@ -106,8 +106,12 @@ public struct Snapshot: Sendable {
     public let text: String
     public let usageTokens: UInt64?
     public let inputContext: (tokens: UInt32, capacity: UInt32)?
-    public init(text: String, usageTokens: UInt64? = nil, inputContext: (tokens: UInt32, capacity: UInt32)? = nil) {
+    public let inferenceStartedOrdinal: UInt32?
+    public let inferenceUsage: RequestUsage?
+    public init(text: String, usageTokens: UInt64? = nil, inputContext: (tokens: UInt32, capacity: UInt32)? = nil,
+        inferenceStartedOrdinal: UInt32? = nil, inferenceUsage: RequestUsage? = nil) {
         self.text = text; self.usageTokens = usageTokens; self.inputContext = inputContext
+        self.inferenceStartedOrdinal = inferenceStartedOrdinal; self.inferenceUsage = inferenceUsage
     }
 }
 public struct BackendFailure: Error, Sendable {
@@ -194,12 +198,12 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
     private let localToolDestination: Bool
     private let reportsUsage: Bool
     private let tokenCounter: NativeTokenCounter?
-    private let instrumentationFactory: (@Sendable (@escaping @Sendable (Snapshot) async throws -> Void) -> Model)?
+    private let instrumentationFactory: (@Sendable (InferenceUsageObserver, @escaping @Sendable (Snapshot) async throws -> Void) -> Model)?
     public init(model: Model, contextTokens: UInt32?,
         reportedContextTokens: UInt32? = nil, contextSource: ContextCapacitySource? = nil,
         modelName: String, supportsTools: Bool,
         reportsUsage: Bool = false, localToolDestination: Bool = false, capabilityProfile: CapabilityProfile? = nil, tokenCounter: NativeTokenCounter? = nil,
-        instrumentationFactory: (@Sendable (@escaping @Sendable (Snapshot) async throws -> Void) -> Model)? = nil) {
+        instrumentationFactory: (@Sendable (InferenceUsageObserver, @escaping @Sendable (Snapshot) async throws -> Void) -> Model)? = nil) {
         self.model = model; self.contextTokens = contextTokens
         self.reportedContextTokens = reportedContextTokens ?? contextTokens
         self.contextSource = contextSource; self.modelName = modelName
@@ -229,8 +233,10 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
         try Task.checkCancellation()
         let entries = SystemBackend.history(input)
         let current = Transcript.Entry.prompt(.init(segments: [.text(.init(content: input.prompt))]))
-        let generationModel = instrumentationFactory?(snapshot) ?? model
-        let boundedModel = BoundedToolModel(base: generationModel, maximumTokens: Int(maximumTokens), toolsEnabled: handler != nil)
+        let requestUsage = InferenceUsageObserver(snapshot: snapshot)
+        let generationModel = instrumentationFactory?(requestUsage, snapshot) ?? model
+        let boundedModel = BoundedToolModel(base: generationModel, maximumTokens: Int(maximumTokens),
+            toolsEnabled: handler != nil, usageObserver: requestUsage)
         do {
             let guardedHandler: ToolHandler?
             if let handler {

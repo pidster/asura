@@ -172,6 +172,7 @@ fn terminal_event(turn: &journal::TurnTerminal) -> pb::ConversationEvent {
         usage_tokens: turn.usage_known.then_some(u64::from(turn.output_tokens)),
         tools: Vec::new(),
         model_context: None,
+        statistics: None,
     }
 }
 /// Helper output counters describe one SDK response, not aggregate tool inference.
@@ -391,6 +392,67 @@ struct LiveTool {
     dispatched: bool,
     result: Option<journal::ToolResult>,
 }
+/// Current-owner measurements. Restart leaves these absent rather than inventing history.
+#[derive(Clone)]
+struct TurnMeasurements {
+    started: Option<Instant>,
+    ended: Option<Instant>,
+    count: u32,
+    input: Option<u64>,
+    output: Option<u64>,
+    cached: Option<u64>,
+    complete: bool,
+    tool_start: [Option<Instant>; 8],
+    tool_ms: [Option<u64>; 8],
+}
+impl Default for TurnMeasurements {
+    fn default() -> Self {
+        Self {
+            started: None,
+            ended: None,
+            count: 0,
+            input: None,
+            output: None,
+            cached: None,
+            complete: true,
+            tool_start: [None; 8],
+            tool_ms: [None; 8],
+        }
+    }
+}
+impl TurnMeasurements {
+    fn record(&mut self, value: &mp::InferenceUsage) {
+        self.count += 1;
+        if let Some(n) = value.input_tokens {
+            self.input = self.input.unwrap_or(0).checked_add(n);
+        }
+        if let Some(n) = value.output_tokens {
+            self.output = self.output.unwrap_or(0).checked_add(n);
+        }
+        if let Some(n) = value.cached_input_tokens {
+            self.cached = self.cached.unwrap_or(0).checked_add(n);
+        }
+        self.complete &=
+            value.complete == Some(true) && self.input.is_some() && self.output.is_some();
+    }
+    fn snapshot(&self, now: Instant) -> Option<pb::TurnStatistics> {
+        let start = self.started?;
+        Some(pb::TurnStatistics {
+            elapsed_ms: Some(
+                self.ended
+                    .unwrap_or(now)
+                    .saturating_duration_since(start)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            ),
+            input_tokens: (self.count > 0).then_some(self.input).flatten(),
+            output_tokens: (self.count > 0).then_some(self.output).flatten(),
+            cached_input_tokens: (self.count > 0).then_some(self.cached).flatten(),
+            complete: Some(self.count > 0 && self.complete),
+            request_count: Some(self.count),
+        })
+    }
+}
 struct Active {
     foreground_user: bool,
     queue_input: Option<journal::Id>,
@@ -401,6 +463,7 @@ struct Active {
     accepted: bool,
     ready: bool,
     start_committed: bool,
+    measurements: TurnMeasurements,
     tools_enabled: bool,
     capabilities: crate::model::CapabilityProfile,
     activation: [crate::model::Activation; 4],
@@ -518,6 +581,7 @@ pub(crate) struct Owner {
     started: bool,
     automatic_initialization: AutomaticInitialization,
     model_context: VecDeque<(journal::Id, pb::ModelContext)>,
+    measurements: VecDeque<(journal::Id, TurnMeasurements)>,
     hold_reasons: BTreeMap<journal::Id, &'static str>,
     wake: Option<asura_platform::events::WakeSender>,
     observations: Vec<(pb::Envelope, Instant)>,
@@ -555,16 +619,17 @@ impl Owner {
             started: false,
             automatic_initialization: AutomaticInitialization::NotAttempted,
             model_context: VecDeque::new(),
+            measurements: VecDeque::new(),
             hold_reasons: BTreeMap::new(),
             wake: None,
             observations: Vec::new(),
         }
     }
     fn note_hold(&mut self, input: journal::Id, reason: &'static str) {
-        if self.hold_reasons.len() == 16 {
-            if let Some(key) = self.hold_reasons.keys().next().copied() {
-                self.hold_reasons.remove(&key);
-            }
+        if self.hold_reasons.len() == 16
+            && let Some(key) = self.hold_reasons.keys().next().copied()
+        {
+            self.hold_reasons.remove(&key);
         }
         self.hold_reasons.insert(input, reason);
     }
@@ -1259,13 +1324,6 @@ impl Owner {
             };
             return Some(reply(request, Body::SensorsReply(value)));
         }
-        let background_pending = matches!(
-            self.pending,
-            Some((
-                _,
-                Job::SensorLoad(_) | Job::SensorStore(_, _) | Job::SensorReconcile(_)
-            ))
-        );
         let foreground_command = matches!(
             request.body,
             Some(
@@ -1285,7 +1343,7 @@ impl Owner {
         );
         if foreground_command
             && !self.dispatching_foreground
-            && (background_pending || !self.foreground.is_empty())
+            && (self.pending.is_some() || !self.foreground.is_empty())
         {
             if self.foreground.len() >= 32 {
                 return Some(error(request, "conversation_busy"));
@@ -1660,6 +1718,7 @@ impl Owner {
                     usage_tokens: None,
                     usage_known: None,
                     tools: self.tool_progress(operation),
+                    statistics: active.measurements.snapshot(Instant::now()),
                     model_context: self
                         .model_context
                         .iter()
@@ -1833,6 +1892,7 @@ impl Owner {
             accepted: false,
             ready: false,
             start_committed: false,
+            measurements: TurnMeasurements::default(),
             tools_enabled,
             capabilities: Default::default(),
             activation: [crate::model::Activation::Unknown; 4],
@@ -2209,6 +2269,9 @@ impl Owner {
             Job::Start => {
                 let active = self.active.as_mut().expect("active permit");
                 active.start_committed = true;
+                if active.cancel.is_none() && !self.closing {
+                    active.measurements.started = Some(now);
+                }
                 if active.cancel.is_none()
                     && !self.closing
                     && let Err(message) = active.model.start()
@@ -2232,6 +2295,7 @@ impl Owner {
                 let active = self.active.as_mut().expect("active tool intent");
                 let tool = active.tool.as_mut().expect("pending tool");
                 tool.intent_committed = true;
+                active.measurements.tool_start[tool.call.ordinal as usize - 1] = Some(now);
                 if !matches!(tool.call.arguments, tools::Arguments::Shell { .. }) {
                     tool.deadline = now + std::time::Duration::from_secs(2);
                 }
@@ -2241,6 +2305,13 @@ impl Owner {
                 let active = self.active.as_mut().expect("active tool result");
                 let tool = active.tool.take().expect("pending tool");
                 let result = tool.result.expect("settled tool result");
+                let index = tool.call.ordinal as usize - 1;
+                active.measurements.tool_ms[index] =
+                    active.measurements.tool_start[index].map(|start| {
+                        now.saturating_duration_since(start)
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64
+                    });
                 if let Some(emitter) = &self.audit_emitter {
                     let _ = emitter.try_emit(audit_tools::tool_finished(
                         &active.turn,
@@ -2288,7 +2359,17 @@ impl Owner {
                 }
             }
             Job::Finish => {
-                let active = self.active.take().expect("finished operation");
+                let mut active = self.active.take().expect("finished operation");
+                active.measurements.ended = Some(now);
+                active.measurements.complete &= active
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|t| t.kind == journal::TerminalKind::Complete);
+                if self.measurements.len() >= 8 {
+                    self.measurements.pop_front();
+                }
+                self.measurements
+                    .push_back((active.turn.operation, active.measurements.clone()));
                 if let (Some(emitter), Some(terminal)) = (&self.audit_emitter, &active.terminal) {
                     let _ = emitter.try_emit(audit_tools::finished(&active.turn, terminal));
                 }
@@ -2469,6 +2550,11 @@ impl Owner {
                             })
                             .map(|(_, value)| value.clone());
                         event.tools = self.tool_progress(terminal.operation);
+                        event.statistics = self
+                            .measurements
+                            .iter()
+                            .find(|(id, _)| *id == terminal.operation)
+                            .and_then(|(_, measurements)| measurements.snapshot(Instant::now()));
                         reply(request, Body::ConversationEvent(event))
                     }
                     _ => error(request, "authority_repair_required"),
@@ -2483,6 +2569,8 @@ impl Owner {
             outcome,
             reason,
             snapshot_bytes = active.snapshot.len(),
+            inference_requests = active.measurements.count,
+            measured_output_tokens = ?active.measurements.output,
             tools_enabled = active.tools_enabled,
             "model_helper_diagnostic"
         );
@@ -2763,6 +2851,10 @@ impl Owner {
                     } else {
                         active.ready = true;
                     }
+                }
+                ModelEvent::InferenceUsage(value) => {
+                    active.measurements.record(&value);
+                    active.cursor += 1;
                 }
                 ModelEvent::ContextMeasured {
                     input_tokens,
@@ -3437,6 +3529,30 @@ impl Owner {
                     None => 1,
                 }),
                 status: tool.result_status.map(u32::from),
+                arguments: Some(tool.arguments.clone()),
+                policy_decision: Some(if matches!(tool.kind, 4 | 5 | 9 | 10 | 11 | 13) {
+                    3
+                } else if tool.result_status == Some(2) {
+                    2
+                } else {
+                    1
+                }),
+                elapsed_ms: self
+                    .active
+                    .as_ref()
+                    .filter(|a| a.turn.operation == operation)
+                    .map(|a| &a.measurements)
+                    .or_else(|| {
+                        self.measurements
+                            .iter()
+                            .find(|(id, _)| *id == operation)
+                            .map(|(_, m)| m)
+                    })
+                    .and_then(|m| m.tool_ms[index]),
+                result_bytes: tool.result_status.map(|_| tool.result_bytes as u64),
+                preview: tool.preview.clone(),
+                truncated: tool.truncated,
+                exit_code: tool.exit_code,
             })
             .collect()
     }
@@ -3695,3 +3811,7 @@ mod observation_tests {
 #[cfg(test)]
 #[path = "conversation/tool_tests.rs"]
 mod tool_tests;
+
+#[cfg(test)]
+#[path = "conversation/foreground_tests.rs"]
+mod foreground_tests;

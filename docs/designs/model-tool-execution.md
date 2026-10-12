@@ -2,7 +2,7 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens with tool passes of 1,024/512/512. Historical
+New admissions reserve 2,048 tokens. The selected [per-request usage and budget correction](turn-usage-helper.md#turn-budget-and-request-admission) removes the independent three-pass cap: first request at most 1,024 tokens, later requests at most 512, with refunds only from verified successful output counts and at most 64 requests. Historical
 512-token journal records retain their recorded accounting. Earlier numerical
 examples and validation evidence below describe that earlier packet.
 

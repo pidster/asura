@@ -431,6 +431,11 @@ pub struct ToolRecord {
     pub intent_frame: Range<usize>,
     pub result_frame: Option<Range<usize>>,
     pub result_bytes: usize,
+    /// Bounded display projections of verified format-1 records, not authority.
+    pub arguments: String,
+    pub preview: Option<String>,
+    pub truncated: Option<bool>,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

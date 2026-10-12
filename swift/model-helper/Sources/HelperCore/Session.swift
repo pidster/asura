@@ -30,6 +30,8 @@ public actor HelperSession {
     private let timerSleep: @Sendable (UInt32) async throws -> Void
     private var generationDeadlineMilliseconds: UInt32?
     private var measuredContext = false
+    private var settledInferenceOrdinal: UInt32 = 0
+    private var activeInferenceOrdinal: UInt32?
     private var latest: Snapshot?
     private var transmitting: Data?
     private var transfer: UInt64 = 2
@@ -357,6 +359,24 @@ public actor HelperSession {
 
     private func snapshot(_ value: Snapshot) async throws {
         guard phase == .running, pendingFailure == nil else { throw CancellationError() }
+        if let ordinal = value.inferenceStartedOrdinal {
+            guard value.text.isEmpty, value.usageTokens == nil, value.inputContext == nil,
+                value.inferenceUsage == nil, activeInferenceOrdinal == nil,
+                settledInferenceOrdinal < 64, ordinal == settledInferenceOrdinal + 1 else { throw HelperError.protocolFault }
+            activeInferenceOrdinal = ordinal
+            return
+        }
+        if let report = value.inferenceUsage {
+            guard value.text.isEmpty, value.usageTokens == nil, value.inputContext == nil,
+                report.ordinal == activeInferenceOrdinal, report.ordinal == settledInferenceOrdinal + 1 else {
+                throw HelperError.protocolFault
+            }
+            let message = envelope(.inferenceUsage(report.wire))
+            try Wire.validate(message, from: .helper)
+            settledInferenceOrdinal = report.ordinal; activeInferenceOrdinal = nil
+            try await transport.send(message)
+            return
+        }
         if let context = value.inputContext {
             guard !measuredContext, value.text.isEmpty, value.usageTokens == nil,
                 context.capacity > 0, context.tokens <= context.capacity else { throw HelperError.protocolFault }
@@ -439,6 +459,10 @@ public actor HelperSession {
         phase = .terminal
         finishTool(.failure(CancellationError()))
         timer?.cancel(); modelTask?.cancel()
+        if let ordinal = activeInferenceOrdinal {
+            activeInferenceOrdinal = nil; settledInferenceOrdinal = ordinal
+            try await transport.send(envelope(.inferenceUsage(RequestUsage(ordinal: ordinal).wire)))
+        }
         latest = nil; transmitting = nil; inputData.removeAll(); decodedInput = nil
         var end = Asura_Model_V1_Terminal()
         end.outcome = outcome; end.lastRevision = revision

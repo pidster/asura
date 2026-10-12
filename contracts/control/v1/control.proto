@@ -246,6 +246,7 @@ message ConversationEvent {
   optional bool usage_known = 8;
   repeated ToolProgress tools = 9;
   optional ModelContext model_context = 10;
+  optional TurnStatistics statistics = 11;
 }
 message ConversationCancel { optional bytes operation_id = 1; optional uint64 generation = 2; }
 message ConversationCancelAccepted { optional bytes operation_id = 1; optional bool terminal = 2; }
@@ -382,7 +383,20 @@ message ConversationQueueReply {
   optional bytes accepted_input_id = 8; // new Submit receipt within the bounded projection
 }
 
-message ToolProgress { optional uint32 ordinal = 1; optional string name = 2; optional ToolProgressState state = 3; optional uint32 status = 4; }
+message ToolProgress {
+  optional uint32 ordinal = 1; optional string name = 2;
+  optional ToolProgressState state = 3; optional uint32 status = 4;
+  optional string arguments = 5; optional uint32 policy_decision = 6;
+  optional uint64 elapsed_ms = 7; optional uint64 result_bytes = 8;
+  optional string preview = 9; optional bool truncated = 10;
+  optional sint32 exit_code = 11;
+}
+// Optional observations; complete means every measured request has full input/output counts.
+message TurnStatistics {
+  optional uint64 elapsed_ms = 1; optional uint64 input_tokens = 2;
+  optional uint64 output_tokens = 3; optional uint64 cached_input_tokens = 4;
+  optional bool complete = 5; optional uint32 request_count = 6;
+}
 enum ToolProgressState { TOOL_PROGRESS_STATE_UNSPECIFIED = 0; TOOL_PROGRESS_STATE_RUNNING = 1; TOOL_PROGRESS_STATE_COMPLETE = 2; TOOL_PROGRESS_STATE_FAILED = 3; TOOL_PROGRESS_STATE_INTERRUPTED = 4; }
 
 // basis 1 means the measured input at generation start, not current occupancy.

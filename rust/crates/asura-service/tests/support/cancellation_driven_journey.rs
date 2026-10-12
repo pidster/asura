@@ -103,10 +103,10 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(task) = self.thread.take() {
-            if let Ok(Err(error)) = task.join() {
-                eprintln!("loopback fixture server error: {:?}", error.kind());
-            }
+        if let Some(task) = self.thread.take()
+            && let Ok(Err(error)) = task.join()
+        {
+            eprintln!("loopback fixture server error: {:?}", error.kind());
         }
     }
 }

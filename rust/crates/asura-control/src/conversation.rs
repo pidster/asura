@@ -262,9 +262,25 @@ pub(super) fn valid(body: &Body) -> bool {
                         _ => false,
                     }
                 })
+                && v.statistics.as_ref().is_none_or(|s| {
+                    s.request_count.is_some_and(|n| n <= 64)
+                        && s.input_tokens.is_none_or(|n| n <= 64_000_000_000)
+                        && s.output_tokens.is_none_or(|n| n <= 64_000_000_000)
+                        && s.cached_input_tokens
+                            .is_none_or(|n| s.input_tokens.is_some_and(|i| n <= i))
+                        && s.complete.is_some()
+                        && (s.complete != Some(true)
+                            || (s.request_count.is_some_and(|n| n > 0)
+                                && s.input_tokens.is_some()
+                                && s.output_tokens.is_some()))
+                })
                 && v.tools.len() <= 8
                 && v.tools.iter().enumerate().all(|(index, tool)| {
-                    tool.ordinal == Some(index as u32 + 1)
+                    tool.arguments.as_ref().is_none_or(|s| s.len() <= 192)
+                        && tool.preview.as_ref().is_none_or(|s| s.len() <= 128)
+                        && tool.policy_decision.is_none_or(|n| (1..=3).contains(&n))
+                        && tool.result_bytes.is_none_or(|n| n <= 65_536)
+                        && tool.ordinal == Some(index as u32 + 1)
                         && tool.name.as_ref().is_some_and(|name| {
                             !name.is_empty()
                                 && name.len() <= 64
@@ -523,6 +539,7 @@ mod tests {
     fn terminal_cursor_and_usage_are_explicit() {
         let event = pb::ConversationEvent {
             model_context: None,
+            statistics: None,
             operation_id: Some(vec![1; 16]),
             cursor: Some(u64::MAX),
             generation: Some(1),
@@ -695,5 +712,54 @@ mod tests {
         reply.entries[0].state = Some(2);
         reply.entries[0].hold_reason = Some("bad reason".into());
         assert!(!valid(&Body::ConversationQueueReply(reply)));
+    }
+    #[test]
+    fn maximum_activity_frame_retains_complete_response_and_signed_exit() {
+        let event = pb::ConversationEvent {
+            operation_id: Some(vec![1; 16]),
+            generation: Some(1),
+            cursor: Some(u64::MAX),
+            kind: Some(3),
+            reason: Some(0),
+            text: Some("a".repeat(61440)),
+            usage_known: Some(false),
+            tools: (1..=8)
+                .map(|ordinal| pb::ToolProgress {
+                    ordinal: Some(ordinal),
+                    name: Some("a".repeat(64)),
+                    state: Some(2),
+                    status: Some(1),
+                    arguments: Some("a".repeat(192)),
+                    preview: Some("a".repeat(128)),
+                    policy_decision: Some(1),
+                    elapsed_ms: Some(u64::MAX),
+                    result_bytes: Some(65536),
+                    truncated: Some(true),
+                    exit_code: Some(i32::MIN),
+                })
+                .collect(),
+            statistics: Some(pb::TurnStatistics {
+                elapsed_ms: Some(u64::MAX),
+                request_count: Some(64),
+                input_tokens: Some(64_000_000_000),
+                output_tokens: Some(64_000_000_000),
+                cached_input_tokens: Some(64_000_000_000),
+                complete: Some(true),
+            }),
+            ..Default::default()
+        };
+        let message = envelope(Body::ConversationEvent(event));
+        assert!(valid(message.body.as_ref().unwrap()));
+        let frame = crate::encode_frame(&message).unwrap();
+        assert!(frame.len() <= crate::MAX_FRAME_BYTES + crate::HEADER_BYTES);
+        assert_eq!(
+            crate::decode_body(&frame[crate::HEADER_BYTES..]).unwrap(),
+            message
+        );
+        let mut invalid = message.clone();
+        if let Some(Body::ConversationEvent(v)) = invalid.body.as_mut() {
+            v.tools[0].arguments = Some("a".repeat(193));
+        }
+        assert!(!valid(invalid.body.as_ref().unwrap()));
     }
 }

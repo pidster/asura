@@ -1526,6 +1526,25 @@ fn native_tools(provider: &str) -> Result<()> {
         Some(false),
         "per-step usage cannot become aggregate tool usage"
     );
+    if provider == "ollama" {
+        let stats = event
+            .statistics
+            .as_ref()
+            .ok_or("native Ollama request measurements absent")?;
+        assert_eq!(stats.complete, Some(true));
+        assert!(stats.request_count.is_some_and(|n| (2..=64).contains(&n)));
+        assert!(stats.input_tokens.is_some_and(|n| n > 0));
+        assert!(stats.output_tokens.is_some_and(|n| n > 0 && n <= 2048));
+        assert_eq!(stats.cached_input_tokens, None);
+        assert!(stats.elapsed_ms.is_some());
+        println!(
+            "PASS native Ollama measured tool continuation: requests={} input={} output={}",
+            stats.request_count.unwrap(),
+            stats.input_tokens.unwrap(),
+            stats.output_tokens.unwrap()
+        );
+    }
+
     fixture
         .stop()
         .map_err(|e| format!("native-tools stop: {e}"))?;
@@ -1554,7 +1573,19 @@ fn native_tools(provider: &str) -> Result<()> {
     let recovered =
         observe(&fixture, operation).map_err(|e| format!("native-tools replay observe: {e}"))?;
     assert_eq!(recovered.text, event.text);
-    assert_eq!(recovered.tools, event.tools);
+    assert!(
+        recovered.statistics.is_none(),
+        "restart cannot reconstruct transient request counters"
+    );
+    assert!(
+        recovered.tools.iter().all(|tool| tool.elapsed_ms.is_none()),
+        "restart cannot invent tool duration"
+    );
+    let mut durable_tools = event.tools.clone();
+    for tool in &mut durable_tools {
+        tool.elapsed_ms = None;
+    }
+    assert_eq!(recovered.tools, durable_tools);
     let status = submit(
         &fixture,
         project,
@@ -1846,13 +1877,12 @@ fn native_ollama() -> Result<()> {
             0,
             "Say hello in one short sentence.",
         )
-        .map_err(|error| {
+        .inspect_err(|_error| {
             fixture.print_model_diagnostics();
             let _ = fs::copy(
                 fixture.home.join("service.log"),
                 "/private/tmp/asura-native-ollama-startup.log",
             );
-            error
         })?;
         stage = "native completion";
         let terminal = observe(&fixture, checked_id(accepted.operation_id)?)?;

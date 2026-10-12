@@ -10,10 +10,14 @@ pub(super) struct Activity {
     cursor: u64,
     kind: i32,
     tools: Vec<pb::ToolProgress>,
+    statistics: Option<pb::TurnStatistics>,
     expanded: bool,
     unavailable: bool,
 }
 impl Activity {
+    pub(super) fn clear_statistics(&mut self) {
+        self.statistics = None;
+    }
     pub(super) fn active(&self) -> bool {
         self.kind < 3 && !self.unavailable
     }
@@ -37,6 +41,12 @@ impl Activity {
             if expanded { "▾" } else { "▸" },
             self.tools.len()
         );
+        if let Some(statistics) = &self.statistics {
+            text.push_str(&format!(
+                "\n  {}",
+                statistics_text(statistics, self.kind >= 3)
+            ));
+        }
         if expanded {
             for tool in &self.tools {
                 let state = match tool.state {
@@ -47,10 +57,24 @@ impl Activity {
                     _ => "unknown",
                 };
                 text.push_str(&format!(
-                    "\n  {}. {} · {state}",
+                    "\n  ⚙ {}. {} · {state}",
                     tool.ordinal.unwrap_or(0),
                     literal(tool.name.as_deref().unwrap_or("unknown"), 64)
                 ));
+                if let Some(arguments) = &tool.arguments {
+                    text.push_str(&format!("\n    {}", literal(arguments, 192)));
+                }
+                if let Some(policy) = tool.policy_decision {
+                    text.push_str(&format!(
+                        "\n    · {}",
+                        match policy {
+                            1 => "service admitted",
+                            2 => "access denied",
+                            3 => "arguments rejected",
+                            _ => "admission unknown",
+                        }
+                    ));
+                }
                 if tool.state == Some(3) {
                     text.push_str(&format!(
                         " · {}",
@@ -65,10 +89,73 @@ impl Activity {
                         }
                     ));
                 }
+                if tool.state.is_some_and(|state| state >= 2) {
+                    text.push_str(&format!("\n    ↳ {state}"));
+                    if let Some(exit) = tool.exit_code {
+                        text.push_str(&format!(" · exit {exit}"));
+                    }
+                    if let Some(bytes) = tool.result_bytes {
+                        text.push_str(&format!(" · {} bytes", grouped_count(bytes)));
+                    }
+                    if let Some(elapsed) = tool.elapsed_ms {
+                        if elapsed < 1000 {
+                            text.push_str(&format!(" · {elapsed} ms"));
+                        } else {
+                            text.push_str(&format!(" · {:.1}s", elapsed as f64 / 1000.0));
+                        }
+                    }
+                    if tool.truncated == Some(true) {
+                        text.push_str(" · captured result truncated");
+                    }
+                    if let Some(preview) = &tool.preview {
+                        text.push_str(&format!("\n      preview: {}", literal(preview, 128)));
+                    }
+                }
             }
         }
         text
     }
+}
+
+fn grouped_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut text = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            text.push(',');
+        }
+        text.push(digit);
+    }
+    text
+}
+
+fn statistics_text(statistics: &pb::TurnStatistics, terminal: bool) -> String {
+    let elapsed = statistics
+        .elapsed_ms
+        .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
+        .unwrap_or_else(|| "?".into());
+    let input = statistics
+        .input_tokens
+        .map(grouped_count)
+        .unwrap_or_else(|| "?".into());
+    let output = statistics
+        .output_tokens
+        .map(grouped_count)
+        .unwrap_or_else(|| "?".into());
+    let mut text = format!(
+        "{}:{elapsed} · ↓{input} ↑{output}",
+        if terminal { "last" } else { "now" }
+    );
+    if let Some(cached) = statistics.cached_input_tokens {
+        text.push_str(&format!(" · cached {}", grouped_count(cached)));
+    }
+    if let Some(requests) = statistics.request_count {
+        text.push_str(&format!(" · {requests} requests"));
+    }
+    if statistics.complete != Some(true) {
+        text.push_str(" · partial");
+    }
+    text
 }
 impl App {
     pub(super) fn append_response(&mut self, prompt: String, operation: Option<Vec<u8>>) {
@@ -135,6 +222,11 @@ impl App {
         entry.unavailable = false;
         // A busy journal read can send an equal-cursor, empty Pending heartbeat.
         if cursor == entry.cursor && entry.cursor != 0 {
+            // Service-owned elapsed time can change without a journal revision.
+            // An empty Pending heartbeat cannot replace tools, response or kind.
+            if let Some(statistics) = &event.statistics {
+                entry.statistics = Some(*statistics);
+            }
             return None;
         }
         entry.operation = Some(operation.clone());
@@ -144,6 +236,7 @@ impl App {
             return None;
         }
         entry.kind = event.kind.unwrap_or(1);
+        entry.statistics = event.statistics;
         entry.unavailable = false;
         if !event.tools.is_empty() || entry.kind != 1 {
             entry.tools = event.tools.iter().take(8).cloned().collect();
@@ -286,6 +379,7 @@ mod tests {
                 name: Some("shell".into()),
                 state: Some(state),
                 status: (state == 2).then_some(1),
+                ..Default::default()
             }],
             ..Default::default()
         }
@@ -318,6 +412,147 @@ mod tests {
             .unwrap();
         }
         buffer.content.iter().map(|cell| cell.symbol()).collect()
+    }
+    #[test]
+    fn rich_tool_activity_and_turn_statistics_keep_verified_values_visible() {
+        let mut app = App::new();
+        app.append_response("Find matching files".into(), Some(vec![1; 16]));
+        app.active_operation = Some(vec![1; 16]);
+        app.insert("draft stays");
+        let mut running = event(1, 2, 2, 1);
+        running.tools[0].arguments = Some("find . -name *.wisp".into());
+        running.tools[0].policy_decision = Some(1);
+        running.statistics = Some(pb::TurnStatistics {
+            elapsed_ms: Some(200),
+            request_count: Some(1),
+            complete: Some(false),
+            ..Default::default()
+        });
+        apply(&mut app, running);
+        let live = draw(&mut app, 100, 32, "rich-running");
+        assert!(live.contains("find . -name *.wisp"));
+        assert!(live.contains("service admitted"));
+        assert!(live.contains("now:0.2s · ↓? ↑?"));
+        assert!(!live.contains("safe by rules"));
+        let mut complete = event(1, 3, 3, 2);
+        complete.text = Some("The complete response is retained.".into());
+        complete.tools[0].arguments = Some("find . -name *.wisp".into());
+        complete.tools[0].policy_decision = Some(1);
+        complete.tools[0].elapsed_ms = Some(2);
+        complete.tools[0].result_bytes = Some(989);
+        complete.tools[0].exit_code = Some(0);
+        complete.tools[0].preview = Some("./functionality-self-test.wisp".into());
+        complete.tools[0].truncated = Some(false);
+        complete.statistics = Some(pb::TurnStatistics {
+            elapsed_ms: Some(42_100),
+            input_tokens: Some(17_524),
+            output_tokens: Some(739),
+            cached_input_tokens: Some(0),
+            complete: Some(true),
+            request_count: Some(2),
+        });
+        apply(&mut app, complete);
+        let collapsed = draw(&mut app, 100, 32, "rich-collapsed");
+        assert!(collapsed.contains("last:42.1s · ↓17,524 ↑739"));
+        assert!(!collapsed.contains("find . -name *.wisp"));
+        key(&mut app, KeyCode::F(6));
+        key(&mut app, KeyCode::Enter);
+        let expanded = draw(&mut app, 100, 32, "rich-expanded");
+        assert!(expanded.contains("↳ complete · exit 0 · 989 bytes · 2 ms"));
+        assert!(expanded.contains("preview: ./functionality-self-test.wisp"));
+        assert!(expanded.contains("cached 0"));
+        assert!(!expanded.contains("captured result truncated"));
+        assert_eq!(app.transcript[0].1, "The complete response is retained.");
+        assert_eq!(app.draft(), "draft stays");
+    }
+    #[test]
+    fn equal_cursor_statistics_refresh_preserves_response_and_tool_state() {
+        let mut app = App::new();
+        app.active_operation = Some(vec![1; 16]);
+        let mut running = event(1, 4, 2, 1);
+        running.text = Some("Current answer".into());
+        running.statistics = Some(pb::TurnStatistics {
+            elapsed_ms: Some(1000),
+            ..Default::default()
+        });
+        apply(&mut app, running);
+        let mut heartbeat = event(1, 4, 1, 1);
+        heartbeat.tools.clear();
+        heartbeat.statistics = Some(pb::TurnStatistics {
+            elapsed_ms: Some(2000),
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            complete: Some(false),
+            ..Default::default()
+        });
+        apply(&mut app, heartbeat.clone());
+        assert_eq!(app.activity[0].kind, 2);
+        assert_eq!(app.activity[0].tools.len(), 1);
+        assert_eq!(app.transcript[0].1, "Current answer");
+        assert!(app.activity[0].display().contains("now:2.0s · ↓0 ↑0"));
+        heartbeat.generation = Some(2);
+        heartbeat.statistics.as_mut().unwrap().elapsed_ms = Some(9000);
+        apply(&mut app, heartbeat);
+        assert!(app.activity[0].display().contains("now:2.0s"));
+        // A replay projection explicitly lacking statistics does not inherit
+        // the prior owner's volatile counts or monotonic timing.
+        apply(&mut app, event(1, 5, 2, 1));
+        assert!(app.activity[0].statistics.is_none());
+    }
+    #[test]
+    fn service_epoch_change_removes_volatile_statistics_without_losing_draft() {
+        let mut app = App::new();
+        app.view.epoch = Some("old-owner".into());
+        app.active_operation = Some(vec![1; 16]);
+        let mut complete = event(1, 4, 3, 2);
+        complete.text = Some("Retained answer".into());
+        complete.statistics = Some(pb::TurnStatistics {
+            elapsed_ms: Some(2000),
+            input_tokens: Some(32),
+            output_tokens: Some(7),
+            complete: Some(true),
+            ..Default::default()
+        });
+        apply(&mut app, complete);
+        app.insert("preserved draft");
+        let mut view = app.view.clone();
+        view.epoch = Some("new-owner".into());
+        app.set_view(view);
+        assert!(app.activity[0].statistics.is_none());
+        assert_eq!(app.transcript[0].1, "Retained answer");
+        assert_eq!(app.draft(), "preserved draft");
+    }
+    #[test]
+    fn partial_unknown_counts_and_literal_previews_cannot_claim_completeness() {
+        let statistics = pb::TurnStatistics {
+            input_tokens: Some(1_000_000),
+            output_tokens: None,
+            complete: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            statistics_text(&statistics, true),
+            "last:? · ↓1,000,000 ↑? · partial"
+        );
+        let mut record = event(1, 2, 4, 3).tools.remove(0);
+        record.arguments = Some("arg\n\u{1b}[31m".repeat(100));
+        record.preview = Some("preview\n\u{1b}[31m".repeat(100));
+        record.policy_decision = Some(2);
+        record.truncated = Some(true);
+        record.exit_code = Some(-1);
+        let activity = Activity {
+            tools: vec![record],
+            expanded: true,
+            kind: 4,
+            ..Default::default()
+        };
+        let display = activity.display();
+        assert!(display.contains("access denied"));
+        assert!(display.contains("captured result truncated"));
+        assert!(display.contains("exit -1"));
+        assert!(!display.contains('\u{1b}'));
+        assert!(display.len() < 700);
+        assert_eq!(grouped_count(u64::MAX), "18,446,744,073,709,551,615");
     }
     #[test]
     fn live_pending_activity_survives_heartbeats_and_collapses_on_completion() {
@@ -427,6 +662,7 @@ mod tests {
                 name: Some("service_read_audit".into()),
                 state: Some(if ordinal == 8 { 4 } else { 3 }),
                 status: (ordinal < 8).then_some(ordinal.max(2)),
+                ..Default::default()
             })
             .collect();
         apply(&mut app, complete);

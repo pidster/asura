@@ -243,6 +243,96 @@ model prompt content from governing instructions. An old conversation may be
 retrieved as evidence, but its commands remain quoted data. This prevents a
 summary or embedding from silently becoming a higher-priority instruction.
 
+## Deterministic thread context by turn
+
+**Required behavior, 2026-09-30:** the graph stores coherent, versioned information
+from which Asura can reconstruct a thread's model context for any recorded turn.
+Here, thread means the existing conversation identity; it does not introduce a
+second conversation owner. Each inference request within a turn has its own
+ordinal and composition manifest. Tool continuations can therefore have different
+contexts while sharing one turn.
+
+This extends the [conversation projections](conversation-projections.md). The
+graph stores typed records and provenance, not only unstructured transcript blobs.
+The existing service context owner computes the projection. Storage owns typed
+queries and immutable records; neither the helper nor the TUI queries SurrealDB.
+
+| Graph record | Required identity and content |
+| --- | --- |
+| Conversation projection | Existing accepted conversation/project identity and journal provenance |
+| Turn projection | Accepted operation, conversation generation, immutable input and terminal references |
+| Inference request | Turn identity, request ordinal, selected model and exact composition manifest |
+| Composition manifest | Ordered selected version IDs and spans, omitted candidates and reasons, graph publication watermark, policy/config versions, composer revision and formatter/template/schema digests |
+| Context segment | Role, ordinal, exact content digest and retained content reference; summaries also link to source versions and summary revision |
+
+Relations attach turns to their conversation, requests to their turn, manifests
+to their request, and ordered segments to their source versions. Reuse the existing
+`context_manifest`, immutable source versions and `selected_for` semantics. Detailed
+relation table declarations remain part of the graph implementation packet.
+Do not make graph projections authoritative replacements for journal lifecycle.
+
+### GM-D3: turn context provenance — required relationship view
+
+Arrows name linked identities, not execution or permission grants.
+
+```mermaid
+erDiagram
+    CONVERSATION_REF ||--o{ TURN_PROJECTION : contains
+    TURN_PROJECTION ||--o{ INFERENCE_REQUEST : issues
+    INFERENCE_REQUEST ||--|| CONTEXT_MANIFEST : records
+    CONTEXT_MANIFEST ||--o{ ORDERED_SEGMENT : selects
+    SOURCE_VERSION ||--o{ ORDERED_SEGMENT : supplies
+    SUMMARY_VERSION ||--o{ ORDERED_SEGMENT : supplies
+    SOURCE_VERSION }o--o{ SUMMARY_VERSION : supports
+    COMPOSER_REVISION ||--o{ CONTEXT_MANIFEST : builds
+```
+
+Two operations must remain distinct:
+
+- **Reconstruct the actual request:** resolve the manifest's exact versions and
+  segment order using its recorded serialization rules. Verify the resulting
+  digest against the accepted request digest. Later notes, rules or graph links
+  must not enter this historical context.
+- **Compose a new request:** select currently eligible graph versions under current
+  policy, then commit a new manifest. It may use the same thread with a different
+  context; it must not overwrite the historical manifest.
+
+Determinism requires explicit ordering and tie-breakers, canonical encoding,
+versioned selection/formatting rules and a coherent publication cutoff. An unordered
+SurrealDB traversal is insufficient. Freeze semantic-search candidate identities
+and ranking results if their generation is not reproducible. Store generated
+summaries as immutable versions; never regenerate them during exact reconstruction.
+Do not embed current clock values, environment state or mutable file contents unless
+captured as versioned inputs. Provider-specific message and tool-schema ordering
+also belongs to the manifest. Deterministic context covers Asura-controlled input and observable adapter request
+content. Hidden SDK or provider transformations are outside byte-reconstruction
+claims. It does not promise deterministic model output, tokenization across runtime
+versions or provider cache behavior.
+
+The graph adapter must prove coherent publication reads using the pinned engine
+before selecting its snapshot mechanism. References to large payloads remain in
+the graph; verified bytes remain under the file-storage contract. A manifest's
+referenced versions and payloads must be retained for its promised reconstruction
+lifetime. If a source, composer revision or serializer is unavailable, return
+`reconstruction_unavailable`. Do not manufacture historical context from current
+sources. Legacy turns without sufficient manifests are explicitly unreconstructable.
+
+Historical reads still require current access checks. A denied source returns an
+access error or a labelled redacted view; that view cannot claim the original
+request digest. Reconstruction is inspection, not permission to execute under an
+old policy. New dispatch always validates current authority.
+
+Required tests reconstruct the same request twice and compare exact bytes and
+digest; reorder database rows; add later versions; change current policy; restart;
+exercise multiple requests per turn; and remove a required source or composer.
+Integration verifies graph/file publication and retention under crash and concurrent
+updates. End-to-end inspection selects a recorded turn and identifies the exact
+context, selected evidence and omissions without changing the live conversation.
+The implementation packet must retain the existing asynchronous execution gates
+and define numeric query, payload, worker and retention bounds before code.
+GM-D3 was rendered with Mermaid CLI 12.0.0 and visually inspected on 2026-09-30.
+This validates the diagram presentation, not runtime reconstruction.
+
 ## Physical SurrealDB shape and typed graph operations
 
 **Proposed mechanism:** retain the implemented `graph_marker`, `memory_note`,

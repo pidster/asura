@@ -2,9 +2,10 @@
 
 Status: selected design for automatic project-scoped conversation restoration,
 revised for the [managed input queue](managed-input-queue.md) on 2026-09-29.
-The 2026-09-28 validation remains historical; revised queue-first end-to-end
-validation remains open. Protocol numbering stays 0.1 and the authority journal
-remains format 1.
+The 2026-09-28 validation remains historical. The revised queue-first lifecycle
+gate passed on 2026-09-30 with a deterministic local provider and the actual
+packaged helper. Protocol numbering stays 0.1 and the authority journal remains
+format 1.
 
 ## Behavior and ownership
 
@@ -137,6 +138,45 @@ sequenceDiagram
 ```
 
 ## Asynchronous hydration and recovery
+
+### Service read scheduling
+
+History, prompt reads and queue snapshots share the canonical journal writer.
+When any writer job is pending, the conversation owner retains foreground
+requests in its existing FIFO, up to 32 requests with a two-second retention
+deadline. This applies to foreground reads as well as sensor jobs. The owner
+dispatches the oldest retained request after the pending job completes. It
+returns `conversation_busy` when the FIFO is full, `storage_timeout` when a
+retained request expires, and `service_draining` during shutdown. There is no
+client retry or second scheduler. Active operation observations and cancellation
+continue through their existing immediate paths. Terminal long-poll observations
+retain their existing bounded observation wait while the writer is occupied.
+
+```mermaid
+flowchart TD
+    Request["Foreground history, prompt or queue request"] --> Pending{"Writer pending or foreground FIFO nonempty?"}
+    Pending -->|No| Dispatch["Dispatch through canonical conversation owner"]
+    Pending -->|Yes| Space{"Fewer than 32 retained requests?"}
+    Space -->|No| Busy["Reply conversation_busy"]
+    Space -->|Yes| Retain["Retain in FIFO with two-second deadline"]
+    Retain --> Ready{"Writer completes before deadline and shutdown?"}
+    Ready -->|Yes| Dispatch
+    Ready -->|No| Error["Reply storage_timeout or service_draining"]
+    Immediate["Active observation or cancellation"] --> Bypass["Existing immediate operation path"]
+```
+
+Unit validation interleaves foreground history, prompt and queue requests with
+pending queue snapshot, history, prompt and terminal read jobs. It checks FIFO
+ordering, the 32-request bound, expiry, shutdown and active observation/cancel
+bypass. Integration and end-to-end validation use the real service, journal and
+two-launch queue-history PTY fixture to verify restoration and subsequent
+admission. Synthetic ticket tests prove scheduling, not disk completion.
+
+**Verified behavior, 2026-09-30:** all 137 service library tests passed, including
+four controlled-ticket scheduling regressions. The actual CLI lifecycle gate
+passed two restored-history admissions, exact replay checks, queue reorder and
+owned cleanup. The fixture uses the canonical service and packaged helper;
+provider responses are deterministic rather than native model prose.
 
 The TUI starts restoration after project discovery or an authorized project
 selection. The render and key paths perform no file, socket or model calls.

@@ -327,6 +327,37 @@ fails, the journey stops before fixture creation. This prevents a mistaken
 production-binary argument from reaching the account's live service. The
 positive probe and a production-binary rejection are required checks.
 
+The restored-history admission journey uses a deterministic numeric-loopback
+Ollama fixture through the actual packaged helper. It must not depend on System
+model availability or model prose for its admission oracle. The fixture advertises
+completion and an 8,192-token capacity, streams provisional text, then a recognized
+final stop record with measured counts. A single retained test server allows at
+most eight requests across two launches, 64 KiB per request, two-second socket IO,
+60 seconds of server work and a three-second cleanup join. It serves no external
+endpoint and emits no tool actions. Configuration is written only in the private
+fixture home before launch. No helper identity check is bypassed.
+
+The existing exact format-1 replay verification remains the oracle: both restored
+launches must advance the same conversation once, with the expected generations
+and original conversation identity. Streamed text provides deterministic UI
+activity for history/draft interaction checks; it does not replace durable
+admission proof. Each turn reaches its final state before its owned backend is
+closed; all test services and the HTTP worker settle under the cleanup contract.
+This refines MQ10 validation without changing production queue behavior.
+
+```mermaid
+flowchart LR
+    Seed[Private canonical journal seed] --> Launch[Restore TUI and configure local fixture]
+    Launch --> Queue[Submit exact next input]
+    Queue --> Service[Canonical service admission and dispatch]
+    Service --> Helper[Actual verified packaged helper]
+    Helper --> Fixture[Bounded local provider streams then finishes]
+    Fixture --> UI[Exercise history while draft is retained]
+    UI --> Close[Wait terminal and close owned backend]
+    Close --> Replay[Verify exact journal identity and generation]
+    Replay --> Again[Repeat restored launch once]
+```
+
 For fairness, the scheduler selects each continuously ready lane once before
 selecting any ready lane a second time. A lane leaves this set when its project
 becomes unavailable or its head becomes Held. This is a scheduling invariant,

@@ -234,7 +234,7 @@ class Trial:
     def idle(self, seconds):
         end = time.monotonic() + min(seconds, remaining(seconds))
         while time.monotonic() < end:
-            self.read(min(0.025, end - time.monotonic()))
+            self.read(max(0, min(0.025, end - time.monotonic())))
             assert self.process.poll() is None, bytes(self.output[-2500:])
 
     def stop_child(self):
@@ -902,6 +902,86 @@ def repeated_initialization(fixture):
 
 
 def queue_history_admission(fixture, source):
+    """Deterministic provider transport; the journal remains the admission oracle."""
+    import threading
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(0.1)
+    endpoint = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    stopped = threading.Event()
+    errors = []
+    chats = []
+
+    def serve():
+        end = time.monotonic() + 60
+        try:
+            for _ in range(8):
+                while not stopped.is_set() and time.monotonic() < end:
+                    try:
+                        peer, _ = listener.accept()
+                        break
+                    except socket.timeout:
+                        continue
+                else:
+                    return
+                with peer:
+                    peer.settimeout(2)
+                    request = bytearray()
+                    while True:
+                        data = peer.recv(4096)
+                        assert data, "incomplete fixture request"
+                        request.extend(data)
+                        assert len(request) <= 65536, "fixture request limit"
+                        if b"\r\n\r\n" in request:
+                            header, body = request.split(b"\r\n\r\n", 1)
+                            length = next((int(line.split(b":", 1)[1]) for line in header.split(b"\r\n")
+                                           if line.lower().startswith(b"content-length:")), 0)
+                            assert length <= 65536
+                            if len(body) >= length:
+                                break
+                    if request.startswith(b"POST /api/show "):
+                        payload = b'{"capabilities":["completion"],"model_info":{"fixture.context_length":8192}}'
+                        peer.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+                    elif request.startswith(b"POST /api/chat "):
+                        chat = json.loads(body[:length])
+                        chats.append(chat)
+                        assert len(chats) <= 2, "unexpected duplicate dispatch"
+                        assert chat["model"] == "history-fixture", chat["model"]
+                        assert not chat.get("tools"), "plain fixture cannot execute tools"
+                        expected = f"queue-history-admission-{len(chats)}"
+                        assert any(message.get("role") == "user" and message.get("content") == expected
+                                   for message in chat["messages"]), chat["messages"]
+                        peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                        peer.sendall(b'{"message":{"role":"assistant","content":"fixture working "},"done":false}\n')
+                        # Provisional output establishes real Running state;
+                        # retain it long enough for the history key journey.
+                        if stopped.wait(1):
+                            return
+                        peer.sendall(b'{"message":{"role":"assistant","content":"fixture done"},"done":true,"done_reason":"stop","prompt_eval_count":32,"eval_count":4}\n')
+                        if len(chats) == 2:
+                            return
+                    else:
+                        raise AssertionError("unexpected fixture request")
+        except Exception as error:
+            if not stopped.is_set():
+                errors.append(error)
+
+    server = threading.Thread(target=serve, name="asura-queue-history-provider")
+    server.start()
+    try:
+        queue_history_with_provider(fixture, source, endpoint)
+        assert len(chats) == 2 and not errors, (len(chats), errors)
+    finally:
+        stopped.set()
+        server.join(timeout=3)
+        listener.close()
+        assert not server.is_alive(), "fixture provider cleanup unconfirmed"
+        assert not errors, errors
+
+
+def queue_history_with_provider(fixture, source, endpoint):
     # The oracle is durable admission, never generated text or native availability.
     helper = source.parent / "asura-model"
     assert helper.is_file(), "Build the packaged helper beside the lifecycle fixture"
@@ -909,11 +989,22 @@ def queue_history_admission(fixture, source):
     (fixture.root / "asura-model").chmod(0o700)
     result = fixture.command("--seed-queue-history")
     assert result[0] == 0, result
+    config = fixture.root / "home/.asura/config.yaml"
+    config.write_text(f"model: ollama:history-fixture\nproviders:\n  ollama:\n    endpoint: {endpoint}\n")
+    config.chmod(0o600)
     for count in (1, 2):
         trial = fixture.launch(cwd=fixture.root / "project")
         try:
             trial.until("project · ".encode(), plain=True, limit=15)
-            trial.until(f"Restored {count + 3} conversation turns".encode(), plain=True, limit=20)
+            try:
+                trial.until(f"Restored {count + 3} conversation turns".encode(), plain=True, limit=20)
+            except AssertionError:
+                # Reveal the bounded notice without retrying or altering the
+                # failed workflow; the narrow header can clip its reason.
+                trial.resize(200, 24)
+                trial.idle(0.1)
+                print("Queue-history restoration diagnostic:\n" + trial.screen.text(), file=sys.stderr)
+                raise
             trial.send(b"\x1b[1;2A")  # Shift+Up enters the scrollable conversation pane.
             trial.until(b"scroll history", plain=True, limit=5)
             focus_offset = len(trial.output)
@@ -929,7 +1020,7 @@ def queue_history_admission(fixture, source):
                 assert time.monotonic() < end, trial.screen.text()
                 trial.read(0.025)
             trial.send(f"queue-history-admission-{count}\r".encode())
-            trial.until(b"Generating", plain=True, limit=12, reject="request_conflict")
+            trial.until(b"Generating", plain=True, limit=30, reject="request_conflict")
             trial.send(b"activity draft")
             trial.send(b"\x1b[17~")  # F6 enters response history without recalling input.
             trial.until(b"responses", plain=True, limit=5)
@@ -1165,6 +1256,12 @@ def composer_interactions(fixture, source):
             # transition rather than inspecting an intermediate terminal write.
             trial.until(b"Enter open", offset, plain=True)
             trial.until(b"preserved draft", offset, plain=True)
+            notice = "Model selected for future inputs"
+            rows = trial.screen.text().splitlines()
+            assert notice in rows[0], trial.screen.text()
+            assert rows[0].startswith(" Asura"), rows[0]
+            assert rows[0].rstrip().endswith(notice), rows[0]
+            assert all(notice not in row for row in rows[1:]), trial.screen.text()
             saved = (fixture.root / "home/.asura/config.yaml").read_text()
             assert "coreai:composer-test" in saved, saved
             # Picker-origin config must not create an overlay or consume the draft.
@@ -1181,6 +1278,178 @@ def composer_interactions(fixture, source):
             trial.close()
             fixture.stop()
         print("PASS composer project/model selectors, acknowledged model save, preserved draft, history and cleanup")
+
+
+def rich_activity(fixture, source, multipass=False):
+    """Real service/helper tools and TUI; deterministic local provider, no weights."""
+    import threading
+
+    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    (fixture.root / "asura-model").chmod(0o700)
+    project = fixture.root / "project"
+    project.mkdir(mode=0o700)
+    if multipass:
+        (project / "README.md").write_text("FIXTURE README evidence\n")
+        (project / "README.md").chmod(0o600)
+        outside = fixture.root / "outside"
+        outside.mkdir(mode=0o700)
+        (project / "src").symlink_to(outside, target_is_directory=True)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(0.1)
+    endpoint = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    stopped = threading.Event()
+    errors = []
+    requests = []
+
+    def serve():
+        end = time.monotonic() + 60
+        try:
+            for _ in range(12):
+                while not stopped.is_set() and time.monotonic() < end:
+                    try:
+                        peer, _ = listener.accept()
+                        break
+                    except socket.timeout:
+                        continue
+                else:
+                    return
+                with peer:
+                    peer.settimeout(2)
+                    request = bytearray()
+                    while True:
+                        data = peer.recv(4096)
+                        assert data, "incomplete fixture request"
+                        request.extend(data)
+                        assert len(request) <= 65536, "fixture request limit"
+                        if b"\r\n\r\n" in request:
+                            header, body = request.split(b"\r\n\r\n", 1)
+                            length = next((int(line.split(b":", 1)[1]) for line in header.split(b"\r\n")
+                                           if line.lower().startswith(b"content-length:")), 0)
+                            assert length <= 65536
+                            if len(body) >= length:
+                                break
+                    if request.startswith(b"POST /api/show "):
+                        response = {"capabilities": ["completion", "tools"],
+                                    "model_info": {"fixture.context_length": 8192}}
+                    elif request.startswith(b"GET /api/version "):
+                        response = {"version": "0.34.4"}
+                    elif request.startswith(b"POST /api/chat "):
+                        chat = json.loads(body[:length])
+                        requests.append(chat)
+                        final_request = 4 if multipass else 2
+                        assert len(requests) <= final_request, "unexpected extra inference"
+                        assert chat["model"] == "fixture:latest:local", chat["model"]
+                        peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                        if multipass and len(requests) < 4:
+                            calls = [
+                                ("project", {"command": "read_file", "path": "README.md", "offset": 0, "limit": 100}),
+                                ("project", {"command": "list_directory", "path": "src"}),
+                                ("service", {"command": "tools"}),
+                            ]
+                            name, arguments = calls[len(requests) - 1]
+                            assert any(tool["function"]["name"] == name for tool in chat["tools"])
+                            if len(requests) == 2:
+                                assert any("FIXTURE README evidence" in message.get("content", "")
+                                           for message in chat["messages"] if message.get("role") == "tool")
+                            if len(requests) == 3:
+                                assert any("Tool failed" in message.get("content", "")
+                                           for message in chat["messages"] if message.get("role") == "tool")
+                            response = {"message": {"role": "assistant", "content": "", "tool_calls": [
+                                        {"function": {"name": name, "arguments": arguments}}]},
+                                        "done": True, "done_reason": "stop",
+                                        "prompt_eval_count": 16 * (len(requests) + 1), "eval_count": 2}
+                        elif not multipass and len(requests) == 1:
+                            assert any(tool["function"]["name"] == "shell" for tool in chat["tools"])
+                            response = {"message": {"role": "assistant", "content": "",
+                                        "tool_calls": [{"function": {"name": "shell", "arguments": {
+                                            "command": "sleep 1; printf fixture-result", "cwd": ".", "timeout_seconds": 5}}}]},
+                                        "done": True, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}
+                        else:
+                            tool_messages = [message for message in chat["messages"] if message.get("role") == "tool"]
+                            if multipass:
+                                assert len(tool_messages) == 3, tool_messages
+                                assert "shell" in tool_messages[-1]["content"], tool_messages[-1]
+                            else:
+                                assert any("fixture-result" in message.get("content", "")
+                                           for message in tool_messages), chat["messages"]
+                            # Keep final generation pending long enough to inspect
+                            # the live committed outcome before automatic collapse.
+                            peer.sendall(b'{"message":{"role":"assistant","content":"Result "},"done":false}\n')
+                            if stopped.wait(1):
+                                return
+                            response = {"message": {"role": "assistant", "content": "COMPLETE"},
+                                        "done": True, "done_reason": "stop",
+                                        "prompt_eval_count": 80 if multipass else 48, "eval_count": 5}
+                        peer.sendall(json.dumps(response).encode() + b"\n")
+                        if len(requests) == final_request:
+                            return
+                        continue
+                    else:
+                        raise AssertionError("unexpected fixture request")
+                    payload = json.dumps(response).encode()
+                    peer.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+        except Exception as error:
+            if not stopped.is_set():
+                errors.append(error)
+
+    server = threading.Thread(target=serve, name="asura-rich-activity-fixture")
+    server.start()
+    trial = None
+    try:
+        trial = fixture.launch()
+        if multipass:
+            trial.resize(120, 40)
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        for key, value in [("providers.ollama.endpoint", endpoint), ("model", "ollama:fixture")]:
+            trial.send(f"/config set {key} {value}\r".encode())
+            trial.until(f"Saved {key}".encode(), plain=True)
+            trial.send(b"\x1b")
+            trial.idle(0.1)
+        trial.send(b"Run the fixture command.\r")
+        trial.until(b"README.md" if multipass else b"sleep 1; printf fixture-result",
+                    plain=True, limit=25, reject="Incomplete response")
+        trial.until(b"service admitted", plain=True, limit=5)
+        trial.send(b"preserved draft")
+        trial.until(b"preserved draft", plain=True, limit=2)
+        trial.until(b"Result COMPLETE", plain=True, limit=15, reject="Incomplete response")
+        trial.until(("↓224 ↑11" if multipass else "↓80 ↑7").encode(), plain=True, limit=5)
+        trial.until(b"last:", plain=True, limit=8)  # Durable terminal event, not provisional final text.
+        assert not errors, errors
+        trial.send(b"\x1b[17~\r")  # F6 response history, Enter expands its activity.
+        trial.until("▾ Activity · Complete".encode(), plain=True)
+        trial.until(b"FIXTURE README evidence" if multipass else b"exit 0", plain=True)
+        trial.until(b"preview:", plain=True)
+        trial.idle(0.1)  # Drain the remainder of this terminal frame before inspecting its cells.
+        screen = trial.screen.text()
+        assert "service admitted" in screen, screen
+        if multipass:
+            assert "FIXTURE README evidence" in screen and "failed" in screen, screen
+            assert len(requests) == 4, len(requests)
+        else:
+            assert "fixture-result" in screen, screen
+        assert "last:" in screen and "partial" not in screen, screen
+        assert "preserved draft" in screen, screen
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        assert not list((fixture.root / "home/.asura/run").glob("model-*"))
+        print("PASS " + ("three tool passes, denied directory and fourth final answer; " if multipass else "")
+              + "live tool admission, captured outcome/preview, measured totals, history/draft and owned cleanup")
+    finally:
+        if trial is not None:
+            trial.close()
+        stopped.set()
+        server.join(timeout=3)
+        listener.close()
+        assert not server.is_alive(), "fixture server cleanup unconfirmed"
+        assert not errors, errors
 
 
 def long_observation(fixture, source):
@@ -1308,11 +1577,15 @@ def main():
     queue_history = len(sys.argv) == 3 and sys.argv[2] == "--queue-history"
     queue_reorder = len(sys.argv) == 3 and sys.argv[2] == "--queue-reorder"
     long = len(sys.argv) == 3 and sys.argv[2] == "--long-observation"
-    assert len(sys.argv) == 2 or native or setup or models or composer or queue_history or queue_reorder or long, __doc__
+    activity = len(sys.argv) == 3 and sys.argv[2] == "--activity"
+    multipass = len(sys.argv) == 3 and sys.argv[2] == "--activity-multipass"
+    assert len(sys.argv) == 2 or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
         DEADLINE = time.monotonic() + 160
+    if activity or multipass:
+        DEADLINE = time.monotonic() + 90
     source = Path(sys.argv[1]).resolve(strict=True)
     probe = subprocess.run(
         [str(source), "--asura-lifecycle-fixture-probe"],
@@ -1323,6 +1596,9 @@ def main():
             and not probe.stderr), "PTY journey requires the isolated lifecycle fixture"
     fixture = Fixture(source)
     try:
+        if activity or multipass:
+            rich_activity(fixture, source, multipass)
+            return
         if long:
             long_observation(fixture, source)
             return
@@ -1359,7 +1635,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

@@ -36,7 +36,7 @@ pub struct Replay {
     transition_ids: BTreeSet<Id>,
     generated_ids: BTreeSet<Id>,
     // Conservative per-entry allocation charges include B-tree nodes and strings.
-    // Frame bodies are never cloned into these indexes.
+    // Only bounded tool display prefixes are cloned; full bodies remain in frames.
     memory_charge: usize,
     input_charge: usize,
 }
@@ -49,6 +49,32 @@ fn require(ok: bool) -> Result<()> {
 }
 fn next(n: u64) -> Result<u64> {
     n.checked_add(1).ok_or(ReplayError::Limit)
+}
+/// UTF-8 byte bound independent of terminal rendering and journal encoding.
+fn display_prefix(text: &str, limit: usize) -> String {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+fn display_arguments(p: &ToolIntent) -> String {
+    let text = match p.kind {
+        1 => format!("read_file {} offset={} limit={}", p.path, p.offset, p.limit),
+        2 => format!("list_directory {}", p.path),
+        3 => "status".into(),
+        6 => format!("list_notes after={} limit={}", p.path, p.limit),
+        7 => format!("get_note {} offset={} limit={}", p.path, p.offset, p.limit),
+        8 => format!("note_sources {}", p.path),
+        14 => "tools".into(),
+        15 => format!("audit limit={}", p.limit),
+        16 => {
+            let (command, cwd) = p.path.split_once('\0').unwrap_or((&p.path, ""));
+            format!("{} cwd={} timeout={}s", command, cwd, p.limit)
+        }
+        _ => "invalid arguments".into(),
+    };
+    display_prefix(&text, 192)
 }
 impl Replay {
     /// Return the effective display name and independent name revision.
@@ -376,7 +402,7 @@ impl Replay {
                         && self.projects.contains_key(&p.project)
                         && !self.project_memory_blocked(p.project),
                 )?;
-                self.charge(512)?;
+                self.charge(1024)?;
                 let owner = self.owner_generation;
                 let op = self.operation_mut(p.operation, p.generation)?;
                 require(
@@ -388,6 +414,10 @@ impl Replay {
                         && op.tools.iter().all(|t| t.result_frame.is_some()),
                 )?;
                 op.tools.push(ToolRecord {
+                    arguments: format!("create_note body_bytes={}", p.body_bytes),
+                    preview: None,
+                    truncated: None,
+                    exit_code: None,
                     create: Some(Box::new(p)),
                     kind: 12,
                     offset: 0,
@@ -399,7 +429,7 @@ impl Replay {
                 });
             }
             Record::ToolIntent(p) => {
-                self.charge(256)?;
+                self.charge(1024)?;
                 let owner = self.owner_generation;
                 let op = self.operation_mut(p.operation, p.generation)?;
                 require(
@@ -411,6 +441,10 @@ impl Replay {
                         && op.tools.iter().all(|t| t.result_frame.is_some()),
                 )?;
                 op.tools.push(ToolRecord {
+                    arguments: display_arguments(&p),
+                    preview: None,
+                    truncated: None,
+                    exit_code: None,
                     create: None,
                     kind: p.kind,
                     offset: p.offset,
@@ -476,6 +510,31 @@ impl Replay {
                 tool.result_frame = Some(frame);
                 tool.result_status = Some(p.status);
                 tool.result_bytes = p.text.len();
+                tool.preview = Some(if matches!(tool.kind, 7 | 12) {
+                    format!("captured {} bytes", p.text.len())
+                } else if tool.kind == SHELL_TOOL_KIND {
+                    let output = p
+                        .text
+                        .split_once("\nstdout:\n")
+                        .map(|(_, body)| body)
+                        .unwrap_or("");
+                    let (stdout, stderr) = output.split_once("\nstderr:\n").unwrap_or((output, ""));
+                    display_prefix(if stdout.is_empty() { stderr } else { stdout }, 128)
+                } else {
+                    display_prefix(&p.text, 128)
+                });
+                tool.truncated = Some(p.truncated);
+                if tool.kind == SHELL_TOOL_KIND {
+                    tool.exit_code = p
+                        .text
+                        .lines()
+                        .next()
+                        .and_then(|line| {
+                            line.split_whitespace()
+                                .find_map(|field| field.strip_prefix("exit_code="))
+                        })
+                        .and_then(|value| value.parse().ok());
+                }
             }
             Record::TurnTerminal(p) => self.terminal(p, frame)?,
         }
@@ -1009,10 +1068,8 @@ impl Replay {
         if self.input_status(id) != Some(InputStatus::Queued) {
             return false;
         }
-        if input.resumed {
-            if !input.v2 {
-                return true;
-            }
+        if input.resumed && !input.v2 {
+            return true;
         }
         if input.v2 {
             if input.kind == InputKind::Steer {

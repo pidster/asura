@@ -26,6 +26,7 @@ public enum Wire {
         guard message.unknownFields.data.isEmpty, let body = message.body else { throw HelperError.protocolFault }
         let known: Bool
         switch body {
+        case .inferenceUsage(let v): known = v.unknownFields.data.isEmpty
         case .contextMeasured(let v): known = v.unknownFields.data.isEmpty
         case .hello(let v): known = v.unknownFields.data.isEmpty
             && v.models.allSatisfy { $0.unknownFields.data.isEmpty }
@@ -87,6 +88,12 @@ public enum Wire {
                 && value.operationID.contains(where: { $0 != 0 }) && value.hasGeneration && value.generation > 0)
         }
         switch body {
+        case .inferenceUsage(let v):
+            try check(!service && v.hasRequestOrdinal && (1...64).contains(v.requestOrdinal) && v.hasComplete
+                && (!v.hasInputTokens || v.inputTokens <= 1_000_000_000)
+                && (!v.hasOutputTokens || v.outputTokens <= 1_000_000_000)
+                && (!v.hasCachedInputTokens || (v.hasInputTokens && v.cachedInputTokens <= v.inputTokens))
+                && (!v.complete || (v.hasInputTokens && v.hasOutputTokens)))
         case .contextMeasured(let v):
             try check(!service && v.hasInputTokens && v.hasCapacityTokens && v.capacityTokens > 0 && v.inputTokens <= v.capacityTokens)
         case .hello(let v):

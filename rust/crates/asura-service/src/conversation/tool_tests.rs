@@ -62,6 +62,7 @@ impl Fixture {
             accepted: true,
             ready: false,
             start_committed: true,
+            measurements: TurnMeasurements::default(),
             tools_enabled: true,
             capabilities: crate::model::CapabilityProfile {
                 supported: Some(1),
@@ -126,6 +127,7 @@ impl Fixture {
                 started: true,
                 automatic_initialization: AutomaticInitialization::Complete,
                 model_context: VecDeque::new(),
+                measurements: VecDeque::new(),
                 hold_reasons: BTreeMap::new(),
                 wake: None,
                 observations: vec![],
@@ -1019,6 +1021,10 @@ fn committed_tool_activity_is_observable_before_model_text() {
         .unwrap()
         .tools
         .push(journal::ToolRecord {
+            arguments: String::new(),
+            preview: None,
+            truncated: None,
+            exit_code: None,
             create: None,
             kind: 14,
             offset: 0,
@@ -1057,4 +1063,77 @@ fn committed_tool_activity_is_observable_before_model_text() {
     };
     assert_eq!(event.tools[0].state, Some(2));
     assert!(event.text.is_none());
+}
+
+#[test]
+fn turn_measurements_preserve_partial_counts_zero_and_frozen_duration() {
+    let start = Instant::now();
+    let mut m = TurnMeasurements {
+        started: Some(start),
+        ..Default::default()
+    };
+    let initial = m.snapshot(start).unwrap();
+    assert_eq!(initial.input_tokens, None);
+    assert_eq!(initial.complete, Some(false));
+    m.record(&mp::InferenceUsage {
+        request_ordinal: Some(1),
+        input_tokens: Some(20),
+        output_tokens: Some(0),
+        complete: Some(true),
+        ..Default::default()
+    });
+    m.record(&mp::InferenceUsage {
+        request_ordinal: Some(2),
+        input_tokens: None,
+        output_tokens: Some(3),
+        complete: Some(false),
+        ..Default::default()
+    });
+    let partial = m.snapshot(start).unwrap();
+    assert_eq!(partial.input_tokens, Some(20));
+    assert_eq!(partial.output_tokens, Some(3));
+    assert_eq!(partial.cached_input_tokens, None);
+    assert_eq!(partial.complete, Some(false));
+    m.ended = Some(start + std::time::Duration::from_millis(42));
+    assert_eq!(
+        m.snapshot(start + std::time::Duration::from_secs(10))
+            .unwrap()
+            .elapsed_ms,
+        Some(42)
+    );
+    assert!(TurnMeasurements::default().snapshot(start).is_none());
+}
+
+#[test]
+fn aggregate_measurements_fail_closed_on_arithmetic_overflow() {
+    let mut m = TurnMeasurements {
+        input: Some(u64::MAX),
+        output: Some(0),
+        ..Default::default()
+    };
+    m.record(&mp::InferenceUsage {
+        request_ordinal: Some(1),
+        input_tokens: Some(1),
+        output_tokens: Some(0),
+        complete: Some(true),
+        ..Default::default()
+    });
+    assert_eq!(m.input, None);
+    assert!(!m.complete);
+}
+
+#[test]
+fn settled_measurements_cache_evicts_oldest_and_restart_stays_unknown() {
+    let mut fixture = inventory_fixture();
+    let mut active = fixture.owner.active.take().unwrap();
+    for n in 1..=9 {
+        active.turn.operation = [n; 16];
+        fixture.owner.active = Some(active);
+        fixture.acknowledge(Job::Finish);
+        active = inventory_fixture().owner.active.take().unwrap();
+    }
+    assert_eq!(fixture.owner.measurements.len(), 8);
+    assert_eq!(fixture.owner.measurements.front().unwrap().0, [2; 16]);
+    assert_eq!(fixture.owner.measurements.back().unwrap().0, [9; 16]);
+    assert!(inventory_fixture().owner.measurements.is_empty());
 }

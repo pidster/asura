@@ -652,3 +652,97 @@ func lateInputMeasurementPreservesOutputAndRejectsDuplicate(_ duplicate: Bool) a
     service.close()
     await running.value
 }
+
+private actor UsageSocketBackend: ModelBackend {
+    let mode: String
+    private(set) var started = false
+    private(set) var lateReportRejected = false
+    init(mode: String) { self.mode = mode }
+    func status() async -> BackendStatus {
+        BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system)
+    }
+    func generate(_ input: ModelInput, maximumTokens: UInt32,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await snapshot(Snapshot(text: "", inferenceStartedOrdinal: 1))
+        started = true
+        if mode == "cancel" {
+            do { try await Task.sleep(for: .seconds(30)) }
+            catch {
+                do { try await snapshot(Snapshot(text: "", inferenceUsage: RequestUsage(ordinal: 1))) }
+                catch is CancellationError { lateReportRejected = true }
+                throw CancellationError()
+            }
+        } else {
+            try await snapshot(Snapshot(text: "complete response", usageTokens: 4))
+            let report = RequestUsage(ordinal: 1, inputTokens: 0, outputTokens: 4, complete: true)
+            try await snapshot(Snapshot(text: "", inferenceUsage: report))
+            if mode == "duplicate" { try await snapshot(Snapshot(text: "", inferenceUsage: report)) }
+        }
+    }
+}
+
+@Test(arguments: ["complete", "duplicate", "cancel"])
+func usageReportsPreserveTextAndCancellationHasOneReportBeforeTerminal(mode: String) async throws {
+    let (helper, service) = try pair()
+    defer { helper.close(); service.close() }
+    let identity = Data(repeating: 1, count: 32)
+    let backend = UsageSocketBackend(mode: mode)
+    let session = HelperSession(transport: helper, backend: backend, buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    var replies = service.frames.makeAsyncIterator()
+    try await service.send(hello(identity)); _ = try await replies.next()
+    var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
+    let bytes = try input.serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    begin.inputBytes = UInt64(bytes.count); begin.maxResponseTokens = 512
+    try await service.send(scoped(.begin(begin))); _ = try await replies.next()
+    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+    chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
+    try await service.send(scoped(.chunk(chunk)), control: false)
+    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(bytes.count)
+    try await service.send(scoped(.inputEnd(end)), control: false); _ = try await replies.next()
+    try await service.send(scoped(.start(.init())))
+    if mode == "cancel" {
+        let limit = ContinuousClock.now.advanced(by: .seconds(1))
+        while !(await backend.started) {
+            guard ContinuousClock.now < limit else { throw HelperError.timeout }
+            await Task.yield()
+        }
+        var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
+        try await service.send(scoped(.cancel(cancel)))
+    } else { try await service.send(outputCredit(2)) }
+    var reports: [Asura_Model_V1_InferenceUsage] = []
+    var text = Data()
+    var terminal: Asura_Model_V1_Terminal?
+    while let raw = try await replies.next() {
+        let frame = try Wire.decode(raw)
+        switch frame.body {
+        case .inferenceUsage(let report): reports.append(report)
+        case .chunk(let value): text.append(value.data)
+        case .snapshotEnd: break
+        case .terminal(let value):
+            #expect(reports.count == 1)
+            terminal = value
+        default: Issue.record("unexpected inference usage output")
+        }
+        if terminal != nil { break }
+    }
+    let report = try #require(reports.first)
+    #expect(report.requestOrdinal == 1)
+    if mode == "cancel" {
+        #expect(!report.complete && !report.hasInputTokens && !report.hasOutputTokens)
+        #expect(terminal?.outcome == .cancelled)
+        #expect(text.isEmpty)
+    } else {
+        #expect(report.complete && report.hasInputTokens && report.inputTokens == 0 && report.outputTokens == 4)
+        #expect(String(decoding: text, as: UTF8.self) == "complete response")
+        #expect(terminal?.lastRevision == 1)
+        #expect(terminal?.outcome == (mode == "duplicate" ? .failed : .complete))
+    }
+    await running.value
+    if mode == "cancel" {
+        let limit = ContinuousClock.now.advanced(by: .seconds(1))
+        while !(await backend.lateReportRejected) && ContinuousClock.now < limit { await Task.yield() }
+        #expect(await backend.lateReportRejected)
+    }
+}

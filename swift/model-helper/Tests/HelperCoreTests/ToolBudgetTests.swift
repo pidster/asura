@@ -108,19 +108,19 @@ private struct ProbeModel: LanguageModel {
 }
 
 
-@Test func smallerCallerCapsDoNotRefundToolPassAllocation() async throws {
+@Test func smallCallerCapsStillHaveARequestResourceBound() async throws {
     let probe = DispatchProbe()
     let model = BoundedToolModel(base: ProbeModel(probe: probe))
     let executor = try BoundedToolModel<ProbeModel>.Executor(configuration: 0)
     let request = LanguageModelExecutorGenerationRequest(id: UUID(), transcript: Transcript(entries: []),
         enabledTools: [], generationOptions: GenerationOptions(maximumResponseTokens: 20),
         contextOptions: ContextOptions(), metadata: [:])
-    for _ in 0..<3 { try await executor.respond(to: request, model: model, streamingInto: .init()) }
+    for _ in 0..<64 { try await executor.respond(to: request, model: model, streamingInto: .init()) }
     await #expect(throws: BackendFailure.self) {
         try await executor.respond(to: request, model: model, streamingInto: .init())
     }
-    #expect(await probe.limits == [20, 20, 20])
-    #expect(ToolRoundLimits.allocations.reduce(0, +) == 2048)
+    #expect(await probe.limits == Array(repeating: 20, count: 64))
+    #expect(await probe.limits.compactMap { $0 }.reduce(0, +) <= 2048)
 }
 
 

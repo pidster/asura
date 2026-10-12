@@ -147,7 +147,8 @@ pub fn validate_semantics(
         | Body::SnapshotEnd(_)
         | Body::Terminal(_)
         | Body::ToolCall(_)
-        | Body::ContextMeasured(_) => !service,
+        | Body::ContextMeasured(_)
+        | Body::InferenceUsage(_) => !service,
         Body::Chunk(v) => v.direction == Some(if service { 1 } else { 2 }),
     };
     if !allowed {
@@ -330,6 +331,16 @@ pub fn validate_semantics(
         }
         Body::ContextMeasured(v) => {
             matches!((v.input_tokens, v.capacity_tokens), (Some(n), Some(c)) if c > 0 && n <= c)
+        }
+        Body::InferenceUsage(v) => {
+            v.request_ordinal.is_some_and(|n| (1..=64).contains(&n))
+                && v.input_tokens.is_none_or(|n| n <= 1_000_000_000)
+                && v.output_tokens.is_none_or(|n| n <= 1_000_000_000)
+                && v.cached_input_tokens
+                    .is_none_or(|n| v.input_tokens.is_some_and(|i| n <= i))
+                && matches!(v.complete, Some(false) | Some(true))
+                && (v.complete != Some(true)
+                    || (v.input_tokens.is_some() && v.output_tokens.is_some()))
         }
         Body::Begin(v) => {
             v.model.as_deref().is_some_and(selector)

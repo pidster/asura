@@ -1707,3 +1707,26 @@ fn old_owner_result_exception_cannot_resolve_an_ordinary_tool_or_wrong_create() 
         assert!(inspect(&journal.bytes).is_err());
     }
 }
+
+#[test]
+fn reopened_tool_display_projections_are_bounded_and_capture_stdout() {
+    let mut journal = Journal::started();
+    let mut intent = shell_intent(1);
+    intent.path = format!("printf {}\0.", "界".repeat(100));
+    journal.append(Record::ToolIntent(intent));
+    journal.append(Record::ToolResult(ToolResult {
+        text: format!("failure=None exit_code=17 signal=none reason=none truncated=true cleanup_confirmed=true\nstdout:\n{}\nstderr:\nwarning", "界".repeat(100)),
+        ..shell_result(1, 1)
+    }));
+    let state = inspect(&journal.bytes).unwrap();
+    let tool = &state.operations[&id(10)].tools[0];
+    assert!(tool.arguments.len() <= 192);
+    assert!(tool.preview.as_ref().unwrap().len() <= 128);
+    assert!(tool.preview.as_ref().unwrap().starts_with("界"));
+    assert_eq!(tool.exit_code, Some(17));
+    assert_eq!(tool.truncated, Some(true));
+    assert_eq!(
+        inspect(&journal.bytes).unwrap().operations[&id(10)].tools[0],
+        *tool
+    );
+}

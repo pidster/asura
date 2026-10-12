@@ -2,7 +2,9 @@ import Foundation
 import FoundationModels
 
 public enum ToolRoundLimits {
-    public static let allocations = [1024, 512, 512]
+    public static let firstAllocation = 1024
+    public static let continuationAllocation = 512
+    public static let maximumRequests = 64
 }
 
 /// Budget state belongs to one admitted turn, even if the framework caches executors.
@@ -13,6 +15,7 @@ public actor ToolRoundBudget {
     private let toolsEnabled: Bool
     private var failure: BackendFailure?
     private var inferenceActive = false
+    private var activeAllocation: Int?
     private var waiters: [UUID: CheckedContinuation<Void, any Error>] = [:]
     public init(maximumTokens: Int = 2048, toolsEnabled: Bool = true) {
         remaining = min(max(0, maximumTokens), 2048)
@@ -22,8 +25,13 @@ public actor ToolRoundBudget {
         if failure == nil { failure = error }
     }
     public func recordedFailure() -> BackendFailure? { failure }
-    public func finishInference(_ error: BackendFailure? = nil) {
+    public func finishInference(_ error: BackendFailure? = nil, measuredOutput: UInt64? = nil) {
         if let error { record(error) }
+        if let measuredOutput, let allocation = activeAllocation, error == nil, failure == nil {
+            if measuredOutput <= UInt64(allocation) { remaining += allocation - Int(measuredOutput) }
+            else { record(BackendFailure(.protocolFault)) }
+        }
+        activeAllocation = nil
         inferenceActive = false
         let pending = waiters.values
         waiters.removeAll()
@@ -66,18 +74,24 @@ public actor ToolRoundBudget {
         waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
     }
     func pendingCallbacks() -> Int { waiters.count }
-    public func reserve() throws -> Int {
+    public func reserve(requestedMaximum: Int? = nil) throws -> Int {
         try Task.checkCancellation()
         if let failure { throw failure }
-        guard remaining > 0, used < (toolsEnabled ? ToolRoundLimits.allocations.count : 1) else {
+        guard remaining > 0, used < (toolsEnabled ? ToolRoundLimits.maximumRequests : 1) else {
             let error = BackendFailure(.outputLimit)
             record(error)
             throw error
         }
-        let allocation = min(remaining, toolsEnabled ? ToolRoundLimits.allocations[used] : remaining)
+        guard !inferenceActive else {
+            let error = BackendFailure(.protocolFault); record(error); throw error
+        }
+        let requested = requestedMaximum ?? remaining
+        guard requested > 0 else { throw BackendFailure(.outputLimit) }
+        let passLimit = toolsEnabled ? (used == 0 ? ToolRoundLimits.firstAllocation : ToolRoundLimits.continuationAllocation) : remaining
+        let allocation = min(remaining, passLimit, requested)
         used += 1
         remaining -= allocation
-        inferenceActive = true
+        inferenceActive = true; activeAllocation = allocation
         return allocation
     }
 
@@ -88,8 +102,9 @@ public actor ToolRoundBudget {
 public struct BoundedToolModel<Base: LanguageModel>: LanguageModel {
     public let base: Base
     public let budget: ToolRoundBudget
-    public init(base: Base, maximumTokens: Int = 2048, toolsEnabled: Bool = true) {
-        self.base = base
+    public let usageObserver: InferenceUsageObserver?
+    public init(base: Base, maximumTokens: Int = 2048, toolsEnabled: Bool = true, usageObserver: InferenceUsageObserver? = nil) {
+        self.base = base; self.usageObserver = usageObserver
         self.budget = ToolRoundBudget(maximumTokens: maximumTokens, toolsEnabled: toolsEnabled)
     }
     public var capabilities: LanguageModelCapabilities { base.capabilities }
@@ -104,21 +119,26 @@ public struct BoundedToolModel<Base: LanguageModel>: LanguageModel {
         }
         public func respond(to request: LanguageModelExecutorGenerationRequest, model: Model,
             streamingInto channel: LanguageModelExecutorGenerationChannel) async throws {
-            let allocation = try await model.budget.reserve()
+            let allocation = try await model.budget.reserve(requestedMaximum: request.generationOptions.maximumResponseTokens)
             var bounded = request
-            bounded.generationOptions.maximumResponseTokens = min(
-                request.generationOptions.maximumResponseTokens ?? allocation,
-                allocation)
-            do {
-                try await underlying.respond(to: bounded, model: model.base, streamingInto: channel)
-                await model.budget.finishInference()
-            } catch let error as BackendFailure {
-                await model.budget.finishInference(error)
-                // Let the SDK drain buffered text. The guarded native callback
-                // and every later inference dispatch reject this retained error.
-            } catch {
-                await model.budget.finishInference(BackendFailure(.internalError))
+            bounded.generationOptions.maximumResponseTokens = allocation
+            do { try await model.usageObserver?.begin(request.id, cap: allocation) }
+            catch {
+                await model.budget.finishInference((error as? BackendFailure) ?? BackendFailure(.internalError))
                 throw error
+            }
+            var failure: (any Error)?
+            do { try await underlying.respond(to: bounded, model: model.base, streamingInto: channel) }
+            catch { failure = error }
+            var measuredOutput: UInt64?
+            do { measuredOutput = try await model.usageObserver?.settle(request.id, succeeded: failure == nil) }
+            catch { if failure == nil { failure = error } }
+            if let failure {
+                await model.budget.finishInference((failure as? BackendFailure) ?? BackendFailure(.internalError))
+                // Preserve typed failures while letting the SDK drain already buffered text.
+                if !(failure is BackendFailure) { throw failure }
+            } else {
+                await model.budget.finishInference(measuredOutput: measuredOutput)
             }
         }
     }

@@ -255,6 +255,10 @@ fn pending_projection() -> Arc<journal::Replay> {
             cancel: None,
             terminal: None,
             tools: vec![journal::ToolRecord {
+                arguments: String::new(),
+                preview: None,
+                truncated: None,
+                exit_code: None,
                 kind: 12,
                 intent_frame: 0..1,
                 create: Some(Box::new(create)),

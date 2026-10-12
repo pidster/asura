@@ -116,7 +116,9 @@ fn tables(
             let kind = match field.r#type() {
                 Type::Bool => "Kind::Bool".to_string(),
                 Type::Uint64 => "Kind::U64".to_string(),
-                Type::Uint32 => "Kind::U32".to_string(),
+                // Zigzag sint32 has the same encoded unsigned 32-bit bound;
+                // prost decodes its signed value and canonical re-encoding follows.
+                Type::Uint32 | Type::Sint32 => "Kind::U32".to_string(),
                 Type::String => "Kind::String".to_string(),
                 Type::Bytes => "Kind::Bytes".to_string(),
                 Type::Enum => format!(

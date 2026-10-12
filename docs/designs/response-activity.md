@@ -2,6 +2,11 @@
 
 Status: selected implementation design for live activity and expandable response history.
 
+The selected 2026-09-30 extension below adds richer live feedback and turn
+measurements. The [conversation projection direction](conversation-projections.md)
+also proposes recoverable full results and recomposable model context. Those later
+extensions remain design work.
+
 ## Ownership and data
 
 The service owns tool execution and durable intent/result records. Existing
@@ -27,7 +32,8 @@ Active responses show their tool list automatically. Each row shows its ordinal,
 name and running, complete, failed or interrupted state. Failed rows also show the
 result reason. The lifecycle row shows waiting, generating, complete, failed,
 cancelled or interrupted. This is execution metadata, not private model reasoning.
-Raw arguments, tool output and shell output streaming are outside this packet.
+The selected extension adds bounded arguments and captured-result previews.
+Continuous shell output streaming remains outside this packet.
 
 Completed responses show a compact activity summary. F6 enters response navigation
 at the newest entry. Up/Down select a response; Home/End select oldest/newest.
@@ -84,10 +90,12 @@ Run CLI unit and lifecycle checks, focused service coverage, lint and final buil
 
 ## Response limits and truthful completion
 
-Selected correction: new admissions reserve 2,048 output tokens. Local custom model
-inference with tools allocates 1,024, 512 and 512 tokens across at most three passes.
-This replaces the overly small 256/128/128 split. The service retains its 60-second
-turn deadline, eight-tool limit and 61,440-byte response bound. Limits remain
+Selected correction: new admissions reserve 2,048 output tokens. Tool inference
+requests use a first-request cap of 1,024 and continuation caps of 512.
+The 2026-09-30 extension removes the independent three-request limit and releases
+unused reservations only from verified successful output counts. The service uses
+the selected cancellation-driven turn lifetime and retains its
+eight-tool limit and 61,440-byte response bound. Limits remain
 necessary; reaching one must preserve received text and mark the response incomplete.
 The TUI retains every received response byte within the wire bound, sanitizes control
 characters and permits scrolling through the complete retained text.
@@ -167,11 +175,11 @@ The helper session retains one pending backend failure reason while its existing
 current snapshot and replaceable latest snapshot drain through output credit.
 It accepts no further backend snapshots or tool requests after that failure.
 After the final SnapshotEnd, it sends a failed terminal with the original reason
-and unknown usage. This adds no snapshot queue and does not reset the Begin
-absolute deadline. Control cancellation and deadline expiry terminate immediately;
+and unknown usage. This adds no snapshot queue and does not reset an explicitly supplied Begin
+deadline. Control cancellation and deadline expiry terminate immediately;
 transport failure or an output bound reached by the drain also terminates without
-retrying the failed pump. Thus a peer withholding credit cannot retain the helper
-beyond the existing deadline. Socket tests cover delayed credit preserving both
+retrying the failed pump. An explicitly supplied deadline bounds this wait. Without one, the wait remains
+cancellation-driven with bounded retained snapshots and responsive controls. Socket tests cover delayed credit preserving both
 snapshots, withheld credit reaching timeout, and cancellation during the drain.
 
 ```mermaid
@@ -249,3 +257,116 @@ Rust formatting, diff checks and the final CLI build passed. The local Mermaid
 CLI rendered this flow and its output was inspected. The PTY fixture does not
 inject a deterministic Markdown model response; the Ratatui buffer test provides
 the direct styled-cell evidence.
+
+## Rich activity and turn measurements — selected 2026-09-30
+
+The owner authorizes work items 1–2 of the conversation projection direction.
+Extend existing service events, tool replay projections, helper callbacks and
+client activity. Result payload retention and richer graph ontology remain design
+work; no new output store, context composer or scheduler is introduced here.
+
+ToolProgress adds optional arguments (192 UTF-8 bytes), policy_decision (1 service
+admitted, 2 access denied, 3 rejected arguments), elapsed_ms, result_bytes,
+preview (128 UTF-8 bytes), truncated and exit_code. Rejected note content and
+large note bodies are not exposed; show version/body size references. Values
+come from typed service intents and committed results, not model assertions.
+Current-owner timing uses monotonic instants; replay can recover arguments and
+captured previews but cannot invent absent timing. Preview truncation is separate
+from stored-result truncation. Existing shell tails remain explicitly truncated.
+
+The replay projection caches bounded argument/result descriptions in ToolRecord,
+derived from verified journal bytes. This adds no filesystem access on the reactor
+and no new journal encoding. Charge the additional fixed memory against its existing
+16 MiB replay limit. At most eight tools are sent per event, with 192-byte arguments
+and 128-byte preview caps preserving room beside the existing 61,440-byte response.
+Strict wire validation and a maximal-frame regression must enforce that bound.
+The TUI sanitizes every string, displays running tools immediately, and expands
+committed outcomes/previews in response history. It cannot label execution safe
+merely because admission succeeded. A filesystem access failure can follow admission.
+
+ConversationEvent adds optional TurnStatistics: elapsed_ms, input_tokens,
+output_tokens, cached_input_tokens, complete and request_count. Duration starts
+when durable Start is dispatched, excludes queue/preparation and ends on settlement.
+Live observations report elapsed time without incrementing cursor for time alone.
+At most eight current-owner operation summaries are retained for terminal replay;
+restart leaves measurements absent. This explicitly does not persist new statistics
+in format-1 records. That belongs to the result/graph storage packet. Token IO is
+informational and does not replace existing durable charge accounting.
+
+Private InferenceUsage reports use envelope field 23 and consecutive request
+ordinals 1–64. Each optional count is at most 1,000,000,000; cached input requires
+measured input and cannot exceed it. Every settled request reports once; absent
+counts remain unknown. Service totals sum measured counts with checked arithmetic
+and mark them partial unless all reported requests completed with both counts.
+Channel loss/cancellation with an unreported active inference makes totals partial.
+The [helper usage design](turn-usage-helper.md) defines actual provider observations,
+start-marker cancellation settlement and conservative unknown counts. System,
+CoreAI and MLX cannot claim per-request counts from opaque SDK events; Ollama can.
+No counter comes from context occupancy, byte estimates or budget reservations.
+
+The observed failure after three tool passes requires correcting the fixed pass
+allocation guard. Keep the 2,048-token turn budget, first tool-pass cap 1,024,
+later-pass cap 512 and eight native proposals. Remove the independent three-pass
+limit. Only verified actual output from a successful request refunds unused
+reservation; unknown, failed and cancelled requests consume their reservation.
+The helper design specifies request identity, counter checks and release ordering.
+Plain-text generation keeps its single admitted request. This introduces no retry
+and does not repeat earlier tool effects.
+
+### Rich activity delivery — selected flow
+
+Arrows show existing execution events and bounded projection updates.
+
+```mermaid
+flowchart TD
+    Intent[Durable typed tool intent] --> Running[Publish bounded arguments and admission state]
+    Result[Durable tool outcome] --> Enrich[Publish bytes, captured preview and available timing]
+    Usage[One fenced usage report per inference] --> Sum[Checked per-operation token totals]
+    Running --> Event[Existing conversation event worker]
+    Enrich --> Event
+    Sum --> Event
+    Event --> Fence[Client identity, generation and cursor checks]
+    Fence --> Cache[Replace bounded response activity]
+    Cache --> UI[Live rows or expanded history and turn statistics]
+    Restart[Owner restart] --> Unknown[Replay captured evidence; timing and token IO unknown]
+    Unknown --> Event
+```
+
+Added work is bounded local CPU and existing awaited transport only. Existing
+workers, retained slots, transport deadlines, cancellation, priority inboxes and
+owned shutdown remain in force. No file/network calls occur in key/render loops.
+Service unit tests cover truthful policy/result mapping, unknown/replayed timing,
+duplicate/stale usage, overflow and failure. Storage tests verify bounded derived
+previews through reopen. Swift tests cover multiple small tool passes followed by
+an answer, conservative unknown accounting, cancellation and counter validation.
+Cross-language fixtures cover new fields and malformed messages. Process checks
+verify real Ollama continuation usage and responsive controls. PTY checks verify
+live metadata, expanded history, statistics, header notice relocation, draft
+preservation and owned cleanup. Native unsupported-provider counts remain unknown.
+
+### Recorded qualification — 2026-09-30
+
+**Verified behavior:** Swift helper tests passed 98 cases. The cross-language
+fixture exchange passed valid, unknown, zero and malformed inference-usage cases.
+Affected Rust library and journal suites passed 432 cases: CLI 168, control 31,
+service 137, storage 50, authority conversation 37 and journal writer 9.
+
+The actual local Ollama 0.34.4 service with `granite4.1:8b` completed a native
+tool continuation: two inference requests, 2,134 input tokens and 61 output tokens.
+The same process journey verified durable replay, disconnect continuation and
+outside-project secret non-disclosure. The Swift SDK regression completed three
+small tool calls followed by a fourth inference request and final answer.
+
+Isolated PTY journeys passed live shell activity and a four-request tool sequence,
+including a denied file access, full response, measurements, history navigation,
+draft preservation and owned cleanup. Composer navigation also passed.
+The restored-history journey exposed an intermittent writer-admission race.
+The service correction retains foreground reads behind any pending writer job.
+Four deterministic regressions passed, including active observation/cancellation
+bypass. The final CLI argument and lifecycle gate passed, including two restored
+launches with exact journal checks, queue reorder, ownership and terminal cleanup.
+
+Workspace Clippy passed with warnings denied. The actual debug CLI and matching
+Swift helper package were built. Timing and per-request token counts remain
+volatile across service restart. These checks do not verify full-result paging,
+new graph ontology implementation or native terminal visual correctness.

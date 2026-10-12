@@ -17,7 +17,7 @@ pub(super) struct Request {
 }
 
 pub(super) enum Outcome {
-    Reply(pb::ProjectRenameReply),
+    Reply(Box<pb::ProjectRenameReply>),
     Definite(String),
     Unconfirmed(String),
 }
@@ -91,7 +91,7 @@ impl Worker {
                     client.rename_project(request.command.clone())
                 };
                 let outcome = match run() {
-                    Ok(reply) => Outcome::Reply(reply),
+                    Ok(reply) => Outcome::Reply(Box::new(reply)),
                     Err(error) => classify(error),
                 };
                 Update {
