@@ -2,7 +2,9 @@
 
 Status: implemented, with scoped native process and system-model validation on
 2026-09-28. The evidence below defines the verified scope. Protocol numbering
-remains 0.1 and journal format remains 1.
+remains 0.1 and journal format remains 1. The proposed
+[tool job controller](tool-job-controller.md) would run shell commands as
+conversation-scoped jobs; until it is implemented, this contract governs.
 
 ## Scope and existing owners
 

@@ -198,6 +198,9 @@ flowchart TD
 
 ## Proposed delivery packets and validation
 
+The [tool job controller](tool-job-controller.md) applies this separation to
+long-running tools: the model receives only previews and pages it requests.
+
 Implement these in order; each packet needs its detailed schema and recovery design
 before code. Protocol remains 0.1 and journal format remains 1.
 

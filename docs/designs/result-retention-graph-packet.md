@@ -109,6 +109,10 @@ flowchart LR
 
 ### Capture contract
 
+The proposed [tool job controller](tool-job-controller.md#capture-watermark-and-page-contract-amendments)
+extends this contract with reads of a running job's staging objects and up to
+four concurrent captures. Its review must update the limits below.
+
 Propose immutable raw-byte payloads per result stream. Shell has separate `stdout`
 and `stderr` objects. A typed tool may also retain a `result` object containing
 its exact returned UTF-8 body. A service-generated descriptor connects streams
