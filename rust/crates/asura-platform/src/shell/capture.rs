@@ -55,20 +55,25 @@ impl Capture {
         let bytes: Vec<_> = self.bytes.iter().copied().collect();
         let text = String::from_utf8_lossy(&bytes);
         let mut lost = self.lost || matches!(text, std::borrow::Cow::Owned(_));
-        let mut result = String::new();
-        for c in text.chars() {
-            let c = if c.is_control() && c != '\n' && c != '\t' {
-                lost = true;
-                '�'
-            } else {
-                c
-            };
-            if result.len() + c.len_utf8() > 6144 {
-                lost = true;
-                break;
-            }
-            result.push(c);
+        let chars: Vec<char> = text
+            .chars()
+            .map(|c| {
+                if c.is_control() && c != '\n' && c != '\t' {
+                    lost = true;
+                    '�'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        // Keep the most recent output: a failure's cause is usually at the end.
+        let mut start = chars.len();
+        let mut size = 0;
+        while start > 0 && size + chars[start - 1].len_utf8() <= 6144 {
+            start -= 1;
+            size += chars[start].len_utf8();
         }
-        (result, lost)
+        lost |= start > 0;
+        (chars[start..].iter().collect(), lost)
     }
 }

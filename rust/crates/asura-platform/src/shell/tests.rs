@@ -87,6 +87,10 @@ fn capture_is_bounded_sanitized_and_marks_tail_loss() {
     let (text, truncated) = c.text();
     assert!(truncated);
     assert!(text.len() <= 6144);
+    assert!(
+        text.ends_with("x�[31m�\n"),
+        "the rendered stream keeps the latest output"
+    );
     assert!(!text.contains('\x1b'));
     assert!(c.eof);
     assert_eq!(c.total, 16384 + control.len() as u64);

@@ -69,7 +69,8 @@ cumulative output. Closed stdin is `/dev/null`, not an unconsumed pipe.
 
 Return a fixed textual envelope with outcome, optional exit_code or signal,
 stdout_truncated, stderr_truncated, cleanup state, and labelled stdout/stderr.
-Keep each rendered stream at most 6144 UTF-8 bytes and fixed metadata at most 512
+Keep each rendered stream at most 6144 UTF-8 bytes, taken from the most recent end
+of its tail ring so the latest output survives, and fixed metadata at most 512
 bytes; the complete ToolResult remains below 16384 bytes. Sanitize terminal escape
 and control bytes before text rendering; preserve newline/tab and replace invalid
 UTF-8 explicitly. A bounded streaming sanitizer must not retain an unbounded
