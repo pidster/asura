@@ -1605,7 +1605,17 @@ impl App {
                     self.queue_input(if key.code == KeyCode::Char('s') { 2 } else { 1 });
                     return false;
                 }
-                KeyCode::Char('d') => return self.editor.is_empty(),
+                KeyCode::Char('d') => {
+                    // Unreceipted local input gets the same warning as Ctrl+Q.
+                    if !self.editor.is_empty() {
+                        return false;
+                    }
+                    if self.local_outbox.is_empty() {
+                        return true;
+                    }
+                    self.overlay = Some(Overlay::Exit(false));
+                    return false;
+                }
                 KeyCode::Char('j') => return false,
                 KeyCode::Char('v') => {
                     self.notice.clear();
@@ -4535,6 +4545,25 @@ mod tests {
         key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
         key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         assert!(key(&mut app, KeyCode::Enter, KeyModifiers::NONE));
+    }
+    #[test]
+    fn ctrl_d_warns_about_unreceipted_input_and_ignores_a_draft() {
+        let mut app = App::new();
+        assert!(key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL));
+        app.local_outbox.push(LocalInput {
+            request_id: [1; 16],
+            project: [2; 16],
+            text: "unsent".into(),
+            state: LocalInputState::Waiting,
+        });
+        assert!(!key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(matches!(app.overlay, Some(Overlay::Exit(false))));
+        app.overlay = None;
+        app.local_outbox.clear();
+        app.handle(Event::Paste("draft".into()));
+        assert!(!key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(app.overlay.is_none());
+        assert_eq!(app.draft(), "draft");
     }
     #[test]
     fn queue_subscription_preserves_explicit_command_and_fences_project_change() {

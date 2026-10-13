@@ -270,7 +270,8 @@ With text, display `Discard draft and exit?` with `Keep editing` initially
 selected. With unreceipted local input, the prompt states how many provisional
 inputs are not yet durable. Tab/arrow changes
 the selection; Enter confirms it. Escape or repeated exit keys preserve text.
-Ctrl+D exits only when the draft is empty and no overlay is open. An OS SIGINT,
+Ctrl+D acts only when the draft is empty and no overlay is open. With
+unreceipted local input it opens the exit confirmation instead of exiting. An OS SIGINT,
 SIGTERM or SIGHUP requests cleanup and exit; the process cannot promise draft
 preservation after an external termination. Do not intercept native terminal
 selection/copy or enable mouse capture in this checkpoint.

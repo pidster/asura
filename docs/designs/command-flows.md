@@ -190,7 +190,8 @@ flowchart TD
 F1 opens help. Escape closes help or a result panel. Result scrolling activates
 only when content exceeds the visible box. Ctrl+Q/Ctrl+C exits only when the
 draft and the local outbox are both empty. Otherwise it opens the exit
-confirmation. Ctrl+D exits only with an empty draft. Slash `/quit` and `/exit`
+confirmation. Ctrl+D acts only with an empty draft. It exits when the local outbox is also
+empty; otherwise it opens the exit confirmation, as `/quit` does. Slash `/quit` and `/exit`
 need no draft-discard confirmation. They open the exit confirmation when the
 local outbox holds unreceipted input. Repeated action key events do not submit twice.
 
