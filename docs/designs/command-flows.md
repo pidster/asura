@@ -241,7 +241,7 @@ flowchart TD
     Discover --> Registry{"Registry result"}
     Registry -->|"Error or malformed pages"| Error["Show error: do not assume empty"]
     Registry -->|Nonempty| Names["Display registered names and preserve current selection"]
-    Names --> Match["If unselected: deepest launch-directory match or sole current project"]
+    Names --> Match["If unselected: deepest launch-directory match with other-match hint; no match leaves selection unset"]
     Match --> Keep["Do not prompt"]
     Registry -->|Empty| Cwd["Worker normalizes current directory"]
     Cwd -->|Failure| Error

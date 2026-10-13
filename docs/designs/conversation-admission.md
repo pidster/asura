@@ -115,6 +115,14 @@ permits one internal Initialize request with a new request ID. The existing writ
 rechecks the fresh-state condition and owns all initialization writes. No client
 performs initialization policy, and no project is registered automatically.
 
+Required behavior (owner, 2026-10-13, reconciling threat-model TB9): after an
+automatic initialization, the client shows a notice once. It states that Asura
+created a new installation at `~/.asura` and that any earlier data was not found.
+The service cannot tell first use from prior loss, so every fresh initialization
+produces the notice. Proposed mechanism: the service reports that the current
+installation was initialized automatically and whether the notice has been
+acknowledged; the acknowledgement record is open. The notice is not implemented.
+
 The root entry `.DS_Store` is Finder metadata, not installation authority. The
 platform scanner accepts only a regular file owned by the account, with one
 hard link and no group or world write permission. Read permission for other

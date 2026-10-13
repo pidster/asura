@@ -87,12 +87,13 @@ observer runs Git as a sandboxed, deadline-bounded child process
 | TB6 | Git metadata is malformed, huge or slow | Observer bounds input, time and output; status becomes unknown without blocking typing or control. |
 | TB7 | Database, file or client acknowledgement is lost during commit | Owner resolves the original operation identity; it does not infer failure or create a second registration. |
 | TB8 | Old backup restores stale policy, binding or graph references | Restore validation gates work until identity, generation, current authority and references are reconciled. |
-| TB9 | Entire `.asura` root is absent at launch after prior loss | Service cannot infer first-ever use; it requires explicit initialization and warns about possible prior data loss. Known conflicting state enters recovery. |
+| TB9 | Entire `.asura` root is absent at launch after prior loss | Service cannot infer first-ever use. It initializes automatically and the client shows a notice that a new installation was created and any earlier data was not found (owner decision, 2026-10-13). Known conflicting state enters recovery. |
 | TB10 | A same-UID process calls the control API or launches the signed CLI | I1 treats it as the local principal but applies current scope and policy; no claim of same-UID adversary resistance. Credential-bearing later work needs a separate authority decision. |
 
-TB9 conflicts with the selected [automatic initialization](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow):
-the service initializes a verified runtime-only root without an explicit request,
-and no prior-loss warning is implemented. Owner review must reconcile TB9.
+The owner reconciled TB9 with [automatic initialization](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow)
+on 2026-10-13: automatic initialization stays, and every fresh initialization
+produces a notice. The notice is not implemented. A marker outside `.asura` that
+separates first use from loss remains a possible later improvement.
 
 The [installation binding contract](context-storage-candidates.md#selected-installation-binding-and-change-contract)
 owns TB3 and cross-store recovery. The

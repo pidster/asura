@@ -170,13 +170,17 @@ the notice digest, so replay reconstructs the same turn input.
 ### TUI behavior
 
 Proposed mechanism. The client principal is the local person using the TUI.
-Job commands are scoped to the TUI's selected project.
+Required behavior (owner, 2026-10-13): job commands default to the TUI's selected
+project. The person can list every project's jobs on request. The service runs
+for one OS account, so this view grants no new access; the confirmation below
+guards against acting on the wrong project.
 
 | Command | Behavior |
 | --- | --- |
 | `/jobs` | Navigable list of jobs of all conversations in the selected project, with state, age, exit status and bytes per stream; Enter opens the job viewer |
-| `/job ID` | Open the job viewer for one job in the selected project |
-| `/job cancel ID` | Request cancellation of one job in the selected project |
+| `/jobs all` | The same list for every registered project, each row labelled with its project |
+| `/job ID` | Open the job viewer for one job; a job outside the selected project shows its project in the header |
+| `/job cancel ID` | Request cancellation of one job; a job outside the selected project needs confirmation that names its project |
 
 A job's activity row in the transcript also opens the job viewer. The person can
 reach it through the existing response browser while the turn is live or later.
@@ -198,8 +202,11 @@ range. Navigation uses byte offsets. A line index for "go to line" is not
 proposed here.
 
 The service rechecks project registration and retained identity on every list,
-page and cancel. A job ID from another project returns `not_found`. The status
-row shows the selected project's live job count.
+page and cancel. A job of an unregistered project returns `not_found` to the
+client. The model's scope does not change: it sees only its own conversation's
+jobs, and any other job ID returns `not_found`. The status row shows the selected
+project's live job count. A `busy` result with reason `quota` names the projects
+whose retained output holds the space.
 
 `/new` and exit open a confirmation while the current conversation has live jobs.
 Confirmation cancels those jobs; declining keeps the conversation and its jobs.
@@ -259,7 +266,7 @@ sequenceDiagram
     participant S as Payload adapter
     U->>W: Open viewer: stdout at offset 0
     W->>R: JobRead(job, stdout, 0, 8 KiB)
-    R->>K: Scoped to selected project
+    R->>K: Scoped to the person's request
     K->>S: Read page under watermark or descriptor
     S-->>K: Page and next offset
     K-->>R: Page and stream totals
@@ -269,7 +276,7 @@ sequenceDiagram
     U->>W: Follow on at stream end
     loop Until follow off, close, settlement or worker stop
         W->>R: JobObserve(job, stream, offset, wait 1 s)
-        R->>K: Scoped to selected project
+        R->>K: Scoped to the person's request
         K->>S: Read page under watermark or descriptor
         S-->>K: Page or no new bytes
         K-->>R: Page, state and next offset
@@ -302,7 +309,10 @@ stateDiagram-v2
     Starting --> NotStarted: Setup failure proves no owned process
     Running --> Stopping: Cancel trigger
     Running --> Draining: Leader exits
-    Draining --> Stopping: Cancel trigger with group members left
+    Running --> CapturePaused: Reservation cannot grow after expiry attempt
+    CapturePaused --> Running: Freed space extends the reservation
+    CapturePaused --> Stopping: Cancel trigger, including job deadline
+    Draining --> Stopping: Cancel trigger with group members left, including quota
     Stopping --> Draining: Owned group signalled
     Draining --> Finalizing: Leader reaped, group gone, pipes at EOF
     Draining --> CleanupUnconfirmed: Cleanup deadline expires
@@ -313,6 +323,7 @@ stateDiagram-v2
     Admitted --> Interrupted: Restart
     Starting --> Interrupted: Restart
     Running --> Interrupted: Restart
+    CapturePaused --> Interrupted: Restart
     Stopping --> Interrupted: Restart
     Draining --> Interrupted: Restart
     CleanupUnconfirmed --> Interrupted: Restart
@@ -320,10 +331,12 @@ stateDiagram-v2
     Interrupted --> [*]
 ```
 
-Cancel triggers are model or client cancel, job deadline, capture stop and every
-revocation trigger in the [security section](#security-and-authority). A turn
+Cancel triggers are model or client cancel, job deadline, capture stop, quota
+exhaustion during `Draining` and every revocation trigger in the
+[security section](#security-and-authority). A turn
 ending, steering or the TUI `/cancel` of a turn is not a trigger after handle
 delivery. `CleanupUnconfirmed` keeps its slot and counts toward live job limits.
+`CapturePaused` also keeps its slot; see [retained output lifetime](#retained-output-lifetime).
 
 ### Capture, watermark and page contract amendments
 
@@ -382,7 +395,7 @@ changes them.
 | `yield_seconds` | 0–30, default 10; 0 returns the handle immediately after spawn |
 | `timeout_seconds` (job lifetime) | 1–3600, default 600; the guardian enforces it |
 | Live jobs | 4 per service and 2 per conversation, including `CleanupUnconfirmed`; another start returns `busy` before intent |
-| Retained output | 64 MiB combined streams per job, reserved at intent; reaching it stops capture and cancels the job |
+| Retained output | 64 MiB combined streams per job; reaching it stops capture and cancels the job. The reservation grows with output under [retained output lifetime](#retained-output-lifetime); the initial size is open |
 | Preview | Head 1 KiB and tail 2 KiB per stream, at most 6 KiB in one result |
 | `read` page | At most 8 KiB source bytes, within the existing 16 KiB result limit |
 | `wait` | 1–30 seconds per call; turn cancellation ends the wait, not the job |
@@ -423,6 +436,84 @@ asynchronously and never delays the signal. Model reads remain ordinary tool
 intents and results. Replay rebuilds job state from these records. A record never
 resumes a process.
 
+## Retained output lifetime
+
+Required behavior (owner, 2026-10-13): all four approaches apply together.
+
+| Approach | Selected behavior |
+| --- | --- |
+| A: Automatic expiry | The service deletes settled job output that nothing references. |
+| B: Growing reservation | A job reserves a small amount at intent and extends it as output arrives, up to the per-job limit. |
+| C: User cleanup | The person can delete retained job output explicitly. |
+| D: Value detection | Retention depends on the output's value. Successful build logs are usually less valuable than failed builds. A job may have a summary note, retained longer than its log, that explains what happened. |
+
+Expiry, growth and cleanup act on the quota. Value detection decides the order
+and timing of expiry. A summary note is separate from the log it describes, so
+deleting a log keeps the note. The job viewer shows expired output as expired,
+with the note where one exists.
+
+Required behavior (owner, 2026-10-13): the service always writes a factual
+summary from recorded facts, such as command, exit status, duration, byte counts
+and stop reason. The model or the person may add notes beside it. Each note
+records its author. A model note is a model assertion, not a controller fact.
+Summary notes live as long as their conversation. They never expire on their own;
+deleting the conversation deletes them.
+
+Required behavior (owner, 2026-10-13): four signals set value.
+
+| Signal | Examples |
+| --- | --- |
+| Outcome | Exit status, stop reason, cancellation, timeout, capture stop |
+| Person actions | Viewed, pinned or noted by the person |
+| Model use | The model read pages or added a note |
+| Content checks | Mechanical checks, such as non-empty stderr or matched error patterns |
+
+Content checks are untrusted observations of tool output. They can raise or lower
+retention priority only; they grant no authority. How signals combine into value
+classes is a proposed mechanism for the integration review.
+
+Required behavior (owner, 2026-10-13): expiry uses both age and quota pressure.
+Each value class has a retention age. When the quota needs space before then,
+the service expires the lowest-value eligible output first. The classes, ages
+and tie-breaking order are open.
+
+Required behavior (owner, 2026-10-13): these references prevent expiry, including
+under quota pressure.
+
+| Reference | Hold lasts |
+| --- | --- |
+| Person pin | Until the person unpins it |
+| Evidence link from a retained result, memory graph, plan or task | While the linking record exists |
+| Open person or model read | While the read or viewer is open |
+| Model reference | While the model used the handle in the current or previous turn |
+
+Held output can fill the quota. New jobs then return `busy` with reason `quota`
+until a hold ends or the person deletes output.
+
+Required behavior (owner, 2026-10-13): when a running job cannot extend its
+reservation, the service first tries to expire eligible output. If that frees too
+little, the job enters `CapturePaused`, a temporary ending under the
+[loop closure](loop-closure.md#permanent-and-temporary-endings) model:
+
+- The controller stops reading the job's pipes. The OS then blocks the tool's
+  next write to stdout or stderr. Bytes already read are retained; none are dropped.
+- Freed space resumes capture. The job deadline and every other cancel trigger
+  still apply, and the deadline makes the ending permanent.
+- The service shows the person the paused job and the reason.
+- This pauses only the tool's writes to its output pipes. Files that the tool
+  writes itself are a separate resource.
+
+Required behavior (owner, 2026-10-13): capture never pauses in `Draining`. If
+the reservation cannot grow there after the expiry attempt, the controller treats
+it as a cancel trigger. It signals the remaining group members, keeps the captured
+prefix and records the stop reason `quota`. Pausing would block members from
+exiting and risk `CleanupUnconfirmed`.
+
+Open decisions for this section:
+
+1. The initial reservation and growth step sizes.
+2. The value classes, their retention ages and the eviction tie-break order.
+
 ## Failure handling and recovery
 
 ### TJ-R1: proposed failure and restart handling
@@ -435,6 +526,12 @@ flowchart TD
     Kind -->|Storage write stalls| Stall[Stop capture, request cancel, capture incomplete]
     Kind -->|Retained output limit| Limit[Stop capture, cancel, capture output_limited]
     Kind -->|Journal unavailable| Unavail[Cancel all live jobs]
+    Kind -->|Quota cannot grow| Expire[Expire eligible output]
+    Expire --> Freed{Enough space freed?}
+    Freed -->|Yes| Continue[Extend reservation, continue capture]
+    Freed -->|No| Paused[CapturePaused: stop reading pipes, notify person]
+    Paused -->|Space freed| Continue
+    Paused -->|Cancel trigger or job deadline| Settle
     Kind -->|Cleanup deadline| Unconf[CleanupUnconfirmed: keep slot and scratch]
     Kind -->|Service restart or crash| Restart[Guardian sees lease EOF and kills group]
     Stall --> Settle[Normal settlement path]
@@ -449,13 +546,17 @@ flowchart TD
 
 - **Stalled storage:** the controller stops accepting output when transfer queues
   are full, then requests cancellation. It never drops bytes silently.
+- **Quota cannot grow:** the controller expires eligible output, then pauses
+  capture if space is still short. See [retained output lifetime](#retained-output-lifetime).
 - **Stalled read:** a page request has a 2-second storage deadline. Expiry returns
   `busy`; the retained read slot stays held until the worker settles.
 - **Journal unavailable:** the owner enters its existing repair path and cancels
   all live jobs, as it cancels the shell today. Settlement records wait for repair
   and use their reserved capacity.
 - **Quota exhausted:** new jobs return `busy` with reason `quota`. Running jobs
-  keep their reservations. Recovery depends on open decision 4.
+  keep their reservations. Expiry and user cleanup free space under
+  [retained output lifetime](#retained-output-lifetime); behavior when a growing
+  job cannot extend its reservation is open there.
 - **Stale handle:** an unknown job, or a job outside the caller's conversation or
   project, returns `not_found` without revealing whether it exists elsewhere.
 - **Duplicate call:** an identical retried start returns the existing job, even at
@@ -477,8 +578,9 @@ apply unchanged. The longer lifetime widens none of them.
 **Read access.** A model read, wait, status or cancel requires a current admitted
 turn in the same conversation. That turn's existing `read_authorized` grant must
 cover the job's project. The service rechecks project registration and retained
-identity on every request. A client request is scoped to the client's selected
-project as described in [TUI behavior](#tui-behavior).
+identity on every request. A client request defaults to the client's selected
+project and may cover every registered project, as described in
+[TUI behavior](#tui-behavior).
 
 **Revocation triggers.** Each trigger cancels the affected live jobs:
 
@@ -526,7 +628,8 @@ real model provider and the TUI PTY harness.
 | TJ-09 | Output and quota limits | Capture stop reasons | 64 MiB flood, quota fill from retained jobs | Partial capture labelled |
 | TJ-10 | Stalled storage and observer saturation | Read `busy`, reserved model read | Blocked writer and reader, 4 observers | Controls stay responsive |
 | TJ-11 | Restart at each checkpoint | Replay of intent-only, running, finalizing, settled-not-installed | Crash at each point; guardian cleanup | Interrupted job listed and readable |
-| TJ-12 | Cross-conversation and cross-project access | `not_found` without disclosure | Second conversation and other project denied for model and client | — |
+| TJ-12 | Cross-conversation and cross-project access | Model `not_found` without disclosure | Model denied other conversations and projects; client denied unregistered projects | — |
+| TJ-25 | Person's all-projects view | Project labels; cross-project cancel confirmation state | `/jobs all` lists every registered project; quota `busy` names holders | PTY: list all, open another project's job, confirm and decline cancel |
 | TJ-13 | `/new` and exit with live jobs | Confirmation state | Cancel on confirm only | PTY confirmation journeys |
 | TJ-14 | Revocation triggers | Each trigger cancels the right jobs | Unregister, identity change, policy change | — |
 | TJ-15 | Journal unavailable and full | Reserved settlement capacity | Writer fault during live job | Repair then settlement recorded |
@@ -535,6 +638,10 @@ real model provider and the TUI PTY harness.
 | TJ-18 | Person navigates both streams from the start | Viewer state: Tab keeps positions, Home, End, follow | Pages from byte 0 of each stream while running and after settlement | PTY: open from `/jobs` and from an activity row, read both streams |
 | TJ-19 | Model reads both streams from the start | Separate cursors; preview does not advance them | `read` at 0 for `stdout` and `stderr`, running and settled | Native model reads `stderr` after `stdout` |
 | TJ-20 | Prefix retained after capture stop | Retained range reported | Output limit flood keeps bytes from 0 | Viewer shows stop reason and range |
+| TJ-21 | Value-ordered expiry | Value from outcome, person, model and content signals; age per class | Quota pressure expires lowest value first; held output survives | Viewer shows expired output with its summary |
+| TJ-22 | Expiry holds | Each hold type blocks expiry and ends correctly | Pin, evidence link, open read and model reference under quota pressure | Held quota returns `busy` until cleanup |
+| TJ-23 | Summary and attributed notes | Service summary fields; note author recorded | Notes survive log expiry | Person and model notes shown with authors |
+| TJ-24 | Growing reservation and capture pause | Growth steps; `CapturePaused` transitions | Expiry attempted first; pipes not read while paused; resume on freed space; deadline cancels | PTY: paused job shown with reason, then resumes |
 
 Environments: macOS 27 development host with the native process harness, scratch
 installation, the system model and verified local Ollama. Release qualification is
@@ -566,12 +673,12 @@ flowchart TD
    control tags and model fields within protocol `0.1` and format `1`.
 3. **Numeric limits:** the table values need measured qualification, especially
    the 3600-second lifetime and 4 live jobs.
-4. **Retained job output and quota:** every shell call becomes a job and reserves
-   up to 64 MiB. The retention packet's explicit-deletion lifetime and 1 GiB quota
-   would stop all shell use once full. This needs an owner decision: automatic
-   expiry of settled job output, a smaller default reservation, or user cleanup.
-5. **Client scope:** this design scopes TUI job commands to the selected project.
-   A view of all projects' jobs needs an owner decision on client authority.
+4. **Retained job output and quota:** the owner selected automatic expiry, growing
+   reservations, user cleanup and value detection on 2026-10-13. Their detailed
+   decisions are listed under [retained output lifetime](#retained-output-lifetime).
+5. **Client scope:** selected by the owner on 2026-10-13: the selected project by
+   default, `/jobs all` on request and confirmation for cross-project cancel.
+   See [TUI behavior](#tui-behavior).
 6. **Other tools:** which future tools adopt the controller. Short typed tools
    remain synchronous.
 

@@ -786,9 +786,11 @@ invalid IDs, repeated cursors and incomplete pagination without publishing a
 partial registry. Network calls and launch-directory lookup stay in the worker.
 Retain the registry as display state. Show project directory names in the header,
 mark the selected name, and mark stale entries. An unknown registry is not empty.
-Prefer the deepest current project containing the launch directory. If none
-matches, select the sole current project; otherwise leave selection unset and
-display the known projects. A refresh preserves a still-current explicit selection.
+Prefer the deepest current project containing the launch directory. When other
+current projects also contain it, show that other matches exist. If none matches,
+leave selection unset and display the known projects, even when only one exists.
+The owner selected this on 2026-10-13; it replaces the sole-project fallback, which
+remains in the code until corrected. A refresh preserves a still-current explicit selection.
 Successful registration refreshes the registry in the same worker job before
 publishing completion. It selects the registered project. A refresh failure
 reports that registration succeeded but listing failed; it does not retry the
@@ -829,10 +831,13 @@ flowchart TD
     Empty -->|Yes| Offer["Offer launch-directory registration once per client session"]
     Empty -->|No| Keep{"Selected project still current?"}
     Keep -->|Yes| Show["Display names and selected marker"]
-    Keep -->|No| Candidate{"Deepest launch-directory match or sole current project?"}
-    Candidate -->|Yes| Select["Select candidate and clear previous conversation identity"]
-    Candidate -->|No| Unset["Clear selection but display known projects"]
-    Select --> Show
+    Keep -->|No| Candidate{"Any current project contains the launch directory?"}
+    Candidate -->|Yes| Select["Select the deepest match and clear previous conversation identity"]
+    Select --> Others{"Other current matches?"}
+    Others -->|Yes| Hint["Show that other matches exist"]
+    Candidate -->|No| Unset["Clear selection but display known projects, even if only one"]
+    Hint --> Show
+    Others -->|No| Show
     Unset --> Show
     Offer -->|Yes and registration succeeds| Queue
     Offer -->|No or Escape| Unchanged["Preserve registry and draft"]

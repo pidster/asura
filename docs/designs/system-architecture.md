@@ -178,11 +178,15 @@ after reconnect. TUI proof follows in I4. SDK availability alone is not
 runtime evidence. D7 must assign executable cases and pin host, filesystem,
 timeouts and acceptance thresholds.
 
-This I1 slice is not implementation-ready until lock-inode retention, socket
-replacement handling, runtime-directory lifecycle, owner fencing and
-protocol schema are exact and qualified. D2 still owes the Swift/Rust process
-allocation, helper boundaries and full deployment view before its whole stage
-can be ready.
+Status, 2026-10-13: this I1 slice is implemented, and its control schema has a
+passing validation corpus. The [developer checkpoint](../plans/production-foundation-implementation.md#developer-checkpoint-evidence-on-2026-09-26)
+recorded a held-lock case, real filesystem cases, the real-account start and stop
+journey and two simultaneous starts converging on one epoch. Lock-inode retention,
+socket replacement handling, runtime-directory lifecycle across logout and owner
+fencing remain unqualified. The 100 paired starts, cross-UID checks and the full
+FND fault, load and logout matrix are outstanding. ADR-0009 and ADR-0010 selected
+the helper process and channel; the [local-model boundary](swift-rust-boundary.md#proposed-deployment-view)
+still proposes, rather than selects, the full deployment view.
 
 ## Foundation service proposal: stages 1–2
 

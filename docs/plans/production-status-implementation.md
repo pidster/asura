@@ -410,7 +410,8 @@ implemented; the control schema has no message for them.
 
 **Runnable result:** the CLI registers an existing directory, lists authorized
 projects and asks the service to match a launch directory. The service returns
-all eligible overlap matches. It never chooses the deepest match automatically.
+all eligible overlap matches. The client selects the deepest and shows that other
+matches exist (owner revision, 2026-10-13).
 The same registry owns an explicitly marked project parent and bounded candidate
 discovery. A child needs a separate registration action.
 
@@ -1248,7 +1249,9 @@ or live terminal qualification run.
 The TUI previously discarded nonempty registry replies and confused no selection
 with no projects. It now retains the complete bounded registry, displays names,
 and selects the deepest current project containing the launch directory. A sole
-current project is the fallback. A new service epoch refreshes the registry while
+current project is the fallback. On 2026-10-13 the owner kept the deepest match, added
+a hint about other matches and removed the sole-project fallback; that correction
+is not implemented. A new service epoch refreshes the registry while
 preserving a still-current selection and the draft. Listing shares the canonical
 bounded client helper. Invalid or incomplete pagination never publishes a partial
 registry. All socket calls remain in the worker.

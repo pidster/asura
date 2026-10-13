@@ -96,8 +96,9 @@ new project context, marking it as a project parent, selection of a known projec
 or continuation without a selected project. A project parent is a discovery
 container only; marking one creates no project or task scope. D1/D3 must design
 its validated marker and bounded child discovery before enabling that action.
-If several associations match, require explicit choice instead of
-choosing the deepest root. The service owns matching and authority checks.
+The owner revised overlap handling on 2026-10-13: if several associations match,
+select the deepest one and show that other matches exist. If none matches,
+require explicit choice. The service owns matching and authority checks.
 Initial visible selection does not register a location, create a conversation or
 task, or authorize work. A failed registration leaves the draft, selection and
 existing registry intact and shows one actionable error. This interaction does
@@ -183,7 +184,10 @@ process remain D2/D4 decisions; this document does not select a new process.
 Partly implemented. Steps 1–4 are implemented through automatic setup and
 explicit registration. Steps 5–6 are not implemented as written: the TUI
 selects the deepest current registration that contains the launch directory,
-and status arrives through `ObserveContext` subscriptions.
+and status arrives through `ObserveContext` subscriptions. The owner selected the
+deepest match on 2026-10-13, with a visible hint about other matches. The current
+fallback to a sole project with no match conflicts with that decision; the
+correction and the hint are not implemented.
 
 Original proposed behavior for D3/D6 review:
 
@@ -808,7 +812,7 @@ review. An open entry blocks only the packet whose behavior depends on it.
 | PBS-D4 | Proposed | I1 contains minimal embedded/external graph-binding verification; I2 adds graph semantics. Qualify both modes before I1 graph-ready claims. |
 | PBS-D5 | Principal, installation and Unix socket selected; remaining mechanism proposed | I1 uses a standalone command, per-user service and one macOS-user principal. The [service design](system-architecture.md) proposes peer-UID checks and owner fencing over the selected Unix socket; D1-D2 must qualify homes and mechanism. |
 | PBS-D6 | Open | D3 chooses conflict detection for absent roots, atomic initialization, authority-store schema, commit-time location identity checks, migrations and cross-store backup/restore. |
-| PBS-D7 | Initial selection and parent role selected; other UX open | D6 uses a unique authorized launch-directory match first. Overlap or no match requires explicit choice; no automatic last-viewed fallback. A marked project parent is a discovery container only. [Project naming](project-names.md) is selected; exact first-use controls, unavailable-status wording and measurable responsiveness remain open. |
+| PBS-D7 | Initial selection and parent role selected; other UX open | D6 selects the deepest authorized launch-directory match and shows that other matches exist (owner revision, 2026-10-13). No match requires explicit choice, even with one registered project; no automatic last-viewed fallback. A marked project parent is a discovery container only. [Project naming](project-names.md) is selected; exact first-use controls, unavailable-status wording and measurable responsiveness remain open. |
 | PBS-D8 | Open by later increment | D4 defines Git observation and actual model-context accounting; I4 consumes their typed results. |
 
 The design spans four delivery increments. Readiness is assessed per bounded
