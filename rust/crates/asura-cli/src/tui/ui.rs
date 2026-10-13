@@ -2205,7 +2205,6 @@ impl App {
             .bg(INPUT_TINT)
             .add_modifier(Modifier::BOLD);
         let draft = self.editor.text();
-        let command_mode = draft.starts_with('/');
         self.editor
             .set_highlight(active_command(&draft).map(|range| (range, input.fg(COMMAND_AMBER))));
         let focused = self.overlay.is_none()
@@ -2222,11 +2221,7 @@ impl App {
         );
         if self.editor.first_row_visible() {
             frame.render_widget(
-                Paragraph::new("›").style(input.fg(if command_mode {
-                    COMMAND_AMBER
-                } else {
-                    INPUT_GLOW
-                })),
+                Paragraph::new("›").style(input.fg(INPUT_GLOW)),
                 Rect::new(area.x, editor_y, 1, 1),
             );
         }
@@ -3534,7 +3529,7 @@ mod tests {
             .collect()
     }
     #[test]
-    fn prompt_is_bold_glow_and_slash_commands_switch_marker_and_highlight() {
+    fn prompt_is_bold_glow_and_known_slash_commands_are_highlighted() {
         let mut app = App::new();
         let marker = markers(&input_cells(&mut app));
         assert_eq!(marker.len(), 1);
@@ -3542,7 +3537,7 @@ mod tests {
         assert!(marker[0].add_modifier.contains(Modifier::BOLD));
         app.insert("/help me");
         let cells = input_cells(&mut app);
-        assert_eq!(markers(&cells)[0].fg, Some(COMMAND_AMBER));
+        assert_eq!(markers(&cells)[0].fg, Some(INPUT_GLOW));
         let row = cells
             .iter()
             .find(|(x, _, s, _)| *x == 1 && s == "›")
@@ -3564,7 +3559,7 @@ mod tests {
         let mut unknown = App::new();
         unknown.insert("/nope x");
         let cells = input_cells(&mut unknown);
-        assert_eq!(markers(&cells)[0].fg, Some(COMMAND_AMBER));
+        assert_eq!(markers(&cells)[0].fg, Some(INPUT_GLOW));
         let row = cells
             .iter()
             .find(|(x, _, s, _)| *x == 1 && s == "›")
