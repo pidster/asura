@@ -652,11 +652,15 @@ not claimed by these cases.
 ### TJ-P1: proposed delivery order
 
 Arrows mean prerequisites. Each packet needs its tests before the next starts.
+Required behavior (owner, 2026-10-13): the reviewed
+[execution threat model](execution-threat-model.md) must cover tool jobs before
+J2 starts.
 
 ```mermaid
 flowchart TD
     RG[Retention review decisions 1, 2 and 4] --> J1[J1: staging capture, live pages and install order]
     Rev[TJ open decisions resolved] --> J2[J2: controller, slots, records and shell adoption]
+    TM[Execution threat model reviewed for tool jobs] --> J2
     J1 --> J2
     J2 --> J3[J3: model job tool and yield results]
     J2 --> J4[J4: control API and TUI jobs]

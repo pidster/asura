@@ -15,7 +15,10 @@ figures above are current implementation to be replaced under
 [model-sized limits](loop-closure.md#model-sized-limits). The owner selected both
 the Chat Completions and Responses surfaces, capacity in the configuration file
 with sensible defaults, and probe, test, person confirmation and configuration
-only when neither a per-model entry nor a default applies. This design must select defaults, probe methods and test bounds.
+only when neither a per-model entry nor a default applies. This design must
+select defaults, probe methods and test bounds. Remote providers must not be
+implemented until the reviewed [execution threat model](execution-threat-model.md)
+covers remote endpoints, data egress and credentials (owner, 2026-10-13).
 
 Status: MP2 integrated and compiled, with native system, Ollama and MLX checks
 recorded below, 2026-09-28. CoreAI now also passes the scoped HM3 native Memory
@@ -506,6 +509,35 @@ field only when the supplied display name is nonempty, within the byte limit and
 contains no control characters. Otherwise it omits the field; the client retains
 the configured selector. This avoids slicing UTF-8 or silently changing routing.
 Tests cover names at and above the multibyte boundary and full selector retention.
+
+## Loopback endpoint restriction — selected 2026-10-13
+
+Required behavior (owner, 2026-10-13): until the
+[execution threat model](execution-threat-model.md) is reviewed, the Ollama
+endpoint must be a loopback address. This closes finding EX7, where an HTTPS
+endpoint sent conversation content off the device.
+
+| Path | Selected behavior |
+| --- | --- |
+| `/config set providers.ollama.endpoint` | Rejects a non-loopback endpoint with `config_remote_endpoint_restricted`. The file is unchanged. |
+| Existing configuration file with a non-loopback endpoint | The file still loads, so other settings keep working. The endpoint stays visible through `/config`. |
+| Turn preparation with an Ollama model | Rejects a non-loopback endpoint with `remote_endpoint_restricted` before any helper or network request. A queued input is held with that reason. |
+| Model helper Ollama backend | Rejects a non-loopback endpoint as an invalid configuration. This is defense in depth and covers `/models` inventory. |
+
+Loopback means host `127.0.0.1` or `::1`, with scheme `http` or `https`, under the
+existing endpoint grammar. Host names, including `localhost`, are not loopback.
+The storage configuration owner defines the rule once; the service uses it for
+turn preparation and for the existing local tool-destination check. The Swift
+helper keeps its own equal check at the transport boundary.
+
+All checks are pure in-memory string validation; none blocks. Removing the
+restriction later needs the threat-model review and an owner decision.
+
+Validation: unit tests cover the rule, configuration set rejection, loading an
+existing non-loopback file, turn preparation rejection before helper start, and
+Swift backend rejection. The existing service conversation tests and Swift suite
+must pass. A TUI journey that sets a remote endpoint and submits a prompt is
+required for end-to-end proof.
 
 ## MP3: model inventory command
 

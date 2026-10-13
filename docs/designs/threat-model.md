@@ -11,7 +11,9 @@ or select all mechanisms. It must be reviewed with
 
 The scope is one backend for one OS user on one macOS device, its `.asura` root,
 registered working locations, local clients and the optional external graph.
-Remote AI and remote Asura hosts require later threat models. Git status is a
+Remote AI and remote Asura hosts require later threat models. The proposed
+[execution threat model](execution-threat-model.md) covers model-driven effects
+and model endpoints. Git status is a
 read-only observation; it does not grant host-tool or source-write authority.
 
 | Asset | Required protection |
