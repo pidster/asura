@@ -72,8 +72,12 @@ hint clipping applies; the full key list remains available through `/help`.
 Required behavior (owner, 2026-10-13): adopt four details of Wisp's prompt box
 and highlight active slash commands. Revised the same day: a marker colour change
 was too subtle, so slash commands show only the text highlight. Command amber
-`#E8B577` as a box tint is reserved for a later person-run `!` command mode,
-which needs its own design.
+`#E8B577` as a box tint is reserved for the person-run `!` command mode.
+
+Required behavior (owner, 2026-10-13): the `!` and `?` modes tint the whole input
+box, including its half-block strips. The
+[person command mode](person-command-mode.md) and [help mode](help-mode.md)
+designs own each mode's behavior; this section owns their presentation.
 
 | Element | Selected presentation |
 | --- | --- |
@@ -82,9 +86,12 @@ which needs its own design.
 | Marker placement | Only on the first visual row of the draft. When the draft has scrolled, no row shows the marker. |
 | Slash commands | The box and marker keep their normal colours while the draft starts with `/` |
 | Active command | When the first word exactly names a TUI command, that word uses command amber `#E8B577`, bold. Other words and unknown names keep the typed-text style. |
+| `!` command mode | Box and strips in command amber `#E8B577`; marker `!` and text in bold black `#000000`. A sent command's log line is a stripe in `#745A3C` with light text. |
+| `?` help mode | Box and strips in help indigo `#252D4E`; marker `?` in glow `#CFF1FF`, bold; text in the typed-text style |
 | Context gauge | `N% input` stays muted below 50%, uses glow `#CFF1FF` from 50% and amber `#F2B950` from 80%. The model name stays muted. |
 
-The values come from Wisp's palette (`tools/wisp-tui/src/palette.rs`). The TUI
+The values come from Wisp's palette (`tools/wisp-tui/src/palette.rs`), except help
+indigo, which the owner chose from rendered candidates on 2026-10-13. The TUI
 defines them once as named composer roles instead of repeating literals. Moving
 the remaining hard-coded colours in `ui.rs` into those roles is separate work.
 

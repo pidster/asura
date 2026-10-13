@@ -27,6 +27,7 @@ does not establish implemented or verified behavior. The
 | [Decisions](decisions/README.md) | Selected architecture decisions, rationale and recorded contract reviews. |
 | [Designs](designs/README.md) | Workflows, implemented component contracts, validation limits, proposals and the isolated TUI experiment. |
 | [Plans](plans/README.md) | Design stages, delivery dependencies and scoped implementation packets. |
+| [User guide](user/README.md) | Guide, commands and keys for people using Asura; the planned single source for in-app help. |
 
 The [visual reading path](decisions/README.md#visual-reading-path) connects the
 architecture to detailed contracts and review gates. These directory indexes

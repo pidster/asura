@@ -21,6 +21,8 @@ In scope:
   by the model, and model endpoints, including HTTPS Ollama endpoints.
 - **Proposed:** [tool jobs](tool-job-controller.md) and remote providers through
   the OpenAI API specification.
+- **Proposed:** person-typed `!` commands; see
+  [Person-typed commands](#person-typed-commands).
 
 Out of scope: remote Asura hosts, sensors acting autonomously, plan and task
 execution, and network access from tools. Each needs its own review.
@@ -138,8 +140,156 @@ end-to-end tests drive the TUI with a native model where a model is involved.
 5. EX10: restrict shell to qualified models, or qualify the others.
 6. EX11: add a person-controlled execution setting.
 
+## Person-typed commands
+
+Status: proposed section, 2026-10-13; not reviewed. The owner directed it on
+2026-10-13 so that [person command mode](person-command-mode.md) can be
+implemented once this section and its decisions PX1–PX6 are approved. Approval
+of this section does not approve EX1–EX15 or the open decisions above. It
+selects no mechanism; the design's proposals and PC1–PC9 remain open there.
+
+### What changes
+
+The person, a trusted principal, runs a command through the shell path with a
+person execution profile. The owner fixed its terms on 2026-10-13. Compared
+with the model's shell, a person command:
+
+- has network access;
+- reads across the person's home, including `~/.ssh`;
+- writes the project, `$TMPDIR` and `~/.cargo`, `~/.rustup`, `~/.cache`,
+  `~/Library/Caches` and `~/.npm`;
+- uses the person's PATH and HOME;
+- has no timeout; the person stops it;
+- queues behind model turns, and its outcome reaches the model as a notice.
+
+The sandbox keeps write confinement. Shell configuration, `~/.ssh` and other
+dotfiles stay read-only. The person typing a command is the approval; there is
+no classifier or prompt. A person command can never do more than the same
+command typed in the person's own terminal, which is unsandboxed.
+
+### Person command trust view
+
+Proposed view. Solid arrows carry data or requests. Dashed arrows carry effects.
+Labels PT1–PT8 mark where the threats below act.
+
+```mermaid
+flowchart TD
+    Model["Model output in the log"] -->|"PT1: suggested command"| Person["Person types or pastes a command"]
+    Person --> TUI["TUI command mode"]
+    TUI -->|"command, cwd, PATH (PT7)"| Svc["Service: queue, person grant"]
+    Svc -->|"kinds 21-23 (PT5)"| Journal[("Journal")]
+    Svc -->|"spawn"| Box
+    subgraph Box["sandbox-exec: person profile, no timeout (PT8)"]
+        Cmd["Command and children"]
+    end
+    ModelWrites["Earlier model shell writes"] -.->|"PT2: hooks, build scripts"| Proj[("Project")]
+    Proj -->|"executed by the command"| Cmd
+    Cmd -.->|"PT3: egress"| Net(("Network"))
+    Cmd -.->|"read"| Home[("Home, incl. ~/.ssh")]
+    Cmd -.->|"PT4: write"| Cache[("Cache dirs, incl. ~/.cargo/bin")]
+    Cmd -.->|"PT6: connect"| Ctl["Asura control socket and ~/.asura"]
+    Svc -->|"PT5: notice, 2 KiB output"| Next["Next model turn"]
+    Next -->|"remote destination later (EX13)"| Remote["Remote endpoint"]
+    Cache -.->|"later unsandboxed run"| Terminal["Person's own terminal"]
+```
+
+### Existing threats that apply
+
+| ID | Effect for person commands |
+| --- | --- |
+| EX1 | Amplified. Model-written hooks and build scripts run when the person types `!git commit` or `!cargo build`. They then run with network, home reads and cache writes. See PT2. |
+| EX2 | Changed. Network is allowed by owner decision. See PT3. |
+| EX3 | Changed. Home reads are allowed by owner decision. |
+| EX4 | Applies. The journal keeps up to 6144 bytes per stream of each command's output. The person may print secrets. See PT5. |
+| EX5 | Applies, with no timeout. The owned-group cleanup and the documented escape limit are unchanged. See PT8. |
+| EX7, EX13 | Apply to the notice. It carries up to 2 KiB of output to the model's destination. See PT5. |
+| EX6, EX8, EX9, EX10, EX12 | Not affected. The person command has no memory write, no credentials, no model proposer and no job. |
+| EX11 | Does not apply. Each person command is an explicit person action. |
+
+### New threats, mitigations and gaps
+
+"Required" names a control the [design](person-command-mode.md) must deliver.
+"Gap" is residual risk that needs an owner decision.
+
+| ID | Threat | Required mitigation | Gap |
+| --- | --- | --- | --- |
+| PT1 | Injected text in model output persuades the person to run a command, for example by pasting a line that starts with `!` | No UI affordance copies model output into command mode. Recall holds only submitted person text. Command mode is visible: amber box, `!` marker, cwd hint. The log sanitizes control and escape bytes. | A pasted multi-line command runs every line on one Enter. PX5. |
+| PT2 | Model-planted project content, such as `.git/hooks` or `build.rs`, runs under the person profile | Write confinement still holds. Writes to shell configuration and dotfiles are denied. | The planted code can read `~/.ssh` and send it over the network. The person's own terminal has the same exposure. PX1. |
+| PT3 | Exfiltration over the network | None beyond the person's intent. Audit records each command's outcome without content. | Accepted by owner decision for the person's own commands. Combined with PT2 it is the main residual risk. |
+| PT4 | A command writes cache directories that run later outside the sandbox: `~/.cargo/bin` is usually on PATH, and `~/.cargo/config.toml` can set a compiler wrapper | Shell configuration and dotfiles stay read-only. | Writable caches allow persistence into later unsandboxed runs. PX2. |
+| PT5 | Secrets in output persist in the journal and reach the model | The journal is private and local. The notice keeps at most 2 KiB and labels the output untrusted. Audit never stores output. | No secret detection. A future remote destination would receive notices. PX4, PX6. |
+| PT6 | A command, or planted code it runs, reaches Asura's control socket or `~/.asura` and acts as the person | The service accepts command submits only on authenticated control attachments, and the model channel has no such message. The `~/.asura` tree is not writable. | With network allowed, a command can connect to the control socket and submit more commands or change configuration. Home reads include Asura's journals for every project. PX3. |
+| PT7 | The client's environment leaks into the service, or a PATH entry runs project-planted binaries | Only PATH and the PC3 allow-list are sent. The service drops empty and relative PATH entries, never adopts the client's PATH into its own environment, and never logs or audits it. HOME comes from the account database. | An absolute PATH entry inside the project, such as a direnv `bin`, still runs project content. Accepted as the person's configuration. |
+| PT8 | A command runs unattended: no timeout and the client has gone | Ctrl-C, `/cancel` and service shutdown stop it. Guardian lease EOF stops it on service death. | Without the PC5 detach rule a command can run for hours after the TUI exits. |
+
+The model cannot forge a person command. It has no control attachment, and its
+shell profile has no network access, so it cannot reach the control socket.
+The notice states that the person ran the command and that the model did not.
+This prevents the model from treating the person's action as its own work.
+
+### Person command validation
+
+| ID | Case |
+| --- | --- |
+| PX-V1 | Writes to `~/.zshrc`, `~/.ssh/config`, `~/.gitconfig` and `~/.asura` fail; writes to the project, `$TMPDIR` and an existing cache directory succeed |
+| PX-V2 | A model-planted `.git/hooks/pre-commit` runs under `!git commit`; record what it can read, write and reach |
+| PX-V3 | Connecting to the Asura control socket from a person command; the result matches the PX3 decision |
+| PX-V4 | A client PATH with `.`, an empty entry and a relative entry; a planted `ls` in the project does not run for `!ls` |
+| PX-V5 | No client message other than the typed submit creates a person command; the model channel cannot |
+| PX-V6 | The notice for `!cat` of a fixture secret holds at most 2 KiB and the untrusted-data label |
+| PX-V7 | The TUI exits while a command runs; the result matches PC5 and no process remains in the owned group |
+| PX-V8 | Audit records for person commands contain no command, PATH or output bytes |
+
+### Person command decisions
+
+1. **PX1 — Planted content under the person profile (PT2).**
+   (a) Accept and document it; it equals running the command in a terminal.
+   (b) Warn before a person command when the model changed `.git/hooks`, build
+   scripts or other run-later paths since the last person command.
+   (c) Deny network to person commands while unreviewed model writes exist.
+   Recommendation: (a) now. Revisit (b) with EX1's open decision.
+2. **PX2 — Cache write roots (PT4).**
+   (a) Keep the owner's list unchanged.
+   (b) Keep it, but deny `~/.cargo/bin`, `~/.cargo/config`, `~/.cargo/config.toml`
+   and `~/.cargo/env`; `cargo install` then fails in `!`.
+   (c) Allow only cache subdirectories, such as `~/.cargo/registry` and
+   `~/.cargo/git`.
+   Recommendation: (a). A pasted command can already persist through project
+   files such as `.git/hooks`, so (b) and (c) remove little risk and break
+   common commands.
+3. **PX3 — Asura's own state and control socket (PT6).**
+   (a) Deny connections to the control socket and reads of `~/.asura`.
+   (b) Deny the control socket only.
+   (c) Allow both, as the home-read decision implies.
+   Recommendation: (a). No developer tool needs them. It stops planted code
+   from submitting commands as the person and from reading every project's
+   conversations. The cost: `!asura …` commands do not work inside Asura.
+4. **PX4 — Notice egress to a non-local model (PT5, EX13).**
+   (a) Send the notice without output to a remote destination until a
+   destination grant covers person command output.
+   (b) Send the same notice as to a local model.
+   (c) Send no notice to a remote destination.
+   Recommendation: (a). Non-loopback endpoints are refused today, so this
+   decision is needed before remote providers return.
+5. **PX5 — Pasted commands (PT1).**
+   (a) No extra control beyond the visible mode.
+   (b) When a pasted command has more than one line, the hint shows
+   `pasted · N lines will run`.
+   (c) A pasted multi-line command needs a confirmation before it runs.
+   Recommendation: (b). It informs without adding an approval step the owner
+   has rejected for person actions.
+6. **PX6 — Secret-bearing output (PT5, EX4).**
+   (a) Accept, and apply the outcome of EX4 decision 2 to person commands too.
+   (b) Add a person-chosen private variant that journals only counts and sends
+   no output to the model.
+   (c) Redact known token formats in the notice only.
+   Recommendation: (a) now. The owner fixed the durable record on 2026-10-13;
+   (b) is a later feature, and (c) gives false assurance.
+
 ## Design verification
 
 The facts above were gathered from the code on 2026-10-13 by a read-only research
 pass and spot-checked by the primary. No adversarial test was run. The diagram was
-rendered locally with Mermaid CLI 12 and inspected.
+rendered locally with Mermaid CLI 12 and inspected. The person-typed commands
+section was added on 2026-10-13 from code and design inspection; its diagram was
+rendered with Mermaid CLI 12.0.0 and inspected. No adversarial test was run.
