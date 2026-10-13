@@ -3595,6 +3595,9 @@ impl Owner {
             recorded_owner_generation: Some(state.owner_generation),
             binding_generation: state.binding.as_ref().map(|b| b.generation),
             authority_format: Some(1),
+            new_installation: (state.binding.is_some()
+                && self.automatic_initialization == AutomaticInitialization::Complete)
+                .then_some(true),
         })
     }
     pub(crate) fn shutdown(&mut self) {

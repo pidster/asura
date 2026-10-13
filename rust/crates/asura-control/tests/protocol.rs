@@ -174,6 +174,7 @@ fn service_projection_capabilities_and_stop_epoch_are_exact() {
     assert!(validate_semantics(&value, Direction::ServerToClient).is_err());
     value = inspect();
     value.body = Some(Body::InspectReply(pb::InspectReply {
+        new_installation: None,
         lifecycle: Some(2),
         installation: Some(1),
         unavailable_reason: None,
@@ -213,6 +214,7 @@ fn protocol_zero_one_is_exact_and_development_versions_are_rejected() {
 
 fn installation_reply(state: i32, reason: i32) -> pb::InspectInstallationReply {
     pb::InspectInstallationReply {
+        new_installation: None,
         installation: Some(state),
         reason: Some(reason),
         installation_id: None,
@@ -226,6 +228,47 @@ fn valid_reply(reply: pb::InspectInstallationReply) -> bool {
     let mut envelope = inspect();
     envelope.body = Some(Body::InspectInstallationReply(reply));
     validate_semantics(&envelope, Direction::ServerToClient).is_ok()
+}
+#[test]
+fn new_installation_flag_is_true_only_for_verified_graph_ready_replies() {
+    let ready = pb::InspectInstallationReply {
+        installation: Some(6),
+        reason: Some(16),
+        installation_id: Some(vec![7; 16]),
+        authority_revision: Some(3),
+        recorded_owner_generation: Some(2),
+        binding_generation: Some(1),
+        authority_format: Some(1),
+        new_installation: Some(true),
+    };
+    assert!(valid_reply(ready.clone()));
+    assert!(valid_reply(pb::InspectInstallationReply {
+        new_installation: None,
+        ..ready.clone()
+    }));
+    assert!(!valid_reply(pb::InspectInstallationReply {
+        new_installation: Some(false),
+        ..ready.clone()
+    }));
+    assert!(!valid_reply(pb::InspectInstallationReply {
+        new_installation: Some(true),
+        ..installation_reply(3, 1)
+    }));
+    let status = |installation, reason, new_installation| {
+        let mut envelope = inspect();
+        envelope.body = Some(Body::InspectReply(pb::InspectReply {
+            lifecycle: Some(2),
+            installation: Some(installation),
+            unavailable_reason: None,
+            reason: Some(reason),
+            new_installation,
+        }));
+        validate_semantics(&envelope, Direction::ServerToClient).is_ok()
+    };
+    assert!(status(6, 16, Some(true)));
+    assert!(status(6, 16, None));
+    assert!(!status(6, 16, Some(false)));
+    assert!(!status(3, 1, Some(true)));
 }
 #[test]
 fn inspection_state_reason_pairs_and_journal_presence_are_exact() {
@@ -311,6 +354,7 @@ fn installation_request_uses_identity_and_rejects_legacy_reason() {
     envelope.request_counter = Some(1);
     for reason in [None, Some(2)] {
         envelope.body = Some(Body::InspectReply(pb::InspectReply {
+            new_installation: None,
             lifecycle: Some(2),
             installation: Some(2),
             unavailable_reason: Some(1),
@@ -323,6 +367,7 @@ fn installation_request_uses_identity_and_rejects_legacy_reason() {
 #[test]
 fn installation_replay_fields_reject_invalid_identity_and_roundtrip() {
     let valid = pb::InspectInstallationReply {
+        new_installation: None,
         installation: Some(4),
         reason: Some(4),
         installation_id: Some(vec![7; 16]),
@@ -496,6 +541,7 @@ fn stored_memory_status_is_bounded_truthful_and_paired_with_service_uptime() {
         revision: Some(1),
         pending: Some(false),
         status: Some(pb::InspectReply {
+            new_installation: None,
             lifecycle: Some(2),
             installation: Some(6),
             reason: Some(16),

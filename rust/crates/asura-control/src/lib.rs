@@ -193,9 +193,18 @@ fn installation_pair(state: Option<i32>, reason: Option<i32>) -> bool {
             )
     )
 }
+/// Present only as true, and only for a verified graph-ready installation.
+fn new_installation(flag: Option<bool>, installation: Option<i32>, reason: Option<i32>) -> bool {
+    flag.is_none()
+        || (flag == Some(true)
+            && installation == Some(pb::InstallationState::GraphReady as i32)
+            && reason == Some(pb::InstallationInspectionReason::GraphVerified as i32))
+}
 fn installation_reply(value: &pb::InspectInstallationReply) -> bool {
     use pb::InstallationInspectionReason as R;
-    if !installation_pair(value.installation, value.reason) {
+    if !installation_pair(value.installation, value.reason)
+        || !new_installation(value.new_installation, value.installation, value.reason)
+    {
         return false;
     }
     let replayed = matches!(
@@ -303,6 +312,7 @@ pub fn validate_semantics(
                 .is_some_and(|n| pb::Lifecycle::try_from(n).is_ok() && n != 0)
                 && installation_pair(v.installation, v.reason)
                 && v.unavailable_reason.is_none()
+                && new_installation(v.new_installation, v.installation, v.reason)
         }
         Body::InspectInstallationReply(v) => installation_reply(v),
         Body::ObserveService(_) => true,

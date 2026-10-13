@@ -325,6 +325,7 @@ impl Model {
     }
     pub(super) fn view(&self) -> super::ui::View {
         let mut view = super::ui::View {
+            new_installation: false,
             configured_model: None,
             service: None,
             connection: "connecting",
@@ -352,6 +353,7 @@ impl Model {
                 view.lifecycle = crate::app::lifecycle_name(snapshot.lifecycle);
                 view.installation = crate::app::installation_name(snapshot.installation);
                 view.reason = crate::app::reason_name(snapshot.reason);
+                view.new_installation = snapshot.new_installation;
                 view.epoch = Some(
                     snapshot
                         .service_epoch
@@ -440,6 +442,7 @@ mod tests {
             lifecycle: 2,
             installation: 2,
             reason: 2,
+            new_installation: false,
         }
     }
     #[test]

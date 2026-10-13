@@ -103,6 +103,7 @@ fn status_uses_nulls_for_absent_data() {
         lifecycle: 2,
         installation: 2,
         reason: 2,
+        new_installation: false,
     };
     let value = snapshot_status(&snapshot);
     assert_eq!(value["installation"], "uninitialized");

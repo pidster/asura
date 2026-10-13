@@ -108,6 +108,7 @@ message InspectReply {
   optional InstallationState installation = 2;
   optional UnavailableReason unavailable_reason = 3;
   optional InstallationInspectionReason reason = 4;
+  optional bool new_installation = 5;
 }
 message InspectInstallation {}
 message InspectInstallationReply {
@@ -118,6 +119,7 @@ message InspectInstallationReply {
   optional uint64 recorded_owner_generation = 5;
   optional uint64 binding_generation = 6;
   optional uint32 authority_format = 7;
+  optional bool new_installation = 8;
 }
 message Stop { optional bytes expected_epoch = 1; }
 message StopAccepted {}

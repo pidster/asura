@@ -29,6 +29,8 @@ pub struct View {
     pub installation: &'static str,
     pub reason: &'static str,
     pub epoch: Option<String>,
+    /// The service initialized this installation automatically in its current run.
+    pub new_installation: bool,
 }
 
 /// Launch hint naming the other current projects that contain the launch directory.
@@ -74,6 +76,9 @@ fn conversation_reason(reason: i32) -> &'static str {
     }
 }
 
+/// Shown once per session after automatic initialization (threat model TB9).
+const NEW_INSTALLATION_NOTICE: &str =
+    "New installation created at ~/.asura. Earlier data, if any, was not found.";
 const LOCAL_COMMANDS: [&str; 14] = [
     "/help", "/quit", "/exit", "/config", "/init", "/project", "/cancel", "/observe", "/retry",
     "/queue", "/models", "/tools", "/audit", "/new",
@@ -148,6 +153,7 @@ pub struct App {
     launch_directory: Option<String>,
     project_discovery_started: bool,
     project_offer_seen: bool,
+    new_installation_notice_shown: bool,
     project_offer: Option<String>,
     observed_model: Option<String>,
     model_context: Option<asura_control::pb::ModelContext>,
@@ -200,6 +206,7 @@ impl App {
             picker_model_save: None,
             history: super::history::History::new(),
             view: View {
+                new_installation: false,
                 configured_model: None,
                 service: None,
                 connection: "connecting",
@@ -239,6 +246,7 @@ impl App {
             launch_directory: None,
             project_discovery_started: false,
             project_offer_seen: false,
+            new_installation_notice_shown: false,
             project_offer: None,
             observed_model: None,
             model_context: None,
@@ -1164,6 +1172,10 @@ impl App {
         if view.epoch.is_some() {
             self.queue_last_epoch = view.epoch.clone();
         }
+        if view.new_installation && !self.new_installation_notice_shown {
+            self.new_installation_notice_shown = true;
+            self.notice = NEW_INSTALLATION_NOTICE.into();
+        }
         self.view = view;
     }
 
@@ -1423,6 +1435,10 @@ impl App {
         };
         if key.kind == KeyEventKind::Release {
             return false;
+        }
+        // The one-time installation notice yields the header to status on the next key.
+        if self.notice == NEW_INSTALLATION_NOTICE {
+            self.notice.clear();
         }
         // Actions require a distinct press. Editing repeats remain available.
         if key.kind != KeyEventKind::Press
@@ -3885,6 +3901,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Event::Paste("draft".into()));
         app.set_view(View {
+            new_installation: false,
             configured_model: None,
             service: None,
             connection: "unavailable",
@@ -3944,6 +3961,7 @@ mod tests {
         key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(render(&mut app, 90, 24).contains("No project selected."));
         app.set_view(View {
+            new_installation: false,
             configured_model: None,
             service: None,
             connection: "connected",
@@ -4086,6 +4104,7 @@ mod tests {
         app.model_context = Some(measured);
         app.observed_model = Some("Native model".into());
         app.set_view(View {
+            new_installation: false,
             configured_model: None,
             service: None,
             connection: "connected",
@@ -4599,6 +4618,31 @@ mod tests {
     }
 
     #[test]
+    fn new_installation_notice_appears_once_per_session_and_keeps_draft() {
+        let mut app = project_discovery_app();
+        let view = |new_installation| View {
+            configured_model: None,
+            service: None,
+            connection: "connected",
+            lifecycle: "serving",
+            installation: "graph_ready",
+            reason: "graph_verified",
+            epoch: Some("epoch".into()),
+            new_installation,
+        };
+        app.set_view(view(false));
+        assert!(!app.notice.contains("New installation"));
+        app.set_view(view(true));
+        assert_eq!(app.notice, NEW_INSTALLATION_NOTICE);
+        assert_eq!(app.draft(), "draft before discovery");
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.notice.is_empty());
+        assert_eq!(app.draft(), "draft before discovery");
+        app.set_view(view(true));
+        assert!(app.notice.is_empty());
+    }
+
+    #[test]
     fn launch_selection_hints_at_other_matching_projects_without_clearing_draft() {
         use super::super::conversation::Update;
         use asura_control::pb::ProjectReply;
@@ -4668,6 +4712,7 @@ mod tests {
         assert_eq!(app.draft(), "draft before discovery");
         app.selected_project = Some([4; 16]);
         app.set_view(View {
+            new_installation: false,
             configured_model: None,
             service: None,
             connection: "connected",
@@ -4705,6 +4750,7 @@ mod tests {
     fn project_discovery_app() -> App {
         let mut app = App::new();
         app.set_view(View {
+            new_installation: false,
             configured_model: None,
             service: None,
             connection: "connected",

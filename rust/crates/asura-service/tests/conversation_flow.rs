@@ -257,6 +257,14 @@ fn journey(native: bool) -> Result<()> {
     let initialized = wait_ready(&fixture, None)?;
     let installation = initialized.installation_id.map(|id| id.to_vec());
     println!("PASS fresh startup initialized without an initialization command");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.attach()?.inspect()?.new_installation {
+        if Instant::now() >= deadline {
+            return Err("automatic initialization did not report a new installation".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    println!("PASS automatic initialization reports a new installation for this run");
     let project_dir = fixture.home.join("project");
     fs::create_dir(&project_dir)?;
     fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o700))?;
@@ -355,6 +363,10 @@ fn journey(native: bool) -> Result<()> {
     fixture.stop()?;
     fixture.start()?;
     wait_ready(&fixture, installation.clone())?;
+    assert!(
+        !fixture.attach()?.inspect()?.new_installation,
+        "a restarted service must not report a new installation"
+    );
     let repeated = fixture.attach()?.initialize(pb::InitializeInstallation {
         request_id: Some(asura_platform::random_id().to_vec()),
         mode: Some("embedded".into()),

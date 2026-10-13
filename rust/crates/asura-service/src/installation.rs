@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) fn snapshot(state: State, reason: Reason) -> pb::InspectInstallationReply {
     pb::InspectInstallationReply {
+        new_installation: None,
         installation: Some(state as i32),
         reason: Some(reason as i32),
         installation_id: None,

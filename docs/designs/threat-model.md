@@ -94,7 +94,9 @@ observer runs Git as a sandboxed, deadline-bounded child process
 
 The owner reconciled TB9 with [automatic initialization](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow)
 on 2026-10-13: automatic initialization stays, and every fresh initialization
-produces a notice. The notice is not implemented. A marker outside `.asura` that
+produces a notice, shown once per service run; see the
+[admission design](conversation-admission.md#automatic-initialization-and-explicit-registration-workflow).
+A marker outside `.asura` that
 separates first use from loss remains a possible later improvement.
 
 The [installation binding contract](context-storage-candidates.md#selected-installation-binding-and-change-contract)

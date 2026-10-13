@@ -115,6 +115,8 @@ pub struct Snapshot {
     pub lifecycle: i32,
     pub installation: i32,
     pub reason: i32,
+    /// Automatic initialization completed in the current service run.
+    pub new_installation: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -308,6 +310,7 @@ impl Client {
                         lifecycle: status.lifecycle.ok_or(Error::Protocol)?,
                         installation: status.installation.ok_or(Error::Protocol)?,
                         reason: status.reason.ok_or(Error::Protocol)?,
+                        new_installation: status.new_installation == Some(true),
                     },
                     revision: value.revision.ok_or(Error::Protocol)?,
                     pending: value.pending.ok_or(Error::Protocol)?,
@@ -356,6 +359,7 @@ impl Client {
             lifecycle: status.lifecycle.ok_or(Error::Protocol)?,
             installation: status.installation.ok_or(Error::Protocol)?,
             reason: status.reason.ok_or(Error::Protocol)?,
+            new_installation: status.new_installation == Some(true),
         })
     }
 

@@ -274,6 +274,7 @@ mod tests {
         let runtime = RuntimeDirectory::scratch(&path, true).unwrap();
         let (_reader, sender) = asura_platform::events::wake_pair().unwrap();
         let status = pb::InspectReply {
+            new_installation: None,
             lifecycle: Some(1),
             installation: Some(1),
             reason: Some(1),
@@ -348,6 +349,7 @@ mod tests {
         let runtime = RuntimeDirectory::scratch(&path, true).unwrap();
         let (_, wake) = asura_platform::events::wake_pair().unwrap();
         let status = pb::InspectReply {
+            new_installation: None,
             lifecycle: Some(2),
             installation: Some(6),
             reason: Some(16),

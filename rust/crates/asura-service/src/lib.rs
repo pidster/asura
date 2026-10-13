@@ -200,6 +200,7 @@ struct Dispatcher {
 impl Dispatcher {
     fn status(&self, lifecycle: pb::Lifecycle) -> pb::InspectReply {
         pb::InspectReply {
+            new_installation: self.installation.new_installation,
             lifecycle: Some(lifecycle as i32),
             installation: self.installation.installation,
             reason: self.installation.reason,
@@ -370,6 +371,7 @@ impl Dispatcher {
         let (body, action) = match request.body.as_ref() {
             Some(Body::Inspect(_)) => (
                 Body::InspectReply(pb::InspectReply {
+                    new_installation: self.installation.new_installation,
                     lifecycle: Some(lifecycle as i32),
                     installation: self.installation.installation,
                     unavailable_reason: None,

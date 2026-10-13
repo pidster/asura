@@ -375,6 +375,10 @@ def absent_and_signal(fixture):
     for action in ("normal", "/quit", "/exit", "signal", "crash"):
         trial = fixture.launch()
         try:
+            if action == "normal":
+                # First launch initializes automatically and shows the TB9 notice once;
+                # the launch helper's Escape dismisses it.
+                assert b"New installation created" in trial.output, bytes(trial.output[-2500:])
             assert "Connected (process)" in trial.screen.text(), trial.screen.text()
             assert "uptime " in trial.screen.text() and "memory:" in trial.screen.text(), trial.screen.text()
             log = fixture.root / "home/.asura/logs/asura.log"

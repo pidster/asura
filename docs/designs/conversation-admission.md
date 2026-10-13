@@ -119,9 +119,25 @@ Required behavior (owner, 2026-10-13, reconciling threat-model TB9): after an
 automatic initialization, the client shows a notice once. It states that Asura
 created a new installation at `~/.asura` and that any earlier data was not found.
 The service cannot tell first use from prior loss, so every fresh initialization
-produces the notice. Proposed mechanism: the service reports that the current
-installation was initialized automatically and whether the notice has been
-acknowledged; the acknowledgement record is open. The notice is not implemented.
+produces the notice. The owner selected a per-run notice on 2026-10-13; nothing
+durable records it.
+
+- The control schema adds `optional bool new_installation` as field 8 of
+  `InspectInstallationReply` and field 5 of `InspectReply`. Protocol stays 0.1.
+- The service sets it to true only after automatic initialization completes in
+  the current service run, and only with installation `GraphReady` and reason
+  `GraphVerified`. Otherwise the field is absent. Validation rejects `false` and
+  any other combination. An explicit `/init` does not set it.
+- A service restart clears it, so the notice never returns for that installation.
+- The TUI shows the notice once per client session when an inspect reply carries
+  the field: "New installation created at ~/.asura. Earlier data, if any, was
+  not found." It uses the existing notice line and never clears the draft. The
+  next key press dismisses it, so the header returns to service status.
+
+Validation: control unit tests for the field rules; service unit tests that the
+flag follows `Complete` only; the service conversation-flow test checks it after
+fresh startup and its absence after restart; a TUI unit test checks the notice
+appears once.
 
 The root entry `.DS_Store` is Finder metadata, not installation authority. The
 platform scanner accepts only a regular file owned by the account, with one
