@@ -1009,8 +1009,12 @@ def queue_history_with_provider(fixture, source, endpoint):
                 trial.idle(0.1)
                 print("Queue-history restoration diagnostic:\n" + trial.screen.text(), file=sys.stderr)
                 raise
-            trial.send(b"\x1b[1;2A")  # Shift+Up enters the scrollable conversation pane.
+            trial.send(b"\x1b[1;2A")  # Shift+Up enters the log; restored inputs are not queued.
             trial.until(b"scroll history", plain=True, limit=5)
+            # Plain Up/Down scroll the log; they no longer leave it to recall input.
+            trial.send(b"\x1b[A\x1b[A\x1b[B")
+            trial.idle(0.1)
+            assert "scroll history" in trial.screen.text(), trial.screen.text()
             focus_offset = len(trial.output)
             trial.send(b"\x1b[5~\x1b")  # Page up, then return to the editor.
             trial.until("↑↓ recall".encode(), focus_offset, plain=True, limit=5)
@@ -1229,6 +1233,14 @@ def composer_interactions(fixture, source):
             trial.idle(0.1)
             trial.send(b"preserved draft")
             trial.until(b"preserved draft", plain=True)
+            # Meta word keys: Alt+B moves one word left, Alt+Backspace deletes
+            # the inserted word, and Alt+F returns to the end of the draft.
+            offset = len(trial.output)
+            trial.send(b"\x1bbX")
+            trial.until(b"preserved Xdraft", offset, plain=True)
+            offset = len(trial.output)
+            trial.send(b"\x1b\x7f\x1bf")
+            trial.until(b"preserved draft", offset, plain=True)
             offset = len(trial.output)
             trial.send(b"\x1b[B")  # Plain Down on the final input row enters status focus.
             trial.until(b"Enter open", offset, plain=True)

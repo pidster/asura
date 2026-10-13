@@ -90,7 +90,7 @@ impl App {
             .filter(|entry| matches!(entry.state, Some(1 | 2)))
             .collect()
     }
-    fn queue_focus_ids(&self) -> Vec<Vec<u8>> {
+    pub(super) fn queue_focus_ids(&self) -> Vec<Vec<u8>> {
         self.unresolved()
             .into_iter()
             .filter_map(|entry| entry.input_id.clone())
@@ -100,6 +100,26 @@ impl App {
                     .map(|item| item.request_id.to_vec()),
             )
             .collect()
+    }
+    /// Focus the queue's last unresolved item. False when the queue is empty.
+    fn enter_queue_last(&mut self) -> bool {
+        let ids = self.queue_focus_ids();
+        let Some(id) = ids.last() else {
+            return false;
+        };
+        self.queue_focused_id = Some(id.clone());
+        self.focus = Focus::Queue(ids.len() - 1);
+        true
+    }
+    /// Focus the conversation log at its latest row. False without a transcript.
+    fn enter_log(&mut self) -> bool {
+        if self.transcript.is_empty() {
+            return false;
+        }
+        self.focus = Focus::Editor;
+        self.history_focus = true;
+        self.history_scroll = self.history_scroll_max;
+        true
     }
     fn move_queue_item(&mut self, id: &[u8], up: bool) {
         if let Some(index) = self
@@ -293,11 +313,7 @@ impl App {
         if key.modifiers == KeyModifiers::CONTROL && self.focus == Focus::Editor {
             match key.code {
                 KeyCode::Up => {
-                    let ids = self.queue_focus_ids();
-                    if let Some(id) = ids.last() {
-                        self.queue_focused_id = Some(id.clone());
-                        self.focus = Focus::Queue(ids.len() - 1);
-                    }
+                    self.enter_queue_last();
                     return true;
                 }
                 KeyCode::Down => {
@@ -307,19 +323,43 @@ impl App {
                 _ => {}
             }
         }
+        // The focus chain runs log, queue, editor, status bar from top to
+        // bottom. The log owns its own Shift+Down in `history_key`.
+        if key.modifiers == KeyModifiers::SHIFT && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            let up = key.code == KeyCode::Up;
+            match self.focus {
+                Focus::Editor if up => {
+                    if !self.enter_queue_last() {
+                        self.enter_log();
+                    }
+                }
+                Focus::Editor => self.focus = Focus::Project,
+                Focus::Project | Focus::Model if up => self.focus = Focus::Editor,
+                Focus::Project | Focus::Model => {}
+                Focus::Queue(_) if up => {
+                    self.enter_log();
+                }
+                Focus::Queue(_) => self.focus = Focus::Editor,
+            }
+            return true;
+        }
         if !key.modifiers.is_empty() {
             return self.focus != Focus::Editor;
         }
         match self.focus {
+            // Browsing recall steps entries from any row. Otherwise Up and Down
+            // move one visual row and act only at the draft's first or final row.
             Focus::Editor => match key.code {
-                KeyCode::Up => {
+                KeyCode::Up if self.history.is_browsing() || self.editor.on_first_visual_row() => {
                     self.recall(true);
                     true
                 }
-                KeyCode::Down => {
-                    if !self.recall(false) && self.editor.on_final_visual_row() {
-                        self.focus = Focus::Project;
-                    }
+                KeyCode::Down if self.history.is_browsing() => {
+                    self.recall(false);
+                    true
+                }
+                KeyCode::Down if self.editor.on_final_visual_row() => {
+                    self.focus = Focus::Project;
                     true
                 }
                 _ => false,
@@ -387,6 +427,7 @@ impl App {
                         self.focus = Focus::Editor;
                         return true;
                     }
+                    KeyCode::Up if selected == 0 && self.enter_log() => return true,
                     KeyCode::Char('[' | ']') => {
                         self.move_queue_item(&ids[selected], key.code == KeyCode::Char('['));
                     }
@@ -481,7 +522,12 @@ impl App {
             return "↑↓ responses · Enter activity · PgUp/PgDn scroll · Esc input".into();
         }
         if self.history_focus {
-            return "⇧↑/⇧↓ scroll history · ↑↓ recall · PgUp/PgDn page · Esc input".into();
+            let below = if self.queue_focus_ids().is_empty() {
+                "input"
+            } else {
+                "queue"
+            };
+            return format!("↑↓ scroll history · PgUp/PgDn page · ⇧↓ {below} · Esc input");
         }
         if self.picker_model_save.is_some() {
             return "Saving model selection · draft preserved".into();
@@ -489,25 +535,35 @@ impl App {
         if self.picker.is_some() {
             return "↑↓ select · Enter apply · Esc close".into();
         }
+        // Shift+Up names the pane it will focus; it is omitted with neither.
+        let above = if !self.queue_focus_ids().is_empty() {
+            " · ⇧↑ queue"
+        } else if !self.transcript.is_empty() {
+            " · ⇧↑ history"
+        } else {
+            ""
+        };
+        let history_above = if self.transcript.is_empty() {
+            ""
+        } else {
+            " · ⇧↑ history"
+        };
         match self.focus {
-            Focus::Editor if self.conversation_busy => format!(
-                "↵ queue · {newline_chord} newline · ↑↓ recall · ⇧↑/⇧↓ scroll · ^↑ queue · ↓ status"
+            Focus::Editor => format!(
+                "{} · {newline_chord} newline · ↑↓ recall{above} · ⇧↓ status",
+                if self.conversation_busy {
+                    "↵ queue"
+                } else {
+                    "↵ send"
+                }
             ),
-            Focus::Editor => {
-                format!(
-                    "↵ send · {newline_chord} newline · ↑↓ recall · ⇧↑/⇧↓ scroll · ^↑ queue · ↓ status"
-                )
-            }
             Focus::Project | Focus::Model => {
                 "←→ / Tab select item · Enter open · ↑ / Esc input".into()
             }
             Focus::Queue(_) if self.queue_busy => "Queue request pending · Esc input".into(),
-            Focus::Queue(_) if self.conversation_busy => {
-                "↑↓ select · [ move up · ] move down · ↵ send now · Esc input".into()
-            }
-            Focus::Queue(_) => {
-                "↑↓ select · [ move up · ] move down · ↵ send now · Esc input".into()
-            }
+            Focus::Queue(_) => format!(
+                "↑↓ select · [ move up · ] move down · ↵ send now{history_above} · Esc input"
+            ),
         }
     }
     pub(super) fn focus_style(&self, focus: Focus, style: Style) -> Style {
@@ -762,12 +818,28 @@ fn navigate(selected: &mut usize, count: usize, key: KeyCode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rat_text::TextPosition;
     use ratatui::{Terminal, backend::TestBackend};
     fn key(app: &mut App, code: KeyCode) {
         app.handle(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
     }
     fn modified_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         app.handle(Event::Key(KeyEvent::new(code, modifiers)));
+    }
+    fn queued(id: u8) -> asura_control::pb::ConversationQueueEntry {
+        asura_control::pb::ConversationQueueEntry {
+            input_id: Some(vec![id; 16]),
+            state: Some(1),
+            text: Some(format!("queued {id}")),
+            ..Default::default()
+        }
+    }
+    fn with_long_log(app: &mut App) {
+        for index in 0..8 {
+            app.append_response(format!("prompt {index}"), None);
+            app.transcript[index].1 = format!("answer {index} with enough text to fill a row");
+            app.rendered_responses[index] = markdown::render(&app.transcript[index].1);
+        }
     }
     fn project(id: u8, current: bool) -> asura_control::pb::ProjectReply {
         asura_control::pb::ProjectReply {
@@ -805,7 +877,11 @@ mod tests {
         };
         let idle = app.hints();
         assert!(idle.contains("↑↓ recall"));
-        assert!(idle.contains("⇧↑/⇧↓ scroll"));
+        assert!(idle.contains("⇧↓ status"));
+        assert!(
+            !idle.contains("⇧↑"),
+            "Shift+Up does nothing without queue or log"
+        );
         assert!(idle.contains(&format!("{newline} newline")));
         assert!(!idle.contains("Ctrl+"));
         assert!(draw(&mut app, "key-hints", 110, 26).contains(newline));
@@ -814,6 +890,18 @@ mod tests {
         let busy = app.hints();
         assert!(busy.contains(&format!("{newline} newline")));
         assert!(busy.contains("↵ queue"));
+
+        app.append_response("prompt".into(), None);
+        assert!(app.hints().contains("⇧↑ history"));
+        app.queue_entries.push(queued(7));
+        assert!(app.hints().contains("⇧↑ queue"));
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(app.hints().contains("⇧↑ history"));
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        let log = app.hints();
+        assert!(log.contains("↑↓ scroll history") && log.contains("⇧↓ queue"));
+        app.queue_entries.clear();
+        assert!(app.hints().contains("⇧↓ input"));
     }
     #[test]
     fn status_project_picker_preserves_draft_and_rejects_stale_or_busy() {
@@ -921,13 +1009,13 @@ mod tests {
         assert_eq!(app.focus, Focus::Project);
         key(&mut app, KeyCode::Up);
         app.insert("first line\nsecond line with 🦀 and enough text to wrap at narrow width");
-        draw(&mut app, "multiline-status-boundary", 24, 24);
+        draw(&mut app, "multiline-status-boundary", 32, 24);
         modified_key(&mut app, KeyCode::Home, KeyModifiers::CONTROL);
-        draw(&mut app, "multiline-start", 24, 24);
+        draw(&mut app, "multiline-start", 32, 24);
         key(&mut app, KeyCode::Down);
         assert_eq!(app.focus, Focus::Editor);
         modified_key(&mut app, KeyCode::End, KeyModifiers::CONTROL);
-        draw(&mut app, "multiline-end", 24, 24);
+        draw(&mut app, "multiline-end", 32, 24);
         let draft = app.draft();
         key(&mut app, KeyCode::Down);
         assert_eq!(app.focus, Focus::Project);
@@ -946,7 +1034,14 @@ mod tests {
         app.insert("unsent\n🦀 draft");
         draw(&mut app, "recall", 80, 24);
         key(&mut app, KeyCode::Up);
+        assert_eq!(
+            app.draft(),
+            "unsent\n🦀 draft",
+            "Up first moves to the top row"
+        );
+        key(&mut app, KeyCode::Up);
         assert_eq!(app.draft(), "second\nline");
+        // Browsing steps entries even though the cursor is on the final row.
         key(&mut app, KeyCode::Up);
         assert_eq!(app.draft(), "first");
         key(&mut app, KeyCode::Up);
@@ -984,61 +1079,345 @@ mod tests {
         assert_eq!(app.draft(), "drafX");
     }
     #[test]
-    fn shift_scroll_takes_precedence_over_queue_and_empty_transcript_keeps_draft() {
+    fn rn1_up_and_down_move_one_visual_row_then_recall_or_enter_status() {
+        let mut app = App::new();
+        app.history.record("earlier");
+        app.insert("alpha one\nbravo two");
+        draw(&mut app, "rows", 80, 24);
+        for _ in 0..3 {
+            key(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.editor.selection_points().1, TextPosition::new(6, 1));
+        key(&mut app, KeyCode::Up);
+        draw(&mut app, "rows", 80, 24);
+        assert_eq!(app.editor.selection_points().1, TextPosition::new(6, 0));
+        assert_eq!(app.draft(), "alpha one\nbravo two");
+        key(&mut app, KeyCode::Down);
+        draw(&mut app, "rows", 80, 24);
+        assert_eq!(app.editor.selection_points().1, TextPosition::new(6, 1));
+        assert_eq!(app.focus, Focus::Editor);
+        key(&mut app, KeyCode::Up);
+        draw(&mut app, "rows", 80, 24);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.draft(), "earlier", "Up on the first row starts recall");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.draft(), "alpha one\nbravo two");
+        draw(&mut app, "rows", 80, 24);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, Focus::Project, "Down on the final row");
+        key(&mut app, KeyCode::Up);
+
+        // Hard wrapping: the 32-column terminal gives the editor 28 columns.
+        let mut app = App::new();
+        app.history.record("earlier");
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh";
+        app.insert(text);
+        draw(&mut app, "wrapped-rows", 32, 24);
+        assert_eq!(app.editor.selection_points().1, TextPosition::new(70, 0));
+        key(&mut app, KeyCode::Up);
+        draw(&mut app, "wrapped-rows", 32, 24);
+        assert_eq!(app.editor.selection_points().1, TextPosition::new(42, 0));
+        key(&mut app, KeyCode::Up);
+        draw(&mut app, "wrapped-rows", 32, 24);
+        assert_eq!(app.editor.selection_points().1, TextPosition::new(14, 0));
+        assert_eq!(app.draft(), text);
+        key(&mut app, KeyCode::Down);
+        draw(&mut app, "wrapped-rows", 32, 24);
+        assert_eq!(app.editor.selection_points().1, TextPosition::new(42, 0));
+        assert_eq!(app.focus, Focus::Editor);
+        key(&mut app, KeyCode::Up);
+        draw(&mut app, "wrapped-rows", 32, 24);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.draft(), "earlier");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.draft(), text);
+        draw(&mut app, "wrapped-rows", 32, 24);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, Focus::Project);
+        assert_eq!(app.draft(), text);
+        key(&mut app, KeyCode::Esc);
+
+        // A scrolled editor hides the first row; Up moves rows until it shows.
+        app.editor = Editor::new();
+        let lines = (0..10).map(|n| format!("line {n}")).collect::<Vec<_>>();
+        app.insert(&lines.join("\n"));
+        draw(&mut app, "scrolled-rows", 32, 24);
+        assert!(!app.editor.first_row_visible());
+        for row in (0..9).rev() {
+            key(&mut app, KeyCode::Up);
+            draw(&mut app, "scrolled-rows", 32, 24);
+            assert_eq!(app.editor.selection_points().1.y, row);
+        }
+        assert!(app.editor.first_row_visible());
+        assert!(!app.history.is_browsing());
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.draft(), "earlier");
+    }
+    #[test]
+    fn rn2_browsing_steps_entries_from_any_row_until_an_edit() {
+        let mut app = App::new();
+        app.history.record("older");
+        app.history.record("one\ntwo\nthree");
+        app.insert("draft 界");
+        draw(&mut app, "browse", 80, 24);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.draft(), "one\ntwo\nthree");
+        draw(&mut app, "browse", 80, 24);
+        // Cursor movement does not end browsing; Up still steps entries.
+        key(&mut app, KeyCode::Left);
+        modified_key(&mut app, KeyCode::Left, KeyModifiers::ALT);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.draft(), "older");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.draft(), "one\ntwo\nthree");
+        draw(&mut app, "browse", 80, 24);
+        // An edit ends browsing. Up then moves a row instead of recalling.
+        key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.draft(), "one\ntwo\nthreex");
+        assert!(!app.history.is_browsing());
+        draw(&mut app, "browse", 80, 24);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.draft(), "one\ntwo\nthreex");
+        assert_eq!(app.editor.selection_points().1.y, 1);
+        key(&mut app, KeyCode::Down);
+        draw(&mut app, "browse", 80, 24);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.focus,
+            Focus::Project,
+            "no longer browsing at the final row"
+        );
+        key(&mut app, KeyCode::Esc);
+        // The edited text becomes the saved draft of the next recall.
+        modified_key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(app.draft(), "one\ntwo\nthree");
+        modified_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(app.draft(), "one\ntwo\nthreex");
+        // Option+Backspace is an edit too.
+        modified_key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        modified_key(&mut app, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(app.draft(), "one\ntwo\n");
+        assert!(!app.history.is_browsing());
+    }
+    #[test]
+    fn rn3_word_keys_reach_the_editor_from_the_composer() {
+        let mut app = App::new();
+        app.insert("héllo wörld");
+        draw(&mut app, "words", 80, 24);
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            modified_key(&mut app, KeyCode::Left, modifiers);
+            assert_eq!(app.editor.selection_points().1, TextPosition::new(6, 0));
+            modified_key(&mut app, KeyCode::Right, modifiers);
+            assert_eq!(app.editor.selection_points().1, TextPosition::new(11, 0));
+        }
+        modified_key(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
+        modified_key(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
+        modified_key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT);
+        assert_eq!(app.editor.selection_points().1, TextPosition::new(5, 0));
+        modified_key(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            app.editor.selection_points(),
+            (TextPosition::new(5, 0), TextPosition::new(11, 0))
+        );
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.draft(), "héllo wörld");
+        modified_key(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+        modified_key(&mut app, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(app.draft(), "héllo ");
+    }
+    #[test]
+    fn fn1_shift_up_enters_queue_then_log_and_is_ignored_with_neither() {
         let mut app = App::new();
         app.insert("draft");
         modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
         assert!(!app.history_focus);
+        assert_eq!(app.focus, Focus::Editor);
         assert_eq!(app.draft(), "draft");
-        app.history.record("submitted");
-        app.queue_entries
-            .push(asura_control::pb::ConversationQueueEntry {
-                input_id: Some(vec![7; 16]),
-                state: Some(1),
-                text: Some("queued".into()),
-                ..Default::default()
-            });
-        app.append_response("prompt".into(), None);
-        draw(&mut app, "queue-and-history", 80, 24);
+        // Queue without transcript: the log is outside the chain.
+        app.queue_entries = vec![queued(1), queued(2)];
+        draw(&mut app, "queue-only", 80, 24);
         modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
-        assert!(app.history_focus);
-        assert_eq!(app.focus, Focus::Editor);
-        assert_eq!(app.draft(), "draft");
+        assert_eq!(app.focus, Focus::Queue(1), "the queue's last item");
         key(&mut app, KeyCode::Up);
+        assert_eq!(app.focus, Focus::Queue(0));
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.focus, Focus::Queue(0));
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(app.focus, Focus::Queue(0));
         assert!(!app.history_focus);
-        assert_eq!(app.draft(), "submitted");
-        assert_eq!(app.focus, Focus::Editor);
-    }
-    #[test]
-    fn shift_arrows_scroll_conversation_without_changing_draft() {
-        let mut app = App::new();
-        for index in 0..8 {
-            app.append_response(format!("prompt {index}"), None);
-            app.transcript[index].1 = format!("answer {index} with enough text to fill a row");
-            app.rendered_responses[index] = markdown::render(&app.transcript[index].1);
-        }
-        app.insert("unsent draft");
-        draw(&mut app, "history-bottom", 80, 20);
+        key(&mut app, KeyCode::Esc);
+        // Queue and transcript: Shift+Up enters the queue before the log.
+        with_long_log(&mut app);
+        draw(&mut app, "queue-and-log", 80, 20);
         assert!(app.history_scroll_max > 0);
         modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
-        assert!(app.history_focus);
-        assert_eq!(app.history_scroll, app.history_scroll_max - 1);
-        assert_eq!(app.draft(), "unsent draft");
+        assert_eq!(app.focus, Focus::Queue(1));
+        assert!(!app.history_focus);
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Up);
+        assert!(app.history_focus, "Up on the first item enters the log");
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.history_scroll, app.history_scroll_max, "latest row");
+        key(&mut app, KeyCode::Esc);
         modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
-        assert_eq!(app.history_scroll, app.history_scroll_max - 2);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(app.history_focus, "Shift+Up from the queue enters the log");
+        assert_eq!(app.history_scroll, app.history_scroll_max);
+        key(&mut app, KeyCode::Esc);
+        // Transcript without queue: Shift+Up enters the log directly.
+        app.queue_entries.clear();
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(app.history_focus);
+        assert_eq!(app.history_scroll, app.history_scroll_max);
+        assert_eq!(app.draft(), "draft");
+    }
+    #[test]
+    fn fn2_shift_down_steps_log_queue_editor_status_and_escape_returns() {
+        let mut app = App::new();
+        app.insert("draft");
+        with_long_log(&mut app);
+        app.queue_entries = vec![queued(1), queued(2)];
+        draw(&mut app, "focus-down", 80, 20);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(app.history_focus);
+        modified_key(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert!(!app.history_focus);
+        assert_eq!(app.focus, Focus::Queue(0), "the queue's first item");
+        modified_key(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(!app.history_focus);
+        modified_key(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.focus, Focus::Project);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(app.focus, Focus::Editor);
+        // Escape returns from the queue and from the log.
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(app.focus, Focus::Queue(1));
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, Focus::Editor, "Down past the last item");
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Editor);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.history_focus);
+        assert_eq!(app.focus, Focus::Editor);
+        // An empty queue is skipped on the way down.
+        app.queue_entries.clear();
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(app.history_focus);
+        modified_key(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert!(!app.history_focus);
+        assert_eq!(app.focus, Focus::Editor);
+        // Status returns with Up and Escape too.
+        modified_key(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.focus, Focus::Editor);
+        modified_key(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.draft(), "draft");
+    }
+    #[test]
+    fn fn3_log_arrows_scroll_one_row_and_clamp_without_recall() {
+        let mut app = App::new();
+        app.history.record("submitted");
+        with_long_log(&mut app);
+        app.insert("unsent draft");
+        draw(&mut app, "history-bottom", 80, 20);
+        let max = app.history_scroll_max;
+        assert!(max > 2);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(app.history_focus);
+        assert_eq!(app.history_scroll, max);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.history_scroll, max, "Down clamps at the latest row");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.history_scroll, max - 1);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.history_scroll, max - 2);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.history_scroll, max - 1);
+        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(
+            app.history_scroll,
+            max - 1,
+            "Shift+Up in the log is a no-op"
+        );
+        assert!(app.history_focus);
         key(&mut app, KeyCode::Home);
         assert_eq!(app.history_scroll, 0);
-        modified_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
-        assert_eq!(app.history_scroll, 0);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.history_scroll, 0, "Up clamps at the top");
         assert!(draw(&mut app, "history-top", 80, 20).contains("prompt 0"));
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.history_scroll, app.history_page.min(max));
+        key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.history_scroll, 0);
         key(&mut app, KeyCode::End);
-        assert_eq!(app.history_scroll, app.history_scroll_max);
-        modified_key(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.history_scroll, max);
         assert!(app.history_focus);
-        assert_eq!(app.history_scroll, app.history_scroll_max);
-        key(&mut app, KeyCode::Down);
+        assert_eq!(app.draft(), "unsent draft", "log keys never recall");
+        assert!(!app.history.is_browsing());
+        key(&mut app, KeyCode::Esc);
         assert!(!app.history_focus);
         assert_eq!(app.draft(), "unsent draft");
+    }
+    #[test]
+    fn fn4_focus_round_trips_keep_draft_cursor_selection_and_recall() {
+        let mut app = App::new();
+        app.history.record("older 界");
+        with_long_log(&mut app);
+        app.queue_entries = vec![queued(1)];
+        app.insert("first 🦀\nsecond");
+        draw(&mut app, "round-trip", 80, 20);
+        key(&mut app, KeyCode::Up);
+        modified_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        modified_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        let points = app.editor.selection_points();
+        assert_ne!(points.0, points.1);
+        let journey = [
+            (KeyCode::Up, KeyModifiers::SHIFT),
+            (KeyCode::Up, KeyModifiers::SHIFT),
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::Down, KeyModifiers::SHIFT),
+            (KeyCode::Down, KeyModifiers::SHIFT),
+            (KeyCode::Down, KeyModifiers::SHIFT),
+            (KeyCode::Up, KeyModifiers::SHIFT),
+            (KeyCode::Up, KeyModifiers::CONTROL),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Down, KeyModifiers::CONTROL),
+            (KeyCode::Esc, KeyModifiers::NONE),
+        ];
+        for (code, modifiers) in journey {
+            modified_key(&mut app, code, modifiers);
+            draw(&mut app, "round-trip", 80, 20);
+        }
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(!app.history_focus);
+        assert_eq!(app.draft(), "first 🦀\nsecond");
+        assert_eq!(app.editor.selection_points(), points);
+        // Recall state survives the same round trip.
+        app.insert("edited");
+        let draft = app.draft();
+        modified_key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(app.draft(), "older 界");
+        let points = app.editor.selection_points();
+        for (code, modifiers) in journey {
+            modified_key(&mut app, code, modifiers);
+            draw(&mut app, "round-trip", 80, 20);
+        }
+        assert!(app.history.is_browsing());
+        assert_eq!(app.draft(), "older 界");
+        assert_eq!(app.editor.selection_points(), points);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.draft(), draft, "Down restores the saved draft");
     }
     #[test]
     fn held_queue_row_explains_known_and_unknown_causes() {

@@ -152,7 +152,25 @@ impl Editor {
         let navigation = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
         let document = key.modifiers == KeyModifiers::CONTROL
             || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        // Option+arrow arrives as Alt+arrow, or as Alt+B/F from terminals that
+        // send Meta sequences. Ctrl+arrow is the common non-macOS chord.
+        let alt = key.modifiers == KeyModifiers::ALT
+            || key.modifiers == (KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let word = alt || document;
         match key.code {
+            KeyCode::Left if word => {
+                self.state.move_to_prev_word(extend);
+            }
+            KeyCode::Right if word => {
+                self.state.move_to_next_word(extend);
+            }
+            KeyCode::Char('b' | 'B') if alt => {
+                self.state.move_to_prev_word(extend);
+            }
+            KeyCode::Char('f' | 'F') if alt => {
+                self.state.move_to_next_word(extend);
+            }
+            KeyCode::Backspace if key.modifiers == KeyModifiers::ALT => self.delete_word()?,
             KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
                 self.state.select_all();
             }
@@ -233,6 +251,30 @@ impl Editor {
         }
         if !range.is_empty() {
             self.replace(range, "")?;
+        }
+        Ok(())
+    }
+
+    /// Delete the selection, or the previous word, through the bounded
+    /// replacement path so size, undo and cursor rules match other edits.
+    fn delete_word(&mut self) -> Result<(), EditError> {
+        let selection = self.state.selection();
+        let range = if selection.start != selection.end {
+            selection
+        } else {
+            let cursor = self.state.cursor();
+            let start = self
+                .state
+                .try_prev_word_start(cursor)
+                .map_err(dependency_error)?;
+            TextRange::new(start, cursor)
+        };
+        let bytes = self
+            .state
+            .try_bytes_at_range(range)
+            .map_err(dependency_error)?;
+        if !bytes.is_empty() {
+            self.replace(bytes, "")?;
         }
         Ok(())
     }
@@ -369,6 +411,30 @@ impl Editor {
         self.state.offset().1 == 0 && self.state.sub_row_offset() == 0
     }
 
+    /// Anchor and cursor, for focus round-trip tests.
+    #[cfg(test)]
+    pub fn selection_points(&self) -> (TextPosition, TextPosition) {
+        (self.state.anchor(), self.state.cursor())
+    }
+
+    /// True when the cursor is on the draft's first visual row.
+    pub fn on_first_visual_row(&self) -> bool {
+        let start = TextPosition::new(0, 0);
+        if self.state.cursor() == start {
+            return true;
+        }
+        if self.state.rendered.width == 0 {
+            return self.state.cursor().y == 0;
+        }
+        match (
+            self.state.pos_to_relative_screen(self.state.cursor()),
+            self.state.pos_to_relative_screen(start),
+        ) {
+            (Some((_, cursor_row)), Some((_, start_row))) => cursor_row == start_row,
+            _ => false,
+        }
+    }
+
     pub fn on_final_visual_row(&self) -> bool {
         let end = end_position(&self.text());
         // The endpoint is always on the final row, even when a narrow viewport
@@ -470,6 +536,113 @@ mod tests {
         assert!(editor.on_final_visual_row());
         assert_eq!(editor.text(), "abcdefghij\n界🦀last");
     }
+    #[test]
+    fn first_visual_row_tracks_wrapping_unicode_and_resize() {
+        let mut editor = Editor::new();
+        editor.insert("abcdefghij\n界🦀last").unwrap();
+        draw(&mut editor, 5, 3);
+        assert!(!editor.on_first_visual_row());
+        editor.state.set_cursor((3, 0), false);
+        draw(&mut editor, 5, 3);
+        assert!(editor.on_first_visual_row());
+        editor.state.set_cursor((7, 0), false);
+        draw(&mut editor, 5, 3);
+        assert!(!editor.on_first_visual_row(), "hard-wrapped second row");
+        draw(&mut editor, 20, 3);
+        assert!(
+            editor.on_first_visual_row(),
+            "resize unwraps the first line"
+        );
+        editor.state.set_cursor((0, 1), false);
+        draw(&mut editor, 20, 3);
+        assert!(!editor.on_first_visual_row());
+        assert_eq!(editor.text(), "abcdefghij\n界🦀last");
+    }
+
+    #[test]
+    fn rn3_word_movement_accepts_option_ctrl_and_meta_forms() {
+        let text = "héllo wörld 界界 end";
+        let alt = KeyModifiers::ALT;
+        let ctrl = KeyModifiers::CONTROL;
+        for (back, forward) in [
+            ((KeyCode::Left, alt), (KeyCode::Right, alt)),
+            ((KeyCode::Left, ctrl), (KeyCode::Right, ctrl)),
+            ((KeyCode::Char('b'), alt), (KeyCode::Char('f'), alt)),
+        ] {
+            let mut editor = Editor::new();
+            editor.insert(text).unwrap();
+            draw(&mut editor, 40, 3);
+            press(&mut editor, back.0, back.1);
+            assert_eq!(editor.state.cursor(), TextPosition::new(15, 0));
+            press(&mut editor, back.0, back.1);
+            assert_eq!(editor.state.cursor(), TextPosition::new(12, 0));
+            press(&mut editor, back.0, back.1);
+            assert_eq!(editor.state.cursor(), TextPosition::new(6, 0));
+            press(&mut editor, forward.0, forward.1);
+            assert_eq!(editor.state.cursor(), TextPosition::new(11, 0));
+            assert_eq!(editor.state.anchor(), editor.state.cursor());
+            // Shift with a word key extends the selection from the anchor.
+            press(&mut editor, forward.0, forward.1 | KeyModifiers::SHIFT);
+            assert_eq!(editor.state.anchor(), TextPosition::new(11, 0));
+            assert_eq!(editor.state.cursor(), TextPosition::new(14, 0));
+            editor.insert("X").unwrap();
+            assert_eq!(editor.text(), "héllo wörldX end");
+        }
+        let mut editor = Editor::new();
+        editor.insert("one two").unwrap();
+        press(&mut editor, KeyCode::Char('B'), alt | KeyModifiers::SHIFT);
+        assert_eq!(editor.state.anchor(), TextPosition::new(7, 0));
+        assert_eq!(editor.state.cursor(), TextPosition::new(4, 0));
+        assert_eq!(editor.text(), "one two", "movement never edits");
+    }
+
+    #[test]
+    fn rn3_option_backspace_deletes_one_word_through_bounded_path() {
+        let mut editor = Editor::new();
+        editor.insert("héllo wörld 界界").unwrap();
+        press(&mut editor, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(editor.text(), "héllo wörld ");
+        press(&mut editor, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(editor.text(), "héllo ");
+        press(&mut editor, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(editor.text(), "héllo wörld ");
+        // A selection is deleted instead of a word.
+        editor.state.set_selection((1, 0), (3, 0));
+        press(&mut editor, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(editor.text(), "hlo wörld ");
+        assert_eq!(editor.state.cursor(), TextPosition::new(1, 0));
+        // At the start there is nothing to delete and no undo entry.
+        editor.state.set_cursor((0, 0), false);
+        let history = editor.state.undo_buffer().unwrap().open_undo();
+        press(&mut editor, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(editor.text(), "hlo wörld ");
+        assert_eq!(editor.state.undo_buffer().unwrap().open_undo(), history);
+        // A full draft stays within the size and undo bounds.
+        let mut editor = Editor::new();
+        let full = format!("{} {}", "x".repeat(MAX_DRAFT_BYTES - 4), "界");
+        editor.insert(&full).unwrap();
+        assert_eq!(editor.text().len(), MAX_DRAFT_BYTES);
+        assert_eq!(editor.insert("a"), Err(EditError::TooLarge));
+        press(&mut editor, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(editor.text().len(), MAX_DRAFT_BYTES - 3);
+        editor.insert("界").unwrap();
+        assert_eq!(editor.text(), full);
+        // Word deletion shares the 100-sequence undo bound with other edits.
+        let mut editor = Editor::new();
+        editor.insert("keep 界").unwrap();
+        for _ in 0..60 {
+            press(&mut editor, KeyCode::Backspace, KeyModifiers::ALT);
+            editor.insert("界").unwrap();
+        }
+        assert_eq!(editor.text(), "keep 界");
+        for _ in 0..100 {
+            press(&mut editor, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        }
+        let oldest = editor.text();
+        press(&mut editor, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(editor.text(), oldest);
+    }
+
     #[test]
     fn completion_preserves_unicode_tail_and_rejects_stale_or_oversized_edits() {
         let mut editor = Editor::new();

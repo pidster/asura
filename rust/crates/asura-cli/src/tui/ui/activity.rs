@@ -306,27 +306,9 @@ impl App {
         }
         true
     }
+    /// Log focus: scroll the conversation and step down the focus chain.
+    /// Entering the log is owned by the composer's focus chain.
     pub(super) fn history_key(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers == KeyModifiers::SHIFT
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
-            && self.focus == Focus::Editor
-        {
-            if self.transcript.is_empty() {
-                return true;
-            }
-            if !self.history_focus {
-                self.history_focus = true;
-                self.history_scroll = self.history_scroll_max;
-            }
-            self.history_scroll = if key.code == KeyCode::Up {
-                self.history_scroll.saturating_sub(1)
-            } else {
-                self.history_scroll
-                    .saturating_add(1)
-                    .min(self.history_scroll_max)
-            };
-            return true;
-        }
         if !self.history_focus {
             return false;
         }
@@ -335,18 +317,33 @@ impl App {
                 key.code,
                 KeyCode::Char('p' | 'n') | KeyCode::Up | KeyCode::Down
             ))
-            || (key.modifiers.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down))
             || (key.modifiers == KeyModifiers::SHIFT
                 && matches!(key.code, KeyCode::Left | KeyCode::Right))
         {
             self.history_focus = false;
             return false;
         }
+        if key.modifiers == KeyModifiers::SHIFT && key.code == KeyCode::Down {
+            self.history_focus = false;
+            let ids = self.queue_focus_ids();
+            if let Some(id) = ids.first() {
+                self.queue_focused_id = Some(id.clone());
+                self.focus = Focus::Queue(0);
+            }
+            return true;
+        }
         if !key.modifiers.is_empty() {
             return true;
         }
         match key.code {
             KeyCode::Esc => self.history_focus = false,
+            KeyCode::Up => self.history_scroll = self.history_scroll.saturating_sub(1),
+            KeyCode::Down => {
+                self.history_scroll = self
+                    .history_scroll
+                    .saturating_add(1)
+                    .min(self.history_scroll_max)
+            }
             KeyCode::PageUp => {
                 self.history_scroll = self.history_scroll.saturating_sub(self.history_page)
             }

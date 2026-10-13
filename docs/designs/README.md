@@ -14,7 +14,7 @@ own authorization and validation scope; it does not establish product readiness.
 | Document | Purpose and status |
 | --- | --- |
 | [Composer interactions](composer-interactions.md) | Selected production focus navigation, selectors, history and queue interaction. |
-| [Composer editor navigation](composer-editor-navigation.md) | Selected visual row boundaries and bounded draft history recall. |
+| [Composer editor navigation](composer-editor-navigation.md) | Selected visual row boundaries, row and word movement, the Shift+Up/Down focus chain and bounded draft history recall. |
 | [Service status pane](service-status-pane.md) | Selected connection ownership, service uptime and bounded stored-memory footprint observations; implemented, with no runtime evidence recorded. |
 | [Context observations](context-observations.md) | Service-owned filesystem signals, bounded Git collection and scoped status observations; runtime qualification required. |
 | [Sensors](sensors.md) | Passive and directed observations, durable evidence inspection, held proposals and selected System 1/System 2 direction. |

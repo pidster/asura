@@ -51,19 +51,15 @@ after success. Failure preserves selection and draft. This affects future admiss
 it does not change a running model. The picker never loads weights or starts inference.
 Picker-origin requests must not clear drafts or open command-result overlays.
 
-Plain Up recalls previously submitted commands and inputs. While browsing input
-history, Down selects newer input and finally restores the exact unsent draft.
-The next Down on the final visual input row enters status focus. With no active
-recall, Down above the final row leaves focus in the editor. Ctrl+P/Ctrl+N remain recall aliases. Ctrl+Up
-enters the queue when unresolved items exist. Shift+Up/Down scroll the conversation
-history by visual rows without editing or submitting the draft. Shift+Up enters
-history focus even when the queue has items. At the top or bottom, further Shift
-arrows clamp and keep focus; Escape returns to the editor. Plain Up/Down while
-history is focused return to the editor and perform input recall. Page Up,
-Page Down, Home and End continue scrolling the focused pane. The history pane
-retains its scroll position while focused and follows the latest turn again when
-focus returns to the editor. A Shift+Up/Down event with no visible conversation
-is ignored; it must not select draft text. These local operations perform no I/O.
+Key routing between the editor, queue, log and status bar follows the
+[focus chain](composer-editor-navigation.md#focus-chain-and-draft-movement--selected-2026-10-13).
+In summary, plain Up/Down move between draft rows and recall input at the
+edges. Shift+Up/Down move focus up to the queue and log, or down to the status
+bar. Ctrl+Up/Down remain queue and status shortcuts, and Ctrl+P/N remain recall
+aliases. With the log focused, Up, Down, Page Up, Page Down, Home and End scroll
+it, and Escape returns to the editor. The log retains its scroll position while
+focused and follows the latest turn again when focus returns to the editor.
+These local operations perform no I/O.
 Hints expose these interactions. Rendering and key handling perform no I/O.
 The hint row uses `^` for Control chords and `↵` for Return. On macOS it
 uses `⌥` for Option; on other systems it writes `Alt+`. It shows the newline
@@ -141,7 +137,7 @@ Selected design. Arrows describe key events and completed worker outcomes.
 ```mermaid
 stateDiagram-v2
   [*] --> Editor
-  Editor --> Status: Down on final input row after recall ends, or Ctrl+Down
+  Editor --> Status: Down on final input row after recall ends, Shift+Down or Ctrl+Down
   Status --> Editor: Up or Escape
   Status --> ProjectList: Enter on project
   Status --> ModelList: Enter on model
@@ -151,12 +147,14 @@ stateDiagram-v2
   Saving --> ModelList: Rejection or timeout
   ProjectList --> ProjectList: Stale or busy selection rejected
   ModelList --> Status: Escape cancels discovery
-  Editor --> Editor: Up/Down or Ctrl+P/N recall input
-  Editor --> Queue: Ctrl+Up with queued inputs
-  Editor --> History: Shift+Up/Down with visible turns
-  History --> History: Shift+Up/Down, Page keys, Home or End scroll
-  History --> Editor: Escape or plain Up/Down recalls input
-  Queue --> Editor: Escape or Down past last row
+  Editor --> Editor: Up/Down move rows or recall, Ctrl+P/N recall
+  Editor --> Queue: Shift+Up or Ctrl+Up with queued inputs
+  Editor --> History: Shift+Up with no queue and visible turns
+  Queue --> History: Shift+Up, or Up on first row, with visible turns
+  History --> History: Up/Down, Page keys, Home or End scroll
+  History --> Queue: Shift+Down with queued inputs
+  History --> Editor: Escape, or Shift+Down with no queue
+  Queue --> Editor: Escape, Shift+Down or Down past last row
   Queue --> Queue: Move, send now, acknowledge or reject
 ```
 

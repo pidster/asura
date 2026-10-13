@@ -62,6 +62,11 @@ impl History {
         }
     }
 
+    /// True while an entry is recalled and the saved draft awaits restoration.
+    pub fn is_browsing(&self) -> bool {
+        self.selected.is_some()
+    }
+
     pub fn reset_navigation(&mut self) {
         self.selected = None;
         self.draft = None;

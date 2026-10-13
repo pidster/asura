@@ -1562,6 +1562,7 @@ impl App {
                             let text = self.capture.as_ref().unwrap().text.clone();
                             match self.editor.insert(&text) {
                                 Ok(()) => {
+                                    self.history.reset_navigation();
                                     self.capture = None;
                                     self.overlay = None;
                                 }
@@ -1659,14 +1660,14 @@ impl App {
             KeyCode::Enter if key.modifiers.is_empty() => return self.submit(),
             KeyCode::Esc => {}
             _ => {
-                if matches!(
-                    key.code,
-                    KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
-                ) {
-                    self.history.reset_navigation();
-                }
+                // An applied edit ends recall browsing; cursor and word
+                // movement keep it, so Up and Down still step entries.
+                let browsed = self.history.is_browsing().then(|| self.editor.text());
                 if let Err(error) = self.editor.key(key) {
                     self.notice = error.to_string();
+                }
+                if browsed.is_some_and(|text| text != self.editor.text()) {
+                    self.history.reset_navigation();
                 }
             }
         }
@@ -1674,7 +1675,10 @@ impl App {
     }
     fn complete(&mut self, header: &CommandHeader, name: &str) {
         match self.editor.complete_command_name(header, name) {
-            Ok(true) => self.notice.clear(),
+            Ok(true) => {
+                self.history.reset_navigation();
+                self.notice.clear();
+            }
             Ok(false) => self.notice = "Completion target changed; draft retained".into(),
             Err(error) => self.notice = error.to_string(),
         }
@@ -2779,8 +2783,14 @@ fn help_table(width: usize) -> String {
         ("/observe ID", "Observe a recorded operation"),
         ("/retry", "Retry with the original request ID"),
         ("Enter", "Submit; queue automatically during active work"),
-        ("Up / Down", "Recall submitted input; restore unsent draft"),
-        ("Shift+Up / Shift+Down", "Scroll conversation history"),
+        (
+            "Up / Down",
+            "Move a row; recall at top row; status at bottom",
+        ),
+        (
+            "Shift+Up / Shift+Down",
+            "Focus queue or history above / status below",
+        ),
         ("Ctrl+Up / Ctrl+Down", "Focus queue / project-model status"),
         ("[ / ] in queue", "Move an undispatched input up / down"),
         (
@@ -2799,6 +2809,11 @@ fn help_table(width: usize) -> String {
             "Left / Right; Shift+Left / Right",
             "Move cursor / select text",
         ),
+        (
+            "Alt or Ctrl+Left / Right",
+            "Move one word; Shift selects; Alt+B / F also",
+        ),
+        ("Alt+Backspace", "Delete the previous word"),
         ("Ctrl+A", "Select all text"),
         ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
         ("Ctrl+V", "Start or finish paste capture"),
