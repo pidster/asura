@@ -789,8 +789,9 @@ mark the selected name, and mark stale entries. An unknown registry is not empty
 Prefer the deepest current project containing the launch directory. When other
 current projects also contain it, show that other matches exist. If none matches,
 leave selection unset and display the known projects, even when only one exists.
-The owner selected this on 2026-10-13; it replaces the sole-project fallback, which
-remains in the code until corrected. A refresh preserves a still-current explicit selection.
+The owner selected this on 2026-10-13; it replaces the earlier sole-project
+fallback. The hint appears in the notice line, names each other match with its
+ID and suggests `/project select ID`; it never clears the draft. A refresh preserves a still-current explicit selection.
 Successful registration refreshes the registry in the same worker job before
 publishing completion. It selects the registered project. A refresh failure
 reports that registration succeeded but listing failed; it does not retry the

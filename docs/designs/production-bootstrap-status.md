@@ -185,9 +185,9 @@ Partly implemented. Steps 1–4 are implemented through automatic setup and
 explicit registration. Steps 5–6 are not implemented as written: the TUI
 selects the deepest current registration that contains the launch directory,
 and status arrives through `ObserveContext` subscriptions. The owner selected the
-deepest match on 2026-10-13, with a visible hint about other matches. The current
-fallback to a sole project with no match conflicts with that decision; the
-correction and the hint are not implemented.
+deepest match on 2026-10-13, with a visible hint about other matches, and
+removed the fallback to a sole project with no match. The TUI implements both;
+the hint names the other matches and their IDs in the notice line.
 
 Original proposed behavior for D3/D6 review:
 

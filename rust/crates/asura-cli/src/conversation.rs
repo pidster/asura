@@ -266,27 +266,31 @@ fn registry_id(value: Option<&[u8]>) -> Result<[u8; 16], String> {
     Ok(id)
 }
 
-pub(crate) fn initial_project(projects: &[pb::ProjectReply], launch: &str) -> Option<[u8; 16]> {
-    let current = projects
-        .iter()
-        .filter(|p| p.current == Some(true))
-        .collect::<Vec<_>>();
-    let matched = current
+/// Launch selection: the deepest current project containing the launch
+/// directory, plus the other current matches for a hint. No match selects
+/// nothing, even when only one project exists.
+pub(crate) fn initial_project(
+    projects: &[pb::ProjectReply],
+    launch: &str,
+) -> (Option<[u8; 16]>, Vec<[u8; 16]>) {
+    let mut matched = projects
         .iter()
         .filter(|p| {
-            p.location
-                .as_deref()
-                .is_some_and(|path| std::path::Path::new(launch).starts_with(path))
+            p.current == Some(true)
+                && p.location
+                    .as_deref()
+                    .is_some_and(|path| std::path::Path::new(launch).starts_with(path))
         })
-        .max_by_key(|p| {
-            std::path::Path::new(p.location.as_deref().unwrap_or_default())
+        .filter_map(|p| {
+            let depth = std::path::Path::new(p.location.as_deref()?)
                 .components()
-                .count()
-        });
-    let selected = matched
-        .copied()
-        .or_else(|| (current.len() == 1).then(|| current[0]));
-    selected.and_then(|p| registry_id(p.project_id.as_deref()).ok())
+                .count();
+            Some((depth, registry_id(p.project_id.as_deref()).ok()?))
+        })
+        .collect::<Vec<_>>();
+    matched.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut ids = matched.into_iter().map(|(_, id)| id);
+    (ids.next(), ids.collect())
 }
 
 fn initialization_rejected(
@@ -424,7 +428,7 @@ mod tests {
         );
     }
     #[test]
-    fn selection_uses_deepest_current_component_match_or_sole_current() {
+    fn selection_uses_deepest_current_match_and_reports_other_matches() {
         let projects = vec![
             record(1, "/work", true),
             record(2, "/work/sub", true),
@@ -432,18 +436,22 @@ mod tests {
         ];
         assert_eq!(
             initial_project(&projects, "/work/sub/deep/file"),
-            Some([2; 16])
+            (Some([2; 16]), vec![[1; 16]])
         );
-        assert_eq!(initial_project(&projects, "/workspace"), None);
+        assert_eq!(initial_project(&projects, "/work/x"), (Some([1; 16]), vec![]));
+        assert_eq!(initial_project(&projects, "/workspace"), (None, vec![]));
         assert_eq!(
             initial_project(
                 &[record(1, "/other", true), record(2, "/stale", false)],
                 "/here"
             ),
-            Some([1; 16])
+            (None, vec![])
         );
-        assert_eq!(initial_project(&[record(1, "/here", false)], "/here"), None);
-        assert_eq!(initial_project(&[], "/here"), None);
+        assert_eq!(
+            initial_project(&[record(1, "/here", false)], "/here"),
+            (None, vec![])
+        );
+        assert_eq!(initial_project(&[], "/here"), (None, vec![]));
     }
     #[test]
     fn initialization_rejections_distinguish_existing_busy_conflict_and_uncertainty() {

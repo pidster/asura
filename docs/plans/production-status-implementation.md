@@ -1248,10 +1248,9 @@ or live terminal qualification run.
 
 The TUI previously discarded nonempty registry replies and confused no selection
 with no projects. It now retains the complete bounded registry, displays names,
-and selects the deepest current project containing the launch directory. A sole
-current project is the fallback. On 2026-10-13 the owner kept the deepest match, added
-a hint about other matches and removed the sole-project fallback; that correction
-is not implemented. A new service epoch refreshes the registry while
+and selects the deepest current project containing the launch directory. On
+2026-10-13 the owner kept the deepest match, added a hint about other matches and
+removed the earlier sole-project fallback; the TUI implements that correction. A new service epoch refreshes the registry while
 preserving a still-current selection and the draft. Listing shares the canonical
 bounded client helper. Invalid or incomplete pagination never publishes a partial
 registry. All socket calls remain in the worker.

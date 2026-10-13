@@ -41,6 +41,7 @@ pub(super) struct Update {
     pub projects: Option<Vec<pb::ProjectReply>>,
     pub restore: Option<RestoreUpdate>,
     pub preserve_project_selection: bool,
+    pub other_matches: Vec<[u8; 16]>,
     pub success: bool,
     pub done: bool,
 }
@@ -236,9 +237,9 @@ impl Worker {
                                 else { Ok(()) }
                             })?;
                             let launch = crate::conversation::location(".")?;
-                            let project = crate::conversation::initial_project(&projects, &launch);
+                            let (project, other_matches) = crate::conversation::initial_project(&projects, &launch);
                             let project_offer = projects.is_empty().then(|| launch.clone());
-                            publish(Update{projects: Some(projects), preserve_project_selection: true, project, project_offer, launch_directory: Some(launch), success:true,done:true,..Default::default()});
+                            publish(Update{projects: Some(projects), preserve_project_selection: true, project, other_matches, project_offer, launch_directory: Some(launch), success:true,done:true,..Default::default()});
                             return Ok(());
                         }
                         Request::Setup(crate::conversation::Command::Observe(id)) => (id, 0),

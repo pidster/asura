@@ -31,6 +31,30 @@ pub struct View {
     pub epoch: Option<String>,
 }
 
+/// Launch hint naming the other current projects that contain the launch directory.
+fn launch_match_hint(projects: &[asura_control::pb::ProjectReply], others: &[[u8; 16]]) -> String {
+    let names = others
+        .iter()
+        .filter_map(|id| {
+            projects
+                .iter()
+                .find(|p| p.project_id.as_deref() == Some(id.as_slice()))
+                .map(|p| {
+                    format!(
+                        "{} ({})",
+                        crate::conversation::project_display_name(p),
+                        crate::conversation::hex(id)
+                    )
+                })
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    literal(
+        &format!("Also matches this directory: {names}. Use /project select ID to switch."),
+        1024,
+    )
+}
+
 fn conversation_reason(reason: i32) -> &'static str {
     match reason {
         0 => "none",
@@ -904,6 +928,9 @@ impl App {
                 self.rendered_responses.clear();
                 self.activity.clear();
                 self.model_context = None;
+                if self.selected_project.is_some() && !update.other_matches.is_empty() {
+                    self.notice = launch_match_hint(&projects, &update.other_matches);
+                }
             }
             if !projects.is_empty() {
                 self.project_offer = None;
@@ -4569,6 +4596,45 @@ mod tests {
                 assert!(path.ends_with("/src"));
             }
         }
+    }
+
+    #[test]
+    fn launch_selection_hints_at_other_matching_projects_without_clearing_draft() {
+        use super::super::conversation::Update;
+        use asura_control::pb::ProjectReply;
+        let project = |id: u8, path: &str, name: &str| ProjectReply {
+            project_id: Some(vec![id; 16]),
+            location: Some(path.into()),
+            name: Some(name.into()),
+            current: Some(true),
+            ..Default::default()
+        };
+        let projects = vec![project(3, "/work", "Work"), project(4, "/work/sub", "Sub")];
+        let mut app = project_discovery_app();
+        app.conversation_finished(Update {
+            preserve_project_selection: true,
+            projects: Some(projects.clone()),
+            project: Some([4; 16]),
+            other_matches: vec![[3; 16]],
+            success: true,
+            done: true,
+            ..Default::default()
+        });
+        assert_eq!(app.selected_project, Some([4; 16]));
+        assert!(app.notice.contains("Also matches this directory: Work ("), "{}", app.notice);
+        assert!(app.notice.contains(&crate::conversation::hex(&[3; 16])));
+        assert_eq!(app.draft(), "draft before discovery");
+        let mut unmatched = project_discovery_app();
+        unmatched.conversation_finished(Update {
+            preserve_project_selection: true,
+            projects: Some(vec![project(5, "/elsewhere", "Only")]),
+            project: None,
+            success: true,
+            done: true,
+            ..Default::default()
+        });
+        assert_eq!(unmatched.selected_project, None);
+        assert!(!unmatched.notice.contains("Also matches"));
     }
 
     #[test]
