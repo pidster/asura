@@ -838,24 +838,21 @@ fn local_tool_destination(selection: &Selection, attested: bool) -> bool {
     if resolved.provider().name() != "ollama" || !attested {
         return false;
     }
-    let endpoint = selection
-        .endpoint
-        .as_deref()
-        .unwrap_or("http://127.0.0.1:11434");
-    let authority = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .and_then(|rest| rest.strip_suffix('/').or(Some(rest)));
-    authority.is_some_and(|host| {
-        ["127.0.0.1", "[::1]"].iter().any(|ip| {
-            host == *ip
-                || host.strip_prefix(ip).is_some_and(|port| {
-                    port.strip_prefix(':')
-                        .and_then(|port| port.parse::<u16>().ok())
-                        .is_some_and(|port| port > 0)
-                })
-        })
-    })
+    asura_storage::config::loopback_endpoint(
+        selection
+            .endpoint
+            .as_deref()
+            .unwrap_or(DEFAULT_OLLAMA_ENDPOINT),
+    )
+}
+
+const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
+
+/// Remote endpoints stay restricted to loopback until the execution threat
+/// model is reviewed. Only Ollama uses a configured endpoint today.
+pub(crate) fn endpoint_permitted(provider: &str, endpoint: Option<&str>) -> bool {
+    provider != "ollama"
+        || asura_storage::config::loopback_endpoint(endpoint.unwrap_or(DEFAULT_OLLAMA_ENDPOINT))
 }
 
 #[cfg(test)]
@@ -997,6 +994,17 @@ mod tests {
         }
         selection.endpoint = Some("http://[::1]:11434/".into());
         assert!(local_tool_destination(&selection, true));
+    }
+
+    #[test]
+    fn remote_ollama_endpoints_are_not_permitted_for_turns() {
+        assert!(endpoint_permitted("ollama", None));
+        assert!(endpoint_permitted("ollama", Some("http://127.0.0.1:11434")));
+        assert!(endpoint_permitted("ollama", Some("https://[::1]:8443")));
+        for endpoint in ["https://models.example", "https://localhost", "https://10.0.0.1"] {
+            assert!(!endpoint_permitted("ollama", Some(endpoint)), "{endpoint}");
+        }
+        assert!(endpoint_permitted("system", Some("https://models.example")));
     }
 
     #[test]

@@ -11,8 +11,13 @@ import Testing
             try OllamaLanguageModel.Settings(name: "model:tag", endpoint: URL(string: text)!)
         }
     }
-    let remote = try OllamaLanguageModel.Settings(name: "example", endpoint: URL(string: "https://models.example:8443")!)
-    #expect(remote.endpoint.scheme == "https")
+    for text in ["https://models.example:8443", "https://localhost:11434", "https://10.0.0.1"] {
+        #expect(throws: OllamaLanguageModel.Failure.self) {
+            try OllamaLanguageModel.Settings(name: "example", endpoint: URL(string: text)!)
+        }
+    }
+    let loopback = try OllamaLanguageModel.Settings(name: "example", endpoint: URL(string: "https://127.0.0.1:8443")!)
+    #expect(loopback.endpoint.scheme == "https")
     let settings = try OllamaLanguageModel.Settings(name: "Granite:8B")
     #expect(settings.name == "Granite:8B")
     #expect(settings.endpoint.host == "127.0.0.1")

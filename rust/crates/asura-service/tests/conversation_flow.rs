@@ -269,6 +269,7 @@ fn journey(native: bool) -> Result<()> {
         return Err(error.into());
     }
     let project = checked_id(registered.project_id)?;
+    remote_endpoint_restriction(&fixture, project)?;
     let listed = fixture.attach()?.projects(None)?;
     assert_eq!(listed.projects.len(), 1);
     assert_eq!(
@@ -1635,6 +1636,43 @@ fn native_tools(provider: &str) -> Result<()> {
     println!(
         "PASS native project tool, file-only answer proof, disconnect continuation, conservative accounting, durable replay and outside-secret non-disclosure"
     );
+    Ok(())
+}
+
+fn remote_endpoint_restriction(fixture: &Fixture, project: [u8; 16]) -> Result<()> {
+    let rejected = fixture
+        .attach()?
+        .config("providers.ollama.endpoint", Some("https://models.example"))?;
+    assert_eq!(
+        rejected.error.as_deref(),
+        Some("config_remote_endpoint_restricted")
+    );
+    let path = fixture.home.join(".asura/config.yaml");
+    let original = fs::read(&path).ok();
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?
+            .write_all(
+                b"model: ollama:fixture\nproviders:\n  ollama:\n    endpoint: https://models.example\n",
+            )?;
+    }
+    let failure = provider_submit(fixture, project, None, 0, "Hello")
+        .expect_err("remote endpoint must not reach a model");
+    assert!(
+        matches!(failure.downcast_ref::<asura_client::Error>(), Some(asura_client::Error::Remote(_, message)) if message == "remote_endpoint_restricted"),
+        "unexpected remote endpoint failure: {failure}"
+    );
+    match original {
+        Some(bytes) => fs::write(&path, bytes)?,
+        None => fs::remove_file(&path)?,
+    }
+    println!("PASS remote model endpoints are restricted to loopback");
     Ok(())
 }
 

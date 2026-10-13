@@ -293,6 +293,9 @@ impl Config {
                 let Value::String(endpoint) = value else {
                     return Err("config_invalid_value");
                 };
+                if valid_endpoint(&endpoint) && !loopback_endpoint(&endpoint) {
+                    return Err("config_remote_endpoint_restricted");
+                }
                 self.providers.ollama.endpoint = Some(endpoint);
             }
             "audit" => {
@@ -393,6 +396,21 @@ fn valid_endpoint(value: &str) -> bool {
         return false;
     }
     scheme == "https" || matches!(host, "127.0.0.1" | "::1")
+}
+
+/// Valid endpoint whose host is a numeric loopback address. Remote endpoints
+/// stay restricted until the execution threat model is reviewed.
+pub fn loopback_endpoint(value: &str) -> bool {
+    if !valid_endpoint(value) {
+        return false;
+    }
+    let address = value.split_once("://").map_or("", |(_, address)| address);
+    let address = address.strip_suffix('/').unwrap_or(address);
+    let host = match address.strip_prefix('[') {
+        Some(bracketed) => bracketed.split_once(']').map_or("", |(host, _)| host),
+        None => address.split_once(':').map_or(address, |(host, _)| host),
+    };
+    matches!(host, "127.0.0.1" | "::1")
 }
 
 fn yaml(value: &impl Serialize) -> Result<String> {
@@ -532,11 +550,17 @@ mod tests {
         assert_eq!(call("audit.keepFiles", None).unwrap(), "8\n");
         assert_eq!(call("model", None).unwrap(), "provider:model\n");
         let original = conversation_snapshot(runtime.clone(), deadline, &cancel).unwrap();
-        call(
-            "providers.ollama.endpoint",
-            Some("https://models.example:8443"),
-        )
-        .unwrap();
+        let file = root.0.join(".asura/config.yaml");
+        let before = std::fs::read(&file).unwrap();
+        assert_eq!(
+            call(
+                "providers.ollama.endpoint",
+                Some("https://models.example:8443")
+            ),
+            Err("config_remote_endpoint_restricted")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        call("providers.ollama.endpoint", Some("https://127.0.0.1:8443")).unwrap();
         let changed = conversation_snapshot(runtime.clone(), deadline, &cancel).unwrap();
         assert_eq!(changed.model, original.model);
         assert_eq!(
@@ -545,12 +569,12 @@ mod tests {
         );
         assert_eq!(
             changed.ollama_endpoint.as_deref(),
-            Some("https://models.example:8443")
+            Some("https://127.0.0.1:8443")
         );
         assert_ne!(changed.digest, original.digest);
         assert_eq!(
             call("providers.ollama.endpoint", None).unwrap(),
-            "https://models.example:8443\n"
+            "https://127.0.0.1:8443\n"
         );
         assert!(
             call("", None)
@@ -605,6 +629,34 @@ mod tests {
         assert!(call("model", Some("replacement")).is_err());
         assert!(call("", None).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), invalid);
+    }
+    #[test]
+    fn remote_endpoints_are_restricted_to_numeric_loopback() {
+        for endpoint in [
+            "http://127.0.0.1:11434",
+            "http://[::1]:11434/",
+            "https://127.0.0.1:8443",
+            "https://[::1]",
+        ] {
+            assert!(loopback_endpoint(endpoint), "{endpoint}");
+        }
+        for endpoint in [
+            "https://models.example",
+            "https://localhost:11434",
+            "https://127.0.0.2",
+            "https://10.0.0.1:11434",
+            "https://[::2]",
+            "http://remote.example",
+            "",
+        ] {
+            assert!(!loopback_endpoint(endpoint), "{endpoint}");
+        }
+        let mut config = Config::default();
+        assert_eq!(
+            config.set("providers.ollama.endpoint", "https://models.example"),
+            Err("config_remote_endpoint_restricted")
+        );
+        assert_eq!(config.providers.ollama.endpoint, None);
     }
     #[test]
     fn endpoint_schema_is_closed_and_transport_grammar_is_explicit() {

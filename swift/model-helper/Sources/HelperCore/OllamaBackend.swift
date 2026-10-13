@@ -15,8 +15,8 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 let url = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
                 endpoint.absoluteString.utf8.count <= 2048,
                 let host = url.host, !host.isEmpty,
-                (url.scheme == "https" ||
-                    (url.scheme == "http" && ["127.0.0.1", "[::1]", "::1"].contains(host))),
+                // Remote endpoints stay restricted until the execution threat model is reviewed.
+                ["http", "https"].contains(url.scheme ?? ""), ["127.0.0.1", "[::1]", "::1"].contains(host),
                 url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
                 url.path.isEmpty || url.path == "/", url.port.map({ (1...65535).contains($0) }) ?? true
             else { throw Failure.invalidConfiguration }

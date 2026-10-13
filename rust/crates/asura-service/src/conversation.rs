@@ -1799,11 +1799,17 @@ impl Owner {
         prepared: writer::Prepared,
         now: Instant,
     ) -> Result<(), &'static str> {
-        crate::model::resolve(
+        let resolved = crate::model::resolve(
             prepared.model.parse().map_err(|_| "model_unavailable")?,
             &[crate::model::Capability::Text],
         )
         .map_err(|_| "model_unavailable")?;
+        if !crate::model_owner::endpoint_permitted(
+            resolved.provider().name(),
+            prepared.ollama_endpoint.as_deref(),
+        ) {
+            return Err("remote_endpoint_restricted");
+        }
         let project = id(&value.project_id);
         let original = value
             .conversation_id

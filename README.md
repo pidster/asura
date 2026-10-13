@@ -142,8 +142,10 @@ Provider selectors are `system`, `ollama:MODEL`, `mlx:NAME` and `coreai:NAME`.
 MLX and CoreAI require installed assets below `$HOME/.asura/data/models/mlx/NAME`
 and `$HOME/.asura/data/models/coreai/NAME`; Asura does not download missing assets.
 Ollama defaults to `http://127.0.0.1:11434`. Set `providers.ollama.endpoint` to
-select another endpoint. Remote endpoints require HTTPS; authenticated endpoints
-need credential support that is not yet implemented.
+select another port on `127.0.0.1` or `::1`. Remote endpoints are restricted to
+loopback until the [execution threat model](docs/designs/execution-threat-model.md)
+is reviewed; Asura rejects them with `config_remote_endpoint_restricted` or, for
+an existing configuration file, `remote_endpoint_restricted`.
 
 Values use YAML syntax. Quote strings containing spaces or YAML punctuation.
 The audit defaults are the values above; `model` starts unset. Get/set validates

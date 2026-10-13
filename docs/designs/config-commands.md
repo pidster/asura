@@ -21,7 +21,7 @@ the working directory or an environment override. Tests use scratch runtime root
 | `audit.maxFileBytes` | Integer, 1 through 1099511627776 | `10485760` |
 | `audit` | Mapping of all three audit fields | Defaults above |
 | `providers.mlx.models` | Up to 64 exact asset keys, each with a bounded capability list; see below | Empty mapping |
-| `providers.ollama.endpoint` | ASCII URL, at most 2048 bytes; HTTPS host or numeric-loopback HTTP | `http://127.0.0.1:11434` at inference admission |
+| `providers.ollama.endpoint` | ASCII URL, at most 2048 bytes; numeric-loopback host over HTTP or HTTPS. Set rejects other hosts with `config_remote_endpoint_restricted` under the [loopback restriction](model-provider-integration.md#loopback-endpoint-restriction--selected-2026-10-13) | `http://127.0.0.1:11434` at inference admission |
 
 `/config` without arguments returns the complete effective configuration as YAML,
 including audit defaults and omitting an unset model. It uses the same bounded
