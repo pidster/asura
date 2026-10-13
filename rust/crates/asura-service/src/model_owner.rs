@@ -1001,7 +1001,11 @@ mod tests {
         assert!(endpoint_permitted("ollama", None));
         assert!(endpoint_permitted("ollama", Some("http://127.0.0.1:11434")));
         assert!(endpoint_permitted("ollama", Some("https://[::1]:8443")));
-        for endpoint in ["https://models.example", "https://localhost", "https://10.0.0.1"] {
+        for endpoint in [
+            "https://models.example",
+            "https://localhost",
+            "https://10.0.0.1",
+        ] {
             assert!(!endpoint_permitted("ollama", Some(endpoint)), "{endpoint}");
         }
         assert!(endpoint_permitted("system", Some("https://models.example")));

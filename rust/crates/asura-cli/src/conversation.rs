@@ -288,7 +288,7 @@ pub(crate) fn initial_project(
             Some((depth, registry_id(p.project_id.as_deref()).ok()?))
         })
         .collect::<Vec<_>>();
-    matched.sort_by(|a, b| b.0.cmp(&a.0));
+    matched.sort_by_key(|m| std::cmp::Reverse(m.0));
     let mut ids = matched.into_iter().map(|(_, id)| id);
     (ids.next(), ids.collect())
 }
@@ -438,7 +438,10 @@ mod tests {
             initial_project(&projects, "/work/sub/deep/file"),
             (Some([2; 16]), vec![[1; 16]])
         );
-        assert_eq!(initial_project(&projects, "/work/x"), (Some([1; 16]), vec![]));
+        assert_eq!(
+            initial_project(&projects, "/work/x"),
+            (Some([1; 16]), vec![])
+        );
         assert_eq!(initial_project(&projects, "/workspace"), (None, vec![]));
         assert_eq!(
             initial_project(

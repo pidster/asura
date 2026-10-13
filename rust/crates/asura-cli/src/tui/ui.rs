@@ -2196,9 +2196,8 @@ impl App {
             .add_modifier(Modifier::BOLD);
         let draft = self.editor.text();
         let command_mode = draft.starts_with('/');
-        self.editor.set_highlight(active_command(&draft).map(|range| {
-            (range, input.fg(COMMAND_AMBER))
-        }));
+        self.editor
+            .set_highlight(active_command(&draft).map(|range| (range, input.fg(COMMAND_AMBER))));
         let focused = self.overlay.is_none()
             && self.capture.is_none()
             && self.focus == Focus::Editor
@@ -3534,8 +3533,18 @@ mod tests {
         app.insert("/help me");
         let cells = input_cells(&mut app);
         assert_eq!(markers(&cells)[0].fg, Some(COMMAND_AMBER));
-        let row = cells.iter().find(|(x, _, s, _)| *x == 1 && s == "›").unwrap().1;
-        let at = |x: u16| cells.iter().find(|c| c.0 == x && c.1 == row).unwrap().clone();
+        let row = cells
+            .iter()
+            .find(|(x, _, s, _)| *x == 1 && s == "›")
+            .unwrap()
+            .1;
+        let at = |x: u16| {
+            cells
+                .iter()
+                .find(|c| c.0 == x && c.1 == row)
+                .unwrap()
+                .clone()
+        };
         for x in 3..8 {
             assert_eq!(at(x).3.fg, Some(COMMAND_AMBER), "{:?}", at(x));
             assert!(at(x).3.add_modifier.contains(Modifier::BOLD));
@@ -3546,7 +3555,11 @@ mod tests {
         unknown.insert("/nope x");
         let cells = input_cells(&mut unknown);
         assert_eq!(markers(&cells)[0].fg, Some(COMMAND_AMBER));
-        let row = cells.iter().find(|(x, _, s, _)| *x == 1 && s == "›").unwrap().1;
+        let row = cells
+            .iter()
+            .find(|(x, _, s, _)| *x == 1 && s == "›")
+            .unwrap()
+            .1;
         let first = cells.iter().find(|c| c.0 == 3 && c.1 == row).unwrap();
         assert_eq!((first.2.as_str(), first.3.fg), ("/", Some(INPUT_TEXT)));
     }
@@ -4788,7 +4801,11 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(app.selected_project, Some([4; 16]));
-        assert!(app.notice.contains("Also matches this directory: Work ("), "{}", app.notice);
+        assert!(
+            app.notice.contains("Also matches this directory: Work ("),
+            "{}",
+            app.notice
+        );
         assert!(app.notice.contains(&crate::conversation::hex(&[3; 16])));
         assert_eq!(app.draft(), "draft before discovery");
         let mut unmatched = project_discovery_app();
