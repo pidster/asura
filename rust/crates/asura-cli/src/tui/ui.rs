@@ -8,7 +8,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Clear, Paragraph, Wrap},
 };
@@ -31,6 +31,12 @@ pub struct View {
     pub epoch: Option<String>,
     /// The service initialized this installation automatically in its current run.
     pub new_installation: bool,
+}
+
+/// Byte range of a slash command's first word when it exactly names a TUI command.
+fn active_command(draft: &str) -> Option<std::ops::Range<usize>> {
+    let end = draft.find(char::is_whitespace).unwrap_or(draft.len());
+    (draft.starts_with('/') && LOCAL_COMMANDS.contains(&&draft[..end])).then_some(0..end)
 }
 
 /// Launch hint naming the other current projects that contain the launch directory.
@@ -79,6 +85,12 @@ fn conversation_reason(reason: i32) -> &'static str {
 /// Shown once per session after automatic initialization (threat model TB9).
 const NEW_INSTALLATION_NOTICE: &str =
     "New installation created at ~/.asura. Earlier data, if any, was not found.";
+// Composer roles from Wisp's palette; see composer-interactions.md, input styling.
+const INPUT_TINT: Color = Color::Rgb(0x25, 0x3B, 0x4E);
+const INPUT_GLOW: Color = Color::Rgb(0xCF, 0xF1, 0xFF);
+const INPUT_TEXT: Color = Color::Rgb(0xE6, 0xED, 0xF0);
+const COMMAND_AMBER: Color = Color::Rgb(0xE8, 0xB5, 0x77);
+const GAUGE_AMBER: Color = Color::Rgb(0xF2, 0xB9, 0x50);
 const LOCAL_COMMANDS: [&str; 14] = [
     "/help", "/quit", "/exit", "/config", "/init", "/project", "/cancel", "/observe", "/retry",
     "/queue", "/models", "/tools", "/audit", "/new",
@@ -2178,10 +2190,15 @@ impl App {
         }
         let editor_area = Rect::new(full_area.x, editor_y, full_area.width, rows);
         frame.render_widget(Paragraph::new("").style(band), editor_area);
-        frame.render_widget(
-            Paragraph::new("›").style(band.fg(Color::Rgb(143, 211, 244))),
-            Rect::new(area.x, editor_y, 1, 1),
-        );
+        let input = Style::default()
+            .fg(INPUT_TEXT)
+            .bg(INPUT_TINT)
+            .add_modifier(Modifier::BOLD);
+        let draft = self.editor.text();
+        let command_mode = draft.starts_with('/');
+        self.editor.set_highlight(active_command(&draft).map(|range| {
+            (range, input.fg(COMMAND_AMBER))
+        }));
         let focused = self.overlay.is_none()
             && self.capture.is_none()
             && self.focus == Focus::Editor
@@ -2191,9 +2208,19 @@ impl App {
         self.editor.render(
             Rect::new(area.x + 2, editor_y, area.width - 2, rows),
             frame.buffer_mut(),
-            band,
+            input,
             focused,
         );
+        if self.editor.first_row_visible() {
+            frame.render_widget(
+                Paragraph::new("›").style(input.fg(if command_mode {
+                    COMMAND_AMBER
+                } else {
+                    INPUT_GLOW
+                })),
+                Rect::new(area.x, editor_y, 1, 1),
+            );
+        }
         if strips > 0 {
             line(
                 frame,
@@ -2244,8 +2271,23 @@ impl App {
                 1,
             ),
         );
+        let percent = measured_percent(self.model_context.as_ref());
+        let gauge_end = model.find(" · ").unwrap_or(model.len());
+        let (gauge, rest) = model.split_at(gauge_end);
         frame.render_widget(
-            Paragraph::new(model).style(self.focus_style(Focus::Model, muted)),
+            Paragraph::new(Line::from(vec![
+                // Focus styling wins over the gauge colour on the selected item.
+                Span::styled(
+                    gauge.to_owned(),
+                    if self.focus == Focus::Model {
+                        Style::default()
+                    } else {
+                        gauge_style(percent, muted)
+                    },
+                ),
+                Span::raw(rest.to_owned()),
+            ]))
+            .style(self.focus_style(Focus::Model, muted)),
             Rect::new(
                 status_area.right() - right_width,
                 status_area.y,
@@ -2960,6 +3002,27 @@ fn render_history(
     max_scroll
 }
 
+/// Measured input share of the model's context, when the basis is measured.
+fn measured_percent(context: Option<&asura_control::pb::ModelContext>) -> Option<u64> {
+    context.and_then(
+        |value| match (value.input_tokens, value.capacity_tokens, value.basis) {
+            (Some(input), Some(capacity), Some(1)) if capacity > 0 && input <= capacity => {
+                Some(u64::from(input) * 100 / u64::from(capacity))
+            }
+            _ => None,
+        },
+    )
+}
+
+/// Gauge colour: muted below 50%, glow from 50% and amber from 80%.
+fn gauge_style(percent: Option<u64>, muted: Style) -> Style {
+    match percent {
+        Some(80..) => muted.fg(GAUGE_AMBER),
+        Some(50..) => muted.fg(INPUT_GLOW),
+        _ => muted,
+    }
+}
+
 fn status_groups(
     count: usize,
     width: u16,
@@ -2979,18 +3042,8 @@ fn status_groups(
         format!(" · {count} chars")
     };
     let right_budget = (available / 2).min(available.saturating_sub(count.len() + 4));
-    let measured = context
-        .and_then(
-            |value| match (value.input_tokens, value.capacity_tokens, value.basis) {
-                (Some(input), Some(capacity), Some(1)) if capacity > 0 && input <= capacity => {
-                    Some(format!(
-                        "{}% input",
-                        u64::from(input) * 100 / u64::from(capacity)
-                    ))
-                }
-                _ => None,
-            },
-        )
+    let measured = measured_percent(context)
+        .map(|percent| format!("{percent}% input"))
         .unwrap_or_else(|| "0%".into());
     let model = format!(
         "{measured} · {}",
@@ -3448,6 +3501,76 @@ mod tests {
             .collect();
         assert!(!top.contains('界'));
         assert!(top.contains("Asura"));
+    }
+    fn input_cells(app: &mut App) -> Vec<(u16, u16, String, Style)> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut cells = Vec::new();
+        for y in 0..24 {
+            for x in 0..80 {
+                let cell = &buffer[(x, y)];
+                if cell.bg == INPUT_TINT {
+                    cells.push((x, y, cell.symbol().to_owned(), cell.style()));
+                }
+            }
+        }
+        cells
+    }
+    fn markers(cells: &[(u16, u16, String, Style)]) -> Vec<Style> {
+        cells
+            .iter()
+            .filter(|(x, _, symbol, _)| *x == 1 && symbol == "›")
+            .map(|(.., style)| *style)
+            .collect()
+    }
+    #[test]
+    fn prompt_is_bold_glow_and_slash_commands_switch_marker_and_highlight() {
+        let mut app = App::new();
+        let marker = markers(&input_cells(&mut app));
+        assert_eq!(marker.len(), 1);
+        assert_eq!(marker[0].fg, Some(INPUT_GLOW));
+        assert!(marker[0].add_modifier.contains(Modifier::BOLD));
+        app.insert("/help me");
+        let cells = input_cells(&mut app);
+        assert_eq!(markers(&cells)[0].fg, Some(COMMAND_AMBER));
+        let row = cells.iter().find(|(x, _, s, _)| *x == 1 && s == "›").unwrap().1;
+        let at = |x: u16| cells.iter().find(|c| c.0 == x && c.1 == row).unwrap().clone();
+        for x in 3..8 {
+            assert_eq!(at(x).3.fg, Some(COMMAND_AMBER), "{:?}", at(x));
+            assert!(at(x).3.add_modifier.contains(Modifier::BOLD));
+        }
+        assert_eq!(at(9).2, "m");
+        assert_eq!(at(9).3.fg, Some(INPUT_TEXT));
+        let mut unknown = App::new();
+        unknown.insert("/nope x");
+        let cells = input_cells(&mut unknown);
+        assert_eq!(markers(&cells)[0].fg, Some(COMMAND_AMBER));
+        let row = cells.iter().find(|(x, _, s, _)| *x == 1 && s == "›").unwrap().1;
+        let first = cells.iter().find(|c| c.0 == 3 && c.1 == row).unwrap();
+        assert_eq!((first.2.as_str(), first.3.fg), ("/", Some(INPUT_TEXT)));
+    }
+    #[test]
+    fn prompt_marker_leaves_scrolled_continuation_rows() {
+        let mut app = App::new();
+        app.insert(&"line\n".repeat(12));
+        assert!(markers(&input_cells(&mut app)).is_empty());
+        let mut short = App::new();
+        short.insert("one\ntwo");
+        assert_eq!(markers(&input_cells(&mut short)).len(), 1);
+    }
+    #[test]
+    fn active_command_and_gauge_thresholds() {
+        assert_eq!(active_command("/help topic"), Some(0..5));
+        assert_eq!(active_command("/help"), Some(0..5));
+        assert_eq!(active_command("/helpx"), None);
+        assert_eq!(active_command("help"), None);
+        let muted = Style::default().fg(Color::Rgb(134, 174, 200));
+        assert_eq!(gauge_style(None, muted), muted);
+        assert_eq!(gauge_style(Some(49), muted), muted);
+        assert_eq!(gauge_style(Some(50), muted).fg, Some(INPUT_GLOW));
+        assert_eq!(gauge_style(Some(79), muted).fg, Some(INPUT_GLOW));
+        assert_eq!(gauge_style(Some(80), muted).fg, Some(GAUGE_AMBER));
     }
     #[test]
     fn composer_top_separator_fills_when_status_overlay_opens() {

@@ -52,6 +52,7 @@ impl std::error::Error for EditError {}
 pub struct Editor {
     state: TextAreaState,
     screen_cursor: Option<(u16, u16)>,
+    highlight: Option<(Range<usize>, Style)>,
 }
 
 impl Default for Editor {
@@ -74,6 +75,7 @@ impl Editor {
         Self {
             state,
             screen_cursor: None,
+            highlight: None,
         }
     }
 
@@ -329,11 +331,18 @@ impl Editor {
             self.state.set_sub_row_offset(0);
         }
         self.state.scroll_cursor_to_visible();
-        TextArea::new()
+        let mut widget = TextArea::new()
             .text_wrap(TextWrap::Hard)
             .style(style)
-            .select_style(style.add_modifier(Modifier::REVERSED))
-            .render(area, buffer, &mut self.state);
+            .select_style(style.add_modifier(Modifier::REVERSED));
+        match &self.highlight {
+            Some((range, highlight)) if range.end <= self.state.text().len() => {
+                self.state.set_styles(vec![(range.clone(), 0)]);
+                widget = widget.text_style_idx(0, *highlight);
+            }
+            _ => self.state.set_styles(Vec::new()),
+        }
+        widget.render(area, buffer, &mut self.state);
         if focused {
             // Upstream pos_to_screen excludes row/column zero. Translate its
             // public relative mapping and enforce viewport bounds here.
@@ -348,6 +357,16 @@ impl Editor {
 
     pub fn cursor(&self) -> Option<(u16, u16)> {
         self.screen_cursor
+    }
+
+    /// Style one byte range of the draft at the next render, or clear it.
+    pub fn set_highlight(&mut self, highlight: Option<(Range<usize>, Style)>) {
+        self.highlight = highlight;
+    }
+
+    /// True when the last render showed the draft's first visual row.
+    pub fn first_row_visible(&self) -> bool {
+        self.state.offset().1 == 0 && self.state.sub_row_offset() == 0
     }
 
     pub fn on_final_visual_row(&self) -> bool {

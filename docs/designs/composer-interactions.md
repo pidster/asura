@@ -71,6 +71,29 @@ chord only when the editor can accept it. These labels describe existing key
 events and do not change their handling. If a terminal is narrow, the existing
 hint clipping applies; the full key list remains available through `/help`.
 
+## Input styling and command highlighting — selected 2026-10-13
+
+Required behavior (owner, 2026-10-13): adopt four details of Wisp's prompt box
+and highlight active slash commands. A later person-run command mode will reuse
+the mode marker below; its behavior needs its own design.
+
+| Element | Selected presentation |
+| --- | --- |
+| Prompt marker | `›` in glow `#CFF1FF`, bold, on the input tint `#253B4E` |
+| Typed text | White `#E6EDF0`, bold; selection keeps the existing reversed style inside the editor |
+| Marker placement | Only on the first visual row of the draft. When the draft has scrolled, no row shows the marker. |
+| Slash-command mode | While the draft starts with `/`, the marker uses command amber `#E8B577` |
+| Active command | When the first word exactly names a TUI command, that word uses command amber, bold. Other words and unknown names keep the typed-text style. |
+| Context gauge | `N% input` stays muted below 50%, uses glow `#CFF1FF` from 50% and amber `#F2B950` from 80%. The model name stays muted. |
+
+The values come from Wisp's palette (`tools/wisp-tui/src/palette.rs`). The TUI
+defines them once as named composer roles instead of repeating literals. Moving
+the remaining hard-coded colours in `ui.rs` into those roles is separate work.
+
+Validation: buffer tests check marker style and placement after scrolling, the
+command-mode marker, highlighting of a known and an unknown command, and each
+gauge threshold. The existing terminal journeys must still pass.
+
 ## Queue interaction
 
 Enter stages every conversational message in a bounded local outbox, whether a
