@@ -38,6 +38,8 @@ schemas and runtime mechanisms remain with their governing designs.
 | Sensor | Scoped source of observations; an observation is evidence, not an instruction, permission or accepted task; see the [sensor design](designs/sensors.md) |
 | Tool job | Proposed conversation-scoped long-running tool effect whose output the service retains; see the [tool job controller](designs/tool-job-controller.md) |
 | Job handle | Opaque service-derived job ID used to reconnect to a tool job; it is not an access token |
+| Loop closure | Ending condition a loop evaluates over its own streams, such as exhaustion, deadline or stall; distinct from an interrupt, which comes from outside the loop; see [loop closure](designs/loop-closure.md) |
+| Permanent or temporary ending | A permanent ending is terminal; a temporary ending suspends a loop with a named resume condition, resolver and expiry |
 
 These are reading definitions. The proposed [D0 domain model](designs/domain-model.md)
 refines their relationships, including actions and individual execution attempts.

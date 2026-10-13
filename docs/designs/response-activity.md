@@ -3,6 +3,10 @@
 Status: implemented for live activity and expandable response history; see the
 [recorded qualification](#recorded-qualification--2026-09-30).
 
+Owner requirement, 2026-10-13: token limits must not be hard-coded. The fixed
+token figures in this design describe the current implementation and will be
+replaced by [model-sized limits](loop-closure.md#model-sized-limits).
+
 The selected 2026-09-30 extension below adds richer live feedback and turn
 measurements. The [conversation projection direction](conversation-projections.md)
 also proposes recoverable full results and recomposable model context. Those later

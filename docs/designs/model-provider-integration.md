@@ -8,6 +8,15 @@ and 512 thereafter, at most 64 per turn, under the
 512-token journal records retain their recorded accounting. Earlier numerical
 examples and validation evidence below describe that earlier packet.
 
+Owner requirement, 2026-10-13: Asura will integrate local and remote models
+through the OpenAI API specification. Token limits must not be hard-coded; each
+model's context and output capacity sets its token bounds. The 2,048-token
+figures above are current implementation to be replaced under
+[model-sized limits](loop-closure.md#model-sized-limits). The owner selected both
+the Chat Completions and Responses surfaces, capacity in the configuration file
+with sensible defaults, and probe, test, person confirmation and configuration
+only when neither a per-model entry nor a default applies. This design must select defaults, probe methods and test bounds.
+
 Status: MP2 integrated and compiled, with native system, Ollama and MLX checks
 recorded below, 2026-09-28. CoreAI now also passes the scoped HM3 native Memory
 journey; see the [Memory evidence](hybrid-memory-ontology.md#hm3-implementation-evidence).

@@ -6,6 +6,10 @@ terminal and native qualification are recorded in the response activity design.
 The parent owns canonical schema, generated bindings, Rust collection, client
 display, documentation indexes and serial validation.
 
+Owner requirement, 2026-10-13: token limits must not be hard-coded. The fixed
+token figures in this design describe the current implementation and will be
+replaced by [model-sized limits](loop-closure.md#model-sized-limits).
+
 ## Scope and ownership
 
 The Swift helper observes actual SDK executor requests in `BoundedToolModel`.
