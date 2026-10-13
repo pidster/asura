@@ -48,7 +48,8 @@ local commands available. An existing service keeps its current log destination.
 
 On launch, the TUI displays registered project names and selects the project
 containing the launch directory. For nested projects, the closest match wins.
-If no directory matches and only one current project exists, it selects that one.
+If no directory matches, no project is selected; choose one from the status bar.
+When the launch directory is inside more than one project, a notice names the others.
 The selected name has a `*` marker. After selection, Enter submits a conversation turn.
 The draft remains until durable acceptance; model output streams into the log pane.
 Without a selected project, Enter shows setup instructions and retains the draft.
