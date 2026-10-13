@@ -24,6 +24,7 @@ own authorization and validation scope; it does not establish product readiness.
 | [Result retention and graph packet](result-retention-graph-packet.md) | Proposed complete captured-result storage and typed thread/evidence graph; analysis and review only. |
 | [Tool job controller](tool-job-controller.md) | Proposed conversation-scoped tool jobs with retained output, yield-window results and model/client reconnect; owner-selected direction, not implemented. |
 | [Loop closure and endings](loop-closure.md) | Owner-confirmed stream model for loop closures, interrupts and permanent or temporary endings; operators and per-loop mapping proposed, not implemented. |
+| [Tool output views and limits](tool-output-views.md) | Selected principles: one retained stream with person and model views, journal references, fixed transport units, evidence-derived turn backstop; classifies 49 tool limits. |
 | [Execution threat model](execution-threat-model.md) | Proposed threats, implemented mitigations and gaps for shell, memory writes, model reads and endpoints; gates tool jobs and remote providers; not reviewed. |
 | [Conversation projections](conversation-projections.md) | Required separation of evidence, audit, model context and presentation; proposed richer activity, result retention and recomposition packets. |
 | [Model context telemetry](model-context-telemetry.md) | Native model identity and measured input context, with explicit basis and asynchronous event delivery. |

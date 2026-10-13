@@ -385,6 +385,11 @@ Open decisions for the per-loop mapping:
    unknown model capacity refuses admission or uses a verified configured value.
 6. Whether the service takes ownership of the turn request loop from the helper.
 
+Owner direction (2026-10-13): the closure that guarantees a turn's tool loop
+ends is derived from evidence. Asura logs tool-loop traces and builds a
+classifier first; see [tool-loop trace evidence](tool-output-views.md#tool-loop-trace-evidence).
+The current 8-call and 64-request limits stay until that work selects closures.
+
 Alternatives considered: a single hard-coded per-turn token total (current;
 conflates concerns, ignores model size and fails without an answer); closures embedded in each loop's control
 flow (no shared vocabulary or composition); escalation as a closure (rejected by
