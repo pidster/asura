@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The authority writer is one per process; tests that run a service take turns.
+static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Scratch(std::path::PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -126,13 +129,29 @@ fn wire_exchange(runtime: &RuntimeDirectory, bytes: &[u8]) -> Frame {
         }
     }
 }
+fn wait_ready(client: &mut Client) -> [u8; 16] {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = client.inspect_installation().unwrap();
+        if status.installation == pb::InstallationState::GraphReady {
+            return status.installation_id.unwrap();
+        }
+        assert!(Instant::now() < end, "not ready: {status:?}");
+        asura_platform::poll(&[], Duration::from_millis(20)).unwrap();
+    }
+}
 #[test]
 fn real_socket_attach_inspect_stop_restart_and_negotiation() {
+    let _writer = WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
     let runtime = RuntimeDirectory::scratch(&scratch.0, true).unwrap();
     let (handle, done) = launch(&runtime, &scratch.0.join("events.log"));
     let mut first = attach(&runtime);
+    // Wait for automatic initialization so stop cannot race it; see
+    // conversation-admission.md "Automatic initialization".
+    let installation = wait_ready(&mut first);
     let first_snapshot = first.inspect().unwrap();
+    assert!(first_snapshot.new_installation);
     let mut second = attach(&runtime);
     let second_snapshot = second.inspect().unwrap();
     assert_eq!(second_snapshot.service_epoch, first_snapshot.service_epoch);
@@ -168,30 +187,43 @@ fn real_socket_attach_inspect_stop_restart_and_negotiation() {
     ));
     let (handle, done) = launch(&runtime, &scratch.0.join("events.log"));
     let mut restarted = attach(&runtime);
+    assert_eq!(wait_ready(&mut restarted), installation);
+    let restarted_snapshot = restarted.inspect().unwrap();
     assert_ne!(
-        restarted.inspect().unwrap().service_epoch,
+        restarted_snapshot.service_epoch,
         first_snapshot.service_epoch
     );
+    assert!(!restarted_snapshot.new_installation);
     restarted.stop().unwrap();
     done.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
     handle.join().unwrap();
     let events = fs::read_to_string(scratch.0.join("events.log")).unwrap();
     let lines: Vec<_> = events.lines().collect();
-    assert_eq!(lines.len(), 6);
-    for sequence in lines.chunks(3) {
-        assert!(sequence[0].contains("service_serving"));
-        assert!(sequence[1].contains("service_draining"));
-        assert!(sequence[2].contains("service_stopped"));
+    let expected = [
+        "service_serving",
+        "installation_initializing",
+        "installation_initialized",
+        "service_draining",
+        "service_stopped",
+        "service_serving",
+        "service_draining",
+        "service_stopped",
+    ];
+    assert_eq!(lines.len(), expected.len(), "{events}");
+    for (line, event) in lines.iter().zip(expected) {
+        assert!(line.contains(event), "{line} lacks {event}");
     }
-    let entries: Vec<_> = fs::read_dir(scratch.0.join(".asura"))
+    let mut entries: Vec<_> = fs::read_dir(scratch.0.join(".asura"))
         .unwrap()
-        .map(|v| v.unwrap().file_name())
+        .map(|v| v.unwrap().file_name().into_string().unwrap())
         .collect();
-    assert_eq!(entries, vec![std::ffi::OsString::from("run")]);
+    entries.sort();
+    assert_eq!(entries, ["db", "logs", "run", "state"]);
 }
 
 #[test]
 fn config_persists_across_service_restart_and_rejects_without_mutation() {
+    let _writer = WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
     let runtime = RuntimeDirectory::scratch(&scratch.0, true).unwrap();
     let (handle, done) = launch(&runtime, &scratch.0.join("events.log"));
