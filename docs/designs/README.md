@@ -16,7 +16,7 @@ own authorization and validation scope; it does not establish product readiness.
 | [Composer interactions](composer-interactions.md) | Selected production focus navigation, selectors, history and queue interaction. |
 | [Composer editor navigation](composer-editor-navigation.md) | Selected visual row boundaries, row and word movement, the Shift+Up/Down focus chain and bounded draft history recall. |
 | [Help mode](help-mode.md) | Selected client-local `?` help: search over the user guide, area help and a single help source; not implemented. |
-| [Person command mode](person-command-mode.md) | Proposed `!` mode: person-typed commands run as tool jobs with a person execution profile; draft being rebased on the job controller; open decisions pending. |
+| [Person command mode](person-command-mode.md) | Proposed `!` mode: person-typed commands run as tool jobs with a person execution profile, complete retained output and a person notice; PC1–PC12 resolved; waits for job packets and threat-model approval. |
 | [Service status pane](service-status-pane.md) | Selected connection ownership, service uptime and bounded stored-memory footprint observations; implemented, with no runtime evidence recorded. |
 | [Context observations](context-observations.md) | Service-owned filesystem signals, bounded Git collection and scoped status observations; runtime qualification required. |
 | [Sensors](sensors.md) | Passive and directed observations, durable evidence inspection, held proposals and selected System 1/System 2 direction. |

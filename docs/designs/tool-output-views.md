@@ -185,7 +185,7 @@ Each owner design must adopt these principles before implementing its part.
 
 | Design | Change |
 | --- | --- |
-| [Tool job controller](tool-job-controller.md) | Replace its fixed preview with a disclosure the composer sizes; hold one retention quota; result records carry references |
+| [Tool job controller](tool-job-controller.md) | Replace its fixed preview with a disclosure the composer sizes; until the composer exists, results carry no output text and the model pages with `job read` (owner, 2026-10-14, with PC12); hold one retention quota; result records carry references |
 | [Result retention packet](result-retention-graph-packet.md) | Align its 64 MiB per-call limit and capture concurrency with the single job quota |
 | [Model tools](model-tool-execution.md) | Move per-result and per-turn byte budgets to the composer; keep page ceilings |
 | [Shell tool](shell-tool.md) | Replace the tail ring, rendered size and 60 s timeout under jobs; fix the truncation-field mismatch |

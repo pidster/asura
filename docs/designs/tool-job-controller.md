@@ -38,6 +38,11 @@ survive service restart, project-scoped daemons and automatic model reactions.
 Each needs a separate design. Context composition remains
 [conversation projections](conversation-projections.md) items 5–6.
 
+Person-origin jobs: [person command mode](person-command-mode.md#job-controller-amendments)
+proposes jobs started by a person `!` command rather than a model call. They
+use a person execution profile with network access, have no deadline and add a
+kill escalation to cancel. J2 must include those amendments before `!` is built.
+
 ## Terms
 
 | Term | Meaning |
