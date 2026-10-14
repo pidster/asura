@@ -47,9 +47,29 @@ Ctrl+D, Ctrl+S, Ctrl+T and Ctrl+V keys in this table work.
 | Ctrl+Z or Ctrl+Y | Undo or redo |
 | Tab | Complete a command name, or insert two spaces |
 | F1 | Show commands and keys |
+| ? | At the start of the draft, enter help mode; elsewhere it is text |
 
 Tab completes a command when the draft starts with `/` and the cursor is in the
 first word. One match completes at once. Several matches open the command list.
+
+## Help mode keys
+
+Type `?` at the start of the input box to enter help mode. Editing keys work
+as in the input box. These keys differ:
+
+| Key | Action |
+| --- | --- |
+| Up or Down | Select the previous or next result |
+| Page Up or Page Down | Move the selection by a page |
+| Enter | Open the selected result; on an empty line, open the area help |
+| Backspace at the start | Leave help mode and keep the text |
+| Escape | Close an opened result; otherwise leave help mode and keep the text |
+| Ctrl+S, Ctrl+T or Ctrl+D | Ignored with a notice to leave help mode first |
+| F1 | Show commands and keys; help mode resumes when it closes |
+
+In help mode, Tab, Option+Enter, Shift+Up, Shift+Down, Ctrl+Up, Ctrl+Down, F6,
+Ctrl+P and Ctrl+N do nothing. Help mode keeps focus in the input box and never
+recalls earlier input.
 
 ## Queue keys
 

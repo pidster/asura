@@ -2,7 +2,8 @@
 
 This guide explains how to use the Asura terminal client. It describes the
 behavior of the current developer build. A section marked **Planned** describes
-designed behavior that the current build does not have yet.
+designed behavior that the current build does not have yet. The build has no
+Planned section at present.
 
 For exact command syntax, see the [commands reference](commands.md). For every
 key, see the [keys reference](keys.md).
@@ -348,17 +349,26 @@ when the content is longer than the panel.
 ## Get help
 
 Type `/help`, or press F1 in the input box, to see commands and keys. Press
-Escape or F1 to close the panel. Arrow keys scroll it.
+Escape or F1 to close the panel. Arrow keys scroll it. To search instead, use
+help mode.
 
-### Help mode (Planned)
-
-**Planned:** the current build does not have this feature.
+### Help mode
 
 Type `?` at the start of the input box to enter help mode. The marker
-changes to `?`. Type words to search commands, keys and help topics. Up and Down
-choose a result and Enter opens it. Enter on an empty line explains the area you
-used last. Backspace at the start of the line, or Escape, leaves help mode and
-keeps your text. Help mode works offline and never sends text to a model.
+changes to `?` and the box turns indigo. Type words to search commands, keys and
+help topics; a panel above the box lists the matches. Up and Down choose a
+result, Page Up and Page Down move by a page, and Enter opens it. Escape closes
+an opened result and returns to the list.
+
+Enter on an empty line lists the screen areas: the input box, queue, log and
+status bar. Choose one to read about it and its keys. The area you used last is
+first. Help mode searches the same text as this guide.
+
+Backspace at the start of the line, or Escape, leaves help mode and keeps your
+text. Typing `?` anywhere else is ordinary text. Tab and Alt+Enter do nothing
+in help mode, and Ctrl+S, Ctrl+T and Ctrl+D ask you to leave help mode first.
+Help mode works offline and never sends text to a model or the service. Your
+help searches are not added to recall.
 
 To send a message that starts with `?`, type a space first.
 

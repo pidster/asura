@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation]
+Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode]
 This verifies process and tty state, not native terminal visual correctness.
 """
 import codecs
@@ -1642,6 +1642,261 @@ def state_isolation(source):
     print("PASS existing overlapping registration is listed unavailable and refused on selection")
 
 
+def help_driver(trial):
+    """Screen helpers for the help journeys; each waits for a complete frame."""
+    def screen():
+        return trial.screen.text()
+
+    def box_line():
+        # The input row is the last line that starts with a marker; the log's
+        # prompts and the result panel's selected row are above it.
+        lines = [line.strip() for line in screen().splitlines()
+                 if line.strip().startswith(("› ", "? ")) or line.strip() in ("›", "?")]
+        return lines[-1] if lines else None
+
+    def until(text, offset=0, limit=8):
+        # Wait for the text, then let the rest of that frame arrive before asserting.
+        trial.until(text, offset, plain=True, limit=limit)
+        trial.idle(0.2)
+
+    def escape():
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+
+    def clear_box():
+        trial.send(b"\x01\x7f")
+        trial.idle(0.1)
+
+    return screen, box_line, until, escape, clear_box
+
+
+def help_mode(fixture):
+    """Client-local help mode (HE1-HE5, HE7) against a real service and a restored log.
+
+    No model, provider or conversation request is involved. The service log must
+    not grow while help mode is used; the final message proves that Backspace at
+    byte 0 leaves the text an ordinary draft.
+    """
+    result = fixture.command("--seed-queue-history")
+    assert result[0] == 0, result
+    log = fixture.root / "home/.asura/logs/asura.log"
+    trial = fixture.launch(cwd=fixture.root / "project")
+    screen, box_line, until, escape, clear_box = help_driver(trial)
+    try:
+        until(b"Restored 4 conversation turns", limit=20)
+        trial.idle(0.5)
+        assert log.exists(), "the service log is the no-request oracle"
+        log_size = log.stat().st_size
+        # HE1: `?` then `queue`; Enter opens an entry; Escape returns with the query kept.
+        offset = len(trial.output)
+        trial.send(b"?")
+        until(b"Area help", offset)
+        until("↑↓ select · ↵ open".encode(), offset)
+        assert "Box (last used)" in screen(), screen()
+        assert box_line() == "?", (box_line(), screen())
+        offset = len(trial.output)
+        trial.send(b"queue")
+        until(b"results", offset)
+        until(b"Queue: Up or Down", offset)
+        assert box_line() == "? queue", (box_line(), screen())
+        offset = len(trial.output)
+        trial.send(b"\r")
+        until(b"Esc back", offset)
+        assert "Help · Queue: Up or Down" in screen(), screen()
+        assert "Queue keys" in screen(), screen()
+        escape()
+        assert "Esc back" not in screen() and "Queue: Up or Down" in screen(), screen()
+        assert box_line() == "? queue", (box_line(), screen())
+        # Escape leaves help mode and keeps the text.
+        escape()
+        assert "? Help" not in screen(), screen()
+        assert box_line() == "› queue", (box_line(), screen())
+        clear_box()
+        assert box_line() == "›", (box_line(), screen())
+        # HE2: visit the log, return, then `?` and Enter on the blank query.
+        offset = len(trial.output)
+        trial.send(b"\x1b[1;2A")  # Shift+Up: the queue is empty, so the log.
+        until(b"scroll history", offset, limit=5)
+        escape()
+        until("↑↓ recall".encode(), limit=5)
+        offset = len(trial.output)
+        trial.send(b"?")
+        until(b"Log (last used)", offset)
+        offset = len(trial.output)
+        trial.send(b"\r")
+        until("Help · Log".encode(), offset)
+        # A tall terminal shows the whole area help, from the guide text to the
+        # last key table row, without scrolling.
+        trial.resize(100, 70)
+        until(b"Conversation log keys", limit=5)
+        until(b"Escape or F6", limit=5)
+        assert "Browse responses and tool activity" in screen(), screen()
+        trial.resize(80, 24)
+        trial.idle(0.3)
+        escape()
+        escape()
+        assert "? Help" not in screen(), screen()
+        # HE4: a bracketed paste of `?model` enters help mode with that query.
+        offset = len(trial.output)
+        trial.send(b"\x1b[200~?model\x1b[201~")
+        until(b"results", offset)
+        assert box_line() == "? model", (box_line(), screen())
+        assert "/models" in screen(), screen()
+        escape()
+        clear_box()
+        # HE5: a real input, then help Enter and leave; Up recalls the real input only.
+        trial.send(b"/tools\r")
+        until("Tools · Esc closes".encode())
+        escape()
+        trial.send(b"?queue\r")
+        until(b"Esc back")
+        escape()
+        escape()
+        clear_box()
+        trial.send(b"\x1b[A")
+        until(b"/tools")
+        assert box_line() == "› /tools", (box_line(), screen())
+        trial.send(b"\x1b[A")
+        trial.idle(0.2)
+        assert box_line() == "› /tools", screen()
+        trial.send(b"\x1b[B")
+        trial.idle(0.2)
+        assert box_line() == "›", (box_line(), screen())
+        # HE7: resizes in help mode match the layouts the buffer checks pin.
+        trial.send(b"?queue")
+        until(b"results")
+        trial.resize(62, 16)
+        trial.idle(0.3)
+        text = screen()
+        assert "? Help" in text and "Select a message" in text, text
+        trial.resize(60, 16)
+        trial.idle(0.3)
+        text = screen()
+        assert "? Help" in text and "Select a message" not in text, text
+        trial.resize(30, 8)
+        trial.idle(0.3)
+        text = screen()
+        assert "? Help" not in text and "↵ open" in text and "? Queue: Up or Down" in text, text
+        trial.resize(80, 24)
+        trial.idle(0.3)
+        assert "? Help" in screen(), screen()
+        escape()
+        clear_box()
+        # No service request or log entry came from any help use above.
+        trial.idle(0.5)
+        assert log.stat().st_size == log_size, "service log grew"
+        # HE3: Backspace at byte 0 leaves help mode with the text; Enter sends it.
+        trial.send(b"?abc\x1b[H")
+        until(b"? abc")
+        trial.send(b"\x7f")
+        trial.idle(0.2)
+        assert "? Help" not in screen() and box_line() == "› abc", (box_line(), screen())
+        trial.send(b"\x7f")
+        trial.idle(0.2)
+        assert box_line() == "› abc", "a second Backspace at byte 0 changes nothing"
+        trial.send(b"\r")
+        # The service accepted it as a message; this fixture has no model helper,
+        # so it is held rather than answered.
+        until(b"Held (model helper unavailable) \xc2\xb7 abc", limit=15)
+        assert box_line() == "›", (box_line(), screen())
+        trial.send(b"/quit\r")
+        trial.finish()
+    finally:
+        trial.close()
+    fixture.wait_absent(stable=0.2)
+    print("PASS help mode: search, entry, area help, paste, recall, resize, quiet service log, message after leaving")
+
+
+def help_mode_backend_gone(fixture):
+    """HE6, unavailable backend: search, area help and /help need no service."""
+    trial = fixture.launch()
+    screen, box_line, until, escape, clear_box = help_driver(trial)
+    try:
+        fixture.stop()
+        until(b"Disconnected", limit=15)
+        trial.send(b"?config")
+        until(b"results")
+        assert box_line() == "? config", (box_line(), screen())
+        trial.send(b"\r")
+        until(b"Esc back")
+        assert "Help · " in screen(), screen()
+        escape()
+        escape()
+        clear_box()
+        trial.send(b"?\r")
+        until("Help · Box".encode())
+        escape()
+        escape()
+        offset = len(trial.output)
+        trial.send(b"\x1bOP")  # F1
+        until("Editor help · Esc closes".encode(), offset)
+        assert "/models" in screen() and "Command / key" in screen(), screen()
+        escape()
+        trial.send(b"\x11")
+        trial.finish(limit=5)
+    finally:
+        trial.close()
+    fixture.wait_absent(stable=0.2)
+    print("PASS help mode with an unavailable backend: search, area help and /help")
+
+
+def help_mode_backend_stalled(fixture):
+    """HE6, stalled backend: help mode stays responsive while the service is stopped."""
+    stdout = fixture.root / "help-stalled.out"
+    stderr = fixture.root / "help-stalled.err"
+    with stdout.open("wb") as out, stderr.open("wb") as err:
+        backend = subprocess.Popen([str(fixture.binary), "service", "run"],
+            cwd=fixture.root, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+    fixture.started = True
+    trial = None
+    stopped = False
+    try:
+        end = time.monotonic() + remaining()
+        while True:
+            assert backend.poll() is None, "foreground fixture exited before serving"
+            code, data, _ = fixture.command("service", "status", "--json")
+            if code == 0 and json.loads(data)["service"] == "current":
+                break
+            assert time.monotonic() < end, "foreground service did not become ready"
+            time.sleep(0.01)
+        trial = fixture.launch()
+        screen, box_line, until, escape, clear_box = help_driver(trial)
+        os.kill(backend.pid, signal.SIGSTOP)
+        stopped = True
+        observed, status = os.waitpid(backend.pid, os.WUNTRACED)
+        assert observed == backend.pid and os.WIFSTOPPED(status)
+        started = time.monotonic()
+        trial.send(b"?queue")
+        until(b"results", limit=2)
+        assert box_line() == "? queue", (box_line(), screen())
+        trial.send(b"\r")
+        until(b"Esc back", limit=2)
+        escape()
+        escape()
+        clear_box()
+        trial.send(b"?\r")
+        until("Help · Box".encode(), limit=2)
+        escape()
+        escape()
+        assert time.monotonic() - started < 3, "help mode waited for the stalled backend"
+        trial.send(b"\x11")
+        trial.finish(limit=3)
+    finally:
+        if trial is not None:
+            trial.close()
+        if stopped and backend.poll() is None:
+            os.kill(backend.pid, signal.SIGCONT)
+        try:
+            fixture.stop()
+            assert backend.wait(timeout=remaining()) == 0
+        except Exception:
+            if backend.poll() is None:
+                backend.kill()
+                backend.wait(timeout=5)
+            raise
+    print("PASS help mode with a stalled backend: responsive search, entry and area help")
+
+
 def main():
     global DEADLINE
     assert len(sys.argv) in (2, 3), __doc__
@@ -1655,7 +1910,8 @@ def main():
     activity = len(sys.argv) == 3 and sys.argv[2] == "--activity"
     multipass = len(sys.argv) == 3 and sys.argv[2] == "--activity-multipass"
     isolation = len(sys.argv) == 3 and sys.argv[2] == "--state-isolation"
-    assert len(sys.argv) == 2 or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation, __doc__
+    helpmode = len(sys.argv) == 3 and sys.argv[2] == "--help-mode"
+    assert len(sys.argv) == 2 or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
@@ -1675,6 +1931,11 @@ def main():
         return
     fixture = Fixture(source)
     try:
+        if helpmode:
+            help_mode(fixture)
+            help_mode_backend_gone(fixture)
+            help_mode_backend_stalled(fixture)
+            return
         if activity or multipass:
             rich_activity(fixture, source, multipass)
             return
@@ -1714,7 +1975,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

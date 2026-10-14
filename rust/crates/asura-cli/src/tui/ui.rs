@@ -1,10 +1,12 @@
 //! Local draft and literal presentation of read-only service observations.
 mod activity;
 mod composer;
+mod help_mode;
 mod markdown;
 use super::editor::{CommandHeader, Editor, MAX_DRAFT_BYTES};
-use composer::{Focus, Picker};
+use composer::{Focus, Picker, selection_style};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use help_mode::{HELP_INDIGO, HelpMode};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -99,6 +101,8 @@ const LOCAL_COMMANDS: [&str; 14] = [
 enum Overlay {
     Commands(CommandHeader, Option<usize>),
     Help(u16),
+    /// An opened help entry: title, rendered Markdown and scroll offset.
+    HelpEntry(String, Text<'static>, u16),
     ProjectOffer(String, bool),
     Config(String, u16),
     Models(super::models::Outcome, u16),
@@ -206,6 +210,8 @@ pub struct App {
     history_scroll: usize,
     history_scroll_max: usize,
     history_page: usize,
+    help: Option<HelpMode>,
+    last_area: super::help::Area,
 }
 impl App {
     pub fn new() -> Self {
@@ -299,6 +305,8 @@ impl App {
             history_scroll: 0,
             history_scroll_max: 0,
             history_page: 1,
+            help: None,
+            last_area: super::help::Area::Box,
         }
     }
     pub(super) fn take_queue_request(
@@ -1428,6 +1436,20 @@ impl App {
         }
     }
     pub fn handle(&mut self, event: Event) -> bool {
+        // Help results and the last-focused area follow every event; selection
+        // keys in help mode change neither the text nor the area.
+        let selection = self.help.is_some()
+            && matches!(&event, Event::Key(key) if key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown)
+                && self.overlay.is_none() && self.capture.is_none());
+        let exit = self.handle_event(event);
+        if !selection {
+            self.help_sync();
+            self.track_area();
+        }
+        exit
+    }
+    fn handle_event(&mut self, event: Event) -> bool {
         if let Event::Paste(text) = event {
             if self.overlay.is_none()
                 && self.focus == Focus::Editor
@@ -1436,7 +1458,7 @@ impl App {
             {
                 if self.capture.is_some() {
                     self.capture(&text);
-                } else {
+                } else if !self.help_entry_paste(&text) {
                     self.insert(&text);
                 }
             }
@@ -1503,11 +1525,14 @@ impl App {
                     }
                     self.overlay = None;
                 }
-                KeyCode::F(1) if matches!(overlay, Overlay::Help(_)) => self.overlay = None,
+                KeyCode::F(1) if matches!(overlay, Overlay::Help(_) | Overlay::HelpEntry(..)) => {
+                    self.overlay = None
+                }
                 KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
                     match overlay {
                         Overlay::Config(_, offset)
                         | Overlay::Help(offset)
+                        | Overlay::HelpEntry(_, _, offset)
                         | Overlay::Models(_, offset)
                         | Overlay::Tools(offset)
                         | Overlay::Audit(_, _, offset) => {
@@ -1591,6 +1616,13 @@ impl App {
                 }
                 _ => self.capture.as_mut().unwrap().invalid = true,
             }
+            return false;
+        }
+        if self.help.is_some() {
+            if let Some(exit) = self.help_key(key) {
+                return exit;
+            }
+        } else if self.help_entry_key(key) {
             return false;
         }
         if key.modifiers == KeyModifiers::CONTROL {
@@ -1685,6 +1717,7 @@ impl App {
     }
 
     fn submit(&mut self) -> bool {
+        self.last_area = super::help::Area::Box;
         let draft = self.editor.text();
         self.history.record(&draft);
         if !draft.starts_with('/') {
@@ -2154,8 +2187,21 @@ impl App {
         let editor_y = area
             .bottom()
             .saturating_sub(2 + picker_height + strips + rows);
-        let tray_height =
-            self.draw_queue(frame, full_area, editor_y.saturating_sub(strips + 1), panel);
+        let tray_bottom = editor_y.saturating_sub(strips + 1);
+        // Help mode takes the queue panel's place; the queue count moves into
+        // its header. Help overlays cover the panel's position instead.
+        let tray_height = if self.help_active() {
+            if matches!(
+                self.overlay,
+                Some(Overlay::Help(_) | Overlay::HelpEntry(..))
+            ) {
+                0
+            } else {
+                self.draw_help_panel(frame, full_area, tray_bottom, panel)
+            }
+        } else {
+            self.draw_queue(frame, full_area, tray_bottom, panel)
+        };
         if !self.transcript.is_empty() {
             let history_area = Rect::new(
                 full_area.x,
@@ -2188,6 +2234,11 @@ impl App {
             self.history_focus = false;
         }
 
+        let tint = if self.help_active() {
+            HELP_INDIGO
+        } else {
+            INPUT_TINT
+        };
         if strips > 0 {
             let top_separator = if self.overlay.is_some() || tray_height > 0 {
                 "█"
@@ -2199,18 +2250,24 @@ impl App {
                 full_area,
                 editor_y - area.y - 1,
                 &top_separator.repeat(full_area.width as usize),
-                Style::default().fg(Color::Rgb(37, 59, 78)),
+                Style::default().fg(tint),
             );
         }
         let editor_area = Rect::new(full_area.x, editor_y, full_area.width, rows);
-        frame.render_widget(Paragraph::new("").style(band), editor_area);
+        frame.render_widget(Paragraph::new("").style(band.bg(tint)), editor_area);
         let input = Style::default()
             .fg(INPUT_TEXT)
-            .bg(INPUT_TINT)
+            .bg(tint)
             .add_modifier(Modifier::BOLD);
-        let draft = self.editor.text();
-        self.editor
-            .set_highlight(active_command(&draft).map(|range| (range, input.fg(COMMAND_AMBER))));
+        // Command highlighting never applies to a help query.
+        if self.help_active() {
+            self.editor.set_highlight(None);
+        } else {
+            let draft = self.editor.text();
+            self.editor.set_highlight(
+                active_command(&draft).map(|range| (range, input.fg(COMMAND_AMBER))),
+            );
+        }
         let focused = self.overlay.is_none()
             && self.capture.is_none()
             && self.focus == Focus::Editor
@@ -2225,7 +2282,8 @@ impl App {
         );
         if self.editor.first_row_visible() {
             frame.render_widget(
-                Paragraph::new("›").style(input.fg(INPUT_GLOW)),
+                Paragraph::new(if self.help_active() { "?" } else { "›" })
+                    .style(input.fg(INPUT_GLOW)),
                 Rect::new(area.x, editor_y, 1, 1),
             );
         }
@@ -2235,7 +2293,7 @@ impl App {
                 full_area,
                 editor_y + rows - area.y,
                 &"▀".repeat(full_area.width as usize),
-                Style::default().fg(Color::Rgb(37, 59, 78)),
+                Style::default().fg(tint),
             );
         }
         let status_area = Rect::new(area.x, area.bottom() - 2 - picker_height, area.width, 1);
@@ -2336,6 +2394,46 @@ impl App {
     }
     fn draw_overlay(&mut self, frame: &mut Frame, area: Rect, style: Style) {
         self.panel_scroll_max = 0;
+        if let Some(Overlay::HelpEntry(title, text, offset)) = &mut self.overlay {
+            if area.width < 3 || area.height < 3 {
+                return;
+            }
+            let body = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
+            let lines = body.line_count(area.width - 2);
+            let height = lines.saturating_add(3).min(usize::from(area.height)) as u16;
+            let popup = Rect::new(
+                area.x,
+                area.bottom().saturating_sub(height),
+                area.width,
+                height,
+            );
+            frame.render_widget(Clear, popup);
+            frame.render_widget(Paragraph::new("").style(style), popup);
+            let inner = Rect::new(popup.x + 1, popup.y + 1, popup.width - 2, popup.height - 2);
+            // The title row stays put; only the entry's text scrolls.
+            let rows = usize::from(inner.height).saturating_sub(1);
+            self.panel_scroll_max = lines.saturating_sub(rows).min(usize::from(u16::MAX)) as u16;
+            *offset = (*offset).min(self.panel_scroll_max);
+            line(
+                frame,
+                inner,
+                0,
+                &format!(
+                    "Help · {title} · Esc back{}",
+                    if lines > rows {
+                        " · arrows scroll"
+                    } else {
+                        ""
+                    }
+                ),
+                style,
+            );
+            frame.render_widget(
+                body.style(style).scroll((*offset, 0)),
+                Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1),
+            );
+            return;
+        }
         let Some(overlay) = &mut self.overlay else {
             return;
         };
@@ -2387,6 +2485,7 @@ impl App {
                     content
                 }
             }
+            Overlay::HelpEntry(..) => String::new(),
             Overlay::ProjectOffer(path, yes) => format!(
                 "Use this directory as a project?\n{}\n{}\nTab/arrows select · Enter confirms · Esc declines",
                 literal(path, 4096),
@@ -2752,103 +2851,56 @@ fn tools_table(width: usize) -> String {
     lines.join("\n")
 }
 
+/// Wrap text to `limit` display cells, splitting words that are longer.
+fn wrap_cells(value: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    let mut lines = vec![String::new()];
+    let cells = |text: &str| unicode_display_width::width(text) as usize;
+    for word in value.split_whitespace() {
+        let current = lines.last_mut().unwrap();
+        if !current.is_empty() && cells(current) + 1 + cells(word) <= limit {
+            current.push(' ');
+            current.push_str(word);
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(String::new());
+        }
+        for grapheme in word.graphemes(true) {
+            let current = lines.last_mut().unwrap();
+            if !current.is_empty() && cells(current) + cells(grapheme) > limit {
+                lines.push(String::new());
+            }
+            lines.last_mut().unwrap().push_str(grapheme);
+        }
+    }
+    lines
+}
+
+/// The `/help` table, built from the embedded guide: command rows in guide
+/// order, then key rows grouped by their section.
 fn help_table(width: usize) -> String {
-    let rows = [
-        ("Command / key", "Action"),
-        ("/help or F1", "Show command help"),
-        ("/quit or /exit", "Close this client"),
-        ("/new", "Start a new conversation in this project"),
-        ("/models", "List models; * marks configured selection"),
-        ("/tools", "List registered tool names and descriptions"),
-        (
-            "/audit [1..16]",
-            "Read recent audit metadata for this project",
-        ),
-        ("/config", "Show current YAML"),
-        ("/config get NAME", "Read a setting"),
-        (
-            "/config set NAME VALUE",
-            "Write a setting; dotted names select nested keys",
-        ),
-        ("/init", "Check installation setup"),
-        ("/project add PATH", "Register and select a project"),
-        ("/project list", "List projects"),
-        ("/project select ID", "Select a project"),
-        ("/project rename NAME", "Rename the selected project"),
-        ("/queue", "List queued inputs"),
-        ("/queue ID", "Show a queued input"),
-        ("/queue resume ID", "Resume held input"),
-        ("/queue drop ID", "Drop held input"),
-        ("/cancel", "Cancel active work"),
-        ("/observe ID", "Observe a recorded operation"),
-        ("/retry", "Retry with the original request ID"),
-        ("Enter", "Submit; queue automatically during active work"),
-        (
-            "Up / Down",
-            "Move a row; recall at top row; status at bottom",
-        ),
-        (
-            "Shift+Up / Shift+Down",
-            "Focus queue or history above / status below",
-        ),
-        ("Ctrl+Up / Ctrl+Down", "Focus queue / project-model status"),
-        ("[ / ] in queue", "Move an undispatched input up / down"),
-        (
-            "Enter in queue",
-            "Send selected input now; active response restarts",
-        ),
-        ("Ctrl+P / Ctrl+N", "Recall submitted input / restore draft"),
-        (
-            "F6",
-            "Browse responses; Enter expands activity; Esc returns",
-        ),
-        ("Ctrl+S / Ctrl+T", "Steer / queue input"),
-        ("Alt+Enter", "Insert a newline"),
-        ("Tab", "Complete commands or insert spaces"),
-        (
-            "Left / Right; Shift+Left / Right",
-            "Move cursor / select text",
-        ),
-        (
-            "Alt or Ctrl+Left / Right",
-            "Move one word; Shift selects; Alt+B / F also",
-        ),
-        ("Alt+Backspace", "Delete the previous word"),
-        ("Ctrl+A", "Select all text"),
-        ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
-        ("Ctrl+V", "Start or finish paste capture"),
-        ("Ctrl+Q / Ctrl+C", "Exit; confirm if a draft exists"),
-        ("Esc", "Close the current panel"),
-    ];
+    let Some(index) = super::help::index() else {
+        return super::help::UNAVAILABLE.into();
+    };
+    let mut rows = vec![("Command / key", "Action")];
+    rows.extend(index.table_rows());
     let left = 28.min(width.saturating_sub(3) / 2).max(1);
     let right = width.saturating_sub(left + 3).max(1);
-    let wrap = |value: &str, limit: usize| {
-        let mut lines = vec![String::new()];
-        for word in value.split_whitespace() {
-            let line = lines.last_mut().unwrap();
-            if !line.is_empty() && line.len() + 1 + word.len() > limit {
-                lines.push(word.to_owned());
-            } else {
-                if !line.is_empty() {
-                    line.push(' ');
-                }
-                line.push_str(word);
-            }
-        }
-        lines
-    };
     let mut lines = Vec::new();
-    for (index, (command, action)) in rows.into_iter().enumerate() {
-        let commands = wrap(command, left);
-        let actions = wrap(action, right);
+    for (position, (command, action)) in rows.into_iter().enumerate() {
+        let commands = wrap_cells(&literal(command, 512), left);
+        let actions = wrap_cells(&literal(action, 512), right);
         for row in 0..commands.len().max(actions.len()) {
+            let name = commands.get(row).map(String::as_str).unwrap_or("");
+            let pad = left.saturating_sub(unicode_display_width::width(name) as usize);
             lines.push(format!(
-                "{:<left$} │ {}",
-                commands.get(row).map(String::as_str).unwrap_or(""),
+                "{name}{} │ {}",
+                " ".repeat(pad),
                 actions.get(row).map(String::as_str).unwrap_or("")
             ));
         }
-        if index == 0 {
+        if position == 0 {
             lines.push(format!("{}─┼─{}", "─".repeat(left), "─".repeat(right)));
         }
     }
@@ -3729,7 +3781,8 @@ mod tests {
         }
         let mut app = App::new();
         key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
-        let screen = render(&mut app, 80, 60);
+        // The table is the whole embedded index, so it needs a tall terminal.
+        let screen = render(&mut app, 80, 250);
         assert!(screen.contains("Command / key"));
         assert!(screen.contains("Action"));
         assert!(!screen.contains("arrows scroll"));
@@ -3738,10 +3791,11 @@ mod tests {
         let compact = render(&mut app, 40, 16);
         assert!(compact.contains("arrows") && compact.contains("scroll"));
         assert!(app.panel_scroll_max > 0);
-        for _ in 0..200 {
+        for _ in 0..1000 {
             key(&mut app, KeyCode::Down, KeyModifiers::NONE);
         }
-        assert!(render(&mut app, 40, 16).contains("Close the"));
+        // The last guide row is the final paste capture key.
+        assert!(render(&mut app, 40, 16).contains("finish"));
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.overlay.is_none());
         key(&mut app, KeyCode::F(1), KeyModifiers::NONE);

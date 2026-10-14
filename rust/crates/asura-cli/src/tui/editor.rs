@@ -87,6 +87,20 @@ impl Editor {
         self.state.is_empty()
     }
 
+    /// True when the cursor is at byte 0 of the whole draft with no selection.
+    pub fn at_start(&self) -> bool {
+        !self.state.has_selection() && self.state.cursor() == TextPosition::new(0, 0)
+    }
+
+    /// At most the first `max` bytes of the draft, cut at a character boundary.
+    /// Copies only that prefix, never the whole draft.
+    pub fn prefix(&self, max: usize) -> String {
+        let rope = self.state.rope();
+        let end = rope.len_bytes().min(max);
+        let end = rope.char_to_byte(rope.byte_to_char(end));
+        rope.byte_slice(..end).to_string()
+    }
+
     /// User-perceived characters, including spaces and normalized newlines.
     pub fn character_count(&self) -> usize {
         self.text().graphemes(true).count()

@@ -5,6 +5,7 @@ mod context;
 mod conversation;
 mod editor;
 mod events;
+mod help;
 mod history;
 mod models;
 mod observation;

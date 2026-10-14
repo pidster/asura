@@ -525,6 +525,9 @@ impl App {
         if self.overlay.is_some() {
             return "Esc close · arrows navigate · Enter confirm".into();
         }
+        if let Some(hint) = self.help_hint() {
+            return hint;
+        }
         if self.response_selection.is_some() {
             return "↑↓ responses · Enter activity · PgUp/PgDn scroll · Esc input".into();
         }
@@ -807,7 +810,7 @@ impl App {
         height
     }
 }
-fn selection_style(style: Style) -> Style {
+pub(super) fn selection_style(style: Style) -> Style {
     style
         .bg(Color::Rgb(70, 82, 94))
         .fg(Color::Rgb(245, 248, 250))

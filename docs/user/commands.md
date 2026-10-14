@@ -15,7 +15,7 @@ on the top bar. An unknown command shows "Unknown command; use /help."
 
 | Command | Action |
 | --- | --- |
-| `/help` | Show commands and keys; F1 does the same |
+| `/help` | Show commands and keys; F1 does the same; `?` searches them |
 | `/quit` | Close this client; a service it started stops too |
 | `/exit` | Same as `/quit` |
 | `/init` | Check the installation setup; normal first use does not need it |

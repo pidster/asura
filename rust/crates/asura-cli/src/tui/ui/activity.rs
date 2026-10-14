@@ -15,6 +15,10 @@ pub(super) struct Activity {
     unavailable: bool,
 }
 impl Activity {
+    #[cfg(test)]
+    pub(super) fn expanded(&self) -> bool {
+        self.expanded
+    }
     pub(super) fn clear_statistics(&mut self) {
         self.statistics = None;
     }

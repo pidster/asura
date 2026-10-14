@@ -7,7 +7,7 @@ describes designed behavior that the build does not have yet.
 
 These files are also the single source for in-client help. The
 [help mode design](../designs/help-mode.md) compiles them into the
-`asura` binary for `/help`, `?` search and area help; that is not yet built. Keep headings stable and
+`asura` binary for `/help`, `?` search and area help. Keep headings stable and
 keep the command and key tables in the format that design defines.
 
 ## Files

@@ -1,9 +1,12 @@
 # Help mode
 
-Status: selected design, 2026-10-13. The owner decisions below are required
-behavior. The owner resolved [HP1–HP6](#resolved-decisions) the same day.
-Nothing in this document is implemented. The [user guide](../user/README.md) exists and
-describes current behavior; this design makes it the single help source.
+Status: selected design, 2026-10-13; implemented 2026-10-14. The owner decisions
+below are required behavior. The owner resolved [HP1–HP6](#resolved-decisions) the
+same day. [Implementation notes](#implementation-notes-and-corrections) record where
+the delivered code differs from the first text of this design, and
+[Verification](#verification-2026-10-14) records the checks that ran. The
+[user guide](../user/README.md) describes current behavior and is the single help
+source.
 
 Protocol numbering remains 0.1 and journal format remains 1. Help mode adds no
 service request, control message, persistence or configuration.
@@ -89,8 +92,8 @@ The Rust TUI client owns help mode completely. No other component participates.
 | --- | --- |
 | `docs/user/*.md` | Canonical help text, command table and key tables |
 | TUI help module (new `tui/help.rs`) | Embedded sources, index build, search, area mapping |
-| TUI application (`tui/ui.rs`, `ui/composer.rs`) | Mode state, key routing, panel and entry rendering, last-area tracking |
-| Editor (`tui/editor.rs`) | Query text editing through its existing bounded paths |
+| TUI application (`tui/ui.rs`, `ui/help_mode.rs`, `ui/composer.rs`) | Mode state, key routing, panel and entry rendering, last-area tracking. `ui/help_mode.rs` holds the help-mode state and its routing; `ui.rs` keeps the overlay, `/help` table and layout hooks |
+| Editor (`tui/editor.rs`) | Query text editing through its existing bounded paths. It adds two read-only helpers, `at_start` and `prefix(max)`, so the entry guard and search never copy the whole draft |
 | Recall history (`tui/history.rs`) | Unchanged; help mode never calls `record`, `previous` or `next` |
 | Markdown renderer (`ui/markdown.rs`) | Presentation of an opened entry, reused unchanged |
 
@@ -449,8 +452,8 @@ unresolved rows, the help header shows their count, so queue state stays visible
 | Row | Kind label, title, summary; `›` marks the selected row in addition to the selection colours |
 | Kind labels | `Command`, `Key`, `Topic`, `Area`, `Guide`, and `Planned` for planned topics |
 | Key rows | Title is `<area>: <key cell>` |
-| Width 60 columns or more | Label, title and summary, shortened with `…` |
-| Width below 60 columns | Label and title only |
+| Inner width 60 columns or more (terminal width 62 or more) | Label, title and summary, shortened with `…` |
+| Inner width below 60 columns | Label and title only |
 | Visible rows | At most 8; fewer when space is short |
 | Scrolling | The selected row stays visible; the header adds `n/m` when rows are hidden |
 | Hint row | `↑↓ select · ↵ open · ⌫ at start or Esc leaves help` |
@@ -460,8 +463,10 @@ Height and small terminals:
 - The panel needs its header, at least one row and two padding rows. It uses the
   space between the history area's top and the box's top strip, as the queue
   panel does today.
-- At 60x16 with a one-row draft, the panel shows four result rows. A buffer test
-  pins this value.
+- At 62x16 with a one-row draft, the panel shows four result rows. A buffer test
+  pins this value. The composer's strips need an inner width of 60 (terminal width
+  62) and a height of 16, so at 60x16 the box has no strips and the panel shows six
+  rows.
 - When space is too short for padding, the panel drops the padding rows first.
 - When even a header and one row do not fit, the panel is hidden. The hint row
   then shows `? <selected title> · ↵ open`. This applies down to the existing
@@ -618,8 +623,8 @@ Unit, render and terminal checks are all required. Test IDs are stable.
 | --- | --- | --- |
 | HR1 | 80x24, help mode | Box and both strips use `#252D4E`; marker `?` in bold `#CFF1FF`; text bold `#E6EDF0` |
 | HR2 | 80x24, scrolled multi-row query | No marker on any row, as in normal mode |
-| HR3 | 60x16, one-row query | Header and exactly four rows; padding present |
-| HR4 | 59x16 and 60x15 | Narrow rows omit summaries; strips follow the existing thresholds |
+| HR3 | 62x16, one-row query | Header and exactly four rows; padding present. At 60x16 the box has no strips and the panel shows six rows |
+| HR4 | 59x16, 60x15 and 60x16 | Narrow rows omit summaries; strips follow the existing thresholds. 62x16 shows summaries and strips |
 | HR5 | 30x8 | Panel hidden; hint row shows the selected title; no underflow |
 | HR6 | Help mode with queued rows | Queue panel hidden; header shows the queued count |
 | HR7 | Selected row | `›` prefix and selection colours; unselected rows have neither |
@@ -635,12 +640,12 @@ owned service, under the existing lifecycle runner.
 | ID | Journey | Required result |
 | --- | --- | --- |
 | HE1 | Type `?`, then `queue` | Panel lists queue entries; Enter opens the queue topic; Escape returns with `queue` kept |
-| HE2 | Visit the log, return, type `?`, Enter | Log help opens and names the log keys |
+| HE2 | Visit the log of a restored conversation, return, type `?`, Enter | Log help opens and names the log keys |
 | HE3 | Type `?abc`, Backspace to byte 0, Backspace again | Normal box with `abc`; Enter then sends `abc` as a message |
 | HE4 | Bracketed paste of `?model` | Help mode with query `model` |
 | HE5 | In help mode press Enter, then leave and press Up | Recall shows the previous real input, never a help query |
-| HE6 | Stop the backend, then use help mode | Search, area help and `/help` work; no backend request appears in the service log |
-| HE7 | Resize to 60x16 and 30x8 in help mode | No crash; layout matches HR3 and HR5 |
+| HE6 | Stop the backend, then use help mode; repeat with a stopped (SIGSTOP) backend. With a running backend, use help mode and compare the service log size | Search, area help and `/help` work and stay responsive; no backend request appears in the service log |
+| HE7 | Resize to 62x16, 60x16 and 30x8 in help mode | No crash; layout matches HR3, HR4 and HR5 |
 
 Environment: macOS with Python 3 and PTYs, as the existing journeys require.
 Help mode needs no model or provider.
@@ -690,11 +695,65 @@ the help panel is shown. Change them only with this document.
 
 ## Delivery
 
-One implementation packet:
+One implementation packet, delivered 2026-10-14:
 
-1. Help module: embedding, size assertion, parser, index and HU1–HU5.
-2. `/help` from the index; remove the literal rows; HR9.
-3. Mode state, entry guards, key routing, last-area tracking; HU6–HU22.
-4. Panel, styling, entry overlay and small-terminal behavior; HR1–HR8, HR10.
+1. Help module: embedding, size assertion, parser, index and HU1–HU5. Done.
+2. `/help` from the index; remove the literal rows; HR9. Done.
+3. Mode state, entry guards, key routing, last-area tracking; HU6–HU22. Done.
+4. Panel, styling, entry overlay and small-terminal behavior; HR1–HR8, HR10. Done.
 5. PTY journeys HE1–HE7; update the guide's Planned section to current behavior,
-   and the [user documentation index](../user/README.md).
+   and the [user documentation index](../user/README.md). Done.
+
+## Implementation notes and corrections
+
+Implemented behavior that differs from, or adds to, the text above. Each item is a
+routine refinement under the [iteration rules](../design-process.md#iteration-and-escalation).
+
+| Item | Change | Reason |
+| --- | --- | --- |
+| Panel thresholds | The summary and strip thresholds use the inner width (terminal width minus the two gutter columns), as the composer's strips already do. HR3 and HE7 use 62x16; 60x16 and 60x15 are narrow | The composer computes `strips` from the inner width; the first text assumed the terminal width. HR4 already listed 60x15 as narrow |
+| Code location | Help-mode state and routing live in `ui/help_mode.rs`, not in `ui.rs` | `ui.rs` is already 5,800 lines; the new module keeps the owner boundary in the Ownership table |
+| Key fixture scope | The fixture covers the four areas' key sections and the guide's `Help mode keys` section. Keys that help mode ignores (Tab, Option+Enter, Shift or Ctrl with Up or Down, F6, Ctrl+P, Ctrl+N) are described in prose below that table, not in it | The router test requires each fixture chord to change state; an ignored key by definition does not |
+| Guide additions | `keys.md` gains a `?` row in the input box keys and a `Help mode keys` section. `guide.md` describes help mode as current behavior. Its heading is `Help mode`, so the ID is `guide#help-mode` | The guide is the single source, so it must document the delivered keys. No guide section is `(Planned)` now; the parser and its test still support the label |
+| Topic summary | A topic's summary is its first sentence outside tables. A topic that starts with a table has an empty summary | Table cells make poor sentences, for example `Command Action /help …` |
+| No results | The panel shows its header (`No matches`) and no rows; the hint row shows `? No help matches` when the panel is hidden | The design named the header and the notice but not the empty body |
+| Panel background | The panel clears its rectangle before it fills it | Without it, status text behind the padding rows shows through |
+| `/help` wrapping | The `/help` table wraps by display width and splits a word that is longer than its column | The index contains longer words than the old literal rows, for example `Option+Backspace` in a narrow column |
+| `/help` test data | `help_table_wraps_columns_and_scrolls_only_when_needed` now checks the no-scroll case at 80x250 and scrolls to the last guide row, `Open the finish dialog`, instead of the old last row `Close the current panel` | The table now holds every guide command and key row. The test still checks wrapping, width limits and scroll limits |
+| HE2 | The journey seeds a restored conversation (`--seed-queue-history`) so the log can be focused without a model | The log cannot take focus without a transcript |
+| HE3 | The journey proves the final send by the service holding `abc` as an accepted message (`model_helper_unavailable`) | The fixture has no model helper; the oracle is acceptance, not an answer |
+
+No design rule, protocol message, journal record, persistence or configuration
+changed. Protocol stays 0.1 and the journal format stays 1.
+
+## Verification (2026-10-14)
+
+Environment: macOS, Rust 1.98.0, pinned `protoc`, Python 3 with PTYs, isolated
+scratch homes under `/private/tmp`. Commands run from the repository root with
+`ASURA_PROTOC="$PWD/.build/dev-tools/protoc"`.
+
+| IDs | Where | Result |
+| --- | --- | --- |
+| HU1, HU3, HU5, HU18, HU19, HU22 and the term and cap checks | `tui/help/tests.rs` | Pass |
+| HU2, HU4, HU6–HU17, HU20, HU21, key router test | `tui/ui/help_mode/tests.rs`, `tests/keys.rs` | Pass |
+| HR1–HR10 | `tui/ui/help_mode/tests.rs`, and the changed `/help` test in `tui/ui.rs` | Pass |
+| HE1–HE7 | `tests/tui_pty.py --help-mode`, run by `tests/lifecycle.rs` | Pass |
+
+Commands:
+
+- `cargo test -p asura-cli --all-features`: 230 unit tests, 3 argument tests and the
+  `lifecycle` gate, which includes the `--help-mode` journeys. All pass.
+- `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+  [--all-features] -- -D warnings`: clean.
+
+Measured work (not the 10 ms and 2 ms reference objectives, which name Apple
+silicon release builds): on the development Mac, index build took 0.9 ms and one
+eight-term refresh took 11 µs in a release test build. The debug test build took
+4.6 ms and 111 µs. A debug-build unit test bounds them at 250 ms and 20 ms to catch
+a change in complexity.
+
+Unverified: the 2 ms and 10 ms objectives on the reference machine; visual
+correctness in a real terminal emulator (the PTY suite checks text and cursor
+output, and the buffer tests check cell styles); the `!` command mode guard
+(HU9 lists it, but that mode does not exist yet, so only the other guards are
+tested); the Ask Asura row, which is deferred.

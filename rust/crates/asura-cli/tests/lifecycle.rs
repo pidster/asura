@@ -422,6 +422,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--queue-history"),
         Some("--queue-reorder"),
         Some("--state-isolation"),
+        Some("--help-mode"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);
