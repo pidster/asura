@@ -237,7 +237,11 @@ association. A repeated original request returns its result. A new request namin
 an already registered device/inode returns that project through a durable request
 alias record, kind 9 below. It does not create another project. A changed path/object
 cannot silently replace an association. Current/stale status is revalidated before
-selection and before each admission. Registration identity and location are
+selection and before each admission. Required behavior (owner, 2026-10-14,
+[PX3](execution-threat-model.md#person-command-decisions)): registration rejects
+a location whose retained directory is the Asura home `~/.asura`, lies inside
+it, or contains it, such as the account home. The platform owner compares
+directory identities, not path text. Registration identity and location are
 immutable; the later [project-name contract](project-names.md) adds a durable
 display-name update without changing either. Removal remains outside this slice.
 

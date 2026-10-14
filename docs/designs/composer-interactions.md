@@ -99,6 +99,26 @@ Validation: buffer tests check marker style and placement after scrolling, the
 unchanged marker for a slash draft, highlighting of a known and an unknown command, and each
 gauge threshold. The existing terminal journeys must still pass.
 
+## Hidden characters — selected 2026-10-14
+
+Required behavior (owner, 2026-10-14,
+[PX5](execution-threat-model.md#person-command-decisions)): in both message and
+`!` command mode, the input box shows each hidden character as a full block `█`
+in hidden-mark red `#B3261E`. The hint row adds `N hidden characters`, so colour
+is not the only signal.
+
+Hidden characters are C0 and C1 controls other than newline and tab, U+00AD,
+U+180E, U+200B–U+200F, U+2028–U+202E, U+2060–U+2064, U+2066–U+2069 and U+FEFF.
+
+The editor keeps the real characters. A message is sent, and a command runs,
+with the bytes as typed. Only the view changes: each hidden character takes one
+cell, and cursor movement steps over it as one character. `HIDDEN_MARK` joins
+the named composer roles.
+
+Validation: buffer tests render each listed character as a red `█` in both
+modes and confirm the draft bytes are unchanged; a hint test counts them; a
+PTY journey pastes text with U+202E and U+200B.
+
 ## Queue interaction
 
 Enter stages every conversational message in a bounded local outbox, whether a

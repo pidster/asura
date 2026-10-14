@@ -77,6 +77,7 @@ two owner decisions: a `!` command is a tool job, and the
 | PCR15 | The log shows the output folded, with the darker amber stripe. It shows the last lines and offers a key to see the rest. The job viewer pages through all retained output. |
 | PCR16 | `!` commands share the prompt recall history. Recalling one restores command mode. Help `?` entries are not recorded. |
 | PCR17 | Protocol stays `0.1`; journal format stays `1`. Schemas may evolve under [numbering authority](../engineering.md#wire-protocol-change-authority). |
+| PCR18 | Before a person command runs, the TUI warns when the model changed build or test paths since the person's last command (PX1, owner 2026-10-14). The warning mechanism and path list need their own design before P4. |
 
 These decisions amend the [shell tool](shell-tool.md) for person origin only.
 That design said toolchain and cache access "requires a subsequent scoped design
@@ -198,6 +199,34 @@ details:
   unsent draft also keeps its mode. `?` help entries are never recorded.
 - The queue panel shows a queued command as `>> ! <excerpt>`. The `!` text
   prefix carries the meaning; colour is not the only signal.
+
+### Command display
+
+Required behavior (owner, 2026-10-14,
+[PX5](execution-threat-model.md#person-command-decisions)): in command mode the
+composer shows each top-level command that `/bin/sh` will run. Proposed
+mechanism:
+
+- One canonical splitter, `asura-platform::shell::split`, ported from Wisp's
+  `CommandSplitter`. It is a pure function with no I/O. It understands single
+  and double quotes, backslash escapes, backslash-newline continuation, `$(…)`,
+  backticks, `( … )` subshells, and the operators `;`, `&`, `&&`, `||`, `|` and
+  newline. It is a display pre-pass, not a shell, and grants no authority.
+- A top-level command ends at an unquoted newline, `;` or `&` outside any
+  substitution or subshell. A chain joined by `&&`, `||` or `|` is one command.
+- Each top-level command's first visual row shows an amber caret `›` in the
+  gutter. The first command's row shows the `!` marker instead. A thin rule `─`
+  in `#745A3C` separates consecutive commands. Continuation rows, from a
+  backslash-newline or a newline inside quotes or a substitution, show no
+  caret.
+- Text the splitter cannot parse, such as an unclosed quote or heredoc, shows
+  as one block with the hint `not split`. The splitter never guesses.
+- With more than one command, the hint row adds `N commands will run`.
+- The split runs on each draft change and is cached with the draft. Rendering
+  reads the cache and performs no parsing. The splitter's input is bounded by
+  the 8192-byte command limit.
+- Hidden characters follow
+  [composer interactions](composer-interactions.md#hidden-characters--selected-2026-10-14).
 
 ### PCM-T1: composer mode switch
 
@@ -323,7 +352,7 @@ column is required behavior where marked PCR, otherwise a proposed mechanism.
 | Seatbelt base | `(deny default)` (`guardian.rs:108-140`) | `(deny default)` with wider explicit roots (PC1) |
 | Exec and read roots | `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`, `/usr/lib`, `/usr/share`, `/System`, project, scratch | Model roots, plus home (PCR8), `$TMPDIR`, cache list and the tool roots selected in PC1 |
 | Write roots | Project and private scratch | Project, `$TMPDIR`, existing cache-list directories (PCR10) |
-| Network | None (no network rule under deny default) | Allowed (PCR7); control socket denial is PX3 |
+| Network | None (no network rule under deny default) | Allowed (PCR7); `~/.asura` and the control socket denied (PX3) |
 | PATH | `/usr/bin:/bin:/usr/sbin:/sbin` (`guardian.rs:198`) | The TUI's PATH, sent with each submit and sanitized (PCR8, PC2) |
 | HOME | Private scratch (`guardian.rs:201`) | Account home (PCR8) |
 | TMPDIR | Private scratch | The person's per-user temporary directory (PCR10) |
@@ -416,9 +445,9 @@ Command text never enters the profile.
 | Process | `process-fork`; `process-exec` and `file-map-executable` under every read root |
 | Reads | Model roots; account home subpath; `$TMPDIR`; `/Library`; `/Applications`; `/opt/homebrew`; `/usr/local`; `/private/etc`; the selected developer directory; the existing `/`, `/private/var/select/sh` and `/dev` literals |
 | Writes | Project; `$TMPDIR`; each cache-list directory that exists; `/dev/null` |
-| Network | `(allow network*)`; optional denial of the Asura control socket (PX3) |
+| Network | `(allow network*)`, then a deny for the Asura control socket (PX3) |
 | Services | `sysctl-read`; a fixed `mach-lookup` list for DNS, TLS trust and configuration, qualified by real `git`, `curl` and `cargo` runs. The list is chosen in the platform packet from observed denials; it is not invented here. |
-| Excluded | Writes to home outside the cache list, `~/.ssh` and dotfiles; reads of `~/.asura` if PX3 selects it |
+| Excluded | Writes to home outside the cache list, `~/.ssh` and dotfiles; reads, writes and connections under `~/.asura` (PX3) |
 
 Missing cache directories are omitted. The service does not create them. A
 cache directory that resolves outside the home directory is omitted. A missing
@@ -969,6 +998,8 @@ cases cover the person path.
 | PC-U17 | No person job running; Ctrl-C | Existing quit or exit-confirm result |
 | PC-U18 | Running person job; `/cancel` twice | One cancel request; no kill |
 | PC-U19 | PATH with empty, relative, NUL and oversized entries | Empty and relative entries dropped; NUL or oversize rejects |
+| PC-U30 | Splitter table: quotes, escapes, continuation, `$(…)`, backticks, subshells, each operator, unclosed quote, heredoc | Top-level commands match the fixture; unparseable input returns one unsplit block |
+| PC-U31 | Draft `make; rm -rf build`, then `echo "a⏎b"`, then `cmd \⏎ --flag`, then three lines | Two carets and one rule; one command; one command; three carets, two rules and `3 commands will run` |
 | PC-U29 | Environment with an unlisted name, a bad `LANG` value, a relative or 104-byte `SSH_AUTH_SOCK` | Unlisted name and bad values reject with `environment_invalid`; service-sourced names never come from the client |
 | PC-U20 | Kind 21 codec and person-origin job records | Exact round trip; bounds; digest order; job ID vectors; no output field |
 | PC-U21 | Replay: person job intent without kind 21, for a dropped input, or for a non-head input | Each rejects the stream |
@@ -1021,6 +1052,7 @@ cases cover the person path.
 | PC-E8 | Relaunch after commands | History shows settled command entries with their folds |
 | PC-E9 | TUI-launched backend; quit with a running and a queued command | Exit confirmation counts both and says they will stop; after relaunch the running one is cancelled with `shutdown` |
 | PC-E10 | `/jobs` after a command | The person job is listed with `!` and opens in the viewer |
+| PC-E12 | Paste a three-line command containing U+202E | Three carets and two rules; a red block where U+202E is; hint counts commands and hidden characters; the command runs with the original bytes |
 | PC-E11 | `!yes \| head -c 50000000` | The fold keeps showing the newest lines while running; TUI input stays responsive |
 
 Required environments: macOS 27 host with `sandbox-exec`, real Git, curl and
