@@ -115,7 +115,12 @@ policy design; MT1 does not silently authorize project egress.
 Initial service limits are one active tool worker, one pending call, eight calls
 per logical turn, 16 KiB per read result and 64 KiB aggregate result bytes per turn.
 Each ordinary tool has its own two-second deadline at admission. The turn has
-no elapsed-time expiry under the cancellation-driven policy.
+no elapsed-time expiry under the cancellation-driven policy. The
+[tool job controller](tool-job-controller.md#reconnecting-to-a-job)'s `job wait`
+is exempt from the two-second deadline (owner, 2026-10-14; limit L10 in
+[tool output views](tool-output-views.md#execution)): it returns when the job
+ends, new output arrives or the turn is cancelled, or after an optional
+model-given time. Its page reads keep their own 2-second storage bound.
 A requested read limit must be 1 through 16,384 bytes. Offset plus limit must not
 overflow. Paths, arguments and result bytes remain out of diagnostic logs.
 

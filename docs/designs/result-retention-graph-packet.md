@@ -5,9 +5,12 @@ Independent source/design review is complete; identified deletion, partial-outco
 graph-outage paging and corruption-classification findings are resolved here.
 All five diagrams were rendered and visually inspected. The implementation gates
 below remain open; this packet does not claim implemented retention or ontology.
-The owner authorized analysis and review of these items. This packet does not
-authorize their implementation. All mechanisms and limits below remain proposals
-until scoped review resolves the open decisions. Protocol numbering remains
+The owner authorized analysis and review of these items. On 2026-10-14 the
+owner authorized item 3 (capture, descriptors and pages) as tool job packet J1
+and deferred item 4 (graph projection) to a separate later review (G1); see
+[owner decisions of 2026-10-14](#owner-decisions-of-2026-10-14). Item 4 remains
+unauthorized. Other mechanisms and limits below remain proposals until scoped
+review resolves the open decisions. Protocol numbering remains
 `0.1`; journal and persisted schema version numbers remain `1`.
 
 ## Scope and governing contracts
@@ -26,6 +29,7 @@ Audit rotation must not remove those sources.
 
 Items 5–6 remain outside this packet: context selection, recomposition, instruction
 precedence resolution, context manifests and deterministic historical reconstruction.
+The [context composer](context-composer.md) design governs them.
 This schema preserves exact sources needed by those items. It does not claim that
 the graph alone makes past model input reproducible. Sensors, reflection, classifier
 training, vector search and automatic policy adoption also remain outside scope.
@@ -148,16 +152,16 @@ derivation labels and collision/conflict rejection need the wire/codec review.
 
 | Boundary | Proposed limit and overload result |
 | --- | --- |
-| Shell retained bytes | 64 MiB combined raw streams per call, preserving the current emitted-output ceiling |
+| Shell retained bytes | No per-call or per-job cap; the shared installation quota applies (owner, 2026-10-14, J1d; PC7 for person jobs) |
 | Other tool result payload | 16 KiB per current returned body; future larger typed tools need separate admission |
-| Capture concurrency | One active capture, matching current serialized admitted tool execution |
+| Capture concurrency | One capture worker per job slot, each with a 512 KiB transfer queue (owner, 2026-10-14, R4) |
 | Capture transfer | Eight chunks of at most 64 KiB; 512 KiB queued bytes plus one active chunk |
 | Capture saturation | Stop accepting bytes and request existing tool cancellation; mark retention incomplete. Never silently drop bytes and claim completeness. |
 | Storage operation | Two-second deadline for each submitted write/read/install step; retained slot after uncertain completion |
-| Installation payload quota | 1 GiB retained bytes plus reservations; reserve a shell call's maximum 64 MiB before spawn |
-| Recovery reserve | Additional 16 MiB reserved for bounded descriptors and settlement; payload admission cannot consume it |
-| Page concurrency | Two reads, eight queued; ninth queued request returns `busy` |
-| Raw page | Up to 8 KiB; base64 expansion plus metadata must remain below 16 KiB encoded result |
+| Installation payload quota | Configurable, default 1 GiB retained bytes plus reservations; each capture reserves 1 MiB at intent and grows in 1 MiB steps (owner, 2026-10-14, R1; growing reservation selected 2026-10-13, [job retained output lifetime](tool-job-controller.md#retained-output-lifetime)) |
+| Recovery reserve | Fixed 16 MiB reserved for bounded descriptors and settlement; payload admission cannot consume it (owner, 2026-10-14, R1) |
+| Page concurrency | Two page-read workers, one reserved for the model (owner, 2026-10-14, R4); eight queued; ninth queued request returns `busy` |
+| Raw page | Deferred after J1 (owner, 2026-10-14, R5). Proposed: up to 8 KiB; base64 expansion plus metadata must remain below 16 KiB encoded result |
 | Text page | Up to 8 KiB decoded source bytes; UTF-8 boundary validation and sanitization preserve exact source offsets |
 | Historical graph page | 32 nodes or edges, at most 64 KiB decoded metadata |
 | Startup recovery | At most 128 candidate objects per batch; indexed continuation, with two-second work steps |
@@ -181,8 +185,11 @@ Before an effect starts, the journal must reserve settlement capacity and record
 capture identity and quota reservation with the existing tool intent. Do not
 write a descriptor and assume the effect was admitted.
 
-After pipe and process cleanup settle, storage verifies and installs payloads.
-The service records the actual tool outcome and a verified descriptor reference.
+After pipe and process cleanup settle, storage syncs the staging objects, whose
+digests it computed incrementally during capture. The service then records the
+actual tool outcome with the digests and a descriptor reference, and only then
+installs the payloads (owner, 2026-10-14, R2). An uninstalled staging file found
+at recovery is an unverified prefix to clean up.
 Outcome and retention availability are separate fields. Failure to retain output
 cannot erase a known exit code or cause the command to run again.
 
@@ -237,8 +244,10 @@ source bytes, not rendered glyphs. Binary or invalid UTF-8 data can always use r
 pages; terminal sanitization never changes the retained original.
 
 An offset beyond the retained stream rejects. An offset equal to its length
-returns an empty complete page. A text offset inside a UTF-8 scalar rejects;
-the page end trims to a scalar boundary. Cursors bind descriptor digest and
+returns an empty complete page. A text offset inside a UTF-8 scalar starts at
+the next scalar boundary and reports the actual start (owner, 2026-10-14, R5);
+the page end trims to a scalar boundary. J1 serves text pages only; raw pages
+follow later, so RG-11 is partial until then. Cursors bind descriptor digest and
 scope. Recheck current authority on every page, not just cursor issuance.
 
 Read results distinguish `expired`, `deleted`, `missing`, `corrupt`,
@@ -419,6 +428,12 @@ decision, not permission to retain private content indefinitely without review.
 At quota, reject new capture before effects start; offer user-controlled cleanup.
 Do not quietly evict active references or recent conversation results.
 
+Amended for tool job output by the owner on 2026-10-13: automatic expiry of
+unreferenced output, growing reservations, user cleanup and value-ordered expiry
+apply together, with expiry holds for pins, evidence links, open reads and recent
+model references. See [job retained output lifetime](tool-job-controller.md#retained-output-lifetime).
+The explicit-deletion proposal above no longer applies to job output.
+
 Protect payloads referenced by admitted work, unresolved capture/projection intents,
 active reads, retained exports and future context manifests. References and GC
 share the existing serialized owner gate. GC must tombstone eligibility first,
@@ -503,16 +518,23 @@ user backend or initialize account state as test setup.
 
 1. **Retention and quota policy:** review the proposed explicit-deletion lifetime,
    1 GiB quota, reservations and user cleanup behavior before implementation.
+   Resolved for tool job output: lifetime and reservation approach on 2026-10-13;
+   quota sizes (R1) and value classes, ages and tie-break (S2) on 2026-10-14
+   ([job retained output lifetime](tool-job-controller.md#retained-output-lifetime)).
 2. **Journal compatibility:** select exact descriptor, reservation, projection and
    deletion record shapes within format 1, including terminal-capacity accounting.
-   Older binaries must reject unsupported required records safely.
+   Older binaries must reject unsupported required records safely. Resolved for
+   item 3 by R3 (owner, 2026-10-14): new kinds allocated in delivery order; the
+   job controller's [durable records](tool-job-controller.md#durable-records) list
+   them. Projection records remain open with item 4.
 3. **Request identity:** align the graph's inference request/attempt IDs with item
    2 telemetry before allocating new fields. Select durable identity and usage
    evidence records; the live item-2 cache cannot reconstruct historical requests.
    No name/argument matching fallback.
 4. **Capture integration:** review the existing process owner's nonblocking
    draining and cancellation extension. Confirm fair streams and no hidden
-   synchronous writes. Do not add another supervisor.
+   synchronous writes. Do not add another supervisor. Resolved by R2 and R4
+   (owner, 2026-10-14).
 5. **Schema migration:** review exact typed tables, relations, indexes, digest and
    marker cutover on SurrealDB 3.2.4. Existing note behavior must survive.
 6. **Encryption and backups:** current private-file protections are not encryption
@@ -522,10 +544,28 @@ user backend or initialize account state as test setup.
    decisions under RG-09; managed-payload purge alone cannot satisfy it.
 7. **Tool and control surface:** choose the grouped result-recovery command and
    exact page encoding, while preserving current result budgets and protocol 0.1.
+   Text pages for J1 resolved by R5 (owner, 2026-10-14); raw encoding remains open.
+
+### Owner decisions of 2026-10-14
+
+The owner resolved these for item 3 on 2026-10-14. The
+[tool job controller](tool-job-controller.md#owner-decisions-of-2026-10-14) is
+canonical for their detail.
+
+| ID | Decision |
+| --- | --- |
+| G1 | Item 3 only, as job packet J1; item 4 deferred to a separate later review |
+| R1 | Configurable quota: default 1 GiB, 1 MiB initial reservation, 1 MiB steps, fixed 16 MiB recovery reserve |
+| R2 | Hash incrementally, commit settlement with digests, then install; uninstalled staging at recovery is an unverified prefix |
+| R3 | New record kinds allocated in delivery order; legacy tools keep ToolResult kind 15 for now |
+| R4 | One capture worker per job slot with a 512 KiB transfer queue; 2 page-read workers |
+| R5 | Text pages only in J1, snapped to UTF-8 boundaries; raw pages later; RG-11 partial |
+| R6 | ENOSPC pauses capture; other I/O faults and stalls cancel |
+| J1d | No per-job output cap; the shared quota only |
 
 Proposed dependency order: review decisions, deliver bounded capture/descriptor
 storage, add read recovery, then add journal-derived graph projections and evidence
-inspection. Do not begin context composer work as part of these packets.
+inspection. Do not begin [context composer](context-composer.md) work as part of these packets.
 
 ### RG-P1: proposed delivery dependency view
 

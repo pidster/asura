@@ -258,8 +258,10 @@ that tool results and filesystem notifications are untrusted observations.
 ### Composite resource condition
 
 Status: proposal, illustrating the owner's example. Solid arrows are events;
-dashed arrows are published ending or suspension events. Whether the job controller
-suspends, stops or only observes the process is an open decision.
+dashed arrows are published ending or suspension events. For job capture the
+owner resolved decision 4 on 2026-10-14: the controller pauses capture, not the
+process, and jobs have no lifetime, so only a cancel, revocation or restart
+makes the suspension permanent.
 
 ```mermaid
 sequenceDiagram
@@ -277,15 +279,15 @@ sequenceDiagram
     Res->>Svc: condition: volume X full
     Svc->>Svc: apply own reservation contract
     Res->>Job: condition: volume X full
-    Job-->>Turn: Suspended(resume: space on volume X, expiry: job lifetime)
+    Job-->>Turn: Suspended(resume: space on volume X, expiry: cancel or restart)
     Turn-->>UI: Suspended chain: turn ← job ← volume X full
     alt Space returns before expiry
         Note over Sen: the person frees space on the host
         Sen->>Res: free space restored (evidence)
         Res->>Job: condition cleared
         Job-->>Turn: Running
-    else Job lifetime expires first
-        Job-->>Turn: Ended(reason: lifetime expired while suspended)
+    else Person cancels the job first
+        Job-->>Turn: Ended(reason: cancelled while suspended)
     end
 ```
 
@@ -323,7 +325,7 @@ behavior; it is not the target.
 | One model request | Model helper | Exhaustion: hard-coded per-request output cap (to be model-sized) | Cancel, steer |
 | Requests within a turn | Model helper | Completion; exhaustion: hard-coded token total (2,048, to be removed) and 64 requests | Cancel, steer |
 | Tool calls within a turn | Service | Exhaustion: 8 calls, 16 KiB per result, 64 KiB total | Cancel, steer |
-| Tool job (proposed) | Service | Deadline: lifetime and wait; exhaustion: capture | Cancel, revocation, restart |
+| Tool job (designed, not implemented) | Service | Completion; capture fault. No lifetime deadline (owner, 2026-10-14). Temporary ending `CapturePaused` on quota or ENOSPC, with no time expiry. A stall closure will come from tool-loop trace evidence. `job wait` ends on events or an optional model time. See [job closures](tool-job-controller.md#job-closures-and-wind-down-bounds). | Cancel, person stop and kill, revocation, restart |
 | Retry and reconnect | Service and client | Exhaustion: attempt limits | Cancel, drain |
 
 ## Failure, security and operations
@@ -378,8 +380,15 @@ Open decisions for the per-loop mapping:
 2. Whether permanence is chosen per attachment, as proposed, or fixed per primitive.
 3. Whether a stall is permanent or temporary by default.
 4. On a resource condition, whether the job controller only observes and signals,
-   suspends the process, or stops it. Suspension keeps open files, locks and
-   descendants; the job lifetime must still run.
+   suspends the process, or stops it. Resolved for job capture by the owner on
+   2026-10-14 (R6, J2a-1): quota exhaustion and ENOSPC on Asura's own capture
+   writes pause capture (`CapturePaused`) and do not suspend the process; other
+   I/O faults and stalls cancel the job. The pause has no time expiry; cancel,
+   revocation, leader exit and restart end it. Its pause facts are recorded in
+   the settlement, not in separate records, an exemption from the durability rule
+   above (J2c). Jobs have no guaranteed-end closure until the stall closure
+   exists; the proposed rule that every loop attaches one does not yet hold for
+   jobs. Other resource conditions and other loops remain open.
 5. Which spend ceilings apply to paid providers under
    [ADR-0003](../decisions/0003-aggregate-budget-admission.md), and whether
    unknown model capacity refuses admission or uses a verified configured value.

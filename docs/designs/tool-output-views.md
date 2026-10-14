@@ -83,7 +83,7 @@ its classification under the principles above.
 
 | ID | Limit | Current value | Class | Owner after review |
 | --- | --- | --- | --- | --- |
-| L1 | Shell timeout | 1–60 s, default 30 | Replace | Job yield window and job lifetime |
+| L1 | Shell timeout | 1–60 s, default 30 | Remove | Job yield window only; jobs have no fixed lifetime (owner, 2026-10-14, J2a-1). Job closures are completion, cancel, revocation, restart and capture fault |
 | L2 | Setup budget | 2 s | Keep | Shell tool |
 | L3 | Cleanup until unconfirmed | 2.5 s | Keep | Shell tool |
 | L4 | TERM to KILL grace | 500 ms | Keep | Shell tool; the person profile sets its own |
@@ -130,7 +130,7 @@ its classification under the principles above.
 | L30 | Journal capacity | 8 MiB, 32,768 frames | Keep; revisit after rule 3 | Journal owner |
 | L31 | Tool result text record | 16,384 B | Replace | Reference, digest and summary record |
 | L32 | Shell intent payload | 9217 B | Keep | Shell tool |
-| L33 | Shell intent timeout | 1–60,000 ms | Replace | Job intent lifetime |
+| L33 | Shell intent timeout | 1–60,000 ms | Remove | Job intent records no timeout (owner, 2026-10-14, J2a-1) |
 | L34 | Record ordinal | 1–8 | Evidence | Follows L20 |
 | L35 | Journal owner memory | 16 MiB; writer 64 MiB | Keep | Journal owner |
 
@@ -157,7 +157,7 @@ its classification under the principles above.
 
 | Mismatch | Design | Code |
 | --- | --- | --- |
-| Shell job scope (L8) | One service-wide job (`shell-tool.md`) | One job per active turn (`conversation.rs:480`) |
+| Shell job scope (L8) | One service-wide job (`shell-tool.md`) | One job per active turn (`conversation.rs:487`); the owner holds one active turn (`conversation.rs:584`), so both statements hold |
 | Truncation fields (L18) | `stdout_truncated` and `stderr_truncated` | One `truncated` field (`shell.rs:51`) |
 | Audit reply bytes (L47) | 16,384 | Stops at 15,000 (`audit_tools.rs:60`) |
 | Ollama context (L26) | No design | `min(capacity, 8192)` (`OllamaBackend.swift:130`) |

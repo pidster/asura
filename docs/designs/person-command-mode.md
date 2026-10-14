@@ -109,7 +109,7 @@ scheduler, queue, payload store or journal.
 | Job slot, setup, capture, retention, settlement, cancel | Job controller from J2 | Person origin: no yield window, no deadline, kill escalation |
 | Spawn, sandbox, guardian, process group | `asura-platform::shell` | Person profile, no-deadline mode, stop-control bytes |
 | Retained streams and pages | Payload adapter from J1 | None |
-| Durable records and replay | Storage authority writer (`asura-storage/src/authority`) | Format-1 kind 21; person origin on J2 job records |
+| Durable records and replay | Storage authority writer (`asura-storage/src/authority`) | Format-1 kind PCQ; person origin on J2 job records |
 | Notice composition | Job notices from J5 | Person entry labels |
 | Model view of output | Context composer; until it exists, model `job read` (PC12) | None here |
 | Model input | Swift model helper | None. The notice arrives as prompt and history text. |
@@ -158,7 +158,7 @@ flowchart TB
     JobW <-->|"JobRead, JobObserve, JobCancel / pages, state"| API
     API <-->|"typed requests / replies"| Owner
     API <-->|"scoped job requests / pages"| Ctl
-    Owner -->|"kind 21"| J
+    Owner -->|"kind PCQ"| J
     Owner -->|"dispatch with person grant"| Ctl
     Ctl -->|"job intent, settlement with digests"| J
     Ctl -->|"append chunks"| P
@@ -316,8 +316,9 @@ Proposed mechanism:
   of the stream. The page start snaps to a UTF-8 boundary under the job
   controller's page contract. Rendering reads only the cached page.
 - While the job runs, the fold updates live (PC6). The job worker keeps one
-  `JobObserve` in flight for each stream. Each reply carries the stream's end
-  page, not the page after the last one seen, so a flood skips ahead instead of
+  `JobObserve` in flight per job, as PC6 selects. With `at_end` set and no
+  stream named, the reply carries the end page of each stream, not the page
+  after the last one seen, so a flood skips ahead instead of
   falling behind. The reply replaces the cached fold and marks the view dirty.
   Pacing comes only from flow control: the long-poll returns when new bytes
   arrive or after 1 s, and the render loop already holds a redraw while
@@ -348,26 +349,26 @@ column is required behavior where marked PCR, otherwise a proposed mechanism.
 | Property | Model profile (implemented) | Person profile |
 | --- | --- | --- |
 | Origin and grant | Admitted turn's `execute_authorized` grant, constant `true` (`conversation.rs:196-206`) | Person command grant; see [authority](#authority-and-grant) |
-| Shell | `/usr/bin/sandbox-exec -p PROFILE /bin/sh -c COMMAND` (`guardian.rs:189-196`) | Same |
-| Seatbelt base | `(deny default)` (`guardian.rs:108-140`) | `(deny default)` with wider explicit roots (PC1) |
+| Shell | `/usr/bin/sandbox-exec -p PROFILE /bin/sh -c COMMAND` (`guardian.rs:212-219`) | Same |
+| Seatbelt base | `(deny default)` (`guardian.rs:123-162`) | `(deny default)` with wider explicit roots (PC1) |
 | Exec and read roots | `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`, `/usr/lib`, `/usr/share`, `/System`, project, scratch | Model roots, plus home (PCR8), `$TMPDIR`, cache list and the tool roots selected in PC1 |
 | Write roots | Project and private scratch | Project, `$TMPDIR`, existing cache-list directories (PCR10) |
 | Network | None (no network rule under deny default) | Allowed (PCR7); `~/.asura` and the control socket denied (PX3) |
-| PATH | `/usr/bin:/bin:/usr/sbin:/sbin` (`guardian.rs:198`) | The TUI's PATH, sent with each submit and sanitized (PCR8, PC2) |
-| HOME | Private scratch (`guardian.rs:201`) | Account home (PCR8) |
+| PATH | `/usr/bin:/bin:/usr/sbin:/sbin` (`guardian.rs:222`) | The TUI's PATH, sent with each submit and sanitized (PCR8, PC2) |
+| HOME | Private scratch (`guardian.rs:225`) | Account home (PCR8) |
 | TMPDIR | Private scratch | The person's per-user temporary directory (PCR10) |
 | Other variables | `LC_ALL=C`, `LANG=C` only | Fixed allow-list plus the SSH agent socket (PC3) |
 | Working directory | Model-chosen project-relative `cwd`, default root | Launch directory if inside the project, else root (PCR9) |
 | Stdin, TTY | `/dev/null`; no TTY | Same |
 | Command bounds | 1–8192 UTF-8 bytes, no NUL | Same |
-| Timeout | 1–60 s, default 30; guardian rejects more than 60 s (`guardian.rs:164`) | None (PCR11); guardian no-deadline mode |
+| Timeout | 1–60 s, default 30; guardian rejects more than 60 s (`guardian.rs:186`) | None (PCR11); guardian no-deadline mode |
 | Stop | Cancel, deadline, turn end, lease EOF | Person stop, person kill, revocation, shutdown, lease EOF |
 | TERM to KILL grace | 500 ms (`guardian.rs:38`) | 2 s (PC8). Kill request: immediate. |
-| Cleanup confirmation | Unconfirmed 2.5 s after stopping starts (`guardian.rs:336`) | Unconfirmed 2.5 s after KILL is sent |
+| Cleanup confirmation | Unconfirmed 2.5 s after stopping starts (`guardian.rs:360`) | Unconfirmed 2.5 s after KILL is sent |
 | Output | Two 8 KiB tail rings (`capture.rs:45`), rendered up to 6144 bytes each | Complete streams retained by the job controller (PCR14) |
 | Output growth | 64 MiB, then `output_limit` (`shell.rs:364`) | Job retention quota with growing reservation, expiry and `CapturePaused` |
 | Concurrency | One shell job per active turn (`conversation.rs:480`) | One job slot under the controller's limits; other turns and jobs continue (PC9) |
-| Durable record | ToolIntent kind 16 and ToolResult with rendered text | Kind 21, then job intent and settlement with person origin |
+| Durable record | ToolIntent kind 16 and ToolResult with rendered text | Kind PCQ, then job intent and settlement with person origin |
 | Model disclosure | ToolResult in the same turn | Person notice on the next turn; output by the composer's view, or by `job read` until the composer exists (PC12) |
 | Audit | `ToolFinished` | Job audit events with origin `person` |
 
@@ -391,7 +392,7 @@ Proposed mechanism; the source of PATH was selected in PC2:
    drops empty and relative entries, because they resolve against the project
    directory. It keeps the remaining order. An empty result rejects the submit
    with `path_invalid`.
-4. Kind 21 stores the sanitized PATH, so a held command can resume after a
+4. Kind PCQ stores the sanitized PATH, so a held command can resume after a
    restart without a client resupplying it.
 5. The setup worker resolves HOME from the account database with the existing
    `account_home` lookup (`asura-platform/src/runtime.rs:182`). The client never
@@ -430,7 +431,7 @@ Required behavior: PCR9. Proposed mechanism:
 - That failure settles the job as not started with `cwd_unavailable`. The
   service never falls back to the root silently, because a command such as
   `rm -rf build` must not run in a directory the person did not see.
-- The directory is fixed when the command is staged. Kind 21 records it.
+- The directory is fixed when the command is staged. Kind PCQ records it.
 
 ### Proposed person Seatbelt profile
 
@@ -457,7 +458,7 @@ required root, such as the home directory, fails setup with
 The guardian receives each extra root as an inherited read-only directory
 descriptor at FDs 11 and above; FD 10 holds the Asura home under
 [state isolation](asura-state-isolation.md#shell-profile). It pins their identities before compiling the
-profile, as it already does for FDs 7–9 (`guardian.rs:68-98`, `guardian.rs:174-180`).
+profile, as it already does for FDs 7–9 (`guardian.rs:66-98`, `guardian.rs:196-200`).
 
 ### Authority and grant
 
@@ -493,10 +494,10 @@ include them before this design is implemented.
 
 | Job controller rule | Person job |
 | --- | --- |
-| Started by a model `shell` call with a yield window | Started by dispatch of a kind-21 queue entry; no yield window and no starting ToolResult |
+| Started by a model `shell` call with a yield window | Started by dispatch of a kind-PCQ queue entry; no yield window and no starting ToolResult |
 | Handle delivery is the starting call's ToolResult | No handle delivery step. The client knows the job ID at queue acceptance, because it derives from the input ID. |
-| `timeout_seconds` 1–3600, guardian-enforced | No deadline (PCR11). Closures are person stop and kill, revocation and shutdown; a client disconnect is not one (PC5). |
-| `CapturePaused` ends at the job deadline | No deadline, so a paused person job waits for freed space, a person stop or another cancel trigger |
+| No job lifetime for any job (owner, 2026-10-14, J2a-1) | No deadline (PCR11). Closures are person stop and kill, revocation and shutdown; a client disconnect is not one (PC5). |
+| `CapturePaused` has no time expiry for any job (owner, 2026-10-14) | A paused person job waits for freed space, a person stop or another cancel trigger |
 | Cancel: TERM, then KILL | Adds `kill`: KILL at once. A kill request after a stop request escalates. |
 | Execution profile from the turn's grant | Person profile and person grant |
 | Job intent binds operation, generation and ordinal | Job intent binds origin `person` and the input ID instead |
@@ -507,7 +508,8 @@ include them before this design is implemented.
 
 Proposed mechanism within protocol `0.1`. The submit needs one new envelope body
 field: `ConversationQueueCommandSubmit`, at the next unused number at
-integration (57 today, after `ProjectRenameReply = 56`). The capability enum
+integration, after the job controller's J4 messages (R3, owner, 2026-10-14).
+Field 57 is no longer claimed. The capability enum
 gains the next unused value, `CAPABILITY_PERSON_COMMAND`.
 
 ```proto
@@ -559,7 +561,7 @@ Proposed mechanism. A person command is a lane entry under the
 [managed queue](managed-input-queue.md). These rules differ from kind-18
 messages:
 
-- Kind 21 replaces kind 18 for the enqueue. It may allocate a new conversation
+- Kind PCQ replaces kind 18 for the enqueue. It may allocate a new conversation
   with `new_conversation`, under the same rules.
 - A person command never advances the conversation generation. It never creates
   `TurnAccepted`.
@@ -579,15 +581,18 @@ messages:
 - A queued person command counts toward the existing 16 unresolved inputs.
 - After restart, an undispatched person command is `Held`, as MQ07R requires.
   It never runs again without explicit Resume.
-- The order revision advances on kind 21, and on dispatch through the job
+- The order revision advances on kind PCQ, and on dispatch through the job
   intent.
 
 ### Durable records
 
 Proposed mechanism: one additive format-1 record kind, plus person origin on the
-job records that J2 allocates. Kinds 1–20 are allocated (`types.rs:221-243`;
-[admission](conversation-admission.md#format-1-and-record-compatibility)). The
-integration packet confirms 21 is still free before writing code.
+job records that J2 allocates. Kinds 1–20 are allocated (`types.rs:228-245`;
+[admission](conversation-admission.md#format-1-and-record-compatibility)).
+Required behavior (owner, 2026-10-14, R3): kinds are allocated in delivery order,
+so the job controller's J1 and J2 kinds come first and this record takes the next
+free kind at integration. Kind PCQ is no longer claimed. This design calls the
+record kind PCQ (`PersonCommandQueued`) until the number is allocated.
 
 ToolIntent kind 14 cannot hold a person command: its `operation`, `generation`
 and `ordinal` bind it to an admitted turn, and replay attaches it to that
@@ -596,7 +601,7 @@ an existing kind by value, which the admission contract forbids.
 
 | Record | Payload, in order |
 | --- | --- |
-| Kind 21 `PersonCommandQueued` | request ID, request digest, input ID, project ID, conversation ID, expected generation, new-conversation flag, command (1–8192 bytes), cwd (1–1024 bytes), sanitized PATH (1–4096 bytes), PC3 client environment (at most 9 entries, one per allowed name), initial order revision |
+| Kind PCQ `PersonCommandQueued` | request ID, request digest, input ID, project ID, conversation ID, expected generation, new-conversation flag, command (1–8192 bytes), cwd (1–1024 bytes), sanitized PATH (1–4096 bytes), PC3 client environment (at most 9 entries, one per allowed name), initial order revision |
 | J2 job intent, origin person | job ID, origin `person`, input ID, project device and inode, cwd device and inode, profile ID, root-set digest, grant snapshot, quota reservation, reserved record capacity, order revision; no deadline |
 | J2 job cancel requested | job ID, requester `person` or `revocation`, kill flag, reason |
 | J2 job settlement | job ID, outcome, exit status, capture state, byte and line counts per stream, digests and payload reference per stream, elapsed milliseconds, cleanup-confirmed flag |
@@ -615,7 +620,7 @@ these reasons:
 | Not started | `cwd_unavailable`, `project_changed`, `sandbox_unavailable`, `spawn_failed`, `setup_timeout` |
 | Interrupted | Recorded at recovery after a restart; effects unknown |
 
-The request digest covers record kind 21, project, conversation, expected
+The request digest covers record kind PCQ, project, conversation, expected
 generation, new-conversation flag, command, cwd, sanitized PATH and environment,
 in that order. An exact retry returns the original input ID; changed fields
 under the same request ID conflict.
@@ -626,14 +631,14 @@ The domain string separates person job IDs from model job IDs.
 
 Replay rules:
 
-- A person-origin job intent requires a kind-21 input that is the lane head, not
+- A person-origin job intent requires a kind-PCQ input that is the lane head, not
   dropped and not started.
-- A kind 21 without a job intent replays as `Held` under a later owner
+- A kind PCQ without a job intent replays as `Held` under a later owner
   generation.
 - Job intent, cancel and settlement replay under the job controller's rules. An
   intent without settlement at recovery becomes `Interrupted`. The service never
   relaunches it.
-- An older binary rejects a stream that contains kind 21 or the J2 kinds,
+- An older binary rejects a stream that contains kind PCQ or the J2 kinds,
   because public inspection must not skip unsupported kinds. Earlier additive
   kinds have the same effect. No existing record is rewritten.
 
@@ -645,10 +650,10 @@ supervisor is added.
 | Change | Detail |
 | --- | --- |
 | Profile selection | `ShellRequest` gains `profile: Model \| Person(PersonRoots)` and an optional deadline. The guardian argv gains a profile token after the job ID. Validated descriptors still authorize the entrypoint. |
-| No-deadline mode | For the person profile the deadline argument is `0`. The guardian skips the deadline check (`guardian.rs:164`) and keeps its 100 ms lease poll. The model profile keeps every existing check. |
-| Stop control | The lease pipe accepts single bytes: `T` starts TERM and the grace timer; `K` sends KILL at once. EOF still means service loss. Today any byte is a protocol fault (`guardian.rs:365-375`). At most 2 bytes are written, below `PIPE_BUF`. J2 may use the same bytes for model job cancel. |
+| No-deadline mode | Every job runs with deadline argument `0` (owner, 2026-10-14, J2a-1). The guardian skips the deadline check (`guardian.rs:186`) and keeps its 100 ms lease poll. Every other existing check stays for both profiles. |
+| Stop control | The lease pipe accepts single bytes: `T` starts TERM and the grace timer; `K` sends KILL at once. EOF still means service loss. Today any byte is a protocol fault (`guardian.rs:389-399`). At most 2 bytes are written, below `PIPE_BUF`. The job controller adopts the same bytes for model job cancel. |
 | Grace | Person profile: 2 s (PC8). The model keeps 500 ms. |
-| Notice reasons | Status notice reason values 10 person stop and 11 person kill, in the reserved range of the existing 32-byte notice. |
+| Notice reasons | Status notice reason values 10 person stop and 11 person kill in the existing 32-byte notice. The decoder rejects reasons above 9 today (`asura-platform/src/shell/protocol.rs:29`) and accepts kind-2 reasons 0–4 only (`protocol.rs:48`), so it must change with them. |
 | Environment | Built from the validated request: sanitized PATH, account HOME, `TMPDIR`, PC3 variables. Model environment unchanged. |
 | Extra roots | Read-only directory FDs 11–17 for `$TMPDIR` and existing cache directories; validated like FDs 7–9 |
 
@@ -660,7 +665,7 @@ to jobs.
 
 Proposed mechanism:
 
-- The conversation owner validates the submit, commits kind 21, orders the lane
+- The conversation owner validates the submit, commits kind PCQ, orders the lane
   and dispatches the person job to the job controller with the person grant.
 - The job controller owns the slot, setup, capture, settlement and cancel. Its
   slot worker accepts a person launch as well as a model launch.
@@ -675,14 +680,14 @@ Proposed mechanism:
 
 Proposed design. Arrows show triggering events with guards. The queue states
 come first. After dispatch the job follows the
-[job lifecycle TJ-S1](tool-job-controller.md#tj-s1-proposed-job-lifecycle), with
+[job lifecycle TJ-S1](tool-job-controller.md#tj-s1-job-lifecycle), with
 the person differences shown here. `Stopping` records a requested stop; the
 completed effect is a later settlement.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Queued: kind 21 committed
-    [*] --> Rejected: validation fails before kind 21
+    [*] --> Queued: kind PCQ committed
+    [*] --> Rejected: validation fails before kind PCQ
     Queued --> Held: owner restart or explicit Hold
     Held --> Queued: durable Resume
     Queued --> Dropped: durable Drop
@@ -731,7 +736,7 @@ sequenceDiagram
     U->>C: Local outbox row, stable request ID
     C->>S: ConversationQueueCommandSubmit
     S->>S: Validate bounds, project, PATH, lane
-    S->>J: Append kind 21 and flush
+    S->>J: Append kind PCQ and flush
     alt Durable
         J-->>S: Input ID, order revision
         S-->>C: Queue reply with accepted input ID
@@ -782,7 +787,7 @@ flowchart TD
     Valid -->|Valid| Dup{"Request ID already recorded?"}
     Dup -->|Same digest| Same["Return original input ID"]
     Dup -->|Different digest| Conflict["idempotency_conflict"]
-    Dup -->|New| Append["Append kind 21"]
+    Dup -->|New| Append["Append kind PCQ"]
     Append -->|Durable| Queued["Queued"]
     Append -->|Uncertain| Unc["Unconfirmed, resolve by request ID"]
     Rpc -->|"No reply in 2 s"| Unc
@@ -1002,21 +1007,21 @@ cases cover the person path.
 | PC-U30 | Splitter table: quotes, escapes, continuation, `$(…)`, backticks, subshells, each operator, unclosed quote, heredoc | Top-level commands match the fixture; unparseable input returns one unsplit block |
 | PC-U31 | Draft `make; rm -rf build`, then `echo "a⏎b"`, then `cmd \⏎ --flag`, then three lines | Two carets and one rule; one command; one command; three carets, two rules and `3 commands will run` |
 | PC-U29 | Environment with an unlisted name, a bad `LANG` value, a relative or 104-byte `SSH_AUTH_SOCK` | Unlisted name and bad values reject with `environment_invalid`; service-sourced names never come from the client |
-| PC-U20 | Kind 21 codec and person-origin job records | Exact round trip; bounds; digest order; job ID vectors; no output field |
-| PC-U21 | Replay: person job intent without kind 21, for a dropped input, or for a non-head input | Each rejects the stream |
+| PC-U20 | Kind PCQ codec and person-origin job records | Exact round trip; bounds; digest order; job ID vectors; no output field |
+| PC-U21 | Replay: person job intent without kind PCQ, for a dropped input, or for a non-head input | Each rejects the stream |
 | PC-U22 | Person notice entry for each outcome and capture state | Labels exact; counts and handle present; no output text |
 | PC-U23 | Dispatch with controller `busy` for slot, then quota | Command stays queued at the head with each reason; retried on free |
 | PC-U24 | Guardian lease bytes `T`, `K`, EOF, unknown byte | TERM plus grace; KILL now; lease end; protocol fault |
 | PC-U25 | Person profile generation from fixture roots | Write rules only for project, TMPDIR and existing caches; network rule present; no command text in profile |
 | PC-U26 | Lane with a running person job, then a queued message | The message waits until settlement |
-| PC-U28 | Running job; fixture observer delivers 1000 replies at once, then none | At most one observe in flight per stream; the fold shows the last end page; no timer drives redraws |
+| PC-U28 | Running job; fixture observer delivers 1000 replies at once, then none | At most one observe in flight per job; the fold shows the last end page; no timer drives redraws |
 | PC-U27 | Conversation idle but with a live model job; another conversation's turn active; command at lane head | The command dispatches; the model job and the other turn continue |
 
 ### Integration
 
 | ID | Initial state and trigger | Required result |
 | --- | --- | --- |
-| PC-I1 | Real service, journal and payload adapter; submit `echo hi` | Kind 21, then person-origin job intent and settlement; exit 0; retained stdout `hi\n`; line count 1; digest matches the stream |
+| PC-I1 | Real service, journal and payload adapter; submit `echo hi` | Kind PCQ, then person-origin job intent and settlement; exit 0; retained stdout `hi\n`; line count 1; digest matches the stream |
 | PC-I2 | Person profile; write to project, TMPDIR and `~/.cargo` fixture | Writes succeed |
 | PC-I3 | Person profile; write `~/.zshrc`, `~/.ssh/x`, `~/other` | Each write is denied by the OS |
 | PC-I4 | Person profile; read `~/.ssh/known_hosts` fixture and `~/.gitconfig` | Reads succeed |
@@ -1073,7 +1078,7 @@ flowchart TD
     J2 --> J3["J3: model job tool"]
     J2 --> J5["J5: job notices"]
     Ready --> P1["P1 platform: person profile, no-deadline guardian, lease bytes, extra roots"]
-    Ready --> P2["P2 storage: kind 21, person origin on job records, replay"]
+    Ready --> P2["P2 storage: kind PCQ, person origin on job records, replay"]
     J2 --> P2
     P1 --> P3["P3 service: queue entry, dispatch, person grant, notice entry"]
     P2 --> P3
