@@ -245,6 +245,14 @@ pending in this client. Changing projects keeps your draft. `[stale]` in the
 list, or `unavailable` in the selector, marks a project whose folder Asura
 cannot use now.
 
+A project cannot be Asura's own folder, `~/.asura`, a folder inside it, or a
+folder that contains it, such as your home folder. Adding one fails with
+`project_overlaps_asura_state`, and nothing is added. A project like this that
+was added by an earlier build shows `[unavailable: contains Asura state]` in the
+list and `unavailable: contains Asura state` in the selector. It cannot be
+selected or used. Add a folder inside your home folder instead, such as a
+folder for one piece of work.
+
 ### Rename a project
 
 `/project rename NAME` renames the selected project. Asura capitalizes the
