@@ -15,7 +15,8 @@ schemas and runtime mechanisms remain with their governing designs.
 | Host | Machine that runs an Asura instance or performs an operation |
 | Host services | Components that start processes, access local resources and enforce permissions and limits |
 | Control client | CLI, TUI or GUI that sends commands and presents task events |
-| Composer | Chat editor together with its adjacent destination, information, status and control areas |
+| Composer | Chat editor together with its adjacent destination, information, status and control areas; distinct from the context composer |
+| Context composer | Service component that chooses, for each model request, the instructions, history, notices and model view of tool output sent to the model, sized from the model's capacity, and records a composition manifest; see the [context composer design](designs/context-composer.md). It is not the TUI input box |
 | Status bar | Compact row below the input showing project/Git context, draft count, running activity and model/context status |
 | Message tray | Bounded area above the input showing submitted messages and their observed states, with access to full text |
 | Task | A unit of user-requested work with goals, limits and completion criteria |

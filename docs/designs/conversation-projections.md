@@ -214,7 +214,7 @@ before code. Protocol remains 0.1 and journal format remains 1.
    flood, slow disk, quota exhaustion, cancellation, crash publication, restart,
    retention and cross-project denial. Verify full byte recovery, not only previews.
 3. **Context composition:** implement the service-owned composer and immutable
-   manifests. Test instruction ordering, changing policy, summary references,
+   manifests, as designed in the [context composer](context-composer.md). Test instruction ordering, changing policy, summary references,
    tool pairing, capacity discovery, bounded selection and cancelled/stale assemblies.
    A real provider journey must recover omitted detail on demand and continue the
    task after recomposition. Cache efficacy requires separately measured provider IO.

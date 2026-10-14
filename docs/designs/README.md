@@ -15,14 +15,15 @@ own authorization and validation scope; it does not establish product readiness.
 | --- | --- |
 | [Composer interactions](composer-interactions.md) | Selected production focus navigation, selectors, history and queue interaction. |
 | [Composer editor navigation](composer-editor-navigation.md) | Selected visual row boundaries, row and word movement, the Shift+Up/Down focus chain and bounded draft history recall. |
-| [Help mode](help-mode.md) | Selected client-local `?` help: search over the user guide, area help and a single help source; not implemented. |
+| [Help mode](help-mode.md) | Client-local `?` help: search over the user guide, area help and a single help source compiled into the client; implemented 2026-10-14. |
 | [Person command mode](person-command-mode.md) | Proposed `!` mode: person-typed commands run as tool jobs with a person execution profile, complete retained output and a person notice; PC1–PC12 resolved; waits for job packets and threat-model approval. |
 | [Service status pane](service-status-pane.md) | Selected connection ownership, service uptime and bounded stored-memory footprint observations; implemented, with no runtime evidence recorded. |
 | [Context observations](context-observations.md) | Service-owned filesystem signals, bounded Git collection and scoped status observations; runtime qualification required. |
 | [Sensors](sensors.md) | Passive and directed observations, durable evidence inspection, held proposals and selected System 1/System 2 direction. |
 | [Turn usage helper](turn-usage-helper.md) | Reviewed request-correlated counters and conservative budget settlement through existing helper owners; implemented, with final qualification recorded in response activity. |
 | [Result retention and graph packet](result-retention-graph-packet.md) | Proposed complete captured-result storage and typed thread/evidence graph; analysis and review only. |
-| [Tool job controller](tool-job-controller.md) | Proposed conversation-scoped tool jobs with retained output, yield-window results and model/client reconnect; owner-selected direction, not implemented. |
+| [Tool job controller](tool-job-controller.md) | Conversation-scoped tool jobs with retained output, no fixed lifetime, reference-only results and model/client reconnect; blocking decisions resolved 2026-10-14; J1 ready, J2 onward gated on the full threat-model review; not implemented. |
+| [Context composer](context-composer.md) | Selected per-request composition of model input from the model's window: calibrated token conversion, fidelity levels, outcome-based excerpts, manifests and streamed window-sized input; slice CC1 ready; not implemented. |
 | [Loop closure and endings](loop-closure.md) | Owner-confirmed stream model for loop closures, interrupts and permanent or temporary endings; operators and per-loop mapping proposed, not implemented. |
 | [Tool output views and limits](tool-output-views.md) | Selected principles: one retained stream with person and model views, journal references, fixed transport units, evidence-derived turn backstop; classifies 49 tool limits. |
 | [Asura state isolation](asura-state-isolation.md) | Implemented EX16 fix: project opens reject roots overlapping `~/.asura` by directory identity, including firmlink and mount-point spellings; overlapping projects are listed unavailable; the model shell profile denies `~/.asura` except its scratch. |
