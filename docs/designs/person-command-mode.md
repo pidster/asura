@@ -455,7 +455,8 @@ required root, such as the home directory, fails setup with
 `sandbox_unavailable`. There is no unsandboxed fallback.
 
 The guardian receives each extra root as an inherited read-only directory
-descriptor at FDs 10 and above. It pins their identities before compiling the
+descriptor at FDs 11 and above; FD 10 holds the Asura home under
+[state isolation](asura-state-isolation.md#shell-profile). It pins their identities before compiling the
 profile, as it already does for FDs 7–9 (`guardian.rs:68-98`, `guardian.rs:174-180`).
 
 ### Authority and grant
@@ -649,7 +650,7 @@ supervisor is added.
 | Grace | Person profile: 2 s (PC8). The model keeps 500 ms. |
 | Notice reasons | Status notice reason values 10 person stop and 11 person kill, in the reserved range of the existing 32-byte notice. |
 | Environment | Built from the validated request: sanitized PATH, account HOME, `TMPDIR`, PC3 variables. Model environment unchanged. |
-| Extra roots | Read-only directory FDs 10–16 for `$TMPDIR` and existing cache directories; validated like FDs 7–9 |
+| Extra roots | Read-only directory FDs 11–17 for `$TMPDIR` and existing cache directories; validated like FDs 7–9 |
 
 Output capture, line counts and retention belong to the job controller and the
 payload adapter. The platform's 8 KiB tail rings and rendered text do not apply
