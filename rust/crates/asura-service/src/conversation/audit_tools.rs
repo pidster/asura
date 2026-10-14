@@ -154,7 +154,7 @@ pub(super) fn reason(code: &str) -> asura_storage::audit::DecisionReason {
         "capacity_exhausted" | "context_limit" | "output_limit" => R::Limit,
         "storage_timeout" | "model_timeout" => R::Timeout,
         "cancelled" | "service_draining" => R::Cancelled,
-        "project_stale" | "project_unknown" => R::Denied,
+        "project_stale" | "project_unknown" | "project_overlaps_asura_state" => R::Denied,
         "model_unavailable"
         | "storage_unavailable"
         | "authority_repair_required"

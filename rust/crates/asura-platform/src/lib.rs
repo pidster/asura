@@ -11,7 +11,9 @@ pub use model_process::ModelProcess;
 pub mod git_observer;
 mod project_identity;
 pub use journal_io::{DatabaseDirectory, JournalFile};
-pub use project_identity::{ProjectIdentity, ProjectListing, ProjectPage, ProjectReadError};
+pub use project_identity::{
+    ProjectIdentity, ProjectListing, ProjectPage, ProjectReadError, StateBoundary,
+};
 mod config;
 pub use authority::{
     AuthorityError, AuthorityReader, AuthorityScan, AuthoritySource, AuthorityWitness,
@@ -44,6 +46,8 @@ pub enum Error {
     Unavailable,
     InvalidNotice,
     Deadline,
+    /// A project location equals, lies inside, or contains the Asura home.
+    OverlapsAsuraState,
     Io(io::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -66,6 +70,7 @@ impl std::fmt::Display for Error {
             Self::Unavailable => "service unavailable",
             Self::InvalidNotice => "invalid startup notice",
             Self::Deadline => "deadline exceeded",
+            Self::OverlapsAsuraState => "project overlaps Asura state",
             Self::Io(_) => "platform I/O failure",
         })
     }

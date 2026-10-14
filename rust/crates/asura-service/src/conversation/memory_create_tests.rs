@@ -374,11 +374,14 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
     let runtime = fixture.owner.runtime.clone();
     let writer = Writer(writer::WriterHandle::start(runtime.clone()).unwrap());
     wait_writer(&writer.0, writer::Command::Initialize { request: [30; 16] });
+    // The Asura home may not be a project; register a directory beside it.
+    let project_path = fixture.path.join("project");
+    std::fs::create_dir(&project_path).unwrap();
     let registered = wait_writer(
         &writer.0,
         writer::Command::Register {
             request: [31; 16],
-            location: fixture.path.to_str().unwrap().into(),
+            location: project_path.to_str().unwrap().into(),
         },
     )
     .replay

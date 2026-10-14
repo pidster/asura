@@ -5,7 +5,7 @@ mod guardian;
 mod protocol;
 mod spawn;
 use crate::runtime::{open_at, stat_fd};
-use crate::{PollInterest, ProjectIdentity, RuntimeDirectory};
+use crate::{PollInterest, ProjectIdentity, RuntimeDirectory, StateBoundary};
 use capture::Capture;
 pub use cleanup::ShellCleanup;
 pub use guardian::run_guardian;
@@ -89,8 +89,12 @@ pub struct PreparedShell {
     request: ShellRequest,
     original_project: String,
     original_cwd: String,
+    boundary: StateBoundary,
     project: OwnedFd,
     cwd: OwnedFd,
+    asura: OwnedFd,
+    #[cfg(feature = "test-support")]
+    omit_state_for_test: bool,
     cleanup: Option<ShellCleanup>,
     setup_deadline: Instant,
 }
@@ -133,6 +137,7 @@ impl PreparedShell {
             .min(Instant::now() + Duration::from_secs(2));
         check(setup_deadline, cancel)?;
         let original_project = project.process_location().to_owned();
+        let boundary = project.boundary().clone();
         let project = project
             .process_directory()
             .map_err(|_| ShellError::Denied)?;
@@ -155,13 +160,18 @@ impl PreparedShell {
             .map_err(|_| ShellError::Denied)?;
         }
         let original_cwd = spawn::path(cwd.as_raw_fd())?;
+        let (asura, _) = runtime.authority_root().map_err(|_| ShellError::Denied)?;
         let cleanup = ShellCleanup::create(&runtime, request.job_id)?;
         let mut result = Self {
             request,
             original_project,
             original_cwd,
+            boundary,
             project,
             cwd,
+            asura,
+            #[cfg(feature = "test-support")]
+            omit_state_for_test: false,
             cleanup: Some(cleanup),
             setup_deadline,
         };
@@ -172,6 +182,14 @@ impl PreparedShell {
             });
         }
         Ok(result)
+    }
+    /// Replace FD 10, or omit it, to qualify the guardian's refusal.
+    #[cfg(feature = "test-support")]
+    pub fn replace_state_for_test(&mut self, fd: Option<OwnedFd>) {
+        match fd {
+            Some(fd) => self.asura = fd,
+            None => self.omit_state_for_test = true,
+        }
     }
     /// After a successful spawn ownership always transfers to ShellJob.
     pub fn spawn(
@@ -193,14 +211,14 @@ impl PreparedShell {
         cancel: &AtomicBool,
     ) -> Result<ShellJob, ShellError> {
         check(self.setup_deadline, cancel)?;
-        let current =
-            ProjectIdentity::open(&self.original_project).map_err(|_| ShellError::Denied)?;
+        let current = ProjectIdentity::open(&self.original_project, &self.boundary)
+            .map_err(|_| ShellError::Denied)?;
         let pinned = stat_fd(self.project.as_raw_fd()).map_err(|_| ShellError::Io)?;
         if current.device != pinned.st_dev as u64 || current.inode != pinned.st_ino {
             return Err(ShellError::Denied);
         }
-        let current_cwd =
-            ProjectIdentity::open(&self.original_cwd).map_err(|_| ShellError::Denied)?;
+        let current_cwd = ProjectIdentity::open(&self.original_cwd, &self.boundary)
+            .map_err(|_| ShellError::Denied)?;
         let pinned_cwd = stat_fd(self.cwd.as_raw_fd()).map_err(|_| ShellError::Io)?;
         if current_cwd.device != pinned_cwd.st_dev as u64 || current_cwd.inode != pinned_cwd.st_ino
         {
@@ -242,7 +260,7 @@ impl PreparedShell {
         if args.iter().map(|value| value.len() + 1).sum::<usize>() > 8704 {
             return Err(ShellError::Invalid);
         }
-        let mappings = [
+        let mappings: &[_] = &[
             (null.as_raw_fd(), 0),
             (null.as_raw_fd(), 1),
             (null.as_raw_fd(), 2),
@@ -253,9 +271,12 @@ impl PreparedShell {
             (self.project.as_raw_fd(), 7),
             (self.cwd.as_raw_fd(), 8),
             (scratch.as_raw_fd(), 9),
+            (self.asura.as_raw_fd(), 10),
         ];
+        #[cfg(feature = "test-support")]
+        let mappings = &mappings[..mappings.len() - usize::from(self.omit_state_for_test)];
         check(self.setup_deadline, cancel)?;
-        let pid = spawn::launch(executable, &args, &[], &mappings, None, false)?;
+        let pid = spawn::launch(executable, &args, &[], mappings, None, false)?;
         // Everything after this point is infallible and transfers the live child.
         Ok(ShellJob {
             pid,

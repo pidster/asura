@@ -122,7 +122,8 @@ fn preparation_pins_cwd_and_cleanup_never_follows_symlink() {
     let runtime = RuntimeDirectory::scratch(&f.0, true).unwrap();
     let project = f.0.join("project");
     fs::create_dir(&project).unwrap();
-    let project = ProjectIdentity::open(project.to_str().unwrap()).unwrap();
+    let project =
+        ProjectIdentity::open(project.to_str().unwrap(), &runtime.state_boundary()).unwrap();
     let cancel = AtomicBool::new(false);
     let mut prepared = match PreparedShell::prepare(runtime, &project, request(), &cancel) {
         Ok(v) => v,
@@ -147,7 +148,7 @@ fn spawn_rejects_replaced_project_and_retains_scratch() {
     let runtime = RuntimeDirectory::scratch(&f.0, true).unwrap();
     let path = f.0.join("project");
     fs::create_dir(&path).unwrap();
-    let project = ProjectIdentity::open(path.to_str().unwrap()).unwrap();
+    let project = ProjectIdentity::open(path.to_str().unwrap(), &runtime.state_boundary()).unwrap();
     let cancel = AtomicBool::new(false);
     let prepared = match PreparedShell::prepare(runtime, &project, request(), &cancel) {
         Ok(v) => v,
@@ -197,7 +198,7 @@ fn spawn_rejects_replaced_cwd_before_any_process() {
     let path = f.0.join("project");
     fs::create_dir(&path).unwrap();
     fs::create_dir(path.join("sub")).unwrap();
-    let project = ProjectIdentity::open(path.to_str().unwrap()).unwrap();
+    let project = ProjectIdentity::open(path.to_str().unwrap(), &runtime.state_boundary()).unwrap();
     let cancel = AtomicBool::new(false);
     let mut req = request();
     req.cwd = Some("./sub/".into());

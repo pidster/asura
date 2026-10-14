@@ -49,13 +49,13 @@ impl Manager {
     pub fn request(
         &mut self,
         request: pb::Envelope,
-        identity: Option<(String, u64, u64)>,
+        identity: Option<(String, u64, u64, asura_platform::StateBoundary)>,
         now: Instant,
     ) -> Option<pb::Envelope> {
         let Some(Body::ObserveContext(query)) = request.body.as_ref() else {
             return Some(failure(request, "context_invalid"));
         };
-        let Some((root, device, inode)) = identity else {
+        let Some((root, device, inode, boundary)) = identity else {
             return Some(failure(request, "project_unavailable"));
         };
         let project: [u8; 16] = query
@@ -80,6 +80,7 @@ impl Manager {
             path,
             device,
             inode,
+            boundary,
         };
         for entry in &mut self.entries {
             if entry.scope != scope {
@@ -277,7 +278,15 @@ mod tests {
         let mut manager = Manager::default();
         for (path, identity) in [
             ("/project/src", None),
-            ("/project-other", Some(("/project".into(), 1, 1))),
+            (
+                "/project-other",
+                Some((
+                    "/project".into(),
+                    1,
+                    1,
+                    asura_platform::StateBoundary::detached_for_test(),
+                )),
+            ),
         ] {
             let reply = manager
                 .request(query(path), identity, Instant::now())
@@ -290,7 +299,12 @@ mod tests {
             manager
                 .request(
                     query("/project"),
-                    Some(("/project".into(), 1, 1)),
+                    Some((
+                        "/project".into(),
+                        1,
+                        1,
+                        asura_platform::StateBoundary::detached_for_test(),
+                    )),
                     Instant::now()
                 )
                 .unwrap()
@@ -306,6 +320,7 @@ mod tests {
             path: "/project".into(),
             device: 1,
             inode: 1,
+            boundary: asura_platform::StateBoundary::detached_for_test(),
         };
         let latest = state.map(|state| {
             let mut git = asura_platform::git_observer::GitSnapshot::unknown("watch_unavailable");
@@ -350,7 +365,16 @@ mod tests {
                 value.after_revision = Some(7);
             }
             let reply = manager
-                .request(request, Some(("/project".into(), 1, 1)), Instant::now())
+                .request(
+                    request,
+                    Some((
+                        "/project".into(),
+                        1,
+                        1,
+                        asura_platform::StateBoundary::detached_for_test(),
+                    )),
+                    Instant::now(),
+                )
                 .unwrap();
             let Some(Body::ContextObservation(value)) = reply.body else {
                 panic!("missing observation");

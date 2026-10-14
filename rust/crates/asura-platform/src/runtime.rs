@@ -97,8 +97,8 @@ fn validate_acl_allocation(acl: *mut libc::c_void, owner: libc::uid_t) -> Result
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
-    device: libc::dev_t,
-    inode: libc::ino_t,
+    pub(crate) device: libc::dev_t,
+    pub(crate) inode: libc::ino_t,
 }
 fn identity_error(error: Error) -> Error {
     match error {
@@ -176,9 +176,82 @@ struct RuntimeInner {
     directories: Vec<Directory>,
     path: PathBuf,
     uid: libc::uid_t,
+    boundary: crate::StateBoundary,
 }
 #[derive(Clone)]
 pub struct RuntimeDirectory(Arc<RuntimeInner>);
+/// Directory levels above the Asura home that a boundary source may visit.
+pub(crate) const BOUNDARY_LEVELS: usize = 64;
+/// Blocking: runs inside the runtime open, before the runtime is shared.
+fn state_boundary(chain: &[Directory]) -> Result<crate::StateBoundary> {
+    let home = &chain[chain.len() - 2];
+    let mut ancestors: Vec<_> = chain[..chain.len() - 2].iter().map(|d| d.id).collect();
+    ancestors.extend(walk_parents(
+        home.fd.try_clone()?,
+        home.id,
+        |fd: &OwnedFd| {
+            let parent = open_at(fd.as_raw_fd(), c"..", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let id = identity(&stat_fd(parent.as_raw_fd())?);
+            Ok((parent, id))
+        },
+    )?);
+    ancestors.extend(mount_chain(home.fd.as_raw_fd())?);
+    Ok(crate::StateBoundary::new(home.id, ancestors))
+}
+/// Identities above `start` by `..` until a directory is its own parent.
+pub(crate) fn walk_parents<T>(
+    start: T,
+    start_id: Identity,
+    mut parent: impl FnMut(&T) -> Result<(T, Identity)>,
+) -> Result<Vec<Identity>> {
+    let (mut current, mut id) = (start, start_id);
+    let mut found = Vec::new();
+    for _ in 0..=BOUNDARY_LEVELS {
+        let (next, next_id) = parent(&current)?;
+        if next_id == id {
+            return Ok(found);
+        }
+        if found.len() == BOUNDARY_LEVELS {
+            break;
+        }
+        found.push(next_id);
+        (current, id) = (next, next_id);
+    }
+    Err(Error::UnsafeRuntime)
+}
+/// Directories on the spelled path to the volume's mount point. On APFS these
+/// carry identities that neither the spelled home path nor `..` visits.
+fn mount_chain(fd: RawFd) -> Result<Vec<Identity>> {
+    // SAFETY: statfs output initialized; borrowed descriptor.
+    let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: output points to one complete statfs.
+    checked(unsafe { libc::fstatfs(fd, &mut filesystem) })?;
+    // SAFETY: fixed kernel f_mntonname is terminated for a successful statfs.
+    let mount = unsafe { CStr::from_ptr(filesystem.f_mntonname.as_ptr()) };
+    let mount = Path::new(std::ffi::OsStr::from_bytes(mount.to_bytes()));
+    if !mount.is_absolute() {
+        return Err(Error::UnsafeRuntime);
+    }
+    let mut held = open_at(libc::AT_FDCWD, c"/", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let mut found = vec![identity(&stat_fd(held.as_raw_fd())?)];
+    for component in mount.components().skip(1) {
+        let Component::Normal(name) = component else {
+            return Err(Error::UnsafeRuntime);
+        };
+        if found.len() > BOUNDARY_LEVELS {
+            return Err(Error::UnsafeRuntime);
+        }
+        let name = CString::new(name.as_bytes()).map_err(|_| Error::UnsafeRuntime)?;
+        held = open_at(
+            held.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+        found.push(identity(&stat_fd(held.as_raw_fd())?));
+    }
+    Ok(found)
+}
 fn account_home(uid: libc::uid_t) -> Result<PathBuf> {
     let mut buffer = vec![0u8; 64 * 1024];
     // SAFETY: passwd is an output POD; pointers are consumed while buffer remains alive.
@@ -239,6 +312,10 @@ impl RuntimeDirectory {
             return Err(last_error());
         }
         Ok((unsafe { OwnedFd::from_raw_fd(raw) }, self.0.uid))
+    }
+    /// The Asura home and every directory containing it; computed at open.
+    pub fn state_boundary(&self) -> crate::StateBoundary {
+        self.0.boundary.clone()
     }
     pub fn account(create: bool) -> Result<Self> {
         let uid = effective_uid()?;
@@ -309,10 +386,12 @@ impl RuntimeDirectory {
         }
         Self::append(&mut directories, b".asura", uid, true, create)?;
         Self::append(&mut directories, b"run", uid, true, create)?;
+        let boundary = state_boundary(&directories)?;
         let runtime = Self(Arc::new(RuntimeInner {
             directories,
             path,
             uid,
+            boundary,
         }));
         runtime.validate()?;
         Ok(runtime)

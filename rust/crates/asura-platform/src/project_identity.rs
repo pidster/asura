@@ -1,49 +1,113 @@
 //! Pinned project directory identity; no symlink traversal.
-use crate::runtime::{open_at, stat_at, stat_fd};
+use crate::runtime::{Identity, open_at, stat_at, stat_fd};
 use crate::{Error, Result};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Component, Path};
+use std::sync::Arc;
+
+/// The Asura home and every directory identity that contains it under some
+/// spelling. A project may not equal, lie inside, or contain the home.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateBoundary(Arc<BoundaryInner>);
+#[derive(Debug, PartialEq, Eq)]
+struct BoundaryInner {
+    home: Identity,
+    ancestors: Vec<Identity>,
+}
+impl StateBoundary {
+    pub(crate) fn new(home: Identity, ancestors: impl IntoIterator<Item = Identity>) -> Self {
+        let mut ancestors: Vec<_> = ancestors.into_iter().filter(|id| *id != home).collect();
+        ancestors.sort_by_key(|id| (id.device, id.inode));
+        ancestors.dedup();
+        Self(Arc::new(BoundaryInner { home, ancestors }))
+    }
+    /// Matches no directory. Test-only, for fixtures with no Asura home.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn detached_for_test() -> Self {
+        Self::new(
+            Identity {
+                device: 0,
+                inode: 0,
+            },
+            [],
+        )
+    }
+    fn is_home(&self, id: Identity) -> bool {
+        self.0.home == id
+    }
+    fn contains_home(&self, id: Identity) -> bool {
+        self.0.ancestors.contains(&id)
+    }
+}
 pub struct ProjectIdentity {
     location: String,
     held: OwnedFd,
+    boundary: StateBoundary,
     pub device: u64,
     pub inode: u64,
 }
-impl ProjectIdentity {
-    pub fn open(location: &str) -> Result<Self> {
-        if location.len() > 4096
-            || !location.starts_with('/')
-            || (location.len() > 1 && location.ends_with('/'))
-            || location.contains("//")
-        {
-            return Err(Error::UnsafeRuntime);
+/// Walks from `/` without following links. With a boundary, any component that
+/// is the Asura home, or a final directory that contains it, is rejected.
+fn open_location(
+    location: &str,
+    boundary: Option<&StateBoundary>,
+) -> Result<(OwnedFd, libc::stat)> {
+    if location.len() > 4096
+        || !location.starts_with('/')
+        || (location.len() > 1 && location.ends_with('/'))
+        || location.contains("//")
+    {
+        return Err(Error::UnsafeRuntime);
+    }
+    let inside = |fd: &OwnedFd| -> Result<libc::stat> {
+        let stat = stat_fd(fd.as_raw_fd())?;
+        if boundary.is_some_and(|b| b.is_home(crate::runtime::identity(&stat))) {
+            return Err(Error::OverlapsAsuraState);
         }
-        let mut held = open_at(libc::AT_FDCWD, c"/", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        for part in Path::new(location).components() {
-            match part {
-                Component::RootDir => {}
-                Component::Normal(name) => {
-                    let name =
-                        CString::new(name.as_encoded_bytes()).map_err(|_| Error::UnsafeRuntime)?;
-                    held = open_at(
-                        held.as_raw_fd(),
-                        &name,
-                        libc::O_RDONLY | libc::O_DIRECTORY,
-                        0,
-                    )?;
-                }
-                _ => return Err(Error::UnsafeRuntime),
+        Ok(stat)
+    };
+    let mut held = open_at(libc::AT_FDCWD, c"/", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let mut stat = inside(&held)?;
+    for part in Path::new(location).components() {
+        match part {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let name =
+                    CString::new(name.as_encoded_bytes()).map_err(|_| Error::UnsafeRuntime)?;
+                held = open_at(
+                    held.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )?;
+                stat = inside(&held)?;
             }
+            _ => return Err(Error::UnsafeRuntime),
         }
-        // Path components normalize dots; reject their spelling independently.
-        if location.split('/').any(|part| part == "." || part == "..") {
-            return Err(Error::UnsafeRuntime);
-        }
-        let stat = stat_fd(held.as_raw_fd())?;
+    }
+    // Path components normalize dots; reject their spelling independently.
+    if location.split('/').any(|part| part == "." || part == "..") {
+        return Err(Error::UnsafeRuntime);
+    }
+    if boundary.is_some_and(|b| b.contains_home(crate::runtime::identity(&stat))) {
+        return Err(Error::OverlapsAsuraState);
+    }
+    Ok((held, stat))
+}
+/// The guardian's identity pin for its inherited descriptors. It applies no
+/// boundary; the guardian checks overlap separately against FD 10.
+pub(crate) fn pinned_identity(location: &str) -> Result<(u64, u64)> {
+    let (_, stat) = open_location(location, None)?;
+    Ok((stat.st_dev as u64, stat.st_ino))
+}
+impl ProjectIdentity {
+    pub fn open(location: &str, boundary: &StateBoundary) -> Result<Self> {
+        let (held, stat) = open_location(location, Some(boundary))?;
         Ok(Self {
             location: location.into(),
             held,
+            boundary: boundary.clone(),
             device: stat.st_dev as u64,
             inode: stat.st_ino,
         })
@@ -51,12 +115,15 @@ impl ProjectIdentity {
     pub(crate) fn process_location(&self) -> &str {
         &self.location
     }
+    pub(crate) fn boundary(&self) -> &StateBoundary {
+        &self.boundary
+    }
     pub(crate) fn process_directory(&self) -> Result<OwnedFd> {
         self.validate()?;
         self.held.try_clone().map_err(Error::from)
     }
     pub fn validate(&self) -> Result<()> {
-        let current = Self::open(&self.location)?;
+        let current = Self::open(&self.location, &self.boundary)?;
         let held = stat_fd(self.held.as_raw_fd())?;
         if current.device != self.device || current.inode != self.inode || held.st_nlink == 0 {
             return Err(Error::UnsafeRuntime);
@@ -389,7 +456,11 @@ mod read_tests {
             Self(path)
         }
         fn identity(&self) -> ProjectIdentity {
-            ProjectIdentity::open(self.0.to_str().unwrap()).unwrap()
+            ProjectIdentity::open(
+                self.0.to_str().unwrap(),
+                &StateBoundary::detached_for_test(),
+            )
+            .unwrap()
         }
     }
     impl Drop for Scratch {
@@ -491,7 +562,9 @@ mod read_tests {
         let root = scratch.0.join("project");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("binary"), [0xff, 0, 1]).unwrap();
-        let project = ProjectIdentity::open(root.to_str().unwrap()).unwrap();
+        let project =
+            ProjectIdentity::open(root.to_str().unwrap(), &StateBoundary::detached_for_test())
+                .unwrap();
         let cancel = AtomicBool::new(false);
         let deadline = Instant::now() + Duration::from_secs(2);
         assert_eq!(
@@ -509,5 +582,181 @@ mod read_tests {
             project.list_project_directory(".", deadline, &cancel),
             Err(ProjectReadError::Changed)
         );
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use crate::runtime::{BOUNDARY_LEVELS, walk_parents};
+    fn id(device: i32, inode: u64) -> Identity {
+        Identity { device, inode }
+    }
+    /// SI-U1: the physical walk ends at a self-parent and rejects 65 levels.
+    #[test]
+    fn walk_stops_at_root_and_rejects_deep_chains() {
+        let step = |depth: &u64| Ok((depth - 1, id(1, (depth - 1).max(1))));
+        assert_eq!(
+            walk_parents(4u64, id(1, 4), step).unwrap(),
+            vec![id(1, 3), id(1, 2), id(1, 1)]
+        );
+        let limit = BOUNDARY_LEVELS as u64;
+        assert_eq!(
+            walk_parents(limit + 1, id(1, limit + 1), step)
+                .unwrap()
+                .len(),
+            BOUNDARY_LEVELS
+        );
+        assert!(matches!(
+            walk_parents(limit + 2, id(1, limit + 2), step),
+            Err(Error::UnsafeRuntime)
+        ));
+        assert!(matches!(
+            walk_parents(4u64, id(1, 4), |_| Err(Error::UnsafeRuntime)),
+            Err(Error::UnsafeRuntime)
+        ));
+    }
+    /// SI-U1 and SI-U2: the union of all sources; only equal, inside or
+    /// containing identities overlap.
+    #[test]
+    fn boundary_unites_sources_and_decides_overlap() {
+        let chain = [id(1, 2), id(1, 10), id(1, 11)];
+        let walk = [id(1, 11), id(1, 2), id(1, 5)];
+        let mount = [id(1, 2), id(1, 7), id(1, 8)];
+        let boundary = StateBoundary::new(id(1, 20), chain.into_iter().chain(walk).chain(mount));
+        assert!(boundary.is_home(id(1, 20)));
+        for contains in [2, 5, 7, 8, 10, 11] {
+            assert!(boundary.contains_home(id(1, contains)), "{contains}");
+        }
+        assert!(!boundary.contains_home(id(1, 20)));
+        assert!(!boundary.contains_home(id(1, 12)), "sibling");
+        assert!(!boundary.contains_home(id(2, 10)), "other device");
+        assert!(!boundary.is_home(id(2, 20)), "other device");
+        assert_eq!(boundary.0.ancestors.len(), 6);
+    }
+    struct Home(std::path::PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn home() -> Home {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::path::PathBuf::from(format!(
+            "/private/tmp/as-si-{}-{}",
+            std::process::id(),
+            crate::random_id()[..6]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Home(path)
+    }
+    /// SI-I1 and SI-I2 at the platform owner, with a scratch runtime.
+    #[test]
+    fn opens_reject_every_overlap_with_the_runtime_home() {
+        let home = home();
+        let runtime = crate::RuntimeDirectory::scratch(&home.0, true).unwrap();
+        let boundary = runtime.state_boundary();
+        std::fs::create_dir_all(home.0.join(".asura/tmp")).unwrap();
+        std::fs::create_dir(home.0.join("project")).unwrap();
+        let sibling = std::path::PathBuf::from(format!("{}-sibling", home.0.display()));
+        std::fs::create_dir(&sibling).unwrap();
+        let _sibling = Home(sibling.clone());
+        let firmlinked = |path: &std::path::Path| {
+            std::path::Path::new("/System/Volumes/Data").join(path.strip_prefix("/").unwrap())
+        };
+        let mut overlapping: Vec<std::path::PathBuf> = [
+            home.0.clone(),
+            home.0.join(".asura"),
+            home.0.join(".asura/tmp"),
+            home.0.join(".asura/run"),
+            home.0.parent().unwrap().to_owned(),
+            "/".into(),
+            "/private".into(),
+            "/System".into(),
+            "/System/Volumes".into(),
+            "/System/Volumes/Data".into(),
+            "/System/Volumes/Data/private".into(),
+        ]
+        .into();
+        overlapping.push(firmlinked(&home.0.join(".asura")));
+        overlapping.push(firmlinked(&home.0));
+        for path in overlapping {
+            let path = path.to_str().unwrap();
+            assert!(
+                matches!(
+                    ProjectIdentity::open(path, &boundary),
+                    Err(Error::OverlapsAsuraState)
+                ),
+                "{path}"
+            );
+        }
+        for path in [
+            home.0.join("project"),
+            sibling.clone(),
+            firmlinked(&sibling),
+        ] {
+            let project = ProjectIdentity::open(path.to_str().unwrap(), &boundary).unwrap();
+            project.validate().unwrap();
+        }
+    }
+    /// SI-I8: a scratch home behind the `/Users` firmlink is protected under
+    /// its `/System/Volumes/Data` spelling. Never touches the account home.
+    #[test]
+    fn overlap_check_crosses_the_users_firmlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let shared = std::path::Path::new("/Users/Shared");
+        let path = shared.join(format!(
+            "as-si-{}-{}",
+            std::process::id(),
+            crate::random_id()[..6]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        if std::fs::create_dir(&path).is_err() {
+            eprintln!("SI-I8 unverified: /Users/Shared is not writable on this host");
+            return;
+        }
+        let home = Home(path);
+        std::fs::set_permissions(&home.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = crate::RuntimeDirectory::scratch(&home.0, true).unwrap();
+        let boundary = runtime.state_boundary();
+        let data = std::path::Path::new("/System/Volumes/Data");
+        let spelled = data.join(home.0.strip_prefix("/").unwrap());
+        for path in [
+            spelled.clone(),
+            spelled.join(".asura"),
+            data.join("Users/Shared"),
+            data.join("Users"),
+            shared.to_owned(),
+        ] {
+            let path = path.to_str().unwrap();
+            assert!(
+                matches!(
+                    ProjectIdentity::open(path, &boundary),
+                    Err(Error::OverlapsAsuraState)
+                ),
+                "{path}"
+            );
+        }
+        std::fs::create_dir(home.0.join("project")).unwrap();
+        ProjectIdentity::open(spelled.join("project").to_str().unwrap(), &boundary).unwrap();
+    }
+    /// A pinned project replaced by one that overlaps fails revalidation.
+    #[test]
+    fn revalidation_applies_the_boundary() {
+        let home = home();
+        let runtime = crate::RuntimeDirectory::scratch(&home.0, true).unwrap();
+        let project = home.0.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let held =
+            ProjectIdentity::open(project.to_str().unwrap(), &runtime.state_boundary()).unwrap();
+        std::fs::remove_dir(&project).unwrap();
+        std::os::unix::fs::symlink(home.0.join(".asura"), &project).unwrap();
+        assert!(held.validate().is_err());
     }
 }

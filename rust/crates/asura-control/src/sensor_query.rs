@@ -93,6 +93,7 @@ pub(crate) fn reply(v: &pb::SensorsReply) -> bool {
                 | "installation_already_initialized"
                 | "request_conflict"
                 | "project_stale"
+                | "project_overlaps_asura_state"
                 | "model_unavailable"
                 | "capacity_exhausted"
                 | "storage_timeout"

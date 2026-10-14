@@ -1,5 +1,7 @@
 //! Native process qualification; private guardian dispatch is identical to the CLI.
-use asura_platform::shell::{PreparedShell, ShellRequest, ShellResult, StopReason, run_guardian};
+use asura_platform::shell::{
+    PreparedShell, ShellError, ShellRequest, ShellResult, StopReason, run_guardian,
+};
 use asura_platform::{ProjectIdentity, RuntimeDirectory};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -54,7 +56,11 @@ impl Drop for Fixture {
 }
 fn prepare(home: &Path, command: &str, timeout: Duration) -> JobGuard {
     let runtime = RuntimeDirectory::scratch(home, true).unwrap();
-    let project = ProjectIdentity::open(home.join("project").to_str().unwrap()).unwrap();
+    let project = ProjectIdentity::open(
+        home.join("project").to_str().unwrap(),
+        &runtime.state_boundary(),
+    )
+    .unwrap();
     let cancel = AtomicBool::new(false);
     let p = PreparedShell::prepare(
         runtime,
@@ -125,6 +131,8 @@ fn qualification() {
     let result = run(&f.0, &command, Duration::from_secs(5), false);
     assert_ne!(result.exit_code, Some(0));
     assert!(!outside.exists());
+    state_isolation(&f.0);
+    guardian_refusals(&f.0);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -174,7 +182,8 @@ fn qualification() {
     group_absent(&f.0.join("project/cancel-pid"));
     let result = run(
         &f.0,
-        r#"for fd in 3 4 5 6 7 8 9; do if eval 'true <&'"$fd" 2>/dev/null; then exit 99; fi; done; exit 0"#,
+        // sh saves redirected descriptors at FD 10, so FD 10 is probed with dup.
+        r#"for fd in 3 4 5 6 7 8 9; do if eval 'true <&'"$fd" 2>/dev/null; then exit 99; fi; done; /usr/bin/perl -MPOSIX -e 'for (3..10) { exit 98 if defined POSIX::dup($_) } exit 0'"#,
         Duration::from_secs(5),
         false,
     );
@@ -251,6 +260,119 @@ fn qualification() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+/// SI-I6: an absent, invalid or mismatched FD 10 refuses setup; no command runs.
+fn guardian_refusals(home: &Path) {
+    use std::os::fd::OwnedFd;
+    let other = home.join("other-state");
+    fs::create_dir(&other).unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o700)).unwrap();
+    let open = |path: &Path| Some(OwnedFd::from(fs::File::open(path).unwrap()));
+    // Descriptor faults stop the guardian before its first notice, as for FDs 3-9.
+    for (label, state, expected) in [
+        ("absent", None, Err(ShellError::Protocol)),
+        (
+            "not a directory",
+            open(&home.join(".asura/secret")),
+            Err(ShellError::Protocol),
+        ),
+        (
+            "wrong mode",
+            open(&home.join("project")),
+            Err(ShellError::Protocol),
+        ),
+        (
+            "not the scratch parent",
+            open(&other),
+            Ok(Some(ShellError::Denied)),
+        ),
+    ] {
+        let runtime = RuntimeDirectory::scratch(home, true).unwrap();
+        let project = ProjectIdentity::open(
+            home.join("project").to_str().unwrap(),
+            &runtime.state_boundary(),
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut prepared = PreparedShell::prepare(
+            runtime,
+            &project,
+            ShellRequest {
+                job_id: asura_platform::random_id(),
+                command: "printf ran > refused-marker".into(),
+                cwd: None,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+            &cancel,
+        )
+        .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
+        prepared.replace_state_for_test(state);
+        let mut job = JobGuard(
+            prepared
+                .spawn(&std::env::current_exe().unwrap(), &cancel)
+                .unwrap_or_else(|e| panic!("spawn: {:?}", e.reason)),
+        );
+        let end = Instant::now() + Duration::from_secs(5);
+        let outcome = loop {
+            if job.settled() {
+                break Ok(job.result().unwrap());
+            }
+            assert!(Instant::now() < end, "{label}: refusal failed to settle");
+            asura_platform::poll(&job.interests(), Duration::from_millis(20)).unwrap();
+            if let Err(error) = job.poll(Instant::now()) {
+                break Err(error);
+            }
+        };
+        assert_eq!(outcome.map(|result| result.failure), expected, "{label}");
+        assert!(!home.join("project/refused-marker").exists(), "{label}");
+        if let Some(mut cleanup) = job.take_cleanup() {
+            cleanup
+                .run(
+                    Instant::now() + Duration::from_secs(2),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+        }
+    }
+}
+/// SI-I4 and SI-I5: the Asura home is denied under both spellings; scratch works.
+fn state_isolation(home: &Path) {
+    let asura = home.join(".asura");
+    fs::write(asura.join("secret"), b"state").unwrap();
+    fs::copy("/bin/echo", asura.join("tool")).unwrap();
+    let firmlinked = Path::new("/System/Volumes/Data").join(asura.strip_prefix("/").unwrap());
+    assert_eq!(fs::read(firmlinked.join("secret")).unwrap(), b"state");
+    for root in [&asura, &firmlinked] {
+        let root = root.display();
+        for (label, command) in [
+            ("read", format!("/bin/cat '{root}/secret' >/dev/null")),
+            ("list", format!("/bin/ls '{root}/run' >/dev/null")),
+            ("write", format!("printf x > '{root}/written'")),
+            ("exec", format!("'{root}/tool' reached")),
+        ] {
+            let result = run(
+                home,
+                &format!("{command}; exit $?"),
+                Duration::from_secs(5),
+                false,
+            );
+            assert_ne!(
+                result.exit_code,
+                Some(0),
+                "{label} under {root}: {result:?}"
+            );
+            assert!(!result.stdout.contains("reached"), "{label} under {root}");
+        }
+    }
+    assert!(!asura.join("written").exists());
+    let result = run(
+        home,
+        "printf '#!/bin/sh\\nprintf scratch-ok\\n' > \"$TMPDIR/tool\" && /bin/chmod 700 \"$TMPDIR/tool\" && \"$TMPDIR/tool\" && /bin/cat \"$TMPDIR/tool\" >/dev/null",
+        Duration::from_secs(5),
+        false,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout, "scratch-ok");
 }
 fn lease_holder(home: &Path) -> ! {
     let mut job = prepare(

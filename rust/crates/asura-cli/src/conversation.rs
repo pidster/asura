@@ -51,6 +51,11 @@ pub(crate) fn project_display_name(project: &pb::ProjectReply) -> String {
         result
     }
 }
+/// The one reason a listed project may carry; see the state isolation design.
+pub(crate) const OVERLAPS_ASURA_STATE: &str = "project_overlaps_asura_state";
+pub(crate) fn overlaps_asura_state(project: &pb::ProjectReply) -> bool {
+    project.error.as_deref() == Some(OVERLAPS_ASURA_STATE)
+}
 pub(crate) fn project_list_line(project: &pb::ProjectReply) -> String {
     format!(
         "{}  {}  {}{}",
@@ -59,6 +64,8 @@ pub(crate) fn project_list_line(project: &pb::ProjectReply) -> String {
         project.location.as_deref().unwrap_or_default(),
         if project.current == Some(true) {
             ""
+        } else if overlaps_asura_state(project) {
+            " [unavailable: contains Asura state]"
         } else {
             " [stale]"
         }
@@ -212,7 +219,9 @@ fn collect_projects(
         let mut last = after;
         for project in &reply.projects {
             let id = registry_id(project.project_id.as_deref())?;
-            if project.error.is_some()
+            let reason_valid = project.error.is_none()
+                || (overlaps_asura_state(project) && project.current == Some(false));
+            if !reason_valid
                 || project.current.is_none()
                 || project.registry_revision != Some(1)
                 || project.location.as_deref().is_none_or(|path| {
@@ -337,6 +346,54 @@ mod tests {
         project.name = None;
         project.location = Some("/".into());
         assert_eq!(project_display_name(&project), "Project 01010101");
+    }
+    /// SI-U5: the overlap reason is accepted, shown, and never auto-selected.
+    #[test]
+    fn overlapping_projects_are_listed_with_their_reason() {
+        let overlapping = pb::ProjectReply {
+            error: Some(OVERLAPS_ASURA_STATE.into()),
+            ..record(1, "/Users/person", false)
+        };
+        let line = project_list_line(&overlapping);
+        assert!(
+            line.ends_with("/Users/person [unavailable: contains Asura state]"),
+            "{line}"
+        );
+        assert!(project_list_line(&record(2, "/gone", false)).ends_with(" [stale]"));
+        let page = |project: pb::ProjectReply| {
+            collect_projects(
+                |_| {
+                    Ok(pb::ProjectsReply {
+                        projects: vec![project.clone()],
+                        next_cursor: None,
+                        error: None,
+                    })
+                },
+                || Ok(()),
+            )
+        };
+        assert_eq!(
+            page(overlapping.clone()).unwrap(),
+            vec![overlapping.clone()]
+        );
+        assert!(
+            page(pb::ProjectReply {
+                current: Some(true),
+                ..overlapping.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            page(pb::ProjectReply {
+                error: Some("project_stale".into()),
+                ..overlapping.clone()
+            })
+            .is_err()
+        );
+        assert_eq!(
+            initial_project(&[overlapping], "/Users/person/work"),
+            (None, vec![])
+        );
     }
     #[test]
     fn registry_collects_pages_and_checks_cancellation() {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder]
+Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation]
 This verifies process and tty state, not native terminal visual correctness.
 """
 import codecs
@@ -698,7 +698,9 @@ def stalled_backend(fixture):
 
 
 def repeated_initialization(fixture):
-    project = fixture.root
+    # The fixture root contains the Asura home and may not be a project.
+    project = fixture.root / "workspace"
+    project.mkdir(mode=0o700)
     default_name = project.name[0].upper() + project.name[1:]
     installation_id = project_id = None
     metadata_root = fixture.root / "home/.asura"
@@ -709,7 +711,7 @@ def repeated_initialization(fixture):
     finder.chmod(0o644)
 
     # Declining the first-use prompt leaves the canonical registry empty.
-    trial = fixture.launch(keep_project_prompt=True)
+    trial = fixture.launch(keep_project_prompt=True, cwd=project)
     try:
         trial.send(b"\x1b")
         end = time.monotonic() + remaining()
@@ -725,7 +727,7 @@ def repeated_initialization(fixture):
     fixture.wait_absent(stable=0.2)
 
     # A new session may offer again. Yes registers exactly the shown directory.
-    trial = fixture.launch(keep_project_prompt=True)
+    trial = fixture.launch(keep_project_prompt=True, cwd=project)
     try:
         assert str(project) in trial.screen.text(), trial.screen.text()
         trial.send(b"\r")
@@ -762,7 +764,7 @@ def repeated_initialization(fixture):
         return trial.screen.text()
 
     for restarted in (False, True):
-        trial = fixture.launch()
+        trial = fixture.launch(cwd=project)
         try:
             # No setup command: first launch itself must become ready.
             trial.until(b"Installation graph_ready", plain=True, limit=15)
@@ -833,8 +835,9 @@ def repeated_initialization(fixture):
             if not restarted:
                 screen = command(trial, "/project rename my project", "Project renamed to My project")
                 assert "My project · " in screen, screen
-                screen = command(trial, "/project list", "My project  " + str(project))
-                assert screen.count(project_id) == 1, screen
+                # At 80 columns the location wraps below the name.
+                screen = command(trial, "/project list", project_id + "  My project")
+                assert screen.count(project_id) == 1 and str(project) in screen, screen
                 dismiss(trial)
             # Canonical CLI list independently confirms the persisted registry.
             code, listed, _ = fixture.command("project", "list")
@@ -1583,6 +1586,62 @@ def long_observation(fixture, source):
         assert not server.is_alive(), "fixture server cleanup unconfirmed"
 
 
+def state_isolation(source):
+    """SI-E1 and SI-E2: the Asura home is never a usable project."""
+    # SI-E1: accepting the first-use offer inside the Asura home's parent fails.
+    fixture = Fixture(source)
+    try:
+        home = fixture.root / "home"
+        trial = fixture.launch(keep_project_prompt=True, cwd=home)
+        try:
+            assert str(home) in trial.screen.text(), trial.screen.text()
+            trial.send(b"\r")
+            trial.until(b"project_overlaps_asura_state", plain=True, limit=15)
+            assert "Use this directory as a project?" not in trial.screen.text(), trial.screen.text()
+            code, projects, _ = fixture.command("project", "list")
+            assert code == 0 and b"No projects." in projects, projects
+            trial.send(b"kept draft")
+            trial.until(b"kept draft", plain=True)
+            trial.send(b"\x01/quit\r")
+            trial.finish()
+        finally:
+            trial.close()
+        fixture.wait_absent(stable=0.2)
+    finally:
+        fixture.cleanup()
+    print("PASS first-use offer in the Asura home reports project_overlaps_asura_state and registers nothing")
+
+    # SI-E2: an existing overlapping registration is listed unavailable.
+    fixture = Fixture(source)
+    try:
+        result = fixture.command("--seed-overlapping-project")
+        assert result[0] == 0, result
+        overlapping = "46" * 16
+        trial = fixture.launch(cwd=fixture.root / "project")
+        try:
+            trial.until(b"Project \xc2\xb7 ", plain=True)
+            code, listed, _ = fixture.command("project", "list")
+            expected = f"{overlapping}  Home  {fixture.root / 'home'} [unavailable: contains Asura state]"
+            assert code == 0 and expected.encode() in listed, listed
+            trial.resize(200, 24)
+            trial.send(b"/project list\r")
+            trial.until(b"[unavailable: contains Asura state]", plain=True, limit=15)
+            trial.send(b"\x1b")
+            trial.idle(0.1)
+            offset = len(trial.output)
+            trial.send(f"/project select {overlapping}\r".encode())
+            trial.until(b"Project unavailable: project_overlaps_asura_state", offset, plain=True)
+            assert "Project \u00b7 " in trial.screen.text(), trial.screen.text()
+            trial.send(b"\x01/quit\r")
+            trial.finish()
+        finally:
+            trial.close()
+        fixture.wait_absent(stable=0.2)
+    finally:
+        fixture.cleanup()
+    print("PASS existing overlapping registration is listed unavailable and refused on selection")
+
+
 def main():
     global DEADLINE
     assert len(sys.argv) in (2, 3), __doc__
@@ -1595,7 +1654,8 @@ def main():
     long = len(sys.argv) == 3 and sys.argv[2] == "--long-observation"
     activity = len(sys.argv) == 3 and sys.argv[2] == "--activity"
     multipass = len(sys.argv) == 3 and sys.argv[2] == "--activity-multipass"
-    assert len(sys.argv) == 2 or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass, __doc__
+    isolation = len(sys.argv) == 3 and sys.argv[2] == "--state-isolation"
+    assert len(sys.argv) == 2 or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
@@ -1610,6 +1670,9 @@ def main():
     assert (probe.returncode == 0
             and probe.stdout == b"ASURA_ISOLATED_LIFECYCLE_FIXTURE_V1\n"
             and not probe.stderr), "PTY journey requires the isolated lifecycle fixture"
+    if isolation:
+        state_isolation(source)
+        return
     fixture = Fixture(source)
     try:
         if activity or multipass:

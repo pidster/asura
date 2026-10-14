@@ -180,11 +180,14 @@ fn bound_authority_reads_only_registered_project_without_journal_mutation() {
             .unwrap(),
     )
     .unwrap();
+    // The Asura home may not be a project; register a directory beside it.
+    let project_path = root.join("project");
+    std::fs::create_dir(&project_path).unwrap();
     let registered = receive(
         writer
             .try_submit(Command::Register {
                 request: [2; 16],
-                location: root.to_str().unwrap().into(),
+                location: project_path.to_str().unwrap().into(),
             })
             .unwrap(),
     )

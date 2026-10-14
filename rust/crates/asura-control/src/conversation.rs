@@ -59,6 +59,21 @@ fn project(v: &pb::ProjectReply) -> bool {
             && (v.name.is_some() == v.name_revision.is_some())
     }
 }
+/// A listed registration may name why it is unavailable. Only the overlap
+/// reason is defined; it accompanies the registration fields.
+fn listed(v: &pb::ProjectReply) -> bool {
+    match v.error.as_deref() {
+        None => project(v),
+        Some("project_overlaps_asura_state") => {
+            v.current == Some(false)
+                && project(&pb::ProjectReply {
+                    error: None,
+                    ..v.clone()
+                })
+        }
+        Some(_) => false,
+    }
+}
 pub(super) fn valid(body: &Body) -> bool {
     match body {
         Body::ConversationEnqueue(v) => {
@@ -405,7 +420,7 @@ pub(super) fn valid(body: &Body) -> bool {
                 text(&v.error, 256) && v.projects.is_empty() && v.next_cursor.is_none()
             } else {
                 v.projects.len() <= 8
-                    && v.projects.iter().all(|p| p.error.is_none() && project(p))
+                    && v.projects.iter().all(listed)
                     && (v.next_cursor.is_none() || id(&v.next_cursor))
             }
         }
@@ -596,8 +611,42 @@ mod tests {
         })));
         assert!(!valid(&Body::ProjectReply(pb::ProjectReply {
             error: Some("busy".into()),
-            ..project
+            ..project.clone()
         })));
+    }
+    /// SI-U5: only the overlap reason may accompany a listed registration.
+    #[test]
+    fn listed_projects_may_name_the_asura_state_overlap_only() {
+        let project = pb::ProjectReply {
+            project_id: Some(vec![1; 16]),
+            location: Some("/Users/person".into()),
+            registry_revision: Some(1),
+            current: Some(false),
+            error: Some("project_overlaps_asura_state".into()),
+            name: Some("Person".into()),
+            name_revision: Some(0),
+        };
+        let page = |project: pb::ProjectReply| {
+            valid(&Body::ProjectsReply(pb::ProjectsReply {
+                projects: vec![project],
+                next_cursor: None,
+                error: None,
+            }))
+        };
+        assert!(page(project.clone()));
+        assert!(!page(pb::ProjectReply {
+            current: Some(true),
+            ..project.clone()
+        }));
+        assert!(!page(pb::ProjectReply {
+            error: Some("project_stale".into()),
+            ..project.clone()
+        }));
+        assert!(!page(pb::ProjectReply {
+            location: None,
+            ..project.clone()
+        }));
+        assert!(!valid(&Body::ProjectReply(project)));
     }
     #[test]
     fn rename_has_bounded_identity_and_stale_projection() {

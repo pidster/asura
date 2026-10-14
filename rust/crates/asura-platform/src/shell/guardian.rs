@@ -64,7 +64,7 @@ fn parse_id(s: &str) -> Result<[u8; 16], ShellError> {
     Ok(id)
 }
 fn descriptors() -> Result<Vec<OwnedFd>, ShellError> {
-    for fd in 3..=9 {
+    for fd in 3..=10 {
         let st = stat_fd(fd).map_err(|_| ShellError::Denied)?;
         // SAFETY: inspect access mode before assuming descriptor ownership.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -87,25 +87,40 @@ fn descriptors() -> Result<Vec<OwnedFd>, ShellError> {
         if (fd == 3 || fd == 4) && flags & libc::O_NONBLOCK == 0 {
             return Err(ShellError::Denied);
         }
-        if fd == 9 && st.st_mode & 0o777 != 0o700 {
+        if fd >= 9 && st.st_mode & 0o777 != 0o700 {
             return Err(ShellError::Denied);
         }
     }
     // SAFETY: this private invocation exclusively receives the validated FDs.
-    Ok((3..=9)
+    Ok((3..=10)
         .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
         .collect())
 }
 fn pinned_path(fd: i32) -> Result<String, ShellError> {
     let path = spawn::path(fd)?;
-    let identity = crate::ProjectIdentity::open(&path).map_err(|_| ShellError::Denied)?;
+    let (device, inode) =
+        crate::project_identity::pinned_identity(&path).map_err(|_| ShellError::Denied)?;
     let held = stat_fd(fd).map_err(|_| ShellError::Denied)?;
-    if identity.device != held.st_dev as u64 || identity.inode != held.st_ino {
+    if device != held.st_dev as u64 || inode != held.st_ino {
         return Err(ShellError::Denied);
     }
     Ok(path)
 }
-fn profile(project: &str, scratch: &str) -> Result<String, ShellError> {
+/// `path` is `root` or lies beneath it.
+fn within(path: &str, root: &str) -> bool {
+    path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/')))
+}
+/// A path check inside the guardian. Storage's identity check is the authority.
+fn separate_from_state(project: &str, scratch: &str, asura: &str) -> Result<(), ShellError> {
+    if !scratch.starts_with(&format!("{asura}/tmp/"))
+        || within(project, asura)
+        || within(asura, project)
+    {
+        return Err(ShellError::Denied);
+    }
+    Ok(())
+}
+fn profile(project: &str, scratch: &str, asura: &str) -> Result<String, ShellError> {
     let quote = |s: &str| crate::git_observer::quoted(s).map_err(|_| ShellError::Denied);
     let roots = [
         "/bin",
@@ -132,8 +147,15 @@ fn profile(project: &str, scratch: &str) -> Result<String, ShellError> {
     for p in ancestors {
         metadata.push_str(&format!(" (literal {})", quote(&p)?));
     }
+    // The last matching rule wins: deny the Asura home, then re-allow scratch.
+    let state = format!(
+        "(deny file-read* file-write* process-exec file-map-executable (subpath {asura}))(allow process-exec file-map-executable file-read* (subpath {scratch}))(allow file-write* (subpath {scratch}))(allow file-read-metadata (literal {asura}) (literal {tmp}))",
+        asura = quote(asura)?,
+        scratch = quote(scratch)?,
+        tmp = quote(&format!("{asura}/tmp"))?,
+    );
     Ok(format!(
-        "(version 1)(deny default)(allow file-read* file-test-existence (literal \"/\"))(allow file-read* (literal \"/private/var/select/sh\"))(allow file-read-metadata (literal \"/private\") (literal \"/private/var\") (literal \"/private/var/select\"))(allow process-fork)(allow process-exec file-map-executable file-read*{filters})(allow file-read-metadata{metadata})(allow file-write* (subpath {}) (subpath {}))(allow sysctl-read)(allow file-read* file-write* (literal \"/dev/null\"))(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\"))",
+        "(version 1)(deny default)(allow file-read* file-test-existence (literal \"/\"))(allow file-read* (literal \"/private/var/select/sh\"))(allow file-read-metadata (literal \"/private\") (literal \"/private/var\") (literal \"/private/var/select\"))(allow process-fork)(allow process-exec file-map-executable file-read*{filters})(allow file-read-metadata{metadata})(allow file-write* (subpath {}) (subpath {}))(allow sysctl-read)(allow file-read* file-write* (literal \"/dev/null\"))(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\")){state}",
         quote(project)?,
         quote(scratch)?
     ))
@@ -174,10 +196,12 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
         let project = pinned_path(7)?;
         let cwd = pinned_path(8)?;
         let scratch = pinned_path(9)?;
+        let asura = pinned_path(10)?;
         if cwd != project && !cwd.starts_with(&format!("{project}/")) {
             return Err(ShellError::Denied);
         }
-        let profile = profile(&project, &scratch)?;
+        separate_from_state(&project, &scratch, &asura)?;
+        let profile = profile(&project, &scratch, &asura)?;
         if lease_reason(3)?.is_some() {
             return Err(ShellError::Cancelled);
         }
@@ -398,6 +422,118 @@ fn group_only_leader(pid: libc::pid_t) -> Result<bool, ShellError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_denies_state_after_existing_rules_then_restores_scratch() {
+        let text = profile("/p", "/h/.asura/tmp/shell-1", "/h/.asura").unwrap();
+        let deny = text
+            .find("(deny file-read* file-write* process-exec file-map-executable (subpath \"/h/.asura\"))")
+            .expect("state deny");
+        let exec = text
+            .rfind("(allow process-exec file-map-executable file-read* (subpath \"/h/.asura/tmp/shell-1\"))")
+            .expect("scratch exec");
+        let write = text
+            .rfind("(allow file-write* (subpath \"/h/.asura/tmp/shell-1\"))")
+            .expect("scratch write");
+        let metadata = text
+            .find("(allow file-read-metadata (literal \"/h/.asura\") (literal \"/h/.asura/tmp\"))")
+            .expect("metadata literals");
+        assert!(
+            text.rfind("(allow file-read* (literal \"/dev/random\")")
+                .unwrap()
+                < deny
+        );
+        assert!(deny < exec && exec < write && write < metadata);
+        assert!(text.ends_with(")"));
+        let quoted = profile("/p", "/h/.as\"ura/tmp/s", "/h/.as\"ura").unwrap();
+        assert!(quoted.contains("(subpath \"/h/.as\\\"ura\")"));
+    }
+    #[test]
+    fn guardian_path_check_rejects_every_overlap() {
+        let asura = "/h/.asura";
+        let scratch = "/h/.asura/tmp/shell-1";
+        assert!(separate_from_state("/h/project", scratch, asura).is_ok());
+        assert!(separate_from_state("/h/.asura-other", scratch, asura).is_ok());
+        for project in ["/h/.asura", "/h/.asura/run", "/h", "/"] {
+            assert_eq!(
+                separate_from_state(project, scratch, asura),
+                Err(ShellError::Denied),
+                "{project}"
+            );
+        }
+        assert_eq!(
+            separate_from_state("/h/project", "/h/project/tmp/x", asura),
+            Err(ShellError::Denied)
+        );
+        assert_eq!(
+            separate_from_state("/h/project", "/h/.asura/tmpx/x", asura),
+            Err(ShellError::Denied)
+        );
+    }
+    /// Defence in depth: even a project that contains the home cannot reach it
+    /// under either spelling, while scratch stays usable.
+    #[test]
+    fn profile_denies_state_inside_a_containing_project() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::path::PathBuf::from(format!(
+            "/private/tmp/as-sh-g-{}-{}",
+            std::process::id(),
+            crate::random_id()[..6]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        std::fs::create_dir(&home).unwrap();
+        let _remove = Remove(home.clone());
+        let asura = home.join(".asura");
+        let scratch = asura.join("tmp/shell-1");
+        std::fs::create_dir_all(&scratch).unwrap();
+        for dir in [&home, &asura, &scratch] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(asura.join("secret"), b"state").unwrap();
+        std::fs::write(home.join("visible"), b"project").unwrap();
+        let text = profile(
+            home.to_str().unwrap(),
+            scratch.to_str().unwrap(),
+            asura.to_str().unwrap(),
+        )
+        .unwrap();
+        let run = |command: &str| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &text, "/bin/sh", "-c", command])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let firmlinked =
+            std::path::Path::new("/System/Volumes/Data").join(asura.strip_prefix("/").unwrap());
+        assert!(run(&format!(
+            "/bin/cat '{}' >/dev/null",
+            home.join("visible").display()
+        )));
+        for root in [&asura, &firmlinked] {
+            let root = root.display();
+            assert!(
+                !run(&format!("/bin/cat '{root}/secret' >/dev/null")),
+                "{root}"
+            );
+            assert!(!run(&format!("printf x > '{root}/written'")), "{root}");
+        }
+        let scratch = scratch.display();
+        assert!(run(&format!(
+            "printf x > '{scratch}/f' && /bin/cat '{scratch}/f' >/dev/null"
+        )));
+        assert!(!asura.join("written").exists());
+    }
     #[test]
     fn lost_child_fence_cannot_be_restored_by_recycled_pid_observation() {
         let mut safety = CleanupSafety::new(1_000);

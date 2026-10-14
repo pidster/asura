@@ -717,7 +717,8 @@ mod tests {
                     project: [2; 16],
                     path: "/does-not-exist".into(),
                     device: 0,
-                    inode: 0
+                    inode: 0,
+                    boundary: asura_platform::StateBoundary::detached_for_test(),
                 },
                 Instant::now() + Duration::from_secs(1)
             ),
@@ -947,6 +948,8 @@ pub struct ExecutionScope {
     pub path: String,
     pub device: u64,
     pub inode: u64,
+    /// The runtime's Asura home boundary; every project open applies it.
+    pub boundary: asura_platform::StateBoundary,
 }
 #[derive(Debug, Eq, PartialEq)]
 pub enum Output {
@@ -1025,7 +1028,7 @@ impl Executor {
             if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(ExecutionError::Rejected(Rejection::Cancelled));
             }
-            let project = asura_platform::ProjectIdentity::open(&scope.path)
+            let project = asura_platform::ProjectIdentity::open(&scope.path, &scope.boundary)
                 .map_err(|_| ExecutionError::Host(asura_platform::ProjectReadError::UnsafePath))?;
             if project.device != scope.device || project.inode != scope.inode {
                 return Err(ExecutionError::Host(

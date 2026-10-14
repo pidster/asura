@@ -19,6 +19,7 @@ pub struct ContextScope {
     pub path: String,
     pub device: u64,
     pub inode: u64,
+    pub boundary: asura_platform::StateBoundary,
 }
 #[derive(Clone, Debug)]
 pub struct ContextSnapshot {
@@ -137,7 +138,13 @@ fn observe(
         *latest.lock().unwrap_or_else(|error| error.into_inner()) = Some(value);
         signal.notify();
     };
-    if let Err(reason) = validate_scope(&scope.root, &scope.path, scope.device, scope.inode) {
+    if let Err(reason) = validate_scope(
+        &scope.root,
+        &scope.path,
+        scope.device,
+        scope.inode,
+        &scope.boundary,
+    ) {
         publish(GitSnapshot::unknown(reason));
         return;
     }
@@ -175,6 +182,7 @@ fn observe(
                 &scope.path,
                 scope.device,
                 scope.inode,
+                &scope.boundary,
                 &git,
                 &cancelled,
             );

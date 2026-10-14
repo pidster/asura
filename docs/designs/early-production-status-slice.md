@@ -848,7 +848,8 @@ flowchart TD
 ### Mandatory command regression execution
 
 The existing CLI `lifecycle` Cargo test must run the default `tui_pty.py`
-journey and its `--setup`, `--queue-history` and `--queue-reorder` journeys.
+journey and its `--setup`, `--queue-history`, `--queue-reorder` and
+`--state-isolation` journeys.
 Cargo passes the current lifecycle executable
 to Python; copied `asura-fixture` executables retain the existing private runtime
 resolver. These tests require Python 3, macOS PTYs and local socket access.

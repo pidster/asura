@@ -20,6 +20,14 @@ impl Scratch {
     fn runtime(&self) -> RuntimeDirectory {
         RuntimeDirectory::scratch(&self.0, true).unwrap()
     }
+    /// A project beside the Asura home; the home itself may not be a project.
+    fn project(&self) -> String {
+        let path = self.0.join("project");
+        if !path.exists() {
+            fs::create_dir(&path).unwrap();
+        }
+        path.to_str().unwrap().into()
+    }
 }
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -230,7 +238,7 @@ fn managed_queue_commits_full_projection_cas_retry_and_restart_hold() {
         &mut writer
             .try_submit(Command::Register {
                 request: [111; 16],
-                location: scratch.0.to_str().unwrap().into(),
+                location: scratch.project(),
             })
             .unwrap(),
     )
@@ -363,14 +371,15 @@ fn project_identity_detects_same_path_replacement_and_symlink() {
     let scratch = Scratch::new();
     let path = scratch.0.join("project");
     fs::create_dir(&path).unwrap();
-    let held = ProjectIdentity::open(path.to_str().unwrap()).unwrap();
+    let boundary = asura_platform::StateBoundary::detached_for_test();
+    let held = ProjectIdentity::open(path.to_str().unwrap(), &boundary).unwrap();
     held.validate().unwrap();
     fs::rename(&path, scratch.0.join("old")).unwrap();
     fs::create_dir(&path).unwrap();
     assert!(held.validate().is_err());
     let link = scratch.0.join("link");
     std::os::unix::fs::symlink(&path, &link).unwrap();
-    assert!(ProjectIdentity::open(link.to_str().unwrap()).is_err());
+    assert!(ProjectIdentity::open(link.to_str().unwrap(), &boundary).is_err());
 }
 #[test]
 fn writer_preserves_incomplete_tail_and_does_not_recreate_missing_authority() {
@@ -477,7 +486,7 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
     assert_eq!(init.revision, after.revision);
     drop(after);
     assert_eq!(before, fs::read(&journal).unwrap());
-    let location = scratch.0.to_str().unwrap().to_owned();
+    let location = scratch.project();
     let registered = wait(
         &mut writer
             .try_submit(Command::Register {
@@ -866,7 +875,7 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
         &mut writer
             .try_submit(Command::Register {
                 request: [101; 16],
-                location: scratch.0.to_str().unwrap().into(),
+                location: scratch.project(),
             })
             .unwrap(),
     )
@@ -1125,5 +1134,163 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
         memory::ReadResult::Page(page) => assert_eq!(page.notes.len(), 1),
         _ => panic!("expected page"),
     }
+    close(&mut writer);
+}
+
+/// SI-I1 and SI-I2: overlapping roots are refused before any append.
+#[cfg(feature = "embedded-memory")]
+#[test]
+fn registration_rejects_projects_overlapping_asura_state() {
+    let _serial = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    wait(
+        &mut writer
+            .try_submit(Command::Initialize { request: [150; 16] })
+            .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.0.join(".asura/tmp")).unwrap();
+    let sequence = || {
+        wait(&mut writer.try_submit(Command::Open).unwrap())
+            .unwrap()
+            .replay
+            .unwrap()
+            .sequence
+    };
+    let before = sequence();
+    let overlapping = [
+        scratch.0.clone(),
+        scratch.0.join(".asura"),
+        scratch.0.join(".asura/tmp"),
+        scratch.0.parent().unwrap().to_owned(),
+        "/".into(),
+        "/System".into(),
+        "/System/Volumes".into(),
+        "/System/Volumes/Data".into(),
+    ];
+    for (n, location) in overlapping.iter().enumerate() {
+        assert!(
+            matches!(
+                wait(
+                    &mut writer
+                        .try_submit(Command::Register {
+                            request: [160 + n as u8; 16],
+                            location: location.to_str().unwrap().into(),
+                        })
+                        .unwrap()
+                ),
+                Err(Error::OverlapsAsuraState)
+            ),
+            "{}",
+            location.display()
+        );
+    }
+    assert_eq!(sequence(), before, "nothing appended");
+    let sibling = Scratch(format!("{}-sibling", scratch.0.display()).into());
+    fs::create_dir(&sibling.0).unwrap();
+    for (n, location) in [sibling.0.to_str().unwrap().to_owned(), scratch.project()]
+        .into_iter()
+        .enumerate()
+    {
+        wait(
+            &mut writer
+                .try_submit(Command::Register {
+                    request: [180 + n as u8; 16],
+                    location,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    close(&mut writer);
+}
+
+/// SI-I3: a registration that overlaps the home is kept, listed unavailable,
+/// and refused for every use.
+#[cfg(feature = "embedded-memory")]
+#[test]
+fn existing_overlapping_registration_is_listed_unavailable() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let location = scratch.project();
+    let register = |location: &str| Command::Register {
+        request: [190; 16],
+        location: location.into(),
+    };
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    wait(
+        &mut writer
+            .try_submit(Command::Initialize { request: [189; 16] })
+            .unwrap(),
+    )
+    .unwrap();
+    let project = *wait(&mut writer.try_submit(register(&location)).unwrap())
+        .unwrap()
+        .replay
+        .unwrap()
+        .projects
+        .keys()
+        .next()
+        .unwrap();
+    close(&mut writer);
+    drop(writer);
+    // The registered directory becomes the Asura home's parent.
+    let home = scratch.0.join("project");
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(scratch.0.join(".asura"), home.join(".asura")).unwrap();
+    let runtime = RuntimeDirectory::scratch(&home, false).unwrap();
+    let mut writer = WriterHandle::start(runtime).unwrap();
+    let opened = wait(&mut writer.try_submit(Command::Open).unwrap()).unwrap();
+    let sequence = opened.replay.as_ref().unwrap().sequence;
+    assert!(
+        opened
+            .replay
+            .as_ref()
+            .unwrap()
+            .projects
+            .contains_key(&project)
+    );
+    drop(opened);
+    let listed = wait(
+        &mut writer
+            .try_submit(Command::Projects {
+                after: None,
+                limit: 8,
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(listed.projects.len(), 1);
+    assert_eq!(listed.projects[0].0.project, project);
+    assert_eq!(listed.projects[0].1, Some(Error::OverlapsAsuraState));
+    drop(listed);
+    assert!(matches!(
+        wait(&mut writer.try_submit(register(&location)).unwrap()),
+        Err(Error::OverlapsAsuraState)
+    ));
+    assert!(matches!(
+        wait(
+            &mut writer
+                .try_submit(Command::QueueInput {
+                    request: [191; 16],
+                    project,
+                    conversation: None,
+                    expected_generation: 0,
+                    new_conversation: true,
+                    prompt: "refused".into(),
+                })
+                .unwrap()
+        ),
+        Err(Error::OverlapsAsuraState)
+    ));
+    let after = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    assert_eq!(after.sequence, sequence, "records kept, nothing appended");
+    assert!(after.projects.contains_key(&project));
+    drop(after);
     close(&mut writer);
 }

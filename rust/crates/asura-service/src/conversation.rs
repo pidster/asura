@@ -84,6 +84,7 @@ fn storage_error(error: writer::Error) -> &'static str {
         writer::Error::OutcomeUnconfirmed => "outcome_unconfirmed",
         writer::Error::Conflict => "request_conflict",
         writer::Error::StaleProject => "project_stale",
+        writer::Error::OverlapsAsuraState => "project_overlaps_asura_state",
         writer::Error::ModelUnavailable => "model_unavailable",
         writer::Error::Limit => "capacity_exhausted",
         writer::Error::Deadline => "storage_timeout",
@@ -116,9 +117,15 @@ pub(crate) fn handles(request: &pb::Envelope) -> bool {
         )
     )
 }
+/// A stale project keeps the existing reply; only an overlap names its reason.
+fn listed_error(failure: Option<writer::Error>) -> Option<String> {
+    failure
+        .filter(|error| *error == writer::Error::OverlapsAsuraState)
+        .map(|error| storage_error(error).into())
+}
 fn project(
     value: &journal::ProjectRegistered,
-    current: bool,
+    failure: Option<writer::Error>,
     state: &journal::Replay,
 ) -> pb::ProjectReply {
     let name = state.project_name(value.project);
@@ -126,8 +133,8 @@ fn project(
         project_id: Some(value.project.to_vec()),
         location: Some(value.location.clone()),
         registry_revision: Some(value.registry_revision),
-        current: Some(current),
-        error: None,
+        current: Some(failure.is_none()),
+        error: listed_error(failure),
         name: name.as_ref().map(|(name, _)| name.clone()),
         name_revision: name.map(|(_, revision)| revision),
     }
@@ -2110,7 +2117,7 @@ impl Owner {
                                 journal::Outcome::Project(id) => s.projects.get(&id),
                                 _ => None,
                             })
-                            .map(|p| Body::ProjectReply(project(p, true, s)))
+                            .map(|p| Body::ProjectReply(project(p, None, s)))
                     });
                     self.out.push_back(match body {
                         Some(body) => reply(request, body),
@@ -2127,7 +2134,7 @@ impl Owner {
                 let projects: Vec<_> = value
                     .projects
                     .iter()
-                    .map(|(p, current)| project(p, *current, state))
+                    .map(|(p, failure)| project(p, *failure, state))
                     .collect();
                 let next_cursor = value.projects.last().and_then(|(last, _)| {
                     state
@@ -2152,7 +2159,7 @@ impl Owner {
                 };
                 let body = self.replay.as_ref().and_then(|state| {
                     state.projects.get(&target).map(|registration| {
-                        let current = project(registration, true, state);
+                        let current = project(registration, None, state);
                         let mut outcome = current.clone();
                         if !value.stale_project_name_revision {
                             outcome.name = value.project_name.clone();
@@ -3342,6 +3349,7 @@ impl Owner {
                                     path: project.location.clone(),
                                     device: project.device,
                                     inode: project.inode,
+                                    boundary: self.runtime.state_boundary(),
                                 },
                                 tool.call.clone(),
                                 tool.shell_intent
@@ -3443,6 +3451,7 @@ impl Owner {
                                         path: project.location.clone(),
                                         device: project.device,
                                         inode: project.inode,
+                                        boundary: self.runtime.state_boundary(),
                                     },
                                     tool.deadline,
                                 )
@@ -3562,7 +3571,10 @@ impl Owner {
             })
             .collect()
     }
-    pub(crate) fn project_identity(&self, project: journal::Id) -> Option<(String, u64, u64)> {
+    pub(crate) fn project_identity(
+        &self,
+        project: journal::Id,
+    ) -> Option<(String, u64, u64, asura_platform::StateBoundary)> {
         if !self.started
             || self.closing
             || self.unavailable.is_some()
@@ -3573,7 +3585,12 @@ impl Owner {
         let state = self.replay.as_ref()?;
         state.binding.as_ref()?;
         let project = state.projects.get(&project)?;
-        Some((project.location.clone(), project.device, project.inode))
+        Some((
+            project.location.clone(),
+            project.device,
+            project.inode,
+            self.runtime.state_boundary(),
+        ))
     }
     pub(crate) fn installation(&self) -> Option<pb::InspectInstallationReply> {
         if let Some(snapshot) = self.automatic_initialization.snapshot() {
@@ -3674,6 +3691,20 @@ mod automatic_initialization_tests {
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+    /// SI-U5: the overlap has its own code and is the only listed reason.
+    #[test]
+    fn asura_state_overlap_has_its_own_code_and_listing_reason() {
+        assert_eq!(
+            storage_error(writer::Error::OverlapsAsuraState),
+            "project_overlaps_asura_state"
+        );
+        assert_eq!(
+            listed_error(Some(writer::Error::OverlapsAsuraState)).as_deref(),
+            Some("project_overlaps_asura_state")
+        );
+        assert_eq!(listed_error(Some(writer::Error::StaleProject)), None);
+        assert_eq!(listed_error(None), None);
+    }
     #[test]
     fn terminal_observation_retains_busy_writer_then_heartbeats_without_claiming_completion() {
         let _writer_owner = crate::TEST_WRITER

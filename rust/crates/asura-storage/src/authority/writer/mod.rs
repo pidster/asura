@@ -33,6 +33,8 @@ pub enum Error {
     Conflict,
     Invalid,
     StaleProject,
+    /// The project equals, lies inside, or contains the Asura home.
+    OverlapsAsuraState,
     ModelUnavailable,
     Limit,
 }
@@ -174,7 +176,8 @@ pub struct Reply {
     pub record: Option<Record>,
     pub history: Option<HistoryPage>,
     pub prepared: Option<Prepared>,
-    pub projects: Vec<(ProjectRegistered, bool)>,
+    /// Each registration with its open failure; `None` means current.
+    pub projects: Vec<(ProjectRegistered, Option<Error>)>,
     pub inputs: Vec<InputView>,
     pub queued: Option<QueuedPreparation>,
     pub order_revision: Option<u64>,

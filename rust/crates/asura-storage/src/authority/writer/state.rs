@@ -32,6 +32,13 @@ impl Drop for Graph {
         }
     }
 }
+/// An overlap with Asura state is reported as itself; other faults are stale.
+fn project_error(error: asura_platform::Error) -> Error {
+    match error {
+        asura_platform::Error::OverlapsAsuraState => Error::OverlapsAsuraState,
+        _ => Error::StaleProject,
+    }
+}
 impl State {
     pub(super) fn new(runtime: RuntimeDirectory) -> Self {
         Self {
@@ -384,7 +391,8 @@ impl State {
             .projects
             .get(&id)
             .ok_or(Error::Invalid)?;
-        let held = ProjectIdentity::open(&project.location).map_err(|_| Error::StaleProject)?;
+        let held = ProjectIdentity::open(&project.location, &self.runtime.state_boundary())
+            .map_err(project_error)?;
         if held.device != project.device || held.inode != project.inode {
             return Err(Error::StaleProject);
         }
@@ -1135,7 +1143,7 @@ impl State {
                     .filter(|(id, _)| after.is_none_or(|after| **id > after))
                     .take(limit)
                 {
-                    reply.projects.push((p.clone(), self.project(*id).is_ok()));
+                    reply.projects.push((p.clone(), self.project(*id).err()));
                 }
                 return Ok(reply);
             }
@@ -1264,7 +1272,8 @@ impl State {
                         Err(Error::Conflict)
                     };
                 }
-                let held = ProjectIdentity::open(&location).map_err(|_| Error::StaleProject)?;
+                let held = ProjectIdentity::open(&location, &self.runtime.state_boundary())
+                    .map_err(project_error)?;
                 let record = if let Some(existing) = state
                     .projects
                     .values()

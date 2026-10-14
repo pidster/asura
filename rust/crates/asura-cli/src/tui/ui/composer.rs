@@ -37,12 +37,19 @@ impl App {
             self.notice = "Finish active work before changing project".into();
             return false;
         }
-        if !self.projects.as_ref().is_some_and(|rows| {
-            rows.iter().any(|row| {
-                row.project_id.as_deref() == Some(id.as_slice()) && row.current == Some(true)
-            })
-        }) {
-            self.notice = "Project unavailable; refresh with /project list".into();
+        let row = self.projects.as_ref().and_then(|rows| {
+            rows.iter()
+                .find(|row| row.project_id.as_deref() == Some(id.as_slice()))
+        });
+        if row.is_none_or(|row| row.current != Some(true)) {
+            self.notice = if row.is_some_and(crate::conversation::overlaps_asura_state) {
+                format!(
+                    "Project unavailable: {}",
+                    crate::conversation::OVERLAPS_ASURA_STATE
+                )
+            } else {
+                "Project unavailable; refresh with /project list".into()
+            };
             return false;
         }
         self.selected_project = Some(id);
@@ -625,6 +632,8 @@ impl App {
                             row.location.as_deref().unwrap_or_default(),
                             if row.current == Some(true) {
                                 ""
+                            } else if crate::conversation::overlaps_asura_state(row) {
+                                " · unavailable: contains Asura state"
                             } else {
                                 " · unavailable"
                             }
@@ -1599,6 +1608,26 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert!(app.picker.is_some());
         assert!(app.notice.contains("unavailable"));
+    }
+    /// SI-U5: the picker and an explicit selection name the overlap.
+    #[test]
+    fn overlapping_project_shows_its_reason_and_is_not_selected() {
+        let mut app = App::new();
+        let mut overlapping = project(2, false);
+        overlapping.error = Some(crate::conversation::OVERLAPS_ASURA_STATE.into());
+        app.projects = Some(vec![project(1, true), overlapping]);
+        app.focus = Focus::Project;
+        key(&mut app, KeyCode::Enter);
+        assert!(draw(&mut app, "picker", 100, 26).contains("unavailable: contains Asura state"));
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_project, None);
+        assert!(
+            app.notice
+                .contains("Project unavailable: project_overlaps_asura_state"),
+            "{}",
+            app.notice
+        );
     }
     #[test]
     fn selector_resize_and_long_list_keep_selection_visible() {

@@ -146,7 +146,7 @@ impl Worker {
             }
             let executable =
                 std::env::current_exe().map_err(|_| failed(ShellError::Unavailable))?;
-            let project = asura_platform::ProjectIdentity::open(&scope.path)
+            let project = asura_platform::ProjectIdentity::open(&scope.path, &scope.boundary)
                 .map_err(|_| failed(ShellError::Denied))?;
             if project.device != scope.device || project.inode != scope.inode {
                 return Err(failed(ShellError::Denied));

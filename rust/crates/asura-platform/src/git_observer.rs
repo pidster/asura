@@ -51,15 +51,22 @@ impl GitSnapshot {
     }
 }
 
-pub fn validate_scope(root: &str, path: &str, device: u64, inode: u64) -> Result<(), &'static str> {
+pub fn validate_scope(
+    root: &str,
+    path: &str,
+    device: u64,
+    inode: u64,
+    boundary: &crate::StateBoundary,
+) -> Result<(), &'static str> {
     if !Path::new(path).starts_with(root) || Path::new(path).components().count() > 64 {
         return Err("context_outside_project");
     }
-    let identity = ProjectIdentity::open(root).map_err(|_| "project_identity_unavailable")?;
+    let identity =
+        ProjectIdentity::open(root, boundary).map_err(|_| "project_identity_unavailable")?;
     if identity.device != device || identity.inode != inode {
         return Err("project_identity_changed");
     }
-    ProjectIdentity::open(path).map_err(|_| "context_identity_unavailable")?;
+    ProjectIdentity::open(path, boundary).map_err(|_| "context_identity_unavailable")?;
     Ok(())
 }
 
@@ -133,6 +140,7 @@ pub fn collect_git(
     path: &str,
     device: u64,
     inode: u64,
+    boundary: &crate::StateBoundary,
     git: &Path,
     cancelled: &AtomicBool,
 ) -> GitSnapshot {
@@ -141,10 +149,11 @@ pub fn collect_git(
         path: &str,
         device: u64,
         inode: u64,
+        boundary: &crate::StateBoundary,
         git: &Path,
         cancelled: &AtomicBool,
     ) -> Result<GitSnapshot, &'static str> {
-        validate_scope(root, path, device, inode)?;
+        validate_scope(root, path, device, inode, boundary)?;
         let Some(repository) = repository(root, path)? else {
             let mut snapshot = GitSnapshot::unknown("unused");
             snapshot.state = GitState::NonRepository;
@@ -244,10 +253,11 @@ pub fn collect_git(
             snapshot.added = Some(added);
             snapshot.deleted = Some(deleted);
         }
-        validate_scope(root, path, device, inode)?;
+        validate_scope(root, path, device, inode, boundary)?;
         Ok(snapshot)
     }
-    collect(root, path, device, inode, git, cancelled).unwrap_or_else(GitSnapshot::unknown)
+    collect(root, path, device, inode, boundary, git, cancelled)
+        .unwrap_or_else(GitSnapshot::unknown)
 }
 
 /// Child handles stay on the retained worker through kill and reap; never detached.
@@ -756,6 +766,7 @@ mod process_tests {
                 cwd.to_str().unwrap(),
                 metadata.dev(),
                 metadata.ino(),
+                &crate::StateBoundary::detached_for_test(),
                 &self.git,
                 &self.token,
             )
@@ -899,6 +910,7 @@ mod process_tests {
                 f.root.to_str().unwrap(),
                 metadata.dev(),
                 metadata.ino().wrapping_add(1),
+                &crate::StateBoundary::detached_for_test(),
                 &f.git,
                 &f.token
             )

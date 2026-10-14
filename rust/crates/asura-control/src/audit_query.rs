@@ -77,6 +77,7 @@ pub(crate) fn reply(v: &pb::AuditReply) -> bool {
                 s,
                 "audit_unavailable"
                     | "project_stale"
+                    | "project_overlaps_asura_state"
                     | "invalid_request"
                     | "capacity_exhausted"
                     | "storage_timeout"

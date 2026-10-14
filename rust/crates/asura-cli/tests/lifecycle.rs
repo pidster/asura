@@ -421,6 +421,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--setup"),
         Some("--queue-history"),
         Some("--queue-reorder"),
+        Some("--state-isolation"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);
@@ -495,6 +496,78 @@ fn suite() -> Result<()> {
 }
 // Fixture-only canonical journal seeding. This branch exists only in the copied
 // integration executable; production CLI has no runtime or journal override.
+/// SI-E2: a registration of the Asura home's parent, as a journal written
+/// before the overlap check would hold it, beside an ordinary project.
+fn overlapping_project_fixture() -> Result<()> {
+    use asura_storage::authority::{conversation as j, writer as w};
+    use std::os::unix::fs::MetadataExt;
+    fn execute(writer: &w::WriterHandle, command: w::Command) -> Result<w::Reply> {
+        let mut ticket = writer
+            .try_submit(command)
+            .map_err(|e| format!("fixture submit:{e:?}"))?;
+        let end = Instant::now() + Duration::from_secs(12);
+        loop {
+            if let Some(result) = ticket.poll() {
+                return result.map_err(|e| format!("fixture writer:{e:?}").into());
+            }
+            require(Instant::now() < end, "fixture writer deadline")?;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let root = std::env::current_exe()?
+        .parent()
+        .ok_or("fixture parent")?
+        .to_owned();
+    let mut writer =
+        w::WriterHandle::start(resolver(true)?).map_err(|e| format!("fixture start:{e:?}"))?;
+    let result = (|| {
+        let state = execute(&writer, w::Command::Initialize { request: [1; 16] })?
+            .replay
+            .ok_or("missing replay")?;
+        let home = root.join("home");
+        let location: String = home.to_str().ok_or("home UTF8")?.into();
+        let metadata = fs::metadata(&home)?;
+        let record = j::Record::ProjectRegistered(j::ProjectRegistered {
+            request: [71; 16],
+            digest: j::request_digest(j::Request::Register {
+                location: &location,
+            })
+            .map_err(|e| format!("digest:{e:?}"))?,
+            project: [70; 16],
+            location,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            registry_revision: 1,
+            visibility: 1,
+        });
+        execute(
+            &writer,
+            w::Command::Append {
+                expected_revision: state.revision,
+                record,
+                admission: None,
+            },
+        )?;
+        let project = root.join("project");
+        fs::DirBuilder::new().mode(0o700).create(&project)?;
+        execute(
+            &writer,
+            w::Command::Register {
+                request: [72; 16],
+                location: project.to_str().ok_or("project UTF8")?.into(),
+            },
+        )?;
+        Ok(())
+    })();
+    writer.close();
+    let end = Instant::now() + Duration::from_secs(10);
+    while !writer.settled() {
+        require(Instant::now() < end, "fixture writer close")?;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    result
+}
+
 fn queue_history_fixture(verify: bool) -> Result<()> {
     use asura_storage::authority::{conversation as j, writer as w};
     fn execute(writer: &w::WriterHandle, command: w::Command) -> Result<w::Reply> {
@@ -952,6 +1025,13 @@ fn main() {
         let verify = std::env::args().nth(1).as_deref() == Some("--verify-queue-reorder");
         if let Err(error) = queue_reorder_fixture(verify) {
             eprintln!("queue reorder fixture: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--seed-overlapping-project") {
+        if let Err(error) = overlapping_project_fixture() {
+            eprintln!("overlapping project fixture: {error}");
             std::process::exit(1);
         }
         return;
