@@ -32,6 +32,15 @@ impl SecretVariable {
     pub fn name(&self) -> String {
         format!("ASURA_SECRET_{}", self.number)
     }
+    /// Any number and value, to exercise `ShellRequest` validation.
+    #[cfg(test)]
+    pub(crate) fn for_test(number: u8, value: &[u8]) -> Self {
+        Self {
+            number,
+            kind: SecretKind::AssignedSecret,
+            value: Zeroizing::new(value.to_vec()),
+        }
+    }
 }
 impl std::fmt::Debug for SecretVariable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

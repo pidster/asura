@@ -3,6 +3,7 @@ use crate::startup::{SpawnActions, SpawnAttributes};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use zeroize::Zeroizing;
 unsafe extern "C" {
     fn posix_spawn_file_actions_addfchdir(
         actions: *mut libc::posix_spawn_file_actions_t,
@@ -68,11 +69,25 @@ pub(super) fn path(fd: RawFd) -> Result<String, ShellError> {
     }
     Ok(path.into())
 }
+/// One NUL-terminated environment entry in memory that is zeroed on drop.
+/// `CString` clears only its first byte when dropped, so it cannot hold a
+/// secret variable.
+fn env_entry(entry: &[u8]) -> Result<Zeroizing<Vec<u8>>, ShellError> {
+    if entry.contains(&0) {
+        return Err(ShellError::Invalid);
+    }
+    let mut owned = Zeroizing::new(Vec::with_capacity(entry.len() + 1));
+    owned.extend_from_slice(entry);
+    owned.push(0);
+    Ok(owned)
+}
 /// All allocations, actions, attributes and duplicates are prepared before spawn.
+/// Environment entries may hold secret variables: their copies here are zeroed
+/// when this function returns, whether or not the spawn succeeded.
 pub(super) fn launch(
     executable: &Path,
     args: &[String],
-    env: &[String],
+    env: &[&[u8]],
     mappings: &[(RawFd, RawFd)],
     cwd: Option<RawFd>,
     group: bool,
@@ -83,13 +98,18 @@ pub(super) fn launch(
         .iter()
         .map(|s| CString::new(s.as_bytes()).map_err(|_| ShellError::Invalid))
         .collect::<Result<_, _>>()?;
-    let env: Vec<CString> = env
+    let env: Vec<Zeroizing<Vec<u8>>> = env
         .iter()
-        .map(|s| CString::new(s.as_bytes()).map_err(|_| ShellError::Invalid))
+        .map(|entry| env_entry(entry))
         .collect::<Result<_, _>>()?;
     let mut argv: Vec<*mut libc::c_char> = args.iter().map(|s| s.as_ptr().cast_mut()).collect();
     argv.push(std::ptr::null_mut());
-    let mut envp: Vec<*mut libc::c_char> = env.iter().map(|s| s.as_ptr().cast_mut()).collect();
+    // Each entry is NUL-terminated by env_entry and is neither moved nor
+    // resized before `env` drops at return, so these pointers stay valid.
+    let mut envp: Vec<*mut libc::c_char> = env
+        .iter()
+        .map(|s| s.as_ptr().cast::<libc::c_char>().cast_mut())
+        .collect();
     envp.push(std::ptr::null_mut());
     let mut duplicates = Vec::new();
     for (source, target) in mappings {

@@ -131,6 +131,8 @@ impl Worker {
             command: command.into(),
             cwd: Some(cwd.into()),
             deadline,
+            // The model shell's rewrite and secret variables arrive with SL3.
+            secrets: Vec::new(),
         };
         let setup_deadline = deadline.min(now + Duration::from_secs(2));
         self.begin(intent, deadline, setup_deadline, move |cancel| {

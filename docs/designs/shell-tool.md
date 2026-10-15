@@ -36,7 +36,7 @@ a shell guardian. Do not copy a complete model owner or add a generic orchestrat
 
 | Argument | Contract |
 | --- | --- |
-| `command` | Required string, 1–8192 UTF-8 bytes, no NUL; exact bytes passed as the single argument after `-c` |
+| `command` | Required string, 1–8192 UTF-8 bytes, no NUL; exact bytes passed as the single argument after `-c`. When the [secret detection](secret-detection.md#environment-path) rewrite created secret variables, the argument is the guardian's fixed preamble followed by the rewritten command (owner, 2026-10-15). |
 | `cwd` | Optional project-relative directory, at most 1024 UTF-8 bytes; absent or `.` means project root; reject absolute paths, NUL and parent traversal |
 | `timeout_seconds` | Optional integer 1–60, default 30; fresh per-command deadline independent of elapsed turn time |
 

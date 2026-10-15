@@ -6,6 +6,8 @@ mod protocol;
 mod spawn;
 pub mod split;
 use crate::runtime::{open_at, stat_fd};
+use crate::secrets::SecretVariable;
+use crate::secrets::rewrite::MAX_SECRET_VARIABLES;
 use crate::{PollInterest, ProjectIdentity, RuntimeDirectory, StateBoundary};
 use capture::Capture;
 pub use cleanup::ShellCleanup;
@@ -16,6 +18,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShellError {
@@ -80,11 +83,19 @@ impl From<ShellError> for ShellFailure {
         }
     }
 }
+/// Commands and secret variables share the 8192-byte limit (secret detection,
+/// environment path).
+pub const MAX_COMMAND_BYTES: usize = 8192;
+/// One shell execution. `secrets` are the command's secret variables from the
+/// rewrite: numbers 1–16, each distinct, values without NUL and at most
+/// [`MAX_COMMAND_BYTES`] in total. They reach the guardian only through its
+/// environment. No `Debug` is derived, and `SecretVariable`'s omits values.
 pub struct ShellRequest {
     pub job_id: [u8; 16],
     pub command: String,
     pub cwd: Option<String>,
     pub deadline: Instant,
+    pub secrets: Vec<SecretVariable>,
 }
 pub struct PreparedShell {
     request: ShellRequest,
@@ -96,6 +107,8 @@ pub struct PreparedShell {
     asura: OwnedFd,
     #[cfg(feature = "test-support")]
     omit_state_for_test: bool,
+    #[cfg(feature = "test-support")]
+    secret_environment_for_test: Option<Vec<Vec<u8>>>,
     cleanup: Option<ShellCleanup>,
     setup_deadline: Instant,
 }
@@ -112,7 +125,7 @@ fn validate(request: &ShellRequest) -> Result<(), ShellError> {
     let cwd = request.cwd.as_deref().unwrap_or(".");
     if request.job_id == [0; 16]
         || request.command.is_empty()
-        || request.command.len() > 8192
+        || request.command.len() > MAX_COMMAND_BYTES
         || request.command.contains('\0')
         || cwd.is_empty()
         || cwd.len() > 1024
@@ -122,7 +135,42 @@ fn validate(request: &ShellRequest) -> Result<(), ShellError> {
     {
         return Err(ShellError::Invalid);
     }
+    validate_secrets(&request.secrets)
+}
+/// The service-side check; the guardian repeats it on its environment.
+fn validate_secrets(secrets: &[SecretVariable]) -> Result<(), ShellError> {
+    let mut seen = [false; MAX_SECRET_VARIABLES + 1];
+    let mut total = 0usize;
+    for secret in secrets {
+        let number = usize::from(secret.number());
+        if !(1..=MAX_SECRET_VARIABLES).contains(&number)
+            || std::mem::replace(&mut seen[number], true)
+            || secret.value().contains(&0)
+        {
+            return Err(ShellError::Invalid);
+        }
+        total += secret.value().len();
+        if total > MAX_COMMAND_BYTES {
+            return Err(ShellError::Invalid);
+        }
+    }
     Ok(())
+}
+/// `ASURA_SECRET_<n>=<value>` entries for the guardian's environment, in
+/// zeroizing memory.
+fn secret_environment(secrets: &[SecretVariable]) -> Vec<Zeroizing<Vec<u8>>> {
+    secrets
+        .iter()
+        .map(|secret| {
+            let name = secret.name();
+            let mut entry =
+                Zeroizing::new(Vec::with_capacity(name.len() + 1 + secret.value().len()));
+            entry.extend_from_slice(name.as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(secret.value());
+            entry
+        })
+        .collect()
 }
 impl PreparedShell {
     /// Blocking descriptor validation and scratch creation; retained setup worker only.
@@ -173,6 +221,8 @@ impl PreparedShell {
             asura,
             #[cfg(feature = "test-support")]
             omit_state_for_test: false,
+            #[cfg(feature = "test-support")]
+            secret_environment_for_test: None,
             cleanup: Some(cleanup),
             setup_deadline,
         };
@@ -192,13 +242,23 @@ impl PreparedShell {
             None => self.omit_state_for_test = true,
         }
     }
+    /// Replace the guardian's environment with raw entries that bypass the
+    /// service-side check, to qualify the guardian's own validation (SDU-13).
+    #[cfg(feature = "test-support")]
+    pub fn replace_secret_environment_for_test(&mut self, entries: Vec<Vec<u8>>) {
+        self.secret_environment_for_test = Some(entries);
+    }
     /// After a successful spawn ownership always transfers to ShellJob.
+    /// The request's secret values are dropped (and zeroed) whether or not
+    /// the spawn succeeds.
     pub fn spawn(
         mut self,
         executable: &Path,
         cancel: &AtomicBool,
     ) -> Result<ShellJob, ShellFailure> {
-        match self.spawn_inner(executable, cancel) {
+        let spawned = self.spawn_inner(executable, cancel);
+        self.request.secrets.clear();
+        match spawned {
             Ok(job) => Ok(job),
             Err(reason) => Err(ShellFailure {
                 reason,
@@ -276,8 +336,20 @@ impl PreparedShell {
         ];
         #[cfg(feature = "test-support")]
         let mappings = &mappings[..mappings.len() - usize::from(self.omit_state_for_test)];
+        let environment = secret_environment(&self.request.secrets);
+        #[cfg(feature = "test-support")]
+        let environment = match &self.secret_environment_for_test {
+            Some(raw) => raw
+                .iter()
+                .map(|entry| Zeroizing::new(entry.clone()))
+                .collect(),
+            None => environment,
+        };
+        let env: Vec<&[u8]> = environment.iter().map(|entry| entry.as_slice()).collect();
         check(self.setup_deadline, cancel)?;
-        let pid = spawn::launch(executable, &args, &[], mappings, None, false)?;
+        let pid = spawn::launch(executable, &args, &env, mappings, None, false)?;
+        drop(env);
+        drop(environment);
         // Everything after this point is infallible and transfers the live child.
         Ok(ShellJob {
             pid,

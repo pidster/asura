@@ -1,4 +1,5 @@
 //! Native process qualification; private guardian dispatch is identical to the CLI.
+use asura_platform::secrets::{SecretVariable, rewrite_command};
 use asura_platform::shell::{
     PreparedShell, ShellError, ShellRequest, ShellResult, StopReason, run_guardian,
 };
@@ -20,6 +21,12 @@ fn main() {
         && flag == "--lease-holder"
     {
         lease_holder(Path::new(home));
+    }
+    if let [_, flag, pid] = args.as_slice()
+        && flag == "--procargs"
+    {
+        procargs_probe(pid.parse().unwrap());
+        return;
     }
     if args.get(1).is_some_and(|s| s == "--escape") {
         escape_child();
@@ -55,6 +62,14 @@ impl Drop for Fixture {
     }
 }
 fn prepare(home: &Path, command: &str, timeout: Duration) -> JobGuard {
+    prepare_with(home, command, Vec::new(), timeout)
+}
+fn prepare_with(
+    home: &Path,
+    command: &str,
+    secrets: Vec<SecretVariable>,
+    timeout: Duration,
+) -> JobGuard {
     let runtime = RuntimeDirectory::scratch(home, true).unwrap();
     let project = ProjectIdentity::open(
         home.join("project").to_str().unwrap(),
@@ -70,6 +85,7 @@ fn prepare(home: &Path, command: &str, timeout: Duration) -> JobGuard {
             command: command.into(),
             cwd: None,
             deadline: Instant::now() + timeout,
+            secrets,
         },
         &cancel,
     )
@@ -80,7 +96,9 @@ fn prepare(home: &Path, command: &str, timeout: Duration) -> JobGuard {
     )
 }
 fn run(home: &Path, command: &str, timeout: Duration, cancel: bool) -> ShellResult {
-    let mut job = prepare(home, command, timeout);
+    settle(prepare(home, command, timeout), timeout, cancel)
+}
+fn settle(mut job: JobGuard, timeout: Duration, cancel: bool) -> ShellResult {
     let started = Instant::now();
     let end = started + timeout + Duration::from_secs(4);
     let mut cancelled = false;
@@ -133,6 +151,8 @@ fn qualification() {
     assert!(!outside.exists());
     state_isolation(&f.0);
     guardian_refusals(&f.0);
+    secret_environment_refusals(&f.0);
+    secret_variables(&f.0);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -302,6 +322,7 @@ fn guardian_refusals(home: &Path) {
                 command: "printf ran > refused-marker".into(),
                 cwd: None,
                 deadline: Instant::now() + Duration::from_secs(5),
+                secrets: Vec::new(),
             },
             &cancel,
         )
@@ -495,4 +516,371 @@ fn escape_child() {
     }
     fs::write("escaped-pid", std::process::id().to_string()).unwrap();
     std::thread::sleep(Duration::from_millis(800));
+}
+
+/// SDU-13 through the real guardian: an environment that bypasses the service
+/// check is refused with the setup failure notice, and no command runs.
+fn secret_environment_refusals(home: &Path) {
+    let mut big = b"ASURA_SECRET_1=".to_vec();
+    big.extend_from_slice(&[b'v'; 8193]);
+    let mut half = b"ASURA_SECRET_2=".to_vec();
+    half.extend_from_slice(&[b'v'; 4097]);
+    let mut other_half = b"ASURA_SECRET_3=".to_vec();
+    other_half.extend_from_slice(&[b'v'; 4096]);
+    // A NUL cannot cross execve: spawn refuses it before any process starts.
+    for (label, entries) in [
+        ("other name", vec![b"OTHER=value".to_vec()]),
+        ("number 0", vec![b"ASURA_SECRET_0=value".to_vec()]),
+        ("number 17", vec![b"ASURA_SECRET_17=value".to_vec()]),
+        (
+            "duplicate",
+            vec![
+                b"ASURA_SECRET_1=value".to_vec(),
+                b"ASURA_SECRET_1=value".to_vec(),
+            ],
+        ),
+        ("over 8192 bytes", vec![big.clone()]),
+        ("over 8192 in total", vec![half.clone(), other_half.clone()]),
+        ("NUL", vec![b"ASURA_SECRET_1=va\0lue".to_vec()]),
+    ] {
+        let runtime = RuntimeDirectory::scratch(home, true).unwrap();
+        let project = ProjectIdentity::open(
+            home.join("project").to_str().unwrap(),
+            &runtime.state_boundary(),
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut prepared = PreparedShell::prepare(
+            runtime,
+            &project,
+            ShellRequest {
+                job_id: asura_platform::random_id(),
+                command: "printf ran > secret-refused-marker".into(),
+                cwd: None,
+                deadline: Instant::now() + Duration::from_secs(5),
+                secrets: Vec::new(),
+            },
+            &cancel,
+        )
+        .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
+        prepared.replace_secret_environment_for_test(entries);
+        let job = match prepared.spawn(&std::env::current_exe().unwrap(), &cancel) {
+            Ok(job) => JobGuard(job),
+            Err(mut failure) => {
+                assert_eq!(label, "NUL");
+                assert_eq!(failure.reason, ShellError::Invalid, "{label}");
+                failure
+                    .cleanup
+                    .as_mut()
+                    .unwrap()
+                    .run(
+                        Instant::now() + Duration::from_secs(2),
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                continue;
+            }
+        };
+        let mut job = job;
+        let end = Instant::now() + Duration::from_secs(5);
+        while !job.settled() {
+            assert!(Instant::now() < end, "{label}: refusal failed to settle");
+            asura_platform::poll(&job.interests(), Duration::from_millis(20)).unwrap();
+            job.poll(Instant::now()).unwrap();
+        }
+        let result = job.result().unwrap();
+        assert_eq!(result.failure, Some(ShellError::Unavailable), "{label}");
+        assert_eq!(result.exit_code, None, "{label}");
+        assert!(
+            !home.join("project/secret-refused-marker").exists(),
+            "{label}"
+        );
+        job.take_cleanup()
+            .unwrap()
+            .run(
+                Instant::now() + Duration::from_secs(2),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+    }
+}
+
+/// A fixture secret assembled at run time, so no token is committed.
+fn fixture_token() -> String {
+    ["ghp_", &"aB3".repeat(12)].concat()
+}
+fn rewritten(command: &str) -> (String, Vec<SecretVariable>) {
+    let rewrite = rewrite_command(command).unwrap_or_else(|r| panic!("{r}"));
+    assert!(!rewrite.command.contains(&fixture_token()));
+    assert_eq!(rewrite.variables.len(), 1);
+    (rewrite.command, rewrite.variables)
+}
+fn holds(bytes: &[u8], needle: &str) -> bool {
+    bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+}
+/// SDI-06, SDI-07, SDI-09 and the argument-vector check.
+fn secret_variables(home: &Path) {
+    let token = fixture_token();
+    // SDI-06: the rewritten command writes the real value to a project file.
+    let (command, secrets) = rewritten(&format!("printf '%s' \"{token}\" > out.txt"));
+    assert_eq!(command, "printf '%s' \"${ASURA_SECRET_1}\" > out.txt");
+    let result = settle(
+        prepare_with(home, &command, secrets, Duration::from_secs(5)),
+        Duration::from_secs(5),
+        false,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(
+        fs::read(home.join("project/out.txt")).unwrap(),
+        token.as_bytes()
+    );
+    assert!(!result.render_text().contains(&token));
+    fs::remove_file(home.join("project/out.txt")).unwrap();
+    println!("SDI-06: out.txt held the value; captured output held no value");
+
+    // SDI-07: no child sees the variable; record what `set` prints.
+    let (command, secrets) = rewritten(&format!("printf '%s' \"{token}\" >/dev/null"));
+    let command = format!(
+        "{command}; echo ---printenv; /usr/bin/printenv; echo ---env; /usr/bin/env; \
+         echo ---child; /bin/sh -c 'printf \"%s\\n\" \"${{ASURA_SECRET_1-unset}}\"'; \
+         echo ---set; set"
+    );
+    let result = settle(
+        prepare_with(home, &command, secrets, Duration::from_secs(5)),
+        Duration::from_secs(5),
+        false,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert!(!result.truncated, "{result:?}");
+    let section = |name: &str| {
+        let start = result.stdout.find(&format!("---{name}\n")).unwrap() + name.len() + 4;
+        let rest = &result.stdout[start..];
+        rest[..rest.find("---").unwrap_or(rest.len())].to_owned()
+    };
+    for name in ["printenv", "env"] {
+        let text = section(name);
+        assert!(text.contains("PATH="), "{name}: {text}");
+        assert!(!text.contains("ASURA_SECRET"), "{name}: {text}");
+        assert!(!text.contains(&token), "{name}");
+    }
+    assert_eq!(section("child"), "unset\n");
+    let set = section("set");
+    assert!(
+        !set.lines().any(|line| line.starts_with("__asura_t=")),
+        "the preamble's temporary is unset"
+    );
+    let line = set
+        .lines()
+        .find(|line| line.starts_with("ASURA_SECRET_1="))
+        .expect("set lists the shell variable");
+    let shows_value = line.contains(&token);
+    println!(
+        "SDI-07: printenv and env hold no secret variable; a child sees it unset; \
+         set prints {} (value shown: {shows_value})",
+        line.replace(&token, "<value>")
+    );
+
+    // SDI-09 and the argument vectors: job A holds a secret while job B probes it.
+    let (command, secrets) = rewritten(&format!(
+        "printf '%s' \"{token}\" >/dev/null; printf '%s' $$ > held-pid; \
+         while [ ! -e release ]; do sleep 0.05; done"
+    ));
+    let held = prepare_with(home, &command, secrets, Duration::from_secs(20));
+    let mut held = held;
+    let guardian = held.guardian_pid_for_test();
+    let pidfile = home.join("project/held-pid");
+    let until = Instant::now() + Duration::from_secs(5);
+    let sh = loop {
+        if let Ok(text) = fs::read_to_string(&pidfile)
+            && let Ok(pid) = text.parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < until, "held job did not start");
+        asura_platform::poll(&held.interests(), Duration::from_millis(20)).unwrap();
+        held.poll(Instant::now()).unwrap();
+    };
+    for pid in [guardian, sh] {
+        let ps = std::process::Command::new("/bin/ps")
+            .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(ps.status.success());
+        assert!(!holds(&ps.stdout, &token), "ps args of {pid}");
+        let (argv, _) = procargs(pid).expect("same-user procargs read");
+        assert!(argv.iter().all(|arg| !holds(arg, &token)), "argv of {pid}");
+    }
+    let sh_argv = procargs(sh).unwrap().0;
+    assert!(
+        sh_argv
+            .iter()
+            .any(|arg| arg.starts_with(b"__asura_t=$ASURA_SECRET_1; unset ASURA_SECRET_1;")),
+        "sh received the preamble"
+    );
+    // The same user, outside any sandbox (the recorded residual risk).
+    let (_, env) = procargs(sh).unwrap();
+    let outside = env.iter().any(|entry| holds(entry, &token));
+    let (_, guardian_env) = procargs(guardian).unwrap();
+    let outside_guardian = guardian_env.iter().any(|entry| holds(entry, &token));
+    let ps_e = |pid: i32| {
+        let ps = std::process::Command::new("/bin/ps")
+            .args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(ps.status.success(), "ps -E of {pid}");
+        (
+            holds(&ps.stdout, &token),
+            String::from_utf8_lossy(&ps.stdout).replace(&token, "<value>"),
+        )
+    };
+    let (sh_ps, sh_ps_text) = ps_e(sh);
+    let (guardian_ps, guardian_ps_text) = ps_e(guardian);
+    println!(
+        "SDI-09 same user, unsandboxed: sh procargs envc={} value={outside}, ps -E value={sh_ps}; \
+         guardian procargs envc={} value={outside_guardian}, ps -E value={guardian_ps}",
+        env.len(),
+        guardian_env.len(),
+    );
+    println!("SDI-09 same-user ps -E of sh: {}", sh_ps_text.trim_end());
+    println!(
+        "SDI-09 same-user ps -E of guardian: {}",
+        guardian_ps_text.trim_end()
+    );
+    // Owner decision (a): the guardian erases its environment after copying.
+    assert!(!outside && !sh_ps, "same-user read of sh found the value");
+    assert!(
+        !outside_guardian && !guardian_ps,
+        "same-user read of the guardian found the value"
+    );
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        home.join("project/procargs-helper"),
+    )
+    .unwrap();
+    let probe = run(
+        home,
+        &format!(
+            "/bin/ps -E -ww -o command= -p {sh}; echo \"ps-exit=$?\"; \
+             echo ---sh; ./procargs-helper --procargs {sh}; echo \"helper-exit=$?\"; \
+             echo ---guardian; ./procargs-helper --procargs {guardian}; echo \"helper-exit=$?\""
+        ),
+        Duration::from_secs(5),
+        false,
+    );
+    fs::write(home.join("project/release"), b"").unwrap();
+    let held = settle(held, Duration::from_secs(20), false);
+    assert_eq!(held.exit_code, Some(0), "{held:?}");
+    let ps_reads = probe
+        .stdout
+        .lines()
+        .take_while(|line| !line.starts_with("ps-exit="))
+        .any(|line| line.contains(&token));
+    let helper_reads = |target: &str| {
+        probe
+            .stdout
+            .split("---")
+            .find(|part| part.starts_with(target))
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("env:") && line.contains(&token))
+    };
+    println!(
+        "SDI-09: sandboxed job B: ps -E of sh read value: {ps_reads}; KERN_PROCARGS2 read \
+         value: sh {}, guardian {}",
+        helper_reads("sh\n"),
+        helper_reads("guardian\n")
+    );
+    println!(
+        "SDI-09 job B output:\n{}\nstderr:\n{}",
+        probe.stdout.replace(&token, "<value>"),
+        probe.stderr.replace(&token, "<value>")
+    );
+    assert!(!ps_reads && !helper_reads("sh\n") && !helper_reads("guardian\n"));
+    assert!(!probe.render_text().contains(&token), "job B saw the value");
+    for name in ["procargs-helper", "release", "held-pid"] {
+        fs::remove_file(home.join("project").join(name)).unwrap();
+    }
+    raw_byte_sweep(home, &token);
+}
+/// Every file under the test home, except the expected value, is free of it.
+fn raw_byte_sweep(root: &Path, token: &str) {
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() {
+            raw_byte_sweep(&path, token);
+        } else if meta.is_file() {
+            assert!(
+                !holds(&fs::read(&path).unwrap_or_default(), token),
+                "raw value in {}",
+                path.display()
+            );
+        }
+    }
+}
+/// Argument vector and environment strings of one process.
+type ProcArgs = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+/// Argument vector and environment of `pid` from KERN_PROCARGS2, or errno.
+fn procargs(pid: i32) -> Result<ProcArgs, i32> {
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&argmax);
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: fixed MIB and a complete output location of the stated size.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&mut argmax as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    }
+    let mut buffer = vec![0u8; argmax as usize];
+    let mut size = buffer.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: the buffer holds `size` writable bytes; sysctl writes at most that.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    }
+    buffer.truncate(size);
+    let argc = i32::from_ne_bytes(buffer[..4].try_into().unwrap()) as usize;
+    let mut rest = &buffer[4..];
+    // Executable path, then NUL padding.
+    let skip = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+    rest = &rest[skip..];
+    let skip = rest.iter().position(|b| *b != 0).unwrap_or(rest.len());
+    rest = &rest[skip..];
+    let mut strings = rest.split(|b| *b == 0);
+    let argv: Vec<Vec<u8>> = strings.by_ref().take(argc).map(<[u8]>::to_vec).collect();
+    let env = strings
+        .take_while(|s| !s.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    Ok((argv, env))
+}
+/// Runs inside a sandboxed job: prints what KERN_PROCARGS2 yields for `pid`.
+fn procargs_probe(pid: i32) {
+    match procargs(pid) {
+        Ok((argv, env)) => {
+            println!("procargs: readable, argc={} envc={}", argv.len(), env.len());
+            for entry in env.iter().filter(|e| e.starts_with(b"ASURA_SECRET_")) {
+                println!("env:{}", String::from_utf8_lossy(entry));
+            }
+        }
+        Err(errno) => println!("procargs: errno={errno}"),
+    }
 }

@@ -1,7 +1,143 @@
-use super::{ShellError, protocol::Notice, spawn};
+use super::{MAX_COMMAND_BYTES, ShellError, protocol::Notice, spawn};
 use crate::runtime::{open_at, stat_fd};
+use crate::secrets::rewrite::MAX_SECRET_VARIABLES;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use zeroize::Zeroizing;
+
+const SECRET_PREFIX: &[u8] = b"ASURA_SECRET_";
+/// CoreFoundation's load-time initializer sets this variable in every process
+/// that links it, before `main`, when the spawner did not. The guardian skips
+/// it and never passes it on; every other name is refused.
+const CF_TEXT_ENCODING: &[u8] = b"__CF_USER_TEXT_ENCODING=";
+/// Bound on the preamble. The longest, for all 16 numbers, is 1,254 bytes, so
+/// the `sh -c` script is at most the 8192-byte command plus this.
+const PREAMBLE_LIMIT: usize = 1280;
+
+/// One validated secret variable from the guardian's own environment: its
+/// number and the whole `ASURA_SECRET_<n>=<value>` entry, zeroed on drop.
+struct SecretEntry {
+    number: u8,
+    entry: Zeroizing<Vec<u8>>,
+}
+
+/// Validate the guardian's environment (SDU-13). Every entry must be
+/// `ASURA_SECRET_<n>=<value>` with a canonical decimal n of 1–16, no number
+/// twice, no NUL, and at most 8192 value bytes in total. Any other entry
+/// refuses the whole set. Returns the entries ordered by number.
+fn secret_environment<'a>(
+    entries: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<Vec<SecretEntry>, ShellError> {
+    let mut accepted: Vec<SecretEntry> = Vec::new();
+    let mut total = 0usize;
+    for entry in entries {
+        if entry.starts_with(CF_TEXT_ENCODING) {
+            continue;
+        }
+        if accepted.len() == MAX_SECRET_VARIABLES || entry.contains(&0) {
+            return Err(ShellError::Invalid);
+        }
+        let split = entry
+            .iter()
+            .position(|b| *b == b'=')
+            .ok_or(ShellError::Invalid)?;
+        let (name, value) = (&entry[..split], &entry[split + 1..]);
+        let digits = name
+            .strip_prefix(SECRET_PREFIX)
+            .ok_or(ShellError::Invalid)?;
+        if digits.is_empty()
+            || digits.len() > 2
+            || digits[0] == b'0'
+            || !digits.iter().all(u8::is_ascii_digit)
+        {
+            return Err(ShellError::Invalid);
+        }
+        let number = digits.iter().fold(0u8, |n, d| n * 10 + (d - b'0'));
+        if usize::from(number) > MAX_SECRET_VARIABLES
+            || accepted.iter().any(|seen| seen.number == number)
+        {
+            return Err(ShellError::Invalid);
+        }
+        total += value.len();
+        if total > MAX_COMMAND_BYTES {
+            return Err(ShellError::Invalid);
+        }
+        accepted.push(SecretEntry {
+            number,
+            entry: Zeroizing::new(entry.to_vec()),
+        });
+    }
+    accepted.sort_by_key(|secret| secret.number);
+    Ok(accepted)
+}
+
+/// Validate this process's own environment, then erase it (owner decision
+/// SDI-09, 2026-10-15).
+///
+/// The strings that `environ` points to at `main` are the ones the kernel
+/// placed on the initial stack, and `KERN_PROCARGS2` (`ps -E`) reads that
+/// memory. After the accepted values are copied into `Zeroizing` buffers, every
+/// walked entry other than the CoreFoundation one is overwritten with zero
+/// bytes, name and value alike, whether the set was accepted or refused. Each
+/// string becomes empty, so the kernel view ends its environment list there.
+/// Entries past the walk bound are not erased; such a set is always refused
+/// and the guardian then exits after its notice.
+fn own_secret_environment() -> Result<Vec<SecretEntry>, ShellError> {
+    use zeroize::Zeroize;
+    let mut walked: Vec<(*mut u8, usize)> = Vec::new();
+    // SAFETY: _NSGetEnviron returns this process's `environ`, a NULL-terminated
+    // array of NUL-terminated strings. The guardian never changes its
+    // environment and runs one thread, so the array and strings stay valid and
+    // unchanged while read here. The walk stops two entries past the limit:
+    // one skipped CoreFoundation entry and one that refuses the set.
+    unsafe {
+        let environ = *libc::_NSGetEnviron();
+        if !environ.is_null() {
+            let mut cursor = environ;
+            while !(*cursor).is_null() && walked.len() <= MAX_SECRET_VARIABLES + 1 {
+                let length = std::ffi::CStr::from_ptr(*cursor).to_bytes().len();
+                walked.push(((*cursor).cast::<u8>(), length));
+                cursor = cursor.add(1);
+            }
+        }
+    }
+    // SAFETY: each pointer and length came from the walk above; no shared
+    // slice outlives this call, because the result holds owned copies.
+    let result = secret_environment(
+        walked
+            .iter()
+            .map(|(pointer, length)| unsafe { std::slice::from_raw_parts(*pointer, *length) }),
+    );
+    for (pointer, length) in walked {
+        // SAFETY: the string is writable process memory of `length` bytes
+        // before its NUL, and no reference to it remains. Writing zeros inside
+        // that range keeps a valid (empty) C string; nothing reads the
+        // environment afterwards, since `sh` gets an explicit array.
+        let entry = unsafe { std::slice::from_raw_parts_mut(pointer, length) };
+        if !entry.starts_with(CF_TEXT_ENCODING) {
+            entry.zeroize();
+        }
+    }
+    result
+}
+
+/// The fixed preamble. Each variable that `sh` imported from its environment
+/// is exported; `unset` and reassignment leave an ordinary shell variable with
+/// the same value, which the command expands but children do not inherit.
+/// Assignment does no field splitting or globbing, so the value is exact. The
+/// text holds names only.
+fn preamble(numbers: impl IntoIterator<Item = u8>) -> String {
+    let mut text = String::new();
+    for n in numbers {
+        text.push_str(&format!(
+            "__asura_t=$ASURA_SECRET_{n}; unset ASURA_SECRET_{n}; ASURA_SECRET_{n}=$__asura_t; "
+        ));
+    }
+    if !text.is_empty() {
+        text.push_str("unset __asura_t; ");
+    }
+    text
+}
 
 // Child ownership loss is irreversible. A later PID observation cannot restore
 // authority to signal that process group. Fault injection tests exercise this
@@ -173,7 +309,7 @@ fn notice(fd: i32, n: Notice, id: [u8; 16]) -> Result<(), ShellError> {
 fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellError> {
     let id = parse_id(jobhex)?;
     if command.is_empty()
-        || command.len() > 8192
+        || command.len() > MAX_COMMAND_BYTES
         || command.contains('\0')
         || deadline_ns.len() > 20
     {
@@ -193,6 +329,7 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
     let setup = (|| {
+        let secrets = own_secret_environment()?;
         let project = pinned_path(7)?;
         let cwd = pinned_path(8)?;
         let scratch = pinned_path(9)?;
@@ -210,21 +347,35 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
         }
         let null =
             open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDONLY, 0).map_err(|_| ShellError::Io)?;
+        // The preamble is added here, after both 8192-byte command checks;
+        // the script is bounded by the command limit plus PREAMBLE_LIMIT.
+        let script = format!(
+            "{}{command}",
+            preamble(secrets.iter().map(|secret| secret.number))
+        );
+        if script.len() > MAX_COMMAND_BYTES + PREAMBLE_LIMIT {
+            return Err(ShellError::Invalid);
+        }
         let args = vec![
             "/usr/bin/sandbox-exec".into(),
             "-p".into(),
             profile,
             "/bin/sh".into(),
             "-c".into(),
-            command.into(),
+            script,
         ];
-        let env = vec![
-            "PATH=/usr/bin:/bin:/usr/sbin:/sbin".into(),
+        let fixed = [
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
             "LC_ALL=C".into(),
             "LANG=C".into(),
             format!("HOME={scratch}"),
             format!("TMPDIR={scratch}"),
         ];
+        let env: Vec<&[u8]> = fixed
+            .iter()
+            .map(|entry| entry.as_bytes())
+            .chain(secrets.iter().map(|secret| secret.entry.as_slice()))
+            .collect();
         spawn::launch(
             Path::new("/usr/bin/sandbox-exec"),
             &args,
@@ -446,6 +597,91 @@ mod tests {
         assert!(text.ends_with(")"));
         let quoted = profile("/p", "/h/.as\"ura/tmp/s", "/h/.as\"ura").unwrap();
         assert!(quoted.contains("(subpath \"/h/.as\\\"ura\")"));
+    }
+    fn numbers(entries: &[&[u8]]) -> Result<Vec<u8>, ShellError> {
+        secret_environment(entries.iter().copied())
+            .map(|accepted| accepted.iter().map(|s| s.number).collect())
+    }
+    /// SDU-13: each refusal becomes the setup failure notice in `guardian`.
+    #[test]
+    fn secret_environment_rejects_names_numbers_duplicates_nul_and_size() {
+        assert_eq!(numbers(&[]), Ok(vec![]));
+        assert_eq!(
+            numbers(&[
+                b"__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x0",
+                b"ASURA_SECRET_1=a"
+            ]),
+            Ok(vec![1]),
+            "the CoreFoundation entry is skipped"
+        );
+        assert_eq!(
+            numbers(&[
+                b"ASURA_SECRET_16=b",
+                b"ASURA_SECRET_1=a=b",
+                b"ASURA_SECRET_2="
+            ]),
+            Ok(vec![1, 2, 16])
+        );
+        let all: Vec<Vec<u8>> = (1..=16)
+            .map(|n| {
+                let mut e = format!("ASURA_SECRET_{n}=").into_bytes();
+                e.extend_from_slice(&[b'v'; 512]);
+                e
+            })
+            .collect();
+        let all: Vec<&[u8]> = all.iter().map(Vec::as_slice).collect();
+        assert_eq!(numbers(&all).map(|n| n.len()), Ok(16), "8192 bytes");
+        let mut big = b"ASURA_SECRET_1=".to_vec();
+        big.extend_from_slice(&[b'v'; 8193]);
+        let mut half = b"ASURA_SECRET_2=".to_vec();
+        half.extend_from_slice(&[b'v'; 4097]);
+        let mut other_half = b"ASURA_SECRET_3=".to_vec();
+        other_half.extend_from_slice(&[b'v'; 4096]);
+        for (label, entries) in [
+            ("other name", vec![&b"PATH=/bin"[..]]),
+            (
+                "other name after valid",
+                vec![&b"ASURA_SECRET_1=a"[..], b"HOME=/x"],
+            ),
+            ("prefix only", vec![&b"ASURA_SECRET_=a"[..]]),
+            ("no separator", vec![&b"ASURA_SECRET_1"[..]]),
+            ("lower case", vec![&b"asura_secret_1=a"[..]]),
+            ("CF prefix", vec![&b"__CF_USER_TEXT_ENCODINGX=a"[..]]),
+            ("number 0", vec![&b"ASURA_SECRET_0=a"[..]]),
+            ("number 17", vec![&b"ASURA_SECRET_17=a"[..]]),
+            ("leading zero", vec![&b"ASURA_SECRET_01=a"[..]]),
+            ("three digits", vec![&b"ASURA_SECRET_100=a"[..]]),
+            ("sign", vec![&b"ASURA_SECRET_+1=a"[..]]),
+            (
+                "duplicate",
+                vec![&b"ASURA_SECRET_1=a"[..], b"ASURA_SECRET_1=a"],
+            ),
+            ("NUL", vec![&b"ASURA_SECRET_1=a\0b"[..]]),
+            ("over 8192 bytes", vec![big.as_slice()]),
+            (
+                "over 8192 in total",
+                vec![half.as_slice(), other_half.as_slice()],
+            ),
+        ] {
+            assert_eq!(numbers(&entries), Err(ShellError::Invalid), "{label}");
+        }
+        let mut seventeen = all.clone();
+        seventeen.push(b"ASURA_SECRET_1=a");
+        assert_eq!(numbers(&seventeen), Err(ShellError::Invalid), "17 entries");
+    }
+    #[test]
+    fn preamble_holds_names_only_and_is_bounded() {
+        assert_eq!(preamble([]), "");
+        assert_eq!(
+            preamble([1, 12]),
+            "__asura_t=$ASURA_SECRET_1; unset ASURA_SECRET_1; ASURA_SECRET_1=$__asura_t; \
+             __asura_t=$ASURA_SECRET_12; unset ASURA_SECRET_12; ASURA_SECRET_12=$__asura_t; \
+             unset __asura_t; "
+        );
+        let longest = preamble(1..=16);
+        assert_eq!(longest.len(), 1254);
+        assert!(longest.len() <= PREAMBLE_LIMIT);
+        assert!(!longest.contains('\n'), "the command keeps its first line");
     }
     #[test]
     fn guardian_path_check_rejects_every_overlap() {

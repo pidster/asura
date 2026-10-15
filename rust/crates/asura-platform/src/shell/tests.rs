@@ -7,6 +7,7 @@ fn request() -> ShellRequest {
         command: "printf ok".into(),
         cwd: None,
         deadline: Instant::now() + Duration::from_secs(5),
+        secrets: Vec::new(),
     }
 }
 #[test]
@@ -28,6 +29,42 @@ fn arguments_reject_effects_outside_contract() {
     assert_eq!(validate(&r), Err(ShellError::Invalid));
     r.command = "x\0y".into();
     assert_eq!(validate(&r), Err(ShellError::Invalid));
+}
+/// The service-side half of SDU-13: the request's secret variables are
+/// checked before any descriptor or process work.
+#[test]
+fn secret_variables_reject_numbers_duplicates_nul_and_size() {
+    let mut r = request();
+    r.secrets = (1..=16)
+        .map(|n| SecretVariable::for_test(n, &[b'v'; 512]))
+        .collect();
+    assert!(validate(&r).is_ok(), "16 values of 8192 bytes in total");
+    r.secrets[15] = SecretVariable::for_test(16, &[b'v'; 513]);
+    assert_eq!(validate(&r), Err(ShellError::Invalid), "8193 bytes");
+    for bad in [
+        vec![SecretVariable::for_test(0, b"value")],
+        vec![SecretVariable::for_test(17, b"value")],
+        vec![
+            SecretVariable::for_test(1, b"value"),
+            SecretVariable::for_test(1, b"other"),
+        ],
+        vec![SecretVariable::for_test(1, b"va\0lue")],
+        vec![SecretVariable::for_test(1, &[b'v'; 8193])],
+    ] {
+        r.secrets = bad;
+        assert_eq!(validate(&r), Err(ShellError::Invalid));
+    }
+    r.secrets = vec![
+        SecretVariable::for_test(3, b"a b\n$c"),
+        SecretVariable::for_test(1, b""),
+    ];
+    assert!(validate(&r).is_ok(), "numbers need not be contiguous");
+    let environment = secret_environment(&r.secrets);
+    let entries: Vec<&[u8]> = environment.iter().map(|e| e.as_slice()).collect();
+    assert_eq!(
+        entries,
+        [&b"ASURA_SECRET_3=a b\n$c"[..], &b"ASURA_SECRET_1="[..]]
+    );
 }
 #[test]
 fn notices_reject_identity_reserved_and_invalid_outcomes() {

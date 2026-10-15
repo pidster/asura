@@ -100,6 +100,7 @@ design applies each one.
 | SO4 | Person chat messages and model replies are a later follow-up design. | [Follow-up designs](#follow-up-designs) |
 | Scan time | No time bound on secret scanning. Matching is linear in the input, so a slow scan backpressures the producer through the transfer queue; it is never a capture fault and never cancels a job. Throughput measurements are acceptance criteria, not closures. | [Asynchronous execution](#asynchronous-execution) |
 | Preamble | Accepted. Secret variables become unexported shell variables; child processes inherit only what the command passes explicitly. | [Environment path](#environment-path) |
+| Guardian erasure | SDI-09 option (a), after the SL2 finding. The guardian copies the accepted values into `Zeroizing` buffers, then overwrites its own environment strings in place before any other setup step, so `KERN_PROCARGS2` and `ps -E` no longer show them. | [Environment path](#environment-path), [SL2 implementation](#sl2-implementation) |
 
 Effect on earlier decisions:
 
@@ -740,6 +741,7 @@ sequenceDiagram
         Set->>G: posix_spawn, argv holds rewritten command, envp holds values
         Set->>Set: zeroize envp and request buffers
         G->>G: validate names 1..16 and sizes
+        G->>G: copy values, overwrite own environment strings with zeros
         G->>Sh: envp is fixed environment plus secret variables, argv is preamble and command
         Sh->>Sh: preamble moves each variable to an unexported shell variable
         Sh-->>Cap: stdout and stderr, may echo values
@@ -768,6 +770,10 @@ preamble on 2026-10-15:
   entries to the fixed environment it builds today (`shell/guardian.rs:221-227`).
   The model profile's environment is otherwise unchanged. The person profile
   adds them to its PC3 environment.
+- After copying the accepted values, and before any other setup step, the
+  guardian overwrites its own environment strings with zero bytes (owner
+  decision, guardian erasure). The kernel's view of its initial environment
+  then holds no value.
 - The guardian prefixes the command with a fixed preamble on the same line:
   for each n, `__asura_t=$ASURA_SECRET_n; unset ASURA_SECRET_n; ASURA_SECRET_n=$__asura_t;`
   then `unset __asura_t;`. A variable that `sh` imported from its environment
@@ -782,9 +788,12 @@ preamble on 2026-10-15:
 
 Exposure that remains:
 
-- The kernel keeps each process's initial environment. The guardian and `sh`
-  hold the values there for their lifetimes. A same-user process can read them,
-  for example with `ps -E`. SDI-09 tests whether a concurrent sandboxed job can.
+- The kernel keeps each process's initial environment. `sh` holds the values
+  there for its lifetime; the guardian holds them only until it erases them,
+  before it starts `sh`. SDI-09 tests whether a same-user process or a
+  concurrent sandboxed job can read them.
+- `set` in the command prints the shell variable with its raw value. The
+  captured output holds that value until SL3's literal matching replaces it.
 - A process the command starts can still receive the value through an
   argument, as the original command intended.
 
@@ -911,7 +920,7 @@ Data handling:
 | --- | --- | --- |
 | Low recall | Wisp's rules found 67 of 211 secrets (32%) on the third-party test set, against 85% on train and 92% on dev. Most secrets in unfamiliar forms pass through. | Asura calls detection best effort wherever it describes it (SR8). SDM-01 measures the port. A value-level classifier may follow (SD1). |
 | Irreversible false positives | A replaced value is gone from the stored stream. Rerunning the command is the only way to see it. | Wisp measured precision 1.00 on train and dev and 9 false lines in 434 on test. SDM-01 measures the port's false alarms, including the hard-negative slice. |
-| Same-user process listing | Secret variables sit in the initial environment of the guardian and `sh` for their lifetimes. | Recorded. SDI-09 tests a concurrent sandboxed job; a failure is a finding for the threat model. |
+| Same-user process listing | Secret variables sit in the initial environment of the guardian and `sh`. | SDI-09 at SL2 found the guardian's copy readable by a concurrent sandboxed job. Owner decision (guardian erasure): the guardian overwrites its environment strings after copying them; SDI-09 now finds no value in the guardian or `sh` on the development host. The `sh` result rests on the kernel not returning `/bin/sh`'s environment; see [SL2 implementation](#sl2-implementation). |
 | Child inheritance | Without the preamble, every child would inherit the variables. | The preamble removes the export. A child started with an explicit environment copy, such as `env "ASURA_SECRET_1=$ASURA_SECRET_1"`, still receives it. |
 | Long lines | A line over 64 KiB, such as minified JavaScript or a JSON blob, loses everything after the limit. | SD5, kept for J1 (SO3). SDM-05 measures the loss; the owner revisits if it is too high. |
 | Evasion | Encoded, reversed, split or delayed output evades rules and literals. | Accepted: detection protects against accidental exposure. |
@@ -1213,6 +1222,97 @@ single-host timings, recorded as acceptance criteria and never enforced at run
 time. SDM-04, SDM-05 and every integration and end-to-end case belong to later
 slices.
 
+## SL2 implementation
+
+Implemented behavior, 2026-10-15. Code in `rust/crates/asura-platform`:
+
+- `shell.rs`: `ShellRequest::secrets` holds the rewrite's `SecretVariable`
+  values; SL2 adds no second type. `validate` refuses a number outside 1–16,
+  a repeated number, a NUL or more than 8192 value bytes in total with
+  `ShellError::Invalid`, before any descriptor work. `MAX_COMMAND_BYTES` names
+  the shared 8192-byte limit. The setup worker builds each
+  `ASURA_SECRET_<n>=<value>` entry in `Zeroizing` memory and passes the
+  entries as `spawn::launch`'s `env`.
+- `shell/spawn.rs`: `launch` takes environment entries as bytes. It copies
+  each entry into a NUL-terminated `Zeroizing<Vec<u8>>` instead of a
+  `CString`, because a dropped `CString` clears only its first byte. The
+  copies are zeroed when `launch` returns, after `posix_spawn` or on any
+  failure.
+- `PreparedShell::spawn` clears `request.secrets` after `spawn_inner` returns,
+  on success and on failure, so each value is zeroed then.
+- `shell/guardian.rs`: the guardian validates its own environment first in
+  setup. It reads `environ` through `_NSGetEnviron` and refuses the set with the
+  setup failure notice (reason 5, outcome `Unavailable`, no process) for any
+  other name, a non-canonical or out-of-range number, a duplicate, a NUL, more
+  than 16 entries or more than 8192 value bytes. It copies accepted entries into
+  `Zeroizing` memory, appends them to the fixed environment and prefixes the
+  `sh -c` script with the preamble in number order.
+
+Refinements made during SL2:
+
+- **CoreFoundation entry.** The guardian binary links CoreFoundation. Its
+  load-time initializer sets `__CF_USER_TEXT_ENCODING` in `environ` before
+  `main` when the spawner did not set it. The kernel's copy of the initial
+  environment does not hold it. The guardian skips exactly this name and never
+  passes it to `sh`; every other unexpected name is still refused.
+- **Number syntax.** A number is canonical decimal: `ASURA_SECRET_01` and
+  `ASURA_SECRET_+1` are refused. Numbers need not be contiguous.
+- **Preamble and the command limit.** The preamble does not count against the
+  8192-byte command limit. The setup worker checks the command (8192 bytes)
+  and the private argument vector (8704 bytes) as before; the guardian checks
+  the received command again (8192 bytes) and adds the preamble after that
+  check. The preamble for all 16 numbers is 1,254 bytes, so the guardian
+  refuses a script above 8192 + 1280 bytes as a defensive check. The
+  preamble is never in the guardian's own argument vector. With no secret
+  variables, the script is the command unchanged, as the
+  [shell tool](shell-tool.md) contract states. With secret variables, the
+  argument after `-c` is the preamble followed by the command.
+- **Test hook.** The `test-support` method
+  `PreparedShell::replace_secret_environment_for_test` sends raw entries that
+  bypass the service check, so the guardian's own check runs on real
+  processes.
+
+Verified behavior on the macOS 27 development host, Rust 1.98, `/bin/sh`
+GNU bash 3.2.57. Real-process cases run in the harness-free `shell_process`
+qualification in private scratch homes. They use a fixture token assembled at
+run time and the real `rewrite_command`.
+
+| Check | Result |
+| --- | --- |
+| SDU-13 | Unit: the guardian check refuses another name, `ASURA_SECRET_0`, `ASURA_SECRET_17`, a leading zero, three digits, a duplicate, a NUL, 8193 bytes in one value or in total, and a 17th entry. The service check refuses the same request cases. Real guardian: another name, 0, 17, a duplicate and both size cases settle with failure `Unavailable`, no exit code and no command effect. A NUL cannot pass `execve`, so `launch` refuses it with `Invalid` before any process starts. |
+| SDI-06 | `printf '%s' "<token>" > out.txt` is rewritten to `printf '%s' "${ASURA_SECRET_1}" > out.txt`. `out.txt` holds the real value. The captured output and the rewritten command hold no value. |
+| SDI-07 | `printenv` and `env` list no `ASURA_SECRET_` variable, and a child `sh` sees `ASURA_SECRET_1` unset. `set` prints the line `ASURA_SECRET_1=<value>` with the raw value, and no `__asura_t` variable. At SL2 the captured output therefore holds the value. The SDI-07 result "`set` shows the placeholder" depends on SL3, whose literal matching replaces the echoed value before storage. |
+| SDI-09 | Job A holds one secret variable while job B, a second sandboxed job, probes it. In job B, `/bin/ps` cannot run: `Operation not permitted`, exit 126. Job B's `KERN_PROCARGS2` reads succeed and return no environment entries: A's `sh` gives argc 3, envc 0; A's guardian gives argc 5, envc 0. Outside the sandbox, the same user gets envc 0 for both, and `ps -E` prints each argument vector with no environment entry. The test asserts that no read holds the value. Before guardian erasure, job B's read and the same-user `ps -E` of the guardian returned `ASURA_SECRET_1=<value>`. |
+| Argument vectors | `ps -o args` and the `KERN_PROCARGS2` argument vector of the guardian and of `sh` hold no value. The `sh` script starts with the preamble. |
+| Raw-byte sweep | After the SL2 cases, no file under the scratch home holds the token, once the expected `out.txt` is removed. |
+
+**Threat-model finding (SDI-09) and its treatment.** Before erasure, a
+concurrent sandboxed job could read another job's secret values from that
+job's guardian through `KERN_PROCARGS2`, for the job's lifetime; the sandbox
+profile allows `sysctl-read`. The kernel did not return the environment of
+`/bin/sh`. The owner selected option (a), guardian erasure:
+
+- `own_secret_environment` walks `*_NSGetEnviron()` once and records each
+  string's pointer and length. It validates and copies the accepted entries
+  into `Zeroizing` buffers.
+- It then overwrites every walked entry with zero bytes, name and value, using
+  `zeroize`'s volatile writes, whether the set was accepted or refused. The one
+  exception is `__CF_USER_TEXT_ENCODING`, which holds no secret.
+- These strings are the ones the kernel placed on the initial stack, which
+  `KERN_PROCARGS2` reads. CoreFoundation's `setenv` adds a new string but does
+  not move the original ones. The writes stay inside each string's length and
+  keep its NUL, so every entry stays a valid empty C string. The guardian runs
+  one thread, and nothing reads its environment afterwards: `sh` receives an
+  explicit array.
+- Entries beyond the walk bound (18 entries) are not erased. Such a set is
+  always refused, and the guardian exits after its notice.
+
+The `set` exposure in SDI-07 remains until SL3.
+
+Proof limits: one host and one `/bin/sh`. The `sh` result can differ on hosts
+where `/bin/sh` is not the platform bash. No service, journal or capture path
+uses secret variables until SL3; SDI-03 and the person path are not claimed.
+
 ## Design verification
 
 Recorded on 2026-10-15: the owner decisions, the Wisp sources above and the
@@ -1236,5 +1336,10 @@ re-rendered with Mermaid CLI 12.0.0 and inspected.
 Recorded at SL1 on 2026-10-15: the refinements and results are in
 [SL1 implementation](#sl1-implementation). No diagram changed. The lockfile
 diff adds three dependency edges to `asura-platform` and no package.
+
+Recorded at SL2 on 2026-10-15: the refinements, results and the SDI-09
+finding are in [SL2 implementation](#sl2-implementation). No dependency was
+added. After the owner selected guardian erasure, SD-Q1 gained the erasure
+step. SD-Q1 was re-rendered with Mermaid CLI 12.0.0 and inspected.
 
 Return to the [design index](README.md).
