@@ -84,7 +84,7 @@ its classification under the principles above.
 | ID | Limit | Current value | Class | Owner after review |
 | --- | --- | --- | --- | --- |
 | L1 | Shell timeout | 1–60 s, default 30 | Remove | Job yield window only; jobs have no fixed lifetime (owner, 2026-10-14, J2a-1). Job closures are completion, cancel, revocation, restart and capture fault |
-| L2 | Setup budget | 2 s | Keep | Shell tool |
+| L2 | Setup budget | 2 s | Remove (owner, 2026-10-15) | Job setup ends on spawn, cancel or setup fault ([job closures](tool-job-controller.md#job-closures-and-wind-down-bounds)) |
 | L3 | Cleanup until unconfirmed | 2.5 s | Keep | Shell tool |
 | L4 | TERM to KILL grace | 500 ms | Keep | Shell tool; the person profile sets its own |
 | L5 | Guardian lease poll and clock step | 100 ms each | Keep | Platform guardian |

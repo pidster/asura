@@ -80,7 +80,7 @@ two owner decisions: a `!` command is a tool job, and the
 | PCR16 | `!` commands share the prompt recall history. Recalling one restores command mode. Help `?` entries are not recorded. |
 | PCR17 | Protocol stays `0.1`; journal format stays `1`. Schemas may evolve under [numbering authority](../engineering.md#wire-protocol-change-authority). |
 | PCR18 | Before a person command runs, the TUI warns when the model changed build or test paths since the person's last command (PX1, owner 2026-10-14). Asura also re-checks the recorded digest of each approved implicit-execution file before relying on it, and warns again when it changed (PX1, EX1, owner 2026-10-15). The warning mechanism, approval flow and path list need their own design before P4. |
-| PCR19 | Secrets in output are detected at capture and replaced with placeholders before storage; the journal, retained streams, viewer and model see placeholders. Secrets only. A secret in the command becomes a per-execution variable such as `$ASURA_SECRET_1`, passed in the environment for that one execution and then dropped; the log keeps only its name. A command that cannot be rewritten safely under shell quoting is refused with a reason (PX6, EX4, owner 2026-10-15). |
+| PCR19 | Secrets in output are detected at capture and replaced with placeholders before storage; the journal, retained streams, viewer and model see placeholders. Secrets only. A secret in the command becomes a per-execution variable such as `$ASURA_SECRET_1`, passed in the environment for that one execution and then dropped; the log keeps only its name. A command that cannot be rewritten safely under shell quoting is refused with a reason (PX6, EX4, owner 2026-10-15). Mechanism: [secret detection](secret-detection.md), slice SL5. |
 
 These decisions amend the [shell tool](shell-tool.md) for person origin only.
 That design said toolchain and cache access "requires a subsequent scoped design
@@ -415,7 +415,7 @@ Other variables (PC3, selected):
 | `LANG`, `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME` | Client, when set; each value at most 64 bytes of ASCII letters, digits, `_`, `-`, `.` and `@` |
 | `SSH_AUTH_SOCK` | Client, when set; an absolute path of at most 103 bytes with no NUL. The setup worker checks with `lstat` that it names a socket; otherwise the variable is dropped and the command still runs. |
 
-| `ASURA_SECRET_<n>` | Service only, never the client. Set when EX4 secret detection rewrites the command (PCR19): the real value, held in memory for that one execution, then dropped. Never journaled, audited or reused across commands. The secret detection design defines the name, count and size bounds. |
+| `ASURA_SECRET_<n>` | Service only, never the client. Set when EX4 secret detection rewrites the command (PCR19): the real value, held in memory for that one execution, then dropped. Never journaled, audited or reused across commands. The [secret detection design](secret-detection.md#environment-path) defines the bounds: n is 1–16, values total at most 8192 bytes, and a guardian preamble stops child processes inheriting them. |
 
 The client sends only names from this table, excluding the service-set
 `ASURA_SECRET_<n>` variables. The service rejects any other client name with
@@ -1131,7 +1131,8 @@ decisions resolved on 2026-10-13. Each entry records the rejected options.
    agent works. Rejected: the allow-list without the agent socket, and the
    client's full environment, which would pass tokens such as `GITHUB_TOKEN` to
    every command and the journal. Amended on 2026-10-15 by EX4: the allow-list
-   also admits the service-set per-execution secret variables (PCR19).
+   also admits the service-set per-execution secret variables (PCR19), as the
+   [secret detection design](secret-detection.md#environment-path) defines.
 4. **PC4 — Notice entries in later turns.** Selected by the owner on
    2026-10-14: each later turn's input recomposes the entry from the journal,
    and the composer chooses its detail, down to one line, like any other
@@ -1190,14 +1191,17 @@ two of its decisions:
 - **PX1 (EX1):** the approval flow records a digest of each approved file and
   re-checks it before Asura relies on it, for example before a person `!`
   command. A later change warns again. See PCR18.
-- **PX6 (EX4):** secret detection with rules plus a classifier, at capture,
+- **PX6 (EX4):** secret detection with Wisp's ported rules (SD1 corrected
+  "rules plus a classifier"; no classifier), at capture,
   replacing each secret with a placeholder; secrets only; command secrets as
   per-execution variables. This supersedes "accept the risk now". See PCR19
   and PC3.
 
-Open for the secret detection design: kind PCQ lets a held command resume
-after restart, but a secret value lives only in memory. That design must state
-what happens to a queued command whose secret value is gone.
+Kind PCQ lets a held command resume after restart, but a secret value lives
+only in memory. The [secret detection design](secret-detection.md#queued-person-commands)
+proposes that such a command stays `Held` and Resume is refused with
+`secrets_lost`, so the person enters it again. This waits for the owner's
+answer to its open item SO2, which gates slice SL5.
 
 Required follow-up designs: secret detection and redaction (before J1 and P1),
 and the approval flow with change detection (before P4). Validation adds

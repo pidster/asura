@@ -10,8 +10,10 @@ the owner resolved every blocking decision of the readiness audit; see
 
 Readiness: packet J1 is not ready. The owner's
 [execution threat model](execution-threat-model.md#owner-decisions) decision EX4
-(2026-10-15) puts secret filtering into the J1 capture path, so J1 waits for a
-secret detection design. J1 is also subject to the
+(2026-10-15) puts secret filtering into the J1 capture path. The
+[secret detection design](secret-detection.md) (selected 2026-10-15, SD1–SD9)
+defines it; J1's filter is its slice SL3, which needs slices SL1 and SL2 and
+the dependency approval that design lists. J1 is also subject to the
 [result retention packet](result-retention-graph-packet.md#review-decisions-and-delivery-dependencies)
 changes that the 2026-10-14 decisions record. The full review of findings
 EX1–EX16 (T1) was completed on 2026-10-15. J2 and the packets after it now wait
@@ -74,7 +76,7 @@ selected here.
 
 | ID | Decision | Effect on this design |
 | --- | --- | --- |
-| EX4 | Owner, 2026-10-15. All tools use jobs; there are no legacy tools. Secrets are detected with rules plus a classifier and replaced with placeholders at capture, before storage; secrets only. A secret in a command becomes a per-execution variable such as `$ASURA_SECRET_1`; the log keeps only its name; an unsafe rewrite is refused. | Supersedes R3's "legacy tools keep kind 15". The J1 capture path filters secrets, so J1 waits for the secret detection design. Retained streams, pages, journal records and both views hold placeholders. Job intent records the rewritten command. How other tools adopt jobs is a follow-up design. |
+| EX4 | Owner, 2026-10-15. All tools use jobs; there are no legacy tools. Secrets are detected with Wisp's ported rules (SD1 corrects "rules plus a classifier"; no classifier) and replaced with placeholders at capture, before storage; secrets only. A secret in a command becomes a per-execution variable such as `$ASURA_SECRET_1`; the log keeps only its name; an unsafe rewrite is refused. | Supersedes R3's "legacy tools keep kind 15". The J1 capture path filters secrets under the [secret detection design](secret-detection.md). Retained streams, pages, journal records and both views hold placeholders. Job intent records the rewritten command. How other tools adopt jobs is a follow-up design. |
 | EX5 | Owner, 2026-10-14. Detect and terminate escapees reliably before J2: `setsid` and new-session escapes, pipe-holding escapees that block settlement, and false `cleanup_confirmed`. | J2 prerequisite. Without it a pipe-holding escapee could hold a slot indefinitely, since jobs have no lifetime (J2a-1). |
 | EX10 | Owner, 2026-10-14. Run SH-E1-style shell qualification for each local tool-capable provider (CoreAI, MLX, Ollama models) before J2. | J2 prerequisite. |
 | EX11 | Owner, 2026-10-14. A person execution setting: global default plus a per-project override, default on. A change is a revocation trigger: turning it off refuses new execution and cancels live model jobs in scope. | Added to [revocation triggers](#security-and-authority) and TJ-14. The setting needs its own design. |
@@ -388,7 +390,7 @@ sequenceDiagram
     U->>W: Tab, scroll or Home: JobRead at new offset
     U->>W: Follow on at stream end
     loop Until follow off, close, settlement or worker stop
-        W->>R: JobObserve(job, stream, offset, wait 1 s)
+        W->>R: JobObserve(job, stream, offset), returns on new output or settlement
         R->>K: Scoped to the person's request
         K->>S: Read page under watermark or descriptor
         S-->>K: Page or no new bytes
@@ -488,12 +490,22 @@ operations. They never end a job's normal run and are not job closures.
 
 | Bound | Value | Source |
 | --- | --- | --- |
-| Setup | 2 s | Existing shell limit L2 |
 | TERM to KILL grace | 500 ms model jobs; 2 s person jobs (PC8) | Owner, 2026-10-14 |
-| Cleanup before `CleanupUnconfirmed` | 2.5 s | Existing shell limit L3 |
 | Page read storage step | 2 s | Owner, 2026-10-14 |
 | Shutdown cleanup | 2 s | Owner, 2026-10-14 |
-| Client long-poll | `JobObserve` waits at most 1 s | Proposed |
+
+The cleanup bound before `CleanupUnconfirmed` (2.5 s, shell limit L3, kept by
+the [limit review](tool-output-views.md#limit-review)) only decides when
+cleanup is reported as unconfirmed after the job has already ended.
+
+Required behavior (owner, 2026-10-15): job setup and client observation have
+no time bound.
+
+- **Setup** ends when the process is spawned, on cancel, or on a setup fault.
+  The existing 2-second shell setup budget (L2) is removed for jobs; the shell
+  code that applies it changes when the shell adopts jobs (J3).
+- **`JobObserve`** returns on new output past the client's offset, job
+  settlement, client detach or cancel. It has no polling timer.
 
 ### Capture, watermark and page contract amendments
 
@@ -900,7 +912,7 @@ and end-to-end tests before the next starts.
 ```mermaid
 flowchart TD
     RP[Retention packet changes: G1, R1, R2, R4, R5] --> J1[J1: staging capture, secret filter, descriptors, text pages, quota]
-    SD[EX4: secret detection design] --> J1
+    SD[EX4: secret detection slices SL1, SL2] --> J1
     ESC[EX5: escapee detection and termination] --> J2[J2: controller core with model and person origin]
     QUAL[EX10: shell qualification per local provider] --> J2
     J1 --> J2
@@ -925,8 +937,9 @@ flowchart TD
 
 ## Open decisions
 
-No open owner decision blocks J1–J6. J1 waits for the EX4 secret detection
-design; J2 waits for the EX5 and EX10 prerequisites. These remain for later
+No open owner decision blocks J1–J6. J1 waits for slices SL1 and SL2 of the
+[secret detection design](secret-detection.md#delivery); J2 waits for the EX5
+and EX10 prerequisites. These remain for later
 designs:
 
 1. **Other tools:** EX4 (owner, 2026-10-15) states that all tools use jobs. The
@@ -974,6 +987,9 @@ with Mermaid CLI 12.0.0 and inspected. No code or test was run.
 Recorded on 2026-10-15: this revision records the completed threat model review
 (T1) and its decisions EX4, EX5, EX10, EX11 and EX12. J1 is no longer ready; it
 waits for the secret detection design. TJ-P1 changed and was re-rendered with
-Mermaid CLI 12.0.0 and inspected. No code or test was run.
+Mermaid CLI 12.0.0 and inspected. No code or test was run. Later the same day
+the [secret detection design](secret-detection.md) was selected; the readiness
+note, the EX4 row, TJ-P1 and the open decisions now link it. TJ-P1 was
+re-rendered with Mermaid CLI 12.0.0 and inspected.
 
 Return to the [design index](README.md).

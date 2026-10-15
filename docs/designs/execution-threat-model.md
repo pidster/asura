@@ -178,9 +178,14 @@ Each entry gives the decision, the required outcome and where it is applied.
    - All tools use jobs; there are no legacy tools. This supersedes R3's
      "legacy tools keep kind 15" in the
      [job controller](tool-job-controller.md#owner-decisions-of-2026-10-14).
-   - Asura detects secrets with rules plus a classifier, as Wisp does, and
-     replaces each with a placeholder. One rule covers model tools and person
-     commands. This supersedes PX6's "redaction rejected for now".
+   - Asura detects secrets with Wisp's `SecretScanner` secret rules and
+     replaces each with a placeholder, following Wisp's `Redactor` approach.
+     One rule covers model tools and person commands. This supersedes PX6's
+     "redaction rejected for now". Correction (owner, SD1, 2026-10-15): the
+     first write-up said "rules plus a classifier, as Wisp does". Wisp ships no
+     secret classifier; ADR 0031 measured one and rejected it. Asura ports the
+     rules only; a value-level classifier may be designed later if
+     measurement shows the rules miss too much.
    - Output is filtered at capture, before storage. Retained storage, the
      journal, the model and the person's job viewer see placeholders. No stored
      copy holds the secret.
@@ -193,7 +198,9 @@ Each entry gives the decision, the required outcome and where it is applied.
      No variable is reused across commands.
 
    Applied in the job controller (J1 capture path) and person command mode
-   (PX6, PT5, PC3). Follow-up design: secret detection and redaction; see
+   (PX6, PT5, PC3). Follow-up design:
+   [secret detection and redaction](secret-detection.md), selected on
+   2026-10-15 with owner decisions SD1–SD9; see also
    [reference: Wisp secret handling](#reference-wisp-secret-handling).
 5. **EX5 — find and stop first (owner, 2026-10-14).** Asura must reliably
    detect and terminate escapees before J2: `setsid` and new-session escapes,
@@ -244,27 +251,29 @@ Each entry gives the decision, the required outcome and where it is applied.
 ### Reference: Wisp secret handling
 
 Design input only; Wisp source is not Asura evidence. The Wisp repository
-(`harness/Sources/WispCore/Condense/` and `training/secrets/`) has three parts
-that EX4 would reuse:
+(`harness/Sources/WispCore/Condense/` and `training/secrets/`) has three parts.
+The [secret detection design](secret-detection.md) reuses the rules, the
+marker approach and the data set; it does not reuse a classifier (SD1):
 
 - **Rules.** `SecretScanner` matches shapes that are credentials by construction,
   such as provider key prefixes, private key blocks and URLs with passwords.
   Each rule has a kind and a category, `secret` or `personal`, and rejects
   placeholders such as `${TOKEN}`. It omits generic high-entropy detection
   because lockfiles and build output hold many hashes.
-- **Trained classifier.** The training set `training/secrets/` labels lines
-  `secret`, `personal` or `none` under the rules in `labels.md`. Wisp's shipped
-  classifier from that set judges personal data. Asura filters secrets only,
-  so its classifier must be trained and measured for the `secret` label.
+- **Labelled data set, no secret classifier.** The set `training/secrets/`
+  labels lines `secret`, `personal` or `none` under the rules in `labels.md`.
+  Wisp's only shipped classifier judges personal data. Its secret classifier
+  was measured at precision 0.53 and not wired in (ADR 0031). Asura uses the
+  set's secret and none lines to measure the ported rules (SD8).
 - **Placeholder markers.** `Redactor` replaces each value with a numbered
   marker, `[REDACTED:<kind>#<n>]`, numbered per kind in order of first
   appearance. A reader can tell that two places hold the same value without
   seeing it.
 
 Wisp is Swift. Asura's capture path is Rust, in the platform and service
-crates. The follow-up design must choose how the rules and classifier run in
-the Rust capture path, and how filtering interacts with stream offsets, digests,
-chunk boundaries and capture throughput.
+crates. The [secret detection design](secret-detection.md) defines how the
+rules run in the Rust capture path, and how filtering interacts with stream
+offsets, digests, chunk boundaries and capture throughput.
 
 ## Superseded: conflict with the remote provider gate
 
@@ -292,7 +301,7 @@ layer. They did not drive a model or the TUI.
 | EX-V5 | Double-fork, `setsid` and pipe-holding escapes; confirm confinement and cleanup | Run 2026-10-14. Same-group escapes were killed. The `setsid` escapee survived, stayed confined, wrote the project after settlement and left `cleanup_confirmed` true. The pipe-holding case is from code reading. The EX5 design must turn this into a passing case. |
 | EX-V6 | Endpoint request content captured; confirm only granted data classes leave | Not run. It needs a local HTTPS capture server with a test certificate. Under EX13 it becomes the grant check: file pages and tool results absent by default. |
 | EX-V7 | Provider switch from local to remote mid-conversation; record which history leaves | Not run. It needs a remote endpoint admitted, which waits for EX13 and EX14 (EX7). |
-| EX-V8 | A fixture secret in command output and in a command, for model and person origin | Required, not run. Retained streams, journal, model view and viewer hold placeholders only. The command runs with the real value through one variable, and the log holds only the variable name. A command that cannot be rewritten safely is refused with a reason. Detailed cases belong to the secret detection design. |
+| EX-V8 | A fixture secret in command output and in a command, for model and person origin | Required, not run. Retained streams, journal, model view and viewer hold placeholders only. The command runs with the real value through one variable, and the log holds only the variable name. A command that cannot be rewritten safely is refused with a reason. Detailed cases are in the [secret detection validation](secret-detection.md#validation). |
 | EX-V9 | `setsid`, double-fork and pipe-holding escapees under a job | Required, not run. Each escapee is detected and terminated, settlement completes, and cleanup is never reported confirmed while one lives. Detailed cases belong to the EX5 design. |
 | EX-V10 | The EX11 setting turned off globally and for one project | Required, not run. New execution is refused and live model jobs in scope are cancelled with a revocation reason. |
 | EX-V11 | Model shell runs `git status` and `git init` with the developer folder readable | Required, not run. Git runs; reads outside the roots stay denied. |
@@ -303,7 +312,7 @@ Each must be designed before its code. None is selected by this document.
 
 | Design | Source | Gates |
 | --- | --- | --- |
-| Secret detection and redaction: rules, classifier, placeholders, command variables, capture integration | EX4, PX6 | Job packet J1; person command mode |
+| Secret detection and redaction: rules, placeholders, command variables, capture integration. Selected 2026-10-15: [secret detection](secret-detection.md) | EX4, PX6, SD1–SD9 | Job packet J1; person command mode |
 | Escapee detection and termination | EX5 | Job packet J2 |
 | Shell qualification per local provider (SH-E1 style) | EX10 | Job packet J2 |
 | Execution setting: global default and per-project override | EX11 | Revocation trigger TJ-14 |
@@ -542,13 +551,14 @@ are caught).
    multi-line commands.
 6. **PX6 — Secret-bearing output (PT5, EX4).** Selected by the owner on
    2026-10-14 and updated on 2026-10-15 by EX4. One rule governs model tools
-   and person commands: secrets are detected at capture with rules plus a
-   classifier and replaced with placeholders before storage. Secrets only;
+   and person commands: secrets are detected at capture with Wisp's ported
+   rules (SD1; no classifier) and replaced with placeholders before storage. Secrets only;
    personal data is not filtered. A secret in a command becomes a
    per-execution variable such as `$ASURA_SECRET_1`; a command that cannot be
    rewritten safely is refused. The EX4 decision supersedes the earlier
    acceptance of the risk and the rejection of token redaction. A person-chosen
-   private variant may still follow as a later feature.
+   private variant may still follow as a later feature. Mechanism:
+   [secret detection](secret-detection.md).
 
 ## Design verification
 

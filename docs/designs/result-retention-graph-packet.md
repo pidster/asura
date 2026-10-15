@@ -143,6 +143,24 @@ Large bytes remain file based. The DB contains typed metadata, digests and links
 `tmp/` contains owned staging files only. Config, diagnostic logs and audit logs
 retain their existing locations and owners.
 
+Secret filtering at capture (EX4, owner 2026-10-15; SD2, SD6 and SD9 of the
+[secret detection design](secret-detection.md)) amends this contract for J1:
+
+- The capture worker scans each stream before hashing and staging. Each
+  detected secret is replaced by `$ASURA_SECRET_<n>`, and bytes it cannot check
+  are replaced by a loss marker. The retained payloads therefore hold redacted
+  bytes, not the exact emitted bytes; raw bytes are never written to disk.
+- The SHA-256 digest, byte offsets, retained length and pages describe the
+  redacted stored stream. No digest of raw output exists anywhere (SD9).
+- Each descriptor records that redaction ran, the rule-set revision and digest,
+  observed and stored byte counts, replacement counts and loss spans. A
+  descriptor without that flag is not a valid J1 capture.
+- `complete_capture` still means every observed byte was handled: retained,
+  replaced or recorded as withheld with its size and reason.
+- Raw pages, when added, return the stored bytes. RG-11's "recover exact
+  bytes" therefore means the exact stored bytes; replaced values cannot be
+  recovered.
+
 Use domain-separated SHA-256 identity derivation with the current 16-byte ID
 encoding. Include installation, operation, generation, ordinal and stream kind.
 Content equality does not merge calls or deduplicate across projects. Exact
