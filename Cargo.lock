@@ -190,8 +190,11 @@ dependencies = [
 name = "asura-platform"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "libc",
+ "regex",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]

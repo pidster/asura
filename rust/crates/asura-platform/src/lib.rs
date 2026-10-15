@@ -22,6 +22,7 @@ pub use config::{PrivateFileError, PrivateFileSnapshot};
 mod lifetime;
 pub use lifetime::{ServiceLease, ServiceLifetime};
 mod runtime;
+pub mod secrets;
 pub mod shell;
 mod startup;
 mod terminal;
@@ -106,10 +107,15 @@ pub(crate) fn effective_uid() -> Result<libc::uid_t> {
 
 pub fn random_id() -> [u8; 16] {
     let mut bytes = [0; 16];
-    // SAFETY: the writable buffer contains the stated 16 bytes. arc4random_buf
+    fill_random(&mut bytes);
+    bytes
+}
+/// Fills `bytes` in place, so a caller can keep key material in its own
+/// zeroizing buffer without an intermediate copy.
+pub(crate) fn fill_random(bytes: &mut [u8]) {
+    // SAFETY: the writable buffer holds exactly bytes.len() bytes. arc4random_buf
     // supplies system randomness and has no recoverable failure result.
     unsafe { libc::arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len()) };
-    bytes
 }
 #[derive(Clone, Copy, Debug)]
 pub struct PollInterest {

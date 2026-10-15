@@ -7,8 +7,9 @@ recorded in [owner decisions](#owner-decisions). Mechanisms marked "proposed"
 are engineering choices under the
 [iteration rules](../design-process.md#iteration-and-escalation). Values marked
 "proposed" in limit tables need the measurements in [validation](#validation).
-Nothing in this design is implemented. Protocol numbering remains `0.1`;
-journal format remains `1`.
+Slice SL1 is implemented and unit tested; see
+[SL1 implementation](#sl1-implementation). SL2–SL6 are not implemented.
+Protocol numbering remains `0.1`; journal format remains `1`.
 
 Readiness: slices SL1–SL3 are ready for implementation review. They unblock
 tool job packet [J1](tool-job-controller.md#delivery-dependencies). No owner
@@ -223,7 +224,12 @@ commit `4305d2ceca370e2f8a8262bc916e36aa0b56086f` (2026-10-15). The seven
 
 Rule-set revision 1 is this port. The rule set's digest is SHA-256 over its
 canonical table: for each rule, its kind, pattern text, value group and
-predicate identifiers, in order. A rule change needs a design update and a new
+predicate identifiers, in order. The encoding is a sequence of fields, each a
+4-byte big-endian length and its bytes: the text `asura-secret-rules`, the
+revision as 4 big-endian bytes, then for each rule its ID, kind, Rust pattern
+text, value group as 4 big-endian bytes, and its predicate identifiers joined
+by commas. Revision 1's digest is
+`54cd1df419cddec67ea8ade827ba37fb6219993cb6be4eb0464395570f8985a9`. A rule change needs a design update and a new
 revision. The revision is a content identifier recorded in data; it is not a
 format, API or protocol version number.
 
@@ -299,7 +305,8 @@ global settings:
 - **G2, bytes.** Negated classes such as `[^\s"']` match any byte, including
   bytes that are not valid UTF-8 (SD6). Values are byte strings.
 - **G3, size limits.** Each expression has a compiled-size limit of 1 MiB and
-  a lazy DFA cache limit of 256 KiB (proposed). A rule that fails to compile
+  a lazy DFA cache limit of 256 KiB (proposed). The combined `RegexSet` has a
+  compiled-size limit of 46 MiB and a lazy DFA cache limit of 2 MiB (proposed). A rule that fails to compile
   fails the service's detection self-check; see [failure handling](#failure-handling).
 
 Rule-specific rewrites (the codes in the table above):
@@ -308,10 +315,10 @@ Rule-specific rewrites (the codes in the table above):
 | --- | --- | --- |
 | U | Supported constructs only | Same pattern text under G1–G3 |
 | B1 | SR-01: `-----BEGIN ([A-Z ]*)PRIVATE KEY( BLOCK\|)-----` with `[\s\S]*?` and backreferences `\1`, `\2` to the END line | The BEGIN expression without the body. The [PEM state machine](#streaming-scanner) finds the END line and compares its label and suffix with the BEGIN captures as bytes. A BEGIN and matching END on one line (an escaped `\n` key in JSON) match within the line. |
-| L1 | `credentialName` starts with `(?<![A-Za-z0-9:])` | Predicate: the byte before the name is absent (line start) or not in `[A-Za-z0-9:]`. A rejected candidate restarts the search one byte after its start. The restarts are bounded by the line, which the 64 KiB carry bounds; no separate step limit applies, and SDM-02's adversarial input measures the cost. |
-| A1 | SR-33 ends with `(?!\s*[+\[])` | Predicate: after the closing quote, skip ASCII whitespace within the line; the next byte is not `+` or `[`. Whitespace after the line end is not visible; the line end counts as "not `+`". |
-| P1 | `unquotedValue` is `([^\s"'\`,;{}()\[\]<>]{4,}+)(?![(\[])` | Greedy `{4,}` with the same class, and a predicate: the byte after the value is not `(` or `[`. The class excludes `(` and `[`, so a greedy match ends where the possessive one does. |
-| L2 | SR-35 `(?<![A-Za-z0-9][ \t]{1,16})` and SR-36 `(?<=[A-Za-z0-9][ \t]{1,16})` before the name | One expression. Predicate: count the run k of space and tab bytes immediately before the name, examining at most 17. If 1 ≤ k ≤ 16 and the byte before the run is in `[A-Za-z0-9]`, the match is in sentence position and SR-36's predicates apply. Otherwise it is in key position and SR-35's apply. |
+| L1 | `credentialName` starts with `(?<![A-Za-z0-9:])` | The consuming prefix `(?:^\|[^A-Za-z0-9:])` before the name: the byte before the name is absent (line start) or not in `[A-Za-z0-9:]`. The next search after a match starts at the match's last byte, so that byte can serve as the next prefix. This is equivalent to the lookbehind and needs no restart. |
+| A1 | SR-33 ends with `(?!\s*[+\[])` | Predicate: after the closing quote, skip ASCII whitespace within the line; the next byte is not `+` or `[`. Whitespace after the line end is not visible; the line end counts as "not `+`". A rejected match restarts the search one byte after the name start, as the lookahead would. The restarts are bounded by the line, which the 64 KiB carry bounds; no separate step limit applies, and SDM-02's adversarial input measures the cost. |
+| P1 | `unquotedValue` is `([^\s"'\`,;{}()\[\]<>]{4,}+)(?![(\[])` | Greedy `{4,}` with the same class, and a predicate: the byte after the value is not `(` or `[`. The class excludes `(` and `[`, so a greedy match ends where the possessive one does. A rejected match restarts one byte after the name start, as A1 does. |
+| L2 | SR-35 `(?<![A-Za-z0-9][ \t]{1,16})` and SR-36 `(?<=[A-Za-z0-9][ \t]{1,16})` before the name | One expression. Predicate: count the run k of space and tab bytes immediately before the name, examining at most 17. If 1 ≤ k ≤ 16 and the byte before the run is in `[A-Za-z0-9]`, the match is in sentence position and SR-36's predicates apply. Otherwise it is in key position and SR-35's apply. SR-35 and SR-36 iterate separately over the shared expression, each restarting after a position rejection, so a rejection by one rule cannot hide a match of the other. |
 | lazy kept | `*?` inside one line | Supported by Rust; leftmost-first semantics give the same first match. |
 
 ### Predicates
@@ -469,8 +476,9 @@ Required behavior (SD3, SD4). Each replaced value becomes the ASCII text
 - A private-key block's value is the whole block.
 
 Proposed mechanism: the number map is keyed by SHA-256 over a per-job random
-32-byte key followed by the value. The key comes from `getentropy` at admission
-and is zeroized at settlement. The map therefore holds no value bytes, and its
+32-byte key followed by the value. The key comes from the platform's existing
+random owner (`arc4random_buf`, which `random_id` also uses) at admission, and
+is zeroized at settlement. The map therefore holds no value bytes, and its
 memory per entry is constant. The keyed digest never leaves memory and never
 reaches a record (SD9).
 
@@ -564,7 +572,9 @@ The same function serves both origins.
    for every source byte, its quoting context and nesting.
 5. Classify each span with SD-F1 below. Any refusal refuses the whole command.
 6. Assign numbers 1 to k by first appearance; equal values share a number. More
-   than 16 distinct values refuses with `too_many_secrets`.
+   than 16 distinct values refuses with `too_many_secrets`. Numbers follow the
+   span bytes, not the scanner's literal numbers, so a propagated piece of a
+   multi-line value never stands for the whole value.
 7. Replace each span:
    - a whole unquoted word becomes `"$ASURA_SECRET_<n>"`;
    - a span inside an unquoted word (SO1) becomes `"$ASURA_SECRET_<n>"` in
@@ -573,31 +583,46 @@ The same function serves both origins.
    - a whole double-quoted word, or a span inside double quotes, becomes
      `${ASURA_SECRET_<n>}` inside the existing quotes. The braces stop a
      following name character from extending the variable name.
-8. Scan the rewritten command again. Any accepted rule match refuses with
-   `residual_secret`. The placeholder predicate rejects the inserted names, so
-   a match means part of a secret remained.
+8. Scan the rewritten command again. Any accepted rule match that holds a
+   byte outside the inserted text refuses with `residual_secret`. The
+   placeholder predicate rejects most matches of the inserted names; rules
+   without it, such as `netrc-password`, can match an inserted name, and a
+   match wholly inside inserted text is not residual.
 9. Return the rewritten command, the secret variable list and the values in
    zeroizing buffers.
 
 Context rules for step 5:
 
 - A **plain unquoted word** has no quote, backslash, `$`, backtick, `*`, `?`,
-  `[`, `{` or `~`, and does not start with `#`. Its shell value equals its raw
-  text, so `"$ASURA_SECRET_<n>"` reproduces it exactly, without field
-  splitting, globbing, brace or tilde expansion.
+  `[`, `{` or `~`, no whitespace and none of `| & ; < > ( )`, and does not
+  start with `#`. Its shell value equals its raw text, so
+  `"$ASURA_SECRET_<n>"` reproduces it exactly, without field splitting,
+  globbing, brace or tilde expansion. The operators are excluded because the
+  ported tokenizer splits words on whitespace only, so a span such as
+  `pw>out` would otherwise hide a redirection.
 - A **span inside an unquoted word** (SO1) must itself pass the plainness
   check, and the byte before it must not be a backslash. The word must hold no
-  unquoted `{`, so the span cannot be part of a brace expansion. The other
+  unquoted `{`, so the span cannot be part of a brace expansion. An unescaped
+  `$` followed only by name characters up to the span would make the span part
+  of a parameter name, so it refuses. A span that starts inside the name of an
+  assignment word (`NAME=`) refuses, because quoting it would end the
+  assignment. The other
   bytes of the word keep their meaning, and the quoted expansion reproduces
   the span's bytes. An assignment word such as `TOKEN=<value>` stays an
   assignment.
 - A **double-quoted span** must not contain a backslash, `$` or backtick,
-  which double quotes would interpret.
-- A span inside `$(…)` or backticks is refused with `secret_in_substitution`.
-  The tokenizer port parses top-level words only and treats substitution
-  bodies as opaque. This applies SD7's "anything the tokenizer cannot parse".
+  which double quotes would interpret. The byte before it must not be a
+  backslash or the end of a `$name` that reaches it.
+- A span inside `$(…)`, backticks or a `( … )` subshell group is refused with
+  `secret_in_substitution`. The tokenizer port parses top-level words only and
+  treats these bodies as opaque, as Wisp's `substitutions(in:)` returns all
+  three. This applies SD7's "anything the tokenizer cannot parse". An unclosed
+  group, quote or backtick, or a heredoc operator without a delimiter, makes
+  the command unparsed.
 - The words after `sh -c`, `bash -c`, `bash -lc`, `zsh -c` and similar shells
-  in Wisp's `innerScripts`, and the words after `eval`, are inner scripts.
+  in Wisp's `innerScripts`, and the words after `eval`, are inner scripts. As
+  in Wisp, wrappers such as `sudo`, `env` and `timeout`, leading keywords such
+  as `if` and `then`, and `find -exec` commands are looked through.
 - A heredoc starts at an unquoted `<<` or `<<-` operator and runs to its
   delimiter line. A here-string `<<<` is not a heredoc; its word follows the
   ordinary rules.
@@ -644,8 +669,10 @@ flowchart TD
 
 A refusal carries a reason code, the rule kind and the 1-based word index. It
 never carries the value, a masked preview, a byte offset or a digest. Example
-text: "Command refused: a `cli-password` secret in word 4 is single-quoted.
-Use double quotes so Asura can pass it as a variable."
+text: "Command refused: a `cli-password` secret in word 4: it is single-quoted.
+Use double quotes so Asura can pass it as a variable." The word index counts
+the tokenizer's words, so a substitution body counts as words. It names the
+first word that holds a span byte, and is absent for a heredoc body.
 
 - **Model origin.** The conversation owner records the intent in
   display-redacted form: every span replaced by its placeholder, with a refused
@@ -775,7 +802,7 @@ controller's own mapping applies to the job.
 | Rule | How this design meets it |
 | --- | --- |
 | AE-01 | The reactor reads pipes and enqueues chunks; it never scans. The command rewrite is an in-memory operation on the admission path over a known-size input of at most 8192 bytes. Its cost is measured by SDM-03 as an acceptance criterion; it has no time bound. If SDM-03 misses its figure, the design is revised to move the rewrite to a retained worker before the intent append; a slow rewrite never refuses a command. |
-| AE-02 | The scanner makes no blocking call. `getentropy` for the per-job key runs once at admission; it is a bounded system call. Environment construction runs on the existing setup worker and guardian. Hashing and staging keep their existing isolation. |
+| AE-02 | The scanner makes no blocking call. `arc4random_buf` for the per-job key runs once at admission; it does not block and has no failure result. Environment construction runs on the existing setup worker and guardian. Hashing and staging keep their existing isolation. |
 | AE-03 | Limits are in the table below. A slow scan fills the 512 KiB transfer queue; the reactor then stops reading that job's pipes, so the job's writes block in the kernel. Other jobs and controls are unaffected. |
 | AE-04 | Scanning has no time bound (owner, 2026-10-15). `regex::bytes` and Aho–Corasick match in time linear in the input, so a chunk's scan time is proportional to its size; SDM-02 measures it. A slow scan fills the transfer queue and backpressures the producer; it is never a capture fault and never cancels the job. The capture worker checks cancellation between chunks. Turn and job cancellation do not stop capture; the scanner flushes at pipe EOF and at settlement as designed. Capture stop for a storage fault drops the carry. |
 | AE-05 | No raw byte is persisted, so recovery never has raw state to reconcile. Replay never needs a value, because a restarted job never runs again. A queued person command that lost its values stays `Held` and cannot resume (SO2). |
@@ -988,6 +1015,7 @@ copied from Wisp `training/secrets/` at commit `4305d2c`:
 | `NOTICE.md` | Wisp `NOTICE.md` unchanged, followed by an Asura section stating the source commit, the removal of personal lines, and the SHA-256 of each copied file |
 | `licenses/Apache-2.0.txt`, `CC-BY-4.0.txt`, `CredSweeper-MIT.txt`, `gitleaks-MIT.txt`, `Privy-MIT.txt` | Unchanged |
 | `licenses/Wisp-MIT.txt` | Wisp's `LICENSE` |
+| `wisp-rule-labels.tsv` | New: Wisp's rule label and kinds for each kept line, from running `SecretScanner.swift` at commit `4305d2c`. It holds no value. SDM-01 compares the port with it. |
 
 Rules for the fixtures:
 
@@ -1015,8 +1043,10 @@ diff before building, as the root instructions require.
 Pinning each at its locked version, as the workspace pins every dependency,
 adds no new package to `Cargo.lock`. Feature selection can still change the
 compiled code and is part of that review. Minimal features: `regex` with
-`std` and `perf` and without `unicode`; `aho-corasick` with `std` and `perf`;
-`zeroize` with `alloc`.
+`std` and `perf` and without `unicode`; `aho-corasick` with `std` and
+`perf-literal`; `zeroize` with `alloc`. `aho-corasick` 1.1.5 has no `perf`
+feature; `perf-literal` is its performance feature, and `regex`'s `perf`
+already enables it.
 
 ## Delivery
 
@@ -1103,6 +1133,86 @@ Design input only; Wisp source is not Asura evidence. Read at Wisp commit
 - `harness/Tests/WispCoreTests/SecretScannerTests.swift`;
 - `training/secrets/labels.md`, `NOTICE.md` and `licenses/`.
 
+## SL1 implementation
+
+Implemented behavior, 2026-10-15. Code:
+
+- `rust/crates/asura-platform/src/secrets.rs`: `SecretKind`, `placeholder`,
+  and `detection()`, which compiles the rule set once per process and checks
+  its digest. A failed self-check makes `rewrite_command` refuse with
+  `secret_detection_unavailable`.
+- `secrets/rules.rs`: the 47-rule table, predicates, per-line matching and the
+  overlap merge.
+- `secrets/stream.rs`: `JobRedaction` (per job: both stream scanners, the
+  keyed number map and the literals), `Redacted`, `StreamStats`, `LossSpan`
+  and `JobSummary`. `Redacted` has no public constructor.
+- `secrets/rewrite.rs`: `rewrite`, `rewrite_command`, `display_redacted`,
+  `SecretVariable`, `Refusal` and `RefusalCode`. `SecretVariable` holds its
+  value in `Zeroizing` memory, and its `Debug` output omits the value.
+- `shell/split.rs`: the tokenizer port (`tokens`, `segments`,
+  `substitutions`, `inner_scripts`) and `analyze`, which records each byte's
+  quoting context, word, heredoc, substitution and inner-script flags.
+
+Refinements made during SL1, beyond those written into the sections above:
+
+- **Partial line in an open block.** An unfinished line that makes the carry
+  reach 64 KiB inside `PemOpen` or `PemOverflow` is withheld up to its
+  terminator inside the `key_block_over_limit` marker. The block then
+  continues in `PemOverflow`. The line cannot be classified without its
+  bytes, so the scanner treats it as part of the block and fails closed.
+- **Terminators.** An unterminated block's placeholder, and a block overflow
+  marker closed by a non-body line, cover the held bytes except the last held
+  line's terminator byte. The scanner stores that byte after the placeholder
+  or marker, as the long-line rule does.
+- **Zero-byte loss.** The scanner writes no marker when the withheld count is
+  0, for example a line of exactly 64 KiB that ends with a delimiter.
+- **BEGIN in a line.** A candidate that reaches past an unmatched BEGIN is cut
+  at BEGIN, because the bytes after BEGIN are held in the block.
+- **Bytes after stream end.** A chunk scanned after `finish` is withheld with
+  `detector_error`, and the stream's degraded flag is set.
+- **Detector error.** `JobRedaction::detector_error` withholds the given
+  undecided bytes and the stream's carry with `detector_error`. No matching
+  path returns an error in SL1; the capture worker in SL3 calls it if
+  scanning a chunk fails.
+- **Search cost.** Matching runs the fast search first. Structural predicates
+  (A1, P1, L2) use only the match bounds. For the credential-name rules
+  SR-33–SR-36, the value bounds come from a byte scan of the name, quote,
+  blanks and separator. Debug builds assert that this scan equals the capture
+  group. Other rules with a value group run a capture search only for a match
+  that passed the fast search.
+- **Display form.** `display_redacted` returns a command with every detected
+  span replaced by its placeholder, for the refused-intent record.
+- **Tokenizer whitespace.** Only ASCII whitespace separates words, as in
+  `/bin/sh`; Wisp also split on Unicode spaces. The heredoc pre-pass does not
+  recognize comments, so a quote inside a comment makes the command
+  unparsed. An arithmetic `<<` counts as a heredoc. Both fail closed.
+
+Verified behavior on the macOS 27 development host, Rust 1.98:
+
+| Check | Result |
+| --- | --- |
+| SDU-01 | 47 rules and 46 expressions compile under G1–G3; the digest equals the recorded value |
+| SDU-02 | 92 vectors (Wisp's tests plus one positive per rule) give Wisp's kinds; each expectation was checked by running the Swift scanner |
+| SDU-03 | 18 boundary vectors for L1, A1, P1 and L2 agree with the Swift expressions |
+| SDU-04–SDU-10 | Pass, including every split offset and 400 sampled three-chunk splits of a mixed stream |
+| SDU-11 | Exact text and variables per form. Real `/bin/sh` expands 11 rewritten commands and one here-string to the original words |
+| SDU-12 | Every refusal code; no reason text or `Debug` output contains the value |
+| SDU-15 | Counts match [fixtures](#fixtures-and-licensing) |
+| SDM-01 | All 885 kept lines agree with Wisp's rule labels; no divergence. Test recall 67/211 (31.8%), 9 false alarms in 216 none lines, 8 of them in the 119-line hard-negative slice. Train 139/164, dev 23/25, both without false alarms |
+| SDM-02 | Release build, 30 runs per 512 KiB input in 64 KiB chunks. Build log, `git log -p`, lockfile, minified JS and binary: p95 at most 1.9 ms, worst at most 4.3 ms. Adversarial `token: ` lines: p50 20.4 ms, p95 20.9 ms, worst 21.2 ms. Adversarial 64 KiB lines: p95 2.8 ms |
+| SDM-03 | Release build, 8192-byte commands: ordinary worst 0.44 ms; adversarial `token:` worst 0.05 ms; quoting worst 0.06 ms; more than 16 secrets (refused) worst 0.81 ms. Figures are the worst of two runs |
+
+SDM-01 also compared byte spans with Wisp on every kept line. The one
+difference is a JSON line whose private key has BEGIN without END. Wisp
+replaces 45 bytes of the quoted value; the port replaces the whole
+unterminated block, as [unterminated block](#sd-s1-per-stream-scanner-states)
+requires. Both label the line `secret`.
+
+Proof limits: these are unit and in-process checks. SDM-02 and SDM-03 are
+single-host timings, recorded as acceptance criteria and never enforced at run
+time. SDM-04, SDM-05 and every integration and end-to-end case belong to later
+slices.
+
 ## Design verification
 
 Recorded on 2026-10-15: the owner decisions, the Wisp sources above and the
@@ -1122,5 +1232,9 @@ were removed, and SDI-05 now tests backpressure from a slowed scanner. A
 sweep removed the 64-restart step limit on rejected candidates and restated
 the rewrite and throughput figures as acceptance criteria only. SD-F1 and SD-P1 were
 re-rendered with Mermaid CLI 12.0.0 and inspected.
+
+Recorded at SL1 on 2026-10-15: the refinements and results are in
+[SL1 implementation](#sl1-implementation). No diagram changed. The lockfile
+diff adds three dependency edges to `asura-platform` and no package.
 
 Return to the [design index](README.md).

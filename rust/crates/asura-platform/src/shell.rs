@@ -4,6 +4,7 @@ mod cleanup;
 mod guardian;
 mod protocol;
 mod spawn;
+pub mod split;
 use crate::runtime::{open_at, stat_fd};
 use crate::{PollInterest, ProjectIdentity, RuntimeDirectory, StateBoundary};
 use capture::Capture;
