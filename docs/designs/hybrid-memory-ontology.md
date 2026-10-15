@@ -2356,3 +2356,21 @@ The [turn budget correction](turn-usage-helper.md#turn-budget-and-request-admiss
 has since replaced the three-pass limit.
 The adapter never repairs arguments itself or sends rejected fields to storage.
 These checks qualify the named model/bundle combinations, not every local model.
+
+### Threat model decision EX6
+
+Required behavior (owner, 2026-10-14), from the
+[execution threat model](execution-threat-model.md#owner-decisions) finding EX6:
+injected content written to a note can steer later sessions.
+
+- The person can delete a note. Deletion tombstones the note; the journal stays
+  append-only. The [deletion lifetime](#eligibility-holds-and-deletion-lifetime)
+  above is the starting point; the person's command and authority need design.
+- A model-written note carries a visible "model-written, unreviewed" mark
+  wherever it is shown, until the person reviews it. Review records need design.
+- When the [context composer](context-composer.md) adds notes to model input
+  automatically (CC5), the owner will revisit whether model-written notes need
+  approval before use.
+
+This changes HM3, which adds no deletion and no review state. Follow-up design:
+note deletion and review, with unit, integration and end-to-end cases.

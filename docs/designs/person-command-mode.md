@@ -4,11 +4,13 @@ Status: proposed design, 2026-10-13, rewritten the same day on the
 [tool job controller](tool-job-controller.md). The owner selected the required
 behavior below and resolved [decisions](#decisions) PC1–PC12 on 2026-10-14;
 those are fixed. Other mechanisms marked "Proposed mechanism" remain proposals
-for review. Implementation waits for two gates: job packets J1–J5, and the
-owner's approval of the
+for review. The owner approved the
 [person-typed commands section](execution-threat-model.md#person-typed-commands)
-of the execution threat model with its decisions PX1–PX6. It does not wait for
-the review of EX1–EX15. Nothing here is implemented. Protocol numbering remains `0.1`; journal format remains
+of the execution threat model, with its decisions PX1–PX6, on 2026-10-15. The
+same review (EX4, owner 2026-10-15) adds secret filtering at capture and
+per-execution secret variables, recorded in [threat model updates](#threat-model-updates-of-2026-10-15).
+Implementation waits for job packets J1–J5, which now include the secret
+detection design. Nothing here is implemented. Protocol numbering remains `0.1`; journal format remains
 `1`.
 
 ## Scope
@@ -77,7 +79,8 @@ two owner decisions: a `!` command is a tool job, and the
 | PCR15 | The log shows the output folded, with the darker amber stripe. It shows the last lines and offers a key to see the rest. The job viewer pages through all retained output. |
 | PCR16 | `!` commands share the prompt recall history. Recalling one restores command mode. Help `?` entries are not recorded. |
 | PCR17 | Protocol stays `0.1`; journal format stays `1`. Schemas may evolve under [numbering authority](../engineering.md#wire-protocol-change-authority). |
-| PCR18 | Before a person command runs, the TUI warns when the model changed build or test paths since the person's last command (PX1, owner 2026-10-14). The warning mechanism and path list need their own design before P4. |
+| PCR18 | Before a person command runs, the TUI warns when the model changed build or test paths since the person's last command (PX1, owner 2026-10-14). Asura also re-checks the recorded digest of each approved implicit-execution file before relying on it, and warns again when it changed (PX1, EX1, owner 2026-10-15). The warning mechanism, approval flow and path list need their own design before P4. |
+| PCR19 | Secrets in output are detected at capture and replaced with placeholders before storage; the journal, retained streams, viewer and model see placeholders. Secrets only. A secret in the command becomes a per-execution variable such as `$ASURA_SECRET_1`, passed in the environment for that one execution and then dropped; the log keeps only its name. A command that cannot be rewritten safely under shell quoting is refused with a reason (PX6, EX4, owner 2026-10-15). |
 
 These decisions amend the [shell tool](shell-tool.md) for person origin only.
 That design said toolchain and cache access "requires a subsequent scoped design
@@ -357,7 +360,7 @@ column is required behavior where marked PCR, otherwise a proposed mechanism.
 | PATH | `/usr/bin:/bin:/usr/sbin:/sbin` (`guardian.rs:222`) | The TUI's PATH, sent with each submit and sanitized (PCR8, PC2) |
 | HOME | Private scratch (`guardian.rs:225`) | Account home (PCR8) |
 | TMPDIR | Private scratch | The person's per-user temporary directory (PCR10) |
-| Other variables | `LC_ALL=C`, `LANG=C` only | Fixed allow-list plus the SSH agent socket (PC3) |
+| Other variables | `LC_ALL=C`, `LANG=C` only; EX4 adds per-execution secret variables | Fixed allow-list plus the SSH agent socket (PC3) and per-execution secret variables (EX4) |
 | Working directory | Model-chosen project-relative `cwd`, default root | Launch directory if inside the project, else root (PCR9) |
 | Stdin, TTY | `/dev/null`; no TTY | Same |
 | Command bounds | 1–8192 UTF-8 bytes, no NUL | Same |
@@ -412,8 +415,11 @@ Other variables (PC3, selected):
 | `LANG`, `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME` | Client, when set; each value at most 64 bytes of ASCII letters, digits, `_`, `-`, `.` and `@` |
 | `SSH_AUTH_SOCK` | Client, when set; an absolute path of at most 103 bytes with no NUL. The setup worker checks with `lstat` that it names a socket; otherwise the variable is dropped and the command still runs. |
 
-The client sends only names from this table. The service rejects any other
-name with `environment_invalid`. Every other inherited variable is absent, as in
+| `ASURA_SECRET_<n>` | Service only, never the client. Set when EX4 secret detection rewrites the command (PCR19): the real value, held in memory for that one execution, then dropped. Never journaled, audited or reused across commands. The secret detection design defines the name, count and size bounds. |
+
+The client sends only names from this table, excluding the service-set
+`ASURA_SECRET_<n>` variables. The service rejects any other client name with
+`environment_invalid`. Every other inherited variable is absent, as in
 the model profile. The guardian still closes every inherited descriptor.
 
 ### Working directory
@@ -601,7 +607,7 @@ an existing kind by value, which the admission contract forbids.
 
 | Record | Payload, in order |
 | --- | --- |
-| Kind PCQ `PersonCommandQueued` | request ID, request digest, input ID, project ID, conversation ID, expected generation, new-conversation flag, command (1–8192 bytes), cwd (1–1024 bytes), sanitized PATH (1–4096 bytes), PC3 client environment (at most 9 entries, one per allowed name), initial order revision |
+| Kind PCQ `PersonCommandQueued` | request ID, request digest, input ID, project ID, conversation ID, expected generation, new-conversation flag, command (1–8192 bytes; the PCR19 rewrite, never a secret value), cwd (1–1024 bytes), sanitized PATH (1–4096 bytes), PC3 client environment (at most 9 entries, one per allowed name), initial order revision |
 | J2 job intent, origin person | job ID, origin `person`, input ID, project device and inode, cwd device and inode, profile ID, root-set digest, grant snapshot, quota reservation, reserved record capacity, order revision; no deadline |
 | J2 job cancel requested | job ID, requester `person` or `revocation`, kill flag, reason |
 | J2 job settlement | job ID, outcome, exit status, capture state, byte and line counts per stream, digests and payload reference per stream, elapsed milliseconds, cleanup-confirmed flag |
@@ -961,7 +967,10 @@ design implements its required controls:
 - The notice labels the action as the person's and the output as untrusted.
 - Journal records and audit never contain output. Audit never contains the
   command or PATH.
-- PX1–PX6 decisions apply when the owner approves them.
+- PX1–PX6 decisions apply; the owner approved them with the section on
+  2026-10-15.
+- Secrets are replaced at capture, and command secrets pass only through
+  per-execution variables (PCR19).
 
 ## Audit and telemetry
 
@@ -1072,8 +1081,10 @@ Proposed plan. Arrows mean "is a prerequisite of".
 
 ```mermaid
 flowchart TD
-    TM["Owner approves threat-model person section and PX1-PX6"] --> Ready["Design ready"]
-    J1["J1: staging capture, live pages, install order"] --> J2["J2: job controller with person-origin amendments"]
+    TM["Threat-model person section and PX1-PX6 approved, 2026-10-15"] --> Ready["Design ready"]
+    SD["EX4: secret detection design"] --> J1
+    SD --> Ready
+    J1["J1: staging capture, secret filter, live pages, install order"] --> J2["J2: job controller with person-origin amendments"]
     J2 --> J4["J4: client job API and viewer"]
     J2 --> J3["J3: model job tool"]
     J2 --> J5["J5: job notices"]
@@ -1119,7 +1130,8 @@ decisions resolved on 2026-10-13. Each entry records the rejected options.
    plus a validated `SSH_AUTH_SOCK`, so `git push` with passphrase keys in the
    agent works. Rejected: the allow-list without the agent socket, and the
    client's full environment, which would pass tokens such as `GITHUB_TOKEN` to
-   every command and the journal.
+   every command and the journal. Amended on 2026-10-15 by EX4: the allow-list
+   also admits the service-set per-execution secret variables (PCR19).
 4. **PC4 — Notice entries in later turns.** Selected by the owner on
    2026-10-14: each later turn's input recomposes the entry from the journal,
    and the composer chooses its detail, down to one line, like any other
@@ -1170,6 +1182,27 @@ decisions resolved on 2026-10-13. Each entry records the rejected options.
     under PC10. Model job results use the same interim rule. Rejected: waiting
     for the composer before shipping `!`, and an interim fixed output tail.
 
+### Threat model updates of 2026-10-15
+
+The owner approved the threat model's person section on 2026-10-15 and updated
+two of its decisions:
+
+- **PX1 (EX1):** the approval flow records a digest of each approved file and
+  re-checks it before Asura relies on it, for example before a person `!`
+  command. A later change warns again. See PCR18.
+- **PX6 (EX4):** secret detection with rules plus a classifier, at capture,
+  replacing each secret with a placeholder; secrets only; command secrets as
+  per-execution variables. This supersedes "accept the risk now". See PCR19
+  and PC3.
+
+Open for the secret detection design: kind PCQ lets a held command resume
+after restart, but a secret value lives only in memory. That design must state
+what happens to a queued command whose secret value is gone.
+
+Required follow-up designs: secret detection and redaction (before J1 and P1),
+and the approval flow with change detection (before P4). Validation adds
+threat model cases PX-V6, PX-V11 and PX-V12.
+
 ## Alternatives considered
 
 - **Run person commands outside the queue.** Rejected by PCR12: the model must
@@ -1192,6 +1225,8 @@ citations refer to that tree. No code or test was run. Wisp ADR 0049 and
 evidence. Diagrams PCM-O1, PCM-T1, PCM-F2, PCM-S1, PCM-Q1, PCM-F1 and PCM-P1
 were rendered with the local Mermaid CLI and visually inspected. On 2026-10-14
 the owner resolved PC1–PC12; the affected diagrams were re-rendered and
-inspected again.
+inspected again. On 2026-10-15 the owner approved the threat model's person
+section and updated PX1 and PX6; PCR18, PCR19, PC3 and PCM-P1 changed. PCM-P1
+was re-rendered with Mermaid CLI 12.0.0 and inspected. No code or test was run.
 
 Return to the [design index](README.md).

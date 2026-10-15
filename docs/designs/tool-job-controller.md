@@ -1,6 +1,6 @@
 # Tool job controller
 
-Status: design, 2026-10-12, revised 2026-10-14; not implemented. The owner
+Status: design, 2026-10-12, revised 2026-10-14 and 2026-10-15; not implemented. The owner
 selected the direction and three decisions on 2026-10-12: conversation-scoped
 jobs, record-only completion and a yield window with a small preview. Later owner
 decisions replace the preview and add person-origin jobs; see
@@ -8,11 +8,16 @@ decisions replace the preview and add person-origin jobs; see
 the owner resolved every blocking decision of the readiness audit; see
 [owner decisions of 2026-10-14](#owner-decisions-of-2026-10-14).
 
-Readiness: packet J1 is ready for implementation, subject to the
+Readiness: packet J1 is not ready. The owner's
+[execution threat model](execution-threat-model.md#owner-decisions) decision EX4
+(2026-10-15) puts secret filtering into the J1 capture path, so J1 waits for a
+secret detection design. J1 is also subject to the
 [result retention packet](result-retention-graph-packet.md#review-decisions-and-delivery-dependencies)
-changes that the same decisions record. J2 and the packets after it are gated on
-the full review of [execution threat model](execution-threat-model.md) findings
-EX1–EX16 (T1). Mechanisms marked "proposed" are engineering choices under the
+changes that the 2026-10-14 decisions record. The full review of findings
+EX1–EX16 (T1) was completed on 2026-10-15. J2 and the packets after it now wait
+for EX5 escapee detection and termination and for EX10 shell qualification of
+each local provider; see [threat model review](#threat-model-review-of-2026-10-15).
+Mechanisms marked "proposed" are engineering choices under the
 [iteration rules](../design-process.md#iteration-and-escalation), not owner
 decisions. Protocol numbering remains `0.1`; journal format remains `1`.
 
@@ -57,7 +62,23 @@ by the [context composer](context-composer.md) (conversation projections items 5
 | Tool output views [required change](tool-output-views.md#required-design-changes) for this design, with [PC12](person-command-mode.md#decisions) | Owner, 2026-10-14 | Until the context composer exists, job results carry no output text. The model pages with `job read`. |
 | [PCR6, PCR11](person-command-mode.md#required-behavior), [PC5, PC7, PC8, PC9, PC10](person-command-mode.md#decisions) | Owner, 2026-10-13 and 2026-10-14 | Person-origin jobs: a person execution profile and grant, stop then kill at once on a second request, a 2 s stop grace, dispatch with no active turn in the conversation, model `cancel` of a person job returns `not_permitted`, and accepted work continues when a client goes away. |
 | [Person job controller amendments](person-command-mode.md#job-controller-amendments) | Proposed mechanisms | `JobCancel.kill`, `JobObserve.at_end`, origin and input ID on job records and replies, and person job ID derivation. J2 includes them. |
+| [Execution threat model review](execution-threat-model.md#owner-decisions) EX4, EX5, EX10, EX11, EX12 | Owner, 2026-10-14 and 2026-10-15 | See [threat model review of 2026-10-15](#threat-model-review-of-2026-10-15). |
 | [Asura state isolation](asura-state-isolation.md) (PX3, SI3) | Implemented, 2026-10-14 | Every shell profile denies `~/.asura` except the call's scratch. The guardian receives the Asura home at FD 10 (`asura-platform/src/shell/guardian.rs:199`); person extra roots use FDs 11–17. Jobs inherit this unchanged. |
+
+### Threat model review of 2026-10-15
+
+The owner completed the [execution threat model](execution-threat-model.md)
+review (T1) on 2026-10-14 and 2026-10-15. These decisions change this design.
+Each records its source; mechanisms they need are follow-up designs, not
+selected here.
+
+| ID | Decision | Effect on this design |
+| --- | --- | --- |
+| EX4 | Owner, 2026-10-15. All tools use jobs; there are no legacy tools. Secrets are detected with rules plus a classifier and replaced with placeholders at capture, before storage; secrets only. A secret in a command becomes a per-execution variable such as `$ASURA_SECRET_1`; the log keeps only its name; an unsafe rewrite is refused. | Supersedes R3's "legacy tools keep kind 15". The J1 capture path filters secrets, so J1 waits for the secret detection design. Retained streams, pages, journal records and both views hold placeholders. Job intent records the rewritten command. How other tools adopt jobs is a follow-up design. |
+| EX5 | Owner, 2026-10-14. Detect and terminate escapees reliably before J2: `setsid` and new-session escapes, pipe-holding escapees that block settlement, and false `cleanup_confirmed`. | J2 prerequisite. Without it a pipe-holding escapee could hold a slot indefinitely, since jobs have no lifetime (J2a-1). |
+| EX10 | Owner, 2026-10-14. Run SH-E1-style shell qualification for each local tool-capable provider (CoreAI, MLX, Ollama models) before J2. | J2 prerequisite. |
+| EX11 | Owner, 2026-10-14. A person execution setting: global default plus a per-project override, default on. A change is a revocation trigger: turning it off refuses new execution and cancels live model jobs in scope. | Added to [revocation triggers](#security-and-authority) and TJ-14. The setting needs its own design. |
+| EX12 | Owner, 2026-10-14. The client shows a visible notice whenever a job outlives its turn. | Added to [turn end](#turn-end-steering-cancellation-and-completion). Proposed placement: J4. |
 
 ### Owner decisions of 2026-10-14
 
@@ -69,11 +90,11 @@ Each row names the section that applies it.
 | G1 | J1 implements retention item 3 only: capture, descriptors and pages. Graph projection (item 4) waits for a separate later review. | [Delivery](#delivery-dependencies); retention packet |
 | R1 | Configurable quota: default 1 GiB total, 1 MiB initial reservation, 1 MiB growth steps, fixed 16 MiB recovery reserve. | [Limits](#arguments-and-limits) |
 | R2 | Settle, then install. Hash incrementally during capture, commit the settlement with digests, then install. An uninstalled file found at recovery is an unverified prefix to clean up. | [Capture amendments](#capture-watermark-and-page-contract-amendments) |
-| R3 | New record kinds for job intent, cancel and settlement, plus a reference-only result kind for job tools. Legacy tools keep kind 15 for now. Kinds are allocated in delivery order, J2 before person-command packet P2; the person design moves to the next free kinds. No data effect. | [Durable records](#durable-records) |
+| R3 | New record kinds for job intent, cancel and settlement, plus a reference-only result kind for job tools. Legacy tools keep kind 15 for now (superseded by EX4, owner 2026-10-15: there are no legacy tools; all tools use jobs). Kinds are allocated in delivery order, J2 before person-command packet P2; the person design moves to the next free kinds. No data effect. | [Durable records](#durable-records) |
 | R4 | One capture worker per job slot, each with a 512 KiB transfer queue, plus 2 page-read workers. | [Limits](#arguments-and-limits), [async](#asynchronous-execution) |
 | R5 | J1 serves text pages only, snapped to UTF-8 boundaries. Raw pages come later; retention case RG-11 is recorded as partial. | [Capture amendments](#capture-watermark-and-page-contract-amendments) |
 | R6 | Disk full (ENOSPC) during capture enters `CapturePaused`, as quota does. Other I/O faults and stalls cancel. Under J2a-1 the pause has no expiry. | [Retained output lifetime](#retained-output-lifetime), [failure](#failure-handling-and-recovery) |
-| T1 | Full review of threat model findings EX1–EX16 before J2. J1 is not gated. | [Delivery](#delivery-dependencies) |
+| T1 | Full review of threat model findings EX1–EX16 before J2. J1 is not gated. Completed on 2026-10-15; its decisions add J1 and J2 prerequisites. | [Delivery](#delivery-dependencies) |
 | J1d | No per-job output cap for model jobs; the shared quota only. | [Limits](#arguments-and-limits) |
 | J2a-1 | No fixed job lifetime. Fixed time limits are unpredictable and stop normal long-running processes; loop closures replace them. Jobs end by completion, model or person cancel, revocation, restart or capture fault. An unattended job holds a slot; the known-size slot limit returns `busy`, and the person cancels through `/jobs`. A stall closure for jobs comes later from tool-loop trace evidence ([tool output views rule 5](tool-output-views.md#required-behavior)). `CapturePaused` has no expiry. | [Job closures](#job-closures-and-wind-down-bounds) |
 | J2a-2 | Counts are configurable, each with a fixed maximum. Defaults: 4 live jobs per service, 2 per conversation; client viewers counted per attachment, 8 per service; 1 page read reserved for the model. | [Limits](#arguments-and-limits) |
@@ -234,6 +255,11 @@ left that the model never learned about.
 
 When a turn is cancelled with live jobs that have delivered handles, the TUI
 shows the count and the `/jobs` hint. `/cancel` itself never cancels those jobs.
+
+Required behavior (owner, 2026-10-14, EX12): whenever a job outlives its turn,
+however the turn ended, the client shows a visible notice. The EX11 execution
+setting is the person's switch to stop such jobs. The notice's form needs
+design with J4.
 
 When a job settles while no turn is running, the controller records the outcome
 and publishes a client event. It must not start, queue or steer a model turn.
@@ -520,7 +546,7 @@ When implemented, this design changes these existing contracts for jobs:
 | Shell: one shell worker per active turn (`conversation.rs:487`) and one active turn (`conversation.rs:584`), so one live shell job service-wide | Controller slots under the limits below |
 | Shell intent: ToolIntent record kind 14 with tool kind 16 stores the timeout as 1–60,000 ms and 1–60 s (`asura-storage/src/authority/conversation/codec.rs:289-305`) | Job intent record (R3) with no timeout |
 | Shell result: end of each stream, at most 6144 bytes (`shell/capture.rs:72`) | No output text (PC12) |
-| Model tools: ToolResult record kind 15 holds result text (`types.rs:415-423`) | Job tools use the reference-only result kind (R3); legacy tools keep kind 15 for now |
+| Model tools: ToolResult record kind 15 holds result text (`types.rs:415-423`) | All tools use jobs and the reference-only result kind (EX4, owner 2026-10-15, superseding R3's "legacy tools keep kind 15") |
 | Guardian: notices of kinds 1–4 (`protocol.rs:47-52`) | Adds kind 5, leader exited (J2b) |
 | Guardian: any byte on the lease pipe is a protocol fault (`guardian.rs:389-399`) | Stop-control bytes, below |
 | Retention: one active capture | One capture worker per job slot (R4) |
@@ -597,7 +623,9 @@ command, at integration.
 | Job result | Reference-only result for a `job` command: operation, generation, ordinal, job ID, stream, offsets and page digest; never page text |
 | Job retention | Pin, unpin, delete or note, keyed by job ID, with author and, for a note, its text (S1) |
 
-No record holds output text (tool output views rule 3). The person design adds
+No record holds output text (tool output views rule 3). Under EX4 (owner,
+2026-10-15) the job intent's command is the rewritten command: a detected secret
+appears only as its per-execution variable name, never as its value. The person design adds
 person-origin fields, line counts, elapsed time and a cleanup flag
 ([durable records](person-command-mode.md#durable-records)).
 
@@ -770,15 +798,18 @@ that started the job. A job continues after that turn ends, with no lifetime
 bound. This is a deliberate change: effects can now continue without an active
 turn. The original grant snapshot, sandbox, environment, scratch, network denial
 and descendant limits apply unchanged. The unbounded lifetime widens none of them.
+A `setsid` escapee currently survives cleanup and can write the project after
+settlement (threat model EX5, probe of 2026-10-14); J2 waits for its detection
+and termination.
 Every profile denies `~/.asura` except the call's scratch (SI3, implemented).
 Person jobs use the [person profile and grant](person-command-mode.md#authority-and-grant)
 instead; they have network access by owner decision (PCR7). The full threat
-model review (T1) must cover this before J2.
+model review (T1) covered this and was completed on 2026-10-15.
 
 Verified behavior (code): `read_authorized` and `execute_authorized` are constant
-`true` in the turn grant (`conversation.rs:203-211`). The read check below and the
-policy revocation trigger therefore have no person-controlled input until the
-threat model's EX11 decision adds one.
+`true` in the turn grant (`conversation.rs:202-212`, at commit `7db114d`). The read
+check below and the policy revocation trigger therefore have no person-controlled
+input until the EX11 setting (owner, 2026-10-14) is built.
 
 **Read access.** A model read, wait, status, note or cancel requires a current
 admitted turn in the same conversation. That turn's existing `read_authorized`
@@ -792,7 +823,7 @@ selected project and may cover every registered project, as described in
 | Trigger | Affected jobs |
 | --- | --- |
 | Project unregistered or retained identity changes | All jobs of that project |
-| Shell policy change disables execution | All jobs started under the old policy; no such policy exists until EX11 |
+| EX11 execution setting turned off, globally or for a project (owner, 2026-10-14) | Live model jobs in scope; new execution is refused. Person jobs are not affected. The setting needs its own design. |
 | Execution grant revoked for a project or principal | Jobs started under that grant |
 | Journal unavailable | All live jobs |
 | Service shutdown, including exit of a TUI-launched backend | All live jobs |
@@ -836,7 +867,7 @@ real model provider and the TUI PTY harness.
 | TJ-11 | Restart at each checkpoint | Replay of intent-only, running, finalizing, settled-not-installed; `interrupted` settlement written once | Crash at each point; guardian cleanup; uninstalled staging becomes an unverified prefix | Interrupted job listed and readable |
 | TJ-12 | Cross-conversation and cross-project access | Model `not_found` without disclosure | Model denied other conversations and projects; client denied unregistered projects | — |
 | TJ-13 | `/new` and exit with live jobs | Neither cancels; records stay with the originating conversation | Jobs survive `/new` and client exit and keep recording to the prior conversation; TUI-launched backend exit stops them through shutdown | PTY: `/new`, then `/jobs` lists the jobs; exit and reattach lists them |
-| TJ-14 | Revocation triggers | Each trigger cancels the right jobs | Unregister, identity change; policy change once EX11 exists | — |
+| TJ-14 | Revocation triggers | Each trigger cancels the right jobs | Unregister, identity change; EX11 setting off globally and per project once it exists | — |
 | TJ-15 | Journal unavailable and full | Reserved settlement capacity | Writer fault during live job | Repair then settlement recorded |
 | TJ-16 | Graceful shutdown | Shutdown reason recorded | Settle within and beyond the 2 s bound | TUI-owned backend exit |
 | TJ-17 | Default shell behavior change | Short commands and commands over 60 s; `timeout_seconds` rejected | A command over 60 s runs to completion | Native model handles both |
@@ -868,8 +899,10 @@ and end-to-end tests before the next starts.
 
 ```mermaid
 flowchart TD
-    RP[Retention packet changes: G1, R1, R2, R4, R5] --> J1[J1: staging capture, descriptors, text pages, quota]
-    TM[T1: full threat model review EX1-EX16] --> J2[J2: controller core with model and person origin]
+    RP[Retention packet changes: G1, R1, R2, R4, R5] --> J1[J1: staging capture, secret filter, descriptors, text pages, quota]
+    SD[EX4: secret detection design] --> J1
+    ESC[EX5: escapee detection and termination] --> J2[J2: controller core with model and person origin]
+    QUAL[EX10: shell qualification per local provider] --> J2
     J1 --> J2
     J2 --> J3[J3: model job tool and shell adoption]
     J2 --> J4[J4: control API, TUI jobs and retention commands]
@@ -883,8 +916,8 @@ flowchart TD
 
 | Packet | Delivers | Decisions it uses |
 | --- | --- | --- |
-| J1 | Retention item 3 under the existing shell: incremental hashing, staging, settle-then-install, descriptors, `live` and `unverified_prefix` text pages, quota and growing-reservation accounting, capture and page-read workers. The model result is unchanged; full output is retained. Graph projection is excluded. | G1, R1, R2, R3 (descriptor kinds), R4, R5, R6 |
-| J2 | Controller core: slots, job records, no lifetime, lease stop-control bytes, leader-exit notice, `CapturePaused` for quota and ENOSPC, revocation, journal outage, restart and shutdown, and the person-origin amendments. Driven by integration tests; the shell is not yet switched. | T1, R3, J1d, J2a-1, J2a-2, J2b, J2c, J2d |
+| J1 | Retention item 3 under the existing shell: secret filtering at capture (EX4), incremental hashing, staging, settle-then-install, descriptors, `live` and `unverified_prefix` text pages, quota and growing-reservation accounting, capture and page-read workers. The model result is unchanged; full output is retained. Graph projection is excluded. | G1, R1, R2, R3 (descriptor kinds), R4, R5, R6, EX4 |
+| J2 | Controller core: slots, job records, no lifetime, lease stop-control bytes, leader-exit notice, `CapturePaused` for quota and ENOSPC, revocation, journal outage, restart and shutdown, and the person-origin amendments. Driven by integration tests; the shell is not yet switched. | T1 (done), EX5, EX10, R3, J1d, J2a-1, J2a-2, J2b, J2c, J2d |
 | J3 | `shell` adoption with yield and no output text, removal of `timeout_seconds`, the `job` tool including `wait` and `note`, and reference-only results. Shipped together, because results carry no output text. | R3, R5, `job wait`, S1 |
 | J4 | Control messages, `/jobs`, the viewer, cancel and kill, `at_end`, and `/job pin`, `unpin`, `delete` and `note`, with their command flowcharts | J2a-2, J4a, S1 |
 | J5 | Job notices before the prompt, bound by the turn input digest | J5a |
@@ -892,10 +925,14 @@ flowchart TD
 
 ## Open decisions
 
-No open decision blocks J1–J6. These remain for later designs:
+No open owner decision blocks J1–J6. J1 waits for the EX4 secret detection
+design; J2 waits for the EX5 and EX10 prerequisites. These remain for later
+designs:
 
-1. **Other tools:** which future tools adopt the controller. Short typed tools
-   remain synchronous.
+1. **Other tools:** EX4 (owner, 2026-10-15) states that all tools use jobs. The
+   earlier assumption that short typed tools remain synchronous no longer holds.
+   A follow-up design must assign how project, memory and service tools adopt
+   the controller.
 2. **Job stall closure:** derived from tool-loop trace evidence under
    [tool output views rule 5](tool-output-views.md#tool-loop-trace-evidence).
 3. **Raw pages:** their encoding and the remaining RG-11 coverage (R5).
@@ -933,5 +970,10 @@ kind 16. The owner then resolved the audit's blocking decisions the same day;
 this revision records them and removes the job lifetime, the per-job cap and the
 fixed `wait` range. TJ-Q1, TJ-S1, TJ-R1 and TJ-P1 changed and were re-rendered
 with Mermaid CLI 12.0.0 and inspected. No code or test was run.
+
+Recorded on 2026-10-15: this revision records the completed threat model review
+(T1) and its decisions EX4, EX5, EX10, EX11 and EX12. J1 is no longer ready; it
+waits for the secret detection design. TJ-P1 changed and was re-rendered with
+Mermaid CLI 12.0.0 and inspected. No code or test was run.
 
 Return to the [design index](README.md).

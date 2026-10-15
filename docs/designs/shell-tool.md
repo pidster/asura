@@ -570,3 +570,29 @@ The [cancellation-driven turn policy](model-provider-integration.md#cancellation
 replaces reduction by a remaining whole-turn duration. A validated shell request
 retains its own 1–60 second duration, default 30. Shell cancellation, cleanup,
 process-group enforcement and recovery contracts remain unchanged.
+
+### Threat model review decisions — 2026-10-14
+
+The owner reviewed the [execution threat model](execution-threat-model.md#owner-decisions)
+on 2026-10-14 and 2026-10-15. These decisions change this contract. Their
+mechanisms need design before code.
+
+- **EX3, developer folder (owner, 2026-10-14).** The model profile must allow
+  reads of the selected system developer directory listed in
+  [authority and confinement](#authority-and-confinement), so the model can run
+  Git. The current profile omits it, and `git init` fails (probe EX-V1,
+  2026-10-14). This widens reads to the Xcode toolchain. The directory must be
+  resolved and validated as that section requires, and any further Seatbelt
+  operation Git needs must be backed by a real process test (threat model
+  EX-V11). Ancestor-directory metadata visibility is recorded as a known minor
+  leak.
+- **EX10, qualification of other providers (owner, 2026-10-14).** Shell stays
+  offered to local tool-capable providers. Each needs SH-E1-style
+  qualification, reported separately: CoreAI, MLX and Ollama models. This is a
+  prerequisite of [tool job](tool-job-controller.md#delivery-dependencies)
+  packet J2.
+- **EX4 and EX5.** Secret filtering at capture with per-execution command
+  secret variables (EX4, owner 2026-10-15) changes this design's fixed
+  environment and result text. Escapee detection and termination (EX5, owner
+  2026-10-14) replaces the documented escape limit above. Both are recorded in
+  the threat model and the job controller and need follow-up designs.

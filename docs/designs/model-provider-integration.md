@@ -18,7 +18,9 @@ with sensible defaults, and probe, test, person confirmation and configuration
 only when neither a per-model entry nor a default applies. This design must
 select defaults, probe methods and test bounds. Remote providers must not be
 implemented until the reviewed [execution threat model](execution-threat-model.md)
-covers remote endpoints, data egress and credentials (owner, 2026-10-13).
+covers remote endpoints, data egress and credentials (owner, 2026-10-13). The
+review was completed on 2026-10-15; remote endpoints wait for the
+[remote provider prerequisites](#remote-provider-prerequisites--owner-2026-10-15).
 
 Status: MP2 integrated and compiled, with native system, Ollama and MLX checks
 recorded below, 2026-09-28. CoreAI now also passes the scoped HM3 native Memory
@@ -515,7 +517,10 @@ Tests cover names at and above the multibyte boundary and full selector retentio
 Required behavior (owner, 2026-10-13): until the
 [execution threat model](execution-threat-model.md) is reviewed, the Ollama
 endpoint must be a loopback address. This closes finding EX7, where an HTTPS
-endpoint sent conversation content off the device.
+endpoint sent conversation content off the device. The owner extended it on
+2026-10-15 (EX7): the restriction stays until both the EX13 destination grant
+and the EX14 Keychain credentials are built. This replaces the provisional
+"inference only now".
 
 | Path | Selected behavior |
 | --- | --- |
@@ -531,13 +536,37 @@ turn preparation and for the existing local tool-destination check. The Swift
 helper keeps its own equal check at the transport boundary.
 
 All checks are pure in-memory string validation; none blocks. Removing the
-restriction later needs the threat-model review and an owner decision.
+restriction needs the EX13 grant and EX14 credentials built (EX7, owner
+2026-10-15). The code comment at `asura-storage/src/config.rs:400-401` still
+names the review as the condition and must be updated with that work.
 
 Validation: unit tests cover the rule, configuration set rejection, loading an
 existing non-loopback file, turn preparation rejection before helper start, and
 Swift backend rejection. The existing service conversation tests and Swift suite
 must pass. A TUI journey that sets a remote endpoint and submits a prompt is
 required for end-to-end proof.
+
+## Remote provider prerequisites — owner, 2026-10-15
+
+Required behavior from the [threat model decisions](execution-threat-model.md#owner-decisions).
+Each item needs its own design before code; none is designed here. Remote
+endpoints return only when EX13 and EX14 are built (EX7).
+
+| ID | Required outcome |
+| --- | --- |
+| EX13 | Owner, 2026-10-15. A grant per endpoint lists the data classes that may leave the device: prompts, history, notices, file pages and tool results. File pages and tool results are off by default. The grant is limited to named projects; an endpoint allowed for one project receives nothing from another. The person sets it through configuration. |
+| EX14 | Owner, 2026-10-14. One Keychain item per provider, read only by the model helper at request time. The service, journal and configuration hold only the provider name. The D1 [credential review](threat-model.md) runs with this work. |
+| EX15 | Owner, 2026-10-15. Per-provider spend ceilings, set by the person and admitted through the [ADR-0003](../decisions/0003-aggregate-budget-admission.md) aggregate budget as an exhaustion closure under [loop closure](loop-closure.md). The client asks the person before a turn whose estimated cost exceeds a set amount. |
+| EX8 | Owner, 2026-10-14. Accepted for credential-free endpoints; credentials wait for EX14. |
+| EX10 | Owner, 2026-10-14. Shell stays offered to local tool-capable providers; each needs SH-E1-style [qualification](shell-tool.md#threat-model-review-decisions--2026-10-14) before tool job packet J2. |
+
+PX4 gives a remote destination the same person notices and `job read` pages as
+a local model. Whether those pages fall under the EX13 tool-results class, off
+by default, is an open owner question recorded in the
+[threat model](execution-threat-model.md#remaining-items).
+
+Validation: threat model cases EX-V6 (only granted classes leave) and EX-V7
+(history on a provider switch) must pass before remote endpoints return.
 
 ## MP3: model inventory command
 
