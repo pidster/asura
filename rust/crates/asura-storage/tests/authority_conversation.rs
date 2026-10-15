@@ -1,7 +1,6 @@
 use asura_storage::authority::{self, ReplayError};
 use authority::conversation::*;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
 
 fn id(n: u64) -> Id {
     let mut id = [0; 16];
@@ -9,11 +8,7 @@ fn id(n: u64) -> Id {
     id
 }
 fn inspect(bytes: &[u8]) -> Result<Replay, ReplayError> {
-    replay(
-        bytes,
-        Instant::now() + Duration::from_secs(5),
-        &AtomicBool::new(false),
-    )
+    replay(bytes, &AtomicBool::new(false))
 }
 struct Journal {
     bytes: Vec<u8>,
@@ -171,12 +166,7 @@ fn roundtrip_requests_terminal_offsets_and_unknown_complete_usage() {
         panic!("terminal")
     };
     assert_eq!(decoded.text, "reply");
-    let summary = authority::replay(
-        &j.bytes,
-        Instant::now() + Duration::from_secs(1),
-        &AtomicBool::new(false),
-    )
-    .unwrap();
+    let summary = authority::replay(&j.bytes, &AtomicBool::new(false)).unwrap();
     assert_eq!(summary.state, authority::ReplayState::ActiveBinding);
     assert_eq!(summary.revision, s.revision);
     assert_eq!(summary.owner_generation, s.owner_generation);
@@ -453,19 +443,10 @@ fn file_fixture_reopen_preserves_the_same_authority_result() {
     assert_eq!(s.last_digest, j.digest);
 }
 #[test]
-fn deadline_and_cancellation_have_no_partial_public_result() {
+fn cancellation_has_no_partial_public_result() {
     let j = Journal::base();
     assert_eq!(
-        replay(&j.bytes, Instant::now(), &AtomicBool::new(false)).unwrap_err(),
-        ReplayError::Timeout
-    );
-    assert_eq!(
-        replay(
-            &j.bytes,
-            Instant::now() + Duration::from_secs(1),
-            &AtomicBool::new(true)
-        )
-        .unwrap_err(),
+        replay(&j.bytes, &AtomicBool::new(true)).unwrap_err(),
         ReplayError::Cancelled
     );
 }
@@ -548,13 +529,7 @@ fn format_one_and_distinct_initialization_kinds_are_enforced() {
             &kind.to_be_bytes()
         );
     }
-    let public = |bytes: &[u8]| {
-        authority::replay(
-            bytes,
-            Instant::now() + Duration::from_secs(1),
-            &AtomicBool::new(false),
-        )
-    };
+    let public = |bytes: &[u8]| authority::replay(bytes, &AtomicBool::new(false));
     let mut wrong_version = journal.bytes[..first].to_vec();
     wrong_version[8..10].copy_from_slice(&2u16.to_be_bytes());
     seal(&mut wrong_version);

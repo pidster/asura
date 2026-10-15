@@ -2,6 +2,7 @@ use super::*;
 use crate::conversation::tool_tests::Fixture;
 use asura_storage::authority::writer::test_support::controlled_ticket;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 fn intent() -> journal::MemoryCreateIntent {
     memory::prepare_create(
@@ -68,7 +69,7 @@ fn resolution_response_is_not_publication_until_job_really_settles() {
     let now = Instant::now();
     let mut mutation = Mutation::new(intent());
     mutation.phase = Phase::Resolve;
-    let (ticket, controller) = controlled_ticket(now + Duration::from_secs(2), false);
+    let (ticket, controller) = controlled_ticket(false);
     mutation.ticket = Some(ticket);
     controller.publish(Ok(response(MemoryCreateResult::Committed(receipt(
         &mutation.intent,
@@ -90,7 +91,7 @@ fn timed_out_mutation_retains_ticket_and_cancellation_until_settlement() {
     let now = Instant::now();
     let mut mutation = Mutation::new(intent());
     mutation.phase = Phase::Mutation;
-    let (ticket, controller) = controlled_ticket(now, true);
+    let (ticket, controller) = controlled_ticket(true);
     mutation.ticket = Some(ticket);
     mutation.cancel();
     assert!(mutation.poll(&writer.0, now, 5).unwrap().is_none());
@@ -233,12 +234,7 @@ fn pending_projection() -> Arc<journal::Replay> {
         }),
     )
     .unwrap();
-    let mut replay = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .unwrap();
+    let mut replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     replay.owner_generation = 2;
     replay.active_operation = Some(create.operation);
     replay.operations.insert(
@@ -293,7 +289,7 @@ fn startup_unconfirmed_resolution_retains_publication_gate_without_terminal_or_m
             .unwrap()
             .project_memory_blocked([3; 16])
     );
-    let (ticket, controller) = controlled_ticket(Instant::now() + Duration::from_secs(2), false);
+    let (ticket, controller) = controlled_ticket(false);
     let recovery = fixture.owner.create_recovery.as_mut().unwrap();
     recovery.phase = Phase::Resolve;
     recovery.ticket = Some(ticket);
@@ -523,12 +519,7 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
         std::thread::sleep(Duration::from_millis(1));
     }
     let bytes = std::fs::read(fixture.path.join(".asura/state/control/slot-0.log")).unwrap();
-    journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .unwrap();
+    journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     let frame = &bytes[result_frame];
     // Format 1 frame boundaries, as in the native journal proof harness.
     match journal::decode_record(15, &frame[144..frame.len() - 40]).unwrap() {

@@ -204,10 +204,13 @@ fn setup() -> Result<(Fixture, Vec<[u8; 16]>)> {
         projects.push(checked_id(
             fixture
                 .attach()?
-                .register_project(pb::ProjectRegister {
-                    request_id: Some(asura_platform::random_id().to_vec()),
-                    location: Some(directory.to_str().ok_or("scratch UTF8")?.into()),
-                })?
+                .register_project(
+                    pb::ProjectRegister {
+                        request_id: Some(asura_platform::random_id().to_vec()),
+                        location: Some(directory.to_str().ok_or("scratch UTF8")?.into()),
+                    },
+                    &|| false,
+                )?
                 .project_id,
         )?);
     }
@@ -326,12 +329,8 @@ fn verify_tool(fixture: &Fixture, operation: [u8; 16], project: [u8; 16]) -> Res
     fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
         .take(asura_storage::authority::MAX_JOURNAL as u64 + 1)
         .read_to_end(&mut bytes)?;
-    let replay = j::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .map_err(|e| format!("audit proof replay:{e:?}"))?;
+    let replay = j::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
+        .map_err(|e| format!("audit proof replay:{e:?}"))?;
     let tools = &replay
         .operations
         .get(&operation)

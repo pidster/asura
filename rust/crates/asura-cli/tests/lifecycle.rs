@@ -423,6 +423,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--queue-reorder"),
         Some("--state-isolation"),
         Some("--help-mode"),
+        Some("--journal-waits"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);
@@ -1058,6 +1059,14 @@ fn main() {
         .and_then(|path| path.file_name().map(|name| name == "asura-fixture"))
         .unwrap_or(false)
     {
+        // Test-only journal holds for the PTY journal-wait journey (J1-0); inert
+        // unless that journey creates a hold file in the fixture home.
+        if let Some(home) = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.join("home")))
+        {
+            asura_platform::journal_gate::install_file_gate(&home);
+        }
         std::process::exit(app::entry_with_logs(resolver, log_resolver));
     }
     if let Err(error) = suite() {

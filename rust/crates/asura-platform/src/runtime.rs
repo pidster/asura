@@ -313,6 +313,11 @@ impl RuntimeDirectory {
         }
         Ok((unsafe { OwnedFd::from_raw_fd(raw) }, self.0.uid))
     }
+    /// The retained runtime path; identifies a scratch runtime to test-support gates.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn run_path(&self) -> &Path {
+        &self.0.path
+    }
     /// The Asura home and every directory containing it; computed at open.
     pub fn state_boundary(&self) -> crate::StateBoundary {
         self.0.boundary.clone()

@@ -19,10 +19,13 @@ fn run_for(long: bool) -> Result<()> {
     let project = checked_id(
         fixture
             .attach()?
-            .register_project(pb::ProjectRegister {
-                request_id: Some(asura_platform::random_id().to_vec()),
-                location: Some(directory.to_str().ok_or("invalid scratch path")?.into()),
-            })?
+            .register_project(
+                pb::ProjectRegister {
+                    request_id: Some(asura_platform::random_id().to_vec()),
+                    location: Some(directory.to_str().ok_or("invalid scratch path")?.into()),
+                },
+                &|| false,
+            )?
             .project_id,
     )?;
     if long {
@@ -73,12 +76,8 @@ fn run_for(long: bool) -> Result<()> {
     );
     fixture.stop()?;
     let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
-    let replay = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .map_err(|error| format!("inventory replay: {error:?}"))?;
+    let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
+        .map_err(|error| format!("inventory replay: {error:?}"))?;
     let tools = &replay
         .operations
         .get(&operation)

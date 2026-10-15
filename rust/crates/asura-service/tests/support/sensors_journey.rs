@@ -36,10 +36,13 @@ pub(super) fn run() -> Result<()> {
     let dir = fixture.home.join("project");
     fs::create_dir(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-    let registered = fixture.attach()?.register_project(pb::ProjectRegister {
-        request_id: Some(asura_platform::random_id().to_vec()),
-        location: Some(dir.to_str().unwrap().into()),
-    })?;
+    let registered = fixture.attach()?.register_project(
+        pb::ProjectRegister {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            location: Some(dir.to_str().unwrap().into()),
+        },
+        &|| false,
+    )?;
     assert!(registered.error.is_none(), "{:?}", registered.error);
     let project: [u8; 16] = registered.project_id.unwrap().try_into().unwrap();
     let initial = loaded(&fixture, project)?;

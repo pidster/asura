@@ -269,10 +269,13 @@ fn journey(native: bool) -> Result<()> {
     fs::create_dir(&project_dir)?;
     fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o700))?;
     let registration_request = asura_platform::random_id().to_vec();
-    let registered = fixture.attach()?.register_project(pb::ProjectRegister {
-        request_id: Some(registration_request.clone()),
-        location: Some(project_dir.to_str().ok_or("non-UTF-8 path")?.into()),
-    })?;
+    let registered = fixture.attach()?.register_project(
+        pb::ProjectRegister {
+            request_id: Some(registration_request.clone()),
+            location: Some(project_dir.to_str().ok_or("non-UTF-8 path")?.into()),
+        },
+        &|| false,
+    )?;
     if let Some(error) = registered.error {
         return Err(error.into());
     }
@@ -292,7 +295,9 @@ fn journey(native: bool) -> Result<()> {
         expected_name_revision: Some(0),
         name: Some("my project".into()),
     };
-    let renamed = fixture.attach()?.rename_project(rename.clone())?;
+    let renamed = fixture
+        .attach()?
+        .rename_project(rename.clone(), &|| false)?;
     assert_eq!(renamed.error, None);
     assert_eq!(renamed.changed, Some(true));
     let renamed_project = renamed.project.ok_or("rename omitted project")?;
@@ -303,34 +308,42 @@ fn journey(native: bool) -> Result<()> {
         Some(project.as_slice())
     );
     assert_eq!(renamed_project.location, listed.projects[0].location);
-    let stale = fixture.attach()?.rename_project(pb::ProjectRename {
-        request_id: Some(asura_platform::random_id().to_vec()),
-        project_id: Some(project.to_vec()),
-        expected_name_revision: Some(0),
-        name: Some("different".into()),
-    })?;
+    let stale = fixture.attach()?.rename_project(
+        pb::ProjectRename {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            project_id: Some(project.to_vec()),
+            expected_name_revision: Some(0),
+            name: Some("different".into()),
+        },
+        &|| false,
+    )?;
     assert_eq!(stale.error.as_deref(), Some("stale_project_name_revision"));
     assert_eq!(
         stale.project.as_ref().and_then(|p| p.name.as_deref()),
         Some("My project")
     );
-    let retry = fixture.attach()?.rename_project(rename.clone())?;
+    let retry = fixture
+        .attach()?
+        .rename_project(rename.clone(), &|| false)?;
     assert_eq!(
         retry.project.as_ref().and_then(|p| p.name_revision),
         Some(1)
     );
-    let same_name = fixture.attach()?.rename_project(pb::ProjectRename {
-        request_id: Some(asura_platform::random_id().to_vec()),
-        project_id: Some(project.to_vec()),
-        expected_name_revision: Some(1),
-        name: Some("my project".into()),
-    })?;
+    let same_name = fixture.attach()?.rename_project(
+        pb::ProjectRename {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            project_id: Some(project.to_vec()),
+            expected_name_revision: Some(1),
+            name: Some("my project".into()),
+        },
+        &|| false,
+    )?;
     assert_eq!(same_name.changed, Some(false));
     assert_eq!(
         same_name.project.as_ref().and_then(|p| p.name_revision),
         Some(2)
     );
-    let late_retry = fixture.attach()?.rename_project(rename)?;
+    let late_retry = fixture.attach()?.rename_project(rename, &|| false)?;
     assert_eq!(
         late_retry.project.as_ref().and_then(|p| p.name_revision),
         Some(1)
@@ -367,11 +380,14 @@ fn journey(native: bool) -> Result<()> {
         !fixture.attach()?.inspect()?.new_installation,
         "a restarted service must not report a new installation"
     );
-    let repeated = fixture.attach()?.initialize(pb::InitializeInstallation {
-        request_id: Some(asura_platform::random_id().to_vec()),
-        mode: Some("embedded".into()),
-        expected_authority_revision: Some(0),
-    })?;
+    let repeated = fixture.attach()?.initialize(
+        pb::InitializeInstallation {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            mode: Some("embedded".into()),
+            expected_authority_revision: Some(0),
+        },
+        &|| false,
+    )?;
     assert_eq!(
         repeated.error.as_deref(),
         Some("installation_already_initialized")
@@ -384,10 +400,13 @@ fn journey(native: bool) -> Result<()> {
         Some("My project")
     );
     assert_eq!(after_restart.projects[0].name_revision, Some(2));
-    let alias = fixture.attach()?.register_project(pb::ProjectRegister {
-        request_id: Some(registration_request),
-        location: Some(project_dir.to_str().ok_or("non-UTF-8 path")?.into()),
-    })?;
+    let alias = fixture.attach()?.register_project(
+        pb::ProjectRegister {
+            request_id: Some(registration_request),
+            location: Some(project_dir.to_str().ok_or("non-UTF-8 path")?.into()),
+        },
+        &|| false,
+    )?;
     assert_eq!(alias.name.as_deref(), Some("My project"));
     assert_eq!(alias.name_revision, Some(2));
     println!("PASS setup, registration, list, clean stop and durable restart");
@@ -507,10 +526,13 @@ fn journey(native: bool) -> Result<()> {
         let other_dir = fixture.home.join("other-project");
         fs::create_dir(&other_dir)?;
         fs::set_permissions(&other_dir, fs::Permissions::from_mode(0o700))?;
-        let other = fixture.attach()?.register_project(pb::ProjectRegister {
-            request_id: Some(asura_platform::random_id().to_vec()),
-            location: Some(other_dir.to_str().ok_or("non-UTF-8 path")?.into()),
-        })?;
+        let other = fixture.attach()?.register_project(
+            pb::ProjectRegister {
+                request_id: Some(asura_platform::random_id().to_vec()),
+                location: Some(other_dir.to_str().ok_or("non-UTF-8 path")?.into()),
+            },
+            &|| false,
+        )?;
         let other = checked_id(other.project_id)?;
         assert!(
             fixture
@@ -571,9 +593,11 @@ fn journey(native: bool) -> Result<()> {
             "Write a detailed long explanation of trees.",
         )?;
         let cancel_operation = checked_id(cancelled.operation_id)?;
-        let reply = fixture
-            .attach()?
-            .cancel_conversation(cancel_operation, cancelled.generation.unwrap())?;
+        let reply = fixture.attach()?.cancel_conversation(
+            cancel_operation,
+            cancelled.generation.unwrap(),
+            &|| false,
+        )?;
         let terminal = observe(&fixture, cancel_operation)?;
         if reply.terminal == Some(false) {
             assert_eq!(terminal.kind, Some(5));
@@ -645,7 +669,10 @@ fn managed_queue_journey(
     let decide = |request: pb::ConversationQueueDecision| -> Result<pb::ConversationQueueReply> {
         let end = Instant::now() + Duration::from_secs(3);
         loop {
-            match fixture.attach()?.decide_conversation_input(request.clone()) {
+            match fixture
+                .attach()?
+                .decide_conversation_input(request.clone(), &|| false)
+            {
                 Ok(reply) => return Ok(reply),
                 Err(asura_client::Error::Remote(_, message))
                     if message == "conversation_busy" && Instant::now() < end =>
@@ -755,15 +782,16 @@ fn managed_queue_journey(
         .attach()?
         .conversation_queue(project, Some(first_id))?;
     assert_eq!(first_state.entries[0].state, Some(2));
-    fixture
-        .attach()?
-        .decide_conversation_input(pb::ConversationQueueDecision {
+    fixture.attach()?.decide_conversation_input(
+        pb::ConversationQueueDecision {
             request_id: Some(asura_platform::random_id().to_vec()),
             input_id: Some(first_id.to_vec()),
             action: Some(2),
             target_operation_id: None,
             target_generation: None,
-        })?;
+        },
+        &|| false,
+    )?;
     let retry_after_drop = managed_submit_call(
         fixture,
         pb::ConversationQueueSubmit {
@@ -791,7 +819,10 @@ fn managed_submit_call(
 ) -> Result<pb::ConversationQueueReply> {
     let end = Instant::now() + Duration::from_secs(3);
     loop {
-        match fixture.attach()?.queue_conversation_input(request.clone()) {
+        match fixture
+            .attach()?
+            .queue_conversation_input(request.clone(), &|| false)
+        {
             Ok(reply) => return Ok(reply),
             Err(asura_client::Error::Remote(_, message))
                 if message == "conversation_busy" && Instant::now() < end =>
@@ -810,7 +841,7 @@ fn managed_reorder_call(
     loop {
         match fixture
             .attach()?
-            .reorder_conversation_input(request.clone())
+            .reorder_conversation_input(request.clone(), &|| false)
         {
             Ok(reply) => return Ok(reply),
             Err(asura_client::Error::Remote(_, message))
@@ -828,7 +859,10 @@ fn queue_call(
 ) -> Result<pb::ConversationQueueReply> {
     let end = Instant::now() + Duration::from_secs(3);
     loop {
-        match fixture.attach()?.enqueue_conversation(request.clone()) {
+        match fixture
+            .attach()?
+            .enqueue_conversation(request.clone(), &|| false)
+        {
             Ok(reply) => return Ok(reply),
             Err(asura_client::Error::Remote(_, message))
                 if message == "conversation_busy" && Instant::now() < end =>
@@ -969,7 +1003,10 @@ fn queue_journey(
     let mutation = |request: pb::ConversationQueueDecision| -> Result<pb::ConversationQueueReply> {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            match fixture.attach()?.decide_conversation_input(request.clone()) {
+            match fixture
+                .attach()?
+                .decide_conversation_input(request.clone(), &|| false)
+            {
                 Ok(reply) => return Ok(reply),
                 Err(asura_client::Error::Remote(_, reason))
                     if reason == "conversation_busy" && Instant::now() < deadline =>
@@ -1018,6 +1055,7 @@ fn queue_journey(
     fixture.attach()?.cancel_conversation(
         checked_id(active.operation_id.clone())?,
         active.generation.unwrap(),
+        &|| false,
     )?;
     observe(fixture, checked_id(active.operation_id)?)?;
     assert_eq!(queue_settled(fixture, project, held_id)?.state, Some(2));
@@ -1033,10 +1071,13 @@ fn queue_journey(
     };
     fixture
         .attach()?
-        .decide_conversation_input(request.clone())?;
+        .decide_conversation_input(request.clone(), &|| false)?;
     let end = Instant::now() + Duration::from_secs(3);
     loop {
-        match fixture.attach()?.decide_conversation_input(request.clone()) {
+        match fixture
+            .attach()?
+            .decide_conversation_input(request.clone(), &|| false)
+        {
             Ok(_) => break,
             Err(asura_client::Error::Remote(_, m))
                 if m == "conversation_busy" && Instant::now() < end =>
@@ -1141,11 +1182,7 @@ fn preservation_journeys() -> Result<()> {
             );
             let after = fs::read(&file)?;
             assert!(after.starts_with(&bytes));
-            let replay = journal::replay(
-                &after,
-                Instant::now() + Duration::from_secs(2),
-                &AtomicBool::new(false),
-            )?;
+            let replay = journal::replay(&after, &AtomicBool::new(false))?;
             assert_eq!(replay.initialization, pending);
             assert!(replay.binding.is_none());
         }
@@ -1169,11 +1206,7 @@ fn preservation_journeys() -> Result<()> {
         fixture.stop()?;
         let file = fixture.home.join(".asura/state/control/slot-0.log");
         let before = fs::read(&file)?;
-        let original = journal::replay(
-            &before,
-            Instant::now() + Duration::from_secs(2),
-            &AtomicBool::new(false),
-        )?;
+        let original = journal::replay(&before, &AtomicBool::new(false))?;
         fs::rename(
             fixture.home.join(".asura/db"),
             fixture.home.join("retained-db"),
@@ -1188,11 +1221,7 @@ fn preservation_journeys() -> Result<()> {
         );
         let after = fs::read(&file)?;
         assert!(after.starts_with(&before));
-        let replay = journal::replay(
-            &after,
-            Instant::now() + Duration::from_secs(2),
-            &AtomicBool::new(false),
-        )?;
+        let replay = journal::replay(&after, &AtomicBool::new(false))?;
         assert_eq!(replay.initialization, original.initialization);
         assert_eq!(replay.binding, original.binding);
         println!("PASS missing bound graph leaves original installation and binding intact");
@@ -1488,10 +1517,13 @@ fn native_tools(provider: &str) -> Result<()> {
         fixture
             .attach()
             .map_err(|e| format!("native-tools attach for registration: {e}"))?
-            .register_project(pb::ProjectRegister {
-                request_id: Some(asura_platform::random_id().to_vec()),
-                location: Some(directory.to_str().ok_or("invalid scratch path")?.into()),
-            })
+            .register_project(
+                pb::ProjectRegister {
+                    request_id: Some(asura_platform::random_id().to_vec()),
+                    location: Some(directory.to_str().ok_or("invalid scratch path")?.into()),
+                },
+                &|| false,
+            )
             .map_err(|e| format!("native-tools register project: {e}"))?
             .project_id,
     )?;
@@ -1562,12 +1594,8 @@ fn native_tools(provider: &str) -> Result<()> {
         .stop()
         .map_err(|e| format!("native-tools stop: {e}"))?;
     let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
-    let replay = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &AtomicBool::new(false),
-    )
-    .map_err(|error| format!("tool journal replay: {error:?}"))?;
+    let replay = journal::replay(&bytes, &AtomicBool::new(false))
+        .map_err(|error| format!("tool journal replay: {error:?}"))?;
     let record = &replay.operations[&operation];
     assert!(!record.tools.is_empty());
     assert!(
@@ -1786,10 +1814,13 @@ fn native_mlx() -> Result<()> {
         let project = checked_id(
             fixture
                 .attach()?
-                .register_project(pb::ProjectRegister {
-                    request_id: Some(asura_platform::random_id().to_vec()),
-                    location: Some(directory.to_str().ok_or("invalid fixture path")?.into()),
-                })?
+                .register_project(
+                    pb::ProjectRegister {
+                        request_id: Some(asura_platform::random_id().to_vec()),
+                        location: Some(directory.to_str().ok_or("invalid fixture path")?.into()),
+                    },
+                    &|| false,
+                )?
                 .project_id,
         )?;
         stage = "missing model configuration";
@@ -1861,9 +1892,11 @@ fn native_mlx() -> Result<()> {
         )?;
         let cancel_operation = checked_id(cancelled.operation_id)?;
         stage = "cancel request";
-        let reply = fixture
-            .attach()?
-            .cancel_conversation(cancel_operation, cancelled.generation.unwrap())?;
+        let reply = fixture.attach()?.cancel_conversation(
+            cancel_operation,
+            cancelled.generation.unwrap(),
+            &|| false,
+        )?;
         stage = "cancel settlement";
         let stopped = observe(&fixture, cancel_operation)?;
         if reply.terminal == Some(false) {
@@ -1902,10 +1935,13 @@ fn native_ollama() -> Result<()> {
         let project = checked_id(
             fixture
                 .attach()?
-                .register_project(pb::ProjectRegister {
-                    request_id: Some(asura_platform::random_id().to_vec()),
-                    location: Some(directory.to_str().ok_or("invalid fixture path")?.into()),
-                })?
+                .register_project(
+                    pb::ProjectRegister {
+                        request_id: Some(asura_platform::random_id().to_vec()),
+                        location: Some(directory.to_str().ok_or("invalid fixture path")?.into()),
+                    },
+                    &|| false,
+                )?
                 .project_id,
         )?;
         stage = "provider configuration";
@@ -2193,6 +2229,8 @@ fn child(home: &Path) -> Result<()> {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(std::io::stderr)
         .init();
+    // Test-only journal holds: inert unless the journey creates a hold file.
+    asura_platform::journal_gate::install_file_gate(home);
     asura_service::run(RuntimeDirectory::scratch(home, true)?, BUILD, None)?;
     Ok(())
 }
@@ -2209,6 +2247,8 @@ fn main() {
     }
     let result = if args.get(1).map(String::as_str) == Some("--conversation-child") {
         child(Path::new(args.get(2).expect("scratch home")))
+    } else if args.iter().any(|a| a == "--journal-waits") {
+        journal_wait_journey()
     } else if args.iter().any(|a| a == "--long-inference") {
         cancellation_driven_journey::run()
     } else if args.iter().any(|a| a == "--native-shell-tools") {
@@ -2275,7 +2315,7 @@ fn main() {
             if args.iter().any(|a| a == "--native") {
                 Ok(())
             } else {
-                audit_journey::run(None)
+                audit_journey::run(None).and_then(|()| journal_wait_journey())
             }
         })
     };
@@ -2283,4 +2323,187 @@ fn main() {
         eprintln!("conversation journey FAILED: {error}");
         std::process::exit(1)
     }
+}
+
+/// Times one already-attached request; responsiveness must not depend on a
+/// held journal append or replay (J1-0-07).
+fn within_100ms<T>(label: &str, call: impl FnOnce() -> T) -> Result<T> {
+    let started = Instant::now();
+    let value = call();
+    let elapsed = started.elapsed();
+    if elapsed >= Duration::from_millis(100) {
+        return Err(format!("{label} took {elapsed:?} during a held journal step").into());
+    }
+    Ok(value)
+}
+fn journal_wait_journey() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.start()?;
+    wait_ready(&fixture, None)?;
+    let project_dir = fixture.home.join("project");
+    fs::create_dir(&project_dir)?;
+    fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o700))?;
+    let registered = fixture.attach()?.register_project(
+        pb::ProjectRegister {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            location: Some(project_dir.to_str().ok_or("non-UTF-8 path")?.into()),
+        },
+        &|| false,
+    )?;
+    let project = checked_id(registered.project_id)?;
+    // Queued inputs are held, never dispatched to a model.
+    fixture
+        .attach()?
+        .config("model", Some("unknown:queue-fixture"))?;
+
+    // J1-0-02, J1-0-05, J1-0-07: a queue mutation held at a real append.
+    let hold_appends = fixture.home.join("journal-hold-appends");
+    fs::write(&hold_appends, b"")?;
+    let held_at = Instant::now();
+    let request = pb::ConversationQueueSubmit {
+        request_id: Some(asura_platform::random_id().to_vec()),
+        project_id: Some(project.to_vec()),
+        conversation_id: None,
+        expected_generation: Some(0),
+        new_conversation: Some(true),
+        prompt: Some("Held journal append".into()),
+    };
+    let mut submitter = fixture.attach()?;
+    let submit = thread::spawn(move || submitter.queue_conversation_input(request, &|| false));
+    thread::sleep(Duration::from_millis(300));
+    for _ in 0..5 {
+        let mut client = fixture.attach()?;
+        within_100ms("Inspect", || client.inspect())??;
+        let mut client = fixture.attach()?;
+        let cancel = within_100ms("cancel", || {
+            client.cancel_conversation(asura_platform::random_id(), 1, &|| false)
+        })?;
+        assert!(matches!(
+            cancel,
+            Err(asura_client::Error::Remote(_, ref message)) if message == "unknown_operation"
+        ));
+    }
+    // Initialization has no client budget: it waits behind the held append
+    // until the person cancels, which ends only the wait.
+    let cancel_at = std::cell::Cell::new(None::<Instant>);
+    let started = Instant::now();
+    let initialized = fixture.attach()?.initialize(
+        pb::InitializeInstallation {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            mode: Some("embedded".into()),
+            expected_authority_revision: Some(0),
+        },
+        &|| {
+            if started.elapsed() < Duration::from_millis(400) {
+                return false;
+            }
+            cancel_at.set(cancel_at.get().or(Some(Instant::now())));
+            true
+        },
+    );
+    if !matches!(initialized, Err(asura_client::Error::OutcomeUnconfirmed)) {
+        return Err(format!("initialization wait was not cancelled: {initialized:?}").into());
+    }
+    let stopped_after = cancel_at.get().ok_or("cancel never requested")?.elapsed();
+    if stopped_after >= Duration::from_millis(100) {
+        return Err(format!("initialization cancel took {stopped_after:?}").into());
+    }
+    // Hold past the removed 2 s ticket and foreground budgets and the removed
+    // 3 s client mutation budget: the client waits for the real reply.
+    thread::sleep(Duration::from_millis(5_200).saturating_sub(held_at.elapsed()));
+    if submit.is_finished() {
+        return Err("queue mutation finished while its append was held".into());
+    }
+    fs::remove_file(&hold_appends)?;
+    let reply = submit.join().map_err(|_| "submit thread panicked")??;
+    let input = checked_id(reply.accepted_input_id.clone())?;
+    if !reply
+        .entries
+        .iter()
+        .any(|entry| entry.input_id.as_deref() == Some(input.as_slice()))
+    {
+        return Err(format!("late queue reply was not applied: {reply:?}").into());
+    }
+    if held_at.elapsed() < Duration::from_secs(5) {
+        return Err("the append was not held past the removed bounds".into());
+    }
+    let listed = fixture.attach()?.conversation_queue(project, Some(input))?;
+    if !listed
+        .entries
+        .iter()
+        .any(|entry| entry.input_id.as_deref() == Some(input.as_slice()))
+    {
+        return Err("late reply did not update the service queue".into());
+    }
+    // The owner is neither unavailable nor fenced after the slow append.
+    fixture.attach()?.projects(None)?;
+    println!(
+        "PASS held append: no timeout, no fence, responsive Inspect/cancel, late reply applied"
+    );
+
+    // J1-0-04, J1-0-07: a held startup replay shows loading and refuses work.
+    fixture.stop()?;
+    let hold_reads = fixture.home.join("journal-hold-reads");
+    fs::write(&hold_reads, b"")?;
+    fixture.start()?;
+    // Past the removed 5 s inspection replay bound.
+    thread::sleep(Duration::from_millis(5_200));
+    for _ in 0..5 {
+        let mut client = fixture.attach()?;
+        let status = within_100ms("InspectInstallation", || client.inspect_installation())??;
+        if status.installation != pb::InstallationState::Recovering
+            || status.reason != pb::InstallationInspectionReason::InspectionPending
+        {
+            return Err(format!(
+                "held replay was not reported as loading: {:?}/{:?}",
+                status.installation, status.reason
+            )
+            .into());
+        }
+        let mut client = fixture.attach()?;
+        let refused = within_100ms("refused work", || client.projects(None))?;
+        let refused = refused?;
+        if refused.error.as_deref() != Some("conversation_busy") {
+            return Err(format!("work was not refused during replay: {refused:?}").into());
+        }
+    }
+    // Shutdown cancels the held replay; the service exits cleanly.
+    fixture.stop()?;
+    fs::remove_file(&hold_reads)?;
+    // The writer's own replay also shows loading after inspection finishes.
+    let hold_writer = fixture.home.join("journal-hold-writer-reads");
+    fs::write(&hold_writer, b"")?;
+    fixture.start()?;
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = fixture.attach()?.inspect_installation()?;
+        if status.installation == pb::InstallationState::Recovering
+            && status.reason == pb::InstallationInspectionReason::InspectionPending
+        {
+            break;
+        }
+        if Instant::now() >= end {
+            return Err(format!(
+                "writer replay was not reported as loading: {:?}/{:?}",
+                status.installation, status.reason
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(500));
+    let status = fixture.attach()?.inspect_installation()?;
+    if status.reason != pb::InstallationInspectionReason::InspectionPending {
+        return Err(format!("writer replay loading ended early: {:?}", status.reason).into());
+    }
+    let refused = fixture.attach()?.projects(None)?;
+    if refused.error.as_deref() != Some("conversation_busy") {
+        return Err(format!("work was not refused during writer replay: {refused:?}").into());
+    }
+    fs::remove_file(&hold_writer)?;
+    wait_ready(&fixture, None)?;
+    fixture.attach()?.projects(None)?;
+    fixture.stop()?;
+    println!("PASS held replay: loading state, refused work, shutdown cancels replay");
+    Ok(())
 }

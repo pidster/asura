@@ -1,5 +1,6 @@
 use asura_platform::{JournalFile, ProjectIdentity, RuntimeDirectory, random_id};
 use asura_storage::authority::{conversation::*, writer::*};
+use std::sync::atomic::AtomicBool;
 use std::{
     fs,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
@@ -34,7 +35,8 @@ impl Drop for Scratch {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn deadline() -> Instant {
+/// Test-harness settling bound; the writer itself has no time bound.
+fn settle_by() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 fn pending() -> Vec<u8> {
@@ -59,7 +61,7 @@ fn pending() -> Vec<u8> {
     .unwrap()
 }
 fn wait(ticket: &mut Ticket) -> Result<Reply> {
-    let end = deadline();
+    let end = settle_by();
     loop {
         if let Some(result) = ticket.poll() {
             return result;
@@ -70,7 +72,7 @@ fn wait(ticket: &mut Ticket) -> Result<Reply> {
 }
 fn close(writer: &mut WriterHandle) {
     writer.close();
-    let end = deadline();
+    let end = settle_by();
     while !writer.settled() {
         assert!(Instant::now() < end);
         std::thread::sleep(Duration::from_millis(1));
@@ -348,13 +350,13 @@ fn descriptor_append_reopens_and_rejects_replacement_without_truncation() {
     let runtime = scratch.runtime();
     let bytes = pending();
     let mut file = JournalFile::open(runtime.clone(), true).unwrap();
-    file.append(0, &bytes, deadline()).unwrap();
+    file.append(0, &bytes).unwrap();
     assert!(JournalFile::open(runtime.clone(), false).is_err());
-    assert_eq!(file.read_all(deadline()).unwrap(), bytes);
-    assert_eq!(file.read_all(deadline()).unwrap(), bytes);
+    assert_eq!(file.read_all(&AtomicBool::new(false)).unwrap(), bytes);
+    assert_eq!(file.read_all(&AtomicBool::new(false)).unwrap(), bytes);
     drop(file);
     let mut file = JournalFile::open(runtime, false).unwrap();
-    assert_eq!(file.read_all(deadline()).unwrap(), bytes);
+    assert_eq!(file.read_all(&AtomicBool::new(false)).unwrap(), bytes);
     let path = scratch.0.join(".asura/state/control/slot-0.log");
     fs::rename(&path, path.with_extension("saved")).unwrap();
     fs::OpenOptions::new()
@@ -363,7 +365,7 @@ fn descriptor_append_reopens_and_rejects_replacement_without_truncation() {
         .mode(0o600)
         .open(&path)
         .unwrap();
-    assert!(file.append(bytes.len(), &[1], deadline()).is_err());
+    assert!(file.append(bytes.len(), &[1]).is_err());
     assert_eq!(fs::read(path.with_extension("saved")).unwrap(), bytes);
 }
 #[test]
@@ -389,7 +391,7 @@ fn writer_preserves_incomplete_tail_and_does_not_recreate_missing_authority() {
     let mut file = JournalFile::open(runtime.clone(), true).unwrap();
     let mut bytes = pending();
     bytes.extend_from_slice(b"ASU");
-    file.append(0, &bytes, deadline()).unwrap();
+    file.append(0, &bytes).unwrap();
     drop(file);
     let mut writer = WriterHandle::start(runtime).unwrap();
     let result = wait(&mut writer.try_submit(Command::Open).unwrap());
@@ -408,7 +410,7 @@ fn different_initialization_request_preserves_pending_state() {
     let scratch = Scratch::new();
     let runtime = scratch.runtime();
     let mut file = JournalFile::open(runtime.clone(), true).unwrap();
-    file.append(0, &pending(), deadline()).unwrap();
+    file.append(0, &pending()).unwrap();
     drop(file);
     let mut writer = WriterHandle::start(runtime).unwrap();
     let state = wait(&mut writer.try_submit(Command::Open).unwrap())
@@ -794,7 +796,7 @@ fn retained_snapshot_generations_apply_backpressure_before_writes() {
     let scratch = Scratch::new();
     let runtime = scratch.runtime();
     let mut file = JournalFile::open(runtime.clone(), true).unwrap();
-    file.append(0, &pending(), deadline()).unwrap();
+    file.append(0, &pending()).unwrap();
     drop(file);
     let mut writer = WriterHandle::start(runtime).unwrap();
     let first = wait(&mut writer.try_submit(Command::Open).unwrap())
@@ -1295,4 +1297,159 @@ fn existing_overlapping_registration_is_listed_unavailable() {
     assert!(after.projects.contains_key(&project));
     drop(after);
     close(&mut writer);
+}
+
+fn open_pending(scratch: &Scratch) -> (WriterHandle, std::sync::Arc<Replay>) {
+    let mut file = JournalFile::open(scratch.runtime(), true).unwrap();
+    file.append(0, &pending()).unwrap();
+    drop(file);
+    let writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let state = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    (writer, state)
+}
+fn owner_generation(revision: u64) -> Command {
+    Command::Append {
+        expected_revision: revision,
+        record: Record::OwnerGeneration,
+        admission: None,
+    }
+}
+fn journal_replay(scratch: &Scratch) -> Replay {
+    let bytes = fs::read(scratch.0.join(".asura/state/control/slot-0.log")).unwrap();
+    replay(&bytes, &AtomicBool::new(false)).unwrap()
+}
+#[test]
+fn j1_0_01_gated_real_append_holds_five_seconds_then_commits() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let gate = asura_platform::journal_gate::JournalGate::new(&scratch.0);
+    let mut file = JournalFile::open(scratch.runtime(), true).unwrap();
+    file.append(0, &pending()).unwrap();
+    drop(file);
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    gate.hold_appends();
+    // Open replays, then appends OwnerGeneration through the held gate.
+    let mut ticket = writer.try_submit(Command::Open).unwrap();
+    let held = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < held {
+        assert!(ticket.poll().is_none(), "a slow append must not settle");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(gate.waiting(), 1);
+    gate.release_appends();
+    let state = wait(&mut ticket).unwrap().replay.unwrap();
+    assert_eq!(state.sequence, 2);
+    close(&mut writer);
+    let durable = journal_replay(&scratch);
+    assert_eq!(durable.sequence, 2);
+    assert_eq!(durable.owner_generation, state.owner_generation);
+}
+#[test]
+fn j1_0_03_queued_appends_commit_in_order_after_a_long_stall() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let gate = asura_platform::journal_gate::JournalGate::new(&scratch.0);
+    let (mut writer, state) = open_pending(&scratch);
+    let base = state.revision;
+    drop(state);
+    gate.hold_appends();
+    let mut tickets: Vec<_> = (0..3)
+        .map(|n| writer.try_submit(owner_generation(base + n)).unwrap())
+        .collect();
+    // Longer than every removed default deadline (2 s and 5 s).
+    std::thread::sleep(Duration::from_millis(5200));
+    assert!(tickets.iter_mut().all(|ticket| ticket.poll().is_none()));
+    gate.release_appends();
+    for (n, ticket) in tickets.iter_mut().enumerate() {
+        let state = wait(ticket).unwrap().replay.unwrap();
+        assert_eq!(state.revision, base + n as u64 + 1);
+    }
+    close(&mut writer);
+    assert_eq!(journal_replay(&scratch).revision, base + 3);
+}
+#[test]
+fn j1_0_06_gated_append_requests_beyond_eight_slots_are_busy() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let gate = asura_platform::journal_gate::JournalGate::new(&scratch.0);
+    let (mut writer, state) = open_pending(&scratch);
+    let base = state.revision;
+    drop(state);
+    gate.hold_appends();
+    let mut tickets: Vec<_> = (0..8)
+        .map(|n| writer.try_submit(owner_generation(base + n)).unwrap())
+        .collect();
+    while gate.waiting() == 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let started = Instant::now();
+    assert!(matches!(
+        writer.try_submit(owner_generation(base + 8)),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        writer.try_submit(Command::Projects {
+            after: None,
+            limit: 1
+        }),
+        Err(Error::Busy)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(100));
+    gate.release_appends();
+    for ticket in &mut tickets {
+        wait(ticket).unwrap();
+    }
+    close(&mut writer);
+    assert_eq!(journal_replay(&scratch).revision, base + 8);
+}
+#[test]
+fn j1_0_08_injected_real_file_errors_fence_and_later_appends_need_repair() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    for fault in [
+        asura_platform::journal_gate::Fault::Write,
+        asura_platform::journal_gate::Fault::Sync,
+    ] {
+        let scratch = Scratch::new();
+        let gate = asura_platform::journal_gate::JournalGate::new(&scratch.0);
+        let (mut writer, state) = open_pending(&scratch);
+        let base = state.revision;
+        drop(state);
+        gate.inject(fault);
+        assert!(matches!(
+            wait(&mut writer.try_submit(owner_generation(base)).unwrap()),
+            Err(Error::OutcomeUnconfirmed)
+        ));
+        assert!(matches!(
+            wait(&mut writer.try_submit(owner_generation(base)).unwrap()),
+            Err(Error::RepairRequired)
+        ));
+        close(&mut writer);
+    }
+}
+#[test]
+fn j1_0_04_gated_replay_holds_until_shutdown_cancels_it() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let gate = asura_platform::journal_gate::JournalGate::new(&scratch.0);
+    let mut file = JournalFile::open(scratch.runtime(), true).unwrap();
+    file.append(0, &pending()).unwrap();
+    drop(file);
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    gate.hold_reads();
+    let mut ticket = writer.try_submit(Command::Open).unwrap();
+    while gate.waiting() == 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(5200));
+    assert!(ticket.poll().is_none(), "replay has no time bound");
+    let started = Instant::now();
+    writer.close();
+    assert!(matches!(wait(&mut ticket), Err(Error::Cancelled)));
+    assert!(started.elapsed() < Duration::from_millis(100));
+    close(&mut writer);
+    // The cancelled replay changed nothing on disk.
+    assert_eq!(journal_replay(&scratch).sequence, 1);
 }

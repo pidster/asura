@@ -65,6 +65,10 @@ fn launch_match_hint(projects: &[asura_control::pb::ProjectReply], others: &[[u8
     )
 }
 
+/// Shown from `/cancel` until the durable `CancelRequested` record lands.
+const CANCELLING: &str = "Cancelling · waiting for the durable cancel record";
+/// Shown once the service acknowledged the durable cancel record.
+const CANCELLED: &str = "Cancelled · waiting for the turn to settle";
 fn conversation_reason(reason: i32) -> &'static str {
     match reason {
         0 => "none",
@@ -145,6 +149,10 @@ pub struct App {
     audit_scope: Option<super::queue_watch::Scope>,
     audit_draft: Option<String>,
     audit_cancel: bool,
+    queue_cancel: bool,
+    /// Turn cancel display: `Some(false)` cancelling, `Some(true)` cancelled.
+    turn_cancel: Option<bool>,
+    project_admin_cancel: bool,
     audit_result: Option<(super::queue_watch::Scope, String)>,
     models_request: bool,
     models_cancel: bool,
@@ -240,6 +248,9 @@ impl App {
             audit_scope: None,
             audit_draft: None,
             audit_cancel: false,
+            queue_cancel: false,
+            turn_cancel: None,
+            project_admin_cancel: false,
             audit_result: None,
             models_request: false,
             models_cancel: false,
@@ -781,6 +792,12 @@ impl App {
     pub(super) fn take_audit_request(&mut self) -> Option<(super::queue_watch::Scope, u32)> {
         self.audit_request.take()
     }
+    pub(super) fn take_project_admin_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.project_admin_cancel)
+    }
+    pub(super) fn take_queue_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.queue_cancel)
+    }
     pub(super) fn take_audit_cancel(&mut self) -> bool {
         std::mem::take(&mut self.audit_cancel)
     }
@@ -1017,7 +1034,15 @@ impl App {
                 }
                 self.append_response(draft, self.active_operation.clone());
             }
-            self.notice = "Generating · /cancel requests cancellation".into();
+            self.notice = match self.turn_cancel {
+                None => "Generating · /cancel requests cancellation".into(),
+                Some(false) => CANCELLING.into(),
+                Some(true) => CANCELLED.into(),
+            };
+        }
+        if update.cancel_accepted && self.turn_cancel.is_some() {
+            self.turn_cancel = Some(true);
+            self.notice = CANCELLED.into();
         }
         if let Some(event) = update.event
             && let Some(response_index) = self.observe_activity(&event)
@@ -1084,6 +1109,7 @@ impl App {
             }
         }
         if update.done {
+            self.turn_cancel = None;
             self.conversation_busy = false;
             self.conversation_cancellable = false;
             self.conversation_draft = None;
@@ -1155,17 +1181,34 @@ impl App {
         };
     }
     fn start_conversation_request(&mut self, request: super::conversation::Request, draft: String) {
+        // Initialization has no time bound; the person can stop the wait.
         self.conversation_cancellable = matches!(
             &request,
-            super::conversation::Request::Setup(crate::conversation::Command::Observe(_))
+            super::conversation::Request::Setup(
+                crate::conversation::Command::Observe(_)
+                    | crate::conversation::Command::Initialize(_)
+                    | crate::conversation::Command::Register(..)
+            )
         );
+        let progress = match &request {
+            super::conversation::Request::Setup(crate::conversation::Command::Initialize(_)) => {
+                Some("initializing installation")
+            }
+            super::conversation::Request::Setup(crate::conversation::Command::Register(..)) => {
+                Some("registering project")
+            }
+            _ => None,
+        };
         self.retained_preserve_draft = false;
         self.retained_request = Some(request.clone());
         self.conversation_request = Some(request);
         self.conversation_draft = Some(draft);
         self.conversation_editor_draft = Some(self.editor.text());
         self.conversation_busy = true;
-        self.notice = "Request pending".into();
+        self.notice = match progress {
+            Some(action) => format!("Request pending: {action}; /cancel stops waiting"),
+            None => "Request pending".into(),
+        };
     }
     pub fn set_view(&mut self, mut view: View) {
         view.epoch = view.epoch.map(|text| literal(&text, 128));
@@ -1885,12 +1928,27 @@ impl App {
                 self.models_cancel = true;
                 self.editor = Editor::new();
                 self.notice = "Model inventory cancellation requested".into();
+            } else if self.project_admin_busy
+                && !(self.conversation_busy && self.conversation_cancellable)
+            {
+                // A rename waits for the journal with no client budget.
+                self.project_admin_cancel = true;
+                self.editor = Editor::new();
+                self.notice =
+                    "Project request wait stopped; the rename may still be applied".into();
+            } else if self.queue_busy && !(self.conversation_busy && self.conversation_cancellable)
+            {
+                // The queue wait has no timer (J1-0); /cancel stops only the wait.
+                self.queue_cancel = true;
+                self.editor = Editor::new();
+                self.notice = "Queue wait stopped; the request may still be applied".into();
             } else if !self.conversation_busy || !self.conversation_cancellable {
                 self.notice = "No active conversation to cancel".into();
             } else {
                 self.cancel_request = true;
                 self.editor = Editor::new();
-                self.notice = "Cancellation requested; waiting for durable result".into();
+                self.turn_cancel = Some(false);
+                self.notice = CANCELLING.into();
             }
             return false;
         }
@@ -4716,6 +4774,33 @@ mod tests {
         assert_eq!(app.draft(), "old");
     }
     #[test]
+    fn j1_0_initialization_and_queue_waits_show_progress_and_cancel_stops_them() {
+        let mut app = App::new();
+        app.insert("/init");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.take_conversation_request().is_some());
+        assert!(app.notice.contains("initializing installation"));
+        assert!(render(&mut app, 100, 24).contains("initializing installation"));
+        // The submitted /init draft is retained until its result arrives.
+        app.editor = Editor::new();
+        app.insert("/cancel");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.take_cancel_request());
+        let mut app = App::new();
+        app.queue_busy = true;
+        app.insert("/cancel");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.take_queue_cancel());
+        assert!(!app.take_cancel_request());
+        assert!(app.notice.contains("Queue wait stopped"));
+        let mut app = App::new();
+        app.project_admin_busy = true;
+        app.insert("/cancel");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.take_project_admin_cancel());
+        assert!(app.notice.contains("Project request wait stopped"));
+    }
+    #[test]
     fn initialization_result_is_visible_and_clears_only_the_submitted_draft() {
         let mut app = App::new();
         app.insert("/init");
@@ -5131,6 +5216,43 @@ mod tests {
         });
         assert_eq!(app.draft(), "/retry");
         assert_eq!(app.selected_project, Some([3; 16]));
+    }
+    #[test]
+    fn turn_cancel_shows_cancelling_until_the_durable_record_then_cancelled() {
+        let mut app = working_queue_app();
+        app.editor = Editor::new();
+        app.insert("/cancel");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.take_cancel_request());
+        assert_eq!(app.notice, CANCELLING);
+        // Streaming updates carry the accepted turn; they keep the cancel state.
+        let accepted = asura_control::pb::ConversationAccepted {
+            operation_id: Some(vec![3; 16]),
+            conversation_id: Some(vec![2; 16]),
+            generation: Some(1),
+            cursor: Some(1),
+        };
+        app.conversation_finished(super::super::conversation::Update {
+            accepted: Some(accepted.clone()),
+            success: true,
+            ..Default::default()
+        });
+        assert_eq!(app.notice, CANCELLING);
+        assert!(render(&mut app, 100, 24).contains("Cancelling"));
+        app.conversation_finished(super::super::conversation::Update {
+            accepted: Some(accepted),
+            cancel_accepted: true,
+            success: true,
+            ..Default::default()
+        });
+        assert_eq!(app.notice, CANCELLED);
+        assert!(render(&mut app, 100, 24).contains("Cancelled"));
+        app.conversation_finished(super::super::conversation::Update {
+            success: true,
+            done: true,
+            ..Default::default()
+        });
+        assert_eq!(app.turn_cancel, None);
     }
     fn working_queue_app() -> App {
         let mut app = App::new();

@@ -321,10 +321,7 @@ fn authority_fixture(root: &Scratch, bytes: &[u8]) -> RuntimeDirectory {
 fn authority_scan(
     runtime: &RuntimeDirectory,
 ) -> std::result::Result<AuthorityScan, AuthorityError> {
-    runtime.authority_source(
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
+    runtime.authority_source(&std::sync::atomic::AtomicBool::new(false))
 }
 #[test]
 fn authority_runtime_logs_remnants_and_unsupported_layout() {
@@ -397,10 +394,7 @@ fn finder_metadata_preserves_fresh_and_initialized_authority() {
                 assert!(!reader.has_unknown_root_content());
                 assert_eq!(
                     reader
-                        .read_all(
-                            Instant::now() + Duration::from_secs(1),
-                            &std::sync::atomic::AtomicBool::new(false),
-                        )
+                        .read_all(&std::sync::atomic::AtomicBool::new(false))
                         .unwrap(),
                     b"journal bytes"
                 );
@@ -486,10 +480,7 @@ fn authority_reads_exact_bytes_and_preserves_known_model_areas() {
     assert!(!reader.has_unknown_root_content());
     assert_eq!(
         reader
-            .read_all(
-                Instant::now() + Duration::from_secs(1),
-                &std::sync::atomic::AtomicBool::new(false)
-            )
+            .read_all(&std::sync::atomic::AtomicBool::new(false))
             .unwrap(),
         bytes
     );
@@ -564,7 +555,7 @@ fn authority_unsafe_links_modes_and_nonregular_files_are_rejected() {
     }
 }
 #[test]
-fn authority_size_census_deadline_and_cancellation_are_bounded() {
+fn authority_size_census_limit_and_cancellation_are_bounded() {
     let root = Scratch::new();
     let runtime = authority_fixture(&root, b"");
     let path = root.0.join(".asura/state/control/slot-0.log");
@@ -579,21 +570,11 @@ fn authority_size_census_deadline_and_cancellation_are_bounded() {
         panic!("journal missing");
     };
     assert_eq!(
-        reader.read_all(
-            Instant::now() + Duration::from_secs(1),
-            &std::sync::atomic::AtomicBool::new(false)
-        ),
+        reader.read_all(&std::sync::atomic::AtomicBool::new(false)),
         Err(AuthorityError::Limit)
     );
     assert!(matches!(
-        runtime.authority_source(Instant::now(), &std::sync::atomic::AtomicBool::new(false)),
-        Err(AuthorityError::Timeout)
-    ));
-    assert!(matches!(
-        runtime.authority_source(
-            Instant::now() + Duration::from_secs(1),
-            &std::sync::atomic::AtomicBool::new(true)
-        ),
+        runtime.authority_source(&std::sync::atomic::AtomicBool::new(true)),
         Err(AuthorityError::Cancelled)
     ));
     for index in 0..64 {

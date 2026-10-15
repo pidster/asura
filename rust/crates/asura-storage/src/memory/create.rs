@@ -181,14 +181,9 @@ mod database_tests {
                 init_operation_id: Id::new([3; 16]).unwrap(),
             };
             let project = Id::new([4; 16]).unwrap();
-            let database = Database::connect(
-                &scratch.0,
-                binding.clone(),
-                true,
-                Instant::now() + Duration::from_secs(10),
-            )
-            .await
-            .unwrap();
+            let database = Database::connect(&scratch.0, binding.clone(), true)
+                .await
+                .unwrap();
             let (source_intent, source) = prepare_create(
                 binding.clone(),
                 project,

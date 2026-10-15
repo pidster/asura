@@ -50,10 +50,13 @@ pub(super) fn observations(case: &mut Case) -> Result<()> {
     fs::create_dir(&project)?;
     fs::create_dir(project.join("src"))?;
     git(&project, &["init", "-q", "-b", "context-test"])?;
-    let registered = attach(case)?.register_project(pb::ProjectRegister {
-        request_id: Some(asura_platform::random_id().to_vec()),
-        location: Some(project.to_str().unwrap().into()),
-    })?;
+    let registered = attach(case)?.register_project(
+        pb::ProjectRegister {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            location: Some(project.to_str().unwrap().into()),
+        },
+        &|| false,
+    )?;
     require(registered.error.is_none(), "project registration failed")?;
     // Retained status requests must release on actual changes and preserve
     // their cursor on a liveness heartbeat. Mutations use another attachment.

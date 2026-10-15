@@ -1,7 +1,6 @@
 //! HM3 retained mutation and readonly reconciliation on the canonical reactor.
 use super::*;
 use asura_storage::memory::{self, MemoryCreateResult};
-use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -17,6 +16,10 @@ pub(super) struct Mutation {
     ticket: Option<writer::Ticket>,
     response: Option<Result<MemoryCreateResult, ()>>,
     response_consumed: bool,
+    /// The caller's own tool deadline (L10). It bounds only this caller's wait:
+    /// when it passes, the cancel flag stops the writer's cancellable put. The
+    /// writer itself has no time bound (J1-0).
+    deadline: Option<Instant>,
 }
 impl Mutation {
     pub fn new(intent: journal::MemoryCreateIntent) -> Self {
@@ -27,20 +30,23 @@ impl Mutation {
             ticket: None,
             response: None,
             response_consumed: false,
+            deadline: None,
         }
     }
     pub fn start(&mut self, writer: &writer::WriterHandle, body: String, deadline: Instant) {
         self.phase = Phase::Mutation;
-        match writer.try_submit_before(
-            writer::Command::MemoryCreate {
-                turn: self.intent.operation,
-                generation: self.intent.generation,
-                ordinal: self.intent.ordinal,
-                body,
-                cancel: self.cancel.clone(),
-            },
-            deadline,
-        ) {
+        if Instant::now() >= deadline {
+            self.phase = Phase::ResolveReady;
+            return;
+        }
+        self.deadline = Some(deadline);
+        match writer.try_submit(writer::Command::MemoryCreate {
+            turn: self.intent.operation,
+            generation: self.intent.generation,
+            ordinal: self.intent.ordinal,
+            body,
+            cancel: self.cancel.clone(),
+        }) {
             Ok(ticket) => self.ticket = Some(ticket),
             Err(_) => self.phase = Phase::ResolveReady,
         }
@@ -53,10 +59,13 @@ impl Mutation {
         self.ticket.as_ref().is_none_or(writer::Ticket::is_settled)
     }
     pub fn next_deadline(&self) -> Option<Instant> {
-        if self.response_consumed {
-            None
+        if self.phase == Phase::Mutation
+            && self.ticket.is_some()
+            && !self.cancel.load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.deadline
         } else {
-            self.ticket.as_ref().map(writer::Ticket::deadline)
+            None
         }
     }
     pub fn poll(
@@ -67,6 +76,10 @@ impl Mutation {
     ) -> Result<Option<journal::ToolResult>, ()> {
         if self.phase == Phase::Done {
             return Ok(None);
+        }
+        if self.phase == Phase::Mutation && self.deadline.is_some_and(|deadline| now >= deadline) {
+            // The caller's wait ended; the writer finishes the job and settles.
+            self.cancel();
         }
         if let Some(ticket) = &mut self.ticket {
             if !self.response_consumed
@@ -108,16 +121,14 @@ impl Mutation {
         if self.phase == Phase::ResolveReady {
             self.phase = Phase::Resolve;
             self.response_consumed = false;
+            // A journal-writer read: it waits for the real reply (J1-0).
             self.ticket = Some(
                 writer
-                    .try_submit_before(
-                        writer::Command::MemoryResolveCreate {
-                            turn: self.intent.operation,
-                            generation: self.intent.generation,
-                            ordinal: self.intent.ordinal,
-                        },
-                        now + Duration::from_secs(2),
-                    )
+                    .try_submit(writer::Command::MemoryResolveCreate {
+                        turn: self.intent.operation,
+                        generation: self.intent.generation,
+                        ordinal: self.intent.ordinal,
+                    })
                     .map_err(|_| {
                         self.phase = Phase::Done;
                     })?,

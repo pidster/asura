@@ -84,7 +84,6 @@ fn storage_error(error: writer::Error) -> &'static str {
         writer::Error::OverlapsAsuraState => "project_overlaps_asura_state",
         writer::Error::ModelUnavailable => "model_unavailable",
         writer::Error::Limit => "capacity_exhausted",
-        writer::Error::Deadline => "storage_timeout",
         writer::Error::Cancelled => "cancelled",
         writer::Error::Invalid => "invalid_request",
         writer::Error::Unavailable => "storage_unavailable",
@@ -512,7 +511,7 @@ impl AutomaticInitialization {
     }
     fn fail(&mut self, error: writer::Error) {
         *self = Self::Failed(match error {
-            writer::Error::Deadline | writer::Error::OutcomeUnconfirmed => {
+            writer::Error::OutcomeUnconfirmed => {
                 pb::InstallationInspectionReason::InspectionTimeout
             }
             _ => pb::InstallationInspectionReason::InspectionIo,
@@ -563,7 +562,9 @@ pub(crate) struct Owner {
     audit_records: Arc<Vec<asura_storage::audit::Record>>,
     audit_health: asura_storage::audit::Health,
     audit_emitter: Option<crate::audit::Emitter>,
-    foreground: VecDeque<(pb::Envelope, Instant)>,
+    /// Commands waiting, in order, for the serialized journal ticket. They wait
+    /// with no timer (J1-0); beyond 32 they are `conversation_busy`.
+    foreground: VecDeque<pb::Envelope>,
     dispatching_foreground: bool,
     sensor_owner: Option<sensors::Owner>,
     sensor_scan_revision: Option<u64>,
@@ -1133,7 +1134,6 @@ impl Owner {
             .unwrap_or_default()
     }
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        let pending = self.pending.as_ref().map(|(ticket, _)| ticket.deadline());
         let model = self
             .active
             .as_ref()
@@ -1145,13 +1145,10 @@ impl Owner {
         let closing = self
             .closing
             .then_some(now + std::time::Duration::from_millis(10));
-        pending
+        self.create_recovery
+            .as_ref()
+            .and_then(memory_create::Mutation::next_deadline)
             .into_iter()
-            .chain(
-                self.create_recovery
-                    .as_ref()
-                    .and_then(memory_create::Mutation::next_deadline),
-            )
             .chain(
                 self.active
                     .as_ref()
@@ -1165,13 +1162,7 @@ impl Owner {
                     .as_ref()
                     .and_then(|a| a.shell_worker.next_deadline(now)),
             )
-            .chain(self.foreground.front().map(|(_, deadline)| {
-                if self.pending.is_none() {
-                    now
-                } else {
-                    *deadline
-                }
-            }))
+            .chain((!self.foreground.is_empty() && self.pending.is_none()).then_some(now))
             .chain(
                 (self.sensor_scan_pending
                     && self.pending.is_none()
@@ -1356,8 +1347,7 @@ impl Owner {
             if self.foreground.len() >= 32 {
                 return Some(error(request, "conversation_busy"));
             }
-            self.foreground
-                .push_back((request, now + std::time::Duration::from_secs(2)));
+            self.foreground.push_back(request);
             return None;
         }
         let wait = match request.body.as_ref() {
@@ -1658,24 +1648,16 @@ impl Owner {
             Err(e) => Some(error(request, storage_error(e))),
         }
     }
+    /// Queued commands wait in order for the journal ticket with no timer
+    /// (J1-0). Only shutdown ends their wait.
     fn dispatch_foreground(&mut self, now: Instant) {
-        while self
-            .foreground
-            .front()
-            .is_some_and(|(_, deadline)| self.closing || now >= *deadline)
+        while self.closing
+            && let Some(request) = self.foreground.pop_front()
         {
-            let (request, _) = self.foreground.pop_front().unwrap();
-            self.out.push_back(error(
-                request,
-                if self.closing {
-                    "service_draining"
-                } else {
-                    "storage_timeout"
-                },
-            ));
+            self.out.push_back(error(request, "service_draining"));
         }
         if self.pending.is_none()
-            && let Some((request, _)) = self.foreground.pop_front()
+            && let Some(request) = self.foreground.pop_front()
         {
             self.dispatching_foreground = true;
             if let Some(response) = self.request(request, now) {
@@ -3424,13 +3406,12 @@ impl Owner {
                                 .as_ref()
                                 .ok_or(writer::Error::Unavailable)
                                 .and_then(|writer| {
-                                    writer.try_submit_before(
-                                        writer::Command::MemoryRead {
-                                            project: active.turn.project,
-                                            query,
-                                        },
-                                        tool.deadline,
-                                    )
+                                    // The tool deadline bounds only this caller's
+                                    // wait (capture_memory_tool), not the writer.
+                                    writer.try_submit(writer::Command::MemoryRead {
+                                        project: active.turn.project,
+                                        query,
+                                    })
                                 }) {
                                 Ok(ticket) => tool.memory_ticket = Some(ticket),
                                 Err(error) => {
@@ -3604,6 +3585,10 @@ impl Owner {
             self.runtime.state_boundary(),
         ))
     }
+    /// True while the writer's own startup replay (Open) is pending.
+    pub(crate) fn replaying(&self) -> bool {
+        matches!(self.pending, Some((_, Job::Open)))
+    }
     pub(crate) fn installation(&self) -> Option<pb::InspectInstallationReply> {
         if let Some(snapshot) = self.automatic_initialization.snapshot() {
             return Some(snapshot);
@@ -3754,12 +3739,7 @@ mod observation_tests {
         )
         .unwrap();
         let now = Instant::now();
-        let mut replay = journal::replay(
-            &bytes,
-            now + Duration::from_secs(2),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+        let mut replay = journal::replay(&bytes, &AtomicBool::new(false)).unwrap();
         replay.operations.insert(
             [6; 16],
             journal::Operation {

@@ -30,7 +30,6 @@ impl Database {
             return Err(Error::Invalid);
         }
         self.verify().await.map_err(map)?;
-        self.active().map_err(map)?;
         // A newly bound graph has no sensor projection table yet. Establish
         // only this additive schema after verifying the installation binding.
         self.db
@@ -39,7 +38,6 @@ impl Database {
             .map_err(|_| Error::Unavailable)?
             .check()
             .map_err(|_| Error::Unavailable)?;
-        self.active().map_err(map)?;
         let mut response = self
             .db
             .query("SELECT * FROM $record;")
@@ -118,7 +116,6 @@ impl Database {
         if current.revision != expected_revision {
             return Err(Error::Stale);
         }
-        self.active().map_err(map)?;
         self.db
             .query(SCHEMA)
             .await
@@ -133,7 +130,6 @@ impl Database {
         row.insert("write_id", hex(&value.write_id));
         row.insert("digest", digest);
         row.insert("body", body);
-        self.active().map_err(map)?;
         self.db
             .query(STORE)
             .bind(("record", record(value.project)))
@@ -222,12 +218,7 @@ mod tests {
             init_operation_id: MemoryId::new([3; 16]).unwrap(),
         };
         let database = runtime
-            .block_on(Database::connect(
-                &root.0,
-                binding.clone(),
-                true,
-                Instant::now() + Duration::from_secs(10),
-            ))
+            .block_on(Database::connect(&root.0, binding.clone(), true))
             .unwrap();
         assert_eq!(
             runtime.block_on(database.sensor_load([4; 16])).unwrap(),
@@ -258,12 +249,7 @@ mod tests {
         );
         close(database, &runtime);
         let database = runtime
-            .block_on(Database::connect(
-                &root.0,
-                binding,
-                false,
-                Instant::now() + Duration::from_secs(10),
-            ))
+            .block_on(Database::connect(&root.0, binding, false))
             .unwrap();
         assert_eq!(runtime.block_on(database.sensor_load([4; 16])), Ok(value));
         close(database, &runtime);

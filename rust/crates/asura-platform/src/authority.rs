@@ -6,7 +6,6 @@ use std::io;
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,7 +13,6 @@ pub enum AuthorityError {
     Unsafe,
     Changed,
     Limit,
-    Timeout,
     Cancelled,
     Io,
 }
@@ -32,11 +30,10 @@ fn map(error: Error) -> AuthorityError {
         _ => AuthorityError::Io,
     }
 }
-fn active(deadline: Instant, cancel: &AtomicBool) -> Result<(), AuthorityError> {
+/// Inspection and replay reads have no time bound (J1-0); only cancel stops them.
+fn active(cancel: &AtomicBool) -> Result<(), AuthorityError> {
     if cancel.load(Ordering::Acquire) {
         Err(AuthorityError::Cancelled)
-    } else if Instant::now() >= deadline {
-        Err(AuthorityError::Timeout)
     } else {
         Ok(())
     }
@@ -50,11 +47,7 @@ impl Drop for DirectoryStream {
         }
     }
 }
-fn census(
-    fd: RawFd,
-    deadline: Instant,
-    cancel: &AtomicBool,
-) -> Result<Vec<CString>, AuthorityError> {
+fn census(fd: RawFd, cancel: &AtomicBool) -> Result<Vec<CString>, AuthorityError> {
     let fresh = open_at(fd, c".", libc::O_RDONLY | libc::O_DIRECTORY, 0).map_err(map)?;
     let raw = fresh.into_raw_fd();
     // SAFETY: fdopendir takes the fresh descriptor on success; failure closes it below.
@@ -69,7 +62,7 @@ fn census(
     let stream = DirectoryStream(stream);
     let mut names = Vec::new();
     loop {
-        active(deadline, cancel)?;
+        active(cancel)?;
         // SAFETY: Darwin errno is thread-local; reset before readdir's EOF/error distinction.
         unsafe {
             *libc::__error() = 0;
@@ -208,12 +201,8 @@ impl AuthorityReader {
     pub fn validate(&self) -> Result<(), AuthorityError> {
         self.inspection.validate()
     }
-    pub fn read_all(
-        &mut self,
-        deadline: Instant,
-        cancelled: &AtomicBool,
-    ) -> Result<Vec<u8>, AuthorityError> {
-        active(deadline, cancelled)?;
+    pub fn read_all(&mut self, cancelled: &AtomicBool) -> Result<Vec<u8>, AuthorityError> {
+        active(cancelled)?;
         self.validate()?;
         let node = &self.inspection.nodes[self.journal];
         let size = u64::try_from(node.before.st_size).map_err(|_| AuthorityError::Unsafe)?;
@@ -227,7 +216,9 @@ impl AuthorityReader {
         let mut offset = 0;
         let mut chunk = [0u8; 64 * 1024];
         while offset < size {
-            active(deadline, cancelled)?;
+            crate::journal_io::gate::read_point(&self.inspection.runtime, cancelled, false)
+                .map_err(|_| AuthorityError::Cancelled)?;
+            active(cancelled)?;
             let wanted = (size - offset).min(chunk.len() as u64) as usize;
             // SAFETY: pread reads at most wanted bytes into a valid buffer; no shared cursor change.
             let count = unsafe {
@@ -255,7 +246,7 @@ impl AuthorityReader {
             bytes.extend_from_slice(&chunk[..count as usize]);
             offset += count as u64;
         }
-        active(deadline, cancelled)?;
+        active(cancelled)?;
         self.validate()?;
         Ok(bytes)
     }
@@ -263,10 +254,9 @@ impl AuthorityReader {
 impl RuntimeDirectory {
     pub fn authority_source(
         &self,
-        deadline: Instant,
         cancelled: &AtomicBool,
     ) -> Result<AuthorityScan, AuthorityError> {
-        active(deadline, cancelled)?;
+        active(cancelled)?;
         let (root, uid) = self.authority_root().map_err(map)?;
         let before = stat_fd(root.as_raw_fd()).map_err(map)?;
         let mut inspection = Inspection {
@@ -282,12 +272,12 @@ impl RuntimeDirectory {
                 content: true,
             }],
         };
-        let names = census(inspection.nodes[0].fd.as_raw_fd(), deadline, cancelled)?;
+        let names = census(inspection.nodes[0].fd.as_raw_fd(), cancelled)?;
         let mut evidence = false;
         let mut unknown = false;
         let mut state = None;
         for name in &names {
-            active(deadline, cancelled)?;
+            active(cancelled)?;
             let non_authority_directory = [c"run", c"logs"].contains(&name.as_c_str());
             let finder_metadata = name.as_c_str() == c".DS_Store";
             let non_authority = non_authority_directory || finder_metadata;
@@ -335,11 +325,7 @@ impl RuntimeDirectory {
             } else {
                 let control =
                     inspection.open(state, c"control", libc::S_IFDIR, Some(0o700), true)?;
-                let entries = census(
-                    inspection.nodes[control].fd.as_raw_fd(),
-                    deadline,
-                    cancelled,
-                )?;
+                let entries = census(inspection.nodes[control].fd.as_raw_fd(), cancelled)?;
                 if entries
                     .iter()
                     .any(|entry| entry.as_c_str() != c"slot-0.log")
@@ -356,7 +342,7 @@ impl RuntimeDirectory {
                         true,
                     )?;
                     inspection.validate()?;
-                    active(deadline, cancelled)?;
+                    active(cancelled)?;
                     let inspection = Arc::new(inspection);
                     return Ok(AuthorityScan {
                         witness: AuthorityWitness(Arc::clone(&inspection)),
@@ -374,7 +360,7 @@ impl RuntimeDirectory {
             AuthoritySource::RuntimeOnly
         };
         inspection.validate()?;
-        active(deadline, cancelled)?;
+        active(cancelled)?;
         Ok(AuthorityScan {
             source: result,
             witness: AuthorityWitness(Arc::new(inspection)),

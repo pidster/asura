@@ -13,12 +13,8 @@ fn recorded(
     fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
         .take(asura_storage::authority::MAX_JOURNAL as u64 + 1)
         .read_to_end(&mut bytes)?;
-    let replay = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .map_err(|error| format!("shell replay: {error:?}"))?;
+    let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
+        .map_err(|error| format!("shell replay: {error:?}"))?;
     let operation = replay
         .operations
         .get(&operation)
@@ -67,10 +63,13 @@ pub(super) fn run(provider: &str) -> Result<()> {
     let project = checked_id(
         fixture
             .attach()?
-            .register_project(pb::ProjectRegister {
-                request_id: Some(asura_platform::random_id().to_vec()),
-                location: Some(directory.to_str().ok_or("scratch UTF8")?.into()),
-            })?
+            .register_project(
+                pb::ProjectRegister {
+                    request_id: Some(asura_platform::random_id().to_vec()),
+                    location: Some(directory.to_str().ok_or("scratch UTF8")?.into()),
+                },
+                &|| false,
+            )?
             .project_id,
     )?;
     let request = pb::ConversationSubmit {
@@ -167,9 +166,11 @@ fn interrupted(
         thread::sleep(Duration::from_millis(25));
     }
     if cancel {
-        fixture
-            .attach()?
-            .cancel_conversation(operation, accepted.generation.ok_or("generation absent")?)?;
+        fixture.attach()?.cancel_conversation(
+            operation,
+            accepted.generation.ok_or("generation absent")?,
+            &|| false,
+        )?;
     }
     let terminal = observe(fixture, operation)?;
     if cancel {

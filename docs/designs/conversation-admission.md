@@ -14,7 +14,8 @@ input pipeline. The implementation extends the canonical ordinary-file authority
 owner and embedded graph adapter. Journal format remains 1. Fault and durability
 qualification remains incomplete where explicitly listed below.
 Journal step J1-0 (owner, 2026-10-15) removes the journal append, observation,
-replay and queue-worker time bounds. It is designed below and not implemented.
+replay and queue-worker time bounds. It is implemented; see
+[J1-0 implementation](#j1-0-implementation).
 
 The [recovery design](persistence-recovery.md) owns the journal and installation
 binding. This amendment defines format 1 and the first conversation writer.
@@ -592,7 +593,7 @@ Code changes (commit `41eebfb`):
 | `writer/mod.rs:486-492` | Default ticket deadlines: 10 s initialize, 5 s open, 2 s other | All removed. Initialization waits for the engine and shows progress; cancel and shutdown still stop it (owner, 2026-10-15) |
 | `writer/mod.rs:322-323` | Drops a queued job whose deadline passed | Removed: queued jobs run in order |
 | `conversation/state.rs:1276-1362`, `authority.rs:44-52` | Replay stops with `Timeout` at its deadline | No deadline; the cancel flag still stops it |
-| Queue worker observation, 5 s (design text above) | Reports uncertainty after 5 s | Waits for the reply; cancel stops the wait. The code site is located at implementation; no `5 s` literal was found by search. |
+| Queue worker observation, 5 s (`asura-cli/src/tui/queue.rs:112`, `:146`) | Reports uncertainty after 5 s | Waits for the reply; cancel stops the wait |
 | `try_submit_before` callers | Pass caller deadlines into the writer | The caller's own deadline applies only to the caller's wait (for example the L10 tool deadline), never to the writer's work |
 
 Unchanged: the 500 ms queue metadata refresh, a polling cadence that ends
@@ -628,6 +629,83 @@ stateDiagram-v2
 | J1-0-06 | Busy beyond capacity | Ninth writer request returns `busy` | Gated append: requests beyond 8 slots return `busy` | — |
 | J1-0-07 | Responsiveness | — | Inspect and cancel respond within 100 ms during each gate above | TUI typing within 100 ms during a gated append |
 | J1-0-08 | Real I/O error still fences | Injected `write` and `F_FULLFSYNC` errors fence and return `OutcomeUnconfirmed` | Injected error on a real file; later appends return `RepairRequired` | — |
+
+#### J1-0 implementation
+
+Implemented on 2026-10-15. Journal format 1 and protocol 0.1 are unchanged.
+These routine refinements apply the owner rule to sites the table did not list:
+
+- **Writer API.** `try_submit_before`, `Ticket::deadline`, the job deadline and
+  `writer::Error::Deadline` are removed. `ReplayError::Timeout` and
+  `AuthorityError::Timeout` are removed because nothing produces them. Control
+  validators still accept the `storage_timeout` wire string for compatibility.
+- **Shutdown cancels replay.** The writer passes its close flag to the
+  authority scan, `JournalFile::read_all` and replay. A replay stopped by
+  shutdown replies `Cancelled`, not `RepairRequired`.
+- **Writer sub-steps.** Configuration reads and embedded database calls on the
+  writer inherited the removed job deadline. They now have none
+  (`conversation_snapshot_without_deadline`).
+- **Embedded database (owner, 2026-10-16).** The SurrealDB 2 s query and
+  transaction timeouts and the adapter's per-command deadline checks are
+  removed everywhere, including the scratch memory owner's command and startup
+  deadlines. Queries end on completion, an engine error or the caller's
+  cancellation (turn cancel through the create's cancel flag, shutdown through
+  owner close). The scratch owner's 2 s slow-close report is unchanged.
+- **Foreground FIFO.** Commands retained behind the serialized writer ticket no
+  longer expire with `storage_timeout` after 2 s. They wait in order; the 33rd
+  gets `conversation_busy`; shutdown replies `service_draining`.
+- **Installation inspection.** The 5 s inspection scan bound is removed. The
+  scan ends on completion, content failure, an epoch change or shutdown. The 2 s
+  wait for the audit bootstrap before the scan starts is not a journal wait and
+  is unchanged.
+- **Loading state (owner, 2026-10-16).** While the inspection replay or the
+  writer's own replay runs, Inspect reports `recovering`/`inspection_pending`
+  and conversation work gets `conversation_busy`. A first run with no journal
+  shows no loading state. When the writer's replay ends, the conversation
+  owner's snapshot applies, or the inspected snapshot returns if it has none
+  (`installation::ReplayLoading`). No state is added.
+- **Memory create (HM3).** The caller keeps its tool deadline (L10) for its own
+  wait. When it passes, the caller sets the create's cancel flag, which stops the
+  cancellable put. The receipt resolution read has no deadline.
+- **Journal-backed client mutations (owner, 2026-10-16).** Initialize, project
+  register and rename, queue enqueue, queue input, reorder and decision, and
+  conversation cancel have no client response budget. The client checks the
+  person's cancel callback every 50 ms; this cadence ends nothing. Cancel or a
+  lost connection returns `OutcomeUnconfirmed`, and the attachment then refuses
+  further requests. `asura init` and `asura project add` print the request ID
+  and progress, and Ctrl-C stops the wait. In the TUI, `/init` and
+  `/project add` show progress and `/cancel` stops the wait, as it does for a
+  rename or queue request. Read, config, models, submit, lifecycle and TUI job
+  budgets are unchanged.
+- **Queue worker.** `/cancel` while a queue request is in flight stops the wait.
+  The slot stays busy until the worker settles. The service-owned queue
+  projection shows the request if it committed.
+- **Turn cancel display (owner, 2026-10-16).** The 100 ms cancel requirement
+  measures admission. After `/cancel` the TUI shows "Cancelling" until the
+  service acknowledges the durable `CancelRequested` record, then "Cancelled"
+  until the turn settles.
+- **Test hook.** `asura_platform::journal_gate` (feature `test-support`) holds or
+  fails appends and reads for one scratch home. A file-based form serves child
+  service processes. Without the feature the hook points compile to no-ops.
+
+Validation, 2026-10-15:
+
+| ID | Unit | Integration | End-to-end |
+| --- | --- | --- | --- |
+| J1-0-01 | `journal_io::tests::j1_0_01_*` (fake target and gated real append past 2 s) | `journal_writer::j1_0_01_*` (5 s hold, commit, replay) | — |
+| J1-0-02 | `writer::tests::j1_0_02_*` (10.1 s without reply); `foreground_tests::j1_0_02_*` (reply after turn cancel applied) | `conversation_flow --journal-waits` (held queue append; late reply applied; owner usable) | — |
+| J1-0-03 | `writer::tests::j1_0_03_*` | `journal_writer::j1_0_03_*` (5.2 s stall) | — |
+| J1-0-04 | `journal_io::tests::j1_0_04_*`; `installation::tests` held scan never expires and `writer_replay_shows_loading_only_when_a_journal_exists` | `journal_writer::j1_0_04_*` (shutdown cancels); `conversation_flow --journal-waits` (loading during inspection and writer replay, refused work, shutdown) | `tui_pty.py --journal-waits` |
+| J1-0-05 | `queue::tests::j1_0_05_*`; client `initialization_wait_has_no_time_bound_and_only_cancel_ends_it` | `conversation_flow --journal-waits` (queue mutation held 5.2 s, past the removed 3 s client budget; no uncertainty) | — |
+| J1-0-06 | `writer::tests::j1_0_06_*` | `journal_writer::j1_0_06_*` | — |
+| J1-0-07 | `ui::tests::j1_0_*` (cancel paths); `ui::tests::turn_cancel_shows_cancelling_until_the_durable_record_then_cancelled` | `conversation_flow --journal-waits` (Inspect, cancel and init cancel under 100 ms) | `tui_pty.py --journal-waits` (typing under 100 ms) |
+| J1-0-08 | `journal_io::tests::j1_0_08_*` | `journal_writer::j1_0_08_*` | — |
+
+The 100 ms cancel requirement measures admission (owner, 2026-10-16). The
+integration check times cancel requests for an unknown operation. A cancel for a
+live turn is admitted without waiting for the writer (unit
+`foreground_tests::j1_0_02_*`). Its durable acknowledgement follows the
+`CancelRequested` record; the TUI shows "Cancelling" until then.
 
 ### Turn and restart states
 

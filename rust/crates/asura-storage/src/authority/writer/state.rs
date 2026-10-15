@@ -2,6 +2,8 @@ use super::super::{HEADER, TRAILER};
 use super::*;
 use asura_platform::{AuthoritySource, random_id};
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "embedded-memory")]
+use std::time::Duration;
 
 pub(super) struct State {
     runtime: RuntimeDirectory,
@@ -11,6 +13,9 @@ pub(super) struct State {
     fenced: bool,
     opened: bool,
     retired: Vec<std::sync::Weak<Replay>>,
+    /// The writer's close flag. Shutdown cancels replay and configuration reads;
+    /// no journal step has a time bound (J1-0).
+    cancel: Arc<AtomicBool>,
     #[cfg(feature = "embedded-memory")]
     graph: Option<Graph>,
 }
@@ -40,9 +45,10 @@ fn project_error(error: asura_platform::Error) -> Error {
     }
 }
 impl State {
-    pub(super) fn new(runtime: RuntimeDirectory) -> Self {
+    pub(super) fn new(runtime: RuntimeDirectory, cancel: Arc<AtomicBool>) -> Self {
         Self {
             runtime,
+            cancel,
             file: None,
             bytes: Vec::new(),
             replay: None,
@@ -76,13 +82,17 @@ impl State {
             stale_project_name_revision: false,
         }
     }
-    fn config(&self, deadline: Instant) -> Result<crate::config::ConversationSnapshot> {
-        crate::config::conversation_snapshot(
-            self.runtime.clone(),
-            deadline,
-            &AtomicBool::new(false),
-        )
-        .map_err(|_| Error::Invalid)
+    fn config(&self) -> Result<crate::config::ConversationSnapshot> {
+        crate::config::conversation_snapshot_without_deadline(self.runtime.clone(), &self.cancel)
+            .map_err(|_| Error::Invalid)
+    }
+    /// A replay failure while closing is a cancel, not damage.
+    fn replay_failed(&self) -> Error {
+        if self.cancel.load(Ordering::Acquire) {
+            Error::Cancelled
+        } else {
+            Error::RepairRequired
+        }
     }
     fn record(&self, range: Range<usize>) -> Result<Record> {
         let bytes = self.bytes.get(range).ok_or(Error::Invalid)?;
@@ -93,8 +103,9 @@ impl State {
         decode_record(kind, &bytes[HEADER..bytes.len() - TRAILER])
             .map_err(|_| Error::RepairRequired)
     }
-    fn append(&mut self, record: Record, deadline: Instant) -> Result<()> {
-        let deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+    /// Appends one record. The write and sync have no time bound (J1-0); only
+    /// an actual I/O or validation error fences the writer.
+    fn append(&mut self, record: Record) -> Result<()> {
         if self.fenced {
             return Err(Error::RepairRequired);
         }
@@ -133,7 +144,7 @@ impl State {
             .try_reserve_exact(frame.len())
             .map_err(|_| Error::Limit)?;
         self.bytes.extend_from_slice(&frame);
-        let proposed = replay(&self.bytes, deadline, &AtomicBool::new(false));
+        let proposed = replay(&self.bytes, &AtomicBool::new(false));
         let proposed = match proposed {
             Ok(state) => state,
             Err(_) => {
@@ -145,7 +156,7 @@ impl State {
             .file
             .as_mut()
             .ok_or(Error::NotInitialized)?
-            .append(old, &frame, deadline)
+            .append(old, &frame)
             .is_err()
         {
             self.fenced = true;
@@ -158,7 +169,7 @@ impl State {
         self.replay = Some(Arc::new(proposed));
         Ok(())
     }
-    fn open(&mut self, deadline: Instant) -> Result<()> {
+    fn open(&mut self) -> Result<()> {
         if self.opened {
             return Ok(());
         }
@@ -167,8 +178,8 @@ impl State {
         }
         let scan = self
             .runtime
-            .authority_source(deadline, &AtomicBool::new(false))
-            .map_err(|_| Error::RepairRequired)?;
+            .authority_source(&self.cancel)
+            .map_err(|_| self.replay_failed())?;
         match scan.source {
             AuthoritySource::RuntimeOnly => {
                 self.opened = true;
@@ -179,13 +190,14 @@ impl State {
         }
         let file =
             JournalFile::open(self.runtime.clone(), false).map_err(|_| Error::RepairRequired)?;
-        let bytes = file.read_all(deadline).map_err(|_| Error::RepairRequired)?;
-        let state =
-            replay(&bytes, deadline, &AtomicBool::new(false)).map_err(|_| Error::RepairRequired)?;
+        let bytes = file
+            .read_all(&self.cancel)
+            .map_err(|_| self.replay_failed())?;
+        let state = replay(&bytes, &self.cancel).map_err(|_| self.replay_failed())?;
         self.file = Some(file);
         self.bytes = bytes;
         self.replay = Some(Arc::new(state));
-        self.append(Record::OwnerGeneration, deadline)?;
+        self.append(Record::OwnerGeneration)?;
         if let Some(id) = self
             .replay
             .as_ref()
@@ -201,39 +213,31 @@ impl State {
             let generation = op.generation;
             let started = op.helper.is_some();
             let reserved_output_tokens = op.reserved_output_tokens;
-            self.append(
-                Record::TurnTerminal(TurnTerminal {
-                    operation: id,
-                    generation,
-                    kind: TerminalKind::Interrupted,
-                    cause: Cause::Restart,
-                    final_cursor: u64::MAX,
-                    usage_known: !started,
-                    output_tokens: 0,
-                    charged_tokens: if started { reserved_output_tokens } else { 0 },
-                    text: String::new(),
-                }),
-                deadline,
-            )?;
+            self.append(Record::TurnTerminal(TurnTerminal {
+                operation: id,
+                generation,
+                kind: TerminalKind::Interrupted,
+                cause: Cause::Restart,
+                final_cursor: u64::MAX,
+                usage_known: !started,
+                output_tokens: 0,
+                charged_tokens: if started { reserved_output_tokens } else { 0 },
+                text: String::new(),
+            }))?;
         }
         if self.replay.as_ref().is_some_and(|r| r.binding.is_some()) {
-            self.connect_graph(false, deadline)?;
+            self.connect_graph(false)?;
         }
         self.opened = true;
         Ok(())
     }
     #[cfg(feature = "embedded-memory")]
-    fn connect_graph(&mut self, initialize: bool, deadline: Instant) -> Result<()> {
+    fn connect_graph(&mut self, initialize: bool) -> Result<()> {
         if let Some(graph) = &self.graph {
             graph
                 .directory
                 .validate()
                 .map_err(|_| Error::RepairRequired)?;
-            graph
-                ._database
-                .as_ref()
-                .expect("live graph")
-                .set_deadline(deadline);
             graph
                 ._runtime
                 .block_on(graph._database.as_ref().expect("live graph").verify())
@@ -270,7 +274,6 @@ impl State {
             directory.path().to_owned(),
             binding,
             initialize,
-            deadline,
         ));
         let database = match database {
             Ok(database) => database,
@@ -299,14 +302,16 @@ impl State {
         Ok(())
     }
     #[cfg(not(feature = "embedded-memory"))]
-    fn connect_graph(&mut self, _initialize: bool, _deadline: Instant) -> Result<()> {
+    fn connect_graph(&mut self, _initialize: bool) -> Result<()> {
         Err(Error::Unavailable)
     }
-    fn initialize(&mut self, request: Id, deadline: Instant) -> Result<()> {
+    /// Initialization has no time bound (owner, 2026-10-15): it waits for the
+    /// engine; shutdown and real errors stop it.
+    fn initialize(&mut self, request: Id) -> Result<()> {
         if !cfg!(feature = "embedded-memory") {
             return Err(Error::Unavailable);
         }
-        self.open(deadline)?;
+        self.open()?;
         let digest = request_digest(Request::Initialize { mode: 1 }).map_err(|_| Error::Invalid)?;
         if let Some(state) = &self.replay {
             if state.initialization.digest != digest {
@@ -328,12 +333,12 @@ impl State {
         } else {
             let scan = self
                 .runtime
-                .authority_source(deadline, &AtomicBool::new(false))
-                .map_err(|_| Error::RepairRequired)?;
+                .authority_source(&self.cancel)
+                .map_err(|_| self.replay_failed())?;
             if !matches!(scan.source, AuthoritySource::RuntimeOnly) {
                 return Err(Error::RepairRequired);
             }
-            let configuration_digest = self.config(deadline)?.digest;
+            let configuration_digest = self.config()?.digest;
             let pending = Record::PendingInit(PendingInit {
                 request,
                 digest,
@@ -351,18 +356,10 @@ impl State {
                 owner_generation: 1,
             };
             let frame = encode_frame(&context, &pending).map_err(|_| Error::Invalid)?;
-            let state =
-                replay(&frame, deadline, &AtomicBool::new(false)).map_err(|_| Error::Invalid)?;
+            let state = replay(&frame, &AtomicBool::new(false)).map_err(|_| Error::Invalid)?;
             let mut file =
                 JournalFile::open(self.runtime.clone(), true).map_err(|_| Error::RepairRequired)?;
-            if file
-                .append(
-                    0,
-                    &frame,
-                    deadline.min(Instant::now() + Duration::from_secs(2)),
-                )
-                .is_err()
-            {
+            if file.append(0, &frame).is_err() {
                 self.fenced = true;
                 self.file = Some(file);
                 return Err(Error::OutcomeUnconfirmed);
@@ -371,17 +368,14 @@ impl State {
             self.bytes = frame;
             self.replay = Some(Arc::new(state));
         }
-        self.connect_graph(true, deadline)?;
+        self.connect_graph(true)?;
         let state = self.replay.as_ref().expect("pending");
-        self.append(
-            Record::ActiveBinding(ActiveBinding {
-                request,
-                generation: 1,
-                graph: state.initialization.graph,
-                configuration_digest: state.initialization.configuration_digest,
-            }),
-            deadline,
-        )
+        self.append(Record::ActiveBinding(ActiveBinding {
+            request,
+            generation: 1,
+            graph: state.initialization.graph,
+            configuration_digest: state.initialization.configuration_digest,
+        }))
     }
     fn project(&self, id: Id) -> Result<ProjectIdentity> {
         let project = self
@@ -515,12 +509,7 @@ impl State {
         Ok(prompt)
     }
     #[cfg(feature = "embedded-memory")]
-    fn memory_read(
-        &mut self,
-        project: Id,
-        query: crate::memory::ReadNotes,
-        deadline: Instant,
-    ) -> Result<Reply> {
+    fn memory_read(&mut self, project: Id, query: crate::memory::ReadNotes) -> Result<Reply> {
         query.validate().map_err(|_| Error::Invalid)?;
         let replay = self.replay.as_ref().ok_or(Error::NotInitialized)?;
         if !replay.projects.contains_key(&project) {
@@ -529,10 +518,9 @@ impl State {
         if replay.project_memory_blocked(project) {
             return Err(Error::Busy);
         }
-        self.connect_graph(false, deadline)?;
+        self.connect_graph(false)?;
         let graph = self.graph.as_ref().ok_or(Error::Unavailable)?;
         let database = graph._database.as_ref().ok_or(Error::Unavailable)?;
-        database.set_deadline(deadline);
         let context = crate::memory::Id::new(project).map_err(|_| Error::Invalid)?;
         let result = graph._runtime.block_on(database.read(context, query));
         graph
@@ -551,7 +539,6 @@ impl State {
         ordinal: u32,
         body: Option<String>,
         cancel: &AtomicBool,
-        deadline: Instant,
     ) -> Result<Reply> {
         let replay = self.replay.as_ref().ok_or(Error::NotInitialized)?;
         let op = replay.operations.get(&turn).ok_or(Error::Invalid)?;
@@ -588,10 +575,9 @@ impl State {
         let command = body
             .map(|body| crate::memory::create::command_for_intent(binding, &intent, body))
             .transpose();
-        self.connect_graph(false, deadline)?;
+        self.connect_graph(false)?;
         let graph = self.graph.as_ref().ok_or(Error::Unavailable)?;
         let database = graph._database.as_ref().ok_or(Error::Unavailable)?;
-        database.set_deadline(deadline);
         let result = graph._runtime.block_on(async {
             if let Some(command) = command? {
                 if let Some((source, _)) = command.source {
@@ -615,18 +601,16 @@ impl State {
         &mut self,
         project: Id,
         write: Option<(u64, crate::sensors::ProjectState)>,
-        deadline: Instant,
     ) -> Result<Reply> {
         let replay = self.replay.as_ref().ok_or(Error::NotInitialized)?;
         if !replay.projects.contains_key(&project) {
             return Err(Error::Invalid);
         }
-        self.connect_graph(false, deadline)?;
+        self.connect_graph(false)?;
         #[cfg(feature = "embedded-memory")]
         {
             let graph = self.graph.as_ref().ok_or(Error::Unavailable)?;
             let database = graph._database.as_ref().ok_or(Error::Unavailable)?;
-            database.set_deadline(deadline);
             let result = match write {
                 Some((revision, state)) => graph
                     ._runtime
@@ -654,7 +638,7 @@ impl State {
             Err(Error::Unavailable)
         }
     }
-    pub(super) fn execute(&mut self, command: Command, deadline: Instant) -> Result<Reply> {
+    pub(super) fn execute(&mut self, command: Command) -> Result<Reply> {
         if self.fenced {
             return Err(Error::RepairRequired);
         }
@@ -675,14 +659,7 @@ impl State {
                 body,
                 cancel,
             } => {
-                return self.memory_create(
-                    turn,
-                    generation,
-                    ordinal,
-                    Some(body),
-                    &cancel,
-                    deadline,
-                );
+                return self.memory_create(turn, generation, ordinal, Some(body), &cancel);
             }
             #[cfg(feature = "embedded-memory")]
             Command::MemoryResolveCreate {
@@ -696,20 +673,19 @@ impl State {
                     ordinal,
                     None,
                     &AtomicBool::new(false),
-                    deadline,
                 );
             }
             #[cfg(feature = "embedded-memory")]
             Command::MemoryRead { project, query } => {
-                return self.memory_read(project, query, deadline);
+                return self.memory_read(project, query);
             }
-            Command::SensorLoad { project } => return self.sensor(project, None, deadline),
+            Command::SensorLoad { project } => return self.sensor(project, None),
             Command::SensorStore {
                 expected_revision,
                 state,
-            } => return self.sensor(state.project, Some((expected_revision, state)), deadline),
+            } => return self.sensor(state.project, Some((expected_revision, state))),
 
-            Command::Open => self.open(deadline)?,
+            Command::Open => self.open()?,
             Command::Inputs { project, input } => {
                 let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
                 if !state.projects.contains_key(&project) {
@@ -827,21 +803,18 @@ impl State {
                 }
                 let held = self.project(project)?;
                 held.validate().map_err(|_| Error::StaleProject)?;
-                self.append(
-                    Record::InputQueued(InputQueued {
-                        request,
-                        digest,
-                        dispatch_request: random_id(),
-                        project,
-                        conversation,
-                        target_operation,
-                        target_generation,
-                        previous,
-                        kind,
-                        prompt,
-                    }),
-                    deadline,
-                )?;
+                self.append(Record::InputQueued(InputQueued {
+                    request,
+                    digest,
+                    dispatch_request: random_id(),
+                    project,
+                    conversation,
+                    target_operation,
+                    target_generation,
+                    previous,
+                    kind,
+                    prompt,
+                }))?;
                 held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
                 return self.queue_reply(request);
             }
@@ -899,21 +872,18 @@ impl State {
                 let held = self.project(project)?;
                 held.validate().map_err(|_| Error::StaleProject)?;
                 let revision = state.order_revision.checked_add(1).ok_or(Error::Limit)?;
-                self.append(
-                    Record::InputQueuedV2(InputQueuedV2 {
-                        request,
-                        digest,
-                        input: random_id(),
-                        dispatch_request: random_id(),
-                        project,
-                        conversation: conversation.unwrap_or_else(random_id),
-                        expected_generation,
-                        new_conversation,
-                        prompt,
-                        order_revision: revision,
-                    }),
-                    deadline,
-                )?;
+                self.append(Record::InputQueuedV2(InputQueuedV2 {
+                    request,
+                    digest,
+                    input: random_id(),
+                    dispatch_request: random_id(),
+                    project,
+                    conversation: conversation.unwrap_or_else(random_id),
+                    expected_generation,
+                    new_conversation,
+                    prompt,
+                    order_revision: revision,
+                }))?;
                 held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
                 let input = match self
                     .replay
@@ -993,17 +963,14 @@ impl State {
                 let revision = state.order_revision.checked_add(1).ok_or(Error::Limit)?;
                 let held = self.project(project)?;
                 held.validate().map_err(|_| Error::StaleProject)?;
-                self.append(
-                    Record::InputReordered(InputReordered {
-                        request,
-                        digest,
-                        input,
-                        after,
-                        expected_order_revision,
-                        order_revision: revision,
-                    }),
-                    deadline,
-                )?;
+                self.append(Record::InputReordered(InputReordered {
+                    request,
+                    digest,
+                    input,
+                    after,
+                    expected_order_revision,
+                    order_revision: revision,
+                }))?;
                 held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
                 return self.project_queue_reply(project, None);
             }
@@ -1032,15 +999,12 @@ impl State {
                 }) {
                     return Err(Error::Conflict);
                 }
-                self.append(
-                    Record::InputDecision(InputDecision {
-                        request,
-                        digest,
-                        input,
-                        action,
-                    }),
-                    deadline,
-                )?;
+                self.append(Record::InputDecision(InputDecision {
+                    request,
+                    digest,
+                    input,
+                    action,
+                }))?;
                 return self.queue_reply(input);
             }
             Command::PromoteInput {
@@ -1076,16 +1040,13 @@ impl State {
                 self.steering_prompt(target_operation, &original.prompt)?;
                 let held = self.project(project)?;
                 held.validate().map_err(|_| Error::StaleProject)?;
-                self.append(
-                    Record::InputPromoted(InputPromoted {
-                        request,
-                        digest,
-                        input,
-                        target_operation,
-                        target_generation,
-                    }),
-                    deadline,
-                )?;
+                self.append(Record::InputPromoted(InputPromoted {
+                    request,
+                    digest,
+                    input,
+                    target_operation,
+                    target_generation,
+                }))?;
                 held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
                 return self.queue_reply(input);
             }
@@ -1111,15 +1072,12 @@ impl State {
                     Record::InputQueuedV2(value) => value.prompt,
                     _ => return Err(Error::RepairRequired),
                 };
-                let mut reply = self.execute(
-                    Command::Prepare {
-                        project: q.project,
-                        conversation: Some(q.conversation),
-                        expected_generation: generation,
-                        prompt: prompt.clone(),
-                    },
-                    deadline,
-                )?;
+                let mut reply = self.execute(Command::Prepare {
+                    project: q.project,
+                    conversation: Some(q.conversation),
+                    expected_generation: generation,
+                    prompt: prompt.clone(),
+                })?;
                 reply.queued = Some(QueuedPreparation {
                     request: q.dispatch_request,
                     project: q.project,
@@ -1130,7 +1088,7 @@ impl State {
                 return Ok(reply);
             }
 
-            Command::Initialize { request } => self.initialize(request, deadline)?,
+            Command::Initialize { request } => self.initialize(request)?,
             Command::Projects { after, limit } => {
                 if !(1..=8).contains(&limit) {
                     return Err(Error::Invalid);
@@ -1174,7 +1132,7 @@ impl State {
                 {
                     return Err(Error::Invalid);
                 }
-                self.connect_graph(false, deadline)?;
+                self.connect_graph(false)?;
                 let held = self.project(project)?;
                 let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
                 let selected = if let Some(conversation) = conversation {
@@ -1224,7 +1182,7 @@ impl State {
                 return Ok(reply);
             }
             Command::ReadPrompt { project, operation } => {
-                self.connect_graph(false, deadline)?;
+                self.connect_graph(false)?;
                 let held = self.project(project)?;
                 let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
                 let op = state.operations.get(&operation).ok_or(Error::Invalid)?;
@@ -1252,7 +1210,7 @@ impl State {
                 return Ok(reply);
             }
             Command::Register { request, location } => {
-                self.connect_graph(false, deadline)?;
+                self.connect_graph(false)?;
                 let digest = request_digest(Request::Register {
                     location: &location,
                 })
@@ -1302,7 +1260,7 @@ impl State {
                     })
                 };
                 held.validate().map_err(|_| Error::StaleProject)?;
-                self.append(record, deadline)?;
+                self.append(record)?;
                 held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
             }
             Command::RenameProject {
@@ -1354,18 +1312,15 @@ impl State {
                 let capitalized = capitalize_project_name(&name).map_err(|_| Error::Invalid)?;
                 let name_revision = current_revision.checked_add(1).ok_or(Error::Limit)?;
                 held.validate().map_err(|_| Error::StaleProject)?;
-                self.append(
-                    Record::ProjectRenamed(ProjectRenamed {
-                        request,
-                        digest,
-                        project,
-                        expected_name_revision,
-                        name_revision,
-                        requested_name: name,
-                        name: capitalized.clone(),
-                    }),
-                    deadline,
-                )?;
+                self.append(Record::ProjectRenamed(ProjectRenamed {
+                    request,
+                    digest,
+                    project,
+                    expected_name_revision,
+                    name_revision,
+                    requested_name: name,
+                    name: capitalized.clone(),
+                }))?;
                 held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
                 let mut reply = self.reply();
                 reply.project_name_changed = Some(current_name != capitalized);
@@ -1379,7 +1334,7 @@ impl State {
                 expected_generation,
                 prompt,
             } => {
-                self.connect_graph(false, deadline)?;
+                self.connect_graph(false)?;
                 let held = self.project(project)?;
                 request_digest(Request::Submit {
                     project,
@@ -1389,7 +1344,7 @@ impl State {
                 })
                 .map_err(|_| Error::Invalid)?;
                 let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                let config = self.config(deadline)?;
+                let config = self.config()?;
                 let model = config.model;
                 let asset_root = config.asset_root;
                 let ollama_endpoint = config.ollama_endpoint;
@@ -1459,16 +1414,16 @@ impl State {
                     let fence = admission.ok_or(Error::Invalid)?;
                     if fence.project != turn.project
                         || fence.configuration_digest != turn.configuration_digest
-                        || self.config(deadline)?.digest != fence.configuration_digest
+                        || self.config()?.digest != fence.configuration_digest
                     {
                         return Err(Error::Conflict);
                     }
-                    self.connect_graph(false, deadline)?;
+                    self.connect_graph(false)?;
                     Some(self.project(fence.project)?)
                 } else {
                     None
                 };
-                self.append(record, deadline)?;
+                self.append(record)?;
                 if let Some(held) = held {
                     held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
                 }

@@ -108,17 +108,23 @@ pub(crate) fn location(path: &str) -> Result<String, String> {
         .map(str::to_owned)
         .ok_or_else(|| "Project path must be UTF-8".into())
 }
+/// `cancelled` ends only the wait of a journal-backed mutation (initialize,
+/// register), which has no time bound (J1-0). Reads keep their client budgets.
 pub(crate) fn execute(
     client: &mut asura_client::Client,
     command: Command,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(String, Option<[u8; 16]>), String> {
     match command {
         Command::Initialize(id) => {
-            let reply = match client.initialize(pb::InitializeInstallation {
-                request_id: Some(id.to_vec()),
-                mode: Some("embedded".into()),
-                expected_authority_revision: Some(0),
-            }) {
+            let reply = match client.initialize(
+                pb::InitializeInstallation {
+                    request_id: Some(id.to_vec()),
+                    mode: Some("embedded".into()),
+                    expected_authority_revision: Some(0),
+                },
+                cancelled,
+            ) {
                 Ok(reply) => reply,
                 Err(asura_client::Error::Remote(_, reason)) => {
                     return initialization_rejected(&reason, &id);
@@ -148,10 +154,13 @@ pub(crate) fn execute(
         }
         Command::Register(id, path) => {
             let reply = client
-                .register_project(pb::ProjectRegister {
-                    request_id: Some(id.to_vec()),
-                    location: Some(path),
-                })
+                .register_project(
+                    pb::ProjectRegister {
+                        request_id: Some(id.to_vec()),
+                        location: Some(path),
+                    },
+                    cancelled,
+                )
                 .map_err(|e| format!("{e}; outcome unconfirmed; request {}", hex(&id)))?;
             if let Some(error) = reply.error {
                 return Err(error);

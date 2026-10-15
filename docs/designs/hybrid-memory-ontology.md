@@ -1241,7 +1241,7 @@ Proposed HM0 limits apply to the adapter and its test process:
 | Database ownership | One instance, one storage owner thread, two Tokio worker threads, at most two blocking-pool threads |
 | Work admission | One executing command, eight queued commands; reject the ninth queued command with `Busy` |
 | Inputs/results | 16 KiB note body, 20 KiB encoded command, 32 records or 64 KiB response; reject before submission or return explicit `LimitExceeded` |
-| Deadlines | Open/initialize 10 seconds; read/write 2 seconds; SDK query and transaction timeout 2 seconds |
+| Deadlines | None (owner, 2026-10-16): open, initialize, reads, writes, SDK queries and transactions end on completion, an engine error or the caller's cancellation. |
 | Shutdown | Stop admission immediately; inspect settlement without blocking the service; after 2 seconds retain ownership and report unavailable |
 | Qualification workload | 1000 notes, at most one source link per note, 64 MiB aggregate logical input |
 
@@ -1598,8 +1598,8 @@ Pagination is a live view, not a snapshot. Immutable versions are ordered by ID,
 not creation time. Concurrent insertion before the cursor appears on a new scan;
 insertion after it can appear on the next page. A cursor names a boundary and
 need not refer to an existing row. No schema or protocol version changes occur.
-The existing owner supplies one active operation, eight queued commands, a
-two-second command budget and nonblocking polling. Cancellation suppresses
+The existing owner supplies one active operation, eight queued commands and
+nonblocking polling; commands have no time bound (owner, 2026-10-16). Cancellation suppresses
 queued work; an active database call keeps its owner until it settles. Reads can
 be retried without a mutation receipt. Existing note writes keep their atomic
 note/link/receipt transaction and original operation ID for uncertain outcomes.
@@ -1643,9 +1643,10 @@ The existing authority worker requires a registered project, verifies its bound
 graph and descriptor, then runs the matching database method on its retained
 executor. The reply carries `memory_result`, preserving typed memory failures.
 Admission and graph attachment failures use the existing authority error enum.
-The two-second deadline and six ordinary/eight total queue slots remain unchanged.
-Dropping a ticket drops result delivery; it does not start a replacement owner.
-The worker checks expiry before execution and retains ownership during settlement.
+The six ordinary/eight total queue slots remain unchanged. The writer and the
+database call have no time bound (J1-0; owner, 2026-10-16); the tool deadline
+bounds only the caller's wait. Dropping a ticket drops result delivery; it does
+not start a replacement owner. The worker retains ownership during settlement.
 These read-only commands write no journal entry and authorize no note mutation.
 
 ```mermaid
@@ -2119,14 +2120,16 @@ schema. Other projects, status, input editing and cancellation remain responsive
 The create worker may validate its own source internally; it cannot bypass another
 unresolved create. A source note from an unpublished operation is ineligible.
 
-Use `try_submit_before` with the earlier of intent acknowledgement plus two seconds
-and the remaining turn deadline. The same deadline reaches database work. The
-existing six ordinary/eight total authority slots and retained settlement token
-remain in force. Cancellation or timeout after dispatch fences inference but does
-not assert rollback. Retain the mutation ticket, tool slot and original metadata
-until actual worker settlement. Then resolve the exact original receipt with a
-separate bounded two-second recovery read, even when the inference deadline has
-expired. This recovery work cannot execute another mutation.
+The caller keeps the earlier of intent acknowledgement plus two seconds and the
+remaining turn deadline as its own wait deadline. Under [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound) that deadline no
+longer reaches the writer or database work: when it passes, the caller sets the
+create's cancel flag, which stops the cancellable put. The existing six
+ordinary/eight total authority slots and retained settlement token remain in
+force. Cancellation or timeout after dispatch fences inference but does not assert
+rollback. Retain the mutation ticket, tool slot and original metadata until actual
+worker settlement. Then resolve the exact original receipt with a separate
+recovery read that waits for the writer's real reply, even when the inference
+deadline has expired. This recovery work cannot execute another mutation.
 
 A matching committed receipt requires a durable success ToolResult, including when
 the user cancelled during commit. The turn can then terminate as cancelled without
@@ -2177,7 +2180,8 @@ terminals. Do not derive these gates from volatile service state or database row
 Then enumerate those intents for receipt reconciliation. Process one receipt lookup
 at a time on the retained worker.
 Replay limits unresolved create intents to 32; exceeding this is a resource-limit
-failure, not permission to discard an intent. Each lookup has a two-second budget.
+failure, not permission to discard an intent. Each lookup waits for the real reply
+with no time bound (J1-0; owner, 2026-10-16).
 New service ownership does not authorize repeating a database write.
 
 After an owner-generation increment, permit ToolResult kind 15 for a projected
@@ -2274,8 +2278,8 @@ mutation or native inference ran during this design packet.
 The existing conversation reactor owns one retained mutation state per live tool,
 and at most one startup receipt reconciliation. It uses the existing authority
 writer queue; it adds no worker or database owner. After a submitted mutation
-settles, it always performs one readonly receipt resolution with a fresh two-second
-recovery deadline. It cannot publish a timeout/cancel result while mutation outcome
+settles, it always performs one readonly receipt resolution that waits for the
+writer's real reply (J1-0). It cannot publish a timeout/cancel result while mutation outcome
 is unknown. A resolution failure retains the journal publication gate and reports
 `memory_write_outcome_unconfirmed`; there is no automatic retry loop.
 

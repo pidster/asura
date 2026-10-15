@@ -18,12 +18,8 @@ fn wait<T>(mut pending: memory::Pending<T>) -> Result<T> {
 }
 fn seed(fixture: &Fixture, project: [u8; 16], foreign: [u8; 16], fact: &str) -> Result<()> {
     let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
-    let replay = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .map_err(|e| format!("seed replay:{e:?}"))?;
+    let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
+        .map_err(|e| format!("seed replay:{e:?}"))?;
     let binding = memory::Binding {
         installation_id: memory::Id::new(replay.installation_id)?,
         graph_id: memory::Id::new(replay.initialization.graph)?,
@@ -92,10 +88,13 @@ pub(super) fn run(provider: &str) -> Result<()> {
         projects.push(checked_id(
             fixture
                 .attach()?
-                .register_project(pb::ProjectRegister {
-                    request_id: Some(asura_platform::random_id().to_vec()),
-                    location: Some(path.to_str().unwrap().into()),
-                })?
+                .register_project(
+                    pb::ProjectRegister {
+                        request_id: Some(asura_platform::random_id().to_vec()),
+                        location: Some(path.to_str().unwrap().into()),
+                    },
+                    &|| false,
+                )?
                 .project_id,
         )?);
     }
@@ -233,12 +232,8 @@ pub(super) fn run(provider: &str) -> Result<()> {
     }
     fixture.stop()?;
     let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
-    let replay = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .map_err(|e| format!("memory replay:{e:?}"))?;
+    let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
+        .map_err(|e| format!("memory replay:{e:?}"))?;
     for (operation, event) in &saved {
         assert_eq!(replay.operations[operation].tools.len(), event.tools.len());
     }
@@ -267,12 +262,8 @@ fn diagnose(fixture: &Fixture, operation: [u8; 16], event: &pb::ConversationEven
             .collect::<String>()
     );
     let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
-    let replay = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .map_err(|e| format!("diagnostic replay:{e:?}"))?;
+    let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
+        .map_err(|e| format!("diagnostic replay:{e:?}"))?;
     for tool in replay.operations[&operation].tools.iter().take(8) {
         // Fixed journal-format-1 header/trailer; replay above has validated these exact frames.
         for range in [Some(tool.intent_frame.clone()), tool.result_frame.clone()]
@@ -316,12 +307,8 @@ fn committed_tools(
     if bytes.len() > asura_storage::authority::MAX_JOURNAL {
         return Err("fixture journal exceeds bound".into());
     }
-    let replay = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .map_err(|e| format!("evidence replay:{e:?}"))?;
+    let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
+        .map_err(|e| format!("evidence replay:{e:?}"))?;
     let mut records = Vec::new();
     for tool in replay
         .operations

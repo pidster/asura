@@ -38,7 +38,7 @@ fn platform_failure(error: AuthorityError) -> pb::InspectInstallationReply {
         AuthorityError::Unsafe => Reason::UnsafeAuthority,
         AuthorityError::Changed => Reason::AuthorityChanged,
         AuthorityError::Limit => Reason::InspectionLimit,
-        AuthorityError::Timeout | AuthorityError::Cancelled => Reason::InspectionTimeout,
+        AuthorityError::Cancelled => Reason::InspectionTimeout,
         AuthorityError::Io => Reason::InspectionIo,
     })
 }
@@ -64,37 +64,30 @@ impl Candidate {
         self.snapshot
     }
 }
-pub(crate) fn scan(
-    runtime: RuntimeDirectory,
-    deadline: Instant,
-    cancelled: Arc<AtomicBool>,
-) -> Candidate {
-    let scan = match runtime.authority_source(deadline, &cancelled) {
+/// Startup inspection replay has no time bound (J1-0); shutdown cancels it.
+pub(crate) fn scan(runtime: RuntimeDirectory, cancelled: Arc<AtomicBool>) -> Candidate {
+    let scan = match runtime.authority_source(&cancelled) {
         Ok(scan) => scan,
         Err(error) => return platform_failure(error).into(),
     };
-    let result = scan_source(scan.source, deadline, &cancelled);
+    let result = scan_source(scan.source, &cancelled);
     Candidate {
         snapshot: result,
         witness: Some(scan.witness),
     }
 }
-fn scan_source(
-    source: AuthoritySource,
-    deadline: Instant,
-    cancelled: &AtomicBool,
-) -> pb::InspectInstallationReply {
+fn scan_source(source: AuthoritySource, cancelled: &AtomicBool) -> pb::InspectInstallationReply {
     let mut reader = match source {
         AuthoritySource::RuntimeOnly => return snapshot(State::Uninitialized, Reason::RuntimeOnly),
         AuthoritySource::Remnants => return failure(Reason::InstallationRemnants),
         AuthoritySource::UnsupportedLayout => return failure(Reason::UnsupportedLayout),
         AuthoritySource::Journal(reader) => reader,
     };
-    let bytes = match reader.read_all(deadline, cancelled) {
+    let bytes = match reader.read_all(cancelled) {
         Ok(bytes) => bytes,
         Err(error) => return platform_failure(error),
     };
-    let replay = authority::replay(&bytes, deadline, cancelled);
+    let replay = authority::replay(&bytes, cancelled);
     if let Err(error) = reader.validate() {
         return platform_failure(error);
     }
@@ -107,7 +100,7 @@ fn scan_source(
                 ReplayError::UnsupportedFormat => Reason::UnsupportedFormat,
                 ReplayError::Corrupt => Reason::CorruptAuthority,
                 ReplayError::Limit => Reason::InspectionLimit,
-                ReplayError::Timeout | ReplayError::Cancelled => Reason::InspectionTimeout,
+                ReplayError::Cancelled => Reason::InspectionTimeout,
             });
         }
     };
@@ -137,7 +130,6 @@ struct ResultEnvelope {
 pub(crate) struct Worker {
     epoch: [u8; 16],
     scan_id: [u8; 16],
-    deadline: Instant,
     cancelled: Arc<AtomicBool>,
     handle: Option<JoinHandle<ResultEnvelope>>,
     retired: bool,
@@ -145,17 +137,16 @@ pub(crate) struct Worker {
 }
 impl Worker {
     pub(crate) fn start(runtime: RuntimeDirectory, epoch: [u8; 16]) -> std::io::Result<Self> {
-        Self::start_with(epoch, Duration::from_secs(5), move |deadline, cancelled| {
-            scan(runtime, deadline, cancelled)
-        })
+        Self::start_with(epoch, move |cancelled| scan(runtime, cancelled))
     }
-    fn start_with<F, T>(epoch: [u8; 16], timeout: Duration, execute: F) -> std::io::Result<Self>
+    /// The scan runs until it finishes, fails on content, or is cancelled by
+    /// shutdown or an epoch change. It has no time bound (J1-0).
+    fn start_with<F, T>(epoch: [u8; 16], execute: F) -> std::io::Result<Self>
     where
-        F: FnOnce(Instant, Arc<AtomicBool>) -> T + Send + 'static,
+        F: FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
         T: Into<Candidate>,
     {
         let scan_id = asura_platform::random_id();
-        let deadline = Instant::now() + timeout;
         let cancelled = Arc::new(AtomicBool::new(false));
         let token = cancelled.clone();
         let completion = crate::completion::Completion::default();
@@ -164,7 +155,7 @@ impl Worker {
             .name("asura-inspection".into())
             .spawn(move || {
                 let _completion = signal.guard();
-                let candidate: Candidate = execute(deadline, token).into();
+                let candidate: Candidate = execute(token).into();
                 ResultEnvelope {
                     epoch,
                     scan_id,
@@ -174,7 +165,6 @@ impl Worker {
         Ok(Self {
             epoch,
             scan_id,
-            deadline,
             cancelled,
             handle: Some(handle),
             retired: false,
@@ -189,8 +179,6 @@ impl Worker {
             None
         } else if self.completion.completed() {
             self.completion.settlement_deadline(now)
-        } else if !self.retired {
-            Some(self.deadline)
         } else {
             None
         }
@@ -202,10 +190,10 @@ impl Worker {
     pub(crate) fn poll(
         &mut self,
         epoch: [u8; 16],
-        now: Instant,
+        _now: Instant,
     ) -> Option<pb::InspectInstallationReply> {
         let mut result = None;
-        if !self.retired && (now >= self.deadline || epoch != self.epoch) {
+        if !self.retired && epoch != self.epoch {
             self.cancel();
             result = Some(failure(Reason::InspectionTimeout));
         }
@@ -225,6 +213,33 @@ impl Worker {
     }
     pub(crate) fn settled(&self) -> bool {
         self.handle.is_none()
+    }
+}
+
+/// Inspect shows `recovering`/`inspection_pending` while the writer's own
+/// startup replay runs (owner, 2026-10-16). A first run with no journal
+/// shows no loading state. Afterwards the conversation owner's snapshot
+/// applies, or the inspected snapshot returns if the owner has none.
+#[derive(Default)]
+pub(crate) struct ReplayLoading {
+    inspected: Option<pb::InspectInstallationReply>,
+}
+impl ReplayLoading {
+    pub(crate) fn update(
+        &mut self,
+        replaying: bool,
+        current: &pb::InspectInstallationReply,
+        owner_has_snapshot: bool,
+    ) -> Option<pb::InspectInstallationReply> {
+        if replaying {
+            if self.inspected.is_none() && current.reason != Some(Reason::RuntimeOnly as i32) {
+                self.inspected = Some(current.clone());
+                return Some(snapshot(State::Recovering, Reason::InspectionPending));
+            }
+            return None;
+        }
+        let inspected = self.inspected.take()?;
+        (!owner_has_snapshot).then_some(inspected)
     }
 }
 
@@ -317,16 +332,41 @@ where
 mod tests {
     use super::*;
     #[test]
-    fn timeout_and_cancellation_discard_late_results_without_blocking_join() {
-        for timeout in [true, false] {
+    fn writer_replay_shows_loading_only_when_a_journal_exists() {
+        let mut loading = ReplayLoading::default();
+        let fresh = snapshot(State::Uninitialized, Reason::RuntimeOnly);
+        assert!(loading.update(true, &fresh, false).is_none());
+        assert!(loading.update(false, &fresh, false).is_none());
+        let inspected = snapshot(
+            State::GraphUnavailable,
+            Reason::GraphVerificationUnavailable,
+        );
+        let shown = loading.update(true, &inspected, false).unwrap();
+        assert_eq!(shown.installation, Some(State::Recovering as i32));
+        assert_eq!(shown.reason, Some(Reason::InspectionPending as i32));
+        let current = shown.clone();
+        assert!(loading.update(true, &current, false).is_none());
+        // Replay finished and the owner publishes its own snapshot.
+        assert!(loading.update(false, &current, true).is_none());
+        // Replay failed without an owner snapshot: the inspected state returns.
+        assert!(loading.update(true, &inspected, false).is_some());
+        assert_eq!(loading.update(false, &current, false), Some(inspected));
+    }
+    #[test]
+    fn epoch_change_and_cancellation_discard_late_results_without_blocking_join() {
+        for epoch_change in [true, false] {
             let (release, gate) = std::sync::mpsc::channel();
-            let mut worker = Worker::start_with([1; 16], Duration::from_secs(5), move |_, _| {
+            let mut worker = Worker::start_with([1; 16], move |_| {
                 gate.recv().unwrap();
                 snapshot(State::Uninitialized, Reason::RuntimeOnly)
             })
             .unwrap();
-            if timeout {
-                let reply = worker.poll([1; 16], worker.deadline).unwrap();
+            // J1-0: a held scan never expires; it reports nothing until it ends.
+            let later = Instant::now() + Duration::from_secs(3600);
+            assert!(worker.poll([1; 16], later).is_none());
+            assert!(worker.next_deadline(later).is_none());
+            if epoch_change {
+                let reply = worker.poll([2; 16], later).unwrap();
                 assert_eq!(reply.reason, Some(Reason::InspectionTimeout as i32));
             } else {
                 worker.cancel();
@@ -354,15 +394,10 @@ mod tests {
             .create(&path)
             .unwrap();
         let runtime = RuntimeDirectory::scratch(&path, true).unwrap();
-        let candidate = scan(
-            runtime,
-            Instant::now() + Duration::from_secs(2),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let candidate = scan(runtime, Arc::new(AtomicBool::new(false)));
         assert_eq!(candidate.snapshot.reason, Some(Reason::RuntimeOnly as i32));
         std::fs::write(path.join(".asura/new-entry"), b"changed").unwrap();
-        let mut worker =
-            Worker::start_with([1; 16], Duration::from_secs(2), |_, _| candidate).unwrap();
+        let mut worker = Worker::start_with([1; 16], |_| candidate).unwrap();
         let end = Instant::now() + Duration::from_secs(2);
         loop {
             if let Some(reply) = worker.poll([1; 16], Instant::now()) {
@@ -406,7 +441,7 @@ mod tests {
             let flag = invoked.clone();
             let mut deferred = Deferred::new(scratch.runtime(), [1; 16], move |_, epoch| {
                 assert!(!flag.swap(true, Ordering::AcqRel));
-                Worker::start_with(epoch, Duration::from_secs(2), |_, _| {
+                Worker::start_with(epoch, |_| {
                     snapshot(State::Uninitialized, Reason::RuntimeOnly)
                 })
             });
@@ -514,7 +549,7 @@ mod tests {
 
     #[test]
     fn obsolete_epoch_cannot_publish() {
-        let mut worker = Worker::start_with([1; 16], Duration::from_secs(5), |_, _| {
+        let mut worker = Worker::start_with([1; 16], |_| {
             snapshot(State::Uninitialized, Reason::RuntimeOnly)
         })
         .unwrap();
@@ -614,7 +649,7 @@ mod reactor_tests {
                 None,
                 Some(lifetime),
                 move |_, epoch| {
-                    Worker::start_with(epoch, Duration::from_secs(5), move |_, _| {
+                    Worker::start_with(epoch, move |_| {
                         gate.recv_timeout(Duration::from_secs(8)).unwrap();
                         snapshot(State::Uninitialized, Reason::RuntimeOnly)
                     })
@@ -679,7 +714,7 @@ mod reactor_tests {
         let (release, gate) = std::sync::mpsc::channel();
         let service = std::thread::spawn(move || {
             crate::run_with_worker(for_service, "asura/test", None, move |_, epoch| {
-                Worker::start_with(epoch, Duration::from_secs(5), move |_, _| {
+                Worker::start_with(epoch, move |_| {
                     gate.recv_timeout(Duration::from_secs(8)).unwrap();
                     snapshot(State::Uninitialized, Reason::RuntimeOnly)
                 })

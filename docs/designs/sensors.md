@@ -615,9 +615,9 @@ restart, after the single reconciliation/retry path is exhausted.
 Sensor storage uses the same writer, but it must not turn a foreground registry
 refresh or mutation into `conversation_busy`. The conversation owner retains up
 to 32 transport requests (at most 2 MiB under the existing 64 KiB request bound)
-while a sensor load, store or reconciliation owns the writer ticket. Each retained
-request has a two-second deadline. Overflow returns an explicit busy response;
-expiry returns `storage_timeout` without submitting that request to storage.
+while a sensor load, store or reconciliation owns the writer ticket. A retained
+request waits with no time bound ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). Overflow returns an explicit busy
+response; shutdown returns `service_draining` without submitting it to storage.
 Cancellation and observation controls continue through their existing paths.
 
 When the current ticket settles, one retained request is dispatched before any
@@ -636,13 +636,11 @@ flowchart TD
     SensorBusy -->|No| Validate[Run canonical command validation and writer dispatch]
     SensorBusy -->|Yes| Capacity{Fewer than 32 retained requests?}
     Capacity -->|No| Busy[Return explicit bounded overload]
-    Capacity -->|Yes| Retain[Retain request with two-second deadline]
-    Retain --> Wake[Writer completion or deadline wake]
+    Capacity -->|Yes| Retain[Retain request with no deadline, J1-0]
+    Retain --> Wake[Writer completion or shutdown wake]
     Wake --> Closing{Service shutting down?}
     Closing -->|Yes| Drain[Return service_draining without admission]
-    Closing -->|No| Expired{Request deadline elapsed?}
-    Expired -->|Yes| Timeout[Return storage_timeout without admission]
-    Expired -->|No| Ready{Writer ticket settled?}
+    Closing -->|No| Ready{Writer ticket settled?}
     Ready -->|No| Retain
     Ready -->|Yes| Validate
     Validate --> Outcome{Validation and admission result?}

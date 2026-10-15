@@ -33,8 +33,8 @@ struct Job {
     receiver: Receiver<Result<pb::ConversationQueueReply, String>>,
     result: Option<Result<pb::ConversationQueueReply, String>>,
     stopped: Arc<AtomicBool>,
-    deadline: Instant,
-    timeout_reported: bool,
+    /// The person stopped waiting; reported once while the worker settles.
+    stop_reported: bool,
 }
 #[derive(Default)]
 pub(super) struct Worker {
@@ -83,14 +83,21 @@ impl Worker {
                     )
                     .map_err(|e| format!("{e}; queue outcome unconfirmed"))?;
                     check()?;
+                    // Queue mutations wait for the journal with no client
+                    // budget (J1-0); /cancel stops the wait.
+                    let stop = || cancelled.load(Ordering::Acquire);
                     let result = match command {
-                        Request::Enqueue(request) => client.enqueue_conversation(request),
-                        Request::Submit(request) => client.queue_conversation_input(request),
-                        Request::Reorder(request) => client.reorder_conversation_input(request),
+                        Request::Enqueue(request) => client.enqueue_conversation(request, &stop),
+                        Request::Submit(request) => client.queue_conversation_input(request, &stop),
+                        Request::Reorder(request) => {
+                            client.reorder_conversation_input(request, &stop)
+                        }
                         Request::List { project, input } => {
                             client.conversation_queue(project, input)
                         }
-                        Request::Decision(request) => client.decide_conversation_input(request),
+                        Request::Decision(request) => {
+                            client.decide_conversation_input(request, &stop)
+                        }
                     };
                     result.map_err(|e| {
                         if matches!(e, asura_client::Error::Remote(..)) {
@@ -109,16 +116,9 @@ impl Worker {
             receiver,
             result: None,
             stopped,
-            deadline: Instant::now() + Duration::from_secs(5),
-            timeout_reported: false,
+            stop_reported: false,
         });
         Ok(())
-    }
-    pub fn next_deadline(&self) -> Option<Instant> {
-        self.job
-            .as_ref()
-            .filter(|job| !job.timeout_reported)
-            .map(|job| job.deadline)
     }
     pub fn poll(&mut self) -> Option<Update> {
         let job = self.job.as_mut()?;
@@ -143,18 +143,24 @@ impl Worker {
                 done: true,
             });
         }
-        if Instant::now() >= job.deadline && !job.timeout_reported {
-            job.timeout_reported = true;
+        // J1-0: the wait has no timer. Only cancel stops it; the slot stays
+        // busy until the worker settles, so a second request gets busy.
+        if job.stopped.load(Ordering::Acquire) && !job.stop_reported {
+            job.stop_reported = true;
             return Some(Update {
                 request: job.request.clone(),
                 outcome: Err(
-                    "Queue observation deadline; outcome unconfirmed; worker is still settling"
-                        .into(),
+                    "Queue wait stopped; outcome unconfirmed; worker is still settling".into(),
                 ),
                 done: false,
             });
         }
         None
+    }
+    /// Stops waiting for the in-flight request. Its reply is not applied here;
+    /// the service-owned queue projection shows the request if it committed.
+    pub fn cancel(&mut self) {
+        self.disconnect();
     }
     pub fn disconnect(&self) {
         if let Some(job) = &self.job {
@@ -170,7 +176,7 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn held_worker(expired: bool) -> (Worker, mpsc::SyncSender<()>) {
+    fn held_worker(cancelled: bool) -> (Worker, mpsc::SyncSender<()>) {
         let (sender, receiver) = mpsc::sync_channel(1);
         let (release, wait) = mpsc::sync_channel(1);
         let handle = std::thread::spawn(move || {
@@ -184,7 +190,7 @@ mod tests {
                     ..Default::default()
                 }))
                 .unwrap();
-            let _ = wait.recv_timeout(Duration::from_secs(3));
+            let _ = wait.recv();
         });
         (
             Worker {
@@ -197,13 +203,8 @@ mod tests {
                     handle,
                     receiver,
                     result: None,
-                    stopped: Arc::new(AtomicBool::new(false)),
-                    deadline: if expired {
-                        Instant::now()
-                    } else {
-                        Instant::now() + Duration::from_secs(5)
-                    },
-                    timeout_reported: false,
+                    stopped: Arc::new(AtomicBool::new(cancelled)),
+                    stop_reported: false,
                 }),
             },
             release,
@@ -216,8 +217,6 @@ mod tests {
         assert!(worker.poll().is_none());
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(worker.is_busy());
-        worker.disconnect();
-        assert!(worker.job.as_ref().unwrap().stopped.load(Ordering::Acquire));
         release.try_send(()).unwrap();
         let end = Instant::now() + Duration::from_secs(3);
         let outcome = loop {
@@ -231,9 +230,25 @@ mod tests {
         assert!(!worker.is_busy());
     }
     #[test]
-    fn observation_timeout_reports_once_and_retains_slot_until_settlement() {
-        let (mut worker, release) = held_worker(true);
+    fn j1_0_05_held_wait_has_no_timer_second_request_is_busy_and_cancel_stops_it() {
+        let (mut worker, release) = held_worker(false);
+        // The removed 5 s observation bound: waiting longer reports nothing.
+        std::thread::sleep(Duration::from_millis(5100));
+        assert!(worker.poll().is_none());
+        assert!(worker.is_busy());
+        let resolve: Resolver = |_| Err(asura_platform::Error::Unavailable);
+        let second = worker.submit(
+            resolve,
+            Request::List {
+                project: [2; 16],
+                input: None,
+            },
+        );
+        assert!(second.unwrap_err().contains("pending"));
+        let started = Instant::now();
+        worker.cancel();
         let update = worker.poll().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
         assert!(!update.done && update.outcome.unwrap_err().contains("unconfirmed"));
         assert!(worker.poll().is_none());
         assert!(worker.is_busy());

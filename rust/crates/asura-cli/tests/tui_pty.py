@@ -697,6 +697,82 @@ def stalled_backend(fixture):
             raise
 
 
+def typed_within_100ms(trial, text):
+    offset = len(trial.output)
+    started = time.monotonic()
+    trial.send(text)
+    trial.until(text, offset, plain=True, limit=2)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.1, f"typing echo took {elapsed:.3f}s during a held journal step"
+    return elapsed
+
+
+def leave_with_draft(trial):
+    trial.until(b"Use this directory as a project?", plain=True, refresh=True)
+    trial.send(b"\x1b")
+    end = time.monotonic() + remaining()
+    while "Use this directory as a project?" in trial.screen.text():
+        assert time.monotonic() < end, trial.screen.text()
+        trial.read(0.025)
+    offset = len(trial.output)
+    trial.send(b"\x11")
+    trial.until(b"Discard draft and exit?", offset, plain=True, refresh=True)
+    offset = len(trial.output)
+    trial.send(b"\t")
+    trial.until(b"[Discard and exit]", offset, plain=True, refresh=True)
+    trial.send(b"\r")
+    trial.finish(limit=4)
+
+
+def journal_waits(fixture):
+    """J1-0-04/07 end-to-end: held journal append and held startup replay."""
+    home = fixture.root / "home"
+    # A held initialization append: the TUI shows loading and stays responsive.
+    hold = home / "journal-hold-appends"
+    hold.touch()
+    fixture.start()
+    trial = Trial(fixture.binary)
+    fixture.active_trials.append(trial)
+    try:
+        trial.until(b"Connected (", plain=True, refresh=True)
+        trial.until(b"recovering", plain=True, refresh=True)
+        # Past every removed 2 s, 5 s and 10 s bound: still loading, no failure.
+        trial.idle(10.5)
+        assert "recovering" in trial.screen.text(), trial.screen.text()
+        assert "Installation unavailable" not in trial.screen.text(), trial.screen.text()
+        elapsed = typed_within_100ms(trial, b"held-append-typing")
+        hold.unlink()
+        trial.until(b"Installation graph_ready", plain=True, refresh=True, limit=15)
+        print(f"PASS TUI held append: loading, typing {elapsed:.3f}s, late reply applied")
+        leave_with_draft(trial)
+    finally:
+        hold.unlink(missing_ok=True)
+        trial.close()
+        fixture.active_trials.remove(trial)
+    fixture.stop()
+    # A held startup replay: loading state, input accepted, then ready.
+    hold = home / "journal-hold-reads"
+    hold.touch()
+    fixture.start()
+    trial = Trial(fixture.binary)
+    fixture.active_trials.append(trial)
+    try:
+        trial.until(b"Connected (", plain=True, refresh=True)
+        trial.until(b"inspection_pending", plain=True, refresh=True)
+        trial.idle(5.5)
+        assert "inspection_pending" in trial.screen.text(), trial.screen.text()
+        elapsed = typed_within_100ms(trial, b"held-replay-typing")
+        hold.unlink()
+        trial.until(b"Installation graph_ready", plain=True, refresh=True, limit=15)
+        print(f"PASS TUI held replay: loading, typing {elapsed:.3f}s, then ready")
+        leave_with_draft(trial)
+    finally:
+        hold.unlink(missing_ok=True)
+        trial.close()
+        fixture.active_trials.remove(trial)
+    fixture.stop()
+
+
 def repeated_initialization(fixture):
     # The fixture root contains the Asura home and may not be a project.
     project = fixture.root / "workspace"
@@ -1952,7 +2028,8 @@ def main():
     isolation = len(sys.argv) == 3 and sys.argv[2] == "--state-isolation"
     helpmode = len(sys.argv) == 3 and sys.argv[2] == "--help-mode"
     long_turns = len(sys.argv) == 3 and sys.argv[2] == "--long-conversation"
-    assert len(sys.argv) == 2 or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns, __doc__
+    waits = len(sys.argv) == 3 and sys.argv[2] == "--journal-waits"
+    assert len(sys.argv) == 2 or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
@@ -1976,6 +2053,10 @@ def main():
     try:
         if long_turns:
             long_conversation(fixture, source)
+            return
+        if waits:
+            DEADLINE = time.monotonic() + 70
+            journal_waits(fixture)
             return
         if helpmode:
             help_mode(fixture)
@@ -2021,7 +2102,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

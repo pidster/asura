@@ -10,7 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const COMMAND_TIME: Duration = Duration::from_secs(2);
+/// How long `close` reports `Ok(false)` before reporting `Timeout`. The owner is
+/// retained either way; this reports, it never stops engine work.
+const CLOSE_REPORT: Duration = Duration::from_secs(2);
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 // HM0 admits one engine instance per process. The worker owns this claim,
 // not the public handle, so dropping a handle cannot permit replacement.
@@ -60,16 +62,15 @@ struct Completion {
 struct Request {
     command: Command,
     cancelled: Arc<AtomicBool>,
-    deadline: Instant,
     counter: u64,
     reply: SyncSender<Completion>,
 }
 
-/// Pollable result; expiry never asserts that an in-flight engine operation stopped.
+/// Pollable result with no time bound (owner, 2026-10-16): it settles on the
+/// engine's reply, cancel or a closed owner.
 pub struct Pending<T> {
     receiver: Receiver<Completion>,
     cancelled: Arc<AtomicBool>,
-    deadline: Instant,
     mutation: bool,
     generation: u64,
     counter: u64,
@@ -102,15 +103,6 @@ impl<T> Pending<T> {
                     Error::OutcomeUnconfirmed
                 } else {
                     Error::Unavailable
-                }))
-            }
-            Err(TryRecvError::Empty) if Instant::now() >= self.deadline => {
-                self.cancelled.store(true, Ordering::Release);
-                self.done = true;
-                Some(Err(if self.mutation {
-                    Error::OutcomeUnconfirmed
-                } else {
-                    Error::Timeout
                 }))
             }
             Err(TryRecvError::Empty) => None,
@@ -157,7 +149,6 @@ impl Memory {
         let stop = closing.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let startup_cancel = cancelled.clone();
-        let deadline = Instant::now() + Duration::from_secs(10);
         let handle = thread::Builder::new()
             .name("asura-memory".into())
             .spawn(move || {
@@ -187,12 +178,8 @@ impl Memory {
                     });
                     return;
                 }
-                let connected = runtime.block_on(Database::connect(
-                    &root,
-                    binding.clone(),
-                    initialize,
-                    deadline,
-                ));
+                let connected =
+                    runtime.block_on(Database::connect(&root, binding.clone(), initialize));
                 match connected {
                     Ok(database) => {
                         if startup_cancel.load(Ordering::Acquire) {
@@ -212,13 +199,8 @@ impl Memory {
                                 || request.cancelled.load(Ordering::Acquire)
                             {
                                 Err(Error::Cancelled)
-                            } else if Instant::now() >= request.deadline {
-                                Err(Error::Timeout)
                             } else {
-                                {
-                                    database.set_deadline(request.deadline);
-                                    runtime.block_on(execute(&database, request.command))
-                                }
+                                runtime.block_on(execute(&database, request.command))
                             };
                             let _ = request.reply.try_send(Completion {
                                 generation,
@@ -264,7 +246,6 @@ impl Memory {
         let pending = Pending {
             receiver: response,
             cancelled,
-            deadline,
             mutation: initialize,
             generation,
             counter: 0,
@@ -293,12 +274,10 @@ impl Memory {
             .map_err(|_| Error::Unavailable)?;
         let (reply, receiver) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let deadline = Instant::now() + COMMAND_TIME;
         self.sender
             .try_send(Some(Request {
                 command,
                 cancelled: cancelled.clone(),
-                deadline,
                 counter,
                 reply,
             }))
@@ -309,7 +288,6 @@ impl Memory {
         Ok(Pending {
             receiver,
             cancelled,
-            deadline,
             mutation,
             generation: self.generation,
             counter,
@@ -385,7 +363,7 @@ impl Memory {
         if self.handle.is_none() {
             return Ok(true);
         }
-        if started.elapsed() >= COMMAND_TIME {
+        if started.elapsed() >= CLOSE_REPORT {
             Err(Error::Timeout)
         } else {
             Ok(false)
@@ -451,7 +429,7 @@ mod tests {
         assert!(Claim::acquire(&path).is_ok());
     }
     #[test]
-    fn bounded_queue_and_pending_expiry_do_not_join_stalled_owner() {
+    fn bounded_queue_and_unbounded_pending_do_not_join_stalled_owner() {
         let (sender, receiver) = mpsc::sync_channel(8);
         let (release, gate) = mpsc::sync_channel(1);
         let handle = thread::spawn(move || {
@@ -472,8 +450,11 @@ mod tests {
             pending.push(memory.resolve(id, [1; 32]).unwrap());
         }
         assert!(matches!(memory.resolve(id, [1; 32]), Err(Error::Busy)));
-        pending[0].deadline = Instant::now();
-        assert_eq!(pending[0].poll(), Some(Err(Error::Timeout)));
+        // No time bound: a stalled command stays pending until cancel.
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(pending[0].poll(), None);
+        pending[0].cancel();
+        assert_eq!(pending[0].poll(), Some(Err(Error::Cancelled)));
         assert!(matches!(memory.resolve(id, [1; 32]), Err(Error::Busy)));
         let now = Instant::now();
         assert_eq!(memory.close(), Ok(false));

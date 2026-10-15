@@ -340,8 +340,9 @@ or audit-consumer activation. Unsupported keys and an unset model are errors.
 Implemented outbox, admission and observation pipeline with service-owned
 admission and durable outcomes. Enter stages each valid non-command input in a
 local outbox of at most 16 entries. The serial queue worker submits one waiting
-entry at a time with its original request ID. Its client request has a 3 s
-deadline; the UI marks the outcome unconfirmed after 5 s. The conversation
+entry at a time with its original request ID. Its client request waits for the
+service's reply with no deadline; `/cancel` stops the wait
+([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound), owner, 2026-10-16). The conversation
 worker observes dispatched operations through one coalescing result mailbox.
 
 ```mermaid
@@ -487,9 +488,9 @@ Audit findings and correction status:
   The full CLI lifecycle gate, including both mandatory terminal journeys, passed.
 - **G03 — Whole-request deadline, restated:** observation has no whole-turn
   budget by design; it ends at a terminal kind or a worker stop. The queue worker
-  bounds admission with a 2 s attach and a 3 s client request deadline. The UI
-  marks the outcome unconfirmed after 5 s and keeps the slot until the thread
-  settles. Socket bounds do not bound a stalled OS lookup during resolution.
+  bounds admission with a 2 s attach. Its request then waits for the real reply
+  (J1-0); only `/cancel` or a lost connection marks the outcome unconfirmed, and
+  the slot stays busy until the thread settles. Socket bounds do not bound a stalled OS lookup during resolution.
 - **G04 — Explicit backend selection:** the current CLI parser has no backend
   parameter. The user's broader startup rule remains incomplete for that branch.
 - **G05 — Repair guidance:** `authority_repair_required` is displayed without an

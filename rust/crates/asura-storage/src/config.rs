@@ -497,14 +497,31 @@ pub fn conversation_snapshot(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<ConversationSnapshot> {
+    conversation_snapshot_until(runtime, Some(deadline), cancel)
+}
+/// The journal writer's configuration read. Its work has no time bound (J1-0).
+pub fn conversation_snapshot_without_deadline(
+    runtime: RuntimeDirectory,
+    cancel: &AtomicBool,
+) -> Result<ConversationSnapshot> {
+    conversation_snapshot_until(runtime, None, cancel)
+}
+fn conversation_snapshot_until(
+    runtime: RuntimeDirectory,
+    deadline: Option<Instant>,
+    cancel: &AtomicBool,
+) -> Result<ConversationSnapshot> {
     use sha2::{Digest, Sha256};
     let asset_root = runtime
         .model_assets_path()
         .into_os_string()
         .into_string()
         .map_err(|_| "config_io_or_unsafe_file")?;
-    let snapshot =
-        PrivateFileSnapshot::read(runtime, "config.yaml", deadline, cancel).map_err(file_error)?;
+    let snapshot = match deadline {
+        Some(deadline) => PrivateFileSnapshot::read(runtime, "config.yaml", deadline, cancel),
+        None => PrivateFileSnapshot::read_without_deadline(runtime, "config.yaml", cancel),
+    }
+    .map_err(file_error)?;
     let config = Config::read(&snapshot.bytes)?;
     let digest = Sha256::digest(yaml(&config)?.as_bytes()).into();
     let model_capabilities = config.model_capabilities();

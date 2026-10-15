@@ -42,6 +42,8 @@ pub(super) struct Update {
     pub restore: Option<RestoreUpdate>,
     pub preserve_project_selection: bool,
     pub other_matches: Vec<[u8; 16]>,
+    /// The service acknowledged the durable `CancelRequested` record.
+    pub cancel_accepted: bool,
     pub success: bool,
     pub done: bool,
 }
@@ -201,6 +203,9 @@ impl Worker {
                     if let Some(previous) = slot.as_ref() && update.accepted.is_none() {
                         update.accepted = previous.accepted.clone();
                     }
+                    if slot.as_ref().is_some_and(|previous| previous.cancel_accepted) {
+                        update.cancel_accepted = true;
+                    }
                     *slot = Some(update);
                     drop(slot);
                     notice.ready();
@@ -262,7 +267,8 @@ impl Worker {
                                 }
                                 other => other,
                             };
-                            let (mut message, project) = crate::conversation::execute(&mut client, command)?;
+                            let stop_waiting = || cancellation.load(Ordering::Acquire) || stopped.load(Ordering::Acquire);
+                            let (mut message, project) = crate::conversation::execute(&mut client, command, &stop_waiting)?;
                             let projects = if project.is_some() {
                                 let deadline = Instant::now() + Duration::from_secs(18);
                                 match crate::conversation::project_registry(&mut client, || {
@@ -282,7 +288,9 @@ impl Worker {
                         generation,
                         |cursor, generation, cancel| {
                             if cancel {
-                                client.cancel_conversation(operation, generation).map_err(|e| format!("Cancel outcome unconfirmed: {e}"))?;
+                                // The reply follows the durable CancelRequested record (J1-0).
+                                client.cancel_conversation(operation, generation, &|| stopped.load(Ordering::Acquire)).map_err(|e| format!("Cancel outcome unconfirmed: {e}"))?;
+                                publish(Update { cancel_accepted: true, success: true, ..Default::default() });
                             }
                             match client.observe_conversation(operation, cursor) {
                                 Ok(event) => Ok(Some(event)),
@@ -292,7 +300,7 @@ impl Worker {
                                 }
                             }
                         },
-                        publish,
+                        &publish,
                     )
                 };
                 if let Err(message) = run() {
@@ -337,6 +345,7 @@ impl Worker {
                 if final_update.accepted.is_none() {
                     final_update.accepted = update.as_ref().and_then(|v| v.accepted.clone());
                 }
+                final_update.cancel_accepted |= update.as_ref().is_some_and(|v| v.cancel_accepted);
                 update = Some(final_update);
             }
             if joined.is_err() {

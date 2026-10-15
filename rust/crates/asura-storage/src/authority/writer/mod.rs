@@ -8,7 +8,6 @@ use std::sync::{
     mpsc::{self, Receiver, SyncSender, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
 mod state;
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -28,7 +27,6 @@ pub enum Error {
     AlreadyInitialized,
     RepairRequired,
     OutcomeUnconfirmed,
-    Deadline,
     Cancelled,
     Conflict,
     Invalid,
@@ -224,7 +222,6 @@ pub struct QueuedPreparation {
 }
 struct Job {
     command: Command,
-    deadline: Instant,
     reply: SyncSender<Result<Reply>>,
     settlement: JobSettlement,
 }
@@ -243,21 +240,21 @@ impl Drop for JobSettlement {
         }
     }
 }
+/// One accepted writer request. Observation has no time bound (J1-0): only the
+/// worker's reply or its disconnection settles the ticket. A caller that stops
+/// waiting, for example after a turn cancel, may keep or drop the ticket; the
+/// job still runs in order and its reply is available when it arrives.
 pub struct Ticket {
     receiver: Receiver<Result<Reply>>,
-    deadline: Instant,
     mutation: bool,
     done: bool,
     settled: Arc<AtomicBool>,
 }
 impl Ticket {
     /// True only when the accepted job finished or was dropped without execution.
-    /// A response deadline or closed result receiver alone cannot establish this.
+    /// A closed result receiver alone cannot establish this.
     pub fn is_settled(&self) -> bool {
         self.settled.load(Ordering::Acquire)
-    }
-    pub fn deadline(&self) -> Instant {
-        self.deadline
     }
     pub fn poll(&mut self) -> Option<Result<Reply>> {
         if self.done {
@@ -270,13 +267,6 @@ impl Ticket {
             } else {
                 Error::Unavailable
             })),
-            Err(TryRecvError::Empty) if Instant::now() >= self.deadline => {
-                Some(Err(if self.mutation {
-                    Error::OutcomeUnconfirmed
-                } else {
-                    Error::Deadline
-                }))
-            }
             Err(TryRecvError::Empty) => None,
         };
         if result.is_some() {
@@ -313,20 +303,8 @@ impl WriterHandle {
             .name("asura-journal".into())
             .spawn(move || {
                 let _claim = claim;
-                let mut state = state::State::new(runtime);
-                while !stop.load(Ordering::Acquire) {
-                    let job = match receiver.recv() {
-                        Ok(Some(job)) => job,
-                        Ok(None) | Err(_) => break,
-                    };
-                    let result = if Instant::now() >= job.deadline {
-                        Err(Error::Deadline)
-                    } else {
-                        state.execute(job.command, job.deadline)
-                    };
-                    let _ = job.reply.try_send(result);
-                    drop(job.settlement);
-                }
+                let mut state = state::State::new(runtime, stop.clone());
+                run_jobs(&receiver, &stop, |command| state.execute(command));
             })
             .map_err(|_| Error::Unavailable)?;
         Ok(Self {
@@ -340,15 +318,9 @@ impl WriterHandle {
     pub fn set_wake(&mut self, wake: asura_platform::events::WakeSender) {
         self.wake = Some(wake);
     }
+    /// Admits one request to the 8-slot queue or returns `Busy`. The writer's work
+    /// has no time bound; a caller's own deadline applies only to its own wait.
     pub fn try_submit(&self, command: Command) -> Result<Ticket> {
-        self.submit(command, None)
-    }
-    /// Preserve a caller's earlier operation deadline through queueing and database work.
-    /// A caller cannot extend the owner's normal command budget.
-    pub fn try_submit_before(&self, command: Command, deadline: Instant) -> Result<Ticket> {
-        self.submit(command, Some(deadline))
-    }
-    fn submit(&self, command: Command, before: Option<Instant>) -> Result<Ticket> {
         if let Command::SensorStore {
             expected_revision,
             state,
@@ -482,18 +454,6 @@ impl WriterHandle {
             _ => {}
         }
 
-        let now = Instant::now();
-        let default_deadline = now
-            + Duration::from_secs(match command {
-                Command::Initialize { .. } => 10,
-                Command::Open => 5,
-                _ => 2,
-            });
-        let deadline = before.map_or(default_deadline, |cap| cap.min(default_deadline));
-        if deadline <= now {
-            return Err(Error::Deadline);
-        }
-
         let control = matches!(
             &command,
             Command::Append {
@@ -531,7 +491,6 @@ impl WriterHandle {
             .sender
             .try_send(Some(Job {
                 command,
-                deadline,
                 reply,
                 settlement: JobSettlement {
                     settled: settled.clone(),
@@ -546,7 +505,6 @@ impl WriterHandle {
         }
         Ok(Ticket {
             receiver,
-            deadline,
             mutation,
             done: false,
             settled,
@@ -564,6 +522,22 @@ impl WriterHandle {
         self.handle.is_none()
     }
 }
+/// Runs queued jobs in order until close. No job is dropped for age (J1-0).
+fn run_jobs(
+    receiver: &Receiver<Option<Job>>,
+    stop: &AtomicBool,
+    mut execute: impl FnMut(Command) -> Result<Reply>,
+) {
+    while !stop.load(Ordering::Acquire) {
+        let job = match receiver.recv() {
+            Ok(Some(job)) => job,
+            Ok(None) | Err(_) => break,
+        };
+        let result = execute(job.command);
+        let _ = job.reply.try_send(result);
+        drop(job.settlement);
+    }
+}
 impl Drop for WriterHandle {
     fn drop(&mut self) {
         self.close();
@@ -576,6 +550,7 @@ impl Drop for WriterHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     fn queued_writer() -> (WriterHandle, Receiver<Option<Job>>) {
         let (sender, receiver) = mpsc::sync_channel(8);
         (
@@ -589,89 +564,134 @@ mod tests {
             receiver,
         )
     }
-    #[test]
-    fn expired_caller_deadline_never_reserves_or_enqueues_work() {
-        let (writer, receiver) = queued_writer();
-        assert!(matches!(
-            writer.try_submit_before(Command::Open, Instant::now()),
-            Err(Error::Deadline)
-        ));
-        assert_eq!(writer.count.load(Ordering::Acquire), 0);
-        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
-    }
-    #[test]
-    fn caller_deadline_caps_both_ticket_and_job_without_extending_default() {
-        let (writer, receiver) = queued_writer();
-        let cap = Instant::now() + Duration::from_millis(500);
-        let ticket = writer.try_submit_before(Command::Open, cap).unwrap();
-        let job = receiver.try_recv().unwrap().unwrap();
-        assert_eq!(ticket.deadline(), cap);
-        assert_eq!(job.deadline, cap);
-        assert!(!ticket.is_settled());
-        drop(job);
-        assert!(ticket.is_settled());
-        for (command, seconds) in [
-            (Command::Open, 5),
-            (Command::Initialize { request: [1; 16] }, 10),
-            (Command::SensorLoad { project: [1; 16] }, 2),
-        ] {
-            let start = Instant::now();
-            let ticket = writer
-                .try_submit_before(command, start + Duration::from_secs(60))
-                .unwrap();
-            let end = Instant::now();
-            let job = receiver.try_recv().unwrap().unwrap();
-            assert_eq!(ticket.deadline(), job.deadline);
-            assert!(job.deadline >= start + Duration::from_secs(seconds));
-            assert!(job.deadline <= end + Duration::from_secs(seconds));
-            drop(job);
-            assert!(ticket.is_settled());
+    fn empty_reply() -> Reply {
+        Reply {
+            #[cfg(feature = "embedded-memory")]
+            memory_result: None,
+            #[cfg(feature = "embedded-memory")]
+            memory_create_result: None,
+            sensor_state: None,
+            replay: None,
+            record: None,
+            history: None,
+            prepared: None,
+            projects: Vec::new(),
+            inputs: Vec::new(),
+            queued: None,
+            order_revision: None,
+            stale_order: false,
+            accepted_input_id: None,
+            project_name: None,
+            project_name_revision: None,
+            project_name_changed: None,
+            stale_project_name_revision: false,
         }
+    }
+    fn control() -> Command {
+        Command::Append {
+            expected_revision: 1,
+            record: Record::OwnerGeneration,
+            admission: None,
+        }
+    }
+    #[test]
+    fn j1_0_06_ninth_writer_request_is_busy_and_six_ordinary_slots_remain() {
+        let (writer, receiver) = queued_writer();
+        let ordinary: Vec<_> = (0..6)
+            .map(|_| writer.try_submit(Command::Open).unwrap())
+            .collect();
+        assert!(matches!(writer.try_submit(Command::Open), Err(Error::Busy)));
+        let controls: Vec<_> = (0..2)
+            .map(|_| writer.try_submit(control()).unwrap())
+            .collect();
+        assert!(matches!(writer.try_submit(control()), Err(Error::Busy)));
+        assert_eq!(writer.count.load(Ordering::Acquire), 8);
+        drop((ordinary, controls));
+        // Queued jobs keep their slots until the worker settles them.
+        assert_eq!(writer.count.load(Ordering::Acquire), 8);
+        drop(receiver);
         assert_eq!(writer.count.load(Ordering::Acquire), 0);
     }
     #[test]
-    fn expired_mutation_observation_is_uncertain_and_never_becomes_success() {
+    fn j1_0_02_ticket_without_reply_never_reports_uncertainty_and_late_reply_applies() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let mut ticket = Ticket {
             receiver,
-            deadline: Instant::now(),
             mutation: true,
             done: false,
             settled: Arc::new(AtomicBool::new(false)),
         };
-        let started = Instant::now();
-        assert!(matches!(
-            ticket.poll(),
-            Some(Err(Error::OutcomeUnconfirmed))
-        ));
-        assert!(started.elapsed() < Duration::from_millis(100));
-        sender
-            .try_send(Ok(Reply {
-                #[cfg(feature = "embedded-memory")]
-                memory_result: None,
-                #[cfg(feature = "embedded-memory")]
-                memory_create_result: None,
-                sensor_state: None,
-                replay: None,
-                record: None,
-                history: None,
-                prepared: None,
-                projects: Vec::new(),
-                inputs: Vec::new(),
-                queued: None,
-                order_revision: None,
-                stale_order: false,
-                accepted_input_id: None,
-                project_name: None,
-                project_name_revision: None,
-                project_name_changed: None,
-                stale_project_name_revision: false,
-            }))
-            .unwrap();
+        // Past the removed 10 s initialization budget, the ticket still waits.
+        let end = Instant::now() + Duration::from_millis(10_100);
+        while Instant::now() < end {
+            assert!(ticket.poll().is_none());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The caller stopped caring (a turn cancel) but kept the ticket: the
+        // late reply is still delivered and applied.
+        sender.try_send(Ok(empty_reply())).unwrap();
+        assert!(matches!(ticket.poll(), Some(Ok(_))));
         assert!(ticket.poll().is_none());
     }
     #[test]
-    fn timed_out_read_retains_its_slot_until_real_job_settlement() {
+    fn j1_0_03_job_queued_behind_a_gated_job_runs_after_release_in_order() {
+        let (writer, receiver) = queued_writer();
+        let mut tickets: Vec<_> = [
+            Command::Open,
+            control(),
+            Command::Projects {
+                after: None,
+                limit: 1,
+            },
+        ]
+        .into_iter()
+        .map(|command| writer.try_submit(command).unwrap())
+        .collect();
+        let (release, gate) = mpsc::channel::<()>();
+        let (order_sender, order) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                run_jobs(&receiver, &stop, |command| {
+                    let name = match command {
+                        Command::Open => "open",
+                        Command::Append { .. } => "append",
+                        _ => "projects",
+                    };
+                    if name == "open" {
+                        gate.recv().unwrap();
+                    }
+                    order_sender.send(name).unwrap();
+                    Ok(empty_reply())
+                })
+            })
+        };
+        // Stall the first job past every removed default deadline.
+        thread::sleep(Duration::from_millis(2100));
+        assert!(tickets.iter_mut().all(|ticket| ticket.poll().is_none()));
+        release.send(()).unwrap();
+        let ran: Vec<_> = (0..3)
+            .map(|_| order.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert_eq!(ran, ["open", "append", "projects"]);
+        for ticket in &mut tickets {
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = ticket.poll() {
+                    assert!(result.is_ok());
+                    break;
+                }
+                assert!(Instant::now() < end);
+                thread::yield_now();
+            }
+        }
+        stop.store(true, Ordering::Release);
+        writer.close();
+        worker.join().unwrap();
+    }
+    #[test]
+    fn response_delivery_is_not_job_settlement() {
         let (reply, receiver) = mpsc::sync_channel(1);
         let settled = Arc::new(AtomicBool::new(false));
         let count = Arc::new(AtomicUsize::new(1));
@@ -682,31 +702,26 @@ mod tests {
         };
         let mut ticket = Ticket {
             receiver,
-            deadline: Instant::now(),
             mutation: false,
             done: false,
             settled,
         };
-        assert!(matches!(ticket.poll(), Some(Err(Error::Deadline))));
-        assert!(!ticket.is_settled());
-        assert_eq!(count.load(Ordering::Acquire), 1);
+        assert!(ticket.poll().is_none());
         let (release, released) = mpsc::sync_channel(1);
         let (sent, observed) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let _settlement = settlement;
             reply.try_send(Err(Error::Unavailable)).unwrap();
             sent.send(()).unwrap();
-            released.recv_timeout(Duration::from_secs(2)).unwrap();
+            released.recv().unwrap();
         });
         observed.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(
-            ticket.poll().is_none(),
-            "a late response must not overwrite timeout"
-        );
+        assert!(matches!(ticket.poll(), Some(Err(Error::Unavailable))));
         assert!(
             !ticket.is_settled(),
             "response delivery is not job settlement"
         );
+        assert_eq!(count.load(Ordering::Acquire), 1);
         release.send(()).unwrap();
         worker.join().unwrap();
         assert!(ticket.is_settled());
@@ -722,7 +737,6 @@ mod tests {
             let (wake_reader, wake_sender) = asura_platform::events::wake_pair().unwrap();
             let job = Job {
                 command: Command::Open,
-                deadline: Instant::now(),
                 reply,
                 settlement: JobSettlement {
                     settled: settled.clone(),
@@ -769,7 +783,6 @@ mod tests {
         let (reply, _) = mpsc::sync_channel(1);
         let job = Job {
             command: Command::Open,
-            deadline: Instant::now(),
             reply,
             settlement: JobSettlement {
                 settled: settled.clone(),
@@ -789,7 +802,6 @@ mod tests {
         drop(sender);
         let mut ticket = Ticket {
             receiver,
-            deadline: Instant::now() + Duration::from_secs(2),
             mutation: true,
             done: false,
             settled: Arc::new(AtomicBool::new(false)),

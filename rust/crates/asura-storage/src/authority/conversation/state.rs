@@ -3,7 +3,6 @@ use crate::authority::{self, HEADER, MAX_FRAME, MAX_FRAMES, MAX_JOURNAL, ReplayE
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
 
 type Result<T> = std::result::Result<T, ReplayError>;
 const TERMINAL_CAPACITY: usize = HEADER + TRAILER + 47 + MAX_TEXT;
@@ -1273,8 +1272,8 @@ impl Replay {
 }
 /// Strict all-or-nothing replay. Returned offsets refer only to the input journal;
 /// the caller must retain its validated immutable identity before reading them.
-pub fn replay(bytes: &[u8], deadline: Instant, cancelled: &AtomicBool) -> Result<Replay> {
-    authority::active(deadline, cancelled)?;
+pub fn replay(bytes: &[u8], cancelled: &AtomicBool) -> Result<Replay> {
+    authority::active(cancelled)?;
     if bytes.len() > MAX_JOURNAL {
         return Err(ReplayError::Limit);
     }
@@ -1284,7 +1283,7 @@ pub fn replay(bytes: &[u8], deadline: Instant, cancelled: &AtomicBool) -> Result
     let mut result: Option<Replay> = None;
     let mut offset = 0;
     while offset < bytes.len() {
-        authority::active(deadline, cancelled)?;
+        authority::active(cancelled)?;
         let envelope = authority::envelope(&bytes[offset..])?;
         let ctx = &envelope.context;
         let record = decode_record(envelope.kind, envelope.payload)?;
@@ -1359,14 +1358,13 @@ pub fn replay(bytes: &[u8], deadline: Instant, cancelled: &AtomicBool) -> Result
         s.reserve()?;
         offset = end;
     }
-    authority::active(deadline, cancelled)?;
+    authority::active(cancelled)?;
     result.ok_or(ReplayError::Empty)
 }
 
 #[cfg(test)]
 mod restoration_tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn latest_conversation_uses_accepted_frame_and_project() {
@@ -1389,12 +1387,7 @@ mod restoration_tests {
             }),
         )
         .unwrap();
-        let mut state = replay(
-            &frame,
-            Instant::now() + Duration::from_secs(1),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+        let mut state = replay(&frame, &AtomicBool::new(false)).unwrap();
         state.conversations.insert(
             [9; 16],
             Conversation {

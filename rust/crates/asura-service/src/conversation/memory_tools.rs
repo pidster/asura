@@ -106,7 +106,6 @@ pub(super) fn encode(call: &tools::Call, value: memory::Result<ReadResult>) -> j
 pub(super) fn writer_error(call: &tools::Call, error: writer::Error) -> journal::ToolResult {
     match error {
         writer::Error::Busy => failure(call, 4, "memory_busy"),
-        writer::Error::Deadline => failure(call, 5, ""),
         writer::Error::Cancelled => failure(call, 6, ""),
         writer::Error::Invalid => failure(call, 3, ""),
         writer::Error::Limit => failure(call, 7, ""),

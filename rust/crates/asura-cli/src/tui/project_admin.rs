@@ -88,7 +88,11 @@ impl Worker {
                     if stopped.load(Ordering::Acquire) {
                         return Err(asura_client::Error::Unavailable);
                     }
-                    client.rename_project(request.command.clone())
+                    // The rename waits for the journal with no client budget;
+                    // the person's /cancel or this job's budget stops the wait.
+                    client.rename_project(request.command.clone(), &|| {
+                        stopped.load(Ordering::Acquire)
+                    })
                 };
                 let outcome = match run() {
                     Ok(reply) => Outcome::Reply(Box::new(reply)),

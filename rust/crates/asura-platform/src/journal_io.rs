@@ -4,6 +4,7 @@ use crate::{Error, Result, RuntimeDirectory, checked};
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const LIMIT: usize = 8 * 1024 * 1024;
@@ -142,14 +143,17 @@ impl JournalFile {
         }
         Ok(())
     }
-    pub fn read_all(&self, deadline: Instant) -> Result<Vec<u8>> {
+    /// Reads the whole journal. There is no time bound (J1-0); only the
+    /// caller's cancel flag, a real I/O error or validation stops the read.
+    pub fn read_all(&self, cancel: &AtomicBool) -> Result<Vec<u8>> {
         self.validate()?;
         let fd = self.nodes.last().expect("file").fd.try_clone()?;
         let file = std::fs::File::from(fd);
         let mut bytes = Vec::with_capacity(self.size);
         while bytes.len() < self.size {
-            if Instant::now() >= deadline {
-                return Err(Error::Deadline);
+            gate::read_point(&self.runtime, cancel, true)?;
+            if cancel.load(Ordering::Acquire) {
+                return Err(Error::Unavailable);
             }
             let mut chunk = [0; 65536];
             let wanted = chunk.len().min(self.size - bytes.len());
@@ -162,7 +166,10 @@ impl JournalFile {
         self.validate()?;
         Ok(bytes)
     }
-    pub fn append(&mut self, expected: usize, bytes: &[u8], deadline: Instant) -> Result<()> {
+    /// Appends one frame. The write and its `F_FULLFSYNC` have no time bound
+    /// (J1-0): only an actual `write_at`, `F_FULLFSYNC`, `stat` or validation
+    /// error leaves the file fenced. Slowness never fences.
+    pub fn append(&mut self, expected: usize, bytes: &[u8]) -> Result<()> {
         if self.fenced
             || expected != self.size
             || bytes.is_empty()
@@ -173,31 +180,56 @@ impl JournalFile {
         }
         self.validate()?;
         self.fenced = true;
+        let fault = gate::append_point(&self.runtime);
         let node = self.nodes.last_mut().expect("file");
         let file = std::fs::File::from(node.fd.try_clone()?);
-        let mut written = 0;
-        while written < bytes.len() {
-            if Instant::now() >= deadline {
-                return Err(Error::Deadline);
-            }
-            match file.write_at(&bytes[written..], (self.size + written) as u64) {
-                Ok(0) => return Err(Error::Unavailable),
-                Ok(n) => written += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        // SAFETY: fcntl full-sync borrows the held regular-file descriptor.
-        checked(unsafe { libc::fcntl(node.fd.as_raw_fd(), libc::F_FULLFSYNC) })?;
-        if Instant::now() >= deadline {
-            return Err(Error::Deadline);
-        }
+        write_and_sync(&HeldFile { file: &file, fault }, self.size, bytes)?;
         node.before = stat_fd(node.fd.as_raw_fd())?;
         self.size += bytes.len();
         self.validate()?;
         self.fenced = false;
         Ok(())
     }
+}
+
+/// The two blocking calls of one append. A fake implements this in unit tests.
+trait AppendTarget {
+    fn write_at(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize>;
+    fn full_sync(&self) -> Result<()>;
+}
+struct HeldFile<'a> {
+    file: &'a std::fs::File,
+    fault: Option<gate::Fault>,
+}
+impl AppendTarget for HeldFile<'_> {
+    fn write_at(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
+        if self.fault == Some(gate::Fault::Write) {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        self.file.write_at(bytes, offset)
+    }
+    fn full_sync(&self) -> Result<()> {
+        if self.fault == Some(gate::Fault::Sync) {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+        }
+        // SAFETY: fcntl full-sync borrows the held regular-file descriptor.
+        checked(unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC) })?;
+        Ok(())
+    }
+}
+/// Writes the complete frame, then syncs it. Short writes advance the same
+/// offset and EINTR retries; no timer ends the loop.
+fn write_and_sync(target: &impl AppendTarget, offset: usize, bytes: &[u8]) -> Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        match target.write_at(&bytes[written..], (offset + written) as u64) {
+            Ok(0) => return Err(Error::Unavailable),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    target.full_sync()
 }
 
 /// Retains the validated database directory while the embedded engine owns it.
@@ -253,3 +285,6 @@ impl DatabaseDirectory {
 }
 
 mod footprint;
+pub(crate) mod gate;
+#[cfg(test)]
+mod tests;

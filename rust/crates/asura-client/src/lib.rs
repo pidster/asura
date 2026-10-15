@@ -140,6 +140,8 @@ pub struct Client {
     attachment: [u8; 16],
     counter: u64,
     build: String,
+    /// Set when a cancelled wait left a reply in flight; later requests refuse.
+    abandoned: bool,
 }
 
 fn remaining(end: Instant) -> Result<Duration> {
@@ -147,13 +149,34 @@ fn remaining(end: Instant) -> Result<Duration> {
         .filter(|d| !d.is_zero())
         .ok_or(Error::Unavailable)
 }
+/// What ends one request's wait: a client response budget, or, for a request
+/// with no time bound (initialization, J1-0), only the person's cancel.
+#[derive(Clone, Copy)]
+enum Until<'a> {
+    Deadline(Instant),
+    Cancel(&'a dyn Fn() -> bool),
+}
+/// The cancel check cadence of an unbounded wait. It ends nothing by itself.
+const CANCEL_POLL: Duration = Duration::from_millis(50);
+impl Until<'_> {
+    fn slice(self) -> Result<Duration> {
+        match self {
+            Self::Deadline(end) => remaining(end),
+            Self::Cancel(cancelled) if cancelled() => Err(Error::OutcomeUnconfirmed),
+            Self::Cancel(_) => Ok(CANCEL_POLL),
+        }
+    }
+}
 fn wait(stream: &AuthenticatedStream, write: bool, end: Instant) -> Result<()> {
+    wait_until(stream, write, Until::Deadline(end))
+}
+fn wait_until(stream: &AuthenticatedStream, write: bool, until: Until) -> Result<()> {
     let interest = PollInterest {
         fd: stream.stream().as_raw_fd(),
         read: !write,
         write,
     };
-    asura_platform::poll(&[interest], remaining(end)?)?;
+    asura_platform::poll(&[interest], until.slice()?)?;
     Ok(())
 }
 fn write_frame(
@@ -161,14 +184,23 @@ fn write_frame(
     envelope: &pb::Envelope,
     end: Instant,
 ) -> Result<()> {
+    write_frame_until(stream, envelope, Until::Deadline(end))
+}
+fn write_frame_until(
+    stream: &mut AuthenticatedStream,
+    envelope: &pb::Envelope,
+    until: Until,
+) -> Result<()> {
     let bytes = encode_frame(envelope).map_err(|_| Error::Protocol)?;
     let mut offset = 0;
     while offset < bytes.len() {
-        remaining(end)?;
+        until.slice()?;
         match stream.stream_mut().write(&bytes[offset..]) {
             Ok(0) => return Err(Error::Unavailable),
             Ok(n) => offset += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => wait(stream, true, end)?,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_until(stream, true, until)?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
             Err(_) => return Err(Error::Unavailable),
         }
@@ -180,9 +212,16 @@ fn read_frame(
     codec: &mut ControlCodec,
     end: Instant,
 ) -> Result<Frame> {
+    read_frame_until(stream, codec, Until::Deadline(end))
+}
+fn read_frame_until(
+    stream: &mut AuthenticatedStream,
+    codec: &mut ControlCodec,
+    until: Until,
+) -> Result<Frame> {
     let mut buffer = [0u8; 8192];
     loop {
-        remaining(end)?;
+        until.slice()?;
         if let Some(frame) = codec.next_frame().map_err(|_| Error::Protocol)? {
             return Ok(frame);
         }
@@ -194,7 +233,9 @@ fn read_frame(
                     return Err(Error::Protocol);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => wait(stream, false, end)?,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_until(stream, false, until)?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
             Err(_) => return Err(Error::Unavailable),
         }
@@ -256,6 +297,7 @@ impl Client {
             attachment,
             counter: 0,
             build: hello.service_build.ok_or(Error::Protocol)?,
+            abandoned: false,
         })
     }
 
@@ -264,6 +306,31 @@ impl Client {
         body: pb::envelope::Body,
         deadline: Instant,
     ) -> Result<pb::envelope::Body> {
+        self.request_until(body, Until::Deadline(deadline))
+    }
+    /// A journal-backed mutation: the service replies only after its journal
+    /// append, which has no time bound (J1-0). The client waits for the real
+    /// reply with no response budget. Only `cancelled` or a lost connection ends
+    /// the wait, as `OutcomeUnconfirmed`; the caller retains its request ID.
+    fn mutation(
+        &mut self,
+        body: pb::envelope::Body,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<pb::envelope::Body> {
+        self.request_until(body, Until::Cancel(cancelled))
+            .map_err(|error| match error {
+                Error::Remote(..) => error,
+                _ => Error::OutcomeUnconfirmed,
+            })
+    }
+    fn request_until(
+        &mut self,
+        body: pb::envelope::Body,
+        until: Until,
+    ) -> Result<pb::envelope::Body> {
+        if self.abandoned {
+            return Err(Error::Unavailable);
+        }
         self.runtime.validate()?;
         self.witness.validate()?;
         self.counter = self.counter.checked_add(1).ok_or(Error::Protocol)?;
@@ -274,8 +341,13 @@ impl Client {
             body: Some(body),
         };
         validate_semantics(&request, Direction::ClientToServer).map_err(|_| Error::Protocol)?;
-        write_frame(&mut self.stream, &request, deadline)?;
-        let Frame::Message(reply) = read_frame(&mut self.stream, &mut self.codec, deadline)? else {
+        // A cancelled wait leaves a reply in flight: this attachment is retired.
+        let result = write_frame_until(&mut self.stream, &request, until)
+            .and_then(|()| read_frame_until(&mut self.stream, &mut self.codec, until));
+        if result.is_err() && matches!(until, Until::Cancel(_)) {
+            self.abandoned = true;
+        }
+        let Frame::Message(reply) = result? else {
             return Err(Error::Protocol);
         };
         validate_semantics(&reply, Direction::ServerToClient).map_err(|_| Error::Protocol)?;
@@ -468,13 +540,19 @@ impl Client {
 
     /// Mutations use caller-owned request IDs. An uncertain reply must be resolved
     /// with that same ID, never retried as a new operation.
+    ///
+    /// Initialization has no client response budget (owner, 2026-10-15): the
+    /// client waits for the service's reply. Only `cancelled` returning true or
+    /// a lost connection ends the wait, as `OutcomeUnconfirmed`; the caller
+    /// retains the request ID and digest for resolution.
     pub fn initialize(
         &mut self,
         request: pb::InitializeInstallation,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::InitializationReply> {
-        match self.request(
+        match self.mutation(
             pb::envelope::Body::InitializeInstallation(request),
-            Instant::now() + Duration::from_secs(6),
+            cancelled,
         )? {
             pb::envelope::Body::InitializationReply(reply) => Ok(reply),
             _ => Err(Error::Protocol),
@@ -492,21 +570,23 @@ impl Client {
             _ => Err(Error::Protocol),
         }
     }
-    pub fn register_project(&mut self, request: pb::ProjectRegister) -> Result<pb::ProjectReply> {
-        match self.request(
-            pb::envelope::Body::ProjectRegister(request),
-            Instant::now() + Duration::from_secs(3),
-        )? {
+    pub fn register_project(
+        &mut self,
+        request: pb::ProjectRegister,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<pb::ProjectReply> {
+        match self.mutation(pb::envelope::Body::ProjectRegister(request), cancelled)? {
             pb::envelope::Body::ProjectReply(reply) => Ok(reply),
             _ => Err(Error::Protocol),
         }
     }
-    pub fn rename_project(&mut self, request: pb::ProjectRename) -> Result<pb::ProjectRenameReply> {
+    pub fn rename_project(
+        &mut self,
+        request: pb::ProjectRename,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<pb::ProjectRenameReply> {
         let project_id = request.project_id.clone();
-        match self.request(
-            pb::envelope::Body::ProjectRename(request),
-            Instant::now() + Duration::from_secs(3),
-        )? {
+        match self.mutation(pb::envelope::Body::ProjectRename(request), cancelled)? {
             pb::envelope::Body::ProjectRenameReply(reply)
                 if rename_reply_matches(&project_id, &reply) =>
             {
@@ -548,12 +628,10 @@ impl Client {
     pub fn enqueue_conversation(
         &mut self,
         request: pb::ConversationEnqueue,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::ConversationQueueReply> {
         let expected = request.request_id.clone();
-        match self.request(
-            pb::envelope::Body::ConversationEnqueue(request),
-            Instant::now() + Duration::from_secs(3),
-        )? {
+        match self.mutation(pb::envelope::Body::ConversationEnqueue(request), cancelled)? {
             pb::envelope::Body::ConversationQueueReply(reply) if reply.request_id == expected => {
                 Ok(reply)
             }
@@ -563,11 +641,12 @@ impl Client {
     pub fn queue_conversation_input(
         &mut self,
         request: pb::ConversationQueueSubmit,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::ConversationQueueReply> {
         let expected = request.clone();
-        match self.request(
+        match self.mutation(
             pb::envelope::Body::ConversationQueueSubmit(request),
-            Instant::now() + Duration::from_secs(3),
+            cancelled,
         )? {
             pb::envelope::Body::ConversationQueueReply(reply)
                 if queue_submit_reply_matches(&expected, &reply) =>
@@ -580,11 +659,12 @@ impl Client {
     pub fn reorder_conversation_input(
         &mut self,
         request: pb::ConversationQueueReorder,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::ConversationQueueReply> {
         let expected = request.clone();
-        match self.request(
+        match self.mutation(
             pb::envelope::Body::ConversationQueueReorder(request),
-            Instant::now() + Duration::from_secs(3),
+            cancelled,
         )? {
             pb::envelope::Body::ConversationQueueReply(reply)
                 if queue_reorder_reply_matches(&expected, &reply) =>
@@ -622,11 +702,12 @@ impl Client {
     pub fn decide_conversation_input(
         &mut self,
         request: pb::ConversationQueueDecision,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::ConversationQueueReply> {
         let expected = request.request_id.clone();
-        match self.request(
+        match self.mutation(
             pb::envelope::Body::ConversationQueueDecision(request),
-            Instant::now() + Duration::from_secs(3),
+            cancelled,
         )? {
             pb::envelope::Body::ConversationQueueReply(reply) if reply.request_id == expected => {
                 Ok(reply)
@@ -730,17 +811,20 @@ impl Client {
             _ => Err(Error::Protocol),
         }
     }
+    /// The service acknowledges a live cancel after its durable record, so the
+    /// wait has no client budget; `cancelled` stops only the wait.
     pub fn cancel_conversation(
         &mut self,
         operation: [u8; 16],
         generation: u64,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::ConversationCancelAccepted> {
-        match self.request(
+        match self.mutation(
             pb::envelope::Body::ConversationCancel(pb::ConversationCancel {
                 operation_id: Some(operation.to_vec()),
                 generation: Some(generation),
             }),
-            Instant::now() + Duration::from_secs(3),
+            cancelled,
         )? {
             pb::envelope::Body::ConversationCancelAccepted(reply)
                 if reply.operation_id.as_deref() == Some(operation.as_slice()) =>
@@ -1094,6 +1178,18 @@ mod tests {
         ] {
             assert!(!is_absent(&error));
         }
+    }
+    #[test]
+    fn initialization_wait_has_no_time_bound_and_only_cancel_ends_it() {
+        let cancelled = std::cell::Cell::new(false);
+        let check = || cancelled.get();
+        let until = Until::Cancel(&check);
+        // The poll slice only paces cancel checks; it never ends the wait.
+        for _ in 0..3 {
+            assert_eq!(until.slice().unwrap(), CANCEL_POLL);
+        }
+        cancelled.set(true);
+        assert!(matches!(until.slice(), Err(Error::OutcomeUnconfirmed)));
     }
     #[test]
     fn deadlines_do_not_restart_and_errors_do_not_disclose_paths() {

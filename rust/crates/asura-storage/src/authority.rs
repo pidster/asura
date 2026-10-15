@@ -4,7 +4,6 @@ pub mod writer;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 pub const MAX_JOURNAL: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -32,7 +31,6 @@ pub enum ReplayError {
     UnsupportedFormat,
     Corrupt,
     Limit,
-    Timeout,
     Cancelled,
 }
 impl std::fmt::Display for ReplayError {
@@ -41,11 +39,10 @@ impl std::fmt::Display for ReplayError {
     }
 }
 impl std::error::Error for ReplayError {}
-fn active(deadline: Instant, cancelled: &AtomicBool) -> Result<(), ReplayError> {
+/// Replay has no time bound (J1-0); only the cancel flag stops it.
+fn active(cancelled: &AtomicBool) -> Result<(), ReplayError> {
     if cancelled.load(Ordering::Acquire) {
         Err(ReplayError::Cancelled)
-    } else if Instant::now() >= deadline {
-        Err(ReplayError::Timeout)
     } else {
         Ok(())
     }
@@ -64,12 +61,8 @@ fn id_at(bytes: &[u8], offset: usize) -> [u8; 16] {
 }
 /// Replays complete format-1 frames. Any error discards the entire public result.
 /// The input plus the bounded operation-ID set stay below the 16 MiB replay budget.
-pub fn replay(
-    bytes: &[u8],
-    deadline: Instant,
-    cancelled: &AtomicBool,
-) -> Result<Replay, ReplayError> {
-    active(deadline, cancelled)?;
+pub fn replay(bytes: &[u8], cancelled: &AtomicBool) -> Result<Replay, ReplayError> {
+    active(cancelled)?;
     if bytes.len() > MAX_JOURNAL {
         return Err(ReplayError::Limit);
     }
@@ -78,7 +71,7 @@ pub fn replay(
     }
     // Distinct initialization kinds share format 1 without reinterpreting payloads.
     if envelope(bytes)?.kind == 10 {
-        let state = conversation::replay(bytes, deadline, cancelled)?;
+        let state = conversation::replay(bytes, cancelled)?;
         return Ok(Replay {
             installation_id: state.installation_id,
             revision: state.revision,
@@ -104,7 +97,7 @@ pub fn replay(
     let mut configuration = [0; 32];
     let mut binding = None;
     while offset < bytes.len() {
-        active(deadline, cancelled)?;
+        active(cancelled)?;
         if count >= MAX_FRAMES as u64 {
             return Err(ReplayError::Limit);
         }
@@ -173,7 +166,7 @@ pub fn replay(
         count = sequence;
         offset += length;
     }
-    active(deadline, cancelled)?;
+    active(cancelled)?;
     Ok(Replay {
         installation_id: installation,
         revision,

@@ -469,7 +469,26 @@ fn setup(command: crate::conversation::Command, resolve: RuntimeResolver) -> i32
         let runtime = resolve(false).map_err(|e| e.to_string())?;
         let mut client = Client::attach(&runtime, BUILD, Instant::now() + Duration::from_secs(2))
             .map_err(|e| e.to_string())?;
-        crate::conversation::execute(&mut client, command)
+        // Journal-backed mutations wait for the service with no time bound
+        // (J1-0). They show progress, and Ctrl-C stops the wait (the request
+        // may still commit; its ID is printed for resolution).
+        let progress = match &command {
+            crate::conversation::Command::Initialize(id) => Some(("Initializing installation", id)),
+            crate::conversation::Command::Register(id, _) => Some(("Registering project", id)),
+            _ => None,
+        };
+        let cancellable = if let Some((action, id)) = progress {
+            eprintln!(
+                "{action}; request {}. Press Ctrl-C to stop waiting.",
+                crate::conversation::hex(id)
+            );
+            asura_platform::install_signals().is_ok()
+        } else {
+            false
+        };
+        crate::conversation::execute(&mut client, command, &|| {
+            cancellable && asura_platform::take_termination_signal().is_some()
+        })
     })();
     match result {
         Ok((message, _)) => {

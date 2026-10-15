@@ -339,9 +339,8 @@ fn registry_refresh_waits_for_sensor_writer_then_runs_before_background_work() {
 }
 
 #[test]
-fn retained_foreground_requests_expire_without_storage_admission() {
+fn retained_foreground_requests_wait_without_a_timer_and_drain_on_shutdown() {
     let mut fixture = Fixture::new();
-    let now = Instant::now();
     let request = pb::Envelope {
         service_epoch: Some(vec![1; 16]),
         attachment_id: Some(vec![2; 16]),
@@ -351,12 +350,20 @@ fn retained_foreground_requests_expire_without_storage_admission() {
             limit: Some(16),
         })),
     };
-    fixture.owner.foreground.push_back((request, now));
-    fixture.owner.dispatch_foreground(now);
-    assert!(fixture.owner.pending.is_none());
+    let (ticket, _controller) =
+        asura_storage::authority::writer::test_support::controlled_ticket(false);
+    fixture.owner.pending = Some((ticket, Job::SensorLoad([3; 16])));
+    fixture.owner.foreground.push_back(request);
+    // J1-0: a queued command never expires while the journal ticket is pending.
+    let later = Instant::now() + Duration::from_secs(3600);
+    fixture.owner.dispatch_foreground(later);
+    assert_eq!(fixture.owner.foreground.len(), 1);
+    assert!(fixture.owner.out.is_empty());
+    fixture.owner.closing = true;
+    fixture.owner.dispatch_foreground(later);
     assert!(fixture.owner.foreground.is_empty());
     assert!(
-        matches!(fixture.owner.out.pop_front().unwrap().body, Some(Body::ProjectsReply(value)) if value.error.as_deref() == Some("storage_timeout"))
+        matches!(fixture.owner.out.pop_front().unwrap().body, Some(Body::ProjectsReply(value)) if value.error.as_deref() == Some("service_draining"))
     );
 }
 
@@ -700,7 +707,7 @@ fn memory_cancel_and_deadline_suppress_late_data_and_preserve_slot() {
     assert!(result.text.is_empty());
 }
 
-fn memory_reply() -> writer::Reply {
+pub(super) fn memory_reply() -> writer::Reply {
     let id = |n| asura_storage::memory::Id::new([n; 16]).unwrap();
     writer::Reply {
         memory_create_result: None,
@@ -740,8 +747,7 @@ fn memory_reply() -> writer::Reply {
 fn memory_response_does_not_release_slot_before_worker_settles() {
     let mut fixture = Fixture::new();
     let now = Instant::now();
-    let (ticket, controller) =
-        writer::test_support::controlled_ticket(now + Duration::from_secs(20), false);
+    let (ticket, controller) = writer::test_support::controlled_ticket(false);
     let active = fixture.owner.active.as_mut().unwrap();
     let tool = active.tool.as_mut().unwrap();
     tool.call.arguments = tools::Arguments::MemoryGetNote {
@@ -807,8 +813,7 @@ fn unsettled_memory_timeout_or_steering_never_delivers_late_body() {
     for steering in [false, true] {
         let mut fixture = Fixture::new();
         let now = Instant::now();
-        let (ticket, controller) =
-            writer::test_support::controlled_ticket(now + Duration::from_secs(20), false);
+        let (ticket, controller) = writer::test_support::controlled_ticket(false);
         let active = fixture.owner.active.as_mut().unwrap();
         let tool = active.tool.as_mut().unwrap();
         tool.call.arguments = tools::Arguments::MemoryGetNote {
@@ -885,12 +890,7 @@ fn install_recorded_memory_cancel(fixture: &mut Fixture) {
         }),
     )
     .unwrap();
-    let mut replay = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .unwrap();
+    let mut replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     let active = fixture.owner.active.as_ref().unwrap();
     replay.operations.insert(
         active.turn.operation,

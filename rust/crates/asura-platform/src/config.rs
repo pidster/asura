@@ -26,7 +26,11 @@ fn error(_: Error) -> PrivateFileError {
     PrivateFileError::UnsafeOrIo
 }
 fn active(deadline: Instant, cancel: &AtomicBool) -> Result<()> {
-    if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+    active_until(Some(deadline), cancel)
+}
+fn active_until(deadline: Option<Instant>, cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    {
         Err(PrivateFileError::CancelledOrExpired)
     } else {
         Ok(())
@@ -63,7 +67,24 @@ impl PrivateFileSnapshot {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<Self> {
-        active(deadline, cancel)?;
+        Self::read_until(runtime, name, Some(deadline), cancel)
+    }
+    /// Reads for an owner whose work has no time bound, such as the journal
+    /// writer (J1-0). Only cancel or a real error stops the read.
+    pub fn read_without_deadline(
+        runtime: RuntimeDirectory,
+        name: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        Self::read_until(runtime, name, None, cancel)
+    }
+    fn read_until(
+        runtime: RuntimeDirectory,
+        name: &str,
+        deadline: Option<Instant>,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        active_until(deadline, cancel)?;
         if name.is_empty() || name.len() > 255 || name.contains('/') || matches!(name, "." | "..") {
             return Err(PrivateFileError::UnsafeOrIo);
         }
@@ -107,7 +128,7 @@ impl PrivateFileSnapshot {
             }
         }
         snapshot.validate()?;
-        active(deadline, cancel)?;
+        active_until(deadline, cancel)?;
         Ok(snapshot)
     }
     fn validate(&self) -> Result<()> {

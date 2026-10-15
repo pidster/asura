@@ -560,6 +560,7 @@ where
     let mut endpoint_removed = false;
     let mut lifetime_ended = false;
     let mut retry_after_inspection = false;
+    let mut replay_loading = installation::ReplayLoading::default();
     let result = (|| -> Result<(), Error> {
         loop {
             wake_reader.drain()?;
@@ -703,6 +704,14 @@ where
                         client.queue(&reply, now)?;
                     }
                 }
+            }
+            if let Some(snapshot) = replay_loading.update(
+                conversations.replaying(),
+                &dispatcher.installation,
+                conversations.installation().is_some(),
+            ) {
+                dispatcher.installation = snapshot;
+                wake_sender.notify()?;
             }
             if let Some(snapshot) = conversations.installation()
                 && dispatcher.installation != snapshot

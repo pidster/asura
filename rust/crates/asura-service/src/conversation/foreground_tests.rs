@@ -50,8 +50,7 @@ fn foreground_reads_wait_for_every_pending_read_kind_in_fifo_order() {
             2 => Job::ReadPrompt(request.clone()),
             _ => Job::Read(request),
         };
-        let (ticket, controller) =
-            writer::test_support::controlled_ticket(now + Duration::from_secs(2), false);
+        let (ticket, controller) = writer::test_support::controlled_ticket(false);
         owner.pending = Some((ticket, job));
         for (counter, body) in [(1, history()), (2, prompt()), (3, queue())] {
             assert!(owner.request(envelope(body, counter), now).is_none());
@@ -75,12 +74,11 @@ fn foreground_reads_wait_for_every_pending_read_kind_in_fifo_order() {
 }
 
 #[test]
-fn foreground_fifo_has_exact_bound_and_expires_without_dispatch() {
+fn foreground_fifo_has_exact_bound_and_waits_in_order_without_a_timer() {
     let mut fixture = tool_tests::Fixture::new();
     let owner = &mut fixture.owner;
     let now = Instant::now();
-    let (ticket, controller) =
-        writer::test_support::controlled_ticket(now + Duration::from_secs(3), false);
+    let (ticket, controller) = writer::test_support::controlled_ticket(false);
     owner.pending = Some((ticket, Job::Read(envelope(history(), 100))));
     for counter in 1..=32 {
         assert!(owner.request(envelope(history(), counter), now).is_none());
@@ -89,18 +87,19 @@ fn foreground_fifo_has_exact_bound_and_expires_without_dispatch() {
         error_message(owner.request(envelope(history(), 33), now).unwrap()),
         "conversation_busy"
     );
-    owner.dispatch_foreground(now + Duration::from_millis(1999));
+    // J1-0: queued commands wait for the journal ticket; time alone ends nothing.
+    owner.dispatch_foreground(now + Duration::from_secs(3600));
     assert_eq!(owner.foreground.len(), 32);
     assert!(owner.out.is_empty());
-    owner.dispatch_foreground(now + Duration::from_secs(2));
-    assert!(owner.foreground.is_empty());
-    for counter in 1..=32 {
-        let response = owner.out.pop_front().unwrap();
-        assert_eq!(response.request_counter, Some(counter));
-        assert_eq!(error_message(response), "storage_timeout");
-    }
     owner.pending = None;
     controller.finish();
+    owner.dispatch_foreground(now);
+    // The first queued command is dispatched; the rest keep their order.
+    assert!(
+        owner.pending.is_some() || owner.out.front().and_then(|r| r.request_counter) == Some(1)
+    );
+    assert_eq!(owner.foreground.len(), 31);
+    assert_eq!(owner.foreground.front().unwrap().request_counter, Some(2));
 }
 
 #[test]
@@ -108,8 +107,7 @@ fn foreground_drain_is_explicit_and_does_not_wait_for_writer() {
     let mut fixture = tool_tests::Fixture::new();
     let owner = &mut fixture.owner;
     let now = Instant::now();
-    let (ticket, controller) =
-        writer::test_support::controlled_ticket(now + Duration::from_secs(2), false);
+    let (ticket, controller) = writer::test_support::controlled_ticket(false);
     owner.pending = Some((ticket, Job::Read(envelope(history(), 100))));
     assert!(owner.request(envelope(prompt(), 1), now).is_none());
     owner.closing = true;
@@ -123,7 +121,7 @@ fn foreground_drain_is_explicit_and_does_not_wait_for_writer() {
     controller.finish();
 }
 
-fn active_projection(owner: &Owner, now: Instant) -> Arc<journal::Replay> {
+fn active_projection(owner: &Owner) -> Arc<journal::Replay> {
     let bytes = journal::encode_frame(
         &journal::FrameContext {
             installation_id: [1; 16],
@@ -143,12 +141,7 @@ fn active_projection(owner: &Owner, now: Instant) -> Arc<journal::Replay> {
         }),
     )
     .unwrap();
-    let mut replay = journal::replay(
-        &bytes,
-        now + Duration::from_secs(2),
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .unwrap();
+    let mut replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     let active = owner.active.as_ref().unwrap();
     replay.operations.insert(
         active.turn.operation,
@@ -174,9 +167,8 @@ fn active_observation_and_cancel_bypass_pending_foreground_reads() {
     let mut fixture = tool_tests::Fixture::new();
     let owner = &mut fixture.owner;
     let now = Instant::now();
-    owner.replay = Some(active_projection(owner, now));
-    let (ticket, controller) =
-        writer::test_support::controlled_ticket(now + Duration::from_secs(2), false);
+    owner.replay = Some(active_projection(owner));
+    let (ticket, controller) = writer::test_support::controlled_ticket(false);
     owner.pending = Some((ticket, Job::Read(envelope(history(), 100))));
     assert!(owner.request(envelope(history(), 1), now).is_none());
     let response = owner
@@ -228,5 +220,58 @@ fn active_observation_and_cancel_bypass_pending_foreground_reads() {
     assert_eq!(active.cancel_replies[0].request_counter, Some(4));
     assert_eq!(owner.foreground.len(), 1);
     owner.pending = None;
+    controller.finish();
+}
+
+#[test]
+fn j1_0_02_late_reply_after_turn_cancel_is_applied_without_failing_the_turn() {
+    let mut fixture = tool_tests::Fixture::new();
+    let owner = &mut fixture.owner;
+    let now = Instant::now();
+    let projection = active_projection(owner);
+    let revision = projection.revision;
+    owner.replay = Some(projection.clone());
+    let (ticket, controller) = writer::test_support::controlled_ticket(true);
+    owner.pending = Some((ticket, Job::QueueHold));
+    // The person cancels the turn while the journal append is stalled.
+    let operation = owner.active.as_ref().unwrap().turn.operation.to_vec();
+    assert!(
+        owner
+            .request(
+                envelope(
+                    Body::ConversationCancel(pb::ConversationCancel {
+                        operation_id: Some(operation),
+                        generation: Some(1),
+                    }),
+                    1,
+                ),
+                now,
+            )
+            .is_none()
+    );
+    // No timer settles the stalled ticket: no uncertainty, no failed turn.
+    let later = now + Duration::from_secs(3600);
+    owner.poll(later);
+    assert!(matches!(owner.pending, Some((_, Job::QueueHold))));
+    assert!(owner.unavailable.is_none());
+    assert!(owner.active.is_some());
+    // The late reply arrives and is applied.
+    let mut advanced = active_projection(owner);
+    Arc::get_mut(&mut advanced).unwrap().revision = revision + 1;
+    let mut reply = tool_tests::memory_reply();
+    reply.memory_result = None;
+    reply.replay = Some(advanced);
+    assert!(controller.publish(Ok(reply)));
+    // Apply exactly the delivered reply, as `poll` does first; the fixture has
+    // no writer for the follow-on cancel append.
+    let result = owner.pending.as_mut().unwrap().0.poll().unwrap();
+    let (_, job) = owner.pending.take().unwrap();
+    owner.job_done(job, result, later);
+    assert!(owner.active.as_ref().unwrap().cancel.is_some());
+    assert_eq!(owner.replay.as_ref().unwrap().revision, revision + 1);
+    assert_eq!(
+        owner.unavailable, None,
+        "late reply must not fail the owner"
+    );
     controller.finish();
 }

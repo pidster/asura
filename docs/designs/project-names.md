@@ -243,9 +243,9 @@ if both the generation and exact text still match; an equal newer draft is not
 cleared. Definite service rejection retains the draft and request reason.
 Unknown transport outcome retains the original request ID for `/retry`.
 The service uses the existing bounded control frame and serialized writer queue;
-rename cannot bypass that owner. The client request deadline is 3 seconds. The
-eight-slot writer uses its existing 2-second mutation deadline and settlement
-rules. Cancellation of client waiting does not
+rename cannot bypass that owner. The client waits for the reply with no
+response budget, and `/cancel` stops the wait ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound), owner, 2026-10-16). The
+eight-slot writer has no time bound and keeps its settlement rules. Cancellation of client waiting does not
 cancel an uncertain append. If the writer cannot settle, service status reports
 repair/unavailable while the UI remains responsive. On overload the service
 returns its typed busy result and the TUI retains the command draft. On restart,

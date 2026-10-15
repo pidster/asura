@@ -1,11 +1,9 @@
 //! Fixed queries and strict record decoding. No query text crosses the public API.
 use super::types::*;
 use std::{
-    cell::Cell,
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
 };
 use surrealdb::{
     Surreal,
@@ -18,7 +16,6 @@ const SCHEMA: &str = include_str!("schema.surql");
 pub(crate) struct Database {
     pub(super) db: Surreal<Db>,
     pub(super) binding: Binding,
-    deadline: Cell<Instant>,
 }
 fn record(table: &str, id: Id) -> RecordId {
     RecordId::new(table, id.hex())
@@ -89,20 +86,14 @@ fn path(root: &Path, initialize: bool) -> Result<PathBuf> {
     Ok(db)
 }
 impl Database {
-    pub(crate) async fn connect(
-        root: &Path,
-        binding: Binding,
-        initialize: bool,
-        deadline: Instant,
-    ) -> Result<Self> {
+    pub(crate) async fn connect(root: &Path, binding: Binding, initialize: bool) -> Result<Self> {
         let path = path(root, initialize)?;
-        Self::connect_path(path, binding, initialize, deadline).await
+        Self::connect_path(path, binding, initialize).await
     }
     pub(crate) async fn connect_path(
         path: PathBuf,
         binding: Binding,
         initialize: bool,
-        deadline: Instant,
     ) -> Result<Self> {
         let empty = fs::read_dir(&path)
             .map_err(|_| Error::Unavailable)?
@@ -114,10 +105,9 @@ impl Database {
         if !empty {
             existing_layout(&path)?;
         }
-        let config = Config::new()
-            .query_timeout(Duration::from_secs(2))
-            .transaction_timeout(Duration::from_secs(2))
-            .capabilities(Capabilities::none());
+        // Queries and transactions have no time bound (owner, 2026-10-16): they
+        // end on completion, an engine error or the caller's cancellation.
+        let config = Config::new().capabilities(Capabilities::none());
         let db = Surreal::new::<SurrealKv>((path, config))
             .sync("every")
             .with_capacity(1)
@@ -127,12 +117,7 @@ impl Database {
             .use_db("memory")
             .await
             .map_err(|_| Error::Unavailable)?;
-        let adapter = Self {
-            db,
-            binding,
-            deadline: Cell::new(deadline),
-        };
-        adapter.active()?;
+        let adapter = Self { db, binding };
         if initialize && empty {
             let sql = format!(
                 "BEGIN TRANSACTION;\n{SCHEMA}\nCREATE graph_marker:installation CONTENT $marker;\nCOMMIT TRANSACTION;"
@@ -149,18 +134,7 @@ impl Database {
         initialization_verification(initialize && empty, adapter.verify().await)?;
         Ok(adapter)
     }
-    pub(crate) fn set_deadline(&self, deadline: Instant) {
-        self.deadline.set(deadline);
-    }
-    pub(super) fn active(&self) -> Result<()> {
-        if Instant::now() >= self.deadline.get() {
-            Err(Error::Timeout)
-        } else {
-            Ok(())
-        }
-    }
     pub(crate) async fn verify(&self) -> Result<()> {
-        self.active()?;
         let mut result = self
             .db
             .query("SELECT * FROM graph_marker:installation;")
@@ -220,7 +194,6 @@ impl Database {
         edge.insert("context_id", command.context_id.hex());
         edge.insert("operation_id", command.operation_id.hex());
         edge.insert("kind", "derived_from");
-        self.active()?;
         let sql = if command.source.is_some() {
             PUT_LINK
         } else {
@@ -243,7 +216,6 @@ impl Database {
         if cancel.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::Cancelled);
         }
-        self.active()?;
         query
             .await
             .map_err(|_| Error::OutcomeUnconfirmed)?
@@ -277,7 +249,6 @@ impl Database {
         command.validate()?;
         self.check_binding(&command.binding)?;
         self.verify().await?;
-        self.active()?;
         let after = command
             .after
             .map(|id| record("memory_note", id))
@@ -327,7 +298,6 @@ impl Database {
     pub(crate) async fn get(&self, binding: Binding, context: Id, version: Id) -> Result<Note> {
         self.check_binding(&binding)?;
         self.verify().await?;
-        self.active()?;
         let mut rows = self
             .db
             .query("SELECT * FROM $note_id;")
@@ -352,7 +322,6 @@ impl Database {
         version: Id,
     ) -> Result<Vec<Note>> {
         self.get(binding.clone(), context, version).await?;
-        self.active()?;
         let mut rows = self
             .db
             .query("SELECT * FROM memory_link WHERE in = $note_id LIMIT 33;")
@@ -408,7 +377,6 @@ impl Database {
             Err(Error::NotFound) => {
                 // Missing receipt is absence only if no partial effect exists.
                 // These identities are immutable and unique to this intent.
-                self.active()?;
                 let version = Id::new(intent.version)?;
                 let mut rows = self.db.query("SELECT id FROM $note_id; SELECT id FROM memory_link WHERE operation_id = $operation OR in = $note_id LIMIT 1;")
                     .bind(("note_id", record("memory_note", version)))
@@ -448,7 +416,6 @@ impl Database {
             return Err(Error::InvalidRecord);
         }
         super::create::command_for_intent(self.binding.clone(), intent, note.body)?;
-        self.active()?;
         let mut rows = self
             .db
             .query("SELECT * FROM memory_link WHERE in = $note_id LIMIT 2;")
@@ -494,7 +461,6 @@ impl Database {
     }
     pub(crate) async fn resolve(&self, operation: Id, hash: [u8; 32]) -> Result<Receipt> {
         self.verify().await?;
-        self.active()?;
         let mut rows = self
             .db
             .query("SELECT * FROM $receipt_id;")

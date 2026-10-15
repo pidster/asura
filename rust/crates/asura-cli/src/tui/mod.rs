@@ -122,6 +122,13 @@ pub(crate) fn run(
             if app.take_audit_cancel() {
                 audit_worker.cancel();
             }
+            if app.take_project_admin_cancel() {
+                project_admin_worker.cancel();
+            }
+            let queue_cancelled = app.take_queue_cancel();
+            if queue_cancelled {
+                queue_worker.cancel();
+            }
             if app.take_models_cancel() {
                 models_worker.cancel();
             }
@@ -161,7 +168,7 @@ pub(crate) fn run(
                 app.project_admin_finished(update);
                 dirty = true;
             }
-            if (has(Source::Queue) || queue_worker.next_deadline().is_some_and(|at| now >= at))
+            if (has(Source::Queue) || queue_cancelled)
                 && let Some(update) = queue_worker.poll()
             {
                 app.queue_finished(update);
@@ -303,7 +310,6 @@ pub(crate) fn run(
                 config_worker.next_deadline(),
                 models_worker.next_deadline(),
                 audit_worker.next_deadline(),
-                queue_worker.next_deadline(),
                 project_admin_worker.next_deadline(),
                 context_worker.next_deadline(),
                 queue_observer.next_deadline(),

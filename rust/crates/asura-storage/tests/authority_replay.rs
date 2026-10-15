@@ -11,11 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const PENDING: &[u8] = include_bytes!("fixtures/pending.bin");
 const ACTIVE: &[u8] = include_bytes!("fixtures/active.bin");
 fn inspect(bytes: &[u8]) -> Result<asura_storage::authority::Replay, ReplayError> {
-    replay(
-        bytes,
-        Instant::now() + Duration::from_secs(2),
-        &AtomicBool::new(false),
-    )
+    replay(bytes, &AtomicBool::new(false))
 }
 fn seal(frame: &mut [u8]) {
     let end = frame.len() - 40;
@@ -166,15 +162,7 @@ fn unsupported_format_and_lengths_limits_and_cancellation() {
     assert_eq!(inspect(&bytes), Err(ReplayError::Limit));
     assert_eq!(inspect(&vec![0; MAX_JOURNAL + 1]), Err(ReplayError::Limit));
     assert_eq!(
-        replay(PENDING, Instant::now(), &AtomicBool::new(false)),
-        Err(ReplayError::Timeout)
-    );
-    assert_eq!(
-        replay(
-            PENDING,
-            Instant::now() + Duration::from_secs(1),
-            &AtomicBool::new(true)
-        ),
+        replay(PENDING, &AtomicBool::new(true)),
         Err(ReplayError::Cancelled)
     );
 }

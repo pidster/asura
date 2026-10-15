@@ -20,10 +20,13 @@ pub(super) fn inspect(case: &mut Case) -> Result<()> {
     }
     let project = case.root.join("project");
     fs::create_dir(&project)?;
-    let registered = client.register_project(pb::ProjectRegister {
-        request_id: Some(asura_platform::random_id().to_vec()),
-        location: Some(project.to_str().unwrap().into()),
-    })?;
+    let registered = client.register_project(
+        pb::ProjectRegister {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            location: Some(project.to_str().unwrap().into()),
+        },
+        &|| false,
+    )?;
     require(
         registered.error.is_none(),
         "sensor project registration failed",

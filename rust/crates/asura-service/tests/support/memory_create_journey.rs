@@ -14,12 +14,8 @@ fn replay(fixture: &Fixture) -> Result<(Vec<u8>, journal::Replay)> {
     if bytes.len() > asura_storage::authority::MAX_JOURNAL {
         return Err("HM3 fixture journal exceeds bound".into());
     }
-    let state = journal::replay(
-        &bytes,
-        Instant::now() + Duration::from_secs(2),
-        &AtomicBool::new(false),
-    )
-    .map_err(|e| format!("HM3 replay: {e:?}"))?;
+    let state = journal::replay(&bytes, &AtomicBool::new(false))
+        .map_err(|e| format!("HM3 replay: {e:?}"))?;
     Ok((bytes, state))
 }
 fn binding(state: &journal::Replay) -> Result<memory::Binding> {
@@ -423,10 +419,13 @@ pub(super) fn run(provider: &str) -> Result<()> {
         projects.push(checked_id(
             fixture
                 .attach()?
-                .register_project(pb::ProjectRegister {
-                    request_id: Some(asura_platform::random_id().to_vec()),
-                    location: Some(path.to_str().unwrap().into()),
-                })?
+                .register_project(
+                    pb::ProjectRegister {
+                        request_id: Some(asura_platform::random_id().to_vec()),
+                        location: Some(path.to_str().unwrap().into()),
+                    },
+                    &|| false,
+                )?
                 .project_id,
         )?);
     }

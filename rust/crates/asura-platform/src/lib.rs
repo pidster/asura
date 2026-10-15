@@ -11,6 +11,12 @@ pub use model_process::ModelProcess;
 pub mod git_observer;
 mod project_identity;
 pub use journal_io::{DatabaseDirectory, JournalFile};
+/// Journal hold and fault injection for scratch homes (J1-0 tests only).
+#[cfg(feature = "test-support")]
+pub mod journal_gate {
+    pub use crate::journal_io::gate::Fault;
+    pub use crate::journal_io::gate::support::{JournalGate, install_file_gate};
+}
 pub use project_identity::{
     ProjectIdentity, ProjectListing, ProjectPage, ProjectReadError, StateBoundary,
 };

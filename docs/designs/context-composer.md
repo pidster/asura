@@ -670,7 +670,7 @@ normal redispatch rules apply.
 | --- | --- |
 | Capacity missing, malformed or disagreeing with Hello | `model_unavailable`, as today; no composition |
 | `B ≤ 0` or mandatory segments do not fit | `context_limit` with each mandatory size; queued input kept |
-| Candidate read fails (writer deadline, repair, busy) | Existing writer error mapping (`storage_timeout`, `authority_repair_required`, `conversation_busy`); no acceptance |
+| Candidate read fails (repair, busy, unavailable) | Existing writer error mapping (`authority_repair_required`, `conversation_busy`, `storage_unavailable`); writer reads have no deadline (J1-0); no acceptance |
 | Page `busy`, storage step bound reached, `expired`, `deleted`, `denied`, `corrupt` | That source stays a reference with its state stated. The turn continues. Never rerun the tool and never substitute a summary for missing content (CCR13). |
 | Encoded input still too large after four attempts | `context_limit` |
 | Fence changes during composition (steer, cancel, generation, policy) | Discard the composition; no `TurnAccepted`; steer and cancel follow their existing rules |

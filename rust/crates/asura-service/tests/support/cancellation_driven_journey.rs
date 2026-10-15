@@ -121,10 +121,13 @@ pub(super) fn run() -> Result<()> {
     let project = checked_id(
         fixture
             .attach()?
-            .register_project(pb::ProjectRegister {
-                request_id: Some(asura_platform::random_id().to_vec()),
-                location: Some(directory.to_str().ok_or("fixture path")?.into()),
-            })?
+            .register_project(
+                pb::ProjectRegister {
+                    request_id: Some(asura_platform::random_id().to_vec()),
+                    location: Some(directory.to_str().ok_or("fixture path")?.into()),
+                },
+                &|| false,
+            )?
             .project_id,
     )?;
     for (key, value) in [

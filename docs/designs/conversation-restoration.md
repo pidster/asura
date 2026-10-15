@@ -143,11 +143,11 @@ sequenceDiagram
 
 History, prompt reads and queue snapshots share the canonical journal writer.
 When any writer job is pending, the conversation owner retains foreground
-requests in its existing FIFO, up to 32 requests with a two-second retention
-deadline. This applies to foreground reads as well as sensor jobs. The owner
-dispatches the oldest retained request after the pending job completes. It
-returns `conversation_busy` when the FIFO is full, `storage_timeout` when a
-retained request expires, and `service_draining` during shutdown. There is no
+requests in its existing FIFO, up to 32 requests. A retained request waits for
+the writer with no time bound ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). This applies to foreground reads as well
+as sensor jobs. The owner dispatches the oldest retained request after the
+pending job completes. It returns `conversation_busy` when the FIFO is full and
+`service_draining` during shutdown. There is no
 client retry or second scheduler. Active operation observations and cancellation
 continue through their existing immediate paths. Terminal long-poll observations
 retain their existing bounded observation wait while the writer is occupied.
@@ -158,16 +158,16 @@ flowchart TD
     Pending -->|No| Dispatch["Dispatch through canonical conversation owner"]
     Pending -->|Yes| Space{"Fewer than 32 retained requests?"}
     Space -->|No| Busy["Reply conversation_busy"]
-    Space -->|Yes| Retain["Retain in FIFO with two-second deadline"]
-    Retain --> Ready{"Writer completes before deadline and shutdown?"}
+    Space -->|Yes| Retain["Retain in FIFO with no deadline (J1-0)"]
+    Retain --> Ready{"Writer completes before shutdown?"}
     Ready -->|Yes| Dispatch
-    Ready -->|No| Error["Reply storage_timeout or service_draining"]
+    Ready -->|No| Error["Reply service_draining"]
     Immediate["Active observation or cancellation"] --> Bypass["Existing immediate operation path"]
 ```
 
 Unit validation interleaves foreground history, prompt and queue requests with
 pending queue snapshot, history, prompt and terminal read jobs. It checks FIFO
-ordering, the 32-request bound, expiry, shutdown and active observation/cancel
+ordering, the 32-request bound, no expiry (J1-0), shutdown and active observation/cancel
 bypass. Integration and end-to-end validation use the real service, journal and
 two-launch queue-history PTY fixture to verify restoration and subsequent
 admission. Synthetic ticket tests prove scheduling, not disk completion.
