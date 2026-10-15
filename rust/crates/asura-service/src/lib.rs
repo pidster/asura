@@ -2,6 +2,7 @@
 mod audit;
 mod completion;
 mod config_worker;
+mod context;
 mod context_manager;
 mod context_observer;
 mod conversation;

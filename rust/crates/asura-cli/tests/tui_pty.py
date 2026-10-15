@@ -1586,6 +1586,46 @@ def long_observation(fixture, source):
         assert not server.is_alive(), "fixture server cleanup unconfirmed"
 
 
+def long_conversation(fixture, source):
+    """CC-E1: a real conversation past the former 16-turn failure keeps answering."""
+    helper = source.parent / "asura-model"
+    assert helper.is_file(), "Build the verified native helper beside the fixture executable"
+    shutil.copyfile(helper, fixture.root / "asura-model")
+    (fixture.root / "asura-model").chmod(0o700)
+    project = fixture.root / "project"
+    project.mkdir(mode=0o700)
+    trial = fixture.launch()
+    try:
+        trial.until(b"Installation graph_ready", plain=True, limit=15)
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        for n in range(1, 41):
+            token = f"TOKEN{n:02d}X"
+            trial.send(f"Reply with only {token}.\r".encode())
+            end = time.monotonic() + remaining(65)
+            while trial.screen.text().count(token) < 2 or "Generating" in trial.screen.text():
+                text = trial.screen.text()
+                for failure in ("context_limit", "capacity_exhausted", "model_input_invalid"):
+                    assert failure not in text, (n, text)
+                assert time.monotonic() < end, (n, text)
+                trial.read(0.025)
+        trial.send(b"/quit\r")
+        trial.finish()
+    finally:
+        if trial.process.poll() is None:
+            try:
+                trial.signal(signal.SIGTERM)
+                trial.finish(limit=3)
+            finally:
+                trial.close()
+        else:
+            trial.close()
+    fixture.wait_absent(stable=0.2)
+    print("PASS 40-turn native conversation answers every turn past the former 16-turn limit")
+
+
 def state_isolation(source):
     """SI-E1 and SI-E2: the Asura home is never a usable project."""
     # SI-E1: accepting the first-use offer inside the Asura home's parent fails.
@@ -1911,13 +1951,16 @@ def main():
     multipass = len(sys.argv) == 3 and sys.argv[2] == "--activity-multipass"
     isolation = len(sys.argv) == 3 and sys.argv[2] == "--state-isolation"
     helpmode = len(sys.argv) == 3 and sys.argv[2] == "--help-mode"
-    assert len(sys.argv) == 2 or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation, __doc__
+    long_turns = len(sys.argv) == 3 and sys.argv[2] == "--long-conversation"
+    assert len(sys.argv) == 2 or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
         DEADLINE = time.monotonic() + 160
     if activity or multipass:
         DEADLINE = time.monotonic() + 90
+    if long_turns:
+        DEADLINE = time.monotonic() + 900
     source = Path(sys.argv[1]).resolve(strict=True)
     probe = subprocess.run(
         [str(source), "--asura-lifecycle-fixture-probe"],
@@ -1931,6 +1974,9 @@ def main():
         return
     fixture = Fixture(source)
     try:
+        if long_turns:
+            long_conversation(fixture, source)
+            return
         if helpmode:
             help_mode(fixture)
             help_mode_backend_gone(fixture)
@@ -1975,7 +2021,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

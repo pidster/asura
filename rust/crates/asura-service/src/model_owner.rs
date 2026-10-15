@@ -38,6 +38,8 @@ pub(crate) enum ModelEvent {
         context_source: u32,
         model_name: Option<String>,
         tools_available: bool,
+        /// Bytes of the project tool definitions; the composer's overhead `S`.
+        tool_schema_bytes: u32,
         capabilities: crate::model::CapabilityProfile,
     },
     InferenceUsage(pb::InferenceUsage),
@@ -90,6 +92,10 @@ pub(crate) struct ModelOwner {
     written: usize,
     incoming: Vec<u8>,
     input: Option<Vec<u8>>,
+    /// Sliding input credit (context-composer.md, streamed input transfer).
+    input_sent: u64,
+    input_accepted: u64,
+    input_granted: u64,
     snapshot: Vec<u8>,
     revision: u64,
     chunks: u64,
@@ -234,6 +240,9 @@ impl ModelOwner {
             written: 0,
             incoming: Vec::new(),
             input: None,
+            input_sent: 0,
+            input_accepted: 0,
+            input_granted: 0,
             snapshot: Vec::new(),
             revision: 0,
             chunks: 0,
@@ -267,6 +276,10 @@ impl ModelOwner {
             return Err("model_not_ready");
         }
         model::decode_input(&input).map_err(|_| "model_input_invalid")?;
+        // A protocol sanity bound on allocation, not a content limit.
+        if (input.len() as u64) > u64::from(self.effective_context.unwrap_or(0)).saturating_mul(8) {
+            return Err("model_input_invalid");
+        }
         // Absence of native tool support is negotiated before inference. A real
         // provider failure never retries the turn without tools.
         let enable_tools = enable_tools && self.tools_available;
@@ -281,7 +294,11 @@ impl ModelOwner {
             enable_project_tools: enable_tools.then_some(true),
         }))?;
         self.input = Some(input);
+        self.input_sent = 0;
+        self.input_accepted = 0;
+        self.input_granted = 0;
         self.phase = Phase::Input;
+        // Restarted on each credit: ends only a transfer that makes no progress.
         self.deadline = now + Duration::from_secs(5);
         Ok(())
     }
@@ -396,6 +413,7 @@ impl ModelOwner {
                             build_id: Some(self.identity.build_id.to_vec()),
                             schema_digest: Some(self.identity.schema_digest.to_vec()),
                             max_frame_bytes: Some(65536),
+                            tool_schema_bytes: None,
                             availability: Some(3),
                             capabilities: Some(0),
                             context_tokens: None,
@@ -657,6 +675,7 @@ impl ModelOwner {
                 context_source: hello.context_source.unwrap(),
                 model_name: hello.model_name,
                 tools_available: self.tools_available,
+                tool_schema_bytes: hello.tool_schema_bytes.unwrap_or(0),
                 capabilities: crate::model::CapabilityProfile {
                     supported: hello.supported_capabilities,
                     source: hello.capability_source,
@@ -669,27 +688,50 @@ impl ModelOwner {
             .map_err(|_| "model_protocol_identity_mismatch")?;
         match envelope.body.ok_or("model_protocol_fault")? {
             Body::Credit(credit) if self.phase == Phase::Input => {
-                let input = self.input.take().ok_or("model_protocol_fault")?;
+                let input = self.input.as_ref().ok_or("model_protocol_fault")?;
+                let total = input.len() as u64;
+                let (Some(accepted), Some(granted)) = (credit.accepted_bytes, credit.granted_bytes)
+                else {
+                    return Err("model_protocol_fault");
+                };
                 if credit.transfer_id != Some(1)
-                    || credit.accepted_bytes != Some(0)
-                    || credit.granted_bytes != Some(65536)
+                    || accepted < self.input_accepted
+                    || accepted > self.input_sent
+                    || granted <= self.input_granted
+                    || granted < self.input_sent
+                    || granted - accepted > model::CREDIT_WINDOW
                 {
                     return Err("model_protocol_fault");
                 }
-                let count = input.len().div_ceil(16384);
-                for (ordinal, chunk) in input.chunks(16384).enumerate() {
+                self.input_accepted = accepted;
+                self.input_granted = granted;
+                self.deadline = Instant::now() + Duration::from_secs(5);
+                let chunk = model::MAX_CHUNK_BYTES as u64;
+                // Send whole chunks only, so each ordinal names a fixed offset.
+                loop {
+                    let start = self.input_sent;
+                    let end = (start + chunk).min(total);
+                    if start >= total || end > granted {
+                        break;
+                    }
+                    let data =
+                        self.input.as_ref().expect("input")[start as usize..end as usize].to_vec();
                     self.queue(Body::Chunk(pb::Chunk {
                         transfer_id: Some(1),
                         direction: Some(1),
-                        ordinal: Some(ordinal as u64),
-                        data: Some(chunk.to_vec()),
+                        ordinal: Some(start / chunk),
+                        data: Some(data),
                         revision: Some(0),
                     }))?;
+                    self.input_sent = end;
                 }
-                self.queue(Body::InputEnd(pb::InputEnd {
-                    count: Some(count as u64),
-                    total_bytes: Some(input.len() as u64),
-                }))?;
+                if self.input_sent == total {
+                    self.queue(Body::InputEnd(pb::InputEnd {
+                        count: Some(total.div_ceil(chunk)),
+                        total_bytes: Some(total),
+                    }))?;
+                    self.input = None;
+                }
             }
             Body::Ready(_) if self.phase == Phase::Input && self.input.is_none() => {
                 self.phase = Phase::Ready;
@@ -880,6 +922,31 @@ impl ModelOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn owner_with_capacity(tokens: u32) -> ModelOwner {
+        let mut owner = owner(Phase::Available);
+        owner.effective_context = Some(tokens);
+        owner
+    }
+    impl ModelOwner {
+        /// Whether this credit would be refused, without changing the ledger.
+        fn clone_ledger_check(&mut self, credit: pb::Envelope) -> bool {
+            let saved = (
+                self.input.clone(),
+                self.input_sent,
+                self.input_accepted,
+                self.input_granted,
+                self.outgoing.len(),
+            );
+            let refused = self.receive(credit, &mut Vec::new()).is_err();
+            self.input = saved.0;
+            self.input_sent = saved.1;
+            self.input_accepted = saved.2;
+            self.input_granted = saved.3;
+            self.outgoing.truncate(saved.4);
+            self.faulted = false;
+            refused
+        }
+    }
     pub(super) fn owner(phase: Phase) -> ModelOwner {
         ModelOwner {
             preparation: None,
@@ -912,6 +979,9 @@ mod tests {
             written: 0,
             incoming: Vec::new(),
             input: None,
+            input_sent: 0,
+            input_accepted: 0,
+            input_granted: 0,
             snapshot: Vec::new(),
             revision: 0,
             chunks: 0,
@@ -1227,6 +1297,103 @@ mod tests {
         owner.start().unwrap();
         assert!(owner.start().is_err());
     }
+    /// CC-U16 and CC-U18: input above 64 KiB streams under a sliding credit
+    /// window; nothing is sent beyond the grant; the capacity bound applies.
+    #[test]
+    fn window_sized_input_streams_under_sliding_credit() {
+        let mut owner = owner(Phase::Available);
+        owner.effective_context = Some(100_000);
+        let input = model::encode_input(&pb::ModelInput {
+            instructions: Some("x".repeat(200_000)),
+            history: vec![],
+            prompt: Some("hello".into()),
+        })
+        .unwrap();
+        let total = input.len() as u64;
+        owner
+            .begin([4; 16], 1, input, false, Instant::now())
+            .unwrap();
+        let credit = |accepted: u64, granted: u64| {
+            message(Body::Credit(pb::Credit {
+                transfer_id: Some(1),
+                direction: Some(1),
+                accepted_bytes: Some(accepted),
+                granted_bytes: Some(granted),
+            }))
+        };
+        let mut events = Vec::new();
+        owner.receive(credit(0, 65_536), &mut events).unwrap();
+        assert_eq!(owner.input_sent, 65_536);
+        // A window wider than 64 KiB, or acceptance of unsent bytes, is a fault.
+        assert!(owner.clone_ledger_check(credit(0, 131_073)));
+        assert!(owner.clone_ledger_check(credit(65_537, 131_072)));
+        let mut accepted = 0;
+        while owner.input.is_some() {
+            // The I/O pass writes queued frames to the helper; drain them here.
+            owner.outgoing.clear();
+            accepted += 16_384;
+            let granted = accepted + 65_536;
+            owner
+                .receive(credit(accepted, granted), &mut events)
+                .unwrap();
+            assert!(owner.input_sent <= granted);
+        }
+        assert_eq!(owner.input_sent, total);
+        owner
+            .receive(message(Body::Ready(pb::Ready {})), &mut events)
+            .unwrap();
+        owner.start().unwrap();
+        let mut owner = owner_with_capacity(100);
+        let input = model::encode_input(&pb::ModelInput {
+            instructions: Some("x".repeat(801)),
+            history: vec![],
+            prompt: Some("hello".into()),
+        })
+        .unwrap();
+        assert!(
+            owner
+                .begin([4; 16], 1, input, false, Instant::now())
+                .is_err()
+        );
+    }
+    #[test]
+    fn cancel_during_transfer_stops_sending() {
+        let mut owner = owner(Phase::Available);
+        owner.effective_context = Some(100_000);
+        let input = model::encode_input(&pb::ModelInput {
+            instructions: Some("x".repeat(200_000)),
+            history: vec![],
+            prompt: Some("hello".into()),
+        })
+        .unwrap();
+        owner
+            .begin([4; 16], 1, input, false, Instant::now())
+            .unwrap();
+        let mut events = Vec::new();
+        owner
+            .receive(
+                message(Body::Credit(pb::Credit {
+                    transfer_id: Some(1),
+                    direction: Some(1),
+                    accepted_bytes: Some(0),
+                    granted_bytes: Some(65_536),
+                })),
+                &mut events,
+            )
+            .unwrap();
+        owner.cancel(1, Instant::now());
+        let sent = owner.input_sent;
+        let _ = owner.receive(
+            message(Body::Credit(pb::Credit {
+                transfer_id: Some(1),
+                direction: Some(1),
+                accepted_bytes: Some(16_384),
+                granted_bytes: Some(81_920),
+            })),
+            &mut events,
+        );
+        assert_eq!(owner.input_sent, sent);
+    }
     #[test]
     fn output_limit_is_checked_before_snapshot_allocation() {
         let mut owner = owner(Phase::Running);
@@ -1279,6 +1446,7 @@ mod tests {
             generation: None,
             body: Some(Body::Hello(pb::Hello {
                 local_tool_destination: None,
+                tool_schema_bytes: None,
                 reasoning_disabled: None,
                 supported_capabilities: None,
                 capability_source: None,
@@ -1316,6 +1484,7 @@ mod tests {
             generation: None,
             body: Some(Body::Hello(pb::Hello {
                 local_tool_destination: None,
+                tool_schema_bytes: None,
                 reasoning_disabled: None,
                 supported_capabilities: None,
                 capability_source: None,

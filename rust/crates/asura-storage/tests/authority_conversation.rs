@@ -118,6 +118,7 @@ fn turn() -> TurnAccepted {
         prompt: "hello".into(),
         reserved_output_tokens: 512,
         event_cursor: 1,
+        composition: None,
     }
 }
 fn start() -> Record {
@@ -317,6 +318,63 @@ fn history_must_be_complete_same_conversation_and_ordered() {
     p.prior_operations = vec![id(10)];
     j.append(Record::TurnAccepted(Box::new(p)));
     assert!(inspect(&j.bytes).is_err());
+}
+/// Composed turns (kind 21) round-trip and account for every completed prior turn.
+#[test]
+fn composed_turns_record_budget_and_account_for_omitted_history() {
+    let composed = |shown: Vec<Id>, omitted: u32| {
+        let mut p = turn();
+        p.request = id(20);
+        p.original_conversation = Some(id(8));
+        p.expected_generation = 1;
+        p.generation = 2;
+        p.task = id(21);
+        p.operation = id(22);
+        p.prior_operations = shown;
+        p.digest = request_digest(Request::Submit {
+            project: p.project,
+            conversation: p.original_conversation,
+            expected_generation: 1,
+            prompt: &p.prompt,
+        })
+        .unwrap();
+        p.composition = Some(Composition {
+            omitted_turns: omitted,
+            manifest_digest: [7; 32],
+            composer_revision: 1,
+            window_tokens: 4096,
+            output_reservation: 2048,
+            overhead_tokens: 300,
+            bytes_per_token_milli: 1000,
+        });
+        p
+    };
+    let started = || {
+        let mut j = Journal::started();
+        j.append(Record::TurnTerminal(terminal(
+            TerminalKind::Complete,
+            Cause::None,
+            true,
+        )));
+        j
+    };
+    for (shown, omitted) in [(vec![id(10)], 0), (vec![], 1)] {
+        let p = composed(shown, omitted);
+        let record = Record::TurnAccepted(Box::new(p.clone()));
+        assert_eq!(record.kind(), 21);
+        let mut j = started();
+        j.append(record);
+        let state = inspect(&j.bytes).unwrap();
+        assert_eq!(state.conversations[&id(8)].generation, 2);
+    }
+    for (shown, omitted) in [(vec![id(10)], 1), (vec![], 0), (vec![], 2)] {
+        let mut j = started();
+        j.append(Record::TurnAccepted(Box::new(composed(shown, omitted))));
+        assert!(inspect(&j.bytes).is_err());
+    }
+    let mut legacy = composed(vec![id(10)], 0);
+    legacy.composition = None;
+    assert_eq!(Record::TurnAccepted(Box::new(legacy)).kind(), 5);
 }
 #[test]
 fn malformed_bytes_mixed_versions_and_truncated_frames_reject() {

@@ -11,7 +11,12 @@ public enum HelperError: Error, Sendable, Equatable {
 
 public enum Limits {
     public static let frame = 65_536
-    public static let input = 65_536
+    /// Input streams across fixed frames: at most 65,536 chunks of 16 KiB (1 GiB).
+    public static let input: UInt64 = 65_536 * 16_384
+    /// Sliding input credit window.
+    public static let creditWindow: UInt64 = 65_536
+    public static let historyEntries = 2048
+    public static let toolSchemaBytes: UInt32 = 1_048_576
     public static let output = 61_440
     public static let chunk = 16_384
     public static let cumulativeOutput = 4 * 1024 * 1024
@@ -106,6 +111,8 @@ public enum Wire {
                 if selector.hasPrefix("ollama:") { return ContextCapacitySource.ollama.rawValue }
                 return nil
             }()
+            try check(!v.hasToolSchemaBytes || (!service && !v.inventoryOnly && v.availability == .available
+                && v.toolSchemaBytes <= Limits.toolSchemaBytes))
             try check(!v.hasReportedContextTokens || (!service && !v.inventoryOnly))
             try check(!v.hasContextSource || (!service && !v.inventoryOnly))
             try check(v.hasReportedContextTokens == v.hasContextSource)
@@ -174,7 +181,7 @@ public enum Wire {
                     && v.reason == .modelUnavailable)
             }
         case .begin(let v):
-            try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...65_536).contains(v.inputBytes)
+            try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...Limits.input).contains(v.inputBytes)
                 && (!v.hasDeadlineRemainingMs || (1...60_000).contains(v.deadlineRemainingMs))
                 && v.hasMaxResponseTokens && (1...2048).contains(v.maxResponseTokens))
         case .chunk(let v):
@@ -185,10 +192,11 @@ public enum Wire {
         case .credit(let v):
             try check(v.hasTransferID && v.hasDirection && transfer(v.transferID, v.direction)
                 && v.direction == (service ? .output : .input) && v.hasAcceptedBytes && v.hasGrantedBytes
-                && v.acceptedBytes <= (service ? 61_440 : 65_536) && v.grantedBytes >= v.acceptedBytes
-                && v.grantedBytes - v.acceptedBytes <= 65_536)
+                && v.acceptedBytes <= (service ? 61_440 : Limits.input) && v.grantedBytes >= v.acceptedBytes
+                && v.grantedBytes - v.acceptedBytes <= Limits.creditWindow)
         case .inputEnd(let v):
-            try check(service && v.hasCount && v.count > 0 && v.hasTotalBytes && counts(v.count, v.totalBytes, 65_536))
+            try check(service && v.hasCount && v.count > 0 && v.count <= 65_536 && v.hasTotalBytes
+                && counts(v.count, v.totalBytes, Limits.input))
         case .ready: try check(!service)
         case .start: try check(service)
         case .cancel(let v): try check(service && v.hasReason && (1...4).contains(v.reason.rawValue))
@@ -234,10 +242,11 @@ public enum Wire {
     }
 
     public static func input(_ data: Data) throws -> ModelInput {
-        guard data.count <= Limits.input else { throw HelperError.limit }
+        guard UInt64(data.count) <= Limits.input else { throw HelperError.limit }
         let value = try ModelInput(serializedBytes: data)
+        // The prompt field carries the service's context block; only the total bounds it.
         guard value.unknownFields.data.isEmpty, value.hasInstructions, value.hasPrompt,
-            !value.prompt.isEmpty, value.prompt.utf8.count <= 32_768, value.history.count <= 32,
+            !value.prompt.isEmpty, value.history.count <= Limits.historyEntries,
             try value.serializedData() == data else { throw HelperError.protocolFault }
         var bytes = value.instructions.utf8.count + value.prompt.utf8.count
         for turn in value.history {
@@ -245,7 +254,7 @@ public enum Wire {
                 turn.role == .user || turn.role == .assistant else { throw HelperError.protocolFault }
             bytes += turn.text.utf8.count
         }
-        guard bytes <= Limits.input else { throw HelperError.limit }
+        guard UInt64(bytes) <= Limits.input else { throw HelperError.limit }
         return value
     }
 

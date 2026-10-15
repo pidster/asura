@@ -142,6 +142,8 @@ fn tables(
                 (".asura.control.v1.SensorsReply", "observations") => 16,
                 (".asura.control.v1.AuditReply", "entries") => 16,
                 (".asura.control.v1.SensorsReply", "proposals") => 8,
+                // Two entries per shown turn; the context composer bounds segments.
+                (".asura.model.v1.ModelInput", "history") => 2048,
                 _ => 32,
             };
             result.push_str(&format!(

@@ -4,10 +4,7 @@ mod memory_create;
 mod memory_tools;
 use crate::model_owner::{ModelOwner, PackageIdentity};
 use crate::{sensors, tools};
-use asura_control::{
-    model::{self, pb as mp},
-    pb,
-};
+use asura_control::{model::pb as mp, pb};
 use asura_platform::RuntimeDirectory;
 use asura_storage::authority::{conversation as journal, writer};
 use asura_storage::sensors as sensor_record;
@@ -466,6 +463,8 @@ struct Active {
     request: Option<pb::Envelope>,
     turn: journal::TurnAccepted,
     input: Vec<u8>,
+    /// Prior turns for the composer; consumed when the model reports its window.
+    candidates: Vec<crate::context::Candidate>,
     model: ModelOwner,
     accepted: bool,
     ready: bool,
@@ -588,6 +587,7 @@ pub(crate) struct Owner {
     started: bool,
     automatic_initialization: AutomaticInitialization,
     model_context: VecDeque<(journal::Id, pb::ModelContext)>,
+    calibration: crate::context::Calibration,
     measurements: VecDeque<(journal::Id, TurnMeasurements)>,
     hold_reasons: BTreeMap<journal::Id, &'static str>,
     wake: Option<asura_platform::events::WakeSender>,
@@ -626,6 +626,7 @@ impl Owner {
             started: false,
             automatic_initialization: AutomaticInitialization::NotAttempted,
             model_context: VecDeque::new(),
+            calibration: Default::default(),
             measurements: VecDeque::new(),
             hold_reasons: BTreeMap::new(),
             wake: None,
@@ -1823,32 +1824,19 @@ impl Owner {
             .as_ref()
             .map(|v| v.as_slice().try_into().unwrap());
         let prompt = value.prompt.clone().unwrap();
-        let mut history = Vec::new();
-        let mut prior_operations = Vec::new();
-        for (prior, terminal) in prepared.history {
-            prior_operations.push(prior.operation);
-            history.push(mp::HistoryTurn {
-                role: Some(1),
-                text: Some(prior.prompt),
-            });
-            history.push(mp::HistoryTurn {
-                role: Some(2),
-                text: Some(terminal.text),
-            });
-        }
+        // The composer runs when the model reports its window (context-composer.md).
+        let candidates = prepared
+            .history
+            .into_iter()
+            .map(|(prior, terminal)| crate::context::Candidate {
+                operation: prior.operation,
+                generation: prior.generation,
+                prompt: prior.prompt,
+                answer: terminal.text,
+            })
+            .collect();
         let tools_enabled =
             ENABLE_PROJECT_TOOLS && crate::model::project_tools_allowed(&prepared.model);
-        let instructions = if tools_enabled {
-            TOOL_INSTRUCTIONS
-        } else {
-            INSTRUCTIONS
-        };
-        let input = model::encode_input(&mp::ModelInput {
-            instructions: Some(instructions.into()),
-            history,
-            prompt: Some(prompt.clone()),
-        })
-        .map_err(|_| "context_limit")?;
         let turn = journal::TurnAccepted {
             request: id(&value.request_id),
             digest: journal::request_digest(journal::Request::Submit {
@@ -1871,12 +1859,14 @@ impl Owner {
             operation: asura_platform::random_id(),
             model: prepared.model,
             configuration_digest: prepared.configuration_digest,
-            instructions_digest: Sha256::digest(instructions.as_bytes()).into(),
-            input_digest: Sha256::digest(&input).into(),
-            prior_operations,
+            // Bound by composition before acceptance.
+            instructions_digest: [0; 32],
+            input_digest: [0; 32],
+            prior_operations: Vec::new(),
             prompt,
             reserved_output_tokens: journal::OUTPUT_RESERVATION,
             event_cursor: 1,
+            composition: None,
         };
         let mut model = ModelOwner::new(
             self.runtime.clone(),
@@ -1900,7 +1890,8 @@ impl Owner {
             queue_input: None,
             request,
             turn,
-            input,
+            input: Vec::new(),
+            candidates,
             model,
             accepted: false,
             ready: false,
@@ -2810,6 +2801,7 @@ impl Owner {
                     context_source,
                     model_name,
                     tools_available,
+                    tool_schema_bytes,
                     capabilities,
                 } => {
                     active.cursor += 1;
@@ -2833,36 +2825,49 @@ impl Owner {
                     tracing::debug!(supported = ?active.capabilities.supported,
                         source = ?active.capabilities.source, activation = ?active.activation,
                         "model capabilities negotiated");
-                    // Capability negotiation occurs before durable acceptance. Keep
-                    // the accepted instructions and input digests equal to what runs.
-                    if !active.tools_enabled {
-                        match model::decode_input(&active.input) {
-                            Ok(mut input) => {
-                                input.instructions = Some(INSTRUCTIONS.into());
-                                match model::encode_input(&input) {
-                                    Ok(bytes) => {
-                                        active.input = bytes;
-                                        active.turn.instructions_digest =
-                                            Sha256::digest(INSTRUCTIONS.as_bytes()).into();
-                                        active.turn.input_digest =
-                                            Sha256::digest(&active.input).into();
-                                    }
-                                    Err(_) => {
-                                        Self::failed(active, "model_input_invalid", now);
-                                        continue;
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                Self::failed(active, "model_input_invalid", now);
-                                continue;
-                            }
-                        }
-                    }
-                    if context_tokens <= active.turn.reserved_output_tokens {
-                        Self::failed(active, "context_limit", now);
+                    // Compose against the window the helper reported, before durable
+                    // acceptance, so the accepted digests equal what runs.
+                    let instructions = if active.tools_enabled {
+                        TOOL_INSTRUCTIONS
                     } else {
-                        active.ready = true;
+                        INSTRUCTIONS
+                    };
+                    let budget = crate::context::Budget {
+                        window_tokens: context_tokens,
+                        output_reservation: active.turn.reserved_output_tokens,
+                        overhead_tokens: if active.tools_enabled {
+                            tool_schema_bytes
+                        } else {
+                            0
+                        },
+                        bytes_per_token_milli: self.calibration.milli(&active.turn.model).0,
+                    };
+                    let candidates = std::mem::take(&mut active.candidates);
+                    match crate::context::compose(
+                        instructions,
+                        &active.turn.prompt,
+                        &candidates,
+                        budget,
+                    ) {
+                        Ok(composed) => {
+                            active.turn.instructions_digest =
+                                Sha256::digest(instructions.as_bytes()).into();
+                            active.turn.input_digest = Sha256::digest(&composed.input).into();
+                            active.turn.composition = Some(composed.composition(budget));
+                            active.turn.prior_operations = composed.shown;
+                            active.input = composed.input;
+                            active.ready = true;
+                        }
+                        Err(crate::context::Error::ContextLimit {
+                            mandatory_bytes,
+                            budget_bytes,
+                        }) => {
+                            tracing::warn!(mandatory_bytes, budget_bytes, "context_limit");
+                            Self::failed(active, "context_limit", now);
+                        }
+                        Err(crate::context::Error::Invalid) => {
+                            Self::failed(active, "model_input_invalid", now);
+                        }
                     }
                 }
                 ModelEvent::InferenceUsage(value) => {
@@ -2883,6 +2888,8 @@ impl Owner {
                         context.basis = Some(1);
                         active.cursor += 1;
                     }
+                    self.calibration
+                        .record(&active.turn.model, active.input.len(), input_tokens);
                 }
                 ModelEvent::Ready => active.ready = true,
                 ModelEvent::Snapshot { revision, text } => {
@@ -2989,6 +2996,11 @@ impl Owner {
                     reason,
                     usage_tokens,
                 } => {
+                    // The helper's own count rejected the input: the learned bound was
+                    // wrong for this model, so it returns to the fallback.
+                    if reason == mp::Reason::ContextLimit as i32 {
+                        self.calibration.reset(&active.turn.model);
+                    }
                     Self::helper_terminal(active, outcome, reason, usage_tokens);
                 }
                 ModelEvent::Inventory { .. } => Self::failed(active, "model_protocol_fault", now),

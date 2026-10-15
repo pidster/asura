@@ -617,7 +617,12 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.bytes(&p.configuration_digest);
             w.bytes(&p.instructions_digest);
             w.bytes(&p.input_digest);
-            if p.prior_operations.len() > 32 {
+            let limit = if p.composition.is_some() {
+                MAX_COMPOSED_PRIOR
+            } else {
+                32
+            };
+            if p.prior_operations.len() > limit {
                 return Err(ReplayError::Limit);
             }
             w.bytes(&(p.prior_operations.len() as u16).to_be_bytes());
@@ -627,6 +632,15 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.string(&p.prompt, MAX_PROMPT)?;
             w.u32(p.reserved_output_tokens);
             w.u64(p.event_cursor);
+            if let Some(c) = &p.composition {
+                w.u32(c.omitted_turns);
+                w.bytes(&c.manifest_digest);
+                w.u32(c.composer_revision);
+                w.u32(c.window_tokens);
+                w.u32(c.output_reservation);
+                w.u32(c.overhead_tokens);
+                w.u32(c.bytes_per_token_milli);
+            }
         }
         Record::StartAuthorized(p) => {
             w.bytes(&p.operation);
@@ -847,7 +861,8 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             requested_name: r.string(128)?,
             name: r.string(128)?,
         }),
-        5 => {
+        5 | 21 => {
+            let composed = kind == 21;
             let request = r.array()?;
             let digest = r.array()?;
             let project = r.array()?;
@@ -862,13 +877,29 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             let instructions_digest = r.array()?;
             let input_digest = r.array()?;
             let count = u16::from_be_bytes(r.array()?) as usize;
-            if count > 32 {
+            if count > if composed { MAX_COMPOSED_PRIOR } else { 32 } {
                 return Err(ReplayError::Limit);
             }
             let mut prior_operations = Vec::with_capacity(count);
             for _ in 0..count {
                 prior_operations.push(r.array()?);
             }
+            let prompt = r.string(MAX_PROMPT)?;
+            let reserved_output_tokens = r.u32()?;
+            let event_cursor = r.u64()?;
+            let composition = if composed {
+                Some(Composition {
+                    omitted_turns: r.u32()?,
+                    manifest_digest: r.array()?,
+                    composer_revision: r.u32()?,
+                    window_tokens: r.u32()?,
+                    output_reservation: r.u32()?,
+                    overhead_tokens: r.u32()?,
+                    bytes_per_token_milli: r.u32()?,
+                })
+            } else {
+                None
+            };
             Record::TurnAccepted(Box::new(TurnAccepted {
                 request,
                 digest,
@@ -884,9 +915,10 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 instructions_digest,
                 input_digest,
                 prior_operations,
-                prompt: r.string(MAX_PROMPT)?,
-                reserved_output_tokens: r.u32()?,
-                event_cursor: r.u64()?,
+                prompt,
+                reserved_output_tokens,
+                event_cursor,
+                composition,
             }))
         }
         6 => Record::StartAuthorized(StartAuthorized {

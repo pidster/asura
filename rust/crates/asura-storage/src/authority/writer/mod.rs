@@ -163,6 +163,7 @@ pub struct Prepared {
     pub ollama_endpoint: Option<String>,
     pub model_capabilities: Option<u32>,
     pub configuration_digest: Hash,
+    /// Every completed prior turn of the conversation, newest first.
     pub history: Vec<(TurnAccepted, TurnTerminal)>,
 }
 #[derive(Debug)]

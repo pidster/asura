@@ -30,6 +30,7 @@ fn hello(service: bool) -> pb::Envelope {
         context_tokens: (!service).then_some(4096),
         reported_context_tokens: (!service).then_some(4096),
         context_source: (!service).then_some(1),
+        tool_schema_bytes: None,
         reason: Some(0),
     }))
 }
@@ -250,7 +251,7 @@ fn input_unicode_repeated_history_presence_and_byte_bounds() {
                 role: Some(1),
                 text: Some("世界".into())
             };
-            32
+            MAX_HISTORY_ENTRIES
         ],
         prompt: Some("question".into()),
     };
@@ -259,19 +260,104 @@ fn input_unicode_repeated_history_presence_and_byte_bounds() {
     input.history.push(input.history[0].clone());
     assert!(encode_input(&input).is_err());
     assert!(decode_input(&input.encode_to_vec()).is_err());
+    // The former 32 KiB prompt and 64 KiB input bounds no longer apply.
     input.history.clear();
     input.prompt = Some("x".repeat(32769));
+    input.instructions = Some("x".repeat(65536));
+    let bytes = encode_input(&input).unwrap();
+    assert!(bytes.len() > 65536);
+    assert_eq!(decode_input(&bytes).unwrap(), input);
+    input.prompt = Some(String::new());
     assert!(encode_input(&input).is_err());
-    input.prompt = Some("x".repeat(32768));
-    input.instructions = Some("x".repeat(32768));
-    assert!(encode_input(&input).is_err()); // encoded total, even when decoded text fits
+    input.prompt = Some("x".into());
     input.instructions = None;
     assert!(encode_input(&input).is_err());
     input.instructions = Some(String::new());
-    input.prompt = Some("x".into());
     let mut bytes = input.encode_to_vec();
     bytes.extend_from_slice(&[0x0a, 0]);
     assert!(decode_input(&bytes).is_err());
+}
+/// CC-U18 at the stateless layer: `Begin` may announce up to 1 GiB; credit stays a
+/// sliding 64 KiB window over input up to that size.
+#[test]
+fn input_transfer_bounds_follow_chunk_count_not_a_content_limit() {
+    let begin = |bytes: u64| {
+        envelope(Body::Begin(pb::Begin {
+            model: Some("system".into()),
+            input_bytes: Some(bytes),
+            max_response_tokens: Some(2048),
+            ..Default::default()
+        }))
+    };
+    for bytes in [1, 65_537, MAX_INPUT_BYTES] {
+        assert!(
+            encode_frame(&begin(bytes), Direction::ServiceToHelper).is_ok(),
+            "{bytes}"
+        );
+    }
+    for bytes in [0, MAX_INPUT_BYTES + 1] {
+        assert!(
+            encode_frame(&begin(bytes), Direction::ServiceToHelper).is_err(),
+            "{bytes}"
+        );
+    }
+    let credit = |accepted: u64, granted: u64| {
+        envelope(Body::Credit(pb::Credit {
+            transfer_id: Some(1),
+            direction: Some(1),
+            accepted_bytes: Some(accepted),
+            granted_bytes: Some(granted),
+        }))
+    };
+    assert!(
+        encode_frame(
+            &credit(1 << 20, (1 << 20) + 65_536),
+            Direction::HelperToService
+        )
+        .is_ok()
+    );
+    assert!(
+        encode_frame(
+            &credit(1 << 20, (1 << 20) + 65_537),
+            Direction::HelperToService
+        )
+        .is_err()
+    );
+    let end = |count: u64, total: u64| {
+        envelope(Body::InputEnd(pb::InputEnd {
+            count: Some(count),
+            total_bytes: Some(total),
+        }))
+    };
+    assert!(encode_frame(&end(65, 1 << 20), Direction::ServiceToHelper).is_ok());
+    assert!(
+        encode_frame(
+            &end(MAX_INPUT_CHUNKS + 1, MAX_INPUT_BYTES),
+            Direction::ServiceToHelper
+        )
+        .is_err()
+    );
+}
+/// The helper's tool schema size is a helper-only, available-model field.
+#[test]
+fn tool_schema_bytes_only_from_an_available_helper() {
+    let with = |service: bool, bytes: u32| {
+        let mut message = hello(service);
+        let Some(Body::Hello(value)) = message.body.as_mut() else {
+            panic!()
+        };
+        value.tool_schema_bytes = Some(bytes);
+        message
+    };
+    assert!(encode_frame(&with(false, 4096), Direction::HelperToService).is_ok());
+    assert!(
+        encode_frame(
+            &with(false, MAX_TOOL_SCHEMA_BYTES + 1),
+            Direction::HelperToService
+        )
+        .is_err()
+    );
+    assert!(encode_frame(&with(true, 4096), Direction::ServiceToHelper).is_err());
 }
 #[test]
 fn nested_unknown_fields_and_limits_reject() {
@@ -707,36 +793,44 @@ fn export_cross_language_fixtures() {
         true,
         input.encode_to_vec(),
     );
-    let mut oversized = input.clone();
-    oversized.prompt.as_mut().unwrap().push('x');
+    // The context block shares the prompt field, so only the total input bounds it.
+    let mut larger = input.clone();
+    larger.prompt.as_mut().unwrap().push('x');
     write(
-        "invalid_input_prompt_overflow.pb",
+        "input_prompt_above_person_limit.pb",
         "input",
-        false,
-        oversized.encode_to_vec(),
+        true,
+        larger.encode_to_vec(),
     );
-    let mut oversized = input.clone();
-    oversized.instructions = Some("x".repeat(32768));
+    let mut larger = input.clone();
+    larger.instructions = Some("x".repeat(32768));
     write(
-        "invalid_input_encoded_overflow.pb",
+        "input_above_former_64k.pb",
         "input",
-        false,
-        oversized.encode_to_vec(),
+        true,
+        larger.encode_to_vec(),
     );
-    let mut excessive = input;
-    excessive.prompt = Some("x".into());
-    excessive.history = vec![
+    let mut history = input;
+    history.prompt = Some("x".into());
+    history.history = vec![
         pb::HistoryTurn {
             role: Some(1),
             text: Some(String::new())
         };
-        33
+        MAX_HISTORY_ENTRIES
     ];
     write(
-        "invalid_input_history_33.pb",
+        "input_history_2048.pb",
+        "input",
+        true,
+        history.encode_to_vec(),
+    );
+    history.history.push(history.history[0].clone());
+    write(
+        "invalid_input_history_2049.pb",
         "input",
         false,
-        excessive.encode_to_vec(),
+        history.encode_to_vec(),
     );
     let mut nested = pb::ModelInput {
         instructions: Some(String::new()),

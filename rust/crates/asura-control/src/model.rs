@@ -10,7 +10,15 @@ pub mod pb {
 include!(concat!(env!("OUT_DIR"), "/model-validation.rs"));
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_CHUNK_BYTES: usize = 16_384;
-pub const MAX_INPUT_BYTES: usize = 65_536;
+/// Input streams across fixed frames; at most 65,536 chunks of 16 KiB (1 GiB).
+pub const MAX_INPUT_CHUNKS: u64 = 65_536;
+pub const MAX_INPUT_BYTES: u64 = MAX_INPUT_CHUNKS * MAX_CHUNK_BYTES as u64;
+/// History entries: two per shown turn, bounded by the composer's segment limit.
+pub const MAX_HISTORY_ENTRIES: usize = 2048;
+/// Bound on the helper's reported tool definition size.
+pub const MAX_TOOL_SCHEMA_BYTES: u32 = 1024 * 1024;
+/// Credit window for one direction; a sliding window for input.
+pub const CREDIT_WINDOW: u64 = 65_536;
 const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = 60 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,6 +248,12 @@ pub fn validate_semantics(
                             .as_deref()
                             .is_some_and(|model| model.starts_with("mlx:"))
                 })
+                && v.tool_schema_bytes.is_none_or(|bytes| {
+                    !service
+                        && v.inventory_only != Some(true)
+                        && v.availability == Some(1)
+                        && bytes <= MAX_TOOL_SCHEMA_BYTES
+                })
                 && v.local_tool_destination.is_none_or(|local| {
                     !service && v.inventory_only != Some(true) && v.availability == Some(1) && local
                 })
@@ -344,7 +358,7 @@ pub fn validate_semantics(
         }
         Body::Begin(v) => {
             v.model.as_deref().is_some_and(selector)
-                && positive(v.input_bytes, MAX_INPUT_BYTES as u64)
+                && positive(v.input_bytes, MAX_INPUT_BYTES)
                 && v.deadline_remaining_ms
                     .is_none_or(|n| (1..=60_000).contains(&n))
                 && v.max_response_tokens
@@ -356,7 +370,7 @@ pub fn validate_semantics(
                     .as_ref()
                     .is_some_and(|b| !b.is_empty() && b.len() <= MAX_CHUNK_BYTES)
                 && if v.direction == Some(1) {
-                    v.revision == Some(0) && v.ordinal.is_some_and(|n| n < MAX_INPUT_BYTES as u64)
+                    v.revision == Some(0) && v.ordinal.is_some_and(|n| n < MAX_INPUT_CHUNKS)
                 } else {
                     positive(v.revision, 1024) && v.ordinal.is_some_and(|n| n < MAX_SNAPSHOT_BYTES)
                 }
@@ -364,11 +378,11 @@ pub fn validate_semantics(
         Body::Credit(v) => {
             transfer(v.transfer_id, v.direction)
                 && v.direction == Some(if service { 2 } else { 1 })
-                && matches!((v.accepted_bytes,v.granted_bytes), (Some(a),Some(g)) if a <= if service { MAX_SNAPSHOT_BYTES } else { MAX_INPUT_BYTES as u64 } && g >= a && g - a <= 65_536)
+                && matches!((v.accepted_bytes,v.granted_bytes), (Some(a),Some(g)) if a <= if service { MAX_SNAPSHOT_BYTES } else { MAX_INPUT_BYTES } && g >= a && g - a <= CREDIT_WINDOW)
         }
         Body::InputEnd(v) => {
-            positive(v.count, MAX_INPUT_BYTES as u64)
-                && count_bytes(v.count, v.total_bytes, MAX_INPUT_BYTES as u64)
+            positive(v.count, MAX_INPUT_CHUNKS)
+                && count_bytes(v.count, v.total_bytes, MAX_INPUT_BYTES)
         }
         Body::Ready(_) | Body::Start(_) => true,
         Body::Cancel(v) => v.reason.is_some_and(|n| (1..=4).contains(&n)),
@@ -462,13 +476,13 @@ pub fn validate_semantics(
 pub fn encode_input(input: &pb::ModelInput) -> Result<Vec<u8>, ProtocolError> {
     validate_input(input)?;
     let bytes = input.encode_to_vec();
-    if bytes.len() > MAX_INPUT_BYTES {
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(ProtocolError::InvalidLength);
     }
     Ok(bytes)
 }
 pub fn decode_input(bytes: &[u8]) -> Result<pb::ModelInput, ProtocolError> {
-    if bytes.is_empty() || bytes.len() > MAX_INPUT_BYTES {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(ProtocolError::InvalidLength);
     }
     scan(bytes, INPUT, 1, TABLES)?;
@@ -488,7 +502,9 @@ pub fn validate_input(input: &pb::ModelInput) -> Result<(), ProtocolError> {
         .prompt
         .as_ref()
         .ok_or(ProtocolError::InvalidSemantics)?;
-    if prompt.is_empty() || prompt.len() > 32 * 1024 || input.history.len() > 32 {
+    // The prompt field carries the context block before the person's text, so only
+    // the total input bounds it; the journal bounds the person's own text.
+    if prompt.is_empty() || input.history.len() > MAX_HISTORY_ENTRIES {
         return Err(ProtocolError::InvalidSemantics);
     }
     let mut bytes = instructions
@@ -504,7 +520,7 @@ pub fn validate_input(input: &pb::ModelInput) -> Result<(), ProtocolError> {
             .checked_add(text.len())
             .ok_or(ProtocolError::InvalidLength)?;
     }
-    if bytes > MAX_INPUT_BYTES || input.encoded_len() > MAX_INPUT_BYTES {
+    if bytes as u64 > MAX_INPUT_BYTES || input.encoded_len() as u64 > MAX_INPUT_BYTES {
         Err(ProtocolError::InvalidLength)
     } else {
         Ok(())

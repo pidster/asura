@@ -147,6 +147,21 @@ pub struct TurnAccepted {
     pub prompt: String,
     pub reserved_output_tokens: u32,
     pub event_cursor: u64,
+    /// Present for turns the context composer built; encoded as record kind 21.
+    pub composition: Option<Composition>,
+}
+/// Shown prior turns of a composed turn; `prior_operations` lists them.
+pub const MAX_COMPOSED_PRIOR: usize = 1024;
+/// The context composer's record of one turn-start composition (N1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Composition {
+    pub omitted_turns: u32,
+    pub manifest_digest: Hash,
+    pub composer_revision: u32,
+    pub window_tokens: u32,
+    pub output_reservation: u32,
+    pub overhead_tokens: u32,
+    pub bytes_per_token_milli: u32,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartAuthorized {
@@ -224,6 +239,7 @@ impl Record {
             Self::ActiveBinding(_) => 11,
             Self::OwnerGeneration => 3,
             Self::ProjectRegistered(_) => 4,
+            Self::TurnAccepted(p) if p.composition.is_some() => 21,
             Self::TurnAccepted(_) => 5,
             Self::StartAuthorized(_) => 6,
             Self::CancelRequested(_) => 7,

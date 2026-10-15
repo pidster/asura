@@ -1,14 +1,15 @@
 # Context composer
 
-Status: selected design, 2026-10-14. The owner resolved decisions D1–D10 on
-2026-10-14; they are recorded in [owner decisions](#owner-decisions) with the
-mechanism each one selects. Slice **CC1** is ready for implementation. CC2 waits
+Status: selected design, 2026-10-14; slice **CC1 implemented 2026-10-15**. The
+owner resolved decisions D1–D10 and N1; they are recorded in
+[owner decisions](#owner-decisions) with the mechanism each one selects. CC2 waits
 for tool job packets J1 and J3, CC3 for J5, CC4 for
 [loop closure](loop-closure.md#decisions) decision 6, and CC5 for a memory
-selection design; see [delivery](#dependencies-and-delivery). Nothing in this
-document is implemented. Values marked "proposed" in tables are engineering
-choices made under the decisions and remain open to measured revision.
-Protocol numbering remains `0.1`; journal format remains `1`.
+selection design; see [delivery](#dependencies-and-delivery).
+[CC1 implementation details](#cc1-implementation-details) record what code
+inspection added. Values marked "proposed" in tables are engineering choices
+made under the decisions and remain open to measured revision. Protocol
+numbering remains `0.1`; journal format remains `1`.
 
 ## Purpose and scope
 
@@ -122,7 +123,7 @@ because this design must stay consistent with them, not because they are decided
 | CCR24 | The execution rules AE-01 to AE-07 apply, including startup, cancellation and shutdown. | [Engineering](../engineering.md#asynchronous-execution-and-recovery); ADR-0006 |
 | CCR25 | Protocol stays `0.1` and journal format stays `1`. Schemas may evolve within those numbers. | [Engineering](../engineering.md#wire-protocol-change-authority) |
 | CCR26 | No fixed time limit ends work as a closure. Bounds on Asura's own operations, such as the 2-second page read storage step, are wind-down bounds and are recorded separately from closures. | Tool job controller [job closures and wind-down bounds](tool-job-controller.md#job-closures-and-wind-down-bounds), lines 443-470; J2a-1, owner 2026-10-14 |
-| CCR27 | Job tools record results with a reference-only result kind; legacy tools keep kind 15 for now. J1 is retention item 3 (capture, descriptors, text pages); graph projection is deferred. One page-read worker of two is reserved for the model. | Tool job controller R3, G1, R4, J2a-2 (lines 62-86); [retention packet](result-retention-graph-packet.md) line 162; owner 2026-10-14 |
+| CCR27 | Job tools record results with a reference-only result kind. There are no legacy tools: every tool runs as a job (threat model EX4, owner 2026-10-15, superseding R3's "legacy tools keep kind 15 for now"). J1 is retention item 3 (capture, descriptors, text pages); graph projection is deferred. One page-read worker of two is reserved for the model. | Tool job controller R3, G1, R4, J2a-2 (lines 62-86); [retention packet](result-retention-graph-packet.md) line 162; owner 2026-10-14 and 2026-10-15 |
 
 Proposed sources this design must stay consistent with, not decisions:
 
@@ -148,7 +149,7 @@ mechanism this design applies for it. The sections below give the detail.
 | D2 | Bytes per token are learned per model from measured input tokens (context telemetry), with a safety margin. An unmeasured model uses 1 token per byte. | [Token conversion](#token-conversion) |
 | D3 | The output reservation is a per-model value in the capacity record, defaulting to `min(maximum output, window ÷ 4)`. Keep 2,048 until the capacity record exists. | `R` in the [budget](#per-request-budget-algorithm) |
 | D4 | Stage B (the service owns the request loop and recomposes per request) is the target; stage A (view sizing at the tool callback) comes first. | [Recomposition during tool loops](#recomposition-during-tool-loops). Stage B implies loop closure decision 6, which remains formally open. |
-| D5 | The manifest is a payload object with its digest in the journal. Before J1, `TurnAccepted` carries only the manifest digest and the composer revision. | [Composition manifest](#composition-manifest) |
+| D5 | The manifest is a payload object with its digest in the journal. Before J1, `TurnAccepted` carries the manifest digest and the composer revision, and, under N1, the budget inputs. | [Composition manifest](#composition-manifest) |
 | D6 | History is reduced by mechanical fidelity levels (full, reference, omitted), newest first. Model-written summaries need a separate design. | [Segments and fidelity](#segments-and-fidelity) |
 | D7 | "Match the window to the size the model can handle." The input limit is the model's window from its capacity record, converted to bytes by D2. Input streams across fixed 64 KiB frames (tool output views rule 4). The schema and helper change stays within protocol `0.1`. Built in CC1. | `W` in the [budget](#per-request-budget-algorithm); [streamed input transfer](#streamed-input-transfer) |
 | D8 | Excerpts are outcome-based: on failure, the `stderr` tail first; on success, the `stdout` head and tail. The rule table is tested. | [Excerpt shape](#excerpt-shape) |
@@ -328,7 +329,12 @@ Steps:
    Give each a reference segment while budget remains. The first candidate that
    does not fit, and every older one, join one omitted range.
 5. **Pass 2, upgrades.** Walk the referenced candidates in the same order. Upgrade
-   a history turn to full when its full size fits. For tool output, split the
+   a history turn to full when its full size fits. If it does not fit, the oldest
+   shown turns join the omitted range, one at a time, until it fits or no older
+   shown turn remains; a turn newer than the one being upgraded is never
+   displaced (refined 2026-10-15 during CC1, so the newest turns appear in full
+   under a small window, as CC-U3 requires). A turn whose full text is shorter
+   than its reference line is shown full from pass 1. For tool output, split the
    remaining budget equally among the outstanding views of the same turn. A view
    whose share is below the excerpt floor stays a reference.
 6. **Choose excerpt shape** under D8.
@@ -363,7 +369,7 @@ flowchart TD
     P1Fit -->|"No, or none left"| Omit["Older candidates join<br/>one omitted range"]
     Omit --> P2["Pass 2: next candidate,<br/>newest first"]
     P2 --> Kind{"Candidate kind?"}
-    Kind -->|History turn| Full["Full if whole turn fits,<br/>else keep reference"]
+    Kind -->|History turn| Full["Full if it fits after the oldest<br/>shown turns join the omitted range;<br/>else keep reference"]
     Kind -->|Tool output view| Floor{"View share at least<br/>excerpt floor?"}
     Floor -->|No| Keep["Keep reference"]
     Floor -->|Yes| Shape["Excerpt shape from<br/>outcome (D8)"]
@@ -759,9 +765,65 @@ removed, an Ollama model's window in CC1 is at most 8,192 tokens.
 | Loop closure decision 6 | Stage B | Needed by CC4; formally open |
 | Memory selection design | Evidence and memory segments | Needed by CC5 |
 
+### CC1 implementation details
+
+Selected 2026-10-15 when CC1 implementation began. Code inspection found that the
+slice text above left these points open; they are engineering choices under the
+decisions, except item 8, which the owner selected.
+
+1. **Candidates.** `Prepare` returns every completed prior turn of the
+   conversation, newest first, with its accepted prompt and terminal text. `W` is
+   known only after Hello, so the writer applies no turn-count or byte rule. The
+   journal's fixed 8 MiB capacity (L30) bounds the total text.
+2. **Composition point.** `prepared` builds the turn without input. The
+   composer runs when the helper's Hello reports the model available
+   (`ModelEvent::Available`), before `TurnAccepted` is appended. This replaces
+   the existing re-encode of the instructions there.
+3. **Fence.** Operation, generation, project identity, configuration digest and
+   the tools-enabled state. No separate policy revision exists in code; a
+   configuration change is the policy change (CC-I9).
+4. **Tool overhead `S`.** The helper's Hello gains `tool_schema_bytes` (field
+   22): the UTF-8 byte total of the names, descriptions and argument schema text
+   of the project tools the helper would declare. The service uses it when tools
+   are enabled for the turn, and 0 otherwise, at one token per byte. CC-I13 checks
+   both sides agree.
+5. **Context block and wire bounds.** The block is the leading part of the
+   `ModelInput.prompt` field. The wire check bounds the prompt field only by the
+   total input. The 32 KiB `MAX_PROMPT` bound stays on `TurnAccepted.prompt`,
+   the person's own text. History entries are at most 2,048 (two per shown turn),
+   which replaces the 32-entry check.
+6. **Turn record.** A new record kind 21, `TurnAcceptedV2`, is the next free kind
+   in delivery order (job controller R3). It carries every `TurnAccepted` field
+   plus `omitted_turns` (u32), `manifest_digest`, `composer_revision` (u32) and the
+   N1 budget inputs `window_tokens`, `output_reservation`, `overhead_tokens` and
+   `bytes_per_token_milli` (u32 each). Its `prior_operations` lists the shown prior
+   turns (full or reference), at most 1,024, in generation order. Replay accepts
+   both kinds; new turns write kind 21. Replay requires the shown operations to be
+   completed turns of the conversation in increasing generation, and the shown
+   count plus `omitted_turns` to equal the conversation's completed prior turns.
+7. **Manifest digest.** SHA-256 over a deterministic binary encoding owned by the
+   `context` module: format byte, composer revision, budget fields, then each
+   segment (kind, role, fidelity, source identity, source digest, byte length,
+   content digest), then each omission range. The composer revision versions the
+   encoding.
+8. **Input stall bound (owner, 2026-10-15).** The helper's existing 5-second
+   input-phase bound restarts after each accepted chunk. It ends only a transfer
+   that makes no progress, as a wind-down bound on a stalled peer; a large input
+   never fails for its size.
+9. **Transfer bounds.** The stateless wire check allows `Begin.input_bytes` up to
+   1 GiB (65,536 chunks of 16 KiB). The helper and the model owner also require it
+   to be at most the effective capacity times 8 bytes. Input credit acceptance is
+   bounded by the `Begin` size, and `InputEnd` must equal it.
+10. **Calibration key.** The configured model selector (`TurnAccepted.model`).
+11. **Package assembly.** The schema change regenerates Swift with the locked
+    `protoc` 36.2 and `protoc-gen-swift` 1.38.1, regenerates `BuildIdentity`
+    (schema digest is the SHA-256 of `model.proto`), rebuilds `asura-model` and
+    updates `.build/model-tools/package-identity.txt`, as
+    [platform capabilities](platform-capabilities.md) describes.
+
 ### Slices
 
-**CC1, ready: turn-start composition and window-sized input.**
+**CC1, implemented 2026-10-15: turn-start composition and window-sized input.**
 - The `context` module with the pure core, D6 fidelity and the context block.
 - The writer's `Prepare` returns candidates; the 32-turn and 64 KiB rules go.
 - Calibration (D2) with the 1-byte fallback.
@@ -899,8 +961,25 @@ after CC1 and CC2, per provider. Mock success does not establish quality (CCR19)
 ## Design verification
 
 All seven Mermaid diagrams were rendered locally with Mermaid CLI 12.0.0 and
-visually inspected on 2026-10-14. CC-F1 is a tall single column; it reads at
-normal width without zooming. Rendering does not validate the semantics.
-No code or tests were written or run for this design.
+visually inspected on 2026-10-14; CC-F1 was re-rendered and inspected on
+2026-10-15 after the pass 2 refinement. Rendering does not validate the
+semantics.
+
+CC1 implementation evidence, 2026-10-15, macOS 27 development host:
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| CC-U1, U2, U3, U7, U8, U10, U13, U14, U15 | `asura-service` `context::tests` | Pass |
+| CC-U16, CC-U18 | `model_owner` sliding-credit and cancel tests; Swift `windowSizedInputUsesSlidingCredit`, `beginAboveCapacityBoundIsRefusedBeforeAllocation`; `asura-control` transfer bound test | Pass |
+| CC-I1, CC-I7 | `context::journal_tests`: 40 turns through the real writer, restart, exact recomposition of every turn from the recorded budget inputs | Pass |
+| CC-I13 | Swift `toolSchemaBytesCoverDeclaredTools`; the service uses the helper's reported value | Pass (helper side) |
+| Kind 21 record | `authority_conversation` round trip and replay accounting | Pass |
+| CC-E1 | `tui_pty.py --long-conversation`: 40 real turns with the system model, no `context_limit` or `capacity_exhausted` | Pass |
+| Native journey | `tui_pty.py --conversation` with the rebuilt helper package | Pass |
+| CC-I2, CC-I5, CC-I6, CC-I9, CC-I11, CC-E5 | Not run as dedicated cases | Unverified |
+| CC-I10, CC-I12, CC-E2, CC-E6 | Need a window above 64 KiB or measured Ollama turns. The system model reports 4,096 tokens and the helper clamps Ollama to 8,192 (L26) until the provider design removes the clamp. | Unverified |
+
+The `--long-conversation` journey needs the native model and takes several
+minutes, so it is not in the lifecycle Cargo gate.
 
 Return to the [design index](README.md).

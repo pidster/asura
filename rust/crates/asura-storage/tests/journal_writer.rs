@@ -546,6 +546,7 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
         prompt: "hello".into(),
         reserved_output_tokens: reservation,
         event_cursor: 1,
+        composition: None,
     };
     let accepted = wait(
         &mut writer
@@ -920,6 +921,7 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
         prompt: "remember".into(),
         reserved_output_tokens: 2048,
         event_cursor: 1,
+        composition: None,
     };
     let mut state = wait(
         &mut writer

@@ -1414,11 +1414,10 @@ impl State {
                                     .is_some_and(|t| t.kind == TerminalKind::Complete)
                         })
                         .collect();
-                    prior.sort_by_key(|op| op.generation);
-                    if prior.len() > 32 {
-                        return Err(Error::Limit);
-                    }
-                    let mut size = prompt.len();
+                    // Candidates for the context composer, newest first. The window is
+                    // known only after Hello, so no turn-count or byte rule applies
+                    // here; the journal's fixed capacity bounds the total text.
+                    prior.sort_by_key(|op| std::cmp::Reverse(op.generation));
                     for op in prior {
                         let Record::TurnAccepted(accepted) =
                             self.record(op.accepted_frame.clone())?
@@ -1430,10 +1429,6 @@ impl State {
                         else {
                             return Err(Error::RepairRequired);
                         };
-                        size += accepted.prompt.len() + terminal.text.len();
-                        if size > 64 * 1024 {
-                            return Err(Error::Limit);
-                        }
                         history.push((*accepted, terminal));
                     }
                 } else if expected_generation != 0 {

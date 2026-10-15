@@ -718,6 +718,7 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
                 prompt: prompt.into(),
                 reserved_output_tokens: 512,
                 event_cursor: 1,
+                composition: None,
             };
             append(
                 &writer,
@@ -932,6 +933,7 @@ fn queue_reorder_fixture(verify: bool) -> Result<()> {
                 prompt: prompt.into(),
                 reserved_output_tokens: 512,
                 event_cursor: 1,
+                composition: None,
             })),
             Some(w::AdmissionFence {
                 project,

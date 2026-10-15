@@ -614,6 +614,22 @@ impl Replay {
             )?;
             last_generation = op.generation;
         }
+        // A composed turn accounts for every completed prior turn: shown or omitted.
+        if let Some(c) = &p.composition {
+            let completed = self
+                .operations
+                .values()
+                .filter(|op| {
+                    op.conversation == p.conversation
+                        && op.generation < p.generation
+                        && op
+                            .terminal
+                            .as_ref()
+                            .is_some_and(|t| t.kind == TerminalKind::Complete)
+                })
+                .count();
+            require(p.prior_operations.len() + c.omitted_turns as usize == completed)?;
+        }
         self.fresh(p.task)?;
         self.fresh(p.operation)?;
         self.request(

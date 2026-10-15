@@ -45,13 +45,18 @@ import Testing
     #expect(history.count == 3)
     if case .prompt = history[1] {} else { Issue.record("user role lost") }
     if case .response = history[2] {} else { Issue.record("assistant role lost") }
+    // The prompt field carries the service's context block; only the total bounds it.
     input.prompt = String(repeating: "x", count: 32_769)
+    #expect(try Wire.input(input.serializedData()) == input)
+    input.history = Array(repeating: user, count: Limits.historyEntries + 1)
     #expect(throws: (any Error).self) { _ = try Wire.input(input.serializedData()) }
 }
 
 private actor Scripted: ModelBackend {
     var calls = 0
-    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
+    let capacity: UInt32
+    init(capacity: UInt32 = 4096) { self.capacity = capacity }
+    func status() async -> BackendStatus { BackendStatus(contextTokens: capacity, reportedContextTokens: capacity, contextSource: .system) }
     func generate(_ input: ModelInput, maximumTokens: UInt32, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         calls += 1
         try await snapshot(Snapshot(text: "first"))
@@ -175,6 +180,75 @@ private func outputCredit(_ id: UInt64) -> Envelope {
     #expect(await backend.calls == 1)
     service.close()
     await running.value
+}
+
+/// CC-U16 and CC-U18 (helper side): input above 64 KiB arrives under a sliding
+/// credit window; a Begin above capacity times 8 bytes is refused before allocation.
+@Test func windowSizedInputUsesSlidingCredit() async throws {
+    let (helper, service) = try pair()
+    defer { helper.close(); service.close() }
+    let identity = Data(repeating: 1, count: 32)
+    let backend = Scripted(capacity: 100_000)
+    let session = HelperSession(transport: helper, backend: backend, buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    defer { running.cancel() }
+    var replies = service.frames.makeAsyncIterator()
+    try await service.send(hello(identity))
+    let reply = try Wire.decode(#require(try await replies.next()))
+    #expect(reply.hello.availability == .available)
+    #expect(!reply.hello.hasToolSchemaBytes)
+    var input = ModelInput(); input.instructions = String(repeating: "x", count: 200_000); input.prompt = "fixture"
+    let data = try input.serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    begin.inputBytes = UInt64(data.count); begin.maxResponseTokens = 512
+    try await service.send(scoped(.begin(begin)))
+    let first = try Wire.decode(#require(try await replies.next())).credit
+    #expect(first.acceptedBytes == 0 && first.grantedBytes == Limits.creditWindow)
+    var granted = first.grantedBytes
+    var offset = 0
+    var ordinal: UInt64 = 0
+    while offset < data.count {
+        let end = min(offset + Limits.chunk, data.count)
+        #expect(UInt64(end) <= granted)
+        var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+        chunk.ordinal = ordinal; chunk.revision = 0; chunk.data = data.subdata(in: offset..<end)
+        try await service.send(scoped(.chunk(chunk)), control: false)
+        offset = end; ordinal += 1
+        if offset < data.count {
+            let credit = try Wire.decode(#require(try await replies.next())).credit
+            #expect(credit.acceptedBytes == UInt64(offset))
+            #expect(credit.grantedBytes == UInt64(offset) + Limits.creditWindow)
+            granted = credit.grantedBytes
+        }
+    }
+    var end = Asura_Model_V1_InputEnd(); end.count = ordinal; end.totalBytes = UInt64(data.count)
+    try await service.send(scoped(.inputEnd(end)), control: false)
+    let ready = try Wire.decode(#require(try await replies.next()))
+    if case .ready = ready.body {} else { Issue.record("missing ready") }
+    service.close()
+    await running.value
+}
+
+@Test func beginAboveCapacityBoundIsRefusedBeforeAllocation() async throws {
+    let (helper, service) = try pair()
+    defer { helper.close(); service.close() }
+    let identity = Data(repeating: 1, count: 32)
+    let backend = Scripted(capacity: 1000)
+    let session = HelperSession(transport: helper, backend: backend, buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    var replies = service.frames.makeAsyncIterator()
+    try await service.send(hello(identity))
+    _ = try Wire.decode(#require(try await replies.next()))
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"
+    begin.inputBytes = 8_001; begin.maxResponseTokens = 512
+    try await service.send(scoped(.begin(begin)))
+    var credited = false
+    while let raw = try await replies.next() {
+        if case .credit = try Wire.decode(raw).body { credited = true }
+    }
+    #expect(!credited)
+    await running.value
+    #expect(await backend.calls == 0)
 }
 
 @Test func wrongIdentityClosesWithoutCallingBackend() async throws {
@@ -745,4 +819,14 @@ func usageReportsPreserveTextAndCancellationHasOneReportBeforeTerminal(mode: Str
         while !(await backend.lateReportRejected) && ContinuousClock.now < limit { await Task.yield() }
         #expect(await backend.lateReportRejected)
     }
+}
+
+/// CC-I13 (helper side): the reported tool overhead covers every declared tool.
+@Test func toolSchemaBytesCoverDeclaredTools() {
+    let bytes = projectToolSchemaBytes()
+    let names = makeProjectTools({ _ in throw BackendFailure(.internalError) })
+        .reduce(0) { $0 + $1.name.utf8.count + $1.description.utf8.count }
+    #expect(Int(bytes) > names)
+    #expect(bytes <= Limits.toolSchemaBytes)
+    #expect(projectToolSchemaBytes() == bytes)
 }

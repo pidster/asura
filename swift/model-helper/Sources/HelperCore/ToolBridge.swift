@@ -84,6 +84,20 @@ public func makeProjectTools(_ handler: @escaping ToolHandler, budget: ToolRound
         BoundedNativeTool(base: ShellTool(handler: handler), budget: budget)]
 }
 
+/// UTF-8 bytes of the project tool definitions the helper declares: names,
+/// descriptions and argument schema JSON. The service counts them as fixed
+/// overhead when it composes input (context-composer.md, `S`).
+public func projectToolSchemaBytes() -> UInt32 {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    var total = 0
+    for tool in makeProjectTools({ _ in throw BackendFailure(.internalError) }) {
+        total += tool.name.utf8.count + tool.description.utf8.count
+        total += (try? encoder.encode(tool.parameters).count) ?? 0
+    }
+    return UInt32(min(total, Int(Limits.toolSchemaBytes)))
+}
+
 /// Rejected native proposals consume the same turn-local budget as valid proposals.
 struct BoundedNativeTool<Base: Tool>: Tool where Base.Output == String {
     let base: Base

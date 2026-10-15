@@ -36,6 +36,7 @@ impl Fixture {
             prompt: "observe status".into(),
             reserved_output_tokens: 512,
             event_cursor: 1,
+            composition: None,
         };
         let call = tools::Call {
             operation: turn.operation,
@@ -58,6 +59,7 @@ impl Fixture {
             request: None,
             turn,
             input: vec![],
+            candidates: Vec::new(),
             model: ModelOwner::tool_test_fixture(),
             accepted: true,
             ready: false,
@@ -127,6 +129,7 @@ impl Fixture {
                 started: true,
                 automatic_initialization: AutomaticInitialization::Complete,
                 model_context: VecDeque::new(),
+                calibration: Default::default(),
                 measurements: VecDeque::new(),
                 hold_reasons: BTreeMap::new(),
                 wake: None,

@@ -17,6 +17,8 @@ public actor HelperSession {
     private var generation: UInt64 = 0
     private var inputData = Data()
     private var expectedInput: UInt64 = 0
+    /// Effective capacity reported in Hello; bounds the input allocation.
+    private var contextTokens: UInt32 = 0
     private var inputChunks: UInt64 = 0
     private var decodedInput: ModelInput?
     private var maximumTokens: UInt32 = 512
@@ -172,6 +174,8 @@ public actor HelperSession {
                 response.reportedContextTokens = reported
                 response.contextSource = source.rawValue
                 if status.localToolDestination { response.localToolDestination = true }
+                if status.supportsTools { response.toolSchemaBytes = projectToolSchemaBytes() }
+                contextTokens = context
                 if let profile = status.capabilityProfile {
                     response.capabilitySource = profile.provenance.rawValue
                     if profile.reasoningDisabled { response.reasoningDisabled = true }
@@ -194,7 +198,9 @@ public actor HelperSession {
         }
         if phase == .begin {
             guard case .begin(let begin) = body, begin.hasModel, begin.model == selectedModel,
-                begin.hasInputBytes, begin.inputBytes > 0, begin.inputBytes <= UInt64(Limits.input),
+                begin.hasInputBytes, begin.inputBytes > 0, begin.inputBytes <= Limits.input,
+                // A sanity bound on allocation, not a content limit.
+                begin.inputBytes <= UInt64(contextTokens) * 8,
                 (!begin.hasDeadlineRemainingMs || (1...60_000).contains(begin.deadlineRemainingMs)),
                 begin.hasMaxResponseTokens, (1...2048).contains(begin.maxResponseTokens) else { throw HelperError.protocolFault }
             operation = message.operationID; generation = message.generation
@@ -212,7 +218,7 @@ public actor HelperSession {
             phase = .input
             var credit = Asura_Model_V1_Credit()
             credit.transferID = 1; credit.direction = .input; credit.acceptedBytes = 0
-            credit.grantedBytes = UInt64(Limits.input)
+            credit.grantedBytes = Limits.creditWindow
             try await transport.send(envelope(.credit(credit)))
             return
         }
@@ -231,6 +237,16 @@ public actor HelperSession {
                 throw HelperError.protocolFault
             }
             inputData.append(chunk.data); inputChunks += 1
+            // Each accepted chunk advances the sliding window and restarts the
+            // stall bound: it ends only a transfer that makes no progress.
+            arm(milliseconds: 5_000)
+            if UInt64(inputData.count) < expectedInput {
+                var credit = Asura_Model_V1_Credit()
+                credit.transferID = 1; credit.direction = .input
+                credit.acceptedBytes = UInt64(inputData.count)
+                credit.grantedBytes = UInt64(inputData.count) + Limits.creditWindow
+                try await transport.send(envelope(.credit(credit)))
+            }
         case .inputEnd(let end):
             guard phase == .input, end.hasCount, end.count == inputChunks, end.hasTotalBytes,
                 end.totalBytes == expectedInput, UInt64(inputData.count) == expectedInput else { throw HelperError.protocolFault }

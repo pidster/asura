@@ -49,6 +49,8 @@ message Hello {
   optional bool reasoning_disabled = 19;
   optional uint32 reported_context_tokens = 20;
   optional uint32 context_source = 21;
+  // UTF-8 bytes of the project tool definitions the helper would declare.
+  optional uint32 tool_schema_bytes = 22;
 }
 message Begin {
   optional string model = 1;
