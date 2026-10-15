@@ -7,12 +7,15 @@ recorded in [owner decisions](#owner-decisions). Mechanisms marked "proposed"
 are engineering choices under the
 [iteration rules](../design-process.md#iteration-and-escalation). Values marked
 "proposed" in limit tables need the measurements in [validation](#validation).
-Slice SL1 is implemented and unit tested; see
-[SL1 implementation](#sl1-implementation). SL2–SL6 are not implemented.
+Slices SL1 and SL2 are implemented; see
+[SL1 implementation](#sl1-implementation) and
+[SL2 implementation](#sl2-implementation). SL3–SL6 are not implemented.
 Protocol numbering remains `0.1`; journal format remains `1`.
 
-Readiness: slices SL1–SL3 are ready for implementation review. They unblock
-tool job packet [J1](tool-job-controller.md#delivery-dependencies). No owner
+Readiness: slice SL3 is ready for implementation inside tool job packet J1.
+Its implementation details, including record kinds 22 and 23, are in the job
+controller's
+[J1 and SL3 implementation details](tool-job-controller.md#j1-and-sl3-implementation-details). No owner
 decision remains open. SL5 waits only for the person command packets. The SD8
 fixtures can be committed after the licence commit lands; see
 [fixtures and licensing](#fixtures-and-licensing).
@@ -518,8 +521,12 @@ releases them. Settlement, descriptors, pages and cursors bind that digest.
 Byte offsets count stored bytes. Nothing computes a digest of raw output or of
 a secret value, apart from the in-memory keyed number map.
 
-Proposed record fields. They are additive fields of the J1 descriptor and J2
-job records, which are not allocated yet. The journal format stays `1`.
+Proposed record fields. J1 allocates them as record kinds 22 (ShellIntent)
+and 23 (CaptureSettled); the
+[J1 records](tool-job-controller.md#j1-records-kinds-22-and-23) give the exact
+encodings. The journal format stays `1`. J1 records a later exact match of a
+known value as a literal replacement count per stream, not as a third number
+origin, so "propagated" below is a count.
 
 | Record | Added fields, in order |
 | --- | --- |

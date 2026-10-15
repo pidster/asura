@@ -13,6 +13,8 @@ passed on 2026-09-27. The owner authorized conversation execution and the shared
 input pipeline. The implementation extends the canonical ordinary-file authority
 owner and embedded graph adapter. Journal format remains 1. Fault and durability
 qualification remains incomplete where explicitly listed below.
+Journal step J1-0 (owner, 2026-10-15) removes the journal append, observation,
+replay and queue-worker time bounds. It is designed below and not implemented.
 
 The [recovery design](persistence-recovery.md) owns the journal and installation
 binding. This amendment defines format 1 and the first conversation writer.
@@ -350,7 +352,14 @@ from complete turns in the same conversation. Terminal text is at most 60 KiB.
 Maximum frame remains 64 KiB including overhead; encode and check the entire
 frame before append. At most 64 registered projects and 256 conversations are
 admitted in this slice. Journal bounds remain 8 MiB and 32,768 frames. At most
-one operation is nonterminal. No overwrite or deletion makes space at a limit.
+one operation is nonterminal.
+
+Required follow-up design (owner, 2026-10-15): the single 8 MiB file must not
+remain the journal's limit. The owner chose to keep a separate file journal,
+not SurrealDB, and to move to known-size segment files with checkpoint
+snapshots and compaction. Total size comes from a configurable quota and
+available disk space. A separate journal design must define it; it is not
+designed here. Until it lands, the limits above apply. No overwrite or deletion makes space at a limit.
 
 Terminal cause values are closed: 0 none, 1 user cancel, 2 deadline, 3 output limit,
 4 service shutdown, 5 provider failure, 6 protocol failure, 7 restart, 8 authority
@@ -516,8 +525,9 @@ No silent downgrade from a failed full flush is allowed. Unsupported volume or
 sync behavior returns unavailable and blocks writes. Ordinary process-kill tests
 do not qualify physical power-loss durability.
 
-Deadlines: five seconds for startup replay, two seconds for append/flush observation,
-and the separately bounded preparation, handshake and admission stages in
+Deadlines: journal replay, append and append observation have no time bound
+([journal step J1-0](#journal-step-j1-0-journal-waits-without-a-time-bound), owner,
+2026-10-15). Other stages keep the separately bounded preparation, handshake and admission stages in
 [provider integration](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30). Generation and client observation are cancellation-driven.
 Worker deadlines do not cancel a blocked syscall. Keep its writer slot, file handle
 and owner claim until settlement. Inspect and signal processing remain responsive.
@@ -549,6 +559,75 @@ Recovery never starts a model, reuses an old permit or appends a second terminal
 for a completed operation. The helper owner must settle any process it can identify
 as still owned before permitting replacement; uncertain child lifetime blocks
 new generation. Request lookup and cancel intents remain available during recovery.
+
+### Journal step J1-0: journal waits without a time bound
+
+Required behavior (owner, 2026-10-15). No journal wait has a time bound:
+
+- **Append.** An append waits for its write and its `F_FULLFSYNC` to return.
+  Only an actual I/O or validation error makes the outcome unconfirmed and
+  fences the journal; slowness never fences.
+- **Observation.** The service waits for the writer's real reply, with no
+  timer. A cancelled turn stops waiting; the late reply is applied when it
+  arrives. Queued writer jobs run in order and are never dropped for age.
+- **Replay.** Startup replay runs until it finishes, fails on content, or is
+  cancelled by shutdown. While it runs, the service answers Inspect and refuses
+  other work with a loading state.
+- **Queue worker.** The one-slot queue worker waits for the real reply. Cancel
+  stops the wait. A second queue request while one is in flight gets `busy`.
+- **Overload.** Beyond the writer's 8-slot queue, a request gets `busy`. The
+  reactor stays responsive throughout.
+
+Tool job packet J1 depends on this step for its kind 22, 23 and 15 records
+([J1 prerequisite](tool-job-controller.md#j1-prerequisite-journal-step-j1-0)).
+
+Code changes (commit `41eebfb`):
+
+| Site | Today | J1-0 |
+| --- | --- | --- |
+| `asura-storage/src/authority/writer/state.rs:97`, `:362` | Caps the append and the initialization append at 2 s | Removed |
+| `asura-platform/src/journal_io.rs:165-193` | `JournalFile::append` returns `Deadline` between writes and after the sync, and leaves the file fenced | No deadline argument; errors come only from `write_at`, `F_FULLFSYNC`, `stat` or validation |
+| `writer/state.rs:143-153` | Any append error fences the writer | Unchanged: an error now means an actual I/O or validation failure |
+| `writer/mod.rs:273-279` `Ticket::poll` | Reports `OutcomeUnconfirmed` or `Deadline` when its deadline passes | No time check; only a reply or a disconnected worker settles it. The caller may drop its interest on cancel. |
+| `writer/mod.rs:486-492` | Default ticket deadlines: 10 s initialize, 5 s open, 2 s other | All removed. Initialization waits for the engine and shows progress; cancel and shutdown still stop it (owner, 2026-10-15) |
+| `writer/mod.rs:322-323` | Drops a queued job whose deadline passed | Removed: queued jobs run in order |
+| `conversation/state.rs:1276-1362`, `authority.rs:44-52` | Replay stops with `Timeout` at its deadline | No deadline; the cancel flag still stops it |
+| Queue worker observation, 5 s (design text above) | Reports uncertainty after 5 s | Waits for the reply; cancel stops the wait. The code site is located at implementation; no `5 s` literal was found by search. |
+| `try_submit_before` callers | Pass caller deadlines into the writer | The caller's own deadline applies only to the caller's wait (for example the L10 tool deadline), never to the writer's work |
+
+Unchanged: the 500 ms queue metadata refresh, a polling cadence that ends
+nothing. The 10 s initialization budget is removed (owner, 2026-10-15).
+
+#### J1-0 journal wait states
+
+Selected design. Arrows name the event that moves one writer request.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Queued: Request admitted to the 8-slot queue
+    [*] --> Busy: Queue full
+    Busy --> [*]
+    Queued --> Writing: Dequeued in order, never dropped for age
+    Writing --> Syncing: All frame bytes written
+    Writing --> Fenced: write error
+    Syncing --> Committed: F_FULLFSYNC and validation succeed
+    Syncing --> Fenced: F_FULLFSYNC, stat or validation error
+    Committed --> Replied: Replay state advanced
+    Fenced --> Replied: OutcomeUnconfirmed, repair required
+    Replied --> [*]: Caller applies the reply, also after a turn cancel
+    note right of Queued: The caller waits with no timer, and a cancel stops only its wait
+```
+
+| ID | Case | Unit | Integration | End-to-end |
+| --- | --- | --- | --- | --- |
+| J1-0-01 | Stalled append holds | A fake file whose write and sync block past 2 s returns success after release; the writer is not fenced | A test-support gate holds a real append for 5 s; the record commits and replay shows it | — |
+| J1-0-02 | Stalled observation | A ticket with no reply for 10 s never reports `OutcomeUnconfirmed`; a reply after a turn cancel is applied | Gated append: the conversation owner neither fails the turn nor becomes unavailable; the late reply updates state | — |
+| J1-0-03 | Queued jobs never dropped for age | A job queued behind a gated job runs after the gate opens, in order | Real writer: queued appends commit in order after a long stall | — |
+| J1-0-04 | Replay holds | Replay with a gated reader returns only on completion, content failure or cancel | Large journal with a gated read: Inspect returns a loading state; work is refused; shutdown cancels replay | TUI shows loading and accepts input within 100 ms |
+| J1-0-05 | Queue worker holds | A second queue request while one is in flight gets `busy`; cancel stops the wait | Gated queue mutation: no uncertainty report; the late reply is applied | — |
+| J1-0-06 | Busy beyond capacity | Ninth writer request returns `busy` | Gated append: requests beyond 8 slots return `busy` | — |
+| J1-0-07 | Responsiveness | — | Inspect and cancel respond within 100 ms during each gate above | TUI typing within 100 ms during a gated append |
+| J1-0-08 | Real I/O error still fences | Injected `write` and `F_FULLFSYNC` errors fence and return `OutcomeUnconfirmed` | Injected error on a real file; later appends return `RepairRequired` | — |
 
 ### Turn and restart states
 
@@ -672,11 +751,10 @@ entries use `fsync` on their parent directories; journal contents use
 
 The worker owns all replay buffers and mutable state. Callers enqueue at most six
 ordinary requests or eight total requests, including closure controls. Each reply
-has a one-item channel. Polling never waits. A two-second observation deadline
-reports an uncertain outcome for ordinary mutations. Initialization retains HM0's
-10-second operation budget; startup replay uses five seconds. Each journal append
-also has its own two-second flush deadline. The worker keeps its claim until it
-settles. The embedded engine shares the existing process-wide engine claim.
+has a one-item channel. Polling never waits. A caller waits for the real reply,
+with no observation deadline; startup replay and journal appends have no time
+bound either ([journal step J1-0](#journal-step-j1-0-journal-waits-without-a-time-bound)).
+Initialization has no time bound (owner, 2026-10-15, replacing HM0's 10-second operation budget); it waits for the engine, the client shows progress, and cancel or shutdown stop it. The worker keeps its claim until it settles. The embedded engine shares the existing process-wide engine claim.
 Shutdown drops its router and retains the executor until all engine tasks settle.
 Dropping a caller never opens a replacement writer. Shutdown joins only
 a finished worker. Initialization and graph verification run on this same isolated
@@ -783,16 +861,18 @@ Uncertain append fences new scheduling under the existing writer contract.
 
 ### Asynchronous boundaries
 
-Queue mutations use the existing eight-slot isolated journal worker, two-second
-append observation and five-second replay limits. Project checks, prompt reads,
+Queue mutations use the existing eight-slot isolated journal worker. Append,
+append observation and replay have no time bound
+([journal step J1-0](#journal-step-j1-0-journal-waits-without-a-time-bound)). Project checks, prompt reads,
 configuration and history remain worker-side. One in-flight queue mutation uses
 the conversation owner's serialized ticket; the reactor continues Inspect, helper
 signals and cancellation. Scheduler work per reactor cycle is one bounded queue
 transition. Queue projections are immutable bounded results; client workers send
 RPCs and publish results through bounded mailboxes. A separate one-slot queue
-worker permits enqueue while the conversation worker observes execution. Its
-five-second observation deadline reports uncertainty without releasing an
-unsettled worker. Queue metadata refresh uses a 500 ms interval, with no RPC
+worker permits enqueue while the conversation worker observes execution. It
+waits for the real reply with no observation deadline; cancel stops the wait,
+and a second queue request while one is in flight gets `busy` (J1-0). Queue
+metadata refresh uses a 500 ms interval, a polling cadence that ends nothing, with no RPC
 in rendering and no claim of server-push delivery. Rendering performs no RPC,
 filesystem call, database call, blocking receive or producer-lock wait.
 
@@ -936,8 +1016,9 @@ settlement precede replacement dispatch. Other queue dependencies remain unchang
 inputs affected by cancellation become Held. An explicit promotion clears the
 selected input's Held state. Restart holds undispatched promotion,
 and an uncertain append prevents scheduling. No new reactor I/O, worker, retry loop
-or queue is introduced: the eight-slot writer, two-second mutation deadline,
-five-second replay deadline and 16-input limit remain authoritative.
+or queue is introduced: the eight-slot writer and 16-input limit remain
+authoritative. Append, observation and replay have no time bound
+([journal step J1-0](#journal-step-j1-0-journal-waits-without-a-time-bound)).
 
 ### IQ2 promotion flow
 

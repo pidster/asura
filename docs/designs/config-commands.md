@@ -20,6 +20,7 @@ the working directory or an environment override. Tests use scratch runtime root
 | `audit.keepFiles` | Integer, 1 through 10000 | `5` |
 | `audit.maxFileBytes` | Integer, 1 through 1099511627776 | `10485760` |
 | `audit` | Mapping of all three audit fields | Defaults above |
+| `retention.quotaBytes` | Integer, 67108864 (64 MiB, proposed) through 1099511627776 (1 TiB, proposed). Values outside the range are `config_invalid_value`. The service reads it at start; the effective quota is the smaller of this value and retained bytes plus free disk space minus the 16 MiB recovery reserve ([J1 quota ledger](tool-job-controller.md#quota-ledger)) | `1073741824` (1 GiB, owner R1) |
 | `providers.mlx.models` | Up to 64 exact asset keys, each with a bounded capability list; see below | Empty mapping |
 | `providers.ollama.endpoint` | ASCII URL, at most 2048 bytes; numeric-loopback host over HTTP or HTTPS. Set rejects other hosts with `config_remote_endpoint_restricted` under the [loopback restriction](model-provider-integration.md#loopback-endpoint-restriction--selected-2026-10-13) | `http://127.0.0.1:11434` at inference admission |
 
@@ -139,7 +140,8 @@ sequenceDiagram
 ## Validation
 
 Unit checks cover command grammar, typed values, defaults, unknown/duplicate keys,
-nulls, bounds, YAML errors, busy and expired jobs, and literal result display.
+nulls, bounds (including `retention.quotaBytes` at 64 MiB − 1, 64 MiB, 1 TiB and
+1 TiB + 1), YAML errors, busy and expired jobs, and literal result display.
 Platform integration checks use real scratch files for creation, persistence,
 permissions, symlink/hardlink rejection, malformed files, observed replacement,
 size limits and cancellation. Control checks cover new message shapes, directions,
@@ -408,7 +410,7 @@ results. Scope admission records only when the requested project has been valida
 unscoped rejected requests emit no project record. IDs do not authorize access.
 
 Original config events use a closed setting category: model, audit, audit.enabled,
-audit.keepFiles, audit.maxFileBytes or providers.mlx.models. Do not record arbitrary
+audit.keepFiles, audit.maxFileBytes, retention.quotaBytes or providers.mlx.models. Do not record arbitrary
 model asset keys. No record contains prompts, source, note bodies, tool arguments,
 outputs, config values, paths, chain-of-thought or raw provider/OS errors. Enforce
 this allowlist when constructing typed events, before serialization.

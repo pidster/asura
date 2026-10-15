@@ -144,7 +144,10 @@ Large bytes remain file based. The DB contains typed metadata, digests and links
 retain their existing locations and owners.
 
 Secret filtering at capture (EX4, owner 2026-10-15; SD2, SD6 and SD9 of the
-[secret detection design](secret-detection.md)) amends this contract for J1:
+[secret detection design](secret-detection.md)) amends this contract for J1.
+The job controller's
+[J1 and SL3 implementation details](tool-job-controller.md#j1-and-sl3-implementation-details)
+define the records, payload store, quota ledger and pages that implement it:
 
 - The capture worker scans each stream before hashing and staging. Each
   detected secret is replaced by `$ASURA_SECRET_<n>`, and bytes it cannot check
@@ -174,25 +177,26 @@ derivation labels and collision/conflict rejection need the wire/codec review.
 | Other tool result payload | 16 KiB per current returned body; future larger typed tools need separate admission |
 | Capture concurrency | One capture worker per job slot, each with a 512 KiB transfer queue (owner, 2026-10-14, R4) |
 | Capture transfer | Eight chunks of at most 64 KiB; 512 KiB queued bytes plus one active chunk |
-| Capture saturation | Stop accepting bytes and request existing tool cancellation; mark retention incomplete. Never silently drop bytes and claim completeness. |
-| Storage operation | Two-second deadline for each submitted write/read/install step; retained slot after uncertain completion |
+| Capture saturation | Backpressure: stop reading the pipes until the queue drains; no cancellation (owner, 2026-10-15, J1-Q1). After a cancel trigger, bytes that cannot be queued are discarded, counted and recorded; retention is then incomplete. Never silently drop bytes and claim completeness. |
+| Storage operation | No deadline for writes, sync, install or recovery steps (owner, 2026-10-15). A page read keeps its 2 s storage step (owner, 2026-10-14). After a cancel trigger, the shell cleanup bound of 2.5 s (L3) also covers capture settlement; an unsettled capture is recorded `unconfirmed` and its worker stays owned (J1-Q1). |
 | Installation payload quota | Configurable, default 1 GiB retained bytes plus reservations; each capture reserves 1 MiB at intent and grows in 1 MiB steps (owner, 2026-10-14, R1; growing reservation selected 2026-10-13, [job retained output lifetime](tool-job-controller.md#retained-output-lifetime)) |
 | Recovery reserve | Fixed 16 MiB reserved for bounded descriptors and settlement; payload admission cannot consume it (owner, 2026-10-14, R1) |
 | Page concurrency | Two page-read workers, one reserved for the model (owner, 2026-10-14, R4); eight queued; ninth queued request returns `busy` |
 | Raw page | Deferred after J1 (owner, 2026-10-14, R5). Proposed: up to 8 KiB; base64 expansion plus metadata must remain below 16 KiB encoded result |
 | Text page | Up to 8 KiB decoded source bytes; UTF-8 boundary validation and sanitization preserve exact source offsets |
 | Historical graph page | 32 nodes or edges, at most 64 KiB decoded metadata |
-| Startup recovery | At most 128 candidate objects per batch; indexed continuation, with two-second work steps |
+| Startup recovery | At most 128 candidate objects per batch; indexed continuation; no time bound |
 | Shutdown | Close ingress immediately; request cancellation; after two seconds retain unsettled ownership and report pending cleanup |
 
 Filesystem operations include create, write, hash, read, sync, rename, directory
-sync and unlink. Isolate these in storage-owned retained workers. A deadline
-does not prove a blocked OS call stopped. Keep its reservation and slot until
-settlement; do not create replacement workers to evade the limit.
+sync and unlink. Isolate these in storage-owned retained workers. A page-read
+step or the post-cancel settlement bound does not prove a blocked OS call
+stopped. Keep its reservation and slot until settlement; do not create
+replacement workers to evade the limit.
 The service reactor and client render loop must never wait on these calls.
 This design adds no whole-turn deadline.
 
-The proposed quota and deadlines require measured qualification. Reserving space
+The proposed quota and wind-down bounds require measured qualification. Reserving space
 is accounting, not proof that the disk has free blocks. An actual disk-full error
 must take the same explicit incomplete-capture path. A single blocked capture
 must not prevent Inspect, Cancel, typing or disconnect.
@@ -516,7 +520,7 @@ storage behavior; they do not establish provider reasoning quality.
 | --- | --- | --- | --- |
 | RG-01 full capture | Shell emits interleaved streams larger than existing rings | Exact stdout/stderr bytes recover; prefixes/tails/previews cannot masquerade as originals | Unit: offsets, hashing, stream identity. Integration: real pipes and files. E2E: inspect live activity, restart, retrieve each stream and compare bytes. |
 | RG-02 partial capture | Output cap, cancellation, storage error or disconnect interrupts capture | Actual outcome and retained ranges/loss reason stay distinct; no invented missing count | Unit: every reason and boundary. Integration: inject each trigger. E2E: inspect partial result after restart without rerunning. |
-| RG-03 overload | Chunk queue fills or filesystem write stalls | Cancellation reaches the existing owner; memory remains bounded; controls remain responsive | Unit: queue/reservation admission. Integration: stalled storage and full queue. E2E: typing within 100 ms and Inspect within 100 ms under fixture load. |
+| RG-03 overload | Chunk queue fills or filesystem write stalls | While running: backpressure only, no cancellation, no loss. After a cancel trigger: a capture not settled within 2.5 s is recorded `unconfirmed`, the result is delivered and the worker stays owned (J1-Q1, owner, 2026-10-15). Memory remains bounded; controls remain responsive | Unit: queue/reservation admission and the post-cancel bound. Integration: stalled storage and full queue, before and after cancel. E2E: typing within 100 ms and Inspect within 100 ms under fixture load. |
 | RG-04 quota | Two reservations compete for remaining space, or disk fills after reservation | No over-reservation, protected evidence remains, effect cannot start without reservation | Unit: quota race. Integration: real constrained filesystem. E2E: visible admission failure and authorized cleanup. |
 | RG-05 crash recovery | Crash before/after each intent, install, result, receipt and publication checkpoint | One original outcome/reference; no duplicate tool or graph mutation; uncertainty remains explicit | Unit: replay transition matrix. Integration: child-process fault injection at every checkpoint. E2E: restart and recover exact result or precise unavailable state. |
 | RG-06 disclosure | Another project guesses a result ID; permission changes during paging | No bytes or existence leak; stale page fenced; raw paths absent | Unit: scope and cursor matrix. Integration: revocation during read. E2E: two project sessions and a current-authority check on every page. |
@@ -575,7 +579,7 @@ canonical for their detail.
 | G1 | Item 3 only, as job packet J1; item 4 deferred to a separate later review |
 | R1 | Configurable quota: default 1 GiB, 1 MiB initial reservation, 1 MiB steps, fixed 16 MiB recovery reserve |
 | R2 | Hash incrementally, commit settlement with digests, then install; uninstalled staging at recovery is an unverified prefix |
-| R3 | New record kinds allocated in delivery order; legacy tools keep ToolResult kind 15 for now |
+| R3 | New record kinds allocated in delivery order; legacy tools keep ToolResult kind 15 for now. Superseded by EX4 (owner, 2026-10-15): there are no legacy tools; all tools use jobs. J1 allocates kinds 22 and 23. |
 | R4 | One capture worker per job slot with a 512 KiB transfer queue; 2 page-read workers |
 | R5 | Text pages only in J1, snapped to UTF-8 boundaries; raw pages later; RG-11 partial |
 | R6 | ENOSPC pauses capture; other I/O faults and stalls cancel |

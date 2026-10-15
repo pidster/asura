@@ -1390,12 +1390,14 @@ outcome before success. Current format 1 does not supply that contract. HM0-B mu
 select and qualify the format evolution before implementing these service writes.
 The graph marker alone cannot satisfy `ResolveInitialization` after journal loss.
 
-Run initialization on the bounded storage owner with a 10-second operation budget.
-Control requests use a 3-second client response budget. If durable intent is not
-confirmed before that budget, the client reports `OutcomeUnconfirmed` and retains
-the original ID and digest. Once intent is durable, a `Pending` reply allows
-read-only resolution on a new attachment. Deadline expiry does not cancel a
-possibly committed database effect or free its owner. Stop uses the existing
+Run initialization on the bounded storage owner. It has no time bound (owner, 2026-10-15, replacing the earlier 10-second operation budget; see [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)).
+Control requests have no client response budget (owner, 2026-10-15, replacing
+the earlier 3-second budget): the client waits for the service's reply and shows
+that initialization is in progress, and the person can cancel. A lost connection
+or a cancel, never slowness, makes the client report `OutcomeUnconfirmed`; it
+retains the original ID and digest. Once intent is durable, a `Pending` reply
+allows read-only resolution on a new attachment. A client cancel does not cancel
+a possibly committed database effect or free its owner. Stop uses the existing
 settlement/repair path; restart resumes only a verified original PendingInit.
 No automatic resubmission with a fresh request ID is permitted.
 
