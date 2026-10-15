@@ -2,7 +2,9 @@
 
 Status: proposed design, 2026-10-13. The owner confirmed the model in
 [Loops as stream owners](#loops-as-stream-owners) and the distinctions it records.
-The operators, attachment rules and per-loop mapping remain proposals. This design
+The [AE-04](../engineering.md#asynchronous-execution-and-recovery) rewrite
+(owner, 2026-10-15) limits deadline closures and time expiries to owner-approved
+cases. The operators, attachment rules and per-loop mapping remain proposals. This design
 is not implemented and does not authorize code. It refines how loops apply
 [ADR-0006](../decisions/0006-async-event-pipelines.md); it selects no runtime,
 queue or store. Protocol numbering remains `0.1`; journal format remains `1`.
@@ -141,7 +143,7 @@ observes and proposes; it never commits an ending itself.
 | Closure | Operator over the loop's stream | Guarantees an end? | Example |
 | --- | --- | --- | --- |
 | Exhaustion | Running count or sum reaches a limit | Yes | Request count, bytes captured, paid-provider spend |
-| Deadline | A timer event arrives first | Yes | Job lifetime, `job wait` deadline |
+| Deadline | A timer event arrives first | Yes, only where the owner approved it | `job wait` optional model time (the wait ends; the job continues); wind-down bounds on Asura's own operation |
 | Completion | Predicate on an event: the producer declares it is done | No | Model answer with no tool call |
 | Goal predicate | Predicate on external evidence | No | Exit status 0, tests pass, schema valid |
 | Stall | The state fingerprint stops changing | Yes, when the state space is finite | Identical call and result, no new job bytes, repeated empty replies |
@@ -152,8 +154,16 @@ A wind-down is a modifier, not a primitive. Any closure may first propose a soft
 phase, such as "answer now without tools", before the hard ending. The current
 turn failure without an answer is a hard ending with no wind-down.
 
+Required behavior ([AE-04](../engineering.md#asynchronous-execution-and-recovery), owner, 2026-10-15):
+no fixed time limit ends, refuses or fails work by default. A deadline closure
+is allowed only where the owner approved it: a wind-down bound on Asura's own
+operation that never ends the work it serves, or a wait that yields while the
+work continues. Pacing (polls, backoff, heartbeats, refresh cadence) ends nothing
+and is not a closure.
+
 Proposed rule: every loop must attach at least one closure that guarantees an
-end, from exhaustion, deadline or stall. The cancellation-driven
+end, from known-size exhaustion or stall. A deadline counts only under the
+owner-approved cases above. The cancellation-driven
 [turn lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
 remains an interrupt, not a deadline; it does not satisfy this rule alone.
 
@@ -194,7 +204,7 @@ for the person's grant. Exhausting the request ceiling may end the turn.
 | --- | --- | --- |
 | Completion, goal predicate, cycle, diminishing returns | Permanent | Not applicable |
 | Exhaustion | Permanent | The person or a parent can grant more allowance |
-| Deadline | Permanent | It is a wait deadline; the loop can yield and resume |
+| Deadline (owner-approved only) | Permanent | It is a wait that yields; the loop can resume |
 | Stall | Open decision | The loop waits for new input or new output |
 | Cancel, revocation | Permanent | Not applicable |
 | Steer | Permanent for the current loop | Not applicable; it starts a new loop |
@@ -206,7 +216,9 @@ A temporary ending must name four things. Without them it can become a hang.
 1. **Resume condition:** the event that resumes the loop.
 2. **Resolver:** who can satisfy it, such as the person, a parent or the host.
 3. **Retained state:** the durable state that the suspended loop keeps.
-4. **Expiry:** the deadline, cancellation or restart that makes it permanent.
+4. **Expiry:** the event that makes it permanent, such as cancel, revocation,
+   leader exit or restart. A time expiry is allowed only where the owner
+   approved it under AE-04; `CapturePaused` has none (owner, 2026-10-14).
 
 ### Loop ending states
 
@@ -305,7 +317,8 @@ Required behavior (from ADR-0006, applied here):
   Ending, suspension and resume events must not be lost. A temporary ending must
   be durable before any owner relies on it.
 - **Every boundary is bounded.** Suspended loops and their subscriptions need a
-  numeric limit and an expiry. The mapping must select those values.
+  numeric count limit and an expiry event. The mapping must select those values.
+  A time expiry needs owner approval under AE-04.
 
 Proposed mechanism: the service owns turn-level loops and their operators. The
 model helper produces one stream per request. Today the helper's
@@ -346,7 +359,7 @@ behavior; it is not the target.
 | AE-01 | Operators perform bounded in-memory work per event; no operator waits on I/O. |
 | AE-02 | Operators call no blocking APIs. Resource sensors keep their existing isolation. |
 | AE-03 | Fingerprint windows, suspended-loop counts and subscriptions need numeric limits, selected by the mapping. |
-| AE-04 | Every temporary ending has an expiry. Wait deadlines state whether the work continues. |
+| AE-04 | Every temporary ending names the events that end it: cancel, revocation, leader exit or restart. No temporary ending has a time expiry unless the owner approved one (owner, 2026-10-15). An owner-approved wait that yields states whether the work continues. |
 | AE-05 | Ending and suspension records are durable before publication. Stale resume events are rejected by generation. |
 | AE-06 | Drain converts suspended loops to permanent endings unless their contract says otherwise. |
 | AE-07 | Validation below must run under stalled producers and resource exhaustion. |

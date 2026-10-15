@@ -119,6 +119,11 @@ cannot extend the absolute operation deadline.
 Cumulative frame-count and byte limits prevent a flood of small valid frames.
 The numeric deadlines, local hard maximum, aggregate limits and per-message
 field limits remain D2 decisions.
+Owner update, 2026-10-16: the handshake has no time limit; it ends on the next
+message, helper exit, a protocol fault, cancellation or shutdown. The
+cancellation-driven turn lifetime replaced the absolute operation deadline.
+Whether a per-frame completion deadline remains is open for the owner under
+[AE-04](../engineering.md#asynchronous-execution-and-recovery).
 The [I0 probe](../designs/swift-rust-boundary.md#i0-contract-probe-boundary)
 must prove mismatch and oversized-frame rejection with real Rust and Swift
 processes; I3 repeats the relevant cases under durable service admission.

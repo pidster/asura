@@ -43,7 +43,7 @@ schemas and runtime mechanisms remain with their governing designs.
 | Secret variable | The environment variable `ASURA_SECRET_<n>` that carries a command secret into one execution only; records keep its name, never its value; see [secret detection](designs/secret-detection.md#environment-path) |
 | Loss marker | Text in a stored stream that replaces bytes the secret scanner could not check, stating their size and reason; see [secret detection](designs/secret-detection.md#loss-markers) |
 | Secret rule set | Asura's port of Wisp's secret-detection rules, identified by a revision and digest that each capture descriptor records; see [secret detection](designs/secret-detection.md#rule-set) |
-| Loop closure | Ending condition a loop evaluates over its own streams, such as exhaustion, deadline or stall; distinct from an interrupt, which comes from outside the loop; see [loop closure](designs/loop-closure.md) |
+| Loop closure | Ending condition a loop evaluates over its own streams, such as exhaustion, stall or an owner-approved deadline; distinct from an interrupt, which comes from outside the loop; see [loop closure](designs/loop-closure.md) |
 | Permanent or temporary ending | A permanent ending is terminal; a temporary ending suspends a loop with a named resume condition, resolver and expiry |
 
 These are reading definitions. The proposed [D0 domain model](designs/domain-model.md)

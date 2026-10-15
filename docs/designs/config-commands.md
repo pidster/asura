@@ -82,13 +82,16 @@ identifier; the frame header controls protocol negotiation. Old endpoints reject
 One service config job may run at a time. Additional requests return busy. Sets also return busy while initial installation
 inspection retains its snapshot witness; gets remain available. This prevents
 our own temporary files and renames from invalidating that inspection.
-A separate bounded worker isolates file IO and parsing from the reactor. Each job
-has a two-second deadline. The reactor publishes only to its original attachment
-and request counter. No pipelining while a config response is pending. Expiry of a
-set reports outcome unconfirmed and never causes an automatic retry. A timed-out
-worker retains its slot until settlement. Drain cancels jobs and retains the
-service owner lock until all filesystem work settles, using the existing repair
-lifecycle. Before replacement, workers check cancellation and the deadline.
+A separate bounded worker isolates file IO and parsing from the reactor. A job
+has no time bound (owner, 2026-10-16). It ends on completion, a typed failure,
+the requester's cancel or disconnect, or drain. The reactor publishes only to its
+original attachment and request counter. No pipelining while a config response is
+pending. A set abandoned by cancel or disconnect reports outcome unconfirmed and
+never causes an automatic retry. The worker retains its slot until settlement.
+Drain cancels jobs and retains the service owner lock until all filesystem work
+settles ([stop and drain](system-architecture.md#reactor-stop-and-drain)). Before
+replacement, workers check cancellation. The code still applies the earlier
+two-second `config_worker` deadline; a follow-up implementation will remove it.
 
 Platform access uses retained validated directory descriptors. Reject symlinks,
 hard-linked files, foreign ownership, nonregular files and unsafe permissions or
@@ -104,8 +107,11 @@ is never read as config or automatically promoted.
 
 The TUI parses only command syntax. A dedicated bounded client worker accepts one
 command at a time and uses the canonical client API. It does not touch the file.
-The event loop polls results without waiting. Client requests have a five-second
-UI expiry and no retry. Preserve the draft on failure; clear it on success only if
+The event loop polls results without waiting. Client requests have no time bound
+and no retry (owner, 2026-10-16). The client waits for the reply until the person
+runs `/cancel` or the connection is lost; either reports outcome unconfirmed for a
+set. The code still applies the earlier three-second request and five-second UI
+budgets; a follow-up implementation will remove them. Preserve the draft on failure; clear it on success only if
 it still equals the submitted text. Show results in a dismissible result overlay,
 with terminal controls escaped and bounded lines. Bottom-align the result above
 the composer, with one cell of background padding on all four sides. Use muted
@@ -115,8 +121,9 @@ Renderer checks cover padding, bottom alignment, palette separation and a single
 copy of each result. Enable scrolling and show its hint only when wrapped text
 exceeds the visible content rows. Clamp the offset to the final content row;
 reset it to zero when a resize makes the full result fit. `/help` and Tab include `/config`.
-Exit cancels queued work and waits at most 100 ms after terminal restoration;
-in-flight mutations may have an unconfirmed result and must not be called failures.
+Exit cancels queued work and waits at most 100 ms after terminal restoration.
+This 100 ms join is a wind-down bound on the client's own exit; it ends no
+service work. In-flight mutations may have an unconfirmed result and must not be called failures.
 
 ```mermaid
 sequenceDiagram
@@ -129,7 +136,7 @@ sequenceDiagram
     C->>S: Authenticated Protobuf request
     S->>W: Admit one bounded job
     W->>F: Read and validate
-    opt Valid set before deadline
+    opt Valid set, not cancelled
         W->>F: Sync temporary file and atomic replacement
     end
     W-->>S: Value or typed failure
@@ -141,7 +148,7 @@ sequenceDiagram
 
 Unit checks cover command grammar, typed values, defaults, unknown/duplicate keys,
 nulls, bounds (including `retention.quotaBytes` at 64 MiB − 1, 64 MiB, 1 TiB and
-1 TiB + 1), YAML errors, busy and expired jobs, and literal result display.
+1 TiB + 1), YAML errors, busy and cancelled jobs, and literal result display.
 Platform integration checks use real scratch files for creation, persistence,
 permissions, symlink/hardlink rejection, malformed files, observed replacement,
 size limits and cancellation. Control checks cover new message shapes, directions,
@@ -251,7 +258,7 @@ text, credentials, prompts, source, tool arguments or output. Redaction here is
 an allowlist at construction, not a regex over a serialized event. Producers
 cannot supply arbitrary strings except the validated build identifier. Config
 get operations produce no records. A config mutation emits an outcome only from
-its canonical worker completion; a request timeout cannot invent a persisted
+its canonical worker completion; a cancelled or lost request cannot invent a persisted
 outcome. Non-admission before mutation produces no changed event. The journal's
 own failures must never recursively generate journal events.
 
@@ -262,7 +269,7 @@ human correction precedence, retention/consent and training-export rules.
 Do not hash secrets as a substitute for excluding them. Classifier model files
 remain under `.asura/data/classifiers/`; this packet does not train or install any.
 
-### Admission, deadlines and failure
+### Admission, cancellation and failure
 
 Use one channel with capacity 256 records and an enforced 4096-byte record bound
 (at most 1 MiB of encoded payload), one writer thread, and one producer handle.
@@ -278,14 +285,23 @@ Do not claim complete or durable security audit from this mechanism.
 
 The worker opens and validates storage, serializes records, writes and rotates.
 Config load, directory traversal, enumeration, append, sync and cleanup are
-potentially blocking and stay off the reactor. Bound each work cycle by a
-two-second logical deadline, checked between filesystem operations. The OS may
-stall inside an operation: retain the single worker and queue bounds, report a
-stale worker via atomic health, and do not spawn a replacement writer. Producers
-continue to return immediately. Drain cancels admission; a one-second settlement
-budget transitions the service to the existing repair lifecycle if the worker is
-still active. Keep the service owner lock until all journal filesystem work
-settles. Do not release ownership while a detached writer may still append.
+potentially blocking and stay off the reactor. A work cycle has no time bound
+(owner, 2026-10-16). It ends on completion, a filesystem error or drain
+cancellation, checked between filesystem operations. Slowness never makes audit
+Unavailable. The OS may stall inside an operation: retain the single worker and
+queue bounds, and do not spawn a replacement writer. Producers continue to return
+immediately; a full queue records a gap. The code still applies the earlier
+two-second `CYCLE` deadline, which reports `Stale` health and can disable audit;
+a follow-up implementation will remove it.
+
+Drain cancels admission and lets the writer flush for one second. This one-second
+`DRAIN` bound is a wind-down of the audit writer's own flush: when it passes, the
+writer is cancelled. Stop then waits for the cancelled writer to settle; the
+expiry no longer moves the service to the repair lifecycle
+([stop and drain](system-architecture.md#reactor-stop-and-drain), owner,
+2026-10-16; code change pending). Keep the service owner lock until all journal
+filesystem work settles. Do not release ownership while a detached writer may
+still append.
 
 Append batches contain at most 16 records or 64 KiB, and sync at least once per
 second while records are pending, plus after rotation and graceful shutdown.
@@ -322,7 +338,7 @@ either bound disables journal startup without deletion. Reject unsafe matching
 files rather than following them. Sort by retained file creation timestamp, then
 archive name for ties; this defines retention order, not event chronology across
 epochs. Prune oldest validated archives only after a new active file is established,
-until `keepFiles` remain. Delete at most 32 per worker cycle, with deadline/cancel
+until `keepFiles` remain. Delete at most 32 per worker cycle, with cancel
 checks and parent sync. Temporary excess retention is allowed during recovery;
 never exceed admission memory bounds to track it. Unrelated names are not deleted.
 
@@ -460,7 +476,9 @@ archive browser, filesystem path argument or pagination registry in this slice.
 
 `/audit [limit]` accepts a decimal limit 1–16, default 16, and requires a selected
 registered project. Bad arguments retain the draft. The asynchronous command worker
-uses the existing control client, with one pending job and a two-second deadline.
+uses the existing control client, with one pending job. The job waits for the
+reply until the person cancels or the connection is lost (owner, 2026-10-16). The
+code still applies a two-second deadline; a follow-up implementation will remove it.
 It renders a padded newest-first table in the normal result panel, with health and
 recent-window limits. Escape closes; scrolling activates only on overflow.
 
@@ -637,7 +655,7 @@ and nonempty relative components; absolute paths, dot components, backslashes an
 control characters reject. Each list contains at most four unique known names.
 Unknown fields, duplicate mapping keys, nulls and custom tags remain invalid.
 
-The existing 16 KiB file, 4 KiB set value, isolated config worker, deadlines,
+The existing 16 KiB file, 4 KiB set value, isolated config worker,
 atomic replacement and cancellation rules apply. Parsing permits six container
 levels, at most 64 entries per mapping and four scalar sequence elements.
 Typed validation permits sequences only for the capability lists. No metadata,
@@ -680,10 +698,14 @@ unwinding completes. Active, Stale and Unavailable health values are not settlem
 signals. No deadline permits a scanner to race a still-running bootstrap.
 
 The reactor remains available for Hello, Inspect, config reads and Stop while this
-ordering gate is closed. After two seconds it reports inspection timeout once;
-it retains the pending scan factory and starts the scan only after real bootstrap
-completion. The scan retains its existing five-second deadline and unchanged
-identity/witness checks. A late successful scan may replace the timeout snapshot.
+ordering gate is closed. Inspect reports the pending inspection state while the
+gate is closed; it never reports an inspection timeout (owner, 2026-10-16). The
+reactor retains the pending scan factory and starts the scan only after real
+bootstrap completion, or discards it at Stop. The code still publishes an
+inspection timeout after two seconds; a follow-up implementation will remove it.
+The scan has no time bound
+([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound))
+and keeps its identity/witness checks.
 Configuration writes remain busy until the scan settles. Conversation authority
 open follows the completed scan. Stop before release discards the pending factory,
 retains the audit owner until actual settlement, and starts no inspection worker.
@@ -693,8 +715,8 @@ flowchart TD
     Bound[Bind service; reactor remains responsive] --> Audit[Start retained audit bootstrap]
     Audit --> Wait{Bootstrap actually returned or unwound?}
     Wait -->|No| Pending[Defer scan and conversation open]
-    Pending --> Timeout[After 2 seconds publish timeout once; retain gate]
-    Timeout --> Wait
+    Pending --> Report[Inspect reports pending inspection; retain gate]
+    Report --> Wait
     Wait -->|Yes| Scan[Start initial authority scan with unchanged witnesses]
     Scan --> Settled{Scan actually settled?}
     Settled -->|No| Responsive[Continue reactor; retain worker]
@@ -703,10 +725,11 @@ flowchart TD
     Pending --> Stop[Stop discards unstarted scan; retain audit until settled]
 ```
 
-AS-U1 holds bootstrap past its logical deadline, verifies health expiry does not
-release inspection, then checks release on actual return/failure/unwind. AS-U2
-holds the deferred scan factory, checks one timeout and cancellation without
-invocation, then checks one invocation after release. AS-I1 creates a real missing
+AS-U1 holds bootstrap, verifies that a held bootstrap does not release
+inspection, then checks release on actual return/failure/unwind. AS-U2
+holds the deferred scan factory, checks that Inspect reports pending with no
+timeout and that cancellation discards it without invocation, then checks one
+invocation after release. AS-I1 creates a real missing
 logs directory before the scanner starts and verifies the pending-installation
 fixture remains Recovering. The existing changed-authority witness regression must
 still reject an unrelated root mutation. Isolated CLI/native audit lifecycle checks

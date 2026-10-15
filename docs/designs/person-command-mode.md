@@ -299,7 +299,7 @@ flowchart TD
     Kill --> Reply
     Reply -->|"Accepted"| Show["Show stopping or killed state"]
     Reply -->|"Already settled"| Done["Show settled outcome"]
-    Reply -->|"No reply in 2 s"| Unconfirmed["Show stop unconfirmed, allow repeat"]
+    Reply -->|"Lost connection or wait cancelled"| Unconfirmed["Show stop unconfirmed, allow repeat"]
 ```
 
 ### Person view: log and job viewer
@@ -623,7 +623,7 @@ these reasons:
 | Exited | Exit code |
 | Signalled | Signal number, when no stop was requested |
 | Cancelled | `person_stop`, `person_kill`, `shutdown`, `revocation` |
-| Not started | `cwd_unavailable`, `project_changed`, `sandbox_unavailable`, `spawn_failed`, `setup_timeout` |
+| Not started | `cwd_unavailable`, `project_changed`, `sandbox_unavailable`, `spawn_failed` |
 | Interrupted | Recorded at recovery after a restart; effects unknown |
 
 The request digest covers record kind PCQ, project, conversation, expected
@@ -655,7 +655,7 @@ supervisor is added.
 
 | Change | Detail |
 | --- | --- |
-| Profile selection | `ShellRequest` gains `profile: Model \| Person(PersonRoots)` and an optional deadline. The guardian argv gains a profile token after the job ID. Validated descriptors still authorize the entrypoint. |
+| Profile selection | `ShellRequest` gains `profile: Model \| Person(PersonRoots)`. It carries no deadline ([J1-Q3](tool-job-controller.md#j1-timeout-and-setup-budget-removal)). The guardian argv gains a profile token after the job ID. Validated descriptors still authorize the entrypoint. |
 | No-deadline mode | Every job runs with deadline argument `0` (owner, 2026-10-14, J2a-1). The guardian skips the deadline check (`guardian.rs:186`) and keeps its 100 ms lease poll. Every other existing check stays for both profiles. |
 | Stop control | The lease pipe accepts single bytes: `T` starts TERM and the grace timer; `K` sends KILL at once. EOF still means service loss. Today any byte is a protocol fault (`guardian.rs:389-399`). At most 2 bytes are written, below `PIPE_BUF`. The job controller adopts the same bytes for model job cancel. |
 | Grace | Person profile: 2 s (PC8). The model keeps 500 ms. |
@@ -796,15 +796,17 @@ flowchart TD
     Dup -->|New| Append["Append kind PCQ"]
     Append -->|Durable| Queued["Queued"]
     Append -->|Uncertain| Unc["Unconfirmed, resolve by request ID"]
-    Rpc -->|"No reply in 2 s"| Unc
+    Rpc -->|"Lost connection or wait cancelled"| Unc
     Queued --> Ready{"Lane head and no active turn?"}
     Ready -->|No| Wait["Remain queued"]
     Ready -->|Yes| Admit{"Job controller admits?"}
     Admit -->|"busy: slot or quota"| Wait
     Admit -->|Yes| Start["Job intent committed, setup starts"]
-    Start --> Setup{"Setup within 2 s?"}
+    Start --> Setup{"Setup outcome?"}
     Setup -->|"cwd, identity or sandbox failure"| NotStarted["Settlement: not started"]
-    Setup -->|Yes| Run["Running until exit or stop"]
+    Setup -->|"Person stop, revocation or shutdown"| Cancelled["Settlement: cancelled, nothing ran"]
+    Setup -->|Spawned| Run["Running until exit or stop"]
+    Cancelled --> Settle
     Run --> Settle["Settlement with outcome, digests, counts"]
 ```
 
@@ -870,7 +872,7 @@ command may have changed files.
 | Project unregistered or replaced before start | Not started, `project_changed` |
 | Sandbox missing or profile rejected | Not started, `sandbox_unavailable`; no unsandboxed retry |
 | Guardian or shell spawn fails | Not started, `spawn_failed` |
-| Setup exceeds 2 s | Not started, `setup_timeout`; the slot stays retained until the worker finishes |
+| Setup is slow | Setup has no time bound ([J1-Q4](tool-job-controller.md#j1-timeout-and-setup-budget-removal), owner, 2026-10-16). It ends on spawn, a cancel or a setup fault. A cancel before spawn records Cancelled with its reason; nothing runs. The slot stays retained until the worker finishes |
 | Job slot or quota unavailable at dispatch | The command stays queued at the lane head with the reason shown; dispatch retries when space frees |
 | Quota cannot grow while running | Expiry first, then `CapturePaused`; the person sees the reason and can stop the command |
 | Command writes outside its roots | The OS denies it; the command sees `Operation not permitted`; the outcome is its own exit status |
@@ -899,11 +901,11 @@ the person path adds.
 | Call | Owner and isolation | Limit |
 | --- | --- | --- |
 | Read PATH at TUI launch | TUI startup, in memory | 4096 bytes |
-| Submit RPC | Existing serial queue sender; one in flight | 2 s RPC deadline |
-| `JobRead`, `JobObserve`, `JobCancel` | TUI job worker from J4 | 2 s RPC deadline; observe waits at most 1 s |
-| Journal append and flush | Existing eight-slot journal worker | Existing 2 s writer deadline |
-| `getpwuid_r`, `confstr`, open and stat of roots | Job slot setup worker | Inside the existing 2 s setup deadline |
-| `current_exe`, project identity, profile, guardian spawn | Job slot setup worker | Same 2 s deadline |
+| Submit RPC | Existing serial queue sender; one in flight | No time bound; ends on the reply, the person's cancel or a lost connection ([client waits](command-flows.md#client-waits-without-time-bounds), owner, 2026-10-16) |
+| `JobRead`, `JobObserve`, `JobCancel` | TUI job worker from J4 | No time bound, as for submit. The service holds an observe for at most 1 s; that long-poll is pacing and ends nothing |
+| Journal append and flush | Existing eight-slot journal worker | No time bound ([J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)); 8-slot queue, then `busy` |
+| `getpwuid_r`, `confstr`, open and stat of roots | Job slot setup worker | No time bound ([J1-Q4](tool-job-controller.md#j1-timeout-and-setup-budget-removal)); ends on completion, cancel or a setup fault |
+| `current_exe`, project identity, profile, guardian spawn | Job slot setup worker | Same as above |
 | Pipe reads and staging writes | Job controller and payload workers | Job controller limits |
 | Guardian wait, signals, reap | Guardian process | 100 ms poll, existing |
 
@@ -932,16 +934,19 @@ how much output is retained or shown to the model.
 
 | Stage | Deadline | Cancellation owner |
 | --- | --- | --- |
-| Setup | 2 s, existing | Job slot worker |
+| Setup | None ([J1-Q4](tool-job-controller.md#j1-timeout-and-setup-budget-removal)) | Job slot worker: cancel, revocation, shutdown |
 | Command runtime | None (PCR11) | The person through stop and kill; revocation; shutdown; lease EOF |
 | Capture pause | None | Freed space resumes; the same cancellation owners end it |
-| Stop grace | 2 s (PC8) | Guardian |
+| Stop grace | 2 s (PC8), a wind-down bound after the person's stop | Guardian |
 | Cleanup after KILL | 2.5 s before unconfirmed | Guardian and job controller |
 
-AE-04 requires a defined deadline and cancellation owner for each blocking
-boundary. The owner's no-timeout decision is the person-command counterpart of
-the selected cancellation-driven turn lifetime. The cancellation owners above
-replace a fixed expiry. Setup and cleanup keep their fixed deadlines.
+AE-04 requires every wait and every piece of work to end through a
+[loop-closure](loop-closure.md) condition, with a cancellation owner at each
+blocking boundary. No fixed time limit ends work by default (owner, 2026-10-15).
+The cancellation owners above are those closures. The stop grace is a wind-down
+bound: it starts only after the person asked to stop. The cleanup-confirmation
+interval is unchanged by this design; its classification under AE-04 is an open
+question for the owner.
 
 ### Recovery and lifecycle
 

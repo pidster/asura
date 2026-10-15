@@ -4,6 +4,11 @@ Status: selected scoped design for the user-requested Git status replacement,
 2026-09-27. Runtime qualification is required before calling Git status verified.
 Root owns control/client integration; the observer packet owns two new modules.
 
+Time-bound update (owner, 2026-10-16): Git collection, tool lookup and client
+socket calls have no time limit. Staleness is measured in missed heartbeats, not
+seconds. The implementation still applies the former bounds; a follow-up
+implementation will apply this design.
+
 ## Pipeline and scope
 
 Filesystem signals enter the service observation pipeline. The service coalesces
@@ -84,7 +89,7 @@ flowchart TD
     Identity -->|No| Stale["Publish stale identity and stop"]
     Identity -->|Yes| Git["Run confined read-only Git collection"]
     Git --> Result{"Outcome?"}
-    Result -->|Failure, timeout or output limit| Unknown["Publish unknown with reason"]
+    Result -->|Failure, superseded or output limit| Unknown["Publish unknown with reason"]
     Result -->|Repository result| Diff["Collect tracked numstat against HEAD or computed empty tree"]
     Diff --> Counts{"Diff valid within shared bounds?"}
     Counts -->|Yes| Totals["Attach text additions and deletions"]
@@ -122,8 +127,10 @@ retry. No busy retry loop or expensive periodic repository scan is permitted.
 No notification stream proves an atomic filesystem snapshot. Drain notifications
 after collection; if another signal arrived, publish unknown/changed and recollect
 after debounce. Undelivered/coalesced OS notifications remain a consistency limit.
-The UI must show freshness and cannot call stale observations current after 30 s
-without a live subscription. An unchanged live watch does not require a Git scan. If its worker unexpectedly
+The UI must show freshness. The observation is shown stale after five
+consecutive missed one-second heartbeats (owner, 2026-10-16); the UI cannot call
+it current. This one rule replaces the earlier 30-second and five-second texts.
+Staleness changes the display only; it ends no work. An unchanged live watch does not require a Git scan. If its worker unexpectedly
 finishes, the manager publishes Unknown/context_observer_stopped once and never
 uses pending heartbeats to preserve a successful snapshot. A specific setup
 failure remains intact; no-result worker failure becomes revision 1 unknown.
@@ -177,16 +184,17 @@ Submodules do not contribute nested status in this slice.
 | Mailbox | 1 latest snapshot per worker; no per-event queue |
 | Root/path | 4,096 UTF-8 bytes, validated directory identity |
 | Git processes | 1 per worker, no concurrent collection |
-| Collection | 2 seconds absolute including output reads; cancellation checked at most every 20 ms while process runs |
+| Collection | No time limit (owner, 2026-10-16). Ends on completion, cancellation, output limit or supersession by a newer filesystem change. Cancellation checked at most every 20 ms while the process runs (pacing) |
 | Output | 1 MiB stdout and 16 KiB stderr; overflow cancels collection |
-| Tool lookup | 2 seconds, 4 KiB output, performed once per worker |
-| Debounce | 250 ms quiet interval, 2 seconds maximum during sustained writes |
+| Tool lookup | 4 KiB output, performed once per worker. No time limit (owner, 2026-10-16); ends on completion, cancellation or shutdown |
+| Debounce (pacing) | 250 ms quiet interval, 2 seconds maximum during sustained writes |
 | Shutdown | Watch wakes immediately through its cancellation source; owned process killed and reaped; owner never joins an unfinished worker |
 
 Filesystem calls and process creation remain potentially blocking OS operations.
 They are confined to the two retained workers. A stalled worker consumes its slot
-and cannot be replaced. Service shutdown reports incomplete settlement if its
-existing deadline expires; it must not report the worker stopped without evidence.
+and cannot be replaced. Service shutdown waits for the worker to settle after
+cancellation reaches it, and shows progress while it waits (owner, 2026-10-16).
+It must not report the worker stopped without evidence.
 A kill request is not reap evidence. No test may leave a child Git process alive.
 
 ## Validation gate
@@ -197,7 +205,7 @@ A kill request is not reap evidence. No test may leave a child Git process alive
 | CO2 | Output limits and unsafe metadata/path rejection | External config/helper/filter/submodule/alternate fixtures prove no writes, execution, network or external disclosure |
 | CO3 | Debounce and latest mailbox | Nested file mutation triggers real FSEvents collection without UI activity |
 | CO4 | Scope/generation checks and stale rejection | Rename/replace root during collection never publishes a new directory as old scope |
-| CO5 | Cancellation and deadline outcomes | Stall Git/output, saturate two scopes, type/cancel/exit within existing UI responsiveness budget |
+| CO5 | Cancellation and supersession outcomes; a long collection is not ended by time | Stall Git/output, saturate two scopes, type/cancel/exit within existing UI responsiveness budget |
 | CO6 | Unknown versus nonrepo and absent counts | Nonrepo omits Git fields; error shows unknown; zero line counts never fabricated |
 | CO7 | Revision and subscription replacement | Two clients, project switch, disconnect/reconnect and service restart preserve independent scope |
 
@@ -223,11 +231,13 @@ inventing a new Git observation. No request starts a repository scan directly.
 
 Project/path/epoch change cancels the old worker. A replacement waits until that
 worker actually stops; at most one context transport thread exists. Socket RPCs
-have the client's two-second deadline. Errors reconnect after one second using
+have no deadline (owner, 2026-10-16); each ends on reply, cancellation or
+disconnect. Errors reconnect after a one-second backoff (pacing) using
 one replacement worker, without busy looping. An OS resolver stall retains that
 slot; it cannot multiply threads. Mailbox reads use `try_lock` and never block
 rendering. On exit, cancel before terminal restoration and permit only a 100 ms
-post-restoration settlement wait; CLI process exit contains remaining client work.
+post-restoration settlement wait. This is a wind-down bound on the client's own
+exit; CLI process exit contains remaining client work.
 
 Display state rejects mismatched scope, stale revision, older receipt timestamps
 and old worker generations. A monotonic client source generation fences retired
@@ -238,8 +248,9 @@ freshness, so a delayed UI cannot lose a snapshot to mailbox coalescing. A new
 subscription discards that retained observation. Failed thread creation backs off one second and makes
 Git unavailable; it does not exit the chat client.
 A replaced service clears the previous projection. A pending reply for a new
-subscription clears old Git fields. Five seconds without a response makes the
-projection unavailable. Verified nonrepository omits Git; unknown displays `? ? +?-?`.
+subscription clears old Git fields. Five consecutive missed one-second heartbeats
+make the projection unavailable (owner, 2026-10-16). The code still measures five
+seconds; a follow-up implementation will count missed heartbeats. Verified nonrepository omits Git; unknown displays `? ? +?-?`.
 Repository observations show branch or detached state and numeric change totals.
 No absent count appears as zero. Paths and provider strings
 remain literal terminal text. Rendering makes no filesystem or network call.
@@ -251,7 +262,8 @@ passed all 9 tests on macOS 27 with Apple Git 2.54.0. The real fixtures covered
 nonrepository, unborn, clean, dirty, detached, nearest nested repository,
 fsmonitor/filter nonexecution, unchanged index bytes, denied external config,
 unsupported alternate stores, replaced scope, recursive FSEvents and exact-child
-settlement after cancellation, deadline and output overflow.
+settlement after cancellation, deadline and output overflow. The deadline case
+is historical; the owner removed the collection deadline on 2026-10-16.
 
 Earlier restricted profiles failed during dyld bootstrap, `/dev/null` open and
 project-ancestor normalization. Installed dyld bootstrap rules and bounded test
@@ -304,15 +316,18 @@ absent line counts. An unborn repository uses its empty tree as the baseline;
 a confined `hash-object -t tree --stdin` with empty input and without `-w`
 computes the baseline in the repository object format without a write. If that
 baseline cannot be safely obtained, line counts remain absent.
-All sequential collector children share one absolute two-second deadline and
-one aggregate 1 MiB output budget. No child runs concurrently with another.
+All sequential collector children share one aggregate 1 MiB output budget. They
+have no time limit (owner, 2026-10-16); collection ends on completion,
+cancellation, output limit or supersession by a newer change. No child runs concurrently with another.
 Tests cover staged and unstaged changes to one file, binary changes, unborn
 repositories, renames, unusual filenames, output limits and forbidden helpers.
 
 ## Display continuity during refresh
 
 A same-scope `git_changed` or `git_changed_during_observation` event starts a
-two-second display grace interval. The TUI retains its last complete repository
+display grace interval of two heartbeat intervals (owner, 2026-10-16). The grace
+ends at the second heartbeat interval after the event, whether that heartbeat
+arrives or is missed. The code still measures two seconds. The TUI retains its last complete repository
 or nonrepository projection during this interval. This is previous evidence, not
 a new successful observation. Repeated invalidations and heartbeats cannot extend
 the interval. A complete replacement clears it. Expiry, a hard error, disconnect,
@@ -326,7 +341,7 @@ flowchart TD
     Event[Scoped observation] --> Scope{Same source and subscription?}
     Scope -->|No| Clear[Clear previous projection]
     Scope -->|Yes| Refresh{Transient Git refresh?}
-    Refresh -->|Yes, prior evidence| Hold[Retain display for at most two seconds]
+    Refresh -->|Yes, prior evidence| Hold[Retain display for at most two heartbeat intervals]
     Hold --> Done{Next event}
     Done -->|Complete snapshot| Replace[Replace display and clear grace]
     Done -->|Repeated refresh| Hold

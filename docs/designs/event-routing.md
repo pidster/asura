@@ -4,6 +4,12 @@ Status: implemented for the local service and TUI. Validation evidence and
 remaining scope limits are recorded below.
 The wire protocol stays 0.1. The journal stays at format 1.
 
+Time-bound update (owner, 2026-10-16): under
+[AE-04](../engineering.md#asynchronous-execution-and-recovery), the waits below
+end through loop-closure conditions, not fixed time limits. The implementation
+still applies the removed bounds; a follow-up implementation will apply this
+design. [Time bounds](#time-bounds) lists each change.
+
 ## Owners and delivery
 
 The platform owns descriptor wakeups and bounded local inboxes. Each service or
@@ -72,10 +78,10 @@ flowchart TD
 
 E2 converts TUI worker publications and terminal input into typed routed events.
 Its output dispatcher receives explicit commands. Quit and cancel precede status.
-The poll timeout is the nearest explicit deadline, not a periodic status scan.
+The poll timeout is the nearest explicit owner timer, not a periodic status scan.
 
 E3 registers service completion wakeups, lifetime EOF and model transport
-readiness alongside control sockets. Each owner exposes its next deadline.
+readiness alongside control sockets. Each owner exposes its next timer.
 Timer expiry produces an event for that owner. Request routing is bounded per
 client. Filesystem ownership checks move behind a bounded isolation boundary;
 a request cannot cause effects until its required identity validation settles.
@@ -90,7 +96,7 @@ Disconnect releases subscriptions; durable queue work retains service ownership.
 A worker result and worker settlement are different events. The owner retains its
 slot until actual settlement. A bounded isolated reaper may join worker handles
 and publish settlement; the reactor must never join an unfinished thread.
-Operation timeout reports its real effect status and does not release that slot.
+Operation cancellation reports its real effect status and does not release that slot.
 Shutdown closes ingress, cancels work, restores the terminal, and retains service
 ownership through its existing recovery and drain contract.
 
@@ -139,18 +145,26 @@ This is not proof that the JoinHandle has finished. A finished handle still
 owns its slot until the owner consumes and joins it. A thread-state check must
 never clear the only settlement hint while that slot is retained. A 10 ms settlement timer
 rechecks only hinted owners until their handle is finished; occupied slots are
-retained throughout. Configuration and queue deadlines remain explicit timers.
-Context retry and five-second observation expiry expose their next deadline.
+retained throughout. Queue mutations have no client budget
+([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)).
+Configuration requests have no time limit (owner, 2026-10-16). Each ends on its
+reply, cancellation or disconnect. Context retry
+backoff and the missed-heartbeat staleness check expose their next timer; both
+are pacing and end no work.
 Queue projections use the retained E4 subscription below; there is no periodic
 queue-list timer.
 
 The foreground waits on the inbox wake descriptor and stdout writable readiness
-when a frame is pending. The wait deadline is the earliest owner deadline,
-settlement timer or frame deadline. Signal hooks also write to a private
+when a frame is pending. The wait ends at the earliest owner timer, settlement
+timer or output retry timer. Signal hooks also write to a private
 nonblocking socket pair registered in the foreground readiness set. Clock
-continuity is checked on events and owner deadlines; it does not create an idle
+continuity is checked on events and owner timers; it does not create an idle
 poll. The fixed 16 ms global mailbox scan is removed.
-A frame retains the existing 100 ms write deadline. Shutdown first stops input
+A pending frame has no write deadline (owner, 2026-10-16). While stdout is not
+writable, the renderer keeps the frame, retries on writable readiness and
+coalesces newer state into the next frame. Slow output never ends the TUI.
+The code still exits after a 100 ms output stall; a follow-up implementation
+will remove that exit. Shutdown first stops input
 admission and requests cancellation, restores the terminal, then performs bounded
 reader/worker settlement. An unresponsive reader is retained until process exit;
 no replacement reader or ownership reuse is allowed.
@@ -169,7 +183,7 @@ flowchart TD
     Input --> Quit{Exit or fatal input error?}
     Quit -->|Yes| Stop[Close ingress, cancel owners, restore terminal, settle]
     Quit -->|No| Results[Handle ready command results before telemetry]
-    Results --> Timer[Apply only due deadlines and settlement hints]
+    Results --> Timer[Apply only due timers and settlement hints]
     Timer --> Commands[Dispatch typed App requests to canonical workers]
     Commands --> Draw{Dirty and output ready?}
     Draw -->|Yes| Render[Draw projected state and pump bounded output]
@@ -188,19 +202,21 @@ Each isolated service worker publishes a completion signal after storing its
 result. Registration after completion must also signal the reactor. The receiver
 retains the worker handle until settlement. A one-millisecond settlement timer
 runs only after a completion signal and before `JoinHandle::is_finished` succeeds.
-It does not inspect unrelated workers or launch work. Operation deadlines remain
-absolute. Their expiry cannot extend a worker's execution or release its slot.
+It does not inspect unrelated workers or launch work. Service operations have no
+default time limit; each ends on completion, cancellation, disconnect or shutdown
+(owner, 2026-10-16). Cancellation cannot release a worker's slot before settlement.
 Installation source validation occurs on its inspection worker before publishing
 its snapshot. Later mutations retain their own admission identity checks.
 
 Storage replies notify after enqueueing the reply and reducing admitted work.
-The owner reads a ticket only on a completion wake or its absolute deadline.
+The owner reads a ticket only on a completion wake or a cancellation.
 Context producers notify after replacing their typed snapshot. Pending context
-subscriptions wake on observation publication or their one-second liveness timer.
+subscriptions wake on observation publication or their one-second heartbeat timer.
 Transport and lifetime descriptors join the existing poll set. Polling OS
 readiness is permitted; periodic state scans are removed as integration proceeds.
-A service shutdown uses its existing drain deadlines and explicit unsettled-worker
-timers. Guard filesystem validation uses the per-request fence below;
+A service shutdown waits for owned workers to drain after cancellation reaches
+them (owner, 2026-10-16). Explicit settlement timers pace that check; they end
+no work. Guard filesystem validation uses the per-request fence below;
 removing those checks without that fence is forbidden.
 
 ## Service guard validation
@@ -218,9 +234,13 @@ A request cannot dispatch effects until its own successful validation settles an
 all these identities still match. Results cannot authorize another request or
 be cached as blanket runtime validity. Startup also validates before admission.
 
-Validation and cleanup have two-second deadlines and completion wake signals.
-Timeout rejects admission and retains the worker slot. A later success is marked
-expired and cannot authorize effects. Poll joins only an already finished worker;
+Validation has no time limit (owner, 2026-10-16). It ends on completion,
+cancellation, client disconnect or shutdown, and it sends a completion wake signal.
+A disconnect or lifecycle change invalidates the ticket and retains the worker
+slot. A later success for an invalidated ticket cannot authorize effects.
+Cleanup keeps its two-second wind-down bound on Asura's own shutdown work. The
+code still rejects validation after two seconds; a follow-up implementation will
+remove that limit. Poll joins only an already finished worker;
 notification-before-thread-exit uses the existing one-millisecond settlement timer.
 A blocked syscall cannot be forcibly cancelled; cancellation is checked before
 and after validation. No replacement worker starts until settlement.
@@ -228,7 +248,7 @@ and after validation. No replacement worker starts until settlement.
 Endpoint removal transfers the full guard into the same isolated worker and
 returns it after settlement, including failures. A failed thread spawn returns
 the guard to its caller. Cleanup validates and unlinks through the existing
-platform method. A timeout does not claim the unlink did not happen: its effect
+platform method. An expired cleanup wind-down does not claim the unlink did not happen: its effect
 remains unconfirmed until settlement. Shutdown retains the guard and all snapshots
 until every owned worker settles, preserving lock-last release. Client disconnect
 invalidates a pending request ticket without releasing its active worker early.
@@ -238,11 +258,11 @@ flowchart TD
     Request[Retain decoded request and identity ticket] --> Slot{Guard slot free?}
     Slot -->|No| Wait[Keep bounded request pending]
     Slot -->|Yes| Worker[Validate immutable pinned witness off reactor]
-    Worker -->|Deadline| Reject[Reject ticket and retain occupied worker]
+    Worker -->|Disconnect or lifecycle change| Reject[Invalidate ticket and retain occupied worker]
     Worker -->|Completion wake| Finish{Thread finished?}
     Finish -->|No| Timer[Settlement timer only]
     Timer --> Finish
-    Finish -->|Yes| Check{Success, not expired, identities current?}
+    Finish -->|Yes| Check{Success, ticket valid, identities current?}
     Check -->|Yes| Dispatch[Dispatch this request once]
     Check -->|No| Discard[Reject or discard stale request]
     Reject --> Finish
@@ -251,7 +271,7 @@ flowchart TD
 ```
 
 Validation tests cover invalid runtime/endpoint identity, lock retention across
-snapshot ownership, timeout then late success, exactly-once deadline, actual
+snapshot ownership, disconnect then late success, a long validation with no timeout, actual
 settlement, cleanup guard return and completion wake registration. Reactor tests
 must prove stale client/lifecycle tickets cannot dispatch and stalled validation
 does not block input cancellation, other completion handling or shutdown initiation.
@@ -260,11 +280,11 @@ does not block input cancellation, other completion handling or shutdown initiat
 
 A model owner with retained undecoded input bytes schedules an immediate bounded
 next turn even if its OS socket is empty. A partial frame with no retained bytes
-waits for descriptor readiness. After preparation cancellation, its elapsed model
-deadline no longer schedules work; only completion/settlement wakes apply until
+waits for descriptor readiness. Model preparation has no deadline (owner,
+2026-10-16). After preparation cancellation, only completion/settlement wakes apply until
 its worker returns. Failed cleanup-thread creation retains the child and schedules
 an explicit 100 ms retry. Tests cover more than eight coalesced frames, cancelled
-stalled preparation, and cleanup retry deadlines without idle polling.
+stalled preparation, and cleanup retry timers without idle polling.
 
 ## E4 client subscriptions
 
@@ -275,26 +295,34 @@ Transport failure clears the connection/cursor and retries after an explicit
 one-second backoff; cancellation wakes that backoff. Healthy subscriptions have
 no extra client sleep. The configured model selector is a display fallback until
 a native model reports its actual variant. A selector or service epoch change
-clears the previous actual variant and context metrics. Heartbeat snapshots refresh the five-second liveness bound.
+clears the previous actual variant and context metrics. Each heartbeat snapshot
+resets the missed-heartbeat count. After five consecutive missed one-second
+heartbeats, the TUI shows the service as Disconnected (owner, 2026-10-16).
+Staleness changes the display only; it ends no work. The code still measures five seconds; a
+follow-up implementation will count missed heartbeats.
 
 Conversation observation retains its operation/cursor and uses the service's
 one-second wait. The 50 ms client sleep is removed. Cancellation checks run between
-bounded requests; an in-flight observation can delay a cancellation request by
-at most its two-second transport deadline. Conversation generation and terminal
+bounded requests. An in-flight observation has no transport deadline (owner,
+2026-10-16). It ends on the service's reply, which arrives within the one-second
+wait, on cancellation of the worker or on disconnect. Conversation generation and terminal
 result handling remain unchanged.
 
 Queue mutations and explicit `/queue` queries retain their existing operation
 worker. A separate single retained queue observer subscribes to selected project
 and service epoch, so an idle longpoll cannot block a mutation. It has one latest
-mailbox, one connection, a monotonic source generation, one-second heartbeat,
-two-second transport deadline and one-second reconnect backoff. A scope change
+mailbox, one connection, a monotonic source generation, one-second heartbeat
+and one-second reconnect backoff. It has no transport deadline; a request ends
+on reply, cancellation or disconnect (owner, 2026-10-16). A scope change
 cancels its worker; no replacement starts before actual worker settlement.
 Pending replies preserve the last projection in the producer mailbox. The App
 fences project, epoch, source generation and revision before replacing queue
 entries. A new scope clears the previous projection. Subscription results do not
 clear drafts, mutation receipts or explicit command state. The automatic 500 ms
-queue-list request and its timer are removed. A five-second heartbeat expiry
-clears the stale queue projection without changing durable service state.
+queue-list request and its timer are removed. After five consecutive missed
+heartbeats, the App shows the queue projection as stale and clears it without
+changing durable service state (owner, 2026-10-16). Staleness changes the display
+only; it ends no work. The code still measures five seconds.
 
 ```mermaid
 flowchart TD
@@ -332,8 +360,10 @@ immediately. An unchanged revision waits at most one second and returns a
 liveness heartbeat with the current cached status. Epoch changes invalidate cursors.
 
 The service reads the model selector with canonical `conversation_snapshot` on
-one isolated worker at startup and after configuration mutations. The read has a
-two-second deadline. Timeout makes the selector unavailable and retains its worker.
+one isolated worker at startup and after configuration mutations. The read has no
+time limit (owner, 2026-10-16). The selector shows as pending until the read
+returns; it ends on completion, failure or shutdown. The code still applies a
+two-second limit; a follow-up implementation will remove it.
 A heartbeat never rereads configuration. A pending refresh coalesces into one
 subsequent read after the current worker settles. External file edits take effect
 on the next explicit configuration interaction or service restart.
@@ -348,10 +378,10 @@ requests. Mutations keep their independent acknowledgement path.
 
 `ConversationObserve.wait_ms` already exists. The client selects 1000 ms. The
 service returns a changed cursor or terminal immediately; otherwise it retains
-the request until change or heartbeat deadline. No sleeping query loop remains.
+the request until a change or its heartbeat timer. No sleeping query loop remains.
 The service observes journal revision changes in memory. It only reads queue
 prompt excerpts when an actual replacement projection is required. A busy writer
-retains the subscription until its slot is available or the heartbeat deadline.
+retains the subscription until its slot is available or its heartbeat timer fires.
 
 ```mermaid
 flowchart TD
@@ -359,11 +389,11 @@ flowchart TD
     V -->|Yes| S[Return scoped replacement projection]
     V -->|No| Q{Subscription capacity available?}
     Q -->|No| B[Reject busy without acceptance]
-    Q -->|Yes| W[Retain attachment and one-second deadline]
+    Q -->|Yes| W[Retain attachment and one-second heartbeat timer]
     W --> E{Owner event, disconnect or timer}
     E -->|Disconnect| D[Release subscription only]
     E -->|Owner changed| S
-    E -->|Deadline unchanged| H[Return pending heartbeat without source IO]
+    E -->|Heartbeat timer, unchanged| H[Return pending heartbeat without source IO]
     S --> C[Client applies scope and revision fence]
     H --> C
     C --> R
@@ -383,7 +413,7 @@ An empty channel wakes immediately; a full channel already contains work and the
 worker observes closing before another operation. The queue keeps its eight-item
 bound. Commands already queued receive cancellation when shutdown drains them.
 Dropping the handle uses the same wake path. Actual database/runtime settlement
-retains its existing deadline and SDK-task checks; those are shutdown activity,
+retains its existing wind-down bound and SDK-task checks; those are shutdown activity,
 not an idle scan. Tests exercise wake from idle close/drop and a full channel.
 
 ### Git watcher cancellation wake
@@ -398,7 +428,9 @@ before watcher creation. Stream/source registration and removal stay on the work
 
 With no filesystem changes the worker waits for a source event, with no periodic
 cancel checks. With dirty data it waits until the earlier of last-change+250 ms
-and first-change+2 seconds. Active Git child deadlines/reap checks remain bounded
+and first-change+2 seconds. This debounce is pacing. Active Git children have no
+collection deadline (owner, 2026-10-16). Collection ends on completion,
+cancellation or supersession by a newer change. Reap checks remain bounded
 worker activity. Tests signal before and during a long wait and verify immediate
 return; existing real recursive filesystem watch tests remain required.
 
@@ -408,7 +440,7 @@ flowchart TD
     Publish --> Cancel{Cancellation stored?}
     Cancel -->|Yes| Settle[Remove sources on worker and publish settlement]
     Cancel -->|No| Dirty{Pending filesystem changes?}
-    Dirty -->|Yes| Timed[Wait until source event or nearest debounce deadline]
+    Dirty -->|Yes| Timed[Wait until source event or nearest debounce timer]
     Dirty -->|No| Idle[Wait for source event without idle timer]
     Signal[Owner stores cancellation and signals source] --> Idle
     Signal --> Timed
@@ -419,7 +451,7 @@ flowchart TD
 ```
 
 A terminal observation that needs journal text retains its request while the
-writer is occupied. At its heartbeat deadline it returns Pending with the same
+writer is occupied. When its heartbeat timer fires it returns Pending with the same
 operation, generation and last observed cursor. It cannot claim a terminal result
 until the terminal record is read. The next request resumes that read when free.
 
@@ -455,10 +487,32 @@ and the repeated full terminal journey now pass. A parallel lock-release failure
 led to explicit final-owner unlock and a deterministic shared-description test.
 
 These checks establish the tested local flows. Heartbeats, debounce, operation
-deadlines and worker settlement checks remain explicit timed events. Isolated
+deadlines and worker settlement checks were explicit timed events in that run.
+The owner's 2026-10-16 decision removes the operation deadlines; see
+[Time bounds](#time-bounds). Isolated
 terminal parsing and active child supervision retain bounded cancellation checks.
 This is not evidence for remote model providers, remote hosts or enabled project
 tool execution; those retain their separate integration gates.
 
 Final Rust formatting, `git diff --check` and Clippy with warnings denied passed.
 The readiness deadline rounding regression also passed after its correction.
+
+## Time bounds
+
+Required behavior (owner, 2026-10-16): no fixed time limit ends, refuses or fails
+work in this design. The table records each bound this design stated before that
+decision and what now ends the wait. The code change is pending; a follow-up
+implementation will apply it.
+
+| Former bound | Decision | What ends the wait now |
+| --- | --- | --- |
+| Client read, status, queue and conversation transport: 2 s | Removed | Reply, cancellation of the worker, or disconnect |
+| Model selector configuration read: 2 s | Removed | Completion, failure or shutdown; the selector shows as pending |
+| Guard validation: 2 s | Removed | Completion, cancellation, client disconnect or shutdown |
+| Terminal frame write: 100 ms, then the TUI exits | Removed | Writable readiness; frames coalesce and the TUI never exits on slow output |
+| Git child collection: 2 s | Removed | Completion, cancellation or supersession by a newer change |
+| Model preparation deadline | Removed | Next helper message, helper exit, protocol fault, cancellation or shutdown |
+| Service liveness and queue projection: 5 s | Kept as a display rule in missed heartbeats | Five consecutive missed one-second heartbeats mark the projection stale; no work ends |
+| Guard cleanup: 2 s | Kept, wind-down | Bounds Asura's own shutdown cleanup; the effect stays unconfirmed until settlement |
+| Embedded memory shutdown settlement | Kept, wind-down | Bounds Asura's own shutdown work |
+| Heartbeat 1 s, long-poll 1 s, reconnect backoff 1 s, debounce 250 ms and 2 s, settlement timers 1 ms and 10 ms, terminal reader checks 100 ms, cleanup retry 100 ms | Kept, pacing | These timers end no work |

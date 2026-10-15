@@ -253,15 +253,16 @@ any bound returns `inspection_limit`; it cannot authorize partial-state use.
 One bounded storage worker performs one startup scan. The reactor remains able
 to serve Inspect and Stop while the state is `Recovering`/`inspection_pending`.
 The worker posts one typed result with the current service epoch and scan ID.
-A result from a stopped or obsolete scan cannot publish. Use a five-second
-monotonic deadline and cancellation checks between reads and frames. The timer
-marks the view unavailable on expiry; it does not prove a blocked syscall ended.
-Stop cancels the scan and retains ownership until the worker settles. The reactor
-checks worker completion without a blocking join; join only after completion is
-reported. If the existing stop deadline expires first, keep the owner and serve
-responsive `RepairOnly` inspection while settlement remains unknown. A subsequent
-Stop may complete after the worker exits. Never claim timeout killed a blocked
-read. Unknown settlement follows the existing drain failure contract. No periodic scan,
+A result from a stopped or obsolete scan cannot publish. The scan has no time
+bound: it ends on completion, content failure, an epoch change or shutdown, with
+cancellation checks between reads and frames. [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound) removed the earlier
+five-second scan deadline. Stop cancels the scan and retains ownership until the
+worker settles. The reactor checks worker completion without a blocking join;
+join only after completion is reported. Stop waits for the scan worker to settle
+and shows progress meanwhile; a second Stop forces exit
+([stop and drain](system-architecture.md#reactor-stop-and-drain), owner,
+2026-10-16). Only a worker that reports an unknown outcome leaves the owner in
+`RepairOnly` inspection. Never claim that cancellation stopped a blocked read. No periodic scan,
 filesystem watcher or unbounded retry is introduced. Restart requests a new scan.
 
 EOF exactly at a valid frame boundary permits replay. An empty journal is a
@@ -293,7 +294,7 @@ stateDiagram-v2
     Recovering --> RepairRequired: Remnants or invalid authority
     Recovering --> Recovering: Valid pending initialization
     Recovering --> GraphUnavailable: Valid active binding, graph unchecked
-    Recovering --> Unavailable: Deadline, access or identity change
+    Recovering --> Unavailable: Access or identity change
     Uninitialized --> [*]: Stop
     RepairRequired --> [*]: Stop
     GraphUnavailable --> [*]: Stop
@@ -311,7 +312,7 @@ sequenceDiagram
     participant S as Rust service reactor
     participant W as Storage scan worker
     participant P as Platform filesystem owner
-    S->>W: Scan with epoch, scan ID and deadline
+    S->>W: Scan with epoch, scan ID and cancel flag
     W->>P: Open existing validated authority
     CLI->>S: InspectInstallation on authenticated attachment
     S-->>CLI: Recovering, inspection_pending
@@ -320,7 +321,7 @@ sequenceDiagram
     S->>S: Check active scan and current ownership
     alt Current and valid
         S->>S: Publish bounded installation snapshot
-    else Cancelled, replaced or expired
+    else Cancelled or replaced
         S->>S: Discard candidate, preserve unavailable state
     end
     CLI->>S: InspectInstallation

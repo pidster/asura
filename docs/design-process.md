@@ -84,7 +84,7 @@ Every governing design must address:
   dependency direction.
 - **Contracts:** inputs, outputs, errors, state transitions, compatibility, and
   concurrency semantics.
-- **Failure and recovery:** relevant deadlines, cancellation, retries,
+- **Failure and recovery:** loop-closure endings, cancellation, retries,
   idempotency, persistence, restart, and partial outcomes.
 - **Security:** authority, data handling, trust boundaries, enforcement, and
   threat assumptions.
@@ -92,7 +92,8 @@ Every governing design must address:
   performance objectives.
 - **Asynchronous execution:** map the change to [AE-01–AE-07](engineering.md#asynchronous-execution-and-recovery).
   Name blocking APIs, isolation owners, numeric work/queue/concurrency limits,
-  deadline and cancellation behavior, and startup/shutdown settlement.
+  the closures that end each wait, any owner-approved wind-down or pacing bound,
+  cancellation behavior, and startup/shutdown settlement.
   Define overload, stalled-dependency and recovery acceptance cases before coding.
 - **Validation:** mapping from requirements and behaviors to unit, integration,
   and end-to-end cases, plus relevant model, security, performance, and usability

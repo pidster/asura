@@ -74,7 +74,7 @@ never loads file payloads or changes note/source/receipt state.
 
 [HM2](hybrid-memory-ontology.md#hm2-typed-read-only-memory-tools) defines the
 implemented model-facing read integration. Its service dispatcher must submit to the
-existing authority worker, retain a per-job settlement token across deadline expiry,
+existing authority worker, retain a per-job settlement token after the caller stops waiting,
 and persist tool outcomes before model continuation. Storage remains the sole
 owner of graph reads and durable replay; adapters receive bounded evidence only.
 

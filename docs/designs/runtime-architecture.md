@@ -299,7 +299,7 @@ stateDiagram-v2
     Owned --> Draining: Authorized service shutdown
     Owned --> Lost: Owner loss or crash
     Draining --> Stopped: Effects accounted for and ownership released
-    Draining --> Lost: Owner loss or crash
+    Draining --> Lost: Owner loss, crash or forced exit on a second stop
     Lost --> [*]: Replacement repeats ownership checks
     Stopped --> [*]
 ```
@@ -312,9 +312,12 @@ remain valid. Recovery must reconcile outstanding effects before redispatch.
 
 Draining closes new work ingress, records the shutdown transition where possible,
 stops helpers under existing authority and preserves unresolved obligations. It
-must not discard accepted queued work. D2-D3 must define the finite drain deadline
-and crash-safe forced-exit behavior; the diagram's graceful `Stopped` transition
-requires accounted effects. A replacement must fence the old owner before dispatch.
+must not discard accepted queued work. Drain has no deadline (owner, 2026-10-16):
+it waits for cancelled workers to settle and shows progress. Only a worker that
+reports an unknown outcome leads to repair. A second stop request forces a
+crash-safe exit, after which replacement recovery applies, as on the `Lost` path
+([stop and drain](system-architecture.md#reactor-stop-and-drain)). The diagram's
+graceful `Stopped` transition requires accounted effects. A replacement must fence the old owner before dispatch.
 
 ## Validation and open decisions
 

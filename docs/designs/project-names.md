@@ -282,7 +282,7 @@ start. The terminal journey checks both visual capitalization and command flow.
 | PN6 | Reply is lost after commit; same request ID resolves | Exactly one rename frame; original result returned; new request ID not generated | Replay/idempotency unit; fault integration; reconnect end-to-end |
 | PN7 | Old registration alias exists, then rename and restart | Alias replays against registration revision 1; effective name remains renamed | Replay unit; real restart integration; CLI list end-to-end |
 | PN8 | Project A command is in flight; UI selects B | Late A reply cannot rename B's displayed status or selector entry | Scope unit; delayed API integration; TUI end-to-end |
-| PN9 | Writer stalls, queue overloads or journal fills | UI stays responsive; busy/uncertain result truthful; no partial name | Timeout unit; fault integration; TUI responsiveness end-to-end |
+| PN9 | Writer stalls, queue overloads or journal fills | UI stays responsive; busy/uncertain result truthful; no partial name | Held-reply and cancel unit; fault integration; TUI responsiveness end-to-end |
 | PN10 | Unicode name uppercases to multiple scalars or exceeds limit | Deterministic capitalized UTF-8 or definite rejection; never truncate | Unicode unit; API integration; TUI end-to-end |
 | PN11 | Model is running and project-admin worker is free; rename selected project | Rename completes without waiting for model; model keeps its project ID and inputs | Worker unit; concurrent service integration; TUI/model end-to-end |
 | PN12 | New request ID renames to the already displayed name | New frame and name revision commit; exact same-ID retry returns the original result | Writer unit; restart integration; TUI end-to-end |

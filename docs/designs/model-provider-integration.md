@@ -32,6 +32,12 @@ on the selected helper and assets. The MP1 sections below record the earlier
 contract. MP2 supersedes its inventory and endpoint restrictions where stated.
 Provider-specific runtime evidence and its limits are recorded separately below.
 
+Time-limit update (owner, 2026-10-16): the helper handshake, Ollama, Foundation
+and inventory waits have no time limit. See
+[helper and provider waits without time limits](#helper-and-provider-waits-without-time-limits--owner-2026-10-16).
+That section supersedes the time limits stated in earlier sections. The code
+still applies them; a follow-up implementation will remove them.
+
 ## Scope and evidence
 
 Read-only Wisp inspection used revision
@@ -127,7 +133,7 @@ flowchart TD
     Event -->|Text or native call| Emit["Emit bounded framework event"]
     Emit --> Stream
     Event -->|Done with valid usage| Complete["Complete generation"]
-    Event -->|Cancel or deadline| Stop["Cancel URLSession and settle helper operation"]
+    Event -->|Cancel, helper exit or shutdown| Stop["Cancel URLSession and settle helper operation"]
     Event -->|HTTP error, invalid frame or early EOF| Fail["Fail incomplete, preserve outer usage obligation"]
 ```
 
@@ -141,8 +147,8 @@ termination/reap. Adapter retries are disabled; cancellation invalidates its ses
 | Resource | Bound |
 | --- | --- |
 | Model name | 1 to 1,024 UTF-8 bytes, no whitespace/control |
-| Discovery request | 5 seconds total and 64 KiB response |
-| Generation request | No Asura whole-turn expiry;60 seconds network inactivity, SDK default resource bound |
+| Discovery request | 64 KiB response; no time limit (owner, 2026-10-16) |
+| Generation request | No time limit: no whole-turn expiry, network inactivity bound or resource bound (owner, 2026-10-16) |
 | Encoded request | 256 KiB including transcript and tool schemas |
 | NDJSON record | 64 KiB before decoding |
 | Total response | 4 MiB |
@@ -154,7 +160,9 @@ termination/reap. Adapter retries are disabled; cancellation invalidates its ses
 
 Read network bytes incrementally and reject before growing the record buffer beyond
 its limit. HTTP error bodies are not logged or retained. Invalid or redirected
-responses fail without disclosing to a different endpoint. Task cancellation
+responses fail without disclosing to a different endpoint. A request ends on its
+reply, an HTTP or transport error, cancellation, helper exit or service shutdown.
+Silence alone does not end it. Task cancellation
 must invalidate the owned URLSession; helper shutdown remains the final containment
 boundary if a dependency does not stop. Numeric bounds do not establish tested
 responsiveness; MP2 requires real fault injection before activation.
@@ -209,13 +217,14 @@ The assets are trusted account-owned model data; changing files during vendor lo
 can cause failure. This validation is not a sandbox against another same-user process.
 
 Filesystem inspection and vendor initialization run in one detached helper task.
-The service remains the deadline and process-settlement owner. Cancellation stops
-admission; a stalled loader is terminated with its helper. The operation retains
-the boundary deadlines: twenty seconds for helper preparation and five seconds for
-Hello and provider loading. Started generation follows the cancellation-driven
+The service remains the cancellation and process-settlement owner. Cancellation stops
+admission; a stalled loader is terminated with its helper. Preparation and Hello,
+including provider loading, have no time limit (owner, 2026-10-16). Each step ends
+on the next message, helper exit, a protocol fault, cancellation or shutdown, and
+the TUI shows the step it waits for. Started generation follows the cancellation-driven
 turn lifetime below. There are
-no retries or additional helper slots. A model that cannot load within five
-seconds fails availability; larger assets require explicit runtime qualification. Neither
+no retries or additional helper slots. A model that fails to load reports
+unavailable; a slow load stays visibly pending and cancellable. Neither
 filesystem reads nor model loading runs on the service reactor or terminal renderer.
 
 CoreAI uses `CoreAILanguageModel` from `coreai-models` revision
@@ -263,7 +272,7 @@ flowchart TD
     Capacity -->|Yes| Backend["Common FoundationBackend and tool callback bridge"]
     System --> Backend
     Backend --> Bound["Bind Begin to exact selector and operation"]
-    Bound --> Execute["Generate under existing service deadline and grants"]
+    Bound --> Execute["Generate under cancellation-driven lifetime and grants"]
     Execute --> End{"Completion, error or cancellation?"}
     End --> Settle["Service settles helper and durable turn"]
 ```
@@ -368,7 +377,7 @@ Ollama mappings are omitted from default YAML when no endpoint is configured.
 The endpoint validator accepts ASCII DNS names or IP literals, with an optional
 port from 1 to 65535. It rejects escapes and backslashes to keep Rust and Swift
 URL interpretations consistent. Ordinary config get/set continues to use the
-existing command flow, atomic file replacement and worker deadline.
+existing command flow, atomic file replacement and cancellable worker.
 
 
 ### MP2 resolved dependency review
@@ -395,7 +404,7 @@ It copies the verified helper as `asura-model` and the verified resource as
 `mlx.metallib`. Source files must be regular, owned by the service account and not
 group/world writable. Final symlinks are rejected. Bounds are 128 MiB executable
 and 64 MiB Metal resource, copied in 64 KiB chunks under the existing preparation
-deadline and cancellation flag. Both copied inodes are re-read and hashed.
+cancellation flag. Both copied inodes are re-read and hashed.
 
 The platform retains both files and the directory through child settlement.
 Cleanup unlinks only names whose device/inode match retained descriptors, then
@@ -413,7 +422,7 @@ flowchart TD
     Hash -->|No| Fail["Unavailable before spawn"]
     Hash -->|Yes| Dir["Create exclusive private instance directory"]
     Dir --> Copy["Copy and re-hash helper and mlx.metallib"]
-    Copy --> Valid{"Identity, hashes and deadline valid?"}
+    Copy --> Valid{"Identity and hashes valid and not cancelled?"}
     Valid -->|No| Cleanup["Remove only matching owned files and directory"]
     Valid -->|Yes| Spawn["Spawn copied helper with colocated resource"]
     Existing --> Spawn
@@ -463,6 +472,8 @@ step changes the assembled helper identity. Root must rebuild and re-run native
 admission to verify that preparation fits its budget; this change alone is not
 performance evidence. The client submit deadline remains three seconds, so
 increasing preparation time would also require a coordinated admission contract.
+This paragraph records the 2026-09-30 state. The owner later removed the
+preparation and client submit time limits (2026-10-16).
 
 
 Native provider fixtures retain one submit request ID while waiting for prior
@@ -591,14 +602,16 @@ Empty provider directories are a successful empty inventory. Missing provider
 roots are empty; inaccessible roots and invalid metadata produce explicit issues.
 
 The service reuses the canonical configuration snapshot reader on one isolated
-worker, with a two-second deadline. It then uses the verified `ModelOwner` helper
-lifecycle for metadata discovery: twenty-second preparation, five-second Hello and
-existing cancellation, kill, reap and private-path cleanup. A dedicated Hello flag
+worker. It then uses the verified `ModelOwner` helper lifecycle for metadata
+discovery: preparation, Hello and existing cancellation, kill, reap and private-path
+cleanup. The snapshot, preparation and Hello have no time limit (owner, 2026-10-16).
+Each ends on its result, helper exit, a protocol fault, cancellation, disconnect or
+shutdown. A dedicated Hello flag
 selects inventory-only execution. The helper returns inventory in Hello and exits;
 Begin, tool grants and generation are forbidden on this path. The helper executes
 filesystem discovery in a detached task. A stalled filesystem cannot block the
 service reactor or terminal. The inventory slot remains occupied until workers
-and the helper actually settle, even after error, disconnect or timeout.
+and the helper actually settle, even after error, cancellation or disconnect.
 
 One inventory helper may coexist with the existing admitted conversation helper.
 This is a separate read-only slot with no inference permission, not a second
@@ -632,8 +645,9 @@ SDK display names; paths and raw response/error bodies are not returned or logge
 
 Ollama enumeration uses GET `/api/tags` at the snapshotted configured endpoint.
 It reuses endpoint validation and URLSession policy: no redirects, proxy, ambient
-credentials, cookies or cache. The request has a two-second deadline and 64 KiB
-incremental response bound. A provider failure preserves other provider rows.
+credentials, cookies or cache. The request has a 64 KiB incremental response
+bound and no time limit (owner, 2026-10-16). It ends on its reply, an error,
+cancellation or helper exit; a stalled Ollama row stays pending until then. A provider failure preserves other provider rows.
 Listing sends no prompts, project information or filesystem content. Locality is
 not inferred from Ollama; catalog presence establishes neither completion/tool
 capability nor a local execution destination. No new dependency is introduced.
@@ -649,16 +663,16 @@ flowchart TD
     Syntax -->|Yes| Client["Queue typed client request"]
     Client --> Slot{"Service inventory slot free?"}
     Slot -->|No| Busy["models_busy; retry after settlement"]
-    Slot -->|Yes| Config["Isolated configuration snapshot: 2 seconds"]
-    Config -->|Invalid or expired| Error["Return bounded error"]
+    Slot -->|Yes| Config["Isolated configuration snapshot"]
+    Config -->|Invalid| Error["Return bounded error"]
     Config -->|Valid| Helper["Verified inventory-only helper"]
     Helper --> Providers["Probe system; scan assets; fetch Ollama tags"]
     Providers -->|Partial failures| Partial["Keep rows and provider issues"]
     Providers -->|Success| Partial
     Partial --> Selection["Append unchecked selection if absent"]
     Selection --> Table["Publish table through client event queue"]
-    Helper -->|Timeout or protocol failure| Error
-    Client -->|Disconnect or exit| Cancel["Cancel operation"]
+    Helper -->|Helper exit or protocol failure| Error
+    Client -->|Person cancels, disconnect or exit| Cancel["Cancel operation"]
     Cancel --> Settle["Retain slot until worker and child settle"]
     Error --> Settle
     Table --> Settle
@@ -672,7 +686,7 @@ flowchart TD
 | MP3-B | Missing, nested, malformed and symlink assets; bounded scans | Scratch asset roots list metadata without model loading or downloads |
 | MP3-C | Ollama catalog parse, invalid names and response limits | Private HTTP server: success, error, oversized reply, stall and cancellation |
 | MP3-D | Selection marker, missing selection, table formatting and arity | Real service PTY `/models`, scrolling only on overflow, repeated command and quit |
-| MP3-E | Timeout retains slot; late result suppressed | Stalled discovery leaves Inspect and exit responsive; child and scratch cleanup |
+| MP3-E | Cancel retains slot until settlement; late result suppressed | Stalled discovery stays pending without a time limit; Inspect, cancel and exit stay responsive; child and scratch cleanup |
 
 Root owns serial Cargo, Swift and real terminal checks. Model-free tests are
 mandatory; listing itself does not require native inference. Optional account
@@ -754,7 +768,7 @@ it does not return another correction. The wrapper forwards the original schema,
 name and description. It cannot expose an additional tool or grant authority.
 The existing inference allocations (1024 first, 512 later, at most 64 requests
 under the [turn budget](turn-usage-helper.md#turn-budget-and-request-admission)),
-2048 total reservation, turn deadline, callback-waiter bound and output bounds
+2048 total reservation, callback-waiter bound and output bounds
 remain unchanged. No retry
 scheduler or extra model dispatch owner is added; the SDK decides whether to
 correct its proposal within those limits.
@@ -790,27 +804,25 @@ is not proof of failure. Cancellation stops tool admission and settles owned wor
 
 This section supersedes earlier whole-turn deadlines in this design, the first
 conversation packet and context telemetry. Numeric response, tool-call, byte and
-queue limits remain unchanged. Startup preparation allows twenty seconds. Hello,
-input transfer and Ready-to-Start handoffs each have five-second deadlines. Existing
-250 ms helper cancellation and exact-child cleanup stages remain unchanged.
-Tools receive a fresh deadline at admission: ordinary reads and mutations use the
-existing two-second bound; shell uses its validated requested duration, at most
-60 seconds. A later tool does not inherit a deadline from turn startup.
+queue limits remain unchanged. Startup preparation, Hello, input transfer and the
+Ready-to-Start handoff have no time limit (owner, 2026-10-16); see
+[helper and provider waits](#helper-and-provider-waits-without-time-limits--owner-2026-10-16).
+The 250 ms helper cancellation and exact-child cleanup stages remain as wind-down
+bounds. Tools follow the [tool job controller](tool-job-controller.md); a later
+tool does not inherit a time bound from turn startup.
 
 The optional Begin `deadline_remaining_ms` field is omitted by the service. Absence
-means cancellation-driven generation. A supplied positive legacy value up to
-60,000 ms remains a supported explicit generation deadline. Field and numeric acceptance stay
-compatible, but the duration now starts at Start rather than Begin. Old elapsed
-semantics are not preserved across this schema-digest boundary.
-The helper separately bounds input transfer and cancels that timer on Start; only
-an explicitly supplied generation deadline arms a running timer. Schema comments
-change, but the protocol remains 0.1 and journal format remains 1.
+means cancellation-driven generation. The owner removed the legacy explicit
+generation deadline (2026-10-16). The field stays in the 0.1 schema for
+compatibility. The service never sends it, and the helper arms no generation or
+input-transfer timer, whatever value it receives. The protocol remains 0.1 and
+journal format remains 1.
 
-Ollama retains its five-second discovery deadline and 60-second network inactivity
-bound. Its generation URLSession has no Asura-imposed total resource timeout.
-Foundation retains its default seven-day resource cap; this is an SDK limit. Incoming bytes
-keep the transport active; those bytes do not claim model-level progress. SDK-owned
-timeouts and actual provider failures remain reported failures. Async dispatch
+Ollama discovery and generation have no time limit (owner, 2026-10-16); the
+60-second network inactivity bound is removed. Foundation requests set no resource
+time limit in place of the SDK's seven-day default. Incoming bytes do not claim
+model-level progress, and silence does not prove failure. Actual provider
+failures remain reported failures. Async dispatch
 alone is not proof of dependency health. The service controls and client event
 loop remain responsive while inference is pending.
 
@@ -820,13 +832,17 @@ loop remain responsive while inference is pending.
 stateDiagram-v2
     [*] --> Preparing
     Preparing --> Hello: verified child
-    Preparing --> Failed: twenty second deadline or spawn failure
+    Preparing --> Failed: spawn or verification failure
     Hello --> Transfer: available metadata
-    Hello --> Failed: five second deadline or unavailable
+    Hello --> Failed: unavailable, helper exit or protocol fault
     Transfer --> Ready: complete input
-    Transfer --> Failed: five second deadline or protocol fault
+    Transfer --> Failed: helper exit or protocol fault
     Ready --> Running: durable Start
-    Ready --> Failed: five second handoff deadline
+    Ready --> Failed: helper exit or protocol fault
+    Preparing --> Settling: cancel or shutdown
+    Hello --> Settling: cancel or shutdown
+    Transfer --> Settling: cancel or shutdown
+    Ready --> Settling: cancel or shutdown
     Running --> Running: output or admitted bounded tool
     Running --> Running: elapsed time alone causes no expiry
     Running --> Settling: completion or provider failure
@@ -837,10 +853,12 @@ stateDiagram-v2
 ```
 
 Validation: unit checks advance a running model beyond the old deadline and verify
-no timeout, while transfer and cancellation deadlines still fire. Tool-budget tests
+no timeout. Each handshake step, held past its former limit with an injected
+clock, stays pending and visible, then ends on the next message, helper exit,
+protocol fault, cancellation or shutdown. Tool-budget tests
 admit a later tool beyond 60 seconds while retaining call/byte and cancellation
-limits. Helper tests use an injected clock/timer boundary to verify omitted versus
-explicit generation deadlines. Process/PTY checks retain cancellation, disconnect,
+limits. Helper tests verify that a supplied `deadline_remaining_ms` arms no timer.
+Wind-down stages still escalate on cancellation. Process/PTY checks retain cancellation, disconnect,
 shutdown and responsiveness coverage under stalled inference. Native qualification
 must demonstrate a turn exceeding 60 seconds without an elapsed-time failure.
 Mocks and metadata fixtures do not establish that native result.
@@ -862,6 +880,10 @@ prompts, arguments or model responses. Failed fixture runs retain at most 64 KiB
 of the isolated service log in a temporary diagnostic artifact.
 
 ### Recorded lifetime checks — 2026-09-30
+
+These checks predate the owner's 2026-10-16 removal of the handshake and legacy
+generation deadlines; tests that assert those deadlines must change with the
+follow-up implementation.
 
 The matching isolated package passed the 64-second loopback-provider process
 journey. The real service and Swift helper completed the full response. Inspect
@@ -885,6 +907,10 @@ development preview; it is not the active backend.
 
 ### Preparation allowance correction — selected 2026-09-30
 
+Superseded (owner, 2026-10-16): preparation has no time limit. It ends on
+completion, verification failure, cancellation or shutdown. The record below
+explains the former twenty-second allowance.
+
 Actual-package qualification repeatedly expired in Preparing, before any Ollama
 request, under the former two-second copy/verification allowance. The owner
 retains the same single cancellable preparation worker and private verified
@@ -903,19 +929,24 @@ those inference assertions.
 
 ### Client observation and startup budgets — selected 2026-09-30
 
+Partly superseded (owner, 2026-10-16): the model inventory and conversation
+admission time budgets below are removed. See
+[helper and provider waits](#helper-and-provider-waits-without-time-limits--owner-2026-10-16).
+
 A TUI conversation subscriber has no whole-turn expiry. It stays on the existing
 isolated, cancellable observation worker until terminal, explicit cancellation,
 client shutdown or a transport/provider failure. Its individual socket requests,
-mailbox bounds, slot retention and shutdown deadlines remain unchanged. In
-particular, removing its former 65-second loop condition does not make a stalled
-transport call unbounded or introduce another subscriber or service scheduler.
+mailbox bounds and slot retention remain unchanged. Removing its former
+65-second loop condition does not introduce another subscriber or service
+scheduler. The owner later removed client request time limits (2026-10-16): a
+stalled transport call ends on its reply, cancellation by the person, disconnect
+or client shutdown.
 
-Model inventory needs up to two seconds configuration, twenty seconds preparation
-and five seconds Hello. Its typed client request allows thirty seconds; its TUI
-worker allows thirty-five, including two-second attachment and settlement margin.
-Direct conversation admission allows forty seconds for configuration/history,
-preparation, Hello, input transfer and journal acknowledgement. This does not change
-the separate five-second durable input-queue receipt or generation lifetime.
+Former budgets (removed 2026-10-16): model inventory allowed two seconds of
+configuration, twenty seconds of preparation and five seconds of Hello. Its typed
+client request allowed thirty seconds and its TUI worker thirty-five. Direct
+conversation admission allowed forty seconds. These requests now wait for their
+reply. The person can cancel them, and disconnect or shutdown ends them.
 
 ```mermaid
 stateDiagram-v2
@@ -964,4 +995,78 @@ Repeat the focused process checks with `target/debug/conversation_flow
 --native-ollama`, `target/debug/conversation_flow --long-inference`, and
 `python3 rust/crates/asura-cli/tests/tui_pty.py target/debug/lifecycle
 --long-observation`. The latter two checks verify generation and observation
-beyond the former lifetime caps; bounded preparation and transport remain enforced.
+beyond the former lifetime caps. At that time, preparation and transport time
+limits were still enforced; the owner removed them on 2026-10-16.
+
+## Helper and provider waits without time limits — owner, 2026-10-16
+
+Required behavior (owner, 2026-10-16), under
+[AE-04](../engineering.md#asynchronous-execution-and-recovery) and
+[loop closure](loop-closure.md):
+
+- Helper preparation, Hello (including provider loading and inventory), input
+  transfer and the Ready-to-Start handoff have no time limit. The former twenty-
+  and five-second limits are removed.
+- Each step ends on the next protocol message, helper exit, a protocol fault,
+  cancellation or service shutdown. The TUI shows the step that the turn or
+  inventory request waits for.
+- Generation has no legacy explicit deadline. The service never sends
+  `deadline_remaining_ms`; the helper arms no timer from it. The field stays in
+  the 0.1 schema.
+- Ollama `/api/show`, `/api/chat` and `/api/tags` requests have no time limit.
+  Foundation requests set no resource time limit. A request ends on its reply,
+  an HTTP or transport error, cancellation, helper exit or shutdown.
+- `/models` configuration snapshots have no time limit. The client and TUI wait
+  for the reply; the person can cancel, and disconnect or shutdown ends the wait.
+- Wind-down bounds remain: 250 ms cooperative cancellation, SIGTERM, 250 ms, then
+  SIGKILL; one second of reap observation; the helper's 250 ms final drain. They
+  bound Asura's own cleanup after cancellation and never end the work they serve.
+
+Byte, frame, record, row and call limits are known-size bounds and remain.
+Cancellation still stops admission and reaches pending work, and a cancelled or
+disconnected wait reports whether the operation stopped or has an unknown outcome.
+
+Implementation status: the code still applies the removed limits. A follow-up
+implementation will remove them and update the tests that assert them.
+
+### Helper step waits
+
+Status: owner-selected. Arrows are the events that end each wait. No arrow is a
+timer; the dashed note marks wind-down after cancellation.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Preparing
+    Preparing --> Hello: verified child spawned
+    Hello --> Transfer: Hello available
+    Transfer --> Ready: complete input
+    Ready --> Running: durable Start
+    Running --> Settling: completion or provider failure
+    Preparing --> Failed: verification or spawn failure
+    Hello --> Failed: unavailable, helper exit or protocol fault
+    Transfer --> Failed: helper exit or protocol fault
+    Ready --> Failed: helper exit or protocol fault
+    Running --> Failed: helper exit or protocol fault
+    Preparing --> Cancelling: cancel or shutdown
+    Hello --> Cancelling: cancel or shutdown
+    Transfer --> Cancelling: cancel or shutdown
+    Ready --> Cancelling: cancel or shutdown
+    Running --> Cancelling: cancel or shutdown
+    Cancelling --> Settling: helper stops or wind-down kills and reaps it
+    Failed --> Settling: clean owned resources
+    Settling --> [*]: outcome committed
+    note right of Cancelling
+        Wind-down only: 250 ms, SIGTERM,
+        250 ms, SIGKILL, 1 s reap observation
+    end note
+```
+
+Validation required for the follow-up implementation:
+
+| ID | Unit | Integration | End-to-end |
+| --- | --- | --- | --- |
+| HW-01 | Each step, held past its former limit with an injected clock, stays pending | Stalled fixture helper at each step keeps Inspect and cancel responsive | TUI shows the waiting step and cancels it |
+| HW-02 | Helper exit, protocol fault and shutdown end each step with a typed outcome | Real helper killed at each step settles the operation once | Service stop during a stalled step settles the helper |
+| HW-03 | A supplied `deadline_remaining_ms` arms no timer | Long generation with the field supplied runs to completion | |
+| HW-04 | Ollama show, chat and tags requests have no timeout configuration | Stalled private loopback server stays pending until cancel | `/models` with a stalled Ollama row stays pending until the person cancels |
+| HW-05 | Wind-down escalates cancel, SIGTERM and SIGKILL on schedule | Stubborn helper is killed and reaped after cancel | |

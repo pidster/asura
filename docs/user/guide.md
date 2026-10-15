@@ -156,7 +156,7 @@ It shows up to four rows and a `+N` count for more. Each row starts with `>>`.
 | `Held (reason)` | The service holds the message until you resume or drop it |
 | `Pending local` | The message is in this client only; the service has not accepted it |
 | `Sending` | The client is sending the message to the service |
-| `Unconfirmed` | The result of sending is not known yet |
+| `Unconfirmed` | The result of sending is not known: you cancelled the wait or the connection was lost |
 | `Rejected local` | The service rejected the message; its text is kept |
 
 A `Pending local` row is not safe yet. If the client stops, the message can be
@@ -314,8 +314,9 @@ by default Asura uses `http://127.0.0.1:11434`.
 
 Models can use four tools: `project` reads and lists project files, `memory`
 reads and creates notes, `service` reports status, tools and audit data, and
-`shell` runs one command in the project. The shell has no network access and a
-default time limit of 30 seconds. `/tools` lists the tools. A listed tool is not
+`shell` runs one command in the project. The shell has no network access. A
+command runs until it finishes or you stop the answer with `/cancel`; it has no
+time limit. `/tools` lists the tools. A listed tool is not
 always permitted for the current model or project.
 
 ## Configuration

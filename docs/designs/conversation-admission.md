@@ -161,7 +161,8 @@ original intent and requires explicit recovery; automatic startup must not creat
 a replacement intent or graph. Unknown, damaged or missing associated data remains
 unavailable. Failed automatic initialization publishes its failure and does not
 retry with new IDs. Stop prevents scheduling a new initialization job; an already
-submitted job settles under the existing writer deadline and shutdown contract.
+submitted job settles under the writer's settlement and shutdown contract; the
+writer has no time bound ([J1-0](#journal-step-j1-0-journal-waits-without-a-time-bound)).
 Inspection and terminal input remain responsive while initialization runs. Publish
 GraphReady only after the committed binding and graph have been verified.
 
@@ -515,8 +516,8 @@ unfinished workers or holding its event loop on filesystem calls.
 Open existing journal files without truncation. Retain descriptors and expected
 end offset, revision and digest. Before writing, validate the chain identities,
 size and stamp, then write the complete pre-encoded frame with a bounded pwrite
-loop. Short writes advance the same offset; EINTR retries preserve the absolute
-deadline. Zero write, unexpected offset/identity or failed flush fences all new
+loop. Short writes advance the same offset; EINTR retries the same write. The
+append has no time bound (J1-0). Zero write, unexpected offset/identity or failed flush fences all new
 admission. Do not issue another append to guess what committed.
 
 On supported local APFS, use the platform's reviewed `F_FULLFSYNC` wrapper for
@@ -528,11 +529,15 @@ do not qualify physical power-loss durability.
 
 Deadlines: journal replay, append and append observation have no time bound
 ([journal step J1-0](#journal-step-j1-0-journal-waits-without-a-time-bound), owner,
-2026-10-15). Other stages keep the separately bounded preparation, handshake and admission stages in
-[provider integration](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30). Generation and client observation are cancellation-driven.
-Worker deadlines do not cancel a blocked syscall. Keep its writer slot, file handle
+2026-10-15). Helper preparation and handshakes have no time bound either; each
+step ends on the next message, helper exit, a protocol fault, cancel or shutdown
+(owner, 2026-10-16; see [provider integration](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)).
+Generation and client observation are cancellation-driven.
+Cancellation does not stop a blocked syscall. Keep its writer slot, file handle
 and owner claim until settlement. Inspect and signal processing remain responsive.
-After the existing stop budget, retain RepairOnly ownership if work is unsettled.
+Stop waits for the writer to settle. Only a worker that reports an unknown outcome
+leaves the owner in RepairOnly ([stop and drain](system-architecture.md#reactor-stop-and-drain),
+owner, 2026-10-16).
 A full journal or uncertain writer leaves independently safe read-only status usable.
 
 The replay result exposes one canonical internal state: sequence, end offset,
@@ -657,7 +662,9 @@ These routine refinements apply the owner rule to sites the table did not list:
 - **Installation inspection.** The 5 s inspection scan bound is removed. The
   scan ends on completion, content failure, an epoch change or shutdown. The 2 s
   wait for the audit bootstrap before the scan starts is not a journal wait and
-  is unchanged.
+  was unchanged here. A later owner decision (2026-10-16) removes it too; see
+  [audit bootstrap ordering](config-commands.md#audit-bootstrap-and-initial-authority-inspection-ordering). That
+  code change is pending a follow-up implementation.
 - **Loading state (owner, 2026-10-16).** While the inspection replay or the
   writer's own replay runs, Inspect reports `recovering`/`inspection_pending`
   and conversation work gets `conversation_busy`. A first run with no journal
@@ -676,7 +683,10 @@ These routine refinements apply the owner rule to sites the table did not list:
   and progress, and Ctrl-C stops the wait. In the TUI, `/init` and
   `/project add` show progress and `/cancel` stops the wait, as it does for a
   rename or queue request. Read, config, models, submit, lifecycle and TUI job
-  budgets are unchanged.
+  budgets were unchanged in J1-0. A later owner decision (2026-10-16) removes
+  them as well: each wait ends on the real reply, the person's cancel or a lost
+  connection. That code change is pending a follow-up implementation; see
+  [command flows](command-flows.md#client-waits-without-time-bounds).
 - **Queue worker.** `/cancel` while a queue request is in flight stops the wait.
   The slot stays busy until the worker settles. The service-owned queue
   projection shows the request if it committed.
@@ -763,7 +773,7 @@ No model permit may be enabled before the writer and recovery checks below pass.
 | CA04 cancel race | Cancel before/after permit, stale helper, duplicate intent | Gate each append/flush and helper start boundary | Cancel acknowledgement remains distinct from terminal settlement |
 | CA05 completion | Usage limits, provisional/complete distinction, terminal cursor | Kill before/after terminal flush; preserve complete response only after commit | Reconnect displays original complete or interrupted result |
 | CA06 restart | Started versus never-started charge and no re-execution | Real child/service death with durable or incomplete frames | Restart reports Interrupted without another model call |
-| CA07 journal failure | Reserved closure capacity, short writes, zero write and deadline | Real scratch disk/flush failures, identity swaps, stalled worker and owner retention | Inspect/Stop and TUI input remain responsive, unknown outcomes explicit |
+| CA07 journal failure | Reserved closure capacity, short writes, zero write and stalled write | Real scratch disk/flush failures, identity swaps, stalled worker and owner retention | Inspect/Stop and TUI input remain responsive, unknown outcomes explicit |
 | CA08 bounds | 64 projects, 256 conversations, 8 MiB/32768 frame limits, eight-slot queue | Saturation and 16 MiB replay allocation measurement | Capacity exhaustion preserves draft and existing outcomes |
 | CA09 live model | Model selection and result validation | Real helper transport and cancellation, no tools | Supported macOS model completes a scoped turn with durable history |
 
@@ -793,9 +803,10 @@ They cover:
 - Missing database refusal without creating a replacement database.
 - Snapshot retention backpressure before writes, followed by progress after release.
 
-Unit checks verify that expired mutation observations and disconnected completion
-channels report uncertain outcomes. The timeout poll completed within 100 ms in
-that test; this does not qualify responsiveness under an actual stalled syscall.
+Unit checks verified that expired mutation observations and disconnected completion
+channels reported uncertain outcomes. J1-0 later removed observation expiry; a
+disconnected channel still reports an uncertain outcome. The timeout poll completed
+within 100 ms in that test; this does not qualify responsiveness under an actual stalled syscall.
 The 64 MiB journal allocation ceiling has static conservative accounting and a
 retained-snapshot backpressure test. Peak resident-memory measurement remains open.
 
@@ -887,8 +898,10 @@ prompt before acknowledgement. A stale target rejects without effects. Queue
 order is journal sequence order within the conversation. At most 16 unresolved
 inputs exist across the service, each at most 32 KiB UTF-8. Busy storage rejects
 before acceptance; clients retain text. Existing cancellation capacity remains
-reserved. Each dispatch retains the existing 60-second model deadline, current
-output reservation and one active operation limit.
+reserved. Each dispatch uses the
+[cancellation-driven turn lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30),
+which replaced the earlier 60-second model deadline. It keeps the current output
+reservation and one active operation limit.
 
 InputQueued stores its original request/digest, a fresh internal dispatch request
 ID, project, conversation, target operation/generation, optional previous queued

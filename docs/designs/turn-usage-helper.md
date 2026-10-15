@@ -184,9 +184,11 @@ The transport retains its eight control frames, 4096-byte control-frame maximum
 and nonblocking socket owner. Queue saturation fails explicitly; it does not drop
 usage silently or block the service reactor.
 
-Inference retains cancellation-driven lifetime. Existing preparation, handoff,
-transport inactivity and cleanup deadlines remain selected by their designs.
-Counter reporting adds no external call and needs no new dependency deadline.
+Inference retains cancellation-driven lifetime. Preparation, handoff and
+transport waits have no time limit (owner, 2026-10-16); see
+[helper and provider waits](model-provider-integration.md#helper-and-provider-waits-without-time-limits--owner-2026-10-16).
+Cleanup keeps its wind-down bounds. Counter reporting adds no external call and
+no time bound.
 Cancellation and terminal delivery retain existing ordering and cleanup ownership.
 A pending native model cannot prevent the client or service processing controls.
 

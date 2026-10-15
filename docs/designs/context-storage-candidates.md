@@ -550,8 +550,11 @@ workflows. D3-D4 must define security and persistence before I2.
 
 The orchestrator must show the resolved mode in effective configuration and
 diagnostics. External settings must identify the endpoint, namespace, database,
-credential reference and server trust configuration. They must also set connection
-and query deadlines, with bounded reconnect attempts. Embedded mode does not
+credential reference and server trust configuration. They must also define
+cancellation for connections and queries, with bounded reconnect attempts. A
+connection or query ends on completion, an error, cancel or disconnect; no fixed
+time limit ends it unless the owner approves one
+([AE-04](../engineering.md#asynchronous-execution-and-recovery), owner, 2026-10-16). Embedded mode does not
 require these external settings.
 
 The orchestrator must reject ambiguous or incompatible settings. It must not
@@ -622,7 +625,7 @@ sequenceDiagram
 | Graph semantics | Typed nodes/edges, endpoint integrity, unique/versioned relations, cycles, provenance traversal, workspace scoping and stale-evidence invalidation |
 | Representative queries | Bounded neighborhood retrieval, dependency closure, source-to-summary invalidation, evidence supporting a decision, revision-filtered context assembly |
 | Consistency and recovery | Atomic changes, concurrent readers/writers, conflict handling, reopen after forced termination, disk-full behavior, corruption reporting, and graph/ledger reconciliation |
-| Responsiveness | Query cancellation/deadlines and bounded query complexity; p50/p95/p99 context assembly under simultaneous ingestion and agent activity |
+| Responsiveness | Query cancellation and bounded query complexity; p50/p95/p99 context assembly under simultaneous ingestion and agent activity |
 | Resource cost | Cold start, idle/peak memory, disk growth, compaction, binary size, clean/incremental build time and transitive native dependencies on Apple silicon |
 | Security | Workspace/task isolation, query parameterization, selected database capabilities, file protection, backup/deletion behavior and outbound network restrictions |
 | Operations | Schema/data migrations, backup/restore, supported upgrades, rollback limits, export and recovery into a replacement backend |

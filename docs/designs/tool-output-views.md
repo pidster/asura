@@ -147,7 +147,7 @@ its classification under the principles above.
 | L42 | `get_note` page | 1–16,384, default 4096 | Keep ceiling; default becomes a composer choice | Memory tools |
 | L43 | Note sources | 32 | Keep | Memory tools |
 | L44 | Note body | 1–16,384 | Keep | Memory tools |
-| L45 | Store response and deadline | 32 records or 64 KiB; 2 s | Keep | Memory store |
+| L45 | Store response and deadline | 32 records or 64 KiB; 2 s | Keep the response size; remove the 2 s store deadline (owner, 2026-10-16) | Memory store: queries and transactions end on completion, an engine error or the caller's cancel ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). The caller's L10 wait is separate |
 | L46 | `read_audit` | 1–16 records | Keep | Audit tools |
 | L47 | Audit reply bytes | 16,384 in design; 15,000 in code | Keep | Audit tools |
 | L48 | Audit window, record, hydrate | 256; 4096 B; 256 KiB | Keep | Audit |

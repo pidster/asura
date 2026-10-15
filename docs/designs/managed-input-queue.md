@@ -215,8 +215,8 @@ The storage authority derives this status from existing format-1 terminal and
 input records. The service scheduler consumes that status; the TUI does not
 infer or override it. The terminal-eligibility change adds no blocking call,
 worker, queue, or journal record.
-The existing 16-input capacity, eight-slot journal worker, two-second writer
-deadline and cancellation-driven model lifetime still apply. An uncertain append fences
+The existing 16-input capacity, eight-slot journal worker and cancellation-driven
+model lifetime still apply. The writer has no deadline ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). An uncertain append fences
 scheduling until the canonical writer resolves it. Replay and dispatch remain
 idempotent under the existing request and owner-generation checks.
 
@@ -302,9 +302,10 @@ stateDiagram-v2
 The client sender uses the existing one-slot queue transport worker. It holds
 one in-flight request until a definitive reply or exact resolution. It does not
 send later local inputs while an earlier outcome is uncertain; this preserves
-the user's observed ordering. It uses the existing two-second RPC operation
-deadline and five-second observation budget. A timeout reports Unconfirmed and
-retains the worker slot until settlement. Idle rendering, editing, project
+the user's observed ordering. The request has no client budget and the worker
+has no observation bound ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). The wait ends on the reply,
+cancellation by the person or disconnect. Only cancellation or a lost connection
+reports Unconfirmed; the worker slot is retained until settlement. Idle rendering, editing, project
 navigation and quit remain responsive under a stalled service. Exit leaves
 durably accepted inputs in the service. Exit with pending local inputs warns
 that they were not accepted; it does not silently label them queued.
@@ -421,7 +422,7 @@ anchors. Existing IQ2 promotion of a kind-12 input keeps its original contract.
 | ID | Initial state and trigger | Required result | Evidence |
 | --- | --- | --- | --- |
 | MQ01 | Idle service; Enter once, then rapidly enter two more messages | Each Enter stages exact text and clears editor immediately; all three get distinct durable queue receipts; one model operation at a time | Unit outbox/IDs; real service integration; PTY end to end |
-| MQ02 | Backend stalls before first queue reply; user edits and quits | Renderer and keys remain responsive; in-flight ID stays stable; provisional crash-loss risk is visible; no false durable claim | Unit worker timeout; stalled service integration; PTY end to end |
+| MQ02 | Backend stalls before first queue reply; user edits and quits | Renderer and keys remain responsive; in-flight ID stays stable; provisional crash-loss risk is visible; no false durable claim | Unit worker cancellation with no timer; stalled service integration; PTY end to end |
 | MQ03 | Two accepted pending inputs; move second to front | One kind-19 mutation; new revision and dispatch order persist after restart | Replay unit; real journal integration; service and PTY end to end |
 | MQ04 | Concurrent reorder clients use same order revision | Exactly one wins; loser gets stale revision without losing text | Unit CAS; service process integration; two-client end to end |
 | MQ05 | Same reorder request retried after lost reply | Original position/result returned; no second move or dispatch | Codec/replay unit; fault-injected journal integration; control-client end to end |

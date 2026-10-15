@@ -251,8 +251,10 @@ start and in the client's runtime resolver, gains this bounded work in the
 context it already runs in. Holders then copy the computed value; no reactor
 path computes it. The overlap check adds an integer comparison per
 component to an open that already performs one `openat` per component on the
-same worker. The guardian's checks run inside the
-existing 2-second setup deadline. No new thread, queue or deadline is needed.
+same worker. The guardian's checks run inside job setup, which has no time
+bound: it ends on spawn, cancel or a setup fault
+([J1-Q4](tool-job-controller.md#j1-timeout-and-setup-budget-removal), replacing the
+earlier 2-second setup deadline). No new thread, queue or deadline is needed.
 
 ## Validation
 

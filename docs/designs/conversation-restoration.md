@@ -183,15 +183,19 @@ selection. The render and key paths perform no file, socket or model calls.
 The existing conversation client worker owns the read sequence. It posts updates
 to the TUI's bounded event mailbox. Its queue holds one restoration job and at
 most eight turn entries; a newer project selection cancels or supersedes the
-old job. Each control RPC uses the existing two-second attachment/operation
-deadline; the entire restoration has an 18-second deadline. Shutdown requests
-stop the worker and use the existing bounded cleanup path. A hung service cannot
+old job. Restoration has no time bound (owner, 2026-10-16). Each control RPC
+waits for its reply; the restoration ends on completion, `/cancel`, a newer
+project selection, exit or a lost connection
+([client waits](command-flows.md#client-waits-without-time-bounds)). The code
+still applies a two-second attachment/operation deadline and an 18-second
+restoration deadline; a follow-up implementation will remove them. Shutdown
+requests stop the worker and use the existing bounded cleanup path. A hung service cannot
 hold rendering, editor input or quit handling.
 
 The worker fetches newest-first metadata and the latest eight prompts/results.
 It publishes one scope-fenced update containing ordered transcript entries when
 the initial viewport is complete. The UI may show a loading status meanwhile.
-If a read fails or times out, it shows restoration unavailable and keeps the
+If a read fails or the connection is lost, it shows restoration unavailable and keeps the
 draft. It must not silently create a new queue lane with an absent cursor while
 a conversation may exist. Retry restoration on explicit user action or service
 recovery. Before the serial sender submits a staged message, the TUI requires a
@@ -222,7 +226,7 @@ stateDiagram-v2
     [*] --> SelectingProject
     SelectingProject --> Restoring: Project selected
     Restoring --> Ready: Valid history or empty result
-    Restoring --> Unavailable: Timeout, disconnect or repair
+    Restoring --> Unavailable: Cancel, disconnect or repair
     Unavailable --> Restoring: Retry or service recovery
     Ready --> Restoring: Project, epoch or stale generation
     Ready --> NewIntent: /new and no unresolved local or service input
@@ -275,7 +279,7 @@ history only from that packet; this design supplies that capability. Recorded
 | CR03 isolation | Two projects and cross-project IDs | Validator rejects ID mismatch without revealing content | Service read returns non-disclosing error; no mutation | Project switch shows only selected project's history |
 | CR04 stale queue | Historical kind-12 generation 3 then direct generation 4; relaunch | Baseline cannot lower restored cursor | History reply selects generation 4; historical queue row does not change it | PTY next queue submit names restored conversation; dispatch advances from current generation |
 | CR05 pending | Latest accepted turn has no terminal record | Pending entry is visible but excluded from model history | Exact observe resumes; duplicate events do not duplicate rows | Relaunch shows pending work and remains responsive |
-| CR06 faults | Slow or missing service, corrupt record, restart, stale reply | Scope fences discard wrong project/epoch/token; draft remains | Deadlines and cancellation release worker; repair state blocks implicit admission | PTY accepts keys, resize and quit during stalled restoration; owned backend stops |
+| CR06 faults | Slow or missing service, corrupt record, restart, stale reply | Scope fences discard wrong project/epoch/token; draft remains | Cancellation and disconnect release worker; repair state blocks implicit admission | PTY accepts keys, resize and quit during stalled restoration; owned backend stops |
 | CR07 bounds | Eight turns with maximum permitted prompt/result lengths | Each reply fits control frame; no truncation or overflow | Page cursor excludes prior entry; malformed cursor and IDs fail | Long response remains complete after relaunch and history navigation |
 | CR08 provisional lane | First queued input creates a generation-0 lane; client relaunches before dispatch | Queue snapshot selects durable lane, not historical terminal row | Second submit uses the same conversation ID; cross-project ID rejects | PTY relaunch sends next message into the provisional lane without creating another conversation |
 

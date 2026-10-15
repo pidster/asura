@@ -189,7 +189,7 @@ The orchestrator API must be modern, asynchronous, highly reliable, very high
 performance, and secure. Its design must define:
 
 - Typed, versioned commands and structured events with stable context, task and agent identities.
-- Progress streaming, deadlines, cancellation semantics, and bounded backpressure.
+- Progress streaming, [loop-closure](designs/loop-closure.md) endings, cancellation semantics, and bounded backpressure.
 - Durable state and reconnect behavior, including event ordering, replay, and retention.
 - Idempotency and retry semantics, including how a caller resolves an ambiguous
   outcome after a connection or process failure.

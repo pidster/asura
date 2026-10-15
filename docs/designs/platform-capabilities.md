@@ -25,6 +25,10 @@ dated proposals below; the proposals remain as their record.
   `coreai-models`, `mlx-swift-lm` and `swift-transformers`.
 - Helper preparation through Hello has a 20-second deadline in
   `asura-service/src/model_owner.rs`; later pre-start phases use 5 seconds.
+  The owner removed these limits (owner, 2026-10-16). Each step ends on the
+  helper's next message, helper exit, a protocol fault, cancel or shutdown, and
+  the TUI shows the step it waits for. The code change is pending; a follow-up
+  implementation will apply it.
   The package identity has three or four hashes; the optional fourth is the MLX
   `metallib` digest.
 - The storage writer records conversation, project and tool records as new
@@ -268,12 +272,12 @@ They use explicit messages in the evolving 0.1 schemas.
 | Generation response | 512 tokens and 60 KiB UTF-8 | Cancel on byte overflow and mark output incomplete. |
 | Private model-channel frame / chunk payload | 64 KiB / 16 KiB | Reject excessive lengths before allocation. |
 | Input and output credit windows | 64 KiB each | Pause data transfer at zero credit; continue control processing. |
-| Helper startup and identity handshake | 5 seconds absolute | Close channel, terminate and reap only the owned child. |
+| Helper startup and identity handshake | No time limit (owner, 2026-10-16) | The step ends on the next message, helper exit, protocol fault, cancel or shutdown. On a fault, cancel or shutdown, close the channel, terminate and reap only the owned child. |
 | Admission through terminal generation result | [Cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30), no fixed whole-turn expiry | Explicit cancel, provider failure, EOF or shutdown settles owned work. |
-| Grace after cancellation / SIGTERM | 250 ms / 250 ms | Escalate to SIGKILL of the owned child if necessary. |
-| Child reap observation | 1 second after SIGKILL | Retain the child handle and block replacement admission until reaped. |
+| Grace after cancellation / SIGTERM | 250 ms / 250 ms wind-down bounds (owner, 2026-10-16) | Escalate to SIGKILL of the owned child if necessary. These bounds stop Asura's own child after the work has ended. |
+| Child reap observation | 1 second after SIGKILL, a wind-down bound | Retain the child handle and block replacement admission until reaped. |
 | Reserved private control capacity | 8 frames, at most 4 KiB each | Never queue cancellation behind data credit. |
-| Service/TUI progress under a stalled helper | Existing control deadline; TUI input response within 100 ms in the test environment | Report stalls and overload explicitly; no reactor wait for inference. |
+| Service/TUI progress under a stalled helper | No control deadline; TUI input response within 100 ms in the test environment is an acceptance criterion | Show the waiting step; the person can cancel. Report overload explicitly; no reactor wait for inference. |
 
 Model creation, token counting, stream iteration and SDK cleanup stay in the
 owned helper. Rust spawn, identity checks and descriptor preparation use the
@@ -325,7 +329,7 @@ sequenceDiagram
         alt Valid terminal result
             R->>R: Settle complete outcome
             R-->>C: Complete response
-        else Cancel, timeout, crash or protocol fault
+        else Cancel, helper exit, crash or protocol fault
             R->>H: Cancel and bounded child cleanup
             R->>R: Preserve incomplete or uncertain outcome
             R-->>C: Failure with incomplete output
@@ -345,7 +349,7 @@ availability, cancellation or output quality.
 | MC02 unavailable model | SDK reports assets missing or device unavailable | Actionable typed unavailable result; no accepted generation | Error mapping / actual helper availability handshake / TUI preserves draft and stays responsive |
 | MC03 text response | Admitted prompt receives snapshots then completion | Bounded provisional output; one complete response; no tool execution | Snapshot replacement and terminal counts / real socketpair and scripted helper / real TUI to service to live on-device model |
 | MC04 cancellation race | Cancel before or after start permit | Before: no SDK call; after: invalidate and settle only with evidence | Serialized state transitions / helper fault barriers at both sides of permit / user cancels while typing and resizing |
-| MC05 stalled helper | Helper stalls during handshake, counting, stream or cleanup | Absolute deadline; responsive control; exact-child cleanup | Deadline transitions / SIGSTOP or scripted stalls at each phase / TUI input within 100 ms and usable exit |
+| MC05 stalled helper | Helper stalls during handshake, counting, stream or cleanup | No handshake time limit: the TUI shows the waiting step and cancel, helper exit or shutdown ends it; responsive control; exact-child cleanup under the wind-down bounds | Cancel and exit transitions / SIGSTOP or scripted stalls at each phase / TUI input within 100 ms and usable exit |
 | MC06 overload | Second request or excess frame, credit or output arrives | Busy or typed limit failure; bounded allocations; control capacity preserved | Boundary arithmetic / real transport flood and blocked reader / responsive TUI while rejected work is reported |
 | MC07 stale result | Helper crashes or service restarts after a prefix | Prefix incomplete; old generation rejected; no automatic retry | Generation fencing / real child death and restart / reconnect does not show an invented complete answer |
 | MC08 capabilities | Requested provider lacks tool or structured-output capability | Reject before admission; no implicit downgrade | Capability matching / helper reports reduced capability / client receives explicit unavailability |
@@ -407,7 +411,7 @@ The identity and credit rules in the canonical D2 design continue to apply.
 | Body field | Message and numbered fields | Meaning |
 | --- | --- | --- |
 | 10 | Hello: build_id bytes 1; schema_digest bytes 2; max_frame_bytes uint32 3 | Build and schema identities are exactly 32 bytes and must match before input. |
-| 11 | Begin: model string 1; input_bytes uint64 2; deadline_remaining_ms uint32 3; max_response_tokens uint32 4 | Selected provider, at most 64 KiB input; absent deadline selects cancellation-driven generation, present1–60,000 ms is explicit legacy timing. |
+| 11 | Begin: model string 1; input_bytes uint64 2; deadline_remaining_ms uint32 3; max_response_tokens uint32 4 | Selected provider, at most 64 KiB input; generation uses the [cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30). The legacy optional generation deadline is removed (owner, 2026-10-16): the service never sends `deadline_remaining_ms`, and field 3 stays in schema 0.1 unchanged. |
 | 12 | Chunk: transfer_id uint64 1; direction enum 2; ordinal uint64 3; data bytes 4; revision uint64 5 | Directions 1 input and 2 output. Nonempty payload at most 16 KiB. |
 | 13 | Credit: transfer_id uint64 1; direction enum 2; accepted_bytes uint64 3; granted_bytes uint64 4 | Cumulative credit under the existing D2 ledger, never over the 64 KiB window. |
 | 14 | InputEnd: count uint64 1; total_bytes uint64 2 | Exact match to accepted input chunks. |

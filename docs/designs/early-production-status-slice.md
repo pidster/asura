@@ -8,6 +8,13 @@ govern current behavior: [bootstrap and registration](production-bootstrap-statu
 [event routing](event-routing.md) and
 [conversation admission](conversation-admission.md). Remaining trial acceptance
 cases are retained.
+
+Time-bound update (owner, 2026-10-16): client attach, read and initialization
+calls have no deadline, slow terminal output never ends the TUI, stop waits for
+drain, and status staleness is counted in missed heartbeats. Journal-backed
+mutations already have no client budget under [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound). Where the code still
+applies a removed bound, a follow-up implementation will apply this design.
+Terminal restoration retry and worker settlement waits stay as wind-down bounds.
 On 2026-09-25, the owner
 selected a status-first production trial and a Unix-domain socket for its
 standalone per-user service. The trial shows real project and Git status before
@@ -35,8 +42,10 @@ The existing posix_spawn launcher starts the backend as a child. A backend
 started by this TUI must drain and stop when this TUI exits. A TUI attached to
 a pre-existing backend exits alone. Explicit Stop, termination signals and owned
 client exit each retain their shutdown intent through delayed worker settlement.
+Stop waits for workers to drain and shows progress during a long stop (owner,
+2026-10-16). Only a worker that reports an unknown outcome leads to repair-only.
 After entering repair-only during drain, finish shutdown when all workers settle;
-do not require a second Stop. Tests must verify lock retention while stalled and
+do not require a second Stop. A second Stop request may force exit. Tests must verify lock retention while stalled and
 automatic endpoint removal and owner release after settlement. Owner contention attaches to the
 winner. Unsafe paths, protocol mismatch and other errors never authorize spawn.
 One automatic start attempt is allowed per TUI launch, preventing restart loops.
@@ -303,10 +312,11 @@ a TUI-specific cancellable entry delegates to the same startup implementation.
 
 The service registers its nonblocking lifetime reader with the readiness reactor.
 EOF, unexpected bytes or read failure
-request the same canonical drain used for termination. Trigger it once; do not
-reset its deadline on repeated EOF. Preserve inspection cancellation, endpoint
-cleanup and lock-last release. If inspection is still settling after the drain
-budget, preserve the existing repair state and retry final drain when it settles.
+request the same canonical drain used for termination. Trigger it once; repeated
+EOF does not restart it. Preserve inspection cancellation, endpoint cleanup and
+lock-last release. The drain has no time limit (owner, 2026-10-16): it waits for
+workers to settle after cancellation reaches them, including a settling
+inspection. Only a worker that reports an unknown outcome leads to repair.
 A stopped or OS-blocked backend cannot respond until scheduled; the UI must never
 wait indefinitely for it. No PID-based fallback kill is introduced.
 
@@ -314,10 +324,11 @@ Validation must prove: owned backend stops after normal/command/signal/crash exi
 attached backend and its epoch survive client exit; startup cancellation does not
 orphan a late child; contender/replacement identity cannot be stopped accidentally;
 invalid inherited descriptors fail before runtime creation; lifetime closure
-reuses drain with bounded polling; the UI stays responsive with a stalled backend.
+reuses drain with paced polling; the UI stays responsive with a stalled backend.
 Platform tests cover pipe type/direction, EOF and descriptor inheritance. Service
 integration covers EOF drain. Real isolated CLI/PTY journeys cover both lifetime
-modes and cleanup. Preserve all existing deadline, draft and terminal tests.
+modes and cleanup. Preserve all existing draft and terminal tests; replace
+deadline tests for removed bounds with cancellation and disconnect tests.
 
 ```mermaid
 sequenceDiagram
@@ -343,27 +354,32 @@ Its binary and isolated test executable call the same CLI library entry point.
 This keeps test-only unit fixtures out of the copied executable and adds no
 production path override or separate client owner.
 The existing Rust client owns peer authentication, protocol version, attachment
-identity and deadlines. The service owns lifecycle and installation classification.
+identity and cancellation. The service owns lifecycle and installation classification.
 The worker subscribes to service status through `ObserveService`, which contains
 both states. It does not read journal files or connect to a database. No Swift
 process is involved. The [event routing contract](event-routing.md#cursor-subscriptions)
 defines cursors, cached status and heartbeat semantics.
 
 Use one worker, one outstanding subscription and one latest-result slot. Attach
-and transport calls have two-second deadlines. An unchanged subscription waits
+and transport calls have no deadline (owner, 2026-10-16); each ends on reply,
+cancellation or disconnect. An unchanged subscription waits
 for a change or its one-second heartbeat. A failed call closes the attachment;
 reconnect uses one-second backoff and a fresh authenticated attachment. No queue
 of refreshes accumulates. UI/worker cancellation is independent of terminal input.
 Each result carries a local connection generation, service epoch and monotonic
 request-start time. Accept only the current generation and completed request.
 A disconnect/error clears all previous service and installation claims immediately
-on delivery. The UI also expires results five seconds after request start, including a first observation that has not yet arrived; show unavailable until fresh success. Reconnect
+on delivery. The view is shown stale after five consecutive missed one-second
+heartbeats (owner, 2026-10-16). Staleness changes the display only; it ends no
+work. Before the first observation arrives, show unavailable until fresh success.
+The code still measures five seconds from request start; a follow-up
+implementation will count missed heartbeats. Reconnect
 or resume after uncertain clock continuity retires the old generation and data.
 Never present a prior epoch as a currently connected service.
 
 The UI routes input and worker notifications through the bounded priority
-dispatcher in [event routing](event-routing.md). Explicit deadlines wake expiry
-handling. Redraw only on change or resize. No network, filesystem or service wait runs on the render
+dispatcher in [event routing](event-routing.md). Explicit heartbeat timers wake
+staleness handling. Redraw only on change or resize. No network, filesystem or service wait runs on the render
 thread. The fixed-size snapshot and one result slot bound observation memory;
 the editor's existing limits bound draft/history memory.
 
@@ -385,16 +401,18 @@ panic; do not wait for the status worker first. Platform `TerminalOutput` buffer
 nonblocking writes, at most 64 KiB and 16 write attempts per pump;
 WouldBlock retains the pending byte offset and returns immediately. The UI calls
 pump each turn and defers another draw while bytes remain, continuing input,
-cancellation and status processing. One absolute 100 ms output deadline starts
-at first flush and is checked on subsequent pumps; progress never resets it.
-No sleeping or waiting is allowed in the output pump. Deadline/write failure
-exits through cleanup. This bounds queue memory and prevents slow consumers from
+cancellation and status processing. Output has no deadline (owner, 2026-10-16).
+A pending frame waits for writable readiness; newer state coalesces into the next
+frame, and slow output never ends the TUI. No sleeping or waiting is allowed in
+the output pump. A non-retryable write failure exits through cleanup. The code
+still exits after a 100 ms output stall; a follow-up implementation will remove
+that exit. This bounds queue memory and prevents slow consumers from
 blocking the reactor.
 Ratatui is dropped while descriptors are still nonblocking, before guard cleanup.
 Cleanup retries reacquire nonblocking descriptor state before writing if a prior
 cleanup already restored flags. After interactive input closes, final teardown
 may retry WouldBlock restoration for one absolute 100 ms budget, yielding 2 ms
-between attempts. This is bounded terminal settlement after the reactor ends;
+between attempts. This is a wind-down bound on terminal settlement after the reactor ends;
 non-retryable failures return immediately. Never reset the budget on progress.
 Normal event processing never waits for output. Retain setup/panic Drop cleanup
 as best-effort restoration. A lost
@@ -409,7 +427,8 @@ sequence cannot block the foreground dispatcher. The event routing design owns
 input admission, backpressure, cancellation and reader settlement.
 
 Cancel the read-only status worker and restore the terminal, then wait at most
-100 ms for completion using JoinHandle::is_finished. Join only a finished thread.
+100 ms for completion using JoinHandle::is_finished. This 100 ms is a wind-down
+bound on the client's own exit. Join only a finished thread.
 If still running, drop the handle and return from the CLI entry; the existing
 binary's process::exit ends remaining threads. This is an explicit exception to
 the prior mandatory join: this worker owns no terminal state or database mutations. Its optional startup
@@ -450,8 +469,8 @@ setup failure, normal exit, I/O failure, unwind and handled signals. Cleanup is
 idempotent. Panic reporting follows restoration; SIGKILL and terminal loss cannot
 be given a cleanup guarantee. Do not install two competing signal owners.
 
-On exit, cancel the worker and restore the terminal before waiting for it. Use the bounded worker settlement above. Socket deadlines do not bound OS account
-or filesystem lookups; do not use an unconditional join. No new Inspect begins
+On exit, cancel the worker and restore the terminal before waiting for it. Use the bounded worker settlement above. OS account and filesystem lookups
+cannot be cancelled; do not use an unconditional join. No new Inspect begins
 after exit. Buffer at most one stable terminal failure diagnostic for output
 after restoration. Do not emit stderr tracing lines while the alternate screen
 is active; service logging remains in its separate process and existing sink.
@@ -562,8 +581,9 @@ remains a discovery container, not a project or working location.
    Stale and unauthorized fields disappear or become explicitly unavailable.
    Typing and navigation remain responsive while observations are slow.
 
-Exact first-use controls, unavailable wording, status freshness, response
-deadlines and project-parent discovery limits remain D3/D6/D7 decisions. The
+Exact first-use controls, unavailable wording and project-parent discovery
+limits remain D3/D6/D7 decisions. Status staleness counts missed heartbeats, and
+responses have no deadline (owner, 2026-10-16). The
 client may reuse the prototype's geometry and editor adapter only after the
 production ownership and dependency review confirms that reuse is safe.
 
@@ -685,8 +705,10 @@ adds a separate one-slot worker for queue commands and projections. The service
 alone orders, persists, dispatches and recovers accepted inputs. Enter stages
 each valid input in a local outbox of at most 16 entries and clears the draft.
 The queue worker submits one waiting entry at a time with its original request
-ID. It uses a 2 s attach and 3 s request deadline; the UI reports an
-unconfirmed outcome after 5 s. The [composer interaction contract](composer-interactions.md)
+ID. The request has no client budget and the worker no observation bound
+([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). The attach has no deadline (owner, 2026-10-16); the code
+still applies two seconds. The UI reports an unconfirmed outcome only on
+cancellation or a lost connection. The [composer interaction contract](composer-interactions.md)
 defines interactive queue promotion, selectors, history and dynamic hints. Ctrl+S requests cancel-and-replace
 steering; Ctrl+T queues a follow-up. `/queue [ID | resume ID | drop ID]` inspects
 or explicitly recovers retained service inputs. The padded tray shows observed
@@ -697,8 +719,10 @@ The local outbox retains each input's original request ID and text until a
 durable receipt. A worker performs bounded
 attach/request calls outside the terminal loop. Worker notifications wake
 completion handling through the event dispatcher. A mutex mailbox coalesces snapshots into one value, at most 60 KiB. The
-conversation worker has two-second attach/request bounds, three-second mutation
-bounds, and a six-second initialization bound. Observation has no whole-turn
+conversation worker's attach, request and initialization calls have no deadline
+(owner, 2026-10-16), and its journal-backed mutations have no client budget
+([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). Each call ends on reply, cancellation or disconnect.
+The code still applies the attach and read bounds. Observation has no whole-turn
 budget: each long poll waits at most 1000 ms and repeats until a terminal kind
 or a worker stop. It never joins an unfinished worker on the terminal loop.
 Cancellation uses a separate

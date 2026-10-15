@@ -645,7 +645,7 @@ the verified local route described below. Numeric loopback alone is not proof of
 local inference because a daemon can forward.
 
 No additional work queue or blocking call is introduced. Existing provider load
-workers, five-second Hello, cancellation-driven turn, one pending callback, eight tool calls,
+workers, Hello without a time limit (owner, 2026-10-16), cancellation-driven turn, one pending callback, eight tool calls,
 two-second host workers, retained cancellation and cleanup rules apply. Native
 inference requests are capped at 1,024 tokens first and 512 later, at most 64 per
 turn, within the 2,048-token reservation.
@@ -716,8 +716,10 @@ provide local-only enforcement: a remote-backed model returns not-found before
 proxying. The native source suffix, not a prior metadata observation, closes the
 check-to-use race if a tag changes. This trusts the configured local Ollama daemon
 as the execution endpoint; it does not attest an arbitrary malicious proxy.
-Discovery remains under the existing five-second Hello deadline. Each metadata
-response is limited to 64 KiB, version to 1 KiB, with cancellation closing its
+Discovery has no time limit (owner, 2026-10-16): it ends on the daemon's reply,
+an error, cancel, helper exit or shutdown. The 5-second Hello and `api/show`
+limits are removed in design; the code change is pending, and a follow-up
+implementation will apply it. Each metadata response is limited to 64 KiB, version to 1 KiB, with cancellation closing its
 URLSession. No additional daemon, credential or model acquisition is introduced.
 
 

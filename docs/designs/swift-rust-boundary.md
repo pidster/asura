@@ -17,7 +17,9 @@ Foundation Models implementation on 2026-09-25. The owner also selected a
 bounded credit window for each chunk transfer and an exact packaged
 helper-build match. The [first conversation helper](#first-conversation-helper-scoped-d2-contract-2026-09-27)
 section later selected session lifetime, development layout, numeric window and
-framing limits, and deadlines. That scope is implemented in `swift/model-helper`,
+framing limits, and deadlines. The owner removed its handshake and input-transfer
+deadlines on 2026-10-16; see [numeric execution and settlement](#numeric-execution-and-settlement).
+That scope is implemented in `swift/model-helper`,
 `asura-service` and `asura-platform`; [model providers](model-provider-integration.md)
 and [model tool execution](model-tool-execution.md) record later extensions.
 Production sandboxing, signed packaging and the second conformance binding remain
@@ -219,6 +221,12 @@ absolute operation deadlines bound silence and byte dribbling. Aggregate
 frame-count and byte limits reject a stream of individually valid small frames.
 Receiving one byte cannot restart a frame deadline. A completed frame cannot
 extend the absolute operation deadline.
+Owner update, 2026-10-16: the handshake has no time limit. It ends on the next
+message, helper exit, a protocol fault, cancellation or shutdown. The
+[cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
+replaced the absolute operation deadline. Aggregate frame-count and byte limits
+remain known-size bounds. The per-frame completion deadline above is an open
+decision for the owner under AE-04.
 Before model content, both sides exchange the package-build identity, exact
 private-protocol identity, capability bits and maximum frame size. Both
 identities must match the service's expected package and protocol. A mismatch
@@ -308,7 +316,7 @@ through a project path or helper-readable file reference.
 A cancellation or channel loss before a start permit discards partial input and
 does not call the model. A loss during output transfer leaves the operation
 pending reconciliation; the received prefix is not a complete result. D2 must
-set the numeric credit window, schema field types and cleanup deadlines.
+set the numeric credit window, schema field types and cleanup wind-down bounds.
 D4 still owns effective-context provenance and
 what content may enter an input transfer.
 
@@ -433,7 +441,7 @@ sequenceDiagram
         R->>S: Cancel stalled synthetic request
         alt Matching terminal acknowledgement
             S-->>R: Terminal acknowledgement
-        else Deadline expires
+        else Wind-down bound expires
             R->>S: Terminate child
             R->>R: Observe exit and reap
         end
@@ -441,7 +449,7 @@ sequenceDiagram
     else Identity mismatch
         R->>S: Close without model payload
     end
-    alt Child exits within cleanup deadline
+    alt Child exits within cleanup wind-down bound
         R->>R: Reap child
     else Child remains live
         R->>S: Force termination
@@ -454,8 +462,9 @@ sequenceDiagram
 
 Each admitted operation carries a stable request ID, installation and task
 identities, scope revision, implementation identity and capability snapshot,
-model-session generation, input-context generation, the service's remaining
-deadline and a versioned input identity. The first macOS binding adds transfer
+model-session generation, input-context generation and a versioned input
+identity. It carries no deadline; the owner removed the legacy generation
+deadline on 2026-10-16. The first macOS binding adds transfer
 identities to its chunk messages. Each response carries the same operation
 identities. Where streaming is negotiated,
 it carries an ordered position. It carries typed availability/error status,
@@ -475,8 +484,8 @@ The Swift helper serializes Foundation Models calls on one session. Apple’s cu
 session interface reports concurrent-request and transcript-mutation errors;
 the service must not interpret concurrent calls as independent safe work. A
 retained transcript is effective context. The helper does not export or persist
-one merely because the SDK type is Codable. After crash, timeout or context
-invalidation, Rust invalidates that session generation. D4 must define whether
+one merely because the SDK type is Codable. After crash, cancellation, helper
+loss or context invalidation, Rust invalidates that session generation. D4 must define whether
 a transcript is eligible for durable, provenance-preserving restoration before
 any automatic reconstruction is allowed.
 
@@ -497,7 +506,7 @@ sequenceDiagram
     O->>J: Commit scoped model-operation admission
     J-->>O: Durable request ID and generation
     O->>B: Dispatch admitted operation
-    B->>S: Versioned request with scope and deadline
+    B->>S: Versioned request with scope and generation
     S->>M: Call serialized session
     M-->>S: Output or typed error
     S-->>B: Ordered frames and terminal result
@@ -511,7 +520,7 @@ Proposed authority sequence. A callback result is sent to Swift only after
 the action is denied or its separately admitted effect has settled. If the
 task is cancelled or the effect remains uncertain, Rust invalidates the model
 session instead of fabricating a tool result. D4 must still fix the exact
-Foundation Models callback API, deadlines and resumed-session semantics.
+Foundation Models callback API, cancellation and resumed-session semantics.
 
 ```mermaid
 sequenceDiagram
@@ -553,12 +562,13 @@ implementation was asked to stop; it does not prove the model operation, a tool
 callback or descendant work stopped. The Rust owner records cancellation under
 the common failure contract, sends one idempotent cancel signal, and waits for
 a matching terminal result or evidence that the implementation cannot continue.
-Each binding must define its stop mechanism, deadline and evidence. For the proposed
-Swift helper, Swift task cancellation is cooperative. If it does not settle
-within the designed deadline, Rust terminates that helper process and records
-process-exit evidence. It invalidates the session generation. Task-wide
+Each binding must define its stop mechanism, wind-down bound and evidence. For
+the proposed Swift helper, Swift task cancellation is cooperative. If it does not
+settle within the designed wind-down bound, Rust terminates that helper process
+and records process-exit evidence. The wind-down bound applies only after
+cancellation; it never ends work that was not cancelled. It invalidates the session generation. Task-wide
 `Cancelled` is published only after all admitted operations and effects meet
-their settlement conditions. D3-D4 fix numeric deadlines and exact recovery
+their settlement conditions. D3-D4 fix numeric wind-down bounds and exact recovery
 records; I0 must prove bounded cancellation through the real bridge.
 
 A local-model implementation crash, lost channel, malformed frame, wrong
@@ -587,7 +597,7 @@ stateDiagram-v2
     Running --> CancelPending: Durable cancel request
     CancelPending --> ResultPending: Matching terminal outcome
     CancelPending --> Settled: Non-dispatch proved and outcome committed
-    CancelPending --> ReconcilePending: Boundary lost or deadline expires
+    CancelPending --> ReconcilePending: Boundary lost or wind-down bound expires
     Running --> ReconcilePending: Implementation lost or crashes
     ResultPending --> Settled: Outcome committed
     Settled --> [*]
@@ -834,7 +844,9 @@ chunk and byte counts. A failed or interrupted prefix is never committed history
 ### Numeric execution and settlement
 
 The numeric table in the first-conversation packet governs this binding: one
-active helper, five-second handshake and input transfer. The
+active helper. The handshake and input transfer have no time limit (owner,
+2026-10-16). Each ends on the next message, helper exit, a protocol fault,
+cancellation or shutdown. The
 [cancellation-driven policy](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
 replaces the fixed whole-turn deadline. Existing response and byte budgets remain.
 Output transmission is additionally capped at 4 MiB and 1,024 revisions. Retain
@@ -849,13 +861,13 @@ Neither the IO queue nor the Rust reactor waits synchronously for that Task.
 No detached task may outlive the helper's channel/session shutdown contract.
 SDK internal buffers are outside these application caps; live qualification must
 record memory high-water usage and cannot claim a total process bound from queue
-sizes alone. A slow receiver stops iteration/coalesces bounded snapshots and
-cannot extend the absolute deadline.
+sizes alone. A slow receiver stops iteration or coalesces bounded snapshots.
 
 Rust serializes cancellation against Start under the admission owner. Before
 Start, cancellation prevents any model-session inference. After Start, send Cancel
-and invalidate the generation. Allow 250 ms for cooperative completion, then
-SIGTERM, then 250 ms before SIGKILL. Observe reaping for one second. If still
+and invalidate the generation. The wind-down then allows 250 ms for cooperative
+completion, then SIGTERM, then 250 ms before SIGKILL. Observe reaping for one
+second. These wind-down bounds apply only after cancellation or channel loss. If still
 unsettled, retain the exact child handle and ownership slot; reject replacement
 admission and continue nonblocking settlement. Never signal a looked-up PID.
 Channel EOF cancels helper work and starts helper exit. Service shutdown uses the
@@ -1021,7 +1033,7 @@ helper stops admitting input and drains its already ordered output. Previously
 in-flight peer credit is discarded from the bounded input buffer, not treated as
 an instruction to revive work or a reason to truncate the terminal response.
 The helper disables read readiness during this drain. Its 250 ms final-drain
-deadline and the service's owned-child cleanup remain in force; EOF/write failure
+wind-down bound and the service's owned-child cleanup remain in force; EOF/write failure
 also ends the transport. The receiver rejects any data actually emitted after
 Terminal. SnapshotEnd and Terminal must remain ordered behind all preceding
 Chunk frames; reserved control capacity never reorders these dependent messages.
@@ -1030,8 +1042,10 @@ Chunk frames; reserved control capacity never reorders these dependent messages.
 
 The service model owner starts one preparation thread and retains that slot until
 its join and exact child reaping. Preparation validates and copies at most 128 MiB
-of executable bytes with a twenty-second cooperative deadline. Cancellation is
-checked between 64 KiB reads and immediately before spawn. A stalled filesystem
+of executable bytes with no time limit (owner, 2026-10-16; the former
+twenty-second deadline is removed, and a follow-up implementation will remove it
+from the code). Preparation ends on completion, failure, cancellation or
+shutdown. Cancellation is checked between 64 KiB reads and immediately before spawn. A stalled filesystem
 call retains the slot; it cannot block the reactor or permit replacement work.
 The preparation result transfers one owned child to the reactor. The reactor
 polls at most 64 KiB of channel and diagnostic input per pass, with at most eight
@@ -1052,10 +1066,10 @@ stateDiagram-v2
   Input --> Ready: complete input and helper Ready
   Ready --> Running: durable StartAuthorized and Start
   Running --> Draining: terminal or cancellation or channel failure
-  Hello --> Draining: unavailable or deadline or channel failure
-  Available --> Draining: cancellation or deadline
-  Input --> Draining: cancellation or deadline
-  Ready --> Draining: cancellation or deadline
+  Hello --> Draining: unavailable, cancellation or channel failure
+  Available --> Draining: cancellation or channel failure
+  Input --> Draining: cancellation or protocol fault
+  Ready --> Draining: cancellation or channel failure
   Draining --> Cleanup: exact child reaped
   Cleanup --> Settled: owned copy removed and worker joined
   Settled --> [*]

@@ -107,7 +107,7 @@ macOS-account principal. The service checks each request's scope, revision,
 policy and installation state. Same-UID processes can invoke the genuine CLI
 or access same-UID files; this release does not claim malicious same-UID
 resistance. Socket pathname permissions and code signing do not supply human
-intent. Versioned length-bounded protocol frames, bounded queues and timeouts
+intent. Versioned length-bounded protocol frames, bounded queues and cancellation
 are required; D3 must finish the command/event schema before implementation.
 
 ### Standalone startup sequence
@@ -175,8 +175,8 @@ the same UID, another UID, process kill/restart, lock/socket replacement and
 same-UID endpoint races on supported macOS filesystems. CLI end-to-end checks
 must show bounded startup, typed recovery and intact original request results
 after reconnect. TUI proof follows in I4. SDK availability alone is not
-runtime evidence. D7 must assign executable cases and pin host, filesystem,
-timeouts and acceptance thresholds.
+runtime evidence. D7 must assign executable cases and pin host, filesystem
+and acceptance thresholds.
 
 Status, 2026-10-13: this I1 slice is implemented, and its control schema has a
 passing validation corpus. The [developer checkpoint](../plans/production-foundation-implementation.md#developer-checkpoint-evidence-on-2026-09-26)
@@ -305,7 +305,10 @@ Close all other inherited descriptors. Losing the pipe does not transfer ownersh
 The caller reaps its child if it exits during startup. For explicit `service start`, the service outlives the
 caller after successful startup. TUI-owned startup follows the lifetime channel
 contract below. A spawn loser exits normally; the client retries
-attachment. The retry deadline is five seconds with 50 ms intervals.
+attachment at 50 ms intervals. This interval is pacing and ends nothing. The
+retries end when attachment succeeds, a typed failure is reported, or the person
+cancels the command. The earlier five-second retry deadline is removed (owner,
+2026-10-16); the code still applies it until a follow-up implementation.
 
 #### Private startup notice
 
@@ -345,8 +348,10 @@ The fixed cases are:
 | 3 | 3 | Internal startup failure; child exits with failure |
 
 Reject other versions, kinds, codes, extra bytes or EOF before eight bytes.
-Read partial pipe data nonblockingly within the existing five-second startup
-deadline; partial progress never resets it. A malformed notice reports unavailable
+Read partial pipe data nonblockingly. The wait ends on a complete notice, EOF,
+child exit or the person's cancel. It has no time bound: the earlier five-second
+startup deadline is removed (owner, 2026-10-16), and the code change is pending a
+follow-up implementation. A malformed notice reports unavailable
 without forced takeover or PID signalling. A lost notice is not successful startup.
 Any already-running owner remains inspectable through the normal control path.
 
@@ -435,9 +440,11 @@ These synchronous lifecycle diagnostics are a narrow exception to the reactor's
 no-blocking-work rule below; they add no background worker or queue. Slow-sink
 latency remains an explicit limitation of this initial logging feature.
 
+#### Reactor, stop and drain
+
 A connection failure other than absent/refused does not authorize spawning.
 A held lock never permits takeover. An incompatible live owner remains running.
-There is no automatic upgrade, force-stop or timeout-based lock breaking.
+There is no automatic upgrade, automatic force-stop or timeout-based lock breaking.
 
 The service uses one nonblocking reactor and a serialized control dispatcher.
 The platform owner supplies readiness polling; codecs never perform I/O.
@@ -467,9 +474,25 @@ the released lock and its identity still matches. It releases that check lock
 immediately. A successor owner causes `outcome_unconfirmed`; it is never stopped.
 
 Stage 3 must install the durable drain barrier before adding a mutating command.
-That barrier accounts for every accepted operation before lock release. On a
-settlement failure, the owner retains its lock and serves only repair/control
-inspection. A stop deadline produces `outcome_unconfirmed`, not forced exit.
+That barrier accounts for every accepted operation before lock release.
+
+Required behavior (owner, 2026-10-16): stop has no drain deadline.
+
+- Drain cancels every worker first, then waits for each to report settlement.
+  Slowness alone never moves the service to `RepairOnly`.
+- Only a worker that reports an unknown outcome moves the owner to `RepairOnly`.
+  The owner then retains its lock and serves only repair/control inspection.
+- While a stop waits, Inspect reports `Draining`, and the client shows which
+  owners are still settling.
+- A second Stop for the same epoch forces exit without further waiting. Work
+  that has not settled is recovered by the next owner's replay, as after a crash.
+- The client stop wait ends on the released lock, a successor owner, a lost
+  connection or the person's cancel. Cancel or a lost connection reports
+  `outcome_unconfirmed`.
+
+The one-second `DRAIN_TIMEOUT`, which moves the service to `RepairOnly` with
+inspection reason `InspectionTimeout`, is removed by this decision. The code
+still applies it; a follow-up implementation will remove it.
 SIGINT, SIGTERM and SIGHUP enter the same drain path. A crash permits stale-socket
 cleanup by the next lock winner; stage 2 has no state to replay.
 
@@ -485,8 +508,10 @@ stateDiagram-v2
     Starting --> Exited: startup fails
     Serving --> Draining: Stop or signal
     Serving --> Faulted: identity loss
-    Draining --> RepairOnly: settlement fails
+    Draining --> Draining: workers still settling, progress shown
+    Draining --> RepairOnly: worker reports unknown outcome
     Draining --> Exited: cleanup complete
+    Draining --> Exited: second Stop forces exit
     Faulted --> Exited: cleanup complete
     RepairOnly --> Draining: recovery complete
     Exited --> [*]
@@ -676,10 +701,10 @@ are absent. Health of the local channel is not installation readiness.
 | Buffered data | One 64 KiB input and one 64 KiB output body per connection; no unbounded queue. |
 | Requests | One in flight per connection; 32 total. Reject extra pipelined requests. |
 | Per-reactor turn | At most 32 frames total and one frame per ready connection; then process signals and timers. |
-| Hello/frame progress | Two-second absolute deadline from accept/first byte; partial progress does not reset it. |
-| Idle attachment | Close after 60 seconds without a request; clients reconnect explicitly. |
-| Ordinary control result | Two seconds; emit typed timeout or close if output cannot drain. |
-| Startup/stop client wait | Five seconds each; report unavailable or outcome_unconfirmed on expiry. |
+| Hello/frame progress | No time bound (owner, 2026-10-16). A partial frame waits until it completes, the peer disconnects or the service drains. The 32-connection and 64 KiB buffer limits bound the held resources. Code change pending: the code still applies the two-second `FRAME_TIMEOUT`. |
+| Idle attachment | No idle close (owner, 2026-10-16). An attachment ends when the client disconnects or the service drains. Code change pending: the code still applies the 60-second `IDLE_TIMEOUT`. |
+| Ordinary control result | No time bound (owner, 2026-10-16). Pending output stays in the 64 KiB buffer until the client reads it, disconnects or the service drains. Code change pending, as for frame progress. |
+| Startup/stop client wait | No time bound (owner, 2026-10-16). Each wait ends on its result, a lost connection or the person's cancel; cancel or a lost connection reports unavailable or `outcome_unconfirmed`. Code change pending: the client still applies its five-second `LIFECYCLE` budget. |
 | Telemetry | Counters for connections, rejection code and latency; no payload, cwd or project path. |
 
 ### Attachment and shutdown sequence
@@ -706,7 +731,7 @@ sequenceDiagram
     C->>G: Check captured lock identity and release
     alt Lock is free and identity matches
         C->>C: Report stopped
-    else Successor, timeout or changed identity
+    else Successor, changed identity, lost connection or cancel
         C->>C: Report outcome unconfirmed
     end
 ```

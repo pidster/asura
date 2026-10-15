@@ -118,7 +118,8 @@ prefix and reports output-limit. A natural stop reports completion. Unsupported 
 ambiguous finish reasons fail explicitly rather than claiming completion. The shared
 bounded executor records a typed failure in its turn-local budget state, so SDK error
 wrapping cannot turn output-limit into success or an unrelated error. Cancellation
-and deadline checks remain active between inference passes and during streaming.
+checks remain active between inference passes and during streaming. The owner
+removed the legacy explicit generation deadline (2026-10-16).
 
 Validation includes natural and length stops, final-chunk text preservation, wrapped
 executor failure, exact pass allocations, legacy and new journal accounting, and a
@@ -135,7 +136,7 @@ flowchart TD
     Finish -->|Natural stop| Complete[Report complete]
     Finish -->|Length limit| Partial[Preserve text and report output limit]
     Finish -->|Unknown or malformed| Failed[Preserve text and report failure]
-    Cancel[Cancellation or deadline] --> Failed
+    Cancel[Cancellation, helper exit or shutdown] --> Failed
     Complete --> Commit[Commit terminal result with recorded turn budget]
     Partial --> Commit
     Failed --> Commit
@@ -181,12 +182,15 @@ The helper session retains one pending backend failure reason while its existing
 current snapshot and replaceable latest snapshot drain through output credit.
 It accepts no further backend snapshots or tool requests after that failure.
 After the final SnapshotEnd, it sends a failed terminal with the original reason
-and unknown usage. This adds no snapshot queue and does not reset an explicitly supplied Begin
-deadline. Control cancellation and deadline expiry terminate immediately;
-transport failure or an output bound reached by the drain also terminates without
-retrying the failed pump. An explicitly supplied deadline bounds this wait. Without one, the wait remains
-cancellation-driven with bounded retained snapshots and responsive controls. Socket tests cover delayed credit preserving both
-snapshots, withheld credit reaching timeout, and cancellation during the drain.
+and unknown usage. This adds no snapshot queue. Control cancellation terminates
+immediately; transport failure or an output bound reached by the drain also
+terminates without retrying the failed pump. The wait has no time limit (owner,
+2026-10-16; the legacy Begin deadline no longer applies). It stays
+cancellation-driven with bounded retained snapshots and responsive controls, and
+ends on credit, cancellation, channel loss or shutdown. Socket tests cover delayed
+credit preserving both snapshots, withheld credit held until cancellation, and
+cancellation during the drain. The code change is pending; a follow-up
+implementation will remove the deadline branch.
 
 ```mermaid
 flowchart TD
@@ -196,9 +200,9 @@ flowchart TD
     Drain --> Pending{Another snapshot pending?}
     Pending -->|Yes| Credit
     Pending -->|No| Failed[Send failed terminal with original reason]
-    Credit -->|No| Wait[Wait under unchanged Begin deadline]
+    Credit -->|No| Wait[Wait for credit with no time limit]
     Wait -->|Credit| Credit
-    Wait -->|Deadline or cancel| Stop[Terminate immediately]
+    Wait -->|Cancel, channel loss or shutdown| Stop[Terminate immediately]
     Drain -->|Transport or output bound failure| Stop
 ```
 
@@ -339,7 +343,7 @@ flowchart TD
 ```
 
 Added work is bounded local CPU and existing awaited transport only. Existing
-workers, retained slots, transport deadlines, cancellation, priority inboxes and
+workers, retained slots, cancellation, priority inboxes and
 owned shutdown remain in force. No file/network calls occur in key/render loops.
 Service unit tests cover truthful policy/result mapping, unknown/replayed timing,
 duplicate/stale usage, overflow and failure. Storage tests verify bounded derived

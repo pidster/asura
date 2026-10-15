@@ -7,6 +7,14 @@ limits and scoped runtime evidence appear in the implementation section below.
 Earlier proposal sections describe the broader direction. They do not establish
 implemented external adapters or permission for automatic background model work.
 
+Time-bound update (owner, 2026-10-16): sensor waits end through loop-closure
+conditions under [AE-04](../engineering.md#asynchronous-execution-and-recovery).
+The 30-second status freshness, five-minute proposal expiry and seven-day
+retention stay as data freshness and retention rules; they end no work.
+Reconnect backoff never stops. The design-only five-second persistence limit is
+removed. Where SN1 or SN2 code still applies a removed bound, a follow-up
+implementation will apply this design.
+
 ## Purpose and first slice
 
 A **sensor** is a scoped source of observations. It supports one or both modes:
@@ -155,10 +163,10 @@ project, conversation, grant and generation types when adding schema fields.
 | Subscription | ID, descriptor ID, explicit project or installation scope, source configuration digest, grant/policy revision, destination rule, expiry, generation, state, cursor and limits |
 | Observation | ID, subscription or directed operation ID, source identity and generation, source event ID/sequence when available, scope, observed time, received time, expiry, payload type and bounded payload, provenance, sensitivity, correlation and causal parent IDs |
 | Wake proposal | Stable ID, observation references, rule revision, intended destination and purpose, expiry, state and reason, canonical admission request ID when assigned |
-| Capture result | Observation or typed denial, invalid request, unavailable, overload, stale, cancelled, deadline exceeded or outcome unknown |
+| Capture result | Observation or typed denial, invalid request, unavailable, overload, stale, cancelled or outcome unknown |
 
 A source-provided timestamp is untrusted. Use service receipt time and a monotonic
-clock for in-process deadlines. Store wall-clock expiry for restart checks. Clock
+clock for in-process timers and freshness checks. Store wall-clock expiry for restart checks. Clock
 rollback or unknown freshness holds work for revalidation. Installation scope must
 be explicit; a missing project field never means unrestricted access.
 
@@ -245,12 +253,12 @@ flowchart TD
     Support -->|No| Unsupported["Return unsupported or invalid request"]
     Support -->|Yes| Grant{"Current task, scope, generation and grant valid?"}
     Grant -->|No| Deny["Return denied or stale, no capture"]
-    Grant -->|Yes| Limit{"Tool capacity and remaining deadline available?"}
-    Limit -->|No| Busy["Return overload or deadline exceeded"]
+    Grant -->|Yes| Limit{"Tool capacity available?"}
+    Limit -->|No| Busy["Return overload"]
     Limit -->|Yes| Capture["Common executor starts bounded capture"]
     Capture --> Outcome{"Capture outcome?"}
     Outcome -->|Failure| Failure["Return typed unavailable or failure"]
-    Outcome -->|Cancel or timeout| Stop["Stop owned operation and settle or mark unknown"]
+    Outcome -->|Cancel or disconnect| Stop["Stop owned operation and settle or mark unknown"]
     Outcome -->|Observation| Fence{"Still current, fresh and within result limit?"}
     Fence -->|No| Stale["Reject effective result, retain settlement evidence"]
     Fence -->|Yes| Context["Context owner records provenance"]
@@ -274,15 +282,15 @@ Proposed states. Arrows name owner decisions; cancel requests precede closure.
 stateDiagram-v2
     [*] --> Disabled
     Disabled --> Starting: Authorized enable committed
-    Starting --> Active: Source ready within deadline
-    Starting --> Suspended: Failure or deadline
+    Starting --> Active: Source ready
+    Starting --> Suspended: Failure
     Active --> Suspended: Disconnect, gap, grant loss or storage failure
     Suspended --> Starting: Authorized bounded reconnect or resync
     Active --> Closing: Cancel, expiry or shutdown
     Starting --> Closing: Cancel, expiry or shutdown
     Suspended --> Closing: Cancel, expiry or shutdown
     Closing --> Closed: Owned resources settled
-    Closing --> Uncertain: Cleanup deadline without proof
+    Closing --> Uncertain: Cleanup wind-down bound passes without proof
     Uncertain --> Closed: Settlement evidence received
     Closed --> [*]
 ```
@@ -309,12 +317,12 @@ sensor. Internal timer and committed-activity adapters perform no external I/O.
 | Fair dispatch | At most 8 entries per source per reactor turn, 64 total; preserve control/deadline capacity |
 | Snapshot flood | Coalesce by source, scope and kind for 250 ms, maximum delay 2 s; keep latest plus count and gap flag |
 | Durable receipts | 1,024 pending and 20 MiB globally; backpressure before acceptance, never evict accepted obligations |
-| Retention | Settled observations expire after 7 days unless referenced by retained evidence; quota exhaustion stops new retention and receipt acceptance |
+| Retention (data retention, owner, 2026-10-16) | Settled observations expire after 7 days unless referenced by retained evidence; quota exhaustion stops new retention and receipt acceptance |
 | Pending wake proposals | 1 per rule and destination, 64 total; merge observation references up to 32, then retain a summary with explicit omitted count |
-| Freshness | Status snapshot 30 s; activity or idle proposal 5 min; expired proposals cannot dispatch |
-| Persistence or capture | 5 s absolute, including queue wait; timeout becomes unknown if commit/capture cannot be disproved |
-| Reconnect | 1, 2, 4, 8, 16, then 30 s delays with up to 20% jitter; suspend after 5 min; no retry resets subscription expiry |
-| Shutdown | Stop ingress immediately; 2 s subscription cleanup budget within existing service shutdown bound; retain uncertainty if not settled |
+| Freshness (data freshness, owner, 2026-10-16) | Status snapshot 30 s; activity or idle proposal 5 min; expired proposals cannot dispatch. Freshness marks data stale; it ends no work |
+| Persistence or capture | No time limit (owner, 2026-10-16). Ends on commit or capture, failure, cancellation or shutdown. The outcome is unknown only when cancellation or disconnect leaves the commit or capture unproven |
+| Reconnect (pacing) | 1, 2, 4, 8, 16, then 30 s delays with up to 20% jitter. Backoff never stops (owner, 2026-10-16); cancellation, revocation, subscription expiry or shutdown ends it. No retry resets subscription expiry |
+| Shutdown | Stop ingress immediately. A 2 s subscription cleanup wind-down bound applies to Asura's own cleanup; retain uncertainty if not settled |
 | Wake budget | 1 background operation globally, 1 proposal admitted per project per 60 s, 6 per installation per hour |
 | Model cost | Zero automatic model calls without explicit standing budget; reserve token/cost allowance under existing parent budgets before dispatch |
 
@@ -324,7 +332,7 @@ accepted commands, cancellation, usage or operation outcomes. Observation ingres
 cannot consume the control capacity reserved for these obligations.
 
 For the first slice, a database stall blocks sensor persistence, not status or
-cancel. Timeout leaves the existing storage owner responsible for reconciliation;
+cancel. Cancellation leaves the existing storage owner responsible for reconciliation;
 no replacement worker may write around an unresolved operation. Future adapters
 must specify cancellable I/O or supervised process cleanup before implementation.
 A bounded thread alone is not sufficient isolation for an uninterruptible API.
@@ -373,10 +381,10 @@ For each row, implement separate cases for each named failure or race.
 | SN4: ingress saturation and slow storage | Credit/coalescing limits | Flood at all configured maxima, stall persistence | Input/status/cancel respond within 100 ms on supported test host; no silent durable loss |
 | SN5: crash before commit, after commit, or after canonical acceptance | Identity and state decisions | Kill service at each checkpoint, reopen real DB | One admission identity, uncertainty disclosed until reconciled |
 | SN6: wake denied, unsupported intake, full queue, or expired | Every admission branch | Real queue and budget owner | Held/rejected reason visible; no fabricated user intent or steering |
-| SN7: idle threshold, resumed activity, sleep and restart | Controlled monotonic clock | Real service timers plus fake-clock deadline injection | One proposal, no catch-up storm, foreground work remains responsive |
+| SN7: idle threshold, resumed activity, sleep and restart | Controlled monotonic clock | Real service timers plus fake-clock timer injection | One proposal, no catch-up storm, foreground work remains responsive |
 | SN8: self-triggered activity and repeated restarts | Causal hops and budget counters | Loop-producing adapter and persisted quotas | Wake cap holds, no recursive work storm |
 | SN9: cancel during start, capture, persistence or shutdown | State transitions and fencing | Stall each boundary and deliver late results | No replacement source before settlement; stopped or uncertain state is accurate |
-| SN10: classification absent, invalid or timed out | Deterministic fallback rules | Local classifier boundary when implemented | No remote classification or permission escalation |
+| SN10: classification absent, invalid or cancelled | Deterministic fallback rules | Local classifier boundary when implemented | No remote classification or permission escalation |
 
 Future external adapters add real authentication, replay, reconnect, token expiry,
 SSRF and revoked-access tests. Remote model tool tests require a real supported
@@ -390,8 +398,10 @@ evidence to the initial local-only sensor slice.
   enabling automatic wakes. Reuse its queue, request identities and recovery.
 - Tool owner: extend [model tool execution](model-tool-execution.md), which currently
   names `project_read_file` and `project_list_directory`. Reuse operation ID,
-  generation and ordinal identity. Its 2 s call deadline and 16 KiB result cap
-  are stricter than the generic sensor limits in this design. Settle the status-observation descriptor name and typed payload in
+  generation and ordinal identity. Its 16 KiB result cap is stricter than the
+  generic sensor limits in this design. Its 2 s call deadline is the [ordinary tool deadline](tool-job-controller.md#open-decisions),
+  which a follow-up design replaces: a tool call ends on completion, cancel or a
+  fault (owner, 2026-10-15). Settle the status-observation descriptor name and typed payload in
   the common registry. Do not create a parallel sensor executor or adapter loop.
 - Storage owner: assign observation/cursor/proposal records to the existing graph
   mutation boundary and reconcile their publication with canonical admission.
@@ -465,14 +475,15 @@ idempotently before the first store. Reads never treat a database error as absen
 The closed YAML codec rejects anchors, aliases and tags before deserialization. One
 project state replacement is atomic and requires its expected revision. A stable
 write identity and digest distinguish retry from conflicting reuse. An observation
-is durable only after the writer confirms the replacement. Timeout reports an
-unconfirmed outcome; recovery loads and reconciles the original write identity.
+is durable only after the writer confirms the replacement. Cancellation or a lost
+writer reply reports an unconfirmed outcome; recovery loads and reconciles the
+original write identity.
 No graph record is a task grant or an authority journal entry.
 
 The service owner exposes pending persistence separately from committed state.
 Only one sensor write is submitted at a time through the existing writer. The
-writer's existing queue, two-second operation deadline and retained settlement
-rules apply. Storage failure suspends new receipt acceptance for the affected
+writer's existing queue and retained settlement rules apply. The writer has no
+operation deadline ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). Storage failure suspends new receipt acceptance for the affected
 project; the reactor continues status, cancellation and shutdown handling.
 
 Directed `service_observe_status` uses the common tool registry, operation ID,
@@ -481,12 +492,13 @@ cached service projection, plus the durable observation identity, project, sourc
 The stored observation retains project, source epoch and operation correlation.
 The common tool owner validates status-read and destination disclosure authority.
 The observation must be stored before the tool result is committed and exposed.
-A repeated tool identity resolves its original observation. The tool's two-second
-deadline and 16 KiB result cap remain authoritative. No extra capture worker exists.
+A repeated tool identity resolves its original observation. The tool's 16 KiB
+result cap remains authoritative. Its two-second deadline is the [ordinary tool deadline](tool-job-controller.md#open-decisions);
+the follow-up design that replaces it ends the call on completion, cancel or a fault. No extra capture worker exists.
 
 ```mermaid
 flowchart TD
-    Source[Committed journal checkpoint or idle deadline] --> Scan[Scan at most 64 index entries per turn; resume cursor]
+    Source[Committed journal checkpoint or idle trigger] --> Scan[Scan at most 64 index entries per turn; resume cursor]
     Scan --> Validate{Scope, identity, freshness and capacity valid?}
     Validate -->|No| Reject[Hold source checkpoint without durable acknowledgement]
     Validate -->|Yes| Triage[Deduplicate, coalesce and suppress background feedback]
@@ -540,8 +552,10 @@ from canonical replay. No historical inactivity is inferred.
 The status tool adds ToolIntent kind 3 with empty path and zero offset/limit, under
 journal format 1. It uses the same ordinal budget and durable result record as
 project tools. Status capture waits for its observation commit before producing
-ToolResult. Its two-second deadline produces a typed timeout if storage is slow;
-late evidence persistence cannot deliver a late tool result. Cancellation follows
+ToolResult. The code still applies the two-second [ordinary tool deadline](tool-job-controller.md#open-decisions), which
+produces a typed timeout if storage is slow; late evidence persistence cannot
+deliver a late tool result. The follow-up design removes that timeout; the call
+then ends on commit, cancellation or a fault. Cancellation follows
 the same common tool result path. Status metadata supplies no file-read grant.
 
 ### Coalesced journal activity checkpoints
@@ -561,9 +575,10 @@ saved write confirms success. An unchanged previous revision permits one retry
 with the same write ID and content. A second failure, conflicting revision or
 failed load holds that project's sensor state until service restart. Other
 projects continue. Shutdown stops new observations, flushes pending evidence and
-proposals through the writer, then closes it. The existing service shutdown
-deadline remains authoritative; an uncertain commit is recovered by load on
-restart. This does not claim rollback of an uncertain database transaction.
+proposals through the writer, then closes it. Service shutdown waits for that
+flush to drain and shows progress while it waits (owner, 2026-10-16). Only a
+write with an unknown outcome leads to repair; a second stop request can force
+exit. An uncertain commit is recovered by load on restart. This does not claim rollback of an uncertain database transaction.
 
 The fixed additive sensor schema is established at the verified database load or
 write boundary before querying the table. Missing schema is not interpreted as
@@ -571,7 +586,7 @@ empty sensor state. Real database fixtures serialize through the storage test
 owner guard because the embedded database has one process owner.
 
 Replay checkpoint discovery examines at most 64 operation index entries per
-reactor turn. A cursor resumes the scan on an immediate deadline; completed scans
+reactor turn. A cursor resumes the scan on an immediate timer; completed scans
 are reused until the journal revision changes. The checkpoint map retains at most
 64 registered projects. Foreground events remain ahead of this bounded work.
 
@@ -606,7 +621,7 @@ API. The existing Git observer remains its own canonical scope-specific source;
 SN1 does not persist Git events into this new sensor state.
 
 Sensor timers yield while the canonical writer has pending work; its completion
-wake and deadline resume the sensor owner. An expired debounce cannot spin the
+wake resumes the sensor owner. An expired debounce cannot spin the
 reactor while storage is stalled. Failed project intake remains unavailable until
 restart, after the single reconciliation/retry path is exhausted.
 
@@ -703,7 +718,9 @@ shared with protocol validation.
 A request copies at most 16 observations and eight proposals; at most 64 records
 are indexed. The frame limit remains 64 KiB. Existing connection limits, reply
 backpressure and disconnect cleanup apply. The client uses the existing isolated
-control-worker boundary and a two-second request deadline, with no retries.
+control-worker boundary with no retries. The request has no deadline (owner,
+2026-10-16); it ends on reply, cancellation by the person or disconnect. The code
+still applies a two-second deadline; a follow-up implementation will remove it.
 There is no pending query task to cancel or drain. Queries remain available while
 sensor persistence is stalled because they only read committed memory. Restart
 visibility waits for the existing serialized sensor load and never treats a
@@ -771,7 +788,7 @@ flowchart TD
     Retry --> Sample
     Valid -->|Yes| Anchor[Refresh monotonic and wall anchor; clear clock uncertainty]
     Anchor --> Work[Apply existing debounce, idle and expiry rules]
-    Work --> Deadline[Schedule next bounded deadline]
+    Work --> Deadline[Schedule next debounce, idle or freshness timer]
 ```
 
 Validation: controlled-clock owner tests must cover live rollback with an expired
@@ -803,8 +820,9 @@ eligibility and the existing status-read grant. Remote disclosure is denied for
 this first packet. Discovery reports the read-only capability. Tool intent and
 result use the existing durable sequence and eight-call turn limit. Cancellation
 and generation changes discard pending delivery through the existing owner.
-There is no capture worker or new query deadline: the bounded in-memory read is
-part of the common two-second tool deadline. Serialized output must fit 16 KiB;
+There is no capture worker or query deadline. The bounded in-memory read ends on
+completion, cancellation or a fault, as the follow-up design that replaces the
+[ordinary tool deadline](tool-job-controller.md#open-decisions) requires. Serialized output must fit 16 KiB;
 overflow fails explicitly without publishing an incomplete JSON object.
 
 The result uses a fixed JSON structure, with numeric enum values accompanied by

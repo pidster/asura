@@ -638,16 +638,19 @@ flowchart TD
 No graph, file or network call runs in a TUI render loop or the service control
 dispatch loop. The service routes typed work through its existing bounded
 authority/context workers. Storage isolates blocking file and embedded-engine
-calls. External queries have a deadline and cancellation path; late results
+calls. External queries have a cancellation path and no fixed time limit
+(owner, 2026-10-16); late results
 must pass generation, task, binding and disclosure rechecks. Cancellation of a
 write may leave an unknown database commit; retain its receipt identity until
 reconciliation. Shutdown settles owned work and preserves unresolved records.
 
 For the first graph traversal packet, propose hard caps of depth 3, 128 visited
-nodes, 256 traversed edges, 256 KiB decoded content, 32 result items per page,
-and a two-second operation deadline. These are design targets, not measured
-capacity claims. The packet must reconcile them with the existing control frame,
-authority-worker slots, service deadlines and model context budget before code.
+nodes, 256 traversed edges, 256 KiB decoded content and 32 result items per page.
+The operation has no time bound; it ends on completion, a cap or cancel
+(owner, 2026-10-16, replacing a proposed two-second operation deadline). These
+are design targets, not measured capacity claims. The packet must reconcile them
+with the existing control frame, authority-worker slots, service cancellation
+and model context budget before code.
 If closure exceeds a cap, return explicit partial/unavailable status. Do not
 claim absent evidence. Queue overload coalesces low-priority maintenance signals;
 it does not discard accepted control outcomes or turn a stale graph into current
@@ -674,7 +677,7 @@ stateDiagram-v2
     [*] --> Prepared: Admitted operation journaled
     Prepared --> Committing: Bound graph write dispatched
     Committing --> Published: Matching receipt and journal result
-    Committing --> Uncertain: Timeout or lost acknowledgement
+    Committing --> Uncertain: Cancel or lost acknowledgement
     Uncertain --> Published: Original receipt verified and authority current
     Uncertain --> Held: Receipt or binding unresolved
     Prepared --> Held: Source or authority invalid

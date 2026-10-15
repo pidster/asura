@@ -1242,7 +1242,7 @@ Proposed HM0 limits apply to the adapter and its test process:
 | Work admission | One executing command, eight queued commands; reject the ninth queued command with `Busy` |
 | Inputs/results | 16 KiB note body, 20 KiB encoded command, 32 records or 64 KiB response; reject before submission or return explicit `LimitExceeded` |
 | Deadlines | None (owner, 2026-10-16): open, initialize, reads, writes, SDK queries and transactions end on completion, an engine error or the caller's cancellation. |
-| Shutdown | Stop admission immediately; inspect settlement without blocking the service; after 2 seconds retain ownership and report unavailable |
+| Shutdown | Stop admission immediately; inspect settlement without blocking the service; after 2 seconds report unavailable while retaining ownership. This slow-close report is a wind-down signal; it ends no work and releases nothing (kept by J1-0). |
 | Qualification workload | 1000 notes, at most one source link per note, 64 MiB aggregate logical input |
 
 SDK and engine file opens, syncs, reads, compaction, thread joins and destruction
@@ -1250,7 +1250,7 @@ stay off the service reactor. Use a bounded request channel and one result slot
 per accepted command. Tag results with owner generation and request identity.
 Cancellation before submission removes queued work. After submission it prevents
 new work but does not prove the engine stopped. Retain the in-flight slot and
-owner until settlement, even after a caller deadline expires. Never create a
+owner until settlement, even after the caller cancels. Never create a
 replacement owner while the old engine may still write.
 
 The [tagged engine settings](https://raw.githubusercontent.com/surrealdb/surrealdb/v3.2.4/surrealdb/core/src/kvs/surrealkv/cnf.rs)
@@ -1280,7 +1280,7 @@ The selected HM0-A close mechanism accounts for SDK 3.2.4's missing public
 shutdown acknowledgement. After dropping the last SDK handle, the storage owner
 keeps its private runtime alive until `runtime.metrics().num_alive_tasks()` is
 zero. It then destroys that runtime on the owner thread. Callers poll thread
-completion and retain an unsettled owner after their deadline. Reopen and child
+completion and retain an unsettled owner after they stop waiting. Reopen and child
 termination tests must qualify this mechanism. It does not expose suppressed
 engine shutdown errors or establish power-loss durability.
 
@@ -1297,13 +1297,13 @@ stateDiagram-v2
     Opening --> Unavailable: Missing or mismatched binding
     Ready --> Executing: Admit bounded command
     Executing --> Ready: Result and receipt verified
-    Executing --> Uncertain: Deadline or transport loss
+    Executing --> Uncertain: Caller cancels or transport loss
     Uncertain --> Ready: Worker settled and receipt resolved
     Ready --> Closing: Stop admission
     Executing --> Closing: Cancel new work
     Uncertain --> Closing: Stop admission
     Closing --> Closed: Engine and runtime settled
-    Closing --> Unavailable: Settlement deadline
+    Closing --> Unavailable: Slow-close report after 2 s, ownership retained
     Unavailable --> Closed: Retained owner finally settles
 ```
 
@@ -1616,9 +1616,9 @@ flowchart TD
     Bounds -->|No| Invalid[Invalid input]
     Bounds -->|Yes| Queue{Owner queue available?}
     Queue -->|No| Busy[Busy or closed]
-    Queue -->|Yes| Deadline{Cancelled or expired?}
-    Deadline -->|Yes| Stop[Return cancellation or timeout]
-    Deadline -->|No| Binding{Binding and marker match?}
+    Queue -->|Yes| Cancelled{Cancelled?}
+    Cancelled -->|Yes| Stop[Return cancellation]
+    Cancelled -->|No| Binding{Binding and marker match?}
     Binding -->|No| Fail[Return binding error]
     Binding -->|Yes| Query[Read scoped ordered rows with one lookahead]
     Query --> Decode{All records and digests valid?}
@@ -1655,8 +1655,8 @@ sequenceDiagram
     participant W as Authority worker
     participant G as Bound graph
     S->>W: MemoryRead with registered project and typed query
-    alt Unknown project or expired request
-        W-->>S: Invalid or deadline error
+    alt Unknown project or cancelled request
+        W-->>S: Invalid or cancelled error
     else Project accepted
         W->>G: Verify binding and run scoped read
         G-->>W: Typed page, note, sources or memory error
@@ -1760,9 +1760,12 @@ or remote fallback in HM2. A failing memory read cannot trigger remote inference
 ### Dispatch, cancellation and settlement
 
 One logical turn retains the existing eight-call budget, one pending tool call,
-16 KiB result limit, 64 KiB aggregate result limit and 60-second turn deadline.
-A memory call has two seconds from durable-intent acknowledgement, capped by the
-remaining turn deadline. It shares the authority worker's six ordinary/eight total
+16 KiB result limit and 64 KiB aggregate result limit. The turn has no elapsed-time
+deadline: the [cancellation-driven turn lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
+replaced the earlier 60-second turn deadline. A memory call has two seconds from
+durable-intent acknowledgement. That is the ordinary tool deadline (L10), which
+the owner has queued for replacement
+([tool output views](tool-output-views.md#execution)). It shares the authority worker's six ordinary/eight total
 queue slots. There is no new worker thread, engine connection, retry loop or timer
 polling loop in a client or render path.
 
@@ -2120,16 +2123,17 @@ schema. Other projects, status, input editing and cancellation remain responsive
 The create worker may validate its own source internally; it cannot bypass another
 unresolved create. A source note from an unpublished operation is ineligible.
 
-The caller keeps the earlier of intent acknowledgement plus two seconds and the
-remaining turn deadline as its own wait deadline. Under [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound) that deadline no
+The caller keeps intent acknowledgement plus two seconds (the L10 ordinary tool
+deadline, queued for replacement) as its own wait deadline; the turn itself has
+no elapsed-time deadline. Under [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound) that deadline no
 longer reaches the writer or database work: when it passes, the caller sets the
 create's cancel flag, which stops the cancellable put. The existing six
 ordinary/eight total authority slots and retained settlement token remain in
 force. Cancellation or timeout after dispatch fences inference but does not assert
 rollback. Retain the mutation ticket, tool slot and original metadata until actual
 worker settlement. Then resolve the exact original receipt with a separate
-recovery read that waits for the writer's real reply, even when the inference
-deadline has expired. This recovery work cannot execute another mutation.
+recovery read that waits for the writer's real reply, even after the caller's
+wait has ended. This recovery work cannot execute another mutation.
 
 A matching committed receipt requires a durable success ToolResult, including when
 the user cancelled during commit. The turn can then terminate as cancelled without

@@ -52,7 +52,7 @@ sequenceDiagram
     participant Provider as Selected provider
     participant Client as Event subscriber
     Service->>Helper: Hello with exact model selector and operation fence
-    Helper->>Provider: Discover/load under existing deadline
+    Helper->>Provider: Discover/load until reply, cancel or helper exit
     alt Capacity unavailable or discovery fails
         Provider-->>Helper: Unavailable
         Helper-->>Service: Unavailable Hello, no capacity
@@ -71,7 +71,9 @@ sequenceDiagram
     end
 ```
 
-The existing helper preparation and five-second discovery deadlines apply.
+Helper preparation and discovery have no time limit (owner, 2026-10-16). They
+end on the provider's reply, an error, cancellation, helper exit or shutdown; see
+[helper and provider waits](model-provider-integration.md#helper-and-provider-waits-without-time-limits--owner-2026-10-16).
 Generation follows the [cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30). Provider file reads and network calls remain in the helper's
 cancellable work; the service reactor and TUI renderer perform no discovery.
 Cancellation or helper death discards unverified observations. A restart clears
@@ -117,7 +119,7 @@ flowchart TD
   B -->|No| C[Unavailable outcome; no invented telemetry]
   B -->|Yes| D[Hello: native variant and capacity]
   D --> E[Existing async preflight token count]
-  E -->|Cancel or deadline| F[Normal fenced terminal; no measurement]
+  E -->|Cancel or helper exit| F[Normal fenced terminal; no measurement]
   E -->|Count exceeds limit| G[Context limit outcome]
   E -->|Fits| H[One input-at-start measurement]
   H --> I[Service validates identity and order]
@@ -134,7 +136,7 @@ that disagrees with the selected provider. Integration tests exchange the new
 Hello fields across the real helper boundary and verify capacity is cached
 before input measurement and survives coalesced observation. End-to-end PTY evidence must show that an
 unknown input count still displays `0%`, while a measured count uses the selected
-effective capacity. Cancellation, timeout and restart must not publish a stale
+effective capacity. Cancellation, helper exit and restart must not publish a stale
 capacity as current. Native model checks qualify each provider's discovery source
 separately; metadata fixtures do not prove an installed model's actual limit.
 

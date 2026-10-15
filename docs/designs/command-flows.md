@@ -64,10 +64,10 @@ flowchart TD
     Attach -->|"Unsafe / incompatible / other error"| Failure["Report classified failure"]
     Spawn --> Notice{"Startup notice and authenticated attachment"}
     Notice -->|Ready| Started["Inspect and report started: exit 0"]
-    Notice -->|"Another owner won"| Retry["Retry attach within 5 s"]
+    Notice -->|"Another owner won"| Retry["Retry attach every 50 ms (pacing)"]
     Retry -->|Attached| Existing
-    Retry -->|Expired| Failure
-    Notice -->|"Failed / malformed / expired"| Failure
+    Retry -->|"Classified failure or person cancels"| Failure
+    Notice -->|"Failed / malformed / child exit / person cancels"| Failure
 ```
 
 ### CF02b: Inspect, stop and foreground run
@@ -85,7 +85,9 @@ flowchart TD
     Target -->|Error| Failure
     Target -->|Current| Drain{"Request drain for this epoch"}
     Drain -->|Confirmed| Stopped["Report stopped: exit 0"]
-    Drain -->|"Changed owner / expired / failure"| Failure
+    Drain -->|"Workers still settling"| Progress["Show settling owners;<br/>a second stop forces exit"]
+    Progress --> Drain
+    Drain -->|"Changed owner / lost connection / person cancels / failure"| Failure
     Command -->|Run| Mode{"Private startup mode?"}
     Mode -->|No| Owner
     Mode -->|Yes| Private{"Required inherited pipes valid?"}
@@ -96,9 +98,13 @@ flowchart TD
 ```
 
 Foreground `run` without internal flags needs no inherited pipes. Owner arbitration,
-endpoint checks, socket deadlines, child reaping, and repair-only drain behavior
-remain in the service contract. A deadline does not authorize killing a different
-owner or replacing installation data.
+endpoint checks, child reaping, and repair-only drain behavior remain in the
+[service contract](system-architecture.md#reactor-stop-and-drain). Start and stop
+have no time bound (owner, 2026-10-16): each wait ends on its result, a lost
+connection or the person's cancel. A long stop shows progress, and a second stop
+forces exit. A long wait does not authorize killing a different owner or
+replacing installation data. The code still applies the five-second `LIFECYCLE`
+budget; a follow-up implementation will remove it.
 
 ## CF03: TUI startup and shutdown
 
@@ -120,7 +126,7 @@ flowchart TD
     Unavailable --> Inspect
     Inspect -->|"Valid current generation"| Display["Update local display state"]
     Inspect -->|"Stale result"| Ignore["Discard result"]
-    Inspect -->|"5 s without fresh result"| Expired["Display status_expired"]
+    Inspect -->|"Heartbeats missed"| Expired["Display status_expired"]
     Display -->|GraphReady| Discover["First-project discovery: CF06"]
     Display --> Input["Continue terminal input: CF04"]
     Expired --> Input
@@ -136,6 +142,12 @@ flowchart TD
 Connection loss does not authorize spawning a replacement after an initial attach
 or launch attempt. The startup parameter for an explicit backend is not implemented
 by the current argument parser. This chart records local-service behavior only.
+
+`status_expired` is a display rule, not a wait that ends work. Staleness is
+counted in missed heartbeats, not seconds (owner, 2026-10-16); the
+[event routing design](event-routing.md) owns the count. The code still expires
+the status after five seconds; a follow-up implementation will apply the
+heartbeat count.
 
 ## CF04: Slash-command dispatch and local commands
 
@@ -318,21 +330,22 @@ flowchart TD
     Operation -->|Set| Validate{"Known key, valid YAML type and bounds?"}
     Validate -->|No| Failure
     Validate -->|Yes| Write["Write private temporary file and sync"]
-    Write -->|"Failure / cancelled / expired"| Failure
+    Write -->|"Failure / cancelled"| Failure
     Write -->|Success| Rename["Recheck identity and atomically replace"]
     Rename -->|"Failure before replacement"| Failure
     Rename -->|Success| Sync{"Parent sync confirmed?"}
     Sync -->|Yes| Value
     Sync -->|No| Unknown["Outcome unconfirmed: read before retry"]
-    Request -->|"5 s UI expiry or worker panic"| Unknown
+    Request -->|"Person cancels, lost connection or worker panic"| Unknown
     Value --> Panel["Show padded YAML panel: clear only unchanged draft"]
     Unknown --> Retain["Keep draft and worker slot until worker settles"]
 ```
 
-Read commands never write the file. The service serializes one configuration job and uses a two-second logical
-deadline. Blocking OS work may outlast the deadline; it retains ownership until
-settled. No automatic set retry occurs. A five-second client expiry does not prove
-that the write stopped. `/config` reports effective persisted values, not model
+Read commands never write the file. The service serializes one configuration job.
+The job and the client wait have no time bound (owner, 2026-10-16); see
+[client waits](#client-waits-without-time-bounds). Blocking OS work retains
+ownership until settled. No automatic set retry occurs. A cancelled client wait
+does not prove that the write stopped. `/config` reports effective persisted values, not model
 or audit-consumer activation. Unsupported keys and an unset model are errors.
 
 ## CF08: Conversation submit and observation
@@ -356,7 +369,7 @@ flowchart TD
     Worker -->|Yes| Submit["Submit request ID, project, conversation and prompt"]
     Submit --> Admit{"Owner admission and durable receipt"}
     Admit -->|"Definite rejection"| Rejected
-    Admit -->|"Lost reply or 5 s UI deadline"| Retry["Mark unconfirmed; /retry resends same ID"]
+    Admit -->|"Lost reply or person cancels"| Retry["Mark unconfirmed; /retry resends same ID"]
     Admit -->|Accepted| Accept["Remove entry; adopt conversation and generation"]
 ```
 
@@ -390,8 +403,10 @@ Staging clears the draft; the outbox keeps the text until the service receipt.
 Admission errors do not fabricate progress. Observe starts at cursor zero and
 adopts the owner's returned generation. Terminal kinds are complete, failed,
 cancelled and interrupted. Observation has no whole-turn deadline. Each long poll
-uses the client's 2 s request deadline and repeats until a terminal kind or a
-worker stop; see G03.
+asks the service to wait up to 1000 ms for a change. That wait is pacing and ends
+nothing; the client repeats it until a terminal kind or a worker stop; see G03.
+The client's own wait for each reply has no time bound
+([client waits](#client-waits-without-time-bounds)).
 
 ## CF09: Retry and cancellation
 
@@ -462,6 +477,61 @@ The selected correction prevents cancellation flags during setup or discovery.
 Setup and configuration do not acquire conversation-cancellation semantics from
 the command. G01 and G02 record the inspected behavior before this correction.
 
+## Client waits without time bounds
+
+Required behavior (owner, 2026-10-16). A client wait for a service reply has no
+time bound. It ends on the reply, the person's cancel (`/cancel`, Ctrl-C or
+exit) or a lost connection. Cancel or a lost connection reports
+`outcome_unconfirmed` for a mutation and an error for a read. The attachment that
+lost its reply then refuses further requests, as under
+[journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound).
+Pacing intervals, such as the 50 ms cancel check and the 1000 ms long poll, end
+nothing and remain.
+
+J1-0 already removed the client budgets for journal-backed mutations:
+initialize, project register and rename, queue requests and conversation cancel.
+This decision removes the remaining budgets. The code still applies them; a
+follow-up implementation will remove them.
+
+| Wait | Removed bound (code) | What ends the wait |
+| --- | --- | --- |
+| Read RPCs: Inspect, observe, list | 2 s `REQUEST` (`asura-client`) | Reply, cancel, lost connection |
+| Audit, sensors and context reads | 2 s per request | Reply, cancel, lost connection |
+| Model inventory | 30 s request; 35 s TUI job | Reply, `/cancel`, exit, lost connection |
+| Configuration get and set | 3 s request; 5 s TUI job | Reply, `/cancel`, exit, lost connection |
+| Conversation submit, including the journal acknowledgement | 40 s request | Reply, `/cancel`, lost connection |
+| Service start and stop | 5 s `LIFECYCLE` | Ready notice or released lock, child exit, Ctrl-C, lost connection |
+| TUI attachment | 2 s | Attachment result, exit, lost connection |
+| TUI project administration and audit jobs | 5 s and 2 s | Reply, `/cancel`, exit, lost connection |
+| Conversation restoration and discovery | 18 s | Reply, `/cancel`, exit, scope change, lost connection |
+
+A long wait shows that it is waiting, for example the pending command and its
+request ID. The worker slot stays occupied until its thread settles; a second
+request for the same slot gets `busy`.
+
+Selected flow. Arrows are the events that end one client wait.
+
+```mermaid
+flowchart TD
+    Send["Worker sends request on its attachment"] --> Wait["Wait for reply; show pending;<br/>check cancel every 50 ms (pacing)"]
+    Wait -->|Reply| Result["Apply typed result"]
+    Wait -->|"Person cancels or exits"| Cancelled["Stop waiting; mutation outcome unconfirmed"]
+    Wait -->|"Lost connection"| Lost["Report lost connection; mutation outcome unconfirmed"]
+    Cancelled --> Refuse["Attachment refuses further requests"]
+    Lost --> Refuse
+    Result --> Settle["Release worker slot when thread settles"]
+    Refuse --> Settle
+```
+
+### Client wait validation
+
+| ID | Case | Unit | Integration | End-to-end |
+| --- | --- | --- | --- | --- |
+| CW-01 | Held reply | A fake attachment that replies after longer than each removed bound returns the reply, not a timeout | A gated real service reply arrives after each removed bound and is applied | TUI shows the pending state and accepts input within 100 ms |
+| CW-02 | Cancel during a wait | Cancel ends the wait and reports unconfirmed for a mutation | Cancel during a gated real request; the late commit is visible on the next read | `/cancel` and Ctrl-C end the wait |
+| CW-03 | Lost connection | Closing the peer ends the wait | Service stop during a gated request ends the wait with a lost connection | — |
+| CW-04 | Start and stop | Stop wait continues while workers settle; a second stop forces exit | Gated worker during stop: Inspect reports `Draining`; no `RepairOnly` without an unknown outcome | `asura service stop` shows progress |
+
 ## Branch validation and remaining gaps
 
 Required behavior: each command change must update its chart before code changes.
@@ -476,7 +546,8 @@ case. A rendered chart is review evidence, not executable proof.
 | CF05 init and repair | storage writer tests, service `tests/conversation_flow.rs`, terminal `--setup` journey | Metadata-triggered repair regression must pass through scanner, real service and terminal, preserving bytes. |
 | CF06 projects and confirmation | `tui/ui.rs`, service conversation journey and terminal setup journey | Discovery failure must never be treated as an empty registry. |
 | CF07 YAML and uncertainty | configuration storage/service tests and terminal config journey | Mock failures alone do not prove post-rename disk-error handling. |
-| CF08–CF09 acceptance, replay and cancel | service conversation journey, native model journey, client unit tests and `tests/tui_pty.py` | `tui/queue.rs` unit tests cover the 5 s UI deadline with a held worker; add admission-deadline coverage against a stalled real service. |
+| CF08–CF09 acceptance, replay and cancel | service conversation journey, native model journey, client unit tests and `tests/tui_pty.py` | `tui/queue.rs` unit tests cover a held worker with no time bound (J1-0); add coverage that a submit against a stalled real service waits until cancel. |
+| Client waits without time bounds | Client unit tests, real service journeys and `tests/tui_pty.py` | Pending the follow-up implementation; see [validation](#client-wait-validation). |
 
 Audit findings and correction status:
 
@@ -488,7 +559,7 @@ Audit findings and correction status:
   The full CLI lifecycle gate, including both mandatory terminal journeys, passed.
 - **G03 — Whole-request deadline, restated:** observation has no whole-turn
   budget by design; it ends at a terminal kind or a worker stop. The queue worker
-  bounds admission with a 2 s attach. Its request then waits for the real reply
+  attaches and then waits for the real reply
   (J1-0); only `/cancel` or a lost connection marks the outcome unconfirmed, and
   the slot stays busy until the thread settles. Socket bounds do not bound a stalled OS lookup during resolution.
 - **G04 — Explicit backend selection:** the current CLI parser has no backend
@@ -519,11 +590,14 @@ audit chart. Each changed chart was rendered with Mermaid CLI and inspected.
 ## CF10: Model inventory
 
 Selected command path under [MP3](model-provider-integration.md#mp3-model-inventory-command).
-The client has one inventory worker slot. Attachment has a two-second deadline;
-the typed inventory request has thirty seconds. The UI deadline is thirty-five seconds.
+The client has one inventory worker slot. Attachment and the typed inventory
+request have no time bound (owner, 2026-10-16); they end on the reply, `/cancel`,
+exit or a lost connection. The code still applies a two-second attachment, a
+thirty-second request and a thirty-five-second UI deadline; a follow-up
+implementation will remove them.
 Only this worker accesses the socket. Cancellation shuts down a cloned socket
 handle and sets a cancellation flag. The worker checks cancellation before and
-after attachment. A timed-out slot stays occupied until its thread settles.
+after attachment. A cancelled slot stays occupied until its thread settles.
 Late results are discarded. Exit restores the terminal before bounded worker
 settlement. No renderer or input handler performs discovery or transport I/O.
 
@@ -546,7 +620,7 @@ flowchart TD
     Worker -->|Reply| Result{"Valid success?"}
     Result -->|Yes| Table["Queue padded model table"]
     Result -->|No| Error["Show error; retain draft"]
-    Worker -->|Deadline| Error
+    Worker -->|"Lost connection"| Error
     Queue -->|Cancel or exit| Cancel["Cancel and disconnect"]
     Cancel --> Settle["Retain slot until thread settles"]
     Error --> Settle
@@ -569,9 +643,11 @@ PROJECT_ID is 32 hexadecimal digits and must be nonzero. With no cursor it reads
 the first 16 committed observations and all bounded proposals. OFFSET (0–64)
 and REVISION (unsigned 64-bit) resume the same snapshot. Invalid syntax exits 2;
 attachment, loading, unavailable and stale-cursor errors exit 3. Success exits 0.
-It attaches to an existing local service under the same two-second deadline as
-other standalone inspection commands; it does not launch a service. The typed
-query has a separate two-second deadline. There is no UI/render loop to block.
+It attaches to an existing local service as other standalone inspection commands
+do; it does not launch a service. Attachment and the typed query have no time
+bound (owner, 2026-10-16); they end on the reply, a lost connection or the
+person's Ctrl-C. The code still applies two-second deadlines; a follow-up
+implementation will remove them. There is no UI/render loop to block.
 
 The output shows project/revision, pending persistence and intake/clock health,
 a source/sequence/expiry table, and proposal purpose/state/held reason. If more
@@ -585,12 +661,13 @@ owns semantics and persistence. The CLI owns arguments and presentation only.
 flowchart TD
     Start[CLI sensors arguments] --> Valid{ID and optional cursor valid?}
     Valid -->|No| Syntax[Exit 2 with usage]
-    Valid -->|Yes| Attach[Attach existing service with two-second deadline]
+    Valid -->|Yes| Attach[Attach existing service]
     Attach --> Connected{Connected?}
     Connected -->|No| Failure[Report reason and exit 3]
-    Connected -->|Yes| Query[Send typed page request with two-second deadline]
+    Connected -->|Yes| Query[Send typed page request; wait for reply]
     Query --> Reply{Validated reply?}
-    Reply -->|Timeout or protocol error| Failure
+    Reply -->|Lost connection or protocol error| Failure
+    Query -->|Person presses Ctrl-C| Failure
     Reply -->|Typed service error| Failure
     Reply -->|Committed page| Print[Print metadata and proposal tables]
     Print --> More{Next offset present?}
@@ -619,7 +696,8 @@ defines command branches, metadata ownership and model-tool behavior separately.
 owns its typed metadata, limits and read-only native tool. Limit defaults to 16
 and accepts 1 through 16. A dedicated single-slot audit worker in `tui/audit.rs`
 performs the read; a second `/audit` while it runs retains the draft. `/cancel`
-cancels a pending read.
+cancels a pending read. The read has no time bound (owner, 2026-10-16); the code
+still applies a two-second deadline until a follow-up implementation removes it.
 
 ```mermaid
 flowchart TD
@@ -629,9 +707,9 @@ flowchart TD
     Busy -->|Yes| Pending[Show audit busy and retain draft]
     Busy -->|No| Project{Selected registered project with connected service?}
     Project -->|No| Missing[Explain project requirement and retain draft]
-    Project -->|Yes| Read[Dedicated audit worker reads with two-second deadline]
+    Project -->|Yes| Read[Dedicated audit worker reads; waits for reply]
     Read --> Reply{Typed recent-window reply?}
-    Reply -->|Transport failure or timeout| Failure[Show error and retain draft; UI stays responsive]
+    Reply -->|Transport failure or cancel| Failure[Show error and retain draft; UI stays responsive]
     Reply -->|Success| Panel[Show health and newest-first project table]
     Panel --> Size{More lines than visible area?}
     Size -->|Yes| Scroll[Enable scroll]

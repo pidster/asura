@@ -510,11 +510,13 @@ response is rejected by the same routing checks as a successful response.
 Otherwise, an old error could clear a newer valid view. Disconnect retires all
 outstanding requests before a new attachment is negotiated.
 
-Propose a one-second refresh interval, a two-second request deadline, and a
-five-second visible validity limit measured from the client's request start.
-The initial response must use a collection started for that request; it cannot
-reuse an older cached observation. Client monotonic time controls request expiry
-and visible validity. Wall-clock timestamps are diagnostic only. Navigation,
+Propose a one-second refresh interval, which is pacing. A status request has
+no time limit (owner, 2026-10-16): it ends on its reply, a selection change,
+disconnect or cancel. The view is shown stale after five consecutive missed
+one-second heartbeats (owner, 2026-10-16). Staleness changes the display only;
+it ends no work. The initial response must use a collection started for that
+request; it cannot reuse an older cached observation. Client monotonic time
+counts missed heartbeats. Wall-clock timestamps are diagnostic only. Navigation,
 revocation and disconnect invalidate the view immediately regardless of its age.
 On sleep/resume or uncertain clock continuity, the client clears current claims
 and requests a new snapshot. D7 must qualify the platform clock and responsiveness

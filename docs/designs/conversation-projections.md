@@ -221,7 +221,8 @@ before code. Protocol remains 0.1 and journal format remains 1.
 
 Numeric limits remain those of existing paths until a packet selects its extension.
 Each packet must name blocking APIs, isolation owner, payload/queue/concurrency limits,
-deadlines, cancellation, recovery and shutdown before implementation. No background
+loop-closure conditions, cancellation, recovery and shutdown before
+implementation. A fixed time limit needs owner approval under [AE-04](../engineering.md#asynchronous-execution-and-recovery). No background
 summarizer, unbounded output buffer or additional scheduler is authorized here.
 
 ## Design verification

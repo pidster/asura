@@ -171,7 +171,7 @@ stateDiagram-v2
   ProjectList --> Status: Escape or successful selection
   ModelList --> Saving: Enter on selectable model
   Saving --> Status: Configuration saved
-  Saving --> ModelList: Rejection or timeout
+  Saving --> ModelList: Rejection, failure or cancellation
   ProjectList --> ProjectList: Stale or busy selection rejected
   ModelList --> Status: Escape cancels discovery
   Editor --> Editor: Up/Down move rows or recall, Ctrl+P/N recall
@@ -211,9 +211,12 @@ flowchart TD
 
 ## Limits, recovery and tests
 
-Reuse model inventory's 35-second client budget, configuration's existing bounded
-worker, and queue's five-second observation budget. Each retains its worker slot
-until settlement. Escape suppresses late picker results. Quit uses existing bounded
+Reuse the model inventory worker, configuration's existing bounded worker and the
+queue worker. Model discovery and configuration saves have no client time budget
+(owner, 2026-10-16); the code still applies 35-second and five-second budgets,
+and a follow-up implementation will remove them. The queue worker has no
+observation bound ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). Each wait ends on reply, cancellation by the
+person or disconnect. Each worker retains its slot until settlement. Escape suppresses late picker results. Quit uses existing bounded
 worker cancellation and owned-service cleanup. No new polling or timer is added.
 History is volatile, at most 100 entries and 1 MiB. List projections remain bounded
 by existing 64-project, 65-model and 16-unresolved-input service limits. The local
@@ -253,8 +256,8 @@ finishes between polls, remains eligible. Explicit mutation acknowledgements als
 retain eligibility, including when completion precedes the first full snapshot.
 
 The client retains a sequence watermark and at most 16 eligible input identities
-for each project/service-epoch scope. Subscription retries and five-second display
-expiry do not reset this history baseline; a changed project or service epoch does.
+for each project/service-epoch scope. Subscription retries and missed-heartbeat
+display staleness do not reset this history baseline; a changed project or service epoch does.
 Existing 32 observed-operation identities still suppress duplicate transcript rows.
 No helper or storage call is added to the render/input path. Scope, source and
 revision fences remain owned by the existing queue projection. Explicit queue jobs
@@ -293,7 +296,7 @@ Historical regression fixture: persisted kind-12 queued work targeting generatio
 A fresh TUI restores generation 4 from the journal read. It must not adopt
 generation 3 from the queue. Also cover running
 work on the first snapshot, queued-to-complete between polls, new terminal work
-after an empty baseline, reconnect/display expiry, mutation acknowledgement before
+after an empty baseline, reconnect/display staleness, mutation acknowledgement before
 the baseline, duplicate snapshots and a same-conversation generation regression.
 
 The prior native PTY regression created generations 1 and 2, queued generation

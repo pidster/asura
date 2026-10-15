@@ -5,6 +5,11 @@ Status: implemented, with scoped native process and system-model validation on
 remains 0.1 and journal format remains 1. The proposed
 [tool job controller](tool-job-controller.md) would run shell commands as
 conversation-scoped jobs; until it is implemented, this contract governs.
+Tool job packet J1 removes this contract's command timeout and 2-second setup
+budget (J1-Q3, J1-Q4, owner, 2026-10-15): a command then runs until it ends or
+is cancelled, and `timeout_seconds` is accepted and ignored. The timeout text
+below records the implemented contract until J1 lands; see
+[J1 timeout and setup budget removal](tool-job-controller.md#j1-timeout-and-setup-budget-removal).
 
 ## Scope and existing owners
 
