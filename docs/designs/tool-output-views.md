@@ -92,7 +92,7 @@ its classification under the principles above.
 | L7 | Scratch cleanup | 4096 entries, 32 levels | Keep | Shell tool |
 | L8 | Live shell jobs | 1 per active turn | Replace | Job slots per service and per conversation |
 | L9 | Pending tool calls and executors | 1 each | Keep | Model tools |
-| L10 | Ordinary tool deadline | 2 s | Keep | Model tools; `job wait` needs an exemption |
+| L10 | Ordinary tool deadline | 2 s | Replace (owner, 2026-10-15: far too short) | Queued for the design that moves every tool to jobs ([job controller open decisions](tool-job-controller.md#open-decisions)) |
 | L11 | Command and cwd | 8192 B and 1024 B | Keep | Shell tool |
 | L12 | Private argv payload | 8704 B | Keep | Shell tool |
 

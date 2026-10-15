@@ -945,7 +945,11 @@ designs:
 1. **Other tools:** EX4 (owner, 2026-10-15) states that all tools use jobs. The
    earlier assumption that short typed tools remain synchronous no longer holds.
    A follow-up design must assign how project, memory and service tools adopt
-   the controller.
+   the controller. It must also replace the 2-second ordinary tool deadline
+   (L10), which ends a call that has not finished within 2 seconds of its start
+   (`asura-service/src/tools.rs:1026`, `tools.rs:1139-1178`). The owner judged
+   it far too short (2026-10-15); under the owner's loop-closure rule a tool call
+   ends on completion, cancel or a fault, not on a fixed time.
 2. **Job stall closure:** derived from tool-loop trace evidence under
    [tool output views rule 5](tool-output-views.md#tool-loop-trace-evidence).
 3. **Raw pages:** their encoding and the remaining RG-11 coverage (R5).
