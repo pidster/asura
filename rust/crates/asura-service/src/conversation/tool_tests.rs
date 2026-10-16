@@ -56,6 +56,7 @@ impl Fixture {
         let active = Active {
             foreground_user: true,
             queue_input: None,
+            person_held: false,
             request: None,
             turn,
             input: vec![],
@@ -134,6 +135,8 @@ impl Fixture {
                 calibration: Default::default(),
                 measurements: VecDeque::new(),
                 hold_reasons: BTreeMap::new(),
+                published_step: None,
+                step_refresh: false,
                 wake: None,
                 observations: vec![],
                 payloads: Default::default(),

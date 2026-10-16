@@ -416,6 +416,12 @@ Selected correction under the [client command contract](early-production-status-
 read, then a pending model inventory or model picker. Otherwise it requires an
 active cancellable conversation request. Idle, setup and discovery preserve the
 draft and queue no cancellation.
+
+Escape in the editor (owner, 2026-10-16) runs the same cancellation as
+`/cancel`, with two differences: it keeps the draft, and it does nothing when
+nothing is cancellable. An open overlay, picker, command list, queue selection,
+response selection or log focus takes Escape first, so one press closes it and a
+second press cancels. Escape with a modifier is not a cancel.
 The correction is implemented and 58 CLI unit tests pass. The full lifecycle
 rerun remains integration evidence owned by the primary agent. The chart includes
 these corrections; the audit findings distinguish fixed and remaining gaps.
@@ -456,11 +462,19 @@ flowchart TD
     Cancel["/cancel"] --> Arity{"No arguments?"}
     Arity -->|No| Usage["Show use /cancel"]
     Arity -->|Yes| Audit{"Audit read pending?"}
+    Esc["Escape in the editor"] --> Closable{"Overlay, picker, selection or focus open?"}
+    Closable -->|Yes| Close["Close it; no cancellation"]
+    Closable -->|No| Audit
     Audit -->|Yes| AuditCancel["Clear command; cancel audit read"]
     Audit -->|No| Models{"Model inventory or picker pending?"}
     Models -->|Yes| ModelsCancel["Clear command; cancel inventory"]
     Models -->|No| Job{"Cancellable conversation request?"}
-    Job -->|No| Gap["Show no active conversation and retain draft"]
+    Job -->|No| Preparing{"Queue entry shows a waiting step?"}
+    Preparing -->|No| Gap["/cancel: show no active conversation and retain draft; Escape: nothing"]
+    Preparing -->|Yes| Hold["Send Hold (action 4) for that input"]
+    Hold -->|Committed| Held["Show Held (cancelled); helper stops"]
+    Hold -->|input_not_preparing| Started["Show turn already started; use /cancel again"]
+    Hold -->|"Lost reply or /cancel"| HoldUnknown["Show queue outcome unconfirmed"]
     Job -->|Yes| Flag["Clear command and set cancellation flag"]
     Flag --> Generation{"Operation generation known?"}
     Generation -->|No| Observe["Observe until generation is known"]
@@ -473,6 +487,10 @@ flowchart TD
     ObserveResult -->|Cancelled| Stopped["Show cancelled incomplete response"]
     ObserveResult -->|"Failed / interrupted / disconnected"| Other["Show actual outcome or observation uncertainty"]
 ```
+
+Before model admission the TUI has no operation to cancel. While a queue entry
+shows a [waiting step](model-provider-integration.md#waiting-step-display--owner-2026-10-16),
+`/cancel` holds that input instead; the person can then Resume or Drop it.
 
 The selected correction prevents cancellation flags during setup or discovery.
 Setup and configuration do not acquire conversation-cancellation semantics from

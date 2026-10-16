@@ -460,6 +460,7 @@ impl App {
             }
         }
         if (self.notice.starts_with("Input queued;")
+            || self.notice.starts_with("Input waiting:")
             || self.notice.starts_with("Input held (")
             || self.notice == "Input running")
             && let Some(entry) = entries
@@ -481,6 +482,19 @@ impl App {
         }
     }
 
+    /// The selected project's queued input that shows a waiting step.
+    fn preparing_input(&self) -> Option<Vec<u8>> {
+        if self.queue_busy {
+            return None;
+        }
+        let project = self.selected_project?.to_vec();
+        self.queue_entries
+            .iter()
+            .find(|entry| {
+                entry.project_id.as_ref() == Some(&project) && queue_wait_label(entry).is_some()
+            })
+            .and_then(|entry| entry.input_id.clone())
+    }
     fn send_queue(&mut self, request: super::queue::Request) {
         if self.queue_busy {
             self.notice = "Queue request pending; draft retained".into();
@@ -562,12 +576,21 @@ impl App {
         }
         self.synchronize_queue_history_scope();
         let explicit = self.queue_editor.is_some() || self.queue_retained.is_some();
+        // `/cancel` before model admission holds the input (action 4).
+        let hold = match &update.request {
+            super::queue::Request::Decision(decision) if decision.action == Some(4) => {
+                decision.input_id.clone()
+            }
+            _ => None,
+        };
         if update.done {
             self.queue_busy = false;
         }
         match update.outcome {
             Err(error) => {
-                if explicit {
+                if hold.is_some() && error.contains("input_not_preparing") {
+                    self.notice = "Turn already started; use /cancel again".into();
+                } else if explicit {
                     self.notice = literal(&error, 1024);
                 }
                 if update.done {
@@ -585,7 +608,12 @@ impl App {
                 self.queue_projection.advance_revision(reply.revision);
                 if reply.request_id.is_some() {
                     self.queue_retained = None;
-                    self.notice = "Input queued; waiting for model admission".into();
+                    self.notice = if hold.is_some() {
+                        "Model start stopped; input held (cancelled); Resume or Drop required"
+                            .into()
+                    } else {
+                        "Input queued; waiting for model admission".into()
+                    };
                 }
                 if self.queue_editor.take().as_deref() == Some(self.editor.text().as_str()) {
                     self.editor = Editor::new();
@@ -1211,7 +1239,7 @@ impl App {
         self.conversation_editor_draft = Some(self.editor.text());
         self.conversation_busy = true;
         self.notice = match progress {
-            Some(action) => format!("Request pending: {action}; /cancel stops waiting"),
+            Some(action) => format!("Request pending: {action}; Esc stops waiting"),
             None => "Request pending".into(),
         };
     }
@@ -1738,7 +1766,11 @@ impl App {
             KeyCode::F(1) => self.overlay = Some(Overlay::Help(0)),
             KeyCode::Enter if key.modifiers == KeyModifiers::ALT => self.insert("\n"),
             KeyCode::Enter if key.modifiers.is_empty() => return self.submit(),
-            KeyCode::Esc => {}
+            // Esc with no overlay, picker or focus to close does what /cancel
+            // does and keeps the draft; with nothing to cancel it does nothing.
+            KeyCode::Esc if key.modifiers.is_empty() => {
+                self.cancel_current(false);
+            }
             _ => {
                 // An applied edit ends recall browsing; cursor and word
                 // movement keep it, so Up and Down still step entries.
@@ -1764,6 +1796,75 @@ impl App {
         }
     }
 
+    /// Cancels what `/cancel` cancels: a pending command wait, the model start
+    /// (holding the input) or the running turn. `clear` empties the composer,
+    /// whose draft is the `/cancel` command; Esc keeps the person's draft.
+    /// Returns false when nothing is cancellable.
+    fn cancel_current(&mut self, clear: bool) -> bool {
+        if self.audit_draft.is_some() {
+            self.audit_cancel = true;
+            if clear {
+                self.editor = Editor::new();
+            }
+            self.notice = "Audit cancellation requested".into();
+        } else if self.models_draft.is_some() || self.picker_models_pending {
+            self.models_cancel = true;
+            if clear {
+                self.editor = Editor::new();
+            }
+            self.notice = "Model inventory cancellation requested".into();
+        } else if self.config_draft.is_some() || self.picker_model_save.is_some() {
+            // The configuration wait has no time bound (owner, 2026-10-16).
+            self.config_cancel = true;
+            if clear {
+                self.editor = Editor::new();
+            }
+            self.notice = "Configuration wait stopped; a set may still be applied".into();
+        } else if self.project_admin_busy
+            && !(self.conversation_busy && self.conversation_cancellable)
+        {
+            // A rename waits for the journal with no client budget.
+            self.project_admin_cancel = true;
+            if clear {
+                self.editor = Editor::new();
+            }
+            self.notice = "Project request wait stopped; the rename may still be applied".into();
+        } else if self.queue_busy && !(self.conversation_busy && self.conversation_cancellable) {
+            // The queue wait has no timer (J1-0); /cancel stops only the wait.
+            self.queue_cancel = true;
+            if clear {
+                self.editor = Editor::new();
+            }
+            self.notice = "Queue wait stopped; the request may still be applied".into();
+        } else if (!self.conversation_busy || !self.conversation_cancellable)
+            && let Some(input) = self.preparing_input()
+        {
+            // Before model admission there is no operation to cancel: hold
+            // the input under preparation (waiting step display).
+            if clear {
+                self.editor = Editor::new();
+            }
+            self.send_queue(super::queue::Request::Decision(
+                asura_control::pb::ConversationQueueDecision {
+                    request_id: Some(asura_platform::random_id().to_vec()),
+                    input_id: Some(input),
+                    action: Some(4),
+                    ..Default::default()
+                },
+            ));
+            self.notice = "Stopping model start; the input will be held".into();
+        } else if !self.conversation_busy || !self.conversation_cancellable {
+            return false;
+        } else {
+            self.cancel_request = true;
+            if clear {
+                self.editor = Editor::new();
+            }
+            self.turn_cancel = Some(false);
+            self.notice = CANCELLING.into();
+        }
+        true
+    }
     fn submit(&mut self) -> bool {
         self.last_area = super::help::Area::Box;
         let draft = self.editor.text();
@@ -1925,40 +2026,8 @@ impl App {
         if name == "/cancel" {
             if draft.trim() != "/cancel" {
                 self.notice = "Use /cancel".into();
-            } else if self.audit_draft.is_some() {
-                self.audit_cancel = true;
-                self.editor = Editor::new();
-                self.notice = "Audit cancellation requested".into();
-            } else if self.models_draft.is_some() || self.picker_models_pending {
-                self.models_cancel = true;
-                self.editor = Editor::new();
-                self.notice = "Model inventory cancellation requested".into();
-            } else if self.config_draft.is_some() || self.picker_model_save.is_some() {
-                // The configuration wait has no time bound (owner, 2026-10-16).
-                self.config_cancel = true;
-                self.editor = Editor::new();
-                self.notice = "Configuration wait stopped; a set may still be applied".into();
-            } else if self.project_admin_busy
-                && !(self.conversation_busy && self.conversation_cancellable)
-            {
-                // A rename waits for the journal with no client budget.
-                self.project_admin_cancel = true;
-                self.editor = Editor::new();
-                self.notice =
-                    "Project request wait stopped; the rename may still be applied".into();
-            } else if self.queue_busy && !(self.conversation_busy && self.conversation_cancellable)
-            {
-                // The queue wait has no timer (J1-0); /cancel stops only the wait.
-                self.queue_cancel = true;
-                self.editor = Editor::new();
-                self.notice = "Queue wait stopped; the request may still be applied".into();
-            } else if !self.conversation_busy || !self.conversation_cancellable {
+            } else if !self.cancel_current(true) {
                 self.notice = "No active conversation to cancel".into();
-            } else {
-                self.cancel_request = true;
-                self.editor = Editor::new();
-                self.turn_cancel = Some(false);
-                self.notice = CANCELLING.into();
             }
             return false;
         }
@@ -2974,7 +3043,20 @@ fn help_table(width: usize) -> String {
     }
     lines.join("\n")
 }
+/// Pre-admission waiting step labels (owner, 2026-10-16).
+pub(super) fn queue_wait_label(
+    entry: &asura_control::pb::ConversationQueueEntry,
+) -> Option<&'static str> {
+    match (entry.state, entry.waiting_step) {
+        (Some(1), Some(1)) => Some("Preparing model"),
+        (Some(1), Some(2)) => Some("Starting model"),
+        _ => None,
+    }
+}
 fn queue_input_notice(entry: &asura_control::pb::ConversationQueueEntry) -> String {
+    if let Some(step) = queue_wait_label(entry) {
+        return format!("Input waiting: {}; Esc holds it", step.to_lowercase());
+    }
     match entry.state {
         Some(1) => "Input queued; waiting for model admission".into(),
         Some(2) => format!(
@@ -4523,6 +4605,59 @@ mod tests {
     }
 
     #[test]
+    fn escape_cancels_like_the_cancel_command_and_keeps_the_draft() {
+        use super::super::conversation::Request;
+        use crate::conversation::Command;
+        // Nothing to cancel: Esc does nothing and leaves the draft.
+        let mut app = App::new();
+        app.insert("draft text");
+        app.notice = "unchanged".into();
+        assert!(!key(&mut app, KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.notice, "unchanged");
+        assert_eq!(app.draft(), "draft text");
+        // A running turn: Esc cancels it and keeps the draft.
+        let request = Request::Setup(Command::Observe([1; 16]));
+        let mut app = App::new();
+        app.start_conversation_request(request, String::new());
+        app.insert("next message");
+        // An open overlay takes the first Esc; the second cancels.
+        key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        assert!(app.overlay.is_some());
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+        assert!(!app.take_cancel_request());
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.take_cancel_request());
+        assert_eq!(app.notice, CANCELLING);
+        assert_eq!(app.draft(), "next message");
+        // Before model admission Esc holds the input under preparation.
+        let mut app = working_queue_app();
+        app.editor = Editor::new();
+        app.conversation_busy = false;
+        app.conversation_cancellable = false;
+        app.active_operation = None;
+        let entry = asura_control::pb::ConversationQueueEntry {
+            input_id: Some(vec![77; 16]),
+            project_id: Some(vec![1; 16]),
+            conversation_id: Some(vec![2; 16]),
+            kind: Some(1),
+            state: Some(1),
+            text: Some("follow up".into()),
+            sequence: Some(1),
+            waiting_step: Some(2),
+            ..Default::default()
+        };
+        queue_snapshot(&mut app, vec![entry], 2);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.notice, "Stopping model start; the input will be held");
+        let request = app.take_queue_request(std::time::Instant::now()).unwrap();
+        let super::super::queue::Request::Decision(decision) = &request else {
+            panic!("hold decision expected")
+        };
+        assert_eq!(decision.action, Some(4));
+    }
+
+    #[test]
     fn tab_completion_is_contextual_and_never_invokes() {
         for (prefix, full) in [("/he", "/help"), ("/qui", "/quit"), ("/ex", "/exit")] {
             let mut app = App::new();
@@ -4885,6 +5020,7 @@ mod tests {
                 usage_tokens: None,
                 usage_known: Some(false),
                 statistics: None,
+                waiting_step: None,
                 tools: Vec::new(),
                 model_context: Some(asura_control::pb::ModelContext {
                     model_name: Some("Native variant".into()),
@@ -5358,6 +5494,85 @@ mod tests {
             );
             assert!(!app.notice.contains("waiting for model admission"));
         }
+    }
+    /// WS-01/WS-03 (TUI): a pre-admission step is named, and `/cancel` holds
+    /// exactly that input; a lost race asks for a second `/cancel`.
+    #[test]
+    fn cancel_before_model_admission_holds_the_input_with_a_waiting_step() {
+        let mut app = working_queue_app();
+        app.editor = Editor::new();
+        app.conversation_busy = false;
+        app.conversation_cancellable = false;
+        app.active_operation = None;
+        app.insert("/cancel");
+        app.submit();
+        assert_eq!(app.notice, "No active conversation to cancel");
+        assert!(app.take_queue_request(std::time::Instant::now()).is_none());
+        app.editor = Editor::new();
+        app.notice = "Input queued; waiting for model admission".into();
+        let mut entry = asura_control::pb::ConversationQueueEntry {
+            input_id: Some(vec![77; 16]),
+            project_id: Some(vec![1; 16]),
+            conversation_id: Some(vec![2; 16]),
+            kind: Some(1),
+            state: Some(1),
+            text: Some("follow up".into()),
+            sequence: Some(1),
+            waiting_step: Some(1),
+            ..Default::default()
+        };
+        queue_snapshot(&mut app, vec![entry.clone()], 2);
+        assert_eq!(app.notice, "Input waiting: preparing model; Esc holds it");
+        entry.waiting_step = Some(2);
+        queue_snapshot(&mut app, vec![entry.clone()], 2);
+        assert_eq!(app.notice, "Input waiting: starting model; Esc holds it");
+        app.insert("/cancel");
+        app.submit();
+        assert_eq!(app.draft(), "");
+        assert_eq!(app.notice, "Stopping model start; the input will be held");
+        let request = app.take_queue_request(std::time::Instant::now()).unwrap();
+        let super::super::queue::Request::Decision(decision) = &request else {
+            panic!("hold decision expected")
+        };
+        assert_eq!(decision.action, Some(4));
+        assert_eq!(decision.input_id, Some(vec![77; 16]));
+        // A second /cancel while the hold is pending stops only that wait.
+        app.insert("/cancel");
+        app.submit();
+        assert_eq!(
+            app.notice,
+            "Queue wait stopped; the request may still be applied"
+        );
+        app.queue_cancel = false;
+        entry.state = Some(2);
+        entry.waiting_step = None;
+        entry.hold_reason = Some("cancelled".into());
+        app.queue_finished(super::super::queue::Update {
+            request: request.clone(),
+            outcome: Ok(asura_control::pb::ConversationQueueReply {
+                entries: vec![entry.clone()],
+                request_id: decision.request_id.clone(),
+                full_text: Some(false),
+                revision: Some(3),
+                pending: Some(false),
+                ..Default::default()
+            }),
+            done: true,
+        });
+        assert_eq!(
+            app.notice,
+            "Model start stopped; input held (cancelled); Resume or Drop required"
+        );
+        // Acceptance won the race: the service refuses the hold.
+        let mut app = working_queue_app();
+        app.queue_request_scope = app.queue_scope();
+        app.queue_retained = Some(request.clone());
+        app.queue_finished(super::super::queue::Update {
+            request,
+            outcome: Err("service error: input_not_preparing; draft retained".into()),
+            done: true,
+        });
+        assert_eq!(app.notice, "Turn already started; use /cancel again");
     }
     #[test]
     fn queued_notice_tracks_later_hold_and_resume_without_replacing_other_notices() {

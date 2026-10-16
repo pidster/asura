@@ -1030,8 +1030,8 @@ for wind-down; `ModelProcess::spawn` takes no deadline; Begin never sends
 `deadline_remaining_ms`. The Swift `HelperSession` arms only the 250 ms final
 drain and ignores a supplied `deadline_remaining_ms`. The Ollama session sets
 request and resource timeouts to infinity; a live probe held one request 65 s
-and it completed. Open: the TUI still shows a generic "Waiting" instead of the
-waiting step.
+and it completed. The TUI shows the waiting step under
+[waiting step display](#waiting-step-display--owner-2026-10-16).
 
 ### Helper step waits
 
@@ -1077,8 +1077,234 @@ columns below remain open except where these tests cover them:
 
 | ID | Unit | Integration | End-to-end |
 | --- | --- | --- | --- |
-| HW-01 | Each step, held past its former limit with an injected clock, stays pending | Stalled fixture helper at each step keeps Inspect and cancel responsive | TUI shows the waiting step and cancels it |
+| HW-01 | Each step, held past its former limit with an injected clock, stays pending | Stalled fixture helper at each step keeps Inspect and cancel responsive | TUI shows the waiting step and cancels it ([WS-01–WS-04](#validation--waiting-steps)) |
 | HW-02 | Helper exit, protocol fault and shutdown end each step with a typed outcome | Real helper killed at each step settles the operation once | Service stop during a stalled step settles the helper |
 | HW-03 | A supplied `deadline_remaining_ms` arms no timer | Long generation with the field supplied runs to completion | |
 | HW-04 | Ollama show, chat and tags requests have no timeout configuration | Stalled private loopback server stays pending until cancel | `/models` with a stalled Ollama row stays pending until the person cancels |
 | HW-05 | Wind-down escalates cancel, SIGTERM and SIGKILL on schedule | Stubborn helper is killed and reaped after cancel | |
+
+### Waiting step display — owner, 2026-10-16
+
+Status: selected design, implemented 2026-10-16; evidence below.
+
+Required behavior (owner, 2026-10-16): with the handshake time limits removed,
+the TUI shows which step a turn waits on, such as preparing or starting the
+model. A silent helper is then visible, and the person can cancel it. The label
+is display only. It never ends work and adds no timer, deadline or timeout.
+
+The **waiting step** is a live projection of the conversation owner's state.
+It is never journaled, adds no record kind and changes no version number.
+The protocol stays 0.1 and the journal format stays 1. The model helper
+protocol is unchanged; the service derives each step from messages it already
+sees.
+
+| Value | Name | Owner state | TUI label |
+| --- | --- | --- | --- |
+| 1 | `PREPARING_MODEL` | `ModelOwner` is `Preparing`: package copy and checks, then the spawn | Preparing model |
+| 2 | `STARTING_MODEL` | `Hello`: child spawned; the helper loads the provider and has not sent Hello | Starting model |
+| 3 | `SENDING_INPUT` | `Input` after acceptance: credit, chunks and `InputEnd` until `Ready` | Sending input |
+| 4 | `MODEL_OUTPUT` | `Running`, no visible text yet and no tool call pending | Waiting for model output |
+
+No step exists in the other states. `Available` before acceptance and `Ready`
+before the durable Start wait on the service's own journal write, not on the
+helper. A pending tool shows its own row. Visible text shows `Generating`.
+After a cancel request or a terminal outcome, the TUI shows the cancel or
+terminal state instead.
+
+#### Ownership and delivery
+
+`ModelOwner` reports its helper phase. The conversation owner combines it with
+acceptance, cancel, terminal, text and tool state and maps it to the value
+above. No client derives a step. Two existing projections carry it:
+
+- **Before acceptance** the turn has no durable operation, so the TUI cannot
+  observe it. Steps 1 and 2 occur here. The service puts the step on the queue
+  entry of the input being prepared: `ConversationQueueEntry.waiting_step = 15`,
+  present only with state 1 (Queued). This follows the live-only
+  `hold_reason` precedent.
+- **After acceptance** steps 3 and 4 occur. `ConversationEvent.waiting_step = 12`
+  is present only on PENDING events.
+
+Both fields use the new `ConversationWaitStep` enum. Field numbers are the next
+free numbers in each message under the
+[numbering authority](../engineering.md#wire-protocol-change-authority).
+Absence means no step is known, and a client shows today's generic `Waiting` or
+`Queued`. Older clients ignore the unknown field. Older services never send it.
+Stored records are unaffected. Control validation rejects a step on any other
+event kind or entry state, and rejects values outside 3–4 on events and 1–2 on
+entries.
+
+A step change does not advance the event cursor or the journal revision. The
+service therefore answers parked observations promptly when its computed step
+changes. A parked `ConversationObserve` for the operation, or a parked queue
+list, is answered in that poll. While a pre-acceptance step is live, a queue
+list that reaches its existing one-second pacing wait gets a full projection
+instead of the empty `pending` stub. This closes the race in which a watcher's
+next request arrives just after a change. Both waits are existing pacing; they
+end nothing.
+
+#### Cancel during each step
+
+After acceptance, `/cancel` uses the existing durable
+[turn cancellation](#cancellation-driven-turn-lifetime--selected-2026-09-30).
+
+Before acceptance, the TUI has no operation to cancel. `/cancel` with no
+cancellable conversation, while a queue entry shows a waiting step, sends
+`ConversationQueueDecision` action 4 (Hold) for that input. The service accepts
+action 4 only for the input it is preparing; any other input gets
+`input_not_preparing`. The writer appends the existing `InputDecision` Hold
+record, which requires state Queued. The service records the current-owner
+hold reason `cancelled`. When that append commits, the owner marks the turn as
+held by the person, cancels the helper through the existing wind-down and does
+not append `TurnAccepted`. The mark is kept on the turn, not re-read from the
+input state: a Resume that commits while the helper still winds down must not
+cause a second Hold when the helper settles (WS-03 race). The person sees `Held (cancelled)` and can Resume or
+Drop the input. Holding, not dropping, matches how a preparation failure already
+holds an input; it keeps the text and is reversible (owner, 2026-10-16: hold,
+not drop and no extra Drop key).
+
+Race: the writer serializes Hold and `TurnAccepted`. If acceptance commits
+first, the Hold request gets `input_not_preparing`. The TUI then reports
+`Turn already started; use /cancel again` and follows the dispatched operation,
+where `/cancel` uses turn cancellation. If the Hold commits first, the owner
+never appends `TurnAccepted`.
+
+#### Waiting step transitions — selected design
+
+Scope: one turn, from preparation until the step disappears. Arrows name the
+message or owner event that ends the current wait. No arrow is a timer.
+`NoStep` means the field is absent.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PreparingModel: queue head prepared
+    PreparingModel --> StartingModel: verified child spawned
+    StartingModel --> NoStepAccepting: Hello available
+    NoStepAccepting --> SendingInput: TurnAccepted durable, Begin sent
+    SendingInput --> NoStepStarting: Ready received
+    NoStepStarting --> ModelOutput: durable Start, Start sent
+    ModelOutput --> NoStepActive: first text or tool call
+    NoStepActive --> ModelOutput: tool result sent, no text yet
+    PreparingModel --> HeldCancelled: person Hold (action 4) committed
+    StartingModel --> HeldCancelled: person Hold (action 4) committed
+    PreparingModel --> HeldFailed: spawn or check failure
+    StartingModel --> HeldFailed: unavailable, helper exit or protocol fault
+    SendingInput --> Ended: cancel, helper exit, fault or shutdown
+    ModelOutput --> Ended: cancel, completion, helper exit, fault or shutdown
+    HeldCancelled --> [*]: wind-down settles helper
+    HeldFailed --> [*]: wind-down settles helper
+    Ended --> [*]: terminal committed
+    note right of HeldCancelled
+        Pre-acceptance: input kept as Held,
+        no TurnAccepted, no turn terminal
+    end note
+```
+
+#### Step delivery and pre-acceptance cancel — selected design
+
+Scope: the TUI, its queue and conversation workers, the conversation owner, the
+journal writer and the helper. Solid arrows are requests or messages; dashed
+arrows are replies.
+
+```mermaid
+sequenceDiagram
+    participant T as TUI
+    participant Q as Queue watch / worker
+    participant S as Conversation owner
+    participant J as Journal writer
+    participant M as Model helper
+    S->>M: spawn (step PREPARING_MODEL)
+    Q->>S: QueueList(after_revision)
+    S-->>Q: entry waiting_step=1 (full projection)
+    S->>M: Hello sent (step STARTING_MODEL)
+    Note over S,Q: step change answers parked list now
+    S-->>Q: entry waiting_step=2
+    Q-->>T: row "Starting model"
+    alt Person cancels before acceptance
+        T->>Q: /cancel -> QueueDecision action 4 (Hold)
+        Q->>S: Hold input
+        S->>J: InputDecision Hold
+        J-->>S: committed
+        S-->>Q: queue reply, Held (cancelled)
+        S->>M: cancel and wind-down
+    else Hello arrives
+        M-->>S: Hello
+        S->>J: TurnAccepted
+        J-->>S: operation identity
+        S->>M: Begin, input (step SENDING_INPUT)
+        T->>S: Observe(operation, cursor)
+        S-->>T: PENDING, waiting_step=3 or 4
+        T->>S: /cancel -> ConversationCancel
+    end
+```
+
+#### TUI wording and placement
+
+- A queue row with a step reads `>> Starting model · Esc holds · <text>`.
+- The status notice for that input reads
+  `Input waiting: starting model; Esc holds it`.
+- The activity row of an accepted turn reads
+  `Activity · Waiting: model output · Esc stops · 0 tools`.
+  Without a step it keeps `Waiting`.
+- An equal-cursor PENDING heartbeat may change only the step and statistics.
+  It never replaces text, tools or kind.
+
+#### Replay, restart and failure
+
+The step is never stored, so replay, restoration and history show no step for a
+past turn. A restored TUI that observes a live turn receives its current step.
+After a service restart, an interrupted turn has no step. A Queued input is
+prepared again and shows its live step. A Held input shows `Held (reason
+unavailable)` as before. Helper exit, protocol fault and shutdown end each step
+with the outcomes in [helper step waits](#helper-step-waits). Disconnect leaves
+the last observed step and the existing `Observation unavailable` state.
+
+#### Bounds, security and asynchronous execution
+
+- AE-01: step computation is a bounded in-memory match on the owner's poll path.
+  The TUI renders received values only.
+- AE-02: no new blocking call. The Hold append uses the existing writer worker.
+- AE-03: parked observations keep their limit of 32. A pre-acceptance step adds
+  at most one queue journal read per parked watcher per pacing interval
+  (1000 ms). The enum is a fixed four-value field.
+- AE-04: no timer is added. Each step ends on the next message, helper exit,
+  protocol fault, cancel, Hold or shutdown. The 1000 ms observe and queue waits
+  are existing pacing.
+- AE-05/06: Hold before acceptance is idempotent by request ID under the
+  existing decision replay. Wind-down bounds are unchanged.
+- Security: the step carries no prompt, provider or path text. Action 4 targets
+  only the input under preparation; it cannot hold arbitrary inputs.
+
+#### Validation — waiting steps
+
+| ID | Unit | Integration | End-to-end |
+| --- | --- | --- | --- |
+| WS-01 | Each owner phase maps to the step in the table; cancel, terminal, text and pending tool remove it | Real service and helper with a loopback provider holding `/api/show`: the queue entry shows `STARTING_MODEL`; Inspect answers within 100 ms | PTY: the queue row shows `Starting model` |
+| WS-02 | Control accepts steps 3–4 only on PENDING events and 1–2 only on Queued entries | Provider holding `/api/chat`: PENDING events show `MODEL_OUTPUT` | PTY: activity shows `Waiting: model output` |
+| WS-03 | Action 4 for another input is `input_not_preparing`; Hold commit cancels the helper once and marks the turn | Hold during the stalled Hello: input Held with reason `cancelled`, no operation; an immediate Resume runs the input once | PTY: `/cancel` holds the input and shows `Held (cancelled)`; Resume runs it |
+| WS-04 | TUI: equal-cursor heartbeat updates only the step; no step keeps `Waiting` | Cancel during `MODEL_OUTPUT`: terminal Cancelled | PTY: `/cancel` stops the waiting turn and shows `Cancelled` |
+| WS-05 | A step change answers parked observations in the same poll | | |
+
+`PREPARING_MODEL` and `SENDING_INPUT` pass in milliseconds with the real helper,
+so they have unit evidence only. Holding them in a process test would need a
+helper fault hook, which this change does not add. The PTY journey is
+deterministic: the loopback server holds each request until the test releases
+it, and every wait ends on an observed screen state or the journey's existing
+work budget.
+
+#### Recorded waiting step checks — 2026-10-16
+
+Unit: control `waiting_steps_are_bounded_to_pending_events_and_queued_entries`
+and the updated queue decision test; service
+`ws01_helper_step_tracks_phase_and_cancel_removes_it` and the
+`waiting_step_tests` module (WS-01, WS-02, WS-03 twice, WS-05); TUI
+`waiting_step_label_follows_heartbeats_and_clears_on_text`,
+`preparing_queue_row_names_the_waiting_step_and_cancel_hint` and
+`cancel_before_model_admission_holds_the_input_with_a_waiting_step`.
+Integration: `conversation_flow` runs `waiting_step_journey` in its default
+chain (also `--waiting-steps`) with the real service and Swift helper.
+End to end: `tui_pty.py --waiting-steps` runs in the default lifecycle gate
+(about 4 s). The PTY journey first exposed the Resume race above; the fix and
+the immediate-Resume integration step were added before the recorded pass.
+Not covered in a process test: `PREPARING_MODEL` and `SENDING_INPUT` (unit
+only), the `/models` inventory wait, and native providers.

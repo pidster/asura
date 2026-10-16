@@ -70,6 +70,7 @@ fn queue_projection_requires_bounded_text_and_truthful_operation_state() {
         new_conversation: None,
         order_position: None,
         hold_reason: None,
+        waiting_step: None,
     };
     let valid = |entries, full| {
         validate_semantics(
@@ -244,6 +245,7 @@ fn queue_v2_projection_and_stale_order_are_strict() {
         new_conversation: Some(true),
         order_position: Some(1),
         hold_reason: None,
+        waiting_step: None,
     };
     let reply = pb::ConversationQueueReply {
         entries: vec![entry.clone()],
@@ -333,6 +335,14 @@ fn promotion_requires_exact_target_and_ordinary_decisions_forbid_it() {
     assert!(valid(decision.clone()));
     decision.action = Some(2);
     assert!(valid(decision.clone()));
+    // Action 4 holds the input under preparation (waiting step display).
     decision.action = Some(4);
+    assert!(valid(decision.clone()));
+    decision.target_generation = Some(1);
+    decision.target_operation_id = Some(vec![5; 16]);
+    assert!(!valid(decision.clone()));
+    decision.target_generation = None;
+    decision.target_operation_id = None;
+    decision.action = Some(5);
     assert!(!valid(decision));
 }

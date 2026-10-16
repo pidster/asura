@@ -153,6 +153,7 @@ It shows up to four rows and a `+N` count for more. Each row starts with `>>`.
 | Row label | Meaning |
 | --- | --- |
 | No label | The service accepted the message; it waits for the model |
+| `Preparing model` or `Starting model` | The service is starting the model for this message; Escape or `/cancel` holds it |
 | `Held (reason)` | The service holds the message until you resume or drop it |
 | `Pending local` | The message is in this client only; the service has not accepted it |
 | `Sending` | The client is sending the message to the service |
@@ -193,7 +194,16 @@ Asura keeps your draft and shows why.
 
 `/cancel` asks the service to stop the active answer. It also cancels a pending
 `/models` or `/audit` request. Asura waits for the service to confirm the
-cancellation.
+cancellation. Escape in the input box does the same as `/cancel` and keeps your
+draft. If a list, panel or selection is open, the first Escape closes it and a
+second Escape cancels. With nothing to cancel, Escape does nothing.
+
+A slow or silent model does not end by itself; Asura shows what it waits for.
+While the model starts, the queue row shows `Preparing model` or
+`Starting model`. Then Escape or `/cancel` holds the message as `Held (cancelled)`; use
+`/queue resume ID` or `/queue drop ID` for it. After the model starts, the
+activity row shows `Waiting: sending input` or `Waiting: model output`, and
+Escape or `/cancel` stops the answer.
 
 `/retry` repeats a request whose result is unknown. It uses the original request
 ID, so the service does not do the work twice. It also retries restoring the

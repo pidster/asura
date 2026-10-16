@@ -11,6 +11,8 @@ pub(super) struct Activity {
     kind: i32,
     tools: Vec<pb::ToolProgress>,
     statistics: Option<pb::TurnStatistics>,
+    /// Live step a pending turn waits on; display only (owner, 2026-10-16).
+    waiting_step: Option<i32>,
     expanded: bool,
     unavailable: bool,
 }
@@ -26,17 +28,18 @@ impl Activity {
         self.kind < 3 && !self.unavailable
     }
     pub(super) fn display(&self) -> String {
-        let state = if self.unavailable {
-            "Observation unavailable"
+        let state: String = if self.unavailable {
+            "Observation unavailable".into()
         } else {
-            match self.kind {
-                0 | 1 => "Waiting",
-                2 => "Generating",
-                3 => "Complete",
-                4 => "Failed",
-                5 => "Cancelled",
-                6 => "Interrupted",
-                _ => "Unknown",
+            match (self.kind, self.waiting_step.and_then(wait_label)) {
+                (0 | 1, Some(step)) => format!("Waiting: {step} · Esc stops"),
+                (0 | 1, None) => "Waiting".into(),
+                (2, _) => "Generating".into(),
+                (3, _) => "Complete".into(),
+                (4, _) => "Failed".into(),
+                (5, _) => "Cancelled".into(),
+                (6, _) => "Interrupted".into(),
+                _ => "Unknown".into(),
             }
         };
         let expanded = self.active() || self.expanded;
@@ -121,6 +124,14 @@ impl Activity {
     }
 }
 
+/// Waiting step labels for an accepted turn (lowercase, after `Waiting:`).
+fn wait_label(step: i32) -> Option<&'static str> {
+    match step {
+        3 => Some("sending input"),
+        4 => Some("model output"),
+        _ => None,
+    }
+}
 fn grouped_count(count: u64) -> String {
     let digits = count.to_string();
     let mut text = String::with_capacity(digits.len() + digits.len() / 3);
@@ -231,6 +242,11 @@ impl App {
             if let Some(statistics) = &event.statistics {
                 entry.statistics = Some(*statistics);
             }
+            // The step may change without a cursor change; it is the only
+            // other value a heartbeat can replace.
+            if entry.kind <= 1 && event.kind == Some(1) {
+                entry.waiting_step = event.waiting_step;
+            }
             return None;
         }
         entry.operation = Some(operation.clone());
@@ -240,6 +256,7 @@ impl App {
             return None;
         }
         entry.kind = event.kind.unwrap_or(1);
+        entry.waiting_step = event.waiting_step.filter(|_| entry.kind == 1);
         entry.statistics = event.statistics;
         entry.unavailable = false;
         if !event.tools.is_empty() || entry.kind != 1 {
@@ -583,6 +600,59 @@ mod tests {
         apply(&mut app, duplicate);
         assert!(!app.conversation_busy);
         assert_eq!(app.transcript.len(), 1);
+    }
+    /// WS-02/WS-04 (TUI): the activity row names the waiting step; an
+    /// equal-cursor heartbeat may change only the step and statistics.
+    #[test]
+    fn waiting_step_label_follows_heartbeats_and_clears_on_text() {
+        let mut app = App::new();
+        app.append_response("Slow model".into(), Some(vec![1; 16]));
+        app.active_operation = Some(vec![1; 16]);
+        app.conversation_busy = true;
+        let mut pending = event(1, 2, 1, 1);
+        pending.tools.clear();
+        pending.waiting_step = Some(3);
+        apply(&mut app, pending.clone());
+        assert!(
+            draw(&mut app, 100, 25, "sending-input")
+                .contains("Activity · Waiting: sending input · Esc stops · 0 tools")
+        );
+        pending.waiting_step = Some(4);
+        apply(&mut app, pending.clone());
+        assert!(
+            app.activity[0]
+                .display()
+                .contains("Waiting: model output · Esc stops")
+        );
+        // No step keeps the generic label.
+        pending.waiting_step = None;
+        apply(&mut app, pending.clone());
+        assert!(
+            app.activity[0]
+                .display()
+                .contains("Activity · Waiting · 0 tools")
+        );
+        // Unknown or pre-admission values are not shown on an accepted turn.
+        pending.waiting_step = Some(2);
+        apply(&mut app, pending.clone());
+        assert!(
+            app.activity[0]
+                .display()
+                .contains("Activity · Waiting · 0 tools")
+        );
+        let mut text = event(1, 3, 2, 1);
+        text.tools.clear();
+        text.text = Some("partial".into());
+        text.waiting_step = Some(4);
+        apply(&mut app, text);
+        assert!(app.activity[0].display().contains("Generating"));
+        // A heartbeat cannot put a step back on a generating turn.
+        pending.cursor = Some(3);
+        pending.waiting_step = Some(4);
+        apply(&mut app, pending);
+        assert!(app.activity[0].display().contains("Generating"));
+        assert!(!app.activity[0].display().contains("model output"));
+        assert_eq!(app.transcript[0].1, "partial");
     }
     #[test]
     fn stale_operation_cursor_generation_and_observation_failure_are_safe() {

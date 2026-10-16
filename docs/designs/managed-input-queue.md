@@ -208,6 +208,12 @@ An exact decision replay preserves a newer Hold reason. An older Held entry afte
 shown as `Held (reason unavailable)`; the client must not guess that a prior
 model failure caused it. This adds no journal record or format change. The
 service keeps at most 16 reason entries in memory and never logs prompt text.
+While the service prepares the lane head before model admission, that Queued
+entry also carries the live `waiting_step` (preparing or starting the model).
+`/cancel` then sends decision action 4, an explicit Hold that the service
+accepts only for the input it is preparing; the Hold cancels the helper and
+records the current-owner reason `cancelled`. See
+[waiting step display](model-provider-integration.md#waiting-step-display--owner-2026-10-16).
 `Input accepted by service` means only that the queue write committed. The UI
 must not present it as model admission. A Held row explains that the worker
 will not dispatch it until the user resumes or drops it.
@@ -284,6 +290,7 @@ stateDiagram-v2
     Queued --> Queued: Durable reorder
     Queued --> Queued: Earlier turn fails or is cancelled with committed terminal
     Queued --> Held: Owner restart or explicit Hold
+    Queued --> Held: /cancel while preparing (action 4, reason cancelled)
     Queued --> Held: Preparation failure and publish current owner reason
     Held --> Queued: Durable Resume
     Queued --> Steering: Send now with exact active target

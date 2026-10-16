@@ -249,6 +249,8 @@ message ConversationEvent {
   repeated ToolProgress tools = 9;
   optional ModelContext model_context = 10;
   optional TurnStatistics statistics = 11;
+  // Live, unjournaled step a PENDING turn waits on; values 3-4 only.
+  optional ConversationWaitStep waiting_step = 12;
 }
 message ConversationCancel { optional bytes operation_id = 1; optional uint64 generation = 2; }
 message ConversationCancelAccepted { optional bytes operation_id = 1; optional bool terminal = 2; }
@@ -260,6 +262,14 @@ enum ConversationEventKind {
   CONVERSATION_EVENT_KIND_FAILED = 4;
   CONVERSATION_EVENT_KIND_CANCELLED = 5;
   CONVERSATION_EVENT_KIND_INTERRUPTED = 6;
+}
+// Display only; never ends work (owner, 2026-10-16). Absent: no known step.
+enum ConversationWaitStep {
+  CONVERSATION_WAIT_STEP_UNSPECIFIED = 0;
+  CONVERSATION_WAIT_STEP_PREPARING_MODEL = 1;
+  CONVERSATION_WAIT_STEP_STARTING_MODEL = 2;
+  CONVERSATION_WAIT_STEP_SENDING_INPUT = 3;
+  CONVERSATION_WAIT_STEP_MODEL_OUTPUT = 4;
 }
 enum ConversationReason {
   CONVERSATION_REASON_NONE = 0;
@@ -354,7 +364,7 @@ message ConversationQueueList {
 message ConversationQueueDecision {
   optional bytes request_id = 1;
   optional bytes input_id = 2;
-  optional uint32 action = 3; // 1 Resume, 2 Drop, 3 promote existing Queue to Steer
+  optional uint32 action = 3; // 1 Resume, 2 Drop, 3 promote existing Queue to Steer, 4 Hold the input being prepared
   optional bytes target_operation_id = 4; // required only for promotion
   optional uint64 target_generation = 5; // required only for promotion
 }
@@ -373,6 +383,7 @@ message ConversationQueueEntry {
   optional bool new_conversation = 12; // V2 lane; target_generation is expected generation
   optional uint32 order_position = 13; // V2 pending order, independent of immutable sequence
   optional string hold_reason = 14; // Current-owner diagnostic only; absent after restart
+  optional ConversationWaitStep waiting_step = 15; // Live, Queued only, values 1-2; never journaled
 }
 message ConversationQueueReply {
   repeated ConversationQueueEntry entries = 1;

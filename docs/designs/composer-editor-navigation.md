@@ -46,6 +46,7 @@ The log is part of the chain only while the transcript has content.
 | Editor | Option or Ctrl+Left/Right, Alt+B/F | Move one word left or right |
 | Editor | Option+Backspace | Delete the previous word through the editor's bounded delete path |
 | Editor | Ctrl+Up / Ctrl+Down | Unchanged shortcuts to the queue and the status bar |
+| Editor | Escape | Cancel as `/cancel` does, keeping the draft; nothing when nothing is cancellable ([CF09](command-flows.md#cf09-retry-and-cancellation)) |
 | Queue | Up on the first item, Shift+Up | Enter the log at the latest row |
 | Queue | Down past the last item, Shift+Down, Escape | Return to the editor |
 | Log | Up / Down | Scroll one visual row; clamp at the ends |

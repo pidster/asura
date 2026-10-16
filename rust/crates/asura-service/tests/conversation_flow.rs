@@ -14,6 +14,8 @@ mod sensors_journey;
 mod shell_journey;
 #[path = "support/tools_inventory_journey.rs"]
 mod tools_inventory_journey;
+#[path = "support/waiting_step_journey.rs"]
+mod waiting_step_journey;
 use asura_client::Client;
 use asura_control::pb;
 use asura_platform::RuntimeDirectory;
@@ -2275,6 +2277,8 @@ fn main() {
         journal_wait_journey()
     } else if args.iter().any(|a| a == "--stop-drain") {
         stop_drain_journey()
+    } else if args.iter().any(|a| a == "--waiting-steps") {
+        waiting_step_journey::run()
     } else if args.iter().any(|a| a == "--long-inference") {
         cancellation_driven_journey::run()
     } else if args.iter().any(|a| a == "--native-shell-tools") {
@@ -2344,6 +2348,7 @@ fn main() {
                 audit_journey::run(None)
                     .and_then(|()| journal_wait_journey())
                     .and_then(|()| stop_drain_journey())
+                    .and_then(|()| waiting_step_journey::run())
             }
         })
     };

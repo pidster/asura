@@ -65,6 +65,19 @@ pub(crate) enum ModelEvent {
 const WIND_DOWN_GRACE: Duration = Duration::from_millis(250);
 /// Kept wind-down: reap observation after each later escalation step.
 const REAP_OBSERVATION: Duration = Duration::from_secs(1);
+/// The helper wait a turn is in, for the waiting step display only
+/// (owner, 2026-10-16). It never ends work and arms no timer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HelperStep {
+    /// Package copy, checks and spawn.
+    Preparing,
+    /// Spawned; waiting for the helper's Hello (provider load).
+    Hello,
+    /// Begin sent; input transfer until Ready.
+    Input,
+    /// Start sent; generation.
+    Running,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
     Preparing,
@@ -340,6 +353,16 @@ impl ModelOwner {
         self.phase = Phase::Draining;
         self.deadline = Some(now + WIND_DOWN_GRACE);
         self.drain_step = 0;
+    }
+    /// The helper wait this owner is in; `None` outside the four waits.
+    pub(crate) fn helper_step(&self) -> Option<HelperStep> {
+        match self.phase {
+            Phase::Preparing => Some(HelperStep::Preparing),
+            Phase::Hello => Some(HelperStep::Hello),
+            Phase::Input => Some(HelperStep::Input),
+            Phase::Running => Some(HelperStep::Running),
+            Phase::Available | Phase::Ready | Phase::Draining | Phase::Settled => None,
+        }
     }
     pub(crate) fn is_settled(&self) -> bool {
         self.phase == Phase::Settled
@@ -889,6 +912,16 @@ pub(crate) fn endpoint_permitted(provider: &str, endpoint: Option<&str>) -> bool
 
 #[cfg(test)]
 impl ModelOwner {
+    /// An owner held in the helper wait for `step`, or with no step.
+    pub(crate) fn step_test_fixture(step: Option<HelperStep>) -> Self {
+        tests::owner(match step {
+            Some(HelperStep::Preparing) => Phase::Preparing,
+            Some(HelperStep::Hello) => Phase::Hello,
+            Some(HelperStep::Input) => Phase::Input,
+            Some(HelperStep::Running) => Phase::Running,
+            None => Phase::Ready,
+        })
+    }
     pub(crate) fn tool_test_fixture() -> Self {
         let mut value = tests::owner(Phase::Running);
         value.tools_enabled = true;
@@ -1148,6 +1181,43 @@ mod tests {
         let mut owner = owner(Phase::Ready);
         assert!(owner.start().is_ok());
         assert_eq!(owner.phase, Phase::Running);
+    }
+    /// WS-01: the helper step follows the owner's own phase transitions and
+    /// disappears on cancel; it arms no timer.
+    #[test]
+    fn ws01_helper_step_tracks_phase_and_cancel_removes_it() {
+        for (phase, step) in [
+            (Phase::Preparing, Some(HelperStep::Preparing)),
+            (Phase::Hello, Some(HelperStep::Hello)),
+            (Phase::Available, None),
+            (Phase::Input, Some(HelperStep::Input)),
+            (Phase::Ready, None),
+            (Phase::Running, Some(HelperStep::Running)),
+            (Phase::Draining, None),
+            (Phase::Settled, None),
+        ] {
+            let owner = owner(phase);
+            assert_eq!(owner.helper_step(), step, "{phase:?}");
+            assert_eq!(owner.next_deadline(Instant::now()), None, "{phase:?}");
+        }
+        let mut owner = owner(Phase::Available);
+        let input = model::encode_input(&pb::ModelInput {
+            instructions: Some(String::new()),
+            history: vec![],
+            prompt: Some("hello".into()),
+        })
+        .unwrap();
+        owner.begin([4; 16], 1, input, false).unwrap();
+        assert_eq!(owner.helper_step(), Some(HelperStep::Input));
+        let mut owner = owner_with_ready();
+        assert_eq!(owner.helper_step(), None);
+        owner.start().unwrap();
+        assert_eq!(owner.helper_step(), Some(HelperStep::Running));
+        owner.cancel(1, Instant::now());
+        assert_eq!(owner.helper_step(), None);
+    }
+    fn owner_with_ready() -> ModelOwner {
+        owner(Phase::Ready)
     }
     /// HW-03: Begin never sends `deadline_remaining_ms`.
     #[test]

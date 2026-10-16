@@ -433,6 +433,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--journal-waits"),
         Some("--client-waits"),
         Some("--shell-capture"),
+        Some("--waiting-steps"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);

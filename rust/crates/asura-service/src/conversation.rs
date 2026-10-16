@@ -161,8 +161,28 @@ fn accepted(request: pb::Envelope, turn: &journal::TurnAccepted) -> pb::Envelope
         }),
     )
 }
+/// What the active turn waits on, for display only (owner, 2026-10-16).
+/// Derived from messages the owner already sees; it ends nothing.
+fn wait_step(active: &Active) -> Option<pb::ConversationWaitStep> {
+    use crate::model_owner::HelperStep;
+    use pb::ConversationWaitStep as Step;
+    if active.cancel.is_some() || active.terminal.is_some() {
+        return None;
+    }
+    match (active.accepted, active.model.helper_step()?) {
+        (false, HelperStep::Preparing) => Some(Step::PreparingModel),
+        (false, HelperStep::Hello) => Some(Step::StartingModel),
+        (true, HelperStep::Input) => Some(Step::SendingInput),
+        (true, HelperStep::Running) if active.snapshot.is_empty() && active.tool.is_none() => {
+            Some(Step::ModelOutput)
+        }
+        _ => None,
+    }
+}
 fn terminal_event(turn: &journal::TurnTerminal) -> pb::ConversationEvent {
     pb::ConversationEvent {
+        // A terminal turn waits on nothing; steps are never journaled.
+        waiting_step: None,
         operation_id: Some(turn.operation.to_vec()),
         generation: Some(turn.generation),
         cursor: Some(u64::MAX),
@@ -480,6 +500,9 @@ impl TurnMeasurements {
 struct Active {
     foreground_user: bool,
     queue_input: Option<journal::Id>,
+    /// The person held this input before acceptance (action 4). Recorded once,
+    /// so a Resume during helper wind-down cannot be undone by a second Hold.
+    person_held: bool,
     request: Option<pb::Envelope>,
     turn: journal::TurnAccepted,
     input: Vec<u8>,
@@ -615,6 +638,11 @@ pub(crate) struct Owner {
     calibration: crate::context::Calibration,
     measurements: VecDeque<(journal::Id, TurnMeasurements)>,
     hold_reasons: BTreeMap<journal::Id, &'static str>,
+    /// The last computed waiting step: (accepted, input or operation, step).
+    /// Live display state only; never journaled (owner, 2026-10-16).
+    published_step: Option<(bool, journal::Id, i32)>,
+    /// A step changed this poll; parked queue lists read a full projection.
+    step_refresh: bool,
     wake: Option<asura_platform::events::WakeSender>,
     observations: Vec<(pb::Envelope, Instant)>,
     /// Payload recovery, store, page pool and pending installs (J1).
@@ -656,9 +684,39 @@ impl Owner {
             calibration: Default::default(),
             measurements: VecDeque::new(),
             hold_reasons: BTreeMap::new(),
+            published_step: None,
+            step_refresh: false,
             wake: None,
             observations: Vec::new(),
             payloads: Default::default(),
+        }
+    }
+    /// The queued input under preparation and its pre-acceptance step.
+    fn preparing_step(&self) -> Option<(journal::Id, pb::ConversationWaitStep)> {
+        let active = self.active.as_ref().filter(|active| !active.accepted)?;
+        Some((active.queue_input?, wait_step(active)?))
+    }
+    /// The step the active turn waits on, keyed by what a client can see:
+    /// the queued input before acceptance, the operation after it.
+    fn live_step(&self) -> Option<(bool, journal::Id, i32)> {
+        let active = self.active.as_ref()?;
+        let step = wait_step(active)? as i32;
+        if active.accepted {
+            Some((true, active.turn.operation, step))
+        } else {
+            Some((false, active.queue_input?, step))
+        }
+    }
+    /// A step change moves no cursor or revision: answer parked observations
+    /// in this poll so the display follows (pacing, not a closure).
+    fn publish_step(&mut self, now: Instant) {
+        let step = self.live_step();
+        if step != self.published_step {
+            self.published_step = step;
+            self.step_refresh = true;
+            for (_, deadline) in &mut self.observations {
+                *deadline = now;
+            }
         }
     }
     fn note_hold(&mut self, input: journal::Id, reason: &'static str) {
@@ -1503,10 +1561,23 @@ impl Owner {
                         Err(e) => Some(error(request, storage_error(e))),
                     };
                 }
-                let action = if value.action == Some(1) {
-                    journal::InputAction::Resume
-                } else {
-                    journal::InputAction::Drop
+                let action = match value.action {
+                    Some(1) => journal::InputAction::Resume,
+                    Some(4) => {
+                        // Hold only the input under preparation; the hold
+                        // cancels its helper (waiting step display).
+                        let input = id(&value.input_id);
+                        if !self.active.as_ref().is_some_and(|active| {
+                            !active.accepted
+                                && active.queue_input == Some(input)
+                                && active.terminal.is_none()
+                        }) {
+                            return Some(error(request, "input_not_preparing"));
+                        }
+                        self.note_hold(input, "cancelled");
+                        journal::InputAction::Hold
+                    }
+                    _ => journal::InputAction::Drop,
                 };
                 return match self.submit(
                     writer::Command::InputDecision {
@@ -1719,17 +1790,18 @@ impl Owner {
             && active.accepted
             && active.turn.operation == operation
         {
+            let snapshot = active.cursor > after && !active.snapshot.is_empty();
             return Some(reply(
                 request,
                 Body::ConversationEvent(pb::ConversationEvent {
                     operation_id: Some(operation.to_vec()),
                     generation: Some(active.turn.generation),
                     cursor: Some(active.cursor.max(after)),
-                    kind: Some(if active.cursor > after && !active.snapshot.is_empty() {
-                        2
-                    } else {
-                        1
-                    }),
+                    kind: Some(if snapshot { 2 } else { 1 }),
+                    waiting_step: (!snapshot)
+                        .then(|| wait_step(active))
+                        .flatten()
+                        .map(|step| step as i32),
                     text: (active.cursor > after && !active.snapshot.is_empty())
                         .then(|| active.snapshot.clone()),
                     reason: Some(0),
@@ -1896,6 +1968,7 @@ impl Owner {
         self.active = Some(Active {
             foreground_user: true,
             queue_input: None,
+            person_held: false,
             request,
             turn,
             input: Vec::new(),
@@ -2437,6 +2510,12 @@ impl Owner {
                 }
             }
             Job::QueueMutation(request) | Job::QueueList(request) => {
+                if let Some(Body::ConversationQueueDecision(decision)) = &request.body
+                    && decision.action == Some(4)
+                    && let Some(active) = &mut self.active
+                {
+                    Self::person_hold(active, id(&decision.input_id), now);
+                }
                 let request_id = match &request.body {
                     Some(Body::ConversationEnqueue(v)) => v.request_id.clone(),
                     Some(Body::ConversationQueueSubmit(v)) => v.request_id.clone(),
@@ -2445,6 +2524,7 @@ impl Owner {
                     _ => None,
                 };
                 let full_text = matches!(&request.body, Some(Body::ConversationQueueList(v)) if v.input_id.is_some());
+                let preparing = self.preparing_step();
                 let entries = value
                     .inputs
                     .into_iter()
@@ -2476,6 +2556,12 @@ impl Owner {
                                 .then(|| self.hold_reasons.get(&v.input.request).copied())
                                 .flatten()
                                 .map(str::to_owned),
+                            waiting_step: preparing
+                                .filter(|(input, _)| {
+                                    *input == v.input.request
+                                        && v.status == journal::InputStatus::Queued
+                                })
+                                .map(|(_, step)| step as i32),
                         }
                     })
                     .collect();
@@ -2784,6 +2870,29 @@ impl Owner {
             result,
         });
     }
+    /// A committed Hold of the input under preparation (action 4) cancels its
+    /// helper and prevents TurnAccepted. Nothing about the turn is journaled;
+    /// the settle path does not hold the input a second time.
+    fn person_hold(active: &mut Active, input: journal::Id, now: Instant) {
+        if active.accepted || active.queue_input != Some(input) || active.terminal.is_some() {
+            return;
+        }
+        active.person_held = true;
+        active.revoke_create();
+        active.failure_reason = Some("cancelled");
+        active.terminal = Some(journal::TurnTerminal {
+            operation: active.turn.operation,
+            generation: active.turn.generation,
+            kind: journal::TerminalKind::Cancelled,
+            cause: journal::Cause::UserCancel,
+            final_cursor: u64::MAX,
+            usage_known: true,
+            output_tokens: 0,
+            charged_tokens: 0,
+            text: String::new(),
+        });
+        active.model.cancel(1, now);
+    }
     #[track_caller]
     fn failed(active: &mut Active, message: &'static str, now: Instant) {
         active.revoke_create();
@@ -2920,6 +3029,16 @@ impl Owner {
                         .map(|state| state.revision)
                         .unwrap_or(0);
                     if self.pending.is_none() && value.after_revision != Some(revision) {
+                        value.after_revision = None;
+                        if let Some(reply) = self.request(request, now) {
+                            self.out.push_back(reply);
+                        }
+                    } else if now >= deadline
+                        && self.pending.is_none()
+                        && (self.step_refresh || self.preparing_step().is_some())
+                    {
+                        // A live pre-acceptance step has no revision; send the
+                        // full projection at the existing pacing interval.
                         value.after_revision = None;
                         if let Some(reply) = self.request(request, now) {
                             self.out.push_back(reply);
@@ -3183,7 +3302,9 @@ impl Owner {
         self.capture_audit_tool(now);
         self.capture_inventory_tool(now);
         self.drive_sensors(now);
+        self.publish_step(now);
         self.observations(now);
+        self.step_refresh = false;
         if self.closing
             && self.active.is_none()
             && self
@@ -3320,7 +3441,7 @@ impl Owner {
                         }
                         self.out.push_back(error(request, "model_unavailable"));
                     }
-                    let queued = active.queue_input;
+                    let queued = active.queue_input.filter(|_| !active.person_held);
                     let reason = active.failure_reason.unwrap_or("model_start_failed");
                     self.active = None;
                     if let Some(input) = queued {
@@ -4017,3 +4138,6 @@ mod tool_tests;
 #[cfg(test)]
 #[path = "conversation/foreground_tests.rs"]
 mod foreground_tests;
+#[cfg(test)]
+#[path = "conversation/waiting_step_tests.rs"]
+mod waiting_step_tests;

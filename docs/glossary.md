@@ -44,6 +44,7 @@ schemas and runtime mechanisms remain with their governing designs.
 | Loss marker | Text in a stored stream that replaces bytes the secret scanner could not check, stating their size and reason; see [secret detection](designs/secret-detection.md#loss-markers) |
 | Secret rule set | Asura's port of Wisp's secret-detection rules, identified by a revision and digest that each capture descriptor records; see [secret detection](designs/secret-detection.md#rule-set) |
 | Loop closure | Ending condition a loop evaluates over its own streams, such as exhaustion, stall or an owner-approved deadline; distinct from an interrupt, which comes from outside the loop; see [loop closure](designs/loop-closure.md) |
+| Waiting step | Live, unjournaled label for what a pending turn waits on, such as preparing or starting the model; display only, it never ends work; see [waiting step display](designs/model-provider-integration.md#waiting-step-display--owner-2026-10-16) |
 | Permanent or temporary ending | A permanent ending is terminal; a temporary ending suspends a loop with a named resume condition, resolver and expiry |
 
 These are reading definitions. The proposed [D0 domain model](designs/domain-model.md)

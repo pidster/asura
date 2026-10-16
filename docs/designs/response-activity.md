@@ -36,7 +36,9 @@ browser for conversations from previous TUI launches.
 Active responses show their tool list automatically. Each row shows its ordinal,
 name and running, complete, failed or interrupted state. Failed rows also show the
 result reason. The lifecycle row shows waiting, generating, complete, failed,
-cancelled or interrupted. This is execution metadata, not private model reasoning.
+cancelled or interrupted. A pending event may name the
+[waiting step](model-provider-integration.md#waiting-step-display--owner-2026-10-16),
+for example `Waiting: model output · Esc stops`. This is execution metadata, not private model reasoning.
 The selected extension adds bounded arguments and captured-result previews.
 Continuous shell output streaming remains outside this packet.
 

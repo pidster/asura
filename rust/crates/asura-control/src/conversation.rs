@@ -123,7 +123,9 @@ pub(super) fn valid(body: &Body) -> bool {
             id(&v.request_id)
                 && id(&v.input_id)
                 && match v.action {
-                    Some(1 | 2) => v.target_operation_id.is_none() && v.target_generation.is_none(),
+                    Some(1 | 2 | 4) => {
+                        v.target_operation_id.is_none() && v.target_generation.is_none()
+                    }
                     Some(3) => {
                         id(&v.target_operation_id) && v.target_generation.is_some_and(|g| g > 0)
                     }
@@ -181,6 +183,8 @@ pub(super) fn valid(body: &Body) -> bool {
                                 && reason.len() <= 64
                                 && reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
                         })
+                        // Live pre-admission step: Queued only, preparing or starting.
+                        && e.waiting_step.is_none_or(|step| e.state == Some(1) && (1..=2).contains(&step))
                         && e.sequence.is_some_and(|n| n > 0)
                         && e.text
                             .as_ref()
@@ -308,34 +312,39 @@ pub(super) fn valid(body: &Body) -> bool {
                             _ => false,
                         }
                 });
-            base && match v.kind {
-                Some(1) => {
-                    v.text.is_none()
-                        && v.usage_known.is_none()
-                        && v.usage_tokens.is_none()
-                        && v.reason == Some(0)
+            // Live post-admission step: PENDING only, sending input or output.
+            let step = v
+                .waiting_step
+                .is_none_or(|step| v.kind == Some(1) && (3..=4).contains(&step));
+            base && step
+                && match v.kind {
+                    Some(1) => {
+                        v.text.is_none()
+                            && v.usage_known.is_none()
+                            && v.usage_tokens.is_none()
+                            && v.reason == Some(0)
+                    }
+                    Some(2) => {
+                        v.cursor.is_some_and(|n| n > 1 && n < u64::MAX)
+                            && v.text.as_ref().is_some_and(|s| s.len() <= 61440)
+                            && v.reason == Some(0)
+                            && v.usage_known.is_none()
+                            && v.usage_tokens.is_none()
+                    }
+                    Some(3..=6) => {
+                        v.cursor == Some(u64::MAX)
+                            && v.text.as_ref().is_some_and(|s| {
+                                s.len() <= 61440 && (v.kind != Some(3) || !s.is_empty())
+                            })
+                            && (v.kind != Some(3) || v.reason == Some(0))
+                            && match v.usage_known {
+                                Some(true) => v.usage_tokens.is_some_and(|n| n <= 2048),
+                                Some(false) => v.usage_tokens.is_none(),
+                                None => false,
+                            }
+                    }
+                    _ => false,
                 }
-                Some(2) => {
-                    v.cursor.is_some_and(|n| n > 1 && n < u64::MAX)
-                        && v.text.as_ref().is_some_and(|s| s.len() <= 61440)
-                        && v.reason == Some(0)
-                        && v.usage_known.is_none()
-                        && v.usage_tokens.is_none()
-                }
-                Some(3..=6) => {
-                    v.cursor == Some(u64::MAX)
-                        && v.text.as_ref().is_some_and(|s| {
-                            s.len() <= 61440 && (v.kind != Some(3) || !s.is_empty())
-                        })
-                        && (v.kind != Some(3) || v.reason == Some(0))
-                        && match v.usage_known {
-                            Some(true) => v.usage_tokens.is_some_and(|n| n <= 2048),
-                            Some(false) => v.usage_tokens.is_none(),
-                            None => false,
-                        }
-                }
-                _ => false,
-            }
         }
         Body::InitializeInstallation(v) => {
             id(&v.request_id)
@@ -555,6 +564,7 @@ mod tests {
         let event = pb::ConversationEvent {
             model_context: None,
             statistics: None,
+            waiting_step: None,
             operation_id: Some(vec![1; 16]),
             cursor: Some(u64::MAX),
             generation: Some(1),
@@ -761,6 +771,83 @@ mod tests {
         reply.entries[0].state = Some(2);
         reply.entries[0].hold_reason = Some("bad reason".into());
         assert!(!valid(&Body::ConversationQueueReply(reply)));
+    }
+    /// WS-02: a waiting step is live display state with exact placement.
+    #[test]
+    fn waiting_steps_are_bounded_to_pending_events_and_queued_entries() {
+        let mut reply = pb::ConversationQueueReply {
+            entries: vec![pb::ConversationQueueEntry {
+                input_id: Some(vec![3; 16]),
+                project_id: Some(vec![4; 16]),
+                conversation_id: Some(vec![5; 16]),
+                target_generation: Some(1),
+                kind: Some(1),
+                state: Some(1),
+                text: Some("prompt".into()),
+                sequence: Some(1),
+                new_conversation: Some(false),
+                order_position: Some(1),
+                waiting_step: Some(2),
+                ..Default::default()
+            }],
+            full_text: Some(false),
+            revision: Some(1),
+            pending: Some(false),
+            order_revision: Some(1),
+            stale_order: Some(false),
+            ..Default::default()
+        };
+        for step in [1, 2] {
+            reply.entries[0].waiting_step = Some(step);
+            assert!(valid(&Body::ConversationQueueReply(reply.clone())));
+        }
+        for step in [0, 3, 4, 5] {
+            reply.entries[0].waiting_step = Some(step);
+            assert!(!valid(&Body::ConversationQueueReply(reply.clone())));
+        }
+        reply.entries[0].waiting_step = Some(1);
+        reply.entries[0].state = Some(2);
+        assert!(!valid(&Body::ConversationQueueReply(reply)));
+
+        let mut event = pb::ConversationEvent {
+            operation_id: Some(vec![1; 16]),
+            generation: Some(1),
+            cursor: Some(1),
+            kind: Some(1),
+            reason: Some(0),
+            ..Default::default()
+        };
+        for step in [3, 4] {
+            event.waiting_step = Some(step);
+            assert!(valid(&Body::ConversationEvent(event.clone())));
+        }
+        for step in [0, 1, 2, 5] {
+            event.waiting_step = Some(step);
+            assert!(!valid(&Body::ConversationEvent(event.clone())));
+        }
+        let terminal = pb::ConversationEvent {
+            cursor: Some(u64::MAX),
+            kind: Some(5),
+            text: Some(String::new()),
+            usage_known: Some(false),
+            waiting_step: Some(4),
+            ..event
+        };
+        assert!(!valid(&Body::ConversationEvent(terminal.clone())));
+        assert!(valid(&Body::ConversationEvent(pb::ConversationEvent {
+            waiting_step: None,
+            ..terminal
+        })));
+        let decision = |action| {
+            Body::ConversationQueueDecision(pb::ConversationQueueDecision {
+                request_id: Some(vec![1; 16]),
+                input_id: Some(vec![2; 16]),
+                action: Some(action),
+                ..Default::default()
+            })
+        };
+        assert!(valid(&decision(4)));
+        assert!(!valid(&decision(5)));
     }
     #[test]
     fn maximum_activity_frame_retains_complete_response_and_signed_exit() {

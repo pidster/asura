@@ -716,7 +716,9 @@ impl App {
                     entry.input_id.clone()?,
                     format!(
                         ">> {}{}",
-                        if entry.state == Some(2) {
+                        if let Some(step) = super::queue_wait_label(entry) {
+                            format!("{step} · Esc holds · ")
+                        } else if entry.state == Some(2) {
                             format!(
                                 "Held ({}) · ",
                                 entry
@@ -1452,6 +1454,32 @@ mod tests {
         let screen = draw(&mut app, "held", 100, 26);
         assert!(screen.contains("Held (model unavailable) · first"));
         assert!(screen.contains("Held (reason unavailable) · second"));
+    }
+    /// WS-01 (TUI): a queued row names its pre-admission waiting step.
+    #[test]
+    fn preparing_queue_row_names_the_waiting_step_and_cancel_hint() {
+        let mut app = App::new();
+        let row = |id: u8, state: u32, step: Option<i32>, text: &str| {
+            asura_control::pb::ConversationQueueEntry {
+                input_id: Some(vec![id; 16]),
+                state: Some(state),
+                text: Some(text.into()),
+                waiting_step: step,
+                ..Default::default()
+            }
+        };
+        app.queue_entries = vec![row(1, 1, Some(2), "first"), row(2, 1, None, "second")];
+        let screen = draw(&mut app, "starting", 100, 26);
+        assert!(screen.contains(">> Starting model · Esc holds · first"));
+        assert!(screen.contains(">> second"));
+        app.queue_entries = vec![row(1, 1, Some(1), "first")];
+        let screen = draw(&mut app, "preparing", 100, 26);
+        assert!(screen.contains(">> Preparing model · Esc holds · first"));
+        // Only a Queued row can name a step.
+        app.queue_entries = vec![row(1, 2, Some(2), "first")];
+        let screen = draw(&mut app, "held-step", 100, 26);
+        assert!(screen.contains("Held (reason unavailable) · first"));
+        assert!(!screen.contains("Starting model"));
     }
     #[test]
     fn queue_promotion_names_same_input_and_never_clears_unrelated_draft() {

@@ -25,7 +25,7 @@ on the top bar. An unknown command shows "Unknown command; use /help."
 | Command | Action |
 | --- | --- |
 | `/new` | Start a new conversation in the selected project when nothing is active or queued |
-| `/cancel` | Stop the active answer, or a pending `/models` or `/audit` request |
+| `/cancel` | Stop the active answer, hold a message while its model starts, or cancel a pending `/models` or `/audit` request. Escape in the input box does the same and keeps your draft |
 | `/retry` | Repeat a request whose result is unknown, with its original request ID |
 | `/observe ID` | Show the recorded result of an operation |
 
