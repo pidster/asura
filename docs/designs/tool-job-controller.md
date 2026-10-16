@@ -1830,8 +1830,12 @@ and `--test capture_flow` (each takes case names; `capture_flow native` runs
 only when named), `cargo test -p asura-platform --all-features --test
 shell_process`, and `python3 rust/crates/asura-cli/tests/tui_pty.py
 <lifecycle fixture> --shell-capture` with a fixture built by
-`cargo test --workspace --all-features` and the helper beside it. The PTY
-mode and `capture_flow native` are opt-in, like `--activity`.
+`cargo test --all-features` and the helper beside it. The `--shell-capture`
+PTY mode runs in the default lifecycle gate; the CLI's
+test build enables the service `test-support` gates it needs. Only
+`capture_flow native` stays opt-in: it needs the host's system model, whose
+replies vary, so it cannot be a deterministic gate. The fixture model covers
+the same J1T-05 and J1T-25 behaviour in the gate.
 
 Measurements (acceptance figures only, never runtime closures):
 

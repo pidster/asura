@@ -432,6 +432,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--help-mode"),
         Some("--journal-waits"),
         Some("--client-waits"),
+        Some("--shell-capture"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);
