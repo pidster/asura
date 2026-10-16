@@ -6,8 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Test-only capture gates (J1, G18) and platform/storage hooks; never in production builds.
+test-support = ["asura-platform/test-support", "asura-storage/test-support"]
+
 [dependencies]
 sha2 = "=0.10.9"
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 asura-storage = { path = "../asura-storage", features = ["embedded-memory"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 asura-platform = { path = "../asura-platform" }
@@ -18,6 +23,20 @@ asura-storage = { path = "../asura-storage", features = ["embedded-memory", "tes
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
 asura-platform = { path = "../asura-platform", features = ["test-support"] }
 asura-client = { path = "../asura-client" }
+libc = "=0.2.189"
+serde_json = "=1.0.151"
+
+[[test]]
+name = "capture_worker"
+path = "tests/capture_worker.rs"
+harness = false
+required-features = ["test-support"]
+
+[[test]]
+name = "capture_flow"
+path = "tests/capture_flow.rs"
+harness = false
+required-features = ["test-support"]
 
 [[test]]
 name = "conversation_flow"

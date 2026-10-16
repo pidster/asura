@@ -8,7 +8,7 @@ const COMMAND: &str = "printf x >> effect.txt; cat proof.txt; printf stderr-proo
 fn recorded(
     fixture: &Fixture,
     operation: [u8; 16],
-) -> Result<(journal::ToolIntent, journal::ToolResult)> {
+) -> Result<(journal::ShellIntent, journal::ToolResult)> {
     let mut bytes = Vec::new();
     fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
         .take(asura_storage::authority::MAX_JOURNAL as u64 + 1)
@@ -34,9 +34,11 @@ fn recorded(
         )
         .map_err(|error| format!("shell record: {error:?}"))?)
     };
-    let journal::Record::ToolIntent(intent) = decode(tool.intent_frame.clone())? else {
+    // J1: every shell call records kind 22.
+    let journal::Record::ShellIntent(intent) = decode(tool.intent_frame.clone())? else {
         return Err("shell intent variant".into());
     };
+    let intent = *intent;
     let journal::Record::ToolResult(result) =
         decode(tool.result_frame.clone().ok_or("shell result absent")?)?
     else {
@@ -103,9 +105,11 @@ pub(super) fn run(provider: &str) -> Result<()> {
     assert_eq!(retry.operation_id, accepted.operation_id);
     fixture.stop()?;
     let (intent, result) = recorded(&fixture, operation)?;
-    assert_eq!(intent.path, format!("{COMMAND}\0."));
-    assert_eq!(intent.limit, 30);
-    assert!((1..=30_000).contains(&intent.offset));
+    assert_eq!(
+        (intent.command.as_str(), intent.cwd.as_str()),
+        (COMMAND, ".")
+    );
+    assert_eq!(intent.disposition, journal::ShellDisposition::Admitted);
     assert_eq!(result.status, 1);
     assert!(
         result.text.contains(&proof) && result.text.contains("stderr-proof"),
@@ -113,7 +117,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
         result.text
     );
     assert!(!result.truncated);
-    assert!(result.text.starts_with("failure=None exit_code=0 signal=none reason=none truncated=false cleanup_confirmed=true\nstdout:\n"));
+    assert!(result.text.starts_with("failure=None exit_code=0 signal=none reason=none truncated=false cleanup_confirmed=true capture=complete\nstdout:\n"));
     assert!(result.text.contains("\nstderr:\nstderr-proof"));
     fixture.start()?;
     wait_ready(&fixture, None)?;
@@ -121,7 +125,22 @@ pub(super) fn run(provider: &str) -> Result<()> {
     assert_eq!(retry.operation_id, accepted.operation_id);
     let replayed = observe(&fixture, operation)?;
     assert_eq!(replayed.text, event.text);
-    assert_eq!(replayed.tools, event.tools);
+    // Restart leaves live measurements absent rather than inventing history.
+    let without_elapsed = |tools: &[pb::ToolProgress]| {
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                tool.elapsed_ms = None;
+                tool
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        without_elapsed(&replayed.tools),
+        without_elapsed(&event.tools)
+    );
+    assert!(replayed.tools.iter().all(|tool| tool.elapsed_ms.is_none()));
     fixture.stop()?;
     assert_eq!(
         fs::read(directory.join("effect.txt"))?,
@@ -147,8 +166,11 @@ fn interrupted(
     fixture.start()?;
     wait_ready(fixture, None)?;
     let marker = if cancel { "cancel.pid" } else { "timeout.pid" };
+    // J1-Q3: `timeout_seconds` is accepted and ignored; the 1 s request no
+    // longer stops a 3 s command.
+    let sleep = if cancel { 30 } else { 3 };
     let command = format!(
-        "printf partial-output; printf '%s\\n' \"$$\" > {marker}; sleep 30; printf unexpected > {marker}.late"
+        "printf partial-output; printf '%s\\n' \"$$\" > {marker}; sleep {sleep}; printf late > {marker}.late"
     );
     let timeout = if cancel { 30 } else { 1 };
     let prompt = format!(
@@ -178,20 +200,23 @@ fn interrupted(
     }
     fixture.stop()?;
     let (intent, result) = recorded(fixture, operation)?;
-    assert_eq!(intent.path, format!("{command}\0."));
-    assert_eq!(intent.limit, timeout);
-    assert_eq!(result.status, if cancel { 6 } else { 5 });
+    assert_eq!(intent.command, command);
+    assert_eq!(result.status, if cancel { 6 } else { 1 });
     assert!(result.text.contains(if cancel {
         "reason=cancelled"
     } else {
-        "reason=timeout"
+        "reason=none"
     }));
     assert!(result.text.contains("cleanup_confirmed=true"));
     assert!(
         result.text.contains("partial-output"),
         "partial command output must survive timeout/cancel"
     );
-    assert!(!directory.join(format!("{marker}.late")).exists());
+    assert_eq!(
+        directory.join(format!("{marker}.late")).exists(),
+        !cancel,
+        "cancel stops the command; the ignored timeout does not"
+    );
     let pid: i32 = fs::read_to_string(directory.join(marker))?.trim().parse()?;
     assert!(pid > 1);
     assert_group_absent(pid)?;

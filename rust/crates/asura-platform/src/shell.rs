@@ -10,6 +10,7 @@ use crate::secrets::SecretVariable;
 use crate::secrets::rewrite::MAX_SECRET_VARIABLES;
 use crate::{PollInterest, ProjectIdentity, RuntimeDirectory, StateBoundary};
 use capture::Capture;
+pub use capture::{DRAIN_BUDGET, OutputSink, READ_BUFFER, Stream, render_tail};
 pub use cleanup::ShellCleanup;
 pub use guardian::run_guardian;
 use protocol::Notice;
@@ -38,21 +39,29 @@ pub enum StopReason {
     OutputLimit,
     LeaseEnded,
 }
+/// Process facts of a settled job. Output is never kept here: the service's
+/// capture worker owns the redacted stream and its tails (J1, G10).
 #[derive(Clone, Debug)]
 pub struct ShellResult {
     pub failure: Option<ShellError>,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub reason: Option<StopReason>,
+    pub cleanup_confirmed: bool,
+}
+/// Rendered model-visible tails of the redacted streams (see [`render_tail`]).
+#[derive(Clone, Debug, Default)]
+pub struct Tails {
     pub stdout: String,
     pub stderr: String,
     pub truncated: bool,
-    pub cleanup_confirmed: bool,
 }
 impl ShellResult {
-    pub fn render_text(&self) -> String {
+    /// Kind 15 text: today's shape, with the redacted tails and the capture
+    /// state as `capture=<state>` at the end of the header line.
+    pub fn render_text(&self, tails: &Tails, capture: &str) -> String {
         format!(
-            "failure={:?} exit_code={} signal={} reason={} truncated={} cleanup_confirmed={}\nstdout:\n{}\nstderr:\n{}",
+            "failure={:?} exit_code={} signal={} reason={} truncated={} cleanup_confirmed={} capture={}\nstdout:\n{}\nstderr:\n{}",
             self.failure,
             self.exit_code
                 .map_or_else(|| "none".into(), |n| n.to_string()),
@@ -64,10 +73,11 @@ impl ShellResult {
                 Some(StopReason::OutputLimit) => "output_limit",
                 Some(StopReason::LeaseEnded) => "lease_ended",
             },
-            self.truncated,
+            tails.truncated,
             self.cleanup_confirmed,
-            self.stdout,
-            self.stderr
+            capture,
+            tails.stdout,
+            tails.stderr
         )
     }
 }
@@ -90,11 +100,16 @@ pub const MAX_COMMAND_BYTES: usize = 8192;
 /// rewrite: numbers 1–16, each distinct, values without NUL and at most
 /// [`MAX_COMMAND_BYTES`] in total. They reach the guardian only through its
 /// environment. No `Debug` is derived, and `SecretVariable`'s omits values.
+///
+/// `deadline` is `None` for every service call (J1-Q3, J1-Q4): the command
+/// ends on completion or cancel, and setup checks only cancellation. `Some`
+/// remains only for platform qualification of the bounded guardian mode; J3
+/// removes it.
 pub struct ShellRequest {
     pub job_id: [u8; 16],
     pub command: String,
     pub cwd: Option<String>,
-    pub deadline: Instant,
+    pub deadline: Option<Instant>,
     pub secrets: Vec<SecretVariable>,
 }
 pub struct PreparedShell {
@@ -110,12 +125,11 @@ pub struct PreparedShell {
     #[cfg(feature = "test-support")]
     secret_environment_for_test: Option<Vec<Vec<u8>>>,
     cleanup: Option<ShellCleanup>,
-    setup_deadline: Instant,
 }
-fn check(deadline: Instant, cancel: &AtomicBool) -> Result<(), ShellError> {
+fn check(deadline: Option<Instant>, cancel: &AtomicBool) -> Result<(), ShellError> {
     if cancel.load(Ordering::Acquire) {
         Err(ShellError::Cancelled)
-    } else if Instant::now() >= deadline {
+    } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         Err(ShellError::Deadline)
     } else {
         Ok(())
@@ -181,9 +195,7 @@ impl PreparedShell {
         cancel: &AtomicBool,
     ) -> Result<Self, ShellFailure> {
         validate(&request)?;
-        let setup_deadline = request
-            .deadline
-            .min(Instant::now() + Duration::from_secs(2));
+        let setup_deadline = request.deadline;
         check(setup_deadline, cancel)?;
         let original_project = project.process_location().to_owned();
         let boundary = project.boundary().clone();
@@ -224,7 +236,6 @@ impl PreparedShell {
             #[cfg(feature = "test-support")]
             secret_environment_for_test: None,
             cleanup: Some(cleanup),
-            setup_deadline,
         };
         if let Err(reason) = check(setup_deadline, cancel) {
             return Err(ShellFailure {
@@ -251,12 +262,14 @@ impl PreparedShell {
     /// After a successful spawn ownership always transfers to ShellJob.
     /// The request's secret values are dropped (and zeroed) whether or not
     /// the spawn succeeds.
+    /// `sink` receives the job's raw output on the reactor (J1).
     pub fn spawn(
         mut self,
         executable: &Path,
         cancel: &AtomicBool,
+        sink: Box<dyn OutputSink>,
     ) -> Result<ShellJob, ShellFailure> {
-        let spawned = self.spawn_inner(executable, cancel);
+        let spawned = self.spawn_inner(executable, cancel, sink);
         self.request.secrets.clear();
         match spawned {
             Ok(job) => Ok(job),
@@ -270,8 +283,9 @@ impl PreparedShell {
         &mut self,
         executable: &Path,
         cancel: &AtomicBool,
+        sink: Box<dyn OutputSink>,
     ) -> Result<ShellJob, ShellError> {
-        check(self.setup_deadline, cancel)?;
+        check(self.request.deadline, cancel)?;
         let current = ProjectIdentity::open(&self.original_project, &self.boundary)
             .map_err(|_| ShellError::Denied)?;
         let pinned = stat_fd(self.project.as_raw_fd()).map_err(|_| ShellError::Io)?;
@@ -301,21 +315,25 @@ impl PreparedShell {
         let (err_read, err_write) = spawn::pipe(false)?;
         let null =
             open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDWR, 0).map_err(|_| ShellError::Io)?;
-        let ns = spawn::monotonic_ns()?
-            .checked_add(
-                self.request
-                    .deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_nanos()
-                    .try_into()
-                    .map_err(|_| ShellError::Invalid)?,
-            )
-            .ok_or(ShellError::Invalid)?;
+        // No deadline: the guardian's no-deadline mode (J1-Q3).
+        let deadline = match self.request.deadline {
+            None => guardian::NO_DEADLINE.to_owned(),
+            Some(deadline) => spawn::monotonic_ns()?
+                .checked_add(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_nanos()
+                        .try_into()
+                        .map_err(|_| ShellError::Invalid)?,
+                )
+                .ok_or(ShellError::Invalid)?
+                .to_string(),
+        };
         let args = vec![
             executable.to_string_lossy().into_owned(),
             "--asura-shell-guardian".into(),
             hex(self.request.job_id),
-            ns.to_string(),
+            deadline,
             self.request.command.clone(),
         ];
         if args.iter().map(|value| value.len() + 1).sum::<usize>() > 8704 {
@@ -346,7 +364,7 @@ impl PreparedShell {
             None => environment,
         };
         let env: Vec<&[u8]> = environment.iter().map(|entry| entry.as_slice()).collect();
-        check(self.setup_deadline, cancel)?;
+        check(self.request.deadline, cancel)?;
         let pid = spawn::launch(executable, &args, &env, mappings, None, false)?;
         drop(env);
         drop(environment);
@@ -361,8 +379,9 @@ impl PreparedShell {
             notices: 0,
             spawned: false,
             terminal: None,
-            out: Capture::new(out_read),
-            err: Capture::new(err_read),
+            out: Capture::new(out_read, Stream::Stdout),
+            err: Capture::new(err_read, Stream::Stderr),
+            sink,
             deadline: self.request.deadline,
             stop: None,
             cleanup: self.cleanup.take(),
@@ -387,7 +406,8 @@ pub struct ShellJob {
     terminal: Option<Notice>,
     out: Capture,
     err: Capture,
-    deadline: Instant,
+    sink: Box<dyn OutputSink>,
+    deadline: Option<Instant>,
     stop: Option<StopReason>,
     cleanup: Option<ShellCleanup>,
     job_id: [u8; 16],
@@ -400,14 +420,20 @@ impl ShellJob {
         self.pid
     }
 
+    /// Read interests. A stream's interest is omitted while the sink has less
+    /// room than one read buffer (backpressure); the status pipe interest
+    /// stays so exit notices still arrive. After a cancel trigger both pipes
+    /// are read to EOF.
     pub fn interests(&self) -> Vec<PollInterest> {
         let mut result = Vec::with_capacity(3);
-        for (fd, eof) in [
-            (self.status.as_raw_fd(), self.status_eof),
-            (self.out.fd(), self.out.eof),
-            (self.err.fd(), self.err.eof),
+        let room = self.sink.room();
+        let stopping = self.stop.is_some();
+        for (fd, wanted) in [
+            (self.status.as_raw_fd(), !self.status_eof),
+            (self.out.fd(), self.out.wants_read(room, stopping)),
+            (self.err.fd(), self.err.wants_read(room, stopping)),
         ] {
-            if !eof {
+            if wanted {
                 result.push(PollInterest {
                     fd,
                     read: true,
@@ -421,11 +447,12 @@ impl ShellJob {
         if self.settled() {
             None
         } else {
-            Some(if self.lease.is_some() {
-                self.deadline
-                    .min(Instant::now() + Duration::from_millis(100))
-            } else {
-                Instant::now() + Duration::from_millis(100)
+            // The 100 ms poll tick (L5) ends nothing; with no deadline it
+            // is the only timer.
+            let tick = Instant::now() + Duration::from_millis(100);
+            Some(match self.deadline {
+                Some(deadline) if self.lease.is_some() => deadline.min(tick),
+                _ => tick,
             })
         }
     }
@@ -436,7 +463,7 @@ impl ShellJob {
         self.lease.take();
     }
     pub fn poll(&mut self, now: Instant) -> Result<(), ShellError> {
-        if now >= self.deadline {
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
             self.stop(StopReason::Deadline)
         }
         let result = self.poll_inner();
@@ -453,11 +480,12 @@ impl ShellJob {
             (&mut self.out, &mut self.err)
         };
         self.alternate = !self.alternate;
-        first.drain(8192)?;
-        second.drain(8192)?;
-        if self.out.total.saturating_add(self.err.total) > 64 * 1024 * 1024 {
-            self.stop(StopReason::OutputLimit)
-        }
+        let stopping = self.stop.is_some();
+        self.sink.flush();
+        first.drain(DRAIN_BUDGET, self.sink.as_mut(), stopping)?;
+        second.drain(DRAIN_BUDGET, self.sink.as_mut(), stopping)?;
+        self.sink.flush();
+        // No combined output stop (J1-Q2): the shared quota and pause apply.
         if !self.status_eof {
             let mut buf = [0u8; 128];
             // SAFETY: owned nonblocking descriptor and valid output buffer.
@@ -520,8 +548,6 @@ impl ShellJob {
             return None;
         }
         let n = self.terminal?;
-        let (stdout, a) = self.out.text();
-        let (stderr, b) = self.err.text();
         Some(ShellResult {
             failure: if n.kind == 3 {
                 Some(match n.reason {
@@ -542,9 +568,6 @@ impl ShellJob {
                 4 => Some(StopReason::LeaseEnded),
                 _ => None,
             }),
-            stdout,
-            stderr,
-            truncated: a || b,
             cleanup_confirmed: true,
         })
     }

@@ -9,13 +9,15 @@ are engineering choices under the
 "proposed" in limit tables need the measurements in [validation](#validation).
 Slices SL1 and SL2 are implemented; see
 [SL1 implementation](#sl1-implementation) and
-[SL2 implementation](#sl2-implementation). SL3–SL6 are not implemented.
+[SL2 implementation](#sl2-implementation). SL3 is implemented inside tool job
+packet J1; see [SL3 implementation](#sl3-implementation). SL4–SL6 are not implemented.
 Protocol numbering remains `0.1`; journal format remains `1`.
 
-Readiness: slice SL3 is ready for implementation inside tool job packet J1.
-Its implementation details, including record kinds 22 and 23, are in the job
+Readiness: slice SL3 is implemented inside tool job packet J1. Its
+implementation details, including record kinds 22 and 23, are in the job
 controller's
-[J1 and SL3 implementation details](tool-job-controller.md#j1-and-sl3-implementation-details). No owner
+[J1 and SL3 implementation details](tool-job-controller.md#j1-and-sl3-implementation-details)
+and [J1 implementation](tool-job-controller.md#j1-implementation). No owner
 decision remains open. SL5 waits only for the person command packets. The SD8
 fixtures can be committed after the licence commit lands; see
 [fixtures and licensing](#fixtures-and-licensing).
@@ -1314,11 +1316,60 @@ profile allows `sysctl-read`. The kernel did not return the environment of
 - Entries beyond the walk bound (18 entries) are not erased. Such a set is
   always refused, and the guardian exits after its notice.
 
-The `set` exposure in SDI-07 remains until SL3.
+The `set` exposure in SDI-07 remained until SL3; see
+[SL3 implementation](#sl3-implementation).
 
 Proof limits: one host and one `/bin/sh`. The `sh` result can differ on hosts
 where `/bin/sh` is not the platform bash. No service, journal or capture path
 uses secret variables until SL3; SDI-03 and the person path are not claimed.
+
+## SL3 implementation
+
+Implemented behavior, 2026-10-16, inside tool job packet J1. The code map,
+refinements and full test record are in the job controller's
+[J1 implementation](tool-job-controller.md#j1-implementation). SL3 parts:
+
+- **Command rewrite at `ToolCall`.** `secrets::rewrite_shell_call` rewrites
+  the model command, scans the cwd in whole-buffer mode (`secret_in_cwd`,
+  code 14) and refuses a rewrite over 8,192 bytes (`rewritten_command_too_long`,
+  code 13). The conversation owner calls it before any record; kind 22 holds
+  the rewrite, or the display-redacted command when refused. The raw command
+  is zeroized after the rewrite and never retained.
+- **Scanner on the capture worker.** Each chunk is scanned with
+  `JobRedaction::scan` inside `catch_unwind` before staging and hashing.
+  After a panic the stream is degraded and every later chunk goes to
+  `detector_error`; a panic there is a capture fault (`detector_fault`). No
+  path stages unchecked bytes. The worker settles the scanner and drops its
+  literals, numbers and key (SD4). Raw chunk buffers are zeroizing.
+- **Metadata.** Kind 23 records per-stream counts, kinds, loss spans,
+  degraded flags and up to 256 numbers with origin command or output
+  (propagated values count as literal replacements, G17). No record holds a
+  value or a digest of one.
+- **Model tail.** Kind 15 tails come from the redacted stream only, through
+  `render_tail`.
+
+Verified behavior on the macOS 27 development host (real processes, the real
+guardian and sandbox, scratch homes; every integration and end-to-end case
+ends with the raw-byte sweep):
+
+| Check | Result |
+| --- | --- |
+| SDU-14 | Kinds 22 and 23 round trip at every bound and the maximum sizes; each invalid field is `Corrupt`; fixed code tables; no value field (J1T-01) |
+| SDI-01 | A secret printed in three pipe writes 0.4 s apart: 19 `live` pages read during the call showed no piece; the stored stream holds `$ASURA_SECRET_1` (J1T-12) |
+| SDI-02 | A private key block, a 70 KiB line and 256 binary bytes: one key placeholder, one `line_over_limit` marker for 71,680 bytes, binary bytes unchanged, digest equal to the stored object (J1T-13) |
+| SDI-03 | Through the real owner and helper: kind 22 holds `"${ASURA_SECRET_1}"`, variables list one `github-token`; ten `ps -axww` samples during the call held no value; the command wrote the real value (J1T-14) |
+| SDI-04 | Scanner gate held: the producer blocked after about 60 KB (8 queued chunks plus the pipe); after release all 804,000 bytes were stored, no discard, no cancel (J1T-15) |
+| SDI-05 | Scanner throttled to 3 ms per chunk: complete, every byte stored, no fault (J1T-15) |
+| SDI-07 | `set` after a rewritten command stores `ASURA_SECRET_1=$ASURA_SECRET_1`; the value is replaced by literal matching (J1T-16) |
+| SDI-08 | The echoed value on stdout and stderr both store `$ASURA_SECRET_1`, number 1, origin command (J1T-17) |
+| SDI-11 | Four concurrent capture workers fed by real processes: independent numbering (each starts at 1) (J1T-18) |
+| SDE-01 (shell part) | A scripted loopback model issues `cat .env`: kind 15, the tool message the model received and the TUI activity show `GITHUB_TOKEN=$ASURA_SECRET_1` (J1T-24) |
+| SDE-02 | Fixture model: the TUI activity shows the rewritten command and the command ran with the real value; see J1T-25 for the native-model part |
+| SDE-04 (typing part) | See J1T-26 |
+| SDM-04 | Process maximum RSS grew 7.5 MiB for four workers, about 1.9 MiB each (acceptance 6 MiB); a measurement, not a runtime limit |
+
+Proof limits: SDE-01's paging part, SDE-03 and SDE-05 belong to later slices;
+SDI-06, SDI-09 and SDI-10 keep their SL2 results or later-slice scope.
 
 ## Design verification
 

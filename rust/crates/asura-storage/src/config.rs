@@ -33,6 +33,30 @@ struct Config {
     audit: Audit,
     #[serde(default, skip_serializing_if = "Providers::is_empty")]
     providers: Providers,
+    #[serde(default, skip_serializing_if = "Retention::is_default")]
+    retention: Retention,
+}
+/// Retained shell output (J1 quota ledger).
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Retention {
+    #[serde(default = "quota_bytes", rename = "quotaBytes")]
+    quota_bytes: u64,
+}
+fn quota_bytes() -> u64 {
+    crate::payload::DEFAULT_QUOTA
+}
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            quota_bytes: quota_bytes(),
+        }
+    }
+}
+impl Retention {
+    fn is_default(&self) -> bool {
+        self.quota_bytes == quota_bytes()
+    }
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -224,6 +248,8 @@ impl Config {
             model.is_empty() || model.len() > 1024 || model.chars().any(char::is_control)
         }) || !(1..=10_000).contains(&self.audit.keep_files)
             || !(1..=1_099_511_627_776).contains(&self.audit.max_file_bytes)
+            || !(crate::payload::MIN_QUOTA..=crate::payload::MAX_QUOTA)
+                .contains(&self.retention.quota_bytes)
         {
             return Err("config_invalid_value");
         }
@@ -270,6 +296,8 @@ impl Config {
             "audit.enabled" => yaml(&self.audit.enabled),
             "audit.keepFiles" => yaml(&self.audit.keep_files),
             "audit.maxFileBytes" => yaml(&self.audit.max_file_bytes),
+            "retention" => yaml(&RetentionView(&self.retention)),
+            "retention.quotaBytes" => yaml(&self.retention.quota_bytes),
             _ => Err("config_unknown_key"),
         }
     }
@@ -323,6 +351,9 @@ impl Config {
             }
             "audit.maxFileBytes" => {
                 self.audit.max_file_bytes = value.as_u64().ok_or("config_invalid_value")?
+            }
+            "retention.quotaBytes" => {
+                self.retention.quota_bytes = value.as_u64().ok_or("config_invalid_value")?
             }
             _ => return Err("config_unknown_key"),
         }
@@ -413,6 +444,20 @@ pub fn loopback_endpoint(value: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1")
 }
 
+/// The retention mapping with its default, for `get retention`.
+struct RetentionView<'a>(&'a Retention);
+impl Serialize for RetentionView<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("quotaBytes", &self.0.quota_bytes)?;
+        map.end()
+    }
+}
+
 fn yaml(value: &impl Serialize) -> Result<String> {
     serde_yaml_ng::to_string(value).map_err(|_| "config_encode_failed")
 }
@@ -437,6 +482,8 @@ pub fn execute(
                 | "providers.ollama.endpoint"
                 | "providers.mlx"
                 | "providers.mlx.models"
+                | "retention"
+                | "retention.quotaBytes"
         )
     {
         return Err("config_unknown_key");
@@ -454,6 +501,14 @@ pub fn execute(
         return Err("config_cancelled_or_expired");
     }
     config.get(key)
+}
+
+/// The effective `retention.quotaBytes` (J1). Read once at service start on
+/// the payload recovery worker; the work has no time bound.
+pub fn retention_quota(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result<u64> {
+    let snapshot = PrivateFileSnapshot::read_without_deadline(runtime, "config.yaml", cancel)
+        .map_err(file_error)?;
+    Ok(Config::read(&snapshot.bytes)?.retention.quota_bytes)
 }
 
 /// Startup-only typed audit settings from the canonical validated YAML snapshot.
@@ -900,5 +955,32 @@ mod tests {
                 .set("providers.mlx.models.org.model", "[]")
                 .is_err()
         );
+    }
+    /// `retention.quotaBytes` (J1, G13): default 1 GiB, bounds 64 MiB to
+    /// 1 TiB, persisted only when set away from the default.
+    #[test]
+    fn retention_quota_bytes_default_bounds_and_persistence() {
+        let mut config = Config::read(b"").unwrap();
+        assert_eq!(config.get("retention.quotaBytes").unwrap(), "1073741824\n");
+        assert_eq!(config.get("retention").unwrap(), "quotaBytes: 1073741824\n");
+        assert!(!yaml(&config).unwrap().contains("retention"));
+        for bad in ["67108863", "1099511627777", "-1", "true", "'1'"] {
+            assert_eq!(
+                config.set("retention.quotaBytes", bad),
+                Err("config_invalid_value"),
+                "{bad}"
+            );
+        }
+        config.set("retention.quotaBytes", "67108864").unwrap();
+        config.set("retention.quotaBytes", "1099511627776").unwrap();
+        let text = yaml(&config).unwrap();
+        assert!(
+            text.contains("retention:\n  quotaBytes: 1099511627776\n"),
+            "{text}"
+        );
+        let again = Config::read(text.as_bytes()).unwrap();
+        assert_eq!(again.retention.quota_bytes, 1_099_511_627_776);
+        assert!(Config::read(b"retention: {quotaBytes: 1}").is_err());
+        assert!(Config::read(b"retention: {other: 1}").is_err());
     }
 }

@@ -218,7 +218,8 @@ fn real_socket_attach_inspect_stop_restart_and_negotiation() {
         .map(|v| v.unwrap().file_name().into_string().unwrap())
         .collect();
     entries.sort();
-    assert_eq!(entries, ["db", "logs", "run", "state"]);
+    // J1: payload recovery holds `payloads/` once a journal exists.
+    assert_eq!(entries, ["db", "logs", "payloads", "run", "state"]);
 }
 
 #[test]

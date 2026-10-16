@@ -318,6 +318,12 @@ impl RuntimeDirectory {
     pub(crate) fn run_path(&self) -> &Path {
         &self.0.path
     }
+    /// The scratch home of a test runtime (`<home>/.asura/run` → `<home>`),
+    /// for test-support gates in other crates.
+    #[cfg(feature = "test-support")]
+    pub fn scratch_home_for_test(&self) -> Option<&Path> {
+        self.0.path.parent()?.parent()
+    }
     /// The Asura home and every directory containing it; computed at open.
     pub fn state_boundary(&self) -> crate::StateBoundary {
         self.0.boundary.clone()

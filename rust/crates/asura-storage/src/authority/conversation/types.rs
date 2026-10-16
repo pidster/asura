@@ -1,3 +1,4 @@
+pub use asura_platform::secrets::{LossReason, LossSpan, NumberOrigin, RefusalCode, SecretKind};
 use std::ops::Range;
 
 pub type Id = [u8; 16];
@@ -231,6 +232,11 @@ pub enum Record {
     MemoryCreateIntent(MemoryCreateIntent),
     ToolIntent(ToolIntent),
     ToolResult(ToolResult),
+    /// Kind 22 (J1): every new shell call. Kind 14 with tool kind 16 stays
+    /// readable for older journals and is never written by a J1 binary.
+    ShellIntent(Box<ShellIntent>),
+    /// Kind 23 (J1): capture facts of an admitted shell call, before kind 15.
+    CaptureSettled(Box<CaptureSettled>),
 }
 impl Record {
     pub fn kind(&self) -> u16 {
@@ -254,6 +260,8 @@ impl Record {
             Self::ToolIntent(_) => 14,
             Self::ToolResult(_) => 15,
             Self::InputPromoted(_) => 16,
+            Self::ShellIntent(_) => 22,
+            Self::CaptureSettled(_) => 23,
         }
     }
 }
@@ -437,6 +445,187 @@ pub struct ToolResult {
     pub next_offset: Option<u64>,
     pub truncated: bool,
 }
+/// Kind 22 field 4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ShellDisposition {
+    Admitted = 1,
+    Refused = 2,
+    Busy = 3,
+}
+/// Kind 22 field 11, for a `busy` disposition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ShellBusyReason {
+    Quota = 1,
+    CapturePaused = 2,
+    PendingFull = 3,
+    PayloadUnavailable = 4,
+}
+impl ShellBusyReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quota => "quota",
+            Self::CapturePaused => "capture_paused",
+            Self::PendingFull => "pending_full",
+            Self::PayloadUnavailable => "payload_unavailable",
+        }
+    }
+}
+/// Kind 22 fields 8–10 for a `refused` disposition. Never holds a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShellRefusal {
+    pub code: RefusalCode,
+    pub kind: Option<SecretKind>,
+    /// The 1-based word index, 1–4096.
+    pub word: Option<u16>,
+}
+/// Initial capture reservation recorded by an admitted kind 22 (R1).
+pub const INITIAL_RESERVATION: u64 = 1024 * 1024;
+/// Kind 22, ShellIntent (J1). An admitted or busy record holds the rewritten
+/// command; a refused one holds the display-redacted command, cut at 8,192
+/// bytes with `command_truncated`. No field holds a secret value or a digest
+/// of one: `variables` lists the kind of variable `ASURA_SECRET_<i+1>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellIntent {
+    pub operation: Id,
+    pub generation: u64,
+    pub ordinal: u32,
+    pub disposition: ShellDisposition,
+    pub command_truncated: bool,
+    pub command: String,
+    pub cwd: String,
+    pub refusal: Option<ShellRefusal>,
+    pub busy: Option<ShellBusyReason>,
+    pub variables: Vec<SecretKind>,
+    /// Admitted: the `asura.shell.job` derivation; otherwise zero.
+    pub job: Id,
+    /// Admitted: payload IDs for stdout and stderr; otherwise zero.
+    pub stdout_payload: Id,
+    pub stderr_payload: Id,
+    /// Admitted: [`INITIAL_RESERVATION`]; otherwise 0.
+    pub initial_reservation: u64,
+    /// The rule set used; 0 and zero only with `secret_detection_unavailable`.
+    pub rule_set_revision: u32,
+    pub rule_set_digest: Hash,
+}
+/// Kind 23 field 4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CaptureState {
+    Complete = 1,
+    Incomplete = 2,
+    Unconfirmed = 3,
+    NotStarted = 4,
+}
+impl CaptureState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+            Self::Unconfirmed => "unconfirmed",
+            Self::NotStarted => "not_started",
+        }
+    }
+}
+/// Kind 23 field 5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CaptureReason {
+    None = 0,
+    StorageFault = 1,
+    Quota = 2,
+    Enospc = 3,
+    DetectorFault = 4,
+    DiscardedAfterCancel = 5,
+    SettlementUnconfirmed = 6,
+}
+impl CaptureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::StorageFault => "storage_fault",
+            Self::Quota => "quota",
+            Self::Enospc => "enospc",
+            Self::DetectorFault => "detector_fault",
+            Self::DiscardedAfterCancel => "discarded_after_cancel",
+            Self::SettlementUnconfirmed => "settlement_unconfirmed",
+        }
+    }
+}
+/// Kind 23 stream block: stored-stream facts, with no value or value digest.
+/// `digest` is SHA-256 over exactly the stored (redacted) bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CaptureStream {
+    pub observed_bytes: u64,
+    pub stored_bytes: u64,
+    pub digest: Option<Hash>,
+    pub replacements: u64,
+    pub unnumbered_replacements: u64,
+    pub literal_replacements: u64,
+    /// Non-zero counts in increasing kind order.
+    pub kinds: Vec<(SecretKind, u64)>,
+    pub loss_span_count: u64,
+    pub withheld_bytes: u64,
+    /// The first `min(loss_span_count, 64)` spans.
+    pub spans: Vec<LossSpan>,
+    pub degraded: bool,
+    pub discarded_bytes: u64,
+    pub eof: bool,
+}
+/// Kind 23 field 15 entry. "Propagated" is not an origin (G17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureNumber {
+    pub number: u16,
+    pub kind: SecretKind,
+    pub origin: NumberOrigin,
+}
+/// Kind 23, CaptureSettled (J1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureSettled {
+    pub operation: Id,
+    pub generation: u64,
+    pub ordinal: u32,
+    pub state: CaptureState,
+    pub reason: CaptureReason,
+    /// 0 unknown, 1 exited, 2 signalled.
+    pub exit_kind: u8,
+    pub exit_value: u32,
+    pub rule_set_revision: u32,
+    pub rule_set_digest: Hash,
+    pub stdout: CaptureStream,
+    pub stderr: CaptureStream,
+    pub distinct_numbers: u32,
+    pub numbers: Vec<CaptureNumber>,
+    pub pause_count: u32,
+    pub first_pause_ms: u64,
+    pub paused_ms: u64,
+    pub final_reservation: u64,
+}
+/// Replay facts of one kind 22 call: identities, settlement and journal
+/// sequences used as "last use" by the interim expiry (J1-Q2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellCall {
+    pub disposition: ShellDisposition,
+    pub job: Id,
+    pub stdout_payload: Id,
+    pub stderr_payload: Id,
+    pub intent_sequence: u64,
+    /// Kind 22 fields 18–19; kind 23 must name the same rule set.
+    pub rule_set_revision: u32,
+    pub rule_set_digest: Hash,
+    pub settled: Option<ShellSettlement>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellSettlement {
+    pub state: CaptureState,
+    pub reason: CaptureReason,
+    pub sequence: u64,
+    /// Stored bytes and digest per stream (stdout, stderr).
+    pub streams: [(u64, Option<Hash>); 2],
+    pub frame: Range<usize>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolRecord {
     pub create: Option<Box<MemoryCreateIntent>>,
@@ -452,6 +641,8 @@ pub struct ToolRecord {
     pub preview: Option<String>,
     pub truncated: Option<bool>,
     pub exit_code: Option<i32>,
+    /// Present for a kind 22 shell call (J1).
+    pub shell: Option<Box<ShellCall>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

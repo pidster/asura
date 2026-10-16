@@ -9,6 +9,8 @@ const TERMINAL_CAPACITY: usize = HEADER + TRAILER + 47 + MAX_TEXT;
 const START_CAPACITY: usize = HEADER + TRAILER + 72;
 const CANCEL_CAPACITY: usize = HEADER + TRAILER + 25;
 const OWNER_CAPACITY: usize = HEADER + TRAILER;
+/// One maximum kind 23 frame: 4,286 bytes.
+const CAPTURE_CAPACITY: usize = HEADER + TRAILER + super::codec::MAX_CAPTURE_SETTLED_PAYLOAD;
 const MAX_MEMORY: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -425,6 +427,7 @@ impl Replay {
                     intent_frame: frame,
                     result_frame: None,
                     result_bytes: 0,
+                    shell: None,
                 });
             }
             Record::ToolIntent(p) => {
@@ -452,8 +455,11 @@ impl Replay {
                     intent_frame: frame,
                     result_frame: None,
                     result_bytes: 0,
+                    shell: None,
                 });
             }
+            Record::ShellIntent(p) => self.shell_intent(*p, frame)?,
+            Record::CaptureSettled(p) => self.capture_settled(*p, frame)?,
             Record::ToolResult(p) => {
                 let owner = self.owner_generation;
                 let op = self.operation_mut(p.operation, p.generation)?;
@@ -469,6 +475,15 @@ impl Replay {
                 )?;
                 let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
                 require(tool.result_frame.is_none())?;
+                if let Some(shell) = &tool.shell {
+                    // J1 order: admitted 22, 23, 15; refused 22, 15 status 3;
+                    // busy 22, 15 status 4.
+                    require(match shell.disposition {
+                        ShellDisposition::Admitted => shell.settled.is_some(),
+                        ShellDisposition::Refused => p.status == 3,
+                        ShellDisposition::Busy => p.status == 4,
+                    })?;
+                }
                 if tool.kind == SHELL_TOOL_KIND {
                     require(p.next_offset.is_none())?;
                 } else if p.status != 1 {
@@ -537,6 +552,94 @@ impl Replay {
             }
             Record::TurnTerminal(p) => self.terminal(p, frame)?,
         }
+        Ok(())
+    }
+    /// Kind 22 follows the kind 14 admission rules. An admitted record's job
+    /// and payload IDs must equal their derivations from this installation.
+    fn shell_intent(&mut self, p: ShellIntent, frame: Range<usize>) -> Result<()> {
+        p.validate()?;
+        if p.disposition == ShellDisposition::Admitted {
+            let payload = |kind| {
+                crate::payload::payload_id(
+                    self.installation_id,
+                    p.operation,
+                    p.generation,
+                    p.ordinal,
+                    kind,
+                )
+            };
+            require(
+                p.job == shell_job_id(p.operation, p.generation, p.ordinal)
+                    && p.stdout_payload == payload(crate::payload::ObjectKind::Stdout)
+                    && p.stderr_payload == payload(crate::payload::ObjectKind::Stderr),
+            )?;
+        }
+        // ToolRecord, ShellCall and the bounded display prefix.
+        self.charge(1536)?;
+        let sequence = next(self.sequence)?;
+        let owner = self.owner_generation;
+        let op = self.operation_mut(p.operation, p.generation)?;
+        require(
+            op.owner_generation == owner
+                && op.helper.is_some()
+                && op.cancel.is_none()
+                && p.ordinal as usize == op.tools.len() + 1
+                && op.tools.len() < 8
+                && op.tools.iter().all(|t| t.result_frame.is_some()),
+        )?;
+        op.tools.push(ToolRecord {
+            arguments: display_prefix(&format!("{} cwd={}", p.command, p.cwd), 192),
+            preview: None,
+            truncated: None,
+            exit_code: None,
+            create: None,
+            kind: SHELL_TOOL_KIND,
+            offset: 0,
+            limit: 0,
+            result_status: None,
+            intent_frame: frame,
+            result_frame: None,
+            result_bytes: 0,
+            shell: Some(Box::new(ShellCall {
+                disposition: p.disposition,
+                job: p.job,
+                stdout_payload: p.stdout_payload,
+                stderr_payload: p.stderr_payload,
+                intent_sequence: sequence,
+                rule_set_revision: p.rule_set_revision,
+                rule_set_digest: p.rule_set_digest,
+                settled: None,
+            })),
+        });
+        Ok(())
+    }
+    /// Kind 23 settles the pending admitted kind 22, once, before kind 15.
+    fn capture_settled(&mut self, p: CaptureSettled, frame: Range<usize>) -> Result<()> {
+        p.validate()?;
+        self.charge(256)?;
+        let sequence = next(self.sequence)?;
+        let owner = self.owner_generation;
+        let op = self.operation_mut(p.operation, p.generation)?;
+        require(op.owner_generation == owner && p.ordinal as usize == op.tools.len())?;
+        let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
+        require(tool.result_frame.is_none())?;
+        let shell = tool.shell.as_deref_mut().ok_or(ReplayError::Corrupt)?;
+        require(
+            shell.disposition == ShellDisposition::Admitted
+                && shell.settled.is_none()
+                && shell.rule_set_revision == p.rule_set_revision
+                && shell.rule_set_digest == p.rule_set_digest,
+        )?;
+        shell.settled = Some(ShellSettlement {
+            state: p.state,
+            reason: p.reason,
+            sequence,
+            streams: [
+                (p.stdout.stored_bytes, p.stdout.digest),
+                (p.stderr.stored_bytes, p.stderr.digest),
+            ],
+            frame,
+        });
         Ok(())
     }
     fn accept(&mut self, p: TurnAccepted, owner: u64, frame: Range<usize>) -> Result<()> {
@@ -1227,13 +1330,16 @@ impl Replay {
             let op = self.operations.get(&id).ok_or(ReplayError::Corrupt)?;
             self.reserved_bytes = TERMINAL_CAPACITY;
             self.reserved_frames = 1;
-            if op
-                .tools
-                .last()
-                .is_some_and(|tool| tool.result_frame.is_none())
-            {
+            if let Some(tool) = op.tools.last().filter(|tool| tool.result_frame.is_none()) {
                 self.reserved_bytes += HEADER + TRAILER + 43 + 16_384;
                 self.reserved_frames += 1;
+                // An admitted kind 22 also holds room for its kind 23.
+                if tool.shell.as_deref().is_some_and(|shell| {
+                    shell.disposition == ShellDisposition::Admitted && shell.settled.is_none()
+                }) {
+                    self.reserved_bytes += CAPTURE_CAPACITY;
+                    self.reserved_frames += 1;
+                }
             }
             if op.owner_generation == self.owner_generation {
                 self.reserved_bytes += OWNER_CAPACITY;

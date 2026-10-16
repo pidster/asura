@@ -185,10 +185,11 @@ fn acknowledged_committed_create_after_cancel_stays_success_but_is_not_delivered
     let result = mutation.result(MemoryCreateResult::Committed(receipt(&mutation.intent)), 6);
     active.tool = Some(LiveTool {
         create: Some(mutation),
-        shell_intent: None,
+        shell: None,
+        secret_digest: None,
         rejected: false,
         call,
-        deadline: now + Duration::from_secs(2),
+        deadline: Some(now + Duration::from_secs(2)),
         memory_ticket: None,
         intent_committed: true,
         dispatched: true,
@@ -201,9 +202,9 @@ fn acknowledged_committed_create_after_cancel_stays_success_but_is_not_delivered
         now,
     );
     let active = fixture.owner.active.as_ref().unwrap();
-    assert_eq!(active.tool_cache[0].1.status, Some(1));
+    assert_eq!(active.tool_cache[0].2.status, Some(1));
     assert_eq!(
-        active.tool_cache[0].1.text.as_deref(),
+        active.tool_cache[0].2.text.as_deref(),
         Some(result.text.as_str())
     );
     assert!(
@@ -263,6 +264,7 @@ fn pending_projection() -> Arc<journal::Replay> {
                 result_frame: None,
                 result_status: None,
                 result_bytes: 0,
+                shell: None,
             }],
         },
     );

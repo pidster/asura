@@ -26,3 +26,8 @@ asura-platform = { path = "../asura-platform", features = ["test-support"] }
 name = "embedded_memory"
 path = "tests/embedded_memory.rs"
 required-features = ["embedded-memory"]
+
+[[test]]
+name = "payload_store"
+path = "tests/payload_store.rs"
+required-features = ["test-support"]

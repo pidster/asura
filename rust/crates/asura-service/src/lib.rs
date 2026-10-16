@@ -1,11 +1,13 @@
 //! The sole service lifecycle reactor and shared command pipeline.
 mod audit;
+mod capture_worker;
 mod completion;
 mod config_worker;
 mod context;
 mod context_manager;
 mod context_observer;
 mod conversation;
+mod payload_owner;
 mod shell_worker;
 // Real service fixtures share the canonical process-wide writer owner.
 #[cfg(test)]
@@ -18,6 +20,9 @@ mod service_observer;
 include!(concat!(env!("OUT_DIR"), "/model-package.rs"));
 mod installation;
 pub mod model;
+/// Worker-layer harness for J1 qualification; never in production builds.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod tools;
 use asura_control::{
     ControlCodec, Direction, Frame, ProtocolError, encode_frame, pb, validate_semantics,

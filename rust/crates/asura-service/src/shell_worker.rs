@@ -1,17 +1,28 @@
 //! One retained shell slot. Filesystem preparation/cleanup never run on the reactor.
+//!
+//! J1 phases: `Setup` ends on spawn, a setup fault or cancel (no deadline,
+//! J1-Q4); `Running` ends when `ShellJob` settles (no deadline, J1-Q3);
+//! `Cleanup` runs scratch cleanup while the capture worker flushes;
+//! `Finalizing` waits for the sealed capture report. After a cancel trigger
+//! the existing L3 bound of 2.5 s also covers capture settlement (J1-Q1).
 use crate::{
+    capture_worker::{self, Message, Report},
     completion::Completion,
     tools::{self, Arguments, ExecutionError, Rejection},
 };
 use asura_platform::{
     RuntimeDirectory,
     events::WakeSender,
+    secrets::SecretVariable,
     shell::{
         PreparedShell, ShellCleanup, ShellError, ShellFailure, ShellJob, ShellRequest, ShellResult,
-        StopReason,
+        StopReason, Tails, render_tail,
     },
 };
-use asura_storage::authority::conversation::{ToolIntent, ToolResult};
+use asura_storage::authority::conversation::{
+    CaptureReason, CaptureSettled, CaptureState, CaptureStream, ShellDisposition, ShellIntent,
+    ToolResult,
+};
 use std::{
     sync::{
         Arc,
@@ -20,6 +31,9 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+
+/// L3: cleanup until unconfirmed, from the cancel trigger.
+const CLEANUP_BOUND: Duration = Duration::from_millis(2500);
 
 struct ThreadWork<T> {
     thread: JoinHandle<T>,
@@ -56,20 +70,50 @@ enum Phase {
     Setup(ThreadWork<SetupResult>),
     Running(ShellJob),
     Cleanup(ThreadWork<Cleaned>),
+    Finalizing,
     Repair {
         _cleanup: Option<ShellCleanup>,
         _job: Option<ShellJob>,
     },
 }
+/// What the process did: a settled result, or a failure before or at setup.
+enum Process {
+    Settled(ShellResult),
+    Failed(ShellError),
+}
+
+/// One shell call's dispatch: the committed kind 22, the rewritten call, the
+/// secret variables (moved into the request; spawn zeroizes them) and the
+/// capture worker's start.
+pub(crate) struct Dispatch {
+    pub runtime: RuntimeDirectory,
+    pub scope: tools::ExecutionScope,
+    pub call: tools::Call,
+    pub intent: ShellIntent,
+    pub secrets: Vec<SecretVariable>,
+    pub capture: capture_worker::Start,
+}
+
+/// A settled call: kind 23, then kind 15, and the capture worker that
+/// outlives the call (installing, or abandoned after `unconfirmed`).
+pub(crate) struct ShellOutput {
+    pub settled: CaptureSettled,
+    pub result: ToolResult,
+    pub capture: Option<capture_worker::Handle>,
+}
+
 struct Active {
-    intent: ToolIntent,
+    intent: ShellIntent,
     phase: Option<Phase>,
-    setup_deadline: Instant,
-    command_deadline: Instant,
+    /// Set at the cancel trigger: L3 for cleanup and capture settlement.
     cleanup_deadline: Option<Instant>,
     stop: Option<StopReason>,
-    output: Option<ToolResult>,
+    process: Option<Process>,
     repair: bool,
+    capture: Option<capture_worker::Handle>,
+    report: Option<Box<Report>>,
+    /// The capture worker could not start: settle `not_started`.
+    capture_unavailable: bool,
 }
 #[derive(Default)]
 pub(crate) struct Worker {
@@ -87,64 +131,77 @@ impl Worker {
             }
         }
     }
-    /// Caller has committed this exact intent and rechecked the execution grant.
-    pub(crate) fn start(
-        &mut self,
-        runtime: RuntimeDirectory,
-        scope: tools::ExecutionScope,
-        call: tools::Call,
-        intent: ToolIntent,
-        deadline: Instant,
-    ) -> Result<(), ExecutionError> {
+    pub(crate) fn wake(&self) -> Option<WakeSender> {
+        self.wake.clone()
+    }
+    /// Caller has committed this exact kind 22 and rechecked the execution
+    /// grant. The call carries the rewrite; it is compared with kind 22, not
+    /// with the raw arguments (G8). There is no deadline (J1-Q3, J1-Q4).
+    pub(crate) fn start(&mut self, dispatch: Dispatch) -> Result<(), ExecutionError> {
         if self.active.is_some() {
             return Err(ExecutionError::Rejected(Rejection::Busy));
         }
-        let (command, cwd) = intent
-            .shell_arguments()
-            .map_err(|_| ExecutionError::Rejected(Rejection::InvalidArguments))?;
+        let Dispatch {
+            runtime,
+            scope,
+            call,
+            intent,
+            secrets,
+            capture,
+        } = dispatch;
         let Arguments::Shell {
             command: proposed,
             cwd: proposed_cwd,
-            timeout_seconds,
+            ..
         } = &call.arguments
         else {
             return Err(ExecutionError::Rejected(Rejection::Denied));
         };
-        if command != proposed
-            || cwd != proposed_cwd
-            || intent.limit != *timeout_seconds
+        if intent.disposition != ShellDisposition::Admitted
+            || intent.command != *proposed
+            || intent.cwd != *proposed_cwd
             || intent.operation != call.operation
             || intent.generation != call.generation
             || intent.ordinal != call.ordinal
+            || intent.job == [0; 16]
             || scope.project == [0; 16]
         {
             return Err(ExecutionError::Rejected(Rejection::IdentityConflict));
         }
-        let now = Instant::now();
-        if deadline <= now || deadline.duration_since(now) > Duration::from_millis(intent.offset) {
-            return Err(ExecutionError::Rejected(Rejection::Expired));
-        }
-        let request = ShellRequest {
-            job_id: intent
-                .shell_job_id()
-                .map_err(|_| ExecutionError::Rejected(Rejection::InvalidArguments))?,
-            command: command.into(),
-            cwd: Some(cwd.into()),
-            deadline,
-            // The model shell's rewrite and secret variables arrive with SL3.
-            secrets: Vec::new(),
+        let mut capture = capture;
+        capture.wake = self.wake.clone();
+        let handle = capture_worker::start(capture).ok();
+        let Some(handle) = handle else {
+            // The capture thread could not start: `not_started`, no process.
+            self.active = Some(Active {
+                intent,
+                phase: Some(Phase::Finalizing),
+                cleanup_deadline: None,
+                stop: None,
+                process: Some(Process::Failed(ShellError::Unavailable)),
+                repair: false,
+                capture: None,
+                report: None,
+                capture_unavailable: true,
+            });
+            return Ok(());
         };
-        let setup_deadline = deadline.min(now + Duration::from_secs(2));
-        self.begin(intent, deadline, setup_deadline, move |cancel| {
+        let request = ShellRequest {
+            job_id: intent.job,
+            command: intent.command.clone(),
+            cwd: Some(intent.cwd.clone()),
+            deadline: None,
+            secrets,
+        };
+        let sink = handle.output_sink();
+        let work = spawn("asura-shell-setup", self.wake.as_ref(), move |cancel| {
             let failed = |error| Failure {
                 error,
                 cleanup: None,
             };
+            // Setup checks only cancellation (J1-Q4).
             if cancel.load(Ordering::Acquire) {
                 return Err(failed(ShellError::Cancelled));
-            }
-            if Instant::now() >= setup_deadline {
-                return Err(failed(ShellError::Deadline));
             }
             let executable =
                 std::env::current_exe().map_err(|_| failed(ShellError::Unavailable))?;
@@ -153,35 +210,46 @@ impl Worker {
             if project.device != scope.device || project.inode != scope.inode {
                 return Err(failed(ShellError::Denied));
             }
+            #[cfg(feature = "test-support")]
+            setup_gate(&runtime, cancel);
             let prepared = PreparedShell::prepare(runtime, &project, request, cancel)
                 .map_err(Failure::from)?;
-            // Consuming spawn returns the cleanup token if preparation expired.
-            if Instant::now() >= setup_deadline {
-                cancel.store(true, Ordering::Release);
+            prepared
+                .spawn(&executable, cancel, sink)
+                .map_err(Failure::from)
+        });
+        let work = match work {
+            Ok(work) => work,
+            Err(error) => {
+                handle.sink.close();
+                handle.cancel();
+                self.active = Some(Active {
+                    intent,
+                    phase: Some(Phase::Finalizing),
+                    cleanup_deadline: None,
+                    stop: None,
+                    process: Some(Process::Failed(ShellError::Unavailable)),
+                    repair: false,
+                    capture: Some(handle),
+                    report: None,
+                    capture_unavailable: false,
+                });
+                return match error {
+                    ExecutionError::WorkerFailed => Ok(()),
+                    other => Err(other),
+                };
             }
-            prepared.spawn(&executable, cancel).map_err(Failure::from)
-        })
-    }
-    fn begin(
-        &mut self,
-        intent: ToolIntent,
-        deadline: Instant,
-        setup_deadline: Instant,
-        run: impl FnOnce(&AtomicBool) -> SetupResult + Send + 'static,
-    ) -> Result<(), ExecutionError> {
-        if self.active.is_some() {
-            return Err(ExecutionError::Rejected(Rejection::Busy));
-        }
-        let work = spawn("asura-shell-setup", self.wake.as_ref(), run)?;
+        };
         self.active = Some(Active {
             intent,
             phase: Some(Phase::Setup(work)),
-            setup_deadline,
-            command_deadline: deadline,
             cleanup_deadline: None,
             stop: None,
-            output: None,
+            process: None,
             repair: false,
+            capture: Some(handle),
+            report: None,
+            capture_unavailable: false,
         });
         Ok(())
     }
@@ -197,6 +265,15 @@ impl Worker {
     pub(crate) fn settlement_expired(&self) -> bool {
         self.active.as_ref().is_some_and(|a| a.repair)
     }
+    /// Whether the active call's capture is paused (J1-Q2).
+    pub(crate) fn capture_paused(&self) -> bool {
+        self.active
+            .as_ref()
+            .and_then(|a| a.capture.as_ref())
+            .is_some_and(|c| c.paused)
+    }
+    /// A cancel trigger: turn cancel, steering, turn failure, journal
+    /// unavailability or shutdown.
     pub(crate) fn cancel(&mut self, reason: StopReason) {
         if let Some(active) = &mut self.active {
             stop(active, reason, Instant::now());
@@ -205,17 +282,11 @@ impl Worker {
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
         let active = self.active.as_ref()?;
         let stage = match active.phase.as_ref()? {
-            Phase::Setup(w) => w
-                .next_deadline(now)
-                .into_iter()
-                .chain(active.stop.is_none().then_some(active.setup_deadline))
-                .min(),
-            Phase::Running(job) => job
-                .next_deadline()
-                .into_iter()
-                .chain(active.stop.is_none().then_some(active.command_deadline))
-                .min(),
+            Phase::Setup(w) => w.next_deadline(now),
+            Phase::Running(job) => job.next_deadline(),
             Phase::Cleanup(w) => w.next_deadline(now),
+            // The capture worker's messages wake the reactor.
+            Phase::Finalizing => active.report.is_some().then_some(now),
             Phase::Repair { .. } => None,
         };
         stage
@@ -227,20 +298,17 @@ impl Worker {
             )
             .min()
     }
-    /// Emits once, only after actual ownership and scratch cleanup settle.
-    pub(crate) fn poll(&mut self, now: Instant) -> Option<ToolResult> {
+    /// Emits once, only after actual ownership and scratch cleanup settle,
+    /// and after the sealed capture report or, after a cancel trigger, the
+    /// L3 bound (J1-Q1).
+    pub(crate) fn poll(&mut self, now: Instant) -> Option<ShellOutput> {
         let mut active = self.active.take()?;
-        if active.stop.is_none()
-            && (now >= active.command_deadline
-                || matches!(active.phase, Some(Phase::Setup(_))) && now >= active.setup_deadline)
-        {
-            stop(&mut active, StopReason::Deadline, now);
-        }
-        if active.cleanup_deadline.is_some_and(|d| now >= d) {
+        drain_capture(&mut active, now);
+        let past_bound = active.cleanup_deadline.is_some_and(|d| now >= d);
+        let phase = active.phase.take().expect("retained stage");
+        if past_bound && !matches!(phase, Phase::Finalizing) {
             active.repair = true;
         }
-        let phase = active.phase.take().expect("retained stage");
-        let mut complete = false;
         active.phase = Some(match phase {
             Phase::Setup(work) if work.thread.is_finished() => match work.thread.join() {
                 Ok(Ok(mut job)) => {
@@ -255,7 +323,11 @@ impl Worker {
                         Some(_) => ShellError::Cancelled,
                         None => failure.error,
                     };
-                    active.output = Some(failed(&active.intent, error));
+                    active.process = Some(Process::Failed(error));
+                    // No process ran: the producer side ends now.
+                    if let Some(capture) = &active.capture {
+                        capture.sink.close();
+                    }
                     if let Some(token) = failure.cleanup {
                         self.cleanup(&mut active, token, now)
                     } else if matches!(failure.error, ShellError::CleanupUnconfirmed) {
@@ -265,11 +337,7 @@ impl Worker {
                             _job: None,
                         }
                     } else {
-                        complete = true;
-                        Phase::Repair {
-                            _cleanup: None,
-                            _job: None,
-                        }
+                        Phase::Finalizing
                     }
                 }
                 Err(_) => {
@@ -282,25 +350,20 @@ impl Worker {
             },
             Phase::Running(mut job) => {
                 if job.poll(now).is_err() {
-                    if active.output.is_none() {
-                        active.output = Some(failed(&active.intent, ShellError::Protocol));
+                    if active.process.is_none() {
+                        active.process = Some(Process::Failed(ShellError::Protocol));
                     }
                     job.stop(StopReason::Cancelled);
-                    active
-                        .cleanup_deadline
-                        .get_or_insert(now + Duration::from_millis(2500));
+                    active.cleanup_deadline.get_or_insert(now + CLEANUP_BOUND);
+                    if let Some(capture) = &active.capture {
+                        capture.cancel();
+                    }
                 }
                 if job.settled() {
-                    if let Some(result) = job.result() {
-                        if !result.cleanup_confirmed {
-                            active.repair = true;
-                            Phase::Repair {
-                                _cleanup: None,
-                                _job: Some(job),
-                            }
-                        } else {
-                            if active.output.is_none() {
-                                active.output = Some(mapped_result(&active.intent, &result));
+                    match job.result() {
+                        Some(result) if result.cleanup_confirmed => {
+                            if active.process.is_none() {
+                                active.process = Some(Process::Settled(result));
                             }
                             match job.take_cleanup() {
                                 Some(token) => self.cleanup(&mut active, token, now),
@@ -313,11 +376,12 @@ impl Worker {
                                 }
                             }
                         }
-                    } else {
-                        active.repair = true;
-                        Phase::Repair {
-                            _cleanup: None,
-                            _job: Some(job),
+                        _ => {
+                            active.repair = true;
+                            Phase::Repair {
+                                _cleanup: None,
+                                _job: Some(job),
+                            }
                         }
                     }
                 } else {
@@ -325,13 +389,7 @@ impl Worker {
                 }
             }
             Phase::Cleanup(work) if work.thread.is_finished() => match work.thread.join() {
-                Ok(cleaned) if cleaned.result.is_ok() => {
-                    complete = true;
-                    Phase::Repair {
-                        _cleanup: None,
-                        _job: None,
-                    }
-                }
+                Ok(cleaned) if cleaned.result.is_ok() => Phase::Finalizing,
                 Ok(cleaned) => {
                     active.repair = true;
                     Phase::Repair {
@@ -349,17 +407,27 @@ impl Worker {
             },
             phase => phase,
         });
-        if complete && active.output.is_some() {
-            active.output.take()
-        } else {
-            self.active = Some(active);
-            None
+        if matches!(active.phase, Some(Phase::Finalizing)) {
+            // Keep moving bytes that wait on the reactor; then end the producer.
+            if let Some(capture) = &active.capture {
+                capture.sink.flush();
+                if !capture.sink.pending() {
+                    capture.sink.close();
+                }
+            }
+            drain_capture(&mut active, now);
+            let unconfirmed = active.report.is_none()
+                && !active.capture_unavailable
+                && active.cleanup_deadline.is_some_and(|d| now >= d);
+            if active.report.is_some() || unconfirmed || active.capture_unavailable {
+                return Some(output(active));
+            }
         }
+        self.active = Some(active);
+        None
     }
     fn cleanup(&self, active: &mut Active, token: ShellCleanup, now: Instant) -> Phase {
-        let deadline = *active
-            .cleanup_deadline
-            .get_or_insert(now + Duration::from_millis(2500));
+        let deadline = *active.cleanup_deadline.get_or_insert(now + CLEANUP_BOUND);
         // A failed thread spawn must not drop the unique cleanup token.
         // The reactor locks this handoff only if spawn failed: no thread exists
         // then, so no producer can hold the lock or block the reactor.
@@ -388,10 +456,49 @@ impl Worker {
         }
     }
 }
+
+/// Test-support setup gate (J1T-06): holds setup while `HOME/shell-hold-setup`
+/// exists; only cancellation releases it early.
+#[cfg(feature = "test-support")]
+fn setup_gate(runtime: &RuntimeDirectory, cancel: &AtomicBool) {
+    if let Some(home) = runtime.scratch_home_for_test() {
+        while home.join("shell-hold-setup").exists() && !cancel.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn drain_capture(active: &mut Active, now: Instant) {
+    let Some(capture) = active.capture.as_mut() else {
+        return;
+    };
+    let mut fault = false;
+    for message in capture.drain() {
+        match message {
+            Message::Sealed(report) => active.report = Some(report),
+            Message::Fault(reason) => {
+                tracing::warn!(reason = reason.as_str(), "shell_capture_fault");
+                fault = true;
+            }
+            Message::Paused(reason) => {
+                tracing::info!(reason = ?reason, "shell_capture_paused");
+            }
+            _ => {}
+        }
+    }
+    if fault {
+        // A capture fault is a cancel trigger: stop the job, keep the prefix.
+        stop(active, StopReason::Cancelled, now);
+    }
+}
+
 fn stop(active: &mut Active, reason: StopReason, now: Instant) {
     if active.stop.is_none() {
         active.stop = Some(reason);
-        active.cleanup_deadline = Some(now + Duration::from_millis(2500));
+        active.cleanup_deadline.get_or_insert(now + CLEANUP_BOUND);
+    }
+    if let Some(capture) = &active.capture {
+        capture.cancel();
     }
     match active.phase.as_mut() {
         Some(Phase::Setup(work)) => work.cancel.store(true, Ordering::Release),
@@ -399,7 +506,129 @@ fn stop(active: &mut Active, reason: StopReason, now: Instant) {
         _ => {}
     }
 }
-fn mapped_result(intent: &ToolIntent, result: &ShellResult) -> ToolResult {
+
+fn exit_facts(process: Option<&Process>) -> (u8, u32) {
+    match process {
+        Some(Process::Settled(result)) if result.failure.is_none() => {
+            match (result.exit_code, result.signal) {
+                (Some(code), None) if (0..=255).contains(&code) => (1, code as u32),
+                (None, Some(signal)) if (1..=127).contains(&signal) => (2, signal as u32),
+                _ => (0, 0),
+            }
+        }
+        _ => (0, 0),
+    }
+}
+
+/// Builds kind 23 and kind 15 for a settled call.
+fn output(mut active: Active) -> ShellOutput {
+    let (exit_kind, exit_value) = exit_facts(active.process.as_ref());
+    let intent = &active.intent;
+    let report = active.report.take();
+    let (state, reason, streams, distinct_numbers, numbers, pauses, final_reservation) =
+        match &report {
+            Some(report) => (
+                report.state,
+                report.reason,
+                [report.stream(0), report.stream(1)],
+                report.distinct_numbers,
+                report.numbers.clone(),
+                (report.pause_count, report.first_pause_ms, report.paused_ms),
+                report.final_reservation,
+            ),
+            None if active.capture_unavailable => (
+                CaptureState::NotStarted,
+                CaptureReason::None,
+                [CaptureStream::default(), CaptureStream::default()],
+                0,
+                Vec::new(),
+                (0, 0, 0),
+                0,
+            ),
+            None => {
+                // J1-Q1: no sealed report within L3 after the cancel trigger.
+                let (accepted, discarded, ended) = active
+                    .capture
+                    .as_ref()
+                    .map(|c| c.sink.counts())
+                    .unwrap_or_default();
+                let stream = |i: usize| CaptureStream {
+                    observed_bytes: accepted[i],
+                    discarded_bytes: discarded[i],
+                    eof: ended[i],
+                    ..CaptureStream::default()
+                };
+                (
+                    CaptureState::Unconfirmed,
+                    CaptureReason::SettlementUnconfirmed,
+                    [stream(0), stream(1)],
+                    0,
+                    Vec::new(),
+                    (0, 0, 0),
+                    asura_storage::payload::RESERVATION_STEP,
+                )
+            }
+        };
+    let not_started = state == CaptureState::NotStarted;
+    let [stdout, stderr] = streams;
+    let settled = CaptureSettled {
+        operation: intent.operation,
+        generation: intent.generation,
+        ordinal: intent.ordinal,
+        state,
+        reason,
+        exit_kind: if not_started { 0 } else { exit_kind },
+        exit_value: if not_started { 0 } else { exit_value },
+        rule_set_revision: intent.rule_set_revision,
+        rule_set_digest: intent.rule_set_digest,
+        stdout,
+        stderr,
+        distinct_numbers,
+        numbers,
+        pause_count: pauses.0,
+        first_pause_ms: pauses.1,
+        paused_ms: pauses.2,
+        final_reservation,
+    };
+    // Kind 15 tails come from the redacted stream only; `unconfirmed` has none.
+    let tails = report.as_ref().map_or_else(Tails::default, |report| {
+        let render = |i: usize| {
+            let s = &report.streams[i];
+            let (text, cut) = render_tail(&s.tail);
+            (text, cut || s.stored > s.tail.len() as u64)
+        };
+        let (stdout, a) = render(0);
+        let (stderr, b) = render(1);
+        Tails {
+            stdout,
+            stderr,
+            truncated: a || b,
+        }
+    });
+    let result = match active.process.as_ref() {
+        Some(Process::Settled(result)) => mapped_result(intent, result, &tails, state),
+        Some(Process::Failed(error)) => failed(intent, *error),
+        None => failed(intent, ShellError::Protocol),
+    };
+    let capture = active.capture.take();
+    if state == CaptureState::Unconfirmed
+        && let Some(capture) = &capture
+    {
+        capture.abandon();
+    }
+    ShellOutput {
+        settled,
+        result,
+        capture,
+    }
+}
+
+fn mapped_result(
+    intent: &ShellIntent,
+    result: &ShellResult,
+    tails: &Tails,
+    capture: CaptureState,
+) -> ToolResult {
     // A settled setup failure proves cleanup, not successful command execution.
     if let Some(error) = result.failure {
         return failed(intent, error);
@@ -415,7 +644,7 @@ fn mapped_result(intent: &ToolIntent, result: &ShellResult) -> ToolResult {
         Some(StopReason::Cancelled | StopReason::LeaseEnded) => 6,
         None => 1,
     };
-    let text = result.render_text();
+    let text = result.render_text(tails, capture.as_str());
     if text.len() > 16_384 {
         return failed(intent, ShellError::Protocol);
     }
@@ -426,11 +655,11 @@ fn mapped_result(intent: &ToolIntent, result: &ShellResult) -> ToolResult {
         status,
         text,
         next_offset: None,
-        truncated: result.truncated,
+        truncated: tails.truncated,
     }
 }
 
-fn failed(intent: &ToolIntent, error: ShellError) -> ToolResult {
+pub(crate) fn failed(intent: &ShellIntent, error: ShellError) -> ToolResult {
     let (status, text) = match error {
         ShellError::Invalid => (3, "shell_invalid_arguments"),
         ShellError::Denied => (2, "shell_denied"),
@@ -478,192 +707,4 @@ fn spawn<T: Send + 'static>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn intent() -> ToolIntent {
-        ToolIntent {
-            operation: [1; 16],
-            generation: 1,
-            ordinal: 1,
-            kind: 16,
-            path: "true\0.".into(),
-            offset: 1000,
-            limit: 30,
-        }
-    }
-    fn finish(worker: &mut Worker) -> Option<ToolResult> {
-        let end = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(result) = worker.poll(Instant::now()) {
-                return Some(result);
-            }
-            if worker.settlement_expired()
-                && matches!(
-                    worker.active.as_ref().and_then(|a| a.phase.as_ref()),
-                    Some(Phase::Repair { .. })
-                )
-            {
-                return None;
-            }
-            assert!(Instant::now() < end, "worker did not settle");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-    #[test]
-    fn stalled_setup_retains_slot_after_deadline_and_accepts_late_settlement() {
-        let mut worker = Worker::default();
-        let (release, blocked) = std::sync::mpsc::sync_channel(1);
-        let (reader, wake) = asura_platform::events::wake_pair().unwrap();
-        worker.register(wake);
-        let now = Instant::now();
-        worker
-            .begin(
-                intent(),
-                now + Duration::from_secs(10),
-                now,
-                move |cancel| {
-                    blocked.recv_timeout(Duration::from_secs(2)).unwrap();
-                    assert!(cancel.load(Ordering::Acquire));
-                    Err(Failure {
-                        error: ShellError::Cancelled,
-                        cleanup: None,
-                    })
-                },
-            )
-            .unwrap();
-        let before = Instant::now();
-        assert!(worker.poll(now).is_none());
-        assert!(before.elapsed() < Duration::from_millis(100));
-        assert!(!worker.is_settled());
-        assert_eq!(
-            worker.begin(intent(), now, now, |_| unreachable!()),
-            Err(ExecutionError::Rejected(Rejection::Busy))
-        );
-        assert!(worker.poll(now + Duration::from_secs(3)).is_none());
-        assert!(worker.settlement_expired());
-        assert!(worker.next_deadline(now + Duration::from_secs(3)).is_none());
-        release.send(()).unwrap();
-        let result = finish(&mut worker).unwrap();
-        assert_eq!(result.status, 5);
-        assert!(worker.is_settled());
-        reader.drain().unwrap();
-        assert!(worker.poll(Instant::now()).is_none());
-    }
-    #[test]
-    fn completion_signal_is_not_thread_settlement_or_permission_to_replace() {
-        let mut worker = Worker::default();
-        let (release, blocked) = std::sync::mpsc::sync_channel(1);
-        let now = Instant::now();
-        worker
-            .begin(
-                intent(),
-                now + Duration::from_secs(10),
-                now + Duration::from_secs(2),
-                move |_| {
-                    blocked.recv_timeout(Duration::from_secs(2)).unwrap();
-                    Err(Failure {
-                        error: ShellError::Unavailable,
-                        cleanup: None,
-                    })
-                },
-            )
-            .unwrap();
-        if let Some(Phase::Setup(work)) = worker.active.as_ref().unwrap().phase.as_ref() {
-            work.completion.finish();
-        }
-        assert!(worker.next_deadline(now).is_some());
-        assert!(worker.poll(now).is_none());
-        assert!(!worker.is_settled());
-        worker.cancel(StopReason::Cancelled);
-        release.send(()).unwrap();
-        assert_eq!(finish(&mut worker).unwrap().status, 6);
-    }
-    #[test]
-    fn cleanup_deadline_retains_thread_then_success_or_failure_is_handled_once() {
-        for succeeds in [true, false] {
-            let now = Instant::now();
-            let (release, blocked) = std::sync::mpsc::sync_channel(1);
-            let work = spawn("shell-cleanup-fixture", None, move |_| {
-                blocked.recv_timeout(Duration::from_secs(2)).unwrap();
-                Cleaned {
-                    token: None,
-                    result: if succeeds {
-                        Ok(())
-                    } else {
-                        Err(ShellError::Io)
-                    },
-                }
-            })
-            .unwrap();
-            let mut worker = Worker {
-                wake: None,
-                active: Some(Active {
-                    intent: intent(),
-                    phase: Some(Phase::Cleanup(work)),
-                    setup_deadline: now,
-                    command_deadline: now + Duration::from_secs(10),
-                    cleanup_deadline: Some(now),
-                    stop: None,
-                    output: Some(failed(&intent(), ShellError::Deadline)),
-                    repair: false,
-                }),
-            };
-            assert!(worker.poll(now).is_none());
-            assert!(worker.settlement_expired());
-            assert!(!worker.is_settled());
-            assert!(worker.next_deadline(now).is_none());
-            release.send(()).unwrap();
-            let result = finish(&mut worker);
-            if succeeds {
-                assert_eq!(result.unwrap().status, 5);
-                assert!(worker.is_settled());
-            } else {
-                assert!(result.is_none());
-                assert!(!worker.is_settled());
-                assert!(worker.next_deadline(Instant::now()).is_none());
-                assert_eq!(
-                    worker.begin(intent(), now, now, |_| unreachable!()),
-                    Err(ExecutionError::Rejected(Rejection::Busy))
-                );
-            }
-        }
-    }
-    #[test]
-    fn settled_setup_failures_never_become_successful_command_results() {
-        let mut result = ShellResult {
-            exit_code: None,
-            signal: None,
-            reason: None,
-            failure: None,
-            stdout: "untrusted capture".into(),
-            stderr: String::new(),
-            truncated: true,
-            cleanup_confirmed: true,
-        };
-        for (error, status) in [
-            (ShellError::Invalid, 3),
-            (ShellError::Denied, 2),
-            (ShellError::Deadline, 5),
-            (ShellError::Cancelled, 6),
-            (ShellError::Unavailable, 4),
-            (ShellError::Protocol, 4),
-            (ShellError::CleanupUnconfirmed, 4),
-            (ShellError::Io, 4),
-        ] {
-            result.failure = Some(error);
-            let mapped = mapped_result(&intent(), &result);
-            assert_eq!(mapped.status, status);
-            assert!(!mapped.truncated);
-            assert!(mapped.next_offset.is_none());
-            assert!(!mapped.text.contains("untrusted capture"));
-        }
-        result.failure = None;
-        assert_eq!(mapped_result(&intent(), &result).status, 4);
-        result.exit_code = Some(17);
-        assert_eq!(mapped_result(&intent(), &result).status, 1);
-        result.reason = Some(StopReason::Deadline);
-        assert_eq!(mapped_result(&intent(), &result).status, 5);
-        result.failure = Some(ShellError::Denied);
-        assert_eq!(mapped_result(&intent(), &result).status, 2);
-    }
-}
+mod tests;

@@ -306,7 +306,7 @@ class Fixture:
                     trial.send(b"\x1b")
                     end = time.monotonic() + remaining()
                     while "Use this directory as a project?" in trial.screen.text():
-                        assert time.monotonic() < end, trial.screen.text()
+                        assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
                         trial.read(0.025)
             return trial
         except Exception:
@@ -792,7 +792,7 @@ def repeated_initialization(fixture):
         trial.send(b"\x1b")
         end = time.monotonic() + remaining()
         while "Use this directory as a project?" in trial.screen.text():
-            assert time.monotonic() < end, trial.screen.text()
+            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
             trial.read(0.025)
         code, projects, _ = fixture.command("project", "list")
         assert code == 0 and b"No projects." in projects, projects
@@ -830,7 +830,7 @@ def repeated_initialization(fixture):
         # Wait for the panel to close before the next command.
         end = time.monotonic() + remaining()
         while "Setup · Esc closes" in trial.screen.text():
-            assert time.monotonic() < end, trial.screen.text()
+            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
             trial.read(0.025)
 
     def command(trial, text, expected):
@@ -854,7 +854,7 @@ def repeated_initialization(fixture):
                 trial.send(b"\x1b")
                 end = time.monotonic() + remaining(5)
                 while "Tools · Esc closes" in trial.screen.text():
-                    assert time.monotonic() < end, trial.screen.text()
+                    assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
                     trial.read(0.025)
             screen = command(trial, "/audit 4", "Audit · Esc closes")
             trial.until(b"Window: recent", plain=True)
@@ -862,7 +862,7 @@ def repeated_initialization(fixture):
             trial.send(b"\x1b")
             end = time.monotonic() + remaining(5)
             while "Audit · Esc closes" in trial.screen.text():
-                assert time.monotonic() < end, trial.screen.text()
+                assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
                 trial.read(0.025)
             screen = command(trial, "/audit 17", "Use /audit [limit]")
             assert "/audit 17" in screen, screen
@@ -1104,7 +1104,7 @@ def queue_history_with_provider(fixture, source, endpoint):
             trial.send(b"\x1b")
             end = time.monotonic() + remaining(5)
             while "Input queue" in trial.screen.text():
-                assert time.monotonic() < end, trial.screen.text()
+                assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
                 trial.read(0.025)
             trial.send(f"queue-history-admission-{count}\r".encode())
             trial.until(b"Generating", plain=True, limit=30, reject="request_conflict")
@@ -1228,14 +1228,14 @@ def native_conversation(fixture, source):
         # discovers its operation instead of resubmitting the queued prompt.
         end = time.monotonic() + remaining(120)
         while trial.screen.text().count("PINE") < 2 or "Complete" not in trial.screen.text():
-            assert time.monotonic() < end, trial.screen.text()
+            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
             trial.read(0.025)
         # Advance the same conversation past the queued generation before restart.
         trial.send(b"Reply with only BIRCH.\r")
         end = time.monotonic() + remaining(65)
         while trial.screen.text().count("BIRCH") < 2 or "Complete" not in trial.screen.text():
             assert "request_conflict" not in trial.screen.text(), trial.screen.text()
-            assert time.monotonic() < end, trial.screen.text()
+            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
             trial.read(0.025)
         trial.send(b"/queue\r")
         trial.until(b"Input queue", plain=True)
@@ -1252,7 +1252,7 @@ def native_conversation(fixture, source):
         end = time.monotonic() + remaining(65)
         while trial.screen.text().count("MAPLE") < 2 or "Complete" not in trial.screen.text():
             assert "request_conflict" not in trial.screen.text(), trial.screen.text()
-            assert time.monotonic() < end, trial.screen.text()
+            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
             trial.read(0.025)
         trial.send(b"/quit\r")
         trial.finish()
@@ -1547,6 +1547,213 @@ def rich_activity(fixture, source, multipass=False):
         assert not errors, errors
 
 
+def shell_capture(fixture, source):
+    """J1/SL3 end-to-end through the real TUI, service, helper and a scripted
+    loopback model: J1T-24 (placeholders in the result and activity),
+    J1T-25 fixture part (the TUI shows the rewritten command; it runs),
+    J1T-26 (typing within 100 ms during a secret flood), J1T-21 (typing
+    during a stalled capture), J1T-22 (restart and inspect the call) and
+    J1T-08 (a visible busy result). The stalled-capture step needs a
+    test-support build of the fixture binary."""
+    import threading
+
+    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    (fixture.root / "asura-model").chmod(0o700)
+    project = fixture.root / "project"
+    project.mkdir(mode=0o700)
+    first = "ghp_" + "Pw3" * 12
+    second = "ghp_" + "Mz6" * 12
+    (project / ".env").write_text(f"GITHUB_TOKEN={first}\nPLAIN=visible\n")
+    flood = ("i=0; while [ $i -lt 3000 ]; do printf 'line %d token: %s\\n' $i "
+             f"\"{second}\"; i=$((i+1)); done; printf flood-done")
+    script = [
+        {"command": "cat .env", "cwd": "."},
+        {"command": f"printf '%s' \"{second}\" > out.txt; printf rewritten-ok", "cwd": "."},
+        {"command": flood, "cwd": "."},
+        None,
+        {"command": "while :; do printf '%0200d\\n' 1; done", "cwd": "."},
+        None,
+        {"command": "printf after-restart", "cwd": "."},
+        None,
+        {"command": "printf should-not-run > busy.txt", "cwd": "."},
+        None,
+    ]
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    listener.settimeout(0.1)
+    endpoint = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    stopped = threading.Event()
+    errors = []
+    tool_messages = []
+
+    def serve():
+        end = time.monotonic() + 240
+        try:
+            while not stopped.is_set() and time.monotonic() < end:
+                try:
+                    peer, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                with peer:
+                    peer.settimeout(5)
+                    request = bytearray()
+                    while True:
+                        data = peer.recv(65536)
+                        if not data:
+                            break
+                        request.extend(data)
+                        if b"\r\n\r\n" in request:
+                            header, body = request.split(b"\r\n\r\n", 1)
+                            length = next((int(line.split(b":", 1)[1]) for line in header.split(b"\r\n")
+                                           if line.lower().startswith(b"content-length:")), 0)
+                            if len(body) >= length:
+                                break
+                    if request.startswith(b"POST /api/show "):
+                        response = {"capabilities": ["completion", "tools"],
+                                    "model_info": {"fixture.context_length": 16384}}
+                    elif request.startswith(b"GET /api/version "):
+                        response = {"version": "0.34.4"}
+                    elif request.startswith(b"POST /api/chat "):
+                        chat = json.loads(body[:length])
+                        for message in chat["messages"]:
+                            if message.get("role") == "tool":
+                                tool_messages.append(message.get("content", ""))
+                        step = script.pop(0) if script else None
+                        peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                        if step is None:
+                            reply = {"message": {"role": "assistant", "content": "COMPLETE"},
+                                     "done": True, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3}
+                        else:
+                            reply = {"message": {"role": "assistant", "content": "",
+                                                 "tool_calls": [{"function": {"name": "shell", "arguments": step}}]},
+                                     "done": True, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}
+                        peer.sendall(json.dumps(reply).encode() + b"\n")
+                        continue
+                    else:
+                        continue
+                    payload = json.dumps(response).encode()
+                    peer.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+        except Exception as error:
+            if not stopped.is_set():
+                errors.append(error)
+
+    server = threading.Thread(target=serve, name="asura-shell-capture-fixture")
+    server.start()
+    trial = None
+    home = fixture.root / "home"
+    try:
+        trial = fixture.launch()
+        trial.resize(140, 45)
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        for key, value in [("providers.ollama.endpoint", endpoint), ("model", "ollama:fixture")]:
+            trial.send(f"/config set {key} {value}\r".encode())
+            trial.until(f"Saved {key}".encode(), plain=True)
+            trial.send(b"\x1b")
+            trial.idle(0.1)
+        trial.send(b"Run the capture fixture.\r")
+        # J1T-25 (fixture part): the activity shows the rewritten command.
+        trial.until(b"${ASURA_SECRET_1}", plain=True, limit=30, reject="Incomplete response")
+        # J1T-26: typing stays within 100 ms during the secret flood.
+        trial.until(b"line ", plain=True, limit=30)
+        flood_typing = max(typed_within_100ms(trial, ch) for ch in [b"a", b"b", b"c"])
+        trial.until(b"COMPLETE", plain=True, limit=60, reject="Incomplete response")
+        trial.idle(0.2)
+        screen = trial.screen.text()
+        assert first not in screen and second not in screen, "raw secret on screen"
+        assert (project / "out.txt").read_text() == second, "the rewritten command used the value"
+        (project / "out.txt").unlink()
+        # J1T-24: the model saw placeholders, never values.
+        assert any("GITHUB_TOKEN=$ASURA_SECRET_1" in m for m in tool_messages), tool_messages
+        assert all(first not in m and second not in m for m in tool_messages)
+        trial.send(b"\x1b[17~\r")  # F6 response history; Enter expands the activity.
+        trial.until("▾ Activity".encode(), plain=True)
+        trial.until(b"$ASURA_SECRET_1", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        trial.send(b"\x7f" * 3)  # Clear the typed draft.
+        # J1T-21: a stalled capture only backpressures; typing stays responsive.
+        gate = home / "capture-hold-scan"
+        gate.write_bytes(b"")
+        trial.send(b"Stall the capture.\r")
+        trial.until(b"printf '%0200d", plain=True, limit=30)
+        time.sleep(1.5)
+        stall_typing = max(typed_within_100ms(trial, ch) for ch in [b"x", b"y"])
+        trial.send(b"\x7f" * 2)
+        trial.idle(0.1)
+        trial.send(b"/cancel\r")
+        trial.until(b"Cancel", plain=True, limit=20)
+        trial.idle(4)
+        gate.unlink()
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        # J1T-22: restart and inspect the earlier call.
+        trial = fixture.launch()
+        trial.resize(140, 45)
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        trial.send(b"\x1b[17~")
+        trial.until(b"Run the capture fixture.", plain=True, limit=10)
+        trial.send(b"\x1b[A" * 4)  # Select the oldest response.
+        trial.idle(0.2)
+        trial.send(b"\r")
+        trial.until(b"$ASURA_SECRET_1", plain=True, limit=10)
+        screen = trial.screen.text()
+        assert first not in screen and second not in screen, "raw secret after restart"
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        # J1T-08: a quota too small for one reservation is a visible busy.
+        # Free space at the 16 MiB reserve: the quota is only what is retained,
+        # under 1 MiB here even with every earlier call expired.
+        (home / "payload-free-bytes").write_text(str(16 * 1024 * 1024))
+        trial = fixture.launch()
+        trial.resize(140, 45)
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        script[:] = [{"command": "printf should-not-run > busy.txt", "cwd": "."}, None]
+        offset = len(trial.output)
+        trial.send(b"Busy please.\r")
+        end = time.monotonic() + 30
+        while not any("shell_busy: quota" in m for m in tool_messages):
+            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
+            trial.read(0.05)
+        trial.until(b"COMPLETE", offset, plain=True, limit=30, reject="Incomplete response")
+        assert not (project / "busy.txt").exists()
+        assert any("shell_busy: quota" in m for m in tool_messages), tool_messages[-3:]
+        (home / "payload-free-bytes").unlink()
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        (project / ".env").unlink()
+        for path in fixture.root.rglob("*"):
+            if path.is_file() and path.name not in ("asura-fixture", "asura-model"):
+                data = path.read_bytes()
+                assert first.encode() not in data and second.encode() not in data, f"raw secret in {path}"
+        assert not errors, errors
+        print(f"PASS J1T-24/25/26/21/22/08 TUI: placeholders shown, rewrite shown and run, "
+              f"typing {flood_typing*1000:.0f} ms during a flood and {stall_typing*1000:.0f} ms during a "
+              "stalled capture, restart inspection, visible busy, raw-byte sweep clean")
+    finally:
+        if trial is not None:
+            trial.close()
+        stopped.set()
+        server.join(timeout=3)
+        listener.close()
+        assert not server.is_alive(), "fixture server cleanup unconfirmed"
+        assert not errors, errors
+
+
 def long_observation(fixture, source):
     import threading
 
@@ -1630,7 +1837,7 @@ def long_observation(fixture, source):
         end = time.monotonic() + remaining(110)
         while not chatting.is_set():
             assert not errors, errors
-            assert time.monotonic() < end, trial.screen.text()
+            assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
             trial.read(0.025)
         started = time.monotonic()
         typed = False
@@ -2029,13 +2236,16 @@ def main():
     helpmode = len(sys.argv) == 3 and sys.argv[2] == "--help-mode"
     long_turns = len(sys.argv) == 3 and sys.argv[2] == "--long-conversation"
     waits = len(sys.argv) == 3 and sys.argv[2] == "--journal-waits"
-    assert len(sys.argv) == 2 or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits, __doc__
+    capture = len(sys.argv) == 3 and sys.argv[2] == "--shell-capture"
+    assert len(sys.argv) == 2 or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
         DEADLINE = time.monotonic() + 160
     if activity or multipass:
         DEADLINE = time.monotonic() + 90
+    if capture:
+        DEADLINE = time.monotonic() + 240
     if long_turns:
         DEADLINE = time.monotonic() + 900
     source = Path(sys.argv[1]).resolve(strict=True)
@@ -2065,6 +2275,9 @@ def main():
             return
         if activity or multipass:
             rich_activity(fixture, source, multipass)
+            return
+        if capture:
+            shell_capture(fixture, source)
             return
         if long:
             long_observation(fixture, source)
@@ -2102,7 +2315,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

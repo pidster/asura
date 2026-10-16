@@ -1383,3 +1383,49 @@ fn named_rule_values_equal_the_capture_groups() {
     }
     assert!(matched > 500, "{matched}");
 }
+
+/// J1T-03 unit (G6): a rewrite of exactly 8,192 bytes is admitted and one of
+/// 8,193 bytes is refused with `rewritten_command_too_long`, whatever the
+/// original length; the refusal holds no value.
+#[test]
+fn j1t_03_rewritten_command_length_limit() {
+    use super::rewrite::{MAX_REWRITTEN_COMMAND_BYTES, rewrite_shell_call_with};
+    let value = cat(&["Sup3r", "S3cret"]);
+    let unit = cat(&["curl -u admin:", &value, " x;"]);
+    let build = |rewritten_len: usize| {
+        let units = unit.repeat(10);
+        // Each occurrence grows by 6 bytes: 11 value bytes become 17.
+        let filler = rewritten_len - 60 - units.len() - "echo ".len();
+        cat(&[&units, "echo ", &"f".repeat(filler)])
+    };
+    let fits = build(MAX_REWRITTEN_COMMAND_BYTES);
+    assert!(fits.len() < MAX_REWRITTEN_COMMAND_BYTES);
+    let rewrite = rewrite_shell_call_with(Ok(rules()), &fits, ".").unwrap();
+    assert_eq!(rewrite.command.len(), MAX_REWRITTEN_COMMAND_BYTES);
+    assert_eq!(rewrite.variables.len(), 1);
+    let over = build(MAX_REWRITTEN_COMMAND_BYTES + 1);
+    assert!(over.len() <= MAX_REWRITTEN_COMMAND_BYTES);
+    let refusal = rewrite_shell_call_with(Ok(rules()), &over, ".").unwrap_err();
+    assert_eq!(refusal.code, RefusalCode::RewrittenCommandTooLong);
+    assert_eq!(refusal.code.as_str(), "rewritten_command_too_long");
+    assert!(!refusal.to_string().contains(&value));
+}
+/// J1 cwd scan: a detected span in the working directory refuses with
+/// `secret_in_cwd`; a failed self-check refuses first.
+#[test]
+fn j1_cwd_secret_and_detection_unavailable_refuse() {
+    use super::rewrite::rewrite_shell_call_with;
+    let gh = github();
+    let refusal = rewrite_shell_call_with(Ok(rules()), "ls", &cat(&["dir/", &gh])).unwrap_err();
+    assert_eq!(refusal.code, RefusalCode::SecretInCwd);
+    assert_eq!(refusal.code.as_str(), "secret_in_cwd");
+    assert!(!refusal.to_string().contains(&gh));
+    assert!(rewrite_shell_call_with(Ok(rules()), "ls", "src/bin").is_ok());
+    let unavailable =
+        rewrite_shell_call_with(Err(super::SelfCheckError::Digest), "ls", ".").unwrap_err();
+    assert_eq!(unavailable.code, RefusalCode::DetectionUnavailable);
+    // The command refusal comes before the cwd scan.
+    let quoted = cat(&["echo '", &gh, "'"]);
+    let refusal = rewrite_shell_call_with(Ok(rules()), &quoted, &gh).unwrap_err();
+    assert_eq!(refusal.code, RefusalCode::SecretSingleQuoted);
+}

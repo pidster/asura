@@ -1763,3 +1763,508 @@ fn reopened_tool_display_projections_are_bounded_and_capture_stdout() {
         *tool
     );
 }
+
+// J1T-02: kinds 22, 23 and 15 replay order and reservation.
+const FRAME_OVERHEAD: usize = 144 + 40;
+const RESULT_CAPACITY: usize = FRAME_OVERHEAD + 43 + 16_384;
+const CAPTURE_CAPACITY: usize = FRAME_OVERHEAD + 4_102;
+fn shell22(ordinal: u32, disposition: ShellDisposition) -> ShellIntent {
+    use asura_storage::payload::{ObjectKind, payload_id};
+    let admitted = disposition == ShellDisposition::Admitted;
+    let derived = |kind| payload_id(id(1), id(10), 1, ordinal, kind);
+    ShellIntent {
+        operation: id(10),
+        generation: 1,
+        ordinal,
+        disposition,
+        command_truncated: false,
+        command: "printf \"$ASURA_SECRET_1\"".into(),
+        cwd: ".".into(),
+        refusal: (disposition == ShellDisposition::Refused).then_some(ShellRefusal {
+            code: RefusalCode::SecretSingleQuoted,
+            kind: Some(SecretKind::GithubToken),
+            word: Some(2),
+        }),
+        busy: (disposition == ShellDisposition::Busy).then_some(ShellBusyReason::Quota),
+        variables: if admitted {
+            vec![SecretKind::GithubToken]
+        } else {
+            vec![]
+        },
+        job: if admitted {
+            shell_job_id(id(10), 1, ordinal)
+        } else {
+            [0; 16]
+        },
+        stdout_payload: if admitted {
+            derived(ObjectKind::Stdout)
+        } else {
+            [0; 16]
+        },
+        stderr_payload: if admitted {
+            derived(ObjectKind::Stderr)
+        } else {
+            [0; 16]
+        },
+        initial_reservation: if admitted { INITIAL_RESERVATION } else { 0 },
+        rule_set_revision: 1,
+        rule_set_digest: [21; 32],
+    }
+}
+fn stream23(stored: u64) -> CaptureStream {
+    CaptureStream {
+        observed_bytes: stored,
+        stored_bytes: stored,
+        digest: Some([22; 32]),
+        eof: true,
+        ..CaptureStream::default()
+    }
+}
+fn settled23(ordinal: u32) -> CaptureSettled {
+    CaptureSettled {
+        operation: id(10),
+        generation: 1,
+        ordinal,
+        state: CaptureState::Complete,
+        reason: CaptureReason::None,
+        exit_kind: 1,
+        exit_value: 3,
+        rule_set_revision: 1,
+        rule_set_digest: [21; 32],
+        stdout: stream23(5),
+        stderr: stream23(0),
+        distinct_numbers: 0,
+        numbers: vec![],
+        pause_count: 0,
+        first_pause_ms: 0,
+        paused_ms: 0,
+        final_reservation: INITIAL_RESERVATION,
+    }
+}
+fn result15(ordinal: u32, status: u8) -> ToolResult {
+    ToolResult {
+        operation: id(10),
+        generation: 1,
+        ordinal,
+        status,
+        text: "failure=None exit_code=3 signal=none reason=none truncated=false cleanup_confirmed=true capture=complete\nstdout:\nhello\nstderr:\n".into(),
+        next_offset: None,
+        truncated: false,
+    }
+}
+fn r22(ordinal: u32, disposition: ShellDisposition) -> Record {
+    Record::ShellIntent(Box::new(shell22(ordinal, disposition)))
+}
+fn r23(ordinal: u32) -> Record {
+    Record::CaptureSettled(Box::new(settled23(ordinal)))
+}
+fn r15(ordinal: u32, status: u8) -> Record {
+    Record::ToolResult(result15(ordinal, status))
+}
+fn complete() -> Record {
+    Record::TurnTerminal(terminal(TerminalKind::Complete, Cause::None, true))
+}
+fn failed() -> Record {
+    Record::TurnTerminal(terminal(
+        TerminalKind::Failed,
+        Cause::ProviderFailure,
+        false,
+    ))
+}
+fn started_with(records: impl IntoIterator<Item = Record>) -> Journal {
+    let mut journal = Journal::started();
+    for record in records {
+        journal.append(record);
+    }
+    journal
+}
+#[test]
+fn j1t_02_each_disposition_with_and_without_capture_result_and_terminal() {
+    use ShellDisposition::*;
+    let shell = |journal: &Journal| {
+        let state = inspect(&journal.bytes).unwrap();
+        state.operations[&id(10)].tools[0].clone()
+    };
+    // Admitted: 22, then 23, then 15, then a terminal.
+    let journal = started_with([r22(1, Admitted)]);
+    let tool = shell(&journal);
+    let call = tool.shell.as_deref().unwrap();
+    assert_eq!(tool.kind, SHELL_TOOL_KIND);
+    assert_eq!(tool.arguments, "printf \"$ASURA_SECRET_1\" cwd=.");
+    assert_eq!((tool.offset, tool.limit), (0, 0));
+    assert_eq!(call.disposition, Admitted);
+    assert_eq!(call.job, shell_job_id(id(10), 1, 1));
+    assert_eq!(call.intent_sequence, journal.sequence);
+    assert!(call.settled.is_none() && tool.result_frame.is_none());
+    let journal = started_with([r22(1, Admitted), r23(1)]);
+    let tool = shell(&journal);
+    let settled = tool.shell.as_deref().unwrap().settled.clone().unwrap();
+    assert_eq!(settled.state, CaptureState::Complete);
+    assert_eq!(settled.reason, CaptureReason::None);
+    assert_eq!(settled.sequence, journal.sequence);
+    assert_eq!(settled.streams, [(5, Some([22; 32])), (0, Some([22; 32]))]);
+    assert!(tool.result_frame.is_none());
+    let journal = started_with([r22(1, Admitted), r23(1), r15(1, 1)]);
+    let tool = shell(&journal);
+    assert_eq!(tool.result_status, Some(1));
+    assert_eq!(tool.exit_code, Some(3));
+    assert_eq!(tool.preview.as_deref(), Some("hello"));
+    assert!(tool.shell.as_deref().unwrap().settled.is_some());
+    for journal in [
+        started_with([r22(1, Admitted), r23(1), r15(1, 1), complete()]),
+        started_with([r22(1, Admitted), r23(1), r15(1, 5), failed()]),
+        started_with([r22(1, Admitted), r23(1), failed()]),
+    ] {
+        let state = inspect(&journal.bytes).unwrap();
+        assert!(state.operations[&id(10)].terminal.is_some());
+        assert_eq!(state.active_operation, None);
+    }
+    // Refused and busy: 22 then 15 with status 3 or 4, then a terminal.
+    for (disposition, status) in [(Refused, 3), (Busy, 4)] {
+        let journal = started_with([r22(1, disposition)]);
+        let tool = shell(&journal);
+        let call = tool.shell.as_deref().unwrap();
+        assert_eq!(call.disposition, disposition);
+        assert_eq!(
+            [call.job, call.stdout_payload, call.stderr_payload],
+            [[0; 16]; 3]
+        );
+        let journal = started_with([r22(1, disposition), r15(1, status)]);
+        assert_eq!(shell(&journal).result_status, Some(status));
+        for end in [complete(), failed()] {
+            let journal = started_with([r22(1, disposition), r15(1, status), end]);
+            assert!(
+                inspect(&journal.bytes).unwrap().operations[&id(10)]
+                    .terminal
+                    .is_some()
+            );
+        }
+        let journal = started_with([r22(1, disposition), failed()]);
+        assert!(inspect(&journal.bytes).is_ok());
+    }
+    // Calls follow one another; a legacy kind 14 shell keeps its rules.
+    let journal = started_with([
+        r22(1, Refused),
+        r15(1, 3),
+        Record::ToolIntent(shell_intent(2)),
+        Record::ToolResult(shell_result(2, 1)),
+        r22(3, Admitted),
+        r23(3),
+        r15(3, 1),
+        r22(4, Busy),
+        r15(4, 4),
+        complete(),
+    ]);
+    let state = inspect(&journal.bytes).unwrap();
+    let tools = &state.operations[&id(10)].tools;
+    assert_eq!(tools.len(), 4);
+    assert!(tools[1].shell.is_none());
+    assert_eq!(tools[2].shell.as_deref().unwrap().disposition, Admitted);
+}
+#[test]
+fn j1t_02_every_invalid_order_is_corrupt() {
+    use ShellDisposition::*;
+    let mismatched = |change: fn(&mut ShellIntent)| {
+        let mut p = shell22(1, Admitted);
+        change(&mut p);
+        Record::ShellIntent(Box::new(p))
+    };
+    let other_rule_set = |change: fn(&mut CaptureSettled)| {
+        let mut p = settled23(1);
+        change(&mut p);
+        Record::CaptureSettled(Box::new(p))
+    };
+    let cases: Vec<(&str, Journal, Vec<Record>)> = vec![
+        ("23 before 22", Journal::started(), vec![r23(1)]),
+        (
+            "23 twice",
+            Journal::started(),
+            vec![r22(1, Admitted), r23(1), r23(1)],
+        ),
+        (
+            "15 before 23",
+            Journal::started(),
+            vec![r22(1, Admitted), r15(1, 1)],
+        ),
+        (
+            "15 status 3 before 23",
+            Journal::started(),
+            vec![r22(1, Admitted), r15(1, 3)],
+        ),
+        (
+            "23 after 15",
+            Journal::started(),
+            vec![r22(1, Admitted), r23(1), r15(1, 1), r23(1)],
+        ),
+        (
+            "23 after refused",
+            Journal::started(),
+            vec![r22(1, Refused), r23(1)],
+        ),
+        (
+            "23 after busy",
+            Journal::started(),
+            vec![r22(1, Busy), r23(1)],
+        ),
+        (
+            "refused then 15 status 1",
+            Journal::started(),
+            vec![r22(1, Refused), r15(1, 1)],
+        ),
+        (
+            "refused then 15 status 4",
+            Journal::started(),
+            vec![r22(1, Refused), r15(1, 4)],
+        ),
+        (
+            "busy then 15 status 3",
+            Journal::started(),
+            vec![r22(1, Busy), r15(1, 3)],
+        ),
+        (
+            "busy then 15 status 5",
+            Journal::started(),
+            vec![r22(1, Busy), r15(1, 5)],
+        ),
+        (
+            "22 after terminal",
+            Journal::started(),
+            vec![failed(), r22(1, Admitted)],
+        ),
+        (
+            "23 after terminal",
+            Journal::started(),
+            vec![r22(1, Admitted), failed(), r23(1)],
+        ),
+        (
+            "15 after terminal",
+            Journal::started(),
+            vec![r22(1, Admitted), r23(1), failed(), r15(1, 1)],
+        ),
+        (
+            "15 after terminal, refused",
+            Journal::started(),
+            vec![r22(1, Refused), failed(), r15(1, 3)],
+        ),
+        (
+            "complete while 23 pending",
+            Journal::started(),
+            vec![r22(1, Admitted), complete()],
+        ),
+        (
+            "complete while 15 pending",
+            Journal::started(),
+            vec![r22(1, Admitted), r23(1), complete()],
+        ),
+        (
+            "job ID mismatch",
+            Journal::started(),
+            vec![mismatched(|p| p.job = shell_job_id(id(10), 1, 2))],
+        ),
+        (
+            "stdout ID mismatch",
+            Journal::started(),
+            vec![mismatched(|p| p.stdout_payload = p.stderr_payload)],
+        ),
+        (
+            "stderr ID mismatch",
+            Journal::started(),
+            vec![mismatched(|p| p.stderr_payload = [7; 16])],
+        ),
+        (
+            "IDs of another installation",
+            Journal::started(),
+            vec![mismatched(|p| {
+                p.stdout_payload = asura_storage::payload::payload_id(
+                    id(2),
+                    id(10),
+                    1,
+                    1,
+                    asura_storage::payload::ObjectKind::Stdout,
+                )
+            })],
+        ),
+        (
+            "23 rule-set revision differs",
+            Journal::started(),
+            vec![
+                r22(1, Admitted),
+                other_rule_set(|p| p.rule_set_revision = 2),
+            ],
+        ),
+        (
+            "23 rule-set digest differs",
+            Journal::started(),
+            vec![
+                r22(1, Admitted),
+                other_rule_set(|p| p.rule_set_digest = [9; 32]),
+            ],
+        ),
+        (
+            "23 wrong ordinal",
+            Journal::started(),
+            vec![r22(1, Admitted), other_rule_set(|p| p.ordinal = 2)],
+        ),
+        (
+            "23 wrong generation",
+            Journal::started(),
+            vec![r22(1, Admitted), other_rule_set(|p| p.generation = 2)],
+        ),
+        (
+            "23 for a legacy kind 14 shell",
+            Journal::started(),
+            vec![Record::ToolIntent(shell_intent(1)), r23(1)],
+        ),
+        (
+            "22 skips an ordinal",
+            Journal::started(),
+            vec![r22(2, Admitted)],
+        ),
+        (
+            "22 while 22 pending",
+            Journal::started(),
+            vec![r22(1, Refused), r22(2, Refused)],
+        ),
+        (
+            "22 while 15 pending",
+            Journal::started(),
+            vec![r22(1, Admitted), r23(1), r22(2, Admitted)],
+        ),
+        (
+            "22 before start",
+            Journal::accepted(),
+            vec![r22(1, Admitted)],
+        ),
+        (
+            "22 after cancel",
+            Journal::started(),
+            vec![
+                Record::CancelRequested(CancelRequested {
+                    operation: id(10),
+                    generation: 1,
+                    cause: Cause::UserCancel,
+                }),
+                r22(1, Admitted),
+            ],
+        ),
+        (
+            "22 after restart",
+            Journal::started(),
+            vec![Record::OwnerGeneration, r22(1, Admitted)],
+        ),
+        (
+            "23 after restart",
+            Journal::started(),
+            vec![r22(1, Admitted), Record::OwnerGeneration, r23(1)],
+        ),
+        (
+            "15 after restart",
+            Journal::started(),
+            vec![r22(1, Admitted), r23(1), Record::OwnerGeneration, r15(1, 1)],
+        ),
+    ];
+    for (name, mut journal, records) in cases {
+        for record in records {
+            journal.append(record);
+        }
+        assert_eq!(
+            inspect(&journal.bytes).unwrap_err(),
+            ReplayError::Corrupt,
+            "{name}"
+        );
+    }
+    // A ninth tool call.
+    let mut journal = Journal::started();
+    for ordinal in 1..=8 {
+        journal.append(r22(ordinal, Refused));
+        journal.append(r15(ordinal, 3));
+    }
+    assert!(inspect(&journal.bytes).is_ok());
+    // A ninth ordinal cannot even be encoded.
+    let ninth = FrameContext {
+        installation_id: id(1),
+        transition_id: id(99_999),
+        sequence: journal.sequence + 1,
+        prior_digest: journal.digest,
+        expected_revision: journal.sequence,
+        owner_generation: journal.owner,
+    };
+    assert_eq!(
+        encode_frame(&ninth, &r22(9, Refused)),
+        Err(ReplayError::Corrupt)
+    );
+}
+#[test]
+fn j1t_02_terminal_with_admitted_intent_lacking_capture_is_accepted() {
+    let journal = started_with([
+        r22(1, ShellDisposition::Admitted),
+        Record::OwnerGeneration,
+        Record::TurnTerminal(terminal(TerminalKind::Interrupted, Cause::Restart, false)),
+    ]);
+    let state = inspect(&journal.bytes).unwrap();
+    let tool = &state.operations[&id(10)].tools[0];
+    assert!(tool.shell.as_deref().unwrap().settled.is_none());
+    assert!(tool.result_frame.is_none());
+    assert_eq!(state.active_operation, None);
+    for end in [
+        failed(),
+        Record::TurnTerminal(terminal(TerminalKind::Cancelled, Cause::UserCancel, false)),
+    ] {
+        let mut journal = started_with([r22(1, ShellDisposition::Admitted)]);
+        if matches!(&end, Record::TurnTerminal(t) if t.kind == TerminalKind::Cancelled) {
+            journal.append(Record::CancelRequested(CancelRequested {
+                operation: id(10),
+                generation: 1,
+                cause: Cause::UserCancel,
+            }));
+        }
+        journal.append(end);
+        let state = inspect(&journal.bytes).unwrap();
+        assert!(
+            state.operations[&id(10)].tools[0]
+                .shell
+                .as_deref()
+                .unwrap()
+                .settled
+                .is_none()
+        );
+    }
+}
+#[test]
+fn j1t_02_reserve_holds_one_capture_frame_until_kind_23() {
+    use ShellDisposition::*;
+    let reserved = |journal: &Journal| {
+        let state = inspect(&journal.bytes).unwrap();
+        (state.reserved_bytes, state.reserved_frames)
+    };
+    let (base, frames) = reserved(&Journal::started());
+    assert_eq!(CAPTURE_CAPACITY, 4_286);
+    assert_eq!(
+        reserved(&started_with([r22(1, Admitted)])),
+        (base + RESULT_CAPACITY + CAPTURE_CAPACITY, frames + 2)
+    );
+    assert_eq!(
+        reserved(&started_with([r22(1, Admitted), r23(1)])),
+        (base + RESULT_CAPACITY, frames + 1)
+    );
+    assert_eq!(
+        reserved(&started_with([r22(1, Admitted), r23(1), r15(1, 1)])),
+        (base, frames)
+    );
+    for disposition in [Refused, Busy] {
+        assert_eq!(
+            reserved(&started_with([r22(1, disposition)])),
+            (base + RESULT_CAPACITY, frames + 1)
+        );
+    }
+    // A legacy kind 14 shell keeps the result reservation only.
+    assert_eq!(
+        reserved(&started_with([Record::ToolIntent(shell_intent(1))])),
+        (base + RESULT_CAPACITY, frames + 1)
+    );
+    // After restart the old operation keeps the capture frame for its terminal
+    // only while kind 23 is missing; no owner or cancel frames remain.
+    let journal = started_with([r22(1, Admitted), Record::OwnerGeneration]);
+    let state = inspect(&journal.bytes).unwrap();
+    assert!(state.reserved_bytes >= RESULT_CAPACITY + CAPTURE_CAPACITY);
+}

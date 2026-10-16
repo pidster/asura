@@ -205,7 +205,7 @@ struct ShellTool: Tool {
     @Generable struct Arguments {
         @Guide(description: "Command passed exactly to /bin/sh -c; 1 through 8192 UTF-8 bytes.") var command: String
         @Guide(description: "Optional project-relative working directory. Omit or use . for project root; no parent traversal.") var cwd: String?
-        @Guide(description: "Maximum command seconds, 1 through 60; omit for 30.") var timeout_seconds: Int?
+        @Guide(description: "Ignored. The command runs until it ends or the turn is cancelled.") var timeout_seconds: Int?
     }
     func call(arguments: Arguments) async throws -> String {
         guard let timeout = UInt32(exactly: arguments.timeout_seconds ?? 30),

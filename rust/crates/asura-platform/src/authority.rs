@@ -288,6 +288,8 @@ impl RuntimeDirectory {
                 c"sessions",
                 c"tmp",
                 c"state",
+                // J1 retained shell output (tool job controller, payload I/O).
+                c"payloads",
             ]
             .contains(&name.as_c_str());
             evidence |= !non_authority && name.as_c_str() != c"config.yaml";

@@ -17,6 +17,9 @@ impl Writer {
     fn u32(&mut self, n: u32) {
         self.bytes(&n.to_be_bytes());
     }
+    fn u16(&mut self, n: u16) {
+        self.bytes(&n.to_be_bytes());
+    }
     fn string(&mut self, s: &str, limit: usize) -> Result<()> {
         if s.len() > limit {
             return Err(ReplayError::Limit);
@@ -57,6 +60,19 @@ impl<'a> Reader<'a> {
     }
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.array()?))
+    }
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+    /// A J1 string: a length over `limit` is `Corrupt`, like any other field.
+    fn bounded_string(&mut self, limit: usize) -> Result<String> {
+        let n = self.u32()? as usize;
+        if n > limit {
+            return Err(ReplayError::Corrupt);
+        }
+        Ok(std::str::from_utf8(self.take(n)?)
+            .map_err(|_| ReplayError::Corrupt)?
+            .to_owned())
     }
     fn flag(&mut self) -> Result<bool> {
         match self.byte()? {
@@ -304,22 +320,29 @@ fn shell_parts(p: &ToolIntent) -> Result<(&str, &str)> {
     }
     Ok((command, cwd))
 }
+/// The `asura.shell.job` identity of one shell call: the first 16 bytes of
+/// SHA-256 over ASCII `asura.shell.job`, one zero byte, the operation ID, the
+/// generation and the ordinal (big endian). An all-zero result becomes 1 in its
+/// final byte. Kind 14 shell intents and kind 22 share this derivation.
+pub fn shell_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
+    let mut hash = Sha256::new();
+    hash.update(b"asura.shell.job\0");
+    hash.update(operation);
+    hash.update(generation.to_be_bytes());
+    hash.update(ordinal.to_be_bytes());
+    let digest = hash.finalize();
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest[..16]);
+    if id == [0; 16] {
+        id[15] = 1;
+    }
+    id
+}
 impl ToolIntent {
     /// Stable identity for one admitted call, not permission to execute it again.
     pub fn shell_job_id(&self) -> Result<Id> {
         self.shell_arguments()?;
-        let mut hash = Sha256::new();
-        hash.update(b"asura.shell.job\0");
-        hash.update(self.operation);
-        hash.update(self.generation.to_be_bytes());
-        hash.update(self.ordinal.to_be_bytes());
-        let digest = hash.finalize();
-        let mut id = [0; 16];
-        id.copy_from_slice(&digest[..16]);
-        if id == [0; 16] {
-            id[15] = 1;
-        }
-        Ok(id)
+        Ok(shell_job_id(self.operation, self.generation, self.ordinal))
     }
     /// Exact validated bytes; filesystem resolution remains the platform owner's task.
     pub fn shell_arguments(&self) -> Result<(&str, &str)> {
@@ -512,6 +535,559 @@ fn valid_tool_result(p: &ToolResult) -> Result<()> {
         return Err(ReplayError::Corrupt);
     }
     Ok(())
+}
+
+// J1 kinds 22 and 23. These tables are the stored codes. They are written out
+// explicitly so that reordering a platform enum cannot change a stored code.
+// A new secret kind needs a new rule-set revision and a new code.
+/// Kind 22 field 8.
+fn refusal_code(code: RefusalCode) -> u8 {
+    match code {
+        RefusalCode::PlaceholderNotAvailable => 1,
+        RefusalCode::UnparsedCommand => 2,
+        RefusalCode::SecretInHeredoc => 3,
+        RefusalCode::SecretInSubstitution => 4,
+        RefusalCode::SecretInInnerScript => 5,
+        RefusalCode::SecretSingleQuoted => 6,
+        RefusalCode::SecretAnsiQuoted => 7,
+        RefusalCode::SecretMixedQuoting => 8,
+        RefusalCode::SecretWithShellSyntax => 9,
+        RefusalCode::TooManySecrets => 10,
+        RefusalCode::ResidualSecret => 11,
+        RefusalCode::DetectionUnavailable => 12,
+        RefusalCode::RewrittenCommandTooLong => 13,
+        RefusalCode::SecretInCwd => 14,
+    }
+}
+fn refusal_from(code: u8) -> Result<RefusalCode> {
+    Ok(match code {
+        1 => RefusalCode::PlaceholderNotAvailable,
+        2 => RefusalCode::UnparsedCommand,
+        3 => RefusalCode::SecretInHeredoc,
+        4 => RefusalCode::SecretInSubstitution,
+        5 => RefusalCode::SecretInInnerScript,
+        6 => RefusalCode::SecretSingleQuoted,
+        7 => RefusalCode::SecretAnsiQuoted,
+        8 => RefusalCode::SecretMixedQuoting,
+        9 => RefusalCode::SecretWithShellSyntax,
+        10 => RefusalCode::TooManySecrets,
+        11 => RefusalCode::ResidualSecret,
+        12 => RefusalCode::DetectionUnavailable,
+        13 => RefusalCode::RewrittenCommandTooLong,
+        14 => RefusalCode::SecretInCwd,
+        _ => return Err(ReplayError::Corrupt),
+    })
+}
+/// Secret kind codes 1–33: the positions of `SecretKind::ALL` at rule-set revision 1.
+fn kind_code(kind: SecretKind) -> u8 {
+    use SecretKind::*;
+    match kind {
+        PrivateKey => 1,
+        AwsAccessKey => 2,
+        AwsSecretKey => 3,
+        GithubToken => 4,
+        GitlabToken => 5,
+        PypiToken => 6,
+        DockerToken => 7,
+        NpmToken => 8,
+        BitbucketToken => 9,
+        VaultToken => 10,
+        FlyToken => 11,
+        WebhookSecret => 12,
+        MailgunKey => 13,
+        GoogleOauth => 14,
+        AzureKey => 15,
+        SlackToken => 16,
+        SlackWebhook => 17,
+        ChatWebhook => 18,
+        StripeKey => 19,
+        AnthropicKey => 20,
+        OpenaiKey => 21,
+        GoogleApiKey => 22,
+        Jwt => 23,
+        UrlPassword => 24,
+        UrlSecret => 25,
+        AuthHeader => 26,
+        SessionCookie => 27,
+        PasswordHash => 28,
+        AssignedSecret => 29,
+        EnvSecret => 30,
+        CliPassword => 31,
+        NetrcPassword => 32,
+        WifiPassword => 33,
+    }
+}
+fn kind_from(code: u8) -> Result<SecretKind> {
+    use SecretKind::*;
+    Ok(match code {
+        1 => PrivateKey,
+        2 => AwsAccessKey,
+        3 => AwsSecretKey,
+        4 => GithubToken,
+        5 => GitlabToken,
+        6 => PypiToken,
+        7 => DockerToken,
+        8 => NpmToken,
+        9 => BitbucketToken,
+        10 => VaultToken,
+        11 => FlyToken,
+        12 => WebhookSecret,
+        13 => MailgunKey,
+        14 => GoogleOauth,
+        15 => AzureKey,
+        16 => SlackToken,
+        17 => SlackWebhook,
+        18 => ChatWebhook,
+        19 => StripeKey,
+        20 => AnthropicKey,
+        21 => OpenaiKey,
+        22 => GoogleApiKey,
+        23 => Jwt,
+        24 => UrlPassword,
+        25 => UrlSecret,
+        26 => AuthHeader,
+        27 => SessionCookie,
+        28 => PasswordHash,
+        29 => AssignedSecret,
+        30 => EnvSecret,
+        31 => CliPassword,
+        32 => NetrcPassword,
+        33 => WifiPassword,
+        _ => return Err(ReplayError::Corrupt),
+    })
+}
+fn loss_code(reason: LossReason) -> u8 {
+    match reason {
+        LossReason::LineOverLimit => 1,
+        LossReason::KeyBlockOverLimit => 2,
+        LossReason::DetectorError => 3,
+    }
+}
+fn loss_from(code: u8) -> Result<LossReason> {
+    Ok(match code {
+        1 => LossReason::LineOverLimit,
+        2 => LossReason::KeyBlockOverLimit,
+        3 => LossReason::DetectorError,
+        _ => return Err(ReplayError::Corrupt),
+    })
+}
+fn origin_code(origin: NumberOrigin) -> u8 {
+    match origin {
+        NumberOrigin::Command => 1,
+        NumberOrigin::Output => 2,
+    }
+}
+fn origin_from(code: u8) -> Result<NumberOrigin> {
+    Ok(match code {
+        1 => NumberOrigin::Command,
+        2 => NumberOrigin::Output,
+        _ => return Err(ReplayError::Corrupt),
+    })
+}
+/// Kind 22 variables, kind 23 numbers and span entries.
+const MAX_SHELL_VARIABLES: usize = 16;
+const MAX_REFUSAL_WORD: u16 = 4096;
+const MAX_CAPTURE_SPANS: u64 = 64;
+const MAX_CAPTURE_NUMBER: u16 = 16_384;
+const MAX_CAPTURE_NUMBERS: usize = 256;
+const MIB: u64 = 1024 * 1024;
+/// Maximum kind 22 and 23 payloads (`tool-job-controller.md`, J1 records).
+pub(crate) const MAX_SHELL_INTENT_PAYLOAD: usize = 9_384;
+pub(crate) const MAX_CAPTURE_SETTLED_PAYLOAD: usize = 4_102;
+
+fn valid_cwd(cwd: &str) -> bool {
+    !cwd.is_empty()
+        && cwd.len() <= MAX_SHELL_CWD_BYTES
+        && !cwd.contains('\0')
+        && !cwd.starts_with('/')
+        && !cwd.split('/').any(|part| part == "..")
+}
+impl ShellIntent {
+    /// Every kind 22 field rule that the record alone determines. Replay adds
+    /// the state rules and recomputes the job and payload IDs.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let admitted = self.disposition == ShellDisposition::Admitted;
+        let refused = self.disposition == ShellDisposition::Refused;
+        let busy = self.disposition == ShellDisposition::Busy;
+        let unavailable = self
+            .refusal
+            .is_some_and(|r| r.code == RefusalCode::DetectionUnavailable);
+        let ids = [self.job, self.stdout_payload, self.stderr_payload];
+        require(
+            self.operation != [0; 16]
+                && self.generation >= 1
+                && (1..=8).contains(&self.ordinal)
+                && (!self.command_truncated || refused)
+                && !self.command.is_empty()
+                && self.command.len() <= MAX_SHELL_COMMAND_BYTES
+                && !self.command.contains('\0')
+                && valid_cwd(&self.cwd)
+                && self.refusal.is_some() == refused
+                && self
+                    .refusal
+                    .is_none_or(|r| r.word.is_none_or(|w| (1..=MAX_REFUSAL_WORD).contains(&w)))
+                && self.busy.is_some() == busy
+                && self.variables.len() <= MAX_SHELL_VARIABLES
+                && (admitted || self.variables.is_empty())
+                && if admitted {
+                    !ids.contains(&[0; 16]) && self.initial_reservation == INITIAL_RESERVATION
+                } else {
+                    ids == [[0; 16]; 3] && self.initial_reservation == 0
+                }
+                && if unavailable {
+                    self.rule_set_revision == 0 && self.rule_set_digest == [0; 32]
+                } else {
+                    self.rule_set_revision >= 1 && self.rule_set_digest != [0; 32]
+                },
+        )
+    }
+}
+fn valid_stream(s: &CaptureStream) -> bool {
+    s.unnumbered_replacements <= s.replacements
+        && s.literal_replacements <= s.replacements
+        && s.kinds.len() <= SecretKind::ALL.len()
+        && s.kinds.iter().all(|(_, count)| *count > 0)
+        && s.kinds
+            .windows(2)
+            .all(|pair| kind_code(pair[0].0) < kind_code(pair[1].0))
+        && s.spans.len() as u64 == s.loss_span_count.min(MAX_CAPTURE_SPANS)
+        && s.spans
+            .iter()
+            .all(|span| span.stored_offset <= s.stored_bytes)
+}
+impl CaptureSettled {
+    /// Every kind 23 field rule that the record alone determines. Replay adds
+    /// equality with the pending admitted kind 22.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let streams = [&self.stdout, &self.stderr];
+        let digests = streams.iter().all(|s| s.digest.is_some());
+        let no_digest = streams.iter().all(|s| s.digest.is_none());
+        let state = match self.state {
+            CaptureState::Complete => {
+                self.reason == CaptureReason::None
+                    && digests
+                    && streams.iter().all(|s| s.eof && s.discarded_bytes == 0)
+            }
+            CaptureState::Incomplete => {
+                !matches!(
+                    self.reason,
+                    CaptureReason::None | CaptureReason::SettlementUnconfirmed
+                ) && digests
+            }
+            CaptureState::Unconfirmed => {
+                self.reason == CaptureReason::SettlementUnconfirmed && no_digest
+            }
+            CaptureState::NotStarted => {
+                matches!(
+                    self.reason,
+                    CaptureReason::None | CaptureReason::StorageFault
+                ) && self.exit_kind == 0
+                    && no_digest
+                    && streams
+                        .iter()
+                        .all(|s| s.observed_bytes == 0 && s.stored_bytes == 0)
+            }
+        };
+        let exit = match self.exit_kind {
+            0 => self.exit_value == 0,
+            1 => self.exit_value <= 255,
+            2 => (1..=127).contains(&self.exit_value),
+            _ => false,
+        };
+        require(
+            self.operation != [0; 16]
+                && self.generation >= 1
+                && (1..=8).contains(&self.ordinal)
+                && state
+                && exit
+                // Kind 23 follows only an admitted kind 22, which always names
+                // a rule set; replay checks equality with that record.
+                && self.rule_set_revision >= 1
+                && self.rule_set_digest != [0; 32]
+                && streams.iter().all(|s| valid_stream(s))
+                && self.distinct_numbers <= u32::from(MAX_CAPTURE_NUMBER)
+                && self.numbers.len() <= MAX_CAPTURE_NUMBERS
+                && self.numbers.len() as u64 <= u64::from(self.distinct_numbers)
+                && self
+                    .numbers
+                    .iter()
+                    .all(|n| (1..=MAX_CAPTURE_NUMBER).contains(&n.number))
+                && self.numbers.windows(2).all(|p| p[0].number < p[1].number)
+                && self.final_reservation.is_multiple_of(MIB),
+        )
+    }
+}
+fn require(ok: bool) -> Result<()> {
+    if ok {
+        Ok(())
+    } else {
+        Err(ReplayError::Corrupt)
+    }
+}
+fn write_shell_intent(w: &mut Writer, p: &ShellIntent) -> Result<()> {
+    p.validate()?;
+    shell_intent_fields(w, p);
+    Ok(())
+}
+/// Kind 22 field order. Callers validate first; tests use it to build invalid bytes.
+fn shell_intent_fields(w: &mut Writer, p: &ShellIntent) {
+    w.bytes(&p.operation);
+    w.u64(p.generation);
+    w.u32(p.ordinal);
+    w.byte(p.disposition as u8);
+    w.byte(u8::from(p.command_truncated));
+    w.u32(p.command.len() as u32);
+    w.bytes(p.command.as_bytes());
+    w.u32(p.cwd.len() as u32);
+    w.bytes(p.cwd.as_bytes());
+    w.byte(p.refusal.map_or(0, |r| refusal_code(r.code)));
+    w.byte(p.refusal.and_then(|r| r.kind).map_or(0, kind_code));
+    w.u16(p.refusal.and_then(|r| r.word).unwrap_or(0));
+    w.byte(p.busy.map_or(0, |b| b as u8));
+    w.byte(p.variables.len() as u8);
+    for (index, kind) in p.variables.iter().enumerate() {
+        w.byte(index as u8 + 1);
+        w.byte(kind_code(*kind));
+    }
+    w.bytes(&p.job);
+    w.bytes(&p.stdout_payload);
+    w.bytes(&p.stderr_payload);
+    w.u64(p.initial_reservation);
+    w.u32(p.rule_set_revision);
+    w.bytes(&p.rule_set_digest);
+}
+fn read_shell_intent(r: &mut Reader<'_>) -> Result<ShellIntent> {
+    let operation = r.array()?;
+    let generation = r.u64()?;
+    let ordinal = r.u32()?;
+    let disposition = match r.byte()? {
+        1 => ShellDisposition::Admitted,
+        2 => ShellDisposition::Refused,
+        3 => ShellDisposition::Busy,
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let command_truncated = match r.byte()? {
+        0 => false,
+        1 => true,
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let command = r.bounded_string(MAX_SHELL_COMMAND_BYTES)?;
+    let cwd = r.bounded_string(MAX_SHELL_CWD_BYTES)?;
+    let code = r.byte()?;
+    let kind = match r.byte()? {
+        0 => None,
+        code => Some(kind_from(code)?),
+    };
+    let word = match r.u16()? {
+        0 => None,
+        word => Some(word),
+    };
+    let refusal = if code == 0 {
+        require(kind.is_none() && word.is_none())?;
+        None
+    } else {
+        Some(ShellRefusal {
+            code: refusal_from(code)?,
+            kind,
+            word,
+        })
+    };
+    let busy = match r.byte()? {
+        0 => None,
+        1 => Some(ShellBusyReason::Quota),
+        2 => Some(ShellBusyReason::CapturePaused),
+        3 => Some(ShellBusyReason::PendingFull),
+        4 => Some(ShellBusyReason::PayloadUnavailable),
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let count = r.byte()? as usize;
+    require(count <= MAX_SHELL_VARIABLES)?;
+    let mut variables = Vec::with_capacity(count);
+    for index in 0..count {
+        require(r.byte()? as usize == index + 1)?;
+        variables.push(kind_from(r.byte()?)?);
+    }
+    let value = ShellIntent {
+        operation,
+        generation,
+        ordinal,
+        disposition,
+        command_truncated,
+        command,
+        cwd,
+        refusal,
+        busy,
+        variables,
+        job: r.array()?,
+        stdout_payload: r.array()?,
+        stderr_payload: r.array()?,
+        initial_reservation: r.u64()?,
+        rule_set_revision: r.u32()?,
+        rule_set_digest: r.array()?,
+    };
+    value.validate()?;
+    Ok(value)
+}
+fn write_stream(w: &mut Writer, s: &CaptureStream) {
+    w.u64(s.observed_bytes);
+    w.u64(s.stored_bytes);
+    w.byte(u8::from(s.digest.is_some()));
+    w.bytes(&s.digest.unwrap_or([0; 32]));
+    w.u64(s.replacements);
+    w.u64(s.unnumbered_replacements);
+    w.u64(s.literal_replacements);
+    w.byte(s.kinds.len() as u8);
+    for (kind, count) in &s.kinds {
+        w.byte(kind_code(*kind));
+        w.u64(*count);
+    }
+    w.u64(s.loss_span_count);
+    w.u64(s.withheld_bytes);
+    w.byte(s.spans.len() as u8);
+    for span in &s.spans {
+        w.u64(span.stored_offset);
+        w.u64(span.withheld_bytes);
+        w.byte(loss_code(span.reason));
+    }
+    w.byte(u8::from(s.degraded));
+    w.u64(s.discarded_bytes);
+    w.byte(u8::from(s.eof));
+}
+fn read_stream(r: &mut Reader<'_>) -> Result<CaptureStream> {
+    let observed_bytes = r.u64()?;
+    let stored_bytes = r.u64()?;
+    let present = r.flag()?;
+    let digest: Hash = r.array()?;
+    require(present || digest == [0; 32])?;
+    let replacements = r.u64()?;
+    let unnumbered_replacements = r.u64()?;
+    let literal_replacements = r.u64()?;
+    let count = r.byte()? as usize;
+    require(count <= SecretKind::ALL.len())?;
+    let mut kinds = Vec::with_capacity(count);
+    for _ in 0..count {
+        kinds.push((kind_from(r.byte()?)?, r.u64()?));
+    }
+    let loss_span_count = r.u64()?;
+    let withheld_bytes = r.u64()?;
+    let count = r.byte()? as u64;
+    require(count == loss_span_count.min(MAX_CAPTURE_SPANS))?;
+    let mut spans = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        spans.push(LossSpan {
+            stored_offset: r.u64()?,
+            withheld_bytes: r.u64()?,
+            reason: loss_from(r.byte()?)?,
+        });
+    }
+    Ok(CaptureStream {
+        observed_bytes,
+        stored_bytes,
+        digest: present.then_some(digest),
+        replacements,
+        unnumbered_replacements,
+        literal_replacements,
+        kinds,
+        loss_span_count,
+        withheld_bytes,
+        spans,
+        degraded: r.flag()?,
+        discarded_bytes: r.u64()?,
+        eof: r.flag()?,
+    })
+}
+fn write_capture_settled(w: &mut Writer, p: &CaptureSettled) -> Result<()> {
+    p.validate()?;
+    capture_settled_fields(w, p);
+    Ok(())
+}
+/// Kind 23 field order. Callers validate first; tests use it to build invalid bytes.
+fn capture_settled_fields(w: &mut Writer, p: &CaptureSettled) {
+    w.bytes(&p.operation);
+    w.u64(p.generation);
+    w.u32(p.ordinal);
+    w.byte(p.state as u8);
+    w.byte(p.reason as u8);
+    w.byte(p.exit_kind);
+    w.u32(p.exit_value);
+    // Field 8, redaction ran: always 1 (SD9).
+    w.byte(1);
+    w.u32(p.rule_set_revision);
+    w.bytes(&p.rule_set_digest);
+    write_stream(w, &p.stdout);
+    write_stream(w, &p.stderr);
+    w.u32(p.distinct_numbers);
+    w.u16(p.numbers.len() as u16);
+    for n in &p.numbers {
+        w.u16(n.number);
+        w.byte(kind_code(n.kind));
+        w.byte(origin_code(n.origin));
+    }
+    w.u32(p.pause_count);
+    w.u64(p.first_pause_ms);
+    w.u64(p.paused_ms);
+    w.u64(p.final_reservation);
+}
+fn read_capture_settled(r: &mut Reader<'_>) -> Result<CaptureSettled> {
+    let operation = r.array()?;
+    let generation = r.u64()?;
+    let ordinal = r.u32()?;
+    let state = match r.byte()? {
+        1 => CaptureState::Complete,
+        2 => CaptureState::Incomplete,
+        3 => CaptureState::Unconfirmed,
+        4 => CaptureState::NotStarted,
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let reason = match r.byte()? {
+        0 => CaptureReason::None,
+        1 => CaptureReason::StorageFault,
+        2 => CaptureReason::Quota,
+        3 => CaptureReason::Enospc,
+        4 => CaptureReason::DetectorFault,
+        5 => CaptureReason::DiscardedAfterCancel,
+        6 => CaptureReason::SettlementUnconfirmed,
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let exit_kind = r.byte()?;
+    let exit_value = r.u32()?;
+    require(r.byte()? == 1)?;
+    let rule_set_revision = r.u32()?;
+    let rule_set_digest = r.array()?;
+    let stdout = read_stream(r)?;
+    let stderr = read_stream(r)?;
+    let distinct_numbers = r.u32()?;
+    let count = r.u16()? as usize;
+    require(count <= MAX_CAPTURE_NUMBERS)?;
+    let mut numbers = Vec::with_capacity(count);
+    for _ in 0..count {
+        numbers.push(CaptureNumber {
+            number: r.u16()?,
+            kind: kind_from(r.byte()?)?,
+            origin: origin_from(r.byte()?)?,
+        });
+    }
+    let value = CaptureSettled {
+        operation,
+        generation,
+        ordinal,
+        state,
+        reason,
+        exit_kind,
+        exit_value,
+        rule_set_revision,
+        rule_set_digest,
+        stdout,
+        stderr,
+        distinct_numbers,
+        numbers,
+        pause_count: r.u32()?,
+        first_pause_ms: r.u64()?,
+        paused_ms: r.u64()?,
+        final_reservation: r.u64()?,
+    };
+    value.validate()?;
+    Ok(value)
 }
 
 fn payload(record: &Record) -> Result<Vec<u8>> {
@@ -712,6 +1288,8 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u32(p.charged_tokens);
             w.string(&p.text, MAX_TEXT)?;
         }
+        Record::ShellIntent(p) => write_shell_intent(&mut w, p)?,
+        Record::CaptureSettled(p) => write_capture_settled(&mut w, p)?,
     }
     Ok(w.0)
 }
@@ -1003,6 +1581,14 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             };
             p.validate()?;
             Record::MemoryCreateIntent(p)
+        }
+        22 => {
+            require(payload.len() <= MAX_SHELL_INTENT_PAYLOAD)?;
+            Record::ShellIntent(Box::new(read_shell_intent(&mut r)?))
+        }
+        23 => {
+            require(payload.len() <= MAX_CAPTURE_SETTLED_PAYLOAD)?;
+            Record::CaptureSettled(Box::new(read_capture_settled(&mut r)?))
         }
         _ => return Err(ReplayError::UnsupportedFormat),
     };
@@ -1457,5 +2043,1222 @@ mod tests {
         ] {
             assert_ne!(changed.shell_job_id().unwrap(), expected);
         }
+    }
+
+    // J1T-01: kinds 22 and 23.
+    fn admitted() -> ShellIntent {
+        ShellIntent {
+            operation: [1; 16],
+            generation: 1,
+            ordinal: 1,
+            disposition: ShellDisposition::Admitted,
+            command_truncated: false,
+            command: "printf \"$ASURA_SECRET_1\"".into(),
+            cwd: ".".into(),
+            refusal: None,
+            busy: None,
+            variables: vec![SecretKind::GithubToken],
+            job: [2; 16],
+            stdout_payload: [3; 16],
+            stderr_payload: [4; 16],
+            initial_reservation: INITIAL_RESERVATION,
+            rule_set_revision: 1,
+            rule_set_digest: [5; 32],
+        }
+    }
+    fn refused(code: RefusalCode) -> ShellIntent {
+        let unavailable = code == RefusalCode::DetectionUnavailable;
+        ShellIntent {
+            disposition: ShellDisposition::Refused,
+            refusal: Some(ShellRefusal {
+                code,
+                kind: None,
+                word: None,
+            }),
+            variables: vec![],
+            job: [0; 16],
+            stdout_payload: [0; 16],
+            stderr_payload: [0; 16],
+            initial_reservation: 0,
+            rule_set_revision: if unavailable { 0 } else { 1 },
+            rule_set_digest: if unavailable { [0; 32] } else { [5; 32] },
+            ..admitted()
+        }
+    }
+    fn busy(reason: ShellBusyReason) -> ShellIntent {
+        ShellIntent {
+            disposition: ShellDisposition::Busy,
+            refusal: None,
+            busy: Some(reason),
+            ..refused(RefusalCode::UnparsedCommand)
+        }
+    }
+    fn raw22(p: &ShellIntent) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        shell_intent_fields(&mut w, p);
+        w.0
+    }
+    fn round22(p: ShellIntent) -> Vec<u8> {
+        let record = Record::ShellIntent(Box::new(p));
+        let bytes = payload(&record).unwrap();
+        assert_eq!(decode_record(22, &bytes).unwrap(), record);
+        bytes
+    }
+    /// Invalid on encode and, written without validation, on decode.
+    fn invalid22(p: ShellIntent) {
+        let record = Record::ShellIntent(Box::new(p.clone()));
+        assert_eq!(payload(&record), Err(ReplayError::Corrupt), "{p:?}");
+        assert_eq!(
+            decode_record(22, &raw22(&p)),
+            Err(ReplayError::Corrupt),
+            "{p:?}"
+        );
+    }
+    fn context() -> FrameContext {
+        FrameContext {
+            installation_id: [9; 16],
+            transition_id: [8; 16],
+            sequence: 2,
+            prior_digest: [7; 32],
+            expected_revision: 1,
+            owner_generation: 1,
+        }
+    }
+    #[test]
+    fn j1t_01_kind_22_round_trips_every_bound_and_maximum_size() {
+        let max = ShellIntent {
+            generation: u64::MAX,
+            ordinal: 8,
+            command: "x".repeat(MAX_SHELL_COMMAND_BYTES),
+            cwd: "y".repeat(MAX_SHELL_CWD_BYTES),
+            variables: SecretKind::ALL[..16].to_vec(),
+            rule_set_revision: u32::MAX,
+            ..admitted()
+        };
+        let bytes = round22(max.clone());
+        assert_eq!(bytes.len(), 9_384);
+        assert_eq!(bytes.len(), MAX_SHELL_INTENT_PAYLOAD);
+        let frame = encode_frame(&context(), &Record::ShellIntent(Box::new(max))).unwrap();
+        assert_eq!(frame.len(), 9_568);
+        // The largest refused record is the same size: refusal fields are fixed.
+        let refused_max = ShellIntent {
+            command_truncated: true,
+            command: "x".repeat(MAX_SHELL_COMMAND_BYTES),
+            cwd: "y".repeat(MAX_SHELL_CWD_BYTES),
+            refusal: Some(ShellRefusal {
+                code: RefusalCode::SecretInCwd,
+                kind: Some(SecretKind::WifiPassword),
+                word: Some(4096),
+            }),
+            ..refused(RefusalCode::SecretInCwd)
+        };
+        assert_eq!(round22(refused_max).len(), 9_384 - 32);
+        for ordinal in [1, 8] {
+            round22(ShellIntent {
+                ordinal,
+                ..admitted()
+            });
+        }
+        for (command, cwd) in [
+            ("x", "."),
+            ("x", "a/b"),
+            ("x", "./subdir"),
+            ("x", "a//b/"),
+            ("é", "..."),
+            ("x", "a..b"),
+        ] {
+            round22(ShellIntent {
+                command: command.into(),
+                cwd: cwd.into(),
+                ..admitted()
+            });
+        }
+        for count in 0..=16 {
+            round22(ShellIntent {
+                variables: SecretKind::ALL[33 - count..].to_vec(),
+                ..admitted()
+            });
+        }
+        for kind in SecretKind::ALL {
+            round22(ShellIntent {
+                variables: vec![kind; 16],
+                ..admitted()
+            });
+        }
+        for code in REFUSALS {
+            for truncated in [false, true] {
+                round22(ShellIntent {
+                    command_truncated: truncated,
+                    ..refused(code)
+                });
+            }
+        }
+        for kind in SecretKind::ALL {
+            for word in [None, Some(1), Some(4096)] {
+                round22(ShellIntent {
+                    refusal: Some(ShellRefusal {
+                        code: RefusalCode::ResidualSecret,
+                        kind: Some(kind),
+                        word,
+                    }),
+                    ..refused(RefusalCode::ResidualSecret)
+                });
+            }
+        }
+        for reason in [
+            ShellBusyReason::Quota,
+            ShellBusyReason::CapturePaused,
+            ShellBusyReason::PendingFull,
+            ShellBusyReason::PayloadUnavailable,
+        ] {
+            let bytes = round22(ShellIntent {
+                command: "x".into(),
+                ..busy(reason)
+            });
+            assert_eq!(bytes[38 + 1 + 1 + 4], reason as u8);
+        }
+    }
+    #[test]
+    fn j1t_01_kind_22_rejects_each_invalid_field() {
+        let a = admitted;
+        let r = || refused(RefusalCode::UnparsedCommand);
+        let b = || busy(ShellBusyReason::Quota);
+        let unavailable = || refused(RefusalCode::DetectionUnavailable);
+        for p in [
+            ShellIntent {
+                operation: [0; 16],
+                ..a()
+            },
+            ShellIntent {
+                generation: 0,
+                ..a()
+            },
+            ShellIntent { ordinal: 0, ..a() },
+            ShellIntent { ordinal: 9, ..a() },
+            ShellIntent {
+                command_truncated: true,
+                ..a()
+            },
+            ShellIntent {
+                command_truncated: true,
+                ..b()
+            },
+            ShellIntent {
+                command: String::new(),
+                ..a()
+            },
+            ShellIntent {
+                command: "x".repeat(8193),
+                ..a()
+            },
+            ShellIntent {
+                command: "a\0b".into(),
+                ..a()
+            },
+            ShellIntent {
+                cwd: String::new(),
+                ..a()
+            },
+            ShellIntent {
+                cwd: "y".repeat(1025),
+                ..a()
+            },
+            ShellIntent {
+                cwd: "/absolute".into(),
+                ..a()
+            },
+            ShellIntent {
+                cwd: "..".into(),
+                ..a()
+            },
+            ShellIntent {
+                cwd: "a/../b".into(),
+                ..a()
+            },
+            ShellIntent {
+                cwd: "a/..".into(),
+                ..a()
+            },
+            ShellIntent {
+                cwd: "a\0b".into(),
+                ..a()
+            },
+            ShellIntent {
+                refusal: None,
+                ..r()
+            },
+            ShellIntent {
+                refusal: r().refusal,
+                ..a()
+            },
+            ShellIntent {
+                refusal: r().refusal,
+                ..b()
+            },
+            ShellIntent {
+                refusal: Some(ShellRefusal {
+                    code: RefusalCode::UnparsedCommand,
+                    kind: None,
+                    word: Some(4097),
+                }),
+                ..r()
+            },
+            ShellIntent { busy: None, ..b() },
+            ShellIntent {
+                busy: Some(ShellBusyReason::Quota),
+                ..a()
+            },
+            ShellIntent {
+                busy: Some(ShellBusyReason::Quota),
+                ..r()
+            },
+            ShellIntent {
+                variables: vec![SecretKind::Jwt; 17],
+                ..a()
+            },
+            ShellIntent {
+                variables: vec![SecretKind::Jwt],
+                ..r()
+            },
+            ShellIntent {
+                variables: vec![SecretKind::Jwt],
+                ..b()
+            },
+            ShellIntent {
+                job: [0; 16],
+                ..a()
+            },
+            ShellIntent {
+                stdout_payload: [0; 16],
+                ..a()
+            },
+            ShellIntent {
+                stderr_payload: [0; 16],
+                ..a()
+            },
+            ShellIntent {
+                job: [2; 16],
+                ..r()
+            },
+            ShellIntent {
+                stdout_payload: [3; 16],
+                ..b()
+            },
+            ShellIntent {
+                stderr_payload: [4; 16],
+                ..r()
+            },
+            ShellIntent {
+                initial_reservation: 0,
+                ..a()
+            },
+            ShellIntent {
+                initial_reservation: 2 * INITIAL_RESERVATION,
+                ..a()
+            },
+            ShellIntent {
+                initial_reservation: INITIAL_RESERVATION,
+                ..r()
+            },
+            ShellIntent {
+                initial_reservation: INITIAL_RESERVATION,
+                ..b()
+            },
+            ShellIntent {
+                rule_set_revision: 1,
+                ..unavailable()
+            },
+            ShellIntent {
+                rule_set_digest: [5; 32],
+                ..unavailable()
+            },
+            ShellIntent {
+                rule_set_revision: 0,
+                ..r()
+            },
+            ShellIntent {
+                rule_set_digest: [0; 32],
+                ..r()
+            },
+            ShellIntent {
+                rule_set_revision: 0,
+                rule_set_digest: [0; 32],
+                ..a()
+            },
+            ShellIntent {
+                rule_set_revision: 0,
+                rule_set_digest: [0; 32],
+                ..b()
+            },
+        ] {
+            invalid22(p);
+        }
+        // Word 0 is "no word" on the wire, so `Some(0)` is an encode error only.
+        let zero_word = ShellIntent {
+            refusal: Some(ShellRefusal {
+                code: RefusalCode::UnparsedCommand,
+                kind: None,
+                word: Some(0),
+            }),
+            ..r()
+        };
+        assert_eq!(
+            payload(&Record::ShellIntent(Box::new(zero_word))),
+            Err(ReplayError::Corrupt)
+        );
+        // Wire-only values: offsets for command "x" (1 byte) and cwd "." (1 byte).
+        let base = |p: ShellIntent| {
+            raw22(&ShellIntent {
+                command: "x".into(),
+                cwd: ".".into(),
+                ..p
+            })
+        };
+        let refusal_at = 38 + 1 + 1;
+        let wire: [(ShellIntent, usize, u8); 17] = [
+            (a(), 28, 0),
+            (a(), 28, 4),
+            (r(), 29, 2),
+            (r(), 29, 3),
+            (a(), 29, 2),
+            (r(), refusal_at, 15),
+            (r(), refusal_at, 255),
+            (r(), refusal_at + 1, 34),
+            (a(), refusal_at + 1, 1),
+            (a(), refusal_at + 3, 1),
+            (b(), refusal_at + 4, 5),
+            (b(), refusal_at + 4, 0),
+            (a(), refusal_at + 5, 2),
+            (a(), refusal_at + 5, 17),
+            (a(), refusal_at + 6, 2),
+            (a(), refusal_at + 7, 0),
+            (a(), refusal_at + 7, 34),
+        ];
+        for (p, offset, value) in wire {
+            let mut bytes = base(p.clone());
+            assert!(decode_record(22, &bytes).is_ok(), "{p:?}");
+            bytes[offset] = value;
+            assert_eq!(
+                decode_record(22, &bytes),
+                Err(ReplayError::Corrupt),
+                "{offset} {value}"
+            );
+        }
+        let mut bytes = base(a());
+        bytes.push(0);
+        assert_eq!(decode_record(22, &bytes), Err(ReplayError::Corrupt));
+        let bytes = base(a());
+        assert_eq!(
+            decode_record(22, &bytes[..bytes.len() - 1]),
+            Err(ReplayError::Corrupt)
+        );
+        let mut bytes = base(a());
+        bytes[34] = 0xff;
+        assert_eq!(decode_record(22, &bytes), Err(ReplayError::Corrupt));
+        // A length over the field bound is `Corrupt`, not `Limit`.
+        let mut bytes = base(a());
+        bytes[30..34].copy_from_slice(&8193u32.to_be_bytes());
+        assert_eq!(decode_record(22, &bytes), Err(ReplayError::Corrupt));
+    }
+
+    fn stream() -> CaptureStream {
+        CaptureStream {
+            observed_bytes: 10,
+            stored_bytes: 12,
+            digest: Some([6; 32]),
+            replacements: 1,
+            unnumbered_replacements: 0,
+            literal_replacements: 1,
+            kinds: vec![(SecretKind::GithubToken, 1)],
+            loss_span_count: 0,
+            withheld_bytes: 0,
+            spans: vec![],
+            degraded: false,
+            discarded_bytes: 0,
+            eof: true,
+        }
+    }
+    fn settled() -> CaptureSettled {
+        CaptureSettled {
+            operation: [1; 16],
+            generation: 1,
+            ordinal: 1,
+            state: CaptureState::Complete,
+            reason: CaptureReason::None,
+            exit_kind: 1,
+            exit_value: 0,
+            rule_set_revision: 1,
+            rule_set_digest: [5; 32],
+            stdout: stream(),
+            stderr: CaptureStream {
+                kinds: vec![],
+                replacements: 0,
+                literal_replacements: 0,
+                ..stream()
+            },
+            distinct_numbers: 1,
+            numbers: vec![CaptureNumber {
+                number: 1,
+                kind: SecretKind::GithubToken,
+                origin: NumberOrigin::Command,
+            }],
+            pause_count: 0,
+            first_pause_ms: 0,
+            paused_ms: 0,
+            final_reservation: INITIAL_RESERVATION,
+        }
+    }
+    fn raw23(p: &CaptureSettled) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        capture_settled_fields(&mut w, p);
+        w.0
+    }
+    fn round23(p: CaptureSettled) -> Vec<u8> {
+        let record = Record::CaptureSettled(Box::new(p));
+        let bytes = payload(&record).unwrap();
+        assert_eq!(decode_record(23, &bytes).unwrap(), record);
+        bytes
+    }
+    fn invalid23(p: CaptureSettled) {
+        let record = Record::CaptureSettled(Box::new(p.clone()));
+        assert_eq!(payload(&record), Err(ReplayError::Corrupt), "{p:?}");
+        assert_eq!(
+            decode_record(23, &raw23(&p)),
+            Err(ReplayError::Corrupt),
+            "{p:?}"
+        );
+    }
+    fn full_stream() -> CaptureStream {
+        CaptureStream {
+            observed_bytes: u64::MAX,
+            stored_bytes: u64::MAX,
+            digest: Some([6; 32]),
+            replacements: u64::MAX,
+            unnumbered_replacements: u64::MAX,
+            literal_replacements: u64::MAX,
+            kinds: SecretKind::ALL.iter().map(|k| (*k, u64::MAX)).collect(),
+            loss_span_count: u64::MAX,
+            withheld_bytes: u64::MAX,
+            spans: (0..64)
+                .map(|n| LossSpan {
+                    stored_offset: if n == 63 { u64::MAX } else { n },
+                    withheld_bytes: u64::MAX,
+                    reason: [
+                        LossReason::LineOverLimit,
+                        LossReason::KeyBlockOverLimit,
+                        LossReason::DetectorError,
+                    ][n as usize % 3],
+                })
+                .collect(),
+            degraded: true,
+            discarded_bytes: 0,
+            eof: true,
+        }
+    }
+    #[test]
+    fn j1t_01_kind_23_round_trips_every_bound_and_maximum_size() {
+        let origins = [NumberOrigin::Command, NumberOrigin::Output];
+        let max = CaptureSettled {
+            generation: u64::MAX,
+            ordinal: 8,
+            exit_kind: 2,
+            exit_value: 127,
+            rule_set_revision: u32::MAX,
+            stdout: full_stream(),
+            stderr: full_stream(),
+            distinct_numbers: 16_384,
+            numbers: (0..256u16)
+                .map(|n| CaptureNumber {
+                    number: if n == 255 { 16_384 } else { n + 1 },
+                    kind: SecretKind::ALL[n as usize % 33],
+                    origin: origins[n as usize % 2],
+                })
+                .collect(),
+            pause_count: u32::MAX,
+            first_pause_ms: u64::MAX,
+            paused_ms: u64::MAX,
+            final_reservation: u64::MAX - (u64::MAX % MIB),
+            ..settled()
+        };
+        let bytes = round23(max.clone());
+        assert_eq!(bytes.len(), 4_102);
+        assert_eq!(bytes.len(), MAX_CAPTURE_SETTLED_PAYLOAD);
+        let frame = encode_frame(&context(), &Record::CaptureSettled(Box::new(max))).unwrap();
+        assert_eq!(frame.len(), 4_286);
+        // Minimum: no kinds, spans or numbers; 72 + 2 × 101 + 6 + 20 + 8.
+        let min = CaptureSettled {
+            stdout: CaptureStream {
+                kinds: vec![],
+                replacements: 0,
+                literal_replacements: 0,
+                ..stream()
+            },
+            distinct_numbers: 0,
+            numbers: vec![],
+            final_reservation: 0,
+            ..settled()
+        };
+        assert_eq!(round23(min).len(), 308);
+        let without_digests = |s: CaptureStream| CaptureStream { digest: None, ..s };
+        for (state, reason) in [
+            (CaptureState::Complete, CaptureReason::None),
+            (CaptureState::Incomplete, CaptureReason::StorageFault),
+            (CaptureState::Incomplete, CaptureReason::Quota),
+            (CaptureState::Incomplete, CaptureReason::Enospc),
+            (CaptureState::Incomplete, CaptureReason::DetectorFault),
+            (
+                CaptureState::Incomplete,
+                CaptureReason::DiscardedAfterCancel,
+            ),
+            (
+                CaptureState::Unconfirmed,
+                CaptureReason::SettlementUnconfirmed,
+            ),
+            (CaptureState::NotStarted, CaptureReason::None),
+            (CaptureState::NotStarted, CaptureReason::StorageFault),
+        ] {
+            let mut p = CaptureSettled {
+                state,
+                reason,
+                ..settled()
+            };
+            if matches!(state, CaptureState::Unconfirmed | CaptureState::NotStarted) {
+                p.stdout = without_digests(p.stdout);
+                p.stderr = without_digests(p.stderr);
+            }
+            if state == CaptureState::NotStarted {
+                p.exit_kind = 0;
+                for s in [&mut p.stdout, &mut p.stderr] {
+                    s.observed_bytes = 0;
+                    s.stored_bytes = 0;
+                    s.eof = false;
+                }
+            }
+            if state == CaptureState::Incomplete {
+                // Incomplete allows missing EOF and discarded bytes.
+                p.stdout.eof = false;
+                p.stderr.discarded_bytes = u64::MAX;
+            }
+            let bytes = round23(p);
+            assert_eq!(bytes[28], state as u8);
+            assert_eq!(bytes[29], reason as u8);
+        }
+        for (exit_kind, exit_value) in [(0, 0), (1, 0), (1, 255), (2, 1), (2, 127)] {
+            round23(CaptureSettled {
+                exit_kind,
+                exit_value,
+                ..settled()
+            });
+        }
+        for spans in [0, 1, 63, 64, 65, 1000] {
+            let count = spans.min(64) as usize;
+            round23(CaptureSettled {
+                stdout: CaptureStream {
+                    loss_span_count: spans,
+                    spans: full_stream().spans[..count]
+                        .iter()
+                        .map(|s| LossSpan {
+                            stored_offset: 12,
+                            ..*s
+                        })
+                        .collect(),
+                    ..stream()
+                },
+                ..settled()
+            });
+        }
+        for kind in SecretKind::ALL {
+            round23(CaptureSettled {
+                numbers: vec![CaptureNumber {
+                    number: 16_384,
+                    kind,
+                    origin: NumberOrigin::Output,
+                }],
+                distinct_numbers: 16_384,
+                ..settled()
+            });
+        }
+        let digest = round23(settled());
+        // The stdout digest field is the SHA-256 of stored bytes, present flag 1.
+        assert_eq!(digest[72 + 16], 1);
+        assert_eq!(&digest[72 + 17..72 + 49], &[6; 32]);
+        assert_eq!(digest[35], 1, "redaction ran");
+    }
+    #[test]
+    fn j1t_01_kind_23_rejects_each_invalid_field() {
+        let s = settled;
+        let none = |p: CaptureSettled| CaptureSettled {
+            stdout: CaptureStream {
+                digest: None,
+                ..p.stdout
+            },
+            stderr: CaptureStream {
+                digest: None,
+                ..p.stderr
+            },
+            ..p
+        };
+        let not_started = || CaptureSettled {
+            state: CaptureState::NotStarted,
+            exit_kind: 0,
+            stdout: CaptureStream {
+                observed_bytes: 0,
+                stored_bytes: 0,
+                digest: None,
+                ..stream()
+            },
+            stderr: CaptureStream {
+                observed_bytes: 0,
+                stored_bytes: 0,
+                digest: None,
+                ..s().stderr
+            },
+            ..s()
+        };
+        round23(not_started());
+        let numbers = |list: &[u16]| {
+            list.iter()
+                .map(|n| CaptureNumber {
+                    number: *n,
+                    kind: SecretKind::Jwt,
+                    origin: NumberOrigin::Output,
+                })
+                .collect::<Vec<_>>()
+        };
+        let span = |stored_offset| LossSpan {
+            stored_offset,
+            withheld_bytes: 1,
+            reason: LossReason::DetectorError,
+        };
+        for p in [
+            CaptureSettled {
+                operation: [0; 16],
+                ..s()
+            },
+            CaptureSettled {
+                generation: 0,
+                ..s()
+            },
+            CaptureSettled { ordinal: 0, ..s() },
+            CaptureSettled { ordinal: 9, ..s() },
+            CaptureSettled {
+                reason: CaptureReason::StorageFault,
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    digest: None,
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stderr: CaptureStream {
+                    digest: None,
+                    ..s().stderr
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    eof: false,
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stderr: CaptureStream {
+                    eof: false,
+                    ..s().stderr
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    discarded_bytes: 1,
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                state: CaptureState::Incomplete,
+                reason: CaptureReason::None,
+                ..s()
+            },
+            CaptureSettled {
+                state: CaptureState::Incomplete,
+                reason: CaptureReason::SettlementUnconfirmed,
+                ..s()
+            },
+            none(CaptureSettled {
+                state: CaptureState::Incomplete,
+                reason: CaptureReason::Quota,
+                ..s()
+            }),
+            CaptureSettled {
+                state: CaptureState::Incomplete,
+                reason: CaptureReason::Quota,
+                stderr: CaptureStream {
+                    digest: None,
+                    ..s().stderr
+                },
+                ..s()
+            },
+            none(CaptureSettled {
+                state: CaptureState::Unconfirmed,
+                reason: CaptureReason::DiscardedAfterCancel,
+                ..s()
+            }),
+            none(CaptureSettled {
+                state: CaptureState::Unconfirmed,
+                reason: CaptureReason::None,
+                ..s()
+            }),
+            CaptureSettled {
+                state: CaptureState::Unconfirmed,
+                reason: CaptureReason::SettlementUnconfirmed,
+                stdout: CaptureStream {
+                    digest: None,
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                reason: CaptureReason::Quota,
+                ..not_started()
+            },
+            CaptureSettled {
+                reason: CaptureReason::SettlementUnconfirmed,
+                ..not_started()
+            },
+            CaptureSettled {
+                exit_kind: 1,
+                ..not_started()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    observed_bytes: 1,
+                    ..not_started().stdout
+                },
+                ..not_started()
+            },
+            CaptureSettled {
+                stderr: CaptureStream {
+                    stored_bytes: 1,
+                    ..not_started().stderr
+                },
+                ..not_started()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    digest: Some([6; 32]),
+                    ..not_started().stdout
+                },
+                ..not_started()
+            },
+            CaptureSettled {
+                exit_kind: 0,
+                exit_value: 1,
+                ..s()
+            },
+            CaptureSettled {
+                exit_kind: 1,
+                exit_value: 256,
+                ..s()
+            },
+            CaptureSettled {
+                exit_kind: 2,
+                exit_value: 0,
+                ..s()
+            },
+            CaptureSettled {
+                exit_kind: 2,
+                exit_value: 128,
+                ..s()
+            },
+            CaptureSettled {
+                exit_kind: 3,
+                exit_value: 0,
+                ..s()
+            },
+            CaptureSettled {
+                rule_set_revision: 0,
+                ..s()
+            },
+            CaptureSettled {
+                rule_set_digest: [0; 32],
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    unnumbered_replacements: 2,
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    literal_replacements: 2,
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    kinds: vec![(SecretKind::Jwt, 0)],
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    kinds: vec![(SecretKind::Jwt, 1), (SecretKind::Jwt, 1)],
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    kinds: vec![(SecretKind::Jwt, 1), (SecretKind::PrivateKey, 1)],
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    loss_span_count: 2,
+                    spans: vec![span(0)],
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    loss_span_count: 0,
+                    spans: vec![span(0)],
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    loss_span_count: 65,
+                    spans: vec![span(0); 63],
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                stdout: CaptureStream {
+                    loss_span_count: 1,
+                    spans: vec![span(13)],
+                    ..stream()
+                },
+                ..s()
+            },
+            CaptureSettled {
+                distinct_numbers: 16_385,
+                ..s()
+            },
+            CaptureSettled {
+                distinct_numbers: 16_384,
+                numbers: (1..=257).map(|n| numbers(&[n])[0]).collect(),
+                ..s()
+            },
+            CaptureSettled {
+                distinct_numbers: 1,
+                numbers: numbers(&[1, 2]),
+                ..s()
+            },
+            CaptureSettled {
+                distinct_numbers: 0,
+                ..s()
+            },
+            CaptureSettled {
+                distinct_numbers: 2,
+                numbers: numbers(&[0]),
+                ..s()
+            },
+            CaptureSettled {
+                distinct_numbers: 2,
+                numbers: numbers(&[16_385]),
+                ..s()
+            },
+            CaptureSettled {
+                distinct_numbers: 2,
+                numbers: numbers(&[2, 1]),
+                ..s()
+            },
+            CaptureSettled {
+                distinct_numbers: 2,
+                numbers: numbers(&[1, 1]),
+                ..s()
+            },
+            CaptureSettled {
+                final_reservation: 1,
+                ..s()
+            },
+            CaptureSettled {
+                final_reservation: INITIAL_RESERVATION + 1,
+                ..s()
+            },
+        ] {
+            invalid23(p);
+        }
+        // Wire-only values in the default record. stdout starts at 72 and has
+        // one kind entry (110 bytes): kind count +73, loss count +83, span
+        // count +99, degraded +100, discarded +101, EOF +109. stderr starts at
+        // 182 with no entries: EOF +100. Numbers follow at 283.
+        let stdout = 72;
+        let stderr = 182;
+        let numbers_at = stderr + 101;
+        let wire: [(usize, u8); 20] = [
+            (28, 0),
+            (28, 5),
+            (29, 7),
+            (35, 0),
+            (35, 2),
+            (stdout + 16, 2),
+            (stderr + 16, 0),
+            (stdout + 73, 34),
+            (stdout + 73, 2),
+            (stdout + 74, 0),
+            (stdout + 74, 34),
+            (stdout + 99, 1),
+            (stdout + 100, 2),
+            (stdout + 109, 2),
+            (stderr + 100, 2),
+            (numbers_at + 5, 2),
+            (numbers_at + 6 + 2, 0),
+            (numbers_at + 6 + 2, 34),
+            (numbers_at + 6 + 3, 0),
+            (numbers_at + 6 + 3, 3),
+        ];
+        let base = raw23(&s());
+        assert!(decode_record(23, &base).is_ok());
+        for (offset, value) in wire {
+            let mut bytes = base.clone();
+            assert_ne!(bytes[offset], value, "{offset}");
+            bytes[offset] = value;
+            assert_eq!(
+                decode_record(23, &bytes),
+                Err(ReplayError::Corrupt),
+                "{offset} {value}"
+            );
+        }
+        // An absent digest must be zero; a span reason must be 1–3.
+        let mut bytes = raw23(&none(CaptureSettled {
+            state: CaptureState::Unconfirmed,
+            reason: CaptureReason::SettlementUnconfirmed,
+            ..s()
+        }));
+        assert!(decode_record(23, &bytes).is_ok());
+        bytes[stdout + 17] = 1;
+        assert_eq!(decode_record(23, &bytes), Err(ReplayError::Corrupt));
+        let with_span = CaptureSettled {
+            stdout: CaptureStream {
+                loss_span_count: 1,
+                spans: vec![span(0)],
+                ..stream()
+            },
+            ..s()
+        };
+        for reason in [0, 4] {
+            let mut bytes = raw23(&with_span);
+            assert!(decode_record(23, &bytes).is_ok());
+            // The first span starts after the span count, at stdout + 100.
+            assert_eq!(bytes[stdout + 100 + 16], 3);
+            bytes[stdout + 100 + 16] = 1;
+            assert!(decode_record(23, &bytes).is_ok());
+            bytes[stdout + 100 + 16] = reason;
+            assert_eq!(decode_record(23, &bytes), Err(ReplayError::Corrupt));
+        }
+        let mut bytes = base.clone();
+        bytes.push(0);
+        assert_eq!(decode_record(23, &bytes), Err(ReplayError::Corrupt));
+        assert_eq!(
+            decode_record(23, &base[..base.len() - 1]),
+            Err(ReplayError::Corrupt)
+        );
+    }
+    const REFUSALS: [RefusalCode; 14] = [
+        RefusalCode::PlaceholderNotAvailable,
+        RefusalCode::UnparsedCommand,
+        RefusalCode::SecretInHeredoc,
+        RefusalCode::SecretInSubstitution,
+        RefusalCode::SecretInInnerScript,
+        RefusalCode::SecretSingleQuoted,
+        RefusalCode::SecretAnsiQuoted,
+        RefusalCode::SecretMixedQuoting,
+        RefusalCode::SecretWithShellSyntax,
+        RefusalCode::TooManySecrets,
+        RefusalCode::ResidualSecret,
+        RefusalCode::DetectionUnavailable,
+        RefusalCode::RewrittenCommandTooLong,
+        RefusalCode::SecretInCwd,
+    ];
+    #[test]
+    fn j1t_01_code_tables_are_fixed() {
+        let refusals = [
+            "placeholder_not_available",
+            "unparsed_command",
+            "secret_in_heredoc",
+            "secret_in_substitution",
+            "secret_in_inner_script",
+            "secret_single_quoted",
+            "secret_ansi_quoted",
+            "secret_mixed_quoting",
+            "secret_with_shell_syntax",
+            "too_many_secrets",
+            "residual_secret",
+            "secret_detection_unavailable",
+            "rewritten_command_too_long",
+            "secret_in_cwd",
+        ];
+        for (index, name) in refusals.iter().enumerate() {
+            let code = index as u8 + 1;
+            let variant = refusal_from(code).unwrap();
+            assert_eq!(variant.as_str(), *name);
+            assert_eq!(refusal_code(variant), code);
+            assert_eq!(REFUSALS[index], variant);
+            // The stored byte, through the real encoder.
+            let bytes = round22(ShellIntent {
+                command: "x".into(),
+                cwd: ".".into(),
+                ..refused(variant)
+            });
+            assert_eq!(bytes[40], code);
+        }
+        for code in [0, 15, 255] {
+            assert_eq!(refusal_from(code), Err(ReplayError::Corrupt));
+        }
+        let kinds = [
+            "private-key",
+            "aws-access-key",
+            "aws-secret-key",
+            "github-token",
+            "gitlab-token",
+            "pypi-token",
+            "docker-token",
+            "npm-token",
+            "bitbucket-token",
+            "vault-token",
+            "fly-token",
+            "webhook-secret",
+            "mailgun-key",
+            "google-oauth",
+            "azure-key",
+            "slack-token",
+            "slack-webhook",
+            "chat-webhook",
+            "stripe-key",
+            "anthropic-key",
+            "openai-key",
+            "google-api-key",
+            "jwt",
+            "url-password",
+            "url-secret",
+            "auth-header",
+            "session-cookie",
+            "password-hash",
+            "assigned-secret",
+            "env-secret",
+            "cli-password",
+            "netrc-password",
+            "wifi-password",
+        ];
+        assert_eq!(kinds.len(), SecretKind::ALL.len());
+        for (index, name) in kinds.iter().enumerate() {
+            let code = index as u8 + 1;
+            let kind = kind_from(code).unwrap();
+            assert_eq!(kind.as_str(), *name);
+            assert_eq!(kind_code(kind), code);
+            // Codes are the rule-set 1 positions of `SecretKind::ALL`.
+            assert_eq!(SecretKind::ALL[index], kind);
+            let bytes = round22(ShellIntent {
+                command: "x".into(),
+                cwd: ".".into(),
+                variables: vec![kind],
+                ..admitted()
+            });
+            assert_eq!(&bytes[46..48], &[1, code]);
+        }
+        for code in [0, 34, 255] {
+            assert_eq!(kind_from(code), Err(ReplayError::Corrupt));
+        }
+        for (code, reason) in [
+            (1, LossReason::LineOverLimit),
+            (2, LossReason::KeyBlockOverLimit),
+            (3, LossReason::DetectorError),
+        ] {
+            assert_eq!(loss_from(code).unwrap(), reason);
+            assert_eq!(loss_code(reason), code);
+        }
+        for (code, origin) in [(1, NumberOrigin::Command), (2, NumberOrigin::Output)] {
+            assert_eq!(origin_from(code).unwrap(), origin);
+            assert_eq!(origin_code(origin), code);
+        }
+        for (code, state) in [
+            (1, CaptureState::Complete),
+            (2, CaptureState::Incomplete),
+            (3, CaptureState::Unconfirmed),
+            (4, CaptureState::NotStarted),
+        ] {
+            assert_eq!(state as u8, code);
+        }
+        assert_eq!(ShellDisposition::Admitted as u8, 1);
+        assert_eq!(ShellDisposition::Refused as u8, 2);
+        assert_eq!(ShellDisposition::Busy as u8, 3);
+        assert_eq!(CaptureReason::SettlementUnconfirmed as u8, 6);
+    }
+    #[test]
+    fn j1t_01_records_hold_no_value_or_value_digest() {
+        // Kind 22 holds the rewritten command; no other variable-length field
+        // exists. Everything outside command and cwd is structural.
+        let rewritten = "curl -H \"Authorization: Bearer $ASURA_SECRET_1\" https://example.test";
+        for count in [0, 1, 16] {
+            let p = ShellIntent {
+                command: rewritten.into(),
+                cwd: "sub/dir".into(),
+                variables: vec![SecretKind::AuthHeader; count],
+                ..admitted()
+            };
+            let bytes = round22(p.clone());
+            assert_eq!(
+                bytes.len(),
+                30 + 4 + rewritten.len() + 4 + 7 + 6 + 2 * count + 48 + 8 + 36
+            );
+            assert_eq!(&bytes[34..34 + rewritten.len()], rewritten.as_bytes());
+            assert_eq!(
+                &bytes[38 + rewritten.len()..45 + rewritten.len()],
+                b"sub/dir"
+            );
+            // Each variable entry is only (number, kind code).
+            let vars = 45 + rewritten.len() + 6;
+            for i in 0..count {
+                assert_eq!(&bytes[vars + 2 * i..vars + 2 * i + 2], &[i as u8 + 1, 26]);
+            }
+            // The only 32-byte field is the rule-set digest, which is not a
+            // value digest: it is the last field.
+            assert_eq!(&bytes[bytes.len() - 32..], &[5; 32]);
+        }
+        // Kind 23 has no string field: its size depends only on entry counts.
+        let bytes = round23(settled());
+        assert_eq!(bytes.len(), 72 + (101 + 9) + 101 + 6 + 4 + 20 + 8);
+    }
+    #[test]
+    fn j1t_01_shell_job_id_is_shared_by_kinds_14_and_22() {
+        let intent = shell();
+        assert_eq!(
+            shell_job_id(intent.operation, intent.generation, intent.ordinal),
+            intent.shell_job_id().unwrap()
+        );
+        assert_eq!(
+            shell_job_id([1; 16], 1, 1),
+            [
+                0xde, 0x83, 0x9f, 0x8c, 0xd1, 0xb3, 0xc7, 0xa2, 0x16, 0x14, 0x9a, 0xaa, 0x29, 0x03,
+                0x2f, 0xf6,
+            ]
+        );
     }
 }

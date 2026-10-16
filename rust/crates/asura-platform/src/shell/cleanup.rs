@@ -90,7 +90,7 @@ impl ShellCleanup {
         if self.done {
             return Ok(());
         }
-        check(deadline, cancel)?;
+        check(Some(deadline), cancel)?;
         let named = stat_at(self.parent.as_raw_fd(), &self.name)
             .map_err(|_| ShellError::CleanupUnconfirmed)?;
         if named.st_dev as u64 != self.device || named.st_ino != self.inode {
@@ -104,7 +104,7 @@ impl ShellCleanup {
             deadline,
             cancel,
         )?;
-        check(deadline, cancel)?;
+        check(Some(deadline), cancel)?;
         let named = stat_at(self.parent.as_raw_fd(), &self.name)
             .map_err(|_| ShellError::CleanupUnconfirmed)?;
         if named.st_dev as u64 != self.device || named.st_ino != self.inode {
@@ -157,7 +157,7 @@ fn remove_contents(
     }
     let stream = Directory(stream);
     loop {
-        check(deadline, cancel)?;
+        check(Some(deadline), cancel)?;
         // SAFETY: thread-local errno; live exclusively owned stream.
         unsafe {
             *libc::__error() = 0;
@@ -189,7 +189,7 @@ fn remove_contents(
             }
             remove_contents(child.as_raw_fd(), depth + 1, remaining, deadline, cancel)?;
         }
-        check(deadline, cancel)?;
+        check(Some(deadline), cancel)?;
         let after = stat_at(fd, name).map_err(|_| ShellError::Io)?;
         if before.st_dev != after.st_dev || before.st_ino != after.st_ino {
             return Err(ShellError::CleanupUnconfirmed);

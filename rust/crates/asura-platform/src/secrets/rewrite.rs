@@ -73,6 +73,10 @@ pub enum RefusalCode {
     TooManySecrets,
     ResidualSecret,
     DetectionUnavailable,
+    /// J1: the rewritten command is longer than 8,192 bytes (G6).
+    RewrittenCommandTooLong,
+    /// J1: the working directory holds a detected secret.
+    SecretInCwd,
 }
 impl RefusalCode {
     pub fn as_str(self) -> &'static str {
@@ -89,6 +93,8 @@ impl RefusalCode {
             Self::TooManySecrets => "too_many_secrets",
             Self::ResidualSecret => "residual_secret",
             Self::DetectionUnavailable => "secret_detection_unavailable",
+            Self::RewrittenCommandTooLong => "rewritten_command_too_long",
+            Self::SecretInCwd => "secret_in_cwd",
         }
     }
     fn advice(self) -> &'static str {
@@ -119,6 +125,12 @@ impl RefusalCode {
             Self::TooManySecrets => "the command holds more than 16 secrets",
             Self::ResidualSecret => "part of a secret would remain after the rewrite",
             Self::DetectionUnavailable => "secret detection is unavailable",
+            Self::RewrittenCommandTooLong => {
+                "the command would be longer than 8192 bytes after the rewrite. Shorten it"
+            }
+            Self::SecretInCwd => {
+                "the working directory holds a secret. Use a directory without one"
+            }
         }
     }
 }
@@ -161,6 +173,37 @@ pub(crate) fn rewrite_with(
         Ok(rules) => rewrite(rules, command),
         Err(_) => Err(refuse(RefusalCode::DetectionUnavailable, None, None)),
     }
+}
+
+/// The rewritten command limit: the rewrite must fit the shell command and
+/// intent record limits (J1, G6).
+pub const MAX_REWRITTEN_COMMAND_BYTES: usize = 8192;
+
+/// The model shell call path (J1): rewrites `command`, refuses a rewrite
+/// longer than [`MAX_REWRITTEN_COMMAND_BYTES`] with
+/// `rewritten_command_too_long`, and scans `cwd` in whole-buffer mode; a
+/// detected span refuses with `secret_in_cwd`. The person path reuses it.
+pub fn rewrite_shell_call(command: &str, cwd: &str) -> Result<Rewrite, Refusal> {
+    rewrite_shell_call_with(detection(), command, cwd)
+}
+pub(crate) fn rewrite_shell_call_with(
+    rules: Result<&'static RuleSet, super::SelfCheckError>,
+    command: &str,
+    cwd: &str,
+) -> Result<Rewrite, Refusal> {
+    let rewrite = rewrite_with(rules.clone(), command)?;
+    let rules = rules.map_err(|_| refuse(RefusalCode::DetectionUnavailable, None, None))?;
+    let (spans, withheld) = scan_spans(rules, cwd.as_bytes());
+    if let Some(span) = spans.first() {
+        return Err(refuse(RefusalCode::SecretInCwd, Some(span.kind), None));
+    }
+    if withheld {
+        return Err(refuse(RefusalCode::UnparsedCommand, None, None));
+    }
+    if rewrite.command.len() > MAX_REWRITTEN_COMMAND_BYTES {
+        return Err(refuse(RefusalCode::RewrittenCommandTooLong, None, None));
+    }
+    Ok(rewrite)
 }
 
 /// The command with every detected span replaced by its placeholder, for a

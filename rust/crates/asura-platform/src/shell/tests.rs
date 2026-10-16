@@ -6,7 +6,7 @@ fn request() -> ShellRequest {
         job_id: [7; 16],
         command: "printf ok".into(),
         cwd: None,
-        deadline: Instant::now() + Duration::from_secs(5),
+        deadline: None,
         secrets: Vec::new(),
     }
 }
@@ -100,37 +100,111 @@ fn notices_reject_identity_reserved_and_invalid_outcomes() {
     assert!(Notice::decode(&bad, id).is_err());
     assert!(Notice::decode(&valid[..31], id).is_err());
 }
-#[test]
-fn capture_is_bounded_sanitized_and_marks_tail_loss() {
-    let (read, write) = spawn::pipe(false).unwrap();
-    let mut c = Capture::new(read);
-    let bytes = [b'x'; 4096];
-    for _ in 0..4 {
-        // SAFETY: owned pipe, bounded valid input; drain each write before next.
-        assert_eq!(
-            unsafe { libc::write(write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) },
-            4096
-        );
-        c.drain(4096).unwrap();
+/// A sink with a settable room that records what the reactor side gave it.
+#[derive(Default)]
+struct TestSink {
+    room: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    accepted: [Vec<u8>; 2],
+    discarded: [u64; 2],
+    ended: [bool; 2],
+}
+fn index(stream: Stream) -> usize {
+    match stream {
+        Stream::Stdout => 0,
+        Stream::Stderr => 1,
     }
-    let control = b"\x1b[31m\xff\n";
+}
+impl OutputSink for TestSink {
+    fn room(&self) -> usize {
+        self.room.load(Ordering::Acquire)
+    }
+    fn accept(&mut self, stream: Stream, bytes: &[u8]) {
+        assert!(bytes.len() <= self.room(), "accept beyond room");
+        self.room.fetch_sub(bytes.len(), Ordering::AcqRel);
+        self.accepted[index(stream)].extend_from_slice(bytes);
+    }
+    fn discard(&mut self, stream: Stream, bytes: u64) {
+        self.discarded[index(stream)] += bytes;
+    }
+    fn end(&mut self, stream: Stream) {
+        assert!(!self.ended[index(stream)], "end twice");
+        self.ended[index(stream)] = true;
+    }
+}
+fn write_all(fd: &std::os::fd::OwnedFd, bytes: &[u8]) {
+    // SAFETY: owned pipe and bounded valid input below the pipe buffer.
     assert_eq!(
-        unsafe { libc::write(write.as_raw_fd(), control.as_ptr().cast(), control.len()) },
-        control.len() as isize
+        unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) },
+        bytes.len() as isize
     );
-    c.drain(4096).unwrap();
+}
+/// J1T-15 unit: reads never exceed the sink's room, a sink with less room
+/// than one read buffer stops reads, and no byte is lost by backpressure.
+#[test]
+fn j1t_15_drain_respects_sink_room_and_stops_below_one_read_buffer() {
+    let (read, write) = spawn::pipe(false).unwrap();
+    let mut c = Capture::new(read, Stream::Stdout);
+    let mut sink = TestSink::default();
+    sink.room.store(6000, Ordering::Release);
+    write_all(&write, &[b'x'; 10_000]);
+    assert!(c.wants_read(sink.room(), false));
+    c.drain(DRAIN_BUDGET, &mut sink, false).unwrap();
+    // One full read of 4096; the remaining 1904 bytes of room are below a
+    // read buffer, so reading stops (the interest is omitted too).
+    assert_eq!(sink.accepted[0].len(), 4096);
+    assert!(!c.wants_read(sink.room(), false));
+    c.drain(DRAIN_BUDGET, &mut sink, false).unwrap();
+    assert_eq!(sink.accepted[0].len(), 4096, "no read below one buffer");
+    sink.room.store(64 * 1024, Ordering::Release);
+    c.drain(DRAIN_BUDGET, &mut sink, false).unwrap();
+    assert_eq!(
+        sink.accepted[0].len(),
+        4096 + 5904,
+        "budget-limited dispatch"
+    );
     drop(write);
-    c.drain(4096).unwrap();
-    let (text, truncated) = c.text();
+    c.drain(DRAIN_BUDGET, &mut sink, false).unwrap();
+    assert!(c.eof && sink.ended[0]);
+    assert_eq!(sink.accepted[0], vec![b'x'; 10_000]);
+    assert_eq!(sink.discarded, [0, 0]);
+    assert_eq!(c.total, 10_000);
+}
+/// J1T-15 unit, discard after cancel (owner, 2026-10-15): with a cancel
+/// trigger the pipe is read to EOF; bytes the sink cannot take are counted
+/// as discarded, and every later byte of that stream is discarded too.
+#[test]
+fn j1t_15_after_cancel_full_sink_discards_and_never_rejoins_the_stream() {
+    let (read, write) = spawn::pipe(false).unwrap();
+    let mut c = Capture::new(read, Stream::Stderr);
+    let mut sink = TestSink::default();
+    sink.room.store(100, Ordering::Release);
+    write_all(&write, &[b'a'; 300]);
+    assert!(c.wants_read(sink.room(), true), "draining ignores room");
+    assert!(!c.wants_read(sink.room(), false));
+    c.drain(DRAIN_BUDGET, &mut sink, true).unwrap();
+    assert_eq!(sink.accepted[1], vec![b'a'; 100]);
+    assert_eq!(sink.discarded[1], 200);
+    sink.room.store(64 * 1024, Ordering::Release);
+    write_all(&write, &[b'b'; 50]);
+    c.drain(DRAIN_BUDGET, &mut sink, true).unwrap();
+    assert_eq!(sink.accepted[1].len(), 100, "no gap joined to a later tail");
+    assert_eq!(sink.discarded[1], 250);
+    drop(write);
+    c.drain(DRAIN_BUDGET, &mut sink, true).unwrap();
+    assert!(c.eof && sink.ended[1]);
+}
+#[test]
+fn rendered_tail_replaces_short_terminal_controls_and_invalid_utf8() {
+    let (text, truncated) = render_tail(b"ok\x1b[31m\xff\0\n\t");
+    assert_eq!(text, "ok\u{fffd}[31m\u{fffd}\u{fffd}\n\t");
+    assert!(truncated);
+    let mut stream = vec![b'x'; 16384];
+    stream.extend_from_slice(b"\x1b[31m\xff\n");
+    let (text, truncated) = render_tail(&stream);
     assert!(truncated);
     assert!(text.len() <= 6144);
-    assert!(
-        text.ends_with("x�[31m�\n"),
-        "the rendered stream keeps the latest output"
-    );
+    assert!(text.ends_with("x\u{fffd}[31m\u{fffd}\n"));
     assert!(!text.contains('\x1b'));
-    assert!(c.eof);
-    assert_eq!(c.total, 16384 + control.len() as u64);
 }
 struct Fixture(std::path::PathBuf);
 impl Fixture {
@@ -193,7 +267,11 @@ fn spawn_rejects_replaced_project_and_retains_scratch() {
     };
     fs::rename(&path, f.0.join("old-project")).unwrap();
     fs::create_dir(&path).unwrap();
-    let mut failure = match prepared.spawn(Path::new("/usr/bin/true"), &cancel) {
+    let mut failure = match prepared.spawn(
+        Path::new("/usr/bin/true"),
+        &cancel,
+        Box::new(TestSink::default()),
+    ) {
         Err(e) => e,
         Ok(_) => panic!("replaced project spawned"),
     };
@@ -211,24 +289,6 @@ fn guardian_normal_invocation_without_private_descriptors_fails_closed() {
 }
 
 #[test]
-fn capture_replaces_short_terminal_controls_and_invalid_utf8() {
-    let (read, write) = spawn::pipe(false).unwrap();
-    let mut capture = Capture::new(read);
-    let bytes = b"ok\x1b[31m\xff\0\n\t";
-    // SAFETY: bounded bytes written into our owned pipe.
-    assert_eq!(
-        unsafe { libc::write(write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) },
-        bytes.len() as isize
-    );
-    drop(write);
-    capture.drain(4096).unwrap();
-    let (text, truncated) = capture.text();
-    assert_eq!(text, "ok�[31m��\n\t");
-    assert!(truncated);
-    assert!(capture.eof);
-}
-
-#[test]
 fn spawn_rejects_replaced_cwd_before_any_process() {
     let f = Fixture::new();
     let runtime = RuntimeDirectory::scratch(&f.0, true).unwrap();
@@ -243,7 +303,11 @@ fn spawn_rejects_replaced_cwd_before_any_process() {
         .unwrap_or_else(|e| panic!("{:?}", e.reason));
     fs::rename(path.join("sub"), path.join("old-sub")).unwrap();
     fs::create_dir(path.join("sub")).unwrap();
-    let mut failure = match prepared.spawn(Path::new("/usr/bin/true"), &cancel) {
+    let mut failure = match prepared.spawn(
+        Path::new("/usr/bin/true"),
+        &cancel,
+        Box::new(TestSink::default()),
+    ) {
         Err(e) => e,
         Ok(_) => panic!("replaced cwd spawned"),
     };
@@ -273,9 +337,13 @@ fn notice_fixture() -> (ShellJob, std::os::fd::OwnedFd) {
             notices: 0,
             spawned: false,
             terminal: None,
-            out: Capture::new(out),
-            err: Capture::new(err),
-            deadline: Instant::now() + Duration::from_secs(5),
+            out: Capture::new(out, Stream::Stdout),
+            err: Capture::new(err, Stream::Stderr),
+            sink: Box::new(TestSink {
+                room: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(512 * 1024)),
+                ..TestSink::default()
+            }),
+            deadline: None,
             stop: None,
             cleanup: None,
             job_id: [7; 16],
@@ -329,4 +397,53 @@ fn settled_setup_failure_is_never_a_successful_shell_exit() {
     assert_eq!(result.failure, Some(ShellError::Denied));
     assert_eq!(result.exit_code, None);
     assert_eq!(result.signal, None);
+}
+
+/// J1T-15 unit: interests omit a stream's read while the sink has less
+/// than one read buffer of room, keep the status pipe, and return to both
+/// pipes after a cancel trigger.
+#[test]
+fn j1t_15_interests_follow_sink_room_and_cancel() {
+    let (job, _write) = notice_fixture();
+    let mut job = job;
+    job.out.eof = false;
+    job.err.eof = false;
+    let room = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(READ_BUFFER));
+    job.sink = Box::new(TestSink {
+        room: room.clone(),
+        ..TestSink::default()
+    });
+    assert_eq!(job.interests().len(), 3);
+    room.store(READ_BUFFER - 1, Ordering::Release);
+    let interests = job.interests();
+    assert_eq!(interests.len(), 1);
+    assert_eq!(interests[0].fd, job.status.as_raw_fd());
+    job.stop(StopReason::Cancelled);
+    assert_eq!(job.interests().len(), 3, "drain to EOF after cancel");
+}
+/// J1T-07 unit: nothing produces `OutputLimit`; more than 64 MiB of output
+/// does not stop the job (J1-Q2).
+#[test]
+fn j1t_07_no_output_limit_producer() {
+    let (mut job, _write) = notice_fixture();
+    job.out.total = 80 * 1024 * 1024;
+    job.err.total = 80 * 1024 * 1024;
+    let _ = job.poll(Instant::now());
+    assert_ne!(job.stop, Some(StopReason::OutputLimit));
+    assert!(job.stop.is_none() || job.fault);
+}
+/// J1T-05/J1T-06 unit: with no deadline, setup and poll check only
+/// cancellation; a deadline remains only for qualification.
+#[test]
+fn j1t_05_no_deadline_checks_cancel_only() {
+    let cancel = AtomicBool::new(false);
+    assert_eq!(check(None, &cancel), Ok(()));
+    let past = Instant::now() - Duration::from_secs(1);
+    assert_eq!(check(Some(past), &cancel), Err(ShellError::Deadline));
+    cancel.store(true, Ordering::Release);
+    assert_eq!(check(None, &cancel), Err(ShellError::Cancelled));
+    let (mut job, _write) = notice_fixture();
+    job.lease = None;
+    let _ = job.poll(Instant::now() + Duration::from_secs(3600));
+    assert_ne!(job.stop, Some(StopReason::Deadline));
 }

@@ -8,7 +8,10 @@ pub mod rewrite;
 mod rules;
 mod stream;
 
-pub use rewrite::{Refusal, RefusalCode, Rewrite, SecretVariable, rewrite_command};
+pub use rewrite::{
+    MAX_REWRITTEN_COMMAND_BYTES, Refusal, RefusalCode, Rewrite, SecretVariable, display_redacted,
+    rewrite_command, rewrite_shell_call,
+};
 pub use rules::{RULE_SET_DIGEST, RULE_SET_REVISION, RuleSet, SelfCheckError};
 pub use stream::{
     CARRY_LIMIT, JobRedaction, JobSummary, LossReason, LossSpan, MAX_LOSS_SPANS, MAX_NUMBERS,

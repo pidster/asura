@@ -952,7 +952,8 @@ flowchart TD
 
 ## J1 and SL3 implementation details
 
-Status: ready for implementation, 2026-10-15. This section is the governing
+Status: implemented, 2026-10-16; see [J1 implementation](#j1-implementation).
+Ready for implementation since 2026-10-15. This section is the governing
 design for packet J1 and secret detection slice
 [SL3](secret-detection.md#delivery). It resolves the readiness gaps of the J1
 plan (G1–G21) with the owner decisions J1-Q1 to J1-Q4 below. Mechanisms not
@@ -1094,7 +1095,7 @@ a flag is one byte, 0 or 1. Any other value is `Corrupt`.
 
 Replay recomputes fields 14–16 from the record and the frame's installation
 ID and rejects a mismatch as `Corrupt`. The maximum payload is 9,384 bytes:
-30 fixed, 8,196 command, 1,028 cwd, 6 refusal and busy, 33 variables, 48 IDs,
+30 fixed, 8,196 command, 1,028 cwd, 6 refusal and busy, 32 variables, 48 IDs,
 8 reservation and 36 rule set. The maximum frame is 9,568 bytes, below the
 64 KiB frame.
 
@@ -1708,6 +1709,154 @@ claimed.
   a model's choice of commands.
 - A page of output expired by interim expiry reads `missing` after a restart
   until J6 adds durable retention records.
+
+### J1 implementation
+
+Implemented behavior, 2026-10-16, with secret detection slice SL3. Code:
+
+| Owner | Code |
+| --- | --- |
+| Rewrite planner: `rewrite_shell_call` (rewrite, cwd scan, 8,192-byte check), refusal codes 13 and 14 | `asura-platform/src/secrets/rewrite.rs` |
+| `OutputSink`, interest-based backpressure, discard after cancel, `render_tail`; no raw ring; no 64 MiB stop; `ShellRequest::deadline: Option` | `asura-platform/src/shell.rs`, `shell/capture.rs` |
+| Guardian no-deadline mode (`none`), `CleanupSafety` seeded by the first clock sample | `asura-platform/src/shell/guardian.rs` |
+| Payload file primitives on held descriptors, test-support fault gate | `asura-platform/src/payload_io.rs` |
+| `payloads/` accepted as a named root entry by the installation census | `asura-platform/src/authority.rs` |
+| Kinds 22 and 23: codec, replay order, `reserve()`, shared `shell_job_id` | `asura-storage/src/authority/conversation/{types,codec,state}.rs` |
+| Payload IDs, ledger and interim expiry, staging, pages, page-read pool, derived recovery | `asura-storage/src/payload/` |
+| `retention.quotaBytes` | `asura-storage/src/config.rs`, audit setting `retention.quotaBytes` |
+| Capture worker, transfer queue, pause and Fibonacci retry, detector panic path | `asura-service/src/capture_worker.rs` |
+| Shell worker phases with `Finalizing`, settlement after the L3 bound | `asura-service/src/shell_worker.rs` |
+| Rewrite at `ToolCall`, refusal and `busy` records, keyed duplicate digest, settle-then-install | `asura-service/src/conversation.rs`, `conversation/shell_call.rs` |
+| Recovery worker, ready store, page pool, pending-install list | `asura-service/src/payload_owner.rs` |
+| Worker-layer harness (feature `test-support` only) | `asura-service/src/test_support.rs` |
+| Guide text for `timeout_seconds` | `swift/model-helper/Sources/HelperCore/ToolBridge.swift` |
+
+Refinements made during J1 (engineering choices under the iteration rules):
+
+- **Kind 22 size.** The variables take 16 × 2 = 32 bytes, not 33. The maximum
+  payload is 9,384 bytes and the maximum frame 9,568 bytes, as stated above;
+  tests assert both.
+- **Sink.** `OutputSink` gained `discard(stream, bytes)` and `flush()`. The
+  platform reader counts discarded bytes and tells the sink; the sink sends
+  each stream's discard count with its EOF marker. The service keeps a handle
+  to the sink's waiting bytes, so bytes that wait on the reactor keep moving to
+  the worker after `ShellJob` settles and before the producer side closes.
+- **Chunks.** Bytes that wait on the reactor merge into one chunk per stream
+  of at most 64 KiB. With 8 chunks queued, `room()` is 0 as designed, so a
+  stalled worker holds at most 8 chunks plus the pipe buffers.
+- **Free-space check.** Growth requires at least 16 MiB plus the 1 MiB step
+  free before it reserves; a write that still gets `ENOSPC` also pauses.
+  Low free space pauses with reason `enospc`; a short quota with `quota`.
+- **Refused records.** The cwd of every refused record is display-redacted
+  (identity when it holds no span) and cut to 1,024 bytes. If the rule set
+  failed its self-check, nothing can be redacted, so the refused record holds
+  the fixed text `[withheld]` for both command and cwd (G9). A refused or busy
+  call's precomputed kind 15 (status 3 or 4) stands even if the turn is
+  cancelled before dispatch, as replay requires.
+- **Invalid shell arguments.** The control codec rejects them before the
+  owner; kind 22 cannot represent them, so the owner treats one as
+  `model_protocol_fault`.
+- **Duplicate digest.** The keyed SHA-256 covers the secret values of an
+  admitted or busy call, and the raw command of a refused call. It never
+  leaves memory; the per-turn key is zeroized at turn end. The raw command
+  string is zeroized after the rewrite.
+- **Capture states.** A capture whose producer ended without both EOF markers
+  is never `complete`; it is `incomplete` with `storage_fault`. A sealed
+  report clamps loss-span offsets to the stored bytes after a write fault.
+  `not_started` is decided by the worker: no input arrived and the producer
+  closed. Its staging files are removed at once.
+- **Unconfirmed facts.** An `unconfirmed` kind 23 records the raw bytes the
+  sink accepted as observed bytes, its discard counts and EOF flags, no
+  digests and stored bytes 0; the ledger counts the abandoned worker's prefix
+  when the worker exits.
+- **Abandonment.** A dropped capture handle (owner unavailable or shut down)
+  abandons its worker; staging stays an unverified prefix.
+- **Recovery.** The conversation owner extracts the admitted calls' facts
+  from replay on the reactor (bounded by the journal) and passes them to the
+  recovery worker, which never holds a replay snapshot: the journal writer
+  answers `busy` while more than one snapshot is retained. The recovery
+  worker also warms the rule set off the reactor.
+  If an object and a staging file both exist for one recorded payload, the
+  object is checked and the staging file is deleted. After a restart every
+  recovered call is expirable, since its operation has ended.
+- **Pages.** A page that would be empty after trimming keeps its first whole
+  scalar (up to 3 bytes over the limit) so a reader always progresses. An I/O
+  error other than a missing or unsafe file reads `busy`.
+- **Root entry.** `payloads/` exists once recovery runs for an installation
+  with a journal; the census accepts it as a named entry.
+- **Logs.** Recovery completion is a debug event; a store that is unavailable
+  outside shutdown is a warning.
+- **Configuration.** `retention` is persisted only when set away from its
+  default; `get retention` and `get retention.quotaBytes` show the effective
+  value.
+- **Test-support gates.** Files in a scratch home drive the gates:
+  `capture-hold-scan`, `capture-throttle-scan` (microseconds per chunk),
+  `capture-panic-scan` (`twice` also fails `detector_error`),
+  `shell-hold-setup`, `payload-fault-{create,write,sync,install}` and
+  `payload-free-bytes`. Production builds contain none of them.
+
+Verified behavior on the macOS 27 development host, Rust 1.98:
+
+| ID | Evidence (unit; integration; end to end) | Result |
+| --- | --- | --- |
+| J1T-01 | `codec.rs` `j1t_01_*`; `journal_writer` `j1t_01_real_writer_appends_kinds_22_23_15_and_reopens` | Pass: every bound, 9,384/9,568 and 4,102/4,286 bytes, each invalid field `Corrupt`, fixed code tables |
+| J1T-02 | `authority_conversation` `j1t_02_*`; `journal_writer` `j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit` | Pass: 34 invalid orders `Corrupt`; `reserve()` adds 4,286 bytes until kind 23 |
+| J1T-03 | `secrets` `j1t_03_rewritten_command_length_limit`, `shell_call` `j1t_03_refused_display_is_cut_with_the_flag`; owner `tool_tests` `j1t_03_overlong_rewrite_is_a_recorded_refusal` | Pass at unit and owner layers. Through the fixture helper an 8 KiB command exceeds the helper's 8,192-token window before it reaches the service, so the service-level case uses the owner fixture |
+| J1T-04 | `shell_call` `j1t_04_*`; owner `tool_tests` `j1t_04_live_tool_and_cache_hold_no_raw_command` | Pass |
+| J1T-05 | `guardian` `j1t_05_*`, `shell` `j1t_05_no_deadline_checks_cancel_only`, owner `j1t_05_model_timeout_never_applies_to_shell`; `shell_process` (65 s, exit 3), `capture_flow timeout` (65 s through the owner, exit 7; turn cancel); `capture_flow native` (system model, 65 s) | Pass |
+| J1T-06 | `shell_worker` `j1t_06_setup_has_no_deadline`; `capture_flow setup` (setup held 2.6 s still spawned; cancel during setup gives `not_started`) | Pass |
+| J1T-07 | `shell` `j1t_07_no_output_limit_producer`; `shell_process` (70,000,000 bytes), `capture_flow big` (80 MiB stored whole) | Pass |
+| J1T-08 | `store.rs` `j1t_08_*` (race, order, holds, 128 cap); `capture_worker quota` (64 MiB quota, expiry, `expired` page); `capture_flow busy`; `tui_pty.py --shell-capture` | Pass |
+| J1T-09 | `capture_worker` `j1t_09_*` unit; `capture_worker disk` (160 MB APFS image from `hdiutil`), `capture_worker enospc` | Pass: paused under the reserve, resumed at the retry delay and at once on a space event, cancel while paused gives `enospc` |
+| J1T-10 | `pages.rs` and `payload_store` `j1t_10_*`; `capture_worker pages` | Pass |
+| J1T-11 | `payload_store` `j1t_11_*`; `capture_worker pages` (busy after 1.9–2 s, worker held) | Pass |
+| J1T-12 | `capture_worker split` | Pass |
+| J1T-13 | `capture_worker klb` | Pass |
+| J1T-14 | `capture_flow secrets` (kind 22 rewrite, ten `ps` samples, real value used) | Pass |
+| J1T-15 | `shell` `j1t_15_*`, `capture_worker` `j1t_15_sink_room_*`; `capture_worker gate`, `throttle`; `capture_flow overload` (Inspect and cancel under 100 ms) | Pass |
+| J1T-16, J1T-17 | `capture_worker cmd` | Pass |
+| J1T-18 | `capture_worker conc` | Pass |
+| J1T-19 | `payload_store` `j1t_19_*`; `capture_worker full` | Pass |
+| J1T-20 | codec state rules; `capture_worker partial` (write fault, discard after cancel) | Pass |
+| J1T-21 | `shell_worker` `j1t_21_bound_decision_after_a_cancel_trigger`; `capture_worker overload`, `capture_flow overload` (unconfirmed 2.52 s after the cancel, `pending_full`, list drains after release); `tui_pty.py --shell-capture` (typing during a stalled capture) | Pass |
+| J1T-22 | `payload_store` `j1t_22_*`; `capture_flow crash` (five crash points); `tui_pty.py --shell-capture` (restart and inspect) | Pass |
+| J1T-23 | `capture_worker panic` | Pass |
+| J1T-24 | `capture_flow secrets`; `tui_pty.py --shell-capture` | Pass with the scripted loopback model |
+| J1T-25 | `tui_pty.py --shell-capture` (fixture model); `capture_flow native` (system model) | Pass. The native run proves the rewrite was recorded and run; the TUI part used the fixture model |
+| J1T-26 | `tui_pty.py --shell-capture` | Pass |
+
+Commands: `cargo test -p asura-service --all-features --test capture_worker`
+and `--test capture_flow` (each takes case names; `capture_flow native` runs
+only when named), `cargo test -p asura-platform --all-features --test
+shell_process`, and `python3 rust/crates/asura-cli/tests/tui_pty.py
+<lifecycle fixture> --shell-capture` with a fixture built by
+`cargo test --workspace --all-features` and the helper beside it. The PTY
+mode and `capture_flow native` are opt-in, like `--activity`.
+
+Measurements (acceptance figures only, never runtime closures):
+
+- SDM-04: four concurrent workers raised the process maximum RSS by 7.5 MiB,
+  about 1.9 MiB per worker (acceptance 6 MiB each).
+- Typing echo in the PTY harness: 4 ms during a secret flood, 6 ms during a
+  stalled capture (acceptance 100 ms).
+- `unconfirmed` settled 2.52–2.56 s after the cancel trigger (L3 2.5 s).
+- A gated scanner held the producer at about 60 KB: eight small chunks and the
+  pipe buffer.
+- Helper reassembly: `asura-model` rebuilt for the guide text; helper SHA-256
+  `bb5a4218bb40e22b96b61215087ff0a4d02c153107e01a5498e07d138efab3fe` in
+  `.build/model-tools/package-identity.txt`; build ID and schema digest
+  unchanged.
+
+Proof limits added by the implementation:
+
+- Native runs used the system model only. A local Ollama model
+  (`granite4.2:8b`) failed the existing native tool journeys for model
+  reasons unrelated to J1.
+- The ledger can count more than the quota for a moment when restored victims
+  or a failed deletion add bytes back; the files are on disk, so this is
+  reported rather than hidden.
+- The persistence recovery design does not yet list `payloads/` as a named
+  root entry, which the census now accepts.
 
 ### Plan gap resolution
 

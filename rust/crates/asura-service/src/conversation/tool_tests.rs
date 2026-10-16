@@ -86,11 +86,12 @@ impl Fixture {
             failure_reason: None,
             tool: Some(LiveTool {
                 create: None,
-                shell_intent: None,
+                shell: None,
+                secret_digest: None,
                 memory_ticket: None,
                 rejected: false,
                 call,
-                deadline: now + Duration::from_secs(2),
+                deadline: Some(now + Duration::from_secs(2)),
                 intent_committed: false,
                 dispatched: false,
                 result: None,
@@ -99,6 +100,7 @@ impl Fixture {
             tool_executor: tools::Executor::default(),
             shell_worker: crate::shell_worker::Worker::default(),
             tool_cache: vec![],
+            secret_key: zeroize::Zeroizing::new([3; 32]),
         };
         Self {
             path,
@@ -134,6 +136,7 @@ impl Fixture {
                 hold_reasons: BTreeMap::new(),
                 wake: None,
                 observations: vec![],
+                payloads: Default::default(),
                 foreground: VecDeque::new(),
                 dispatching_foreground: false,
             },
@@ -215,7 +218,7 @@ fn result_acknowledgement_after_cancel_or_deadline_never_delivers() {
         let result = fixture.stage_result();
         let active = fixture.owner.active.as_mut().unwrap();
         if expired {
-            active.tool.as_mut().unwrap().deadline = Instant::now();
+            active.tool.as_mut().unwrap().deadline = Some(Instant::now());
         } else {
             active.cancel = Some(journal::Cause::UserCancel);
         }
@@ -518,11 +521,12 @@ fn invalid_semantic_path_is_durable_rejection_not_host_dispatch() {
         assert_eq!(tool_intent(&call, true).kind, if read { 4 } else { 5 });
         active.tool = Some(LiveTool {
             create: None,
-            shell_intent: None,
+            shell: None,
+            secret_digest: None,
             memory_ticket: None,
             rejected: true,
             call,
-            deadline: now + Duration::from_secs(2),
+            deadline: Some(now + Duration::from_secs(2)),
             intent_committed: false,
             dispatched: false,
             result: Some(result.clone()),
@@ -551,7 +555,7 @@ fn invalid_semantic_path_is_durable_rejection_not_host_dispatch() {
                 .model
                 .tool_test_has_delivery(tool_wire_result(&result))
         );
-        assert_eq!(active.tool_cache[0].1.status, Some(3));
+        assert_eq!(active.tool_cache[0].2.status, Some(3));
         assert!(active.tool_budget.is_settled());
     }
 }
@@ -664,7 +668,7 @@ fn memory_cancel_and_deadline_suppress_late_data_and_preserve_slot() {
     };
     tool.intent_committed = true;
     tool.dispatched = true;
-    tool.deadline = now;
+    tool.deadline = Some(now);
     fixture.owner.capture_memory_tool(now);
     let active = fixture.owner.active.as_mut().unwrap();
     assert_eq!(
@@ -690,7 +694,7 @@ fn memory_cancel_and_deadline_suppress_late_data_and_preserve_slot() {
             .is_err()
     );
     active.cancel = Some(journal::Cause::UserCancel);
-    active.tool.as_mut().unwrap().deadline = now + Duration::from_secs(1);
+    active.tool.as_mut().unwrap().deadline = Some(now + Duration::from_secs(1));
     fixture.owner.capture_memory_tool(now);
     let result = fixture
         .owner
@@ -805,7 +809,7 @@ fn memory_response_does_not_release_slot_before_worker_settles() {
     assert!(
         active
             .model
-            .tool_test_has_delivery(active.tool_cache[0].1.clone())
+            .tool_test_has_delivery(active.tool_cache[0].2.clone())
     );
 }
 #[test]
@@ -824,11 +828,11 @@ fn unsettled_memory_timeout_or_steering_never_delivers_late_body() {
         tool.intent_committed = true;
         tool.dispatched = true;
         tool.memory_ticket = Some(ticket);
-        tool.deadline = if steering {
+        tool.deadline = Some(if steering {
             now + Duration::from_secs(2)
         } else {
             now
-        };
+        });
         if steering {
             active.cancel = Some(journal::Cause::Steering);
         }
@@ -996,7 +1000,7 @@ fn inventory_obeys_cancellation_deadline_and_disabled_tool_fences() {
         tool.dispatched = true;
         match status {
             6 => active.cancel = Some(journal::Cause::UserCancel),
-            5 => tool.deadline = Instant::now(),
+            5 => tool.deadline = Some(Instant::now()),
             2 => active.tools_enabled = false,
             _ => unreachable!(),
         }
@@ -1036,6 +1040,7 @@ fn committed_tool_activity_is_observable_before_model_text() {
             intent_frame: 0..1,
             result_frame: None,
             result_bytes: 0,
+            shell: None,
         });
     assert!(fixture.owner.active.as_ref().unwrap().cursor > before);
     assert!(fixture.owner.active.as_ref().unwrap().snapshot.is_empty());
@@ -1139,4 +1144,202 @@ fn settled_measurements_cache_evicts_oldest_and_restart_stays_unknown() {
     assert_eq!(fixture.owner.measurements.front().unwrap().0, [2; 16]);
     assert_eq!(fixture.owner.measurements.back().unwrap().0, [9; 16]);
     assert!(inventory_fixture().owner.measurements.is_empty());
+}
+
+fn shell_call_of(active: &Active, command: &str) -> tools::Call {
+    tools::Call {
+        operation: active.turn.operation,
+        generation: active.turn.generation,
+        ordinal: 1,
+        arguments: tools::Arguments::Shell {
+            command: command.into(),
+            cwd: ".".into(),
+            timeout_seconds: 30,
+        },
+    }
+}
+fn shell_token() -> String {
+    ["ghp_", &"xV7".repeat(12)].concat()
+}
+fn shell_text(call: &tools::Call) -> String {
+    match &call.arguments {
+        tools::Arguments::Shell { command, cwd, .. } => format!("{command}\0{cwd}"),
+        _ => String::new(),
+    }
+}
+
+/// J1T-03 (owner layer): a rewrite over 8,192 bytes is refused at
+/// `ToolCall`, before any record; kind 22 encodes within its frame, so the
+/// append cannot fail on size and make the service unavailable.
+#[test]
+fn j1t_03_overlong_rewrite_is_a_recorded_refusal() {
+    let mut fixture = Fixture::new();
+    let now = Instant::now();
+    let active = fixture.owner.active.as_mut().unwrap();
+    active.tool = None;
+    active.tool_budget = tools::Budget::new(now + Duration::from_secs(60));
+    let unit = ["curl -u admin:", "Sup3r", "S3cret", " x;"].concat();
+    let long = format!(
+        "{}echo {}",
+        unit.repeat(10),
+        "f".repeat(8192 - 60 - unit.len() * 10 - 5 + 1)
+    );
+    assert!(long.len() <= 8192);
+    let call = shell_call_of(active, &long);
+    Owner::tool_call(active, call, now, &fixture.owner.payloads, Some([9; 16]));
+    let tool = active.tool.as_ref().expect("live tool");
+    let shell = tool.shell.as_ref().expect("shell");
+    assert_eq!(shell.intent.disposition, journal::ShellDisposition::Refused);
+    assert_eq!(
+        shell.intent.refusal.map(|r| r.code),
+        Some(journal::RefusalCode::RewrittenCommandTooLong)
+    );
+    assert!(tool.rejected);
+    assert_eq!(tool.result.as_ref().map(|r| r.status), Some(3));
+    let context = journal::FrameContext {
+        installation_id: [9; 16],
+        transition_id: [1; 16],
+        sequence: 2,
+        prior_digest: [0; 32],
+        expected_revision: 1,
+        owner_generation: 1,
+    };
+    let frame = journal::encode_frame(
+        &context,
+        &journal::Record::ShellIntent(Box::new(shell.intent.clone())),
+    )
+    .expect("kind 22 encodes");
+    assert!(frame.len() <= 9568);
+    assert!(fixture.owner.unavailable.is_none());
+}
+
+/// J1T-04 (owner layer, memory inspection): after `ToolCall` and after the
+/// result is cached, neither `LiveTool` nor `tool_cache` holds the raw
+/// command; a repeat with a different value conflicts, an equal one matches.
+#[test]
+fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
+    let mut fixture = Fixture::new();
+    let now = Instant::now();
+    let token = shell_token();
+    let raw = format!("printf '%s' \"{token}\" | wc -c");
+    {
+        let active = fixture.owner.active.as_mut().unwrap();
+        active.tool = None;
+        active.tool_budget = tools::Budget::new(now + Duration::from_secs(60));
+        let call = shell_call_of(active, &raw);
+        // No payload store is ready: the call is recorded busy, which
+        // carries the rewrite too.
+        Owner::tool_call(active, call, now, &fixture.owner.payloads, Some([9; 16]));
+        let tool = active.tool.as_ref().unwrap();
+        assert!(!shell_text(&tool.call).contains(&token));
+        assert!(shell_text(&tool.call).contains("${ASURA_SECRET_1}"));
+        let shell = tool.shell.as_ref().unwrap();
+        assert_eq!(
+            shell.intent.busy,
+            Some(journal::ShellBusyReason::PayloadUnavailable)
+        );
+        assert!(!shell.intent.command.contains(&token));
+        assert!(shell.secrets.is_empty(), "busy keeps no secret value");
+        assert!(tool.secret_digest.is_some());
+    }
+    fixture.acknowledge(Job::ToolIntent);
+    fixture.owner.unavailable = None;
+    {
+        let tool = fixture
+            .owner
+            .active
+            .as_mut()
+            .unwrap()
+            .tool
+            .as_mut()
+            .unwrap();
+        tool.dispatched = true;
+    }
+    fixture.acknowledge(Job::ToolResult);
+    let active = fixture.owner.active.as_mut().unwrap();
+    assert_eq!(active.tool_cache.len(), 1);
+    let (cached, digest, wire) = &active.tool_cache[0];
+    assert!(!shell_text(cached).contains(&token));
+    assert!(digest.is_some());
+    assert!(!wire.text.as_deref().unwrap_or("").contains(&token));
+    // A repeated ordinal is compared by rewrite and keyed digest: the same
+    // value matches the cache entry; a different value with the same rewrite
+    // does not, and the owner treats it as a protocol fault.
+    let other = ["ghp_", &"qQ2".repeat(12)].concat();
+    let mut same = shell_call_of(active, &raw);
+    let (_, same_digest) = shell_call::prepare(&mut same, &active.secret_key);
+    assert_eq!(&same, cached);
+    assert_eq!(Some(same_digest), *digest);
+    let mut different = shell_call_of(active, &format!("printf '%s' \"{other}\" | wc -c"));
+    let (_, different_digest) = shell_call::prepare(&mut different, &active.secret_key);
+    assert_eq!(
+        &different, cached,
+        "the rewrite alone cannot tell them apart"
+    );
+    assert_ne!(Some(different_digest), *digest);
+    let different = shell_call_of(active, &format!("printf '%s' \"{other}\" | wc -c"));
+    Owner::tool_call(
+        active,
+        different,
+        now,
+        &fixture.owner.payloads,
+        Some([9; 16]),
+    );
+    assert_eq!(active.failure_reason, Some("model_protocol_fault"));
+}
+
+/// J1T-05 unit (J1-Q3): a shell call has no tool deadline, so a result
+/// committed long after it started never fails the turn as `model_timeout`;
+/// the ordinary tool deadline (L10) is unchanged.
+#[test]
+fn j1t_05_model_timeout_never_applies_to_shell() {
+    let mut fixture = Fixture::new();
+    let now = Instant::now();
+    {
+        let active = fixture.owner.active.as_mut().unwrap();
+        active.tool = None;
+        active.tool_budget = tools::Budget::new(now + Duration::from_secs(3600));
+        let call = shell_call_of(active, "sleep 65");
+        Owner::tool_call(active, call, now, &fixture.owner.payloads, Some([9; 16]));
+        assert!(active.tool.as_ref().unwrap().deadline.is_none());
+    }
+    fixture.acknowledge(Job::ToolIntent);
+    {
+        let tool = fixture
+            .owner
+            .active
+            .as_mut()
+            .unwrap()
+            .tool
+            .as_mut()
+            .unwrap();
+        assert!(tool.deadline.is_none(), "kind 22 commit sets no deadline");
+        tool.dispatched = true;
+    }
+    fixture.owner.job_done(
+        Job::ToolResult,
+        Ok(writer::Reply {
+            memory_create_result: None,
+            memory_result: None,
+            sensor_state: None,
+            replay: None,
+            record: None,
+            history: None,
+            prepared: None,
+            projects: vec![],
+            inputs: vec![],
+            queued: None,
+            order_revision: None,
+            stale_order: false,
+            accepted_input_id: None,
+            project_name: None,
+            project_name_revision: None,
+            project_name_changed: None,
+            stale_project_name_revision: false,
+        }),
+        now + Duration::from_secs(120),
+    );
+    let active = fixture.owner.active.as_ref().unwrap();
+    assert_ne!(active.failure_reason, Some("model_timeout"));
+    assert_eq!(active.tool_cache.len(), 1);
 }

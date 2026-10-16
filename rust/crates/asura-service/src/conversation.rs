@@ -2,6 +2,7 @@
 mod audit_tools;
 mod memory_create;
 mod memory_tools;
+mod shell_call;
 use crate::model_owner::{ModelOwner, PackageIdentity};
 use crate::{sensors, tools};
 use asura_control::{model::pb as mp, pb};
@@ -71,6 +72,20 @@ fn error(request: pb::Envelope, message: &str) -> pb::Envelope {
         }),
     };
     reply(request, body)
+}
+/// The scratch home whose files drive the test-support capture gates.
+fn gate_home(runtime: &RuntimeDirectory) -> Option<std::path::PathBuf> {
+    #[cfg(feature = "test-support")]
+    {
+        runtime
+            .scratch_home_for_test()
+            .map(std::path::Path::to_path_buf)
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        let _ = runtime;
+        None
+    }
 }
 fn storage_error(error: writer::Error) -> &'static str {
     match error {
@@ -386,10 +401,16 @@ fn tool_wire_result(value: &journal::ToolResult) -> mp::ToolResult {
 
 struct LiveTool {
     create: Option<memory_create::Mutation>,
-    shell_intent: Option<journal::ToolIntent>,
+    /// The shell call (J1): kind 22, secret variables, kind 23 and capture.
+    shell: Option<Box<shell_call::ShellLive>>,
+    /// Keyed digest of the shell call's secret values for duplicate
+    /// detection; never leaves memory (G8, SO2).
+    secret_digest: Option<[u8; 32]>,
     rejected: bool,
+    /// The rewritten call for shell; the raw command is never retained.
     call: tools::Call,
-    deadline: Instant,
+    /// The ordinary 2 s tool deadline (L10); `None` for shell (J1-Q3).
+    deadline: Option<Instant>,
     memory_ticket: Option<writer::Ticket>,
     intent_committed: bool,
     dispatched: bool,
@@ -483,7 +504,9 @@ struct Active {
     tool_budget: tools::Budget,
     tool_executor: tools::Executor,
     shell_worker: crate::shell_worker::Worker,
-    tool_cache: Vec<(tools::Call, mp::ToolResult)>,
+    tool_cache: Vec<(tools::Call, Option<[u8; 32]>, mp::ToolResult)>,
+    /// Per-turn key for the shell duplicate digest; dropped at turn end.
+    secret_key: zeroize::Zeroizing<[u8; 32]>,
 }
 impl Active {
     /// Revoke pending database submission at the lifecycle event's entry point.
@@ -545,6 +568,7 @@ enum Job {
     Cancel,
     Finish,
     ToolIntent,
+    CaptureSettled,
     ToolResult,
     RecoverCreateResult,
     RecoverCreateFinish,
@@ -593,6 +617,8 @@ pub(crate) struct Owner {
     hold_reasons: BTreeMap<journal::Id, &'static str>,
     wake: Option<asura_platform::events::WakeSender>,
     observations: Vec<(pb::Envelope, Instant)>,
+    /// Payload recovery, store, page pool and pending installs (J1).
+    payloads: crate::payload_owner::Payloads,
 }
 impl Owner {
     pub(crate) fn new(runtime: RuntimeDirectory, package: Option<PackageIdentity>) -> Self {
@@ -632,6 +658,7 @@ impl Owner {
             hold_reasons: BTreeMap::new(),
             wake: None,
             observations: Vec::new(),
+            payloads: Default::default(),
         }
     }
     fn note_hold(&mut self, input: journal::Id, reason: &'static str) {
@@ -674,7 +701,7 @@ impl Owner {
             return;
         }
         let cancelled = active.cancel.is_some() || active.terminal.is_some();
-        let expired = now >= tool.deadline;
+        let expired = tool.deadline.is_some_and(|deadline| now >= deadline);
         if cancelled || (expired && tool.result.is_none()) {
             tool.result = Some(tool_result(
                 &tool.call,
@@ -746,7 +773,7 @@ impl Owner {
         }
         let rejection = if active.cancel.is_some() || active.terminal.is_some() || self.closing {
             Some(tools::Rejection::Cancelled)
-        } else if now >= tool.deadline {
+        } else if tool.deadline.is_some_and(|deadline| now >= deadline) {
             Some(tools::Rejection::Expired)
         } else if !active.tools_enabled {
             Some(tools::Rejection::Denied)
@@ -802,7 +829,7 @@ impl Owner {
         }
         let rejection = if active.cancel.is_some() || active.terminal.is_some() || self.closing {
             Some(tools::Rejection::Cancelled)
-        } else if now >= tool.deadline {
+        } else if tool.deadline.is_some_and(|deadline| now >= deadline) {
             Some(tools::Rejection::Expired)
         } else if !active.tools_enabled {
             Some(tools::Rejection::Denied)
@@ -852,7 +879,7 @@ impl Owner {
         }
         let rejection = if active.cancel.is_some() || active.terminal.is_some() {
             Some(tools::Rejection::Cancelled)
-        } else if now >= tool.deadline {
+        } else if tool.deadline.is_some_and(|deadline| now >= deadline) {
             Some(tools::Rejection::Expired)
         } else if self.sensor_failed.contains(&active.turn.project) {
             Some(tools::Rejection::Denied)
@@ -1190,7 +1217,7 @@ impl Owner {
                                     | tools::Arguments::ReadAudit { .. }
                             ) || t.call.arguments.is_memory())
                     })
-                    .map(|t| t.deadline),
+                    .and_then(|t| t.deadline),
             )
             .chain(
                 (self.pending.is_none()
@@ -1209,6 +1236,7 @@ impl Owner {
             )
             .chain(tool)
             .chain(closing)
+            .chain(self.payloads.next_deadline())
             .chain(self.observations.iter().map(|(_, deadline)| *deadline))
             .min()
     }
@@ -1900,6 +1928,12 @@ impl Owner {
                 worker
             },
             tool_cache: Vec::new(),
+            secret_key: zeroize::Zeroizing::new({
+                let mut key = [0u8; 32];
+                key[..16].copy_from_slice(&asura_platform::random_id());
+                key[16..].copy_from_slice(&asura_platform::random_id());
+                key
+            }),
         });
         Ok(())
     }
@@ -2283,9 +2317,40 @@ impl Owner {
                 tool.intent_committed = true;
                 active.measurements.tool_start[tool.call.ordinal as usize - 1] = Some(now);
                 if !matches!(tool.call.arguments, tools::Arguments::Shell { .. }) {
-                    tool.deadline = now + std::time::Duration::from_secs(2);
+                    tool.deadline = Some(now + std::time::Duration::from_secs(2));
                 }
                 active.cursor += 1;
+            }
+            Job::CaptureSettled => {
+                let active = self.active.as_mut().expect("active capture settlement");
+                let tool = active.tool.as_mut().expect("pending tool");
+                let shell = tool.shell.as_mut().expect("shell call");
+                let settled = shell.settled.as_ref().expect("settled capture");
+                shell.settled_committed = true;
+                let sequence = self.replay.as_ref().map_or(0, |r| r.sequence);
+                if let Some(store) = &shell.store {
+                    if settled.state == journal::CaptureState::NotStarted {
+                        store.release(shell.intent.job);
+                    } else {
+                        store.settle(
+                            shell.intent.job,
+                            settled.state,
+                            [
+                                (settled.stdout.stored_bytes, settled.stdout.digest),
+                                (settled.stderr.stored_bytes, settled.stderr.digest),
+                            ],
+                            sequence,
+                            shell.capture.is_some(),
+                        );
+                    }
+                }
+                // The worker installs after kind 23; the turn never waits.
+                if let Some(capture) = shell.capture.take() {
+                    if settled.state != journal::CaptureState::Unconfirmed {
+                        capture.install();
+                    }
+                    self.payloads.push_pending(capture);
+                }
             }
             Job::ToolResult => {
                 let active = self.active.as_mut().expect("active tool result");
@@ -2313,9 +2378,11 @@ impl Owner {
                     Self::failed(active, "model_protocol_fault", now);
                 } else {
                     let wire = tool_wire_result(&result);
-                    active.tool_cache.push((tool.call.clone(), wire.clone()));
+                    active
+                        .tool_cache
+                        .push((tool.call.clone(), tool.secret_digest, wire.clone()));
                     active.cursor += 1;
-                    if now >= tool.deadline || self.closing {
+                    if tool.deadline.is_some_and(|deadline| now >= deadline) || self.closing {
                         Self::failed(active, "model_timeout", now);
                     }
                     if tool.call.arguments.is_memory()
@@ -2346,6 +2413,10 @@ impl Owner {
             }
             Job::Finish => {
                 let mut active = self.active.take().expect("finished operation");
+                // Unverified prefixes of an ended operation become expirable.
+                if let Some(store) = self.payloads.store() {
+                    store.operation_ended(active.turn.operation);
+                }
                 active.measurements.ended = Some(now);
                 active.measurements.complete &= active
                     .terminal
@@ -2595,6 +2666,131 @@ impl Owner {
             output_tokens,
             charged_tokens,
             text: active.snapshot.clone(),
+        });
+    }
+    /// One proposed tool call. A shell call is rewritten before any
+    /// comparison or record (SL3); the raw command is never retained (G8).
+    /// Refusal and `busy` are decided here, before kind 22.
+    fn tool_call(
+        active: &mut Active,
+        mut call: tools::Call,
+        now: Instant,
+        payloads: &crate::payload_owner::Payloads,
+        installation: Option<journal::Id>,
+    ) {
+        let shell = matches!(call.arguments, tools::Arguments::Shell { .. });
+        let mut rejected = call.arguments.validate() == Err(tools::Rejection::InvalidArguments);
+        if shell && rejected {
+            // The control codec rejects these first; kind 22 cannot hold them.
+            Self::failed(active, "model_protocol_fault", now);
+            return;
+        }
+        let prepared = shell.then(|| shell_call::prepare(&mut call, &active.secret_key));
+        let digest = prepared.as_ref().map(|(_, digest)| *digest);
+        if let Some((prior, prior_digest, result)) = active
+            .tool_cache
+            .iter()
+            .find(|(prior, _, _)| prior.ordinal == call.ordinal)
+        {
+            if validate_cached_tool(prior, &call, &active.turn, active.foreground_user).is_err()
+                || *prior_digest != digest
+                || active.model.tool_result(result.clone()).is_err()
+            {
+                Self::failed(active, "model_protocol_fault", now);
+            }
+            return;
+        }
+        if let Some(pending) = &active.tool {
+            if pending.call != call || pending.secret_digest != digest {
+                Self::failed(active, "model_protocol_fault", now);
+            }
+            return;
+        }
+        let grant = tool_grant(&active.turn, active.foreground_user);
+        let reserved = if rejected {
+            active.tool_budget.reserve_rejected(
+                call.clone(),
+                &grant,
+                &tools::Destination::Local,
+                now,
+            )
+        } else {
+            active
+                .tool_budget
+                .reserve(call.clone(), &grant, &tools::Destination::Local, now)
+        };
+        if reserved.is_err() {
+            Self::failed(active, "model_protocol_fault", now);
+            return;
+        }
+        let mut result = rejected.then(|| {
+            tool_result(
+                &call,
+                Err(tools::ExecutionError::Rejected(
+                    tools::Rejection::InvalidArguments,
+                )),
+            )
+        });
+        let mut live = None;
+        if let Some((prepared, _)) = prepared {
+            let Some(installation) = installation else {
+                Self::failed(active, "model_protocol_fault", now);
+                return;
+            };
+            let job = journal::shell_job_id(call.operation, call.generation, call.ordinal);
+            let admission = match &prepared {
+                shell_call::Prepared::Refused { .. } => Err(None),
+                shell_call::Prepared::Rewritten(_) => payloads
+                    .admission(active.shell_worker.capture_paused())
+                    .and_then(|store| {
+                        store
+                            .admit(
+                                installation,
+                                call.operation,
+                                call.generation,
+                                call.ordinal,
+                                job,
+                            )
+                            .map(|victims| (store, victims))
+                            .map_err(|_| journal::ShellBusyReason::Quota)
+                    })
+                    .map_err(Some),
+            };
+            let busy = admission.as_ref().err().copied().flatten();
+            let intent = shell_call::intent(&call, installation, &prepared, busy);
+            if let Some(precomputed) = shell_call::precomputed_result(&call, &prepared, busy) {
+                result = Some(precomputed);
+                rejected = true;
+            }
+            let (store, victims) = match admission {
+                Ok((store, victims)) => (Some(store), victims),
+                Err(_) => (None, Vec::new()),
+            };
+            let secrets = match prepared {
+                shell_call::Prepared::Rewritten(variables) if store.is_some() => variables,
+                _ => Vec::new(),
+            };
+            live = Some(Box::new(shell_call::ShellLive {
+                intent,
+                secrets,
+                victims,
+                store,
+                settled: None,
+                settled_committed: false,
+                capture: None,
+            }));
+        }
+        active.tool = Some(LiveTool {
+            create: None,
+            shell: live,
+            secret_digest: digest,
+            memory_ticket: None,
+            rejected,
+            call,
+            deadline: (!shell).then(|| now + std::time::Duration::from_secs(2)),
+            intent_committed: false,
+            dispatched: false,
+            result,
         });
     }
     #[track_caller]
@@ -2885,90 +3081,13 @@ impl Owner {
                         Self::failed(active, "model_protocol_fault", now);
                     } else if active.cancel.is_none() && active.terminal.is_none() {
                         match proposed_tool(&active.turn, call) {
-                            Ok(call) => {
-                                if let Some((prior, result)) = active
-                                    .tool_cache
-                                    .iter()
-                                    .find(|(prior, _)| prior.ordinal == call.ordinal)
-                                {
-                                    if validate_cached_tool(
-                                        prior,
-                                        &call,
-                                        &active.turn,
-                                        active.foreground_user,
-                                    )
-                                    .is_err()
-                                        || active.model.tool_result(result.clone()).is_err()
-                                    {
-                                        Self::failed(active, "model_protocol_fault", now);
-                                    }
-                                } else if let Some(pending) = &active.tool {
-                                    if pending.call != call {
-                                        Self::failed(active, "model_protocol_fault", now);
-                                    }
-                                } else {
-                                    let grant = tool_grant(&active.turn, active.foreground_user);
-                                    let rejected = call.arguments.validate()
-                                        == Err(tools::Rejection::InvalidArguments);
-                                    let reserved = if rejected {
-                                        active.tool_budget.reserve_rejected(
-                                            call.clone(),
-                                            &grant,
-                                            &tools::Destination::Local,
-                                            now,
-                                        )
-                                    } else {
-                                        active.tool_budget.reserve(
-                                            call.clone(),
-                                            &grant,
-                                            &tools::Destination::Local,
-                                            now,
-                                        )
-                                    };
-                                    if reserved.is_err() {
-                                        Self::failed(active, "model_protocol_fault", now);
-                                    } else {
-                                        let result = rejected.then(|| {
-                                            tool_result(
-                                                &call,
-                                                Err(tools::ExecutionError::Rejected(
-                                                    tools::Rejection::InvalidArguments,
-                                                )),
-                                            )
-                                        });
-                                        let mut deadline = now + std::time::Duration::from_secs(2);
-                                        let shell_intent = if let tools::Arguments::Shell {
-                                            timeout_seconds,
-                                            ..
-                                        } = &call.arguments
-                                        {
-                                            let duration = std::time::Duration::from_secs(
-                                                u64::from(*timeout_seconds),
-                                            );
-                                            deadline = now
-                                                + std::time::Duration::from_millis(
-                                                    duration.as_millis() as u64,
-                                                );
-                                            let mut intent = tool_intent(&call, false);
-                                            intent.offset = duration.as_millis() as u64;
-                                            Some(intent)
-                                        } else {
-                                            None
-                                        };
-                                        active.tool = Some(LiveTool {
-                                            create: None,
-                                            shell_intent,
-                                            memory_ticket: None,
-                                            rejected,
-                                            call,
-                                            deadline,
-                                            intent_committed: false,
-                                            dispatched: false,
-                                            result,
-                                        });
-                                    }
-                                }
-                            }
+                            Ok(call) => Self::tool_call(
+                                active,
+                                call,
+                                now,
+                                &self.payloads,
+                                self.replay.as_ref().map(|r| r.installation_id),
+                            ),
                             Err(_) => Self::failed(active, "model_protocol_fault", now),
                         }
                     }
@@ -3036,8 +3155,9 @@ impl Owner {
             tool.result = Some(result);
         }
         if let Some(active) = &mut self.active
-            && let Some(mut result) = active.shell_worker.poll(now)
+            && let Some(output) = active.shell_worker.poll(now)
         {
+            let mut result = output.result;
             if result.text.len() > active.tool_budget.result_capacity() {
                 result.status = 7;
                 result.text.clear();
@@ -3045,8 +3165,15 @@ impl Owner {
             }
             if let Some(tool) = &mut active.tool {
                 tool.result = Some(result);
+                if let Some(shell) = &mut tool.shell {
+                    shell.settled = Some(output.settled);
+                    shell.capture = output.capture;
+                }
             }
         }
+        self.payloads.poll();
+        self.payloads
+            .ensure_recovery(&self.runtime, self.replay.as_ref(), self.wake.as_ref());
         if self
             .active
             .as_ref()
@@ -3174,6 +3301,11 @@ impl Owner {
                     .and_then(|tool| tool.create.as_ref())
                     .is_none_or(memory_create::Mutation::settled)
             {
+                if let Some(shell) = active.tool.as_mut().and_then(|t| t.shell.as_mut())
+                    && !shell.settled_committed
+                {
+                    shell.release_admission();
+                }
                 self.active = None;
             }
             return;
@@ -3273,6 +3405,9 @@ impl Owner {
         if let Some(tool) = &mut active.tool {
             if !tool.intent_committed {
                 if active.cancel.is_some() || active.terminal.is_some() {
+                    if let Some(shell) = &mut tool.shell {
+                        shell.release_admission();
+                    }
                     active.tool = None;
                 } else {
                     let record = if tool.call.arguments.is_memory_create() && !tool.rejected {
@@ -3301,12 +3436,11 @@ impl Owner {
                                 return;
                             }
                         }
+                    } else if let Some(shell) = &tool.shell {
+                        // Kind 22 for every new shell call; never kind 14 (J1).
+                        journal::Record::ShellIntent(Box::new(shell.intent.clone()))
                     } else {
-                        journal::Record::ToolIntent(
-                            tool.shell_intent
-                                .clone()
-                                .unwrap_or_else(|| tool_intent(&tool.call, tool.rejected)),
-                        )
+                        journal::Record::ToolIntent(tool_intent(&tool.call, tool.rejected))
                     };
                     if let Err(e) = self.append(record, Job::ToolIntent, None) {
                         self.unavailable = Some(storage_error(e));
@@ -3316,14 +3450,22 @@ impl Owner {
             } else {
                 if !tool.dispatched {
                     tool.dispatched = true;
-                    if active.cancel.is_some() || active.terminal.is_some() {
+                    let shell_precomputed =
+                        tool.shell.as_ref().is_some_and(|shell| !shell.admitted());
+                    if (active.cancel.is_some() || active.terminal.is_some()) && !shell_precomputed
+                    {
                         tool.result = Some(tool_result(
                             &tool.call,
                             Err(tools::ExecutionError::Rejected(tools::Rejection::Cancelled)),
                         ));
+                        // Turn cancelled after kind 22, before spawn (J1).
+                        if let Some(shell) = &mut tool.shell {
+                            shell.release_admission();
+                            shell.settled = Some(shell_call::not_started(&shell.intent));
+                        }
                     } else if tool.rejected {
                         // The precomputed rejection is committed without any host dispatch.
-                    } else if matches!(tool.call.arguments, tools::Arguments::Shell { .. }) {
+                    } else if let Some(shell) = &mut tool.shell {
                         let outcome = tools::validate(
                             &tool.call,
                             &tool_grant(&active.turn, active.foreground_user),
@@ -3336,24 +3478,43 @@ impl Owner {
                                 .as_ref()
                                 .and_then(|r| r.projects.get(&active.turn.project))
                                 .ok_or(tools::ExecutionError::Rejected(tools::Rejection::Denied))?;
-                            active.shell_worker.start(
-                                self.runtime.clone(),
-                                tools::ExecutionScope {
+                            let store = shell
+                                .store
+                                .clone()
+                                .ok_or(tools::ExecutionError::Rejected(tools::Rejection::Denied))?;
+                            let rules = asura_platform::secrets::detection().map_err(|_| {
+                                tools::ExecutionError::Rejected(tools::Rejection::Denied)
+                            })?;
+                            let redaction =
+                                asura_platform::secrets::JobRedaction::new(rules, &shell.secrets);
+                            let wake = active.shell_worker.wake();
+                            active.shell_worker.start(crate::shell_worker::Dispatch {
+                                runtime: self.runtime.clone(),
+                                scope: tools::ExecutionScope {
                                     project: project.project,
                                     path: project.location.clone(),
                                     device: project.device,
                                     inode: project.inode,
                                     boundary: self.runtime.state_boundary(),
                                 },
-                                tool.call.clone(),
-                                tool.shell_intent
-                                    .clone()
-                                    .expect("shell intent before dispatch"),
-                                tool.deadline,
-                            )
+                                call: tool.call.clone(),
+                                intent: shell.intent.clone(),
+                                secrets: std::mem::take(&mut shell.secrets),
+                                capture: crate::capture_worker::Start {
+                                    store,
+                                    call: shell.intent.job,
+                                    victims: std::mem::take(&mut shell.victims),
+                                    redaction,
+                                    wake,
+                                    gate_home: gate_home(&self.runtime),
+                                },
+                            })
                         });
                         if let Err(error) = outcome {
+                            // Never started: `not_started` before the result.
                             tool.result = Some(tool_result(&tool.call, Err(error)));
+                            shell.release_admission();
+                            shell.settled = Some(shell_call::not_started(&shell.intent));
                         }
                     } else if tool.call.arguments.is_memory_create() {
                         let authorized = active.foreground_user
@@ -3364,7 +3525,7 @@ impl Owner {
                                 &tools::Destination::Local,
                             )
                             .is_ok();
-                        if !authorized || now >= tool.deadline {
+                        if !authorized || tool.deadline.is_none_or(|deadline| now >= deadline) {
                             tool.result = Some(journal::ToolResult {
                                 operation: tool.call.operation,
                                 generation: tool.call.generation,
@@ -3382,7 +3543,7 @@ impl Owner {
                             tool.create.as_mut().expect("committed create").start(
                                 writer,
                                 body.clone(),
-                                tool.deadline,
+                                tool.deadline.unwrap_or(now),
                             );
                         } else {
                             self.unavailable = Some("memory_write_outcome_unconfirmed");
@@ -3446,13 +3607,29 @@ impl Owner {
                                         inode: project.inode,
                                         boundary: self.runtime.state_boundary(),
                                     },
-                                    tool.deadline,
+                                    tool.deadline.unwrap_or(now),
                                 )
                             });
                         if let Err(error) = outcome {
                             tool.result = Some(tool_result(&tool.call, Err(error)));
                         }
                     }
+                }
+                // Settle, then install (R2): kind 23 commits before kind 15.
+                if let Some(shell) = &tool.shell
+                    && shell.admitted()
+                    && !shell.settled_committed
+                {
+                    if let Some(settled) = &shell.settled
+                        && tool.result.is_some()
+                        && active.shell_worker.is_settled()
+                    {
+                        let record = journal::Record::CaptureSettled(Box::new(settled.clone()));
+                        if let Err(e) = self.append(record, Job::CaptureSettled, None) {
+                            self.unavailable = Some(storage_error(e));
+                        }
+                    }
+                    return;
                 }
                 if let Some(result) = &tool.result
                     && active.tool_executor.is_settled()
@@ -3616,6 +3793,7 @@ impl Owner {
     }
     pub(crate) fn shutdown(&mut self) {
         self.closing = true;
+        self.payloads.shutdown(Instant::now());
         if let Some(active) = &self.active {
             active.revoke_create();
         }
@@ -3629,6 +3807,7 @@ impl Owner {
                 .is_none_or(memory_create::Mutation::settled)
             && self.pending.is_none()
             && self.sensor_owner.as_ref().is_none_or(|o| o.settled())
+            && self.payloads.settled(Instant::now())
             && self.writer.as_mut().is_none_or(|writer| writer.settled())
     }
 }

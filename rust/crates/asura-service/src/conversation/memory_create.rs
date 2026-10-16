@@ -210,12 +210,15 @@ impl Owner {
         let Some(create) = &mut tool.create else {
             return;
         };
-        if active.cancel.is_some() || active.terminal.is_some() || now >= tool.deadline {
+        if active.cancel.is_some()
+            || active.terminal.is_some()
+            || tool.deadline.is_some_and(|deadline| now >= deadline)
+        {
             create.cancel();
         }
         let status = if active.cancel.is_some() {
             6
-        } else if now >= tool.deadline {
+        } else if tool.deadline.is_some_and(|deadline| now >= deadline) {
             5
         } else {
             4

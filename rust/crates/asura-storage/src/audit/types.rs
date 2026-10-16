@@ -162,6 +162,8 @@ pub enum Setting {
     AuditMaxFileBytes,
     #[serde(rename = "providers.mlx.models")]
     ProvidersMlxModels,
+    #[serde(rename = "retention.quotaBytes")]
+    RetentionQuotaBytes,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

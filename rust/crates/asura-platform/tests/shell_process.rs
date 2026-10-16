@@ -1,13 +1,15 @@
 //! Native process qualification; private guardian dispatch is identical to the CLI.
 use asura_platform::secrets::{SecretVariable, rewrite_command};
 use asura_platform::shell::{
-    PreparedShell, ShellError, ShellRequest, ShellResult, StopReason, run_guardian,
+    OutputSink, PreparedShell, ShellError, ShellRequest, ShellResult, StopReason, Stream, Tails,
+    run_guardian,
 };
 use asura_platform::{ProjectIdentity, RuntimeDirectory};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 static CLEAN: AtomicBool = AtomicBool::new(true);
 use std::time::{Duration, Instant};
 fn main() {
@@ -61,6 +63,78 @@ impl Drop for Fixture {
         }
     }
 }
+/// Raw output the test keeps: the first 1 MiB of each stream and counts.
+/// The platform keeps no ring (J1); this test sink stands in for the
+/// service's capture worker.
+#[derive(Default)]
+struct Bytes {
+    kept: [Vec<u8>; 2],
+    total: [u64; 2],
+    ended: [bool; 2],
+    discarded: [u64; 2],
+}
+#[derive(Clone, Default)]
+struct Collected(Arc<Mutex<Bytes>>);
+const KEEP: usize = 1024 * 1024;
+fn slot(stream: Stream) -> usize {
+    match stream {
+        Stream::Stdout => 0,
+        Stream::Stderr => 1,
+    }
+}
+impl OutputSink for Collected {
+    fn room(&self) -> usize {
+        KEEP
+    }
+    fn accept(&mut self, stream: Stream, bytes: &[u8]) {
+        let mut b = self.0.lock().unwrap();
+        let i = slot(stream);
+        b.total[i] += bytes.len() as u64;
+        let space = KEEP.saturating_sub(b.kept[i].len());
+        b.kept[i].extend_from_slice(&bytes[..bytes.len().min(space)]);
+    }
+    fn discard(&mut self, stream: Stream, bytes: u64) {
+        self.0.lock().unwrap().discarded[slot(stream)] += bytes;
+    }
+    fn end(&mut self, stream: Stream) {
+        self.0.lock().unwrap().ended[slot(stream)] = true;
+    }
+}
+/// A settled job's facts plus the test sink's output.
+struct Outcome {
+    result: ShellResult,
+    stdout: String,
+    stderr: String,
+    truncated: bool,
+    total: [u64; 2],
+}
+impl std::ops::Deref for Outcome {
+    type Target = ShellResult;
+    fn deref(&self) -> &ShellResult {
+        &self.result
+    }
+}
+impl std::fmt::Debug for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} stdout={:?} stderr={:?}",
+            self.result, self.stdout, self.stderr
+        )
+    }
+}
+impl Outcome {
+    fn render_text(&self) -> String {
+        self.result.render_text(
+            &Tails {
+                stdout: self.stdout.clone(),
+                stderr: self.stderr.clone(),
+                truncated: self.truncated,
+            },
+            "complete",
+        )
+    }
+}
 fn prepare(home: &Path, command: &str, timeout: Duration) -> JobGuard {
     prepare_with(home, command, Vec::new(), timeout)
 }
@@ -69,6 +143,17 @@ fn prepare_with(
     command: &str,
     secrets: Vec<SecretVariable>,
     timeout: Duration,
+) -> JobGuard {
+    prepare_deadline(home, command, secrets, timeout, None)
+}
+/// `deadline` is `None` in service mode (J1-Q3); `Some` qualifies the
+/// bounded guardian mode only.
+fn prepare_deadline(
+    home: &Path,
+    command: &str,
+    secrets: Vec<SecretVariable>,
+    _timeout: Duration,
+    deadline: Option<Duration>,
 ) -> JobGuard {
     let runtime = RuntimeDirectory::scratch(home, true).unwrap();
     let project = ProjectIdentity::open(
@@ -84,21 +169,35 @@ fn prepare_with(
             job_id: asura_platform::random_id(),
             command: command.into(),
             cwd: None,
-            deadline: Instant::now() + timeout,
+            deadline: deadline.map(|d| Instant::now() + d),
             secrets,
         },
         &cancel,
     )
     .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
+    let collected = Collected::default();
     JobGuard(
-        p.spawn(&std::env::current_exe().unwrap(), &cancel)
-            .unwrap_or_else(|e| panic!("spawn: {:?}", e.reason)),
+        p.spawn(
+            &std::env::current_exe().unwrap(),
+            &cancel,
+            Box::new(collected.clone()),
+        )
+        .unwrap_or_else(|e| panic!("spawn: {:?}", e.reason)),
+        collected,
     )
 }
-fn run(home: &Path, command: &str, timeout: Duration, cancel: bool) -> ShellResult {
+fn run(home: &Path, command: &str, timeout: Duration, cancel: bool) -> Outcome {
     settle(prepare(home, command, timeout), timeout, cancel)
 }
-fn settle(mut job: JobGuard, timeout: Duration, cancel: bool) -> ShellResult {
+/// The bounded guardian mode, kept for qualification until J3.
+fn run_bounded(home: &Path, command: &str, deadline: Duration) -> Outcome {
+    settle(
+        prepare_deadline(home, command, Vec::new(), deadline, Some(deadline)),
+        deadline,
+        false,
+    )
+}
+fn settle(mut job: JobGuard, timeout: Duration, cancel: bool) -> Outcome {
     let started = Instant::now();
     let end = started + timeout + Duration::from_secs(4);
     let mut cancelled = false;
@@ -121,10 +220,33 @@ fn settle(mut job: JobGuard, timeout: Duration, cancel: bool) -> ShellResult {
             &AtomicBool::new(false),
         )
         .unwrap();
-    result
+    let bytes = job.1.0.lock().unwrap();
+    assert!(bytes.ended[0] && bytes.ended[1], "both streams reached EOF");
+    let text = |i: usize| String::from_utf8_lossy(&bytes.kept[i]).into_owned();
+    Outcome {
+        stdout: text(0),
+        stderr: text(1),
+        truncated: bytes.total[0] > KEEP as u64 || bytes.total[1] > KEEP as u64,
+        total: bytes.total,
+        result,
+    }
 }
 fn qualification() {
     let f = Fixture::new();
+    // J1T-05 (platform): with no deadline a command that runs 65 s, past the
+    // removed 60 s limit, completes with its exit code (J1-Q3). It runs
+    // beside the other cases.
+    let long_home = f.0.clone();
+    let long = std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = run(
+            &long_home,
+            "sleep 65; exit 3",
+            Duration::from_secs(70),
+            false,
+        );
+        (result.exit_code, result.reason, started.elapsed())
+    });
     let result = run(
         &f.0,
         "printf stdout; printf stderr >&2; read value || printf eof; exit 7",
@@ -184,11 +306,10 @@ fn qualification() {
         std::io::ErrorKind::WouldBlock,
         "sandboxed child reached loopback listener"
     );
-    let result = run(
+    let result = run_bounded(
         &f.0,
         "printf '%s' $$ > timeout-pid; sleep 30 & wait",
         Duration::from_millis(600),
-        false,
     );
     assert_eq!(result.reason, Some(StopReason::Deadline));
     group_absent(&f.0.join("project/timeout-pid"));
@@ -208,11 +329,10 @@ fn qualification() {
         false,
     );
     assert_eq!(result.exit_code, Some(0));
-    let result = run(
+    let result = run_bounded(
         &f.0,
         "trap '' TERM; printf '%s' $$ > resistant-pid; while :; do sleep 1; done",
         Duration::from_millis(600),
-        false,
     );
     assert_eq!(result.reason, Some(StopReason::Deadline));
     assert_eq!(result.signal, Some(9));
@@ -225,10 +345,18 @@ fn qualification() {
     );
     assert_eq!(result.exit_code, Some(0));
     group_absent(&f.0.join("project/grandchildren-pid"));
-    let result = run(&f.0, "/usr/bin/yes output", Duration::from_secs(15), false);
-    assert_eq!(result.reason, Some(StopReason::OutputLimit));
-    assert!(result.truncated);
-    assert!(result.render_text().len() <= 16384);
+    // J1T-07 (platform): no 64 MiB combined stop; 70,000,000 bytes pass
+    // through the sink and the command exits normally (J1-Q2).
+    let result = run(
+        &f.0,
+        "/usr/bin/yes 0123456789 | /usr/bin/head -c 70000000",
+        Duration::from_secs(60),
+        false,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.reason, None);
+    assert_eq!(result.total[0], 70_000_000);
+    println!("J1T-07 platform: 70,000,000 bytes, no output stop");
     fs::copy(
         std::env::current_exe().unwrap(),
         f.0.join("project/escape-helper"),
@@ -254,6 +382,10 @@ fn qualification() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    let (code, reason, elapsed) = long.join().unwrap();
+    assert_eq!((code, reason), (Some(3), None));
+    assert!(elapsed >= Duration::from_secs(65), "{elapsed:?}");
+    println!("J1T-05 platform: a 65 s command completed with exit 3 after {elapsed:?}");
     // Fresh service-like process dies without dropping Job. Lease EOF must stop its group.
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--lease-holder")
@@ -321,17 +453,23 @@ fn guardian_refusals(home: &Path) {
                 job_id: asura_platform::random_id(),
                 command: "printf ran > refused-marker".into(),
                 cwd: None,
-                deadline: Instant::now() + Duration::from_secs(5),
+                deadline: None,
                 secrets: Vec::new(),
             },
             &cancel,
         )
         .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
         prepared.replace_state_for_test(state);
+        let collected = Collected::default();
         let mut job = JobGuard(
             prepared
-                .spawn(&std::env::current_exe().unwrap(), &cancel)
+                .spawn(
+                    &std::env::current_exe().unwrap(),
+                    &cancel,
+                    Box::new(collected.clone()),
+                )
                 .unwrap_or_else(|e| panic!("spawn: {:?}", e.reason)),
+            collected,
         );
         let end = Instant::now() + Duration::from_secs(5);
         let outcome = loop {
@@ -424,7 +562,7 @@ fn group_absent(path: &Path) {
     assert!(!group_exists(pid), "owned process group remains");
 }
 
-struct JobGuard(asura_platform::shell::ShellJob);
+struct JobGuard(asura_platform::shell::ShellJob, Collected);
 impl std::ops::Deref for JobGuard {
     type Target = asura_platform::shell::ShellJob;
     fn deref(&self) -> &Self::Target {
@@ -557,15 +695,20 @@ fn secret_environment_refusals(home: &Path) {
                 job_id: asura_platform::random_id(),
                 command: "printf ran > secret-refused-marker".into(),
                 cwd: None,
-                deadline: Instant::now() + Duration::from_secs(5),
+                deadline: None,
                 secrets: Vec::new(),
             },
             &cancel,
         )
         .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
         prepared.replace_secret_environment_for_test(entries);
-        let job = match prepared.spawn(&std::env::current_exe().unwrap(), &cancel) {
-            Ok(job) => JobGuard(job),
+        let collected = Collected::default();
+        let job = match prepared.spawn(
+            &std::env::current_exe().unwrap(),
+            &cancel,
+            Box::new(collected.clone()),
+        ) {
+            Ok(job) => JobGuard(job, collected),
             Err(mut failure) => {
                 assert_eq!(label, "NUL");
                 assert_eq!(failure.reason, ShellError::Invalid, "{label}");

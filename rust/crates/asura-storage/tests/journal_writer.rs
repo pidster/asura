@@ -1453,3 +1453,496 @@ fn j1_0_04_gated_replay_holds_until_shutdown_cancels_it() {
     // The cancelled replay changed nothing on disk.
     assert_eq!(journal_replay(&scratch).sequence, 1);
 }
+
+// J1T-01 and J1T-02 integration: kinds 22, 23 and 15 through the real writer.
+fn submit(writer: &mut WriterHandle, revision: &mut u64, record: Record) -> Result<()> {
+    let admission = None;
+    let state = wait(
+        &mut writer
+            .try_submit(Command::Append {
+                expected_revision: *revision,
+                record,
+                admission,
+            })
+            .unwrap(),
+    )?
+    .replay
+    .unwrap();
+    *revision = state.revision;
+    Ok(())
+}
+/// Initialize and register a project; returns the configuration digest.
+fn j1_initialize(scratch: &Scratch, writer: &mut WriterHandle) -> (Id, Hash) {
+    wait(&mut writer.try_submit(Command::Open).unwrap()).unwrap();
+    wait(
+        &mut writer
+            .try_submit(Command::Initialize { request: [30; 16] })
+            .unwrap(),
+    )
+    .unwrap();
+    let registered = wait(
+        &mut writer
+            .try_submit(Command::Register {
+                request: [31; 16],
+                location: scratch.project(),
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .replay
+    .unwrap();
+    let project = *registered.projects.keys().next().unwrap();
+    drop(registered);
+    let prepared = wait(
+        &mut writer
+            .try_submit(Command::Prepare {
+                project,
+                conversation: None,
+                expected_generation: 0,
+                prompt: "hello".into(),
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .prepared
+    .unwrap();
+    (project, prepared.configuration_digest)
+}
+fn j1_turn(project: Id, configuration_digest: Hash) -> TurnAccepted {
+    TurnAccepted {
+        request: [32; 16],
+        digest: request_digest(Request::Submit {
+            project,
+            conversation: None,
+            expected_generation: 0,
+            prompt: "hello",
+        })
+        .unwrap(),
+        project,
+        original_conversation: None,
+        expected_generation: 0,
+        conversation: [33; 16],
+        generation: 1,
+        task: [34; 16],
+        operation: [35; 16],
+        model: "system".into(),
+        configuration_digest,
+        instructions_digest: [36; 32],
+        input_digest: [37; 32],
+        prior_operations: Vec::new(),
+        prompt: "hello".into(),
+        reserved_output_tokens: OUTPUT_RESERVATION,
+        event_cursor: 1,
+        composition: None,
+    }
+}
+fn j1_start() -> Record {
+    Record::StartAuthorized(StartAuthorized {
+        operation: [35; 16],
+        generation: 1,
+        helper: [38; 16],
+        input_digest: [37; 32],
+    })
+}
+/// Admit and start the turn; returns the revision after the start.
+fn j1_admit_and_start(
+    writer: &mut WriterHandle,
+    project: Id,
+    configuration_digest: Hash,
+) -> std::sync::Arc<Replay> {
+    let accepted = wait(
+        &mut writer
+            .try_submit(Command::Append {
+                expected_revision: wait(&mut writer.try_submit(Command::Open).unwrap())
+                    .unwrap()
+                    .replay
+                    .unwrap()
+                    .revision,
+                record: Record::TurnAccepted(Box::new(j1_turn(project, configuration_digest))),
+                admission: Some(AdmissionFence {
+                    project,
+                    configuration_digest,
+                }),
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .replay
+    .unwrap();
+    let mut revision = accepted.revision;
+    drop(accepted);
+    submit(writer, &mut revision, j1_start()).unwrap();
+    wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap()
+}
+fn j1_intent(installation: Id, ordinal: u32, disposition: ShellDisposition) -> ShellIntent {
+    use asura_storage::payload::{ObjectKind, payload_id};
+    let admitted = disposition == ShellDisposition::Admitted;
+    let derived = |kind| {
+        if admitted {
+            payload_id(installation, [35; 16], 1, ordinal, kind)
+        } else {
+            [0; 16]
+        }
+    };
+    ShellIntent {
+        operation: [35; 16],
+        generation: 1,
+        ordinal,
+        disposition,
+        command_truncated: !admitted,
+        command: if admitted {
+            "printf %s \"$ASURA_SECRET_1\"".into()
+        } else {
+            "printf %s '[REDACTED:github-token]'".into()
+        },
+        cwd: ".".into(),
+        refusal: (!admitted).then_some(ShellRefusal {
+            code: RefusalCode::SecretSingleQuoted,
+            kind: Some(SecretKind::GithubToken),
+            word: Some(3),
+        }),
+        busy: None,
+        variables: if admitted {
+            vec![SecretKind::GithubToken]
+        } else {
+            Vec::new()
+        },
+        job: if admitted {
+            shell_job_id([35; 16], 1, ordinal)
+        } else {
+            [0; 16]
+        },
+        stdout_payload: derived(ObjectKind::Stdout),
+        stderr_payload: derived(ObjectKind::Stderr),
+        initial_reservation: if admitted { INITIAL_RESERVATION } else { 0 },
+        rule_set_revision: 1,
+        rule_set_digest: [39; 32],
+    }
+}
+#[test]
+fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    let state = j1_admit_and_start(&mut writer, project, configuration_digest);
+    let installation = state.installation_id;
+    let mut revision = state.revision;
+    drop(state);
+    let intent = j1_intent(installation, 1, ShellDisposition::Admitted);
+    let settled = CaptureSettled {
+        operation: [35; 16],
+        generation: 1,
+        ordinal: 1,
+        state: CaptureState::Incomplete,
+        reason: CaptureReason::Quota,
+        exit_kind: 2,
+        exit_value: 15,
+        rule_set_revision: 1,
+        rule_set_digest: [39; 32],
+        stdout: CaptureStream {
+            observed_bytes: 40,
+            stored_bytes: 33,
+            digest: Some([40; 32]),
+            replacements: 1,
+            literal_replacements: 1,
+            kinds: vec![(SecretKind::GithubToken, 1)],
+            ..CaptureStream::default()
+        },
+        stderr: CaptureStream {
+            digest: Some([41; 32]),
+            eof: true,
+            ..CaptureStream::default()
+        },
+        distinct_numbers: 1,
+        numbers: vec![CaptureNumber {
+            number: 1,
+            kind: SecretKind::GithubToken,
+            origin: NumberOrigin::Command,
+        }],
+        pause_count: 1,
+        first_pause_ms: 10,
+        paused_ms: 20,
+        final_reservation: 2 * INITIAL_RESERVATION,
+    };
+    let result = ToolResult {
+        operation: [35; 16],
+        generation: 1,
+        ordinal: 1,
+        status: 5,
+        text: "failure=None exit_code=none signal=15 reason=none truncated=false cleanup_confirmed=true capture=incomplete\nstdout:\n$ASURA_SECRET_1\nstderr:\n".into(),
+        next_offset: None,
+        truncated: false,
+    };
+    let refused = j1_intent(installation, 2, ShellDisposition::Refused);
+    let refused_result = ToolResult {
+        ordinal: 2,
+        status: 3,
+        text: "refused: secret_single_quoted".into(),
+        ..result.clone()
+    };
+    for record in [
+        Record::ShellIntent(Box::new(intent.clone())),
+        Record::CaptureSettled(Box::new(settled.clone())),
+        Record::ToolResult(result),
+        Record::ShellIntent(Box::new(refused.clone())),
+        Record::ToolResult(refused_result),
+    ] {
+        submit(&mut writer, &mut revision, record).unwrap();
+    }
+    close(&mut writer);
+    // The journal on disk replays with both calls.
+    let durable = journal_replay(&scratch);
+    let tools = &durable.operations[&[35; 16]].tools;
+    assert_eq!(tools.len(), 2);
+    let call = tools[0].shell.as_deref().unwrap();
+    assert_eq!(call.disposition, ShellDisposition::Admitted);
+    assert_eq!(call.job, intent.job);
+    assert_eq!(call.stdout_payload, intent.stdout_payload);
+    let settlement = call.settled.as_ref().unwrap();
+    assert_eq!(settlement.state, CaptureState::Incomplete);
+    assert_eq!(settlement.reason, CaptureReason::Quota);
+    assert_eq!(
+        settlement.streams,
+        [(33, Some([40; 32])), (0, Some([41; 32]))]
+    );
+    assert_eq!(tools[0].result_status, Some(5));
+    assert_eq!(
+        tools[1].shell.as_deref().unwrap().disposition,
+        ShellDisposition::Refused
+    );
+    assert_eq!(tools[1].result_status, Some(3));
+    let intent_frame = tools[0].intent_frame.clone();
+    let settled_frame = settlement.frame.clone();
+    let refused_frame = tools[1].intent_frame.clone();
+    // A restarted writer reopens the journal and reads each record back.
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let reopened = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    assert_eq!(reopened.operations[&[35; 16]].tools, *tools);
+    drop(reopened);
+    close(&mut writer);
+    // Each verified frame range decodes to the appended record.
+    let bytes = fs::read(scratch.0.join(".asura/state/control/slot-0.log")).unwrap();
+    for (range, kind, expected) in [
+        (intent_frame, 22, Record::ShellIntent(Box::new(intent))),
+        (settled_frame, 23, Record::CaptureSettled(Box::new(settled))),
+        (refused_frame, 22, Record::ShellIntent(Box::new(refused))),
+    ] {
+        let frame = &bytes[range];
+        assert_eq!(u16::from_be_bytes([frame[10], frame[11]]), kind);
+        assert_eq!(
+            decode_record(kind, &frame[144..frame.len() - 40]).unwrap(),
+            expected
+        );
+    }
+}
+#[test]
+fn j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit() {
+    const FRAME: usize = 144 + 40;
+    const TERMINAL: usize = FRAME + 47 + MAX_TEXT;
+    const RESULT: usize = FRAME + 43 + 16_384;
+    const OWNER: usize = FRAME;
+    const CANCEL: usize = FRAME + 25;
+    const CAPTURE: usize = FRAME + 4_102;
+    const MARGIN: usize = 100;
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    close(&mut writer);
+    // Frame sizes do not depend on the frame context.
+    let size = |record: &Record| {
+        encode_frame(
+            &FrameContext {
+                installation_id: [1; 16],
+                transition_id: [2; 16],
+                sequence: 2,
+                prior_digest: [0; 32],
+                expected_revision: 1,
+                owner_generation: 1,
+            },
+            record,
+        )
+        .unwrap()
+        .len()
+    };
+    let shell = Record::ShellIntent(Box::new(j1_intent([1; 16], 1, ShellDisposition::Admitted)));
+    let status = Record::ToolIntent(ToolIntent {
+        operation: [35; 16],
+        generation: 1,
+        ordinal: 1,
+        kind: 3,
+        path: String::new(),
+        offset: 0,
+        limit: 0,
+    });
+    let pending_tool = TERMINAL + RESULT + OWNER + CANCEL;
+    // After the start: kind 22 alone fits by MARGIN bytes, but not with its
+    // capture frame; the smaller kind 14 fits.
+    let started_end = asura_storage::authority::MAX_JOURNAL - pending_tool - size(&shell) - MARGIN;
+    assert!(size(&status) <= size(&shell) + MARGIN && MARGIN < CAPTURE);
+    let padded_end = started_end
+        - OWNER
+        - size(&Record::TurnAccepted(Box::new(j1_turn(
+            project,
+            configuration_digest,
+        ))))
+        - size(&j1_start());
+    // Pad with completed turns written directly to the closed journal.
+    let state = journal_replay(&scratch);
+    let mut file = JournalFile::open(scratch.runtime(), false).unwrap();
+    let (mut sequence, mut digest, mut end) = (state.sequence, state.last_digest, state.end_offset);
+    let owner_generation = state.owner_generation;
+    let mut push = |record: Record, file: &mut JournalFile, end: &mut usize| {
+        let frame = encode_frame(
+            &FrameContext {
+                installation_id: state.installation_id,
+                transition_id: random_id(),
+                sequence: sequence + 1,
+                prior_digest: digest,
+                expected_revision: sequence,
+                owner_generation,
+            },
+            &record,
+        )
+        .unwrap();
+        file.append(*end, &frame).unwrap();
+        digest.copy_from_slice(&frame[frame.len() - 40..frame.len() - 8]);
+        sequence += 1;
+        *end += frame.len();
+    };
+    let pad = |n: u64| {
+        let mut id = [0xa5; 16];
+        id[8..].copy_from_slice(&n.to_be_bytes());
+        id
+    };
+    let conversation = pad(0);
+    let turn = |generation: u64| {
+        let original = (generation > 1).then_some(conversation);
+        (
+            Record::TurnAccepted(Box::new(TurnAccepted {
+                request: pad(generation * 4 + 1),
+                digest: request_digest(Request::Submit {
+                    project,
+                    conversation: original,
+                    expected_generation: generation - 1,
+                    prompt: "pad",
+                })
+                .unwrap(),
+                project,
+                original_conversation: original,
+                expected_generation: generation - 1,
+                conversation,
+                generation,
+                task: pad(generation * 4 + 2),
+                operation: pad(generation * 4 + 3),
+                model: "system".into(),
+                configuration_digest,
+                instructions_digest: [1; 32],
+                input_digest: [2; 32],
+                prior_operations: Vec::new(),
+                prompt: "pad".into(),
+                reserved_output_tokens: OUTPUT_RESERVATION,
+                event_cursor: 1,
+                composition: None,
+            })),
+            Record::StartAuthorized(StartAuthorized {
+                operation: pad(generation * 4 + 3),
+                generation,
+                helper: pad(generation * 4 + 4),
+                input_digest: [2; 32],
+            }),
+            move |text: usize| {
+                Record::TurnTerminal(TurnTerminal {
+                    operation: pad(generation * 4 + 3),
+                    generation,
+                    kind: TerminalKind::Complete,
+                    cause: Cause::None,
+                    final_cursor: u64::MAX,
+                    usage_known: true,
+                    output_tokens: 0,
+                    charged_tokens: 0,
+                    text: "x".repeat(text),
+                })
+            },
+        )
+    };
+    // The fixed part of a later turn: accepted, start and an empty terminal.
+    let base = {
+        let (accepted, start, _) = turn(2);
+        size(&accepted) + size(&start) + FRAME + 47
+    };
+    let mut generation = 1;
+    while end < padded_end {
+        let (accepted, start, terminal) = turn(generation);
+        let fixed = size(&accepted) + size(&start) + FRAME + 47;
+        let remaining = padded_end - end;
+        let text = if generation == 1 || remaining > fixed + MAX_TEXT + base {
+            MAX_TEXT
+        } else if remaining - fixed <= MAX_TEXT {
+            remaining - fixed
+        } else {
+            // Leave exactly one later turn with a 1-byte text.
+            remaining - fixed - base - 1
+        };
+        assert!((1..=MAX_TEXT).contains(&text));
+        push(accepted, &mut file, &mut end);
+        push(start, &mut file, &mut end);
+        push(terminal(text), &mut file, &mut end);
+        generation += 1;
+    }
+    assert_eq!(end, padded_end);
+    drop(file);
+    // The restarted writer appends its owner generation, then the turn.
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let started = j1_admit_and_start(&mut writer, project, configuration_digest);
+    assert_eq!(started.end_offset, started_end);
+    assert_eq!(started.reserved_bytes + RESULT, pending_tool);
+    let installation = started.installation_id;
+    let mut revision = started.revision;
+    drop(started);
+    let journal = scratch.0.join(".asura/state/control/slot-0.log");
+    let before = fs::read(&journal).unwrap();
+    let shell = Record::ShellIntent(Box::new(j1_intent(
+        installation,
+        1,
+        ShellDisposition::Admitted,
+    )));
+    assert!(matches!(
+        submit(&mut writer, &mut revision, shell),
+        Err(Error::Invalid)
+    ));
+    assert_eq!(fs::read(&journal).unwrap(), before);
+    // The smaller kind 14 still fits, so the capture frame refused kind 22.
+    submit(&mut writer, &mut revision, status).unwrap();
+    let state = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    assert_eq!(state.reserved_bytes, pending_tool);
+    assert_eq!(
+        asura_storage::authority::MAX_JOURNAL - state.end_offset - state.reserved_bytes,
+        size(&Record::ShellIntent(Box::new(j1_intent(
+            installation,
+            1,
+            ShellDisposition::Admitted
+        )))) + MARGIN
+            - size(&Record::ToolIntent(ToolIntent {
+                operation: [35; 16],
+                generation: 1,
+                ordinal: 1,
+                kind: 3,
+                path: String::new(),
+                offset: 0,
+                limit: 0,
+            }))
+    );
+    drop(state);
+    close(&mut writer);
+}

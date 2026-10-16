@@ -127,6 +127,7 @@ impl Worker {
                 Some("audit.keepFiles") => Some(Setting::AuditKeepFiles),
                 Some("audit.maxFileBytes") => Some(Setting::AuditMaxFileBytes),
                 Some("providers.mlx.models") => Some(Setting::ProvidersMlxModels),
+                Some("retention.quotaBytes") => Some(Setting::RetentionQuotaBytes),
                 _ => None,
             };
             if let (Some(setting), Some(outcome)) = (setting, outcome) {

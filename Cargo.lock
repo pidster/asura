@@ -205,9 +205,12 @@ dependencies = [
  "asura-control",
  "asura-platform",
  "asura-storage",
+ "libc",
+ "serde_json",
  "sha2",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

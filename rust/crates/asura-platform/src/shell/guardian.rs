@@ -142,26 +142,23 @@ fn preamble(numbers: impl IntoIterator<Item = u8>) -> String {
 // Child ownership loss is irreversible. A later PID observation cannot restore
 // authority to signal that process group. Fault injection tests exercise this
 // state without starting or signalling processes.
+//
+// The clock-fault fallback is seeded with the guardian's first clock sample,
+// not a deadline (J1): a failed sample advances 100 ms from the last one.
 struct CleanupSafety {
     fence_valid: bool,
     last_clock: u64,
-    deadline: u64,
 }
 impl CleanupSafety {
-    fn new(deadline: u64) -> Self {
+    fn new(first_sample: u64) -> Self {
         Self {
             fence_valid: true,
-            last_clock: deadline,
-            deadline,
+            last_clock: first_sample,
         }
     }
     fn sample_clock(&mut self, sample: Result<u64, ShellError>) -> (u64, bool) {
         let fault = sample.is_err();
-        let now = sample.unwrap_or_else(|_| {
-            self.last_clock
-                .max(self.deadline)
-                .saturating_add(100_000_000)
-        });
+        let now = sample.unwrap_or_else(|_| self.last_clock.saturating_add(100_000_000));
         self.last_clock = now;
         (now, fault)
     }
@@ -173,6 +170,31 @@ impl CleanupSafety {
     fn kill_due(&self, clock_fault: bool, elapsed: u64, already_killed: bool) -> bool {
         self.fence_valid && !already_killed && (clock_fault || elapsed >= 500_000_000)
     }
+}
+
+/// The deadline argument for no-deadline mode (J1-Q3): the command runs until
+/// it ends, its lease closes or its leader exits.
+pub(super) const NO_DEADLINE: &str = "none";
+
+/// Parses the deadline argument: `none`, or monotonic nanoseconds no more
+/// than 60 s ahead of `now` (the bounded mode kept for qualification).
+fn parse_deadline(deadline_ns: &str, now: u64) -> Result<Option<u64>, ShellError> {
+    if deadline_ns == NO_DEADLINE {
+        return Ok(None);
+    }
+    if deadline_ns.is_empty()
+        || deadline_ns.len() > 20
+        || !deadline_ns.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(ShellError::Invalid);
+    }
+    let deadline = deadline_ns
+        .parse::<u64>()
+        .map_err(|_| ShellError::Invalid)?;
+    if deadline <= now || deadline - now > 60_000_000_000 {
+        return Err(ShellError::Deadline);
+    }
+    Ok(Some(deadline))
 }
 
 /// Private entrypoint; inherited descriptors must pass validation before any effect.
@@ -308,20 +330,11 @@ fn notice(fd: i32, n: Notice, id: [u8; 16]) -> Result<(), ShellError> {
 }
 fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellError> {
     let id = parse_id(jobhex)?;
-    if command.is_empty()
-        || command.len() > MAX_COMMAND_BYTES
-        || command.contains('\0')
-        || deadline_ns.len() > 20
-    {
+    if command.is_empty() || command.len() > MAX_COMMAND_BYTES || command.contains('\0') {
         return Err(ShellError::Invalid);
     }
-    let deadline = deadline_ns
-        .parse::<u64>()
-        .map_err(|_| ShellError::Invalid)?;
-    let now = spawn::monotonic_ns()?;
-    if deadline <= now || deadline - now > 60_000_000_000 {
-        return Err(ShellError::Deadline);
-    }
+    let first_sample = spawn::monotonic_ns()?;
+    let deadline = parse_deadline(deadline_ns, first_sample)?;
     let descriptors = descriptors()?;
     // SAFETY: guardian is a single-purpose fresh child, before spawning command.
     unsafe {
@@ -342,7 +355,10 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
         if lease_reason(3)?.is_some() {
             return Err(ShellError::Cancelled);
         }
-        if spawn::monotonic_ns()? >= deadline {
+        // No-deadline mode skips the setup deadline check (J1-Q4).
+        if let Some(deadline) = deadline
+            && spawn::monotonic_ns()? >= deadline
+        {
             return Err(ShellError::Deadline);
         }
         let null =
@@ -427,7 +443,7 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
     let mut reason = 0;
     let mut killed = false;
     let mut reported_unknown = false;
-    let mut safety = CleanupSafety::new(deadline);
+    let mut safety = CleanupSafety::new(first_sample);
     loop {
         let (now, clock_fault) = safety.sample_clock(spawn::monotonic_ns());
         // SAFETY: WNOWAIT keeps the direct child PID allocated as a group-signal fence.
@@ -454,12 +470,11 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
         let exited = waiting == 0 && info.si_pid == pid;
         if stopping.is_none() {
             let lease = lease_reason(3).unwrap_or(Some(4));
-            if now >= deadline || lease.is_some() || exited || !report_ok {
-                reason = if now >= deadline {
-                    1
-                } else {
-                    lease.unwrap_or(0)
-                };
+            // No-deadline mode never stops with reason 1; lease closure
+            // and leader exit still stop the group.
+            let expired = deadline.is_some_and(|deadline| now >= deadline);
+            if expired || lease.is_some() || exited || !report_ok {
+                reason = if expired { 1 } else { lease.unwrap_or(0) };
                 stopping = Some(now);
                 // SAFETY: leader has never been reaped; its PID fences this owned group.
                 if safety.fence_valid {
@@ -769,6 +784,61 @@ mod tests {
             "printf x > '{scratch}/f' && /bin/cat '{scratch}/f' >/dev/null"
         )));
         assert!(!asura.join("written").exists());
+    }
+    /// J1T-05 unit: `none` selects no-deadline mode; a numeric deadline keeps
+    /// the 60 s rule; anything else is invalid.
+    #[test]
+    fn j1t_05_guardian_deadline_argument_parsing() {
+        let now = 1_000_000_000;
+        assert_eq!(parse_deadline("none", now), Ok(None));
+        assert_eq!(
+            parse_deadline(&(now + 60_000_000_000).to_string(), now),
+            Ok(Some(now + 60_000_000_000))
+        );
+        assert_eq!(
+            parse_deadline(&(now + 60_000_000_001).to_string(), now),
+            Err(ShellError::Deadline)
+        );
+        assert_eq!(
+            parse_deadline(&now.to_string(), now),
+            Err(ShellError::Deadline)
+        );
+        for bad in [
+            "",
+            "None",
+            "NONE",
+            "-1",
+            "+5",
+            "1e9",
+            "123456789012345678901",
+            " none",
+        ] {
+            assert_eq!(
+                parse_deadline(bad, now),
+                Err(ShellError::Invalid),
+                "{bad:?}"
+            );
+        }
+    }
+    /// J1T-05 unit: without a deadline the clock-fault fallback is seeded
+    /// with the first sample and advances 100 ms from the last one.
+    #[test]
+    fn j1t_05_cleanup_safety_without_a_deadline() {
+        let mut safety = CleanupSafety::new(5_000_000_000);
+        assert_eq!(
+            safety.sample_clock(Ok(5_100_000_000)),
+            (5_100_000_000, false)
+        );
+        assert_eq!(
+            safety.sample_clock(Err(ShellError::Io)),
+            (5_200_000_000, true)
+        );
+        assert_eq!(
+            safety.sample_clock(Err(ShellError::Io)),
+            (5_300_000_000, true)
+        );
+        let mut fresh = CleanupSafety::new(7);
+        assert_eq!(fresh.sample_clock(Err(ShellError::Io)), (100_000_007, true));
     }
     #[test]
     fn lost_child_fence_cannot_be_restored_by_recycled_pid_observation() {

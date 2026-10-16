@@ -176,14 +176,16 @@ write access. All other file and directory rules remain applicable.
 non-authoritative: validate their directory type, ownership and safe permissions,
 with no group/world write permission; existing log directories need not be exactly
 0700. Do not replay diagnostic log contents. Their presence alone cannot initialize
-an installation. `config.yaml`, `db/`, `data/`, `sessions/`, `tmp/`, `state/` or any unknown
+an installation. `config.yaml`, `db/`, `data/`, `sessions/`, `tmp/`, `state/`, `payloads/` or any unknown
 entry without a valid journal is installation evidence requiring inspection;
 report `installation_remnants`, never silently call it fresh. A root containing
 only validated `run/` and optional `logs/` is `Uninitialized`. This classification
 permits no initialization action in 3A. Missing records cannot prove first-ever use.
 If a valid journal exists, preserve the named areas without interpreting contents.
 This includes the selected `data/` classifier/model areas, including Core AI and
-MLX artifacts; their presence is not unknown root content. An unlisted root entry
+MLX artifacts, and `payloads/`, the retained shell output that the
+[J1 payload store](tool-job-controller.md#j1-and-sl3-implementation-details) owns;
+their presence is not unknown root content. An unlisted root entry
 still produces `unknown_content`. Configuration and graph
 validation remain unavailable until their owners are implemented.
 

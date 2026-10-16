@@ -37,7 +37,7 @@ text as one YAML value. Quoted model names are supported; `true` is a boolean,
 not a model name. `set audit` requires all three fields. Unknown keys, duplicates,
 nulls, custom tags, invalid types and bounds are errors. No deletion syntax is selected.
 Standard YAML scalar tags are accepted only when their resulting type matches
-the setting schema. The persisted root permits optional model, audit and providers fields; audit fields may be
+the setting schema. The persisted root permits optional model, audit, providers and retention fields (retention is written only when set away from its default, J1); audit fields may be
 omitted to inherit defaults. Invalid existing files are errors, never overwritten.
 An absent or empty file uses defaults. Successful writes emit the complete
 normalized mapping; comments and original formatting are not preserved.
