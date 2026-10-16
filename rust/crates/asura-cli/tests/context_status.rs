@@ -3,7 +3,7 @@ use super::*;
 use asura_control::pb;
 fn attach(case: &Case) -> Result<Client> {
     let runtime = RuntimeDirectory::scratch(&case.root.join("home"), false)?;
-    Ok(Client::attach(&runtime, BUILD, Instant::now() + WAIT)?)
+    Ok(attach_within(&runtime, Instant::now() + WAIT)?)
 }
 fn git(path: &Path, args: &[&str]) -> Result<()> {
     let status = Command::new("/usr/bin/git")
@@ -23,7 +23,7 @@ fn next(
 ) -> Result<pb::ContextObservation> {
     let end = Instant::now() + WAIT;
     loop {
-        let result = client.observe_context(request.clone())?;
+        let result = client.observe_context(request.clone(), &|| false)?;
         request.after_subscription = result.subscription_id.clone();
         request.after_revision = result.revision;
         if result.pending == Some(false) && result.git_state == Some(state) {
@@ -80,7 +80,7 @@ pub(super) fn observations(case: &mut Case) -> Result<()> {
     }
     let before = status.revision;
     let observer = std::thread::spawn(move || status_client.observe_service(Some(before)));
-    let changed = attach(case)?.config("model", Some("ollama:event-test"))?;
+    let changed = attach(case)?.config("model", Some("ollama:event-test"), &|| false)?;
     require(changed.error.is_none(), "model fixture config failed")?;
     let changed = observer.join().map_err(|_| "service observer panicked")??;
     let mut observed = changed;
@@ -122,11 +122,14 @@ pub(super) fn observations(case: &mut Case) -> Result<()> {
         "wrong branch observation",
     )?;
     let mut second = attach(case)?;
-    let shared = second.observe_context(pb::ObserveContext {
-        after_subscription: None,
-        after_revision: None,
-        ..query.clone()
-    })?;
+    let shared = second.observe_context(
+        pb::ObserveContext {
+            after_subscription: None,
+            after_revision: None,
+            ..query.clone()
+        },
+        &|| false,
+    )?;
     require(
         shared.subscription_id == clean.subscription_id,
         "identical scopes did not share observer",
@@ -158,12 +161,15 @@ pub(super) fn observations(case: &mut Case) -> Result<()> {
     let mut overflow = attach(case)?;
     require(
         overflow
-            .observe_context(pb::ObserveContext {
-                working_directory: Some(project.join("other").to_str().unwrap().into()),
-                after_subscription: None,
-                after_revision: None,
-                ..query.clone()
-            })
+            .observe_context(
+                pb::ObserveContext {
+                    working_directory: Some(project.join("other").to_str().unwrap().into()),
+                    after_subscription: None,
+                    after_revision: None,
+                    ..query.clone()
+                },
+                &|| false,
+            )
             .is_err(),
         "observer capacity was not bounded",
     )?;
@@ -179,12 +185,15 @@ pub(super) fn observations(case: &mut Case) -> Result<()> {
         "disconnect removed another subscriber",
     )?;
     // Lexically outside the registered root must never collect evidence.
-    let invalid = second.observe_context(pb::ObserveContext {
-        working_directory: Some(case.root.to_str().unwrap().into()),
-        after_subscription: None,
-        after_revision: None,
-        ..query
-    });
+    let invalid = second.observe_context(
+        pb::ObserveContext {
+            working_directory: Some(case.root.to_str().unwrap().into()),
+            after_subscription: None,
+            after_revision: None,
+            ..query
+        },
+        &|| false,
+    );
     require(invalid.is_err(), "outside context accepted")?;
     drop(second);
     // Cleanup stops the service and proves ownership release after observer cancellation.

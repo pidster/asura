@@ -1,6 +1,6 @@
 use super::*;
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn pair() -> (StartupChild, File) {
     let (read, write) = pipe().unwrap();
@@ -44,35 +44,29 @@ fn exact_notice_cases_and_rejections() {
 #[test]
 fn real_pipe_partial_progress_requires_eof() {
     let (mut child, mut write) = pair();
-    let end = Instant::now() + Duration::from_secs(1);
     let bytes = StartupNotice::Bound.encode();
     write.write_all(&bytes[..3]).unwrap();
-    assert_eq!(child.poll_notice(end).unwrap(), None);
+    assert_eq!(child.poll_notice().unwrap(), None);
     write.write_all(&bytes[3..]).unwrap();
-    assert_eq!(child.poll_notice(end).unwrap(), None);
+    assert_eq!(child.poll_notice().unwrap(), None);
     drop(write);
-    assert_eq!(child.poll_notice(end).unwrap(), Some(StartupNotice::Bound));
+    assert_eq!(child.poll_notice().unwrap(), Some(StartupNotice::Bound));
 }
 #[test]
-fn pipe_early_eof_extra_bytes_and_deadline_fail() {
+fn pipe_early_eof_and_extra_bytes_fail_while_silence_waits() {
     let (mut child, mut write) = pair();
     write.write_all(b"ASS").unwrap();
     drop(write);
-    assert!(matches!(
-        child.poll_notice(Instant::now() + Duration::from_secs(1)),
-        Err(Error::InvalidNotice)
-    ));
+    assert!(matches!(child.poll_notice(), Err(Error::InvalidNotice)));
     let (mut child, mut write) = pair();
     write.write_all(b"ASST\x01\x01\0\0x").unwrap();
-    assert!(matches!(
-        child.poll_notice(Instant::now() + Duration::from_secs(1)),
-        Err(Error::InvalidNotice)
-    ));
+    assert!(matches!(child.poll_notice(), Err(Error::InvalidNotice)));
+    // A silent writer is not a failure: the notice wait has no time bound and
+    // ends on the notice, child exit or the caller's cancel (owner, 2026-10-16).
     let (mut child, _write) = pair();
-    assert!(matches!(
-        child.poll_notice(Instant::now()),
-        Err(Error::Deadline)
-    ));
+    for _ in 0..3 {
+        assert_eq!(child.poll_notice().unwrap(), None);
+    }
 }
 #[test]
 fn writable_pipe_is_required_and_notice_writer_closes() {
@@ -211,7 +205,7 @@ fn spawn_action_case(owned: bool) {
     };
     let end = Instant::now() + Duration::from_secs(5);
     let result = loop {
-        match child.poll_notice(end) {
+        match child.poll_notice() {
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             outcome => break outcome,
         }

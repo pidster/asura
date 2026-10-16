@@ -87,7 +87,7 @@ checks, not implementation or runtime evidence.
 ## Delivery evidence for the review findings
 
 I2 must test F1 in both storage modes: initialization, reopen, identity mismatch
-and interrupted migration. I1–I2 must test F2 across failure, deadline and
+and interrupted migration. I1–I2 must test F2 across failure, revocation and
 cancellation races, including restart and unknown effects. Later increments add
 evidence at each new execution boundary.
 

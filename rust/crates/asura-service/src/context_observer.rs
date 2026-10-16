@@ -177,6 +177,9 @@ fn observe(
                 || now.duration_since(first) >= Duration::from_secs(2)
         }) {
             dirty = None;
+            // Collection has no time bound (owner, 2026-10-16): it ends on
+            // completion, cancellation or supersession by a newer change.
+            let mut changed = false;
             let snapshot = collect_git(
                 &scope.root,
                 &scope.path,
@@ -185,6 +188,10 @@ fn observe(
                 &scope.boundary,
                 &git,
                 &cancelled,
+                &mut || {
+                    changed = changed || watch.poll(0.0);
+                    changed
+                },
             );
             if cancelled.load(Ordering::Acquire) {
                 break;
@@ -193,7 +200,7 @@ fn observe(
                 publish(snapshot);
                 break;
             }
-            if watch.poll(0.0) {
+            if changed || watch.poll(0.0) {
                 publish(GitSnapshot::unknown("git_changed_during_observation"));
                 let now = Instant::now();
                 dirty = Some((now, now));

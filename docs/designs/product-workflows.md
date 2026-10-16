@@ -152,13 +152,16 @@ Deterministic fixtures verify control logic but cannot establish model quality.
 **Initial state:** A task needs information, a policy-permitted approval, or an
 unavailable model/tool capability.
 
-**Trigger:** Present the condition, then receive a timely response, refusal, late
-response or deadline expiry. Repeat while another client cancels the task.
+**Trigger:** Present the condition, then receive a response, refusal, late
+response, revocation or supersession. Hold the decision past any former deadline.
+Repeat while another client cancels the task.
 
 **Required result:** The client explains what is needed and which effects are
 permitted. Responses bind to the pending decision and task revision. A response
-cannot bypass policy or an accepted cancellation. Required-decision expiry uses
-the [common failure procedure](core-harness-brief.md#user-decision-expiry-contract).
+cannot bypass policy or an accepted cancellation. A pending decision has no time
+expiry (owner, 2026-10-16); it waits until a response, cancellation, revocation or
+supersession. Revocation or supersession of a required decision uses the
+[common failure procedure](core-harness-brief.md#user-decision-expiry-contract).
 No unavailable local model may silently cause remote disclosure.
 
 **Proposed refinement:** An unavailable required capability produces a stable,
@@ -166,9 +169,10 @@ actionable reason. Inspection and cancellation remain available. It does not
 produce an invented model result or an unbounded retry loop. D4 selects bounded
 retry/failure behavior; D6 defines refusal versus task-redirection presentation.
 
-**Checks:** Unit response/expiry arbitration; integration with concurrent clients,
-real adapter unavailability and durable restart; CLI/TUI approval, refusal,
-expiry and unavailable-model journeys. Environment: supported macOS; actual model
+**Checks:** Unit response, revocation and supersession arbitration, including a
+decision held past a former deadline with an injected clock; integration with
+concurrent clients, real adapter unavailability and durable restart; CLI/TUI
+approval, refusal, revocation and unavailable-model journeys. Environment: supported macOS; actual model
 availability failures are required in addition to injected adapter errors.
 
 ## W4: Control and reconnect
@@ -182,7 +186,8 @@ goal revision or cancellation. Restart after a durable acknowledgement.
 Pause/cancel acknowledgement means durable intent, not completed interruption.
 Cancellation survives reconciliation and restart. Unknown effects remain visible;
 recovery exhaustion reports failure with uncertainty. Late results cannot reopen
-a terminal task. Task deadlines continue during pause and restart. Revision and
+a terminal task. Tasks have no deadline (owner, 2026-10-16); a paused task stays
+paused until resume, cancellation, revocation or restart recovery. Revision and
 resume require fresh context and current authority. See
 [control and recovery](core-harness-brief.md#proposed-interruption-and-recovery-states).
 
@@ -458,7 +463,9 @@ profiles; do not mix them into the healthy latency percentile or omit their resu
 
 For P5, recovery state must name the cause, remaining uncertainty and available
 controls. It is not permission to dispatch or claim full recovery. D3-D5 select
-separate deadlines and resource bounds for reconciliation and remote operations.
+separate attempt and resource bounds for reconciliation and remote operations.
+No deadline ends that work (owner, 2026-10-16); the thresholds above are
+acceptance criteria, never runtime closures.
 
 For P8, report model runtime, tool descendants and external server memory
 separately. They are excluded from this control-service threshold, not from total

@@ -3,7 +3,6 @@ mod sensors_cli;
 use asura_client::{Client, Error as ClientError};
 use asura_platform::{Error as PlatformError, RuntimeDirectory, StartupPipe};
 use serde_json::{Value, json};
-use std::time::{Duration, Instant};
 
 const BUILD: &str = concat!("asura/", env!("CARGO_PKG_VERSION"));
 
@@ -170,8 +169,7 @@ fn show_installation(value: &Value, json: bool) {
 fn installation_status(resolve: RuntimeResolver, json: bool) -> i32 {
     let result = (|| {
         let runtime = resolve(false).map_err(ClientError::from)?;
-        Client::attach(&runtime, BUILD, Instant::now() + Duration::from_secs(2))?
-            .inspect_installation()
+        Client::attach(&runtime, BUILD, &|| false)?.inspect_installation()
     })();
     match result {
         Ok(snapshot) => {
@@ -202,7 +200,7 @@ pub(crate) fn classify(error: &ClientError) -> (i32, &'static str, &'static str)
 fn status(resolve: RuntimeResolver) -> i32 {
     let result = (|| {
         let runtime = resolve(false).map_err(ClientError::from)?;
-        Client::attach(&runtime, BUILD, Instant::now() + Duration::from_secs(2))?.inspect()
+        Client::attach(&runtime, BUILD, &|| false)?.inspect()
     })();
     match result {
         Ok(snapshot) => {
@@ -238,8 +236,21 @@ fn lifecycle(start: bool, log: Option<&std::fs::File>, resolve: RuntimeResolver)
                 );
             }
         } else {
-            let client = Client::attach(&runtime, BUILD, Instant::now() + Duration::from_secs(2))?;
-            client.stop()?;
+            // Stop has no time bound (owner, 2026-10-16). It shows progress
+            // while workers settle; Ctrl-C stops waiting (outcome unconfirmed)
+            // and a second `asura service stop` forces the service to exit.
+            let cancel = ctrl_c();
+            let mut client = Client::attach(&runtime, BUILD, &*cancel)?;
+            client.set_cancel(cancel);
+            let mut shown = false;
+            client.stop_observed(&mut |snapshot| {
+                if !shown && snapshot.lifecycle == asura_control::pb::Lifecycle::Draining as i32 {
+                    shown = true;
+                    eprintln!(
+                        "Stopping: waiting for service workers to settle. Press Ctrl-C to stop waiting; run `asura service stop` again to force exit."
+                    );
+                }
+            })?;
             tracing::info!("service_stopped: Asura service stopped");
         }
         Ok::<_, ClientError>(())
@@ -467,8 +478,7 @@ mod tests;
 fn setup(command: crate::conversation::Command, resolve: RuntimeResolver) -> i32 {
     let result = (|| {
         let runtime = resolve(false).map_err(|e| e.to_string())?;
-        let mut client = Client::attach(&runtime, BUILD, Instant::now() + Duration::from_secs(2))
-            .map_err(|e| e.to_string())?;
+        let mut client = Client::attach(&runtime, BUILD, &|| false).map_err(|e| e.to_string())?;
         // Journal-backed mutations wait for the service with no time bound
         // (J1-0). They show progress, and Ctrl-C stops the wait (the request
         // may still commit; its ID is printed for resolution).
@@ -500,4 +510,19 @@ fn setup(command: crate::conversation::Command, resolve: RuntimeResolver) -> i32
             3
         }
     }
+}
+
+/// The person's Ctrl-C (or a termination signal) as a latched client cancel.
+/// If signal handling cannot be installed, the default action ends the process,
+/// which also ends the wait.
+fn ctrl_c() -> asura_client::Cancel {
+    let installed = asura_platform::install_signals().is_ok();
+    let latched = std::sync::atomic::AtomicBool::new(false);
+    std::sync::Arc::new(move || {
+        use std::sync::atomic::Ordering;
+        if installed && asura_platform::take_termination_signal().is_some() {
+            latched.store(true, Ordering::Release);
+        }
+        latched.load(Ordering::Acquire)
+    })
 }

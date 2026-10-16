@@ -192,19 +192,16 @@ private func consume(_ text: String, state: inout OllamaLanguageModel.StreamStat
     #expect(emitted == "partial")
 }
 
-@Test func ollamaGenerationKeepsInactivityBoundWithoutAsuraTotalExpiry() {
-    let generation = OllamaLanguageModel.session(seconds: 60)
-    let discovery = OllamaLanguageModel.session(seconds: 5, resourceSeconds: 5)
-    defer { generation.invalidateAndCancel(); discovery.invalidateAndCancel() }
-    let sdkDefault = URLSessionConfiguration.ephemeral.timeoutIntervalForResource
-    #expect(generation.configuration.timeoutIntervalForRequest == 60)
-    #expect(generation.configuration.timeoutIntervalForResource == sdkDefault)
-    #expect(sdkDefault > 60)
-    #expect(discovery.configuration.timeoutIntervalForRequest == 5)
-    #expect(discovery.configuration.timeoutIntervalForResource == 5)
-    #expect(generation.configuration.httpMaximumConnectionsPerHost == 1)
-    #expect(generation.configuration.urlCredentialStorage == nil)
-    #expect(generation.configuration.urlCache == nil)
+/// HW-04 unit: show, chat and tags share one session factory with no request
+/// inactivity or resource time limit (owner, 2026-10-16).
+@Test func hw04OllamaRequestsHaveNoTimeLimit() {
+    let session = OllamaLanguageModel.session()
+    defer { session.invalidateAndCancel() }
+    #expect(session.configuration.timeoutIntervalForRequest == .infinity)
+    #expect(session.configuration.timeoutIntervalForResource == .infinity)
+    #expect(session.configuration.httpMaximumConnectionsPerHost == 1)
+    #expect(session.configuration.urlCredentialStorage == nil)
+    #expect(session.configuration.urlCache == nil)
 }
 
 private actor InputMeasurements {

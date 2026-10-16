@@ -23,12 +23,12 @@ dated proposals below; the proposals remain as their record.
   The helper proposes typed tool calls that the service admits under
   [model tool execution](model-tool-execution.md). The helper package also pins
   `coreai-models`, `mlx-swift-lm` and `swift-transformers`.
-- Helper preparation through Hello has a 20-second deadline in
-  `asura-service/src/model_owner.rs`; later pre-start phases use 5 seconds.
+- Helper preparation through Hello had a 20-second deadline in
+  `asura-service/src/model_owner.rs`, and later pre-start phases used 5 seconds.
   The owner removed these limits (owner, 2026-10-16). Each step ends on the
-  helper's next message, helper exit, a protocol fault, cancel or shutdown, and
-  the TUI shows the step it waits for. The code change is pending; a follow-up
-  implementation will apply it.
+  helper's next message, helper exit, a protocol fault, cancel or shutdown.
+  Implemented 2026-10-16: the owner arms only the wind-down timer. Showing the
+  waiting step in the TUI remains open; the TUI still shows "Waiting".
   The package identity has three or four hashes; the optional fourth is the MLX
   `metallib` digest.
 - The storage writer records conversation, project and tool records as new

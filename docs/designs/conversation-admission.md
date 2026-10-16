@@ -649,7 +649,7 @@ These routine refinements apply the owner rule to sites the table did not list:
   shutdown replies `Cancelled`, not `RepairRequired`.
 - **Writer sub-steps.** Configuration reads and embedded database calls on the
   writer inherited the removed job deadline. They now have none
-  (`conversation_snapshot_without_deadline`).
+  (`conversation_snapshot`, which has no time bound).
 - **Embedded database (owner, 2026-10-16).** The SurrealDB 2 s query and
   transaction timeouts and the adapter's per-command deadline checks are
   removed everywhere, including the scratch memory owner's command and startup
@@ -663,8 +663,8 @@ These routine refinements apply the owner rule to sites the table did not list:
   scan ends on completion, content failure, an epoch change or shutdown. The 2 s
   wait for the audit bootstrap before the scan starts is not a journal wait and
   was unchanged here. A later owner decision (2026-10-16) removes it too; see
-  [audit bootstrap ordering](config-commands.md#audit-bootstrap-and-initial-authority-inspection-ordering). That
-  code change is pending a follow-up implementation.
+  [audit bootstrap ordering](config-commands.md#audit-bootstrap-and-initial-authority-inspection-ordering);
+  implemented 2026-10-16.
 - **Loading state (owner, 2026-10-16).** While the inspection replay or the
   writer's own replay runs, Inspect reports `recovering`/`inspection_pending`
   and conversation work gets `conversation_busy`. A first run with no journal
@@ -685,7 +685,7 @@ These routine refinements apply the owner rule to sites the table did not list:
   rename or queue request. Read, config, models, submit, lifecycle and TUI job
   budgets were unchanged in J1-0. A later owner decision (2026-10-16) removes
   them as well: each wait ends on the real reply, the person's cancel or a lost
-  connection. That code change is pending a follow-up implementation; see
+  connection. Implemented 2026-10-16; see
   [command flows](command-flows.md#client-waits-without-time-bounds).
 - **Queue worker.** `/cancel` while a queue request is in flight stops the wait.
   The slot stays busy until the worker settles. The service-owned queue

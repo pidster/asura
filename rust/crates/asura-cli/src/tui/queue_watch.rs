@@ -111,12 +111,16 @@ impl Worker {
                     if token.load(Ordering::Acquire) {
                         return Ok(());
                     }
+                    // Waits have no time bound (owner, 2026-10-16): each ends on
+                    // the reply, a scope change or exit, or a lost connection.
                     let mut client = asura_client::Client::attach(
                         &runtime,
                         concat!("asura/", env!("CARGO_PKG_VERSION")),
-                        Instant::now() + Duration::from_secs(2),
+                        &|| token.load(Ordering::Acquire),
                     )
                     .map_err(|_| "queue_service_unavailable")?;
+                    let read_stop = token.clone();
+                    client.set_cancel(Arc::new(move || read_stop.load(Ordering::Acquire)));
                     let snapshot = client.inspect().map_err(|_| "queue_service_unavailable")?;
                     if crate::conversation::hex(&snapshot.service_epoch) != worker_scope.epoch {
                         return Err("queue_service_changed");
@@ -124,9 +128,11 @@ impl Worker {
                     let mut revision = None;
                     let mut retained = None;
                     while !token.load(Ordering::Acquire) {
-                        let value = client
-                            .observe_queue(worker_scope.project, revision)
-                            .map_err(|_| "queue_observation_unavailable")?;
+                        let value = match client.observe_queue(worker_scope.project, revision) {
+                            Ok(value) => value,
+                            Err(_) if token.load(Ordering::Acquire) => return Ok(()),
+                            Err(_) => return Err("queue_observation_unavailable"),
+                        };
                         revision = value.revision;
                         publish(Ok(coalesce(&mut retained, value)));
                     }
@@ -274,10 +280,14 @@ impl Projection {
         self.entries.clone()
     }
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.seen.map(|seen| seen + Duration::from_secs(5))
+        // Display pacing: re-check after five missed heartbeats.
+        self.seen.map(super::heartbeat::stale_at)
     }
     pub fn expire(&mut self, now: Instant) -> bool {
-        if self.next_deadline().is_some_and(|at| now >= at) {
+        if self
+            .seen
+            .is_some_and(|seen| super::heartbeat::stale(seen, now))
+        {
             self.seen = None;
             return !std::mem::take(&mut self.entries).is_empty();
         }

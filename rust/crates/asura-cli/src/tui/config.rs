@@ -56,10 +56,13 @@ pub(super) fn parse(draft: &str) -> Result<Request, &'static str> {
 }
 
 pub(super) type Outcome = Result<String, String>;
+/// One configuration wait. It has no time bound (owner, 2026-10-16): it ends
+/// on the reply, the person's `/cancel`, exit or a lost connection.
 struct Job {
     handle: JoinHandle<Outcome>,
     cancel: Arc<AtomicBool>,
-    deadline: Instant,
+    /// A set may still commit after its wait is cancelled.
+    mutation: bool,
     reported: bool,
 }
 #[derive(Default)]
@@ -80,6 +83,7 @@ impl Worker {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let token = cancel.clone();
+        let mutation = request.value.is_some();
         let notice = self.notice.clone();
         let handle = std::thread::Builder::new()
             .name("asura-config-client".into())
@@ -90,15 +94,16 @@ impl Worker {
                         return Err(asura_client::Error::Unavailable);
                     }
                     let runtime = resolve(false)?;
+                    let cancelled = || token.load(Ordering::Acquire);
                     let mut client = asura_client::Client::attach(
                         &runtime,
                         concat!("asura/", env!("CARGO_PKG_VERSION")),
-                        Instant::now() + Duration::from_secs(2),
+                        &cancelled,
                     )?;
-                    if token.load(Ordering::Acquire) {
+                    if cancelled() {
                         return Err(asura_client::Error::Unavailable);
                     }
-                    client.config(&request.key, request.value.as_deref())
+                    client.config(&request.key, request.value.as_deref(), &cancelled)
                 };
                 match run() {
                     Ok(reply) => match (reply.value_yaml, reply.error) {
@@ -123,16 +128,10 @@ impl Worker {
         self.job = Some(Job {
             handle,
             cancel,
-            deadline: Instant::now() + Duration::from_secs(5),
+            mutation,
             reported: false,
         });
         Ok(())
-    }
-    pub fn next_deadline(&self) -> Option<Instant> {
-        self.job
-            .as_ref()
-            .filter(|job| !job.reported)
-            .map(|job| job.deadline)
     }
     pub fn poll(&mut self) -> Option<Outcome> {
         let job = self.job.as_mut()?;
@@ -144,12 +143,15 @@ impl Worker {
                 .unwrap_or_else(|_| Err("Configuration outcome unconfirmed".into()));
             return (!job.reported).then_some(outcome);
         }
-        if !job.reported && Instant::now() >= job.deadline {
+        // The person's cancel reports at once; the slot stays busy until the
+        // worker settles, and its late reply is discarded.
+        if !job.reported && job.cancel.load(Ordering::Acquire) {
             job.reported = true;
-            job.cancel.store(true, Ordering::Release);
-            return Some(Err(
-                "Configuration outcome unconfirmed; use /config get to check".into(),
-            ));
+            return Some(Err(if job.mutation {
+                "Configuration wait stopped; outcome unconfirmed, use /config get to check".into()
+            } else {
+                "Configuration request cancelled".into()
+            }));
         }
         None
     }
@@ -214,7 +216,7 @@ mod tests {
         }
     }
     #[test]
-    fn expired_worker_keeps_slot_and_discards_late_reply() {
+    fn held_reply_waits_and_cancel_keeps_slot_and_discards_late_reply() {
         let (release, wait) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             wait.recv().unwrap();
@@ -225,11 +227,17 @@ mod tests {
             job: Some(Job {
                 handle,
                 cancel: Arc::new(AtomicBool::new(false)),
-                deadline: Instant::now(),
+                mutation: true,
                 reported: false,
             }),
         };
-        assert!(worker.poll().unwrap().is_err());
+        // CW-01: a held reply past the removed 5 s job bound stays pending.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(worker.poll().is_none());
+        assert!(worker.running());
+        // CW-02: the person's cancel ends the wait as unconfirmed for a set.
+        worker.cancel();
+        assert!(worker.poll().unwrap().unwrap_err().contains("unconfirmed"));
         assert!(worker.job.is_some());
         assert!(worker.poll().is_none());
         release.send(()).unwrap();

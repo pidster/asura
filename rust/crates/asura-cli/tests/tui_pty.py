@@ -670,6 +670,26 @@ def stalled_backend(fixture):
         offset = len(trial.output)
         trial.send(b"\x01/models\r")
         trial.until(b"Model inventory pending", offset, plain=True, refresh=True)
+        # CW-01: both waits stay pending past the removed 2 s attach bound; no
+        # timer reports them, and typing stays responsive.
+        trial.idle(2.5)
+        text = trial.screen.text()
+        assert "timed out" not in text and "unconfirmed" not in text, text
+        typed_within_100ms(trial, b"w")
+        # CW-02: /cancel ends the inventory wait, then the configuration wait.
+        offset = len(trial.output)
+        trial.send(b"\x01/cancel\r")
+        trial.until(b"Model inventory cancelled", offset, plain=True, refresh=True)
+        trial.send(b"\x1b")  # Close the inventory result panel.
+        trial.idle(0.1)
+        offset = len(trial.output)
+        trial.send(b"\x01/cancel\r")
+        trial.until(b"unconfirmed", offset, plain=True, refresh=True)
+        trial.send(b"\x1b")  # Close the configuration result panel.
+        trial.idle(0.1)
+        offset = len(trial.output)
+        trial.send(b"\x01backend-stalled")
+        trial.until(b"backend-stalled", offset, plain=True)
         offset = len(trial.output)
         trial.send(b"\x11")
         trial.until(b"Discard draft and exit?", offset, plain=True, refresh=True)
@@ -695,6 +715,77 @@ def stalled_backend(fixture):
                 backend.kill()
                 backend.wait(timeout=5)
             raise
+
+
+def slow_terminal(fixture):
+    """The 100 ms frame write no longer ends the session (owner, 2026-10-16)."""
+    fixture.start()
+    trial = fixture.launch()
+    try:
+        trial.resize(200, 60)
+        # Stop reading the PTY so frames back up past the removed 100 ms bound
+        # while input and resizes force more drawing.
+        os.write(trial.master, b"slow-terminal-" + b"x" * 512)
+        for index in range(20):
+            trial.resize(200 if index % 2 else 198, 60)
+            time.sleep(0.05)
+        time.sleep(1.0)
+        assert trial.process.poll() is None, "TUI exited on slow terminal output"
+        offset = len(trial.output)
+        trial.send(b"-resumed")
+        trial.until(b"-resumed", offset, plain=True, refresh=True)
+        offset = len(trial.output)
+        trial.send(b"\x11")
+        trial.until(b"Discard draft and exit?", offset, plain=True, refresh=True)
+        offset = len(trial.output)
+        trial.send(b"\t")
+        trial.until(b"[Discard and exit]", offset, plain=True, refresh=True)
+        trial.send(b"\r")
+        trial.finish()
+    finally:
+        trial.close()
+    fixture.stop()
+    print("PASS TUI slow terminal: frames wait and coalesce; the session never exits")
+
+
+def stop_progress(fixture):
+    """CW-04: `asura service stop` waits for a held worker and shows progress;
+    a second stop forces exit and the next owner recovers."""
+    home = fixture.root / "home"
+    hold = home / "journal-hold-appends"
+    for force in (False, True):
+        hold.touch()
+        fixture.start()
+        err = fixture.root / f"stop-{force}.err"
+        with err.open("wb") as stderr:
+            stop = subprocess.Popen([str(fixture.binary), "service", "stop"], cwd=fixture.root,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr)
+            try:
+                end = time.monotonic() + remaining()
+                while b"waiting for service workers to settle" not in err.read_bytes():
+                    assert stop.poll() is None, err.read_bytes()
+                    assert time.monotonic() < end, "stop showed no progress"
+                    time.sleep(0.05)
+                # Past the removed 1 s drain and 5 s client stop bounds.
+                time.sleep(1.5)
+                assert stop.poll() is None, "stop ended while a worker was settling"
+                status = fixture.status()
+                assert status["lifecycle"] != "repair_only", status
+                if force:
+                    second = fixture.command("service", "stop")
+                    assert second[0] == 0, second
+                else:
+                    hold.unlink()
+                assert stop.wait(timeout=remaining()) == 0, err.read_bytes()
+            finally:
+                if stop.poll() is None:
+                    stop.kill()
+                    stop.wait(timeout=2)
+                hold.unlink(missing_ok=True)
+        fixture.wait_absent()
+    fixture.start()
+    fixture.stop()
+    print("PASS service stop: progress while draining, completion after settlement, forced exit on second stop")
 
 
 def typed_within_100ms(trial, text):
@@ -2237,7 +2328,8 @@ def main():
     long_turns = len(sys.argv) == 3 and sys.argv[2] == "--long-conversation"
     waits = len(sys.argv) == 3 and sys.argv[2] == "--journal-waits"
     capture = len(sys.argv) == 3 and sys.argv[2] == "--shell-capture"
-    assert len(sys.argv) == 2 or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
+    waits_client = len(sys.argv) == 3 and sys.argv[2] == "--client-waits"
+    assert len(sys.argv) == 2 or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
@@ -2267,6 +2359,11 @@ def main():
         if waits:
             DEADLINE = time.monotonic() + 70
             journal_waits(fixture)
+            return
+        if waits_client:
+            DEADLINE = time.monotonic() + 60
+            slow_terminal(fixture)
+            stop_progress(fixture)
             return
         if helpmode:
             help_mode(fixture)
@@ -2315,7 +2412,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture and not waits_client:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

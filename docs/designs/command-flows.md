@@ -103,8 +103,10 @@ endpoint checks, child reaping, and repair-only drain behavior remain in the
 have no time bound (owner, 2026-10-16): each wait ends on its result, a lost
 connection or the person's cancel. A long stop shows progress, and a second stop
 forces exit. A long wait does not authorize killing a different owner or
-replacing installation data. The code still applies the five-second `LIFECYCLE`
-budget; a follow-up implementation will remove it.
+replacing installation data. Implemented 2026-10-16: `LIFECYCLE` is removed.
+`asura service stop` prints one progress line when Inspect reports `Draining`.
+The progress shows the lifecycle only, not which owners are settling; that
+detail remains open.
 
 ## CF03: TUI startup and shutdown
 
@@ -145,9 +147,8 @@ by the current argument parser. This chart records local-service behavior only.
 
 `status_expired` is a display rule, not a wait that ends work. Staleness is
 counted in missed heartbeats, not seconds (owner, 2026-10-16); the
-[event routing design](event-routing.md) owns the count. The code still expires
-the status after five seconds; a follow-up implementation will apply the
-heartbeat count.
+[event routing design](event-routing.md) owns the count. Implemented 2026-10-16
+in `tui/heartbeat.rs`.
 
 ## CF04: Slash-command dispatch and local commands
 
@@ -490,8 +491,12 @@ nothing and remain.
 
 J1-0 already removed the client budgets for journal-backed mutations:
 initialize, project register and rename, queue requests and conversation cancel.
-This decision removes the remaining budgets. The code still applies them; a
-follow-up implementation will remove them.
+This decision removes the remaining budgets. Implemented 2026-10-16: the client
+has no per-call deadline. A wait ends on the reply, the caller's `cancelled`
+callback or the attachment's `Client::set_cancel`, checked every 50 ms, or a
+lost connection. A cancelled read returns `Cancelled`; a cancelled or lost
+mutation, configuration set or submit returns `OutcomeUnconfirmed`; any failed
+wait retires the attachment.
 
 | Wait | Removed bound (code) | What ends the wait |
 | --- | --- | --- |
@@ -547,7 +552,7 @@ case. A rendered chart is review evidence, not executable proof.
 | CF06 projects and confirmation | `tui/ui.rs`, service conversation journey and terminal setup journey | Discovery failure must never be treated as an empty registry. |
 | CF07 YAML and uncertainty | configuration storage/service tests and terminal config journey | Mock failures alone do not prove post-rename disk-error handling. |
 | CF08–CF09 acceptance, replay and cancel | service conversation journey, native model journey, client unit tests and `tests/tui_pty.py` | `tui/queue.rs` unit tests cover a held worker with no time bound (J1-0); add coverage that a submit against a stalled real service waits until cancel. |
-| Client waits without time bounds | Client unit tests, real service journeys and `tests/tui_pty.py` | Pending the follow-up implementation; see [validation](#client-wait-validation). |
+| Client waits without time bounds | Client unit tests `cw01`–`cw03`, `config_worker` and `installation` reactor tests, `conversation_flow --stop-drain`, `tests/tui_pty.py --client-waits` and the stalled-backend journey | Implemented 2026-10-16. The 30 s, 35 s and 40 s bounds are covered structurally (no deadline input), not by waiting past them. |
 
 Audit findings and correction status:
 
@@ -592,9 +597,7 @@ audit chart. Each changed chart was rendered with Mermaid CLI and inspected.
 Selected command path under [MP3](model-provider-integration.md#mp3-model-inventory-command).
 The client has one inventory worker slot. Attachment and the typed inventory
 request have no time bound (owner, 2026-10-16); they end on the reply, `/cancel`,
-exit or a lost connection. The code still applies a two-second attachment, a
-thirty-second request and a thirty-five-second UI deadline; a follow-up
-implementation will remove them.
+exit or a lost connection. Implemented 2026-10-16.
 Only this worker accesses the socket. Cancellation shuts down a cloned socket
 handle and sets a cancellation flag. The worker checks cancellation before and
 after attachment. A cancelled slot stays occupied until its thread settles.
@@ -646,8 +649,8 @@ attachment, loading, unavailable and stale-cursor errors exit 3. Success exits 0
 It attaches to an existing local service as other standalone inspection commands
 do; it does not launch a service. Attachment and the typed query have no time
 bound (owner, 2026-10-16); they end on the reply, a lost connection or the
-person's Ctrl-C. The code still applies two-second deadlines; a follow-up
-implementation will remove them. There is no UI/render loop to block.
+person's Ctrl-C. Implemented 2026-10-16: `Client::sensors` takes a cancel
+callback; the command passes none, so process exit ends the wait. There is no UI/render loop to block.
 
 The output shows project/revision, pending persistence and intake/clock health,
 a source/sequence/expiry table, and proposal purpose/state/held reason. If more
@@ -696,8 +699,8 @@ defines command branches, metadata ownership and model-tool behavior separately.
 owns its typed metadata, limits and read-only native tool. Limit defaults to 16
 and accepts 1 through 16. A dedicated single-slot audit worker in `tui/audit.rs`
 performs the read; a second `/audit` while it runs retains the draft. `/cancel`
-cancels a pending read. The read has no time bound (owner, 2026-10-16); the code
-still applies a two-second deadline until a follow-up implementation removes it.
+cancels a pending read. The read has no time bound (owner, 2026-10-16);
+implemented 2026-10-16.
 
 ```mermaid
 flowchart TD

@@ -110,15 +110,20 @@ impl Worker {
                     if token.load(Ordering::Acquire) {
                         return Ok(());
                     }
+                    // Waits have no time bound (owner, 2026-10-16): each ends on
+                    // the reply, a scope change or exit, or a lost connection.
+                    let stopped = || token.load(Ordering::Acquire);
                     let mut client = asura_client::Client::attach(
                         &runtime,
                         concat!("asura/", env!("CARGO_PKG_VERSION")),
-                        Instant::now() + Duration::from_secs(2),
+                        &stopped,
                     )
                     .map_err(|_| "context_service_unavailable")?;
-                    if token.load(Ordering::Acquire) {
+                    if stopped() {
                         return Ok(());
                     }
+                    let read_stop = token.clone();
+                    client.set_cancel(Arc::new(move || read_stop.load(Ordering::Acquire)));
                     let snapshot = client
                         .inspect()
                         .map_err(|_| "context_service_unavailable")?;
@@ -129,14 +134,19 @@ impl Worker {
                     let mut revision = None;
                     let mut retained = None;
                     while !token.load(Ordering::Acquire) {
-                        let result = client
-                            .observe_context(pb::ObserveContext {
+                        let result = match client.observe_context(
+                            pb::ObserveContext {
                                 project_id: Some(worker_scope.project.to_vec()),
                                 working_directory: Some(worker_scope.path.clone()),
                                 after_subscription: subscription.clone(),
                                 after_revision: revision,
-                            })
-                            .map_err(|_| "context_observation_unavailable")?;
+                            },
+                            &stopped,
+                        ) {
+                            Ok(result) => result,
+                            Err(_) if stopped() => return Ok(()),
+                            Err(_) => return Err("context_observation_unavailable"),
+                        };
                         subscription = result.subscription_id.clone();
                         revision = result.revision;
                         publish(Ok(coalesce(&mut retained, result)));
@@ -289,7 +299,7 @@ impl Model {
                 .is_some_and(|old| matches!(old.git_state, Some(1..=3)))
         {
             self.refresh_until
-                .get_or_insert(update.received + Duration::from_secs(2));
+                .get_or_insert(super::heartbeat::git_grace_end(update.received));
             return self.expire(update.received);
         }
         self.refresh_until = None;
@@ -305,7 +315,7 @@ impl Model {
     pub fn next_deadline(&self) -> Option<Instant> {
         self.value.as_ref()?;
         self.seen
-            .map(|seen| seen + Duration::from_secs(5))
+            .map(super::heartbeat::stale_at)
             .into_iter()
             .chain(self.refresh_until)
             .min()
@@ -313,9 +323,9 @@ impl Model {
     pub fn expire(&mut self, now: Instant) -> bool {
         if self.value.is_some()
             && (self.refresh_until.is_some_and(|until| now >= until)
-                || self.seen.is_none_or(|seen| {
-                    now.saturating_duration_since(seen) >= Duration::from_secs(5)
-                }))
+                || self
+                    .seen
+                    .is_none_or(|seen| super::heartbeat::stale(seen, now)))
         {
             self.value = None;
             self.refresh_until = None;

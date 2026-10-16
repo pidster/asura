@@ -213,8 +213,9 @@ flowchart TD
 
 Reuse the model inventory worker, configuration's existing bounded worker and the
 queue worker. Model discovery and configuration saves have no client time budget
-(owner, 2026-10-16); the code still applies 35-second and five-second budgets,
-and a follow-up implementation will remove them. The queue worker has no
+(owner, 2026-10-16). Implemented 2026-10-16: the inventory and configuration
+workers carry no job deadline; `/cancel` reports at once and the slot stays busy
+until the worker settles (`tui/models.rs` and `tui/config.rs` unit tests). The queue worker has no
 observation bound ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). Each wait ends on reply, cancellation by the
 person or disconnect. Each worker retains its slot until settlement. Escape suppresses late picker results. Quit uses existing bounded
 worker cancellation and owned-service cleanup. No new polling or timer is added.

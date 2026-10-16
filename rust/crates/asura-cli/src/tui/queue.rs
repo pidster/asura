@@ -8,7 +8,6 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
 };
 #[derive(Clone, Debug)]
 pub(super) enum Request {
@@ -79,10 +78,13 @@ impl Worker {
                     let mut client = asura_client::Client::attach(
                         &runtime,
                         concat!("asura/", env!("CARGO_PKG_VERSION")),
-                        Instant::now() + Duration::from_secs(2),
+                        &|| cancelled.load(Ordering::Acquire),
                     )
                     .map_err(|e| format!("{e}; queue outcome unconfirmed"))?;
                     check()?;
+                    // Reads, too, end only on the reply, /cancel or a lost connection.
+                    let read_stop = cancelled.clone();
+                    client.set_cancel(Arc::new(move || read_stop.load(Ordering::Acquire)));
                     // Queue mutations wait for the journal with no client
                     // budget (J1-0); /cancel stops the wait.
                     let stop = || cancelled.load(Ordering::Acquire);
@@ -176,6 +178,7 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     fn held_worker(cancelled: bool) -> (Worker, mpsc::SyncSender<()>) {
         let (sender, receiver) = mpsc::sync_channel(1);
         let (release, wait) = mpsc::sync_channel(1);

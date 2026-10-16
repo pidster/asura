@@ -62,7 +62,9 @@ enum ModelInventory {
         do {
             guard let url = URL(string: endpoint ?? "http://127.0.0.1:11434") else { throw Failure.unavailable }
             let settings = try OllamaLanguageModel.Settings(name: "inventory", endpoint: url)
-            let session = OllamaLanguageModel.session(seconds: 2)
+            // No time limit: the stalled row stays pending until reply, error,
+            // the person's cancel, helper exit or shutdown (owner, 2026-10-16).
+            let session = OllamaLanguageModel.session()
             defer { session.invalidateAndCancel() }
             return try await withTaskCancellationHandler {
                 let (bytes, response) = try await session.bytes(from: settings.endpoint.appending(path: "api/tags"))

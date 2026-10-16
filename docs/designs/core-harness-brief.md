@@ -49,14 +49,14 @@ stateDiagram-v2
     [*] --> Queued: Authorized acceptance persisted
     Queued --> Running: Valid assignment and grant
     Running --> WaitingUser: Decision required
-    WaitingUser --> Running: Timely authorized response
+    WaitingUser --> Running: Authorized response
     Running --> WaitingExternal: Bounded dispatch
     WaitingExternal --> Running: Outcome reconciled
     Running --> Succeeded: Acceptance criteria verified
     Running --> FailurePending: Fatal error or exhausted task budget
-    WaitingUser --> FailurePending: Decision or task deadline expires
-    WaitingExternal --> FailurePending: Fatal error or task deadline expires
-    Queued --> FailurePending: Task deadline expires
+    WaitingUser --> FailurePending: Decision revoked or superseded
+    WaitingExternal --> FailurePending: Fatal error or revocation
+    Queued --> FailurePending: Fatal error or revocation
     FailurePending --> Failed: Effects accounted for and no cancel intent
     FailurePending --> Reconciling: Unresolved effects
     Succeeded --> [*]
@@ -137,9 +137,13 @@ reconciliation and cannot produce a successful cancellation claim.
 Selected constraint for D3-D4; rationale in
 [ADR-0002](../decisions/0002-failure-settlement.md). `FailurePending` is the
 logical combination of failure intent and stopped dispatch, not a commitment to
-a separate stored enum. Fatal errors, exhausted task budgets, task deadline expiry
-and required user-decision expiry all enter this procedure from **every
-nonterminal state**, including queued, paused, waiting and reconciling states.
+a separate stored enum. Fatal errors, exhausted task budgets, revoked authority and
+a required user decision that is revoked or superseded all enter this procedure
+from **every nonterminal state**, including queued, paused, waiting and
+reconciling states. Elapsed time alone is not a failure trigger: tasks and
+decisions have no default deadline (owner, 2026-10-16, under
+[AE-04](../engineering.md#asynchronous-execution-and-recovery) and
+[loop closure](loop-closure.md)).
 Recoverable per-operation failures may retry only while this procedure has not
 started and current authorization and budgets permit it.
 
@@ -151,7 +155,7 @@ started and current authorization and budgets permit it.
 2. The orchestrator requests that outstanding work stop within the recovery limits.
    It reconciles every admitted operation, including model calls and delegated work.
    Admission records must distinguish work proven not dispatched from work with an
-   unknown outcome. A timeout, process death or disconnection does not prove that
+   unknown outcome. A cancel, process death or disconnection does not prove that
    no effect or cost occurred.
 3. When effects and usage are accounted for, the orchestrator records `Failed`.
    If cancellation won, it records `Cancelled` instead. If the recovery limit is
@@ -168,11 +172,15 @@ stop new dispatch and use only existing bounded stop/cleanup authority until the
 selected persistence contract can record the transition. Remote owners remain
 subject to their lease and host limits. D3/D5 must define that outage protocol.
 
-The task deadline covers queueing, waiting, pause and reconciliation; pausing does
-not extend it. Deadline expiry during reconciliation records failure intent but
-does not skip settlement or reset the recovery bound. Terminalization, failure,
-cancel and dispatch admission are serialized: if success was already durably
-committed, a later timer cannot reopen it. Success requires no outstanding task
+A task has no deadline (owner, 2026-10-16; this replaces the earlier proposed
+task deadline). Queueing, waiting, pause and reconciliation end through loop
+closures: completion, an authorized response, cancellation, revocation,
+supersession, known-size budget exhaustion, shutdown or restart. Recovery bounds
+are attempt and resource limits, not time limits. A failure trigger during
+reconciliation records failure intent but does not skip settlement or reset the
+recovery bound. Terminalization, failure, cancel and dispatch admission are
+serialized: if success was already durably committed, a later trigger cannot
+reopen it. Success requires no outstanding task
 operations and reconciled budget accounting. D3 defines clock representation,
 restart/clock-jump handling and the atomic mechanism. Clock uncertainty must not
 extend work authority. Late observations may append evidence and settle usage
@@ -185,7 +193,7 @@ technology and numerical recovery limits remain D3/D4 design work.
 
 ```mermaid
 flowchart TD
-    Trigger["Fatal error, exhausted budget, task or decision expiry"] --> Fence["Serialize failure intent and dispatch fence against task revision"]
+    Trigger["Fatal error, exhausted budget, revocation or superseded decision"] --> Fence["Serialize failure intent and dispatch fence against task revision"]
     Fence --> Durable{"Authority store acknowledged?"}
     Durable -->|No| Outage["Stop local dispatch, no durable acknowledgement, bounded outage recovery"]
     Outage -->|Authority restored| Fence
@@ -201,21 +209,26 @@ flowchart TD
 
 ### User-decision expiry contract
 
-Resolved brief-level behavior for D3-D4: expiry of a required user decision fails
-the task, rather than asking again or returning to model inference. Apply the
+Resolved brief-level behavior for D3-D4, realigned by the owner on 2026-10-16:
+a required user decision has no time expiry. Its expiry is an event, as in
+[loop closure](loop-closure.md): the decision stays pending until an authorized
+response, cancellation, revocation or supersession by a new task revision. D3
+selects how restart presents or ends a pending durable decision. Revocation or
+supersession of a required decision fails the task, rather than asking again or
+returning to model inference. Apply the
 [common failure procedure](#common-failure-and-deadline-contract): persist the
-expired decision and failure intent, disable further task dispatch, and account
+ended decision and failure intent, disable further task dispatch, and account
 for outstanding effects before reporting failure. With unresolved effects, remain
 in reconciliation until they are accounted for or the recovery contract produces
 an explicit terminal failure with uncertainty. A subsequently accepted cancellation
 supersedes the pending failure outcome as described above.
 
-The orchestrator serializes response acceptance, deadline expiry and control intent
-against the pending decision/task revision. Accept a response only while that
-decision is pending and before its authoritative deadline; late or duplicate
-responses cannot resume work. An already accepted cancellation cannot be replaced
-by timeout failure. D3 must specify the authoritative clock, restart handling and
-atomic update mechanism. A timer wakeup alone is not permission to infer or dispatch.
+The orchestrator serializes response acceptance, revocation, supersession and
+control intent against the pending decision/task revision. Accept a response only
+while that decision is pending; late or duplicate responses cannot resume work.
+An already accepted cancellation cannot be replaced by a later failure. D3 must
+specify restart handling and the atomic update mechanism. A wakeup alone is not
+permission to infer or dispatch.
 
 ## Proposed agent step
 
@@ -226,7 +239,7 @@ atomic update mechanism. A timer wakeup alone is not permission to infer or disp
 | 3. Decide | Ask the on-device subsystem for a typed proposal: gather context, perform a tool action, delegate, ask the user, wait, or finish |
 | 4. Validate | Validate schema, task relevance, context revision, capabilities, data egress, resource limits and preconditions; reject or request clarification |
 | 5. Admit and record intent | Atomically reserve aggregate budgets and durably bind action identity, task revision, selected inputs and grant scope before dispatch |
-| 6. Execute or wait | Dispatch to the local agent/tool, remote inference adapter, or remote host; stream bounded progress and honor deadlines |
+| 6. Execute or wait | Dispatch to the local agent/tool, remote inference adapter, or remote host; stream bounded progress and honor cancellation and the other loop closures |
 | 7. Reconcile | Record actual outcome, artifacts, evidence, and unknown effects; update durable state and graph consistently |
 | 8. Evaluate progress | Check acceptance criteria and independent validation results; continue, replan, ask, or terminate with an explicit reason |
 
@@ -240,7 +253,7 @@ next check or procedure. The following views expand proposal handling and result
 flowchart TD
     Observe["Read inputs, results and task revision"] --> Control{"Pause or cancel pending?"}
     Control -->|Yes| Settle["Use interruption and recovery procedure"]
-    Control -->|No| Budget{"Permission, budget and deadline valid?"}
+    Control -->|No| Budget{"Permission and budget valid?"}
     Budget -->|No| Stop["Use common failure procedure"]
     Budget -->|Yes| Context["Prepare versioned model context"]
     Context --> Decision["Admit and request on-device decision"]
@@ -254,21 +267,21 @@ flowchart TD
 ### Proposal handling
 
 Proposed mechanism for D4. Arrows select a procedure by proposal type. Each return
-to the next step repeats the permission, control and deadline checks above.
+to the next step repeats the permission, control and budget checks above.
 
 ```mermaid
 flowchart TD
     Kind{"Proposed next step"}
     Kind -->|Ask user| User["Persist decision request and wait"]
-    User -->|Timely authorized response| Next["Start next step"]
-    User -->|Decision expired| Stop["Use common failure procedure"]
+    User -->|Authorized response| Next["Start next step"]
+    User -->|"Decision revoked or superseded"| Stop["Use common failure procedure"]
     Kind -->|Finish| Verify{"Acceptance evidence sufficient?"}
     Verify -->|Yes, terminal conditions met| Success["Persist success and validation evidence"]
     Verify -->|No| Result["Use result handling below"]
     Kind -->|Gather, tool or delegate| Action["Use action admission and execution sequence"]
     Action --> Result
-    Kind -->|Wait| Wait["Persist wake condition and deadline"]
-    Wait -->|Event or deadline| Next
+    Kind -->|Wait| Wait["Persist wake condition"]
+    Wait -->|Wake event| Next
 ```
 
 ### Result handling
@@ -292,11 +305,11 @@ The on-device decision request also uses action admission and budget reservation
 The action sequence applies to local tools, remote inference and remote hosts.
 Proposal validation checks the schema, supporting evidence and task revision.
 Admission rejection leads to a limited wait, replan or failure. It must not start
-a busy retry loop. Task deadline checks apply while waiting and before success.
+a busy retry loop. Cancellation and revocation checks apply while waiting and before success.
 Success also requires the terminal conditions in the common failure and deadline
 contract. Reaching a recovery limit must not restart that recovery period.
 
-An unavailable, timed-out, or invalid model response follows the bounded
+An unavailable or invalid model response follows the bounded
 retry/fallback policy; it cannot authorize a remote fallback on its own.
 
 Not every step needs model inference. Deterministic events such as cancellation,
@@ -387,7 +400,7 @@ settlement and ancestor budgets.
 | Consumable steps, tool calls, model tokens and monetary cost | Typed units, cumulative charged usage plus outstanding reservations may not exceed the configured cap at admission. Money records currency and pricing revision; unlike units are never added together. |
 | Concurrent operations or resource occupancy | Reserve capacity while occupied; release only on evidence of completion/non-execution. A lost connection does not free the slot. |
 | Context capacity | Check the entire effective context per invocation, including retained history, with its model-specific limit. This is distinct from cumulative inference-token allowance. |
-| Elapsed task time | Check the authoritative task deadline; it is not replenished by retries, restart, waiting or pausing. |
+| Elapsed task time | Not a budget dimension: tasks have no deadline (owner, 2026-10-16). Elapsed time may be reported; it never ends, refuses or fails work. |
 
 Budgets form a hierarchy: installation and workspace limits where configured,
 then root task, child tasks and operations. Each operation counts once against
@@ -413,7 +426,7 @@ It releases only the allowance proven unused. Proof that the operation never ran
 may release the full reservation.
 
 If execution or billing is unknown, the reservation remains in place through
-timeout, cancellation, terminal failure and restart. Lease expiry prevents new
+disconnection, cancellation, terminal failure and restart. Lease expiry prevents new
 dispatch. It neither proves that old work stopped nor refunds its consumption.
 Late evidence may settle usage without restarting the task.
 
@@ -461,7 +474,7 @@ stateDiagram-v2
     InFlight --> Settled: Durable actual usage and unused portion recorded
     Reserved --> Uncertain: Crash with dispatch status unknown
     InFlight --> Uncertain: Effect or billing outcome unknown
-    note right of Uncertain: Timeout and task termination retain allowance
+    note right of Uncertain: Disconnect and task termination retain allowance
     Uncertain --> Settled: Authoritative non-execution or usage evidence
     Rejected --> [*]
     Settled --> [*]
@@ -789,22 +802,22 @@ before the corresponding implementation packets become ready.
 | H1: failure handling | Stop new dispatch and retain the failure cause through recovery |
 | H2: shared budgets | Prevent duplicate spending and retain allowance for unknown usage |
 | H3: control during recovery | An accepted cancellation prevents work from resuming |
-| H4: user-decision expiry | A missed decision deadline cannot start more task work |
+| H4: user-decision expiry | A revoked or superseded decision cannot start more task work |
 | H5: model session isolation | Reject inputs and results from an invalid task or session generation |
 
 ### H1: failure handling
 
 **Initial state:** a task in any nonterminal state, including paused or waiting.
-**Trigger:** a fatal error, task deadline or exhausted task budget.
-**Required result:** stop new dispatch and preserve the failure cause. Pausing must
-not extend the task deadline. Recovery uses its own limited resources.
+**Trigger:** a fatal error, revocation or exhausted task budget.
+**Required result:** stop new dispatch and preserve the failure cause. Elapsed time
+alone never fails the task. Recovery uses its own limited resources.
 
 - **Unit:** test each trigger in each nonterminal state. Vary the ordering of
   failure, success and cancellation. Verify dispatch is blocked after failure wins.
 - **Integration:** crash at failure-intent recording, stopping and terminal commit.
-  Expire a deadline during external work. Make the authority store unavailable and
+  Revoke authority during external work. Make the authority store unavailable and
   inject unknown effects or usage. Restart must not reset budgets or permit dispatch.
-- **End-to-end:** expire a CLI task during an actual operation, then restart.
+- **End-to-end:** revoke a CLI task's authority during an actual operation, then restart.
   Report the original cause, remaining effects and any uncertainty.
 
 ### H2: shared budgets
@@ -839,14 +852,16 @@ precedence and must prevent new task dispatch.
 ### H4: user-decision expiry
 
 **Initial state:** a required user decision is pending; an action may be unresolved.
-**Trigger:** the decision deadline expires while responses or cancellation arrive.
-**Required result:** record one winning outcome. Expiry must not start new model
-inference, repeat the question or resume task work.
+**Trigger:** the decision is revoked or superseded while responses or cancellation
+arrive. A decision held past any former deadline stays pending.
+**Required result:** record one winning outcome. The ending event must not start
+new model inference, repeat the question or resume task work.
 
-- **Unit:** vary response, timeout and cancellation order against one task revision.
-- **Integration:** restart with an expired decision and unresolved action. Reject
+- **Unit:** vary response, revocation, supersession and cancellation order against
+  one task revision. A decision held with an injected clock stays pending.
+- **Integration:** restart with a pending decision and unresolved action. Reject
   late or duplicate responses and preserve failure or cancellation intent.
-- **End-to-end:** let the decision expire through CLI or TUI. Show failure or
+- **End-to-end:** revoke a pending decision through CLI or TUI. Show failure or
   reconciliation without another question or new work.
 
 ### H5: model session isolation

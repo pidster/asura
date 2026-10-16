@@ -60,6 +60,11 @@ pub(crate) enum ModelEvent {
     ToolCall(pb::ToolCall),
     Failed(&'static str),
 }
+/// Kept wind-down (owner, 2026-10-16): cooperative cancel grace, then the
+/// grace after SIGTERM before SIGKILL. Bounds Asura's own cleanup only.
+const WIND_DOWN_GRACE: Duration = Duration::from_millis(250);
+/// Kept wind-down: reap observation after each later escalation step.
+const REAP_OBSERVATION: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
     Preparing,
@@ -83,7 +88,12 @@ pub(crate) struct ModelOwner {
     tools_available: bool,
     inventory_only: bool,
     phase: Phase,
-    deadline: Instant,
+    /// Wind-down only (owner, 2026-10-16): set when draining after cancel or
+    /// a terminal to escalate 250 ms -> SIGTERM -> 250 ms -> SIGKILL -> 1 s
+    /// reap observation. Preparation, Hello, input transfer and the
+    /// Ready-to-Start handoff have no time limit: each step ends on the next
+    /// message, helper exit, a protocol fault, cancellation or shutdown.
+    deadline: Option<Instant>,
     drain_step: u8,
     operation: [u8; 16],
     generation: u64,
@@ -158,8 +168,8 @@ impl ModelOwner {
             .cleanup
             .as_ref()
             .and_then(|_| self.cleanup_completion.settlement_deadline(now));
-        (self.phase != Phase::Running && (self.child.is_some() || self.phase != Phase::Draining))
-            .then_some(self.deadline)
+        self.deadline
+            .filter(|_| self.phase == Phase::Draining && self.child.is_some())
             .into_iter()
             .chain(settlement)
             .chain(cleanup)
@@ -170,24 +180,21 @@ impl ModelOwner {
         runtime: RuntimeDirectory,
         identity: PackageIdentity,
         selection: Selection,
-        now: Instant,
     ) -> io::Result<Self> {
-        Self::create(runtime, identity, selection, false, now)
+        Self::create(runtime, identity, selection, false)
     }
     pub(crate) fn inventory(
         runtime: RuntimeDirectory,
         identity: PackageIdentity,
         selection: Selection,
-        now: Instant,
     ) -> io::Result<Self> {
-        Self::create(runtime, identity, selection, true, now)
+        Self::create(runtime, identity, selection, true)
     }
     fn create(
         runtime: RuntimeDirectory,
         identity: PackageIdentity,
         selection: Selection,
         inventory_only: bool,
-        now: Instant,
     ) -> io::Result<Self> {
         let resource_digest = if selection.model.starts_with("mlx:") {
             Some(identity.metallib_digest.ok_or_else(|| {
@@ -198,7 +205,6 @@ impl ModelOwner {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let token = cancelled.clone();
-        let deadline = now + Duration::from_secs(20);
         let completion = crate::completion::Completion::default();
         let signal = completion.clone();
         let task = thread::Builder::new()
@@ -215,7 +221,6 @@ impl ModelOwner {
                     &helper,
                     identity.helper_digest,
                     resource_digest,
-                    deadline,
                     &token,
                 )
             })?;
@@ -231,7 +236,7 @@ impl ModelOwner {
             tools_available: false,
             inventory_only,
             phase: Phase::Preparing,
-            deadline,
+            deadline: None,
             drain_step: 0,
             operation: [0; 16],
             generation: 0,
@@ -266,13 +271,8 @@ impl ModelOwner {
         generation: u64,
         input: Vec<u8>,
         enable_tools: bool,
-        now: Instant,
     ) -> Result<(), &'static str> {
-        if self.phase != Phase::Available
-            || now >= self.deadline
-            || generation == 0
-            || operation == [0; 16]
-        {
+        if self.phase != Phase::Available || generation == 0 || operation == [0; 16] {
             return Err("model_not_ready");
         }
         model::decode_input(&input).map_err(|_| "model_input_invalid")?;
@@ -298,8 +298,6 @@ impl ModelOwner {
         self.input_accepted = 0;
         self.input_granted = 0;
         self.phase = Phase::Input;
-        // Restarted on each credit: ends only a transfer that makes no progress.
-        self.deadline = now + Duration::from_secs(5);
         Ok(())
     }
     pub(crate) fn tool_result(&mut self, result: pb::ToolResult) -> Result<(), &'static str> {
@@ -314,7 +312,7 @@ impl ModelOwner {
         Ok(())
     }
     pub(crate) fn start(&mut self) -> Result<(), &'static str> {
-        if self.phase != Phase::Ready || Instant::now() >= self.deadline {
+        if self.phase != Phase::Ready {
             return Err("model_not_ready");
         }
         self.queue(Body::Start(pb::Start {}))?;
@@ -340,7 +338,7 @@ impl ModelOwner {
             }));
         }
         self.phase = Phase::Draining;
-        self.deadline = now + Duration::from_millis(250);
+        self.deadline = Some(now + WIND_DOWN_GRACE);
         self.drain_step = 0;
     }
     pub(crate) fn is_settled(&self) -> bool {
@@ -400,7 +398,6 @@ impl ModelOwner {
                     self.child = Some(child);
                     if self.phase == Phase::Preparing {
                         self.phase = Phase::Hello;
-                        self.deadline = now + Duration::from_secs(5);
                         let hello = Body::Hello(pb::Hello {
                             local_tool_destination: None,
                             reasoning_disabled: None,
@@ -436,7 +433,8 @@ impl ModelOwner {
                             ("preparation_io", error.raw_os_error().unwrap_or(0))
                         }
                         Ok(Err(asura_platform::Error::UnsafeRuntime)) => ("preparation_unsafe", 0),
-                        Ok(Err(asura_platform::Error::Deadline)) => ("preparation_timeout", 0),
+                        // Preparation reports cancellation as `Deadline`.
+                        Ok(Err(asura_platform::Error::Deadline)) => ("preparation_cancelled", 0),
                         Ok(Err(asura_platform::Error::Absent)) => ("preparation_absent", 0),
                         Ok(Err(_)) => ("preparation_unavailable", 0),
                         Err(_) => ("preparation_panic", 0),
@@ -455,14 +453,6 @@ impl ModelOwner {
                 }
             }
         }
-        if now >= self.deadline
-            && !matches!(
-                self.phase,
-                Phase::Running | Phase::Settled | Phase::Draining
-            )
-        {
-            self.fail("model_timeout", now, &mut events);
-        }
         if self.child.is_some() {
             if let Err(reason) = self.io_pass(&mut events) {
                 if self.terminal_seen
@@ -478,7 +468,7 @@ impl ModelOwner {
             }
             if self.terminal_seen && self.phase != Phase::Draining {
                 self.phase = Phase::Draining;
-                self.deadline = now + Duration::from_millis(250);
+                self.deadline = Some(now + WIND_DOWN_GRACE);
                 self.drain_step = 0;
             }
             if let Some(child) = self.child.as_mut() {
@@ -493,15 +483,18 @@ impl ModelOwner {
                     }
                     self.incoming.clear();
                     self.cleanup_pending = Some(Arc::new(Mutex::new(self.child.take())));
-                } else if self.phase == Phase::Draining && now >= self.deadline {
+                } else if self.phase == Phase::Draining
+                    && self.deadline.is_some_and(|deadline| now >= deadline)
+                {
                     let _ = child.terminate(self.drain_step > 0);
                     self.drain_step = self.drain_step.saturating_add(1);
-                    self.deadline = now
-                        + if self.drain_step == 1 {
-                            Duration::from_millis(250)
+                    self.deadline = Some(
+                        now + if self.drain_step == 1 {
+                            WIND_DOWN_GRACE
                         } else {
-                            Duration::from_secs(1)
-                        };
+                            REAP_OBSERVATION
+                        },
+                    );
                 }
             }
         } else if self.phase == Phase::Draining
@@ -668,7 +661,6 @@ impl ModelOwner {
                     hello.local_tool_destination == Some(true),
                 );
             self.phase = Phase::Available;
-            self.deadline = Instant::now() + Duration::from_secs(5);
             events.push(ModelEvent::Available {
                 context_tokens: hello.context_tokens.unwrap(),
                 reported_context_tokens: hello.reported_context_tokens.unwrap(),
@@ -705,7 +697,6 @@ impl ModelOwner {
                 }
                 self.input_accepted = accepted;
                 self.input_granted = granted;
-                self.deadline = Instant::now() + Duration::from_secs(5);
                 let chunk = model::MAX_CHUNK_BYTES as u64;
                 // Send whole chunks only, so each ordinal names a fixed offset.
                 loop {
@@ -735,7 +726,6 @@ impl ModelOwner {
             }
             Body::Ready(_) if self.phase == Phase::Input && self.input.is_none() => {
                 self.phase = Phase::Ready;
-                self.deadline = Instant::now() + Duration::from_secs(5);
                 events.push(ModelEvent::Ready);
             }
             Body::ToolCall(call) if self.phase == Phase::Running && self.tools_enabled => {
@@ -970,7 +960,7 @@ mod tests {
             tools_available: false,
             inventory_only: false,
             phase,
-            deadline: Instant::now() + Duration::from_secs(60),
+            deadline: None,
             drain_step: 0,
             operation: [4; 16],
             generation: 1,
@@ -1093,9 +1083,7 @@ mod tests {
                     prompt: Some("hello".into()),
                 })
                 .unwrap();
-                owner
-                    .begin([4; 16], 1, input, admitted, Instant::now())
-                    .unwrap();
+                owner.begin([4; 16], 1, input, admitted).unwrap();
                 assert_eq!(owner.tools_enabled, admitted && available);
                 assert_eq!(owner.phase, Phase::Input);
             }
@@ -1103,38 +1091,25 @@ mod tests {
     }
 
     #[test]
-    fn missing_native_tools_does_not_hide_unready_or_expired_provider() {
-        for phase in [Phase::Preparing, Phase::Draining] {
+    fn missing_native_tools_does_not_hide_unready_provider() {
+        for phase in [Phase::Preparing, Phase::Hello, Phase::Draining] {
             let mut owner = owner(phase);
             owner.tools_available = false;
-            assert!(
-                owner
-                    .begin([4; 16], 1, vec![], true, Instant::now())
-                    .is_err()
-            );
+            assert!(owner.begin([4; 16], 1, vec![], true).is_err());
             assert!(owner.outgoing.is_empty());
         }
-        let mut owner = owner(Phase::Available);
-        owner.deadline = Instant::now();
-        assert!(
-            owner
-                .begin([4; 16], 1, vec![], true, Instant::now())
-                .is_err()
-        );
-        assert!(owner.outgoing.is_empty());
     }
 
     #[test]
     fn running_generation_does_not_expire_with_elapsed_time() {
         let mut owner = owner(Phase::Running);
         let now = Instant::now();
-        owner.deadline = now - Duration::from_secs(120);
         assert_eq!(owner.next_deadline(now), None);
-        assert!(owner.poll(now).is_empty());
+        assert!(owner.poll(now + Duration::from_secs(120)).is_empty());
         assert_eq!(owner.phase, Phase::Running);
         owner.cancel(1, now);
         assert_eq!(owner.phase, Phase::Draining);
-        assert_eq!(owner.deadline, now + Duration::from_millis(250));
+        assert_eq!(owner.deadline, Some(now + Duration::from_millis(250)));
         assert_eq!(
             owner.next_deadline(now),
             None,
@@ -1143,16 +1118,59 @@ mod tests {
     }
 
     #[test]
-    fn preparation_remains_bounded_and_cancellable() {
-        let mut owner = owner(Phase::Preparing);
-        let now = Instant::now();
-        owner.deadline = now + Duration::from_secs(20);
-        assert!(owner.poll(now + Duration::from_secs(19)).is_empty());
-        assert!(matches!(
-            owner.poll(now + Duration::from_secs(20)).first(),
-            Some(ModelEvent::Failed("model_timeout"))
-        ));
-        assert!(owner.cancel_preparation.load(Ordering::Acquire));
+    /// HW-01: each handshake step, held past its former limit (20 s
+    /// preparation; 5 s Hello, Available-to-Begin and Ready-to-Start) with an
+    /// injected clock, stays pending; no timer fails it. HW-02: cancellation
+    /// ends each step and starts only the wind-down.
+    fn hw01_each_step_waits_without_a_time_limit_until_cancel() {
+        for phase in [
+            Phase::Preparing,
+            Phase::Hello,
+            Phase::Available,
+            Phase::Input,
+            Phase::Ready,
+        ] {
+            let mut owner = owner(phase);
+            let now = Instant::now();
+            assert_eq!(owner.next_deadline(now), None, "{phase:?}");
+            assert!(
+                owner.poll(now + Duration::from_secs(3600)).is_empty(),
+                "{phase:?}"
+            );
+            assert_eq!(owner.phase, phase);
+            assert!(!owner.cancel_preparation.load(Ordering::Acquire));
+            owner.cancel(3, now);
+            assert_eq!(owner.phase, Phase::Draining);
+            assert!(owner.cancel_preparation.load(Ordering::Acquire));
+            assert_eq!(owner.deadline, Some(now + WIND_DOWN_GRACE));
+        }
+        // Available -> Begin and Ready -> Start accept the late step.
+        let mut owner = owner(Phase::Ready);
+        assert!(owner.start().is_ok());
+        assert_eq!(owner.phase, Phase::Running);
+    }
+    /// HW-03: Begin never sends `deadline_remaining_ms`.
+    #[test]
+    fn hw03_begin_sends_no_generation_deadline() {
+        let mut owner = owner(Phase::Available);
+        let input = model::encode_input(&pb::ModelInput {
+            instructions: Some(String::new()),
+            history: vec![],
+            prompt: Some("hello".into()),
+        })
+        .unwrap();
+        owner.begin([4; 16], 1, input, false).unwrap();
+        let frame = owner.outgoing.front().unwrap().clone();
+        let mut codec = ModelCodec::new();
+        codec.push(&frame).unwrap();
+        let envelope = codec
+            .next_frame(Direction::ServiceToHelper)
+            .unwrap()
+            .unwrap();
+        let Some(Body::Begin(begin)) = envelope.body else {
+            panic!("expected Begin")
+        };
+        assert_eq!(begin.deadline_remaining_ms, None);
     }
 
     #[test]
@@ -1275,9 +1293,7 @@ mod tests {
             prompt: Some("hello".into()),
         })
         .unwrap();
-        owner
-            .begin([4; 16], 1, input, false, Instant::now())
-            .unwrap();
+        owner.begin([4; 16], 1, input, false).unwrap();
         assert!(owner.start().is_err());
         let mut events = Vec::new();
         let credit = message(Body::Credit(pb::Credit {
@@ -1288,12 +1304,11 @@ mod tests {
         }));
         owner.receive(credit.clone(), &mut events).unwrap();
         assert!(owner.receive(credit, &mut events).is_err());
-        owner.deadline = Instant::now() + Duration::from_millis(100);
-        let ready_received = Instant::now();
         owner
             .receive(message(Body::Ready(pb::Ready {})), &mut events)
             .unwrap();
-        assert!(owner.deadline >= ready_received + Duration::from_secs(5));
+        // The Ready-to-Start handoff arms no timer (owner, 2026-10-16).
+        assert_eq!(owner.deadline, None);
         owner.start().unwrap();
         assert!(owner.start().is_err());
     }
@@ -1310,9 +1325,7 @@ mod tests {
         })
         .unwrap();
         let total = input.len() as u64;
-        owner
-            .begin([4; 16], 1, input, false, Instant::now())
-            .unwrap();
+        owner.begin([4; 16], 1, input, false).unwrap();
         let credit = |accepted: u64, granted: u64| {
             message(Body::Credit(pb::Credit {
                 transfer_id: Some(1),
@@ -1350,11 +1363,7 @@ mod tests {
             prompt: Some("hello".into()),
         })
         .unwrap();
-        assert!(
-            owner
-                .begin([4; 16], 1, input, false, Instant::now())
-                .is_err()
-        );
+        assert!(owner.begin([4; 16], 1, input, false).is_err());
     }
     #[test]
     fn cancel_during_transfer_stops_sending() {
@@ -1366,9 +1375,7 @@ mod tests {
             prompt: Some("hello".into()),
         })
         .unwrap();
-        owner
-            .begin([4; 16], 1, input, false, Instant::now())
-            .unwrap();
+        owner.begin([4; 16], 1, input, false).unwrap();
         let mut events = Vec::new();
         owner
             .receive(
@@ -1412,10 +1419,8 @@ mod tests {
         assert!(events.is_empty());
     }
     #[test]
-    fn stale_start_and_cancel_reservation_are_bounded() {
+    fn cancel_reservation_is_bounded() {
         let mut owner = owner(Phase::Ready);
-        owner.deadline = Instant::now();
-        assert!(owner.start().is_err());
         for _ in 0..7 {
             owner.credit(2).unwrap();
         }
@@ -1468,11 +1473,7 @@ mod tests {
         owner.receive(hello, &mut events).unwrap();
         assert!(matches!(events.as_slice(), [ModelEvent::Inventory { .. }]));
         assert_eq!(owner.phase, Phase::Draining);
-        assert!(
-            owner
-                .begin([7; 16], 1, vec![], false, Instant::now())
-                .is_err()
-        );
+        assert!(owner.begin([7; 16], 1, vec![], false).is_err());
         assert!(owner.outgoing.is_empty());
     }
     #[test]
@@ -1711,7 +1712,7 @@ mod tests {
         let now = Instant::now();
         owner.cleanup_pending = Some(Arc::new(Mutex::new(None)));
         owner.cleanup_retry = Some(now + Duration::from_millis(100));
-        owner.deadline = now - Duration::from_secs(1);
+        owner.deadline = Some(now - Duration::from_secs(1));
         assert_eq!(owner.next_deadline(now), owner.cleanup_retry);
     }
     #[test]

@@ -95,16 +95,17 @@ fn set_flags(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
 }
 
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
-const OUTPUT_DEADLINE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Bounded frame output for a terminal with an active [`TerminalIo`] guard.
 /// Keep that guard alive through every pump: stdout must remain nonblocking.
 /// Drop does not write. Each pump yields after bounded progress or backpressure.
+/// A pending frame has no write deadline (owner, 2026-10-16): it waits for
+/// writable readiness, and newer state coalesces into the next frame. Slow
+/// output never ends the session.
 #[derive(Default)]
 pub struct TerminalOutput {
     buffer: Vec<u8>,
     sent: usize,
-    deadline: Option<std::time::Instant>,
 }
 impl io::Write for TerminalOutput {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -129,25 +130,14 @@ impl TerminalOutput {
     /// Make at most 16 nonblocking writes and send at most 64 KiB. The event
     /// loop must call this again while pending, without drawing another frame.
     pub fn pump(&mut self) -> io::Result<()> {
-        self.pump_with(std::time::Instant::now, write_stdout)
+        self.pump_with(write_stdout)
     }
-    fn pump_with(
-        &mut self,
-        mut now: impl FnMut() -> std::time::Instant,
-        mut write: impl FnMut(&[u8]) -> io::Result<usize>,
-    ) -> io::Result<()> {
+    fn pump_with(&mut self, mut write: impl FnMut(&[u8]) -> io::Result<usize>) -> io::Result<()> {
         if !self.pending() {
             return Ok(());
         }
-        let deadline = *self.deadline.get_or_insert_with(|| now() + OUTPUT_DEADLINE);
         let mut budget = 64 * 1024;
         for _ in 0..16 {
-            if now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "terminal output deadline",
-                ));
-            }
             let length = (self.buffer.len() - self.sent).min(budget);
             let remaining = &self.buffer[self.sent..self.sent + length];
             match write(remaining) {
@@ -174,7 +164,6 @@ impl TerminalOutput {
             if !self.pending() {
                 self.buffer.clear();
                 self.sent = 0;
-                self.deadline = None;
                 return Ok(());
             }
             if budget == 0 {
@@ -297,83 +286,61 @@ mod tests {
     #[test]
     fn output_partial_progress_backpressure_and_retry_preserve_exact_bytes() {
         use std::io::Write;
-        let start = std::time::Instant::now();
         let mut output = TerminalOutput::default();
         output.write_all(b"abcdef").unwrap();
         let mut received = Vec::new();
         let mut calls = 0;
         output
-            .pump_with(
-                || start,
-                |bytes| {
-                    calls += 1;
-                    match calls {
-                        1 => {
-                            received.extend_from_slice(&bytes[..2]);
-                            Ok(2)
-                        }
-                        2 => Err(io::ErrorKind::Interrupted.into()),
-                        _ => Err(io::ErrorKind::WouldBlock.into()),
+            .pump_with(|bytes| {
+                calls += 1;
+                match calls {
+                    1 => {
+                        received.extend_from_slice(&bytes[..2]);
+                        Ok(2)
                     }
-                },
-            )
+                    2 => Err(io::ErrorKind::Interrupted.into()),
+                    _ => Err(io::ErrorKind::WouldBlock.into()),
+                }
+            })
             .unwrap();
         assert!(output.pending());
         assert_eq!(calls, 3);
         output
-            .pump_with(
-                || start + std::time::Duration::from_millis(10),
-                |bytes| {
-                    received.extend_from_slice(bytes);
-                    Ok(bytes.len())
-                },
-            )
+            .pump_with(|bytes| {
+                received.extend_from_slice(bytes);
+                Ok(bytes.len())
+            })
             .unwrap();
         assert_eq!(received, b"abcdef");
         assert!(!output.pending());
         assert!(output.buffer.is_empty());
         output
-            .pump_with(
-                || panic!("empty flush checks no clock"),
-                |_| panic!("empty flush writes nothing"),
-            )
+            .pump_with(|_| panic!("empty flush writes nothing"))
             .unwrap();
     }
     #[test]
-    fn output_deadline_is_absolute_across_progress_and_ticks() {
+    fn slow_output_stays_pending_without_a_deadline_then_completes() {
         use std::io::Write;
-        let start = std::time::Instant::now();
         let mut output = TerminalOutput::default();
         output.write_all(b"abc").unwrap();
-        output
-            .pump_with(|| start, |_| Err(io::ErrorKind::WouldBlock.into()))
-            .unwrap();
-        let mut calls = 0;
-        output
-            .pump_with(
-                || start + std::time::Duration::from_millis(99),
-                |_| {
-                    calls += 1;
-                    if calls == 1 {
-                        Ok(1)
-                    } else {
-                        Err(io::ErrorKind::WouldBlock.into())
-                    }
-                },
-            )
-            .unwrap();
-        assert_eq!(output.sent, 1);
-        assert_eq!(
+        // A stalled terminal: backpressure past the removed 100 ms bound is
+        // never an error; the frame stays pending (owner, 2026-10-16).
+        for _ in 0..3 {
             output
-                .pump_with(
-                    || start + OUTPUT_DEADLINE,
-                    |_| panic!("expired output must not write")
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::TimedOut
-        );
+                .pump_with(|_| Err(io::ErrorKind::WouldBlock.into()))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
         assert!(output.pending());
+        let mut received = Vec::new();
+        output
+            .pump_with(|bytes| {
+                received.extend_from_slice(bytes);
+                Ok(bytes.len())
+            })
+            .unwrap();
+        assert_eq!(received, b"abc");
+        assert!(!output.pending());
     }
     #[test]
     fn output_capacity_and_per_pump_work_are_bounded() {
@@ -382,37 +349,30 @@ mod tests {
         output.write_all(&vec![b'x'; MAX_FRAME_BYTES]).unwrap();
         assert!(output.write(b"x").is_err());
         assert_eq!(output.buffer.len(), MAX_FRAME_BYTES);
-        let now = std::time::Instant::now();
         let mut bytes_sent = 0;
         output
-            .pump_with(
-                || now,
-                |bytes| {
-                    bytes_sent += bytes.len();
-                    Ok(bytes.len())
-                },
-            )
+            .pump_with(|bytes| {
+                bytes_sent += bytes.len();
+                Ok(bytes.len())
+            })
             .unwrap();
         assert_eq!(bytes_sent, 65536);
         assert!(output.pending());
         let mut calls = 0;
         output
-            .pump_with(
-                || now,
-                |_| {
-                    calls += 1;
-                    Err(io::ErrorKind::Interrupted.into())
-                },
-            )
+            .pump_with(|_| {
+                calls += 1;
+                Err(io::ErrorKind::Interrupted.into())
+            })
             .unwrap();
         assert_eq!(calls, 16);
         assert_eq!(
-            output.pump_with(|| now, |_| Ok(0)).unwrap_err().kind(),
+            output.pump_with(|_| Ok(0)).unwrap_err().kind(),
             io::ErrorKind::WriteZero
         );
         assert_eq!(
             output
-                .pump_with(|| now, |_| Err(io::ErrorKind::BrokenPipe.into()))
+                .pump_with(|_| Err(io::ErrorKind::BrokenPipe.into()))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::BrokenPipe

@@ -29,8 +29,12 @@ public actor HelperSession {
     private var modelTask: Task<Void, Never>?
     private var timer: Task<Void, Never>?
     private var timerRevision: UInt64 = 0
+    /// The only timer is the kept 250 ms final drain after a terminal (owner,
+    /// 2026-10-16). Hello, Begin, input transfer and the Ready-to-Start handoff
+    /// have no time limit: each ends on the next message, channel close, a
+    /// protocol fault or cancellation. A supplied `deadline_remaining_ms` is
+    /// validated but arms no timer.
     private let timerSleep: @Sendable (UInt32) async throws -> Void
-    private var generationDeadlineMilliseconds: UInt32?
     private var measuredContext = false
     private var settledInferenceOrdinal: UInt32 = 0
     private var activeInferenceOrdinal: UInt32?
@@ -72,7 +76,6 @@ public actor HelperSession {
     public func run() async {
         do {
             guard buildID.count == 32, schemaDigest.count == 32 else { throw HelperError.protocolFault }
-            arm(milliseconds: 5_000)
             for try await bytes in transport.frames {
                 if phase == .terminal { continue }
                 try await receive(Wire.decode(bytes, from: .service))
@@ -100,12 +103,10 @@ public actor HelperSession {
             await self?.expired(current)
         }
     }
+    /// The kept 250 ms final drain after a terminal elapsed: close the channel.
     private func expired(_ current: UInt64) async {
         guard current == timerRevision else { return }
-        if operation.isEmpty || phase == .terminal {
-            phase = .terminal; modelTask?.cancel(); transport.close(); return
-        }
-        await fail(.timeout, cancelled: false)
+        phase = .terminal; modelTask?.cancel(); transport.close()
     }
     private func envelope(_ body: Envelope.OneOf_Body) -> Envelope {
         var value = Envelope()
@@ -189,7 +190,6 @@ public actor HelperSession {
             try await transport.send(envelope(.hello(response)))
             if response.availability != .available { phase = .terminal; transport.finish(); return }
             phase = .begin
-            arm(milliseconds: 5_000)
             return
         }
         guard message.hasOperationID, message.operationID.count == 16,
@@ -213,8 +213,6 @@ public actor HelperSession {
                 })
             }
             if projectToolsEnabled && (!supportsTools || !(backend is any ToolModelBackend)) { throw HelperError.unavailable }
-            generationDeadlineMilliseconds = begin.hasDeadlineRemainingMs ? begin.deadlineRemainingMs : nil
-            arm(milliseconds: 5_000)
             phase = .input
             var credit = Asura_Model_V1_Credit()
             credit.transferID = 1; credit.direction = .input; credit.acceptedBytes = 0
@@ -237,9 +235,7 @@ public actor HelperSession {
                 throw HelperError.protocolFault
             }
             inputData.append(chunk.data); inputChunks += 1
-            // Each accepted chunk advances the sliding window and restarts the
-            // stall bound: it ends only a transfer that makes no progress.
-            arm(milliseconds: 5_000)
+            // Each accepted chunk advances the sliding window.
             if UInt64(inputData.count) < expectedInput {
                 var credit = Asura_Model_V1_Credit()
                 credit.transferID = 1; credit.direction = .input
@@ -253,13 +249,10 @@ public actor HelperSession {
             decodedInput = try Wire.input(inputData)
             inputData.removeAll()
             phase = .ready
-            arm(milliseconds: 5_000)
             try await transport.send(envelope(.ready(.init())))
         case .start:
             guard phase == .ready, let input = decodedInput else { throw HelperError.protocolFault }
             decodedInput = nil; phase = .running
-            disarm()
-            if let deadline = generationDeadlineMilliseconds { arm(milliseconds: deadline) }
             guard let backend = self.backend else { throw HelperError.unavailable }
             let maximumTokens = self.maximumTokens
             let owner = self

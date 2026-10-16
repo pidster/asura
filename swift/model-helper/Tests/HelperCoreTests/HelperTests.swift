@@ -373,19 +373,16 @@ private actor Burst: ModelBackend {
     await running.value
 }
 
-private struct SleepingBackend: ModelBackend {
-    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await Task.sleep(for: .seconds(30))
-    }
-}
-
-@Test func stalledGenerationTimesOutWithoutWaitingForBackend() async throws {
+/// HW-03: a supplied `deadline_remaining_ms` arms no timer; a stalled
+/// generation runs past it and ends only on cancellation.
+@Test func suppliedGenerationDeadlineArmsNoTimerAndCancelEndsStall() async throws {
     let (helper, service) = try pair()
     defer { helper.close(); service.close() }
     let identity = Data(repeating: 1, count: 32)
-    let session = HelperSession(transport: helper, backend: SleepingBackend(), buildID: identity, schemaDigest: identity)
+    let timers = ManualSessionTimer()
+    let backend = CancellableGeneration()
+    let session = HelperSession(transport: helper, backend: backend, buildID: identity,
+        schemaDigest: identity, timerSleep: { await timers.sleep($0) })
     let running = Task { await session.run() }
     var replies = service.frames.makeAsyncIterator()
     try await service.send(hello(identity)); _ = try await replies.next()
@@ -393,7 +390,6 @@ private struct SleepingBackend: ModelBackend {
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
     begin.deadlineRemainingMs = 100; begin.maxResponseTokens = 512
-    let clock = ContinuousClock(); let started = clock.now
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -401,11 +397,24 @@ private struct SleepingBackend: ModelBackend {
     var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(bytes.count)
     try await service.send(scoped(.inputEnd(end)), control: false); _ = try await replies.next()
     try await service.send(scoped(.start(.init())))
+    let limit = ContinuousClock.now.advanced(by: .seconds(1))
+    while !(await backend.started) {
+        guard ContinuousClock.now < limit else { throw HelperError.timeout }
+        await Task.yield()
+    }
+    // Past the supplied 100 ms: no timer was armed and generation continues.
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await timers.count() == 0)
+    #expect(!(await backend.cancelled))
+    var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
+    try await service.send(scoped(.cancel(cancel)))
     let terminal = try Wire.decode(#require(try await replies.next())).terminal
-    #expect(terminal.outcome == .failed)
-    #expect(terminal.reason == .timeout)
+    #expect(terminal.outcome == .cancelled)
+    #expect(terminal.reason == .cancelled)
     #expect(!terminal.usageKnown)
-    #expect(started.duration(to: clock.now) < .seconds(1))
+    // Only the kept 250 ms final drain is armed after the terminal.
+    #expect(await timers.count() == 1)
+    await timers.fireAll()
     await running.value
 }
 
@@ -456,7 +465,7 @@ private struct PartialFailureBackend: ModelBackend {
     }
 }
 
-@Test(arguments: ["credit", "timeout", "cancel"])
+@Test(arguments: ["credit", "cancel"])
 func backendFailureDrainsBoundedSnapshotsOrStopsAtExistingBoundary(_ action: String) async throws {
     let (helper, service) = try pair()
     defer { helper.close(); service.close() }
@@ -470,7 +479,8 @@ func backendFailureDrainsBoundedSnapshotsOrStopsAtExistingBoundary(_ action: Str
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    begin.deadlineRemainingMs = action == "timeout" ? 500 : 2_000
+    // Supplied but ignored: it arms no timer (owner, 2026-10-16).
+    begin.deadlineRemainingMs = 500
     begin.maxResponseTokens = 2048
     let clock = ContinuousClock(); let started = clock.now
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
@@ -518,8 +528,8 @@ func backendFailureDrainsBoundedSnapshotsOrStopsAtExistingBoundary(_ action: Str
     } else {
         #expect(snapshots.isEmpty)
         #expect(result.totalBytes == 0)
-        #expect(result.outcome == (action == "cancel" ? .cancelled : .failed))
-        #expect(result.reason == (action == "cancel" ? .cancelled : .timeout))
+        #expect(result.outcome == .cancelled)
+        #expect(result.reason == .cancelled)
         #expect(started.duration(to: clock.now) < .seconds(2))
     }
     await running.value
@@ -552,7 +562,9 @@ private actor CancellableGeneration: ModelBackend {
     }
 }
 
-@Test func omittedGenerationDeadlineRejectsStaleHandoffExpiryAndRemainsCancellable() async throws {
+/// HW-01: Hello, Begin, input transfer and the Ready-to-Start handoff arm no
+/// timer; generation then stays cancellable.
+@Test func handshakeArmsNoTimerAndGenerationRemainsCancellable() async throws {
     let (helper, service) = try pair()
     defer { helper.close(); service.close() }
     let identity = Data(repeating: 1, count: 32)
@@ -562,6 +574,8 @@ private actor CancellableGeneration: ModelBackend {
         schemaDigest: identity, timerSleep: { await timers.sleep($0) })
     let running = Task { await session.run() }
     var replies = service.frames.makeAsyncIterator()
+    try await Task.sleep(for: .milliseconds(20))
+    #expect(await timers.count() == 0, "Hello wait armed a timer")
     try await service.send(hello(identity)); _ = try await replies.next()
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
@@ -573,27 +587,23 @@ private actor CancellableGeneration: ModelBackend {
     try await service.send(scoped(.chunk(chunk)), control: false)
     var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(bytes.count)
     try await service.send(scoped(.inputEnd(end)), control: false); _ = try await replies.next()
+    try await Task.sleep(for: .milliseconds(20))
+    #expect(await timers.count() == 0, "a handshake step armed a timer")
     try await service.send(scoped(.start(.init())))
     let limit = ContinuousClock.now.advanced(by: .seconds(1))
     while !(await backend.started) {
         guard ContinuousClock.now < limit else { throw HelperError.timeout }
         await Task.yield()
     }
-    // Advance every handshake expiry beyond its fixture threshold while inference is pending.
-    while await timers.count() < 4 {
-        guard ContinuousClock.now < limit else { throw HelperError.timeout }
-        await Task.yield()
-    }
-    await timers.fireAll()
-    try await Task.sleep(for: .milliseconds(20))
+    #expect(await timers.count() == 0)
     #expect(!(await backend.cancelled))
     var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
     try await service.send(scoped(.cancel(cancel)))
     let terminal = try Wire.decode(#require(try await replies.next())).terminal
     #expect(terminal.outcome == .cancelled)
     #expect(terminal.reason == .cancelled)
-    await running.value
     await timers.fireAll()
+    await running.value
     let settlementLimit = ContinuousClock.now.advanced(by: .seconds(1))
     while !(await backend.cancelled) && ContinuousClock.now < settlementLimit { await Task.yield() }
     #expect(await backend.cancelled)
@@ -613,8 +623,10 @@ private actor CancellableGeneration: ModelBackend {
     }
 }
 
+/// HW-01/HW-02: a stalled transfer or Ready-to-Start handoff stays pending
+/// with no timer and ends on the service's cancel, before generation starts.
 @Test(arguments: [false, true])
-func omittedGenerationDeadlineStillBoundsTransferAndReadyHandoff(ready: Bool) async throws {
+func stalledTransferAndReadyHandoffWaitUntilCancel(ready: Bool) async throws {
     let (helper, service) = try pair()
     defer { helper.close(); service.close() }
     let identity = Data(repeating: 1, count: 32)
@@ -637,18 +649,16 @@ func omittedGenerationDeadlineStillBoundsTransferAndReadyHandoff(ready: Bool) as
         var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(bytes.count)
         try await service.send(scoped(.inputEnd(end)), control: false); _ = try await replies.next()
     }
-    let limit = ContinuousClock.now.advanced(by: .seconds(1))
-    while await timers.count() < (ready ? 4 : 3) {
-        guard ContinuousClock.now < limit else { throw HelperError.timeout }
-        await Task.yield()
-    }
-    await timers.fireAll()
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(await timers.count() == 0)
+    var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
+    try await service.send(scoped(.cancel(cancel)))
     let terminal = try Wire.decode(#require(try await replies.next())).terminal
-    #expect(terminal.outcome == .failed)
-    #expect(terminal.reason == .timeout)
+    #expect(terminal.outcome == .cancelled)
+    #expect(terminal.reason == .cancelled)
     #expect(!(await backend.started))
-    await running.value
     await timers.fireAll()
+    await running.value
 }
 
 private struct LateMeasured: ModelBackend {

@@ -11,7 +11,7 @@ fn query(project: [u8; 16]) -> pb::SensorsInspect {
 fn loaded(fixture: &Fixture, project: [u8; 16]) -> Result<pb::SensorsReply> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let reply = fixture.attach()?.sensors(query(project))?;
+        let reply = fixture.attach()?.sensors(query(project), &|| false)?;
         if reply.error.is_none() {
             return Ok(reply);
         }
@@ -30,7 +30,11 @@ pub(super) fn run() -> Result<()> {
     fixture.start()?;
     wait_ready(&fixture, None)?;
     assert_eq!(
-        fixture.attach()?.sensors(query([99; 16]))?.error.as_deref(),
+        fixture
+            .attach()?
+            .sensors(query([99; 16]), &|| false)?
+            .error
+            .as_deref(),
         Some("project_unknown")
     );
     let dir = fixture.home.join("project");
@@ -55,11 +59,14 @@ pub(super) fn run() -> Result<()> {
     let committed = loaded(&fixture, project)?;
     assert_eq!(committed.observations.len(), 16);
     assert_eq!(committed.next_offset, Some(16));
-    let continuation = fixture.attach()?.sensors(pb::SensorsInspect {
-        offset: Some(16),
-        revision: committed.revision,
-        ..query(project)
-    })?;
+    let continuation = fixture.attach()?.sensors(
+        pb::SensorsInspect {
+            offset: Some(16),
+            revision: committed.revision,
+            ..query(project)
+        },
+        &|| false,
+    )?;
     assert_eq!(continuation.observations.len(), 2);
     assert_eq!(continuation.next_offset, None);
     assert_eq!(
@@ -77,7 +84,7 @@ pub(super) fn run() -> Result<()> {
         ..query(project)
     };
     assert_eq!(
-        fixture.attach()?.sensors(bad)?.error.as_deref(),
+        fixture.attach()?.sensors(bad, &|| false)?.error.as_deref(),
         Some("revision_conflict")
     );
     let ids: Vec<_> = committed

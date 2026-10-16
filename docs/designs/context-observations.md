@@ -6,8 +6,11 @@ Root owns control/client integration; the observer packet owns two new modules.
 
 Time-bound update (owner, 2026-10-16): Git collection, tool lookup and client
 socket calls have no time limit. Staleness is measured in missed heartbeats, not
-seconds. The implementation still applies the former bounds; a follow-up
-implementation will apply this design.
+seconds. Implemented 2026-10-16: Git collection and the `xcrun` lookup have no
+deadline; `collect_git` takes a supersession callback (`watch.poll(0)`) and ends
+with `git_changed_during_observation` on a newer change (platform test
+`process_supersession_and_output_overflow_kill_and_reap_exact_child`). Client
+socket calls end on reply, scope change, exit or a lost connection.
 
 ## Pipeline and scope
 
@@ -249,8 +252,8 @@ subscription discards that retained observation. Failed thread creation backs of
 Git unavailable; it does not exit the chat client.
 A replaced service clears the previous projection. A pending reply for a new
 subscription clears old Git fields. Five consecutive missed one-second heartbeats
-make the projection unavailable (owner, 2026-10-16). The code still measures five
-seconds; a follow-up implementation will count missed heartbeats. Verified nonrepository omits Git; unknown displays `? ? +?-?`.
+make the projection unavailable (owner, 2026-10-16). Implemented 2026-10-16 with
+the shared heartbeat count in `tui/heartbeat.rs`. Verified nonrepository omits Git; unknown displays `? ? +?-?`.
 Repository observations show branch or detached state and numeric change totals.
 No absent count appears as zero. Paths and provider strings
 remain literal terminal text. Rendering makes no filesystem or network call.
@@ -327,7 +330,8 @@ repositories, renames, unusual filenames, output limits and forbidden helpers.
 A same-scope `git_changed` or `git_changed_during_observation` event starts a
 display grace interval of two heartbeat intervals (owner, 2026-10-16). The grace
 ends at the second heartbeat interval after the event, whether that heartbeat
-arrives or is missed. The code still measures two seconds. The TUI retains its last complete repository
+arrives or is missed. Implemented 2026-10-16 as two heartbeat intervals
+(`heartbeat::git_grace_end`). The TUI retains its last complete repository
 or nonrepository projection during this interval. This is previous evidence, not
 a new successful observation. Repeated invalidations and heartbeats cannot extend
 the interval. A complete replacement clears it. Expiry, a hard error, disconnect,

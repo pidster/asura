@@ -71,8 +71,16 @@ impl Fixture {
         let runtime = self.runtime()?;
         let end = Instant::now() + Duration::from_secs(5);
         loop {
-            match Client::attach(&runtime, BUILD, Instant::now() + Duration::from_secs(2)) {
-                Ok(client) => return Ok(client),
+            // Test-only harness budget: client waits have no time bound in
+            // production (owner, 2026-10-16); a stalled fixture fails here.
+            let harness = Instant::now() + Duration::from_secs(180);
+            let cancel: asura_client::Cancel =
+                std::sync::Arc::new(move || Instant::now() >= harness);
+            match Client::attach(&runtime, BUILD, &*cancel) {
+                Ok(mut client) => {
+                    client.set_cancel(cancel);
+                    return Ok(client);
+                }
                 Err(error) if Instant::now() >= end => return Err(error.into()),
                 Err(_) => thread::sleep(Duration::from_millis(10)),
             }
@@ -215,15 +223,16 @@ fn submit(
     generation: u64,
     prompt: &str,
 ) -> Result<pb::ConversationAccepted> {
-    Ok(fixture
-        .attach()?
-        .submit_conversation(pb::ConversationSubmit {
+    Ok(fixture.attach()?.submit_conversation(
+        pb::ConversationSubmit {
             request_id: Some(asura_platform::random_id().to_vec()),
             project_id: Some(project.to_vec()),
             conversation_id: conversation,
             expected_generation: Some(generation),
             prompt: Some(prompt.into()),
-        })?)
+        },
+        &|| false,
+    )?)
 }
 fn wait_ready(
     fixture: &Fixture,
@@ -421,14 +430,18 @@ fn journey(native: bool) -> Result<()> {
             expected_generation: Some(0),
             prompt: Some("For this conversation only, remember the word ORCHARD. Reply with just ORCHARD. Do not call tools.".into()),
         };
-        let accepted = fixture.attach()?.submit_conversation(original.clone())?;
+        let accepted = fixture
+            .attach()?
+            .submit_conversation(original.clone(), &|| false)?;
         let operation = checked_id(accepted.operation_id.clone())?;
         let before_repeat = fixture.attach()?.observe_conversation(operation, 0)?;
         assert!(
             matches!(before_repeat.kind, Some(1 | 2)),
             "need active admission to prove idempotent replay bypasses busy"
         );
-        let repeated = fixture.attach()?.submit_conversation(original.clone())?;
+        let repeated = fixture
+            .attach()?
+            .submit_conversation(original.clone(), &|| false)?;
         assert_eq!(
             repeated, accepted,
             "same request must retain exact accepted identities"
@@ -437,7 +450,7 @@ fn journey(native: bool) -> Result<()> {
         conflicting.prompt = Some("Changed prompt with the same request identity".into());
         let conflict = fixture
             .attach()?
-            .submit_conversation(conflicting)
+            .submit_conversation(conflicting, &|| false)
             .expect_err("changed digest must conflict");
         assert!(
             matches!(conflict,asura_client::Error::Remote(_,ref message) if message=="request_conflict")
@@ -620,7 +633,7 @@ fn managed_queue_journey(
 ) -> Result<()> {
     let unavailable = fixture
         .attach()?
-        .config("model", Some("unknown:queue-fixture"))?;
+        .config("model", Some("unknown:queue-fixture"), &|| false)?;
     assert!(unavailable.error.is_none());
     let first_request = pb::ConversationQueueSubmit {
         request_id: Some(asura_platform::random_id().to_vec()),
@@ -1470,9 +1483,11 @@ fn select_native_tool_provider(fixture: &Fixture, provider: &str) -> Result<()> 
                 let capabilities = std::env::var("ASURA_TEST_MLX_CAPABILITIES")
                     .unwrap_or_else(|_| "[toolCalling]".into());
                 let declaration = format!("native-fixture: {{capabilities: {capabilities}}}");
-                let configured = fixture
-                    .attach()?
-                    .config("providers.mlx.models", Some(&declaration))?;
+                let configured = fixture.attach()?.config(
+                    "providers.mlx.models",
+                    Some(&declaration),
+                    &|| false,
+                )?;
                 assert!(
                     configured.error.is_none(),
                     "MLX declaration failed: {configured:?}"
@@ -1480,7 +1495,9 @@ fn select_native_tool_provider(fixture: &Fixture, provider: &str) -> Result<()> 
             }
             format!("{provider}:native-fixture")
         };
-        let configured = fixture.attach()?.config("model", Some(&selection))?;
+        let configured = fixture
+            .attach()?
+            .config("model", Some(&selection), &|| false)?;
         assert!(
             configured.error.is_none(),
             "provider selection failed: {configured:?}"
@@ -1680,9 +1697,11 @@ fn native_tools(provider: &str) -> Result<()> {
 }
 
 fn remote_endpoint_restriction(fixture: &Fixture, project: [u8; 16]) -> Result<()> {
-    let rejected = fixture
-        .attach()?
-        .config("providers.ollama.endpoint", Some("https://models.example"))?;
+    let rejected = fixture.attach()?.config(
+        "providers.ollama.endpoint",
+        Some("https://models.example"),
+        &|| false,
+    )?;
     assert_eq!(
         rejected.error.as_deref(),
         Some("config_remote_endpoint_restricted")
@@ -1732,7 +1751,10 @@ fn provider_submit(
     };
     let end = Instant::now() + Duration::from_secs(5);
     loop {
-        match fixture.attach()?.submit_conversation(request.clone()) {
+        match fixture
+            .attach()?
+            .submit_conversation(request.clone(), &|| false)
+        {
             Ok(accepted) => return Ok(accepted),
             Err(asura_client::Error::Remote(_, message))
                 if message == "conversation_busy" && Instant::now() < end =>
@@ -1826,7 +1848,7 @@ fn native_mlx() -> Result<()> {
         stage = "missing model configuration";
         let absent = fixture
             .attach()?
-            .config("model", Some("mlx:missing-fixture"))?;
+            .config("model", Some("mlx:missing-fixture"), &|| false)?;
         assert!(absent.error.is_none(), "configuration failed: {absent:?}");
         stage = "missing model rejection";
         let failure = provider_submit(&fixture, project, None, 0, "Hello")
@@ -1838,7 +1860,7 @@ fn native_mlx() -> Result<()> {
         stage = "valid model configuration";
         let configured = fixture
             .attach()?
-            .config("model", Some("mlx:native-fixture"))?;
+            .config("model", Some("mlx:native-fixture"), &|| false)?;
         assert!(
             configured.error.is_none(),
             "configuration failed: {configured:?}"
@@ -1952,7 +1974,7 @@ fn native_ollama() -> Result<()> {
             ),
             ("model", format!("ollama:{name}")),
         ] {
-            let reply = fixture.attach()?.config(key, Some(&value))?;
+            let reply = fixture.attach()?.config(key, Some(&value), &|| false)?;
             assert!(reply.error.is_none(), "configuration failed: {reply:?}");
         }
         stage = "native submit";
@@ -2133,19 +2155,21 @@ fn inventory_journey() -> Result<()> {
     assert!(
         fixture
             .attach()?
-            .config("providers.ollama.endpoint", Some(&server.endpoint))?
+            .config("providers.ollama.endpoint", Some(&server.endpoint), &|| {
+                false
+            })?
             .error
             .is_none()
     );
     assert!(
         fixture
             .attach()?
-            .config("model", Some("mlx:missing"))?
+            .config("model", Some("mlx:missing"), &|| false)?
             .error
             .is_none()
     );
     let mut query_client = fixture.attach()?;
-    let query = thread::spawn(move || query_client.models());
+    let query = thread::spawn(move || query_client.models(&|| false));
     server.accepted.recv_timeout(Duration::from_secs(30))?;
     let started = Instant::now();
     assert_eq!(
@@ -2154,7 +2178,7 @@ fn inventory_journey() -> Result<()> {
     );
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(
-        fixture.attach()?.models()?.error.as_deref(),
+        fixture.attach()?.models(&|| false)?.error.as_deref(),
         Some("models_busy")
     );
     server.release.send(())?;
@@ -2195,7 +2219,7 @@ fn inventory_journey() -> Result<()> {
     // The catalog listener has closed; the next inventory must preserve local rows.
     let deadline = Instant::now() + Duration::from_secs(5);
     let partial = loop {
-        let reply = fixture.attach()?.models()?;
+        let reply = fixture.attach()?.models(&|| false)?;
         if reply.error.as_deref() == Some("models_busy") && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
             continue;
@@ -2249,6 +2273,8 @@ fn main() {
         child(Path::new(args.get(2).expect("scratch home")))
     } else if args.iter().any(|a| a == "--journal-waits") {
         journal_wait_journey()
+    } else if args.iter().any(|a| a == "--stop-drain") {
+        stop_drain_journey()
     } else if args.iter().any(|a| a == "--long-inference") {
         cancellation_driven_journey::run()
     } else if args.iter().any(|a| a == "--native-shell-tools") {
@@ -2315,7 +2341,9 @@ fn main() {
             if args.iter().any(|a| a == "--native") {
                 Ok(())
             } else {
-                audit_journey::run(None).and_then(|()| journal_wait_journey())
+                audit_journey::run(None)
+                    .and_then(|()| journal_wait_journey())
+                    .and_then(|()| stop_drain_journey())
             }
         })
     };
@@ -2354,7 +2382,7 @@ fn journal_wait_journey() -> Result<()> {
     // Queued inputs are held, never dispatched to a model.
     fixture
         .attach()?
-        .config("model", Some("unknown:queue-fixture"))?;
+        .config("model", Some("unknown:queue-fixture"), &|| false)?;
 
     // J1-0-02, J1-0-05, J1-0-07: a queue mutation held at a real append.
     let hold_appends = fixture.home.join("journal-hold-appends");
@@ -2505,5 +2533,187 @@ fn journal_wait_journey() -> Result<()> {
     fixture.attach()?.projects(None)?;
     fixture.stop()?;
     println!("PASS held replay: loading state, refused work, shutdown cancels replay");
+    Ok(())
+}
+
+/// Hold one queue mutation at a real journal append and return its thread.
+fn held_queue_mutation(
+    fixture: &Fixture,
+    project: [u8; 16],
+) -> Result<thread::JoinHandle<asura_client::Result<pb::ConversationQueueReply>>> {
+    let request = pb::ConversationQueueSubmit {
+        request_id: Some(asura_platform::random_id().to_vec()),
+        project_id: Some(project.to_vec()),
+        conversation_id: None,
+        expected_generation: Some(0),
+        new_conversation: Some(true),
+        prompt: Some("Held during stop".into()),
+    };
+    let mut submitter = fixture.attach()?;
+    let submit = thread::spawn(move || submitter.queue_conversation_input(request, &|| false));
+    thread::sleep(Duration::from_millis(300));
+    Ok(submit)
+}
+
+/// Observe the draining owner past the removed one-second drain bound.
+fn observe_draining(fixture: &Fixture) -> Result<()> {
+    let held = Instant::now() + Duration::from_millis(2_500);
+    let mut draining = false;
+    while Instant::now() < held {
+        if let Ok(mut client) = fixture.attach()
+            && let Ok(status) = client.inspect()
+        {
+            if status.lifecycle == pb::Lifecycle::RepairOnly as i32 {
+                return Err("a slow drain moved the owner to RepairOnly".into());
+            }
+            draining |= status.lifecycle == pb::Lifecycle::Draining as i32;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !draining {
+        return Err("Inspect did not report Draining during a held stop".into());
+    }
+    Ok(())
+}
+
+/// Q-B, CW-03 and CW-04 against a real service process (owner, 2026-10-16):
+/// Stop waits for a held journal append with no drain deadline. Inspect
+/// reports Draining, never RepairOnly; the stop client shows progress; the
+/// held request's wait ends with a lost connection. Releasing the hold lets
+/// the original Stop complete; otherwise a second Stop forces exit and the
+/// next owner recovers.
+fn stop_drain_journey() -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let mut fixture = Fixture::new()?;
+    fixture.start()?;
+    let installation = wait_ready(&fixture, None)?
+        .installation_id
+        .map(|id| id.to_vec());
+    let project_dir = fixture.home.join("project");
+    fs::create_dir(&project_dir)?;
+    fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o700))?;
+    let registered = fixture.attach()?.register_project(
+        pb::ProjectRegister {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            location: Some(project_dir.to_str().ok_or("non-UTF-8 path")?.into()),
+        },
+        &|| false,
+    )?;
+    let project = checked_id(registered.project_id)?;
+    fixture
+        .attach()?
+        .config("model", Some("unknown:queue-fixture"), &|| false)?;
+    let hold = fixture.home.join("journal-hold-appends");
+
+    // Round 1: the held append drains; the original Stop then completes.
+    fs::write(&hold, b"")?;
+    let submit = held_queue_mutation(&fixture, project)?;
+    let progress = Arc::new(AtomicUsize::new(0));
+    let seen = progress.clone();
+    let stopper = fixture.attach()?;
+    let stop = thread::spawn(move || {
+        stopper.stop_observed(&mut |snapshot| {
+            if snapshot.lifecycle == pb::Lifecycle::Draining as i32 {
+                seen.fetch_add(1, Ordering::AcqRel);
+            }
+        })
+    });
+    observe_draining(&fixture)?;
+    if stop.is_finished() {
+        return Err("stop wait ended while a worker was still settling".into());
+    }
+    if progress.load(Ordering::Acquire) == 0 {
+        return Err("the stop wait showed no progress".into());
+    }
+    if fixture
+        .child
+        .as_mut()
+        .ok_or("service child")?
+        .try_wait()?
+        .is_some()
+    {
+        return Err("the service exited before its held worker settled".into());
+    }
+    // CW-03: drain closed the held request's connection.
+    if !matches!(
+        submit.join().map_err(|_| "submit thread panicked")?,
+        Err(asura_client::Error::OutcomeUnconfirmed)
+    ) {
+        return Err("held request did not end with a lost connection".into());
+    }
+    fs::remove_file(&hold)?;
+    stop.join().map_err(|_| "stop thread panicked")??;
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = fixture.child.as_mut().ok_or("service child")?.try_wait()? {
+            fixture.child.take();
+            if !status.success() {
+                return Err(format!("drained service exit {status}").into());
+            }
+            break;
+        }
+        if Instant::now() >= end {
+            return Err("service did not exit after its held worker settled".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    println!(
+        "PASS stop drain: no deadline, Draining with progress, lost-connection wait, clean exit"
+    );
+
+    // Round 2: a second Stop forces exit while the append is still held.
+    fixture.start()?;
+    wait_ready(&fixture, installation.clone())?;
+    fs::write(&hold, b"")?;
+    let submit = held_queue_mutation(&fixture, project)?;
+    let first = fixture.attach()?;
+    let first_stop = thread::spawn(move || first.stop());
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(mut client) = fixture.attach()
+            && let Ok(status) = client.inspect()
+            && status.lifecycle == pb::Lifecycle::Draining as i32
+        {
+            break;
+        }
+        if Instant::now() >= end {
+            return Err("first stop did not start draining".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let forced_at = Instant::now();
+    fixture.attach()?.stop()?;
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fixture
+            .child
+            .as_mut()
+            .ok_or("service child")?
+            .try_wait()?
+            .is_some()
+        {
+            fixture.child.take();
+            break;
+        }
+        if Instant::now() >= end {
+            return Err("second stop did not force exit".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let forced_after = forced_at.elapsed();
+    first_stop
+        .join()
+        .map_err(|_| "first stop thread panicked")??;
+    let _ = submit.join().map_err(|_| "submit thread panicked")?;
+    fs::remove_file(&hold)?;
+    // The next owner recovers by replay, as after a crash.
+    fixture.start()?;
+    wait_ready(&fixture, installation)?;
+    fixture.attach()?.projects(None)?;
+    fixture.stop()?;
+    println!("PASS second stop forced exit in {forced_after:?}; next owner recovered");
     Ok(())
 }

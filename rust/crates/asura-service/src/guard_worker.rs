@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Kept wind-down bound for Asura's own endpoint cleanup at shutdown.
+const CLEANUP_WIND_DOWN: Duration = Duration::from_secs(2);
+
 enum Action {
     Validate(OwnerValidation),
     Cleanup(OwnerGuard),
@@ -33,7 +36,10 @@ pub(crate) enum Event {
 pub(crate) struct Worker {
     task: Option<JoinHandle<Finished>>,
     ticket: u64,
-    deadline: Instant,
+    /// Cleanup only: the kept 2 s wind-down bound on Asura's own endpoint
+    /// removal. Validation has no time bound (owner, 2026-10-16); it ends on
+    /// completion, cancellation, client disconnect or shutdown.
+    deadline: Option<Instant>,
     cancel: Arc<AtomicBool>,
     deadline_reported: bool,
     completion: crate::completion::Completion,
@@ -55,7 +61,7 @@ impl Worker {
         })
     }
     fn launch(action: Action, ticket: u64, now: Instant) -> Result<Self, (io::Error, Action)> {
-        let deadline = now + Duration::from_secs(2);
+        let deadline = matches!(action, Action::Cleanup(_)).then(|| now + CLEANUP_WIND_DOWN);
         let cancel = Arc::new(AtomicBool::new(false));
         let token = cancel.clone();
         let completion = crate::completion::Completion::default();
@@ -75,7 +81,10 @@ impl Worker {
                         };
                     }
                 };
-                let permitted = || !token.load(Ordering::Acquire) && Instant::now() < deadline;
+                let permitted = || {
+                    !token.load(Ordering::Acquire)
+                        && deadline.is_none_or(|deadline| Instant::now() < deadline)
+                };
                 match action {
                     Action::Validate(snapshot) => {
                         let result = if permitted() {
@@ -146,7 +155,7 @@ impl Worker {
         } else if self.completion.completed() {
             self.completion.settlement_deadline(now)
         } else if !self.deadline_reported {
-            Some(self.deadline)
+            self.deadline
         } else {
             None
         }
@@ -155,7 +164,7 @@ impl Worker {
         if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
             let expired = self.deadline_reported
                 || self.cancel.load(Ordering::Acquire)
-                || now >= self.deadline;
+                || self.deadline.is_some_and(|deadline| now >= deadline);
             let finished = self.task.take().unwrap().join().unwrap_or(Finished {
                 result: Err(asura_platform::Error::Unavailable),
                 guard: None,
@@ -167,7 +176,10 @@ impl Worker {
                 expired,
             });
         }
-        if self.task.is_some() && now >= self.deadline && !self.deadline_reported {
+        if self.task.is_some()
+            && self.deadline.is_some_and(|deadline| now >= deadline)
+            && !self.deadline_reported
+        {
             self.deadline_reported = true;
             self.cancel();
             return Some(Event::Deadline {
@@ -182,7 +194,7 @@ impl Worker {
 mod tests {
     use super::*;
     #[test]
-    fn timed_out_validation_retains_slot_and_cannot_authorize_late_success() {
+    fn held_validation_has_no_deadline_and_cancel_forbids_late_success() {
         let completion = crate::completion::Completion::default();
         let signal = completion.clone();
         let (release, wait) = mpsc::channel();
@@ -198,17 +210,18 @@ mod tests {
         let mut worker = Worker {
             task: Some(task),
             ticket: 17,
-            deadline: now,
+            deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline_reported: false,
             completion,
         };
-        assert!(matches!(
-            worker.poll(now),
-            Some(Event::Deadline { ticket: 17 })
-        ));
+        // Held well past the removed 2 s bound (injected clock): still pending.
+        assert!(worker.poll(now + Duration::from_secs(60)).is_none());
+        assert_eq!(worker.next_deadline(now), None);
         assert!(!worker.settled());
-        assert!(worker.poll(now).is_none());
+        // Client disconnect or shutdown cancels it; a late success then
+        // cannot authorize the request.
+        worker.cancel();
         release.send(()).unwrap();
         let limit = Instant::now() + Duration::from_secs(1);
         while !worker.task.as_ref().unwrap().is_finished() {

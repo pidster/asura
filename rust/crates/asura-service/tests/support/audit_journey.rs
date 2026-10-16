@@ -124,13 +124,16 @@ fn seed(fixture: &Fixture, projects: &[[u8; 16]]) -> Result<()> {
 fn conflict(fixture: &Fixture, project: [u8; 16], index: u8) -> Result<()> {
     let error = fixture
         .attach()?
-        .submit_conversation(pb::ConversationSubmit {
-            request_id: Some(request(index).to_vec()),
-            project_id: Some(project.to_vec()),
-            conversation_id: Some(conversation(index).to_vec()),
-            expected_generation: Some(1),
-            prompt: Some("AUDIT_CHANGED_PRIVATE_PROMPT_NOT_EXPOSED".into()),
-        })
+        .submit_conversation(
+            pb::ConversationSubmit {
+                request_id: Some(request(index).to_vec()),
+                project_id: Some(project.to_vec()),
+                conversation_id: Some(conversation(index).to_vec()),
+                expected_generation: Some(1),
+                prompt: Some("AUDIT_CHANGED_PRIVATE_PROMPT_NOT_EXPOSED".into()),
+            },
+            &|| false,
+        )
         .expect_err("canonical changed digest must conflict");
     assert!(
         matches!(error,asura_client::Error::Remote(_,ref code) if code=="request_conflict"),
@@ -139,10 +142,13 @@ fn conflict(fixture: &Fixture, project: [u8; 16], index: u8) -> Result<()> {
     Ok(())
 }
 fn read(fixture: &Fixture, project: [u8; 16], limit: u32) -> Result<pb::AuditReply> {
-    Ok(fixture.attach()?.audit(pb::AuditRead {
-        project_id: Some(project.to_vec()),
-        limit: Some(limit),
-    })?)
+    Ok(fixture.attach()?.audit(
+        pb::AuditRead {
+            project_id: Some(project.to_vec()),
+            limit: Some(limit),
+        },
+        &|| false,
+    )?)
 }
 fn wait_conflict(
     fixture: &Fixture,
@@ -302,7 +308,7 @@ pub(super) fn run(provider: Option<&str>) -> Result<()> {
     assert!(
         fixture
             .attach()?
-            .config("audit.enabled", Some("false"))?
+            .config("audit.enabled", Some("false"), &|| false)?
             .error
             .is_none()
     );

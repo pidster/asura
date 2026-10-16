@@ -23,7 +23,7 @@ fn attach(
     resolve: Resolver,
     log_resolve: LogResolver,
     attempted: &mut bool,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
     lifetime: &asura_platform::ServiceLifetime,
 ) -> Result<(Client, bool), &'static str> {
     let cancelled = || stop.load(Ordering::Acquire);
@@ -36,7 +36,9 @@ fn attach(
             if cancelled() {
                 return Err(asura_client::Error::Unavailable);
             }
-            Client::attach(&runtime, BUILD, Instant::now() + Duration::from_secs(2))
+            // No time bound (owner, 2026-10-16): the attachment, a lost
+            // connection or the worker's stop ends this wait.
+            Client::attach(&runtime, BUILD, &cancelled)
         });
     let client = match attached {
         Ok(client) => {
@@ -60,6 +62,11 @@ fn attach(
     if cancelled() {
         return Err("cancelled");
     }
+    let mut client = client;
+    let stopped = stop.clone();
+    client
+        .0
+        .set_cancel(Arc::new(move || stopped.load(Ordering::Acquire)));
     Ok(client)
 }
 #[cfg(test)]
@@ -67,7 +74,7 @@ fn inspect(
     resolve: Resolver,
     log_resolve: LogResolver,
     attempted: &mut bool,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
     lifetime: &asura_platform::ServiceLifetime,
 ) -> Result<Snapshot, &'static str> {
     attach(resolve, log_resolve, attempted, stop, lifetime)?
@@ -78,7 +85,7 @@ fn inspect(
 struct Shared {
     latest: Mutex<Option<Observation>>,
     changed: Condvar,
-    stop: AtomicBool,
+    stop: Arc<AtomicBool>,
 }
 pub(super) struct Worker {
     notice: super::events::Notice,
@@ -137,7 +144,7 @@ impl Worker {
     #[cfg(test)]
     fn start_with<F>(mut inspect: F) -> io::Result<Self>
     where
-        F: FnMut(&AtomicBool) -> Result<Snapshot, &'static str> + Send + 'static,
+        F: FnMut(&Arc<AtomicBool>) -> Result<Snapshot, &'static str> + Send + 'static,
     {
         Self::start_notified(
             move |stop| inspect(stop).map(|snapshot| (snapshot, None, None)),
@@ -152,7 +159,7 @@ impl Worker {
     ) -> io::Result<Self>
     where
         F: FnMut(
-                &AtomicBool,
+                &Arc<AtomicBool>,
             ) -> Result<
                 (Snapshot, Option<String>, Option<super::ui::ServiceDetails>),
                 &'static str,
@@ -162,7 +169,7 @@ impl Worker {
         let shared = Arc::new(Shared {
             latest: Mutex::new(None),
             changed: Condvar::new(),
-            stop: AtomicBool::new(false),
+            stop: Arc::new(AtomicBool::new(false)),
         });
         let worker = shared.clone();
         let notify = notice.clone();
@@ -302,22 +309,19 @@ impl Model {
         self.expired = true;
         self.not_before = Some(now);
     }
+    /// Display pacing: re-check staleness after five missed heartbeats.
     pub fn next_deadline(&self) -> Option<Instant> {
-        (!self.expired).then(|| {
-            self.current
-                .as_ref()
-                .map_or(self.pending_since, |value| value.started)
-                + Duration::from_secs(5)
-        })
+        (!self.expired).then(|| super::heartbeat::stale_at(self.last_heartbeat()))
     }
+    fn last_heartbeat(&self) -> Instant {
+        self.current
+            .as_ref()
+            .map_or(self.pending_since, |value| value.started)
+    }
+    /// Five consecutive missed heartbeats show the status as expired. This
+    /// changes the display only; it ends no work (owner, 2026-10-16).
     pub(super) fn expire(&mut self, now: Instant) -> bool {
-        if !self.expired
-            && now.saturating_duration_since(
-                self.current
-                    .as_ref()
-                    .map_or(self.pending_since, |value| value.started),
-            ) >= Duration::from_secs(5)
-        {
+        if !self.expired && super::heartbeat::stale(self.last_heartbeat(), now) {
             self.expired = true;
             return true;
         }
@@ -409,7 +413,7 @@ mod tests {
                 result: Err("test observation"),
             })),
             changed: Condvar::new(),
-            stop: AtomicBool::new(false),
+            stop: Arc::new(AtomicBool::new(false)),
         });
         let worker = Worker {
             notice: Default::default(),
@@ -469,7 +473,7 @@ mod tests {
         }
         let mut attempted = false;
         let (_lease, lifetime) = asura_platform::ServiceLifetime::new().unwrap();
-        let stop = AtomicBool::new(false);
+        let stop = Arc::new(AtomicBool::new(false));
         assert!(inspect(unsafe_runtime, no_log, &mut attempted, &stop, &lifetime).is_err());
         assert!(!attempted);
         assert!(matches!(
@@ -519,7 +523,9 @@ mod tests {
             result: Ok(snapshot())
         }));
         assert!(model.view().epoch.is_some());
-        assert!(model.expire(now + Duration::from_secs(5)));
+        // Q-A: four missed heartbeats keep the display; the fifth expires it.
+        assert!(!model.expire(now + super::super::heartbeat::INTERVAL * 4));
+        assert!(model.expire(now + super::super::heartbeat::INTERVAL * 5));
         assert!(model.view().epoch.is_none());
         assert!(model.apply(Observation {
             configured_model: None,

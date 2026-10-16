@@ -5,8 +5,9 @@ for each validation layer are listed under [Validation](#validation). This
 document records no test run or runtime evidence. Protocol remains 0.1.
 
 Time-bound update (owner, 2026-10-16): the stored-size sample has no time limit.
-The pane shows the size as measuring until the sample returns. The code still
-applies a two-second limit; a follow-up implementation will remove it.
+The pane shows the size as measuring until the sample returns. Implemented
+2026-10-16: the sample and footprint walk take no deadline; `size_reason` 2 is
+published while a sample has not returned (`service_observer` unit test).
 
 The top pane reports `Asura · Connected (process|local|remote) · uptime · memory:
 status size · graph: state reason`. Process means this TUI launched the current

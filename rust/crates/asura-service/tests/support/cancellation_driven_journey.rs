@@ -134,7 +134,13 @@ pub(super) fn run() -> Result<()> {
         ("providers.ollama.endpoint", server.endpoint.as_str()),
         ("model", "ollama:fixture"),
     ] {
-        assert!(fixture.attach()?.config(key, Some(value))?.error.is_none());
+        assert!(
+            fixture
+                .attach()?
+                .config(key, Some(value), &|| false)?
+                .error
+                .is_none()
+        );
     }
     let started = Instant::now();
     let accepted = match submit(&fixture, project, None, 0, "Reply when ready") {

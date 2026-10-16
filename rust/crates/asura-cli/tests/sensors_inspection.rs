@@ -13,7 +13,7 @@ pub(super) fn inspect(case: &mut Case) -> Result<()> {
     )?;
     let runtime = RuntimeDirectory::scratch(&case.root.join("home"), false)?;
     let end = Instant::now() + WAIT;
-    let mut client = Client::attach(&runtime, BUILD, end)?;
+    let mut client = attach_within(&runtime, end)?;
     while client.inspect_installation()?.installation != pb::InstallationState::GraphReady {
         require(Instant::now() < end, "sensor installation unavailable")?;
         std::thread::sleep(Duration::from_millis(20));

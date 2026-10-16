@@ -1,12 +1,8 @@
 use asura_platform::RuntimeDirectory;
 use asura_storage::stored_memory::{SizeError, stored_bytes};
-use std::{
-    fs,
-    os::unix::fs::DirBuilderExt,
-    path::PathBuf,
-    sync::atomic::AtomicBool,
-    time::{Duration, Instant},
-};
+#[cfg(feature = "embedded-memory")]
+use std::time::{Duration, Instant};
+use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf, sync::atomic::AtomicBool};
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -27,14 +23,13 @@ impl Drop for Scratch {
 fn footprint_missing_database_is_unknown_and_never_created() {
     let scratch = Scratch::new();
     let runtime = RuntimeDirectory::scratch(&scratch.0, true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
     assert_eq!(
-        stored_bytes(runtime.clone(), deadline, &AtomicBool::new(false)),
+        stored_bytes(runtime.clone(), &AtomicBool::new(false)),
         Err(SizeError::Unavailable)
     );
     assert!(!scratch.0.join(".asura/db").exists());
     assert_eq!(
-        stored_bytes(runtime, deadline, &AtomicBool::new(true)),
+        stored_bytes(runtime, &AtomicBool::new(true)),
         Err(SizeError::Cancelled)
     );
 }
@@ -59,11 +54,7 @@ fn footprint_reports_real_embedded_store_without_another_engine_owner() {
         assert!(Instant::now() < end);
         std::thread::sleep(Duration::from_millis(1));
     }
-    let bytes = stored_bytes(
-        runtime,
-        Instant::now() + Duration::from_secs(2),
-        &AtomicBool::new(false),
-    );
+    let bytes = stored_bytes(runtime, &AtomicBool::new(false));
     while !memory.close().unwrap() {
         assert!(Instant::now() < end);
         std::thread::sleep(Duration::from_millis(1));

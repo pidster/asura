@@ -718,8 +718,7 @@ check-to-use race if a tag changes. This trusts the configured local Ollama daem
 as the execution endpoint; it does not attest an arbitrary malicious proxy.
 Discovery has no time limit (owner, 2026-10-16): it ends on the daemon's reply,
 an error, cancel, helper exit or shutdown. The 5-second Hello and `api/show`
-limits are removed in design; the code change is pending, and a follow-up
-implementation will apply it. Each metadata response is limited to 64 KiB, version to 1 KiB, with cancellation closing its
+limits are removed; implemented 2026-10-16 (infinite URLSession timeouts). Each metadata response is limited to 64 KiB, version to 1 KiB, with cancellation closing its
 URLSession. No additional daemon, credential or model acquisition is introduced.
 
 

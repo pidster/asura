@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 type SnapshotResult = Result<ConversationSnapshot, &'static str>;
@@ -18,7 +18,6 @@ struct Job {
     task: Option<JoinHandle<SnapshotResult>>,
     cancel: Arc<AtomicBool>,
     completion: crate::completion::Completion,
-    deadline: Instant,
     reported: bool,
     model: Option<ModelOwner>,
     configured: Option<String>,
@@ -55,7 +54,7 @@ impl Owner {
             job: None,
         }
     }
-    pub(crate) fn request(&mut self, request: pb::Envelope, now: Instant) -> Option<pb::Envelope> {
+    pub(crate) fn request(&mut self, request: pb::Envelope) -> Option<pb::Envelope> {
         if self.job.is_some() {
             return Some(error(request, "models_busy"));
         }
@@ -68,12 +67,14 @@ impl Owner {
         let completion = crate::completion::Completion::default();
         completion.register(self.wake.clone());
         let signal = completion.clone();
-        let deadline = now + Duration::from_secs(2);
+        // The configuration snapshot has no time bound (owner, 2026-10-16):
+        // it ends on completion, an error, the requester's disconnect or
+        // shutdown; the client shows the inventory as pending meanwhile.
         let task = thread::Builder::new()
             .name("asura-models-config".into())
             .spawn(move || {
                 let _completion = signal.guard();
-                asura_storage::config::conversation_snapshot(runtime, deadline, &token)
+                asura_storage::config::conversation_snapshot(runtime, &token)
             });
         match task {
             Ok(task) => {
@@ -82,7 +83,6 @@ impl Owner {
                     task: Some(task),
                     cancel,
                     completion,
-                    deadline,
                     reported: false,
                     model: None,
                     configured: None,
@@ -97,8 +97,6 @@ impl Owner {
         let config = if job.task.is_some() {
             if job.completion.completed() {
                 job.completion.settlement_deadline(now)
-            } else if !job.reported {
-                Some(job.deadline)
             } else {
                 None
             }
@@ -146,11 +144,6 @@ impl Owner {
                 .join()
                 .unwrap_or(Err("models_unavailable"));
             if !job.reported {
-                let result = if now >= job.deadline {
-                    Err("models_timeout")
-                } else {
-                    result
-                };
                 match result {
                     Ok(config) => {
                         job.configured = Some(canonical_selection(config.model));
@@ -163,7 +156,6 @@ impl Owner {
                                 asset_root: Some(config.asset_root),
                                 endpoint: config.ollama_endpoint,
                             },
-                            now,
                         ) {
                             Ok(mut model) => {
                                 model.register(self.wake.clone());
@@ -181,10 +173,6 @@ impl Owner {
                     }
                 }
             }
-        } else if job.task.is_some() && !job.reported && now >= job.deadline {
-            job.cancel.store(true, Ordering::Release);
-            job.reported = true;
-            reply = Some(error(job.request.clone(), "models_timeout"));
         }
         if let Some(model) = &mut job.model {
             for event in model.poll(now) {
@@ -291,6 +279,7 @@ fn error(mut request: pb::Envelope, reason: &str) -> pb::Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     #[test]
     fn missing_selection_is_not_claimed_available_and_invalid_config_is_visible() {
         assert_eq!(
@@ -312,7 +301,7 @@ mod tests {
         }
     }
     #[test]
-    fn timed_out_configuration_retains_slot_and_suppresses_late_result() {
+    fn held_configuration_has_no_deadline_and_disconnect_cancels_it() {
         use std::{os::unix::fs::DirBuilderExt, sync::mpsc};
         struct Scratch(std::path::PathBuf);
         impl Drop for Scratch {
@@ -353,22 +342,25 @@ mod tests {
             task: Some(task),
             cancel: Arc::new(AtomicBool::new(false)),
             completion,
-            deadline: Instant::now(),
             reported: false,
             model: None,
             configured: None,
         });
-        let reply = owner.poll(&[[2; 16]], Instant::now()).unwrap();
-        let Some(pb::envelope::Body::ModelsReply(reply)) = reply.body else {
-            panic!()
-        };
-        assert_eq!(reply.error.as_deref(), Some("models_timeout"));
+        // HW-01: held far past the removed 2 s snapshot bound, the request
+        // stays pending; no timer replies and nothing is cancelled.
+        let later = Instant::now() + Duration::from_secs(60);
+        assert!(owner.poll(&[[2; 16]], later).is_none());
+        assert_eq!(owner.next_deadline(later), None);
+        assert!(!owner.job.as_ref().unwrap().cancel.load(Ordering::Acquire));
         assert!(!owner.settled());
-        let busy = owner.request(request, Instant::now()).unwrap();
+        let busy = owner.request(request).unwrap();
         let Some(pb::envelope::Body::ModelsReply(busy)) = busy.body else {
             panic!()
         };
         assert_eq!(busy.error.as_deref(), Some("models_busy"));
+        // The requester's disconnect (no current attachment) cancels it; the
+        // slot stays busy until the worker settles and a late result is dropped.
+        assert!(owner.poll(&[], Instant::now()).is_none());
         assert!(owner.job.as_ref().unwrap().cancel.load(Ordering::Acquire));
         send.send(()).unwrap();
         let end = Instant::now() + Duration::from_secs(1);

@@ -156,6 +156,7 @@ pub struct App {
     audit_result: Option<(super::queue_watch::Scope, String)>,
     models_request: bool,
     models_cancel: bool,
+    config_cancel: bool,
     models_draft: Option<String>,
     models_result: Option<super::models::Outcome>,
     config_request: Option<super::config::Request>,
@@ -254,6 +255,7 @@ impl App {
             audit_result: None,
             models_request: false,
             models_cancel: false,
+            config_cancel: false,
             models_draft: None,
             models_result: None,
             config_request: None,
@@ -822,6 +824,9 @@ impl App {
     }
     pub(super) fn take_models_request(&mut self) -> bool {
         std::mem::take(&mut self.models_request)
+    }
+    pub(super) fn take_config_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.config_cancel)
     }
     pub(super) fn take_models_cancel(&mut self) -> bool {
         std::mem::take(&mut self.models_cancel)
@@ -1928,6 +1933,11 @@ impl App {
                 self.models_cancel = true;
                 self.editor = Editor::new();
                 self.notice = "Model inventory cancellation requested".into();
+            } else if self.config_draft.is_some() || self.picker_model_save.is_some() {
+                // The configuration wait has no time bound (owner, 2026-10-16).
+                self.config_cancel = true;
+                self.editor = Editor::new();
+                self.notice = "Configuration wait stopped; a set may still be applied".into();
             } else if self.project_admin_busy
                 && !(self.conversation_busy && self.conversation_cancellable)
             {

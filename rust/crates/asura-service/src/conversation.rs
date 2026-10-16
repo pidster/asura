@@ -1815,7 +1815,6 @@ impl Owner {
         request: Option<pb::Envelope>,
         value: pb::ConversationSubmit,
         prepared: writer::Prepared,
-        now: Instant,
     ) -> Result<(), &'static str> {
         let resolved = crate::model::resolve(
             prepared.model.parse().map_err(|_| "model_unavailable")?,
@@ -1887,7 +1886,6 @@ impl Owner {
                 endpoint: prepared.ollama_endpoint,
                 model_capabilities: prepared.model_capabilities,
             },
-            now,
         )
         .map_err(|_| "model_unavailable")?;
         let mut tool_executor = tools::Executor::default();
@@ -2248,7 +2246,6 @@ impl Owner {
                         _ => unreachable!(),
                     },
                     value.prepared.expect("prepare result"),
-                    now,
                 ) {
                     self.audit_rejected(&request, message);
                     self.out.push_back(error(request, message));
@@ -2281,7 +2278,6 @@ impl Owner {
                     active.turn.generation,
                     std::mem::take(&mut active.input),
                     active.tools_enabled,
-                    now,
                 ) {
                     Self::failed(active, message, now);
                 }
@@ -2510,12 +2506,7 @@ impl Owner {
                 let result = if self.closing {
                     Err("service_closing")
                 } else {
-                    self.prepared(
-                        None,
-                        submit,
-                        value.prepared.expect("queue prepare result"),
-                        now,
-                    )
+                    self.prepared(None, submit, value.prepared.expect("queue prepare result"))
                 };
                 if let Err(reason) = result {
                     self.note_hold(input, reason);

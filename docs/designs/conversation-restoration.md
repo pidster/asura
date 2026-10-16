@@ -186,9 +186,13 @@ most eight turn entries; a newer project selection cancels or supersedes the
 old job. Restoration has no time bound (owner, 2026-10-16). Each control RPC
 waits for its reply; the restoration ends on completion, `/cancel`, a newer
 project selection, exit or a lost connection
-([client waits](command-flows.md#client-waits-without-time-bounds)). The code
-still applies a two-second attachment/operation deadline and an 18-second
-restoration deadline; a follow-up implementation will remove them. Shutdown
+([client waits](command-flows.md#client-waits-without-time-bounds)).
+Implemented 2026-10-16: the two-second attachment/operation and 18-second
+restoration deadlines are removed. In code the restoration ends on completion,
+exit or scope change (the worker's stop flag) or a lost connection. `/cancel`
+does not yet stop a restoration: the G02 rule that `/cancel` outside an active
+conversation reports "No active conversation to cancel" is kept; routing
+`/cancel` to restoration remains open. Shutdown
 requests stop the worker and use the existing bounded cleanup path. A hung service cannot
 hold rendering, editor input or quit handling.
 

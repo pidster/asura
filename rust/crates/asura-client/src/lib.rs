@@ -8,11 +8,13 @@ use asura_platform::{
 use std::{
     io::{Read, Write},
     os::fd::AsRawFd,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-const REQUEST: Duration = Duration::from_secs(2);
-const LIFECYCLE: Duration = Duration::from_secs(5);
+/// What ends a client wait besides the reply or a lost connection: the
+/// person's cancel or exit (owner, 2026-10-16). It is checked at the pacing
+/// cadence [`CANCEL_POLL`] and never ends a wait by itself.
+pub type Cancel = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Debug)]
 pub enum Error {
@@ -21,6 +23,8 @@ pub enum Error {
     Incompatible,
     Unavailable,
     OutcomeUnconfirmed,
+    /// The person cancelled a read wait; nothing was changed by this client.
+    Cancelled,
     Remote(i32, String),
 }
 impl std::fmt::Display for Error {
@@ -29,6 +33,7 @@ impl std::fmt::Display for Error {
             Self::Platform(asura_platform::Error::UnsafeRuntime) => "unsafe_runtime",
             Self::Incompatible => "incompatible_protocol",
             Self::OutcomeUnconfirmed => "outcome_unconfirmed",
+            Self::Cancelled => "cancelled",
             Self::Remote(_, message) => message,
             _ => "service_unavailable",
         })
@@ -140,66 +145,52 @@ pub struct Client {
     attachment: [u8; 16],
     counter: u64,
     build: String,
-    /// Set when a cancelled wait left a reply in flight; later requests refuse.
+    /// Set when a cancelled or lost wait left a reply in flight; later requests refuse.
     abandoned: bool,
+    /// Ends this attachment's waits besides a reply or lost connection.
+    cancel: Cancel,
 }
 
-fn remaining(end: Instant) -> Result<Duration> {
-    end.checked_duration_since(Instant::now())
-        .filter(|d| !d.is_zero())
-        .ok_or(Error::Unavailable)
-}
-/// What ends one request's wait: a client response budget, or, for a request
-/// with no time bound (initialization, J1-0), only the person's cancel.
-#[derive(Clone, Copy)]
-enum Until<'a> {
-    Deadline(Instant),
-    Cancel(&'a dyn Fn() -> bool),
-}
-/// The cancel check cadence of an unbounded wait. It ends nothing by itself.
+/// The cancel check cadence of a wait. Pacing only: it ends nothing by itself.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
-impl Until<'_> {
-    fn slice(self) -> Result<Duration> {
-        match self {
-            Self::Deadline(end) => remaining(end),
-            Self::Cancel(cancelled) if cancelled() => Err(Error::OutcomeUnconfirmed),
-            Self::Cancel(_) => Ok(CANCEL_POLL),
-        }
+/// The poll slice of one wait step; the person's cancel ends the wait.
+fn slice(cancelled: &dyn Fn() -> bool) -> Result<Duration> {
+    if cancelled() {
+        Err(Error::Cancelled)
+    } else {
+        Ok(CANCEL_POLL)
     }
 }
-fn wait(stream: &AuthenticatedStream, write: bool, end: Instant) -> Result<()> {
-    wait_until(stream, write, Until::Deadline(end))
+fn never() -> bool {
+    false
 }
-fn wait_until(stream: &AuthenticatedStream, write: bool, until: Until) -> Result<()> {
+fn wait_until(
+    stream: &AuthenticatedStream,
+    write: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
     let interest = PollInterest {
         fd: stream.stream().as_raw_fd(),
         read: !write,
         write,
     };
-    asura_platform::poll(&[interest], until.slice()?)?;
+    asura_platform::poll(&[interest], slice(cancelled)?)?;
     Ok(())
-}
-fn write_frame(
-    stream: &mut AuthenticatedStream,
-    envelope: &pb::Envelope,
-    end: Instant,
-) -> Result<()> {
-    write_frame_until(stream, envelope, Until::Deadline(end))
 }
 fn write_frame_until(
     stream: &mut AuthenticatedStream,
     envelope: &pb::Envelope,
-    until: Until,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     let bytes = encode_frame(envelope).map_err(|_| Error::Protocol)?;
     let mut offset = 0;
     while offset < bytes.len() {
-        until.slice()?;
+        slice(cancelled)?;
         match stream.stream_mut().write(&bytes[offset..]) {
             Ok(0) => return Err(Error::Unavailable),
             Ok(n) => offset += n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                wait_until(stream, true, until)?
+                wait_until(stream, true, cancelled)?
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
             Err(_) => return Err(Error::Unavailable),
@@ -207,21 +198,14 @@ fn write_frame_until(
     }
     Ok(())
 }
-fn read_frame(
-    stream: &mut AuthenticatedStream,
-    codec: &mut ControlCodec,
-    end: Instant,
-) -> Result<Frame> {
-    read_frame_until(stream, codec, Until::Deadline(end))
-}
 fn read_frame_until(
     stream: &mut AuthenticatedStream,
     codec: &mut ControlCodec,
-    until: Until,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Frame> {
     let mut buffer = [0u8; 8192];
     loop {
-        until.slice()?;
+        slice(cancelled)?;
         if let Some(frame) = codec.next_frame().map_err(|_| Error::Protocol)? {
             return Ok(frame);
         }
@@ -234,7 +218,7 @@ fn read_frame_until(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                wait_until(stream, false, until)?
+                wait_until(stream, false, cancelled)?
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
             Err(_) => return Err(Error::Unavailable),
@@ -243,7 +227,13 @@ fn read_frame_until(
 }
 
 impl Client {
-    pub fn attach(runtime: &RuntimeDirectory, build: &str, deadline: Instant) -> Result<Self> {
+    /// Attach and authenticate. The wait has no time bound (owner, 2026-10-16):
+    /// it ends on the HelloReply, a lost connection or `cancelled`.
+    pub fn attach(
+        runtime: &RuntimeDirectory,
+        build: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self> {
         runtime.validate()?;
         let witness = runtime.capture_lock()?;
         let mut stream = match runtime.connect() {
@@ -266,9 +256,8 @@ impl Client {
             })),
         };
         validate_semantics(&hello, Direction::ClientToServer).map_err(|_| Error::Protocol)?;
-        let end = deadline.min(Instant::now() + REQUEST);
-        write_frame(&mut stream, &hello, end)?;
-        let reply = match read_frame(&mut stream, &mut codec, end)? {
+        write_frame_until(&mut stream, &hello, cancelled)?;
+        let reply = match read_frame_until(&mut stream, &mut codec, cancelled)? {
             Frame::VersionRejected => return Err(Error::Incompatible),
             Frame::Message(reply) => reply,
         };
@@ -298,15 +287,29 @@ impl Client {
             counter: 0,
             build: hello.service_build.ok_or(Error::Protocol)?,
             abandoned: false,
+            cancel: std::sync::Arc::new(never),
         })
     }
 
-    fn request(
+    /// Set what ends this attachment's waits besides a reply or a lost
+    /// connection, for example the person's `/cancel` or exit. Pacing only.
+    pub fn set_cancel(&mut self, cancel: Cancel) {
+        self.cancel = cancel;
+    }
+
+    /// A read or control request. It has no time bound (owner, 2026-10-16):
+    /// it ends on the reply, a lost connection or this attachment's cancel.
+    fn request(&mut self, body: pb::envelope::Body) -> Result<pb::envelope::Body> {
+        self.request_cancellable(body, &never)
+    }
+    /// As [`Self::request`], also ended by the caller's `cancelled`.
+    fn request_cancellable(
         &mut self,
         body: pb::envelope::Body,
-        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::envelope::Body> {
-        self.request_until(body, Until::Deadline(deadline))
+        let cancel = self.cancel.clone();
+        self.request_until(body, &|| cancelled() || cancel())
     }
     /// A journal-backed mutation: the service replies only after its journal
     /// append, which has no time bound (J1-0). The client waits for the real
@@ -317,7 +320,7 @@ impl Client {
         body: pb::envelope::Body,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::envelope::Body> {
-        self.request_until(body, Until::Cancel(cancelled))
+        self.request_cancellable(body, cancelled)
             .map_err(|error| match error {
                 Error::Remote(..) => error,
                 _ => Error::OutcomeUnconfirmed,
@@ -326,7 +329,7 @@ impl Client {
     fn request_until(
         &mut self,
         body: pb::envelope::Body,
-        until: Until,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::envelope::Body> {
         if self.abandoned {
             return Err(Error::Unavailable);
@@ -341,10 +344,11 @@ impl Client {
             body: Some(body),
         };
         validate_semantics(&request, Direction::ClientToServer).map_err(|_| Error::Protocol)?;
-        // A cancelled wait leaves a reply in flight: this attachment is retired.
-        let result = write_frame_until(&mut self.stream, &request, until)
-            .and_then(|()| read_frame_until(&mut self.stream, &mut self.codec, until));
-        if result.is_err() && matches!(until, Until::Cancel(_)) {
+        // A cancelled or lost wait leaves a reply in flight: this attachment
+        // is retired and refuses further requests.
+        let result = write_frame_until(&mut self.stream, &request, cancelled)
+            .and_then(|()| read_frame_until(&mut self.stream, &mut self.codec, cancelled));
+        if result.is_err() {
             self.abandoned = true;
         }
         let Frame::Message(reply) = result? else {
@@ -365,12 +369,9 @@ impl Client {
     }
 
     pub fn observe_service(&mut self, after: Option<u64>) -> Result<ServiceUpdate> {
-        match self.request(
-            pb::envelope::Body::ObserveService(pb::ObserveService {
-                after_revision: after,
-            }),
-            Instant::now() + REQUEST,
-        )? {
+        match self.request(pb::envelope::Body::ObserveService(pb::ObserveService {
+            after_revision: after,
+        }))? {
             pb::envelope::Body::ServiceObservation(value) => {
                 let status = value.status.ok_or(Error::Protocol)?;
                 Ok(ServiceUpdate {
@@ -397,14 +398,13 @@ impl Client {
         project: [u8; 16],
         after: Option<u64>,
     ) -> Result<pb::ConversationQueueReply> {
-        match self.request(
-            pb::envelope::Body::ConversationQueueList(pb::ConversationQueueList {
+        match self.request(pb::envelope::Body::ConversationQueueList(
+            pb::ConversationQueueList {
                 project_id: Some(project.to_vec()),
                 input_id: None,
                 after_revision: after,
-            }),
-            Instant::now() + REQUEST,
-        )? {
+            },
+        ))? {
             pb::envelope::Body::ConversationQueueReply(value)
                 if value.full_text == Some(false)
                     && value
@@ -418,10 +418,7 @@ impl Client {
         }
     }
     pub fn inspect(&mut self) -> Result<Snapshot> {
-        let reply = self.request(
-            pb::envelope::Body::Inspect(pb::Inspect {}),
-            Instant::now() + REQUEST,
-        )?;
+        let reply = self.request(pb::envelope::Body::Inspect(pb::Inspect {}))?;
         let pb::envelope::Body::InspectReply(status) = reply else {
             return Err(Error::Protocol);
         };
@@ -436,10 +433,9 @@ impl Client {
     }
 
     pub fn inspect_installation(&mut self) -> Result<InstallationSnapshot> {
-        let reply = self.request(
-            pb::envelope::Body::InspectInstallation(pb::InspectInstallation {}),
-            Instant::now() + REQUEST,
-        )?;
+        let reply = self.request(pb::envelope::Body::InspectInstallation(
+            pb::InspectInstallation {},
+        ))?;
         let pb::envelope::Body::InspectInstallationReply(status) = reply else {
             return Err(Error::Protocol);
         };
@@ -477,17 +473,15 @@ impl Client {
     pub fn service_epoch(&self) -> [u8; 16] {
         self.epoch
     }
-    /// Read bounded committed audit metadata for the selected project.
-    pub fn audit(&mut self, query: pb::AuditRead) -> Result<pb::AuditReply> {
-        self.audit_before(query, Instant::now() + Duration::from_secs(2))
-    }
-    pub fn audit_before(
+    /// Read bounded committed audit metadata for the selected project. The
+    /// wait ends on the reply, a lost connection or `cancelled`.
+    pub fn audit(
         &mut self,
         query: pb::AuditRead,
-        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::AuditReply> {
         let project = query.project_id.clone();
-        match self.request(pb::envelope::Body::AuditRead(query), deadline)? {
+        match self.request_cancellable(pb::envelope::Body::AuditRead(query), cancelled)? {
             pb::envelope::Body::AuditReply(reply) if reply.project_id == project => Ok(reply),
             _ => Err(Error::Protocol),
         }
@@ -495,22 +489,24 @@ impl Client {
 
     /// Read one bounded page of durable sensor evidence without retrying.
     /// Call from the client control worker, never the render or input loop.
-    pub fn sensors(&mut self, query: pb::SensorsInspect) -> Result<pb::SensorsReply> {
-        match self.request(
-            pb::envelope::Body::SensorsInspect(query),
-            Instant::now() + Duration::from_secs(2),
-        )? {
+    pub fn sensors(
+        &mut self,
+        query: pb::SensorsInspect,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<pb::SensorsReply> {
+        match self.request_cancellable(pb::envelope::Body::SensorsInspect(query), cancelled)? {
             pb::envelope::Body::SensorsReply(reply) => Ok(reply),
             _ => Err(Error::Protocol),
         }
     }
 
     /// Read the service-owned inventory without loading a model or retrying.
-    pub fn models(&mut self) -> Result<pb::ModelsReply> {
-        match self.request(
-            pb::envelope::Body::ModelsList(pb::ModelsList {}),
-            Instant::now() + Duration::from_secs(30),
-        )? {
+    /// The wait has no time bound; it ends on the reply, a lost connection or
+    /// `cancelled` (the person's `/cancel` or exit).
+    pub fn models(&mut self, cancelled: &dyn Fn() -> bool) -> Result<pb::ModelsReply> {
+        match self
+            .request_cancellable(pb::envelope::Body::ModelsList(pb::ModelsList {}), cancelled)?
+        {
             pb::envelope::Body::ModelsReply(reply) => Ok(reply),
             _ => Err(Error::Protocol),
         }
@@ -518,7 +514,14 @@ impl Client {
 
     /// Run one config request without retrying a possibly committed set.
     /// An empty key with no value reads the complete effective configuration.
-    pub fn config(&mut self, key: &str, value: Option<&str>) -> Result<pb::ConfigReply> {
+    /// The wait has no time bound; `cancelled` or a lost connection ends it,
+    /// and a set then reports `OutcomeUnconfirmed`.
+    pub fn config(
+        &mut self,
+        key: &str,
+        value: Option<&str>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<pb::ConfigReply> {
         use pb::envelope::Body;
         let body = match value {
             Some(value) => Body::ConfigSet(pb::ConfigSet {
@@ -529,7 +532,7 @@ impl Client {
                 key: (!key.is_empty()).then(|| key.into()),
             }),
         };
-        let result = self.request(body, Instant::now() + Duration::from_secs(3));
+        let result = self.request_cancellable(body, cancelled);
         match result {
             Ok(Body::ConfigReply(reply)) => Ok(reply),
             _ if value.is_some() => Err(Error::OutcomeUnconfirmed),
@@ -562,10 +565,7 @@ impl Client {
         &mut self,
         request: pb::ResolveInitialization,
     ) -> Result<pb::InitializationReply> {
-        match self.request(
-            pb::envelope::Body::ResolveInitialization(request),
-            Instant::now() + REQUEST,
-        )? {
+        match self.request(pb::envelope::Body::ResolveInitialization(request))? {
             pb::envelope::Body::InitializationReply(reply) => Ok(reply),
             _ => Err(Error::Protocol),
         }
@@ -596,13 +596,10 @@ impl Client {
         }
     }
     pub fn projects(&mut self, after: Option<[u8; 16]>) -> Result<pb::ProjectsReply> {
-        match self.request(
-            pb::envelope::Body::ProjectList(pb::ProjectList {
-                after_project_id: after.map(|id| id.to_vec()),
-                limit: Some(8),
-            }),
-            Instant::now() + REQUEST,
-        )? {
+        match self.request(pb::envelope::Body::ProjectList(pb::ProjectList {
+            after_project_id: after.map(|id| id.to_vec()),
+            limit: Some(8),
+        }))? {
             pb::envelope::Body::ProjectsReply(reply) => Ok(reply),
             _ => Err(Error::Protocol),
         }
@@ -610,13 +607,11 @@ impl Client {
     pub fn observe_context(
         &mut self,
         request: pb::ObserveContext,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::ContextObservation> {
         let project = request.project_id.clone();
         let path = request.working_directory.clone();
-        match self.request(
-            pb::envelope::Body::ObserveContext(request),
-            Instant::now() + Duration::from_secs(2),
-        )? {
+        match self.request_cancellable(pb::envelope::Body::ObserveContext(request), cancelled)? {
             pb::envelope::Body::ContextObservation(reply)
                 if reply.project_id == project && reply.working_directory == path =>
             {
@@ -679,14 +674,13 @@ impl Client {
         project: [u8; 16],
         input: Option<[u8; 16]>,
     ) -> Result<pb::ConversationQueueReply> {
-        match self.request(
-            pb::envelope::Body::ConversationQueueList(pb::ConversationQueueList {
+        match self.request(pb::envelope::Body::ConversationQueueList(
+            pb::ConversationQueueList {
                 project_id: Some(project.to_vec()),
                 input_id: input.map(|v| v.to_vec()),
                 after_revision: None,
-            }),
-            Instant::now() + REQUEST,
-        )? {
+            },
+        ))? {
             pb::envelope::Body::ConversationQueueReply(reply)
                 if reply.full_text == Some(input.is_some())
                     && reply.entries.iter().all(|e| {
@@ -715,16 +709,17 @@ impl Client {
             _ => Err(Error::Protocol),
         }
     }
+    /// Submit, including the service's journal acknowledgement. The wait has
+    /// no time bound (owner, 2026-10-16): `cancelled` or a lost connection
+    /// ends it as `OutcomeUnconfirmed`; the caller retries with the same ID.
     pub fn submit_conversation(
         &mut self,
         request: pb::ConversationSubmit,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<pb::ConversationAccepted> {
         let expected_generation = request.expected_generation.and_then(|n| n.checked_add(1));
         let expected_conversation = request.conversation_id.clone();
-        match self.request(
-            pb::envelope::Body::ConversationSubmit(request),
-            Instant::now() + Duration::from_secs(40),
-        )? {
+        match self.mutation(pb::envelope::Body::ConversationSubmit(request), cancelled)? {
             pb::envelope::Body::ConversationAccepted(reply)
                 if reply.generation == expected_generation
                     && (expected_conversation.is_none()
@@ -742,15 +737,14 @@ impl Client {
         before_accepted_frame: Option<u64>,
         limit: u32,
     ) -> Result<pb::ConversationHistoryReply> {
-        match self.request(
-            pb::envelope::Body::ConversationHistory(pb::ConversationHistory {
+        match self.request(pb::envelope::Body::ConversationHistory(
+            pb::ConversationHistory {
                 project_id: Some(project.to_vec()),
                 conversation_id: conversation.map(|id| id.to_vec()),
                 before_accepted_frame,
                 limit: Some(limit),
-            }),
-            Instant::now() + REQUEST,
-        )? {
+            },
+        ))? {
             pb::envelope::Body::ConversationHistoryReply(reply)
                 if reply.project_id.as_deref() == Some(project.as_slice())
                     && (conversation.is_none()
@@ -773,13 +767,12 @@ impl Client {
         project: [u8; 16],
         operation: [u8; 16],
     ) -> Result<pb::ConversationPromptReply> {
-        match self.request(
-            pb::envelope::Body::ConversationReadPrompt(pb::ConversationReadPrompt {
+        match self.request(pb::envelope::Body::ConversationReadPrompt(
+            pb::ConversationReadPrompt {
                 project_id: Some(project.to_vec()),
                 operation_id: Some(operation.to_vec()),
-            }),
-            Instant::now() + REQUEST,
-        )? {
+            },
+        ))? {
             pb::envelope::Body::ConversationPromptReply(reply)
                 if reply.project_id.as_deref() == Some(project.as_slice())
                     && reply.operation_id.as_deref() == Some(operation.as_slice()) =>
@@ -794,14 +787,13 @@ impl Client {
         operation: [u8; 16],
         after_cursor: u64,
     ) -> Result<pb::ConversationEvent> {
-        match self.request(
-            pb::envelope::Body::ConversationObserve(pb::ConversationObserve {
+        match self.request(pb::envelope::Body::ConversationObserve(
+            pb::ConversationObserve {
                 operation_id: Some(operation.to_vec()),
                 after_cursor: Some(after_cursor),
                 wait_ms: Some(1000),
-            }),
-            Instant::now() + REQUEST,
-        )? {
+            },
+        ))? {
             pb::envelope::Body::ConversationEvent(reply)
                 if reply.operation_id.as_deref() == Some(operation.as_slice())
                     && reply.cursor.is_some_and(|cursor| cursor >= after_cursor) =>
@@ -835,33 +827,45 @@ impl Client {
         }
     }
 
-    pub fn stop(mut self) -> Result<()> {
-        let end = Instant::now() + LIFECYCLE;
+    /// Stop the service this client attached to. The wait has no time bound
+    /// (owner, 2026-10-16): it ends when the retained lock is released, a
+    /// successor owner appears, the connection is lost before `StopAccepted`,
+    /// or this attachment's cancel. Cancel reports `OutcomeUnconfirmed`.
+    pub fn stop(self) -> Result<()> {
+        self.stop_observed(&mut |_| ())
+    }
+
+    /// As [`Self::stop`], reporting progress while the service drains. About
+    /// once per second (display pacing that ends nothing) a fresh attachment
+    /// inspects the draining service; `progress` receives that snapshot.
+    pub fn stop_observed(mut self, progress: &mut dyn FnMut(&Snapshot)) -> Result<()> {
         let body = pb::envelope::Body::Stop(pb::Stop {
             expected_epoch: Some(self.epoch.to_vec()),
         });
-        let reply = self
-            .request(body, end.min(Instant::now() + REQUEST))
-            .map_err(|_| Error::OutcomeUnconfirmed)?;
+        let reply = self.request(body).map_err(|_| Error::OutcomeUnconfirmed)?;
         if !matches!(reply, pb::envelope::Body::StopAccepted(_)) {
             return Err(Error::OutcomeUnconfirmed);
         }
+        let cancel = self.cancel.clone();
         let mut byte = [0];
         loop {
-            if Instant::now() >= end {
-                return Err(Error::OutcomeUnconfirmed);
-            }
             match self.stream.stream_mut().read(&mut byte) {
                 Ok(0) => break,
                 Ok(_) => return Err(Error::OutcomeUnconfirmed),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    wait(&self.stream, false, end).map_err(|_| Error::OutcomeUnconfirmed)?;
+                    wait_until(&self.stream, false, &*cancel)
+                        .map_err(|_| Error::OutcomeUnconfirmed)?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
                 Err(_) => return Err(Error::OutcomeUnconfirmed),
             }
         }
-        while Instant::now() < end {
+        // Lock polls pace at 10 ms; every 100th poll inspects for progress.
+        let mut polls = 0u32;
+        loop {
+            if cancel() {
+                return Err(Error::OutcomeUnconfirmed);
+            }
             self.runtime
                 .validate()
                 .map_err(|_| Error::OutcomeUnconfirmed)?;
@@ -872,9 +876,21 @@ impl Client {
             {
                 return Ok(());
             }
+            polls = polls.wrapping_add(1);
+            if polls.is_multiple_of(100)
+                && let Ok(mut observer) = Client::attach(&self.runtime, &self.build, &*cancel)
+            {
+                if observer.epoch != self.epoch {
+                    // A successor owner is never stopped by this request.
+                    return Err(Error::OutcomeUnconfirmed);
+                }
+                observer.set_cancel(cancel.clone());
+                if let Ok(snapshot) = observer.inspect() {
+                    progress(&snapshot);
+                }
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
-        Err(Error::OutcomeUnconfirmed)
     }
 }
 
@@ -930,19 +946,23 @@ fn start_internal(
         }
     };
     check()?;
-    let end = Instant::now() + LIFECYCLE;
-    match Client::attach(runtime, build, end) {
+    // Startup has no time bound (owner, 2026-10-16). Each wait ends on the
+    // attachment, a classified failure, child exit or the person's cancel.
+    // The 50 ms sleeps are pacing and end nothing.
+    match Client::attach(runtime, build, cancelled) {
         Ok(client) => return Ok((client, false)),
         Err(Error::Platform(asura_platform::Error::OwnerBusy)) => {
             // A held owner may still be binding. Wait without creating a second owner.
             loop {
                 check()?;
-                std::thread::sleep(Duration::from_millis(50).min(remaining(end)?));
+                std::thread::sleep(Duration::from_millis(50));
                 check()?;
-                match Client::attach(runtime, build, end) {
+                match Client::attach(runtime, build, cancelled) {
                     Ok(client) => return Ok((client, false)),
                     Err(Error::Platform(asura_platform::Error::OwnerBusy)) => (),
-                    Err(error) if is_absent(&error) => (),
+                    // The holder released the lock without serving: absence
+                    // permits this client's one start attempt.
+                    Err(error) if is_absent(&error) => break,
                     Err(error) => return Err(error),
                 }
             }
@@ -959,8 +979,7 @@ fn start_internal(
     let mut spawned = false;
     loop {
         check()?;
-        remaining(end)?;
-        if !notice_seen && let Some(notice) = child.poll_notice(end)? {
+        if !notice_seen && let Some(notice) = child.poll_notice()? {
             match notice {
                 StartupNotice::Bound => {
                     notice_seen = true;
@@ -975,15 +994,18 @@ fn start_internal(
         }
         let exited = child.try_reap()?.is_some();
         if notice_seen {
-            match Client::attach(runtime, build, end) {
+            match Client::attach(runtime, build, cancelled) {
                 Ok(client) => return Ok((client, spawned)),
-                Err(error) if is_absent(&error) => (),
+                // The winning owner holds the lock while it binds.
+                Err(Error::Platform(asura_platform::Error::OwnerBusy)) => (),
+                // Lock released with no endpoint: the owner ended.
+                Err(error) if is_absent(&error) => return Err(Error::Unavailable),
                 Err(error) => return Err(error),
             }
         } else if exited {
             return Err(Error::Unavailable);
         }
-        std::thread::sleep(Duration::from_millis(50).min(remaining(end)?));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -1140,7 +1162,7 @@ mod tests {
             .unwrap();
         let runtime = RuntimeDirectory::scratch(&path, true).unwrap();
         let owner = runtime.acquire_owner().unwrap();
-        let error = match Client::attach(&runtime, "test/1", Instant::now() + REQUEST) {
+        let error = match Client::attach(&runtime, "test/1", &|| false) {
             Ok(_) => panic!("unexpected attachment without listener"),
             Err(error) => error,
         };
@@ -1158,7 +1180,7 @@ mod tests {
             start_cancellable(&runtime, "test/1", None, &|| true),
             Err(Error::Unavailable)
         ));
-        let error = match Client::attach(&runtime, "test/1", Instant::now() + REQUEST) {
+        let error = match Client::attach(&runtime, "test/1", &|| false) {
             Ok(_) => panic!("unexpected attachment without listener"),
             Err(error) => error,
         };
@@ -1180,23 +1202,215 @@ mod tests {
         }
     }
     #[test]
-    fn initialization_wait_has_no_time_bound_and_only_cancel_ends_it() {
+    fn wait_slice_paces_and_only_cancel_ends_it() {
         let cancelled = std::cell::Cell::new(false);
         let check = || cancelled.get();
-        let until = Until::Cancel(&check);
         // The poll slice only paces cancel checks; it never ends the wait.
         for _ in 0..3 {
-            assert_eq!(until.slice().unwrap(), CANCEL_POLL);
+            assert_eq!(slice(&check).unwrap(), CANCEL_POLL);
         }
         cancelled.set(true);
-        assert!(matches!(until.slice(), Err(Error::OutcomeUnconfirmed)));
+        assert!(matches!(slice(&check), Err(Error::Cancelled)));
     }
     #[test]
-    fn deadlines_do_not_restart_and_errors_do_not_disclose_paths() {
-        assert!(remaining(Instant::now() - Duration::from_millis(1)).is_err());
+    fn errors_do_not_disclose_paths() {
         let error = Error::Platform(asura_platform::Error::Io(std::io::Error::other(
             "private/path",
         )));
         assert_eq!(error.to_string(), "service_unavailable");
+        assert_eq!(Error::Cancelled.to_string(), "cancelled");
+    }
+
+    /// How the fake service treats the request after Hello.
+    #[derive(Clone, Copy)]
+    enum Fake {
+        /// Reply after holding the request this long.
+        Hold(Duration),
+        /// Never reply; keep the connection open until the test ends.
+        Silent,
+        /// Close the connection without replying.
+        Close,
+    }
+
+    struct FakeService {
+        path: std::path::PathBuf,
+        runtime: RuntimeDirectory,
+        server: Option<std::thread::JoinHandle<()>>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+    impl Drop for FakeService {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn read_envelope(
+        stream: &mut std::os::unix::net::UnixStream,
+        codec: &mut ControlCodec,
+    ) -> Option<pb::Envelope> {
+        let mut buffer = [0u8; 8192];
+        loop {
+            if let Some(Frame::Message(envelope)) = codec.next_frame().ok()? {
+                return Some(*envelope);
+            }
+            let n = stream.read(&mut buffer).ok()?;
+            if n == 0 {
+                return None;
+            }
+            codec.push(&buffer[..n]).ok()?;
+        }
+    }
+
+    /// A real scratch runtime whose endpoint is served by a test thread that
+    /// answers Hello, then treats the one following request as `mode` says.
+    fn fake_service(mode: Fake) -> FakeService {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = std::path::PathBuf::from(format!(
+            "/private/tmp/asura-client-{:x}",
+            u128::from_ne_bytes(asura_platform::random_id())
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&path, true).unwrap();
+        let mut owner = runtime.acquire_owner().unwrap();
+        let listener = owner.bind().unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let _owner = owner;
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            let mut codec = ControlCodec::new();
+            let epoch = [7u8; 16];
+            let attachment = [9u8; 16];
+            read_envelope(&mut stream, &mut codec).unwrap();
+            let hello = pb::Envelope {
+                service_epoch: Some(epoch.to_vec()),
+                attachment_id: Some(attachment.to_vec()),
+                request_counter: None,
+                body: Some(pb::envelope::Body::HelloReply(pb::HelloReply {
+                    service_build: Some("asura/fake".into()),
+                    capabilities: vec![
+                        pb::Capability::Inspect as i32,
+                        pb::Capability::Stop as i32,
+                        pb::Capability::InspectInstallation as i32,
+                        pb::Capability::Config as i32,
+                    ],
+                    max_frame_bytes: Some(asura_control::MAX_FRAME_BYTES as u32),
+                })),
+            };
+            stream.write_all(&encode_frame(&hello).unwrap()).unwrap();
+            let Some(request) = read_envelope(&mut stream, &mut codec) else {
+                return;
+            };
+            match mode {
+                Fake::Close => drop(stream),
+                Fake::Silent => {
+                    let _ = released.recv();
+                }
+                Fake::Hold(hold) => {
+                    std::thread::sleep(hold);
+                    let body = match request.body {
+                        Some(pb::envelope::Body::ConfigSet(_)) => {
+                            pb::envelope::Body::ConfigReply(pb::ConfigReply {
+                                value_yaml: Some("true".into()),
+                                error: None,
+                            })
+                        }
+                        _ => pb::envelope::Body::InspectReply(pb::InspectReply {
+                            lifecycle: Some(pb::Lifecycle::Serving as i32),
+                            installation: Some(pb::InstallationState::Recovering as i32),
+                            unavailable_reason: None,
+                            reason: Some(
+                                pb::InstallationInspectionReason::InspectionPending as i32,
+                            ),
+                            new_installation: None,
+                        }),
+                    };
+                    let reply = pb::Envelope {
+                        service_epoch: Some(epoch.to_vec()),
+                        attachment_id: Some(attachment.to_vec()),
+                        request_counter: request.request_counter,
+                        body: Some(body),
+                    };
+                    let _ = stream.write_all(&encode_frame(&reply).unwrap());
+                    let _ = released.recv();
+                }
+            }
+        });
+        FakeService {
+            path,
+            runtime,
+            server: Some(server),
+            release,
+        }
+    }
+
+    #[test]
+    fn cw01_held_reply_past_the_removed_read_bound_is_returned() {
+        // The removed read bound was 2 s; every request shares this wait.
+        let fake = fake_service(Fake::Hold(Duration::from_millis(2_500)));
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let snapshot = client.inspect().unwrap();
+        assert_eq!(snapshot.lifecycle, pb::Lifecycle::Serving as i32);
+    }
+
+    #[test]
+    fn cw02_cancel_ends_a_held_wait_and_retires_the_attachment() {
+        let fake = fake_service(Fake::Silent);
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setter = flag.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            setter.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let check = || flag.load(std::sync::atomic::Ordering::Acquire);
+        // A set is a mutation: cancel reports an unconfirmed outcome.
+        assert!(matches!(
+            client.config("audit.enabled", Some("true"), &check),
+            Err(Error::OutcomeUnconfirmed)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        cancel.join().unwrap();
+        // The reply may still arrive: this attachment refuses further requests.
+        assert!(matches!(client.inspect(), Err(Error::Unavailable)));
+    }
+
+    #[test]
+    fn cw02_cancel_ends_a_held_read_as_cancelled() {
+        let fake = fake_service(Fake::Silent);
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setter = flag.clone();
+        client.set_cancel(std::sync::Arc::new(move || {
+            flag.load(std::sync::atomic::Ordering::Acquire)
+        }));
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            setter.store(true, std::sync::atomic::Ordering::Release);
+        });
+        assert!(matches!(client.inspect(), Err(Error::Cancelled)));
+        cancel.join().unwrap();
+    }
+
+    #[test]
+    fn cw03_lost_connection_ends_the_wait() {
+        let fake = fake_service(Fake::Close);
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(matches!(client.inspect(), Err(Error::Unavailable)));
+        let fake = fake_service(Fake::Close);
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(matches!(
+            client.config("audit.enabled", Some("true"), &|| false),
+            Err(Error::OutcomeUnconfirmed)
+        ));
     }
 }

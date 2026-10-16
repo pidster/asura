@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 pub(crate) fn snapshot(state: State, reason: Reason) -> pb::InspectInstallationReply {
     pb::InspectInstallationReply {
@@ -243,14 +243,15 @@ impl ReplayLoading {
     }
 }
 
-/// A single deferred scan factory; deadlines never substitute for bootstrap settlement.
+/// A single deferred scan factory. The wait for audit bootstrap has no time
+/// bound (owner, 2026-10-16): Inspect reports the pending inspection until
+/// bootstrap completes and the scan runs, or Stop discards the factory.
 pub(crate) struct Deferred<F> {
     runtime: RuntimeDirectory,
     epoch: [u8; 16],
     factory: Option<F>,
     worker: Option<Worker>,
     wake: Option<asura_platform::events::WakeSender>,
-    deadline: Instant,
     timeout_reported: bool,
     cancelled: bool,
 }
@@ -265,7 +266,6 @@ where
             factory: Some(factory),
             worker: None,
             wake: None,
-            deadline: Instant::now() + Duration::from_secs(2),
             timeout_reported: false,
             cancelled: false,
         }
@@ -298,23 +298,16 @@ where
         if let Some(worker) = &mut self.worker {
             return worker.poll(epoch, now);
         }
-        if !self.cancelled
-            && !self.timeout_reported
-            && (now >= self.deadline || epoch != self.epoch)
-        {
+        if !self.cancelled && !self.timeout_reported && epoch != self.epoch {
             self.timeout_reported = true;
             return Some(failure(Reason::InspectionTimeout));
         }
         None
     }
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        if let Some(worker) = &self.worker {
-            worker.next_deadline(now)
-        } else if !self.cancelled && !self.timeout_reported {
-            Some(self.deadline)
-        } else {
-            None
-        }
+        self.worker
+            .as_ref()
+            .and_then(|worker| worker.next_deadline(now))
     }
     pub(crate) fn cancel(&mut self) {
         self.cancelled = true;
@@ -331,6 +324,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     #[test]
     fn writer_replay_shows_loading_only_when_a_journal_exists() {
         let mut loading = ReplayLoading::default();
@@ -434,7 +428,7 @@ mod tests {
         }
     }
     #[test]
-    fn deferred_scan_timeout_does_not_invoke_factory_and_stop_discards_it() {
+    fn deferred_scan_waits_for_bootstrap_without_a_deadline_and_stop_discards_it() {
         for stop in [false, true] {
             let scratch = Scratch::new();
             let invoked = Arc::new(AtomicBool::new(false));
@@ -445,15 +439,13 @@ mod tests {
                     snapshot(State::Uninitialized, Reason::RuntimeOnly)
                 })
             });
-            let expiry = deferred.deadline;
-            assert_eq!(
-                deferred.poll([1; 16], expiry).unwrap().reason,
-                Some(Reason::InspectionTimeout as i32)
-            );
-            assert!(deferred.poll([1; 16], expiry).is_none());
+            // Held far past the removed 2 s bootstrap bound (injected clock):
+            // no timeout is published; Inspect keeps the pending inspection.
+            let later = Instant::now() + Duration::from_secs(3600);
+            assert!(deferred.poll([1; 16], later).is_none());
             assert!(!invoked.load(Ordering::Acquire));
             assert!(!deferred.settled());
-            assert!(deferred.next_deadline(expiry).is_none());
+            assert!(deferred.next_deadline(later).is_none());
             if stop {
                 deferred.cancel();
                 deferred.release().unwrap();
@@ -571,14 +563,19 @@ mod reactor_tests {
     use super::*;
     use asura_client::Client;
     use std::os::unix::fs::DirBuilderExt;
+    use std::time::Duration;
+    /// Test-only harness budget for one client's waits.
+    fn within(runtime: &RuntimeDirectory, budget: Duration) -> Option<Client> {
+        let end = Instant::now() + budget;
+        let cancel: asura_client::Cancel = Arc::new(move || Instant::now() >= end);
+        let mut client = Client::attach(runtime, "asura/test", &*cancel).ok()?;
+        client.set_cancel(cancel);
+        Some(client)
+    }
     fn attach(runtime: &RuntimeDirectory) -> Client {
         let end = Instant::now() + Duration::from_secs(3);
         loop {
-            if let Ok(client) = Client::attach(
-                runtime,
-                "asura/test",
-                Instant::now() + Duration::from_millis(200),
-            ) {
+            if let Some(client) = within(runtime, Duration::from_secs(3)) {
                 return client;
             }
             assert!(Instant::now() < end);
@@ -625,8 +622,11 @@ mod reactor_tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    /// Q-B: a lifetime drain waits for a stalled scan with no deadline; the
+    /// owner stays `Draining` (never `RepairOnly`) and keeps its lock until
+    /// the worker settles, then releases it.
     #[test]
-    fn lifetime_eof_preserves_drain_deadline_and_retries_after_scan_settles() {
+    fn lifetime_eof_drain_waits_for_stalled_scan_without_repair() {
         let _writer_owner = crate::TEST_WRITER
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -650,7 +650,7 @@ mod reactor_tests {
                 Some(lifetime),
                 move |_, epoch| {
                     Worker::start_with(epoch, move |_| {
-                        gate.recv_timeout(Duration::from_secs(8)).unwrap();
+                        gate.recv_timeout(Duration::from_secs(20)).unwrap();
                         snapshot(State::Uninitialized, Reason::RuntimeOnly)
                     })
                 },
@@ -661,29 +661,24 @@ mod reactor_tests {
             Reason::InspectionPending
         );
         drop(lease);
-        // Repeated EOF cannot reset the one-second drain budget: the service must
-        // enter responsive repair inspection while the worker is still blocked.
-        let end = Instant::now() + Duration::from_secs(3);
-        loop {
-            if let Ok(mut client) = Client::attach(
-                &runtime,
-                "asura/test",
-                Instant::now() + Duration::from_millis(200),
-            ) && let Ok(status) = client.inspect()
-                && status.lifecycle == pb::Lifecycle::RepairOnly as i32
+        // Held past the removed one-second drain bound: still draining.
+        let held = Instant::now() + Duration::from_millis(1_500);
+        let mut draining = false;
+        while Instant::now() < held {
+            if let Some(mut client) = within(&runtime, Duration::from_millis(500))
+                && let Ok(status) = client.inspect()
             {
-                break;
+                assert_ne!(status.lifecycle, pb::Lifecycle::RepairOnly as i32);
+                assert_ne!(status.reason, Reason::InspectionTimeout as i32);
+                draining |= status.lifecycle == pb::Lifecycle::Draining as i32;
             }
-            assert!(Instant::now() < end, "lifetime drain deadline was extended");
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(draining, "Inspect did not report Draining");
         assert!(runtime.acquire_owner().is_err());
-        assert_eq!(
-            attach(&runtime).inspect_installation().unwrap().reason,
-            Reason::InspectionTimeout
-        );
+        assert!(!service.is_finished());
         release.send(()).unwrap();
-        let end = Instant::now() + Duration::from_secs(3);
+        let end = Instant::now() + Duration::from_secs(5);
         while !service.is_finished() {
             assert!(
                 Instant::now() < end,
@@ -694,6 +689,71 @@ mod reactor_tests {
         service.join().unwrap().unwrap();
         assert!(runtime.acquire_owner().is_ok());
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Q-B / CW-04: while the first Stop waits for a stalled worker, a second
+    /// Stop for the same epoch forces exit without further waiting. The owner
+    /// lock stays held until process exit (crash-like), so no successor can
+    /// start while this process's threads still run.
+    #[test]
+    fn second_stop_forces_exit_while_a_worker_is_stalled() {
+        let _writer_owner = crate::TEST_WRITER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = std::path::PathBuf::from("/private/tmp").join(format!(
+            "asura-forced-stop-{:x}",
+            u128::from_ne_bytes(asura_platform::random_id())
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&path, true).unwrap();
+        let for_service = runtime.clone();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let service = std::thread::spawn(move || {
+            crate::run_with_worker(for_service, "asura/test", None, move |_, epoch| {
+                Worker::start_with(epoch, move |_| {
+                    let _ = gate.recv_timeout(Duration::from_secs(30));
+                    snapshot(State::Uninitialized, Reason::RuntimeOnly)
+                })
+            })
+        });
+        let first = attach(&runtime);
+        let first_stop = std::thread::spawn(move || first.stop());
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(mut client) = within(&runtime, Duration::from_millis(500))
+                && let Ok(status) = client.inspect()
+                && status.lifecycle == pb::Lifecycle::Draining as i32
+            {
+                break;
+            }
+            assert!(Instant::now() < end, "first Stop did not start draining");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!service.is_finished());
+        // Second stop request: the reactor exits without waiting for the worker.
+        let second = within(&runtime, Duration::from_secs(3)).unwrap();
+        let second_stop = std::thread::spawn(move || second.stop());
+        let end = Instant::now() + Duration::from_secs(5);
+        while !service.is_finished() {
+            assert!(Instant::now() < end, "second Stop did not force exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        service.join().unwrap().unwrap();
+        // Crash-like: the lock is retained until process exit; the stalled
+        // worker has not settled, and its work is left for replay.
+        assert!(matches!(
+            runtime.acquire_owner(),
+            Err(asura_platform::Error::OwnerBusy)
+        ));
+        // Both stop waits end on their harness budgets (lock never released
+        // in-process); neither reports success.
+        assert!(second_stop.join().unwrap().is_err());
+        release.send(()).unwrap();
+        assert!(first_stop.join().unwrap().is_err());
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]
@@ -727,7 +787,7 @@ mod reactor_tests {
         );
         assert_eq!(
             client
-                .config("model", Some("system"))
+                .config("model", Some("system"), &|| false)
                 .unwrap()
                 .error
                 .as_deref(),
@@ -736,25 +796,49 @@ mod reactor_tests {
         assert!(!path.join(".asura/config.yaml").exists());
         assert_eq!(
             client
-                .config("audit.enabled", None)
+                .config("audit.enabled", None, &|| false)
                 .unwrap()
                 .value_yaml
                 .as_deref(),
             Some("true\n")
         );
+        // CW-04 / Q-B: Stop waits for the stalled scan with no deadline. The
+        // stop client keeps waiting and receives progress; Inspect reports
+        // `Draining`, never `RepairOnly`, and the owner keeps its lock.
         let stopper = attach(&runtime);
-        let stop_thread = std::thread::spawn(move || stopper.stop());
-        let end = Instant::now() + Duration::from_secs(3);
-        loop {
-            let mut client = attach(&runtime);
-            if client.inspect().unwrap().lifecycle == pb::Lifecycle::RepairOnly as i32 {
-                break;
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = progress.clone();
+        let stop_thread = std::thread::spawn(move || {
+            stopper.stop_observed(&mut |snapshot| {
+                if snapshot.lifecycle == pb::Lifecycle::Draining as i32 {
+                    seen.fetch_add(1, Ordering::AcqRel);
+                }
+            })
+        });
+        let held = Instant::now() + Duration::from_millis(2_500);
+        let mut draining = false;
+        while Instant::now() < held {
+            if let Some(mut client) = within(&runtime, Duration::from_millis(500))
+                && let Ok(status) = client.inspect()
+            {
+                assert_ne!(status.lifecycle, pb::Lifecycle::RepairOnly as i32);
+                draining |= status.lifecycle == pb::Lifecycle::Draining as i32;
+                // Work requests are refused while draining.
+                assert!(matches!(
+                    client.config("audit.enabled", None, &|| false),
+                    Err(asura_client::Error::Remote(..))
+                ));
             }
-            assert!(Instant::now() < end);
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(draining);
+        assert!(!stop_thread.is_finished(), "stop wait ended before drain");
+        assert!(
+            progress.load(Ordering::Acquire) > 0,
+            "stop showed no progress"
+        );
         assert!(runtime.acquire_owner().is_err());
-        assert_eq!(
+        assert_ne!(
             attach(&runtime).inspect_installation().unwrap().reason,
             Reason::InspectionTimeout
         );
@@ -769,7 +853,7 @@ mod reactor_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         service.join().unwrap().unwrap();
-        let _ = stop_thread.join().unwrap();
+        stop_thread.join().unwrap().unwrap();
         assert!(runtime.acquire_owner().is_ok());
         std::fs::remove_dir_all(path).unwrap();
     }

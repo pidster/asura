@@ -77,7 +77,7 @@ engine files under the local root. Both modes use the same binding checks. The
 observer runs Git as a sandboxed child process
 (`asura-platform/src/git_observer.rs`). Collection ends on completion, cancel or
 supersession by a newer change; its 2-second limit is removed (owner,
-2026-10-16), and the code change is pending; D2/D4 may later move it to a helper.
+2026-10-16; implemented 2026-10-16); D2/D4 may later move it to a helper.
 
 ## Threats and required outcomes
 

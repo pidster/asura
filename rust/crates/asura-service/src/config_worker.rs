@@ -1,4 +1,7 @@
 //! One bounded filesystem job. Its slot and cancellation live until settlement.
+//! The job has no time bound (owner, 2026-10-16): it ends on completion, an
+//! error, or cancellation by drain; the client's wait ends on its reply,
+//! the person's cancel or a lost connection.
 use asura_control::pb;
 use asura_platform::RuntimeDirectory;
 use std::{
@@ -8,25 +11,20 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 pub(crate) struct Worker {
     task: Option<JoinHandle<Result<String, &'static str>>>,
     cancel: Arc<AtomicBool>,
     request: pb::Envelope,
-    deadline: Instant,
     replied: bool,
     mutation: bool,
     audit_event: Option<asura_storage::audit::Event>,
     completion: crate::completion::Completion,
 }
 impl Worker {
-    pub(crate) fn start(
-        runtime: RuntimeDirectory,
-        request: pb::Envelope,
-        now: Instant,
-    ) -> io::Result<Self> {
+    pub(crate) fn start(runtime: RuntimeDirectory, request: pb::Envelope) -> io::Result<Self> {
         let (key, value) = match request.body.as_ref() {
             Some(pb::envelope::Body::ConfigGet(v)) => (v.key.clone().unwrap_or_default(), None),
             Some(pb::envelope::Body::ConfigSet(v)) => {
@@ -34,7 +32,6 @@ impl Worker {
             }
             _ => unreachable!("validated config request"),
         };
-        let deadline = now + Duration::from_secs(2);
         let cancel = Arc::new(AtomicBool::new(false));
         let token = cancel.clone();
         let mutation = value.is_some();
@@ -44,13 +41,12 @@ impl Worker {
             .name("asura-config".into())
             .spawn(move || {
                 let _completion = signal.guard();
-                asura_storage::config::execute(runtime, &key, value.as_deref(), deadline, &token)
+                asura_storage::config::execute(runtime, &key, value.as_deref(), &token)
             })?;
         Ok(Self {
             task: Some(task),
             cancel,
             request,
-            deadline,
             replied: false,
             mutation,
             audit_event: None,
@@ -65,8 +61,6 @@ impl Worker {
             None
         } else if self.completion.completed() {
             self.completion.settlement_deadline(now)
-        } else if !self.replied {
-            Some(self.deadline)
         } else {
             None
         }
@@ -80,7 +74,7 @@ impl Worker {
     pub(crate) fn take_audit_event(&mut self) -> Option<asura_storage::audit::Event> {
         self.audit_event.take()
     }
-    pub(crate) fn poll(&mut self, now: Instant) -> Option<pb::Envelope> {
+    pub(crate) fn poll(&mut self) -> Option<pb::Envelope> {
         let done = self.task.as_ref().is_some_and(JoinHandle::is_finished);
         let result = if done {
             Some(
@@ -94,13 +88,6 @@ impl Worker {
                         "config_unavailable"
                     })),
             )
-        } else if now >= self.deadline && !self.replied {
-            self.cancel();
-            Some(Err(if self.mutation {
-                "outcome_unconfirmed"
-            } else {
-                "config_timeout"
-            }))
         } else {
             None
         };
@@ -156,6 +143,7 @@ impl Worker {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     fn blocked(mutation: bool) -> (Worker, mpsc::SyncSender<()>) {
         let (send, receive) = mpsc::sync_channel(1);
@@ -183,7 +171,6 @@ mod tests {
                 task: Some(task),
                 cancel: Arc::new(AtomicBool::new(false)),
                 request,
-                deadline: Instant::now(),
                 replied: false,
                 mutation,
                 audit_event: None,
@@ -193,33 +180,32 @@ mod tests {
         )
     }
     #[test]
-    fn expiry_retains_slot_until_settlement_and_never_publishes_late_success() {
+    fn held_job_has_no_deadline_and_replies_on_completion() {
         for mutation in [false, true] {
             let (mut worker, release) = blocked(mutation);
-            let reply = worker.poll(Instant::now()).unwrap();
+            // Held well past the removed 2 s bound (injected clock): pending.
+            let later = Instant::now() + Duration::from_secs(60);
+            assert!(worker.poll().is_none());
+            assert_eq!(worker.next_deadline(later), None);
+            assert!(!worker.settled());
+            assert!(!worker.cancel.load(Ordering::Acquire));
+            release.send(()).unwrap();
+            let end = Instant::now() + Duration::from_secs(1);
+            let reply = loop {
+                if let Some(reply) = worker.poll() {
+                    break reply;
+                }
+                assert!(Instant::now() < end);
+                thread::yield_now();
+            };
             assert_eq!(reply.request_counter, Some(7));
             assert_eq!(reply.attachment_id, Some(vec![2; 16]));
             let Some(pb::envelope::Body::ConfigReply(reply)) = reply.body else {
                 panic!()
             };
-            assert_eq!(
-                reply.error.as_deref(),
-                Some(if mutation {
-                    "outcome_unconfirmed"
-                } else {
-                    "config_timeout"
-                })
-            );
-            assert!(!worker.settled());
-            assert!(worker.take_audit_event().is_none());
-            assert!(worker.cancel.load(Ordering::Acquire));
-            release.send(()).unwrap();
-            let end = Instant::now() + Duration::from_secs(1);
-            while !worker.settled() {
-                assert!(Instant::now() < end);
-                assert!(worker.poll(Instant::now()).is_none());
-                thread::yield_now();
-            }
+            assert_eq!(reply.value_yaml.as_deref(), Some("true\n"));
+            assert!(worker.settled());
+            assert!(worker.poll().is_none());
             let event = worker.take_audit_event();
             if mutation {
                 assert!(matches!(
@@ -241,6 +227,7 @@ mod tests {
 mod reactor_tests {
     use super::*;
     use asura_client::Client;
+    use std::time::Duration;
     use std::{fs, os::unix::fs::DirBuilderExt, sync::mpsc};
 
     #[test]
@@ -266,7 +253,7 @@ mod reactor_tests {
                 None,
                 None,
                 crate::installation::Worker::start,
-                move |_, request, now| {
+                move |_, request| {
                     let receive = release.take().unwrap();
                     let completion = crate::completion::Completion::default();
                     let signal = completion.clone();
@@ -280,7 +267,6 @@ mod reactor_tests {
                         task: Some(task),
                         cancel: Arc::new(AtomicBool::new(false)),
                         request,
-                        deadline: now + Duration::from_secs(2),
                         replied: false,
                         mutation: true,
                         audit_event: None,
@@ -291,21 +277,24 @@ mod reactor_tests {
             done_tx.send(result).unwrap();
         });
         let end = Instant::now() + Duration::from_secs(3);
+        let attach = |budget: Duration| {
+            let end = Instant::now() + budget;
+            let cancel: asura_client::Cancel = Arc::new(move || Instant::now() >= end);
+            let mut client = Client::attach(&runtime, "asura/test", &*cancel)?;
+            client.set_cancel(cancel);
+            Ok::<_, asura_client::Error>(client)
+        };
         let mut client = loop {
-            match Client::attach(&runtime, "asura/test", end) {
+            match attach(Duration::from_secs(10)) {
                 Ok(client) => break client,
                 Err(_) if Instant::now() < end => thread::sleep(Duration::from_millis(5)),
                 Err(error) => panic!("attach: {error}"),
             }
         };
-        let request = thread::spawn(move || client.config("audit.enabled", Some("true")));
+        let request =
+            thread::spawn(move || client.config("audit.enabled", Some("true"), &|| false));
         admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let mut control = Client::attach(
-            &runtime,
-            "asura/test",
-            Instant::now() + Duration::from_secs(2),
-        )
-        .unwrap();
+        let mut control = attach(Duration::from_secs(10)).unwrap();
         let started = Instant::now();
         assert_eq!(
             control.inspect().unwrap().lifecycle,
@@ -313,42 +302,59 @@ mod reactor_tests {
         );
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(
-            control.config("model", None).unwrap().error.as_deref(),
+            control
+                .config("model", None, &|| false)
+                .unwrap()
+                .error
+                .as_deref(),
             Some("config_busy")
         );
+        // CW-01: the held set is still waiting past the removed 2 s job and
+        // 3 s client bounds; no timer answers it.
+        thread::sleep(Duration::from_millis(3_200));
+        assert!(!request.is_finished());
         assert_eq!(
-            request.join().unwrap().unwrap().error.as_deref(),
-            Some("outcome_unconfirmed")
-        );
-        assert_eq!(
-            control.config("model", None).unwrap().error.as_deref(),
+            control
+                .config("model", None, &|| false)
+                .unwrap()
+                .error
+                .as_deref(),
             Some("config_busy")
         );
+        // Q-B: Stop waits for the held job with no deadline; Inspect reports
+        // Draining, never RepairOnly, and the lock is retained.
         let stop = thread::spawn(move || control.stop());
-        let end = Instant::now() + Duration::from_secs(3);
-        loop {
-            if let Ok(mut observer) = Client::attach(&runtime, "asura/test", end)
+        let held = Instant::now() + Duration::from_millis(1_500);
+        let mut draining = false;
+        while Instant::now() < held {
+            if let Ok(mut observer) = attach(Duration::from_millis(500))
                 && let Ok(snapshot) = observer.inspect()
-                && snapshot.lifecycle == pb::Lifecycle::RepairOnly as i32
             {
-                break;
+                assert_ne!(snapshot.lifecycle, pb::Lifecycle::RepairOnly as i32);
+                draining |= snapshot.lifecycle == pb::Lifecycle::Draining as i32;
             }
-            assert!(Instant::now() < end);
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(20));
         }
+        assert!(draining);
         assert!(matches!(
             runtime.acquire_owner(),
             Err(asura_platform::Error::OwnerBusy)
         ));
+        // CW-03: drain closed the held set's connection: its wait ended as a
+        // lost connection with an unconfirmed outcome.
+        assert!(matches!(
+            request.join().unwrap(),
+            Err(asura_client::Error::OutcomeUnconfirmed)
+        ));
         assert!(done_rx.try_recv().is_err());
         release_tx.send(()).unwrap();
-        // The original Stop remains effective after delayed settlement.
+        // The original Stop completes after settlement.
         done_rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
         reactor.join().unwrap();
-        let _ = stop.join().unwrap();
+        stop.join().unwrap().unwrap();
         assert!(runtime.acquire_owner().is_ok());
         drop(runtime);
         fs::remove_dir_all(path).unwrap();

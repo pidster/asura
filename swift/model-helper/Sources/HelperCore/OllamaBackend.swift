@@ -38,7 +38,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
 
     /// Only a checked runtime response can create a model; no implicit network discovery.
     public static func discover(_ settings: Settings) async throws -> Self {
-        let session = session(seconds: 5, resourceSeconds: 5)
+        let session = session()
         defer { session.invalidateAndCancel() }
         return try await withTaskCancellationHandler {
             var request = URLRequest(url: settings.endpoint.appending(path: "api/show"))
@@ -57,7 +57,8 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
             if model.supportsTools, let local = localReference(settings.name),
                 ["127.0.0.1", "::1", "[::1]"].contains(settings.endpoint.host ?? "") {
                 // Locality uncertainty disables tools only; ordinary discovery errors
-                // above still fail. The service outer Hello deadline bounds all probes.
+                // above still fail. Probes end on a reply, an error, cancellation,
+                // helper exit or shutdown; they have no time limit.
                 do {
                     let version = try await metadata(session, request: URLRequest(url: settings.endpoint.appending(path: "api/version")), limit: 1024)
                     struct Version: Decodable { let version: String }
@@ -136,12 +137,14 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                         willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                         completionHandler: @escaping @Sendable (URLRequest?) -> Void) { completionHandler(nil) }
     }
-    static func session(seconds: TimeInterval, resourceSeconds: TimeInterval? = nil) -> URLSession {
+    /// Requests have no time limit (owner, 2026-10-16): neither an inactivity
+    /// nor a resource limit, replacing Foundation's 60 s and seven-day
+    /// defaults. A request ends on its reply, an HTTP or transport error,
+    /// cancellation, helper exit or shutdown. Byte limits stay known-size bounds.
+    static func session() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = seconds
-        // Preserve Foundation's default resource limit for generation (currently seven days).
-        // Only discovery adds an Asura-selected total transport deadline.
-        if let resourceSeconds { config.timeoutIntervalForResource = resourceSeconds }
+        config.timeoutIntervalForRequest = .infinity
+        config.timeoutIntervalForResource = .infinity
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
         config.urlCredentialStorage = nil
@@ -340,7 +343,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 messages: try messages(request.transcript), tools: tools.isEmpty ? nil : tools,
                 options: .init(num_ctx: model.contextTokens, num_predict: maximumTokens)))
             guard body.count <= 262_144 else { throw Failure.limit }
-            let session = session(seconds: 60)
+            let session = session()
             defer { session.invalidateAndCancel() }
             try Task.checkCancellation()
             await model.inputObserver?.begin(request.id, capacity: model.contextTokens)

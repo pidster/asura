@@ -17,8 +17,9 @@ Foundation Models implementation on 2026-09-25. The owner also selected a
 bounded credit window for each chunk transfer and an exact packaged
 helper-build match. The [first conversation helper](#first-conversation-helper-scoped-d2-contract-2026-09-27)
 section later selected session lifetime, development layout, numeric window and
-framing limits, and deadlines. The owner removed its handshake and input-transfer
-deadlines on 2026-10-16; see [numeric execution and settlement](#numeric-execution-and-settlement).
+framing limits, and deadlines. The owner removed its handshake, input-transfer,
+per-frame and absolute helper-channel deadlines on 2026-10-16; see
+[numeric execution and settlement](#numeric-execution-and-settlement).
 That scope is implemented in `swift/model-helper`,
 `asura-service` and `asura-platform`; [model providers](model-provider-integration.md)
 and [model tool execution](model-tool-execution.md) record later extensions.
@@ -90,8 +91,10 @@ resource identity. D2/D7 must define its format and verification before the
 first package is ready. A missing or unverified implementation is unavailable;
 it does not weaken the service's authority checks.
 
-Every operation retains the same task, scope, context-generation, budget and
-deadline identities regardless of implementation. A stateless implementation
+Every operation retains the same task, scope, context-generation and budget
+identities regardless of implementation. Each operation ends through a
+[loop-closure](loop-closure.md) condition (completion, cancellation, helper
+exit, protocol fault or shutdown), not a deadline identity (owner, 2026-10-16). A stateless implementation
 still receives a session-generation identity so late results can be rejected;
 it does not have to retain a transcript. An implementation that retains context
 must report and invalidate that state under D4's provenance contract. The
@@ -216,17 +219,19 @@ field limits. The first handshake uses the local pre-negotiation hard maximum.
 Later frames use the smaller of both advertisements and that hard maximum.
 EOF at a frame boundary is orderly only after a valid terminal
 result or handshake rejection with no admitted operation. Otherwise it is a
-lost channel requiring reconciliation. Handshake, per-frame completion and
-absolute operation deadlines bound silence and byte dribbling. Aggregate
-frame-count and byte limits reject a stream of individually valid small frames.
-Receiving one byte cannot restart a frame deadline. A completed frame cannot
-extend the absolute operation deadline.
-Owner update, 2026-10-16: the handshake has no time limit. It ends on the next
-message, helper exit, a protocol fault, cancellation or shutdown. The
+lost channel requiring reconciliation. Aggregate frame-count and byte limits
+reject a stream of individually valid small frames. They are known-size bounds.
+Owner update, 2026-10-16: the channel has no handshake, per-frame completion or
+absolute operation deadline. A silent or dribbling peer stays pending until the
+next complete message, helper exit, a protocol fault, cancellation or service
+shutdown. The
 [cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
-replaced the absolute operation deadline. Aggregate frame-count and byte limits
-remain known-size bounds. The per-frame completion deadline above is an open
-decision for the owner under AE-04.
+replaced the absolute operation deadline. Cancellation and shutdown use the
+helper wind-down: 250 ms of cooperative cancellation, SIGTERM, 250 ms, then
+SIGKILL, with one second of reap observation and the helper's 250 ms final
+drain. The former open decision on the per-frame completion deadline is closed:
+it is removed under [AE-04](../engineering.md#asynchronous-execution-and-recovery)
+(owner, 2026-10-16).
 Before model content, both sides exchange the package-build identity, exact
 private-protocol identity, capability bits and maximum frame size. Both
 identities must match the service's expected package and protocol. A mismatch
@@ -295,7 +300,8 @@ handling. On cancellation or transfer failure, both sides stop issuing credit;
 the sender stops new chunks and invalidates unused credit. Bytes already in
 flight remain bounded by the window and are rejected or discarded under the
 cancelled transfer. Late credit or data after a terminal result is a protocol
-fault. A stalled grant cannot extend the absolute operation deadline. A credit
+fault. A stalled grant stays pending until cancellation, helper exit, a
+protocol fault or shutdown (owner, 2026-10-16). A credit
 acknowledgement is never evidence that the model call began or completed.
 
 The Swift helper validates the full input transfer against the admitted request
@@ -665,7 +671,7 @@ qualifies a signed installed artifact and Homebrew handover.
 
 | Readiness slice | Decisions and evidence needed before its design is ready |
 | --- | --- |
-| I0 bridge probe | Apply selected process, Protobuf, fixed-prefix, chunking, credit-window, exact-identity, position-plus-total and build-time-generation choices; pin generators, schema, numeric window, per-frame and aggregate limits, probe-build identity, start/cancel ordering, deadlines, probe command, clean-build and fault checks BP1-BP31. |
+| I0 bridge probe | Apply selected process, Protobuf, fixed-prefix, chunking, credit-window, exact-identity, position-plus-total and build-time-generation choices; pin generators, schema, numeric window, per-frame and aggregate limits, probe-build identity, start/cancel ordering, loop closures and wind-down, probe command, clean-build and fault checks BP1-BP31. |
 | I1 service prerequisite | D1-D3 select per-user owner, local peer identity, durable task and operation records, recovery, and control API. I0 cannot substitute for these contracts. |
 | I3 local-model runtime | D4 selects capability eligibility, retained-context provenance, tool callbacks, budget and usage accounting, model evaluation and failure settlement. Prove SR2-SR6 and SR8-SR11 through the real service. |
 | I9 packaged release | D7 selects signed artifact, helper/resource identity and upgrade procedure. Prove SR1, SR4 and SR7 on a clean supported host. |
@@ -687,13 +693,13 @@ the [design process](../design-process.md#design-readiness-lifecycle).
 | SR8 | Helper emits a malformed frame after a model call began | Rust rejects the frame, invalidates that helper generation and reconciles admitted work before any terminal claim. Unit decoder checks, process fault integration, CLI recovery. |
 | SR9 | Candidate lacks a required structured-result or tool capability | Service rejects that candidate before admission and returns explicit unavailability or selects an authorized eligible candidate. Unit matching and snapshot checks, two-implementation integration, CLI result. |
 | SR10 | Capability changes or another implementation appears while work runs | Admitted work remains pinned to its identity and capability snapshot; no silent replay or cross-implementation result is accepted. Unit generation checks, process integration with fault injection, CLI recovery. |
-| SR11 | A stateless local implementation runs the same scoped request | It uses the shared task/context/deadline identities without a retained transcript; cancellation and terminal outcomes obey the same service contract. Unit port conformance, second binding integration, CLI end-to-end probe. |
+| SR11 | A stateless local implementation runs the same scoped request | It uses the shared task/context/budget identities and loop closures without a retained transcript; cancellation and terminal outcomes obey the same service contract. Unit port conformance, second binding integration, CLI end-to-end probe. |
 
 I0 covers only bridge-probe cases BP1-BP31 below. I3 introduces durable model
 admission and covers SR2-SR6 and SR8-SR11 with the real service, real model
 where required, and a deterministic alternative for contract faults. I9
 covers SR1, SR4 and SR7 from a signed installed artifact. D7 must assign
-exact commands, fixture versions, deadlines, model availability conditions
+exact commands, fixture versions, test harness budgets, model availability conditions
 and performance budgets. An I0 probe cannot claim task recovery, model quality
 or support for another OS.
 
@@ -704,15 +710,15 @@ or support for another OS.
 | BP3 | Fixture advertises or sends an oversized frame | Probe rejects before allocating the claimed size or interpreting content. Unit length checks, real-process fault fixture and probe-command failure result. |
 | BP4 | Cancel wins before child spawn | No child starts and no synthetic request dispatches. Unit ordering checks, race integration and probe-command result. |
 | BP5 | Cancel wins after spawn but before request dispatch | Probe closes the channel and reaps the child without sending content. Unit ordering checks, process race integration and probe-command result. |
-| BP6 | Cancel follows dispatch of a stalled synthetic request | Probe observes matching terminal acknowledgement or kills and reaps the child within the selected deadline. Unit timeout checks, process stall integration and probe-command result; no task-wide cancellation claim. |
+| BP6 | Cancel follows dispatch of a stalled synthetic request | Probe observes matching terminal acknowledgement, or the helper wind-down (250 ms, SIGTERM, 250 ms, SIGKILL, 1 s reap observation) kills and reaps the child. Unit wind-down escalation checks, process stall integration and probe-command result; no task-wide cancellation claim. |
 | BP7 | Deterministic second binding has different capabilities | Shared semantic port accepts supported operations and rejects missing ones. Unit capability checks, two-binding integration and probe-command result; no platform-support claim. |
 | BP8 | Fixture sends a zero-length frame or malformed Protobuf body | Probe rejects without dispatch and performs bounded child cleanup. Unit decoder checks, real-process fault fixtures and probe-command failure results for each variant. |
 | BP9 | Fixture closes halfway through the 4-byte prefix or declared body | Probe reports truncated transport, not a completed request; it reaps the child. Unit partial-read checks, real-process fixtures and probe-command failure results for each truncation point. |
 | BP10 | Decoded message lacks a semantic identity or contains an unknown critical enum | Probe rejects before interpretation or capability grant. Unit field-validation checks, generated Rust/Swift fixture exchange and probe-command failure results for each variant. |
-| BP11 | Fixture stays silent, dribbles bytes or floods small valid frames | Handshake, per-frame and absolute deadlines plus cumulative limits end the probe without unbounded memory or work. Unit limit checks, process fault fixtures and bounded probe-command failures for each variant. |
+| BP11 | Fixture stays silent, dribbles bytes or floods small valid frames | A silent or dribbling fixture stays pending, with bounded memory, until cancel, helper exit or shutdown; cancel and status stay responsive. Cumulative frame and byte limits end a flood as a protocol fault. Unit limit checks, process fault fixtures, and probe-command results for each variant: cancelled for silence and dribbling, failed for a flood. |
 | BP12 | Fixture emits duplicate terminal results or frames after terminal | Probe rejects the extra frames and never reports a second success. Unit sequence checks, process fault integration and probe-command failure result. |
 | BP13 | Fixture sends a duplicate, missing or out-of-order chunk | Probe rejects the transfer before any fixture result is accepted. Unit sequence checks, real-process variants and probe-command failure results. |
-| BP14 | Cancel arrives during an incomplete input transfer | Fixture discards partial content, makes no model-equivalent call and settles or exits within the selected cleanup deadline. Unit state checks, process race integration and probe-command result. |
+| BP14 | Cancel arrives during an incomplete input transfer | Fixture discards partial content, makes no model-equivalent call and settles or exits; the helper wind-down kills and reaps a fixture that does not. Unit state checks, process race integration and probe-command result. |
 | BP15 | End marker chunk count or total bytes disagrees with accepted chunks | Receiver rejects the transfer without constructing a complete input or output. Unit total checks, real-process fault integration and probe-command failure result. |
 | BP16 | Channel closes after a valid output prefix but before the terminal result | Probe reports incomplete transfer, not success; partial output remains provisional and child cleanup is bounded. Unit terminal checks, process integration and probe-command failure result. |
 | BP17 | Cancel races the final input marker, ready-to-start reply and start permit | The probe serializes cancellation and permit. A winning cancel prevents the fixture's model-equivalent call; a winning permit makes later cancel follow the running-operation path. Unit transition checks, process race integration and probe-command results for each ordering. |
@@ -723,7 +729,7 @@ or support for another OS.
 | BP22 | Input or output exceeds one window but remains within the aggregate cap | Several chunks can be in flight. The sender pauses at zero credit and resumes only after a matching grant; outstanding transport bytes stay within the window. Unit ledger checks, real-process transfer integration and probe-command success in both directions. |
 | BP23 | A credit message repeats, regresses, overgrants or acknowledges unsent bytes | Sender rejects the credit and fails the transfer without sending extra content. Unit ledger checks, real-process fault variants and probe-command failure results for each variant. |
 | BP24 | Credit names another request, transfer, generation or direction | Sender rejects it; no other transfer gains credit. Unit identity checks, real-process fault variants and probe-command failure results. |
-| BP25 | Receiver stops granting credit while a transfer remains incomplete | The sender remains bounded; cancellation and status remain responsive, and the absolute deadline ends the stalled transfer. Unit deadline checks, stalled-fixture integration and bounded probe-command failure result. |
+| BP25 | Receiver stops granting credit while a transfer remains incomplete | The sender remains bounded by the credit window; cancellation and status remain responsive. The stalled transfer ends on cancel, helper exit, a protocol fault or shutdown, not on a deadline (owner, 2026-10-16). Unit bound and cancel checks, stalled-fixture integration and probe-command cancelled result. |
 | BP26 | Cancellation races queued chunks and a credit grant | Neither peer sends new chunks or grants after observing cancellation. In-flight bytes stay within the window; late credit cannot revive the transfer. Unit transition checks, process race integration and probe-command results for each ordering. |
 | BP27 | Fixture reports a different probe-build identity with the same private protocol | Probe rejects before model payload and reaps the child. Unit equality checks, real-process mismatched fixture and probe-command failure result. This does not prove packaged-helper authenticity. |
 | BP28 | Fixture sends an empty data chunk | Probe rejects it; a zero-byte transfer is valid only through its end marker. Unit chunk checks, real-process fault integration and probe-command failure result. |
@@ -733,7 +739,7 @@ or support for another OS.
 
 This proposal still needs exact semantic capability IDs and eligibility rules,
 generator versions and framing, helper spawn and resource-identity mechanism,
-numeric frame/queue/deadline limits, session invalidation contract, signed
+numeric frame and queue limits, session invalidation contract, signed
 package layout and real packaged-runtime tests. D2/D4 must specify the second
 conformance binding without confusing a test substitute with platform support.
 The owner must review the resulting ready design and plan before any code.
@@ -1043,8 +1049,8 @@ Chunk frames; reserved control capacity never reorders these dependent messages.
 The service model owner starts one preparation thread and retains that slot until
 its join and exact child reaping. Preparation validates and copies at most 128 MiB
 of executable bytes with no time limit (owner, 2026-10-16; the former
-twenty-second deadline is removed, and a follow-up implementation will remove it
-from the code). Preparation ends on completion, failure, cancellation or
+twenty-second deadline is removed; implemented 2026-10-16: `ModelProcess::spawn`
+takes no deadline and reports only cancellation). Preparation ends on completion, failure, cancellation or
 shutdown. Cancellation is checked between 64 KiB reads and immediately before spawn. A stalled filesystem
 call retains the slot; it cannot block the reactor or permit replacement work.
 The preparation result transfers one owned child to the reactor. The reactor

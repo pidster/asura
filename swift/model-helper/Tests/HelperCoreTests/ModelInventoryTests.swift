@@ -151,19 +151,30 @@ private struct InventoryHTTP {
     #expect(limit.issues.first?.reason == "inventory_limit")
 }
 
-@Test func inventoryHTTPStallAndCancellationSettleWithinBound() async throws {
-    let stall = try InventoryHTTP(body: "{}", delay: .seconds(4))
-    let clock = ContinuousClock(); let start = clock.now
-    let timedOut = await ModelInventory.ollama(endpoint: stall.endpoint)
-    #expect(clock.now - start < .seconds(3))
-    #expect(timedOut.issues.first?.reason == "provider_timeout")
-    stall.task.cancel(); await stall.task.value
-    let server = try InventoryHTTP(body: "{}", delay: .seconds(4))
-    let task = Task { await ModelInventory.ollama(endpoint: server.endpoint) }
-    try await Task.sleep(for: .milliseconds(100)); task.cancel()
+/// HW-04 integration: a stalled private loopback server keeps the tags
+/// request pending past the removed 2 s bound; only cancellation ends it.
+@Test func inventoryHTTPStallStaysPendingUntilCancel() async throws {
+    let server = try InventoryHTTP(body: "{}", delay: .seconds(30))
+    let finished = InventoryFlag()
+    let task = Task {
+        let result = await ModelInventory.ollama(endpoint: server.endpoint)
+        await finished.set()
+        return result
+    }
+    // Held past the removed 2 s inactivity bound: still pending.
+    try await Task.sleep(for: .milliseconds(2_500))
+    #expect(await !finished.value)
+    let clock = ContinuousClock(); let cancelledAt = clock.now
+    task.cancel()
     let cancelled = await task.value
-    #expect(!cancelled.issues.isEmpty)
+    #expect(clock.now - cancelledAt < .seconds(1))
+    #expect(cancelled.issues.first?.reason == "cancelled")
     server.task.cancel(); await server.task.value
+}
+
+private actor InventoryFlag {
+    var value = false
+    func set() { value = true }
 }
 
 @Test func inventoryWireRejectsWrongDirectionFieldsStatusesAndUnboundedRows() throws {

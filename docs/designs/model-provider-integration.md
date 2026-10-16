@@ -35,8 +35,8 @@ Provider-specific runtime evidence and its limits are recorded separately below.
 Time-limit update (owner, 2026-10-16): the helper handshake, Ollama, Foundation
 and inventory waits have no time limit. See
 [helper and provider waits without time limits](#helper-and-provider-waits-without-time-limits--owner-2026-10-16).
-That section supersedes the time limits stated in earlier sections. The code
-still applies them; a follow-up implementation will remove them.
+That section supersedes the time limits stated in earlier sections. Implemented
+2026-10-16.
 
 ## Scope and evidence
 
@@ -882,8 +882,7 @@ of the isolated service log in a temporary diagnostic artifact.
 ### Recorded lifetime checks — 2026-09-30
 
 These checks predate the owner's 2026-10-16 removal of the handshake and legacy
-generation deadlines; tests that assert those deadlines must change with the
-follow-up implementation.
+generation deadlines; the tests that asserted them were replaced on 2026-10-16.
 
 The matching isolated package passed the 64-second loopback-provider process
 journey. The real service and Swift helper completed the full response. Inspect
@@ -1026,8 +1025,13 @@ Byte, frame, record, row and call limits are known-size bounds and remain.
 Cancellation still stops admission and reaches pending work, and a cancelled or
 disconnected wait reports whether the operation stopped or has an unknown outcome.
 
-Implementation status: the code still applies the removed limits. A follow-up
-implementation will remove them and update the tests that assert them.
+Implementation status (2026-10-16): implemented. `ModelOwner` arms a timer only
+for wind-down; `ModelProcess::spawn` takes no deadline; Begin never sends
+`deadline_remaining_ms`. The Swift `HelperSession` arms only the 250 ms final
+drain and ignores a supplied `deadline_remaining_ms`. The Ollama session sets
+request and resource timeouts to infinity; a live probe held one request 65 s
+and it completed. Open: the TUI still shows a generic "Waiting" instead of the
+waiting step.
 
 ### Helper step waits
 
@@ -1061,7 +1065,15 @@ stateDiagram-v2
     end note
 ```
 
-Validation required for the follow-up implementation:
+Validation. Rust: `model_owner` tests `hw01_each_step_waits_without_a_time_limit_until_cancel`
+and `hw03_begin_sends_no_generation_deadline`, and the `model_inventory` held
+configuration test. Swift (written 2026-10-16, not run in that session because
+the Metal toolchain was unavailable): `hw04OllamaRequestsHaveNoTimeLimit`,
+`inventoryHTTPStallStaysPendingUntilCancel`,
+`suppliedGenerationDeadlineArmsNoTimerAndCancelEndsStall`,
+`handshakeArmsNoTimerAndGenerationRemainsCancellable` and
+`stalledTransferAndReadyHandoffWaitUntilCancel`. The integration and end-to-end
+columns below remain open except where these tests cover them:
 
 | ID | Unit | Integration | End-to-end |
 | --- | --- | --- | --- |

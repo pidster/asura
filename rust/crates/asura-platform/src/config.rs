@@ -6,12 +6,13 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 const LIMIT: usize = 16 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateFileError {
     UnsafeOrIo,
+    /// The owner cancelled the operation. These operations have no time
+    /// bound (owner, 2026-10-16); the name is kept for wire-stable callers.
     CancelledOrExpired,
     TooLarge,
     Read,
@@ -25,12 +26,8 @@ type Result<T> = std::result::Result<T, PrivateFileError>;
 fn error(_: Error) -> PrivateFileError {
     PrivateFileError::UnsafeOrIo
 }
-fn active(deadline: Instant, cancel: &AtomicBool) -> Result<()> {
-    active_until(Some(deadline), cancel)
-}
-fn active_until(deadline: Option<Instant>, cancel: &AtomicBool) -> Result<()> {
-    if cancel.load(Ordering::Acquire) || deadline.is_some_and(|deadline| Instant::now() >= deadline)
-    {
+fn active(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
         Err(PrivateFileError::CancelledOrExpired)
     } else {
         Ok(())
@@ -61,30 +58,10 @@ impl PrivateFileSnapshot {
         self.stamp.is_some()
     }
 
-    pub fn read(
-        runtime: RuntimeDirectory,
-        name: &str,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> Result<Self> {
-        Self::read_until(runtime, name, Some(deadline), cancel)
-    }
-    /// Reads for an owner whose work has no time bound, such as the journal
-    /// writer (J1-0). Only cancel or a real error stops the read.
-    pub fn read_without_deadline(
-        runtime: RuntimeDirectory,
-        name: &str,
-        cancel: &AtomicBool,
-    ) -> Result<Self> {
-        Self::read_until(runtime, name, None, cancel)
-    }
-    fn read_until(
-        runtime: RuntimeDirectory,
-        name: &str,
-        deadline: Option<Instant>,
-        cancel: &AtomicBool,
-    ) -> Result<Self> {
-        active_until(deadline, cancel)?;
+    /// Read a validated snapshot. It has no time bound (J1-0; owner,
+    /// 2026-10-16): only the owner's cancel or a real error stops the read.
+    pub fn read(runtime: RuntimeDirectory, name: &str, cancel: &AtomicBool) -> Result<Self> {
+        active(cancel)?;
         if name.is_empty() || name.len() > 255 || name.contains('/') || matches!(name, "." | "..") {
             return Err(PrivateFileError::UnsafeOrIo);
         }
@@ -128,7 +105,7 @@ impl PrivateFileSnapshot {
             }
         }
         snapshot.validate()?;
-        active_until(deadline, cancel)?;
+        active(cancel)?;
         Ok(snapshot)
     }
     fn validate(&self) -> Result<()> {
@@ -150,11 +127,13 @@ impl PrivateFileSnapshot {
             _ => Err(PrivateFileError::Changed),
         }
     }
-    pub fn replace(&self, bytes: &[u8], deadline: Instant, cancel: &AtomicBool) -> Result<()> {
+    /// Atomically replace the snapshot. No time bound; cancel stops it before
+    /// the rename, after which the outcome is reported exactly.
+    pub fn replace(&self, bytes: &[u8], cancel: &AtomicBool) -> Result<()> {
         if bytes.len() > LIMIT {
             return Err(PrivateFileError::TooLarge);
         }
-        active(deadline, cancel)?;
+        active(cancel)?;
         self.validate()?;
         let name = CString::new(format!(
             ".private-{:032x}.tmp",
@@ -187,7 +166,7 @@ impl PrivateFileSnapshot {
             {
                 return Err(PrivateFileError::Changed);
             }
-            active(deadline, cancel)?;
+            active(cancel)?;
             // SAFETY: both terminated names are relative to the retained, validated directory.
             if unsafe {
                 libc::renameat(
@@ -245,8 +224,7 @@ mod tests {
         let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
         let path = root.0.join(".asura/config.yaml");
         let cancel = AtomicBool::new(false);
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        let read = || PrivateFileSnapshot::read(runtime.clone(), "config.yaml", deadline, &cancel);
+        let read = || PrivateFileSnapshot::read(runtime.clone(), "config.yaml", &cancel);
         for name in [
             "",
             ".",
@@ -255,13 +233,13 @@ mod tests {
             "nested/config.yaml",
             "nul\0name",
         ] {
-            assert!(PrivateFileSnapshot::read(runtime.clone(), name, deadline, &cancel).is_err());
+            assert!(PrivateFileSnapshot::read(runtime.clone(), name, &cancel).is_err());
             assert!(crate::runtime::open_private_append(&root.0, name).is_err());
         }
 
         read()
             .unwrap()
-            .replace(b"model: example\n", deadline, &cancel)
+            .replace(b"model: example\n", &cancel)
             .unwrap();
         assert_eq!(read().unwrap().bytes, b"model: example\n");
         assert_eq!(
@@ -270,7 +248,7 @@ mod tests {
         );
         let old = read().unwrap();
         std::fs::write(&path, b"model: changed\n").unwrap();
-        assert!(old.replace(b"model: lost", deadline, &cancel).is_err());
+        assert!(old.replace(b"model: lost", &cancel).is_err());
         std::fs::hard_link(&path, root.0.join("hardlink")).unwrap();
         assert!(read().is_err());
         std::fs::remove_file(root.0.join("hardlink")).unwrap();
@@ -283,41 +261,26 @@ mod tests {
         let fifo = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: terminated scratch path and fixed private FIFO creation mode.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         assert!(read().is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         std::fs::remove_file(&path).unwrap();
         let absent = read().unwrap();
-        absent
-            .replace(b"model: temporary", deadline, &cancel)
-            .unwrap();
+        absent.replace(b"model: temporary", &cancel).unwrap();
         std::fs::write(&path, vec![b'x'; LIMIT + 1]).unwrap();
         assert!(read().is_err());
         std::fs::remove_file(&path).unwrap();
         // A new file appearing after the absent snapshot must not be overwritten.
         read()
             .unwrap()
-            .replace(b"model: appeared", deadline, &cancel)
+            .replace(b"model: appeared", &cancel)
             .unwrap();
-        assert!(absent.replace(b"model: lost", deadline, &cancel).is_err());
+        assert!(absent.replace(b"model: lost", &cancel).is_err());
         std::fs::remove_file(&path).unwrap();
         let absent = read().unwrap();
-        assert!(
-            absent
-                .replace(b"model: expired", Instant::now(), &cancel)
-                .is_err()
-        );
-        assert!(
-            absent
-                .replace(&vec![b'x'; LIMIT + 1], deadline, &cancel)
-                .is_err()
-        );
+        assert!(absent.replace(&vec![b'x'; LIMIT + 1], &cancel).is_err());
         cancel.store(true, Ordering::Release);
-        assert!(
-            absent
-                .replace(b"model: cancelled", deadline, &cancel)
-                .is_err()
-        );
+        assert!(absent.replace(b"model: cancelled", &cancel).is_err());
         assert!(!path.exists());
     }
 }

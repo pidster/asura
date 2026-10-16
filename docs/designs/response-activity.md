@@ -189,8 +189,8 @@ terminates without retrying the failed pump. The wait has no time limit (owner,
 cancellation-driven with bounded retained snapshots and responsive controls, and
 ends on credit, cancellation, channel loss or shutdown. Socket tests cover delayed
 credit preserving both snapshots, withheld credit held until cancellation, and
-cancellation during the drain. The code change is pending; a follow-up
-implementation will remove the deadline branch.
+cancellation during the drain. Implemented 2026-10-16: the helper no longer arms
+a generation deadline.
 
 ```mermaid
 flowchart TD

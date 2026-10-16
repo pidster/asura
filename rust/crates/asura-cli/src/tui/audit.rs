@@ -30,10 +30,11 @@ impl Cancellation {
         }
     }
 }
+/// One audit read. It has no time bound (owner, 2026-10-16): it ends on the
+/// reply, the person's `/cancel`, exit or a lost connection.
 struct Job {
     handle: JoinHandle<Outcome>,
     cancel: Arc<Cancellation>,
-    deadline: Instant,
     reported: bool,
 }
 #[derive(Default)]
@@ -57,7 +58,6 @@ impl Worker {
         if self.running() {
             return Err("Audit inspection busy; draft retained");
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
         let cancel = Arc::new(Cancellation::default());
         let token = cancel.clone();
         let notice = self.notice.clone();
@@ -73,10 +73,11 @@ impl Worker {
                     if token.stopped.load(Ordering::Acquire) {
                         return Err(asura_client::Error::Unavailable);
                     }
+                    let cancelled = || token.stopped.load(Ordering::Acquire);
                     let mut client = asura_client::Client::attach(
                         &runtime,
                         concat!("asura/", env!("CARGO_PKG_VERSION")),
-                        deadline,
+                        &cancelled,
                     )?;
                     *token
                         .socket
@@ -90,12 +91,12 @@ impl Worker {
                     if crate::conversation::hex(&client.service_epoch()) != scope.epoch {
                         return Err(asura_client::Error::Unavailable);
                     }
-                    client.audit_before(
+                    client.audit(
                         pb::AuditRead {
                             project_id: Some(scope.project.to_vec()),
                             limit: Some(limit),
                         },
-                        deadline,
+                        &cancelled,
                     )
                 };
                 let result = run().map_err(|error| error.to_string());
@@ -108,20 +109,13 @@ impl Worker {
                     None => Ok(reply),
                 })
             })
-            .map_err(|_| "Cannot start model inventory; draft retained")?;
+            .map_err(|_| "Cannot start audit inspection; draft retained")?;
         self.job = Some(Job {
             handle,
             cancel,
-            deadline,
             reported: false,
         });
         Ok(())
-    }
-    pub fn next_deadline(&self) -> Option<Instant> {
-        self.job
-            .as_ref()
-            .filter(|job| !job.reported)
-            .map(|job| job.deadline)
     }
     pub fn poll(&mut self) -> Option<Outcome> {
         let job = self.job.as_mut()?;
@@ -133,10 +127,11 @@ impl Worker {
                 .unwrap_or_else(|_| Err("Audit inspection failed".into()));
             return (!job.reported).then_some(result);
         }
-        if !job.reported && Instant::now() >= job.deadline {
+        // The person's cancel reports at once; the slot stays busy until the
+        // worker settles, and a late reply is discarded.
+        if !job.reported && job.cancel.stopped.load(Ordering::Acquire) {
             job.reported = true;
-            job.cancel.cancel();
-            return Some(Err("Audit inspection timed out".into()));
+            return Some(Err("Audit inspection cancelled".into()));
         }
         None
     }
@@ -172,7 +167,7 @@ impl Drop for Worker {
 mod tests {
     use super::*;
     #[test]
-    fn timeout_retains_slot_and_discards_late_audit() {
+    fn held_audit_waits_and_cancel_retains_slot_and_discards_late_audit() {
         let (release, wait) = std::sync::mpsc::channel();
         let mut worker = Worker {
             notice: Default::default(),
@@ -182,11 +177,18 @@ mod tests {
                     Ok(pb::AuditReply::default())
                 }),
                 cancel: Arc::new(Cancellation::default()),
-                deadline: Instant::now(),
                 reported: false,
             }),
         };
-        assert!(worker.poll().unwrap().is_err());
+        // CW-01: a held audit reply stays pending; no timer reports it.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(worker.poll().is_none());
+        // CW-02: /cancel ends the wait at once.
+        worker.cancel();
+        assert_eq!(
+            worker.poll().unwrap().unwrap_err(),
+            "Audit inspection cancelled"
+        );
         assert!(worker.running());
         assert!(
             worker

@@ -12,8 +12,9 @@ conditions under [AE-04](../engineering.md#asynchronous-execution-and-recovery).
 The 30-second status freshness, five-minute proposal expiry and seven-day
 retention stay as data freshness and retention rules; they end no work.
 Reconnect backoff never stops. The design-only five-second persistence limit is
-removed. Where SN1 or SN2 code still applies a removed bound, a follow-up
-implementation will apply this design.
+removed. Implemented 2026-10-16 for the inspection client request. No reconnect
+code exists yet, so never-stopping backoff stays a design rule. The L10 tool
+deadline is unchanged and queued for the tool-adoption design.
 
 ## Purpose and first slice
 
@@ -719,8 +720,8 @@ A request copies at most 16 observations and eight proposals; at most 64 records
 are indexed. The frame limit remains 64 KiB. Existing connection limits, reply
 backpressure and disconnect cleanup apply. The client uses the existing isolated
 control-worker boundary with no retries. The request has no deadline (owner,
-2026-10-16); it ends on reply, cancellation by the person or disconnect. The code
-still applies a two-second deadline; a follow-up implementation will remove it.
+2026-10-16); it ends on reply, cancellation by the person or disconnect.
+Implemented 2026-10-16.
 There is no pending query task to cancel or drain. Queries remain available while
 sensor persistence is stalled because they only read committed memory. Restart
 visibility waits for the existing serialized sensor load and never treats a

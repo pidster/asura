@@ -4,8 +4,10 @@ use std::{
     os::fd::{FromRawFd, IntoRawFd},
     sync::atomic::{AtomicBool, Ordering},
 };
-fn active(deadline: Instant, cancel: &AtomicBool) -> Result<()> {
-    if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+/// The footprint walk has no time bound (owner, 2026-10-16): it ends on
+/// completion, an error, the entry budget or cancel (reported as `Deadline`).
+fn active(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
         Err(Error::Deadline)
     } else {
         Ok(())
@@ -30,10 +32,9 @@ fn walk(
     uid: libc::uid_t,
     depth: usize,
     budget: &mut Budget,
-    deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    active(deadline, cancel)?;
+    active(cancel)?;
     budget.directories += 1;
     if depth > 8 || budget.directories > 64 {
         return Err(Error::Unavailable);
@@ -54,7 +55,7 @@ fn walk(
     }
     let stream = Stream(raw);
     loop {
-        active(deadline, cancel)?;
+        active(cancel)?;
         // SAFETY: errno is thread-local and stream is uniquely held through iteration.
         unsafe {
             *libc::__error() = 0;
@@ -98,7 +99,7 @@ fn walk(
                 if identity(&stat_fd(child.as_raw_fd())?) != identity(&named) {
                     return Err(Error::UnsafeRuntime);
                 }
-                walk(&child, uid, depth + 1, budget, deadline, cancel)?;
+                walk(&child, uid, depth + 1, budget, cancel)?;
                 if identity(&stat_at(fd.as_raw_fd(), name)?) != identity(&named) {
                     return Err(Error::UnsafeRuntime);
                 }
@@ -109,18 +110,18 @@ fn walk(
     if identity(&stat_fd(fd.as_raw_fd())?) != identity(&before) {
         return Err(Error::UnsafeRuntime);
     }
-    active(deadline, cancel)
+    active(cancel)
 }
 impl DatabaseDirectory {
-    pub fn stored_bytes(&self, deadline: Instant, cancel: &AtomicBool) -> Result<u64> {
-        active(deadline, cancel)?;
+    pub fn stored_bytes(&self, cancel: &AtomicBool) -> Result<u64> {
+        active(cancel)?;
         self.validate()?;
         let mut budget = Budget {
             entries: 0,
             directories: 0,
             bytes: 0,
         };
-        walk(&self.directory, self.uid, 0, &mut budget, deadline, cancel)?;
+        walk(&self.directory, self.uid, 0, &mut budget, cancel)?;
         self.validate()?;
         Ok(budget.bytes)
     }
@@ -132,7 +133,6 @@ mod tests {
         fs,
         os::unix::fs::{DirBuilderExt, OpenOptionsExt, symlink},
         path::PathBuf,
-        time::Duration,
     };
     struct Scratch(PathBuf);
     impl Drop for Scratch {
@@ -163,9 +163,6 @@ mod tests {
             .set_len(size)
             .unwrap();
     }
-    fn deadline() -> Instant {
-        Instant::now() + Duration::from_secs(2)
-    }
     #[test]
     fn stored_footprint_counts_files_and_rejects_links_specials_and_deadlines() {
         let (s, d) = fixture();
@@ -177,31 +174,27 @@ mod tests {
         file(&db.join("one"), 12);
         file(&db.join("nested/two"), 31);
         let cancel = AtomicBool::new(false);
-        assert_eq!(d.stored_bytes(deadline(), &cancel).unwrap(), 43);
+        assert_eq!(d.stored_bytes(&cancel).unwrap(), 43);
         assert!(matches!(
-            d.stored_bytes(Instant::now(), &cancel),
-            Err(Error::Deadline)
-        ));
-        assert!(matches!(
-            d.stored_bytes(deadline(), &AtomicBool::new(true)),
+            d.stored_bytes(&AtomicBool::new(true)),
             Err(Error::Deadline)
         ));
         symlink("one", db.join("alias")).unwrap();
-        assert!(d.stored_bytes(deadline(), &cancel).is_err());
+        assert!(d.stored_bytes(&cancel).is_err());
         fs::remove_file(db.join("alias")).unwrap();
         fs::hard_link(db.join("one"), db.join("alias")).unwrap();
-        assert!(d.stored_bytes(deadline(), &cancel).is_err());
+        assert!(d.stored_bytes(&cancel).is_err());
         fs::remove_file(db.join("alias")).unwrap();
         // SAFETY: isolated fixture descriptor and fixed child name, never user storage.
         assert_eq!(
             unsafe { libc::mkfifoat(d.directory.as_raw_fd(), c"fifo".as_ptr(), 0o600) },
             0
         );
-        assert!(d.stored_bytes(deadline(), &cancel).is_err());
+        assert!(d.stored_bytes(&cancel).is_err());
         fs::remove_file(db.join("fifo")).unwrap();
         fs::rename(&db, s.0.join("saved")).unwrap();
         fs::DirBuilder::new().mode(0o700).create(&db).unwrap();
-        assert!(d.stored_bytes(deadline(), &cancel).is_err());
+        assert!(d.stored_bytes(&cancel).is_err());
     }
     #[test]
     fn stored_footprint_directory_and_depth_limits_are_enforced() {
@@ -214,7 +207,7 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            d.stored_bytes(deadline(), &AtomicBool::new(false)),
+            d.stored_bytes(&AtomicBool::new(false)),
             Err(Error::Unavailable)
         ));
         let (s, d) = fixture();
@@ -224,7 +217,7 @@ mod tests {
             fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         }
         assert!(matches!(
-            d.stored_bytes(deadline(), &AtomicBool::new(false)),
+            d.stored_bytes(&AtomicBool::new(false)),
             Err(Error::Unavailable)
         ));
     }

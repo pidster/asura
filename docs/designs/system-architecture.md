@@ -308,7 +308,7 @@ contract below. A spawn loser exits normally; the client retries
 attachment at 50 ms intervals. This interval is pacing and ends nothing. The
 retries end when attachment succeeds, a typed failure is reported, or the person
 cancels the command. The earlier five-second retry deadline is removed (owner,
-2026-10-16); the code still applies it until a follow-up implementation.
+2026-10-16; implemented 2026-10-16).
 
 #### Private startup notice
 
@@ -350,8 +350,8 @@ The fixed cases are:
 Reject other versions, kinds, codes, extra bytes or EOF before eight bytes.
 Read partial pipe data nonblockingly. The wait ends on a complete notice, EOF,
 child exit or the person's cancel. It has no time bound: the earlier five-second
-startup deadline is removed (owner, 2026-10-16), and the code change is pending a
-follow-up implementation. A malformed notice reports unavailable
+startup deadline is removed (owner, 2026-10-16; implemented 2026-10-16:
+`StartupChild::poll_notice` takes no deadline). A malformed notice reports unavailable
 without forced takeover or PID signalling. A lost notice is not successful startup.
 Any already-running owner remains inspectable through the normal control path.
 
@@ -491,8 +491,14 @@ Required behavior (owner, 2026-10-16): stop has no drain deadline.
   `outcome_unconfirmed`.
 
 The one-second `DRAIN_TIMEOUT`, which moves the service to `RepairOnly` with
-inspection reason `InspectionTimeout`, is removed by this decision. The code
-still applies it; a follow-up implementation will remove it.
+inspection reason `InspectionTimeout`, is removed by this decision.
+Implemented 2026-10-16. The listener keeps accepting while `Draining`; Inspect
+and InspectInstallation are answered, and work and ObserveService requests get
+`Draining`. A second Stop or a second termination signal forces exit; the owner
+lock and listener stay held until process exit, so the next owner replays as
+after a crash. No current worker reports an unknown outcome at drain, so no code
+path enters `RepairOnly` today. Tests: the `installation` reactor tests and
+`conversation_flow --stop-drain`.
 SIGINT, SIGTERM and SIGHUP enter the same drain path. A crash permits stale-socket
 cleanup by the next lock winner; stage 2 has no state to replay.
 
@@ -701,10 +707,10 @@ are absent. Health of the local channel is not installation readiness.
 | Buffered data | One 64 KiB input and one 64 KiB output body per connection; no unbounded queue. |
 | Requests | One in flight per connection; 32 total. Reject extra pipelined requests. |
 | Per-reactor turn | At most 32 frames total and one frame per ready connection; then process signals and timers. |
-| Hello/frame progress | No time bound (owner, 2026-10-16). A partial frame waits until it completes, the peer disconnects or the service drains. The 32-connection and 64 KiB buffer limits bound the held resources. Code change pending: the code still applies the two-second `FRAME_TIMEOUT`. |
-| Idle attachment | No idle close (owner, 2026-10-16). An attachment ends when the client disconnects or the service drains. Code change pending: the code still applies the 60-second `IDLE_TIMEOUT`. |
-| Ordinary control result | No time bound (owner, 2026-10-16). Pending output stays in the 64 KiB buffer until the client reads it, disconnects or the service drains. Code change pending, as for frame progress. |
-| Startup/stop client wait | No time bound (owner, 2026-10-16). Each wait ends on its result, a lost connection or the person's cancel; cancel or a lost connection reports unavailable or `outcome_unconfirmed`. Code change pending: the client still applies its five-second `LIFECYCLE` budget. |
+| Hello/frame progress | No time bound (owner, 2026-10-16). A partial frame waits until it completes, the peer disconnects or the service drains. The 32-connection and 64 KiB buffer limits bound the held resources. Implemented 2026-10-16: `FRAME_TIMEOUT` is removed. |
+| Idle attachment | No idle close (owner, 2026-10-16). An attachment ends when the client disconnects or the service drains. Implemented 2026-10-16: `IDLE_TIMEOUT` is removed. |
+| Ordinary control result | No time bound (owner, 2026-10-16). Pending output stays in the 64 KiB buffer until the client reads it, disconnects or the service drains. Implemented 2026-10-16. |
+| Startup/stop client wait | No time bound (owner, 2026-10-16). Each wait ends on its result, a lost connection or the person's cancel; cancel or a lost connection reports unavailable or `outcome_unconfirmed`. Implemented 2026-10-16: `LIFECYCLE` is removed. |
 | Telemetry | Counters for connections, rejection code and latency; no payload, cwd or project path. |
 
 ### Attachment and shutdown sequence

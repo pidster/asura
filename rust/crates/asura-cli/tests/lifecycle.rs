@@ -17,6 +17,18 @@ use std::time::{Duration, Instant};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const BUILD: &str = concat!("asura/", env!("CARGO_PKG_VERSION"));
 const WAIT: Duration = Duration::from_secs(8);
+
+/// Test-only harness budget: client waits have no time bound in production
+/// (owner, 2026-10-16), so a fixture cancels them to fail instead of hanging.
+fn attach_within(
+    runtime: &RuntimeDirectory,
+    end: Instant,
+) -> std::result::Result<Client, asura_client::Error> {
+    let cancel: asura_client::Cancel = std::sync::Arc::new(move || Instant::now() >= end);
+    let mut client = Client::attach(runtime, BUILD, &*cancel)?;
+    client.set_cancel(cancel);
+    Ok(client)
+}
 fn require(condition: bool, message: &str) -> Result<()> {
     if condition {
         Ok(())
@@ -156,9 +168,8 @@ impl Case {
                 )?;
             }
             if let Ok(runtime) = RuntimeDirectory::scratch(&self.root.join("home"), false)
-                && let Ok(mut client) = Client::attach(
+                && let Ok(mut client) = attach_within(
                     &runtime,
-                    BUILD,
                     end.min(Instant::now() + Duration::from_millis(500)),
                 )
                 && client.inspect().is_ok()
@@ -189,11 +200,7 @@ impl Case {
             Ok(runtime) => match runtime.capture_lock() {
                 Ok(witness) => {
                     if !witness.owner_released()? {
-                        match Client::attach(
-                            &runtime,
-                            BUILD,
-                            Instant::now() + Duration::from_secs(2),
-                        ) {
+                        match attach_within(&runtime, Instant::now() + WAIT) {
                             Ok(client) => {
                                 client.stop()?;
                             }
@@ -424,6 +431,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--state-isolation"),
         Some("--help-mode"),
         Some("--journal-waits"),
+        Some("--client-waits"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);

@@ -33,7 +33,7 @@ fn run_for(long: bool) -> Result<()> {
             std::env::var("ASURA_TEST_OLLAMA_MODEL").unwrap_or_else(|_| "granite4.1:8b".into());
         let reply = fixture
             .attach()?
-            .config("model", Some(&format!("ollama:{model}")))?;
+            .config("model", Some(&format!("ollama:{model}")), &|| false)?;
         assert!(reply.error.is_none());
     }
     let accepted = submit(

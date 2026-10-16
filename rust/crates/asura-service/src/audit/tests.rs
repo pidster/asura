@@ -23,12 +23,7 @@ impl Drop for Release {
 }
 struct FakeSink(Arc<Gate>);
 impl Sink for FakeSink {
-    fn append(
-        &mut self,
-        records: &[Record],
-        _: Instant,
-        _: &AtomicBool,
-    ) -> Result<(), record::Error> {
+    fn append(&mut self, records: &[Record], _: &AtomicBool) -> Result<(), record::Error> {
         self.0.entered.store(true, Ordering::Release);
         let mut released = self.0.released.lock().unwrap();
         while !*released {
@@ -40,10 +35,10 @@ impl Sink for FakeSink {
         self.0.records.lock().unwrap().extend_from_slice(records);
         Ok(())
     }
-    fn maintain(&mut self, _: Instant, _: &AtomicBool) -> Result<(), record::Error> {
+    fn maintain(&mut self, _: &AtomicBool) -> Result<(), record::Error> {
         Ok(())
     }
-    fn sync(&mut self, _: Instant, _: &AtomicBool) -> Result<(), record::Error> {
+    fn sync(&mut self, _: &AtomicBool) -> Result<(), record::Error> {
         Ok(())
     }
 }
@@ -101,13 +96,15 @@ fn stalled_append_is_invisible_bounded_and_retained_through_close() {
         assert_eq!(emitter.try_emit(changed()), Admission::Accepted);
     }
     assert_eq!(emitter.try_emit(changed()), Admission::Dropped);
-    assert_eq!(
-        worker.health(Instant::now() + CYCLE + CYCLE).state,
-        HealthState::Stale
-    );
+    // A stalled append has no time bound (owner, 2026-10-16): held past the
+    // removed 2 s cycle, health stays active and no work ends.
+    let later = Instant::now() + Duration::from_secs(60);
+    assert_eq!(worker.health(later).state, HealthState::Active);
+    assert_eq!(worker.next_deadline(later), None);
     assert_eq!(worker.health(Instant::now()).dropped, 1);
     worker.close(Instant::now());
     assert!(!worker.settled());
+    // The kept 1 s wind-down after close still cancels unsettled audit IO.
     assert!(worker.settlement_expired(Instant::now() + DRAIN + DRAIN));
     assert_eq!(emitter.try_emit(changed()), Admission::Closed);
     settle(&mut worker, &gate);
@@ -235,11 +232,15 @@ fn sequence_exhaustion_and_tiny_file_limit_are_visible_without_oversize_write() 
         Some(HealthReason::SequenceExhausted)
     );
     assert_eq!(
-        worker.health(Instant::now() + CYCLE + CYCLE).state,
+        worker
+            .health(Instant::now() + Duration::from_secs(60))
+            .state,
         HealthState::Unavailable
     );
     assert_eq!(
-        worker.health(Instant::now() + CYCLE + CYCLE).reason,
+        worker
+            .health(Instant::now() + Duration::from_secs(60))
+            .reason,
         Some(HealthReason::SequenceExhausted)
     );
     settle(&mut worker, &gate);
@@ -261,9 +262,12 @@ fn bootstrap_gate_requires_actual_return_not_expired_or_unavailable_health() {
         })
         .unwrap();
         assert!(!worker.bootstrap_settled());
+        // A held bootstrap has no time bound; health stays starting.
         assert_eq!(
-            worker.health(Instant::now() + Duration::from_secs(3)).state,
-            HealthState::Stale
+            worker
+                .health(Instant::now() + Duration::from_secs(60))
+                .state,
+            HealthState::Starting
         );
         let mut failed = Snapshot::starting();
         failed.health.state = HealthState::Unavailable;

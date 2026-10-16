@@ -6,9 +6,8 @@ The wire protocol stays 0.1. The journal stays at format 1.
 
 Time-bound update (owner, 2026-10-16): under
 [AE-04](../engineering.md#asynchronous-execution-and-recovery), the waits below
-end through loop-closure conditions, not fixed time limits. The implementation
-still applies the removed bounds; a follow-up implementation will apply this
-design. [Time bounds](#time-bounds) lists each change.
+end through loop-closure conditions, not fixed time limits. Implemented
+2026-10-16 except the waiting-step label noted in [Time bounds](#time-bounds). [Time bounds](#time-bounds) lists each change.
 
 ## Owners and delivery
 
@@ -163,8 +162,10 @@ poll. The fixed 16 ms global mailbox scan is removed.
 A pending frame has no write deadline (owner, 2026-10-16). While stdout is not
 writable, the renderer keeps the frame, retries on writable readiness and
 coalesces newer state into the next frame. Slow output never ends the TUI.
-The code still exits after a 100 ms output stall; a follow-up implementation
-will remove that exit. Shutdown first stops input
+Implemented 2026-10-16: `TerminalOutput` has no deadline and the loop's 100 ms
+output wake is removed; covered by the platform unit test
+`slow_output_stays_pending_without_a_deadline_then_completes` and the PTY
+`--client-waits` slow-terminal journey. Shutdown first stops input
 admission and requests cancellation, restores the terminal, then performs bounded
 reader/worker settlement. An unresponsive reader is retained until process exit;
 no replacement reader or ownership reuse is allowed.
@@ -238,9 +239,10 @@ Validation has no time limit (owner, 2026-10-16). It ends on completion,
 cancellation, client disconnect or shutdown, and it sends a completion wake signal.
 A disconnect or lifecycle change invalidates the ticket and retains the worker
 slot. A later success for an invalidated ticket cannot authorize effects.
-Cleanup keeps its two-second wind-down bound on Asura's own shutdown work. The
-code still rejects validation after two seconds; a follow-up implementation will
-remove that limit. Poll joins only an already finished worker;
+Cleanup keeps its two-second wind-down bound on Asura's own shutdown work.
+Implemented 2026-10-16: validation has no deadline and the reactor cancels it
+when its client disconnects (`guard_worker` unit test
+`held_validation_has_no_deadline_and_cancel_forbids_late_success`). Poll joins only an already finished worker;
 notification-before-thread-exit uses the existing one-millisecond settlement timer.
 A blocked syscall cannot be forcibly cancelled; cancellation is checked before
 and after validation. No replacement worker starts until settlement.
@@ -298,8 +300,9 @@ a native model reports its actual variant. A selector or service epoch change
 clears the previous actual variant and context metrics. Each heartbeat snapshot
 resets the missed-heartbeat count. After five consecutive missed one-second
 heartbeats, the TUI shows the service as Disconnected (owner, 2026-10-16).
-Staleness changes the display only; it ends no work. The code still measures five seconds; a
-follow-up implementation will count missed heartbeats.
+Staleness changes the display only; it ends no work. Implemented 2026-10-16:
+`tui/heartbeat.rs` counts missed one-second heartbeats for the status, queue and
+context projections (unit tests in `heartbeat.rs` and `observation.rs`).
 
 Conversation observation retains its operation/cursor and uses the service's
 one-second wait. The 50 ms client sleep is removed. Cancellation checks run between
@@ -322,7 +325,7 @@ clear drafts, mutation receipts or explicit command state. The automatic 500 ms
 queue-list request and its timer are removed. After five consecutive missed
 heartbeats, the App shows the queue projection as stale and clears it without
 changing durable service state (owner, 2026-10-16). Staleness changes the display
-only; it ends no work. The code still measures five seconds.
+only; it ends no work. Implemented 2026-10-16 with the shared heartbeat count.
 
 ```mermaid
 flowchart TD
@@ -362,8 +365,8 @@ liveness heartbeat with the current cached status. Epoch changes invalidate curs
 The service reads the model selector with canonical `conversation_snapshot` on
 one isolated worker at startup and after configuration mutations. The read has no
 time limit (owner, 2026-10-16). The selector shows as pending until the read
-returns; it ends on completion, failure or shutdown. The code still applies a
-two-second limit; a follow-up implementation will remove it.
+returns; it ends on completion, failure or shutdown. Implemented 2026-10-16:
+the observer's sample has no deadline (`service_observer` unit tests).
 A heartbeat never rereads configuration. A pending refresh coalesces into one
 subsequent read after the current worker settles. External file edits take effect
 on the next explicit configuration interaction or service restart.
@@ -501,8 +504,9 @@ The readiness deadline rounding regression also passed after its correction.
 
 Required behavior (owner, 2026-10-16): no fixed time limit ends, refuses or fails
 work in this design. The table records each bound this design stated before that
-decision and what now ends the wait. The code change is pending; a follow-up
-implementation will apply it.
+decision and what now ends the wait. Implemented 2026-10-16 for every row except
+the waiting-step label: the TUI still shows a generic "Waiting" during model
+preparation, so showing "preparing model" or "starting model" remains open.
 
 | Former bound | Decision | What ends the wait now |
 | --- | --- | --- |

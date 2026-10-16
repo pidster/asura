@@ -5,6 +5,7 @@ mod context;
 mod conversation;
 mod editor;
 mod events;
+mod heartbeat;
 mod help;
 mod history;
 mod models;
@@ -71,7 +72,6 @@ pub(crate) fn run(
         let mut dirty = true;
         let mut exit = false;
         let mut settlement_at: Option<Instant> = None;
-        let mut output_at: Option<Instant> = None;
         let mut pending_input = std::collections::VecDeque::new();
         while !exit && !session.interrupted() {
             let now = Instant::now();
@@ -119,7 +119,10 @@ pub(crate) fn run(
             if app.take_cancel_request() {
                 conversation_worker.cancel();
             }
-            if app.take_audit_cancel() {
+            // Worker waits have no time bound (owner, 2026-10-16); the
+            // person's /cancel ends them and is reported on this cycle.
+            let audit_cancelled = app.take_audit_cancel();
+            if audit_cancelled {
                 audit_worker.cancel();
             }
             if app.take_project_admin_cancel() {
@@ -129,25 +132,30 @@ pub(crate) fn run(
             if queue_cancelled {
                 queue_worker.cancel();
             }
-            if app.take_models_cancel() {
+            let models_cancelled = app.take_models_cancel();
+            if models_cancelled {
                 models_worker.cancel();
+            }
+            let config_cancelled = app.take_config_cancel();
+            if config_cancelled {
+                config_worker.cancel();
             }
             let settling = settlement_at.is_some_and(|at| now >= at);
             let ready = router.ready(settling);
             let has = |source: Source| ready & source as u8 != 0;
-            if (has(Source::Config) || config_worker.next_deadline().is_some_and(|at| now >= at))
+            if (has(Source::Config) || config_cancelled)
                 && let Some(outcome) = config_worker.poll()
             {
                 app.config_finished(outcome);
                 dirty = true;
             }
-            if (has(Source::Models) || models_worker.next_deadline().is_some_and(|at| now >= at))
+            if (has(Source::Models) || models_cancelled)
                 && let Some(outcome) = models_worker.poll()
             {
                 app.models_finished(outcome);
                 dirty = true;
             }
-            if (has(Source::Audit) || audit_worker.next_deadline().is_some_and(|at| now >= at))
+            if (has(Source::Audit) || audit_cancelled)
                 && let Some(outcome) = audit_worker.poll()
             {
                 app.audit_finished(outcome);
@@ -159,10 +167,7 @@ pub(crate) fn run(
                 app.conversation_finished(update);
                 dirty = true;
             }
-            if (has(Source::Conversation)
-                || project_admin_worker
-                    .next_deadline()
-                    .is_some_and(|at| now >= at))
+            if has(Source::Conversation)
                 && let Some(update) = project_admin_worker.poll()
             {
                 app.project_admin_finished(update);
@@ -291,12 +296,9 @@ pub(crate) fn run(
                 screen.draw(|frame| app.draw(frame))?;
                 dirty = false;
             }
+            // A pending frame waits for stdout writability with no deadline
+            // (owner, 2026-10-16); newer state coalesces into the next frame.
             let pending = output.borrow().pending();
-            if pending {
-                output_at.get_or_insert(now + Duration::from_millis(100));
-            } else {
-                output_at = None;
-            }
             if router.has_settling() {
                 if settling || settlement_at.is_none() {
                     settlement_at = Some(now + Duration::from_millis(10));
@@ -307,14 +309,9 @@ pub(crate) fn run(
             let deadline = [
                 app.next_deadline(),
                 model.next_deadline(),
-                config_worker.next_deadline(),
-                models_worker.next_deadline(),
-                audit_worker.next_deadline(),
-                project_admin_worker.next_deadline(),
                 context_worker.next_deadline(),
                 queue_observer.next_deadline(),
                 settlement_at,
-                output_at,
             ]
             .into_iter()
             .flatten()

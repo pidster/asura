@@ -43,6 +43,19 @@ flowchart LR
     O -->|Accounted outcome or explicit uncertainty| UI["All control surfaces"]
 ```
 
+### Amendment, 2026-10-16
+
+Owner, 2026-10-16: tasks and required user decisions have no default deadline,
+under [AE-04](../engineering.md#asynchronous-execution-and-recovery) and
+[loop closure](../designs/loop-closure.md). This amends the deadline references
+above without rewriting the decision. Failure triggers are fatal errors,
+exhausted known-size budgets, revoked authority and a required decision that is
+revoked or superseded. A pending decision waits until a response, cancellation,
+revocation or supersession. Recovery bounds are attempt and resource limits, not
+time limits. The [core contract](../designs/core-harness-brief.md#common-failure-and-deadline-contract)
+holds the realigned procedure. Effect accounting, cancellation precedence and
+uncertainty reporting are unchanged.
+
 ## Alternatives and consequences
 
 - Direct failure on timeout is simpler but hides outstanding effects and breaks

@@ -122,11 +122,24 @@ field limits remain D2 decisions.
 Owner update, 2026-10-16: the handshake has no time limit; it ends on the next
 message, helper exit, a protocol fault, cancellation or shutdown. The
 cancellation-driven turn lifetime replaced the absolute operation deadline.
-Whether a per-frame completion deadline remains is open for the owner under
-[AE-04](../engineering.md#asynchronous-execution-and-recovery).
+The per-frame completion deadline is also removed; see the amendment below.
 The [I0 probe](../designs/swift-rust-boundary.md#i0-contract-probe-boundary)
 must prove mismatch and oversized-frame rejection with real Rust and Swift
 processes; I3 repeats the relevant cases under durable service admission.
+
+### Amendment, 2026-10-16
+
+Owner, 2026-10-16: the helper channel has no handshake, per-frame completion or
+absolute operation deadline, under the owner's rule in
+[AE-04](../engineering.md#asynchronous-execution-and-recovery). This amends the
+deadline sentences above without rewriting the decision. A silent or dribbling
+peer stays pending until the next complete message, helper exit, a protocol
+fault, cancellation or shutdown. Cumulative frame-count, byte and frame-size
+limits remain known-size bounds. Helper wind-down remains: 250 ms of cooperative
+cancellation, SIGTERM, 250 ms, then SIGKILL, one second of reap observation and
+the helper's 250 ms final drain. The
+[boundary design](../designs/swift-rust-boundary.md#model-operation-contract)
+records the channel rule and the I0 probe cases.
 
 ## Alternatives and consequences
 

@@ -6,14 +6,13 @@ use serde_yaml_ng::{Mapping, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 type Result<T> = std::result::Result<T, &'static str>;
 
 fn file_error(error: PrivateFileError) -> &'static str {
     match error {
         PrivateFileError::UnsafeOrIo => "config_io_or_unsafe_file",
-        PrivateFileError::CancelledOrExpired => "config_cancelled_or_expired",
+        PrivateFileError::CancelledOrExpired => "config_cancelled",
         PrivateFileError::TooLarge => "config_too_large",
         PrivateFileError::Read => "config_read_failed",
         PrivateFileError::Changed => "config_changed",
@@ -466,7 +465,6 @@ pub fn execute(
     runtime: RuntimeDirectory,
     key: &str,
     value: Option<&str>,
-    deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<String> {
     if !(key.is_empty() && value.is_none())
@@ -488,17 +486,18 @@ pub fn execute(
     {
         return Err("config_unknown_key");
     }
-    let snapshot =
-        PrivateFileSnapshot::read(runtime, "config.yaml", deadline, cancel).map_err(file_error)?;
+    // No time bound (owner, 2026-10-16): the job ends on completion, an error
+    // or the owner's cancel.
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     let mut config = Config::read(&snapshot.bytes)?;
     if let Some(value) = value {
         config.set(key, value)?;
         let serialized = yaml(&config)?;
         snapshot
-            .replace(serialized.as_bytes(), deadline, cancel)
+            .replace(serialized.as_bytes(), cancel)
             .map_err(file_error)?;
-    } else if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-        return Err("config_cancelled_or_expired");
+    } else if cancel.load(Ordering::Acquire) {
+        return Err("config_cancelled");
     }
     config.get(key)
 }
@@ -506,22 +505,19 @@ pub fn execute(
 /// The effective `retention.quotaBytes` (J1). Read once at service start on
 /// the payload recovery worker; the work has no time bound.
 pub fn retention_quota(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result<u64> {
-    let snapshot = PrivateFileSnapshot::read_without_deadline(runtime, "config.yaml", cancel)
-        .map_err(file_error)?;
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     Ok(Config::read(&snapshot.bytes)?.retention.quota_bytes)
 }
 
 /// Startup-only typed audit settings from the canonical validated YAML snapshot.
 pub fn audit_settings(
     runtime: RuntimeDirectory,
-    deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<(crate::audit::Settings, crate::audit::ConfigLoad)> {
-    let snapshot =
-        PrivateFileSnapshot::read(runtime, "config.yaml", deadline, cancel).map_err(file_error)?;
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     let config = Config::read(&snapshot.bytes)?;
-    if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-        return Err("config_cancelled_or_expired");
+    if cancel.load(Ordering::Acquire) {
+        return Err("config_cancelled");
     }
     let settings = crate::audit::Settings {
         enabled: config.audit.enabled,
@@ -546,24 +542,10 @@ pub struct ConversationSnapshot {
     pub digest: [u8; 32],
 }
 
-/// Validated canonical configuration identity for durable admission.
+/// Validated canonical configuration identity for durable admission. The
+/// read has no time bound (J1-0; owner, 2026-10-16); cancel or an error ends it.
 pub fn conversation_snapshot(
     runtime: RuntimeDirectory,
-    deadline: Instant,
-    cancel: &AtomicBool,
-) -> Result<ConversationSnapshot> {
-    conversation_snapshot_until(runtime, Some(deadline), cancel)
-}
-/// The journal writer's configuration read. Its work has no time bound (J1-0).
-pub fn conversation_snapshot_without_deadline(
-    runtime: RuntimeDirectory,
-    cancel: &AtomicBool,
-) -> Result<ConversationSnapshot> {
-    conversation_snapshot_until(runtime, None, cancel)
-}
-fn conversation_snapshot_until(
-    runtime: RuntimeDirectory,
-    deadline: Option<Instant>,
     cancel: &AtomicBool,
 ) -> Result<ConversationSnapshot> {
     use sha2::{Digest, Sha256};
@@ -572,11 +554,7 @@ fn conversation_snapshot_until(
         .into_os_string()
         .into_string()
         .map_err(|_| "config_io_or_unsafe_file")?;
-    let snapshot = match deadline {
-        Some(deadline) => PrivateFileSnapshot::read(runtime, "config.yaml", deadline, cancel),
-        None => PrivateFileSnapshot::read_without_deadline(runtime, "config.yaml", cancel),
-    }
-    .map_err(file_error)?;
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     let config = Config::read(&snapshot.bytes)?;
     let digest = Sha256::digest(yaml(&config)?.as_bytes()).into();
     let model_capabilities = config.model_capabilities();
@@ -614,14 +592,13 @@ mod tests {
             .unwrap();
         let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
         let cancel = AtomicBool::new(false);
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        let call = |key, value| execute(runtime.clone(), key, value, deadline, &cancel);
+        let call = |key, value| execute(runtime.clone(), key, value, &cancel);
         assert_eq!(call("audit.enabled", None).unwrap(), "true\n");
         call("model", Some("provider:model")).unwrap();
         call("audit.keepFiles", Some("8")).unwrap();
         assert_eq!(call("audit.keepFiles", None).unwrap(), "8\n");
         assert_eq!(call("model", None).unwrap(), "provider:model\n");
-        let original = conversation_snapshot(runtime.clone(), deadline, &cancel).unwrap();
+        let original = conversation_snapshot(runtime.clone(), &cancel).unwrap();
         let file = root.0.join(".asura/config.yaml");
         let before = std::fs::read(&file).unwrap();
         assert_eq!(
@@ -633,7 +610,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&file).unwrap(), before);
         call("providers.ollama.endpoint", Some("https://127.0.0.1:8443")).unwrap();
-        let changed = conversation_snapshot(runtime.clone(), deadline, &cancel).unwrap();
+        let changed = conversation_snapshot(runtime.clone(), &cancel).unwrap();
         assert_eq!(changed.model, original.model);
         assert_eq!(
             changed.asset_root,
@@ -656,7 +633,7 @@ mod tests {
         assert_eq!(changed.model_capabilities, None);
         call("providers.mlx.models", Some("{'family/model.v1': {capabilities: [toolCalling, reasoning]}, disabled: {capabilities: []}}")).unwrap();
         call("model", Some("mlx:family/model.v1")).unwrap();
-        let enabled = conversation_snapshot(runtime.clone(), deadline, &cancel).unwrap();
+        let enabled = conversation_snapshot(runtime.clone(), &cancel).unwrap();
         assert_eq!(enabled.model_capabilities, Some(5));
         assert_ne!(enabled.digest, changed.digest);
         assert!(
@@ -672,14 +649,14 @@ mod tests {
         assert!(call("", None).unwrap().contains("mlx:"));
         call("model", Some("mlx:disabled")).unwrap();
         assert_eq!(
-            conversation_snapshot(runtime.clone(), deadline, &cancel)
+            conversation_snapshot(runtime.clone(), &cancel)
                 .unwrap()
                 .model_capabilities,
             Some(0)
         );
         call("model", Some("coreai:family/model.v1")).unwrap();
         assert_eq!(
-            conversation_snapshot(runtime.clone(), deadline, &cancel)
+            conversation_snapshot(runtime.clone(), &cancel)
                 .unwrap()
                 .model_capabilities,
             None

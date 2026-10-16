@@ -38,10 +38,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Known-size bound on held connections. Connections have no frame, idle or
+/// output time limit (owner, 2026-10-16): each ends on completion, the peer's
+/// disconnect or the service's drain; this count and the 64 KiB frame limit
+/// bound the resources a slow peer can hold.
 const CLIENT_LIMIT: usize = 32;
-const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum Error {
@@ -78,16 +79,13 @@ struct Connection {
     counter: u64,
     output: Vec<u8>,
     written: usize,
-    output_started: Option<Instant>,
-    frame_started: Option<Instant>,
-    last_request: Instant,
     close_after_write: bool,
     request_pending: Option<pb::Envelope>,
     validation: Option<(u64, pb::Envelope)>,
     validated: bool,
 }
 impl Connection {
-    fn new(stream: AuthenticatedStream, now: Instant) -> Self {
+    fn new(stream: AuthenticatedStream) -> Self {
         Self {
             stream,
             codec: ControlCodec::new(),
@@ -95,39 +93,16 @@ impl Connection {
             counter: 0,
             output: Vec::new(),
             written: 0,
-            output_started: None,
-            frame_started: Some(now),
-            last_request: now,
             close_after_write: false,
             request_pending: None,
             validation: None,
             validated: false,
         }
     }
-    fn queue(&mut self, envelope: &pb::Envelope, now: Instant) -> Result<(), Error> {
+    fn queue(&mut self, envelope: &pb::Envelope) -> Result<(), Error> {
         self.output = encode_frame(envelope)?;
         self.written = 0;
-        self.output_started = Some(now);
         Ok(())
-    }
-    fn next_deadline(&self) -> Instant {
-        [
-            Some(self.last_request + IDLE_TIMEOUT),
-            self.frame_started.map(|at| at + FRAME_TIMEOUT),
-            self.output_started.map(|at| at + FRAME_TIMEOUT),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap()
-    }
-    fn expired(&self, now: Instant) -> bool {
-        self.frame_started
-            .is_some_and(|at| now.duration_since(at) >= FRAME_TIMEOUT)
-            || self
-                .output_started
-                .is_some_and(|at| now.duration_since(at) >= FRAME_TIMEOUT)
-            || now.duration_since(self.last_request) >= IDLE_TIMEOUT
     }
     fn flush(&mut self) -> io::Result<bool> {
         if self.output.is_empty() {
@@ -149,12 +124,11 @@ impl Connection {
         if self.written == self.output.len() {
             self.output.clear();
             self.written = 0;
-            self.output_started = None;
             return Ok(!self.close_after_write);
         }
         Ok(true)
     }
-    fn receive(&mut self, now: Instant) -> Result<Option<Frame>, ProtocolError> {
+    fn receive(&mut self) -> Result<Option<Frame>, ProtocolError> {
         let mut bytes = [0; 8192];
         match self.stream.stream_mut().read(&mut bytes) {
             Ok(0) => Err(ProtocolError::MalformedWire),
@@ -163,16 +137,11 @@ impl Connection {
                 if !self.output.is_empty() || self.request_pending.is_some() {
                     return Err(ProtocolError::InvalidSemantics);
                 }
-                self.frame_started.get_or_insert(now);
                 let used = self.codec.push(&bytes[..n])?;
                 if used != n {
                     return Err(ProtocolError::InvalidSemantics);
                 }
-                let result = self.codec.next_frame()?;
-                if result.is_some() {
-                    self.frame_started = None;
-                }
-                Ok(result)
+                self.codec.next_frame()
             }
             Err(e)
                 if matches!(
@@ -238,7 +207,6 @@ impl Dispatcher {
         request: &pb::Envelope,
         code: pb::ErrorCode,
         close: bool,
-        now: Instant,
     ) -> Result<Action, Error> {
         let message = match code {
             pb::ErrorCode::InvalidSequence => "invalid_sequence",
@@ -254,7 +222,7 @@ impl Dispatcher {
                 message: Some(message.into()),
             })),
         };
-        connection.queue(&reply, now)?;
+        connection.queue(&reply)?;
         connection.close_after_write = close;
         Ok(Action::Keep)
     }
@@ -262,7 +230,6 @@ impl Dispatcher {
         &self,
         connection: &mut Connection,
         request: pb::Envelope,
-        now: Instant,
         lifecycle: pb::Lifecycle,
     ) -> Result<Action, Error> {
         use pb::envelope::Body;
@@ -291,8 +258,7 @@ impl Dispatcher {
                     max_frame_bytes: Some(asura_control::MAX_FRAME_BYTES as u32),
                 })),
             };
-            connection.queue(&reply, now)?;
-            connection.last_request = now;
+            connection.queue(&reply)?;
             return Ok(Action::Keep);
         }
         let attachment = connection.attachment.unwrap();
@@ -311,19 +277,12 @@ impl Dispatcher {
             return Ok(Action::Close);
         }
         if request.service_epoch.as_deref() != Some(self.epoch.as_slice()) {
-            return self.error(connection, &request, pb::ErrorCode::StaleOwner, true, now);
+            return self.error(connection, &request, pb::ErrorCode::StaleOwner, true);
         }
         if !valid_counter(connection.counter, counter) {
-            return self.error(
-                connection,
-                &request,
-                pb::ErrorCode::InvalidSequence,
-                true,
-                now,
-            );
+            return self.error(connection, &request, pb::ErrorCode::InvalidSequence, true);
         }
         connection.counter = counter;
-        connection.last_request = now;
         if let Some(Body::Stop(stop)) = &request.body
             && stop.expected_epoch.as_ref().is_some_and(|expected| {
                 expected.len() == 16
@@ -331,45 +290,44 @@ impl Dispatcher {
                     && expected.as_slice() != self.epoch.as_slice()
             })
         {
-            return self.error(connection, &request, pb::ErrorCode::StaleOwner, true, now);
+            return self.error(connection, &request, pb::ErrorCode::StaleOwner, true);
         }
         if validate_semantics(&request, Direction::ClientToServer).is_err() {
-            return self.error(
-                connection,
-                &request,
-                pb::ErrorCode::InvalidRequest,
-                false,
-                now,
-            );
+            return self.error(connection, &request, pb::ErrorCode::InvalidRequest, false);
         }
         if matches!(request.body, Some(Body::ModelsList(_))) {
             if lifecycle != pb::Lifecycle::Serving {
-                return self.error(connection, &request, pb::ErrorCode::Draining, false, now);
+                return self.error(connection, &request, pb::ErrorCode::Draining, false);
             }
             connection.request_pending = Some(request);
             return Ok(Action::Models);
         }
         if matches!(request.body, Some(Body::ConfigGet(_) | Body::ConfigSet(_))) {
             if lifecycle != pb::Lifecycle::Serving {
-                return self.error(connection, &request, pb::ErrorCode::Draining, false, now);
+                return self.error(connection, &request, pb::ErrorCode::Draining, false);
             }
             connection.request_pending = Some(request);
             return Ok(Action::Config);
         }
         if matches!(request.body, Some(Body::ObserveContext(_))) {
             if lifecycle != pb::Lifecycle::Serving {
-                return self.error(connection, &request, pb::ErrorCode::Draining, false, now);
+                return self.error(connection, &request, pb::ErrorCode::Draining, false);
             }
             connection.request_pending = Some(request);
             return Ok(Action::Context);
         }
         if matches!(request.body, Some(Body::ObserveService(_))) {
+            // The status observer has shut down; a draining service answers
+            // Inspect, InspectInstallation and a forcing second Stop only.
+            if lifecycle == pb::Lifecycle::Draining {
+                return self.error(connection, &request, pb::ErrorCode::Draining, false);
+            }
             connection.request_pending = Some(request);
             return Ok(Action::Service);
         }
         if conversation::handles(&request) {
             if lifecycle != pb::Lifecycle::Serving {
-                return self.error(connection, &request, pb::ErrorCode::Draining, false, now);
+                return self.error(connection, &request, pb::ErrorCode::Draining, false);
             }
             connection.request_pending = Some(request);
             return Ok(Action::Conversation);
@@ -391,13 +349,7 @@ impl Dispatcher {
             ),
             Some(Body::Stop(_)) => (Body::StopAccepted(pb::StopAccepted {}), Action::Drain),
             _ => {
-                return self.error(
-                    connection,
-                    &request,
-                    pb::ErrorCode::InvalidRequest,
-                    false,
-                    now,
-                );
+                return self.error(connection, &request, pb::ErrorCode::InvalidRequest, false);
             }
         };
         let reply = pb::Envelope {
@@ -406,7 +358,7 @@ impl Dispatcher {
             request_counter: request.request_counter,
             body: Some(body),
         };
-        connection.queue(&reply, now)?;
+        connection.queue(&reply)?;
         Ok(action)
     }
 }
@@ -488,7 +440,7 @@ fn run_reactor_with_config<F, G>(
 ) -> Result<(), Error>
 where
     F: FnOnce(RuntimeDirectory, [u8; 16]) -> io::Result<installation::Worker>,
-    G: FnMut(RuntimeDirectory, pb::Envelope, Instant) -> io::Result<config_worker::Worker>,
+    G: FnMut(RuntimeDirectory, pb::Envelope) -> io::Result<config_worker::Worker>,
 {
     let mut dispatcher = Dispatcher::new(build)?;
     let mut guard = match runtime.acquire_owner() {
@@ -555,7 +507,11 @@ where
     let mut contexts = context_manager::Manager::default();
     contexts.register(wake_sender.clone());
     conversations.register(wake_sender.clone());
-    let mut drain: Option<(usize, Instant)> = None;
+    // Stop and drain (owner, 2026-10-16): no drain deadline. `drain` holds the
+    // requester slot whose StopAccepted must flush first (None after it closes
+    // or for a signal/lifetime drain). A second Stop or signal forces exit.
+    let mut drain: Option<Option<usize>> = None;
+    let mut forced_exit = false;
     let mut lifecycle = pb::Lifecycle::Serving;
     let mut service_observer = service_observer::Observer::new(
         runtime.clone(),
@@ -564,7 +520,6 @@ where
     );
     let mut endpoint_removed = false;
     let mut lifetime_ended = false;
-    let mut retry_after_inspection = false;
     let mut replay_loading = installation::ReplayLoading::default();
     let result = (|| -> Result<(), Error> {
         loop {
@@ -583,7 +538,7 @@ where
                             && request.request_counter == reply.request_counter
                     }) {
                         client.request_pending = None;
-                        client.queue(&reply, now)?;
+                        client.queue(&reply)?;
                     }
                 }
             }
@@ -598,7 +553,7 @@ where
                             && request.request_counter == reply.request_counter
                     }) {
                         client.request_pending = None;
-                        client.queue(&reply, now)?;
+                        client.queue(&reply)?;
                     }
                 }
             }
@@ -662,7 +617,7 @@ where
                 wake_sender.notify()?;
             }
             if let Some(job) = config_job.as_mut() {
-                if let Some(reply) = job.poll(now) {
+                if let Some(reply) = job.poll() {
                     service_observer.refresh();
                     for client in clients.iter_mut().flatten() {
                         if client.request_pending.as_ref().is_some_and(|request| {
@@ -670,7 +625,7 @@ where
                                 && request.request_counter == reply.request_counter
                         }) {
                             client.request_pending = None;
-                            client.queue(&reply, now)?;
+                            client.queue(&reply)?;
                         }
                     }
                 }
@@ -706,7 +661,7 @@ where
                             && request.request_counter == reply.request_counter
                     }) {
                         client.request_pending = None;
-                        client.queue(&reply, now)?;
+                        client.queue(&reply)?;
                     }
                 }
             }
@@ -730,15 +685,14 @@ where
                     .is_some_and(|reader| reader.ended().unwrap_or(true));
             lifetime_ended |= owner_ended;
             let signal = asura_platform::take_termination_signal().is_some();
-            let settled_retry = retry_after_inspection
-                && inspection.settled()
-                && config_job.is_none()
-                && models.settled()
-                && conversations.settled()
-                && contexts.settled()
-                && service_observer.settled()
-                && audit.as_ref().is_none_or(|worker| worker.settled());
-            if owner_ended || signal || settled_retry {
+            if signal && drain.is_some() {
+                // A second stop request forces exit without further waiting;
+                // unsettled work is recovered by the next owner's replay.
+                tracing::info!(reason = "signal", "service_forced_exit");
+                forced_exit = true;
+                break;
+            }
+            if (owner_ended || signal) && drain.is_none() {
                 for client in &mut clients {
                     *client = None;
                 }
@@ -761,62 +715,51 @@ where
                 if let Some(job) = &config_job {
                     job.cancel();
                 }
-                // Repeated EOF or signals must not extend an existing drain budget.
-                drain.get_or_insert((CLIENT_LIMIT, now + DRAIN_TIMEOUT));
-                retry_after_inspection = false;
+                // A lifetime EOF triggers the drain once; it never restarts it.
+                drain = Some(None);
+                lifecycle = pb::Lifecycle::Draining;
             }
-            if let Some((slot, deadline)) = drain
-                && (now >= deadline || slot == CLIENT_LIMIT || clients[slot].is_none())
+            if let Some(Some(slot)) = drain
+                && clients[slot].is_none()
             {
-                for client in &mut clients {
-                    *client = None;
-                }
-                if !inspection.settled()
-                    || config_job.is_some()
-                    || !models.settled()
-                    || !conversations.settled()
-                    || !contexts.settled()
-                    || !service_observer.settled()
-                    || audit.as_ref().is_some_and(|worker| !worker.settled())
-                    || guard_job.as_ref().is_some_and(|job| !job.settled())
-                {
-                    if now >= deadline
-                        || audit
-                            .as_ref()
-                            .is_some_and(|worker| worker.settlement_expired(now))
-                    {
-                        lifecycle = pb::Lifecycle::RepairOnly;
-                        dispatcher.installation = installation::snapshot(
-                            pb::InstallationState::Unavailable,
-                            pb::InstallationInspectionReason::InspectionTimeout,
-                        );
-                        drain = None;
-                        // Keep the lock and repair endpoint while the worker settles.
-                        // A TUI-owned service must then finish its requested shutdown.
-                        retry_after_inspection = true;
-                    }
-                } else {
-                    if let Some(owned) = guard.take() {
-                        match guard_worker::Worker::start_cleanup(owned, 0, now) {
-                            Ok(job) => {
-                                job.register(wake_sender.clone());
-                                guard_job = Some(job);
-                            }
-                            Err((error, returned)) => {
-                                guard = Some(returned);
-                                return Err(error.into());
-                            }
+                // The requester's StopAccepted has flushed and its connection closed.
+                drain = Some(None);
+            }
+            if drain == Some(None) {
+                // Wait for every cancelled worker to report settlement, with no
+                // deadline (owner, 2026-10-16). Slowness never moves the owner
+                // to RepairOnly; only a worker reporting an unknown outcome
+                // would, and no current worker reports one at drain. Inspect
+                // reports `Draining` meanwhile, so a client can show progress.
+                let settled = inspection.settled()
+                    && config_job.is_none()
+                    && models.settled()
+                    && conversations.settled()
+                    && contexts.settled()
+                    && service_observer.settled()
+                    && audit.as_ref().is_none_or(|worker| worker.settled())
+                    && guard_job.as_ref().is_none_or(|job| job.settled());
+                if settled && let Some(owned) = guard.take() {
+                    match guard_worker::Worker::start_cleanup(owned, 0, now) {
+                        Ok(job) => {
+                            job.register(wake_sender.clone());
+                            guard_job = Some(job);
+                        }
+                        Err((error, returned)) => {
+                            guard = Some(returned);
+                            return Err(error.into());
                         }
                     }
                 }
             }
-            for client in &mut clients {
-                if client.as_ref().is_some_and(|c| c.expired(now)) {
-                    *client = None;
-                }
+            // A disconnected client cancels its pending validation.
+            if let Some((slot, _)) = guard_slot
+                && clients[slot].is_none()
+                && let Some(job) = &guard_job
+            {
+                job.cancel();
             }
             if guard_job.is_none()
-                && drain.is_none()
                 && let Some(guard) = guard.as_ref()
             {
                 let candidates: Vec<_> = clients
@@ -871,9 +814,11 @@ where
                     guard_job = Some(job);
                 }
             }
+            // A draining owner keeps accepting so Inspect can show progress and
+            // a second Stop can force exit; work requests get `Draining`.
             let mut interests = vec![PollInterest {
                 fd: listener.as_raw_fd(),
-                read: drain.is_none() && guard.is_some(),
+                read: guard.is_some(),
                 write: false,
             }];
             let mut slots = vec![None];
@@ -881,9 +826,7 @@ where
                 if let Some(client) = client {
                     interests.push(PollInterest {
                         fd: client.stream.stream().as_raw_fd(),
-                        read: drain.is_none()
-                            && !client.close_after_write
-                            && client.validation.is_none(),
+                        read: !client.close_after_write && client.validation.is_none(),
                         write: !client.output.is_empty(),
                     });
                     slots.push(Some(slot));
@@ -918,11 +861,9 @@ where
                 interests.push(interest);
                 slots.push(None);
             }
-            let deadline = clients
-                .iter()
-                .flatten()
-                .map(Connection::next_deadline)
-                .chain(inspection.next_deadline(now))
+            let deadline = inspection
+                .next_deadline(now)
+                .into_iter()
                 .chain(config_job.as_ref().and_then(|job| job.next_deadline(now)))
                 .chain(contexts.next_deadline(now))
                 .chain(service_observer.next_deadline(now))
@@ -930,11 +871,6 @@ where
                 .chain(conversations.next_deadline(now))
                 .chain(models.next_deadline(now))
                 .chain(guard_job.as_ref().and_then(|job| job.next_deadline(now)))
-                .chain(
-                    drain
-                        .map(|(_, deadline)| deadline)
-                        .filter(|deadline| *deadline > now),
-                )
                 .min();
             let has_validated = clients.iter().flatten().any(|client| client.validated);
             let timeout = deadline
@@ -964,7 +900,7 @@ where
             }
             for event in ready {
                 if event.index == 0 {
-                    if drain.is_some() {
+                    if guard.is_none() {
                         continue;
                     }
                     for _ in 0..CLIENT_LIMIT {
@@ -975,7 +911,7 @@ where
                                     continue;
                                 };
                                 if let Ok(stream) = AuthenticatedStream::from_stream(stream) {
-                                    clients[slot] = Some(Connection::new(stream, Instant::now()));
+                                    clients[slot] = Some(Connection::new(stream));
                                 }
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -993,19 +929,15 @@ where
                 };
                 let now = Instant::now();
                 let mut action = Action::Keep;
-                if client.validated && drain.is_none() {
+                if client.validated {
                     client.validated = false;
                     let (_, request) = client
                         .validation
                         .take()
                         .expect("validated request retained");
-                    action = dispatcher.dispatch(client, request, now, lifecycle)?;
-                } else if event.read
-                    && drain.is_none()
-                    && !client.close_after_write
-                    && client.validation.is_none()
-                {
-                    match client.receive(now) {
+                    action = dispatcher.dispatch(client, request, lifecycle)?;
+                } else if event.read && !client.close_after_write && client.validation.is_none() {
+                    match client.receive() {
                         Ok(Some(Frame::Message(request))) => {
                             validation_ticket = validation_ticket
                                 .checked_add(1)
@@ -1020,7 +952,6 @@ where
                         {
                             client.output = version_rejection().to_vec();
                             client.written = 0;
-                            client.output_started = Some(now);
                             client.close_after_write = true;
                         }
                         Err(_) => action = Action::Close,
@@ -1038,7 +969,7 @@ where
                         let request = client.request_pending.as_ref().unwrap().clone();
                         if let Some(reply) = service_observer.request(request, now) {
                             client.request_pending = None;
-                            client.queue(&reply, now)?;
+                            client.queue(&reply)?;
                         }
                     }
                     Action::Close => clients[slot] = None,
@@ -1051,7 +982,7 @@ where
                         {
                             Some("config_busy")
                         } else {
-                            match start_config(runtime.clone(), request.clone(), now) {
+                            match start_config(runtime.clone(), request.clone()) {
                                 Ok(job) => {
                                     job.register(wake_sender.clone());
                                     config_job = Some(job);
@@ -1067,21 +998,21 @@ where
                                 value_yaml: None,
                                 error: Some(error.into()),
                             }));
-                            client.queue(&reply, now)?;
+                            client.queue(&reply)?;
                         }
                     }
                     Action::Models => {
                         let request = client.request_pending.as_ref().unwrap().clone();
-                        if let Some(reply) = models.request(request, now) {
+                        if let Some(reply) = models.request(request) {
                             client.request_pending = None;
-                            client.queue(&reply, now)?;
+                            client.queue(&reply)?;
                         }
                     }
                     Action::Conversation => {
                         let request = client.request_pending.as_ref().unwrap().clone();
                         if let Some(reply) = conversations.request(request, now) {
                             client.request_pending = None;
-                            client.queue(&reply, now)?;
+                            client.queue(&reply)?;
                         }
                     }
                     Action::Context => {
@@ -1099,8 +1030,16 @@ where
                         };
                         if let Some(reply) = contexts.request(request, identity, now) {
                             client.request_pending = None;
-                            client.queue(&reply, now)?;
+                            client.queue(&reply)?;
                         }
+                    }
+                    Action::Drain if drain.is_some() => {
+                        // A second Stop for this epoch forces exit without
+                        // further waiting (owner, 2026-10-16).
+                        tracing::info!(reason = "second_stop", "service_forced_exit");
+                        let _ = client.flush();
+                        forced_exit = true;
+                        break;
                     }
                     Action::Drain => {
                         audit_shutdown_reason.get_or_insert(asura_storage::audit::StopReason::Stop);
@@ -1113,7 +1052,8 @@ where
                         if let Some(job) = &config_job {
                             job.cancel();
                         }
-                        drain = Some((slot, now + DRAIN_TIMEOUT));
+                        drain = Some(Some(slot));
+                        lifecycle = pb::Lifecycle::Draining;
                         for (index, entry) in clients.iter_mut().enumerate() {
                             if index == slot {
                                 if let Some(client) = entry {
@@ -1127,9 +1067,31 @@ where
                     }
                 }
             }
+            if forced_exit {
+                break;
+            }
         }
         Ok(())
     })();
+    if forced_exit {
+        // Forced exit on a second stop request (owner, 2026-10-16), as after a
+        // crash: workers are cancelled but not awaited. The owner lock and the
+        // endpoint stay held until the process exits, so no successor can
+        // start while this process's threads still run; the next lock winner
+        // removes the stale endpoint and replays unsettled work.
+        inspection.cancel();
+        conversations.shutdown();
+        contexts.shutdown();
+        service_observer.shutdown();
+        models.shutdown(Instant::now());
+        if let Some(job) = &config_job {
+            job.cancel();
+        }
+        drop(clients);
+        std::mem::forget(listener);
+        std::mem::forget(guard);
+        return result;
+    }
     // An unsafe runtime error forbids further dispatch, but cannot release ownership
     // while any worker is still using retained filesystem handles.
     audit_shutdown_reason.get_or_insert(asura_storage::audit::StopReason::OwnerLifetimeEnded);
@@ -1167,7 +1129,7 @@ where
         let _ = models.poll(&[], now);
         let _ = inspection.poll(dispatcher.epoch, now);
         if let Some(job) = config_job.as_mut() {
-            let _ = job.poll(now);
+            let _ = job.poll();
             if let Some(event) = job.take_audit_event()
                 && let Some(worker) = &audit
             {
@@ -1294,10 +1256,7 @@ mod tests {
     fn dispatcher_replay_and_stale_stop_never_enter_drain() {
         use pb::envelope::Body;
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let mut connection = Connection::new(
-            AuthenticatedStream::from_stream(stream).unwrap(),
-            Instant::now(),
-        );
+        let mut connection = Connection::new(AuthenticatedStream::from_stream(stream).unwrap());
         let dispatcher = Dispatcher::new("asura/test").unwrap();
         let hello = pb::Envelope {
             service_epoch: None,
@@ -1309,12 +1268,7 @@ mod tests {
         };
         assert_eq!(
             dispatcher
-                .dispatch(
-                    &mut connection,
-                    hello,
-                    Instant::now(),
-                    pb::Lifecycle::Serving
-                )
+                .dispatch(&mut connection, hello, pb::Lifecycle::Serving)
                 .unwrap(),
             Action::Keep
         );
@@ -1326,12 +1280,7 @@ mod tests {
         };
         assert_eq!(
             dispatcher
-                .dispatch(
-                    &mut connection,
-                    request.clone(),
-                    Instant::now(),
-                    pb::Lifecycle::RepairOnly
-                )
+                .dispatch(&mut connection, request.clone(), pb::Lifecycle::RepairOnly)
                 .unwrap(),
             Action::Keep
         );
@@ -1350,12 +1299,7 @@ mod tests {
         }));
         assert_eq!(
             dispatcher
-                .dispatch(
-                    &mut connection,
-                    request.clone(),
-                    Instant::now(),
-                    pb::Lifecycle::Serving
-                )
+                .dispatch(&mut connection, request.clone(), pb::Lifecycle::Serving)
                 .unwrap(),
             Action::Keep
         );
@@ -1371,12 +1315,7 @@ mod tests {
         }));
         assert_eq!(
             dispatcher
-                .dispatch(
-                    &mut connection,
-                    request.clone(),
-                    Instant::now(),
-                    pb::Lifecycle::Serving
-                )
+                .dispatch(&mut connection, request.clone(), pb::Lifecycle::Serving)
                 .unwrap(),
             Action::Keep
         );
@@ -1393,12 +1332,7 @@ mod tests {
         }));
         assert_eq!(
             dispatcher
-                .dispatch(
-                    &mut connection,
-                    request,
-                    Instant::now(),
-                    pb::Lifecycle::Serving
-                )
+                .dispatch(&mut connection, request, pb::Lifecycle::Serving)
                 .unwrap(),
             Action::Keep
         );

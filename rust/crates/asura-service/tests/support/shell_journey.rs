@@ -83,7 +83,9 @@ pub(super) fn run(provider: &str) -> Result<()> {
             "Call shell exactly once with command `{COMMAND}`, cwd `.`, timeout_seconds 30. Then reply only with the proof token returned on stdout. Do not use other tools or repeat the command."
         )),
     };
-    let accepted = fixture.attach()?.submit_conversation(request.clone())?;
+    let accepted = fixture
+        .attach()?
+        .submit_conversation(request.clone(), &|| false)?;
     let operation = checked_id(accepted.operation_id.clone())?;
     let event = observe(&fixture, operation)?;
     if event.kind != Some(3) {
@@ -101,7 +103,9 @@ pub(super) fn run(provider: &str) -> Result<()> {
             .any(|tool| tool.name.as_deref() == Some("shell") && tool.status == Some(1))
     );
     assert_eq!(fs::read(directory.join("effect.txt"))?, b"x");
-    let retry = fixture.attach()?.submit_conversation(request.clone())?;
+    let retry = fixture
+        .attach()?
+        .submit_conversation(request.clone(), &|| false)?;
     assert_eq!(retry.operation_id, accepted.operation_id);
     fixture.stop()?;
     let (intent, result) = recorded(&fixture, operation)?;
@@ -121,7 +125,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
     assert!(result.text.contains("\nstderr:\nstderr-proof"));
     fixture.start()?;
     wait_ready(&fixture, None)?;
-    let retry = fixture.attach()?.submit_conversation(request)?;
+    let retry = fixture.attach()?.submit_conversation(request, &|| false)?;
     assert_eq!(retry.operation_id, accepted.operation_id);
     let replayed = observe(&fixture, operation)?;
     assert_eq!(replayed.text, event.text);

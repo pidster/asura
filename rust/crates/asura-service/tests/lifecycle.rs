@@ -61,8 +61,14 @@ fn launch(
 fn attach(runtime: &RuntimeDirectory) -> Client {
     let end = Instant::now() + Duration::from_secs(3);
     loop {
-        match Client::attach(runtime, "asura/test", end) {
-            Ok(client) => return client,
+        // Test-only harness budget for this attachment's waits.
+        let harness = Instant::now() + Duration::from_secs(30);
+        let cancel: asura_client::Cancel = std::sync::Arc::new(move || Instant::now() >= harness);
+        match Client::attach(runtime, "asura/test", &*cancel) {
+            Ok(mut client) => {
+                client.set_cancel(cancel);
+                return client;
+            }
             Err(error)
                 if (asura_client::is_absent(&error)
                     || matches!(
@@ -231,35 +237,45 @@ fn config_persists_across_service_restart_and_rejects_without_mutation() {
     let mut client = attach(&runtime);
     assert_eq!(
         client
-            .config("audit.enabled", None)
+            .config("audit.enabled", None, &|| false)
             .unwrap()
             .value_yaml
             .as_deref(),
         Some("true\n")
     );
-    assert!(client.config("model", None).unwrap().error.is_some());
+    assert!(
+        client
+            .config("model", None, &|| false)
+            .unwrap()
+            .error
+            .is_some()
+    );
     assert_eq!(
-        client.config("", None).unwrap().value_yaml.as_deref(),
+        client
+            .config("", None, &|| false)
+            .unwrap()
+            .value_yaml
+            .as_deref(),
         Some("audit:\n  enabled: true\n  keepFiles: 5\n  maxFileBytes: 10485760\n")
     );
     assert!(!scratch.0.join(".asura/config.yaml").exists());
     assert!(
         client
-            .config("model", Some("provider/conversation-model"))
+            .config("model", Some("provider/conversation-model"), &|| false)
             .unwrap()
             .error
             .is_none()
     );
     assert!(
         client
-            .config("audit.keepFiles", Some("8"))
+            .config("audit.keepFiles", Some("8"), &|| false)
             .unwrap()
             .error
             .is_none()
     );
     assert!(
         client
-            .config("audit.enabled", Some("false"))
+            .config("audit.enabled", Some("false"), &|| false)
             .unwrap()
             .error
             .is_none()
@@ -268,7 +284,7 @@ fn config_persists_across_service_restart_and_rejects_without_mutation() {
     let before = fs::read(&path).unwrap();
     assert_eq!(
         client
-            .config("", None)
+            .config("", None, &|| false)
             .unwrap()
             .value_yaml
             .unwrap()
@@ -285,7 +301,13 @@ fn config_persists_across_service_restart_and_rejects_without_mutation() {
             "{enabled: true, enabled: false, keepFiles: 5, maxFileBytes: 100}",
         ),
     ] {
-        assert!(client.config(key, Some(value)).unwrap().error.is_some());
+        assert!(
+            client
+                .config(key, Some(value), &|| false)
+                .unwrap()
+                .error
+                .is_some()
+        );
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(
             client.inspect().unwrap().lifecycle,
@@ -298,12 +320,16 @@ fn config_persists_across_service_restart_and_rejects_without_mutation() {
     let (handle, done) = launch(&runtime, &scratch.0.join("events.log"));
     let mut client = attach(&runtime);
     assert_eq!(
-        client.config("model", None).unwrap().value_yaml.as_deref(),
+        client
+            .config("model", None, &|| false)
+            .unwrap()
+            .value_yaml
+            .as_deref(),
         Some("provider/conversation-model\n")
     );
     assert_eq!(
         client
-            .config("audit.keepFiles", None)
+            .config("audit.keepFiles", None, &|| false)
             .unwrap()
             .value_yaml
             .as_deref(),
@@ -311,7 +337,7 @@ fn config_persists_across_service_restart_and_rejects_without_mutation() {
     );
     assert_eq!(
         client
-            .config("audit.enabled", None)
+            .config("audit.enabled", None, &|| false)
             .unwrap()
             .value_yaml
             .as_deref(),
@@ -319,7 +345,7 @@ fn config_persists_across_service_restart_and_rejects_without_mutation() {
     );
     assert_eq!(
         client
-            .config("audit.maxFileBytes", None)
+            .config("audit.maxFileBytes", None, &|| false)
             .unwrap()
             .value_yaml
             .as_deref(),

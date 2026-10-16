@@ -14,12 +14,13 @@ struct ReadValue {
     size: Result<u64, asura_storage::stored_memory::SizeError>,
     sampled: Instant,
 }
+/// One configuration and stored-bytes sample. No time bound (owner,
+/// 2026-10-16): it ends on completion, an error or shutdown; the pane shows
+/// the size as measuring (`size_reason` 2) until it returns.
 struct Read {
     handle: JoinHandle<ReadValue>,
     completion: crate::completion::Completion,
     cancel: Arc<AtomicBool>,
-    deadline: Instant,
-    expired: bool,
 }
 pub(crate) struct Observer {
     runtime: RuntimeDirectory,
@@ -104,15 +105,15 @@ impl Observer {
         let previous_model = self.model.clone();
         let previous_size = (self.size, self.size_reason);
         if let Some(read) = self.read.as_mut() {
-            if now >= read.deadline && !read.expired {
-                read.expired = true;
-                read.cancel.store(true, Ordering::Release);
-                self.size_reason = 3;
+            if !read.handle.is_finished() && !read.cancel.load(Ordering::Acquire) {
+                // A sample that has not returned shows as measuring, keeping
+                // the last valid byte count and sample time (stale).
+                self.size_reason = 2;
             }
             if read.handle.is_finished() {
                 let read = self.read.take().unwrap();
                 let result = read.handle.join();
-                if !read.expired {
+                if !read.cancel.load(Ordering::Acquire) {
                     match result {
                         Ok(value) => {
                             self.model = value.model;
@@ -140,7 +141,6 @@ impl Observer {
             self.refresh = false;
             self.next_sample = now + Duration::from_secs(30);
             let runtime = self.runtime.clone();
-            let deadline = now + Duration::from_secs(2);
             let completion = crate::completion::Completion::default();
             completion.register(self.wake.clone());
             let signal = completion.clone();
@@ -150,15 +150,11 @@ impl Observer {
                 .name("asura-status-config".into())
                 .spawn(move || {
                     let _done = signal.guard();
-                    let model = asura_storage::config::conversation_snapshot(
-                        runtime.clone(),
-                        deadline,
-                        &token,
-                    )
-                    .ok()
-                    .map(|snapshot| snapshot.model);
-                    let size =
-                        asura_storage::stored_memory::stored_bytes(runtime, deadline, &token);
+                    let model =
+                        asura_storage::config::conversation_snapshot(runtime.clone(), &token)
+                            .ok()
+                            .map(|snapshot| snapshot.model);
+                    let size = asura_storage::stored_memory::stored_bytes(runtime, &token);
                     ReadValue {
                         model,
                         size,
@@ -170,8 +166,6 @@ impl Observer {
                     handle,
                     completion,
                     cancel,
-                    deadline,
-                    expired: false,
                 });
             } else {
                 self.size_reason = 5;
@@ -213,15 +207,11 @@ impl Observer {
             .iter()
             .map(|(_, deadline)| *deadline)
             .chain((self.read.is_none() && !self.closing).then_some(self.next_sample))
-            .chain(self.read.as_ref().and_then(|read| {
-                if read.completion.completed() {
-                    read.completion.settlement_deadline(now)
-                } else if !read.expired {
-                    Some(read.deadline)
-                } else {
-                    None
-                }
-            }))
+            .chain(
+                self.read
+                    .as_ref()
+                    .and_then(|read| read.completion.settlement_deadline(now)),
+            )
             .min()
     }
     pub fn shutdown(&mut self) {
@@ -368,7 +358,7 @@ mod tests {
         let token = cancel.clone();
         let handle = std::thread::spawn(move || {
             let _guard = done.guard();
-            blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(token.load(Ordering::Acquire));
             ReadValue {
                 model: Some("late".into()),
@@ -380,15 +370,16 @@ mod tests {
             handle,
             completion,
             cancel,
-            deadline: now,
-            expired: false,
         });
         let before = Instant::now();
-        owner.poll(status, &[], now);
+        // Held past the removed 2 s bound (injected clock): still measuring,
+        // with the last valid size retained; nothing is cancelled.
+        owner.poll(status, &[], now + Duration::from_secs(10));
         assert!(before.elapsed() < Duration::from_millis(100));
         assert!(!owner.settled());
         assert_eq!(owner.size, Some((42, 0)));
-        assert_eq!(owner.size_reason, 3);
+        assert_eq!(owner.size_reason, 2);
+        assert!(!owner.read.as_ref().unwrap().cancel.load(Ordering::Acquire));
         owner.refresh();
         owner.poll(status, &[], now + Duration::from_secs(31));
         assert!(!owner.settled());
@@ -402,7 +393,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(owner.size, Some((42, 0)));
-        assert_eq!(owner.size_reason, 3);
+        assert_eq!(owner.size_reason, 2);
         assert!(owner.model.is_none());
         assert!(owner.next_deadline(Instant::now()).is_none());
         let request = pb::Envelope {

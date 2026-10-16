@@ -5,7 +5,6 @@ use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 const LIMIT: usize = 8 * 1024 * 1024;
 struct Node {

@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,15 +103,12 @@ fn repository(root: &str, path: &str) -> Result<Option<PathBuf>, &'static str> {
 }
 
 /// Fixed developer-tool discovery. Never resolve an executable using repository PATH.
+/// The lookup has no time bound (owner, 2026-10-16): it ends on completion, a
+/// failure or `cancelled`.
 pub fn git_executable(cancelled: &AtomicBool) -> Result<PathBuf, &'static str> {
     let mut command = Command::new("/usr/bin/xcrun");
     command.env_clear().args(["--find", "git"]);
-    let output = run(
-        command,
-        Instant::now() + Duration::from_secs(2),
-        cancelled,
-        4096,
-    )?;
+    let output = run(command, cancelled, &mut || false, 4096)?;
     let path = std::str::from_utf8(&output)
         .map_err(|_| "git_unavailable")?
         .trim();
@@ -135,6 +132,11 @@ pub(crate) fn quoted(value: &str) -> Result<String, &'static str> {
     ))
 }
 
+/// Collect one Git snapshot. Collection has no time bound (owner, 2026-10-16):
+/// it ends on completion, `cancelled`, or supersession by a newer change
+/// (`superseded` returns true, reported as `git_changed_during_observation`).
+/// The output and stderr byte caps are known-size bounds.
+#[allow(clippy::too_many_arguments)]
 pub fn collect_git(
     root: &str,
     path: &str,
@@ -143,7 +145,9 @@ pub fn collect_git(
     boundary: &crate::StateBoundary,
     git: &Path,
     cancelled: &AtomicBool,
+    superseded: &mut dyn FnMut() -> bool,
 ) -> GitSnapshot {
+    #[allow(clippy::too_many_arguments)]
     fn collect(
         root: &str,
         path: &str,
@@ -152,6 +156,7 @@ pub fn collect_git(
         boundary: &crate::StateBoundary,
         git: &Path,
         cancelled: &AtomicBool,
+        superseded: &mut dyn FnMut() -> bool,
     ) -> Result<GitSnapshot, &'static str> {
         validate_scope(root, path, device, inode, boundary)?;
         let Some(repository) = repository(root, path)? else {
@@ -176,7 +181,6 @@ pub fn collect_git(
             (subpath \"/System/Volumes/Preboot/Cryptexes/OS/System/Library\")\
             (subpath \"/System/Volumes/Preboot/Cryptexes/OS/usr/lib\"))"
         );
-        let deadline = Instant::now() + Duration::from_secs(2);
         // Reserve each child's stderr cap in the aggregate output budget.
         let mut remaining: usize = 1024 * 1024;
         let command = || {
@@ -210,7 +214,7 @@ pub fn collect_git(
             remaining = remaining.checked_sub(16_384).ok_or("git_output_limit")?;
             let mut child = command();
             child.args(args);
-            let output = run(child, deadline, cancelled, remaining)?;
+            let output = run(child, cancelled, superseded, remaining)?;
             remaining -= output.len();
             Ok::<_, &'static str>(output)
         };
@@ -256,15 +260,17 @@ pub fn collect_git(
         validate_scope(root, path, device, inode, boundary)?;
         Ok(snapshot)
     }
-    collect(root, path, device, inode, boundary, git, cancelled)
-        .unwrap_or_else(GitSnapshot::unknown)
+    collect(
+        root, path, device, inode, boundary, git, cancelled, superseded,
+    )
+    .unwrap_or_else(GitSnapshot::unknown)
 }
 
 /// Child handles stay on the retained worker through kill and reap; never detached.
 fn run(
     mut command: Command,
-    deadline: Instant,
     cancelled: &AtomicBool,
+    superseded: &mut dyn FnMut() -> bool,
     limit: usize,
 ) -> Result<Vec<u8>, &'static str> {
     let mut child = command
@@ -297,8 +303,8 @@ fn run(
         if cancelled.load(Ordering::Acquire) {
             break Err("git_cancelled");
         }
-        if Instant::now() >= deadline {
-            break Err("git_deadline");
+        if superseded() {
+            break Err("git_changed_during_observation");
         }
         let mut buffer = [0u8; 8192];
         match output.read(&mut buffer) {
@@ -726,6 +732,7 @@ mod tests {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+    use std::time::Instant;
     struct Fixture {
         root: PathBuf,
         git: PathBuf,
@@ -751,13 +758,7 @@ mod process_tests {
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .args(args);
-            run(
-                command,
-                Instant::now() + Duration::from_secs(2),
-                &self.token,
-                1024 * 1024,
-            )
-            .unwrap();
+            run(command, &self.token, &mut || false, 1024 * 1024).unwrap();
         }
         fn observe(&self, cwd: &Path) -> GitSnapshot {
             let metadata = fs::metadata(&self.root).unwrap();
@@ -769,6 +770,7 @@ mod process_tests {
                 &crate::StateBoundary::detached_for_test(),
                 &self.git,
                 &self.token,
+                &mut || false,
             )
         }
         fn init(&self) {
@@ -912,7 +914,8 @@ mod process_tests {
                 metadata.ino().wrapping_add(1),
                 &crate::StateBoundary::detached_for_test(),
                 &f.git,
-                &f.token
+                &f.token,
+                &mut || false,
             )
             .reason,
             Some("project_identity_changed")
@@ -956,25 +959,34 @@ mod process_tests {
         command
     }
     #[test]
-    fn process_deadline_and_output_overflow_kill_and_reap_exact_child() {
+    fn process_supersession_and_output_overflow_kill_and_reap_exact_child() {
         let f = Fixture::new();
-        let deadline_pid = f.root.join("deadline-pid");
+        // A stalled child is not ended by elapsed time (owner, 2026-10-16): it
+        // runs past the removed 2 s bound until a newer change supersedes it.
+        let superseded_pid = f.root.join("superseded-pid");
+        let started = Instant::now();
+        let mut checks = 0u32;
         assert_eq!(
             run(
-                child_fixture(&deadline_pid, false),
-                Instant::now() + Duration::from_millis(250),
+                child_fixture(&superseded_pid, false),
                 &f.token,
+                &mut || {
+                    checks += 1;
+                    started.elapsed() >= Duration::from_millis(2_500)
+                },
                 1024
             ),
-            Err("git_deadline")
+            Err("git_changed_during_observation")
         );
-        child_pid_gone(&deadline_pid);
+        assert!(started.elapsed() >= Duration::from_millis(2_500));
+        assert!(checks > 1);
+        child_pid_gone(&superseded_pid);
         let output_pid = f.root.join("output-pid");
         assert_eq!(
             run(
                 child_fixture(&output_pid, true),
-                Instant::now() + Duration::from_secs(2),
                 &f.token,
+                &mut || false,
                 16
             ),
             Err("git_output_limit")
@@ -995,12 +1007,7 @@ mod process_tests {
             }
             setter_token.store(true, Ordering::Release);
         });
-        let outcome = run(
-            child_fixture(&pid_path, false),
-            Instant::now() + Duration::from_secs(2),
-            &token,
-            1024,
-        );
+        let outcome = run(child_fixture(&pid_path, false), &token, &mut || false, 1024);
         setter.join().unwrap();
         assert_eq!(outcome, Err("git_cancelled"));
         child_pid_gone(&pid_path);

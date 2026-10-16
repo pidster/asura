@@ -12,7 +12,6 @@ use std::{
     },
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
 };
 
 struct PinnedCopy {
@@ -225,14 +224,15 @@ pub struct ModelProcess {
 }
 impl ModelProcess {
     /// Called only from the single bounded preparation worker. `helper` is the fixed package sibling.
+    /// Preparation has no time bound (owner, 2026-10-16): it ends on
+    /// completion, a verification or spawn failure, or `cancelled`.
     pub fn spawn(
         runtime: &RuntimeDirectory,
         helper: &Path,
         expected: [u8; 32],
-        deadline: Instant,
         cancelled: &AtomicBool,
     ) -> Result<Self> {
-        Self::spawn_with_resource(runtime, helper, expected, None, deadline, cancelled)
+        Self::spawn_with_resource(runtime, helper, expected, None, cancelled)
     }
 
     /// MLX requires the package sibling resource; other providers pass no digest.
@@ -241,11 +241,11 @@ impl ModelProcess {
         helper: &Path,
         expected: [u8; 32],
         resource_digest: Option<[u8; 32]>,
-        deadline: Instant,
         cancelled: &AtomicBool,
     ) -> Result<Self> {
+        // Cancellation is reported as `Error::Deadline` (stable mapping).
         let check = || {
-            if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            if cancelled.load(Ordering::Acquire) {
                 Err(Error::Deadline)
             } else {
                 Ok(())
@@ -489,7 +489,11 @@ impl ModelProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
     struct Fixture {
         root: PathBuf,
         runtime: RuntimeDirectory,
@@ -521,7 +525,6 @@ mod tests {
                 &self.runtime,
                 &self.helper,
                 self.digest,
-                Instant::now() + Duration::from_secs(2),
                 &AtomicBool::new(false),
             )
             .unwrap()
@@ -565,7 +568,6 @@ mod tests {
             &fixture.helper,
             fixture.digest,
             Some(Sha256::digest(resource).into()),
-            Instant::now() + Duration::from_secs(2),
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -594,7 +596,6 @@ mod tests {
                     &fixture.helper,
                     fixture.digest,
                     Some([0; 32]),
-                    Instant::now() + Duration::from_secs(2),
                     &AtomicBool::new(false)
                 )
                 .is_err()
@@ -611,7 +612,6 @@ mod tests {
                 &fixture.helper,
                 fixture.digest,
                 Some([0; 32]),
-                Instant::now() + Duration::from_secs(2),
                 &AtomicBool::new(false),
             )
             .is_err()
@@ -622,7 +622,6 @@ mod tests {
             &fixture.helper,
             fixture.digest,
             None,
-            Instant::now() + Duration::from_secs(2),
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -646,7 +645,6 @@ mod tests {
             &fixture.helper,
             fixture.digest,
             Some(Sha256::digest(resource).into()),
-            Instant::now() + Duration::from_secs(2),
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -703,7 +701,6 @@ mod tests {
                 &fixture.runtime,
                 &fixture.helper,
                 [0; 32],
-                Instant::now() + Duration::from_secs(2),
                 &AtomicBool::new(false)
             )
             .is_err()
@@ -714,7 +711,6 @@ mod tests {
                 &fixture.runtime,
                 &fixture.helper,
                 fixture.digest,
-                Instant::now() + Duration::from_secs(2),
                 &AtomicBool::new(true)
             )
             .is_err()

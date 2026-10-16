@@ -90,8 +90,9 @@ pending. A set abandoned by cancel or disconnect reports outcome unconfirmed and
 never causes an automatic retry. The worker retains its slot until settlement.
 Drain cancels jobs and retains the service owner lock until all filesystem work
 settles ([stop and drain](system-architecture.md#reactor-stop-and-drain)). Before
-replacement, workers check cancellation. The code still applies the earlier
-two-second `config_worker` deadline; a follow-up implementation will remove it.
+replacement, workers check cancellation. Implemented 2026-10-16: `config_worker`,
+storage `config::execute` and platform `PrivateFileSnapshot` take no deadline
+(`config_worker` unit and reactor tests).
 
 Platform access uses retained validated directory descriptors. Reject symlinks,
 hard-linked files, foreign ownership, nonregular files and unsafe permissions or
@@ -110,8 +111,8 @@ command at a time and uses the canonical client API. It does not touch the file.
 The event loop polls results without waiting. Client requests have no time bound
 and no retry (owner, 2026-10-16). The client waits for the reply until the person
 runs `/cancel` or the connection is lost; either reports outcome unconfirmed for a
-set. The code still applies the earlier three-second request and five-second UI
-budgets; a follow-up implementation will remove them. Preserve the draft on failure; clear it on success only if
+set. Implemented 2026-10-16: the client and TUI budgets are removed; `/cancel`
+now routes to a pending configuration request and reports at once. Preserve the draft on failure; clear it on success only if
 it still equals the submitted text. Show results in a dismissible result overlay,
 with terminal controls escaped and bounded lines. Bottom-align the result above
 the composer, with one cell of background padding on all four sides. Use muted
@@ -290,16 +291,16 @@ potentially blocking and stay off the reactor. A work cycle has no time bound
 cancellation, checked between filesystem operations. Slowness never makes audit
 Unavailable. The OS may stall inside an operation: retain the single worker and
 queue bounds, and do not spawn a replacement writer. Producers continue to return
-immediately; a full queue records a gap. The code still applies the earlier
-two-second `CYCLE` deadline, which reports `Stale` health and can disable audit;
-a follow-up implementation will remove it.
+immediately; a full queue records a gap. Implemented 2026-10-16: `CYCLE` is
+removed; elapsed time no longer reports `Stale` or `Deadline` health, and the
+platform `audit_io` and storage audit store take no deadline (audit unit tests).
 
 Drain cancels admission and lets the writer flush for one second. This one-second
 `DRAIN` bound is a wind-down of the audit writer's own flush: when it passes, the
 writer is cancelled. Stop then waits for the cancelled writer to settle; the
 expiry no longer moves the service to the repair lifecycle
 ([stop and drain](system-architecture.md#reactor-stop-and-drain), owner,
-2026-10-16; code change pending). Keep the service owner lock until all journal
+2026-10-16; implemented 2026-10-16). Keep the service owner lock until all journal
 filesystem work settles. Do not release ownership while a detached writer may
 still append.
 
@@ -477,8 +478,8 @@ archive browser, filesystem path argument or pagination registry in this slice.
 `/audit [limit]` accepts a decimal limit 1–16, default 16, and requires a selected
 registered project. Bad arguments retain the draft. The asynchronous command worker
 uses the existing control client, with one pending job. The job waits for the
-reply until the person cancels or the connection is lost (owner, 2026-10-16). The
-code still applies a two-second deadline; a follow-up implementation will remove it.
+reply until the person cancels or the connection is lost (owner, 2026-10-16).
+Implemented 2026-10-16 (`tui/audit.rs` unit test).
 It renders a padded newest-first table in the normal result panel, with health and
 recent-window limits. Escape closes; scrolling activates only on overflow.
 
@@ -701,8 +702,9 @@ The reactor remains available for Hello, Inspect, config reads and Stop while th
 ordering gate is closed. Inspect reports the pending inspection state while the
 gate is closed; it never reports an inspection timeout (owner, 2026-10-16). The
 reactor retains the pending scan factory and starts the scan only after real
-bootstrap completion, or discards it at Stop. The code still publishes an
-inspection timeout after two seconds; a follow-up implementation will remove it.
+bootstrap completion, or discards it at Stop. Implemented 2026-10-16: the
+deferred scan publishes no timeout (`installation` unit test
+`deferred_scan_waits_for_bootstrap_without_a_deadline_and_stop_discards_it`).
 The scan has no time bound
 ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound))
 and keeps its identity/witness checks.

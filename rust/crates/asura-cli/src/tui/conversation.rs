@@ -6,6 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 #[derive(Clone)]
 pub(super) enum Request {
@@ -56,7 +57,8 @@ fn restore(
     if client.service_epoch() != epoch {
         return Err("Service changed during conversation restoration".into());
     }
-    let deadline = Instant::now() + Duration::from_secs(18);
+    // Restoration has no time bound (owner, 2026-10-16): each read ends on its
+    // reply, exit or scope change (`stopped`), or a lost connection.
     let history = client
         .conversation_history(project, None, None, 8)
         .map_err(|e| e.to_string())?;
@@ -82,8 +84,8 @@ fn restore(
     let mut previous_frame = u64::MAX;
     let mut turns = Vec::with_capacity(history.entries.len());
     for entry in history.entries {
-        if stopped.load(Ordering::Acquire) || Instant::now() >= deadline {
-            return Err("Conversation restoration cancelled or expired".into());
+        if stopped.load(Ordering::Acquire) {
+            return Err("Conversation restoration stopped".into());
         }
         let frame = entry.accepted_frame.ok_or("Missing history cursor")?;
         if frame >= previous_frame {
@@ -210,13 +212,18 @@ impl Worker {
                     drop(slot);
                     notice.ready();
                 };
+                // Waits have no time bound (owner, 2026-10-16): each ends on
+                // the reply, exit or scope change (`stopped`), or a lost connection.
                 let attach = || {
                     let runtime = resolve(false)?;
-                    asura_client::Client::attach(
+                    let mut client = asura_client::Client::attach(
                         &runtime,
                         concat!("asura/", env!("CARGO_PKG_VERSION")),
-                        Instant::now() + Duration::from_secs(2),
-                    )
+                        &|| stopped.load(Ordering::Acquire),
+                    )?;
+                    let read_stop = stopped.clone();
+                    client.set_cancel(Arc::new(move || read_stop.load(Ordering::Acquire)));
+                    Ok::<_, asura_client::Error>(client)
                 };
                 let restore_scope = match &request {
                     Request::Restore { project, epoch } => Some((*project, *epoch)),
@@ -235,10 +242,8 @@ impl Worker {
                             return Ok(());
                         }
                         Request::DiscoverProject => {
-                            let deadline = Instant::now() + Duration::from_secs(18);
                             let projects = crate::conversation::project_registry(&mut client, || {
                                 if stopped.load(Ordering::Acquire) { Err("Project discovery cancelled".into()) }
-                                else if Instant::now() >= deadline { Err("Project discovery deadline".into()) }
                                 else { Ok(()) }
                             })?;
                             let launch = crate::conversation::location(".")?;
@@ -249,10 +254,8 @@ impl Worker {
                         }
                         Request::Setup(crate::conversation::Command::Observe(id)) => (id, 0),
                         Request::Setup(crate::conversation::Command::List) => {
-                            let deadline = Instant::now() + Duration::from_secs(18);
                             let projects = crate::conversation::project_registry(&mut client, || {
                                 if stopped.load(Ordering::Acquire) { Err("Project discovery cancelled".into()) }
-                                else if Instant::now() >= deadline { Err("Project discovery deadline".into()) }
                                 else { Ok(()) }
                             })?;
                             let message = if projects.is_empty() { "No projects. Use /project add PATH".into() }
@@ -270,9 +273,8 @@ impl Worker {
                             let stop_waiting = || cancellation.load(Ordering::Acquire) || stopped.load(Ordering::Acquire);
                             let (mut message, project) = crate::conversation::execute(&mut client, command, &stop_waiting)?;
                             let projects = if project.is_some() {
-                                let deadline = Instant::now() + Duration::from_secs(18);
                                 match crate::conversation::project_registry(&mut client, || {
-                                    if stopped.load(Ordering::Acquire) || Instant::now() >= deadline { Err("Registry refresh stopped or expired".into()) } else { Ok(()) }
+                                    if stopped.load(Ordering::Acquire) { Err("Registry refresh stopped".into()) } else { Ok(()) }
                                 }) {
                                     Ok(projects) => Some(projects),
                                     Err(error) => { message.push_str(&format!("\nRegistration succeeded; registry refresh failed: {error}. Use /project list.")); None }

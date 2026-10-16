@@ -18,8 +18,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 const CAPACITY: usize = 256;
-const CYCLE: Duration = Duration::from_secs(2);
+/// Kept wind-down bound (owner, 2026-10-16): after close, cancel audit IO that
+/// has not settled. Reaching it never moves the service to repair. Audit work
+/// itself (open, append, maintain) has no time bound; it ends on completion,
+/// an error or cancellation.
 const DRAIN: Duration = Duration::from_secs(1);
+/// Pacing of the idle receive loop; ends nothing.
 const IDLE: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
@@ -50,11 +54,9 @@ struct Shared {
     state: AtomicU32,
     fatal: AtomicU32,
     dropped: AtomicU64,
-    deadline_ms: AtomicU64,
     bootstrap_complete: AtomicBool,
     closing: AtomicBool,
     cancel: AtomicBool,
-    anchor: Instant,
     completion: crate::completion::Completion,
 }
 impl Shared {
@@ -67,18 +69,6 @@ impl Shared {
             .store(snapshot.health.state as u32, Ordering::Release);
         *self.publication.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot.clone());
         self.completion.notify();
-    }
-    fn begin_cycle(&self) -> Instant {
-        let deadline = Instant::now() + CYCLE;
-        self.deadline_ms.store(
-            millis(deadline.saturating_duration_since(self.anchor)).max(1),
-            Ordering::Release,
-        );
-        self.completion.notify();
-        deadline
-    }
-    fn idle(&self) {
-        self.deadline_ms.store(0, Ordering::Release);
     }
     fn dropped(&self, count: u64) {
         let _ = self
@@ -210,31 +200,24 @@ impl Worker {
         wake: WakeSender,
     ) -> io::Result<Self> {
         Self::launch(epoch, build, wake, move |shared| {
-            let deadline = shared.begin_cycle();
             let (settings, configuration) =
-                asura_storage::config::audit_settings(runtime.clone(), deadline, &shared.cancel)
-                    .map_err(|code| match code {
-                        "config_cancelled_or_expired" => {
-                            StartError::Storage(if shared.cancel.load(Ordering::Acquire) {
-                                record::Error::Cancelled
-                            } else {
-                                record::Error::Deadline
-                            })
-                        }
+                asura_storage::config::audit_settings(runtime.clone(), &shared.cancel).map_err(
+                    |code| match code {
+                        "config_cancelled" => StartError::Storage(record::Error::Cancelled),
                         "config_io_or_unsafe_file" | "config_changed" => {
                             StartError::Storage(record::Error::UnsafeStorage)
                         }
                         "config_read_failed" => StartError::Storage(record::Error::Io),
                         _ => StartError::Config,
-                    })?;
+                    },
+                )?;
             let mut snapshot = Snapshot::starting();
             snapshot.health.enabled = settings.enabled;
             snapshot.health.keep_files = Some(settings.keep_files);
             snapshot.health.max_file_bytes = Some(settings.max_file_bytes);
             shared.publish(&snapshot);
-            let opened =
-                record::AuditStore::open(runtime, settings, epoch, deadline, &shared.cancel)
-                    .map_err(StartError::Storage)?;
+            let opened = record::AuditStore::open(runtime, settings, epoch, &shared.cancel)
+                .map_err(StartError::Storage)?;
             Ok(Bootstrap {
                 settings,
                 configuration,
@@ -267,11 +250,9 @@ impl Worker {
             state: AtomicU32::new(1),
             fatal: AtomicU32::new(0),
             dropped: AtomicU64::new(0),
-            deadline_ms: AtomicU64::new(2_000),
             bootstrap_complete: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
-            anchor: Instant::now(),
             completion,
         });
         let emitter = Emitter {
@@ -346,7 +327,7 @@ impl Worker {
         }
         snapshot
     }
-    pub(crate) fn health(&self, now: Instant) -> Health {
+    pub(crate) fn health(&self, _now: Instant) -> Health {
         let mut health = self.latest.health.clone();
         health.dropped = self.emitter.shared.dropped.load(Ordering::Acquire);
         if self.emitter.shared.fatal.load(Ordering::Acquire)
@@ -355,28 +336,15 @@ impl Worker {
             health.state = HealthState::Unavailable;
             health.reason = Some(HealthReason::SequenceExhausted);
         }
-        let deadline = self.emitter.shared.deadline_ms.load(Ordering::Acquire);
-        if deadline > 0
-            && health.state != HealthState::Unavailable
-            && !self.settled()
-            && millis(now.saturating_duration_since(self.emitter.shared.anchor)) >= deadline
-        {
-            health.state = HealthState::Stale;
-            health.reason = Some(HealthReason::Deadline);
-        }
         health
     }
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        let work = self.emitter.shared.deadline_ms.load(Ordering::Acquire);
-        let work = (work > 0)
-            .then(|| self.emitter.shared.anchor + Duration::from_millis(work))
-            .filter(|d| *d > now);
         let drain = self
             .closing_at
             .map(|at| at + DRAIN)
             .filter(|d| *d > now && !self.settled());
-        work.into_iter()
-            .chain(drain)
+        drain
+            .into_iter()
             .chain(
                 self.task
                     .as_ref()
@@ -415,29 +383,19 @@ impl Drop for Worker {
     }
 }
 trait Sink: Send {
-    fn append(
-        &mut self,
-        records: &[Record],
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> Result<(), record::Error>;
-    fn maintain(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), record::Error>;
-    fn sync(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), record::Error>;
+    fn append(&mut self, records: &[Record], cancel: &AtomicBool) -> Result<(), record::Error>;
+    fn maintain(&mut self, cancel: &AtomicBool) -> Result<(), record::Error>;
+    fn sync(&mut self, cancel: &AtomicBool) -> Result<(), record::Error>;
 }
 impl Sink for record::AuditStore {
-    fn append(
-        &mut self,
-        records: &[Record],
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> Result<(), record::Error> {
-        self.append_batch(records, deadline, cancel)
+    fn append(&mut self, records: &[Record], cancel: &AtomicBool) -> Result<(), record::Error> {
+        self.append_batch(records, cancel)
     }
-    fn maintain(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), record::Error> {
-        self.maintain(deadline, cancel)
+    fn maintain(&mut self, cancel: &AtomicBool) -> Result<(), record::Error> {
+        self.maintain(cancel)
     }
-    fn sync(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), record::Error> {
-        self.sync(deadline, cancel)
+    fn sync(&mut self, cancel: &AtomicBool) -> Result<(), record::Error> {
+        self.sync(cancel)
     }
 }
 struct Bootstrap {
@@ -474,7 +432,6 @@ where
                     .count() as u64,
             );
             shared.publish(&snapshot);
-            shared.idle();
             return;
         }
     };
@@ -495,7 +452,6 @@ where
     }
     shared.publish(&snapshot);
     if !opened.settings.enabled {
-        shared.idle();
         return;
     }
     let mut last_diagnostic = None;
@@ -510,7 +466,6 @@ where
         },
     ));
     loop {
-        shared.idle();
         let incoming = if let Some(first) = first.take() {
             Some(first)
         } else {
@@ -525,7 +480,6 @@ where
         let Some(incoming) = incoming else {
             break;
         };
-        let deadline = shared.begin_cycle();
         if shared.dropped.load(Ordering::Acquire) > 0
             && last_diagnostic.is_none_or(|at: Instant| at.elapsed() >= Duration::from_secs(60))
         {
@@ -567,7 +521,7 @@ where
                 .is_ok_and(|bytes| bytes.len() as u64 <= opened.settings.max_file_bytes)
         });
         if !batch.is_empty() {
-            if let Err(error) = opened.sink.append(&batch, deadline, &shared.cancel) {
+            if let Err(error) = opened.sink.append(&batch, &shared.cancel) {
                 shared.dropped(
                     batch
                         .iter()
@@ -584,7 +538,6 @@ where
                         .count() as u64,
                 );
                 shared.publish(&snapshot);
-                shared.idle();
                 return;
             }
             let mut recent: VecDeque<_> = Arc::make_mut(&mut snapshot.records).drain(..).collect();
@@ -598,7 +551,7 @@ where
             snapshot.records = Arc::new(recent.into());
             shared.publish(&snapshot);
         }
-        if let Err(error) = opened.sink.maintain(deadline, &shared.cancel) {
+        if let Err(error) = opened.sink.maintain(&shared.cancel) {
             snapshot.health.state = HealthState::Unavailable;
             snapshot.health.reason = Some(reason(error));
             snapshot.records = Arc::new(Vec::new());
@@ -609,17 +562,15 @@ where
                     .count() as u64,
             );
             shared.publish(&snapshot);
-            shared.idle();
             return;
         }
     }
-    if let Err(error) = opened.sink.sync(shared.begin_cycle(), &shared.cancel) {
+    if let Err(error) = opened.sink.sync(&shared.cancel) {
         snapshot.health.state = HealthState::Unavailable;
         snapshot.health.reason = Some(reason(error));
         snapshot.records = Arc::new(Vec::new());
         shared.publish(&snapshot);
     }
-    shared.idle();
 }
 fn reason(error: record::Error) -> HealthReason {
     match error {
@@ -644,9 +595,6 @@ fn make_record(build: &str, epoch: [u8; 16], sequence: u64, event: Event) -> Rec
             .and_then(|d| u64::try_from(d.as_millis()).ok()),
         event,
     }
-}
-fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

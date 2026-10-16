@@ -5,7 +5,6 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartupNotice {
@@ -86,12 +85,11 @@ pub struct StartupChild {
     reaped: Option<i32>,
 }
 impl StartupChild {
-    pub fn poll_notice(&mut self, deadline: Instant) -> Result<Option<StartupNotice>> {
+    /// Read the startup notice without blocking. The caller's wait has no time
+    /// bound (owner, 2026-10-16): it ends on the notice, child exit or cancel.
+    pub fn poll_notice(&mut self) -> Result<Option<StartupNotice>> {
         if let Some(notice) = self.notice {
             return Ok(Some(notice));
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::Deadline);
         }
         loop {
             let mut buffer = [0u8; 9];
@@ -108,11 +106,7 @@ impl StartupChild {
                     self.bytes.extend_from_slice(&buffer[..n]);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::Deadline);
-                    }
-                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
                 Err(e) => return Err(e.into()),
             }
         }

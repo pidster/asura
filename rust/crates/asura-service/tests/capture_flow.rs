@@ -71,8 +71,16 @@ impl Fixture {
         let runtime = self.runtime()?;
         let end = Instant::now() + Duration::from_secs(10);
         loop {
-            match Client::attach(&runtime, BUILD, Instant::now() + Duration::from_secs(2)) {
-                Ok(client) => return Ok(client),
+            // Test-only harness budget: client waits have no time bound in
+            // production (owner, 2026-10-16); a stalled fixture fails here.
+            let harness = Instant::now() + Duration::from_secs(180);
+            let cancel: asura_client::Cancel =
+                std::sync::Arc::new(move || Instant::now() >= harness);
+            match Client::attach(&runtime, BUILD, &*cancel) {
+                Ok(mut client) => {
+                    client.set_cancel(cancel);
+                    return Ok(client);
+                }
                 Err(error) if Instant::now() >= end => return Err(error.into()),
                 Err(_) => thread::sleep(Duration::from_millis(10)),
             }
@@ -146,7 +154,7 @@ impl Fixture {
             ("providers.ollama.endpoint", endpoint),
             ("model", "ollama:fixture"),
         ] {
-            let reply = self.attach()?.config(key, Some(value))?;
+            let reply = self.attach()?.config(key, Some(value), &|| false)?;
             assert!(reply.error.is_none(), "{key}: {:?}", reply.error);
         }
         Ok(())
@@ -322,15 +330,16 @@ fn serve(
 // ----------------------------------------------------------------- turns
 
 fn submit(fixture: &Fixture, project: [u8; 16], prompt: &str) -> Result<[u8; 16]> {
-    let accepted = fixture
-        .attach()?
-        .submit_conversation(pb::ConversationSubmit {
+    let accepted = fixture.attach()?.submit_conversation(
+        pb::ConversationSubmit {
             request_id: Some(asura_platform::random_id().to_vec()),
             project_id: Some(project.to_vec()),
             conversation_id: None,
             expected_generation: Some(0),
             prompt: Some(prompt.into()),
-        })?;
+        },
+        &|| false,
+    )?;
     id(accepted.operation_id)
 }
 fn finish(

@@ -83,7 +83,7 @@ impl State {
         }
     }
     fn config(&self) -> Result<crate::config::ConversationSnapshot> {
-        crate::config::conversation_snapshot_without_deadline(self.runtime.clone(), &self.cancel)
+        crate::config::conversation_snapshot(self.runtime.clone(), &self.cancel)
             .map_err(|_| Error::Invalid)
     }
     /// A replay failure while closing is a cancel, not damage.

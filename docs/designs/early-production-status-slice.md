@@ -12,8 +12,8 @@ cases are retained.
 Time-bound update (owner, 2026-10-16): client attach, read and initialization
 calls have no deadline, slow terminal output never ends the TUI, stop waits for
 drain, and status staleness is counted in missed heartbeats. Journal-backed
-mutations already have no client budget under [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound). Where the code still
-applies a removed bound, a follow-up implementation will apply this design.
+mutations already have no client budget under [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound). Implemented
+2026-10-16.
 Terminal restoration retry and worker settlement waits stay as wind-down bounds.
 On 2026-09-25, the owner
 selected a status-first production trial and a Unix-domain socket for its
@@ -372,8 +372,7 @@ A disconnect/error clears all previous service and installation claims immediate
 on delivery. The view is shown stale after five consecutive missed one-second
 heartbeats (owner, 2026-10-16). Staleness changes the display only; it ends no
 work. Before the first observation arrives, show unavailable until fresh success.
-The code still measures five seconds from request start; a follow-up
-implementation will count missed heartbeats. Reconnect
+Implemented 2026-10-16 in `tui/heartbeat.rs`. Reconnect
 or resume after uncertain clock continuity retires the old generation and data.
 Never present a prior epoch as a currently connected service.
 
@@ -404,9 +403,8 @@ pump each turn and defers another draw while bytes remain, continuing input,
 cancellation and status processing. Output has no deadline (owner, 2026-10-16).
 A pending frame waits for writable readiness; newer state coalesces into the next
 frame, and slow output never ends the TUI. No sleeping or waiting is allowed in
-the output pump. A non-retryable write failure exits through cleanup. The code
-still exits after a 100 ms output stall; a follow-up implementation will remove
-that exit. This bounds queue memory and prevents slow consumers from
+the output pump. A non-retryable write failure exits through cleanup. Implemented
+2026-10-16: the 100 ms output exit is removed. This bounds queue memory and prevents slow consumers from
 blocking the reactor.
 Ratatui is dropped while descriptors are still nonblocking, before guard cleanup.
 Cleanup retries reacquire nonblocking descriptor state before writing if a prior
@@ -706,8 +704,8 @@ alone orders, persists, dispatches and recovers accepted inputs. Enter stages
 each valid input in a local outbox of at most 16 entries and clears the draft.
 The queue worker submits one waiting entry at a time with its original request
 ID. The request has no client budget and the worker no observation bound
-([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). The attach has no deadline (owner, 2026-10-16); the code
-still applies two seconds. The UI reports an unconfirmed outcome only on
+([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). The attach has no deadline (owner, 2026-10-16;
+implemented 2026-10-16). The UI reports an unconfirmed outcome only on
 cancellation or a lost connection. The [composer interaction contract](composer-interactions.md)
 defines interactive queue promotion, selectors, history and dynamic hints. Ctrl+S requests cancel-and-replace
 steering; Ctrl+T queues a follow-up. `/queue [ID | resume ID | drop ID]` inspects
@@ -722,7 +720,7 @@ completion handling through the event dispatcher. A mutex mailbox coalesces snap
 conversation worker's attach, request and initialization calls have no deadline
 (owner, 2026-10-16), and its journal-backed mutations have no client budget
 ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). Each call ends on reply, cancellation or disconnect.
-The code still applies the attach and read bounds. Observation has no whole-turn
+Implemented 2026-10-16. Observation has no whole-turn
 budget: each long poll waits at most 1000 ms and repeats until a terminal kind
 or a worker stop. It never joins an unfinished worker on the terminal loop.
 Cancellation uses a separate

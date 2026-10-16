@@ -6,7 +6,6 @@ use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink},
     path::PathBuf,
     sync::atomic::AtomicBool,
-    time::{Duration, Instant},
 };
 struct Scratch(PathBuf);
 impl Scratch {
@@ -48,9 +47,6 @@ impl Drop for Scratch {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(10)
-}
 fn record(sequence: u64) -> Record {
     Record {
         schema: 1,
@@ -71,7 +67,6 @@ fn open(s: &Scratch, enabled: bool) -> Result<Opened, Error> {
             ..Settings::default()
         },
         [2; 16],
-        deadline(),
         &AtomicBool::new(false),
     )
 }
@@ -108,7 +103,7 @@ fn absent_disabled_creates_nothing_and_config_source_is_truthful() {
     let s = Scratch::new();
     let runtime = s.runtime();
     let (settings, source) =
-        crate::config::audit_settings(runtime, deadline(), &AtomicBool::new(false)).unwrap();
+        crate::config::audit_settings(runtime, &AtomicBool::new(false)).unwrap();
     assert_eq!(settings, Settings::default());
     assert_eq!(source, ConfigLoad::Defaults);
     let mut opened = open(&s, false).unwrap();
@@ -117,13 +112,10 @@ fn absent_disabled_creates_nothing_and_config_source_is_truthful() {
     assert_eq!(
         opened
             .store
-            .append_batch(&[record(1)], deadline(), &AtomicBool::new(false)),
+            .append_batch(&[record(1)], &AtomicBool::new(false)),
         Err(Error::Disabled)
     );
-    opened
-        .store
-        .maintain(deadline(), &AtomicBool::new(false))
-        .unwrap();
+    opened.store.maintain(&AtomicBool::new(false)).unwrap();
     assert!(!s.logs().exists());
 }
 #[test]
@@ -159,14 +151,13 @@ fn enabled_repairs_only_partial_suffix_seals_then_hydrates_after_restart() {
     next.service_epoch = [2; 16];
     opened
         .store
-        .append_batch(&[next.clone()], deadline(), &AtomicBool::new(false))
+        .append_batch(&[next.clone()], &AtomicBool::new(false))
         .unwrap();
     drop(opened);
     let reopened = AuditStore::open(
         s.runtime(),
         Settings::default(),
         [3; 16],
-        deadline(),
         &AtomicBool::new(false),
     )
     .unwrap();
@@ -212,17 +203,13 @@ fn rotation_retains_only_configured_archives_and_never_deletes_unrelated_files()
             max_file_bytes: max,
         },
         [1; 16],
-        deadline(),
         &cancel,
     )
     .unwrap();
     fs::write(s.logs().join("other.log"), b"keep").unwrap();
     for n in 1..=5 {
-        opened
-            .store
-            .append_batch(&[record(n)], deadline(), &cancel)
-            .unwrap();
-        opened.store.maintain(deadline(), &cancel).unwrap();
+        opened.store.append_batch(&[record(n)], &cancel).unwrap();
+        opened.store.maintain(&cancel).unwrap();
     }
     assert_eq!(fs::read_dir(s.logs()).unwrap().count(), 3);
     assert_eq!(fs::read(s.logs().join("other.log")).unwrap(), b"keep");
@@ -261,7 +248,7 @@ fn unsafe_links_permissions_replacement_and_archive_collision_fail_closed() {
     assert!(
         opened
             .store
-            .append_batch(&[rec], deadline(), &AtomicBool::new(false))
+            .append_batch(&[rec], &AtomicBool::new(false))
             .is_err()
     );
     assert_eq!(fs::read(s.active()).unwrap(), b"replacement");
@@ -288,7 +275,6 @@ fn cancelled_expired_oversize_and_invalid_batch_do_not_append() {
             s.runtime(),
             Settings::default(),
             [1; 16],
-            deadline(),
             &AtomicBool::new(true)
         ),
         Err(Error::Cancelled)
@@ -301,23 +287,16 @@ fn cancelled_expired_oversize_and_invalid_batch_do_not_append() {
             ..Settings::default()
         },
         [1; 16],
-        deadline(),
         &AtomicBool::new(false),
     )
     .unwrap();
     assert_eq!(
         opened
             .store
-            .append_batch(&[record(1)], deadline(), &AtomicBool::new(false)),
+            .append_batch(&[record(1)], &AtomicBool::new(false)),
         Err(Error::Limit)
     );
     assert!(fs::read(s.active()).unwrap().is_empty());
-    assert_eq!(
-        opened
-            .store
-            .append_batch(&[record(1)], Instant::now(), &AtomicBool::new(false)),
-        Err(Error::Deadline)
-    );
 }
 
 #[test]
@@ -341,23 +320,19 @@ fn retention_decrease_removes_at_most_32_per_cycle_after_new_active_exists() {
             ..Settings::default()
         },
         [2; 16],
-        deadline(),
         &cancel,
     )
     .unwrap();
     // Startup sealed the old active and performed exactly one bounded cycle.
     assert!(s.active().exists());
     assert_eq!(fs::read_dir(s.logs()).unwrap().count(), 40);
-    opened.store.maintain(deadline(), &cancel).unwrap();
+    opened.store.maintain(&cancel).unwrap();
     assert!(s.active().exists());
     assert_eq!(fs::read_dir(s.logs()).unwrap().count(), 8);
-    opened.store.maintain(deadline(), &cancel).unwrap();
+    opened.store.maintain(&cancel).unwrap();
     assert!(s.active().exists());
     assert_eq!(fs::read_dir(s.logs()).unwrap().count(), 2);
     let mut row = record(1);
     row.service_epoch = [2; 16];
-    opened
-        .store
-        .append_batch(&[row], deadline(), &cancel)
-        .unwrap();
+    opened.store.append_batch(&[row], &cancel).unwrap();
 }

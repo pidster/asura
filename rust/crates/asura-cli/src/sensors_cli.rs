@@ -1,5 +1,5 @@
 //! Standalone sensor inspection; presentation only, no sensor policy.
-use super::{BUILD, Client, Duration, Instant, RuntimeResolver};
+use super::{BUILD, Client, RuntimeResolver};
 use asura_control::pb;
 pub(super) fn parse_id(value: &str) -> Result<[u8; 16], ()> {
     if value.len() != 32 || !value.is_ascii() {
@@ -88,15 +88,17 @@ pub(super) fn run(
 ) -> i32 {
     let result = (|| {
         let runtime = resolve(false).map_err(|e| e.to_string())?;
-        let mut client = Client::attach(&runtime, BUILD, Instant::now() + Duration::from_secs(2))
-            .map_err(|e| e.to_string())?;
+        let mut client = Client::attach(&runtime, BUILD, &|| false).map_err(|e| e.to_string())?;
         let reply = client
-            .sensors(pb::SensorsInspect {
-                project_id: Some(project.to_vec()),
-                offset: Some(offset),
-                revision,
-                limit: Some(16),
-            })
+            .sensors(
+                pb::SensorsInspect {
+                    project_id: Some(project.to_vec()),
+                    offset: Some(offset),
+                    revision,
+                    limit: Some(16),
+                },
+                &|| false,
+            )
             .map_err(|e| e.to_string())?;
         if let Some(reason) = reply.error {
             return Err(reason);

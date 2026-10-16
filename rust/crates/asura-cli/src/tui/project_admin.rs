@@ -37,12 +37,12 @@ pub(super) struct Update {
     pub settled: bool,
 }
 
+/// One project administration wait. It has no time bound (owner, 2026-10-16):
+/// it ends on the reply, the person's `/cancel`, exit or a lost connection.
 struct Job {
     handle: JoinHandle<Update>,
     request: Request,
     cancel: Arc<AtomicBool>,
-    deadline: Instant,
-    reported: bool,
 }
 
 #[derive(Default)]
@@ -82,14 +82,14 @@ impl Worker {
                     let mut client = asura_client::Client::attach(
                         &runtime,
                         concat!("asura/", env!("CARGO_PKG_VERSION")),
-                        Instant::now() + Duration::from_secs(2),
+                        &|| stopped.load(Ordering::Acquire),
                     )?;
                     service_epoch = Some(client.service_epoch());
                     if stopped.load(Ordering::Acquire) {
                         return Err(asura_client::Error::Unavailable);
                     }
                     // The rename waits for the journal with no client budget;
-                    // the person's /cancel or this job's budget stops the wait.
+                    // the person's /cancel, exit or a lost connection stops the wait.
                     client.rename_project(request.command.clone(), &|| {
                         stopped.load(Ordering::Acquire)
                     })
@@ -110,19 +110,11 @@ impl Worker {
             handle,
             request: retained,
             cancel,
-            deadline: Instant::now() + Duration::from_secs(5),
-            reported: false,
         });
         Ok(())
     }
-    pub fn next_deadline(&self) -> Option<Instant> {
-        self.job
-            .as_ref()
-            .filter(|job| !job.reported)
-            .map(|job| job.deadline)
-    }
     pub fn poll(&mut self) -> Option<Update> {
-        let job = self.job.as_mut()?;
+        let job = self.job.as_ref()?;
         if job.handle.is_finished() {
             let job = self.job.take().unwrap();
             let update = job.handle.join().unwrap_or_else(|_| Update {
@@ -132,17 +124,6 @@ impl Worker {
                 settled: true,
             });
             return Some(update);
-        }
-        if !job.reported && Instant::now() >= job.deadline {
-            job.reported = true;
-            job.cancel.store(true, Ordering::Release);
-            // The TUI retains the exact request ID and waits for settlement before retry.
-            return Some(Update {
-                request: job.request.clone(),
-                outcome: Outcome::Unconfirmed("Project request deadline expired".into()),
-                service_epoch: None,
-                settled: false,
-            });
         }
         None
     }
@@ -217,12 +198,62 @@ mod tests {
                 handle,
                 request,
                 cancel: Arc::new(AtomicBool::new(false)),
-                deadline: Instant::now() + Duration::from_secs(1),
-                reported: false,
             }),
         };
         let update = worker.poll().expect("panic is a reported outcome");
         assert!(matches!(update.outcome, Outcome::Unconfirmed(_)));
+        assert!(!worker.is_busy());
+    }
+    #[test]
+    fn held_rename_waits_until_cancel_settles_it_unconfirmed() {
+        let request = Request {
+            command: pb::ProjectRename {
+                request_id: Some(vec![1; 16]),
+                project_id: Some(vec![2; 16]),
+                expected_name_revision: Some(0),
+                name: Some("Test".into()),
+            },
+            draft: "/project rename Test".into(),
+            epoch: "epoch".into(),
+            editor_generation: 1,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopped = cancel.clone();
+        let held = request.clone();
+        // The worker waits like the client: only the cancel flag ends it.
+        let handle = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Update {
+                request: held,
+                outcome: classify(asura_client::Error::OutcomeUnconfirmed),
+                service_epoch: None,
+                settled: true,
+            }
+        });
+        let mut worker = Worker {
+            notice: Default::default(),
+            job: Some(Job {
+                handle,
+                request,
+                cancel,
+            }),
+        };
+        // CW-01: the removed 5 s job bound no longer reports anything.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(worker.poll().is_none());
+        assert!(worker.is_busy());
+        // CW-02: /cancel ends the wait; the outcome is unconfirmed.
+        worker.cancel();
+        let update = loop {
+            if let Some(update) = worker.poll() {
+                break update;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(update.outcome, Outcome::Unconfirmed(_)));
+        assert!(update.settled);
         assert!(!worker.is_busy());
     }
 }
