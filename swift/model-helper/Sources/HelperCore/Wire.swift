@@ -102,9 +102,9 @@ public enum Wire {
         case .contextMeasured(let v):
             try check(!service && v.hasInputTokens && v.hasCapacityTokens && v.capacityTokens > 0 && v.inputTokens <= v.capacityTokens)
         case .hello(let v):
-            try check(!v.hasSelectedModel || selector(v.selectedModel))
+            try check(v.hasSelectedModel && selector(v.selectedModel))
             let expectedContextSource: UInt32? = {
-                if !v.hasSelectedModel || v.selectedModel == "system" { return ContextCapacitySource.system.rawValue }
+                if v.selectedModel == "system" { return ContextCapacitySource.system.rawValue }
                 let selector = v.selectedModel.lowercased()
                 if selector.hasPrefix("coreai:") { return ContextCapacitySource.coreai.rawValue }
                 if selector.hasPrefix("mlx:") { return ContextCapacitySource.mlx.rawValue }
@@ -120,16 +120,15 @@ public enum Wire {
             try check(!v.hasEndpoint || (service && !v.endpoint.isEmpty && v.endpoint.utf8.count <= 2048 && !v.endpoint.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })))
             try check(!v.hasModelName || (!service && !v.modelName.isEmpty && v.modelName.utf8.count <= 256 && !v.modelName.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })))
             try check(v.hasBuildID && v.buildID.count == 32 && v.hasSchemaDigest && v.schemaDigest.count == 32
-                && v.hasMaxFrameBytes && v.maxFrameBytes == 65_536 && v.hasAvailability && v.hasCapabilities && v.hasReason)
+                && v.hasMaxFrameBytes && v.maxFrameBytes == 65_536 && v.hasAvailability && v.hasReason)
             try check(!v.hasReasoningDisabled || (!service && !v.inventoryOnly && v.availability == .available
                 && (!v.reasoningDisabled || (v.hasSupportedCapabilities && v.supportedCapabilities & 4 != 0 && v.selectedModel.hasPrefix("mlx:")))))
             if v.hasCapabilitySource || v.hasSupportedCapabilities {
                 try check(!service && !v.inventoryOnly && v.availability == .available)
-                if v.capabilitySource == 4 { try check(!v.hasSupportedCapabilities && v.capabilities == 1) }
+                if v.capabilitySource == 4 { try check(!v.hasSupportedCapabilities) }
                 else {
                     try check(v.hasCapabilitySource && (1...3).contains(v.capabilitySource)
-                        && v.hasSupportedCapabilities && v.supportedCapabilities <= 15
-                        && ((v.supportedCapabilities & 1 != 0) == (v.capabilities == 3)))
+                        && v.hasSupportedCapabilities && v.supportedCapabilities <= 15)
                 }
             }
             try check(!v.hasModelCapabilities || (service && !v.inventoryOnly && v.modelCapabilities <= 15 && v.selectedModel.hasPrefix("mlx:")))
@@ -137,8 +136,8 @@ public enum Wire {
             try check(!v.hasInventoryOnly || v.inventoryOnly)
             try check(v.inventoryOnly || (v.models.isEmpty && v.issues.isEmpty))
             if v.inventoryOnly {
-                try check(v.hasSelectedModel && v.selectedModel == "system" && !v.hasModelName
-                    && v.availability == .unknown && v.capabilities == 0 && !v.hasContextTokens
+                try check(v.selectedModel == "system" && !v.hasModelName
+                    && v.availability == .unknown && !v.hasContextTokens
                     && !v.hasReportedContextTokens && !v.hasContextSource && v.reason == .none)
                 if service { try check(v.models.isEmpty && v.issues.isEmpty) }
                 else {
@@ -166,23 +165,22 @@ public enum Wire {
                     }
                 }
             } else if service {
-                try check(v.availability == .unknown && v.capabilities == 0 && !v.hasContextTokens
+                try check(v.availability == .unknown && !v.hasContextTokens
                     && !v.hasReportedContextTokens && !v.hasContextSource && v.reason == .none)
             } else if v.availability == .available {
-                try check((v.capabilities == 1 || v.capabilities == 3) && v.hasContextTokens
+                try check(v.hasContextTokens
                     && v.contextTokens > 512 && v.hasReportedContextTokens
                     && v.reportedContextTokens >= v.contextTokens
                     && v.hasContextSource && expectedContextSource == v.contextSource
                     && v.reason == .none)
             } else {
                 try check((v.availability == .unknown || v.availability == .unavailable)
-                    && v.capabilities == 0 && !v.hasContextTokens
+                    && !v.hasContextTokens
                     && !v.hasReportedContextTokens && !v.hasContextSource
                     && v.reason == .modelUnavailable)
             }
         case .begin(let v):
             try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...Limits.input).contains(v.inputBytes)
-                && (!v.hasDeadlineRemainingMs || (1...60_000).contains(v.deadlineRemainingMs))
                 && v.hasMaxResponseTokens && (1...2048).contains(v.maxResponseTokens))
         case .chunk(let v):
             try check(v.hasTransferID && v.hasDirection && transfer(v.transferID, v.direction)
@@ -208,7 +206,7 @@ public enum Wire {
             switch v.arguments {
             case .observeStatus: break
             case .execCmd(let args):
-                try check(args.hasCommand && validExecCmdArguments(command: args.command, cwd: args.hasCwd ? args.cwd : nil, timeoutSeconds: args.hasTimeoutSeconds ? args.timeoutSeconds : nil))
+                try check(args.hasCommand && validExecCmdArguments(command: args.command, cwd: args.hasCwd ? args.cwd : nil))
             case .listTools: break
             case .readAudit(let args): try check(args.hasLimit && (1...16).contains(args.limit))
             case .memoryListNotes(let args):

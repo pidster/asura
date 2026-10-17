@@ -35,7 +35,7 @@ func memoryCallbacksUseSameServiceResultAndCancellationBridge(selector: String) 
             .memoryListNotes(after: nil, limit: 8),
             .memoryListNotes(after: "", limit: 0),
             .memoryGetNote(version: "0123456789abcdef0123456789abcdef", offset: 4, limit: 32),
-            .memoryNoteSources(version: "0123456789abcdef0123456789abcdef"), .listTools, .readAudit(limit: 16), .execCmd(command: "printf fixture", cwd: ".", timeoutSeconds: 30)] as [ToolArguments] {
+            .memoryNoteSources(version: "0123456789abcdef0123456789abcdef"), .listTools, .readAudit(limit: 16), .execCmd(command: "printf fixture", cwd: ".")] as [ToolArguments] {
             try await toolCallbackJourney(cancel: cancel, selector: selector, arguments: arguments)
         }
     }
@@ -65,16 +65,16 @@ private func toolCallbackJourney(cancel: Bool, selector: String, arguments: Tool
     var replies = service.frames.makeAsyncIterator()
     var hello = Asura_Model_V1_Hello()
     hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
-    hello.availability = .unknown; hello.capabilities = 0; hello.reason = .none
+    hello.availability = .unknown; hello.reason = .none
     hello.selectedModel = selector; hello.assetRoot = "/tmp/model-fixture"
     var helloEnvelope = Envelope(); helloEnvelope.body = .hello(hello)
     try await service.send(helloEnvelope)
     let greeting = try Wire.decode(#require(try await replies.next()), from: .helper)
-    #expect(greeting.hello.selectedModel == selector && greeting.hello.capabilities == 3)
+    #expect(greeting.hello.selectedModel == selector && greeting.hello.supportedCapabilities & 1 != 0)
     var input = ModelInput(); input.instructions = ""; input.prompt = "read file"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = selector; begin.inputBytes = UInt64(data.count)
-    begin.deadlineRemainingMs = 2_000; begin.maxResponseTokens = 512; begin.enableProjectTools = true
+    begin.maxResponseTokens = 512; begin.enableProjectTools = true
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = data
@@ -91,10 +91,10 @@ private func toolCallbackJourney(cancel: Bool, selector: String, arguments: Tool
     let call = try Wire.decode(#require(try await replies.next()), from: .helper)
     #expect(call.toolCall.ordinal == 1)
     switch arguments {
-    case .execCmd(let command, let cwd, let timeout):
+    case .execCmd(let command, let cwd):
         #expect(call.toolCall.execCmd.command == command)
         #expect(call.toolCall.execCmd.hasCwd == (cwd != nil) && call.toolCall.execCmd.cwd == (cwd ?? ""))
-        #expect(call.toolCall.execCmd.timeoutSeconds == timeout)
+        #expect(call.toolCall.execCmd.unknownFields.data.isEmpty)
     case .readAudit(let limit):
         #expect(call.toolCall.readAudit.hasLimit && call.toolCall.readAudit.limit == limit)
     case .listTools:

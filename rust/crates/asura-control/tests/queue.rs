@@ -8,58 +8,13 @@ fn envelope(body: Body) -> pb::Envelope {
         body: Some(body),
     }
 }
-fn request() -> pb::ConversationEnqueue {
-    pb::ConversationEnqueue {
-        request_id: Some(vec![3; 16]),
-        project_id: Some(vec![4; 16]),
-        conversation_id: Some(vec![5; 16]),
-        target_operation_id: Some(vec![6; 16]),
-        target_generation: Some(1),
-        kind: Some(1),
-        prompt: Some("follow-up".into()),
-    }
-}
-#[test]
-fn queue_roundtrips_with_strict_identity_direction_and_bounds() {
-    let value = envelope(Body::ConversationEnqueue(request()));
-    assert!(validate_semantics(&value, Direction::ClientToServer).is_ok());
-    assert!(validate_semantics(&value, Direction::ServerToClient).is_err());
-    let frame = encode_frame(&value).unwrap();
-    assert_eq!(decode_body(&frame[HEADER_BYTES..]).unwrap(), value);
-    for changed in [
-        pb::ConversationEnqueue {
-            kind: Some(3),
-            ..request()
-        },
-        pb::ConversationEnqueue {
-            target_generation: Some(0),
-            ..request()
-        },
-        pb::ConversationEnqueue {
-            target_operation_id: None,
-            ..request()
-        },
-        pb::ConversationEnqueue {
-            prompt: Some("x".repeat(32769)),
-            ..request()
-        },
-    ] {
-        assert!(
-            validate_semantics(
-                &envelope(Body::ConversationEnqueue(changed)),
-                Direction::ClientToServer
-            )
-            .is_err()
-        );
-    }
-}
 #[test]
 fn queue_projection_requires_bounded_text_and_truthful_operation_state() {
     let entry = pb::ConversationQueueEntry {
         input_id: Some(vec![1; 16]),
         project_id: Some(vec![2; 16]),
         conversation_id: Some(vec![3; 16]),
-        target_operation_id: Some(vec![4; 16]),
+        target_operation_id: None,
         target_generation: Some(1),
         kind: Some(1),
         state: Some(1),
@@ -67,8 +22,8 @@ fn queue_projection_requires_bounded_text_and_truthful_operation_state() {
         operation_id: None,
         generation: None,
         sequence: Some(5),
-        new_conversation: None,
-        order_position: None,
+        new_conversation: Some(false),
+        order_position: Some(1),
         hold_reason: None,
         waiting_step: None,
     };
@@ -229,7 +184,7 @@ fn new_queue_requests_roundtrip_and_reject_malformed_cursor_or_move() {
 }
 
 #[test]
-fn queue_v2_projection_and_stale_order_are_strict() {
+fn queue_projection_and_stale_order_are_strict() {
     let entry = pb::ConversationQueueEntry {
         input_id: Some(vec![1; 16]),
         project_id: Some(vec![2; 16]),
@@ -264,6 +219,24 @@ fn queue_v2_projection_and_stale_order_are_strict() {
         )
         .is_ok()
     );
+    // A promoted kind 18 input is a Steer entry naming its exact target.
+    let steer = pb::ConversationQueueEntry {
+        kind: Some(2),
+        new_conversation: Some(false),
+        target_operation_id: Some(vec![5; 16]),
+        target_generation: Some(1),
+        ..entry.clone()
+    };
+    assert!(
+        validate_semantics(
+            &envelope(Body::ConversationQueueReply(pb::ConversationQueueReply {
+                entries: vec![steer],
+                ..reply.clone()
+            })),
+            Direction::ServerToClient
+        )
+        .is_ok()
+    );
     for changed in [
         pb::ConversationQueueReply {
             order_revision: None,
@@ -287,7 +260,31 @@ fn queue_v2_projection_and_stale_order_are_strict() {
         pb::ConversationQueueReply {
             entries: vec![pb::ConversationQueueEntry {
                 new_conversation: None,
-                ..entry
+                ..entry.clone()
+            }],
+            ..reply.clone()
+        },
+        // A Queue entry never names a target; a Steer entry always does.
+        pb::ConversationQueueReply {
+            entries: vec![pb::ConversationQueueEntry {
+                target_operation_id: Some(vec![5; 16]),
+                ..entry.clone()
+            }],
+            ..reply.clone()
+        },
+        pb::ConversationQueueReply {
+            entries: vec![pb::ConversationQueueEntry {
+                kind: Some(2),
+                new_conversation: Some(false),
+                target_generation: Some(1),
+                ..entry.clone()
+            }],
+            ..reply.clone()
+        },
+        pb::ConversationQueueReply {
+            entries: vec![pb::ConversationQueueEntry {
+                order_position: None,
+                ..entry.clone()
             }],
             ..reply.clone()
         },

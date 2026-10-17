@@ -251,8 +251,9 @@ selecting an executor, queue library or process layout.
 - **SB-02 — Validate at entry.** Each trust boundary must validate identity,
   version, framing, size, structure and semantic constraints before acting.
   Tests must cover malformed, truncated, oversized, duplicate and incompatible
-  inputs. Parser success alone must not imply authorization. Unknown fields and
-  variants must follow the versioned compatibility policy.
+  inputs. Parser success alone must not imply authorization. Unknown record kinds
+  and invalid variants must be rejected, never treated as valid. Before the first
+  release, no compatibility with older data or builds is required (owner, 2026-10-17).
   **Enforcement: Static, Test, Review.**
 
 - **SB-03 — Files and processes.** File access must enforce the designed path,
@@ -295,11 +296,12 @@ selecting an executor, queue library or process layout.
   Tests must inject failure on both sides of each persistence/effect boundary.
   **Enforcement: Test, Review.**
 
-- **PO-02 — Compatible change.** Persisted schemas and public contracts must be
-  versioned. Changes require an explicit compatibility matrix and migration design,
-  including interruption, verification, recovery and unsupported-version rejection.
-  Migrations must not silently reset data. Destructive transformation requires
-  the authorization and recoverability specified by its governing design.
+- **PO-02 — Schema change.** Persisted schemas and public contracts keep their
+  frozen version numbers. Before the first release, no compatibility with older
+  journals, data or builds is required (owner, 2026-10-17). Change schemas in place
+  and remove legacy decode paths, aliases and migration text. Removed record kinds
+  and field numbers stay unassigned. Replay and decoders must reject records they
+  do not recognize. Producers, consumers, fixtures and bindings must stay consistent.
   **Enforcement: Static, Test, Review.**
 
 - **PO-03 — Language boundary.** Each Swift/Rust boundary must define identity,

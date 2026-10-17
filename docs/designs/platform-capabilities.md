@@ -2,11 +2,11 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens. Tool requests are capped at 1,024 tokens first
+Every admission reserves exactly 2,048 tokens; replay rejects any other
+reservation (owner, 2026-10-17). Tool requests are capped at 1,024 tokens first
 and 512 thereafter, at most 64 per turn, under the
-[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Historical
-512-token journal records retain their recorded accounting. Earlier numerical
-examples and validation evidence below describe that earlier packet.
+[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Earlier
+numerical examples and validation evidence below describe that earlier packet.
 
 Implementation update, 2026-10-12: committed code supersedes these parts of the
 dated proposals below; the proposals remain as their record.
@@ -268,8 +268,8 @@ They use explicit messages in the evolving 0.1 schemas.
 | Resource or operation | Proposed limit | Required failure behavior |
 | --- | --- | --- |
 | Active helper generations | 1 per service initially | Reject additional admission as busy; no hidden waiting queue. |
-| Input including instructions and scoped history | 64 KiB UTF-8 and the model's measured token window minus 512 response tokens | Reject overflow before the start permit; preserve the draft. |
-| Generation response | 512 tokens and 60 KiB UTF-8 | Cancel on byte overflow and mark output incomplete. |
+| Input including instructions and scoped history | 64 KiB UTF-8 and the model's measured token window minus 2,048 response tokens | Reject overflow before the start permit; preserve the draft. |
+| Generation response | 2,048 tokens and 60 KiB UTF-8 | Cancel on byte overflow and mark output incomplete. |
 | Private model-channel frame / chunk payload | 64 KiB / 16 KiB | Reject excessive lengths before allocation. |
 | Input and output credit windows | 64 KiB each | Pause data transfer at zero credit; continue control processing. |
 | Helper startup and identity handshake | No time limit (owner, 2026-10-16) | The step ends on the next message, helper exit, protocol fault, cancel or shutdown. On a fault, cancel or shutdown, close the channel, terminate and reap only the owned child. |
@@ -314,7 +314,7 @@ sequenceDiagram
     participant R as Rust service owner
     participant H as Owned Swift helper
     participant M as Foundation Models
-    C->>R: Submit scoped conversation intent
+    C->>R: Queue scoped conversation input for service dispatch
     R->>R: Validate context and reserve bounded operation
     R->>H: Verified identity and bounded input transfer
     H->>R: Request start permit
@@ -362,16 +362,16 @@ unavailable model assets leave MC03 live evidence incomplete.
 ### Control messages at version 0.1
 
 Extend `contracts/control/v1/control.proto` using envelope body field numbers
-22 through 27 for `ConversationSubmit`, `ConversationAccepted`,
-`ConversationObserve`, `ConversationEvent`, `ConversationCancel`, and
-`ConversationCancelAccepted`. Capability value 5 is `CAPABILITY_CONVERSATION`.
+24 through 27 for `ConversationObserve`, `ConversationEvent`, `ConversationCancel`
+and `ConversationCancelAccepted`. Fields 22 `ConversationSubmit` and 23
+`ConversationAccepted` are removed and reserved (owner, 2026-10-17); conversation
+input enters only through `ConversationQueueSubmit` under the
+[managed input queue](managed-input-queue.md). Capability value 5 is `CAPABILITY_CONVERSATION`.
 The receiver retains existing epoch, attachment and request-counter validation.
 Unavailable capability produces the existing unsupported-operation error.
 
 | Message | Fields in numeric order starting at 1 | Validation and meaning |
 | --- | --- | --- |
-| ConversationSubmit | request_id bytes; project_id bytes; conversation_id bytes; expected_generation uint64; prompt string | IDs are nonzero 16-byte values. Empty conversation ID requests creation within the named project. Generation is zero only for creation. Prompt is nonempty, at most 32 KiB UTF-8. |
-| ConversationAccepted | operation_id bytes; conversation_id bytes; generation uint64; cursor uint64 | Returned only after durable admission and token reservation. |
 | ConversationObserve | operation_id bytes; after_cursor uint64; wait_ms uint32 | Wait at most 1,000 ms without blocking a reactor. At most one observation wait per attachment. |
 | ConversationEvent | operation_id bytes; cursor uint64; generation uint64; kind enum; text string; reason enum; usage_tokens uint64; usage_known bool | One event per response. Text is a complete replacement snapshot of at most 60 KiB. Kinds: 1 pending, 2 snapshot, 3 complete, 4 failed, 5 cancelled, 6 interrupted. Unknown kinds reject. |
 | ConversationCancel | operation_id bytes; generation uint64 | Idempotent intent, scoped to the admitted operation. Stale generation rejects. |
@@ -410,8 +410,8 @@ The identity and credit rules in the canonical D2 design continue to apply.
 
 | Body field | Message and numbered fields | Meaning |
 | --- | --- | --- |
-| 10 | Hello: build_id bytes 1; schema_digest bytes 2; max_frame_bytes uint32 3 | Build and schema identities are exactly 32 bytes and must match before input. |
-| 11 | Begin: model string 1; input_bytes uint64 2; deadline_remaining_ms uint32 3; max_response_tokens uint32 4 | Selected provider, at most 64 KiB input; generation uses the [cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30). The legacy optional generation deadline is removed (owner, 2026-10-16): the service never sends `deadline_remaining_ms`, and field 3 stays in schema 0.1 unchanged. |
+| 10 | Hello: build_id bytes 1; schema_digest bytes 2; max_frame_bytes uint32 3; later fields in [model tools](model-tool-execution.md#selected-provider-handshake) | Build and schema identities are exactly 32 bytes and must match before input. `selected_model` (field 9) is required in every Hello; field 5 is reserved. |
+| 11 | Begin: model string 1; input_bytes uint64 2; field 3 reserved; max_response_tokens uint32 4 | Selected provider, at most 64 KiB input; generation uses the [cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30). Field 3, the earlier `deadline_remaining_ms`, is removed and reserved (owner, 2026-10-17). |
 | 12 | Chunk: transfer_id uint64 1; direction enum 2; ordinal uint64 3; data bytes 4; revision uint64 5 | Directions 1 input and 2 output. Nonempty payload at most 16 KiB. |
 | 13 | Credit: transfer_id uint64 1; direction enum 2; accepted_bytes uint64 3; granted_bytes uint64 4 | Cumulative credit under the existing D2 ledger, never over the 64 KiB window. |
 | 14 | InputEnd: count uint64 1; total_bytes uint64 2 | Exact match to accepted input chunks. |
@@ -495,7 +495,7 @@ in-memory task or write a separate conversation authority file.
 
 Deliver the authority prerequisite first through the existing storage owner:
 project registration, conversation identity/context generation, idempotent model
-admission, 512-token reservation, cancellation intent, terminal outcome and
+admission, 2,048-token reservation, cancellation intent, terminal outcome and
 restart interruption. Extend the canonical journal format with these records,
 its writer and replay rules. Preserve the existing frame/digest/durability
 contract, define crash points and retain unknown usage charges after interruption.

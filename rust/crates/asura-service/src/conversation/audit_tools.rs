@@ -152,7 +152,6 @@ pub(super) fn reason(code: &str) -> asura_storage::audit::DecisionReason {
         "invalid_request" | "model_input_invalid" => R::Invalid,
         "conversation_busy" | "model_busy" => R::Busy,
         "capacity_exhausted" | "context_limit" | "output_limit" => R::Limit,
-        "storage_timeout" | "model_timeout" => R::Timeout,
         "cancelled" | "service_draining" => R::Cancelled,
         "project_stale" | "project_unknown" | "project_overlaps_asura_state" => R::Denied,
         "model_unavailable"
@@ -167,7 +166,9 @@ pub(super) fn rejected(
     state: Option<&asura_storage::authority::conversation::Replay>,
     code: &str,
 ) -> Option<Event> {
-    let pb::envelope::Body::ConversationSubmit(query) = request.body.as_ref()? else {
+    // Conversation input enters through the queue; a rejected submission is
+    // the admission decision the audit records.
+    let pb::envelope::Body::ConversationQueueSubmit(query) = request.body.as_ref()? else {
         return None;
     };
     let project: [u8; 16] = query.project_id.as_deref()?.try_into().ok()?;

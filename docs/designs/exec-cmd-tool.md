@@ -6,10 +6,15 @@ remains 0.1 and journal format remains 1. The proposed
 [tool job controller](tool-job-controller.md) would run shell commands as
 conversation-scoped jobs; until it is implemented, this contract governs.
 Tool job packet J1 removes this contract's command timeout and 2-second setup
-budget (J1-Q3, J1-Q4, owner, 2026-10-15): a command then runs until it ends or
-is cancelled, and `timeout_seconds` is accepted and ignored. The timeout text
-below records the implemented contract until J1 lands; see
+budget (J1-Q3, J1-Q4, owner, 2026-10-15): a command runs until it ends, the turn
+is cancelled or the service shuts down; see
 [J1 timeout and setup budget removal](tool-job-controller.md#j1-timeout-and-setup-budget-removal).
+Current contract (owner, 2026-10-17): the tool schema has no `timeout_seconds`
+argument (model ExecCmd field 3 is reserved). The guardian has no numeric deadline
+mode, and status reason 1 (`timeout`) is unassigned. Replay rejects ToolIntent
+kind 14 that carries tool kind 16; exec_cmd is admitted only by kind 22
+ExecCmdIntent and settled by kind 23. The timeout, setup-budget and kind-16
+intent text below records the earlier implemented contract.
 
 Renamed from `shell` to `exec_cmd` (owner, 2026-10-17). Names only; field
 numbers, record kinds and formats are unchanged. Model ToolCall field 19, tool
@@ -47,7 +52,7 @@ an exec_cmd guardian. Do not copy a complete model owner or add a generic orches
 | --- | --- |
 | `command` | Required string, 1–8192 UTF-8 bytes, no NUL; exact bytes passed as the single argument after `-c`. When the [secret detection](secret-detection.md#environment-path) rewrite created secret variables, the argument is the guardian's fixed preamble followed by the rewritten command (owner, 2026-10-15). |
 | `cwd` | Optional project-relative directory, at most 1024 UTF-8 bytes; absent or `.` means project root; reject absolute paths, NUL and parent traversal |
-| `timeout_seconds` | Optional integer 1–60, default 30; fresh per-command deadline independent of elapsed turn time |
+| `timeout_seconds` | Removed (owner, 2026-10-17). The command has no time limit; it ends on exit, turn cancel or shutdown |
 
 Preserve command bytes without quoting, interpolation or rewriting by another
 shell. The shell itself interprets them. Reject invalid native arguments before
@@ -305,7 +310,7 @@ new version number or RPC service. Encoding is exactly:
 | --- | --- |
 | 0–3 | ASCII `ASSH` |
 | 4 | Kind:1 spawned,2 settled,3 setup_failed,4 cleanup_unconfirmed |
-| 5 | Reason:0 none,1 timeout,2 cancel,3 output_limit,4 lease_ended,5 spawn_failed,6 sandbox_unavailable,7 identity_invalid,8 protocol_fault,9 cleanup_failed |
+| 5 | Reason:0 none,1 unassigned (former timeout, removed 2026-10-17),2 cancel,3 output_limit,4 lease_ended,5 spawn_failed,6 sandbox_unavailable,7 identity_invalid,8 protocol_fault,9 cleanup_failed |
 | 6 | Exit kind:0 absent,1 exit_code,2 signal |
 | 7 | Cleanup:0 unconfirmed,1 owned_group_settled |
 | 8–23 | Exact nonzero 16-byte job ID |
@@ -409,21 +414,20 @@ reports each provider separately; mocked callbacks do not qualify native inferen
 
 ## Model wire packet
 
-Model ToolCall field 19 is ExecCmd. ExecCmd fields are required command string 1,
-optional cwd string 2 and optional timeout_seconds uint32 field 3. Command is
+Model ToolCall field 19 is ExecCmd. ExecCmd fields are required command string 1
+and optional cwd string 2. Field 3, the earlier `timeout_seconds`, is removed and
+reserved (owner, 2026-10-17). Command is
 1–8192 UTF-8 bytes with no NUL. Present cwd is 1–1024 UTF-8 bytes, must be relative,
-has no NUL or parent (`..`) component; `.` means the project root. Present timeout
-is 1–60 seconds; absence means 30. Rust and Swift strict codecs reject missing
-command, invalid bounds, forbidden cwd, unknown nested fields and wrong direction
-before any effect. The native exec_cmd function has optional cwd/timeout arguments
-and supplies default timeout 30 through its existing service callback. It never
-executes a process in Swift.
+has no NUL or parent (`..`) component; `.` means the project root. Rust and Swift
+strict codecs reject missing command, invalid bounds, forbidden cwd, unknown nested
+fields and wrong direction before any effect. The native exec_cmd function has an
+optional cwd argument and no timeout argument. It never executes a process in Swift.
 
 The shared private ToolResult permits bounded text and truncation on failure,
 but never a continuation offset on failure. The service's durable result owner
 permits nonempty failed text/truncation only for a matching exec_cmd intent; other
 tool policies remain unchanged. exec_cmd's Swift adapter renders the fixed status
-plus bounded service-owned body on failure so timeout/output-limit evidence remains
+plus bounded service-owned body on failure so cancel/output-limit evidence remains
 visible. Other adapters retain their existing failed-result rendering. No new wire
 fields or version increment are needed.
 
@@ -434,6 +438,12 @@ including cancellation and duplicate callback tests for all existing local backe
 selectors. Native execution qualification remains SH-E1.
 
 ## Durable encoding packet
+
+Superseded (owner, 2026-10-17): replay rejects ToolIntent kind 14 carrying tool
+kind 16. Kind 22 ExecCmdIntent admits exec_cmd and kind 23 settles it under the
+[J1 records](tool-job-controller.md#j1-records-kinds-22-and-23). Tool kind 16
+remains the record kind of a kind 22 intent in replay state. The text below
+records the earlier encoding.
 
 ToolIntent kind 16 uses the unchanged record layout. Its path contains the exact
 command (1–8192 UTF-8 bytes, no NUL), one NUL delimiter, then cwd (1–1024 UTF-8
@@ -462,15 +472,15 @@ it automatically or infer rollback from a missing result.
 
 ```mermaid
 flowchart TD
-    Proposal[Typed exec_cmd proposal] --> Validate{Exact byte bounds and timeout valid?}
+    Proposal[Typed exec_cmd proposal] --> Validate{Exact command and cwd bounds valid?}
     Validate -->|No| Reject[Reject before execution]
     Validate -->|Yes| Grant[Service checks local execution grant and project identity]
-    Grant --> Intent[Commit kind 16 with command NUL cwd and timeout fields]
+    Grant --> Intent[Commit kind 22 ExecCmdIntent for tool kind 16]
     Intent --> Identity[Derive stable job ID from operation generation ordinal]
     Identity --> Effect[One retained exec_cmd job]
     Effect --> Result[Commit bounded result without continuation]
     Result --> Replay{Matching durable intent kind?}
-    Replay -->|exec_cmd 16| exec_cmd[Allow captured body and truncation on success timeout cancel limit]
+    Replay -->|exec_cmd 16| exec_cmd[Allow captured body and truncation on success, cancel or limit]
     Replay -->|Other| Existing[Preserve existing result restrictions]
     Restart[Restart unresolved intent] --> Unknown[Interrupted effects unknown; never launch]
 ```

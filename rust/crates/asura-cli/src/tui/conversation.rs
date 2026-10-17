@@ -33,7 +33,6 @@ pub(super) struct RestoreUpdate {
 }
 #[derive(Clone, Default)]
 pub(super) struct Update {
-    pub accepted: Option<pb::ConversationAccepted>,
     pub event: Option<pb::ConversationEvent>,
     pub message: Option<String>,
     pub project: Option<[u8; 16]>,
@@ -202,9 +201,6 @@ impl Worker {
                 let _settlement = notice.guard();
                 let publish = |mut update: Update| {
                     let mut slot = mailbox.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(previous) = slot.as_ref() && update.accepted.is_none() {
-                        update.accepted = previous.accepted.clone();
-                    }
                     if slot.as_ref().is_some_and(|previous| previous.cancel_accepted) {
                         update.cancel_accepted = true;
                     }
@@ -344,9 +340,6 @@ impl Worker {
             if let Some(mut final_update) =
                 job.updates.lock().unwrap_or_else(|e| e.into_inner()).take()
             {
-                if final_update.accepted.is_none() {
-                    final_update.accepted = update.as_ref().and_then(|v| v.accepted.clone());
-                }
                 final_update.cancel_accepted |= update.as_ref().is_some_and(|v| v.cancel_accepted);
                 update = Some(final_update);
             }

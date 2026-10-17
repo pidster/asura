@@ -192,7 +192,6 @@ fn settled_setup_failures_never_become_successful_command_results() {
     for (error, status) in [
         (ExecCmdError::Invalid, 3),
         (ExecCmdError::Denied, 2),
-        (ExecCmdError::Deadline, 5),
         (ExecCmdError::Cancelled, 6),
         (ExecCmdError::Unavailable, 4),
         (ExecCmdError::Protocol, 4),

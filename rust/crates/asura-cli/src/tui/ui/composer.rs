@@ -184,10 +184,6 @@ impl App {
             self.notice = "Input is already at this end of its queue".into();
             return;
         };
-        if lane[index].new_conversation.is_none() || lane[other].new_conversation.is_none() {
-            self.notice = "Legacy queued inputs cannot move".into();
-            return;
-        }
         let Some(revision) = self.queue_order_revision else {
             self.notice = "Queue order unavailable; wait for a fresh snapshot".into();
             return;
@@ -213,16 +209,12 @@ impl App {
             self.notice = "Queue request pending; move not sent".into();
             return;
         }
-        let Some(entry) = self
+        if !self
             .unresolved()
             .into_iter()
-            .find(|entry| entry.input_id.as_deref() == Some(id))
-        else {
+            .any(|entry| entry.input_id.as_deref() == Some(id))
+        {
             self.notice = "Selected input is no longer queued".into();
-            return;
-        };
-        if entry.new_conversation.is_none() {
-            self.notice = "Legacy queued inputs cannot move".into();
             return;
         }
         let Some(revision) = self.queue_order_revision else {

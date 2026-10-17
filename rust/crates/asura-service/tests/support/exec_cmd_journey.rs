@@ -74,18 +74,20 @@ pub(super) fn run(provider: &str) -> Result<()> {
             )?
             .project_id,
     )?;
-    let request = pb::ConversationSubmit {
-        request_id: Some(asura_platform::random_id().to_vec()),
-        project_id: Some(project.to_vec()),
-        conversation_id: None,
-        expected_generation: Some(0),
-        prompt: Some(format!(
-            "Call exec_cmd exactly once with command `{COMMAND}`, cwd `.`, timeout_seconds 30. Then reply only with the proof token returned on stdout. Do not use other tools or repeat the command."
-        )),
-    };
-    let accepted = fixture
-        .attach()?
-        .submit_conversation(request.clone(), &|| false)?;
+    let request = queue_submit::queue_request(
+        project,
+        None,
+        0,
+        &format!(
+            "Call exec_cmd exactly once with command `{COMMAND}` and cwd `.`. Then reply only with the proof token returned on stdout. Do not use other tools or repeat the command."
+        ),
+    );
+    let receipt = managed_submit_call(&fixture, request.clone())?;
+    let accepted = queue_submit::dispatched(
+        &|| fixture.attach(),
+        project,
+        checked_id(receipt.accepted_input_id.clone())?,
+    )?;
     let operation = checked_id(accepted.operation_id.clone())?;
     let event = observe(&fixture, operation)?;
     if event.kind != Some(3) {
@@ -103,9 +105,9 @@ pub(super) fn run(provider: &str) -> Result<()> {
             .any(|tool| tool.name.as_deref() == Some("exec_cmd") && tool.status == Some(1))
     );
     assert_eq!(fs::read(directory.join("effect.txt"))?, b"x");
-    let retry = fixture
-        .attach()?
-        .submit_conversation(request.clone(), &|| false)?;
+    let retry = managed_submit_call(&fixture, request.clone())?;
+    assert_eq!(retry.accepted_input_id, receipt.accepted_input_id);
+    let retry = queue_submit::dispatched(&|| fixture.attach(), project, accepted.input_id)?;
     assert_eq!(retry.operation_id, accepted.operation_id);
     fixture.stop()?;
     let (intent, result) = recorded(&fixture, operation)?;
@@ -125,7 +127,9 @@ pub(super) fn run(provider: &str) -> Result<()> {
     assert!(result.text.contains("\nstderr:\nstderr-proof"));
     fixture.start()?;
     wait_ready(&fixture, None)?;
-    let retry = fixture.attach()?.submit_conversation(request, &|| false)?;
+    let retry = managed_submit_call(&fixture, request)?;
+    assert_eq!(retry.accepted_input_id, receipt.accepted_input_id);
+    let retry = queue_submit::dispatched(&|| fixture.attach(), project, accepted.input_id)?;
     assert_eq!(retry.operation_id, accepted.operation_id);
     let replayed = observe(&fixture, operation)?;
     assert_eq!(replayed.text, event.text);
@@ -156,7 +160,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
     interrupted(&mut fixture, project, &directory, false)?;
     interrupted(&mut fixture, project, &directory, true)?;
     println!(
-        "PASS native {provider} exec_cmd proof, exact exit/stdout/stderr, one effect, durable result, exact retry/restart, timeout/cancel cleanup; fixture service stopped/reaped"
+        "PASS native {provider} exec_cmd proof, exact exit/stdout/stderr, one effect, durable result, exact retry/restart, completion/cancel cleanup; fixture service stopped/reaped"
     );
     Ok(())
 }
@@ -169,16 +173,14 @@ fn interrupted(
 ) -> Result<()> {
     fixture.start()?;
     wait_ready(fixture, None)?;
-    let marker = if cancel { "cancel.pid" } else { "timeout.pid" };
-    // J1-Q3: `timeout_seconds` is accepted and ignored; the 1 s request no
-    // longer stops a 3 s command.
+    let marker = if cancel { "cancel.pid" } else { "complete.pid" };
+    // No time bound: a 3 s command completes; only cancel stops one.
     let sleep = if cancel { 30 } else { 3 };
     let command = format!(
         "printf partial-output; printf '%s\\n' \"$$\" > {marker}; sleep {sleep}; printf late > {marker}.late"
     );
-    let timeout = if cancel { 30 } else { 1 };
     let prompt = format!(
-        "Call exec_cmd exactly once with command `{command}`, cwd `.`, timeout_seconds {timeout}. After it returns reply only FINISHED. Do not use other tools or repeat the command."
+        "Call exec_cmd exactly once with command `{command}` and cwd `.`. After it returns reply only FINISHED. Do not use other tools or repeat the command."
     );
     let accepted = submit(fixture, project, None, 0, &prompt)?;
     let operation = checked_id(accepted.operation_id)?;
@@ -214,12 +216,12 @@ fn interrupted(
     assert!(result.text.contains("cleanup_confirmed=true"));
     assert!(
         result.text.contains("partial-output"),
-        "partial command output must survive timeout/cancel"
+        "partial command output must survive completion and cancel"
     );
     assert_eq!(
         directory.join(format!("{marker}.late")).exists(),
         !cancel,
-        "cancel stops the command; the ignored timeout does not"
+        "cancel stops the command; nothing else does"
     );
     let pid: i32 = fs::read_to_string(directory.join(marker))?.trim().parse()?;
     assert!(pid > 1);

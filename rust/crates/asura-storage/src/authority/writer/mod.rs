@@ -66,15 +66,6 @@ pub enum Command {
         expected_revision: u64,
         state: crate::sensors::ProjectState,
     },
-    Enqueue {
-        request: Id,
-        project: Id,
-        conversation: Id,
-        target_operation: Id,
-        target_generation: u64,
-        kind: InputKind,
-        prompt: String,
-    },
     QueueInput {
         request: Id,
         project: Id,
@@ -205,9 +196,15 @@ pub struct HistoryEntry {
 }
 #[derive(Debug)]
 pub struct InputView {
+    /// The durable kind 18 record; the prompt is a bounded excerpt unless full.
     pub input: InputQueued,
-    pub v2: Option<InputQueuedV2>,
-    pub order_position: Option<u32>,
+    /// Queue, or Steer after a durable promotion.
+    pub kind: InputKind,
+    /// The promotion target; present only for Steer.
+    pub target_operation: Option<Id>,
+    /// Expected generation, or the promotion target generation for Steer.
+    pub target_generation: u64,
+    pub order_position: u32,
     pub status: InputStatus,
     pub operation: Option<(Id, u64)>,
     pub sequence: u64,
@@ -368,11 +365,6 @@ impl WriterHandle {
                     return Err(Error::Invalid);
                 }
             }
-            Command::Enqueue {
-                request, prompt, ..
-            } if *request == [0; 16] || prompt.is_empty() || prompt.len() > MAX_PROMPT => {
-                return Err(Error::Invalid);
-            }
             Command::QueueInput {
                 request,
                 project,
@@ -475,7 +467,6 @@ impl WriterHandle {
                 | Command::Initialize { .. }
                 | Command::Register { .. }
                 | Command::RenameProject { .. }
-                | Command::Enqueue { .. }
                 | Command::QueueInput { .. }
                 | Command::ReorderInput { .. }
                 | Command::InputDecision { .. }

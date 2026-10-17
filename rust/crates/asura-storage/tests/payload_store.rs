@@ -5,7 +5,7 @@ use asura_platform::RuntimeDirectory;
 use asura_platform::payload_io::gate::{self, Fault, Point};
 use asura_platform::secrets::{JobRedaction, Redacted, Stream, detection};
 use asura_storage::authority::conversation::{
-    ActiveBinding, CaptureReason, CaptureSettled, CaptureState, CaptureStream, Cause,
+    ActiveBinding, CaptureReason, CaptureSettled, CaptureState, CaptureStream, Cause, Composition,
     ExecCmdDisposition, ExecCmdIntent, Hash, INITIAL_RESERVATION, Id, PendingInit,
     ProjectRegistered, Record, Replay, Request, StartAuthorized, TerminalKind, ToolResult,
     TurnAccepted, TurnTerminal, encode_frame, exec_cmd_job_id, replay, request_digest,
@@ -613,9 +613,9 @@ impl Journal {
             input_digest: [12; 32],
             prior_operations: vec![],
             prompt: "hello".into(),
-            reserved_output_tokens: 512,
+            reserved_output_tokens: 2048,
             event_cursor: 1,
-            composition: None,
+            composition: Composition::default(),
         })));
         j.append(Record::StartAuthorized(StartAuthorized {
             operation: id(10),
@@ -706,7 +706,7 @@ impl Journal {
             final_cursor: u64::MAX,
             usage_known: false,
             output_tokens: 0,
-            charged_tokens: 512,
+            charged_tokens: 2048,
             text: "reply".into(),
         }));
     }

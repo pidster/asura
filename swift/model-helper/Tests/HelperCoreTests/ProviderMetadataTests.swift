@@ -43,7 +43,7 @@ private struct NamedProvider: ModelBackend {
     var replies = service.frames.makeAsyncIterator()
     var hello = Asura_Model_V1_Hello()
     hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
-    hello.availability = .unknown; hello.capabilities = 0; hello.reason = .none
+    hello.availability = .unknown; hello.reason = .none
     hello.selectedModel = selector
     var frame = Envelope(); frame.body = .hello(hello)
     try await service.send(frame)
@@ -52,7 +52,7 @@ private struct NamedProvider: ModelBackend {
     #expect(reply.hello.selectedModel == selector)
     #expect(!reply.hello.hasModelName)
     var begin = Asura_Model_V1_Begin()
-    begin.model = selector; begin.inputBytes = 10; begin.deadlineRemainingMs = 2_000
+    begin.model = selector; begin.inputBytes = 10
     begin.maxResponseTokens = 512
     frame = Envelope(); frame.operationID = Data(repeating: 7, count: 16); frame.generation = 1
     frame.body = .begin(begin)

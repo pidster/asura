@@ -140,9 +140,9 @@ rows leave this panel.
 Ctrl+Up from the editor enters queue focus at the last unresolved input.
 Up/Down traverse the queue; Down past its last item returns to the editor. Escape
 also returns. `[` and `]` move a selected unsent local row one position in the
-local outbox. For an accepted kind-18 row, they request a same-lane durable move
-with the observed order revision. In-flight, running, terminal and legacy kind-12
-rows cannot move. A stale order result refreshes the projection without claiming
+local outbox. For an accepted row, they request a same-lane durable move
+with the observed order revision. In-flight, running and terminal rows cannot
+move. A stale order result refreshes the projection without claiming
 the move succeeded.
 
 Enter on a queued or held accepted input sends it now. With an exact active
@@ -150,9 +150,18 @@ operation in the same conversation, the canonical service atomically promotes
 the same input to Steer. The hint says this stops and restarts the response.
 Without an active operation, Enter requests a move of a queued input to the
 front; a held input does not move, and the notice asks for `/queue resume ID`.
-Never combine client Drop and Enqueue. If the
+Never combine client Drop and a second queue input. If the
 target is stale or the input was dispatched, show rejection and keep the
-projection. Enter on a rejected local row restores its exact text only when
+projection.
+
+Ctrl+T stages the draft in the local outbox exactly as Enter does. Ctrl+S
+requires an acknowledged active operation in the current conversation; it
+stages the draft with that steer target. After the durable kind-18 receipt, the
+TUI promotes the accepted input with decision action 3 if the target is still
+active. Otherwise the input stays Queued and the notice explains that the turn
+ended before steering. Without an active target, Ctrl+S keeps the draft and
+shows a notice. The [steering keys contract](managed-input-queue.md#steering-keys-ctrls-and-ctrlt)
+owns this rule. Enter on a rejected local row restores its exact text only when
 the editor is empty. The UI keeps uncertain decisions for `/retry`; success
 does not clear an unrelated draft. Changed project/epoch invalidates stale
 focus and projections.
@@ -191,9 +200,10 @@ Selected design. Arrows show dispatch, failure and acknowledgement boundaries.
 
 ```mermaid
 flowchart TD
-  Key[Enter] --> Focus{Focused element}
-  Focus -->|Editor, conversational input| Stage[Stage exact text in bounded local outbox]
+  Key[Enter, Ctrl+T or Ctrl+S] --> Focus{Focused element}
+  Focus -->|Editor, conversational input| Stage[Stage exact text in bounded local outbox; Ctrl+S marks steer target]
   Stage -->|Serial sender claims row| Enqueue[Typed queue submit with stable request ID]
+  Enqueue -->|Receipt for Ctrl+S row and target still active| Promote
   Focus -->|Queued item and active same-conversation operation| Promote[Promote same input with exact target]
   Focus -->|Queued item and idle service| Reorder[Move input to front with order revision]
   Focus -->|Model row| Config[Existing config worker]
@@ -231,7 +241,7 @@ exact retry, stale targets, duplicate steering, size rejection and restart hold.
 Integration and real terminal checks exercise project and model selectors, local
 staging, serial delivery, durable reorder, promotion and history while requests
 are pending. Verify editor/quit responsiveness with stalled discovery and queue
-delivery. [MQ01–MQ12](managed-input-queue.md#acceptance-cases-and-delivery-order)
+delivery. [MQ01–MQ16](managed-input-queue.md#acceptance-cases-and-delivery-order)
 define the new queue unit, integration and end-to-end proof. Root runs serial
 Cargo/Swift checks and builds the executable.
 Render and inspect both diagrams and terminal previews before reporting completion.
@@ -292,8 +302,8 @@ flowchart TD
     Older -->|No| Observe[Observe exact operation once through existing worker]
 ```
 
-Historical regression fixture: persisted kind-12 queued work targeting generation
-2 completes as generation 3, then a direct turn advances that conversation to 4.
+Historical regression fixture: queued work targeting generation
+2 completes as generation 3, then a later turn advances that conversation to 4.
 A fresh TUI restores generation 4 from the journal read. It must not adopt
 generation 3 from the queue. Also cover running
 work on the first snapshot, queued-to-complete between polls, new terminal work

@@ -268,7 +268,6 @@ mod tests {
             lifecycle: Some(1),
             installation: Some(1),
             reason: Some(1),
-            unavailable_reason: None,
         };
         let mut owner = Observer::new(runtime, sender, status);
         owner.closing = true; // This unit exercises cache delivery without starting source IO.
@@ -343,7 +342,6 @@ mod tests {
             lifecycle: Some(2),
             installation: Some(6),
             reason: Some(16),
-            unavailable_reason: None,
         };
         let mut owner = Observer::new(runtime, wake, status);
         owner.refresh = false;

@@ -570,7 +570,7 @@ It never receives paths or file descriptors.
 
 | Interface | Direction | Content |
 | --- | --- | --- |
-| Candidate records | Writer → composer | Turn identities, prompts, terminal text, tool intents, result records (legacy kind 15 text, or the reference-only kind with reference, digest, summary, outcome and capture state), job and person notice records |
+| Candidate records | Writer → composer | Turn identities, prompts, terminal text, tool intents, result records (kind 15 text for current non-job tools, or the reference-only kind with reference, digest, summary, outcome and capture state), job and person notice records |
 | Page request | Composer → job controller | Handle or result ID, stream, offset, limit, representation `text` (J1 serves text pages only, R5); uses the reserved model page-read worker |
 | Page reply | Job controller → composer | Bytes, source offset, next offset, total retained bytes, state (`live`, `complete`, `unverified_prefix`, `expired`, `busy`, `denied`, …), digest or watermark |
 | Manifest digest | Conversation owner → writer | Added to `TurnAccepted` (and to request records in stage B) as additive format-1 fields, with the composer revision |
@@ -580,8 +580,8 @@ A live page binds the job's watermark, not a digest. The manifest therefore
 records the SHA-256 of the exact bytes it included, so reconstruction can verify
 them after installation changes the page binding.
 
-Until CC2, legacy tool results still carry text in kind 15 records and are not
-carried into later turns, as today. CC1 does not change in-turn tool delivery.
+Until CC2, results of the current non-job tools carry text in kind 15 records
+and are not carried into later turns, as today. CC1 does not change in-turn tool delivery.
 
 ### Composition manifest
 
@@ -937,7 +937,7 @@ Ollama.
 | ID | Check | Layers |
 | --- | --- | --- |
 | TV1 | A tool result larger than any former fixed limit is retained whole, shown in full to the person, and reaches the model only as the composer's view plus a handle that pages the rest. | Unit CC-U5, CC-U6. Integration: a 1 MiB stream, above every former fixed limit, with manifest ranges checked against the stream. E2E CC-E3, CC-E4 with the job viewer showing all bytes. |
-| TV2 | No journal record contains tool output text; each result record's reference and digest match the retained stream. | Unit: the reference-only record encoder has no text field. Integration: scan every journal frame after CC2 cases; compare digests with payloads. E2E: journal scan after CC-E3. Legacy kind 15 tools are outside TV2 until they adopt references. |
+| TV2 | No journal record contains tool output text; each result record's reference and digest match the retained stream. | Unit: the reference-only record encoder has no text field. Integration: scan every journal frame after CC2 cases; compare digests with payloads. E2E: journal scan after CC-E3. Current non-job tools that use kind 15 are outside TV2 until they adopt references. |
 
 Model evaluation: compare task correctness on a fixed multi-turn set before and
 after CC1 and CC2, per provider. Mock success does not establish quality (CCR19).

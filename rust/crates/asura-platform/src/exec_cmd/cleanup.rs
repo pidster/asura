@@ -1,4 +1,4 @@
-use super::{ExecCmdError, ExecCmdFailure, check, hex};
+use super::{ExecCmdError, ExecCmdFailure, hex};
 use crate::RuntimeDirectory;
 use crate::runtime::{open_at, stat_at, stat_fd, validate_acl};
 use std::ffi::{CStr, CString};
@@ -91,7 +91,7 @@ impl ExecCmdCleanup {
         if self.done {
             return Ok(());
         }
-        check(Some(deadline), cancel)?;
+        wind_down(deadline, cancel)?;
         let named = stat_at(self.parent.as_raw_fd(), &self.name)
             .map_err(|_| ExecCmdError::CleanupUnconfirmed)?;
         if named.st_dev as u64 != self.device || named.st_ino != self.inode {
@@ -105,7 +105,7 @@ impl ExecCmdCleanup {
             deadline,
             cancel,
         )?;
-        check(Some(deadline), cancel)?;
+        wind_down(deadline, cancel)?;
         let named = stat_at(self.parent.as_raw_fd(), &self.name)
             .map_err(|_| ExecCmdError::CleanupUnconfirmed)?;
         if named.st_dev as u64 != self.device || named.st_ino != self.inode {
@@ -135,6 +135,17 @@ impl Drop for Directory {
         }
     }
 }
+/// Cleanup is Asura's own operation. Past its owner-approved wind-down
+/// bound the scratch stays for recovery and cleanup reports unconfirmed.
+fn wind_down(deadline: Instant, cancel: &AtomicBool) -> Result<(), ExecCmdError> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        Err(ExecCmdError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(ExecCmdError::CleanupUnconfirmed)
+    } else {
+        Ok(())
+    }
+}
 fn remove_contents(
     fd: i32,
     depth: usize,
@@ -158,7 +169,7 @@ fn remove_contents(
     }
     let stream = Directory(stream);
     loop {
-        check(Some(deadline), cancel)?;
+        wind_down(deadline, cancel)?;
         // SAFETY: thread-local errno; live exclusively owned stream.
         unsafe {
             *libc::__error() = 0;
@@ -190,7 +201,7 @@ fn remove_contents(
             }
             remove_contents(child.as_raw_fd(), depth + 1, remaining, deadline, cancel)?;
         }
-        check(Some(deadline), cancel)?;
+        wind_down(deadline, cancel)?;
         let after = stat_at(fd, name).map_err(|_| ExecCmdError::Io)?;
         if before.st_dev != after.st_dev || before.st_ino != after.st_ino {
             return Err(ExecCmdError::CleanupUnconfirmed);

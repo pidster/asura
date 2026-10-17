@@ -180,7 +180,7 @@ private actor InventoryFlag {
 @Test func inventoryWireRejectsWrongDirectionFieldsStatusesAndUnboundedRows() throws {
     var hello = Asura_Model_V1_Hello()
     hello.buildID = Data(repeating: 1, count: 32); hello.schemaDigest = hello.buildID
-    hello.maxFrameBytes = 65_536; hello.availability = .unknown; hello.capabilities = 0
+    hello.maxFrameBytes = 65_536; hello.availability = .unknown
     hello.reason = .none; hello.selectedModel = "system"; hello.inventoryOnly = true
     var message = Envelope(); message.body = .hello(hello)
     try Wire.validate(message, from: .service)
@@ -218,7 +218,7 @@ private actor InventoryBackend: ModelBackend {
     let server = try InventoryHTTP(body: #"{"models":[]}"#)
     var hello = Asura_Model_V1_Hello()
     hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
-    hello.availability = .unknown; hello.capabilities = 0; hello.reason = .none
+    hello.availability = .unknown; hello.reason = .none
     hello.selectedModel = "system"; hello.inventoryOnly = true; hello.endpoint = server.endpoint
     var envelope = Envelope(); envelope.body = .hello(hello)
     try await client.send(envelope)

@@ -10,6 +10,8 @@ mod exec_cmd_journey;
 mod memory_create_journey;
 #[path = "support/memory_tools_journey.rs"]
 mod memory_tools_journey;
+#[path = "support/queue_submit.rs"]
+mod queue_submit;
 #[path = "support/sensors_journey.rs"]
 mod sensors_journey;
 #[path = "support/tools_inventory_journey.rs"]
@@ -131,7 +133,6 @@ impl Fixture {
             "unclassified",
             "model_helper_failed",
             "model_protocol_fault",
-            "model_timeout",
         ];
         for line in String::from_utf8_lossy(&bytes)
             .lines()
@@ -218,23 +219,21 @@ fn observe(fixture: &Fixture, operation: [u8; 16]) -> Result<pb::ConversationEve
     }
     Err("native operation observation deadline".into())
 }
+/// Queues one input and waits for its turn; there is no direct submission.
 fn submit(
     fixture: &Fixture,
     project: [u8; 16],
     conversation: Option<Vec<u8>>,
     generation: u64,
     prompt: &str,
-) -> Result<pb::ConversationAccepted> {
-    Ok(fixture.attach()?.submit_conversation(
-        pb::ConversationSubmit {
-            request_id: Some(asura_platform::random_id().to_vec()),
-            project_id: Some(project.to_vec()),
-            conversation_id: conversation,
-            expected_generation: Some(generation),
-            prompt: Some(prompt.into()),
-        },
-        &|| false,
-    )?)
+) -> Result<queue_submit::Accepted> {
+    queue_submit::submit_queued(
+        &|| fixture.attach(),
+        project,
+        conversation,
+        generation,
+        prompt,
+    )
 }
 fn wait_ready(
     fixture: &Fixture,
@@ -425,34 +424,39 @@ fn journey(native: bool) -> Result<()> {
         managed_queue_journey(&mut fixture, project, installation.clone())?;
     }
     if native {
-        let original = pb::ConversationSubmit {
-            request_id: Some(asura_platform::random_id().to_vec()),
-            project_id: Some(project.to_vec()),
-            conversation_id: None,
-            expected_generation: Some(0),
-            prompt: Some("For this conversation only, remember the word ORCHARD. Reply with just ORCHARD. Do not call tools.".into()),
-        };
-        let accepted = fixture
-            .attach()?
-            .submit_conversation(original.clone(), &|| false)?;
+        let original = queue_submit::queue_request(
+            project,
+            None,
+            0,
+            "For this conversation only, remember the word ORCHARD. Reply with just ORCHARD. Do not call tools.",
+        );
+        let receipt = managed_submit_call(&fixture, original.clone())?;
+        let accepted = queue_submit::dispatched(
+            &|| fixture.attach(),
+            project,
+            checked_id(receipt.accepted_input_id.clone())?,
+        )?;
         let operation = checked_id(accepted.operation_id.clone())?;
         let before_repeat = fixture.attach()?.observe_conversation(operation, 0)?;
         assert!(
             matches!(before_repeat.kind, Some(1 | 2)),
             "need active admission to prove idempotent replay bypasses busy"
         );
-        let repeated = fixture
-            .attach()?
-            .submit_conversation(original.clone(), &|| false)?;
+        let repeated = managed_submit_call(&fixture, original.clone())?;
         assert_eq!(
-            repeated, accepted,
-            "same request must retain exact accepted identities"
+            repeated.accepted_input_id, receipt.accepted_input_id,
+            "same request must retain exact input identity"
+        );
+        assert_eq!(
+            queue_submit::dispatched(&|| fixture.attach(), project, accepted.input_id)?,
+            accepted,
+            "an exact retry never dispatches a second turn"
         );
         let mut conflicting = original;
         conflicting.prompt = Some("Changed prompt with the same request identity".into());
         let conflict = fixture
             .attach()?
-            .submit_conversation(conflicting, &|| false)
+            .queue_conversation_input(conflicting, &|| false)
             .expect_err("changed digest must conflict");
         assert!(
             matches!(conflict,asura_client::Error::Remote(_,ref message) if message=="request_conflict")
@@ -743,7 +747,7 @@ fn managed_queue_journey(
         .conversation_queue(project, None)?
         .entries
         .into_iter()
-        .filter(|entry| entry.order_position.is_some())
+        .filter(|entry| matches!(entry.state, Some(1 | 2)))
         .map(|entry| checked_id(entry.input_id).unwrap())
         .collect();
     assert_eq!(order, vec![first_id, third_id, second_id]);
@@ -758,7 +762,7 @@ fn managed_queue_journey(
     let recovered_order: Vec<_> = after
         .entries
         .iter()
-        .filter(|entry| entry.order_position.is_some())
+        .filter(|entry| matches!(entry.state, Some(1 | 2)))
         .map(|entry| checked_id(entry.input_id.clone()).unwrap())
         .collect();
     assert_eq!(recovered_order, vec![first_id, third_id, second_id]);
@@ -868,26 +872,6 @@ fn managed_reorder_call(
         }
     }
 }
-fn queue_call(
-    fixture: &Fixture,
-    request: pb::ConversationEnqueue,
-) -> Result<pb::ConversationQueueReply> {
-    let end = Instant::now() + Duration::from_secs(3);
-    loop {
-        match fixture
-            .attach()?
-            .enqueue_conversation(request.clone(), &|| false)
-        {
-            Ok(reply) => return Ok(reply),
-            Err(asura_client::Error::Remote(_, message))
-                if message == "conversation_busy" && Instant::now() < end =>
-            {
-                thread::sleep(Duration::from_millis(10))
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
 fn queue_entry(
     fixture: &Fixture,
     project: [u8; 16],
@@ -929,21 +913,38 @@ fn queue_settled(
         thread::sleep(Duration::from_millis(25));
     }
 }
-fn queue_request(
-    project: [u8; 16],
-    accepted: &pb::ConversationAccepted,
-    kind: u32,
-    prompt: &str,
-) -> pb::ConversationEnqueue {
-    pb::ConversationEnqueue {
-        request_id: Some(asura_platform::random_id().to_vec()),
-        project_id: Some(project.to_vec()),
-        conversation_id: accepted.conversation_id.clone(),
-        target_operation_id: accepted.operation_id.clone(),
-        target_generation: accepted.generation,
-        kind: Some(kind),
-        prompt: Some(prompt.into()),
+fn decide_call(
+    fixture: &Fixture,
+    request: pb::ConversationQueueDecision,
+) -> Result<pb::ConversationQueueReply> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match fixture
+            .attach()?
+            .decide_conversation_input(request.clone(), &|| false)
+        {
+            Ok(reply) => return Ok(reply),
+            Err(asura_client::Error::Remote(_, reason))
+                if reason == "conversation_busy" && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
+}
+/// A queued follow-up to the conversation of `accepted`.
+fn follow_up(
+    project: [u8; 16],
+    accepted: &queue_submit::Accepted,
+    prompt: &str,
+) -> pb::ConversationQueueSubmit {
+    queue_submit::queue_request(
+        project,
+        accepted.conversation_id.clone(),
+        accepted.generation.unwrap_or(0),
+        prompt,
+    )
 }
 fn queue_journey(
     fixture: &mut Fixture,
@@ -957,19 +958,18 @@ fn queue_journey(
         0,
         "Write a detailed 300 word explanation of how trees grow.",
     )?;
-    let q1 = queue_request(project, &first, 1, "Reply with only ORCHARD.");
-    let q2 = queue_request(project, &first, 1, "Reply with only MAPLE.");
-    let id1 = checked_id(q1.request_id.clone())?;
-    let id2 = checked_id(q2.request_id.clone())?;
-    let ack = queue_call(fixture, q1.clone())?;
+    let q1 = follow_up(project, &first, "Reply with only ORCHARD.");
+    let q2 = follow_up(project, &first, "Reply with only MAPLE.");
+    let ack = managed_submit_call(fixture, q1.clone())?;
     assert_eq!(ack.request_id, q1.request_id);
-    queue_call(fixture, q2)?;
-    let retry = queue_call(fixture, q1.clone())?;
-    assert_eq!(retry.entries[0].input_id, Some(id1.to_vec()));
+    let id1 = checked_id(ack.accepted_input_id.clone())?;
+    let id2 = checked_id(managed_submit_call(fixture, q2)?.accepted_input_id)?;
+    let retry = managed_submit_call(fixture, q1.clone())?;
+    assert_eq!(retry.accepted_input_id, Some(id1.to_vec()));
     let mut conflict = q1;
     conflict.prompt = Some("changed".into());
     assert!(
-        matches!(queue_call(fixture,conflict).unwrap_err().downcast_ref::<asura_client::Error>(),Some(asura_client::Error::Remote(_,message)) if message=="request_conflict")
+        matches!(managed_submit_call(fixture,conflict).unwrap_err().downcast_ref::<asura_client::Error>(),Some(asura_client::Error::Remote(_,message)) if message=="request_conflict")
     );
     // Each call used an independent attachment: disconnect cannot own scheduling.
     let one = queue_settled(fixture, project, id1)?;
@@ -979,25 +979,10 @@ fn queue_journey(
     assert_eq!(one.generation, Some(2));
     assert_eq!(two.generation, Some(3));
     assert_ne!(one.operation_id, two.operation_id);
-    println!("PASS durable queue FIFO, disconnect and original-request retry");
+    println!("PASS durable queue order, disconnect and original-request retry");
 
-    let active = submit(
-        fixture,
-        project,
-        None,
-        0,
-        "Write a detailed 300 word explanation of forests.",
-    )?;
-    let steer = queue_request(project, &active, 2, "Instead reply with only CEDAR.");
-    let steer_id = checked_id(steer.request_id.clone())?;
-    queue_call(fixture, steer)?;
-    let interrupted = observe(fixture, checked_id(active.operation_id)?)?;
-    assert_eq!(interrupted.kind, Some(5));
-    let replacement = queue_settled(fixture, project, steer_id)?;
-    assert_eq!(replacement.state, Some(4));
-    assert_eq!(replacement.generation, Some(2));
-    println!("PASS steering cancellation settled before replacement turn");
-
+    // Ctrl+S: one kind 18 input, then IQ2 promotion (kind 16) during the
+    // active turn (IQ2-R1). The promotion never reports repair_required.
     let active = submit(
         fixture,
         project,
@@ -1005,9 +990,11 @@ fn queue_journey(
         0,
         "Write a detailed 300 word explanation of oceans.",
     )?;
-    let queued = queue_request(project, &active, 1, "Instead reply with only CORAL.");
-    let input = checked_id(queued.request_id.clone())?;
-    queue_call(fixture, queued)?;
+    let queued = managed_submit_call(
+        fixture,
+        follow_up(project, &active, "Instead reply with only CORAL."),
+    )?;
+    let input = checked_id(queued.accepted_input_id)?;
     let promote = pb::ConversationQueueDecision {
         request_id: Some(asura_platform::random_id().to_vec()),
         input_id: Some(input.to_vec()),
@@ -1015,36 +1002,20 @@ fn queue_journey(
         target_operation_id: active.operation_id.clone(),
         target_generation: active.generation,
     };
-    let mutation = |request: pb::ConversationQueueDecision| -> Result<pb::ConversationQueueReply> {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            match fixture
-                .attach()?
-                .decide_conversation_input(request.clone(), &|| false)
-            {
-                Ok(reply) => return Ok(reply),
-                Err(asura_client::Error::Remote(_, reason))
-                    if reason == "conversation_busy" && Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-    };
-    let promoted = mutation(promote.clone())?;
+    let promoted = decide_call(fixture, promote.clone())?;
     assert_eq!(promoted.entries.len(), 1);
     assert_eq!(
         promoted.entries[0].input_id.as_deref(),
         Some(input.as_slice())
     );
     assert_eq!(promoted.entries[0].kind, Some(2));
-    let repeated = mutation(promote.clone())?;
+    assert_eq!(promoted.entries[0].target_operation_id, active.operation_id);
+    let repeated = decide_call(fixture, promote.clone())?;
     assert_eq!(repeated.entries[0].input_id, promoted.entries[0].input_id);
     let mut conflicting = promote;
     conflicting.target_generation = Some(active.generation.unwrap() + 1);
     assert!(
-        matches!(mutation(conflicting).unwrap_err().downcast_ref::<asura_client::Error>(),
+        matches!(decide_call(fixture, conflicting).unwrap_err().downcast_ref::<asura_client::Error>(),
         Some(asura_client::Error::Remote(_, reason)) if reason == "request_conflict")
     );
     assert_eq!(
@@ -1055,8 +1026,9 @@ fn queue_journey(
     assert_eq!(replacement.state, Some(4));
     assert_eq!(replacement.generation, Some(2));
     assert_eq!(replacement.input_id.as_deref(), Some(input.as_slice()));
-    println!("PASS existing queued input promoted atomically; exact retry and one replacement");
+    println!("PASS queued input promoted atomically; exact retry and one replacement");
 
+    // A restart holds an undispatched input; explicit Resume runs it once.
     let active = submit(
         fixture,
         project,
@@ -1064,16 +1036,11 @@ fn queue_journey(
         0,
         "Write a detailed 300 word explanation of leaves.",
     )?;
-    let held = queue_request(project, &active, 1, "Reply with only BIRCH.");
-    let held_id = checked_id(held.request_id.clone())?;
-    queue_call(fixture, held)?;
-    fixture.attach()?.cancel_conversation(
-        checked_id(active.operation_id.clone())?,
-        active.generation.unwrap(),
-        &|| false,
+    let held = managed_submit_call(
+        fixture,
+        follow_up(project, &active, "Reply with only BIRCH."),
     )?;
-    observe(fixture, checked_id(active.operation_id)?)?;
-    assert_eq!(queue_settled(fixture, project, held_id)?.state, Some(2));
+    let held_id = checked_id(held.accepted_input_id)?;
     fixture.stop()?;
     fixture.start()?;
     wait_ready(fixture, installation)?;
@@ -1084,26 +1051,10 @@ fn queue_journey(
         action: Some(1),
         ..Default::default()
     };
-    fixture
-        .attach()?
-        .decide_conversation_input(request.clone(), &|| false)?;
-    let end = Instant::now() + Duration::from_secs(3);
-    loop {
-        match fixture
-            .attach()?
-            .decide_conversation_input(request.clone(), &|| false)
-        {
-            Ok(_) => break,
-            Err(asura_client::Error::Remote(_, m))
-                if m == "conversation_busy" && Instant::now() < end =>
-            {
-                thread::sleep(Duration::from_millis(10))
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
+    decide_call(fixture, request.clone())?;
+    decide_call(fixture, request)?;
     assert_eq!(queue_settled(fixture, project, held_id)?.state, Some(4));
-    println!("PASS cancellation holds queued input across restart; explicit resume runs once");
+    println!("PASS restart holds queued input; explicit resume runs once");
     Ok(())
 }
 
@@ -1743,29 +1694,8 @@ fn provider_submit(
     conversation: Option<Vec<u8>>,
     generation: u64,
     prompt: &str,
-) -> Result<pb::ConversationAccepted> {
-    let request = pb::ConversationSubmit {
-        request_id: Some(asura_platform::random_id().to_vec()),
-        project_id: Some(project.to_vec()),
-        conversation_id: conversation,
-        expected_generation: Some(generation),
-        prompt: Some(prompt.into()),
-    };
-    let end = Instant::now() + Duration::from_secs(5);
-    loop {
-        match fixture
-            .attach()?
-            .submit_conversation(request.clone(), &|| false)
-        {
-            Ok(accepted) => return Ok(accepted),
-            Err(asura_client::Error::Remote(_, message))
-                if message == "conversation_busy" && Instant::now() < end =>
-            {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
+) -> Result<queue_submit::Accepted> {
+    submit(fixture, project, conversation, generation, prompt)
 }
 
 fn copy_assets(
@@ -2267,9 +2197,7 @@ fn main() {
         .is_some_and(|a| a == "--asura-exec-cmd-guardian")
     {
         let code = match args.as_slice() {
-            [_, _, job, deadline, command] => {
-                asura_platform::exec_cmd::run_guardian(job, deadline, command)
-            }
+            [_, _, job, command] => asura_platform::exec_cmd::run_guardian(job, command),
             _ => 2,
         };
         std::process::exit(code);
@@ -2282,6 +2210,8 @@ fn main() {
         stop_drain_journey()
     } else if args.iter().any(|a| a == "--waiting-steps") {
         waiting_step_journey::run()
+    } else if args.iter().any(|a| a == "--queue-steer") {
+        waiting_step_journey::steer()
     } else if args.iter().any(|a| a == "--long-inference") {
         cancellation_driven_journey::run()
     } else if args.iter().any(|a| a == "--native-exec-cmd-tools") {
@@ -2352,6 +2282,7 @@ fn main() {
                     .and_then(|()| journal_wait_journey())
                     .and_then(|()| stop_drain_journey())
                     .and_then(|()| waiting_step_journey::run())
+                    .and_then(|()| waiting_step_journey::steer())
             }
         })
     };

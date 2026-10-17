@@ -179,7 +179,6 @@ impl Dispatcher {
             lifecycle: Some(lifecycle as i32),
             installation: self.installation.installation,
             reason: self.installation.reason,
-            unavailable_reason: None,
         }
     }
     fn new(build: &str) -> Result<Self, Error> {
@@ -338,7 +337,6 @@ impl Dispatcher {
                     new_installation: self.installation.new_installation,
                     lifecycle: Some(lifecycle as i32),
                     installation: self.installation.installation,
-                    unavailable_reason: None,
                     reason: self.installation.reason,
                 }),
                 Action::Keep,

@@ -12,8 +12,10 @@ must extend the same authority contract to the full task/action ledger.
 The [first conversation amendment](conversation-admission.md) extends format 1
 for installation request outcomes, project registration, conversation admission,
 token reservation and terminal recovery. Root selected its CA-A pure codec/replay
-packet after review. All journal frames remain format 1; its diagnostic records
-retain their original payloads and are never silently converted.
+packet after review. All journal frames remain format 1. The diagnostic
+initialization kinds 1 and 2 are removed (owner, 2026-10-17): Asura is not
+released, so no compatibility with older journals is required. A journal must
+start with kind 10; replay rejects any other first record.
 Writer, production graph binding and service integration retain that amendment's
 separate validation gates. This extends the same authority owner and file.
 
@@ -197,7 +199,7 @@ one contiguous header, payload and trailer. The table order is byte order.
 | Header field | Bytes | Validation |
 | --- | --- | --- |
 | Magic | 8 | ASCII `ASURAJ01` |
-| Format version; record kind | 2 each | Version 1; diagnostic kinds 1–3 below; conversation kinds in the amendment |
+| Format version; record kind | 2 each | Version 1; kind 3 below; initialization and conversation kinds in the amendment |
 | Total frame length | 4 | Includes 144-byte header, payload and 40-byte trailer |
 | Sequence | 8 | Starts at 1, increases by 1, never wraps |
 | Previous frame digest | 32 | All zero for sequence 1; otherwise preceding digest |
@@ -215,29 +217,27 @@ this design introduces no handwritten digest implementation or dependency change
 
 | Kind | Exact payload, in order | Replay effect |
 | --- | --- | --- |
-| 1 PendingInit | Mode u8 (1 embedded, 2 external); configuration revision u64; configuration digest 32 bytes; intended graph ID 16 bytes | Only sequence 1, owner generation 1; records pending initialization |
-| 2 ActiveBinding | Binding generation u64; graph ID 16 bytes; configuration digest 32 bytes | Once after PendingInit; generation 1; graph ID and digest must match pending intent |
 | 3 OwnerGeneration | Empty | Previous owner generation plus 1; no binding or operation completion effect |
 
-Configuration revision and graph ID must be nonzero. Kind 2 retains the current
-owner generation; kind 3 may follow either initialization state. Revision, sequence
+The earlier diagnostic kinds 1 PendingInit and 2 ActiveBinding are removed and
+unassigned (owner, 2026-10-17). Kinds 10 PendingInit and 11 ActiveBinding in the
+[conversation amendment](conversation-admission.md#transition-payloads) carry
+request identity. Kind 3 may follow either initialization state. Revision, sequence
 or generation exhaustion rejects rather than wrapping. Unknown kinds reject. Adding an authorized record kind does not change the
 format number. Only the owner can authorize a format-number change. The adapter rejects repeated operation IDs, including
 identical bytes at a new sequence. The same initialization intent is correlated
 by its installation/graph/configuration identity; each committed transition has
-its own operation ID. Future durable request/outcome schemas must distinguish
-that transition identity from the user's initialization request before a writer
-is implemented. Stage 3A cannot answer `ResolveRequest` or claim a user request
-completed from these diagnostic bootstrap records.
+its own operation ID. Kinds 10 and 11 distinguish that transition identity from
+the user's initialization request.
 
-The [conversation amendment](conversation-admission.md#format-1-and-record-compatibility)
+The [conversation amendment](conversation-admission.md#format-1-and-record-kinds)
 adds request-bearing initialization kinds 10 and 11, plus kinds 4 through 9.
-Later amendments add kinds 12–20.
-Kind 3 remains shared. The first record selects diagnostic or request-bearing
-initialization rules. Public inspection validates the complete corresponding
-stream before returning its summary. A diagnostic stream cannot acquire request
-outcomes by mixing these initialization records. Their payloads and numbers are
-distinct; none changes the format-1 envelope or existing diagnostic fixtures.
+Later amendments add kinds 13–23. Kinds 1, 2, 5 and 12 are unassigned.
+Every stream starts with kind 10. Public inspection validates the complete stream
+before returning its summary. None of these kinds changes the format-1 envelope.
+The envelope crash and truncation suite uses kind-10 and kind-11 frames built by
+the canonical encoder; it checks damage at every byte, truncation at every frame
+boundary and writer death at every byte.
 
 A complete valid frame is a replayed commit boundary even if its acknowledgement
 was lost. That does not establish successful graph verification now. Stage 3A
@@ -513,11 +513,12 @@ graph backup; copying `.asura/` alone is incomplete. Restore verifies every
 member, current policy and reference before any work admission. An arbitrary
 live directory copy is not a qualified backup.
 
-Every file and frame format has a compatibility version. An unsupported version
-blocks admission without automatic rewrite. An authorized migration records
-its operation ID and phase before changing files, preserves old references and
-resumes or blocks after a crash. D3 must define supported upgrade pairs,
-checkpoint order, rollback limits and the treatment of old slots.
+Every file and frame format has a version. An unsupported version blocks
+admission without automatic rewrite. Upgrade and migration across released
+versions are deferred until the first release (owner, 2026-10-17); before then,
+schemas change in place and no older data is migrated. The release design must
+then define supported upgrade pairs, checkpoint order, rollback limits and the
+treatment of old slots.
 
 ## Required qualification and remaining choices
 

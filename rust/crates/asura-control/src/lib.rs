@@ -186,7 +186,7 @@ fn installation_pair(state: Option<i32>, reason: Option<i32>) -> bool {
             | (
                 S::Unavailable,
                 R::InspectionLimit
-                    | R::InspectionTimeout
+                    | R::InspectionCancelled
                     | R::UnsafeAuthority
                     | R::AuthorityChanged
                     | R::InspectionIo
@@ -251,7 +251,6 @@ pub fn validate_semantics(
             | Body::AuditRead(_)
             | Body::ConfigGet(_)
             | Body::ConfigSet(_)
-            | Body::ConversationSubmit(_)
             | Body::ConversationHistory(_)
             | Body::ConversationReadPrompt(_)
             | Body::ConversationObserve(_)
@@ -261,7 +260,6 @@ pub fn validate_semantics(
             | Body::ProjectRegister(_)
             | Body::ProjectRename(_)
             | Body::ProjectList(_)
-            | Body::ConversationEnqueue(_)
             | Body::ConversationQueueSubmit(_)
             | Body::ConversationQueueReorder(_)
             | Body::ConversationQueueList(_)
@@ -311,7 +309,6 @@ pub fn validate_semantics(
             v.lifecycle
                 .is_some_and(|n| pb::Lifecycle::try_from(n).is_ok() && n != 0)
                 && installation_pair(v.installation, v.reason)
-                && v.unavailable_reason.is_none()
                 && new_installation(v.new_installation, v.installation, v.reason)
         }
         Body::InspectInstallationReply(v) => installation_reply(v),
@@ -341,7 +338,6 @@ pub fn validate_semantics(
                         .lifecycle
                         .is_some_and(|n| pb::Lifecycle::try_from(n).is_ok() && n != 0)
                         && installation_pair(status.installation, status.reason)
-                        && status.unavailable_reason.is_none()
                 })
                 && (v.configured_model.is_none()
                     || v.configured_model.as_ref().is_some_and(|s| {

@@ -434,6 +434,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--client-waits"),
         Some("--exec-cmd-capture"),
         Some("--waiting-steps"),
+        Some("--queue-steer"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);
@@ -505,6 +506,100 @@ fn suite() -> Result<()> {
     }
     terminal_regressions()?;
     Ok(())
+}
+/// IQ2-R1 PTY evidence: after Enter, then Ctrl+S during the active turn, then
+/// Ctrl+T, the journal holds three kind 18 inputs. The Ctrl+S input was promoted (kind 16)
+/// to steer the first turn, which ended Cancelled for steering; the
+/// replacement completed once in generation 2.
+fn queue_steer_verify() -> Result<()> {
+    use asura_storage::authority::{conversation as j, writer as w};
+    let mut writer =
+        w::WriterHandle::start(resolver(true)?).map_err(|e| format!("fixture start:{e:?}"))?;
+    let result = (|| -> Result<()> {
+        let mut ticket = writer
+            .try_submit(w::Command::Open)
+            .map_err(|e| format!("fixture submit:{e:?}"))?;
+        let end = Instant::now() + Duration::from_secs(12);
+        let state = loop {
+            if let Some(result) = ticket.poll() {
+                break result
+                    .map_err(|e| format!("fixture writer:{e:?}"))?
+                    .replay
+                    .ok_or("missing replay")?;
+            }
+            require(Instant::now() < end, "fixture writer deadline")?;
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        // Enter, Ctrl+S and Ctrl+T each wrote one kind 18 input.
+        require(state.inputs.len() == 3, "expected three kind 18 inputs")?;
+        require(
+            state
+                .inputs
+                .values()
+                .filter(|input| input.kind == j::InputKind::Queue)
+                .all(|input| state.input_status(input.request).is_some()),
+            "unknown input status",
+        )?;
+        let steer: Vec<_> = state
+            .inputs
+            .values()
+            .filter(|input| input.kind == j::InputKind::Steer)
+            .collect();
+        require(steer.len() == 1, "expected exactly one promoted input")?;
+        let steer = steer[0];
+        let status = state.input_status(steer.request);
+        if status != Some(j::InputStatus::Complete) {
+            let detail: Vec<_> = state
+                .inputs
+                .values()
+                .map(|input| (input.kind, state.input_status(input.request)))
+                .chain(std::iter::once((steer.kind, status)))
+                .collect();
+            let terminals: Vec<_> = state
+                .operations
+                .values()
+                .map(|op| {
+                    (
+                        op.generation,
+                        op.terminal.as_ref().map(|t| (t.kind, t.cause)),
+                    )
+                })
+                .collect();
+            return Err(format!("replacement did not complete: {detail:?} {terminals:?}").into());
+        }
+        let (operation, generation) = state
+            .input_operation(steer.request)
+            .ok_or("replacement never dispatched")?;
+        require(generation == 2, "replacement generation")?;
+        require(steer.target_generation == 1, "promotion target generation")?;
+        let target = state
+            .operations
+            .get(&steer.target_operation)
+            .ok_or("missing steered operation")?;
+        require(
+            target.terminal.as_ref().is_some_and(|t| {
+                t.kind == j::TerminalKind::Cancelled && t.cause == j::Cause::Steering
+            }),
+            "steered turn did not end for steering",
+        )?;
+        require(
+            state
+                .operations
+                .values()
+                .filter(|op| op.generation == 2)
+                .count()
+                == 1
+                && state.operations.contains_key(&operation),
+            "replacement ran more than once",
+        )
+    })();
+    writer.close();
+    let end = Instant::now() + Duration::from_secs(12);
+    while !writer.settled() {
+        require(Instant::now() < end, "fixture writer cleanup deadline")?;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    result
 }
 // Fixture-only canonical journal seeding. This branch exists only in the copied
 // integration executable; production CLI has no runtime or journal override.
@@ -678,6 +773,7 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
         let project = *registered.projects.keys().next().ok_or("missing project")?;
         let mut revision = registered.revision;
         let mut dispatch = None;
+        let mut queued_input = None;
         for generation in 1u8..=4 {
             let conversation = if generation == 1 {
                 None
@@ -727,9 +823,13 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
                 input_digest: [61; 32],
                 prior_operations: vec![],
                 prompt: prompt.into(),
-                reserved_output_tokens: 512,
+                reserved_output_tokens: j::OUTPUT_RESERVATION,
                 event_cursor: 1,
-                composition: None,
+                // Every earlier fixture turn completed and is omitted.
+                composition: j::Composition {
+                    omitted_turns: u32::from(generation - 1),
+                    ..j::Composition::default()
+                },
             };
             append(
                 &writer,
@@ -752,28 +852,28 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
                 None,
             )?;
             if generation == 2 {
-                let queued = execute(
+                let reply = execute(
                     &writer,
-                    w::Command::Enqueue {
+                    w::Command::QueueInput {
                         request: [80; 16],
                         project,
-                        conversation: [20; 16],
-                        target_operation: operation,
-                        target_generation: 2,
-                        kind: j::InputKind::Queue,
+                        conversation: Some([20; 16]),
+                        expected_generation: 2,
+                        new_conversation: false,
                         prompt: "queued fixture input".into(),
                     },
-                )?
-                .replay
-                .ok_or("missing queued replay")?;
+                )?;
+                let input = reply.accepted_input_id.ok_or("missing queued input")?;
+                let queued = reply.replay.ok_or("missing queued replay")?;
                 revision = queued.revision;
                 dispatch = Some(
                     queued
                         .inputs
-                        .get(&[80; 16])
+                        .get(&input)
                         .ok_or("missing queued row")?
                         .dispatch_request,
                 );
+                queued_input = Some(input);
             }
             append(
                 &writer,
@@ -796,7 +896,8 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
             .replay
             .ok_or("missing seeded replay")?;
         require(
-            state.input_status([80; 16]) == Some(j::InputStatus::Complete),
+            state.input_status(queued_input.ok_or("missing queued input")?)
+                == Some(j::InputStatus::Complete),
             "queued seed not complete",
         )?;
         require(
@@ -855,10 +956,6 @@ fn queue_reorder_fixture(verify: bool) -> Result<()> {
             let second_id = input([92; 16])?;
             let first = state.inputs.get(&first_id).ok_or("missing first input")?;
             let second = state.inputs.get(&second_id).ok_or("missing second input")?;
-            require(
-                first.v2 && second.v2,
-                "fixture inputs are not managed inputs",
-            )?;
             require(
                 state.input_status(first_id) == Some(j::InputStatus::Held)
                     && state.input_status(second_id) == Some(j::InputStatus::Held),
@@ -942,9 +1039,9 @@ fn queue_reorder_fixture(verify: bool) -> Result<()> {
                 input_digest: [61; 32],
                 prior_operations: vec![],
                 prompt: prompt.into(),
-                reserved_output_tokens: 512,
+                reserved_output_tokens: j::OUTPUT_RESERVATION,
                 event_cursor: 1,
-                composition: None,
+                composition: j::Composition::default(),
             })),
             Some(w::AdmissionFence {
                 project,
@@ -1039,6 +1136,13 @@ fn main() {
         let verify = std::env::args().nth(1).as_deref() == Some("--verify-queue-reorder");
         if let Err(error) = queue_reorder_fixture(verify) {
             eprintln!("queue reorder fixture: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--verify-queue-steer") {
+        if let Err(error) = queue_steer_verify() {
+            eprintln!("queue steer fixture: {error}");
             std::process::exit(1);
         }
         return;

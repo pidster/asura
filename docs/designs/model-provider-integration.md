@@ -2,11 +2,11 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens. Tool requests are capped at 1,024 tokens first
+Every admission reserves exactly 2,048 tokens; replay rejects any other
+reservation (owner, 2026-10-17). Tool requests are capped at 1,024 tokens first
 and 512 thereafter, at most 64 per turn, under the
-[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Historical
-512-token journal records retain their recorded accounting. Earlier numerical
-examples and validation evidence below describe that earlier packet.
+[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Earlier
+numerical examples and validation evidence below describe that earlier packet.
 
 Owner requirement, 2026-10-13: Asura will integrate local and remote models
 through the OpenAI API specification. Token limits must not be hard-coded; each
@@ -811,11 +811,10 @@ The 250 ms helper cancellation and exact-child cleanup stages remain as wind-dow
 bounds. Tools follow the [tool job controller](tool-job-controller.md); a later
 tool does not inherit a time bound from turn startup.
 
-The optional Begin `deadline_remaining_ms` field is omitted by the service. Absence
-means cancellation-driven generation. The owner removed the legacy explicit
-generation deadline (2026-10-16). The field stays in the 0.1 schema for
-compatibility. The service never sends it, and the helper arms no generation or
-input-transfer timer, whatever value it receives. The protocol remains 0.1 and
+Begin has no time field. The owner removed the explicit generation deadline
+(2026-10-16), and Begin field 3 (`deadline_remaining_ms`) is removed and
+reserved (owner, 2026-10-17). Generation is cancellation-driven; the helper arms
+no generation or input-transfer timer. The protocol remains 0.1 and
 journal format remains 1.
 
 Ollama discovery and generation have no time limit (owner, 2026-10-16); the
@@ -857,7 +856,7 @@ no timeout. Each handshake step, held past its former limit with an injected
 clock, stays pending and visible, then ends on the next message, helper exit,
 protocol fault, cancellation or shutdown. Tool-budget tests
 admit a later tool beyond 60 seconds while retaining call/byte and cancellation
-limits. Helper tests verify that a supplied `deadline_remaining_ms` arms no timer.
+limits. Helper tests verify that a stalled generation ends only on cancel.
 Wind-down stages still escalate on cancellation. Process/PTY checks retain cancellation, disconnect,
 shutdown and responsiveness coverage under stalled inference. Native qualification
 must demonstrate a turn exceeding 60 seconds without an elapsed-time failure.
@@ -881,7 +880,7 @@ of the isolated service log in a temporary diagnostic artifact.
 
 ### Recorded lifetime checks — 2026-09-30
 
-These checks predate the owner's 2026-10-16 removal of the handshake and legacy
+These checks predate the owner's 2026-10-16 removal of the handshake and
 generation deadlines; the tests that asserted them were replaced on 2026-10-16.
 
 The matching isolated package passed the 64-second loopback-provider process
@@ -1009,9 +1008,8 @@ Required behavior (owner, 2026-10-16), under
 - Each step ends on the next protocol message, helper exit, a protocol fault,
   cancellation or service shutdown. The TUI shows the step that the turn or
   inventory request waits for.
-- Generation has no legacy explicit deadline. The service never sends
-  `deadline_remaining_ms`; the helper arms no timer from it. The field stays in
-  the 0.1 schema.
+- Generation has no explicit deadline. Begin field 3 (`deadline_remaining_ms`)
+  is removed and reserved (owner, 2026-10-17); the helper arms no generation timer.
 - Ollama `/api/show`, `/api/chat` and `/api/tags` requests have no time limit.
   Foundation requests set no resource time limit. A request ends on its reply,
   an HTTP or transport error, cancellation, helper exit or shutdown.
@@ -1026,9 +1024,9 @@ Cancellation still stops admission and reaches pending work, and a cancelled or
 disconnected wait reports whether the operation stopped or has an unknown outcome.
 
 Implementation status (2026-10-16): implemented. `ModelOwner` arms a timer only
-for wind-down; `ModelProcess::spawn` takes no deadline; Begin never sends
-`deadline_remaining_ms`. The Swift `HelperSession` arms only the 250 ms final
-drain and ignores a supplied `deadline_remaining_ms`. The Ollama session sets
+for wind-down; `ModelProcess::spawn` takes no deadline; Begin has no deadline
+field (removed 2026-10-17). The Swift `HelperSession` arms only the 250 ms final
+drain. The Ollama session sets
 request and resource timeouts to infinity; a live probe held one request 65 s
 and it completed. The TUI shows the waiting step under
 [waiting step display](#waiting-step-display--owner-2026-10-16).
@@ -1079,7 +1077,7 @@ columns below remain open except where these tests cover them:
 | --- | --- | --- | --- |
 | HW-01 | Each step, held past its former limit with an injected clock, stays pending | Stalled fixture helper at each step keeps Inspect and cancel responsive | TUI shows the waiting step and cancels it ([WS-01–WS-04](#validation--waiting-steps)) |
 | HW-02 | Helper exit, protocol fault and shutdown end each step with a typed outcome | Real helper killed at each step settles the operation once | Service stop during a stalled step settles the helper |
-| HW-03 | A supplied `deadline_remaining_ms` arms no timer | Long generation with the field supplied runs to completion | |
+| HW-03 | Begin has no deadline field; a stalled generation arms no timer and ends on Cancel | Long generation runs to completion | |
 | HW-04 | Ollama show, chat and tags requests have no timeout configuration | Stalled private loopback server stays pending until cancel | `/models` with a stalled Ollama row stays pending until the person cancels |
 | HW-05 | Wind-down escalates cancel, SIGTERM and SIGKILL on schedule | Stubborn helper is killed and reaped after cancel | |
 
@@ -1128,9 +1126,8 @@ above. No client derives a step. Two existing projections carry it:
 Both fields use the new `ConversationWaitStep` enum. Field numbers are the next
 free numbers in each message under the
 [numbering authority](../engineering.md#wire-protocol-change-authority).
-Absence means no step is known, and a client shows today's generic `Waiting` or
-`Queued`. Older clients ignore the unknown field. Older services never send it.
-Stored records are unaffected. Control validation rejects a step on any other
+Absence means no step is known, and a client shows the generic `Waiting` or
+`Queued`. Stored records are unaffected. Control validation rejects a step on any other
 event kind or entry state, and rejects values outside 3–4 on events and 1–2 on
 entries.
 

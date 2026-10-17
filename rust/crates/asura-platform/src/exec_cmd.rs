@@ -25,7 +25,6 @@ use zeroize::Zeroizing;
 pub enum ExecCmdError {
     Invalid,
     Denied,
-    Deadline,
     Cancelled,
     Unavailable,
     Protocol,
@@ -35,7 +34,6 @@ pub enum ExecCmdError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StopReason {
     Cancelled,
-    Deadline,
     OutputLimit,
     LeaseEnded,
 }
@@ -69,7 +67,6 @@ impl ExecCmdResult {
             match self.reason {
                 None => "none",
                 Some(StopReason::Cancelled) => "cancelled",
-                Some(StopReason::Deadline) => "timeout",
                 Some(StopReason::OutputLimit) => "output_limit",
                 Some(StopReason::LeaseEnded) => "lease_ended",
             },
@@ -101,15 +98,12 @@ pub const MAX_COMMAND_BYTES: usize = 8192;
 /// [`MAX_COMMAND_BYTES`] in total. They reach the guardian only through its
 /// environment. No `Debug` is derived, and `SecretVariable`'s omits values.
 ///
-/// `deadline` is `None` for every service call (J1-Q3, J1-Q4): the command
-/// ends on completion or cancel, and setup checks only cancellation. `Some`
-/// remains only for platform qualification of the bounded guardian mode; J3
-/// removes it.
+/// The command has no time bound: it ends on completion or cancel, and setup
+/// checks only cancellation.
 pub struct ExecCmdRequest {
     pub job_id: [u8; 16],
     pub command: String,
     pub cwd: Option<String>,
-    pub deadline: Option<Instant>,
     pub secrets: Vec<SecretVariable>,
 }
 pub struct PreparedExecCmd {
@@ -126,11 +120,9 @@ pub struct PreparedExecCmd {
     secret_environment_for_test: Option<Vec<Vec<u8>>>,
     cleanup: Option<ExecCmdCleanup>,
 }
-fn check(deadline: Option<Instant>, cancel: &AtomicBool) -> Result<(), ExecCmdError> {
+fn check(cancel: &AtomicBool) -> Result<(), ExecCmdError> {
     if cancel.load(Ordering::Acquire) {
         Err(ExecCmdError::Cancelled)
-    } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        Err(ExecCmdError::Deadline)
     } else {
         Ok(())
     }
@@ -195,8 +187,7 @@ impl PreparedExecCmd {
         cancel: &AtomicBool,
     ) -> Result<Self, ExecCmdFailure> {
         validate(&request)?;
-        let setup_deadline = request.deadline;
-        check(setup_deadline, cancel)?;
+        check(cancel)?;
         let original_project = project.process_location().to_owned();
         let boundary = project.boundary().clone();
         let project = project
@@ -210,7 +201,7 @@ impl PreparedExecCmd {
             .split('/')
             .filter(|s| !s.is_empty() && *s != ".")
         {
-            check(setup_deadline, cancel)?;
+            check(cancel)?;
             let name = CString::new(part).map_err(|_| ExecCmdError::Invalid)?;
             cwd = open_at(
                 cwd.as_raw_fd(),
@@ -237,7 +228,7 @@ impl PreparedExecCmd {
             secret_environment_for_test: None,
             cleanup: Some(cleanup),
         };
-        if let Err(reason) = check(setup_deadline, cancel) {
+        if let Err(reason) = check(cancel) {
             return Err(ExecCmdFailure {
                 reason,
                 cleanup: result.cleanup.take(),
@@ -285,7 +276,7 @@ impl PreparedExecCmd {
         cancel: &AtomicBool,
         sink: Box<dyn OutputSink>,
     ) -> Result<ExecCmdJob, ExecCmdError> {
-        check(self.request.deadline, cancel)?;
+        check(cancel)?;
         let current = ProjectIdentity::open(&self.original_project, &self.boundary)
             .map_err(|_| ExecCmdError::Denied)?;
         let pinned = stat_fd(self.project.as_raw_fd()).map_err(|_| ExecCmdError::Io)?;
@@ -319,25 +310,10 @@ impl PreparedExecCmd {
         let (err_read, err_write) = spawn::pipe(false)?;
         let null =
             open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDWR, 0).map_err(|_| ExecCmdError::Io)?;
-        // No deadline: the guardian's no-deadline mode (J1-Q3).
-        let deadline = match self.request.deadline {
-            None => guardian::NO_DEADLINE.to_owned(),
-            Some(deadline) => spawn::monotonic_ns()?
-                .checked_add(
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_nanos()
-                        .try_into()
-                        .map_err(|_| ExecCmdError::Invalid)?,
-                )
-                .ok_or(ExecCmdError::Invalid)?
-                .to_string(),
-        };
         let args = vec![
             executable.to_string_lossy().into_owned(),
             "--asura-exec-cmd-guardian".into(),
             hex(self.request.job_id),
-            deadline,
             self.request.command.clone(),
         ];
         if args.iter().map(|value| value.len() + 1).sum::<usize>() > 8704 {
@@ -368,7 +344,7 @@ impl PreparedExecCmd {
             None => environment,
         };
         let env: Vec<&[u8]> = environment.iter().map(|entry| entry.as_slice()).collect();
-        check(self.request.deadline, cancel)?;
+        check(cancel)?;
         let pid = spawn::launch(executable, &args, &env, mappings, None, false)?;
         drop(env);
         drop(environment);
@@ -386,7 +362,6 @@ impl PreparedExecCmd {
             out: Capture::new(out_read, Stream::Stdout),
             err: Capture::new(err_read, Stream::Stderr),
             sink,
-            deadline: self.request.deadline,
             stop: None,
             cleanup: self.cleanup.take(),
             job_id: self.request.job_id,
@@ -411,7 +386,6 @@ pub struct ExecCmdJob {
     out: Capture,
     err: Capture,
     sink: Box<dyn OutputSink>,
-    deadline: Option<Instant>,
     stop: Option<StopReason>,
     cleanup: Option<ExecCmdCleanup>,
     job_id: [u8; 16],
@@ -451,13 +425,8 @@ impl ExecCmdJob {
         if self.settled() {
             None
         } else {
-            // The 100 ms poll tick (L5) ends nothing; with no deadline it
-            // is the only timer.
-            let tick = Instant::now() + Duration::from_millis(100);
-            Some(match self.deadline {
-                Some(deadline) if self.lease.is_some() => deadline.min(tick),
-                _ => tick,
-            })
+            // The 100 ms poll tick (L5) ends nothing; it is the only timer.
+            Some(Instant::now() + Duration::from_millis(100))
         }
     }
     pub fn stop(&mut self, reason: StopReason) {
@@ -466,10 +435,7 @@ impl ExecCmdJob {
         }
         self.lease.take();
     }
-    pub fn poll(&mut self, now: Instant) -> Result<(), ExecCmdError> {
-        if self.deadline.is_some_and(|deadline| now >= deadline) {
-            self.stop(StopReason::Deadline)
-        }
+    pub fn poll(&mut self, _now: Instant) -> Result<(), ExecCmdError> {
         let result = self.poll_inner();
         if result.is_err() {
             self.fault = true;
@@ -565,8 +531,8 @@ impl ExecCmdJob {
             },
             exit_code: (n.exit_kind == 1).then_some(n.value as i32),
             signal: (n.exit_kind == 2).then_some(n.value as i32),
+            // Reason 1 (the removed deadline) is unassigned.
             reason: self.stop.or(match n.reason {
-                1 => Some(StopReason::Deadline),
                 2 => Some(StopReason::Cancelled),
                 3 => Some(StopReason::OutputLimit),
                 4 => Some(StopReason::LeaseEnded),

@@ -38,7 +38,7 @@ fn platform_failure(error: AuthorityError) -> pb::InspectInstallationReply {
         AuthorityError::Unsafe => Reason::UnsafeAuthority,
         AuthorityError::Changed => Reason::AuthorityChanged,
         AuthorityError::Limit => Reason::InspectionLimit,
-        AuthorityError::Cancelled => Reason::InspectionTimeout,
+        AuthorityError::Cancelled => Reason::InspectionCancelled,
         AuthorityError::Io => Reason::InspectionIo,
     })
 }
@@ -100,7 +100,7 @@ fn scan_source(source: AuthoritySource, cancelled: &AtomicBool) -> pb::InspectIn
                 ReplayError::UnsupportedFormat => Reason::UnsupportedFormat,
                 ReplayError::Corrupt => Reason::CorruptAuthority,
                 ReplayError::Limit => Reason::InspectionLimit,
-                ReplayError::Cancelled => Reason::InspectionTimeout,
+                ReplayError::Cancelled => Reason::InspectionCancelled,
             });
         }
     };
@@ -195,7 +195,7 @@ impl Worker {
         let mut result = None;
         if !self.retired && epoch != self.epoch {
             self.cancel();
-            result = Some(failure(Reason::InspectionTimeout));
+            result = Some(failure(Reason::InspectionCancelled));
         }
         if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
             let finished = self.handle.take().unwrap().join();
@@ -300,7 +300,7 @@ where
         }
         if !self.cancelled && !self.timeout_reported && epoch != self.epoch {
             self.timeout_reported = true;
-            return Some(failure(Reason::InspectionTimeout));
+            return Some(failure(Reason::InspectionCancelled));
         }
         None
     }
@@ -361,7 +361,7 @@ mod tests {
             assert!(worker.next_deadline(later).is_none());
             if epoch_change {
                 let reply = worker.poll([2; 16], later).unwrap();
-                assert_eq!(reply.reason, Some(Reason::InspectionTimeout as i32));
+                assert_eq!(reply.reason, Some(Reason::InspectionCancelled as i32));
             } else {
                 worker.cancel();
             }
@@ -490,8 +490,8 @@ mod tests {
                     .mode(0o600)
                     .open(scratch.0.join(".asura/state/control/slot-0.log"))
                     .unwrap();
-                file.write_all(include_bytes!(
-                    "../../asura-storage/tests/fixtures/pending.bin"
+                file.write_all(&asura_storage::authority::fixture::initialization_journal(
+                    false,
                 ))
                 .unwrap();
                 file.sync_all().unwrap();
@@ -547,7 +547,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             worker.poll([2; 16], Instant::now()).unwrap().reason,
-            Some(Reason::InspectionTimeout as i32)
+            Some(Reason::InspectionCancelled as i32)
         );
         let end = Instant::now() + Duration::from_secs(2);
         while !worker.settled() {
@@ -669,7 +669,7 @@ mod reactor_tests {
                 && let Ok(status) = client.inspect()
             {
                 assert_ne!(status.lifecycle, pb::Lifecycle::RepairOnly as i32);
-                assert_ne!(status.reason, Reason::InspectionTimeout as i32);
+                assert_ne!(status.reason, Reason::InspectionCancelled as i32);
                 draining |= status.lifecycle == pb::Lifecycle::Draining as i32;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -840,7 +840,7 @@ mod reactor_tests {
         assert!(runtime.acquire_owner().is_err());
         assert_ne!(
             attach(&runtime).inspect_installation().unwrap().reason,
-            Reason::InspectionTimeout
+            Reason::InspectionCancelled
         );
         release.send(()).unwrap();
         // The original Stop finishes without a second client command.

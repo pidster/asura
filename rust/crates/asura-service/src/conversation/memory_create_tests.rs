@@ -66,7 +66,6 @@ fn resolution_response_is_not_publication_until_job_really_settles() {
     let _serial = crate::TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let fixture = Fixture::new();
     let writer = Writer(writer::WriterHandle::start(fixture.owner.runtime.clone()).unwrap());
-    let now = Instant::now();
     let mut mutation = Mutation::new(intent());
     mutation.phase = Phase::Resolve;
     let (ticket, controller) = controlled_ticket(false);
@@ -75,36 +74,34 @@ fn resolution_response_is_not_publication_until_job_really_settles() {
         &mutation.intent,
     )))));
     mutation.cancel();
-    assert!(mutation.poll(&writer.0, now, 6).unwrap().is_none());
+    assert!(mutation.poll(&writer.0, 6).unwrap().is_none());
     assert!(!mutation.settled());
     controller.finish();
-    let result = mutation.poll(&writer.0, now, 6).unwrap().unwrap();
+    let result = mutation.poll(&writer.0, 6).unwrap().unwrap();
     assert_eq!(result.status, 1);
     assert_eq!(result.text, mutation.intent.success_text());
     assert!(mutation.settled());
 }
 #[test]
-fn timed_out_mutation_retains_ticket_and_cancellation_until_settlement() {
+fn cancelled_mutation_retains_ticket_and_cancellation_until_settlement() {
     let _serial = crate::TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let fixture = Fixture::new();
     let writer = Writer(writer::WriterHandle::start(fixture.owner.runtime.clone()).unwrap());
-    let now = Instant::now();
     let mut mutation = Mutation::new(intent());
     mutation.phase = Phase::Mutation;
     let (ticket, controller) = controlled_ticket(true);
     mutation.ticket = Some(ticket);
     mutation.cancel();
-    assert!(mutation.poll(&writer.0, now, 5).unwrap().is_none());
+    assert!(mutation.poll(&writer.0, 5).unwrap().is_none());
     assert!(mutation.cancel.load(Ordering::Acquire));
     assert!(!mutation.settled());
-    assert!(mutation.next_deadline().is_none());
     controller.publish(Ok(response(MemoryCreateResult::Committed(receipt(
         &mutation.intent,
     )))));
-    assert!(mutation.poll(&writer.0, now, 5).unwrap().is_none());
+    assert!(mutation.poll(&writer.0, 5).unwrap().is_none());
     assert!(mutation.phase == Phase::Mutation);
     controller.finish();
-    assert!(mutation.poll(&writer.0, now, 5).unwrap().is_none());
+    assert!(mutation.poll(&writer.0, 5).unwrap().is_none());
     assert!(mutation.phase == Phase::Resolve);
 }
 #[test]
@@ -171,13 +168,12 @@ fn acknowledged_committed_create_after_cancel_stays_success_but_is_not_delivered
             source_version: None,
         },
     };
-    let mut budget = tools::Budget::new(now + Duration::from_secs(60));
+    let mut budget = tools::Budget::cancellation_driven();
     budget
         .reserve(
             call.clone(),
             &tool_grant(&active.turn, true),
             &tools::Destination::Local,
-            now,
         )
         .unwrap();
     active.tool_budget = budget;
@@ -189,7 +185,6 @@ fn acknowledged_committed_create_after_cancel_stays_success_but_is_not_delivered
         secret_digest: None,
         rejected: false,
         call,
-        deadline: Some(now + Duration::from_secs(2)),
         memory_ticket: None,
         intent_committed: true,
         dispatched: true,
@@ -296,13 +291,13 @@ fn startup_unconfirmed_resolution_retains_publication_gate_without_terminal_or_m
     recovery.phase = Phase::Resolve;
     recovery.ticket = Some(ticket);
     controller.publish(Err(writer::Error::Unavailable));
-    assert!(fixture.owner.drive_create_recovery(Instant::now()));
+    assert!(fixture.owner.drive_create_recovery());
     assert!(
         fixture.owner.unavailable.is_none(),
         "response alone is not settlement"
     );
     controller.finish();
-    assert!(fixture.owner.drive_create_recovery(Instant::now()));
+    assert!(fixture.owner.drive_create_recovery());
     assert_eq!(
         fixture.owner.unavailable,
         Some("memory_write_outcome_unconfirmed")
@@ -561,7 +556,7 @@ fn failure_and_helper_terminal_revoke_create_at_entry_without_poll() {
         if helper_terminal {
             Owner::helper_terminal(active, 2, 9, None);
         } else {
-            Owner::failed(active, "model_timeout", Instant::now());
+            Owner::failed(active, "model_unavailable", Instant::now());
         }
         assert!(cancel.load(Ordering::Acquire));
         assert!(active.terminal.is_some());
@@ -572,7 +567,7 @@ fn failure_and_helper_terminal_revoke_create_at_entry_without_poll() {
         if helper_terminal {
             Owner::helper_terminal(active, 2, 9, None);
         } else {
-            Owner::failed(active, "model_timeout", Instant::now());
+            Owner::failed(active, "model_unavailable", Instant::now());
         }
         assert!(cancel.load(Ordering::Acquire));
     }

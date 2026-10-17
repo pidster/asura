@@ -18,8 +18,6 @@ message Envelope {
     ConfigGet config_get = 19;
     ConfigSet config_set = 20;
     ConfigReply config_reply = 21;
-    ConversationSubmit conversation_submit = 22;
-    ConversationAccepted conversation_accepted = 23;
     ConversationObserve conversation_observe = 24;
     ConversationEvent conversation_event = 25;
     ConversationCancel conversation_cancel = 26;
@@ -31,7 +29,6 @@ message Envelope {
     ProjectReply project_reply = 32;
     ProjectList project_list = 33;
     ProjectsReply projects_reply = 34;
-    ConversationEnqueue conversation_enqueue = 35;
     ConversationQueueList conversation_queue_list = 36;
     ConversationQueueDecision conversation_queue_decision = 37;
     ConversationQueueReply conversation_queue_reply = 38;
@@ -54,6 +51,9 @@ message Envelope {
     ProjectRename project_rename = 55;
     ProjectRenameReply project_rename_reply = 56;
   }
+  // Removed operations: direct ConversationSubmit (22) and its reply (23), and
+  // the target-bearing ConversationEnqueue (35). Conversation input uses the queue.
+  reserved 22, 23, 35;
 }
 message ObserveService { optional uint64 after_revision = 1; }
 message ServiceObservation {
@@ -106,7 +106,7 @@ message Inspect {}
 message InspectReply {
   optional Lifecycle lifecycle = 1;
   optional InstallationState installation = 2;
-  optional UnavailableReason unavailable_reason = 3;
+  reserved 3;
   optional InstallationInspectionReason reason = 4;
   optional bool new_installation = 5;
 }
@@ -153,10 +153,6 @@ enum InstallationState {
   INSTALLATION_STATE_REPAIR_REQUIRED = 5;
   INSTALLATION_STATE_GRAPH_READY = 6;
 }
-enum UnavailableReason {
-  UNAVAILABLE_REASON_UNSPECIFIED = 0;
-  UNAVAILABLE_REASON_AUTHORITY_NOT_INSTALLED = 1;
-}
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   ERROR_CODE_UNSUPPORTED_OPERATION = 1;
@@ -181,26 +177,13 @@ enum InstallationInspectionReason {
   INSTALLATION_INSPECTION_REASON_INCOMPLETE_TAIL = 9;
   INSTALLATION_INSPECTION_REASON_CORRUPT_AUTHORITY = 10;
   INSTALLATION_INSPECTION_REASON_INSPECTION_LIMIT = 11;
-  INSTALLATION_INSPECTION_REASON_INSPECTION_TIMEOUT = 12;
+  INSTALLATION_INSPECTION_REASON_INSPECTION_CANCELLED = 12;
   INSTALLATION_INSPECTION_REASON_UNSAFE_AUTHORITY = 13;
   INSTALLATION_INSPECTION_REASON_AUTHORITY_CHANGED = 14;
   INSTALLATION_INSPECTION_REASON_INSPECTION_IO = 15;
   INSTALLATION_INSPECTION_REASON_GRAPH_VERIFIED = 16;
 }
 
-message ConversationSubmit {
-  optional bytes request_id = 1;
-  optional bytes project_id = 2;
-  optional bytes conversation_id = 3;
-  optional uint64 expected_generation = 4;
-  optional string prompt = 5;
-}
-message ConversationAccepted {
-  optional bytes operation_id = 1;
-  optional bytes conversation_id = 2;
-  optional uint64 generation = 3;
-  optional uint64 cursor = 4;
-}
 message ConversationObserve {
   optional bytes operation_id = 1;
   optional uint64 after_cursor = 2;
@@ -331,15 +314,6 @@ message ProjectList { optional bytes after_project_id = 1; optional uint32 limit
 message ProjectsReply { repeated ProjectReply projects = 1; optional bytes next_cursor = 2; optional string error = 3; }
 
 // Durable service-owned input queue. Values evolve within protocol 0.1.
-message ConversationEnqueue {
-  optional bytes request_id = 1;
-  optional bytes project_id = 2;
-  optional bytes conversation_id = 3;
-  optional bytes target_operation_id = 4;
-  optional uint64 target_generation = 5;
-  optional uint32 kind = 6; // 1 Queue, 2 cancel-and-replace Steer
-  optional string prompt = 7;
-}
 // Queue a prompt before model admission. A new conversation has no ID yet and
 // must explicitly carry generation zero and new_conversation=true.
 message ConversationQueueSubmit {
@@ -380,8 +354,8 @@ message ConversationQueueEntry {
   optional bytes operation_id = 9;
   optional uint64 generation = 10;
   optional uint64 sequence = 11;
-  optional bool new_conversation = 12; // V2 lane; target_generation is expected generation
-  optional uint32 order_position = 13; // V2 pending order, independent of immutable sequence
+  optional bool new_conversation = 12; // target_generation is the expected generation
+  optional uint32 order_position = 13; // pending lane order, independent of immutable sequence
   optional string hold_reason = 14; // Current-owner diagnostic only; absent after restart
   optional ConversationWaitStep waiting_step = 15; // Live, Queued only, values 1-2; never journaled
 }

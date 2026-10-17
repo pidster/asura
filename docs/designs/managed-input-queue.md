@@ -4,9 +4,9 @@ Status: selected design for the owner's 2026-09-29 queue instruction. Codec,
 authority, service and TUI implementation are integrated. Focused unit,
 service and isolated lifecycle/PTY checks passed; the full validation matrix
 below remains open. Protocol number remains
-0.1. Journal format remains 1. The existing [IQ1 and IQ2 contracts](conversation-admission.md#durable-input-queue-iq1)
-govern legacy records and steering settlement. This document replaces their
-busy-only and direct-idle submission rules for new conversational input.
+0.1. Journal format remains 1. The [IQ1 and IQ2 contracts](conversation-admission.md#durable-input-queue-iq1)
+govern durable input records, promotion and steering settlement. Every queued
+input is one kind-18 record (owner choice “One record”, 2026-10-17).
 
 ## Required behavior and scope
 
@@ -24,15 +24,15 @@ queue. A literal slash message follows the existing escape or quoting rule.
 This packet does not add a generic job scheduler, another process, multiple
 simultaneous model operations or automatic execution after uncertain recovery.
 
-The old IQ1 sentence “Existing idle Submit ... remain unchanged” and its
-active-target requirement conflict with this instruction. The owner explicitly
-replaced them. The old IQ1 predecessor chain based on immutable enqueue order
-also cannot define the new reorderable order. New records use this contract;
-replay of old records retains their original dependency meaning. IQ2's atomic
-promotion, exact target validation, cancel-and-replace behavior and prompt size
-limit remain in force. IQ2's automatic hold of ordinary follow-ups after a
-settled steering cancellation applies to legacy kind-12 inputs. Kind-18 Queue
-successors keep their durable order behind the promoted replacement.
+The owner replaced the earlier direct idle submission and the target-bearing
+kind-12 queue record. Both are removed, with the `ConversationSubmit` (envelope
+field 22) and `ConversationEnqueue` (field 35) operations (owner, 2026-10-17).
+Asura is not released, so no compatibility with older journals is required;
+replay rejects kind 12. Ctrl+T queues the draft exactly as Enter does. Ctrl+S
+queues the draft as a kind-18 input, then requests IQ2 promotion of that input
+(see [steering keys](#steering-keys-ctrls-and-ctrlt)). IQ2's atomic promotion,
+exact target validation, cancel-and-replace behavior and prompt size limit remain
+in force. Queue successors keep their durable order behind the promoted replacement.
 
 ## Ownership and process boundaries
 
@@ -109,13 +109,10 @@ validates the generation. This extends the restoration contract without
 mistaking a historical terminal queue row for a current cursor.
 
 The queue has one ordered lane per conversation. Reorder moves one `Queued` or
-`Held` kind-18 input after a named kind-18 pending input in that same lane; an absent predecessor
+`Held` input after a named pending input in that same lane; an absent predecessor
 means the front. The predecessor cannot be the moved input. Running, terminal,
 promoted steering and in-flight local entries cannot move. Unsent local rows
-may change position before the sender claims them. Kind-12 legacy entries
-cannot move or serve as reorder anchors until a separate migration contract
-has been designed and tested. In a mixed lane, unresolved kind-12 entries
-stay ahead of kind-18 entries; a kind-18 move cannot cross them. A successful reorder
+may change position before the sender claims them. A successful reorder
 does not modify prompt, input ID, dispatch ID or conversation generation. It
 changes only future selection order. It cannot preempt a dispatch already
 committed as `TurnAccepted`.
@@ -133,9 +130,8 @@ and expected order revision in that order. It excludes request ID and resulting
 revision. A position-preserving move still records its request result and
 advances the revision, so exact retries remain stable.
 
-Existing kind-12 `InputQueued` requires an active operation and immutable
-predecessor. The new idle-capable payload cannot reuse that kind. Reserve
-kind 18 for `InputQueuedV2` and kind 19 for `InputReordered`. Kind 18 contains,
+Kind 18 is `InputQueuedV2` and kind 19 is `InputReordered`. Kind 12, the earlier
+target-bearing record, is removed and unassigned. Kind 18 contains,
 in order, request ID, request digest, input ID, dispatch request ID, project ID,
 conversation ID, expected generation, new-conversation flag, exact prompt and
 initial order revision. The new-conversation flag requires an unused generated
@@ -145,28 +141,23 @@ canonical binary payload is
 request ID, request digest, input ID, optional predecessor input ID, expected
 order revision and resulting order revision. Replay rejects a missing input,
 wrong lane, non-pending predecessor, changed request digest, revision gap,
-duplicate ID or impossible order. Existing records are not rewritten. Extend
-the version-0.1 Protobuf envelope with unused field numbers for a typed reorder
-request and reply; add `order_revision` to queue projections. Do not reuse the
-existing journal `revision` as an order revision. Add distinct
-`ConversationQueueSubmit` and `ConversationQueueReorder` envelope operations at
-unused field numbers 53 and 54; keep the existing target-bearing
-`ConversationEnqueue` intact for exact legacy retries. Submit returns the common
-queue reply with input ID, conversation ID and order revision. Reorder returns
-the common queue reply with the committed order revision. Add `stale_order`
-to that reply: a stale reorder returns `stale_order = true` and the current
-bounded queue projection with its current order revision. A successful reorder
-returns `stale_order = false`; old replies may omit it. Reject malformed
-optional fields before admission.
-New Submit and Reorder replies carry the full bounded same-project projection.
+duplicate ID or impossible order. The version-0.1 Protobuf envelope carries
+`ConversationQueueSubmit` (field 53) and `ConversationQueueReorder` (field 54);
+queue projections carry `order_revision`. Do not reuse the journal `revision` as
+an order revision. Submit returns the common queue reply with input ID,
+conversation ID and order revision. Reorder returns the common queue reply with
+the committed order revision. A stale reorder returns `stale_order = true` and the
+current bounded queue projection with its current order revision. A successful
+reorder returns `stale_order = false`. Reject malformed optional fields before
+admission.
+Submit and Reorder replies carry the full bounded same-project projection.
 Submit also returns `accepted_input_id` so the client can correlate its local
 request with one projected entry; an absent or mismatched identity rejects the
-reply. Exact legacy replies retain their existing one-entry shape.
-Keep each entry's `sequence` as its immutable journal acceptance sequence for
-history-baseline detection. Add a separate `order_position` to queue entries for
-new records. The service returns new pending entries in their committed order;
-the TUI uses `order_position` for presentation and move anchors. Legacy entries
-keep their sequence order and have no `order_position`.
+reply. Decision replies (Resume, Drop, promotion, Hold) carry the one decided entry.
+Each entry's `sequence` is its immutable journal acceptance sequence for
+history-baseline detection. Its `order_position` gives the committed lane order.
+The service returns pending entries in that order; the TUI uses `order_position`
+for presentation and move anchors.
 
 The queue keeps at most 16 unresolved service inputs across all projects, each
 at most 32 KiB. The client outbox keeps at most 16 local pending inputs and one
@@ -189,13 +180,11 @@ No operation from a lane runs concurrently with another operation from that
 conversation. Model reservation, current configuration and complete-turn history
 are checked only at dispatch. A queued input has no reserved model budget.
 
-For kind-18 Queue inputs, a committed terminal `Failed` or `Cancelled` outcome
+For Queue inputs, a committed terminal `Failed` or `Cancelled` outcome
 settles the preceding operation. Queued successors and inputs submitted after
 that terminal remain `Queued`; the service dispatches them in durable lane order.
 The next prompt uses the normal history policy. A failed response is not reported
-as a successful response or retried by this transition. This rule replaces IQ1's
-successful-predecessor requirement only for kind-18 Queue inputs. Legacy kind-12
-inputs keep their original dependency rule. An interrupted operation after owner
+as a successful response or retried by this transition. An interrupted operation after owner
 restart does not grant dispatch authority. Owner-generation replay, explicit Hold,
 and uncertain journal settlement keep undispatched inputs `Held` until Resume or
 Drop. Reordering does not erase an explicit or recovery hold. A held head blocks
@@ -233,7 +222,44 @@ then requests cancel-and-replace. The TUI says this stops and restarts the
 response. If no active operation exists, `Send now` moves the item to the front
 with a reorder request; it does not create a steering cancellation. A stale
 target, conflicting steer or already dispatched input rejects and preserves
-the queue. The TUI never implements steering as Drop plus a second Enqueue.
+the queue. The TUI never implements steering as Drop plus a second queue input.
+
+### Steering keys: Ctrl+S and Ctrl+T
+
+Selected design (owner choice “One record”, 2026-10-17). Ctrl+T stages the draft
+in the local outbox exactly as Enter does; it becomes one kind-18 queued input.
+Ctrl+S requires an acknowledged active operation in the current conversation.
+It stages the draft in the local outbox and marks the row with that steer target
+(operation ID and generation). The serial sender submits it like any other row.
+When the durable kind-18 receipt arrives, the TUI checks the target. If the same
+operation is still active, it sends `ConversationQueueDecision` action 3 for the
+accepted input and that exact target. The service commits one kind-16
+`InputPromoted` record, then requests cancel-and-replace under IQ2. If the target
+is no longer active, the TUI sends no promotion. The input stays Queued in lane
+order, and the notice says that the turn ended before steering. A stale-target
+promotion rejection also leaves the input Queued. A crash between the receipt and
+the promotion leaves a Queued input; it never loses the text.
+
+Selected flow. Arrows show key handling, requests and durable outcomes.
+
+```mermaid
+flowchart TD
+    Key{"Key"} -->|"Enter or Ctrl+T"| Stage["Stage draft in local outbox"]
+    Key -->|"Ctrl+S"| Target{"Acknowledged active operation in this conversation?"}
+    Target -->|No| Keep["Keep draft; notice: no active target"]
+    Target -->|Yes| StageS["Stage draft with steer target"]
+    Stage --> Send["Serial sender: ConversationQueueSubmit"]
+    StageS --> Send
+    Send -->|"Rejected"| Rejected["Rejected local row keeps text"]
+    Send -->|"Unconfirmed"| Unconfirmed["Keep request ID for exact retry"]
+    Send -->|"Durable kind-18 receipt"| Marked{"Row has steer target?"}
+    Marked -->|No| Queued["Queued in lane order"]
+    Marked -->|Yes| Active{"Same operation still active?"}
+    Active -->|No| QueuedNote["Queued; notice: turn ended before steering"]
+    Active -->|Yes| Promote["Decision action 3: input, target, generation"]
+    Promote -->|"InputPromoted durable"| Steer["Cancel and replace under IQ2"]
+    Promote -->|"Stale target"| QueuedNote
+```
 
 ### Admission and delivery — selected design
 
@@ -249,7 +275,7 @@ sequenceDiagram
     U->>C: Enter: stage exact text and stable request ID
     U->>U: Clear editor and render provisional Pending local
     C->>C: Claim first row and lock its position while in flight
-    C->>S: Enqueue(project, conversation, generation, request, text)
+    C->>S: QueueSubmit(project, conversation, generation, request, text)
     S->>J: Validate and append InputQueuedV2
     alt Flush succeeds
         J-->>S: Input ID and order revision
@@ -293,7 +319,7 @@ stateDiagram-v2
     Queued --> Held: /cancel while preparing (action 4, reason cancelled)
     Queued --> Held: Preparation failure and publish current owner reason
     Held --> Queued: Durable Resume
-    Queued --> Steering: Send now with exact active target
+    Queued --> Steering: Send now or Ctrl+S promotion with exact active target
     Held --> Steering: Send now with exact active target
     Steering --> Held: Unrelated cancellation or restart
     Steering --> Running: Steering settlement and dispatch
@@ -392,8 +418,7 @@ flowchart TD
     Move["[ or ] on selected queue row"] --> State{"Row state?"}
     State -->|"In-flight or terminal"| Reject["Reject move and keep position"]
     State -->|"Unsent local"| Local["Reorder local outbox without durable claim"]
-    State -->|"Accepted kind 12"| Reject
-    State -->|"Accepted kind 18"| Retry{"Request ID already recorded?"}
+    State -->|"Accepted input"| Retry{"Request ID already recorded?"}
     Retry -->|Same digest| Receipt["Return original result"]
     Retry -->|Different digest| Reject["Reject and keep projection"]
     Retry -->|No| Check{"Pending same-lane IDs and order revision match?"}
@@ -419,10 +444,7 @@ model; provider selection remains governed by its own policy.
 
 Runtime checks recorded in this document cover only their listed cases; the full
 MQ matrix, fairness and visual quality remain unqualified. Power-loss durability
-remains limited by the existing journal qualification evidence. Old IQ1 queued
-records must replay under their original predecessor links; migration must not
-reinterpret them as reorderable records. Reorder rejects kind-12 inputs and
-anchors. Existing IQ2 promotion of a kind-12 input keeps its original contract.
+remains limited by the existing journal qualification evidence.
 
 ## Acceptance cases and delivery order
 
@@ -433,15 +455,18 @@ anchors. Existing IQ2 promotion of a kind-12 input keeps its original contract.
 | MQ03 | Two accepted pending inputs; move second to front | One kind-19 mutation; new revision and dispatch order persist after restart | Replay unit; real journal integration; service and PTY end to end |
 | MQ04 | Concurrent reorder clients use same order revision | Exactly one wins; loser gets stale revision without losing text | Unit CAS; service process integration; two-client end to end |
 | MQ05 | Same reorder request retried after lost reply | Original position/result returned; no second move or dispatch | Codec/replay unit; fault-injected journal integration; control-client end to end |
-| MQ06 | Operation active; select same-conversation queued item to send now | IQ2 promotion commits before cancellation; one replacement; kind-18 successors stay ordered behind it unless explicitly held | Unit target/bounds; real service/helper integration; PTY end to end |
-| MQ07 | A turn fails or is cancelled with a committed terminal; one kind-18 successor is already queued; then one new input arrives | Existing and new inputs stay Queued and dispatch in durable lane order, without duplicating the failed turn | Replay and scheduler unit; real journal/service integration; PTY end to end |
+| MQ06 | Operation active; select same-conversation queued item to send now | IQ2 promotion commits before cancellation; one replacement; successors stay ordered behind it unless explicitly held; never `repair_required` (regression IQ2-R1) | Writer unit target/bounds; real service/helper integration; PTY end to end |
+| MQ07 | A turn fails or is cancelled with a committed terminal; one successor is already queued; then one new input arrives | Existing and new inputs stay Queued and dispatch in durable lane order, without duplicating the failed turn | Replay and scheduler unit; real journal/service integration; PTY end to end |
 | MQ07R | Owner restarts with undispatched inputs or journal settlement is uncertain | Inputs remain Held; no automatic retry; unrelated lanes progress; explicit Resume or Drop is needed | Replay unit; restart journal integration; PTY end to end |
 | MQ07H | Provider preparation fails before admission | Input becomes Held with a reason code; queue pane explains required Resume; no model turn is fabricated | Service unit and queue reply integration; PTY held-row rendering |
 | MQ08 | 16 unresolved inputs, local outbox full, or 8 MiB journal full | Definite rejection preserves draft and existing queue; controls remain responsive | Bounds unit; fault-injected service integration; PTY end to end |
 | MQ09 | Two ready lanes across projects, one busy model | Scheduler rotates after each terminal; no lane starves under the stated invariant | Scheduler unit; two-project service integration; control-client end to end |
 | MQ10 | Reconnect after dispatch and owner crash | Exact input maps to one operation; historical queue rows do not lower restored cursor | Replay unit; restart integration; relaunch PTY end to end |
-| MQ11 | Legacy kind-12 and new kind-18 rows coexist; user presses `[` or `]` | Legacy row and anchor reject moves; new row cannot cross unresolved legacy work; replay order stays valid | Unit validation; mixed-journal integration; PTY end to end |
 | MQ12 | First outbox row is in flight; later input is edited; service rejects first | In-flight row cannot move; exact rejected text remains retrievable without overwriting newer draft; unsent rows can move | Unit state/focus; stalled service integration; PTY end to end |
+| MQ13 | Operation active; Ctrl+S with a draft | One kind-18 input, then one kind-16 promotion for that input and target; target cancels and the replacement runs once (IQ2-S1) | TUI unit staging and promotion request; service integration; PTY end to end |
+| MQ14 | Ctrl+S row receipt arrives after its target already settled | No promotion is sent; the input stays Queued in lane order; notice explains | TUI unit; service integration |
+| MQ15 | Ctrl+T with a draft, idle or busy | Same result as Enter: one kind-18 input in lane order | TUI unit; PTY end to end |
+| MQ16 | Journal contains a kind-12 record | Replay rejects the journal as unsupported; no conversion | Codec/replay unit |
 
 First implement codec, replay and typed wire additions. Then implement service
 admission, order mutation and scheduler under the existing journal writer. Last,

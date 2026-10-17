@@ -302,7 +302,6 @@ impl ModelOwner {
         self.queue(Body::Begin(pb::Begin {
             model: Some(self.selection.model.clone()),
             input_bytes: Some(input.len() as u64),
-            deadline_remaining_ms: None,
             max_response_tokens: Some(asura_storage::authority::conversation::OUTPUT_RESERVATION),
             enable_project_tools: enable_tools.then_some(true),
         }))?;
@@ -435,7 +434,6 @@ impl ModelOwner {
                             max_frame_bytes: Some(65536),
                             tool_schema_bytes: None,
                             availability: Some(3),
-                            capabilities: Some(0),
                             context_tokens: None,
                             reported_context_tokens: None,
                             context_source: None,
@@ -668,16 +666,17 @@ impl ModelOwner {
                 self.cancel(4, Instant::now());
                 return Ok(());
             }
-            if hello.selected_model.as_deref().unwrap_or("system") != self.selection.model {
+            // Validation requires the selector; there is no default.
+            if hello.selected_model.as_deref() != Some(self.selection.model.as_str()) {
                 return Err("model_protocol_identity_mismatch");
             }
             // The canonical codec validates the source against the selector,
             // including case-insensitive provider prefixes. Identity stays exact.
             self.effective_context = hello.context_tokens;
-            self.tools_available = hello.capabilities == Some(3)
-                && hello
-                    .supported_capabilities
-                    .is_some_and(|mask| mask & 1 != 0)
+            // Tool support comes from the capability mask alone (owner, 2026-10-17).
+            self.tools_available = hello
+                .supported_capabilities
+                .is_some_and(|mask| mask & 1 != 0)
                 && matches!(hello.capability_source, Some(1..=3))
                 && local_tool_destination(
                     &self.selection,
@@ -1045,9 +1044,10 @@ mod tests {
             total_bytes: Some(text.len() as u64),
         })
     }
+    /// B3: tool availability comes from `supported_capabilities` bit 0 alone.
     #[test]
-    fn legacy_tool_bit_without_known_support_never_grants_tools() {
-        for supported in [None, Some(0), Some(1)] {
+    fn tool_availability_comes_from_the_capability_mask_alone() {
+        for supported in [None, Some(0), Some(1), Some(4), Some(5)] {
             let mut owner = owner(Phase::Hello);
             let hello = pb::Envelope {
                 body: Some(Body::Hello(pb::Hello {
@@ -1058,7 +1058,6 @@ mod tests {
                     context_tokens: Some(4096),
                     reported_context_tokens: Some(4096),
                     context_source: Some(1),
-                    capabilities: Some(3),
                     supported_capabilities: supported,
                     capability_source: supported.map(|_| 1),
                     ..Default::default()
@@ -1066,7 +1065,10 @@ mod tests {
                 ..Default::default()
             };
             owner.receive(hello, &mut Vec::new()).unwrap();
-            assert_eq!(owner.tools_available, supported == Some(1));
+            assert_eq!(
+                owner.tools_available,
+                supported.is_some_and(|mask| mask & 1 != 0)
+            );
         }
     }
 
@@ -1240,7 +1242,8 @@ mod tests {
         let Some(Body::Begin(begin)) = envelope.body else {
             panic!("expected Begin")
         };
-        assert_eq!(begin.deadline_remaining_ms, None);
+        // Begin has no time field; generation ends only on Cancel.
+        assert_eq!(begin.max_response_tokens, Some(2048));
     }
 
     #[test]
@@ -1570,7 +1573,6 @@ mod tests {
                 schema_digest: Some(vec![2; 32]),
                 max_frame_bytes: Some(65536),
                 availability: Some(1),
-                capabilities: Some(1),
                 context_tokens: Some(4096),
                 reported_context_tokens: Some(4096),
                 context_source: Some(1),

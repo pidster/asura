@@ -182,7 +182,7 @@ fn journal(case: &mut Case, bytes: &[u8], reason: &str, revision: Option<u64>) -
     fs::write(&path, bytes)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     let mut prior_epoch = serde_json::Value::Null;
-    for _ in 0..2 {
+    for attempt in 0..2u64 {
         start(case)?;
         let value = inspect(case)?;
         require(
@@ -199,12 +199,29 @@ fn journal(case: &mut Case, bytes: &[u8], reason: &str, revision: Option<u64>) -
         )?;
         prior_epoch = value["service_epoch"].clone();
         if let Some(revision) = revision {
+            // A valid kind 10 journal is a live authority: each service owner
+            // may append one empty kind 3 OwnerGeneration frame (184 bytes).
+            // Inspection reports a consistent snapshot of that journal.
+            let owner = value["recorded_owner_generation"].as_u64().unwrap_or(0);
             require(
-                value["authority_revision"] == revision
+                (1..=attempt + 2).contains(&owner)
+                    && value["authority_revision"] == revision + owner - 1
                     && value["authority_format"] == 1
-                    && value["recorded_owner_generation"] == 1
                     && value["installation_id"] == "11111111111111111111111111111111",
-                "replay identity",
+                &format!("replay identity: {value}"),
+            )?;
+            let current = fs::read(&path)?;
+            let added = current.len() - bytes.len().min(current.len());
+            require(
+                current.starts_with(bytes)
+                    && added % 184 == 0
+                    && (added / 184) as u64 >= owner - 1
+                    && (added / 184) as u64 <= attempt + 1,
+                &format!(
+                    "owner start rewrote existing records: {} -> {} bytes",
+                    bytes.len(),
+                    current.len()
+                ),
             )?;
             if revision == 2 {
                 require(
@@ -224,8 +241,8 @@ fn journal(case: &mut Case, bytes: &[u8], reason: &str, revision: Option<u64>) -
                 "invalid journal not repair required",
             )?;
             no_identity(&value)?;
+            require(fs::read(&path)? == bytes, "inspection modified journal")?;
         }
-        require(fs::read(&path)? == bytes, "inspection modified journal")?;
         require(
             !case.root.join("home/.asura/db").exists(),
             "existing authority triggered replacement database",
@@ -237,24 +254,34 @@ fn journal(case: &mut Case, bytes: &[u8], reason: &str, revision: Option<u64>) -
     }
     Ok(())
 }
-const PENDING: &[u8] = include_bytes!("../../asura-storage/tests/fixtures/pending.bin");
-const ACTIVE: &[u8] = include_bytes!("../../asura-storage/tests/fixtures/active.bin");
+use asura_storage::authority::fixture::initialization_journal;
 pub(super) fn pending(case: &mut Case) -> Result<()> {
-    journal(case, PENDING, "initialization_pending", Some(1))
+    journal(
+        case,
+        &initialization_journal(false),
+        "initialization_pending",
+        Some(1),
+    )
 }
 pub(super) fn active(case: &mut Case) -> Result<()> {
-    journal(case, ACTIVE, "graph_verification_unavailable", Some(2))
+    journal(
+        case,
+        &initialization_journal(true),
+        "graph_verification_unavailable",
+        Some(2),
+    )
 }
 pub(super) fn corrupt(case: &mut Case) -> Result<()> {
-    let mut bytes = PENDING.to_vec();
+    let mut bytes = initialization_journal(false);
     bytes[150] ^= 1;
     journal(case, &bytes, "corrupt_authority", None)
 }
 pub(super) fn incomplete(case: &mut Case) -> Result<()> {
-    journal(case, &PENDING[..PENDING.len() - 1], "incomplete_tail", None)
+    let bytes = initialization_journal(false);
+    journal(case, &bytes[..bytes.len() - 1], "incomplete_tail", None)
 }
 pub(super) fn version(case: &mut Case) -> Result<()> {
-    let mut bytes = PENDING.to_vec();
+    let mut bytes = initialization_journal(false);
     bytes[9] = 2;
     journal(case, &bytes, "unsupported_format", None)
 }

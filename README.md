@@ -63,8 +63,8 @@ Ctrl+Q exits; with a draft, select
 **Discard and exit** to confirm. Drafts are local to this TUI session and are not
 saved on exit. Completed conversation history is stored by the service.
 
-The current client uses protocol 0.1. Stop an older service with its previous CLI
-before starting this build; a protocol mismatch leaves the old service running.
+The client uses protocol 0.1. A protocol mismatch reports `incompatible_protocol`
+and leaves that service running.
 
 ### First conversation
 
@@ -85,10 +85,11 @@ To try the system model explicitly, run `/config set model system` first.
 recorded operation. `/retry` retains the original request ID after an uncertain
 request outcome; it does not allocate another turn.
 
-During active work, Enter queues input without a choice dialog. Queue waits for
-successful completion. Select a queued input and press Enter to send it now;
+During active work, Enter queues input without a choice dialog. Queued input runs
+in order after the current answer ends. Select a queued input and press Enter to send it now;
 this stops the active generation before starting its replacement.
-Ctrl+T queues and Ctrl+S steers. `/queue` lists queued inputs; `/queue ID` shows
+Ctrl+T queues like Enter. Ctrl+S queues the text and then steers the active
+answer with it. `/queue` lists queued inputs; `/queue ID` shows
 one entry. Use `/queue resume ID` or `/queue drop ID` for held work. The service
 stores accepted inputs durably; restart holds queued work for an explicit decision.
 
@@ -113,8 +114,8 @@ turns. It stores an immutable note and can link it to an existing source version
 in the same project. Write recovery uses durable intents and database receipts;
 native write qualification is recorded separately in the Memory design.
 The `exec_cmd` tool runs one noninteractive `/bin/sh` command in the selected project.
-It returns bounded stdout, stderr and exit status. `cwd` is project-relative;
-`timeout_seconds` defaults to 30 and accepts 1–60, within the remaining turn budget.
+It returns bounded stdout, stderr and exit status. `cwd` is project-relative.
+A command has no time limit; it runs until it ends or you cancel the turn.
 The sandbox permits project and private scratch writes and denies network access.
 For example, ask: “Use exec_cmd to run pwd and git status --short.”
 The system-model exec_cmd journey is verified; other local adapters have shared
@@ -207,9 +208,8 @@ installation state. `--logs DIR` works with this command too. A successful
 inspection means the state was read. Only `graph_ready` confirms the current
 verified binding.
 
-Control protocol 0.1 requires matching client and service binaries. Stop a running
-1.0 service with its previous CLI before starting the new binary. A version
-mismatch reports `incompatible_protocol` and leaves that service running.
+Control protocol 0.1 requires matching client and service binaries. A mismatch
+reports `incompatible_protocol` and leaves that service running.
 
 Build with installed Rust 1.98.0 and an explicit protoc 36.2 executable verified
 against the pinned archive in `tools/protobuf/lock.json`:

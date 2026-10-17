@@ -2,12 +2,13 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens. The implemented
+Every admission reserves exactly 2,048 tokens; replay rejects any other
+reservation (owner, 2026-10-17). The implemented
 [per-request usage and budget correction](turn-usage-helper.md#turn-budget-and-request-admission)
 removes the independent three-pass cap: first request at most 1,024 tokens, later
 requests at most 512, refunds only from verified successful output counts and at
-most 64 requests. Historical 512-token journal records retain their recorded accounting. Earlier numerical
-examples and validation evidence below describe that earlier packet.
+most 64 requests. Earlier numerical examples and validation evidence below
+describe that earlier packet.
 
 Status: implemented and activated for the `system` model selection. On 2026-09-28,
 the isolated native journey passed file reading, directed service status,
@@ -37,7 +38,7 @@ job settlement. The HM2 packet owns their arguments, limits and validation evide
 One registry defines tool names, typed arguments, limits and result types.
 Provider adapters translate requests and results. They never authorize or execute
 host operations. The service validates the accepted task, project identity,
-operation generation, grant, remaining deadline and budget before each dispatch.
+operation generation, grant, cancellation and budget before each dispatch.
 The platform supplies descriptor-relative file access. Storage owns durable tool
 records. The TUI displays service events and sends control requests only.
 
@@ -92,7 +93,7 @@ File results contain valid UTF-8 text, the requested offset, bytes returned and 
 continuation flag. If the page ends inside a UTF-8 character, return the valid
 prefix and resume at its byte boundary. A page too small for its first character
 returns a typed limit error. The platform reads at most 16 KiB plus one byte.
-The worker checks cancellation and its deadline between operations and rejects
+The worker checks cancellation between operations and rejects
 a changed file identity, size or modification stamp after reading. Binary/invalid UTF-8 input yields a typed error. Reads never
 silently replace invalid text. Directory results contain at most 128 immediate
 entries; incomplete lists carry `truncated`, never a false complete marker.
@@ -114,13 +115,14 @@ policy design; MT1 does not silently authorize project egress.
 
 Initial service limits are one active tool worker, one pending call, eight calls
 per logical turn, 16 KiB per read result and 64 KiB aggregate result bytes per turn.
-Each ordinary tool has its own two-second deadline at admission. The turn has
-no elapsed-time expiry under the cancellation-driven policy. The
+An ordinary tool call has no deadline (owner, 2026-10-17; removes limit L10 in
+[tool output views](tool-output-views.md#execution)). It ends on completion,
+turn cancel, steering, service shutdown or helper exit; the service never fails
+a turn as `model_timeout`. The turn has no elapsed-time expiry under the
+cancellation-driven policy. The
 [tool job controller](tool-job-controller.md#reconnecting-to-a-job)'s `job wait`
-is exempt from the two-second deadline (owner, 2026-10-14; limit L10 in
-[tool output views](tool-output-views.md#execution)): it returns when the job
-ends, new output arrives or the turn is cancelled, or after an optional
-model-given time. Its page reads keep their own 2-second storage bound.
+returns when the job ends, new output arrives or the turn is cancelled, or after
+an optional model-given time.
 A requested read limit must be 1 through 16,384 bytes. Offset plus limit must not
 overflow. Paths, arguments and result bytes remain out of diagnostic logs.
 
@@ -153,8 +155,8 @@ flowchart TD
   Next[Validated call] --> D{Duplicate call identity?}
   D -->|Same payload| Replay[Return committed result or pending]
   D -->|Changed payload| Conflict[Reject identity conflict]
-  D -->|New| B{Deadline and call budgets available?}
-  B -->|No| Limit[Reject expired or limit]
+  D -->|New| B{Call budgets available?}
+  B -->|No| Limit[Reject limit]
   B -->|Yes| Journal[Commit tool intent]
   Journal -->|Uncertain or failed| Hold[Hold task and report uncertainty]
   Journal -->|Committed| Fence{Still authorized and not cancelled?}
@@ -189,7 +191,7 @@ remain evidence of the original observation, not a statement of current contents
 
 Blocking open/read/readdir/stat calls run in one retained host worker, never the
 reactor or Swift callback actor. Cancellation is checked between bounded reads.
-A syscall can outlive its deadline. Retain its worker slot and pinned descriptors,
+A syscall can outlive a cancel. Retain its worker slot and pinned descriptors,
 report cancellation pending and block replacement execution until it settles.
 Shutdown uses existing owner settlement rules; it must not detach uncertain work
 and create another worker. Reserved cancellation capacity is separate from data.
@@ -206,7 +208,7 @@ stateDiagram-v2
   IntentPending --> Running: Intent committed and fence current
   IntentPending --> Held: Commit uncertain
   IntentPending --> Settling: Cancel before dispatch
-  Running --> Settling: Result, error, cancellation or deadline
+  Running --> Settling: Result, error, cancellation, steering or shutdown
   Settling --> Settled: Worker ended and result committed
   Settling --> Held: Worker or durable outcome uncertain
   Held --> Interrupted: Restart reconciliation
@@ -273,7 +275,7 @@ Only the conversation owner may call start after durable intent. The executor
 checks the saved device/inode before reading; opening the project and every file
 operation occur on that worker. Poll joins only a finished thread. Cancel sets an
 atomic fence and retains the slot until poll observes termination. A second start
-returns busy while the first slot remains held, including after a deadline.
+returns busy while the first slot remains held, including after a cancel.
 The same executor instance must remain owned by the service through shutdown.
 
 ### Validation evidence and current limits
@@ -357,13 +359,23 @@ admits requests under the turn budget: 1,024 tokens first, 512 later and at most
 implement the same structured tool callbacks and enforce the passed output cap;
 provider inventory alone never enables tools.
 
-The host worker's two-second deadline is also an explicit reactor timer. Expiry
+The host worker has no deadline and no reactor timer (owner, 2026-10-17); the
+earlier two-second deadline is removed. A turn cancel, steering or shutdown
 fences model continuation and cancels the model and host worker without waiting
 for the blocked syscall. The worker slot, project descriptors and operation stay
-retained until actual settlement. Its eventual durable result is a timeout, not
+retained until actual settlement. Its eventual durable result is cancelled, not
 a fresh observation; no late successful bytes are disclosed. The turn terminal
 cannot commit before that unresolved tool result settles or recovery interrupts
 it. Startup/restart never retries an unfinished tool automatically.
+
+MT-D1 (stalled tool ends on cancel): initial state, a turn runs a non-exec tool
+whose host worker is stalled. Trigger: the person cancels the turn. Required
+result: the turn ends as Cancelled with no `model_timeout`; no timer fires while
+the tool is stalled; no late bytes are delivered. Evidence: service unit tests
+`stalled_worker_schedules_no_deadline_and_ends_on_cancel` (executor with a stalled
+worker thread) and `stalled_memory_read_waits_without_a_timer_and_ends_on_cancel`
+(owner with a held writer ticket). Service integration evidence remains open: no
+test fault gate yet stalls a project or memory read in a real service process.
 
 Provider selection and disclosure are immutable for a turn. Local project tools
 require an admitted user task and the selected registered project. Remote results
@@ -374,8 +386,8 @@ Unknown provider capability leaves tools unavailable, with no text-command parse
 The provider factory and helper negotiation changes are coordinated with the
 provider packet; schema edits belong to the primary agent.
 
-MT3 tests add service-enforced conservative accounting, deadline expiry while a
-host worker is stalled, cancellation-before-intent/after-intent/after-result,
+MT3 tests add service-enforced conservative accounting, cancellation while a
+host worker is stalled (MT-D1), cancellation-before-intent/after-intent/after-result,
 result commit failure fencing, duplicate argument identity, stale generations,
 and recovery with unresolved intent. The native scratch-project journey must
 observe a committed tool result and an answer containing a file-only random
@@ -412,8 +424,8 @@ flowchart TD
     Call --> Validate{Identity, grant, destination and limits valid?}
     Validate -->|No| Fault[Explicit failure; no host dispatch]
     Validate -->|Yes| Intent[Commit intent]
-    Intent --> Host[Start one retained host worker and two-second timer]
-    Host -->|Deadline| Fence[Cancel continuation; keep host slot]
+    Intent --> Host[Start one retained host worker; no timer]
+    Host -->|Cancel, steering or shutdown| Fence[Cancel continuation; keep host slot]
     Host -->|Settles| Result[Commit bounded result]
     Fence --> Late[Wait actual settlement; discard late successful bytes]
     Late --> Result
@@ -428,12 +440,15 @@ flowchart TD
 ### Selected-provider handshake
 
 Private Hello service fields 9 selected_model, 10 asset_root and 11 endpoint carry
-the admitted provider selection before discovery. Absent selected_model retains
-`system` for existing injected fixtures. Asset root is a canonical service-provided
+the admitted provider selection before discovery. selected_model is required in
+every Hello in both directions; a Hello without it is a protocol fault
+(owner, 2026-10-17). Asset root is a canonical service-provided
 local path; it never comes from model output or the helper's HOME. Endpoint is an
 explicit selected provider setting. These two fields occur only service-to-helper.
-The helper echoes selected_model and reports capability bits 1 (text) or 3 (text
-and native tools). Begin.model must equal that discovered selector exactly; there
+The helper echoes selected_model. Availability (field 4) reports whether text
+generation is available. Hello field 5, the earlier capability bits, is removed
+(reserved). Native tool support comes only from `supported_capabilities` bit 0
+with a known `capability_source`. Begin.model must equal that discovered selector exactly; there
 is no fallback provider. Per-turn tool enablement also requires the service's
 local/disclosure policy. Unknown capacity keeps the current unavailable admission
 behavior until a provider supplies a truthful capacity and overflow contract.
@@ -443,8 +458,8 @@ behavior until a provider supplies a truthful capacity and overflow contract.
 `service_observe_status` takes an empty typed argument object. Private ToolCall
 uses ObserveStatus at tag 12; journal ToolIntent uses kind 3 with empty path,
 zero offset and zero limit. It uses the same admitted task/project read grant,
-eight-call limit, result-byte accounting, generation fences and two-second
-execution deadline as project reads. Remote disclosure remains denied.
+eight-call limit, result-byte accounting, generation fences and cancellation
+as project reads; it has no execution deadline. Remote disclosure remains denied.
 
 The service sensor owner captures the cached status and stores its typed
 observation through the canonical writer. It returns bounded JSON (at most
@@ -452,7 +467,7 @@ observation through the canonical writer. It returns bounded JSON (at most
 stores ToolResult before delivering it to inference. The filesystem executor
 rejects this argument; it never becomes another sensor owner. Duplicate calls
 retain the same observation identity. Cancellation, unavailable cache, persistence
-failure or deadline produces an explicit failed result with no late payload.
+failure produces an explicit failed result with no late payload.
 
 ```mermaid
 flowchart TD
@@ -462,7 +477,7 @@ flowchart TD
     Intent --> Capture[Canonical sensor owner captures cached status]
     Capture --> Store[Canonical writer stores observation]
     Store -->|Acknowledged and still current| Result[Persist bounded tool result]
-    Store -->|Failure, cancel or deadline| Failed[Persist failed result without payload]
+    Store -->|Failure or cancel| Failed[Persist failed result without payload]
     Result --> Reply[Deliver through shared native callback]
     Failed --> Settle[Settle pending work before terminal]
 ```
@@ -473,12 +488,12 @@ qualification. Typed memory note/source tools extend this checkpoint through
 
 ### Cancellation at private output boundaries
 
-A tool result must pass the current model deadline before it enters the private
+A tool result must pass the current cancellation fence before it enters the private
 output queue. Cancellation discards all unstarted queued frames before queuing
 Cancel. If a frame is partly written, cancellation closes the private socket
 instead of completing that frame or sending a corrupt replacement. The existing
-bounded child drain and process settlement still own cleanup. Tests cover expired
-result admission, queued result cancellation and partial-frame cancellation.
+bounded child drain and process settlement still own cleanup. Tests cover
+cancelled result admission, queued result cancellation and partial-frame cancellation.
 
 MLX helper preparation also verifies an optional fourth package identity hash
 for the sibling `mlx.metallib` resource. MLX selection requires this hash; other
@@ -578,11 +593,11 @@ Journal format 1 adds intent kind 4 (rejected read) and 5 (rejected list), using
 existing fields. Their original nonempty UTF-8 path is bounded to 1024 bytes;
 read limits remain 1–16384, while unsafe path syntax/read range are retained for
 audit. Kind 5 requires zero offset/limit. These records never authorize execution.
-Replay accepts only empty status-3 invalid-arguments results (or empty cancelled/
-timeout results during settlement), with no offset or truncation; success is
+Replay accepts only empty status-3 invalid-arguments results (or empty cancelled
+results during settlement), with no offset or truncation; success is
 corrupt. Existing executable kinds 1–3 retain their strict validation. Restart
 interrupts an unresolved rejected intent without executing it. Exact duplicates
-return the committed rejection after current identity/authority/deadline checks;
+return the committed rejection after current identity/authority checks;
 changed arguments at an existing ordinal fail.
 
 ```mermaid
@@ -594,7 +609,7 @@ flowchart TD
     Args -->|No| Reserve[Reserve call budget without host dispatch]
     Reserve --> Intent[Commit rejected intent kind 4 or 5]
     Intent --> Result[Commit empty invalid-arguments result]
-    Intent -->|Cancel or timeout| Failed[Commit empty cancellation or timeout result]
+    Intent -->|Cancel| Failed[Commit empty cancellation result]
     Result --> Callback[Resume SDK with typed rejection]
     Failed --> Settle[Settle turn without continuation]
 ```
@@ -646,7 +661,8 @@ local inference because a daemon can forward.
 
 No additional work queue or blocking call is introduced. Existing provider load
 workers, Hello without a time limit (owner, 2026-10-16), cancellation-driven turn, one pending callback, eight tool calls,
-two-second host workers, retained cancellation and cleanup rules apply. Native
+host workers without a deadline (owner, 2026-10-17), retained cancellation and
+cleanup rules apply. Native
 inference requests are capped at 1,024 tokens first and 512 later, at most 64 per
 turn, within the 2,048-token reservation.
 
@@ -754,8 +770,10 @@ is providerControlled; SDK refusal of unsupported mandatory reasoning is preserv
 The helper reports optional `supported_capabilities` (Hello field 17) and
 `capability_source` (field 18: framework 1, runtime 2, configuration 3, undeclared 4).
 They are helper-only on available non-inventory Hello. Known sources require a
-0..15 support mask; undeclared requires absent mask. Absent report remains unknown
-for compatibility within the frozen protocol number. The service retains this
+0..15 support mask; undeclared requires absent mask. An absent report means
+unknown support, so tools stay unavailable. Tool availability comes only from
+mask bit 0 with a known source and an eligible local destination; there is no
+separate tool bit. The service retains this
 profile on the active turn and records activation independently: tools enabled
 only by negotiated grant, guided/vision disabled, reasoning providerControlled
 when supported, disabled when unsupported, unknown when undeclared. These are
@@ -835,7 +853,7 @@ is needed for this static command. `/tools` accepts no arguments, supports help
 and completion, and uses the existing padded, scrollable result panel. Invalid
 arguments retain the draft. Escape closes the panel; repeated use is harmless.
 
-Model calls use the existing grant, local destination, ordinal, deadline,
+Model calls use the existing grant, local destination, ordinal,
 cancellation, eight-call and result-byte limits. Add an empty `ListTools` argument
 at model ToolCall field 17; field 16 is `MemoryCreateNote`.
 Durable ToolIntent kind 14 represents inventory with empty path, offset zero and
@@ -862,8 +880,8 @@ flowchart TD
     Intent --> Read[Read same registry within result bounds]
     Read --> Result[Commit tool result]
     Result --> Deliver[Deliver through existing fenced model channel]
-    Intent -->|Storage failure or timeout| Failure[Existing settlement and recovery path]
-    Result -->|Storage failure or timeout| Failure
+    Intent -->|Storage failure| Failure[Existing settlement and recovery path]
+    Result -->|Storage failure| Failure
 ```
 
 Validation: strict Rust/Swift wire cases; registry/result bounds and journal replay;
@@ -907,8 +925,7 @@ cleanup and durable result ownership through the same conversation pipeline.
 The [turn lifetime policy](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
 removes the fixed whole-turn expiry. The tool budget retains call count, total
 result bytes, one pending call, identity, generation and cancellation checks.
-Ordinary tool work receives its existing two-second deadline at tool admission.
-exec_cmd receives its validated requested duration. Cached results revalidate exact
-call identity and current authority; elapsed turn time does not invalidate them.
-An expired live-tool deadline still prevents delivery. Tests must cover a late
-admission and cached result, plus cancellation and expired-tool rejection.
+Ordinary tool work and exec_cmd have no deadline (owner, 2026-10-17). Cached
+results revalidate exact call identity and current authority; elapsed turn time
+does not invalidate them. Cancellation prevents delivery. Tests must cover a late
+admission and cached result, plus cancellation of a stalled tool (MT-D1).

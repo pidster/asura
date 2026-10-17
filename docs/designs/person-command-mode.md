@@ -594,7 +594,7 @@ messages:
 
 Proposed mechanism: one additive format-1 record kind, plus person origin on the
 job records that J2 allocates. Kinds 1–20 are allocated (`types.rs:228-245`;
-[admission](conversation-admission.md#format-1-and-record-compatibility)).
+[admission](conversation-admission.md#format-1-and-record-kinds)).
 Required behavior (owner, 2026-10-14, R3): kinds are allocated in delivery order,
 so the job controller's J1 and J2 kinds come first and this record takes the next
 free kind at integration. Kind PCQ is no longer claimed. This design calls the
@@ -644,9 +644,9 @@ Replay rules:
 - Job intent, cancel and settlement replay under the job controller's rules. An
   intent without settlement at recovery becomes `Interrupted`. The service never
   relaunches it.
-- An older binary rejects a stream that contains kind PCQ or the J2 kinds,
-  because public inspection must not skip unsupported kinds. Earlier additive
-  kinds have the same effect. No existing record is rewritten.
+- Replay rejects any kind it does not recognize; public inspection must not
+  skip unsupported kinds. No compatibility with older binaries is required
+  (owner, 2026-10-17).
 
 ### Platform changes
 

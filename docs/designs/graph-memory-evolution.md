@@ -315,7 +315,9 @@ the graph; verified bytes remain under the file-storage contract. A manifest's
 referenced versions and payloads must be retained for its promised reconstruction
 lifetime. If a source, composer revision or serializer is unavailable, return
 `reconstruction_unavailable`. Do not manufacture historical context from current
-sources. Legacy turns without sufficient manifests are explicitly unreconstructable.
+sources. Every TurnAccepted is kind 21 and carries its required composition; the
+earlier kind 5 without composition is removed (owner, 2026-10-17). A turn whose
+manifest sources are unavailable is explicitly unreconstructable.
 
 Historical reads still require current access checks. A denied source returns an
 access error or a labelled redacted view; that view cannot claim the original
@@ -706,7 +708,8 @@ SurrealDB version, exact schema, index and migration behavior, numeric queues,
 retention, grants, wire fields within protocol 0.1, and meaningful unit,
 integration and macOS end-to-end checks. The journal remains format 1 unless
 the owner explicitly changes its number. New record kinds need their own
-compatibility and recovery review without inferring a version bump.
+recovery review without inferring a version bump. Before the first release no
+compatibility with older journals is required (owner, 2026-10-17).
 
 ## Open decisions and proof limits
 

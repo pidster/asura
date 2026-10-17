@@ -177,7 +177,6 @@ fn service_projection_capabilities_and_stop_epoch_are_exact() {
         new_installation: None,
         lifecycle: Some(2),
         installation: Some(1),
-        unavailable_reason: None,
         reason: Some(12),
     }));
     assert!(validate_semantics(&value, Direction::ServerToClient).is_ok());
@@ -259,7 +258,6 @@ fn new_installation_flag_is_true_only_for_verified_graph_ready_replies() {
         envelope.body = Some(Body::InspectReply(pb::InspectReply {
             lifecycle: Some(2),
             installation: Some(installation),
-            unavailable_reason: None,
             reason: Some(reason),
             new_installation,
         }));
@@ -334,7 +332,7 @@ fn inspection_state_reason_pairs_and_journal_presence_are_exact() {
     assert!(!valid_reply(installation_reply(1, 16)));
 }
 #[test]
-fn installation_request_uses_identity_and_rejects_legacy_reason() {
+fn installation_request_uses_identity_and_requires_a_reason() {
     let mut envelope = inspect();
     envelope.body = Some(Body::InspectInstallation(pb::InspectInstallation {}));
     assert!(validate_semantics(&envelope, Direction::ClientToServer).is_ok());
@@ -352,16 +350,13 @@ fn installation_request_uses_identity_and_rejects_legacy_reason() {
     envelope.request_counter = Some(0);
     assert!(validate_semantics(&envelope, Direction::ClientToServer).is_err());
     envelope.request_counter = Some(1);
-    for reason in [None, Some(2)] {
-        envelope.body = Some(Body::InspectReply(pb::InspectReply {
-            new_installation: None,
-            lifecycle: Some(2),
-            installation: Some(2),
-            unavailable_reason: Some(1),
-            reason,
-        }));
-        assert!(validate_semantics(&envelope, Direction::ServerToClient).is_err());
-    }
+    envelope.body = Some(Body::InspectReply(pb::InspectReply {
+        new_installation: None,
+        lifecycle: Some(2),
+        installation: Some(2),
+        reason: None,
+    }));
+    assert!(validate_semantics(&envelope, Direction::ServerToClient).is_err());
 }
 
 #[test]
@@ -545,7 +540,6 @@ fn stored_memory_status_is_bounded_truthful_and_paired_with_service_uptime() {
             lifecycle: Some(2),
             installation: Some(6),
             reason: Some(16),
-            unavailable_reason: None,
         }),
         configured_model: None,
         uptime_ms: Some(100),

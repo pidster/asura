@@ -874,12 +874,10 @@ type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let [_, flag, id, deadline, command] = args.as_slice()
+    if let [_, flag, id, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
-        std::process::exit(asura_platform::exec_cmd::run_guardian(
-            id, deadline, command,
-        ));
+        std::process::exit(asura_platform::exec_cmd::run_guardian(id, command));
     }
     let selected: Vec<&str> = args[1..]
         .iter()

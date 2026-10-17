@@ -22,7 +22,7 @@ remain in their existing owners. No string command interpreter is added.
 | service | status | none |
 | service | tools | none |
 | service | audit | limit defaults 16 |
-| exec_cmd | unchanged | command, cwd, timeout_seconds |
+| exec_cmd | unchanged | command, cwd |
 
 For example, `memory` receives `{ "command": "get_note", "version": "…" }`.
 Command enums carry meaningful names rather than another resource selector when
@@ -36,9 +36,10 @@ The Rust service registry owns public discovery. Keep its internal operation
 metadata separate: durable activity and audit records continue to identify the
 exact operation, such as memory_get_note. Existing journal kind numbers and model
 wire variants retain their meaning. Protocol stays 0.1 and journal format stays 1.
-The helper exposes only grouped names, without duplicate legacy advertised tools.
-Legacy wrappers may remain internal translators so their tested schema semantics
-can be reused; they cannot independently bypass the shared handler.
+The helper exposes only grouped names, without duplicate per-operation advertised
+tools. The per-operation wrappers may remain internal translators so their tested
+schema semantics can be reused; they cannot independently bypass the shared
+handler. No compatibility with older builds is required (owner, 2026-10-17).
 
 ## Validation and failure handling
 

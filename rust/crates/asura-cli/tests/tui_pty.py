@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps]
+Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer]
 This verifies process and tty state, not native terminal visual correctness.
 """
 import codecs
@@ -1548,7 +1548,7 @@ def rich_activity(fixture, source, multipass=False):
                             assert any(tool["function"]["name"] == "exec_cmd" for tool in chat["tools"])
                             response = {"message": {"role": "assistant", "content": "",
                                         "tool_calls": [{"function": {"name": "exec_cmd", "arguments": {
-                                            "command": "sleep 1; printf fixture-result", "cwd": ".", "timeout_seconds": 5}}}]},
+                                            "command": "sleep 1; printf fixture-result", "cwd": "."}}}]},
                                         "done": True, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}
                         else:
                             tool_messages = [message for message in chat["messages"] if message.get("role") == "tool"]
@@ -1973,6 +1973,163 @@ def waiting_steps(fixture, source):
         assert not errors, errors
         print(f"PASS WS-01..04 TUI: Starting model shown, typing {typing*1000:.0f} ms while the helper "
               "is silent, /cancel holds it, Resume shows Waiting: model output, Esc stops it")
+    finally:
+        if trial is not None:
+            trial.close()
+        stopped.set()
+        server.join(timeout=5)
+        listener.close()
+        assert not server.is_alive(), "fixture server cleanup unconfirmed"
+        assert not errors, errors
+
+
+def queue_steer(fixture, source):
+    """IQ2-R1, MQ13 and MQ15 end to end through the real TUI, service and Swift
+    helper. A private loopback provider holds the first turn's /api/chat.
+    Enter starts that turn; Ctrl+S stages the steering text as one kind 18
+    input, and its receipt promotes it (kind 16) for the active turn. The
+    service cancels the turn for steering and the replacement completes once.
+    Ctrl+T then queues one more input like Enter. The fixture verifies the
+    journal. Each wait ends on an observed
+    screen state or the journey work budget."""
+    import threading
+
+    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    (fixture.root / "asura-model").chmod(0o700)
+    project = fixture.root / "project"
+    project.mkdir(mode=0o700)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    listener.settimeout(0.1)
+    endpoint = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    stopped = threading.Event()
+    hold = {"path": b"POST /api/chat "}
+    holding = threading.Event()
+    released = []
+    errors = []
+
+    def handle(peer):
+        with peer:
+            peer.settimeout(2)
+            request = bytearray()
+            while True:
+                data = peer.recv(65536)
+                if not data:
+                    return
+                request.extend(data)
+                assert len(request) <= 65536, "fixture request bound"
+                if b"\r\n\r\n" in request:
+                    header, body = request.split(b"\r\n\r\n", 1)
+                    length = next((int(line.split(b":", 1)[1]) for line in header.split(b"\r\n")
+                                   if line.lower().startswith(b"content-length:")), 0)
+                    if len(body) >= length:
+                        break
+            if request.startswith(hold["path"]):
+                # Hold without replying until the helper closes the request.
+                holding.set()
+                peer.settimeout(0.05)
+                while not stopped.is_set():
+                    try:
+                        if not peer.recv(1):
+                            break
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                released.append(bytes(request[:14]))
+                return
+            if request.startswith(b"POST /api/show "):
+                payload = json.dumps({"capabilities": ["completion"],
+                                      "model_info": {"fixture.context_length": 8192}}).encode()
+                peer.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+            elif request.startswith(b"POST /api/chat "):
+                peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                peer.sendall(json.dumps({"message": {"role": "assistant", "content": "STEERED-REPLY"}, "done": True,
+                                         "done_reason": "stop", "prompt_eval_count": 1, "eval_count": 1}).encode() + b"\n")
+
+    def serve():
+        workers = []
+        try:
+            while not stopped.is_set() and len(workers) < 8:
+                try:
+                    peer, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                worker = threading.Thread(target=handle, args=(peer,), name="asura-steer-peer")
+                worker.start()
+                workers.append(worker)
+        except Exception as error:
+            if not stopped.is_set():
+                errors.append(error)
+        for worker in workers:
+            worker.join(timeout=3)
+
+    server = threading.Thread(target=serve, name="asura-steer-fixture")
+    server.start()
+    trial = None
+    try:
+        trial = fixture.launch()
+        trial.resize(140, 45)
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        for key, value in [("providers.ollama.endpoint", endpoint), ("model", "ollama:fixture")]:
+            trial.send(f"/config set {key} {value}\r".encode())
+            trial.until(f"Saved {key}".encode(), plain=True)
+            trial.send(b"\x1b")
+            trial.idle(0.1)
+        trial.send(b"Hold the output.\r")
+        trial.until("Waiting: model output".encode(), plain=True, limit=30)
+        # Only after the first turn's output request is held is the
+        # replacement's own output answered.
+        assert holding.wait(remaining(15)), "first turn output was never requested"
+        hold["path"] = b"NO-HOLD "
+        offset = len(trial.output)
+        trial.send(b"Steer now.")
+        trial.idle(0.1)
+        trial.send(b"\x13")  # Ctrl+S
+        # The transcript keeps the replacement's reply; a promotion failure
+        # would show its error code instead.
+        trial.until(b"STEERED-REPLY", offset, plain=True, limit=30, reject="repair_required")
+        # Let the replacement settle before closing its owner.
+        end = time.monotonic() + remaining(30)
+        while True:
+            screen = trial.screen.text()
+            assert "Steer now." in screen, screen
+            response = screen.rsplit("Steer now.", 1)[1]
+            if "Complete" in response and "Generating" not in response:
+                break
+            assert "Incomplete response" not in response, screen
+            assert time.monotonic() < end, screen
+            trial.read(0.025)
+        # MQ15: Ctrl+T stages one more kind 18 input exactly as Enter does.
+        trial.send(b"Queued by Ctrl+T.")
+        trial.idle(0.1)
+        trial.send(b"\x14")  # Ctrl+T
+        end = time.monotonic() + remaining(30)
+        while True:
+            screen = trial.screen.text()
+            if "Queued by Ctrl+T." in screen:
+                response = screen.rsplit("Queued by Ctrl+T.", 1)[1]
+                if "Complete" in response and "Generating" not in response:
+                    break
+            assert time.monotonic() < end, screen
+            trial.read(0.025)
+        end = time.monotonic() + remaining(10)
+        while not released:
+            assert time.monotonic() < end, "helper kept the steered chat open"
+            trial.read(0.05)
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        assert not errors, errors
+        result = fixture.command("--verify-queue-steer")
+        assert result[0] == 0, result
+        print("PASS IQ2-R1 TUI: Ctrl+S staged one kind 18 input, its receipt promoted it during "
+              "the active turn, the turn ended for steering and the replacement ran once; "
+              "Ctrl+T queued like Enter")
     finally:
         if trial is not None:
             trial.close()
@@ -2468,7 +2625,8 @@ def main():
     capture = len(sys.argv) == 3 and sys.argv[2] == "--exec-cmd-capture"
     waits_client = len(sys.argv) == 3 and sys.argv[2] == "--client-waits"
     steps = len(sys.argv) == 3 and sys.argv[2] == "--waiting-steps"
-    assert len(sys.argv) == 2 or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
+    steer = len(sys.argv) == 3 and sys.argv[2] == "--queue-steer"
+    assert len(sys.argv) == 2 or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
@@ -2519,6 +2677,10 @@ def main():
             DEADLINE = time.monotonic() + 70
             waiting_steps(fixture, source)
             return
+        if steer:
+            DEADLINE = time.monotonic() + 70
+            queue_steer(fixture, source)
+            return
         if long:
             long_observation(fixture, source)
             return
@@ -2555,7 +2717,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture and not waits_client and not steps:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture and not waits_client and not steps and not steer:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

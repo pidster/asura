@@ -6,15 +6,11 @@ pub type Hash = [u8; 32];
 pub const MAX_PROJECTS: usize = 64;
 pub const MAX_CONVERSATIONS: usize = 256;
 pub const OUTPUT_RESERVATION: u32 = 2048;
-/// Historical format-1 admissions retain their recorded reservation.
-pub const LEGACY_OUTPUT_RESERVATION: u32 = 512;
 pub const MAX_PROMPT: usize = 32 * 1024;
 pub const MAX_TEXT: usize = 60 * 1024;
 pub const EXEC_CMD_TOOL_KIND: u8 = 16;
 pub const MAX_EXEC_CMD_COMMAND_BYTES: usize = 8192;
 pub const MAX_EXEC_CMD_CWD_BYTES: usize = 1024;
-pub const MAX_EXEC_CMD_INTENT_BYTES: usize =
-    MAX_EXEC_CMD_COMMAND_BYTES + 1 + MAX_EXEC_CMD_CWD_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameContext {
@@ -43,14 +39,6 @@ pub enum Request<'a> {
         project: Id,
         conversation: Option<Id>,
         expected_generation: u64,
-        prompt: &'a str,
-    },
-    Queue {
-        project: Id,
-        conversation: Id,
-        target_operation: Id,
-        target_generation: u64,
-        kind: InputKind,
         prompt: &'a str,
     },
     QueueInput {
@@ -149,13 +137,13 @@ pub struct TurnAccepted {
     pub prompt: String,
     pub reserved_output_tokens: u32,
     pub event_cursor: u64,
-    /// Present for turns the context composer built; encoded as record kind 21.
-    pub composition: Option<Composition>,
+    /// The context composer's record; every accepted turn carries one (kind 21).
+    pub composition: Composition,
 }
 /// Shown prior turns of a composed turn; `prior_operations` lists them.
 pub const MAX_COMPOSED_PRIOR: usize = 1024;
 /// The context composer's record of one turn-start composition (N1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Composition {
     pub omitted_turns: u32,
     pub manifest_digest: Hash,
@@ -226,15 +214,13 @@ pub enum Record {
     CancelRequested(CancelRequested),
     TurnTerminal(TurnTerminal),
     InputQueued(InputQueued),
-    InputQueuedV2(InputQueuedV2),
     InputReordered(InputReordered),
     InputDecision(InputDecision),
     InputPromoted(InputPromoted),
     MemoryCreateIntent(MemoryCreateIntent),
     ToolIntent(ToolIntent),
     ToolResult(ToolResult),
-    /// Kind 22 (J1): every new exec_cmd call. Kind 14 with tool kind 16 stays
-    /// readable for older journals and is never written by a J1 binary.
+    /// Kind 22 (J1): every exec_cmd call. Kind 14 never carries tool kind 16.
     ExecCmdIntent(Box<ExecCmdIntent>),
     /// Kind 23 (J1): capture facts of an admitted exec_cmd call, before kind 15.
     CaptureSettled(Box<CaptureSettled>),
@@ -246,15 +232,13 @@ impl Record {
             Self::ActiveBinding(_) => 11,
             Self::OwnerGeneration => 3,
             Self::ProjectRegistered(_) => 4,
-            Self::TurnAccepted(p) if p.composition.is_some() => 21,
-            Self::TurnAccepted(_) => 5,
+            Self::TurnAccepted(_) => 21,
             Self::StartAuthorized(_) => 6,
             Self::CancelRequested(_) => 7,
             Self::TurnTerminal(_) => 8,
             Self::ProjectRequestAlias(_) => 9,
             Self::ProjectRenamed(_) => 20,
-            Self::InputQueued(_) => 12,
-            Self::InputQueuedV2(_) => 18,
+            Self::InputQueued(_) => 18,
             Self::InputReordered(_) => 19,
             Self::InputDecision(_) => 13,
             Self::MemoryCreateIntent(_) => 17,
@@ -361,19 +345,6 @@ pub enum InputStatus {
 pub struct InputQueued {
     pub request: Id,
     pub digest: Hash,
-    pub dispatch_request: Id,
-    pub project: Id,
-    pub conversation: Id,
-    pub target_operation: Id,
-    pub target_generation: u64,
-    pub previous: Option<Id>,
-    pub kind: InputKind,
-    pub prompt: String,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InputQueuedV2 {
-    pub request: Id,
-    pub digest: Hash,
     pub input: Id,
     pub dispatch_request: Id,
     pub project: Id,
@@ -406,8 +377,8 @@ pub struct QueuedInput {
     pub project: Id,
     pub conversation: Id,
     pub target_operation: Id,
+    /// Expected generation, or the promotion target generation for Steer.
     pub target_generation: u64,
-    pub previous: Option<Id>,
     pub kind: InputKind,
     pub frame: Range<usize>,
     pub sequence: u64,
@@ -415,7 +386,6 @@ pub struct QueuedInput {
     pub held: bool,
     pub dropped: bool,
     pub resumed: bool,
-    pub v2: bool,
     pub order_position: u64,
 }
 
@@ -642,7 +612,7 @@ pub struct ToolRecord {
     pub preview: Option<String>,
     pub truncated: Option<bool>,
     pub exit_code: Option<i32>,
-    /// Present for a kind 22 exec_cmd call (J1).
+    /// Present exactly when `kind` is 16: only kind 22 creates an exec_cmd call.
     pub exec_cmd: Option<Box<ExecCmdCall>>,
 }
 

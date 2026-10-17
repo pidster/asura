@@ -104,7 +104,6 @@ pub fn run_jobs(
                     arguments: Arguments::ExecCmd {
                         command: job.command,
                         cwd: ".".into(),
-                        timeout_seconds: 30,
                     },
                 },
                 intent: intent.clone(),

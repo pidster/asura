@@ -214,17 +214,14 @@ pub fn validate_semantics(
             let profile = match (v.supported_capabilities, v.capability_source) {
                 (None, None) => true,
                 (None, Some(4)) => {
-                    !service
-                        && v.inventory_only != Some(true)
-                        && v.availability == Some(1)
-                        && v.capabilities == Some(1)
+                    !service && v.inventory_only != Some(true) && v.availability == Some(1)
                 }
+                // Bit 0 alone states tool support (owner, 2026-10-17).
                 (Some(mask), Some(1..=3)) => {
                     !service
                         && v.inventory_only != Some(true)
                         && v.availability == Some(1)
                         && mask <= 15
-                        && ((mask & 1 != 0) == (v.capabilities == Some(3)))
                 }
                 _ => false,
             };
@@ -270,15 +267,11 @@ pub fn validate_semantics(
                             && match v
                                 .selected_model
                                 .as_deref()
-                                .unwrap_or("system")
+                                .unwrap_or_default()
                                 .to_lowercase()
                                 .split_once(':')
                             {
-                                None => {
-                                    source == 1
-                                        && v.selected_model.as_deref().unwrap_or("system")
-                                            == "system"
-                                }
+                                None => source == 1 && v.selected_model.as_deref() == Some("system"),
                                 Some(("coreai", _)) => source == 2,
                                 Some(("mlx", _)) => source == 3,
                                 Some(("ollama", _)) => source == 4,
@@ -290,7 +283,8 @@ pub fn validate_semantics(
                 }
                 && v.inventory_only != Some(false)
                 && inventory
-                && v.selected_model.as_deref().is_none_or(selector)
+                // Every Hello names the exact selector (owner, 2026-10-17).
+                && v.selected_model.as_deref().is_some_and(selector)
                 && v.asset_root.as_ref().is_none_or(|p| {
                     service
                         && p.starts_with('/')
@@ -310,14 +304,12 @@ pub fn validate_semantics(
             shape
                 && if service {
                     v.availability == Some(3)
-                        && v.capabilities == Some(0)
                         && v.context_tokens.is_none()
                         && v.reported_context_tokens.is_none()
                         && v.context_source.is_none()
                         && v.reason == Some(0)
                 } else if v.inventory_only == Some(true) {
                     v.availability == Some(3)
-                        && v.capabilities == Some(0)
                         && v.context_tokens.is_none()
                         && v.reported_context_tokens.is_none()
                         && v.context_source.is_none()
@@ -326,15 +318,13 @@ pub fn validate_semantics(
                 } else {
                     match v.availability {
                         Some(1) => {
-                            matches!(v.capabilities, Some(1 | 3))
-                                && v.context_tokens.is_some_and(|n| n > 0)
+                            v.context_tokens.is_some_and(|n| n > 0)
                                 && v.reported_context_tokens.is_some()
                                 && v.context_source.is_some()
                                 && v.reason == Some(0)
                         }
                         Some(2 | 3) => {
-                            v.capabilities == Some(0)
-                                && v.context_tokens.is_none()
+                            v.context_tokens.is_none()
                                 && v.reported_context_tokens.is_none()
                                 && v.context_source.is_none()
                                 && v.reason == Some(1)
@@ -359,8 +349,6 @@ pub fn validate_semantics(
         Body::Begin(v) => {
             v.model.as_deref().is_some_and(selector)
                 && positive(v.input_bytes, MAX_INPUT_BYTES)
-                && v.deadline_remaining_ms
-                    .is_none_or(|n| (1..=60_000).contains(&n))
                 && v.max_response_tokens
                     .is_some_and(|n| (1..=2048).contains(&n))
         }
@@ -405,7 +393,6 @@ pub fn validate_semantics(
                                     && !p.contains('\0')
                                     && !p.split('/').any(|c| c == "..")
                             })
-                            && args.timeout_seconds.is_none_or(|n| (1..=60).contains(&n))
                     }
 
                     Some(pb::tool_call::Arguments::ReadAudit(args)) => {

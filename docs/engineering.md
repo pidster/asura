@@ -31,10 +31,15 @@ Feature work and schema changes do not authorize a number increase.
 
 Schemas and operations may evolve within the current numbers for authorized feature
 work. Follow the normal design, ownership and testing rules. Keep producers,
-consumers, contracts, fixtures and generated bindings consistent. Document effects
-on existing data and peers; an unchanged number does not prove compatibility.
-Preserve data and define rejection or recovery for incompatible records. This rule
-does not authorize deleting user data or silently treating incompatible data as valid.
+consumers, contracts, fixtures and generated bindings consistent.
+
+Asura is not released. No compatibility with older journals, data or builds is
+required (owner, 2026-10-17): “Ignore old journals and backward compatibility. We
+are not released yet and can start over at any time.” Change schemas in place.
+Remove legacy decode paths, aliases and migration text. Do not renumber kinds or
+fields that remain; removed kind and field numbers stay unassigned, and Protobuf
+schemas mark them `reserved`. Replay must still reject a record it does not
+recognize; it must never silently treat such data as valid.
 Schema work does not require separate permission merely because a message or record
 changes. Follow the [iteration rules](design-process.md#iteration-and-escalation).
 

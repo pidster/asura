@@ -83,17 +83,18 @@ flowchart TB
 `posix_spawn` with a new session is the proposed standalone launch mechanism.
 The CLI must pass a fixed service-mode argument, not project-controlled
 environment or arbitrary inherited descriptors. Packaging must pin the
-executable path and version contract; a client connecting to an older service
-negotiates protocol compatibility or fails clearly. An independently started service outlives attached terminal sessions; a
+executable path and version contract; a client connecting to a service with a
+different protocol reports `incompatible_protocol` and leaves it running. An independently started service outlives attached terminal sessions; a
 TUI-owned service follows its launching TUI lifetime. Restart, logout and update
 behavior need real-process
 qualification. There is no LaunchAgent or Mach service in this I1 choice.
 The selected [Homebrew tap distribution](../decisions/0008-homebrew-tap-distribution.md)
 installs this standalone command. A formula update does not itself replace a
 live service; [release distribution](release-distribution.md) owns the proposed
-upgrade and handover behavior. D2-D3 must define the stable maintenance
-handshake, owner-generation-guarded drain and version negotiation before an
-older live service can be replaced. The owner lock remains authoritative for
+upgrade and handover behavior. Upgrade and handover design is deferred until the
+first release (owner, 2026-10-17). The maintenance handshake, owner-generation-guarded
+drain and version negotiation needed to replace a live service belong to that
+deferred work. The owner lock remains authoritative for
 handover; a changed Homebrew symlink cannot transfer ownership.
 Homebrew may remove the old keg while its service is still alive. The old
 service cannot re-exec a path from that keg or dispatch through a helper or
@@ -491,7 +492,9 @@ Required behavior (owner, 2026-10-16): stop has no drain deadline.
   `outcome_unconfirmed`.
 
 The one-second `DRAIN_TIMEOUT`, which moves the service to `RepairOnly` with
-inspection reason `InspectionTimeout`, is removed by this decision.
+inspection reason `InspectionTimeout`, is removed by this decision. Reason 12 is
+renamed in place to `InspectionCancelled` (wire name `inspection_cancelled`); it
+reports an inspection that cancellation or shutdown stopped (owner, 2026-10-17).
 Implemented 2026-10-16. The listener keeps accepting while `Draining`; Inspect
 and InspectInstallation are answered, and work and ObserveService requests get
 `Draining`. A second Stop or a second termination signal forces exit; the owner
@@ -568,7 +571,7 @@ be reserved. There are no maps, `Any`, opaque command bytes or recursive message
 | `Hello` | 1 `client_build`: optional string. |
 | `HelloReply` | 1 `service_build`: optional string; 2 `capabilities`: repeated Capability, packed; 3 `max_frame_bytes`: optional uint32. |
 | `Inspect` | Empty message. Identity comes from Envelope. |
-| `InspectReply` | 1 `lifecycle`: optional Lifecycle; 2 `installation`: optional InstallationState; 3 `unavailable_reason`: optional UnavailableReason. |
+| `InspectReply` | 1 `lifecycle`: optional Lifecycle; 2 `installation`: optional InstallationState; 3 reserved (former `unavailable_reason`, removed 2026-10-17); later slices add 4 `reason` and 5 `new_installation`. |
 | `Stop` | 1 `expected_epoch`: optional bytes. Must equal Envelope epoch. |
 | `StopAccepted` | Empty message. It acknowledges drain admission only. |
 | `Error` | 1 `code`: optional ErrorCode; 2 `message`: optional string. |
@@ -577,7 +580,7 @@ Foundation `Capability` values are 0 Unspecified, 1 Inspect and 2 Stop; later
 slices add values 3–6 in `contracts/control/v1/control.proto`. `Lifecycle` values
 are 0 Unspecified, 1 Starting, 2 Serving, 3 Draining, 4 Faulted and 5 RepairOnly.
 `InstallationState` is 0 Unspecified or 1 Unavailable in the foundation packet.
-`UnavailableReason` is 0 Unspecified or 1 AuthorityNotInstalled.
+The foundation `UnavailableReason` enum is removed (owner, 2026-10-17).
 `ErrorCode` values are 0 Unspecified, 1 UnsupportedOperation, 2 InvalidSequence,
 3 StaleOwner, 4 Draining, 5 Timeout, 6 InvalidRequest and 7 InternalUnavailable.
 Unknown numeric values are rejected. Do not map them to Unspecified or success.
@@ -651,7 +654,7 @@ Use these fixed fields; unavailable values are JSON null, not invented defaults:
 | `service_build` | Validated HelloReply build label for that current snapshot; otherwise null |
 | `lifecycle` | `starting`, `serving`, `draining`, `faulted` or `repair_only` for a current snapshot; otherwise null |
 | `installation` | `unavailable` for a current foundation snapshot; otherwise null |
-| `unavailable_reason` | `authority_not_installed` for that snapshot; otherwise null |
+| `unavailable_reason` | The installation inspection reason name (InspectReply field 4), such as `runtime_only`; otherwise null. The key name is unchanged |
 | `error_code` | Null for a current or absent result; `incompatible_protocol`, `unsafe_runtime`, `log_unavailable` or `service_unavailable` for the corresponding failure |
 
 Malformed arguments retain the packet's exit code 2 and stderr diagnostic; they

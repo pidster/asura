@@ -354,7 +354,8 @@ or audit-consumer activation. Unsupported keys and an unset model are errors.
 Implemented outbox, admission and observation pipeline with service-owned
 admission and durable outcomes. Enter stages each valid non-command input in a
 local outbox of at most 16 entries. The serial queue worker submits one waiting
-entry at a time with its original request ID. Its client request waits for the
+entry at a time with its original request ID through `ConversationQueueSubmit`;
+there is no other submit operation (owner, 2026-10-17). Its client request waits for the
 service's reply with no deadline; `/cancel` stops the wait
 ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound), owner, 2026-10-16). The conversation
 worker observes dispatched operations through one coalescing result mailbox.
@@ -367,7 +368,7 @@ flowchart TD
     Local -->|Valid| Stage["Stage in local outbox and clear draft"]
     Stage --> Worker{"Queue worker idle; same project?"}
     Worker -->|"Project changed"| Rejected["Mark rejected; keep text"]
-    Worker -->|Yes| Submit["Submit request ID, project, conversation and prompt"]
+    Worker -->|Yes| Submit["ConversationQueueSubmit: request ID, project, conversation and prompt"]
     Submit --> Admit{"Owner admission and durable receipt"}
     Admit -->|"Definite rejection"| Rejected
     Admit -->|"Lost reply or person cancels"| Retry["Mark unconfirmed; /retry resends same ID"]
@@ -392,13 +393,19 @@ flowchart TD
     Observe -->|"Worker stop or client disconnect"| Stop["Stop observing without claiming cancellation"]
 ```
 
-[IQ1](conversation-admission.md#durable-input-queue-iq1) supplies the full Queue,
-Steer, list, inspect, resume and drop outcome flowcharts.
+[IQ1](conversation-admission.md#durable-input-queue-iq1) supplies the full queue
+input, list, inspect, resume and drop outcome flowcharts.
 [IQ2](conversation-admission.md#existing-input-promotion-iq2) adds atomic Send now for an
 existing input. [Composer interactions](composer-interactions.md) defines focus,
 selectors, history and queue navigation. These commands use a
 separate bounded client worker; they never make the TUI an execution scheduler.
-Ctrl+S and Ctrl+T send explicit steer and follow-up requests through that worker.
+Ctrl+T stages the draft exactly as Enter does. Ctrl+S stages it with the active
+steer target, then promotes the accepted input with decision action 3 if that
+target is still active. Both keys queue one kind-18 input; no other submit path
+exists (owner, 2026-10-17). The
+[steering keys flowchart](managed-input-queue.md#steering-keys-ctrls-and-ctrlt)
+shows each outcome: no active target, rejection, unconfirmed receipt, target
+ended before promotion, stale target and durable promotion.
 
 Staging clears the draft; the outbox keeps the text until the service receipt.
 Admission errors do not fabricate progress. Observe starts at cursor zero and

@@ -20,7 +20,8 @@ Root owns dependency graph review and serial builds.
 
 The [conversation admission amendment](../../../docs/designs/conversation-admission.md)
 adds CA-A: pure format-1 conversation encoding and replay in the existing authority owner.
-Preserve diagnostic kinds 1–3 and their fixtures. Request-bearing initialization
-uses distinct kinds 10 and 11. Do not change any format, API or protocol number
+Diagnostic initialization kinds 1 and 2 and their fixtures are removed
+(owner, 2026-10-17). Replay requires kind 10 first; kind 11 binds the graph and
+kind 3 OwnerGeneration remains. No compatibility with older journals is required. Do not change any format, API or protocol number
 without explicit owner authorization. The current owner assignment includes CA-B filesystem writer and production graph
 initialization under that contract and its required fault/durability evidence.

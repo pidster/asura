@@ -111,9 +111,9 @@ fn turn() -> TurnAccepted {
         input_digest: [12; 32],
         prior_operations: vec![],
         prompt: "hello".into(),
-        reserved_output_tokens: 512,
+        reserved_output_tokens: OUTPUT_RESERVATION,
         event_cursor: 1,
-        composition: None,
+        composition: Composition::default(),
     }
 }
 fn start() -> Record {
@@ -133,7 +133,7 @@ fn terminal(kind: TerminalKind, cause: Cause, known: bool) -> TurnTerminal {
         final_cursor: u64::MAX,
         usage_known: known,
         output_tokens: if known { 12 } else { 0 },
-        charged_tokens: if known { 12 } else { 512 },
+        charged_tokens: if known { 12 } else { OUTPUT_RESERVATION },
         text: "reply".into(),
     }
 }
@@ -159,7 +159,7 @@ fn roundtrip_requests_terminal_offsets_and_unknown_complete_usage() {
     );
     let t = s.operations[&id(10)].terminal.as_ref().unwrap();
     assert!(!t.usage_known);
-    assert_eq!(t.charged_tokens, 512);
+    assert_eq!(t.charged_tokens, OUTPUT_RESERVATION);
     let frame = &j.bytes[t.frame.clone()];
     let Record::TurnTerminal(decoded) = decode_record(8, &frame[144..frame.len() - 40]).unwrap()
     else {
@@ -194,7 +194,7 @@ fn restart_never_reuses_permit_and_charges_conservatively() {
                 .as_ref()
                 .unwrap()
                 .charged_tokens,
-            if started { 512 } else { 0 }
+            if started { OUTPUT_RESERVATION } else { 0 }
         );
     }
     let mut j = Journal::accepted();
@@ -328,7 +328,7 @@ fn composed_turns_record_budget_and_account_for_omitted_history() {
             prompt: &p.prompt,
         })
         .unwrap();
-        p.composition = Some(Composition {
+        p.composition = Composition {
             omitted_turns: omitted,
             manifest_digest: [7; 32],
             composer_revision: 1,
@@ -336,7 +336,7 @@ fn composed_turns_record_budget_and_account_for_omitted_history() {
             output_reservation: 2048,
             overhead_tokens: 300,
             bytes_per_token_milli: 1000,
-        });
+        };
         p
     };
     let started = || {
@@ -362,9 +362,17 @@ fn composed_turns_record_budget_and_account_for_omitted_history() {
         j.append(Record::TurnAccepted(Box::new(composed(shown, omitted))));
         assert!(inspect(&j.bytes).is_err());
     }
-    let mut legacy = composed(vec![id(10)], 0);
-    legacy.composition = None;
-    assert_eq!(Record::TurnAccepted(Box::new(legacy)).kind(), 5);
+    // Removed kind 5 (an accepted turn without composition) is an unknown kind.
+    let payload = {
+        let mut j = started();
+        let start = j.bytes.len();
+        j.append(Record::TurnAccepted(Box::new(composed(vec![id(10)], 0))));
+        j.bytes[start + 144..j.bytes.len() - 40].to_vec()
+    };
+    assert_eq!(
+        decode_record(5, &payload).unwrap_err(),
+        ReplayError::UnsupportedFormat
+    );
 }
 #[test]
 fn malformed_bytes_mixed_versions_and_truncated_frames_reject() {
@@ -381,8 +389,13 @@ fn malformed_bytes_mixed_versions_and_truncated_frames_reject() {
             ReplayError::IncompleteTail
         );
     }
+    // A removed diagnostic kind 1 after kind 10 is an unknown kind.
+    let second = u32::from_be_bytes(j.bytes[first + 12..first + 16].try_into().unwrap()) as usize;
+    let mut removed = j.bytes[first..first + second].to_vec();
+    removed[10..12].copy_from_slice(&1u16.to_be_bytes());
+    seal(&mut removed);
     let mut mixed = j.bytes[..first].to_vec();
-    mixed.extend_from_slice(include_bytes!("fixtures/pending.bin"));
+    mixed.extend(removed);
     assert_eq!(inspect(&mixed).unwrap_err(), ReplayError::UnsupportedFormat);
     assert!(decode_record(3, &[1]).is_err());
     assert_eq!(
@@ -539,17 +552,13 @@ fn format_one_and_distinct_initialization_kinds_are_enforced() {
     );
     assert_eq!(public(&wrong_version), Err(ReplayError::UnsupportedFormat));
 
-    // Correct checksums cannot make the new payload valid as diagnostic kind 1.
-    let mut wrong_kind = journal.bytes[..first].to_vec();
-    wrong_kind[10..12].copy_from_slice(&1u16.to_be_bytes());
-    seal(&mut wrong_kind);
-    assert_eq!(public(&wrong_kind), Err(ReplayError::Corrupt));
-
-    // Nor may a diagnostic payload become request-bearing merely by changing its kind.
-    let mut diagnostic = include_bytes!("fixtures/pending.bin").to_vec();
-    diagnostic[10..12].copy_from_slice(&10u16.to_be_bytes());
-    seal(&mut diagnostic);
-    assert!(public(&diagnostic).is_err());
+    // Removed diagnostic kinds 1 and 2 never start a journal, even with correct checksums.
+    for kind in [1u16, 2] {
+        let mut wrong_kind = journal.bytes[..first].to_vec();
+        wrong_kind[10..12].copy_from_slice(&kind.to_be_bytes());
+        seal(&mut wrong_kind);
+        assert_eq!(public(&wrong_kind), Err(ReplayError::UnsupportedFormat));
+    }
 
     // All earlier records remain valid here: inspection must validate the changed tail.
     let mut mixed = journal.bytes[..first + second_length].to_vec();
@@ -557,36 +566,13 @@ fn format_one_and_distinct_initialization_kinds_are_enforced() {
     seal(&mut mixed[first..]);
     assert_eq!(public(&mixed), Err(ReplayError::UnsupportedFormat));
     assert_eq!(
-        public(include_bytes!("fixtures/active.bin"))
+        public(&journal.bytes[..first + second_length])
             .unwrap()
             .revision,
         2
     );
 }
 
-fn queued(n: u64, previous: Option<Id>, kind: InputKind) -> InputQueued {
-    let prompt = format!("follow-up {n}");
-    InputQueued {
-        request: id(n),
-        digest: request_digest(Request::Queue {
-            project: id(6),
-            conversation: id(8),
-            target_operation: id(10),
-            target_generation: 1,
-            kind,
-            prompt: &prompt,
-        })
-        .unwrap(),
-        dispatch_request: id(n + 100),
-        project: id(6),
-        conversation: id(8),
-        target_operation: id(10),
-        target_generation: 1,
-        previous,
-        kind,
-        prompt,
-    }
-}
 fn decision(request: u64, input: u64, action: InputAction) -> Record {
     Record::InputDecision(InputDecision {
         request: id(request),
@@ -600,16 +586,35 @@ fn decision(request: u64, input: u64, action: InputAction) -> Record {
     })
 }
 
-fn queued_v2(
+fn queued(
     request: u64,
     input: u64,
     dispatch: u64,
     conversation: u64,
     new_conversation: bool,
     revision: u64,
-) -> InputQueuedV2 {
+) -> InputQueued {
+    queued_at(
+        request,
+        input,
+        dispatch,
+        conversation,
+        new_conversation,
+        revision,
+        0,
+    )
+}
+fn queued_at(
+    request: u64,
+    input: u64,
+    dispatch: u64,
+    conversation: u64,
+    new_conversation: bool,
+    revision: u64,
+    expected_generation: u64,
+) -> InputQueued {
     let prompt = format!("queued {request}");
-    InputQueuedV2 {
+    InputQueued {
         request: id(request),
         digest: request_digest(Request::QueueInput {
             project: id(6),
@@ -618,7 +623,7 @@ fn queued_v2(
             } else {
                 Some(id(conversation))
             },
-            expected_generation: 0,
+            expected_generation,
             new_conversation,
             prompt: &prompt,
         })
@@ -627,7 +632,7 @@ fn queued_v2(
         dispatch_request: id(dispatch),
         project: id(6),
         conversation: id(conversation),
-        expected_generation: 0,
+        expected_generation,
         new_conversation,
         prompt,
         order_revision: revision,
@@ -635,12 +640,12 @@ fn queued_v2(
 }
 
 #[test]
-fn v2_idle_first_input_reorder_replay_and_provisional_dispatch() {
+fn idle_first_input_reorder_replay_and_provisional_dispatch() {
     let mut j = Journal::base();
-    let first = queued_v2(40, 41, 42, 43, true, 1);
-    let second = queued_v2(44, 45, 46, 43, false, 2);
-    j.append(Record::InputQueuedV2(first.clone()));
-    j.append(Record::InputQueuedV2(second.clone()));
+    let first = queued(40, 41, 42, 43, true, 1);
+    let second = queued(44, 45, 46, 43, false, 2);
+    j.append(Record::InputQueued(first.clone()));
+    j.append(Record::InputQueued(second.clone()));
     let state = inspect(&j.bytes).unwrap();
     assert_eq!(state.conversations[&id(43)].generation, 0);
     assert_eq!(state.order_revision, 2);
@@ -690,25 +695,25 @@ fn v2_idle_first_input_reorder_replay_and_provisional_dispatch() {
     assert_eq!(state.order_revision, 4);
     // A serial client may still hold generation zero while the first queued
     // message has already dispatched. The known lane accepts the later input.
-    j.append(Record::InputQueuedV2(queued_v2(48, 49, 50, 43, false, 5)));
+    j.append(Record::InputQueued(queued(48, 49, 50, 43, false, 5)));
     let state = inspect(&j.bytes).unwrap();
     assert_eq!(state.input_status(id(49)), Some(InputStatus::Queued));
     assert_eq!(state.order_revision, 5);
 }
 
 #[test]
-fn v2_rejects_revision_gap_and_holds_after_owner_restart() {
+fn queue_rejects_revision_gap_and_holds_after_owner_restart() {
     let mut j = Journal::base();
-    let first = queued_v2(40, 41, 42, 43, true, 1);
-    j.append(Record::InputQueuedV2(first.clone()));
-    let mut bad = queued_v2(44, 45, 46, 43, false, 3);
-    j.append(Record::InputQueuedV2(bad.clone()));
+    let first = queued(40, 41, 42, 43, true, 1);
+    j.append(Record::InputQueued(first.clone()));
+    let mut bad = queued(44, 45, 46, 43, false, 3);
+    j.append(Record::InputQueued(bad.clone()));
     assert!(inspect(&j.bytes).is_err());
     // Build a fresh, valid chain rather than claiming a truncated tail is repairable.
     let mut j = Journal::base();
     bad.order_revision = 2;
-    j.append(Record::InputQueuedV2(queued_v2(40, 41, 42, 43, true, 1)));
-    j.append(Record::InputQueuedV2(bad));
+    j.append(Record::InputQueued(queued(40, 41, 42, 43, true, 1)));
+    j.append(Record::InputQueued(bad));
     j.append(Record::OwnerGeneration);
     let state = inspect(&j.bytes).unwrap();
     assert_eq!(state.input_status(id(41)), Some(InputStatus::Held));
@@ -717,16 +722,16 @@ fn v2_rejects_revision_gap_and_holds_after_owner_restart() {
 }
 
 #[test]
-fn v2_committed_failure_or_cancellation_keeps_successors_eligible() {
+fn committed_failure_or_cancellation_keeps_successors_eligible() {
     for (kind, cause) in [
         (TerminalKind::Failed, Cause::ProviderFailure),
         (TerminalKind::Failed, Cause::Deadline),
         (TerminalKind::Cancelled, Cause::UserCancel),
     ] {
         let mut j = Journal::started();
-        let first = queued_v2(40, 41, 42, 8, false, 1);
-        let second = queued_v2(44, 45, 46, 8, false, 2);
-        j.append(Record::InputQueuedV2(first.clone()));
+        let first = queued(40, 41, 42, 8, false, 1);
+        let second = queued(44, 45, 46, 8, false, 2);
+        j.append(Record::InputQueued(first.clone()));
         if kind == TerminalKind::Cancelled {
             j.append(Record::CancelRequested(CancelRequested {
                 operation: id(10),
@@ -735,7 +740,7 @@ fn v2_committed_failure_or_cancellation_keeps_successors_eligible() {
             }));
         }
         j.append(Record::TurnTerminal(terminal(kind, cause, false)));
-        j.append(Record::InputQueuedV2(second.clone()));
+        j.append(Record::InputQueued(second.clone()));
         let state = inspect(&j.bytes).unwrap();
         assert_eq!(state.input_status(first.input), Some(InputStatus::Queued));
         assert_eq!(state.input_status(second.input), Some(InputStatus::Queued));
@@ -784,28 +789,29 @@ fn v2_committed_failure_or_cancellation_keeps_successors_eligible() {
 #[test]
 fn input_queue_is_durable_offset_backed_and_fifo_dispatch_is_atomic() {
     let mut j = Journal::started();
-    let first = queued(20, None, InputKind::Queue);
+    let first = queued(20, 21, 22, 8, false, 1);
     j.append(Record::InputQueued(first.clone()));
-    j.append(Record::InputQueued(queued(
-        21,
-        Some(id(20)),
-        InputKind::Queue,
-    )));
+    j.append(Record::InputQueued(queued(23, 24, 25, 8, false, 2)));
     let state = inspect(&j.bytes).unwrap();
-    assert_eq!(state.input_status(id(20)), Some(InputStatus::Queued));
+    assert_eq!(state.input_status(first.input), Some(InputStatus::Queued));
     assert_eq!(state.ready_input(), None);
-    let range = state.inputs[&id(20)].frame.clone();
+    let range = state.inputs[&first.input].frame.clone();
     let frame = &j.bytes[range];
     assert_eq!(
-        decode_record(12, &frame[144..frame.len() - 40]).unwrap(),
+        decode_record(18, &frame[144..frame.len() - 40]).unwrap(),
         Record::InputQueued(first.clone())
+    );
+    // Removed kind 12 is an unknown kind, never an input record.
+    assert_eq!(
+        decode_record(12, &frame[144..frame.len() - 40]).unwrap_err(),
+        ReplayError::UnsupportedFormat
     );
     j.append(Record::TurnTerminal(terminal(
         TerminalKind::Complete,
         Cause::None,
         false,
     )));
-    assert_eq!(inspect(&j.bytes).unwrap().ready_input(), Some(id(20)));
+    assert_eq!(inspect(&j.bytes).unwrap().ready_input(), Some(first.input));
     let mut next = turn();
     next.request = first.dispatch_request;
     next.original_conversation = Some(id(8));
@@ -813,7 +819,8 @@ fn input_queue_is_durable_offset_backed_and_fifo_dispatch_is_atomic() {
     next.generation = 2;
     next.operation = id(30);
     next.task = id(31);
-    next.prompt = first.prompt;
+    next.prompt = first.prompt.clone();
+    next.composition.omitted_turns = 1;
     next.digest = request_digest(Request::Submit {
         project: id(6),
         conversation: Some(id(8)),
@@ -823,9 +830,9 @@ fn input_queue_is_durable_offset_backed_and_fifo_dispatch_is_atomic() {
     .unwrap();
     j.append(Record::TurnAccepted(Box::new(next.clone())));
     let state = inspect(&j.bytes).unwrap();
-    assert_eq!(state.input_status(id(20)), Some(InputStatus::Running));
-    assert_eq!(state.input_operation(id(20)), Some((id(30), 2)));
-    assert!(!state.can_promote_input(id(20), id(30), 2));
+    assert_eq!(state.input_status(first.input), Some(InputStatus::Running));
+    assert_eq!(state.input_operation(first.input), Some((id(30), 2)));
+    assert!(!state.can_promote_input(first.input, id(30), 2));
     assert_eq!(state.ready_input(), None);
     // Exact dispatch cannot be replayed as another operation.
     next.operation = id(32);
@@ -834,36 +841,30 @@ fn input_queue_is_durable_offset_backed_and_fifo_dispatch_is_atomic() {
     assert!(inspect(&j.bytes).is_err());
 }
 #[test]
-fn failed_dependency_holds_successors_and_resume_drop_are_explicit() {
-    let mut j = Journal::started();
-    j.append(Record::InputQueued(queued(20, None, InputKind::Queue)));
-    j.append(Record::InputQueued(queued(
-        21,
-        Some(id(20)),
-        InputKind::Queue,
-    )));
-    j.append(Record::TurnTerminal(terminal(
-        TerminalKind::Failed,
-        Cause::ProviderFailure,
-        false,
-    )));
+fn held_head_blocks_its_lane_and_resume_drop_are_explicit() {
+    let mut j = Journal::base();
+    j.append(Record::InputQueued(queued(20, 21, 22, 43, true, 1)));
+    j.append(Record::InputQueued(queued(23, 24, 25, 43, false, 2)));
+    j.append(decision(50, 21, InputAction::Hold));
     let state = inspect(&j.bytes).unwrap();
-    assert_eq!(state.input_status(id(20)), Some(InputStatus::Held));
     assert_eq!(state.input_status(id(21)), Some(InputStatus::Held));
+    assert_eq!(state.input_status(id(24)), Some(InputStatus::Queued));
     assert_eq!(state.ready_input(), None);
-    j.append(decision(50, 20, InputAction::Resume));
-    assert_eq!(inspect(&j.bytes).unwrap().ready_input(), Some(id(20)));
-    j.append(decision(51, 20, InputAction::Hold));
-    j.append(decision(52, 20, InputAction::Drop));
+    j.append(decision(51, 21, InputAction::Resume));
+    assert_eq!(inspect(&j.bytes).unwrap().ready_input(), Some(id(21)));
+    j.append(decision(52, 21, InputAction::Hold));
+    j.append(decision(53, 21, InputAction::Drop));
     let state = inspect(&j.bytes).unwrap();
-    assert_eq!(state.input_status(id(20)), Some(InputStatus::Dropped));
-    assert_eq!(state.input_status(id(21)), Some(InputStatus::Held));
-    assert_eq!(state.ready_input(), None);
+    assert_eq!(state.input_status(id(21)), Some(InputStatus::Dropped));
+    assert_eq!(state.ready_input(), Some(id(24)));
+    // Resume needs Held; Hold needs Queued.
+    j.append(decision(54, 24, InputAction::Resume));
+    assert!(inspect(&j.bytes).is_err());
 }
 #[test]
 fn restart_holds_queued_input_without_replaying_any_dispatch() {
     let mut j = Journal::started();
-    j.append(Record::InputQueued(queued(20, None, InputKind::Queue)));
+    j.append(Record::InputQueued(queued(20, 21, 22, 8, false, 1)));
     j.append(Record::OwnerGeneration);
     j.append(Record::TurnTerminal(terminal(
         TerminalKind::Interrupted,
@@ -871,21 +872,31 @@ fn restart_holds_queued_input_without_replaying_any_dispatch() {
         false,
     )));
     let state = inspect(&j.bytes).unwrap();
-    assert_eq!(state.input_status(id(20)), Some(InputStatus::Held));
+    assert_eq!(state.input_status(id(21)), Some(InputStatus::Held));
     assert_eq!(state.ready_input(), None);
-    assert_eq!(state.input_operation(id(20)), None);
-    j.append(decision(50, 20, InputAction::Resume));
-    assert_eq!(inspect(&j.bytes).unwrap().ready_input(), Some(id(20)));
+    assert_eq!(state.input_operation(id(21)), None);
+    j.append(decision(50, 21, InputAction::Resume));
+    assert_eq!(inspect(&j.bytes).unwrap().ready_input(), Some(id(21)));
 }
+/// MQ06/IQ2 replay: a queued kind 18 input promoted during the active turn
+/// becomes its single Steer input; only a steering cancellation lets it run.
 #[test]
-fn steering_requires_exact_cancel_cause_and_never_runs_after_restart() {
+fn promoted_kind_18_input_steers_only_after_steering_cancel_and_never_after_restart() {
     for cause in [Cause::UserCancel, Cause::Steering, Cause::ServiceShutdown] {
         let mut j = Journal::started();
-        j.append(Record::InputQueued(queued(20, None, InputKind::Steer)));
-        assert_eq!(
-            inspect(&j.bytes).unwrap().steering_input(id(10)),
-            Some(id(20))
-        );
+        j.append(Record::InputQueued(queued(20, 21, 22, 8, false, 1)));
+        j.append(Record::InputQueued(queued(23, 24, 25, 8, false, 2)));
+        let state = inspect(&j.bytes).unwrap();
+        assert!(state.can_promote_input(id(24), id(10), 1));
+        assert!(!state.can_promote_input(id(24), id(10), 2));
+        assert!(!state.can_promote_input(id(24), id(99), 1));
+        j.append(promotion(26, 24, 10, 1));
+        let state = inspect(&j.bytes).unwrap();
+        assert_eq!(state.steering_input(id(10)), Some(id(24)));
+        assert_eq!(state.inputs[&id(24)].kind, InputKind::Steer);
+        assert_eq!(state.order_revision, 3);
+        // One steering input per target.
+        assert!(!state.can_promote_input(id(21), id(10), 1));
         j.append(Record::CancelRequested(CancelRequested {
             operation: id(10),
             generation: 1,
@@ -896,17 +907,18 @@ fn steering_requires_exact_cancel_cause_and_never_runs_after_restart() {
             cause,
             false,
         )));
-        assert_eq!(
-            inspect(&j.bytes).unwrap().ready_input(),
-            if cause == Cause::Steering {
-                Some(id(20))
-            } else {
-                None
-            }
-        );
+        let state = inspect(&j.bytes).unwrap();
+        if cause == Cause::Steering {
+            // The replacement runs before its lane's ordinary successors.
+            assert_eq!(state.ready_input(), Some(id(24)));
+            assert_eq!(state.input_status(id(21)), Some(InputStatus::Queued));
+        } else {
+            assert_eq!(state.input_status(id(24)), Some(InputStatus::Held));
+            assert_eq!(state.ready_input(), Some(id(21)));
+        }
         j.append(Record::OwnerGeneration);
         assert_eq!(
-            inspect(&j.bytes).unwrap().input_status(id(20)),
+            inspect(&j.bytes).unwrap().input_status(id(24)),
             Some(InputStatus::Held)
         );
     }
@@ -914,34 +926,45 @@ fn steering_requires_exact_cancel_cause_and_never_runs_after_restart() {
 #[test]
 fn queue_rejects_stale_targets_duplicate_identity_and_overload() {
     let mut j = Journal::started();
-    let mut wrong = queued(20, None, InputKind::Queue);
-    wrong.target_generation = 2;
-    j.append(Record::InputQueued(wrong));
+    j.append(Record::InputQueued(queued_at(20, 21, 22, 8, false, 1, 2)));
     assert!(inspect(&j.bytes).is_err());
+    let mut j = Journal::started();
+    j.append(Record::InputQueued(queued(20, 21, 22, 8, false, 1)));
+    // Promotion requires the exact active target.
+    let mut stale = Journal::started();
+    stale.append(Record::InputQueued(queued(20, 21, 22, 8, false, 1)));
+    stale.append(Record::TurnTerminal(terminal(
+        TerminalKind::Complete,
+        Cause::None,
+        false,
+    )));
+    stale.append(promotion(23, 21, 10, 1));
+    assert!(inspect(&stale.bytes).is_err());
     let mut j = Journal::started();
     for n in 0..16 {
         j.append(Record::InputQueued(queued(
-            20 + n,
-            if n == 0 { None } else { Some(id(19 + n)) },
-            InputKind::Queue,
+            100 + 3 * n,
+            101 + 3 * n,
+            102 + 3 * n,
+            8,
+            false,
+            n + 1,
         )));
     }
     assert_eq!(inspect(&j.bytes).unwrap().inputs.len(), 16);
-    j.append(Record::InputQueued(queued(
-        36,
-        Some(id(35)),
-        InputKind::Queue,
-    )));
+    j.append(Record::InputQueued(queued(200, 201, 202, 8, false, 17)));
     assert_eq!(inspect(&j.bytes).unwrap_err(), ReplayError::Limit);
     let mut j = Journal::started();
-    let input = queued(20, None, InputKind::Steer);
+    let input = queued(20, 21, 22, 8, false, 1);
     j.append(Record::InputQueued(input.clone()));
-    j.append(Record::InputQueued(input));
+    let mut again = input;
+    again.order_revision = 2;
+    j.append(Record::InputQueued(again));
     assert!(inspect(&j.bytes).is_err());
 }
 
-fn tool_intent() -> Record {
-    Record::ToolIntent(ToolIntent {
+fn tool_intent_value() -> ToolIntent {
+    ToolIntent {
         operation: id(10),
         generation: 1,
         ordinal: 1,
@@ -949,7 +972,10 @@ fn tool_intent() -> Record {
         path: "README.md".into(),
         offset: 0,
         limit: 1024,
-    })
+    }
+}
+fn tool_intent() -> Record {
+    Record::ToolIntent(tool_intent_value())
 }
 fn tool_result() -> Record {
     Record::ToolResult(ToolResult {
@@ -1006,7 +1032,10 @@ fn restart_interrupts_pending_tool_without_fabricating_result() {
     let state = inspect(&j.bytes).unwrap();
     let operation = &state.operations[&id(10)];
     assert!(operation.tools[0].result_frame.is_none());
-    assert_eq!(operation.terminal.as_ref().unwrap().charged_tokens, 512);
+    assert_eq!(
+        operation.terminal.as_ref().unwrap().charged_tokens,
+        OUTPUT_RESERVATION
+    );
     assert!(state.active_operation.is_none());
     let mut duplicate = Journal::started();
     duplicate.append(tool_intent());
@@ -1073,7 +1102,7 @@ fn status_tool_result_replays_and_rejects_file_paging_or_oversized_payload() {
             .as_ref()
             .unwrap()
             .charged_tokens,
-        512
+        OUTPUT_RESERVATION
     );
     for invalid in [
         ToolResult {
@@ -1204,7 +1233,7 @@ fn rejected_semantic_tool_intents_never_replay_success_or_host_data() {
                 .as_ref()
                 .unwrap()
                 .charged_tokens,
-            512
+            OUTPUT_RESERVATION
         );
     }
 }
@@ -1226,26 +1255,22 @@ fn promotion(request: u64, input: u64, target: u64, generation: u64) -> Record {
 #[test]
 fn promotion_preserves_identity_and_prompt_and_waits_for_steering_settlement() {
     let mut j = Journal::started();
-    j.append(Record::InputQueued(queued(20, None, InputKind::Queue)));
-    j.append(Record::InputQueued(queued(
-        21,
-        Some(id(20)),
-        InputKind::Queue,
-    )));
-    let before = inspect(&j.bytes).unwrap().inputs[&id(21)].clone();
-    j.append(promotion(50, 21, 10, 1));
+    j.append(Record::InputQueued(queued(20, 21, 22, 8, false, 1)));
+    j.append(Record::InputQueued(queued(23, 24, 25, 8, false, 2)));
+    let before = inspect(&j.bytes).unwrap().inputs[&id(24)].clone();
+    j.append(promotion(50, 24, 10, 1));
     let state = inspect(&j.bytes).unwrap();
-    let after = &state.inputs[&id(21)];
+    let after = &state.inputs[&id(24)];
     assert_eq!(state.inputs.len(), 2);
     assert_eq!(after.request, before.request);
     assert_eq!(after.dispatch_request, before.dispatch_request);
     assert_eq!(after.frame, before.frame);
     assert_eq!(after.sequence, before.sequence);
-    assert_eq!(after.previous, None);
+    assert_eq!(after.order_position, before.order_position);
     assert_eq!(after.kind, InputKind::Steer);
     assert_eq!(state.ready_input(), None);
-    assert_eq!(state.steering_input(id(10)), Some(id(21)));
-    assert!(!state.can_promote_input(id(20), id(10), 1));
+    assert_eq!(state.steering_input(id(10)), Some(id(24)));
+    assert!(!state.can_promote_input(id(21), id(10), 1));
     j.append(Record::CancelRequested(CancelRequested {
         operation: id(10),
         generation: 1,
@@ -1257,11 +1282,12 @@ fn promotion_preserves_identity_and_prompt_and_waits_for_steering_settlement() {
         false,
     )));
     let state = inspect(&j.bytes).unwrap();
-    assert_eq!(state.ready_input(), Some(id(21)));
-    assert_eq!(state.input_status(id(20)), Some(InputStatus::Held));
+    assert_eq!(state.ready_input(), Some(id(24)));
+    // Ordinary successors keep their durable order behind the replacement.
+    assert_eq!(state.input_status(id(21)), Some(InputStatus::Queued));
     j.append(Record::OwnerGeneration);
     assert_eq!(
-        inspect(&j.bytes).unwrap().input_status(id(21)),
+        inspect(&j.bytes).unwrap().input_status(id(24)),
         Some(InputStatus::Held)
     );
     assert_eq!(inspect(&j.bytes).unwrap().ready_input(), None);
@@ -1270,13 +1296,13 @@ fn promotion_preserves_identity_and_prompt_and_waits_for_steering_settlement() {
 fn promotion_replay_rejects_stale_unknown_cancelled_and_competing_targets() {
     for (target, generation) in [(10, 2), (99, 1)] {
         let mut j = Journal::started();
-        j.append(Record::InputQueued(queued(20, None, InputKind::Queue)));
-        j.append(promotion(50, 20, target, generation));
+        j.append(Record::InputQueued(queued(20, 21, 22, 8, false, 1)));
+        j.append(promotion(50, 21, target, generation));
         assert!(inspect(&j.bytes).is_err());
     }
     for cancel in [false, true] {
         let mut j = Journal::started();
-        j.append(Record::InputQueued(queued(20, None, InputKind::Queue)));
+        j.append(Record::InputQueued(queued(20, 21, 22, 8, false, 1)));
         if cancel {
             j.append(Record::CancelRequested(CancelRequested {
                 operation: id(10),
@@ -1284,9 +1310,10 @@ fn promotion_replay_rejects_stale_unknown_cancelled_and_competing_targets() {
                 cause: Cause::UserCancel,
             }));
         } else {
-            j.append(Record::InputQueued(queued(21, None, InputKind::Steer)));
+            j.append(Record::InputQueued(queued(23, 24, 25, 8, false, 2)));
+            j.append(promotion(49, 24, 10, 1));
         }
-        j.append(promotion(50, 20, 10, 1));
+        j.append(promotion(50, 21, 10, 1));
         assert!(inspect(&j.bytes).is_err());
     }
 }
@@ -1294,16 +1321,16 @@ fn promotion_replay_rejects_stale_unknown_cancelled_and_competing_targets() {
 #[test]
 fn explicit_promotion_clears_hold_with_exact_active_target() {
     let mut j = Journal::started();
-    j.append(Record::InputQueued(queued(20, None, InputKind::Queue)));
-    j.append(decision(49, 20, InputAction::Hold));
+    j.append(Record::InputQueued(queued(20, 21, 22, 8, false, 1)));
+    j.append(decision(49, 21, InputAction::Hold));
     assert_eq!(
-        inspect(&j.bytes).unwrap().input_status(id(20)),
+        inspect(&j.bytes).unwrap().input_status(id(21)),
         Some(InputStatus::Held)
     );
-    j.append(promotion(50, 20, 10, 1));
+    j.append(promotion(50, 21, 10, 1));
     let state = inspect(&j.bytes).unwrap();
-    assert_eq!(state.input_status(id(20)), Some(InputStatus::Queued));
-    assert_eq!(state.steering_input(id(10)), Some(id(20)));
+    assert_eq!(state.input_status(id(21)), Some(InputStatus::Queued));
+    assert_eq!(state.steering_input(id(10)), Some(id(21)));
     assert_eq!(state.inputs.len(), 1);
 }
 
@@ -1450,112 +1477,25 @@ fn inventory_results_replay_without_file_pagination_or_redispatch() {
     );
 }
 
-fn exec_cmd_intent(ordinal: u32) -> ToolIntent {
-    ToolIntent {
-        operation: id(10),
-        generation: 1,
-        ordinal,
-        kind: EXEC_CMD_TOOL_KIND,
-        path: "printf proof\0.".into(),
-        offset: 1000,
-        limit: 30,
-    }
-}
-fn exec_cmd_result(ordinal: u32, status: u8) -> ToolResult {
-    ToolResult {
-        operation: id(10),
-        generation: 1,
-        ordinal,
-        status,
-        text: "stdout: partial proof\nstderr: warning".into(),
-        next_offset: None,
-        truncated: true,
-    }
-}
+/// A4: kind 14 never carries tool kind 16; exec_cmd uses kind 22 only.
 #[test]
-fn exec_cmd_captured_outcomes_bind_to_intent_and_preserve_other_tool_rules() {
-    for status in [1, 5, 6, 7] {
-        let mut journal = Journal::started();
-        journal.append(Record::ToolIntent(exec_cmd_intent(1)));
-        journal.append(Record::ToolResult(exec_cmd_result(1, status)));
-        assert_eq!(
-            inspect(&journal.bytes).unwrap().operations[&id(10)].tools[0].result_status,
-            Some(status)
-        );
-    }
+fn kind_14_exec_cmd_frame_is_rejected_even_with_valid_checksums() {
     let mut journal = Journal::started();
-    journal.append(Record::ToolIntent(exec_cmd_intent(1)));
-    journal.append(Record::ToolResult(ToolResult {
-        next_offset: Some(1),
-        ..exec_cmd_result(1, 1)
-    }));
-    assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
-    for status in [5, 6, 7] {
-        let mut journal = Journal::started();
-        journal.append(Record::ToolIntent(ToolIntent {
-            kind: 14,
-            path: String::new(),
-            offset: 0,
-            limit: 0,
-            ..exec_cmd_intent(1)
-        }));
-        journal.append(Record::ToolResult(exec_cmd_result(1, status)));
-        assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
-    }
-}
-#[test]
-fn exec_cmd_unresolved_restart_has_no_result_or_new_execution_authority() {
-    let intent = exec_cmd_intent(1);
-    let mut journal = Journal::started();
-    journal.append(Record::ToolIntent(intent.clone()));
-    journal.append(Record::OwnerGeneration);
-    let state = inspect(&journal.bytes).unwrap();
-    assert!(state.operations[&id(10)].tools[0].result_frame.is_none());
-    journal.append(Record::TurnTerminal(terminal(
-        TerminalKind::Interrupted,
-        Cause::Restart,
-        false,
-    )));
-    let state = inspect(&journal.bytes).unwrap();
-    assert!(state.operations[&id(10)].tools[0].result_frame.is_none());
-    for changed in [false, true] {
-        let mut journal = Journal::started();
-        journal.append(Record::ToolIntent(intent.clone()));
-        let mut duplicate = intent.clone();
-        if changed {
-            duplicate.path = "echo different\0.".into();
-        }
-        journal.append(Record::ToolIntent(duplicate));
-        assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
-    }
-    let mut journal = Journal::started();
-    journal.append(Record::OwnerGeneration);
-    journal.append(Record::ToolIntent(intent));
-    assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
-}
-#[test]
-fn exec_cmd_results_enforce_existing_aggregate_result_budget() {
-    let mut journal = Journal::started();
-    for ordinal in 1..=4 {
-        journal.append(Record::ToolIntent(exec_cmd_intent(ordinal)));
-        journal.append(Record::ToolResult(ToolResult {
-            text: "x".repeat(16_384),
-            ..exec_cmd_result(ordinal, 5)
-        }));
-    }
-    assert!(inspect(&journal.bytes).is_ok());
-    journal.append(Record::ToolIntent(exec_cmd_intent(5)));
-    journal.append(Record::ToolResult(ToolResult {
-        text: "x".into(),
-        ..exec_cmd_result(5, 5)
-    }));
+    let start = journal.bytes.len();
+    journal.append(tool_intent());
+    let mut frame = journal.bytes[start..].to_vec();
+    // Payload: operation 16, generation 8, ordinal 4, then the tool kind byte.
+    frame[144 + 28] = EXEC_CMD_TOOL_KIND;
+    seal(&mut frame);
+    journal.bytes.truncate(start);
+    journal.bytes.extend(frame);
     assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
 }
 
 #[test]
-fn response_accounting_uses_each_recorded_reservation_for_new_and_legacy_turns() {
+fn response_accounting_uses_the_recorded_reservation() {
     assert_eq!(OUTPUT_RESERVATION, 2048);
-    for reservation in [LEGACY_OUTPUT_RESERVATION, OUTPUT_RESERVATION] {
+    for reservation in [OUTPUT_RESERVATION] {
         for known in [false, true] {
             let mut journal = Journal::base();
             let mut admitted = turn();
@@ -1574,10 +1514,8 @@ fn response_accounting_uses_each_recorded_reservation_for_new_and_legacy_turns()
                 reservation
             );
         }
-        for (known, output, charged) in [
-            (true, reservation + 1, reservation + 1),
-            (false, 0, if reservation == 512 { 2048 } else { 512 }),
-        ] {
+        for (known, output, charged) in [(true, reservation + 1, reservation + 1), (false, 0, 512)]
+        {
             let mut journal = Journal::base();
             let mut admitted = turn();
             admitted.reserved_output_tokens = reservation;
@@ -1607,7 +1545,8 @@ fn response_accounting_uses_each_recorded_reservation_for_new_and_legacy_turns()
             reservation
         );
     }
-    for invalid in [0, 511, 513, 1024, 2047, 2049, u32::MAX] {
+    // The removed 512 reservation is rejected like any other value.
+    for invalid in [0, 511, 512, 513, 1024, 2047, 2049, u32::MAX] {
         let mut journal = Journal::base();
         let mut admitted = turn();
         admitted.reserved_output_tokens = invalid;
@@ -1743,21 +1682,26 @@ fn old_owner_result_exception_cannot_resolve_an_ordinary_tool_or_wrong_create() 
 
 #[test]
 fn reopened_tool_display_projections_are_bounded_and_capture_stdout() {
-    let mut journal = Journal::started();
-    let mut intent = exec_cmd_intent(1);
-    intent.path = format!("printf {}\0.", "界".repeat(100));
-    journal.append(Record::ToolIntent(intent));
-    journal.append(Record::ToolResult(ToolResult {
-        text: format!("failure=None exit_code=17 signal=none reason=none truncated=true cleanup_confirmed=true\nstdout:\n{}\nstderr:\nwarning", "界".repeat(100)),
-        ..exec_cmd_result(1, 1)
-    }));
+    let mut intent = exec_cmd22(1, ExecCmdDisposition::Admitted);
+    intent.command = format!("printf {}", "界".repeat(100));
+    let journal = started_with([
+        Record::ExecCmdIntent(Box::new(intent)),
+        r23(1),
+        Record::ToolResult(ToolResult {
+            text: format!(
+                "failure=None exit_code=17 signal=none reason=none truncated=true cleanup_confirmed=true\nstdout:\n{}\nstderr:\nwarning",
+                "界".repeat(100)
+            ),
+            ..result15(1, 1)
+        }),
+    ]);
     let state = inspect(&journal.bytes).unwrap();
     let tool = &state.operations[&id(10)].tools[0];
     assert!(tool.arguments.len() <= 192);
     assert!(tool.preview.as_ref().unwrap().len() <= 128);
     assert!(tool.preview.as_ref().unwrap().starts_with("界"));
     assert_eq!(tool.exit_code, Some(17));
-    assert_eq!(tool.truncated, Some(true));
+    assert_eq!(tool.truncated, Some(false));
     assert_eq!(
         inspect(&journal.bytes).unwrap().operations[&id(10)].tools[0],
         *tool
@@ -1942,12 +1886,21 @@ fn j1t_02_each_disposition_with_and_without_capture_result_and_terminal() {
         let journal = started_with([r22(1, disposition), failed()]);
         assert!(inspect(&journal.bytes).is_ok());
     }
-    // Calls follow one another; a legacy kind 14 exec_cmd keeps its rules.
+    // Calls follow one another, including ordinary kind 14 tools.
     let journal = started_with([
         r22(1, Refused),
         r15(1, 3),
-        Record::ToolIntent(exec_cmd_intent(2)),
-        Record::ToolResult(exec_cmd_result(2, 1)),
+        Record::ToolIntent(ToolIntent {
+            ordinal: 2,
+            ..tool_intent_value()
+        }),
+        Record::ToolResult(ToolResult {
+            ordinal: 2,
+            text: "observed".into(),
+            next_offset: Some(8),
+            truncated: false,
+            ..result15(2, 1)
+        }),
         r22(3, Admitted),
         r23(3),
         r15(3, 1),
@@ -2111,9 +2064,9 @@ fn j1t_02_every_invalid_order_is_corrupt() {
             vec![r22(1, Admitted), other_rule_set(|p| p.generation = 2)],
         ),
         (
-            "23 for a legacy kind 14 exec_cmd",
+            "23 for an ordinary kind 14 tool",
             Journal::started(),
-            vec![Record::ToolIntent(exec_cmd_intent(1)), r23(1)],
+            vec![tool_intent(), r23(1)],
         ),
         (
             "22 skips an ordinal",
@@ -2257,9 +2210,9 @@ fn j1t_02_reserve_holds_one_capture_frame_until_kind_23() {
             (base + RESULT_CAPACITY, frames + 1)
         );
     }
-    // A legacy kind 14 exec_cmd keeps the result reservation only.
+    // An ordinary kind 14 tool keeps the result reservation only.
     assert_eq!(
-        reserved(&started_with([Record::ToolIntent(exec_cmd_intent(1))])),
+        reserved(&started_with([tool_intent()])),
         (base + RESULT_CAPACITY, frames + 1)
     );
     // After restart the old operation keeps the capture frame for its terminal

@@ -272,7 +272,6 @@ mod tests {
             arguments: Arguments::ExecCmd {
                 command: command.into(),
                 cwd: cwd.into(),
-                timeout_seconds: 30,
             },
         }
     }

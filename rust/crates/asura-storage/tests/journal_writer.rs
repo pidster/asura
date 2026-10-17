@@ -300,7 +300,7 @@ fn managed_queue_commits_full_projection_cas_retry_and_restart_hold() {
         changed
             .inputs
             .iter()
-            .map(|q| q.input.request)
+            .map(|q| q.input.input)
             .collect::<Vec<_>>(),
         vec![second_id, first_id]
     );
@@ -437,9 +437,7 @@ fn different_initialization_request_preserves_pending_state() {
 #[test]
 fn initialization_registration_admission_and_restart_are_durable() {
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
-    for reservation in [LEGACY_OUTPUT_RESERVATION, OUTPUT_RESERVATION] {
-        initialization_registration_admission_and_restart_with_budget(reservation);
-    }
+    initialization_registration_admission_and_restart_with_budget(OUTPUT_RESERVATION);
 }
 #[cfg(feature = "embedded-memory")]
 fn initialization_registration_admission_and_restart_with_budget(reservation: u32) {
@@ -548,7 +546,7 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
         prompt: "hello".into(),
         reserved_output_tokens: reservation,
         event_cursor: 1,
-        composition: None,
+        composition: Composition::default(),
     };
     let accepted = wait(
         &mut writer
@@ -568,17 +566,25 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
     assert_eq!(accepted.active_operation, Some([16; 16]));
     drop(registered);
     drop(accepted);
-    let queue_command = || Command::Enqueue {
+    // Every queued input is kind 18, also while an operation is active.
+    let queue_command = || Command::QueueInput {
         request: [60; 16],
         project,
-        conversation: [14; 16],
-        target_operation: [16; 16],
-        target_generation: 1,
-        kind: InputKind::Queue,
+        conversation: Some([14; 16]),
+        expected_generation: 1,
+        new_conversation: false,
         prompt: "durable queued text".into(),
     };
     let queued = wait(&mut writer.try_submit(queue_command()).unwrap()).unwrap();
-    assert_eq!(queued.inputs[0].status, InputStatus::Queued);
+    let input = queued.accepted_input_id.unwrap();
+    let entry = queued
+        .inputs
+        .iter()
+        .find(|v| v.input.input == input)
+        .unwrap();
+    assert_eq!(entry.status, InputStatus::Queued);
+    assert_eq!(entry.kind, InputKind::Queue);
+    assert_eq!(entry.target_operation, None);
     let queued_revision = queued.replay.as_ref().unwrap().revision;
     drop(queued);
     let repeated = wait(&mut writer.try_submit(queue_command()).unwrap()).unwrap();
@@ -587,13 +593,12 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
     assert!(matches!(
         wait(
             &mut writer
-                .try_submit(Command::Enqueue {
+                .try_submit(Command::QueueInput {
                     request: [60; 16],
                     project,
-                    conversation: [14; 16],
-                    target_operation: [16; 16],
-                    target_generation: 1,
-                    kind: InputKind::Queue,
+                    conversation: Some([14; 16]),
+                    expected_generation: 1,
+                    new_conversation: false,
                     prompt: "changed text".into(),
                 })
                 .unwrap()
@@ -601,9 +606,11 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
         Err(Error::Conflict)
     ));
     assert_eq!(fs::read(&journal).unwrap(), before_queue_conflict);
+    // MQ06 regression: promoting a queued kind 18 input during the active
+    // turn commits kind 16; it never reports repair_required.
     let promote = |generation| Command::PromoteInput {
         request: [65; 16],
-        input: [60; 16],
+        input,
         target_operation: [16; 16],
         target_generation: generation,
     };
@@ -613,9 +620,14 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
     ));
     assert_eq!(fs::read(&journal).unwrap(), before_queue_conflict);
     let promoted = wait(&mut writer.try_submit(promote(1)).unwrap()).unwrap();
-    assert_eq!(promoted.inputs[0].input.request, [60; 16]);
-    assert_eq!(promoted.inputs[0].input.kind, InputKind::Steer);
+    assert_eq!(promoted.inputs[0].input.input, input);
+    assert_eq!(promoted.inputs[0].kind, InputKind::Steer);
+    assert_eq!(promoted.inputs[0].target_operation, Some([16; 16]));
     assert_eq!(promoted.replay.as_ref().unwrap().inputs.len(), 1);
+    assert_eq!(
+        promoted.replay.as_ref().unwrap().steering_input([16; 16]),
+        Some(input)
+    );
     let promoted_revision = promoted.replay.as_ref().unwrap().revision;
     drop(promoted);
     let retried = wait(&mut writer.try_submit(promote(1)).unwrap()).unwrap();
@@ -647,14 +659,14 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
     .unwrap();
     assert!(matches!(read.record, Some(Record::TurnTerminal(_))));
     drop(read);
-    assert_eq!(recovered.input_status([60; 16]), Some(InputStatus::Held));
+    assert_eq!(recovered.input_status(input), Some(InputStatus::Held));
     assert_eq!(recovered.ready_input(), None);
     drop(recovered);
     let inspected = wait(
         &mut writer
             .try_submit(Command::Inputs {
                 project,
-                input: Some([60; 16]),
+                input: Some(input),
             })
             .unwrap(),
     )
@@ -666,7 +678,7 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
         &mut writer
             .try_submit(Command::InputDecision {
                 request: [61; 16],
-                input: [60; 16],
+                input,
                 action: InputAction::Resume,
             })
             .unwrap(),
@@ -674,12 +686,8 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
     .unwrap();
     assert_eq!(resumed.inputs[0].status, InputStatus::Queued);
     drop(resumed);
-    let queued_preparation = wait(
-        &mut writer
-            .try_submit(Command::PrepareInput { input: [60; 16] })
-            .unwrap(),
-    )
-    .unwrap();
+    let queued_preparation =
+        wait(&mut writer.try_submit(Command::PrepareInput { input }).unwrap()).unwrap();
     assert_eq!(
         queued_preparation.queued.unwrap().prompt,
         "Original request:\nhello\n\nSteering instruction:\ndurable queued text"
@@ -689,7 +697,7 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
         &mut writer
             .try_submit(Command::InputDecision {
                 request: [62; 16],
-                input: [60; 16],
+                input,
                 action: InputAction::Hold,
             })
             .unwrap(),
@@ -700,7 +708,7 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
         &mut writer
             .try_submit(Command::InputDecision {
                 request: [63; 16],
-                input: [60; 16],
+                input,
                 action: InputAction::Drop,
             })
             .unwrap(),
@@ -713,7 +721,7 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
         &mut writer
             .try_submit(Command::InputDecision {
                 request: [63; 16],
-                input: [60; 16],
+                input,
                 action: InputAction::Drop,
             })
             .unwrap(),
@@ -923,7 +931,7 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
         prompt: "remember".into(),
         reserved_output_tokens: 2048,
         event_cursor: 1,
-        composition: None,
+        composition: Composition::default(),
     };
     let mut state = wait(
         &mut writer
@@ -1533,7 +1541,7 @@ fn j1_turn(project: Id, configuration_digest: Hash) -> TurnAccepted {
         prompt: "hello".into(),
         reserved_output_tokens: OUTPUT_RESERVATION,
         event_cursor: 1,
-        composition: None,
+        composition: Composition::default(),
     }
 }
 fn j1_start() -> Record {
@@ -1855,7 +1863,11 @@ fn j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit() 
                 prompt: "pad".into(),
                 reserved_output_tokens: OUTPUT_RESERVATION,
                 event_cursor: 1,
-                composition: None,
+                // Every earlier padding turn completed and is omitted.
+                composition: Composition {
+                    omitted_turns: (generation - 1) as u32,
+                    ..Composition::default()
+                },
             })),
             Record::StartAuthorized(StartAuthorized {
                 operation: pad(generation * 4 + 3),

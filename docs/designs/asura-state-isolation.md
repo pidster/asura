@@ -165,8 +165,8 @@ Proposed mechanism:
   because the service maps the same storage error there. The schema and
   protocol number do not change. Peer effect: a client built before this change
   rejects a listing that contains an overlapping project as invalid; listings
-  without one are unchanged. The client and service ship in one binary, so this
-  arises only when a service from an older build is still running.
+  without one are unchanged. The client and service ship in one binary; no
+  compatibility with older builds is required (owner, 2026-10-17).
 - **Selection:** launch-time auto-selection already skips projects whose
   `current` is false (`asura-cli/src/conversation.rs:279`). Selecting one
   explicitly shows the reason; the draft is kept.

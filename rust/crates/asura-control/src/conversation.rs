@@ -4,12 +4,10 @@ use pb::envelope::Body;
 pub(super) fn handles(body: &Body) -> bool {
     matches!(
         body,
-        Body::ConversationSubmit(_)
-            | Body::ConversationHistory(_)
+        Body::ConversationHistory(_)
             | Body::ConversationHistoryReply(_)
             | Body::ConversationReadPrompt(_)
             | Body::ConversationPromptReply(_)
-            | Body::ConversationAccepted(_)
             | Body::ConversationObserve(_)
             | Body::ConversationEvent(_)
             | Body::ConversationCancel(_)
@@ -23,7 +21,6 @@ pub(super) fn handles(body: &Body) -> bool {
             | Body::ProjectRenameReply(_)
             | Body::ProjectList(_)
             | Body::ProjectsReply(_)
-            | Body::ConversationEnqueue(_)
             | Body::ConversationQueueSubmit(_)
             | Body::ConversationQueueReorder(_)
             | Body::ConversationQueueList(_)
@@ -76,17 +73,6 @@ fn listed(v: &pb::ProjectReply) -> bool {
 }
 pub(super) fn valid(body: &Body) -> bool {
     match body {
-        Body::ConversationEnqueue(v) => {
-            id(&v.request_id)
-                && id(&v.project_id)
-                && id(&v.conversation_id)
-                && id(&v.target_operation_id)
-                && v.target_generation.is_some_and(|n| n > 0)
-                && matches!(v.kind, Some(1 | 2))
-                && v.prompt
-                    .as_ref()
-                    .is_some_and(|p| !p.is_empty() && p.len() <= 32768)
-        }
         Body::ConversationQueueSubmit(v) => {
             id(&v.request_id)
                 && id(&v.project_id)
@@ -157,25 +143,27 @@ pub(super) fn valid(body: &Body) -> bool {
                     id(&e.input_id)
                         && id(&e.project_id)
                         && id(&e.conversation_id)
-                        && match e.new_conversation {
-                            None => {
-                                id(&e.target_operation_id)
-                                    && e.target_generation.is_some_and(|n| n > 0)
-                                    && e.order_position.is_none()
-                            }
-                            Some(new) => {
+                        && e.new_conversation.is_some()
+                        // A promoted Steer entry names its exact target; a Queue
+                        // entry carries its expected generation.
+                        && match e.kind {
+                            Some(1) => {
                                 e.target_operation_id.is_none()
                                     && e.target_generation.is_some_and(|generation| {
-                                        (new && generation == 0) || (!new && generation < u64::MAX)
+                                        if e.new_conversation == Some(true) {
+                                            generation == 0
+                                        } else {
+                                            generation < u64::MAX
+                                        }
                                     })
-                                    && if matches!(e.state, Some(1 | 2)) {
-                                        e.order_position.is_some_and(|position| position > 0)
-                                    } else {
-                                        e.order_position.is_none_or(|position| position > 0)
-                                    }
                             }
+                            Some(2) => {
+                                id(&e.target_operation_id)
+                                    && e.target_generation.is_some_and(|n| n > 0)
+                            }
+                            _ => false,
                         }
-                        && matches!(e.kind, Some(1 | 2))
+                        && e.order_position.is_some_and(|position| position > 0)
                         && e.state.is_some_and(|n| (1..=6).contains(&n))
                         && e.hold_reason.as_ref().is_none_or(|reason| {
                             e.state == Some(2)
@@ -195,18 +183,6 @@ pub(super) fn valid(body: &Body) -> bool {
                             e.operation_id.is_none() && e.generation.is_none()
                         }
                 })
-        }
-        Body::ConversationSubmit(v) => {
-            id(&v.request_id)
-                && id(&v.project_id)
-                && if v.conversation_id.is_none() {
-                    v.expected_generation == Some(0)
-                } else {
-                    id(&v.conversation_id) && v.expected_generation.is_some_and(|n| n > 0)
-                }
-                && v.prompt
-                    .as_ref()
-                    .is_some_and(|s| !s.is_empty() && s.len() <= 32768)
         }
         Body::ConversationHistory(v) => {
             id(&v.project_id)
@@ -247,12 +223,6 @@ pub(super) fn valid(body: &Body) -> bool {
                 && v.prompt
                     .as_ref()
                     .is_some_and(|s| !s.is_empty() && s.len() <= 32768)
-        }
-        Body::ConversationAccepted(v) => {
-            id(&v.operation_id)
-                && id(&v.conversation_id)
-                && v.generation.is_some_and(|n| n > 0)
-                && v.cursor == Some(1)
         }
         Body::ConversationObserve(v) => {
             id(&v.operation_id) && v.after_cursor.is_some() && v.wait_ms.is_some_and(|n| n <= 1000)
@@ -450,15 +420,16 @@ mod tests {
         }
     }
     #[test]
-    fn submit_presence_generation_bounds_and_direction() {
-        let request = pb::ConversationSubmit {
+    fn queue_submit_presence_generation_bounds_and_direction() {
+        let request = pb::ConversationQueueSubmit {
             request_id: Some(vec![3; 16]),
             project_id: Some(vec![4; 16]),
             conversation_id: None,
             expected_generation: Some(0),
+            new_conversation: Some(true),
             prompt: Some("Hello".into()),
         };
-        let value = envelope(Body::ConversationSubmit(request.clone()));
+        let value = envelope(Body::ConversationQueueSubmit(request.clone()));
         assert!(validate_semantics(&value, Direction::ClientToServer).is_ok());
         assert!(validate_semantics(&value, Direction::ServerToClient).is_err());
         assert_eq!(
@@ -466,24 +437,45 @@ mod tests {
             value
         );
         for changed in [
-            pb::ConversationSubmit {
+            pb::ConversationQueueSubmit {
                 conversation_id: Some(vec![]),
                 ..request.clone()
             },
-            pb::ConversationSubmit {
+            pb::ConversationQueueSubmit {
                 expected_generation: None,
                 ..request.clone()
             },
-            pb::ConversationSubmit {
+            pb::ConversationQueueSubmit {
                 prompt: Some("x".repeat(32769)),
                 ..request.clone()
             },
-            pb::ConversationSubmit {
+            pb::ConversationQueueSubmit {
                 conversation_id: Some(vec![5; 16]),
                 ..request
             },
         ] {
-            assert!(!valid(&Body::ConversationSubmit(changed)));
+            assert!(!valid(&Body::ConversationQueueSubmit(changed)));
+        }
+    }
+    /// Removed operations 22 (Submit), 23 (Accepted) and 35 (Enqueue) carry
+    /// no body; the service never treats them as a request.
+    #[test]
+    fn removed_conversation_operations_are_not_requests() {
+        for field in [22u8, 23, 35] {
+            let mut bytes = vec![0x0a, 16];
+            bytes.extend([1; 16]);
+            bytes.extend([0x12, 16]);
+            bytes.extend([2; 16]);
+            bytes.extend([0x18, 1]);
+            // Tag (field << 3 | 2) as a two-byte varint, then an empty body.
+            let tag = (u16::from(field) << 3) | 2;
+            bytes.extend([(tag as u8 & 0x7f) | 0x80, (tag >> 7) as u8, 0]);
+            let decoded = decode_body(&bytes);
+            assert!(
+                decoded.is_err()
+                    || validate_semantics(&decoded.unwrap(), Direction::ClientToServer).is_err(),
+                "field {field}"
+            );
         }
     }
     #[test]

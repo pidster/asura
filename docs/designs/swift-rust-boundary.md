@@ -2,11 +2,11 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens. Tool requests are capped at 1,024 tokens first
+Every admission reserves exactly 2,048 tokens; replay rejects any other
+reservation (owner, 2026-10-17). Tool requests are capped at 1,024 tokens first
 and 512 thereafter, at most 64 per turn, under the
-[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Historical
-512-token journal records retain their recorded accounting. Earlier numerical
-examples and validation evidence below describe that earlier packet.
+[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Earlier
+numerical examples and validation evidence below describe that earlier packet.
 
 Status: proposed D2 design for I0 and I3. Rust and Swift are selected languages;
 Ratatui and the Rust chat backend are selected. The Rust-owned local-model
@@ -233,7 +233,8 @@ drain. The former open decision on the per-frame completion deadline is closed:
 it is removed under [AE-04](../engineering.md#asynchronous-execution-and-recovery)
 (owner, 2026-10-16).
 Before model content, both sides exchange the package-build identity, exact
-private-protocol identity, capability bits and maximum frame size. Both
+private-protocol identity, selected model, availability, capability report and
+maximum frame size. Both
 identities must match the service's expected package and protocol. A mismatch
 closes the channel without interpreting request content, and the service
 performs bounded child cleanup. There is no compatible-version negotiation
@@ -469,8 +470,9 @@ sequenceDiagram
 Each admitted operation carries a stable request ID, installation and task
 identities, scope revision, implementation identity and capability snapshot,
 model-session generation, input-context generation and a versioned input
-identity. It carries no deadline; the owner removed the legacy generation
-deadline on 2026-10-16. The first macOS binding adds transfer
+identity. It carries no deadline; the owner removed the generation deadline on
+2026-10-16, and Begin field 3 (`deadline_remaining_ms`) is removed and reserved
+(owner, 2026-10-17). The first macOS binding adds transfer
 identities to its chunk messages. Each response carries the same operation
 identities. Where streaming is negotiated,
 it carries an ordered position. It carries typed availability/error status,
@@ -647,6 +649,9 @@ client's path. It checks the helper against the package manifest before spawn
 and rejects a handshake mismatch before model content. D2/D7 must select
 exact paths, identity generation and signature/manifest checks before packaging.
 
+Deferred until the first release (owner, 2026-10-17): keg removal and upgrade handling below. The live helper identity check
+(exact `build_id` and `schema_digest`) stays in force now.
+
 Homebrew can remove an old keg while its service runs. If the matching helper
 file or resource is gone before spawn, the old service rejects new model work
 and retains control availability. It must not use a helper from a new keg or
@@ -689,7 +694,7 @@ the [design process](../design-process.md#design-readiness-lifecycle).
 | SR4 | Cancel while Swift model call is blocked | Rust stops admission, observes helper settlement or exit, and keeps control responsive. Unit state checks, process integration, CLI cancellation. |
 | SR5 | Helper crashes after a tool proposal | Rust never assumes the tool ran; it reconciles any separately admitted effect. Unit identity check, crash integration, CLI recovery. |
 | SR6 | Context generation changes before a late frame | Rust rejects the stale frame; no cross-context output or tool effect escapes. Unit generation check, process integration, multi-context CLI. |
-| SR7 | Old Homebrew keg disappears before helper spawn or during a call | No unverified executable starts; accepted effects reconcile, while status and cancellation work. Unit decision checks, real-upgrade integration, CLI recovery. |
+| SR7 | Old Homebrew keg disappears before helper spawn or during a call | Deferred until the first release (owner, 2026-10-17). No unverified executable starts; accepted effects reconcile, while status and cancellation work. Unit decision checks, real-upgrade integration, CLI recovery. |
 | SR8 | Helper emits a malformed frame after a model call began | Rust rejects the frame, invalidates that helper generation and reconciles admitted work before any terminal claim. Unit decoder checks, process fault integration, CLI recovery. |
 | SR9 | Candidate lacks a required structured-result or tool capability | Service rejects that candidate before admission and returns explicit unavailability or selects an authorized eligible candidate. Unit matching and snapshot checks, two-implementation integration, CLI result. |
 | SR10 | Capability changes or another implementation appears while work runs | Admitted work remains pinned to its identity and capability snapshot; no silent replay or cross-implementation result is accepted. Unit generation checks, process integration with fault injection, CLI recovery. |
@@ -812,19 +817,20 @@ size is explicit unavailability, not permission to send unchecked history.
 The packet's private message/field tables are the canonical initial schema
 inventory under this D2 section. Preserve its 64 KiB frames, 16 KiB chunks,
 64 KiB per-direction credit windows and monotonic transfer identities. Add these
-fields to `Hello`: availability enum 4, capabilities uint32 5, context_tokens
-uint32 6, and reason enum 7. Availability is 1 available, 2 unavailable, 3 unknown.
-Capability bit 0 denotes text generation; all other bits are reserved and zero.
-A helper never advertises tools or structured generation in this first adapter.
-MT2 and MT3 later assigned bit 1 to tool calling, so a tool-capable helper reports
-capabilities 3; see [model tools](model-tool-execution.md).
+fields to `Hello`: availability enum 4, context_tokens uint32 6, and reason
+enum 7. Availability is 1 available, 2 unavailable, 3 unknown. Available means
+text generation is available. Field 5, the earlier capability bits, is removed
+and reserved (owner, 2026-10-17). Tool support comes only from
+`supported_capabilities` (field 17) bit 0 with a known `capability_source`; see
+[model tools](model-tool-execution.md).
 The service keeps registry availability unknown until identity and this report
 have been verified. `context_tokens` is required and positive only when available.
 
-The service Hello sets availability unknown, capabilities zero, reason none and
-omits context capacity. An available helper sets text capability, positive context
-capacity and reason none. An unavailable or unknown helper omits context capacity
-and supplies reason model_unavailable; its capability bits remain zero. All Hello
+The service Hello sets availability unknown, reason none and its selected model,
+and omits context capacity. An available helper sets positive context capacity,
+reason none and echoes the selected model. An unavailable or unknown helper omits
+context capacity and supplies reason model_unavailable. `selected_model` (field 9)
+is required in every Hello in both directions (owner, 2026-10-17). All Hello
 scalar fields except conditional context capacity require presence. Terminal
 `usage_known` requires presence; when false, `usage_tokens` must be absent. When
 true, `usage_tokens` must be present and zero is valid. Unknown usage retains the

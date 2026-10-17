@@ -417,6 +417,7 @@ fn app_for(setup: Setup) -> App {
                 project: [1; 16],
                 text: "rejected text".into(),
                 state: LocalInputState::Rejected,
+                steer: None,
             });
             frame(&mut app, 80, 24);
             press_with(&mut app, KeyCode::Up, CTRL);

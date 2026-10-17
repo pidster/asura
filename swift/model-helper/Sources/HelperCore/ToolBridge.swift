@@ -6,7 +6,7 @@ public enum ToolArguments: Sendable {
     case observeStatus
     case listTools
     case readAudit(limit: UInt32)
-    case execCmd(command: String, cwd: String?, timeoutSeconds: UInt32)
+    case execCmd(command: String, cwd: String?)
     case memoryListNotes(after: String?, limit: UInt32)
     case memoryGetNote(version: String, offset: UInt64, limit: UInt32)
     case memoryNoteSources(version: String)
@@ -190,13 +190,13 @@ struct ServiceReadAuditTool: Tool {
 }
 
 /// Pure transport bounds shared by native proposals and private wire validation.
-func validExecCmdArguments(command: String, cwd: String?, timeoutSeconds: UInt32?) -> Bool {
+func validExecCmdArguments(command: String, cwd: String?) -> Bool {
     guard !command.isEmpty, command.utf8.count <= 8192, !command.contains("\0") else { return false }
     if let cwd {
         guard !cwd.isEmpty, cwd.utf8.count <= 1024, !cwd.hasPrefix("/"), !cwd.contains("\0"),
             !cwd.split(separator: "/", omittingEmptySubsequences: false).contains("..") else { return false }
     }
-    return timeoutSeconds.map { (1...60).contains($0) } ?? true
+    return true
 }
 struct ExecCmdTool: Tool {
     let name = "exec_cmd"
@@ -205,14 +205,12 @@ struct ExecCmdTool: Tool {
     @Generable struct Arguments {
         @Guide(description: "Command passed exactly to /bin/sh -c; 1 through 8192 UTF-8 bytes.") var command: String
         @Guide(description: "Optional project-relative working directory. Omit or use . for project root; no parent traversal.") var cwd: String?
-        @Guide(description: "Ignored. The command runs until it ends or the turn is cancelled.") var timeout_seconds: Int?
     }
     func call(arguments: Arguments) async throws -> String {
-        guard let timeout = UInt32(exactly: arguments.timeout_seconds ?? 30),
-            validExecCmdArguments(command: arguments.command, cwd: arguments.cwd, timeoutSeconds: timeout) else {
+        guard validExecCmdArguments(command: arguments.command, cwd: arguments.cwd) else {
             throw BackendFailure(.inputLimit)
         }
-        let result = try await handler(.execCmd(command: arguments.command, cwd: arguments.cwd, timeoutSeconds: timeout))
+        let result = try await handler(.execCmd(command: arguments.command, cwd: arguments.cwd))
         guard result.status != .success else {return result.rendered}
         return "Tool failed: \(result.status)\n\(result.text)\n[truncated: \(result.truncated)]"
     }

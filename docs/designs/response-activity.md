@@ -107,9 +107,10 @@ necessary; reaching one must preserve received text and mark the response incomp
 The TUI retains every received response byte within the wire bound, sanitizes control
 characters and permits scrolling through the complete retained text.
 
-Historical journal turns retain their recorded 512-token reservation. New turns use
-2,048. Replay accepts both and validates each terminal charge against its own turn's
-reservation. Recovery charges the recorded reservation if usage is unknown. Journal
+Every turn reserves exactly 2,048 output tokens. Replay rejects any other
+reservation, including the earlier 512-token value (owner, 2026-10-17: no
+compatibility with older journals). Replay validates each terminal charge against
+its turn's reservation. Recovery charges the recorded reservation if usage is unknown. Journal
 format remains 1 and protocol remains 0.1. Model wire limits permit up to 2,048;
 per-turn enforcement still uses the actual Begin reservation. Context checks reserve
 the actual requested output budget before generation. Small contexts reject excessive
@@ -121,10 +122,11 @@ ambiguous finish reasons fail explicitly rather than claiming completion. The sh
 bounded executor records a typed failure in its turn-local budget state, so SDK error
 wrapping cannot turn output-limit into success or an unrelated error. Cancellation
 checks remain active between inference passes and during streaming. The owner
-removed the legacy explicit generation deadline (2026-10-16).
+removed the explicit generation deadline (2026-10-16); Begin has no deadline
+field (owner, 2026-10-17).
 
 Validation includes natural and length stops, final-chunk text preservation, wrapped
-executor failure, exact pass allocations, legacy and new journal accounting, and a
+executor failure, exact pass allocations, rejection of a non-2,048 reservation, and a
 native local Ollama post-tool response longer than 128 tokens with an expected ending.
 No heuristic based on punctuation decides whether an answer is complete.
 
@@ -160,7 +162,7 @@ measured output from a successful request refunds unused reservation. Zero
 remaining tokens or a 65th tool dispatch fails before provider I/O. Plain-text
 dispatch reserves its actual admitted maximum once.
 The first typed executor failure is retained through SDK error wrapping; cancellation
-still takes priority. Tests cover smaller legacy reservations and separate turns.
+still takes priority. Tests cover small remaining reservations and separate turns.
 
 The installed SDK drops buffered response text if its executor throws. For a typed
 executor failure, the bounded adapter therefore records the failure and returns
@@ -187,7 +189,7 @@ After the final SnapshotEnd, it sends a failed terminal with the original reason
 and unknown usage. This adds no snapshot queue. Control cancellation terminates
 immediately; transport failure or an output bound reached by the drain also
 terminates without retrying the failed pump. The wait has no time limit (owner,
-2026-10-16; the legacy Begin deadline no longer applies). It stays
+2026-10-16; Begin has no deadline field). It stays
 cancellation-driven with bounded retained snapshots and responsive controls, and
 ends on credit, cancellation, channel loss or shutdown. Socket tests cover delayed
 credit preserving both snapshots, withheld credit held until cancellation, and

@@ -16,10 +16,6 @@ pub(super) struct Mutation {
     ticket: Option<writer::Ticket>,
     response: Option<Result<MemoryCreateResult, ()>>,
     response_consumed: bool,
-    /// The caller's own tool deadline (L10). It bounds only this caller's wait:
-    /// when it passes, the cancel flag stops the writer's cancellable put. The
-    /// writer itself has no time bound (J1-0).
-    deadline: Option<Instant>,
 }
 impl Mutation {
     pub fn new(intent: journal::MemoryCreateIntent) -> Self {
@@ -30,16 +26,12 @@ impl Mutation {
             ticket: None,
             response: None,
             response_consumed: false,
-            deadline: None,
         }
     }
-    pub fn start(&mut self, writer: &writer::WriterHandle, body: String, deadline: Instant) {
+    /// The write has no time bound (J1-0): it ends on its reply or the
+    /// turn's cancel, which stops the writer's cancellable put.
+    pub fn start(&mut self, writer: &writer::WriterHandle, body: String) {
         self.phase = Phase::Mutation;
-        if Instant::now() >= deadline {
-            self.phase = Phase::ResolveReady;
-            return;
-        }
-        self.deadline = Some(deadline);
         match writer.try_submit(writer::Command::MemoryCreate {
             turn: self.intent.operation,
             generation: self.intent.generation,
@@ -58,28 +50,13 @@ impl Mutation {
     pub fn settled(&self) -> bool {
         self.ticket.as_ref().is_none_or(writer::Ticket::is_settled)
     }
-    pub fn next_deadline(&self) -> Option<Instant> {
-        if self.phase == Phase::Mutation
-            && self.ticket.is_some()
-            && !self.cancel.load(std::sync::atomic::Ordering::Acquire)
-        {
-            self.deadline
-        } else {
-            None
-        }
-    }
     pub fn poll(
         &mut self,
         writer: &writer::WriterHandle,
-        now: Instant,
         absent_status: u8,
     ) -> Result<Option<journal::ToolResult>, ()> {
         if self.phase == Phase::Done {
             return Ok(None);
-        }
-        if self.phase == Phase::Mutation && self.deadline.is_some_and(|deadline| now >= deadline) {
-            // The caller's wait ended; the writer finishes the job and settles.
-            self.cancel();
         }
         if let Some(ticket) = &mut self.ticket {
             if !self.response_consumed
@@ -191,7 +168,7 @@ pub(super) fn prepare(
     Ok(Mutation::new(intent))
 }
 impl Owner {
-    pub(super) fn capture_memory_create(&mut self, now: Instant) {
+    pub(super) fn capture_memory_create(&mut self) {
         if matches!(self.pending, Some((_, Job::ToolResult))) {
             return;
         }
@@ -210,26 +187,17 @@ impl Owner {
         let Some(create) = &mut tool.create else {
             return;
         };
-        if active.cancel.is_some()
-            || active.terminal.is_some()
-            || tool.deadline.is_some_and(|deadline| now >= deadline)
-        {
+        if active.cancel.is_some() || active.terminal.is_some() {
             create.cancel();
         }
-        let status = if active.cancel.is_some() {
-            6
-        } else if tool.deadline.is_some_and(|deadline| now >= deadline) {
-            5
-        } else {
-            4
-        };
-        match create.poll(writer, now, status) {
+        let status = if active.cancel.is_some() { 6 } else { 4 };
+        match create.poll(writer, status) {
             Ok(Some(result)) => tool.result = Some(result),
             Ok(None) => (),
             Err(()) => self.unavailable = Some("memory_write_outcome_unconfirmed"),
         }
     }
-    pub(super) fn drive_create_recovery(&mut self, now: Instant) -> bool {
+    pub(super) fn drive_create_recovery(&mut self) -> bool {
         if self.create_recovery.is_none() {
             return false;
         }
@@ -240,7 +208,7 @@ impl Owner {
             return true;
         };
         let recovery = self.create_recovery.as_mut().expect("recovery");
-        match recovery.poll(writer, now, 4) {
+        match recovery.poll(writer, 4) {
             Ok(Some(result)) => {
                 if let Err(error) = self.append(
                     journal::Record::ToolResult(result),

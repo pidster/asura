@@ -14,10 +14,10 @@ static CLEAN: AtomicBool = AtomicBool::new(true);
 use std::time::{Duration, Instant};
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    if let [_, flag, id, deadline, command] = args.as_slice()
+    if let [_, flag, id, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
-        std::process::exit(run_guardian(id, deadline, command));
+        std::process::exit(run_guardian(id, command));
     }
     if let [_, flag, home] = args.as_slice()
         && flag == "--lease-holder"
@@ -144,17 +144,7 @@ fn prepare_with(
     secrets: Vec<SecretVariable>,
     timeout: Duration,
 ) -> JobGuard {
-    prepare_deadline(home, command, secrets, timeout, None)
-}
-/// `deadline` is `None` in service mode (J1-Q3); `Some` qualifies the
-/// bounded guardian mode only.
-fn prepare_deadline(
-    home: &Path,
-    command: &str,
-    secrets: Vec<SecretVariable>,
-    _timeout: Duration,
-    deadline: Option<Duration>,
-) -> JobGuard {
+    let _ = timeout;
     let runtime = RuntimeDirectory::scratch(home, true).unwrap();
     let project = ProjectIdentity::open(
         home.join("project").to_str().unwrap(),
@@ -169,7 +159,6 @@ fn prepare_deadline(
             job_id: asura_platform::random_id(),
             command: command.into(),
             cwd: None,
-            deadline: deadline.map(|d| Instant::now() + d),
             secrets,
         },
         &cancel,
@@ -188,14 +177,6 @@ fn prepare_deadline(
 }
 fn run(home: &Path, command: &str, timeout: Duration, cancel: bool) -> Outcome {
     settle(prepare(home, command, timeout), timeout, cancel)
-}
-/// The bounded guardian mode, kept for qualification until J3.
-fn run_bounded(home: &Path, command: &str, deadline: Duration) -> Outcome {
-    settle(
-        prepare_deadline(home, command, Vec::new(), deadline, Some(deadline)),
-        deadline,
-        false,
-    )
 }
 fn settle(mut job: JobGuard, timeout: Duration, cancel: bool) -> Outcome {
     let started = Instant::now();
@@ -306,13 +287,6 @@ fn qualification() {
         std::io::ErrorKind::WouldBlock,
         "sandboxed child reached loopback listener"
     );
-    let result = run_bounded(
-        &f.0,
-        "printf '%s' $$ > timeout-pid; sleep 30 & wait",
-        Duration::from_millis(600),
-    );
-    assert_eq!(result.reason, Some(StopReason::Deadline));
-    group_absent(&f.0.join("project/timeout-pid"));
     let result = run(
         &f.0,
         "printf '%s' $$ > cancel-pid; sleep 30 & wait",
@@ -329,12 +303,14 @@ fn qualification() {
         false,
     );
     assert_eq!(result.exit_code, Some(0));
-    let result = run_bounded(
+    // A TERM-resistant group ends on cancel: SIGTERM, then SIGKILL.
+    let result = run(
         &f.0,
         "trap '' TERM; printf '%s' $$ > resistant-pid; while :; do sleep 1; done",
-        Duration::from_millis(600),
+        Duration::from_secs(5),
+        true,
     );
-    assert_eq!(result.reason, Some(StopReason::Deadline));
+    assert_eq!(result.reason, Some(StopReason::Cancelled));
     assert_eq!(result.signal, Some(9));
     group_absent(&f.0.join("project/resistant-pid"));
     let result = run(
@@ -453,7 +429,6 @@ fn guardian_refusals(home: &Path) {
                 job_id: asura_platform::random_id(),
                 command: "printf ran > refused-marker".into(),
                 cwd: None,
-                deadline: None,
                 secrets: Vec::new(),
             },
             &cancel,
@@ -695,7 +670,6 @@ fn secret_environment_refusals(home: &Path) {
                 job_id: asura_platform::random_id(),
                 command: "printf ran > secret-refused-marker".into(),
                 cwd: None,
-                deadline: None,
                 secrets: Vec::new(),
             },
             &cancel,

@@ -183,12 +183,13 @@ you decide.
 
 While the model is answering, type text in the input box and press a key:
 
-- Ctrl+S steers: Asura stops the current answer and restarts it with your text
-  as a new instruction.
-- Ctrl+T queues the text behind the current answer.
+- Ctrl+S steers: Asura queues your text, then stops the current answer and
+  restarts it with your text as a new instruction. If the answer ends before
+  the service accepts your text, the text stays queued and Asura says so.
+- Ctrl+T queues the text behind the current answer, the same as Enter.
 
-These keys need an active answer that the service has confirmed. Otherwise
-Asura keeps your draft and shows why.
+Ctrl+S needs an active answer that the service has confirmed. Otherwise Asura
+keeps your draft and shows why.
 
 ## Cancel, retry and observe work
 

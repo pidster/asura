@@ -115,12 +115,10 @@ pub(crate) fn handles(request: &pb::Envelope) -> bool {
                 | Body::SensorsInspect(_)
                 | Body::AuditRead(_)
                 | Body::ProjectList(_)
-                | Body::ConversationSubmit(_)
                 | Body::ConversationHistory(_)
                 | Body::ConversationReadPrompt(_)
                 | Body::ConversationObserve(_)
                 | Body::ConversationCancel(_)
-                | Body::ConversationEnqueue(_)
                 | Body::ConversationQueueSubmit(_)
                 | Body::ConversationQueueReorder(_)
                 | Body::ConversationQueueList(_)
@@ -149,17 +147,6 @@ fn project(
         name: name.as_ref().map(|(name, _)| name.clone()),
         name_revision: name.map(|(_, revision)| revision),
     }
-}
-fn accepted(request: pb::Envelope, turn: &journal::TurnAccepted) -> pb::Envelope {
-    reply(
-        request,
-        Body::ConversationAccepted(pb::ConversationAccepted {
-            operation_id: Some(turn.operation.to_vec()),
-            conversation_id: Some(turn.conversation.to_vec()),
-            generation: Some(turn.generation),
-            cursor: Some(1),
-        }),
-    )
 }
 /// What the active turn waits on, for display only (owner, 2026-10-16).
 /// Derived from messages the owner already sees; it ends nothing.
@@ -264,7 +251,6 @@ fn proposed_tool(
         Some(mp::tool_call::Arguments::ExecCmd(args)) => tools::Arguments::ExecCmd {
             command: args.command.ok_or(tools::Rejection::InvalidArguments)?,
             cwd: args.cwd.unwrap_or_else(|| ".".into()),
-            timeout_seconds: args.timeout_seconds.unwrap_or(30),
         },
         Some(mp::tool_call::Arguments::ObserveStatus(_)) => tools::Arguments::ObserveStatus,
         Some(mp::tool_call::Arguments::ListTools(_)) => tools::Arguments::ListTools,
@@ -321,16 +307,9 @@ fn tool_intent(call: &tools::Call, rejected: bool) -> journal::ToolIntent {
             limit,
         } => (1, path.clone(), *offset, *limit),
         tools::Arguments::ListDirectory { path } => (2, path.clone(), 0, 0),
-        tools::Arguments::ExecCmd {
-            command,
-            cwd,
-            timeout_seconds,
-        } => (
-            16,
-            format!("{command}\0{cwd}"),
-            u64::from(*timeout_seconds) * 1000,
-            *timeout_seconds,
-        ),
+        // exec_cmd is always kind 22 (J1). Kind 14 replay rejects tool kind
+        // 16, so a misrouted call fails its append instead of being journaled.
+        tools::Arguments::ExecCmd { .. } => (16, String::new(), 0, 0),
         tools::Arguments::ObserveStatus => (3, String::new(), 0, 0),
         tools::Arguments::ListTools => (14, String::new(), 0, 0),
         tools::Arguments::ReadAudit { limit } => (15, String::new(), 0, *limit),
@@ -393,8 +372,6 @@ fn tool_result(
             result.status = match error {
                 tools::ExecutionError::Host(H::Cancelled)
                 | tools::ExecutionError::Rejected(tools::Rejection::Cancelled) => 6,
-                tools::ExecutionError::Host(H::Deadline)
-                | tools::ExecutionError::Rejected(tools::Rejection::Expired) => 5,
                 tools::ExecutionError::Host(H::Limit)
                 | tools::ExecutionError::Rejected(tools::Rejection::Limit) => 7,
                 tools::ExecutionError::Host(H::InvalidArguments | H::NotText)
@@ -429,8 +406,6 @@ struct LiveTool {
     rejected: bool,
     /// The rewritten call for exec_cmd; the raw command is never retained.
     call: tools::Call,
-    /// The ordinary 2 s tool deadline (L10); `None` for exec_cmd (J1-Q3).
-    deadline: Option<Instant>,
     memory_ticket: Option<writer::Ticket>,
     intent_committed: bool,
     dispatched: bool,
@@ -503,7 +478,6 @@ struct Active {
     /// The person held this input before acceptance (action 4). Recorded once,
     /// so a Resume during helper wind-down cannot be undone by a second Hold.
     person_held: bool,
-    request: Option<pb::Envelope>,
     turn: journal::TurnAccepted,
     input: Vec<u8>,
     /// Prior turns for the composer; consumed when the model reports its window.
@@ -558,7 +532,7 @@ impl AutomaticInitialization {
     fn fail(&mut self, error: writer::Error) {
         *self = Self::Failed(match error {
             writer::Error::OutcomeUnconfirmed => {
-                pb::InstallationInspectionReason::InspectionTimeout
+                pb::InstallationInspectionReason::InspectionCancelled
             }
             _ => pb::InstallationInspectionReason::InspectionIo,
         });
@@ -585,7 +559,6 @@ enum Job {
     RenameProject(pb::Envelope),
     History(pb::Envelope),
     ReadPrompt(pb::Envelope),
-    Prepare(pb::Envelope),
     Accept,
     Start,
     Cancel,
@@ -740,7 +713,7 @@ impl Owner {
             self.sensor_owner = sensors::Owner::new(epoch, status).ok();
         }
     }
-    fn capture_memory_tool(&mut self, now: Instant) {
+    fn capture_memory_tool(&mut self) {
         // A submitted result record is immutable; delivery fences apply at acknowledgement.
         if matches!(self.pending, Some((_, Job::ToolResult))) {
             return;
@@ -758,16 +731,11 @@ impl Owner {
         {
             return;
         }
-        let cancelled = active.cancel.is_some() || active.terminal.is_some();
-        let expired = tool.deadline.is_some_and(|deadline| now >= deadline);
-        if cancelled || (expired && tool.result.is_none()) {
+        // No time bound: the read ends on its reply or the turn's cancel.
+        if active.cancel.is_some() || active.terminal.is_some() {
             tool.result = Some(tool_result(
                 &tool.call,
-                Err(tools::ExecutionError::Rejected(if expired {
-                    tools::Rejection::Expired
-                } else {
-                    tools::Rejection::Cancelled
-                })),
+                Err(tools::ExecutionError::Rejected(tools::Rejection::Cancelled)),
             ));
         }
         if let Some(ticket) = &mut tool.memory_ticket
@@ -818,7 +786,7 @@ impl Owner {
     pub(crate) fn set_audit_health(&mut self, health: asura_storage::audit::Health) {
         self.audit_health = health;
     }
-    fn capture_audit_tool(&mut self, now: Instant) {
+    fn capture_audit_tool(&mut self) {
         let Some(active) = &mut self.active else {
             return;
         };
@@ -831,8 +799,6 @@ impl Owner {
         }
         let rejection = if active.cancel.is_some() || active.terminal.is_some() || self.closing {
             Some(tools::Rejection::Cancelled)
-        } else if tool.deadline.is_some_and(|deadline| now >= deadline) {
-            Some(tools::Rejection::Expired)
         } else if !active.tools_enabled {
             Some(tools::Rejection::Denied)
         } else {
@@ -871,7 +837,7 @@ impl Owner {
             }
         });
     }
-    fn capture_inventory_tool(&mut self, now: Instant) {
+    fn capture_inventory_tool(&mut self) {
         let Some(active) = &mut self.active else {
             return;
         };
@@ -887,8 +853,6 @@ impl Owner {
         }
         let rejection = if active.cancel.is_some() || active.terminal.is_some() || self.closing {
             Some(tools::Rejection::Cancelled)
-        } else if tool.deadline.is_some_and(|deadline| now >= deadline) {
-            Some(tools::Rejection::Expired)
         } else if !active.tools_enabled {
             Some(tools::Rejection::Denied)
         } else {
@@ -937,8 +901,6 @@ impl Owner {
         }
         let rejection = if active.cancel.is_some() || active.terminal.is_some() {
             Some(tools::Rejection::Cancelled)
-        } else if tool.deadline.is_some_and(|deadline| now >= deadline) {
-            Some(tools::Rejection::Expired)
         } else if self.sensor_failed.contains(&active.turn.project) {
             Some(tools::Rejection::Denied)
         } else {
@@ -1230,18 +1192,8 @@ impl Owner {
         let closing = self
             .closing
             .then_some(now + std::time::Duration::from_millis(10));
-        self.create_recovery
-            .as_ref()
-            .and_then(memory_create::Mutation::next_deadline)
+        model
             .into_iter()
-            .chain(
-                self.active
-                    .as_ref()
-                    .and_then(|a| a.tool.as_ref())
-                    .and_then(|t| t.create.as_ref())
-                    .and_then(memory_create::Mutation::next_deadline),
-            )
-            .chain(model)
             .chain(
                 self.active
                     .as_ref()
@@ -1260,22 +1212,6 @@ impl Owner {
                     .as_ref()
                     .filter(|_| self.pending.is_none() && self.unavailable.is_none())
                     .and_then(|s| s.next_deadline()),
-            )
-            .chain(
-                self.active
-                    .as_ref()
-                    .and_then(|a| a.tool.as_ref())
-                    .filter(|t| {
-                        t.result.is_none()
-                            && !t.call.arguments.is_memory_create()
-                            && (matches!(
-                                t.call.arguments,
-                                tools::Arguments::ObserveStatus
-                                    | tools::Arguments::ListTools
-                                    | tools::Arguments::ReadAudit { .. }
-                            ) || t.call.arguments.is_memory())
-                    })
-                    .and_then(|t| t.deadline),
             )
             .chain(
                 (self.pending.is_none()
@@ -1416,10 +1352,8 @@ impl Owner {
                     | Body::ProjectRegister(_)
                     | Body::ProjectRename(_)
                     | Body::ProjectList(_)
-                    | Body::ConversationSubmit(_)
                     | Body::ConversationHistory(_)
                     | Body::ConversationReadPrompt(_)
-                    | Body::ConversationEnqueue(_)
                     | Body::ConversationQueueSubmit(_)
                     | Body::ConversationQueueReorder(_)
                     | Body::ConversationQueueDecision(_)
@@ -1493,26 +1427,6 @@ impl Owner {
                     return Some(error(request, "request_conflict"));
                 }
                 return Some(self.initialization_reply(request));
-            }
-            Body::ConversationEnqueue(value) => {
-                let kind = if value.kind == Some(2) {
-                    journal::InputKind::Steer
-                } else {
-                    journal::InputKind::Queue
-                };
-                let command = writer::Command::Enqueue {
-                    request: id(&value.request_id),
-                    project: id(&value.project_id),
-                    conversation: id(&value.conversation_id),
-                    target_operation: id(&value.target_operation_id),
-                    target_generation: value.target_generation.unwrap(),
-                    kind,
-                    prompt: value.prompt.clone().unwrap(),
-                };
-                return match self.submit(command, Job::QueueMutation(request.clone())) {
-                    Ok(()) => None,
-                    Err(e) => Some(error(request, storage_error(e))),
-                };
             }
             Body::ConversationQueueSubmit(value) => {
                 let command = writer::Command::QueueInput {
@@ -1656,9 +1570,7 @@ impl Owner {
                     Err(e) => Some(error(request, storage_error(e))),
                 };
             }
-            _ if (self.pending.is_some() || self.active.is_some())
-                && !matches!(request.body, Some(Body::ConversationSubmit(_))) =>
-            {
+            _ if self.pending.is_some() || self.active.is_some() => {
                 return Some(error(request, "conversation_busy"));
             }
             Body::InitializeInstallation(value) => writer::Command::Initialize {
@@ -1675,70 +1587,9 @@ impl Owner {
                     .map(|v| v.as_slice().try_into().unwrap()),
                 limit: value.limit.unwrap() as usize,
             },
-            Body::ConversationSubmit(value) => {
-                if let Some(state) = &self.replay {
-                    let digest = match journal::request_digest(journal::Request::Submit {
-                        project: id(&value.project_id),
-                        conversation: value
-                            .conversation_id
-                            .as_ref()
-                            .map(|v| v.as_slice().try_into().unwrap()),
-                        expected_generation: value.expected_generation.unwrap(),
-                        prompt: value.prompt.as_ref().unwrap(),
-                    }) {
-                        Ok(digest) => digest,
-                        Err(_) => return Some(error(request, "invalid_request")),
-                    };
-                    if let Some(prior) = state.requests.get(&id(&value.request_id)) {
-                        if prior.digest != digest {
-                            return Some(error(request, "request_conflict"));
-                        }
-                        if let journal::Outcome::Turn {
-                            conversation,
-                            generation,
-                            operation,
-                            ..
-                        } = prior.result
-                        {
-                            return Some(reply(
-                                request,
-                                Body::ConversationAccepted(pb::ConversationAccepted {
-                                    operation_id: Some(operation.to_vec()),
-                                    conversation_id: Some(conversation.to_vec()),
-                                    generation: Some(generation),
-                                    cursor: Some(1),
-                                }),
-                            ));
-                        }
-                        return Some(error(request, "request_conflict"));
-                    }
-                }
-                if self.pending.is_some()
-                    || self.active.is_some()
-                    || self
-                        .replay
-                        .as_ref()
-                        .is_some_and(|r| r.ready_input().is_some())
-                {
-                    return Some(error(request, "conversation_busy"));
-                }
-                if self.package.is_none() {
-                    return Some(error(request, "model_package_unavailable"));
-                }
-                writer::Command::Prepare {
-                    project: id(&value.project_id),
-                    conversation: value
-                        .conversation_id
-                        .as_ref()
-                        .map(|v| v.as_slice().try_into().unwrap()),
-                    expected_generation: value.expected_generation.unwrap(),
-                    prompt: value.prompt.clone().unwrap(),
-                }
-            }
             _ => return Some(error(request, "invalid_request")),
         };
         let job = match command {
-            writer::Command::Prepare { .. } => Job::Prepare(request.clone()),
             writer::Command::Projects { .. } => Job::Projects(request.clone()),
             _ => Job::Setup(request.clone()),
         };
@@ -1882,10 +1733,11 @@ impl Owner {
         active.cancel_replies.push(request);
         None
     }
+    /// Starts the model for the queued input the writer prepared. Every turn
+    /// comes from the input queue; there is no direct submission.
     fn prepared(
         &mut self,
-        request: Option<pb::Envelope>,
-        value: pb::ConversationSubmit,
+        queued: writer::QueuedPreparation,
         prepared: writer::Prepared,
     ) -> Result<(), &'static str> {
         let resolved = crate::model::resolve(
@@ -1899,12 +1751,9 @@ impl Owner {
         ) {
             return Err("remote_endpoint_restricted");
         }
-        let project = id(&value.project_id);
-        let original = value
-            .conversation_id
-            .as_ref()
-            .map(|v| v.as_slice().try_into().unwrap());
-        let prompt = value.prompt.clone().unwrap();
+        let project = queued.project;
+        let original = Some(queued.conversation);
+        let prompt = queued.prompt;
         // The composer runs when the model reports its window (context-composer.md).
         let candidates = prepared
             .history
@@ -1919,23 +1768,19 @@ impl Owner {
         let tools_enabled =
             ENABLE_PROJECT_TOOLS && crate::model::project_tools_allowed(&prepared.model);
         let turn = journal::TurnAccepted {
-            request: id(&value.request_id),
+            request: queued.request,
             digest: journal::request_digest(journal::Request::Submit {
                 project,
                 conversation: original,
-                expected_generation: value.expected_generation.unwrap(),
+                expected_generation: queued.generation,
                 prompt: &prompt,
             })
             .map_err(|_| "invalid_request")?,
             project,
             original_conversation: original,
-            expected_generation: value.expected_generation.unwrap(),
-            conversation: original.unwrap_or_else(asura_platform::random_id),
-            generation: value
-                .expected_generation
-                .unwrap()
-                .checked_add(1)
-                .ok_or("generation_limit")?,
+            expected_generation: queued.generation,
+            conversation: queued.conversation,
+            generation: queued.generation.checked_add(1).ok_or("generation_limit")?,
             task: asura_platform::random_id(),
             operation: asura_platform::random_id(),
             model: prepared.model,
@@ -1947,7 +1792,8 @@ impl Owner {
             prompt,
             reserved_output_tokens: journal::OUTPUT_RESERVATION,
             event_cursor: 1,
-            composition: None,
+            // Replaced by the composer's record before acceptance.
+            composition: journal::Composition::default(),
         };
         let mut model = ModelOwner::new(
             self.runtime.clone(),
@@ -1969,7 +1815,6 @@ impl Owner {
             foreground_user: true,
             queue_input: None,
             person_held: false,
-            request,
             turn,
             input: Vec::new(),
             candidates,
@@ -2081,10 +1926,6 @@ impl Owner {
                             self.unavailable = Some(storage_error(e));
                         }
                     }
-                    Job::Prepare(request) => {
-                        self.audit_rejected(&request, message);
-                        self.out.push_back(error(request, message));
-                    }
                     Job::Projects(request)
                     | Job::RenameProject(request)
                     | Job::History(request)
@@ -2094,19 +1935,6 @@ impl Owner {
                     _ => {
                         self.unavailable = Some(message);
                         if let Some(active) = &mut self.active {
-                            if let Some(request) = active.request.take() {
-                                if let (Some(emitter), Some(event)) = (
-                                    &self.audit_emitter,
-                                    audit_tools::rejected(
-                                        &request,
-                                        self.replay.as_deref(),
-                                        message,
-                                    ),
-                                ) {
-                                    let _ = emitter.try_emit(event);
-                                }
-                                self.out.push_back(error(request, message));
-                            }
                             for request in active.cancel_replies.drain(..) {
                                 self.out.push_back(error(request, message));
                             }
@@ -2308,22 +2136,6 @@ impl Owner {
                     _ => error(request, "authority_repair_required"),
                 });
             }
-            Job::Prepare(request) => {
-                if self.closing {
-                    self.audit_rejected(&request, "service_draining");
-                    self.out.push_back(error(request, "service_draining"));
-                } else if let Err(message) = self.prepared(
-                    Some(request.clone()),
-                    match request.body.clone().expect("submit") {
-                        Body::ConversationSubmit(v) => v,
-                        _ => unreachable!(),
-                    },
-                    value.prepared.expect("prepare result"),
-                ) {
-                    self.audit_rejected(&request, message);
-                    self.out.push_back(error(request, message));
-                }
-            }
             Job::Accept => {
                 let active = self.active.as_mut().expect("active admission");
                 active.accepted = true;
@@ -2343,9 +2155,6 @@ impl Owner {
                     });
                 }
 
-                if let Some(request) = active.request.take() {
-                    self.out.push_back(accepted(request, &active.turn));
-                }
                 if let Err(message) = active.model.begin(
                     active.turn.operation,
                     active.turn.generation,
@@ -2385,9 +2194,6 @@ impl Owner {
                 let tool = active.tool.as_mut().expect("pending tool");
                 tool.intent_committed = true;
                 active.measurements.tool_start[tool.call.ordinal as usize - 1] = Some(now);
-                if !matches!(tool.call.arguments, tools::Arguments::ExecCmd { .. }) {
-                    tool.deadline = Some(now + std::time::Duration::from_secs(2));
-                }
                 active.cursor += 1;
             }
             Job::CaptureSettled => {
@@ -2451,8 +2257,10 @@ impl Owner {
                         .tool_cache
                         .push((tool.call.clone(), tool.secret_digest, wire.clone()));
                     active.cursor += 1;
-                    if tool.deadline.is_some_and(|deadline| now >= deadline) || self.closing {
-                        Self::failed(active, "model_timeout", now);
+                    if self.closing {
+                        // Shutdown ends the turn through its cancel path.
+                        active.revoke_create();
+                        active.cancel.get_or_insert(journal::Cause::ServiceShutdown);
                     }
                     if tool.call.arguments.is_memory()
                         && (!active.tools_enabled
@@ -2517,7 +2325,6 @@ impl Owner {
                     Self::person_hold(active, id(&decision.input_id), now);
                 }
                 let request_id = match &request.body {
-                    Some(Body::ConversationEnqueue(v)) => v.request_id.clone(),
                     Some(Body::ConversationQueueSubmit(v)) => v.request_id.clone(),
                     Some(Body::ConversationQueueReorder(v)) => v.request_id.clone(),
                     Some(Body::ConversationQueueDecision(v)) => v.request_id.clone(),
@@ -2532,33 +2339,29 @@ impl Owner {
                         // Exact decision replay returns current state. Preserve a
                         // newer Hold reason if a resumed preparation failed again.
                         if v.status != journal::InputStatus::Held {
-                            self.hold_reasons.remove(&v.input.request);
+                            self.hold_reasons.remove(&v.input.input);
                         }
-                        let new_conversation = v.v2.as_ref().map(|input| input.new_conversation);
                         pb::ConversationQueueEntry {
-                            input_id: Some(v.input.request.to_vec()),
+                            input_id: Some(v.input.input.to_vec()),
                             project_id: Some(v.input.project.to_vec()),
                             conversation_id: Some(v.input.conversation.to_vec()),
-                            target_operation_id: v
-                                .v2
-                                .is_none()
-                                .then(|| v.input.target_operation.to_vec()),
-                            target_generation: Some(v.input.target_generation),
-                            kind: Some(v.input.kind as u32),
+                            target_operation_id: v.target_operation.map(|id| id.to_vec()),
+                            target_generation: Some(v.target_generation),
+                            kind: Some(v.kind as u32),
                             state: Some(v.status as u32),
                             text: Some(v.input.prompt),
                             sequence: Some(v.sequence),
                             operation_id: v.operation.map(|(id, _)| id.to_vec()),
                             generation: v.operation.map(|(_, generation)| generation),
-                            new_conversation,
-                            order_position: v.order_position,
+                            new_conversation: Some(v.input.new_conversation),
+                            order_position: Some(v.order_position),
                             hold_reason: (v.status == journal::InputStatus::Held)
-                                .then(|| self.hold_reasons.get(&v.input.request).copied())
+                                .then(|| self.hold_reasons.get(&v.input.input).copied())
                                 .flatten()
                                 .map(str::to_owned),
                             waiting_step: preparing
                                 .filter(|(input, _)| {
-                                    *input == v.input.request
+                                    *input == v.input.input
                                         && v.status == journal::InputStatus::Queued
                                 })
                                 .map(|(_, step)| step as i32),
@@ -2582,17 +2385,10 @@ impl Owner {
             Job::QueuePrepare(input) => {
                 self.hold_reasons.remove(&input);
                 let queued = value.queued.expect("queued preparation");
-                let submit = pb::ConversationSubmit {
-                    request_id: Some(queued.request.to_vec()),
-                    project_id: Some(queued.project.to_vec()),
-                    conversation_id: Some(queued.conversation.to_vec()),
-                    expected_generation: Some(queued.generation),
-                    prompt: Some(queued.prompt),
-                };
                 let result = if self.closing {
                     Err("service_closing")
                 } else {
-                    self.prepared(None, submit, value.prepared.expect("queue prepare result"))
+                    self.prepared(queued, value.prepared.expect("queue prepare result"))
                 };
                 if let Err(reason) = result {
                     self.note_hold(input, reason);
@@ -2785,16 +2581,13 @@ impl Owner {
         }
         let grant = tool_grant(&active.turn, active.foreground_user);
         let reserved = if rejected {
-            active.tool_budget.reserve_rejected(
-                call.clone(),
-                &grant,
-                &tools::Destination::Local,
-                now,
-            )
+            active
+                .tool_budget
+                .reserve_rejected(call.clone(), &grant, &tools::Destination::Local)
         } else {
             active
                 .tool_budget
-                .reserve(call.clone(), &grant, &tools::Destination::Local, now)
+                .reserve(call.clone(), &grant, &tools::Destination::Local)
         };
         if reserved.is_err() {
             Self::failed(active, "model_protocol_fault", now);
@@ -2864,7 +2657,6 @@ impl Owner {
             memory_ticket: None,
             rejected,
             call,
-            deadline: (!exec_cmd).then(|| now + std::time::Duration::from_secs(2)),
             intent_committed: false,
             dispatched: false,
             result,
@@ -2912,23 +2704,13 @@ impl Owner {
         {
             active.model.cancel(4, now);
             active.tool_executor.cancel();
-            active.exec_cmd_worker.cancel(
-                if active
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|t| t.cause == journal::Cause::Deadline)
-                {
-                    asura_platform::exec_cmd::StopReason::Deadline
-                } else {
-                    asura_platform::exec_cmd::StopReason::Cancelled
-                },
-            );
+            active
+                .exec_cmd_worker
+                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             active.tool_budget.cancel();
             return;
         }
-        let cause = if message.contains("timeout") {
-            journal::Cause::Deadline
-        } else if message.contains("protocol") {
+        let cause = if message.contains("protocol") {
             journal::Cause::ProtocolFailure
         } else {
             journal::Cause::ProviderFailure
@@ -2950,17 +2732,9 @@ impl Owner {
         });
         active.model.cancel(4, now);
         active.tool_executor.cancel();
-        active.exec_cmd_worker.cancel(
-            if active
-                .terminal
-                .as_ref()
-                .is_some_and(|t| t.cause == journal::Cause::Deadline)
-            {
-                asura_platform::exec_cmd::StopReason::Deadline
-            } else {
-                asura_platform::exec_cmd::StopReason::Cancelled
-            },
-        );
+        active
+            .exec_cmd_worker
+            .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
         active.tool_budget.cancel();
     }
     pub(crate) fn retain_observers(&mut self, attachments: &[[u8; 16]]) {
@@ -3141,7 +2915,7 @@ impl Owner {
                             active.turn.instructions_digest =
                                 Sha256::digest(instructions.as_bytes()).into();
                             active.turn.input_digest = Sha256::digest(&composed.input).into();
-                            active.turn.composition = Some(composed.composition(budget));
+                            active.turn.composition = composed.composition(budget);
                             active.turn.prior_operations = composed.shown;
                             active.input = composed.input;
                             active.ready = true;
@@ -3215,27 +2989,8 @@ impl Owner {
                     Self::helper_terminal(active, outcome, reason, usage_tokens);
                 }
                 ModelEvent::Inventory { .. } => Self::failed(active, "model_protocol_fault", now),
-                ModelEvent::Failed(message) => {
-                    if !matches!(self.pending, Some((_, Job::Accept)))
-                        && let Some(request) = active.request.take()
-                    {
-                        if let (Some(emitter), Some(event)) = (
-                            &self.audit_emitter,
-                            audit_tools::rejected(&request, self.replay.as_deref(), message),
-                        ) {
-                            let _ = emitter.try_emit(event);
-                        }
-                        self.out.push_back(error(request, message));
-                    }
-                    Self::failed(active, message, now);
-                }
+                ModelEvent::Failed(message) => Self::failed(active, message, now),
             }
-        }
-        if let Some(active) = &mut self.active
-            && active.tool_executor.expire(now)
-            && active.terminal.is_none()
-        {
-            Self::failed(active, "model_timeout", now);
         }
         if let Some(active) = &mut self.active
             && let Some(outcome) = active.tool_executor.poll()
@@ -3292,15 +3047,15 @@ impl Owner {
             self.unavailable = Some("authority_repair_required");
         }
         self.dispatch_foreground(now);
-        self.capture_memory_create(now);
-        self.capture_memory_tool(now);
+        self.capture_memory_create();
+        self.capture_memory_tool();
         self.capture_sensor_tool(now);
-        self.capture_audit_tool(now);
-        self.capture_inventory_tool(now);
+        self.capture_audit_tool();
+        self.capture_inventory_tool();
         self.drive(now);
         self.capture_sensor_tool(now);
-        self.capture_audit_tool(now);
-        self.capture_inventory_tool(now);
+        self.capture_audit_tool();
+        self.capture_inventory_tool();
         self.drive_sensors(now);
         self.publish_step(now);
         self.observations(now);
@@ -3320,7 +3075,7 @@ impl Owner {
         self.out.drain(..).collect()
     }
     fn drive(&mut self, now: Instant) {
-        if self.drive_create_recovery(now) {
+        if self.drive_create_recovery() {
             return;
         }
         if !self.closing && self.unavailable.is_none() {
@@ -3357,48 +3112,24 @@ impl Owner {
         }
         if active.terminal.is_some() {
             active.tool_executor.cancel();
-            active.exec_cmd_worker.cancel(
-                if active
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|t| t.cause == journal::Cause::Deadline)
-                {
-                    asura_platform::exec_cmd::StopReason::Deadline
-                } else {
-                    asura_platform::exec_cmd::StopReason::Cancelled
-                },
-            );
+            active
+                .exec_cmd_worker
+                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
         }
         if active.cancel.is_some() {
             active.tool_budget.cancel();
             active.tool_executor.cancel();
-            active.exec_cmd_worker.cancel(
-                if active
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|t| t.cause == journal::Cause::Deadline)
-                {
-                    asura_platform::exec_cmd::StopReason::Deadline
-                } else {
-                    asura_platform::exec_cmd::StopReason::Cancelled
-                },
-            );
+            active
+                .exec_cmd_worker
+                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             active.model.cancel(if self.closing { 3 } else { 1 }, now);
         }
         if self.unavailable.is_some() {
             active.model.cancel(3, now);
             active.tool_executor.cancel();
-            active.exec_cmd_worker.cancel(
-                if active
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|t| t.cause == journal::Cause::Deadline)
-                {
-                    asura_platform::exec_cmd::StopReason::Deadline
-                } else {
-                    asura_platform::exec_cmd::StopReason::Cancelled
-                },
-            );
+            active
+                .exec_cmd_worker
+                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             if active.model.is_settled()
                 && active.tool_executor.is_settled()
                 && active.exec_cmd_worker.is_settled()
@@ -3428,19 +3159,6 @@ impl Owner {
         if !active.accepted {
             if active.terminal.is_some() || self.closing {
                 if active.model.is_settled() {
-                    if let Some(request) = active.request.take() {
-                        if let (Some(emitter), Some(event)) = (
-                            &self.audit_emitter,
-                            audit_tools::rejected(
-                                &request,
-                                self.replay.as_deref(),
-                                "model_unavailable",
-                            ),
-                        ) {
-                            let _ = emitter.try_emit(event);
-                        }
-                        self.out.push_back(error(request, "model_unavailable"));
-                    }
                     let queued = active.queue_input.filter(|_| !active.person_held);
                     let reason = active.failure_reason.unwrap_or("model_start_failed");
                     self.active = None;
@@ -3644,12 +3362,12 @@ impl Owner {
                                 &tools::Destination::Local,
                             )
                             .is_ok();
-                        if !authorized || tool.deadline.is_none_or(|deadline| now >= deadline) {
+                        if !authorized {
                             tool.result = Some(journal::ToolResult {
                                 operation: tool.call.operation,
                                 generation: tool.call.generation,
                                 ordinal: tool.call.ordinal,
-                                status: if authorized { 5 } else { 2 },
+                                status: 2,
                                 text: String::new(),
                                 truncated: false,
                                 next_offset: None,
@@ -3659,11 +3377,10 @@ impl Owner {
                             tools::Arguments::MemoryCreateNote { body, .. },
                         ) = (&self.writer, &tool.call.arguments)
                         {
-                            tool.create.as_mut().expect("committed create").start(
-                                writer,
-                                body.clone(),
-                                tool.deadline.unwrap_or(now),
-                            );
+                            tool.create
+                                .as_mut()
+                                .expect("committed create")
+                                .start(writer, body.clone());
                         } else {
                             self.unavailable = Some("memory_write_outcome_unconfirmed");
                         }
@@ -3686,8 +3403,7 @@ impl Owner {
                                 .as_ref()
                                 .ok_or(writer::Error::Unavailable)
                                 .and_then(|writer| {
-                                    // The tool deadline bounds only this caller's
-                                    // wait (capture_memory_tool), not the writer.
+                                    // The read ends on its reply or the turn's cancel.
                                     writer.try_submit(writer::Command::MemoryRead {
                                         project: active.turn.project,
                                         query,
@@ -3726,7 +3442,6 @@ impl Owner {
                                         inode: project.inode,
                                         boundary: self.runtime.state_boundary(),
                                     },
-                                    tool.deadline.unwrap_or(now),
                                 )
                             });
                         if let Err(error) = outcome {

@@ -2,6 +2,8 @@
 //! against a scripted loopback model endpoint, the real conversation owner,
 //! guardian, sandbox, capture workers, journal and payload store, all in
 //! private scratch homes. Every case ends with the raw-byte sweep.
+#[path = "support/queue_submit.rs"]
+mod queue_submit;
 use asura_client::Client;
 use asura_control::pb;
 use asura_platform::RuntimeDirectory;
@@ -327,17 +329,9 @@ fn serve(
 
 // ----------------------------------------------------------------- turns
 
+/// Queues a new-conversation input and waits for its turn.
 fn submit(fixture: &Fixture, project: [u8; 16], prompt: &str) -> Result<[u8; 16]> {
-    let accepted = fixture.attach()?.submit_conversation(
-        pb::ConversationSubmit {
-            request_id: Some(asura_platform::random_id().to_vec()),
-            project_id: Some(project.to_vec()),
-            conversation_id: None,
-            expected_generation: Some(0),
-            prompt: Some(prompt.into()),
-        },
-        &|| false,
-    )?;
+    let accepted = queue_submit::submit_queued(&|| fixture.attach(), project, None, 0, prompt)?;
     id(accepted.operation_id)
 }
 fn finish(
@@ -1002,7 +996,7 @@ fn native() -> Result<()> {
     let long = submit(
         &fixture,
         project,
-        "Call exec_cmd exactly once with command `sleep 65; echo slept-65`, cwd `.`, timeout_seconds 60. Then reply only DONE. Do not use other tools.",
+        "Call exec_cmd exactly once with command `sleep 65; echo slept-65`, cwd `.`. Then reply only DONE. Do not use other tools.",
     )?;
     let event = finish(&fixture, long, Duration::from_secs(300))?;
     assert_eq!(event.kind, Some(3), "{event:?}");
@@ -1058,12 +1052,10 @@ type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let [_, flag, job, deadline, command] = args.as_slice()
+    if let [_, flag, job, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
-        std::process::exit(asura_platform::exec_cmd::run_guardian(
-            job, deadline, command,
-        ));
+        std::process::exit(asura_platform::exec_cmd::run_guardian(job, command));
     }
     if args.get(1).map(String::as_str) == Some("--capture-child") {
         if let Err(error) = child(Path::new(&args[2])) {

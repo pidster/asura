@@ -249,11 +249,14 @@ Use one new reason enum: 0 unspecified (invalid); 1 inspection_pending;
 2 runtime_only; 3 initialization_pending; 4 graph_verification_unavailable;
 5 installation_remnants; 6 unknown_content; 7 unsupported_layout;
 8 unsupported_format; 9 incomplete_tail; 10 corrupt_authority;
-11 inspection_limit; 12 inspection_timeout; 13 unsafe_authority;
-14 authority_changed; 15 inspection_io. Existing Inspect's reason field must
-represent these same codes through a separate new field at tag 4 of that reply;
-its old unavailable_reason field is absent in protocol 1.1. The validator rejects
-mixed old/new reason fields rather than choosing one silently.
+11 inspection_limit; 12 inspection_cancelled; 13 unsafe_authority;
+14 authority_changed; 15 inspection_io. Code 12 was named `inspection_timeout`
+until the inspection time bound was removed; it reports a cancelled inspection
+(owner, 2026-10-17). Inspect's reason field represents these same codes at tag 4
+of that reply. Its earlier `unavailable_reason` field 3 and the
+`UnavailableReason` enum are removed and field 3 is reserved (owner, 2026-10-17).
+The CLI JSON key `unavailable_reason` remains; it reports the inspection reason
+name.
 
 `runtime_only` pairs only with Uninitialized. Pending scan/initialization pair
 with Recovering; valid binding pairs with GraphUnavailable. Remnants, unknown
@@ -363,9 +366,8 @@ The lock contains the same 135 registry packages. The storage crate reuses
 `sha2 0.10.9`; no new registry dependency was selected. The reviewed lock digest is
 `4e452b20d2d7e4429dc7bba78b37bba740da4173dc99b9cf2202939442eb799a`.
 
-The user's running service was not stopped or reconfigured. Protocol 1.1 requires
-a matching service; a 1.0 client must stop an older service before replacement.
-The existing diagram-rendering gap remains recorded below. This checkpoint does
+The user's running service was not stopped or reconfigured. The
+existing diagram-rendering gap remains recorded below. This checkpoint does
 not complete write-enabled stage 3A, stage 3B or the full status TUI.
 
 ## Stage 3B: explicit initialization and binding

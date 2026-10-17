@@ -336,9 +336,11 @@ compatibility and performance evidence. Follow the
 
 - Fresh installation on a supported host.
 - Formula audit and installation from the exact qualified prebuilt release asset.
-- Recovery during upgrade and migration.
-- Upgrade with a live per-user service, uninstall with user data retained, and
-  rejection of an unsupported binary or authority schema.
+- Recovery during upgrade and migration, and upgrade with a live per-user
+  service. These are deferred until the first release (owner, 2026-10-17);
+  before then no compatibility with older builds or data is required.
+- Uninstall with user data retained, and rejection of an unsupported binary or
+  authority schema.
 - Security regression tests and collector outage.
 - Sustained workloads and usability acceptance.
 

@@ -69,10 +69,6 @@ fn display_arguments(p: &ToolIntent) -> String {
         8 => format!("note_sources {}", p.path),
         14 => "tools".into(),
         15 => format!("audit limit={}", p.limit),
-        16 => {
-            let (command, cwd) = p.path.split_once('\0').unwrap_or((&p.path, ""));
-            format!("{} cwd={} timeout={}s", command, cwd, p.limit)
-        }
         _ => "invalid arguments".into(),
     };
     display_prefix(&text, 192)
@@ -295,7 +291,6 @@ impl Replay {
                 );
             }
             Record::InputQueued(p) => self.enqueue(p, generation, frame)?,
-            Record::InputQueuedV2(p) => self.enqueue_v2(p, generation, frame)?,
             Record::InputReordered(p) => self.reorder_input(p)?,
             Record::InputPromoted(p) => {
                 require(
@@ -313,7 +308,6 @@ impl Replay {
                 input.held = false;
                 input.target_operation = p.target_operation;
                 input.target_generation = p.target_generation;
-                input.previous = None;
                 input.resumed = false;
                 input.owner_generation = generation;
                 self.order_revision = next(self.order_revision)?;
@@ -475,16 +469,16 @@ impl Replay {
                 )?;
                 let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
                 require(tool.result_frame.is_none())?;
-                if let Some(exec_cmd) = &tool.exec_cmd {
+                if tool.kind == EXEC_CMD_TOOL_KIND {
+                    // Only kind 22 creates tool kind 16, so its call state exists.
                     // J1 order: admitted 22, 23, 15; refused 22, 15 status 3;
                     // busy 22, 15 status 4.
+                    let exec_cmd = tool.exec_cmd.as_deref().ok_or(ReplayError::Corrupt)?;
                     require(match exec_cmd.disposition {
                         ExecCmdDisposition::Admitted => exec_cmd.settled.is_some(),
                         ExecCmdDisposition::Refused => p.status == 3,
                         ExecCmdDisposition::Busy => p.status == 4,
                     })?;
-                }
-                if tool.kind == EXEC_CMD_TOOL_KIND {
                     require(p.next_offset.is_none())?;
                 } else if p.status != 1 {
                     // The structural codec cannot see the intent kind. exec_cmd is
@@ -554,7 +548,7 @@ impl Replay {
         }
         Ok(())
     }
-    /// Kind 22 follows the kind 14 admission rules. An admitted record's job
+    /// Kind 22 follows the kind 14 ordering rules. An admitted record's job
     /// and payload IDs must equal their derivations from this installation.
     fn exec_cmd_intent(&mut self, p: ExecCmdIntent, frame: Range<usize>) -> Result<()> {
         p.validate()?;
@@ -660,10 +654,8 @@ impl Replay {
             )?;
         }
         require(
-            matches!(
-                p.reserved_output_tokens,
-                LEGACY_OUTPUT_RESERVATION | OUTPUT_RESERVATION
-            ) && p.event_cursor == 1
+            p.reserved_output_tokens == OUTPUT_RESERVATION
+                && p.event_cursor == 1
                 && !p.model.is_empty(),
         )?;
         require(
@@ -694,9 +686,9 @@ impl Replay {
                 )?;
                 if c.generation == 0 {
                     require(
-                        self.inputs.values().any(|q| {
-                            q.v2 && q.conversation == id && q.dispatch_request == p.request
-                        }),
+                        self.inputs
+                            .values()
+                            .any(|q| q.conversation == id && q.dispatch_request == p.request),
                     )?;
                 }
             }
@@ -716,22 +708,20 @@ impl Replay {
             )?;
             last_generation = op.generation;
         }
-        // A composed turn accounts for every completed prior turn: shown or omitted.
-        if let Some(c) = &p.composition {
-            let completed = self
-                .operations
-                .values()
-                .filter(|op| {
-                    op.conversation == p.conversation
-                        && op.generation < p.generation
-                        && op
-                            .terminal
-                            .as_ref()
-                            .is_some_and(|t| t.kind == TerminalKind::Complete)
-                })
-                .count();
-            require(p.prior_operations.len() + c.omitted_turns as usize == completed)?;
-        }
+        // Every turn accounts for every completed prior turn: shown or omitted.
+        let completed = self
+            .operations
+            .values()
+            .filter(|op| {
+                op.conversation == p.conversation
+                    && op.generation < p.generation
+                    && op
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|t| t.kind == TerminalKind::Complete)
+            })
+            .count();
+        require(p.prior_operations.len() + p.composition.omitted_turns as usize == completed)?;
         self.fresh(p.task)?;
         self.fresh(p.operation)?;
         self.request(
@@ -781,101 +771,6 @@ impl Replay {
         Ok(())
     }
     fn enqueue(&mut self, p: InputQueued, owner: u64, frame: Range<usize>) -> Result<()> {
-        require(self.binding.is_some() && self.active_operation == Some(p.target_operation))?;
-        let op = self
-            .operations
-            .get(&p.target_operation)
-            .ok_or(ReplayError::Corrupt)?;
-        require(
-            op.conversation == p.conversation
-                && op.generation == p.target_generation
-                && op.terminal.is_none()
-                && op.cancel.is_none(),
-        )?;
-        require(
-            self.conversations
-                .get(&p.conversation)
-                .is_some_and(|c| c.project == p.project && c.generation == p.target_generation),
-        )?;
-        require(
-            p.digest
-                == request_digest(Request::Queue {
-                    project: p.project,
-                    conversation: p.conversation,
-                    target_operation: p.target_operation,
-                    target_generation: p.target_generation,
-                    kind: p.kind,
-                    prompt: &p.prompt,
-                })?,
-        )?;
-        if self
-            .inputs
-            .values()
-            .filter(|q| {
-                matches!(
-                    self.input_status(q.request),
-                    Some(InputStatus::Queued | InputStatus::Held | InputStatus::Running)
-                )
-            })
-            .count()
-            >= MAX_INPUTS
-        {
-            return Err(ReplayError::Limit);
-        }
-        require(
-            p.dispatch_request != p.request
-                && !self.requests.contains_key(&p.dispatch_request)
-                && !self
-                    .inputs
-                    .values()
-                    .any(|q| q.dispatch_request == p.request),
-        )?;
-        if p.kind == InputKind::Steer {
-            require(p.previous.is_none() && self.steering_input(p.target_operation).is_none())?;
-        } else {
-            let expected = self
-                .inputs
-                .values()
-                .filter(|q| {
-                    q.conversation == p.conversation
-                        && q.kind == InputKind::Queue
-                        && matches!(
-                            self.input_status(q.request),
-                            Some(InputStatus::Queued | InputStatus::Held | InputStatus::Running)
-                        )
-                })
-                .max_by_key(|q| q.sequence)
-                .map(|q| q.request);
-            require(p.previous == expected)?;
-        }
-        self.fresh(p.dispatch_request)?;
-        self.request(p.request, p.digest, Outcome::Input(p.request))?;
-        self.charge(512)?;
-        self.inputs.insert(
-            p.request,
-            QueuedInput {
-                request: p.request,
-                dispatch_request: p.dispatch_request,
-                project: p.project,
-                conversation: p.conversation,
-                target_operation: p.target_operation,
-                target_generation: p.target_generation,
-                previous: p.previous,
-                kind: p.kind,
-                frame,
-                sequence: next(self.sequence)?,
-                owner_generation: owner,
-                held: false,
-                dropped: false,
-                resumed: false,
-                v2: false,
-                order_position: 0,
-            },
-        );
-        self.order_revision = next(self.order_revision)?;
-        Ok(())
-    }
-    fn enqueue_v2(&mut self, p: InputQueuedV2, owner: u64, frame: Range<usize>) -> Result<()> {
         require(self.binding.is_some() && self.projects.contains_key(&p.project))?;
         require(
             p.input != [0; 16]
@@ -905,7 +800,6 @@ impl Replay {
             )?;
             require(!self.inputs.values().any(|q| {
                 q.project == p.project
-                    && q.v2
                     && self
                         .conversations
                         .get(&q.conversation)
@@ -973,7 +867,7 @@ impl Replay {
         let order_position = self
             .inputs
             .values()
-            .filter(|q| q.v2 && q.conversation == p.conversation)
+            .filter(|q| q.conversation == p.conversation)
             .map(|q| q.order_position)
             .max()
             .unwrap_or(0)
@@ -988,7 +882,6 @@ impl Replay {
                 conversation: p.conversation,
                 target_operation: [0; 16],
                 target_generation: p.expected_generation,
-                previous: None,
                 kind: InputKind::Queue,
                 frame,
                 sequence: next(self.sequence)?,
@@ -996,7 +889,6 @@ impl Replay {
                 held: false,
                 dropped: false,
                 resumed: false,
-                v2: true,
                 order_position,
             },
         );
@@ -1017,32 +909,26 @@ impl Replay {
                 })?,
         )?;
         let input = self.inputs.get(&p.input).ok_or(ReplayError::Corrupt)?;
-        require(
-            input.v2
-                && matches!(
-                    self.input_status(p.input),
-                    Some(InputStatus::Queued | InputStatus::Held)
-                ),
-        )?;
+        require(matches!(
+            self.input_status(p.input),
+            Some(InputStatus::Queued | InputStatus::Held)
+        ))?;
         let lane = input.conversation;
         if let Some(after) = p.after {
             let anchor = self.inputs.get(&after).ok_or(ReplayError::Corrupt)?;
             require(
-                anchor.v2
-                    && anchor.conversation == lane
+                anchor.conversation == lane
                     && matches!(
                         self.input_status(after),
                         Some(InputStatus::Queued | InputStatus::Held)
                     ),
             )?;
         }
-        // Legacy unresolved entries are fixed ahead of V2 entries. A V2 move
-        // among V2 anchors cannot cross that boundary.
         let mut ids: Vec<_> = self
             .inputs
             .values()
             .filter(|q| {
-                q.v2 && q.conversation == lane
+                q.conversation == lane
                     && matches!(
                         self.input_status(q.request),
                         Some(InputStatus::Queued | InputStatus::Held)
@@ -1127,56 +1013,30 @@ impl Replay {
         if input.resumed {
             return Some(InputStatus::Queued);
         }
-        if input.v2 {
-            if input.kind == InputKind::Steer {
-                let target = self.operations.get(&input.target_operation)?;
-                return Some(match &target.terminal {
-                    None => InputStatus::Queued,
-                    Some(t)
-                        if t.kind == TerminalKind::Cancelled
-                            && t.cause == Cause::Steering
-                            && input.owner_generation == self.owner_generation =>
-                    {
-                        InputStatus::Queued
-                    }
-                    Some(_) => InputStatus::Held,
-                });
-            }
-            let latest = self
-                .operations
-                .values()
-                .filter(|op| op.conversation == input.conversation)
-                .max_by_key(|op| op.generation);
-            return Some(match latest.and_then(|op| op.terminal.as_ref()) {
-                // A committed failure or cancellation settles the old turn.
-                // Owner restart and explicit holds remain separate recovery gates.
-                Some(t) if t.kind == TerminalKind::Interrupted => InputStatus::Held,
-                _ => InputStatus::Queued,
-            });
-        }
-        if let Some(previous) = input.previous {
-            return Some(match self.input_status(previous)? {
-                InputStatus::Complete | InputStatus::Queued | InputStatus::Running => {
+        if input.kind == InputKind::Steer {
+            let target = self.operations.get(&input.target_operation)?;
+            return Some(match &target.terminal {
+                None => InputStatus::Queued,
+                Some(t)
+                    if t.kind == TerminalKind::Cancelled
+                        && t.cause == Cause::Steering
+                        && input.owner_generation == self.owner_generation =>
+                {
                     InputStatus::Queued
                 }
-                _ => InputStatus::Held,
+                Some(_) => InputStatus::Held,
             });
         }
-        let target = self.operations.get(&input.target_operation)?;
-        Some(match &target.terminal {
-            None => InputStatus::Queued,
-            Some(t) if input.kind == InputKind::Queue && t.kind == TerminalKind::Complete => {
-                InputStatus::Queued
-            }
-            Some(t)
-                if input.kind == InputKind::Steer
-                    && t.kind == TerminalKind::Cancelled
-                    && t.cause == Cause::Steering
-                    && input.owner_generation == self.owner_generation =>
-            {
-                InputStatus::Queued
-            }
-            Some(_) => InputStatus::Held,
+        let latest = self
+            .operations
+            .values()
+            .filter(|op| op.conversation == input.conversation)
+            .max_by_key(|op| op.generation);
+        Some(match latest.and_then(|op| op.terminal.as_ref()) {
+            // A committed failure or cancellation settles the old turn.
+            // Owner restart and explicit holds remain separate recovery gates.
+            Some(t) if t.kind == TerminalKind::Interrupted => InputStatus::Held,
+            _ => InputStatus::Queued,
         })
     }
     pub fn input_ready(&self, id: Id) -> bool {
@@ -1186,32 +1046,21 @@ impl Replay {
         if self.input_status(id) != Some(InputStatus::Queued) {
             return false;
         }
-        if input.resumed && !input.v2 {
-            return true;
+        if input.kind == InputKind::Steer {
+            return self
+                .operations
+                .get(&input.target_operation)
+                .is_some_and(|op| op.terminal.is_some());
         }
-        if input.v2 {
-            if input.kind == InputKind::Steer {
-                return self
-                    .operations
-                    .get(&input.target_operation)
-                    .is_some_and(|op| op.terminal.is_some());
-            }
-            return !self.inputs.values().any(|prior| {
-                prior.conversation == input.conversation
-                    && prior.request != id
-                    && matches!(
-                        self.input_status(prior.request),
-                        Some(InputStatus::Queued | InputStatus::Held | InputStatus::Running)
-                    )
-                    && (!prior.v2 || prior.order_position < input.order_position)
-            });
-        }
-        if let Some(previous) = input.previous {
-            return self.input_status(previous) == Some(InputStatus::Complete);
-        }
-        self.operations
-            .get(&input.target_operation)
-            .is_some_and(|op| op.terminal.is_some())
+        !self.inputs.values().any(|prior| {
+            prior.conversation == input.conversation
+                && prior.request != id
+                && matches!(
+                    self.input_status(prior.request),
+                    Some(InputStatus::Queued | InputStatus::Held | InputStatus::Running)
+                )
+                && prior.order_position < input.order_position
+        })
     }
     pub fn ready_input(&self) -> Option<Id> {
         if self.active_operation.is_some() {
@@ -1229,21 +1078,9 @@ impl Replay {
             lanes
                 .entry(input.conversation)
                 .and_modify(|(current, _)| {
-                    if (
-                        input.kind != InputKind::Steer,
-                        if input.v2 {
-                            input.order_position
-                        } else {
-                            input.sequence
-                        },
-                    ) < (
-                        current.kind != InputKind::Steer,
-                        if current.v2 {
-                            current.order_position
-                        } else {
-                            current.sequence
-                        },
-                    ) {
+                    if (input.kind != InputKind::Steer, input.order_position)
+                        < (current.kind != InputKind::Steer, current.order_position)
+                    {
                         *current = input;
                     }
                 })

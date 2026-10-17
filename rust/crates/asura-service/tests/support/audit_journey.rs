@@ -69,9 +69,9 @@ fn seed(fixture: &Fixture, projects: &[[u8; 16]]) -> Result<()> {
                 input_digest: [2; 32],
                 prior_operations: vec![],
                 prompt: prompt.into(),
-                reserved_output_tokens: 512,
+                reserved_output_tokens: j::OUTPUT_RESERVATION,
                 event_cursor: 1,
-                composition: None,
+                composition: j::Composition::default(),
             };
             revision = execute(
                 &writer,
@@ -122,14 +122,16 @@ fn seed(fixture: &Fixture, projects: &[[u8; 16]]) -> Result<()> {
     result
 }
 fn conflict(fixture: &Fixture, project: [u8; 16], index: u8) -> Result<()> {
+    // The queue submission reuses a recorded turn request with another digest.
     let error = fixture
         .attach()?
-        .submit_conversation(
-            pb::ConversationSubmit {
+        .queue_conversation_input(
+            pb::ConversationQueueSubmit {
                 request_id: Some(request(index).to_vec()),
                 project_id: Some(project.to_vec()),
                 conversation_id: Some(conversation(index).to_vec()),
                 expected_generation: Some(1),
+                new_conversation: Some(false),
                 prompt: Some("AUDIT_CHANGED_PRIVATE_PROMPT_NOT_EXPOSED".into()),
             },
             &|| false,

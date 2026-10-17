@@ -1,12 +1,12 @@
 # First conversation: durable admission and recovery
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
-supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-New admissions reserve 2,048 tokens. Tool requests are capped at 1,024 tokens first
+supersedes this packet's earlier 256/128/128 allocations. Every admission
+reserves exactly 2,048 output tokens; replay rejects any other reservation
+(owner, 2026-10-17). Tool requests are capped at 1,024 tokens first
 and 512 thereafter, at most 64 per turn, under the
-[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Historical
-512-token journal records retain their recorded accounting. Earlier numerical
-examples and validation evidence below describe that earlier packet.
+[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Earlier
+validation evidence below describes the earlier packet.
 
 Status: CA-A through CA-D implemented. The storage validation subset below
 passed on 2026-09-27. The owner authorized conversation execution and the shared
@@ -30,7 +30,7 @@ Deliver one active text generation per service and one project per conversation.
 Tools were outside this packet; [model tools](model-tool-execution.md) defines
 current tool behavior. The initial provider is the admitted `system` model. One submitted
 turn creates one task and one model operation. Both have durable identities.
-The task has one operation and a 512-output-token budget. This packet does not
+The task has one operation and a 2,048-output-token budget. This packet does not
 implement multi-step scheduling, remote providers, conversation branching, history
 editing, retention deletion or journal compaction.
 
@@ -258,28 +258,25 @@ it never automatically resubmits a previous draft under a new request ID.
 Durable automated client-session recovery is outside this first packet. Clients
 write no control or recovery files; the existing journal remains the only authority.
 
-## Format 1 and record compatibility
+## Format 1 and record kinds
 
 Journal format remains **1**. Format, API and protocol numbers change only when
-the owner explicitly authorizes the change. Authorized feature work can add record
-kinds without changing the format number.
+the owner explicitly authorizes the change. Authorized feature work can add or
+change record kinds without changing the format number. Asura is not released, so
+no compatibility with older journals is required (owner, 2026-10-17). Schemas change
+in place. A removed kind number stays unassigned; replay rejects it as unsupported.
 
-Preserve diagnostic initialization kinds 1 and 2 and their exact payloads from the
-[recovery contract](persistence-recovery.md#format-1-byte-contract). Request-bearing
-PendingInit and ActiveBinding use distinct kinds 10 and 11. Kind 3 keeps its existing
-OwnerGeneration meaning; kinds 4 through 9 add the conversation transitions below.
-Later amendments add kinds 12–20 for input, tools, promotion, Memory create,
-the managed queue and project rename.
-Never reinterpret an existing kind based on payload length. A stream starts with
-either diagnostic kind 1 or request-bearing kind 10. The first record selects its
-transition rules; mixing diagnostic and request-bearing initialization records
-rejects the complete stream. Diagnostic streams remain inspectable but have no
-request outcomes and cannot admit conversation writes. No automatic conversion or
-startup migration is defined. Missing request authority is not a version mismatch.
+Every stream starts with kind 10 PendingInit; kind 11 ActiveBinding binds the
+graph. The earlier diagnostic initialization kinds 1 and 2 are removed, and replay
+rejects a stream that starts with any other kind. Kind 3 keeps its OwnerGeneration
+meaning; kinds 4 through 9 add the conversation transitions below. Later amendments
+add kinds 13–23 for queue decisions, tools, promotion, Memory create, the managed
+queue, project rename, composed turns and exec_cmd. Kinds 1, 2, 5 and 12 are
+unassigned. Never reinterpret an existing kind based on payload length.
 
 Public inspection validates all transitions before returning the installation
-summary, including conversation records when kind 10 starts the stream. It must
-not skip unsupported kinds or return a valid prefix after an invalid transition.
+summary. It must not skip unsupported kinds or return a valid prefix after an
+invalid transition.
 
 Retain the 144-byte header, SHA-256 chain, 40-byte trailer, byte order and size
 limits from the [format-1 contract](persistence-recovery.md#format-1-byte-contract).
@@ -308,10 +305,12 @@ request ID, generated result IDs and current filesystem state are excluded.
 | --- | --- |
 | InitializeInstallation | u16 1, mode u8, expected authority revision u64 (must be 0) |
 | ProjectRegister | u16 4, normalized absolute location string |
-| ConversationSubmit | u16 5, project ID, optional original conversation ID, expected generation u64, exact prompt string |
+| Turn dispatch (internal, from a queued input) | u16 5, project ID, optional original conversation ID, expected generation u64, exact prompt string |
 | ConversationCancel | u16 7, model-operation ID, conversation generation u64 |
 
-For a create submit, the original conversation option is 0 and expected generation
+Command kind 5 identifies the service's internal dispatch of one queued input.
+There is no public submit request; clients queue input with `ConversationQueueSubmit`.
+For a create dispatch, the original conversation option is 0 and expected generation
 is 0. For an existing conversation, the option is 1 followed by its nonzero ID,
 and expected generation equals its current positive generation. TurnAccepted
 retains both those original fields and the resulting conversation/generation.
@@ -325,7 +324,7 @@ components and no trailing separator except the filesystem root. It does not fol
 symlinks or replace the locator with current filesystem metadata while hashing.
 The platform independently resolves and pins the directory for admission. Alias
 transitions retain the same original locator so replay recomputes command kind 4.
-PendingInit has implicit expected authority revision 0 and recomputes kind 1.
+PendingInit has implicit expected authority revision 0 and recomputes command kind 1.
 Cancellation has no independent client request ID in the selected wire contract;
 its operation/generation key is idempotent, and only one cancel intent is committed.
 Internal deadline/shutdown cancellation retains its distinct recorded cause.
@@ -343,14 +342,15 @@ include the complete state/result/event obligation described below.
 | 3 OwnerGeneration | no payload | Previous owner generation plus 1; durable before any new dispatch |
 | 4 ProjectRegistered | request ID, request digest, project ID, location string, device u64, inode u64, registry revision u64, visibility u8 | First project revision 1, visibility 1 closed; records original result and pinned association |
 | 9 ProjectRequestAlias | request ID, request digest, original location string, existing project ID, registry revision u64 | Existing same-object association; records idempotent result for a new request without another project |
-| 5 TurnAccepted | request ID, request digest, project ID, original conversation ID optional, expected generation u64, conversation ID, generation u64, task ID, model-operation ID, model string, configuration digest, instructions digest, input digest, prior-operation ID list, prompt string, reserved-output-tokens u32, event cursor u64 | Registry and expected generation verified; atomically creates conversation when needed, accepts task/operation, reserves exactly 512 tokens and records acceptance cursor 1 |
+| 21 TurnAccepted | request ID, request digest, project ID, original conversation ID optional, expected generation u64, conversation ID, generation u64, task ID, model-operation ID, model string, configuration digest, instructions digest, input digest, prior-operation ID list, prompt string, reserved-output-tokens u32, event cursor u64, then the required composition (see [graph memory evolution](graph-memory-evolution.md)) | Registry and expected generation verified; atomically creates conversation when needed, accepts task/operation, reserves exactly 2,048 tokens and records acceptance cursor 1. Kind 5, the earlier form without composition, is removed |
 | 6 StartAuthorized | model-operation ID, conversation generation u64, helper-instance ID, input digest | Accepted operation, no cancel/terminal and same owner generation; one dispatch permit only |
 | 7 CancelRequested | model-operation ID, conversation generation u64, cause u8 | Cause 1 user, 2 deadline, 3 output limit, 4 service shutdown; one intent per operation, existing intent wins |
 | 8 TurnTerminal | model-operation ID, conversation generation u64, terminal kind u8, cause u8, final cursor u64, usage-known u8, output-tokens u32, charged-tokens u32, text string | Kind 1 complete, 2 failed, 3 cancelled, 4 interrupted; only once, helper settled where applicable; terminal task/operation, accounting and final event commit atomically |
 
 Location is at most 4096 UTF-8 bytes. Model identity is at most 1024 bytes. Prompt
-is nonempty and at most 32 KiB. Prior-operation list has at most 32 distinct IDs
-from complete turns in the same conversation. Terminal text is at most 60 KiB.
+is nonempty and at most 32 KiB. The prior-operation list names the complete turns
+in the same conversation that the composition shows; the composition accounts for
+the omitted ones. Terminal text is at most 60 KiB.
 Maximum frame remains 64 KiB including overhead; encode and check the entire
 frame before append. At most 64 registered projects and 256 conversations are
 admitted in this slice. Journal bounds remain 8 MiB and 32,768 frames. At most
@@ -366,7 +366,7 @@ designed here. Until it lands, the limits above apply. No overwrite or deletion 
 Terminal cause values are closed: 0 none, 1 user cancel, 2 deadline, 3 output limit,
 4 service shutdown, 5 provider failure, 6 protocol failure, 7 restart, 8 authority
 failure, 9 input/context limit. Complete requires cause 0, valid terminal metadata and no committed cancel intent.
-A complete response can have unknown usage; it retains the full 512-token charge.
+A complete response can have unknown usage; it retains the full 2,048-token charge.
 Unknown usage requires output-tokens 0 plus usage-known 0; the flag prevents that
 placeholder from being reported as measured zero. Before-start terminal usage is
 known zero. A restart terminal requires interrupted kind and cause 7. Terminal
@@ -398,13 +398,14 @@ No successful recovery or automatic space reclamation is claimed in that case.
    permit under the selected D2 helper contract.
 3. Recheck scope, generation, configuration identity, owner generation and the
    one-active-operation slot. Reserve journal capacity and append TurnAccepted.
-4. Wait for its durable result asynchronously. Only then return ConversationAccepted.
-   Publication uses the accepted operation and conversation identities from that frame.
+4. Wait for its durable result asynchronously. Only then publish the Running
+   queue projection. Publication uses the accepted operation and conversation
+   identities from that frame.
 5. Serialize cancellation against start authorization. Append StartAuthorized and
    wait for durability before delivering its one-use permit to the identified helper.
    Recheck a committed cancel intent before sending the permit. If the selected
    adapter has a native input counter, the helper validates its measured window
-   with 512 output tokens reserved. Otherwise, input usage stays unknown and the
+   with 2,048 output tokens reserved. Otherwise, input usage stays unknown and the
    provider must enforce context overflow under its provider contract.
    A context/counting failure becomes a durable failed terminal with known zero
    output usage when the helper confirms no generation started.
@@ -432,10 +433,10 @@ sequenceDiagram
     participant A as Admission owner
     participant J as Journal worker
     participant H as Model helper
-    C->>A: Submit original request ID and scoped prompt
-    A->>J: TurnAccepted with 512-token reservation
+    C->>A: Queue input with original request ID and scoped prompt
+    A->>J: TurnAccepted with 2,048-token reservation for the dispatch ID
     J-->>A: Durable acceptance
-    A-->>C: ConversationAccepted
+    A-->>C: Running queue projection
     alt Cancel wins before dispatch
         C->>A: Cancel operation and generation
         A->>J: CancelRequested
@@ -483,7 +484,7 @@ volatile revisions. `after_cursor == u64::MAX` returns the same terminal result.
 
 ## Budget and terminal outcomes
 
-The 512-token reservation bounds output generation for this one-operation task.
+The 2,048-token reservation bounds output generation for this one-operation task.
 Input-window accounting is separate and is measured after the durable start permit,
 before generation, as selected by D2. The
 helper limit and reservation use the same value. This packet creates no money
@@ -491,12 +492,12 @@ budget or fabricated provider billing estimate.
 
 | Terminal condition | Charged output tokens | History and recovery |
 | --- | --- | --- |
-| Complete with validated known count 0 through 512 | Actual count; release unused reservation | Complete text becomes history after durable terminal commit |
-| Complete with unknown count | 512, usage unknown | Complete text becomes history after durable terminal commit; no measured usage is invented |
+| Complete with validated known count 0 through 2,048 | Actual count; release unused reservation | Complete text becomes history after durable terminal commit |
+| Complete with unknown count | 2,048, usage unknown | Complete text becomes history after durable terminal commit; no measured usage is invented |
 | Cancel/failure before any StartAuthorized record | 0, usage known | No helper generation was permitted |
-| Started operation with validated known terminal count | Actual count 0 through 512 | Incomplete text excluded from history |
-| Started operation with unknown count, crash or uncertain permit delivery | 512, usage unknown | Full reservation remains charged; never infer zero usage |
-| Count above 512 or invalid terminal metadata | 512, usage unknown and failed result | Protocol failure; no complete-history publication |
+| Started operation with validated known terminal count | Actual count 0 through 2,048 | Incomplete text excluded from history |
+| Started operation with unknown count, crash or uncertain permit delivery | 2,048, usage unknown | Full reservation remains charged; never infer zero usage |
+| Count above 2,048 or invalid terminal metadata | 2,048, usage unknown and failed result | Protocol failure; no complete-history publication |
 
 Retained unknown charges are conservative accounting, not a claim of measured
 usage. Restart cannot restore them to available task budget. A new user turn is
@@ -560,7 +561,7 @@ an old witness and leave permanent `authority_changed` status.
 After successful replay, append and flush OwnerGeneration. Before accepting new
 work, settle every previously nonterminal operation as Interrupted. An operation
 with no durable StartAuthorized record charges zero. A durable start record charges
-512 with unknown usage unless an already committed terminal record supplies usage.
+2,048 with unknown usage unless an already committed terminal record supplies usage.
 Recovery never starts a model, reuses an old permit or appends a second terminal
 for a completed operation. The helper owner must settle any process it can identify
 as still owned before permitting replacement; uncertain child lifetime blocks
@@ -599,7 +600,7 @@ Code changes (commit `41eebfb`):
 | `writer/mod.rs:322-323` | Drops a queued job whose deadline passed | Removed: queued jobs run in order |
 | `conversation/state.rs:1276-1362`, `authority.rs:44-52` | Replay stops with `Timeout` at its deadline | No deadline; the cancel flag still stops it |
 | Queue worker observation, 5 s (`asura-cli/src/tui/queue.rs:112`, `:146`) | Reports uncertainty after 5 s | Waits for the reply; cancel stops the wait |
-| `try_submit_before` callers | Pass caller deadlines into the writer | The caller's own deadline applies only to the caller's wait (for example the L10 tool deadline), never to the writer's work |
+| `try_submit_before` callers | Pass caller deadlines into the writer | The caller's own deadline applies only to the caller's wait, never to the writer's work. The L10 tool deadline was later removed (owner, 2026-10-17) |
 
 Unchanged: the 500 ms queue metadata refresh, a polling cadence that ends
 nothing. The 10 s initialization budget is removed (owner, 2026-10-15).
@@ -642,8 +643,8 @@ These routine refinements apply the owner rule to sites the table did not list:
 
 - **Writer API.** `try_submit_before`, `Ticket::deadline`, the job deadline and
   `writer::Error::Deadline` are removed. `ReplayError::Timeout` and
-  `AuthorityError::Timeout` are removed because nothing produces them. Control
-  validators still accept the `storage_timeout` wire string for compatibility.
+  `AuthorityError::Timeout` are removed because nothing produces them. The
+  `storage_timeout` wire string is no longer accepted (owner, 2026-10-17).
 - **Shutdown cancels replay.** The writer passes its close flag to the
   authority scan, `JournalFile::read_all` and replay. A replay stopped by
   shutdown replies `Cancelled`, not `RepairRequired`.
@@ -671,18 +672,19 @@ These routine refinements apply the owner rule to sites the table did not list:
   shows no loading state. When the writer's replay ends, the conversation
   owner's snapshot applies, or the inspected snapshot returns if it has none
   (`installation::ReplayLoading`). No state is added.
-- **Memory create (HM3).** The caller keeps its tool deadline (L10) for its own
-  wait. When it passes, the caller sets the create's cancel flag, which stops the
+- **Memory create (HM3).** The caller's wait has no deadline; the earlier
+  2 s tool deadline (L10) is removed (owner, 2026-10-17). A turn cancel,
+  steering or shutdown sets the create's cancel flag, which stops the
   cancellable put. The receipt resolution read has no deadline.
 - **Journal-backed client mutations (owner, 2026-10-16).** Initialize, project
-  register and rename, queue enqueue, queue input, reorder and decision, and
+  register and rename, queue input, reorder and decision, and
   conversation cancel have no client response budget. The client checks the
   person's cancel callback every 50 ms; this cadence ends nothing. Cancel or a
   lost connection returns `OutcomeUnconfirmed`, and the attachment then refuses
   further requests. `asura init` and `asura project add` print the request ID
   and progress, and Ctrl-C stops the wait. In the TUI, `/init` and
   `/project add` show progress and `/cancel` stops the wait, as it does for a
-  rename or queue request. Read, config, models, submit, lifecycle and TUI job
+  rename or queue request. Read, config, models, lifecycle and TUI job
   budgets were unchanged in J1-0. A later owner decision (2026-10-16) removes
   them as well: each wait ends on the real reply, the person's cancel or a lost
   connection. Implemented 2026-10-16; see
@@ -746,13 +748,13 @@ stateDiagram-v2
 ## Implementation order and acceptance
 
 Root must integrate this amendment into the canonical recovery design before
-changing journal code. Preserve diagnostic record layouts and fixtures. Public
-inspection validates both supported initialization paths and rejects malformed records.
+changing journal code. Public inspection validates the kind-10 initialization
+path and rejects malformed records and removed kinds.
 No model permit may be enabled before the writer and recovery checks below pass.
 
 1. **CA-A, pure codec/replay:** own canonical storage authority modules and tests.
    Encode/decode the exact format-1 records, validate transitions, reconstruct
-   indexes and preserve format-1 compatibility. No filesystem writes or model calls.
+   indexes within format 1. No filesystem writes or model calls.
 2. **CA-B, platform IO and storage writer:** implement descriptor-held create/open,
    full flush/directory durability, expected-offset append and uncertain settlement.
    Integrate the production graph binding adapter and explicit initialization.
@@ -767,9 +769,9 @@ No model permit may be enabled before the writer and recovery checks below pass.
 
 | Case | Unit | Integration | End-to-end |
 | --- | --- | --- | --- |
-| CA01 format | Header stays 1; distinct initialization kinds; reject unknown versions, kinds and mixed initialization paths | Diagnostic fixtures stay unchanged; conversation file survives reopen and public inspection | Diagnostic installation remains inspectable; missing request authority never triggers silent migration |
+| CA01 format | Header stays 1; first record must be kind 10; reject unknown versions, removed kinds 1, 2, 5 and 12, and other unknown kinds | Kind-10/11 frames from the canonical encoder pass every-byte damage, every-boundary truncation and writer-death checks; conversation file survives reopen and public inspection | A journal that starts with another kind is reported unsupported, never converted |
 | CA02 initialization/project | Original request mapping, identity, revision and visibility | PendingInit/ActiveBinding fault boundaries; pinned directory replacement | Explicit initialize/register/restart resolves original IDs |
-| CA03 admission | Duplicate ID, changed digest, generation mismatch, limits and 512 reservation | Real journal commit before scripted helper permit | Lost acceptance reply and reconnect produce one operation |
+| CA03 admission | Duplicate ID, changed digest, generation mismatch, limits and 2,048 reservation | Real journal commit before scripted helper permit | Lost acceptance reply and reconnect produce one operation |
 | CA04 cancel race | Cancel before/after permit, stale helper, duplicate intent | Gate each append/flush and helper start boundary | Cancel acknowledgement remains distinct from terminal settlement |
 | CA05 completion | Usage limits, provisional/complete distinction, terminal cursor | Kill before/after terminal flush; preserve complete response only after commit | Reconnect displays original complete or interrupted result |
 | CA06 restart | Started versus never-started charge and no re-execution | Real child/service death with durable or incomplete frames | Restart reports Interrupted without another model call |
@@ -798,7 +800,7 @@ They cover:
 - Exclusive journal locking and project directory replacement/symlink refusal.
 - Preservation of an incomplete journal tail.
 - Initialization request replay, registration and guarded turn acceptance.
-- Restart settlement with known zero usage before start and unknown 512-token
+- Restart settlement with known zero usage before start and unknown full-reservation
   charge after a durable start permit.
 - Missing database refusal without creating a replacement database.
 - Snapshot retention backpressure before writes, followed by progress after release.
@@ -816,8 +818,7 @@ boundary, and physical power loss. Successful APFS full-sync calls and normal
 reopen tests do not establish physical power-loss durability. These limits prevent
 a claim that every CA01–CA09 acceptance case is complete.
 
-Diagnostic initialization conversion and external database deployment remain
-outside this slice. Preserve existing evidence and report unavailable capabilities.
+External database deployment remains outside this slice. Preserve existing evidence and report unavailable capabilities.
 Root owns integration, the design index and delivery-plan updates.
 
 ## Packet validation
@@ -874,38 +875,37 @@ Tests retain old generations to prove this backpressure and release them to resu
 
 ## Durable input queue (IQ1)
 
-Status: selected legacy kind-12 input contract, 2026-09-27. The service owns
-its durable records and existing replay. The [managed input queue](managed-input-queue.md)
-supersedes this section's submission and successful-predecessor rules for new
-conversational input. New input uses kind-18 `InputQueuedV2`, including when the
-service is idle. A committed failed or cancelled turn does not hold kind-18 Queue
-successors. Existing kind-12 records retain their original dependency and
-steering meaning; they are not converted into reorderable records. The
-[composer interaction](composer-interactions.md) covers the current client.
-Wire stays 0.1 and journal format stays 1.
+Status: selected input contract, revised 2026-10-17. The service owns its durable
+records and replay. The [managed input queue](managed-input-queue.md) defines
+submission, order, reorder and scheduling. Every queued input is one kind-18
+`InputQueuedV2` record (owner choice “One record”, 2026-10-17), including when
+the service is idle and when the person steers with Ctrl+S. The earlier
+target-bearing kind-12 `InputQueued` record, its digest command kind 12 and the
+`ConversationEnqueue` operation are removed. No compatibility with older journals
+is required (owner, 2026-10-17); replay rejects kind 12 as unsupported. The
+[composer interaction](composer-interactions.md) covers the client. Wire stays
+0.1 and journal format stays 1.
 
 ### Ownership and bounded admission
 
-For kind-12 records, the conversation service owner accepts, orders, dispatches
-and recovers inputs.
+The conversation service owner accepts, orders, dispatches and recovers inputs.
 The existing journal writer alone persists them. Clients retain an unsent draft,
 one unacknowledged request and a service projection. Disconnect never deletes an
 accepted input. Retries reuse the original request ID and exact payload.
 
-A queue input names an existing project, conversation, active operation and
-captured generation. Queue acceptance validates these identities and records the
-prompt before acknowledgement. A stale target rejects without effects. Queue
-order is journal sequence order within the conversation. At most 16 unresolved
-inputs exist across the service, each at most 32 KiB UTF-8. Busy storage rejects
-before acceptance; clients retain text. Existing cancellation capacity remains
+A queue input names its project and either an existing conversation with its
+observed generation or an explicit new conversation. Queue acceptance validates
+these identities and records the prompt before acknowledgement. A stale or
+foreign identity rejects without effects. At most 16 unresolved inputs exist
+across the service, each at most 32 KiB UTF-8. Busy storage rejects before
+acceptance; clients retain text. Existing cancellation capacity remains
 reserved. Each dispatch uses the
-[cancellation-driven turn lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30),
-which replaced the earlier 60-second model deadline. It keeps the current output
-reservation and one active operation limit.
+[cancellation-driven turn lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30).
+It keeps the current output reservation and one active operation limit.
 
-InputQueued stores its original request/digest, a fresh internal dispatch request
-ID, project, conversation, target operation/generation, optional previous queued
-input ID, kind (Queue or Steer), prompt and frame sequence. Internal dispatch IDs
+InputQueuedV2 stores its original request/digest, a service-generated input ID,
+a fresh internal dispatch request ID, project, conversation, expected generation,
+new-conversation flag, prompt and initial order revision. Internal dispatch IDs
 cannot collide with any request or another queued dispatch ID. Acceptance creates
 no model operation or token reservation. TurnAccepted for the internal dispatch
 ID establishes dispatch atomically and remains subject to canonical admission.
@@ -918,28 +918,28 @@ metadata entries with 256-byte UTF-8-safe excerpts; one-input inspection returns
 its bounded full text. A frame remains limited by the existing 64 KiB contract.
 Queue projection reads cannot wait on filesystem or inference in the reactor.
 
-### Dependencies, steering and recovery
+### Order, steering and recovery
 
-A Queue input depends on the last unresolved Queue input in its conversation, or
-its captured active operation when no such input exists. Dispatch requires the
-dependency to complete successfully. Failure, cancellation, interruption, dropped
-predecessor or preparation failure holds the input. Held inputs do not run until
-an explicit Resume command commits. Resume bypasses that input's failed dependency;
-its successors still depend on its eventual successful result. Drop commits a
-terminal queue decision and never deletes the retained prompt or rewrites history.
+Within a conversation lane, the durable order revision and order positions
+define dispatch order; the [managed queue](managed-input-queue.md#scheduling-dependency-and-steering)
+owns that rule. A committed failed or cancelled turn settles its operation; queued
+successors stay Queued. Interruption after owner restart, preparation failure or
+an explicit Hold holds an input. Held inputs do not run until an explicit Resume
+commits. Drop commits a terminal queue decision and never deletes the retained
+prompt or rewrites history.
 
 Steer uses an explicit cancel-and-replace boundary in this first model adapter.
+An input becomes Steer only through IQ2 promotion of an accepted kind-18 input.
 Its presentation says that active generation will stop and restart with the
 instruction. It does not claim to modify running inference. Only one unresolved
-Steer may target an operation. Durable acceptance precedes cancellation. The owner
+Steer may target an operation. Durable promotion precedes cancellation. The owner
 fences output and uses existing cancellation/settlement before replacement.
 The replacement prompt includes the original user prompt and the new instruction;
 it excludes incomplete assistant output. Their combined UTF-8 size must fit 32 KiB,
-or steering rejects before cancellation. A Steer is eligible only after its exact
+or promotion rejects before cancellation. A Steer is eligible only after its exact
 target is durably Cancelled by that steering request. Restart, unrelated user
-cancellation, service shutdown or failed settlement holds it instead. Legacy
-kind-12 follow-ups affected by that cancellation remain Held for explicit review.
-Kind-18 Queue successors follow the managed queue design.
+cancellation, service shutdown or failed settlement holds it instead. Queue
+successors in the lane keep their durable order behind the promoted replacement.
 
 The journal records InputDecision with Hold for preparation failure, or Resume/Drop
 for explicit recovery. Decisions have unique request IDs and canonical digests; exact retries
@@ -960,57 +960,52 @@ the conversation owner's serialized ticket; the reactor continues Inspect, helpe
 signals and cancellation. Scheduler work per reactor cycle is one bounded queue
 transition. Queue projections are immutable bounded results; client workers send
 RPCs and publish results through bounded mailboxes. A separate one-slot queue
-worker permits enqueue while the conversation worker observes execution. It
+worker permits queue input while the conversation worker observes execution. It
 waits for the real reply with no observation deadline; cancel stops the wait,
 and a second queue request while one is in flight gets `busy` (J1-0). Queue
 metadata refresh uses a 500 ms interval, a polling cadence that ends nothing, with no RPC
 in rendering and no claim of server-push delivery. Rendering performs no RPC,
 filesystem call, database call, blocking receive or producer-lock wait.
 
-The historical kind-12 client showed Pending until durable acknowledgement, then
-Queued, Steering pending, Running, Complete, Held or Dropped from service state.
-New drafts could not be cleared by late acknowledgements. The current
-[composer design](composer-interactions.md) and [managed queue](managed-input-queue.md)
-define all-input staging, queue presentation and promotion. A stale kind-12
-target retains text and requires a fresh action. /queue lists service state;
-/queue resume
-ID and /queue drop ID operate on exact retained identities. /retry retains request
-identity; /cancel retains the current operation's existing semantics.
+The [composer design](composer-interactions.md) and [managed queue](managed-input-queue.md)
+define all-input staging, queue presentation and promotion. /queue lists service
+state; /queue resume ID and /queue drop ID operate on exact retained identities.
+/retry retains request identity; /cancel retains the current operation's
+existing semantics.
 
 ### Command and scheduler outcomes
 
 Selected flow. Arrows are decisions or durable transitions; no arrow bypasses
-canonical service admission.
+canonical service admission. Ctrl+S adds a promotion request after this flow
+acknowledges the input (see [IQ2](#existing-input-promotion-iq2)).
 
 ```mermaid
 flowchart TD
-    Input["Queue or Steer with captured target"] --> Validate{"Identity and bounds valid?"}
+    Input["Queue input: project, conversation, generation, text"] --> Validate{"Identity and bounds valid?"}
     Validate -->|No| Reject["Reject and retain client text"]
     Validate -->|Yes| Prior{"Request already recorded?"}
     Prior -->|"Same digest"| Ack["Return original durable result"]
     Prior -->|"Changed digest"| Reject
-    Prior -->|No| Capacity{"Target active and capacity available?"}
+    Prior -->|No| Capacity{"Known lane and capacity available?"}
     Capacity -->|No| Reject
-    Capacity -->|Yes| Persist["Append InputQueued and flush"]
+    Capacity -->|Yes| Persist["Append InputQueuedV2 (kind 18) and flush"]
     Persist -->|"Uncertain or failed"| Fence["Fence scheduling and retain request identity"]
     Persist -->|Durable| Ack
 ```
 
-Selected legacy kind-12 scheduler flow. Durable queue records supply work;
-clients do not dispatch. Kind-18 Queue inputs follow the managed queue design.
+Selected scheduler flow. Durable queue records supply work; clients do not dispatch.
 
 ```mermaid
 flowchart TD
-    Ack["Durable queued input"] --> Kind{"Steer?"}
+    Ack["Durable queued input"] --> Kind{"Promoted to Steer?"}
     Kind -->|Yes| Cancel["Fence and settle exact active generation"]
-    Kind -->|No| Wait["Wait for successful dependency"]
+    Kind -->|No| Head{"Lane head and service idle?"}
     Cancel --> Settled{"Steering cancellation settled?"}
     Settled -->|Yes| Prepare["Resolve current history and admit replacement"]
     Settled -->|"No or restart"| Held["Held until explicit review"]
-    Wait --> Outcome{"Dependency outcome"}
-    Outcome -->|Success| Prepare
-    Outcome -->|"Failure or cancellation"| Held
-    Outcome -->|Pending| Wait
+    Head -->|No| WaitHead["Wait for earlier lane inputs or active turn to settle"]
+    WaitHead --> Head
+    Head -->|"Yes, not Held"| Prepare
     Prepare -->|Failure| Held
     Prepare -->|"TurnAccepted durable"| Run["Run once under existing model lifecycle"]
 ```
@@ -1034,13 +1029,14 @@ flowchart TD
 
 ### Required validation
 
-IQ01 codec/replay unit tests cover record bounds, dependency identities, duplicate
+IQ01 codec/replay unit tests cover record bounds, lane identities, duplicate
 requests, changed digests, dispatch association, capacity and invalid transitions.
+They also prove that kind 12 is rejected as an unsupported kind.
 IQ02 real journal integration tests cover queued acceptance/reopen, owner restart,
 held text, exact decision retries and one dispatch across lost acknowledgement.
-IQ03 service process tests cover FIFO successful execution, concurrent clients,
+IQ03 service process tests cover in-order execution, concurrent clients,
 stale target rejection, overload, steering commit-before-cancel and helper settlement.
-IQ04 terminal tests cover default queue, selection-based promotion, pending acknowledgement, retained
+IQ04 terminal tests cover default queue, Ctrl+T and Ctrl+S staging, selection-based promotion, pending acknowledgement, retained
 new draft, queue projection, resume/drop and reconnect. No synthetic fixture alone
 proves production scheduling. IQ05 stalled storage/helper tests retain responsive
 Inspect/cancel/input with a 100 ms target; uncertain work must not lose its owner.
@@ -1080,7 +1076,7 @@ Status: implemented and extended by the [managed queue](managed-input-queue.md).
 The composer queues new text
 without a choice dialog. Selecting an accepted queued input can send it now.
 The service changes that same input to Steer; clients must not copy its prompt or
-combine Drop and Enqueue. IQ1 bounds, transport, ownership and settlement apply.
+combine Drop and a second queue input. IQ1 bounds, transport, ownership and settlement apply.
 Protocol remains 0.1 and the journal remains format 1.
 
 `ConversationQueueDecision.action = 3` requests promotion. It includes the input
@@ -1088,23 +1084,32 @@ ID, a fresh stable request ID, and the observed active operation ID and generati
 (fields 4 and 5). Resume and Drop omit these target fields. Exact retries return
 the original result; a changed target or input under the same request ID conflicts.
 
-The writer requires an undispatched Queue input in Queued or Held state, the exact active
+The writer requires an undispatched kind-18 Queue input in Queued or Held state, the exact active
 operation in that input's conversation and project, and no existing Steer for that
 operation. A completed, cancelled, changed or dispatched target rejects without
 cancellation. The writer reads the retained prompt through its existing bounded
 record reader and verifies the combined steering prompt fits 32 KiB. It validates
 the project identity, then commits one InputPromoted record (kind 16). That record
 retains the original input and dispatch identities, prompt frame and sequence. It
-changes the effective kind and target and removes the promoted input's predecessor.
-The original enqueue request remains retryable with its original digest.
-The [managed queue](managed-input-queue.md) extends promotion to kind-18 inputs.
-It preserves this exact-target, same-input, durable-before-cancel contract. An
-idle Send now instead moves a kind-18 input to the front by durable reorder.
+changes the effective kind and target. The original queue request remains
+retryable with its original digest. An idle Send now instead moves the input to
+the front by durable reorder.
+
+Ctrl+S uses the same promotion. The TUI first queues the draft as a kind-18 input.
+When the durable receipt arrives and the captured target operation is still
+active, it sends action 3 for the accepted input and that exact target. If the
+target is no longer active, it sends no promotion; the input stays Queued in lane
+order and the notice says so. A stale-target rejection also leaves it Queued.
+
+Correction (2026-10-17): the writer previously read the input's record as kind 12
+and returned `repair_required` for a kind-18 input, so Send now failed during an
+active turn. The writer reads the kind-18 record. Regression case IQ2-R1 covers
+it at the writer unit, service integration and PTY journey layers.
 
 The service detects the committed Steer through the existing scheduling path.
 Only then may it cancel the active generation. Existing output fencing and helper
-settlement precede replacement dispatch. Other queue dependencies remain unchanged;
-inputs affected by cancellation become Held. An explicit promotion clears the
+settlement precede replacement dispatch. Other queued inputs keep their lane
+order behind the replacement. An explicit promotion clears the
 selected input's Held state. Restart holds undispatched promotion,
 and an uncertain append prevents scheduling. No new reactor I/O, worker, retry loop
 or queue is introduced: the eight-slot writer and 16-input limit remain
@@ -1144,6 +1149,14 @@ flowchart TD
   cancellation and replacement completion, then verifies one input and one dispatch.
   TUI tests cover default queue, selection, pending acknowledgement, draft retention,
   project fencing and responsive navigation while the mutation is pending.
+- IQ2-R1 regression: with a turn active, a queued kind-18 input is promoted by
+  Send now (action 3). Required: one InputPromoted record, target cancellation and
+  one replacement dispatch; never `repair_required`. Evidence: writer unit test,
+  service integration test and a PTY journey.
+- IQ2-S1 Ctrl+S: with a turn active, Ctrl+S stages the draft, the kind-18 receipt
+  arrives, then action 3 names that input and target. Required: one kind-18 record
+  and one kind-16 record, then replacement. If the target settled first, the input
+  stays Queued and no promotion is sent. Evidence: TUI unit tests and the PTY journey.
 
 ### IQ2 history-baseline correction
 
@@ -1154,15 +1167,14 @@ same-conversation generation. The separate [conversation restoration read](conve
 selects the latest accepted conversation from the journal. The
 [composer history baseline](composer-interactions.md#queue-history-and-the-active-conversation-cursor)
 defines bounded eligibility tracking for new/live completions across reconnects.
-Service admission still rejects a stale expected generation for direct legacy
-submission. The [managed queue](managed-input-queue.md) permits lagging observed
-generation in a known conversation lane while using current generation at dispatch.
+The [managed queue](managed-input-queue.md) permits a lagging observed generation
+in a known conversation lane while using the current generation at dispatch.
 This historical baseline correction itself did not change journal records or
 stored user data.
 
 ```mermaid
 flowchart LR
-    History[Legacy queued turn completed at generation 3] --> Later[Historical direct turn advances conversation to 4]
+    History[Queued turn completed at generation 3] --> Later[Later turn advances conversation to 4]
     Later --> Launch[Fresh client receives historical queue entry]
     Launch --> Baseline[Mark terminal entry as baseline history]
     Launch --> Read[Read latest accepted conversation from journal]
@@ -1173,7 +1185,7 @@ flowchart LR
 ```
 
 The historical validation fixture includes the generation-2 target,
-generation-3 queued completion and generation-4 later direct turn. Revised
+generation-3 queued completion and generation-4 later turn. Revised
 queue-first validation must cover live transitions and provisional lanes.
 
 Historical verification on 2026-09-28: the normal CLI lifecycle suite passed the

@@ -74,7 +74,7 @@ private func pair() throws -> (Transport, Transport) {
 private func hello(_ identity: Data) -> Envelope {
     var value = Asura_Model_V1_Hello()
     value.buildID = identity; value.schemaDigest = identity; value.maxFrameBytes = 65_536
-    value.availability = .unknown; value.capabilities = 0; value.reason = .none
+    value.availability = .unknown; value.reason = .none; value.selectedModel = "system"
     var frame = Envelope(); frame.body = .hello(value); return frame
 }
 private func availableHello(selector: String, capacity: UInt32, reported: UInt32,
@@ -85,7 +85,6 @@ private func availableHello(selector: String, capacity: UInt32, reported: UInt32
     value.maxFrameBytes = 65_536
     value.selectedModel = selector
     value.availability = .available
-    value.capabilities = 1
     value.reason = .none
     value.contextTokens = capacity
     value.reportedContextTokens = reported
@@ -142,7 +141,7 @@ private func outputCredit(_ id: UInt64) -> Envelope {
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = UInt64(data.count); begin.deadlineRemainingMs = 2_000; begin.maxResponseTokens = 512
+    begin.inputBytes = UInt64(data.count); begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin)))
     #expect(try Wire.decode(#require(try await replies.next())).credit.transferID == 1)
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
@@ -301,7 +300,7 @@ private func outputCredit(_ id: UInt64) -> Envelope {
     try await service.send(hello(identity))
     _ = try await replies.next()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = 20
-    begin.deadlineRemainingMs = 2_000; begin.maxResponseTokens = 512
+    begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin)))
     _ = try await replies.next()
     var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
@@ -338,7 +337,7 @@ private actor Burst: ModelBackend {
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    begin.deadlineRemainingMs = 2_000; begin.maxResponseTokens = 512
+    begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -373,9 +372,9 @@ private actor Burst: ModelBackend {
     await running.value
 }
 
-/// HW-03: a supplied `deadline_remaining_ms` arms no timer; a stalled
-/// generation runs past it and ends only on cancellation.
-@Test func suppliedGenerationDeadlineArmsNoTimerAndCancelEndsStall() async throws {
+/// HW-03: Begin carries no time bound; a stalled generation arms no timer
+/// and ends only on cancellation.
+@Test func stalledGenerationArmsNoTimerAndCancelEndsStall() async throws {
     let (helper, service) = try pair()
     defer { helper.close(); service.close() }
     let identity = Data(repeating: 1, count: 32)
@@ -389,7 +388,7 @@ private actor Burst: ModelBackend {
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    begin.deadlineRemainingMs = 100; begin.maxResponseTokens = 512
+    begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -402,7 +401,7 @@ private actor Burst: ModelBackend {
         guard ContinuousClock.now < limit else { throw HelperError.timeout }
         await Task.yield()
     }
-    // Past the supplied 100 ms: no timer was armed and generation continues.
+    // No timer was armed and generation continues while stalled.
     try await Task.sleep(for: .milliseconds(300))
     #expect(await timers.count() == 0)
     #expect(!(await backend.cancelled))
@@ -439,7 +438,7 @@ private struct UnsolicitedCancellationBackend: ModelBackend {
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    begin.deadlineRemainingMs = 2_000; begin.maxResponseTokens = 512
+    begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -479,8 +478,6 @@ func backendFailureDrainsBoundedSnapshotsOrStopsAtExistingBoundary(_ action: Str
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    // Supplied but ignored: it arms no timer (owner, 2026-10-16).
-    begin.deadlineRemainingMs = 500
     begin.maxResponseTokens = 2048
     let clock = ContinuousClock(); let started = clock.now
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
@@ -609,18 +606,37 @@ private actor CancellableGeneration: ModelBackend {
     #expect(await backend.cancelled)
 }
 
-@Test func beginDeadlineIsOptionalButExplicitValuesRemainBounded() throws {
+/// Begin has no deadline field; the removed field 3 is an unknown field.
+@Test func beginCarriesNoDeadlineAndRemovedFieldIsRejected() throws {
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
     begin.inputBytes = 10; begin.maxResponseTokens = 512
     try Wire.validate(scoped(.begin(begin)), from: .service)
-    for valid in [UInt32(1), 60_000] {
-        begin.deadlineRemainingMs = valid
-        try Wire.validate(scoped(.begin(begin)), from: .service)
-    }
-    for invalid in [UInt32(0), 60_001] {
-        begin.deadlineRemainingMs = invalid
-        #expect(throws: HelperError.self) { try Wire.validate(scoped(.begin(begin)), from: .service) }
-    }
+    var raw = try begin.serializedData(); raw.append(contentsOf: [0x18, 0xd0, 0x0f])
+    let stale = try Asura_Model_V1_Begin(serializedBytes: raw)
+    #expect(throws: HelperError.self) { try Wire.decode(scoped(.begin(stale)).serializedData(), from: .service) }
+}
+
+/// selected_model is required in every Hello; there is no "system" default.
+@Test func helloWithoutSelectedModelIsRejected() async throws {
+    var value = Asura_Model_V1_Hello()
+    let identity = Data(repeating: 1, count: 32)
+    value.buildID = identity; value.schemaDigest = identity; value.maxFrameBytes = 65_536
+    value.availability = .unknown; value.reason = .none
+    var frame = Envelope(); frame.body = .hello(value)
+    #expect(throws: HelperError.self) { try Wire.validate(frame, from: .service) }
+    value.selectedModel = "system"; frame.body = .hello(value)
+    try Wire.validate(frame, from: .service)
+    // The session also refuses a service Hello lacking the selector.
+    let (helper, service) = try pair()
+    defer { helper.close(); service.close() }
+    let session = HelperSession(transport: helper, backend: CancellableGeneration(), buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    value.clearSelectedModel(); frame.body = .hello(value)
+    try? await service.send(frame)
+    var replies = service.frames.makeAsyncIterator()
+    let reply = (try? await replies.next()) ?? nil
+    #expect(reply == nil)
+    await running.value
 }
 
 /// HW-01/HW-02: a stalled transfer or Ready-to-Start handoff stays pending
@@ -693,7 +709,7 @@ func lateInputMeasurementPreservesOutputAndRejectsDuplicate(_ duplicate: Bool) a
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = UInt64(data.count); begin.deadlineRemainingMs = 2_000; begin.maxResponseTokens = 512
+    begin.inputBytes = UInt64(data.count); begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin)))
     #expect(try Wire.decode(#require(try await replies.next())).credit.transferID == 1)
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input

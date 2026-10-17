@@ -467,7 +467,8 @@ fn finder_metadata_exception_does_not_accept_other_unknown_names() {
 #[test]
 fn authority_reads_exact_bytes_and_preserves_known_model_areas() {
     let root = Scratch::new();
-    let bytes = include_bytes!("../../asura-storage/tests/fixtures/pending.bin");
+    // The scanner preserves exact bytes; it never decodes records.
+    let bytes = b"ASURAJ01 exact authority bytes";
     let runtime = authority_fixture(&root, bytes);
     fs::DirBuilder::new()
         .mode(0o700)

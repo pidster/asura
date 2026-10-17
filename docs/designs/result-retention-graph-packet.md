@@ -130,9 +130,8 @@ observed counts, missing counts when known and a closed loss reason.
 Unknown emitted bytes must remain unknown. Never reconstruct them from tails.
 
 Retain contiguous prefixes when capture stops; do not concatenate a prefix and
-tail as if there were no gap. Existing tail previews may remain in the ToolResult
-for compatibility. Their descriptor labels them `legacy_tail` or `partial`, with
-`complete_capture=false`. Old output cannot be recovered retrospectively.
+tail as if there were no gap. A tail preview in the ToolResult is labelled
+`partial`, with `complete_capture=false`.
 
 Proposed path shape:
 `$HOME/.asura/sessions/<artifact-set-id>/objects/<payload-id>`.
@@ -545,7 +544,8 @@ user backend or initialize account state as test setup.
    ([job retained output lifetime](tool-job-controller.md#retained-output-lifetime)).
 2. **Journal compatibility:** select exact descriptor, reservation, projection and
    deletion record shapes within format 1, including terminal-capacity accounting.
-   Older binaries must reject unsupported required records safely. Resolved for
+   Replay rejects records it does not recognize; no compatibility with older
+   binaries is required (owner, 2026-10-17). Resolved for
    item 3 by R3 (owner, 2026-10-14): new kinds allocated in delivery order; the
    job controller's [durable records](tool-job-controller.md#durable-records) list
    them. Projection records remain open with item 4.

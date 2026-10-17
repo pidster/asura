@@ -6,7 +6,6 @@ fn request() -> ExecCmdRequest {
         job_id: [7; 16],
         command: "printf ok".into(),
         cwd: None,
-        deadline: None,
         secrets: Vec::new(),
     }
 }
@@ -285,7 +284,7 @@ fn spawn_rejects_replaced_project_and_retains_scratch() {
 }
 #[test]
 fn guardian_normal_invocation_without_private_descriptors_fails_closed() {
-    assert_eq!(run_guardian("not-a-job", "0", "printf no"), 1);
+    assert_eq!(run_guardian("not-a-job", "printf no"), 1);
 }
 
 #[test]
@@ -343,7 +342,6 @@ fn notice_fixture() -> (ExecCmdJob, std::os::fd::OwnedFd) {
                 room: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(512 * 1024)),
                 ..TestSink::default()
             }),
-            deadline: None,
             stop: None,
             cleanup: None,
             job_id: [7; 16],
@@ -432,18 +430,16 @@ fn j1t_07_no_output_limit_producer() {
     assert_ne!(job.stop, Some(StopReason::OutputLimit));
     assert!(job.stop.is_none() || job.fault);
 }
-/// J1T-05/J1T-06 unit: with no deadline, setup and poll check only
-/// cancellation; a deadline remains only for qualification.
+/// J1T-05/J1T-06 unit: setup and poll check only cancellation; there is
+/// no request deadline and no guardian reason 1.
 #[test]
 fn j1t_05_no_deadline_checks_cancel_only() {
     let cancel = AtomicBool::new(false);
-    assert_eq!(check(None, &cancel), Ok(()));
-    let past = Instant::now() - Duration::from_secs(1);
-    assert_eq!(check(Some(past), &cancel), Err(ExecCmdError::Deadline));
+    assert_eq!(check(&cancel), Ok(()));
     cancel.store(true, Ordering::Release);
-    assert_eq!(check(None, &cancel), Err(ExecCmdError::Cancelled));
+    assert_eq!(check(&cancel), Err(ExecCmdError::Cancelled));
     let (mut job, _write) = notice_fixture();
     job.lease = None;
     let _ = job.poll(Instant::now() + Duration::from_secs(3600));
-    assert_ne!(job.stop, Some(StopReason::Deadline));
+    assert_ne!(job.stop, Some(StopReason::OutputLimit));
 }

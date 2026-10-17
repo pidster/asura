@@ -96,7 +96,6 @@ pub(crate) fn reply(v: &pb::SensorsReply) -> bool {
                 | "project_overlaps_asura_state"
                 | "model_unavailable"
                 | "capacity_exhausted"
-                | "storage_timeout"
                 | "cancelled"
                 | "invalid_request"
         ) && v.project_id.is_none()

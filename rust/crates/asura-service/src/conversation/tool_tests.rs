@@ -17,7 +17,6 @@ impl Fixture {
             .create(&path)
             .unwrap();
         let runtime = RuntimeDirectory::scratch(&path, true).unwrap();
-        let now = Instant::now();
         let turn = journal::TurnAccepted {
             request: [1; 16],
             digest: [2; 32],
@@ -34,9 +33,9 @@ impl Fixture {
             input_digest: [9; 32],
             prior_operations: vec![],
             prompt: "observe status".into(),
-            reserved_output_tokens: 512,
+            reserved_output_tokens: 2048,
             event_cursor: 1,
-            composition: None,
+            composition: journal::Composition::default(),
         };
         let call = tools::Call {
             operation: turn.operation,
@@ -44,20 +43,18 @@ impl Fixture {
             ordinal: 1,
             arguments: tools::Arguments::ObserveStatus,
         };
-        let mut budget = tools::Budget::new(now + Duration::from_secs(60));
+        let mut budget = tools::Budget::cancellation_driven();
         budget
             .reserve(
                 call.clone(),
                 &tool_grant(&turn, true),
                 &tools::Destination::Local,
-                now,
             )
             .unwrap();
         let active = Active {
             foreground_user: true,
             queue_input: None,
             person_held: false,
-            request: None,
             turn,
             input: vec![],
             candidates: Vec::new(),
@@ -92,7 +89,6 @@ impl Fixture {
                 memory_ticket: None,
                 rejected: false,
                 call,
-                deadline: Some(now + Duration::from_secs(2)),
                 intent_committed: false,
                 dispatched: false,
                 result: None,
@@ -215,16 +211,12 @@ fn cancellation_after_intent_produces_failed_result_without_capture_or_delivery(
 }
 
 #[test]
-fn result_acknowledgement_after_cancel_or_deadline_never_delivers() {
-    for expired in [false, true] {
+fn result_acknowledgement_after_cancel_never_delivers() {
+    for cause in [journal::Cause::UserCancel, journal::Cause::Steering] {
         let mut fixture = Fixture::new();
         let result = fixture.stage_result();
         let active = fixture.owner.active.as_mut().unwrap();
-        if expired {
-            active.tool.as_mut().unwrap().deadline = Some(Instant::now());
-        } else {
-            active.cancel = Some(journal::Cause::UserCancel);
-        }
+        active.cancel = Some(cause);
         fixture.acknowledge(Job::ToolResult);
         let active = fixture.owner.active.as_ref().unwrap();
         assert!(
@@ -449,7 +441,7 @@ fn status_capture_does_not_return_before_sensor_commit() {
 fn helper_settlement_cancellation_preserves_first_service_failure() {
     for (message, cause) in [
         ("model_protocol_fault", journal::Cause::ProtocolFailure),
-        ("model_timeout", journal::Cause::Deadline),
+        ("model_unavailable", journal::Cause::ProviderFailure),
     ] {
         let mut fixture = Fixture::new();
         let active = fixture.owner.active.as_mut().unwrap();
@@ -503,14 +495,13 @@ fn invalid_semantic_path_is_durable_rejection_not_host_dispatch() {
             },
         )
         .unwrap();
-        active.tool_budget = tools::Budget::new(now + Duration::from_secs(60));
+        active.tool_budget = tools::Budget::cancellation_driven();
         active
             .tool_budget
             .reserve_rejected(
                 call.clone(),
                 &tool_grant(&active.turn, active.foreground_user),
                 &tools::Destination::Local,
-                now,
             )
             .unwrap();
         let result = tool_result(
@@ -529,7 +520,6 @@ fn invalid_semantic_path_is_durable_rejection_not_host_dispatch() {
             memory_ticket: None,
             rejected: true,
             call,
-            deadline: Some(now + Duration::from_secs(2)),
             intent_committed: false,
             dispatched: false,
             result: Some(result.clone()),
@@ -658,10 +648,12 @@ fn memory_intent_kinds_are_explicit_and_rejections_never_dispatch() {
     assert!(tool.memory_ticket.is_none());
     assert_eq!(tool.result.as_ref().unwrap().status, 3);
 }
+/// MT-D1: a stalled non-exec tool has no time bound. Long after the
+/// removed two-second limit it still waits; only cancel ends it.
 #[test]
-fn memory_cancel_and_deadline_suppress_late_data_and_preserve_slot() {
+fn stalled_memory_read_waits_without_a_timer_and_ends_on_cancel() {
     let mut fixture = Fixture::new();
-    let now = Instant::now();
+    let (ticket, controller) = writer::test_support::controlled_ticket(false);
     let active = fixture.owner.active.as_mut().unwrap();
     let tool = active.tool.as_mut().unwrap();
     tool.call.arguments = tools::Arguments::MemoryGetNote {
@@ -671,47 +663,31 @@ fn memory_cancel_and_deadline_suppress_late_data_and_preserve_slot() {
     };
     tool.intent_committed = true;
     tool.dispatched = true;
-    tool.deadline = Some(now);
-    fixture.owner.capture_memory_tool(now);
-    let active = fixture.owner.active.as_mut().unwrap();
-    assert_eq!(
-        active
-            .tool
-            .as_ref()
-            .unwrap()
-            .result
-            .as_ref()
-            .unwrap()
-            .status,
-        5
-    );
+    tool.memory_ticket = Some(ticket);
+    let later = Instant::now() + Duration::from_secs(3600);
+    fixture.owner.capture_memory_tool();
+    fixture.owner.drive(later);
+    let active = fixture.owner.active.as_ref().unwrap();
+    assert!(active.tool.as_ref().unwrap().result.is_none());
+    assert!(active.terminal.is_none());
+    assert_ne!(active.failure_reason, Some("model_timeout"));
+    // No tool timer is scheduled for the stalled read.
     assert!(
-        active
-            .tool_budget
-            .reserve(
-                active.tool.as_ref().unwrap().call.clone(),
-                &tool_grant(&active.turn, active.foreground_user),
-                &tools::Destination::Local,
-                now
-            )
-            .is_err()
+        fixture
+            .owner
+            .next_deadline(later)
+            .is_none_or(|deadline| deadline > later)
     );
-    active.cancel = Some(journal::Cause::UserCancel);
-    active.tool.as_mut().unwrap().deadline = Some(now + Duration::from_secs(1));
-    fixture.owner.capture_memory_tool(now);
-    let result = fixture
-        .owner
-        .active
-        .as_ref()
-        .unwrap()
-        .tool
-        .as_ref()
-        .unwrap()
-        .result
-        .as_ref()
-        .unwrap();
+    fixture.owner.active.as_mut().unwrap().cancel = Some(journal::Cause::UserCancel);
+    fixture.owner.capture_memory_tool();
+    let active = fixture.owner.active.as_ref().unwrap();
+    let tool = active.tool.as_ref().unwrap();
+    let result = tool.result.as_ref().unwrap();
     assert_eq!(result.status, 6);
     assert!(result.text.is_empty());
+    // The writer slot stays held until its job settles.
+    assert!(!tool.memory_ticket.as_ref().unwrap().is_settled());
+    controller.finish();
 }
 
 pub(super) fn memory_reply() -> writer::Reply {
@@ -772,11 +748,10 @@ fn memory_response_does_not_release_slot_before_worker_settles() {
             tool.call.clone(),
             &tool_grant(&active.turn, active.foreground_user),
             &tools::Destination::Local,
-            now,
         )
         .unwrap();
     assert!(controller.publish(Ok(memory_reply())));
-    fixture.owner.capture_memory_tool(now);
+    fixture.owner.capture_memory_tool();
     fixture.owner.drive(now);
     let active = fixture.owner.active.as_ref().unwrap();
     let tool = active.tool.as_ref().unwrap();
@@ -816,7 +791,7 @@ fn memory_response_does_not_release_slot_before_worker_settles() {
     );
 }
 #[test]
-fn unsettled_memory_timeout_or_steering_never_delivers_late_body() {
+fn unsettled_memory_cancel_or_steering_never_delivers_late_body() {
     for steering in [false, true] {
         let mut fixture = Fixture::new();
         let now = Instant::now();
@@ -831,24 +806,19 @@ fn unsettled_memory_timeout_or_steering_never_delivers_late_body() {
         tool.intent_committed = true;
         tool.dispatched = true;
         tool.memory_ticket = Some(ticket);
-        tool.deadline = Some(if steering {
-            now + Duration::from_secs(2)
+        active.cancel = Some(if steering {
+            journal::Cause::Steering
         } else {
-            now
+            journal::Cause::UserCancel
         });
-        if steering {
-            active.cancel = Some(journal::Cause::Steering);
-        }
-        if steering {
-            install_recorded_memory_cancel(&mut fixture);
-        }
+        install_recorded_memory_cancel(&mut fixture);
         assert!(controller.publish(Ok(memory_reply())));
-        fixture.owner.capture_memory_tool(now);
+        fixture.owner.capture_memory_tool();
         fixture.owner.drive(now);
         let active = fixture.owner.active.as_ref().unwrap();
         let tool = active.tool.as_ref().unwrap();
         let result = tool.result.as_ref().unwrap();
-        assert_eq!(result.status, if steering { 6 } else { 5 });
+        assert_eq!(result.status, 6);
         assert!(result.text.is_empty());
         assert!(!tool.memory_ticket.as_ref().unwrap().is_settled());
         assert!(fixture.owner.pending.is_none());
@@ -902,7 +872,7 @@ fn install_recorded_memory_cancel(fixture: &mut Fixture) {
     replay.operations.insert(
         active.turn.operation,
         journal::Operation {
-            reserved_output_tokens: 512,
+            reserved_output_tokens: 2048,
             conversation: active.turn.conversation,
             generation: active.turn.generation,
             task: active.turn.task,
@@ -930,7 +900,6 @@ fn inventory_fixture() -> Fixture {
             tool.call.clone(),
             &tool_grant(&active.turn, active.foreground_user),
             &tools::Destination::Local,
-            Instant::now(),
         )
         .unwrap();
     fixture
@@ -947,7 +916,7 @@ fn inventory_requires_durable_intent_and_result_without_host_or_database_executi
         .as_mut()
         .unwrap()
         .dispatched = true;
-    fixture.owner.capture_inventory_tool(Instant::now());
+    fixture.owner.capture_inventory_tool();
     assert!(
         fixture
             .owner
@@ -961,7 +930,7 @@ fn inventory_requires_durable_intent_and_result_without_host_or_database_executi
             .is_none()
     );
     fixture.acknowledge(Job::ToolIntent);
-    fixture.owner.capture_inventory_tool(Instant::now());
+    fixture.owner.capture_inventory_tool();
     let active = fixture.owner.active.as_ref().unwrap();
     let tool = active.tool.as_ref().unwrap();
     assert_eq!(tool_intent(&tool.call, false).kind, 14);
@@ -994,8 +963,8 @@ fn inventory_requires_durable_intent_and_result_without_host_or_database_executi
     );
 }
 #[test]
-fn inventory_obeys_cancellation_deadline_and_disabled_tool_fences() {
-    for status in [6, 5, 2] {
+fn inventory_obeys_cancellation_and_disabled_tool_fences() {
+    for status in [6, 2] {
         let mut fixture = inventory_fixture();
         fixture.acknowledge(Job::ToolIntent);
         let active = fixture.owner.active.as_mut().unwrap();
@@ -1003,11 +972,10 @@ fn inventory_obeys_cancellation_deadline_and_disabled_tool_fences() {
         tool.dispatched = true;
         match status {
             6 => active.cancel = Some(journal::Cause::UserCancel),
-            5 => tool.deadline = Some(Instant::now()),
             2 => active.tools_enabled = false,
             _ => unreachable!(),
         }
-        fixture.owner.capture_inventory_tool(Instant::now());
+        fixture.owner.capture_inventory_tool();
         let active = fixture.owner.active.as_ref().unwrap();
         let result = active.tool.as_ref().unwrap().result.as_ref().unwrap();
         assert_eq!(result.status, status);
@@ -1157,7 +1125,6 @@ fn exec_cmd_call_of(active: &Active, command: &str) -> tools::Call {
         arguments: tools::Arguments::ExecCmd {
             command: command.into(),
             cwd: ".".into(),
-            timeout_seconds: 30,
         },
     }
 }
@@ -1180,7 +1147,7 @@ fn j1t_03_overlong_rewrite_is_a_recorded_refusal() {
     let now = Instant::now();
     let active = fixture.owner.active.as_mut().unwrap();
     active.tool = None;
-    active.tool_budget = tools::Budget::new(now + Duration::from_secs(60));
+    active.tool_budget = tools::Budget::cancellation_driven();
     let unit = ["curl -u admin:", "Sup3r", "S3cret", " x;"].concat();
     let long = format!(
         "{}echo {}",
@@ -1231,7 +1198,7 @@ fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     {
         let active = fixture.owner.active.as_mut().unwrap();
         active.tool = None;
-        active.tool_budget = tools::Budget::new(now + Duration::from_secs(60));
+        active.tool_budget = tools::Budget::cancellation_driven();
         let call = exec_cmd_call_of(active, &raw);
         // No payload store is ready: the call is recorded busy, which
         // carries the rewrite too.
@@ -1294,20 +1261,18 @@ fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     assert_eq!(active.failure_reason, Some("model_protocol_fault"));
 }
 
-/// J1T-05 unit (J1-Q3): an exec_cmd call has no tool deadline, so a result
-/// committed long after it started never fails the turn as `model_timeout`;
-/// the ordinary tool deadline (L10) is unchanged.
+/// J1T-05 unit (J1-Q3): no tool call has a time bound, so a result
+/// committed long after it started never fails the turn.
 #[test]
-fn j1t_05_model_timeout_never_applies_to_exec_cmd() {
+fn j1t_05_late_exec_cmd_result_never_fails_the_turn() {
     let mut fixture = Fixture::new();
     let now = Instant::now();
     {
         let active = fixture.owner.active.as_mut().unwrap();
         active.tool = None;
-        active.tool_budget = tools::Budget::new(now + Duration::from_secs(3600));
+        active.tool_budget = tools::Budget::cancellation_driven();
         let call = exec_cmd_call_of(active, "sleep 65");
         Owner::tool_call(active, call, now, &fixture.owner.payloads, Some([9; 16]));
-        assert!(active.tool.as_ref().unwrap().deadline.is_none());
     }
     fixture.acknowledge(Job::ToolIntent);
     {
@@ -1319,7 +1284,6 @@ fn j1t_05_model_timeout_never_applies_to_exec_cmd() {
             .tool
             .as_mut()
             .unwrap();
-        assert!(tool.deadline.is_none(), "kind 22 commit sets no deadline");
         tool.dispatched = true;
     }
     fixture.owner.job_done(

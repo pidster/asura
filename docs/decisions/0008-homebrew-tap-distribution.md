@@ -53,8 +53,9 @@ flowchart TD
 - The release must package every executable and runtime asset Asura needs on a
   supported host; installing Asura must not require Xcode or a Rust toolchain.
 - Homebrew upgrade can replace the installed command while an older service
-  remains active. The control protocol must reject unsupported mixed versions
-  and provide an explicit, recoverable handover path.
+  remains active. The control protocol rejects a mismatched version with
+  `incompatible_protocol`. The recoverable handover path is deferred until the
+  first release (owner, 2026-10-17).
 - Homebrew uninstall must leave per-user authority files and graph data intact.
   Any data removal requires a separate explicit user action.
 - The existing tap is a distribution precedent. It does not establish Asura's

@@ -31,6 +31,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 [dev-dependencies]
 libc = "=0.2.189"
 asura-platform = { path = "../asura-platform", features = ["test-support"] }
+asura-storage = { path = "../asura-storage", features = ["test-support"] }
 # The --exec-cmd-capture journey drives the payload free-space gate (J1T-08).
 asura-service = { path = "../asura-service", features = ["test-support"] }
 

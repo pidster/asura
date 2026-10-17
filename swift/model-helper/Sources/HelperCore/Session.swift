@@ -32,8 +32,8 @@ public actor HelperSession {
     /// The only timer is the kept 250 ms final drain after a terminal (owner,
     /// 2026-10-16). Hello, Begin, input transfer and the Ready-to-Start handoff
     /// have no time limit: each ends on the next message, channel close, a
-    /// protocol fault or cancellation. A supplied `deadline_remaining_ms` is
-    /// validated but arms no timer.
+    /// protocol fault or cancellation. Begin carries no time field (owner,
+    /// 2026-10-17); nothing else arms a timer.
     private let timerSleep: @Sendable (UInt32) async throws -> Void
     private var measuredContext = false
     private var settledInferenceOrdinal: UInt32 = 0
@@ -121,7 +121,7 @@ public actor HelperSession {
         response.buildID = buildID; response.schemaDigest = schemaDigest
         response.maxFrameBytes = UInt32(Limits.frame)
         response.selectedModel = "system"; response.inventoryOnly = true
-        response.availability = .unknown; response.capabilities = 0; response.reason = .none
+        response.availability = .unknown; response.reason = .none
         response.models = inventory.rows; response.issues = inventory.issues
         do { try await transport.send(envelope(.hello(response))) }
         catch { transport.close() }
@@ -135,10 +135,10 @@ public actor HelperSession {
                 hello.hasBuildID, hello.buildID == buildID, hello.hasSchemaDigest, hello.schemaDigest == schemaDigest,
                 hello.hasMaxFrameBytes, hello.maxFrameBytes == UInt32(Limits.frame),
                 hello.hasAvailability, hello.availability == .unknown,
-                hello.hasCapabilities, hello.capabilities == 0, !hello.hasContextTokens,
+                hello.hasSelectedModel, !hello.hasContextTokens,
                 !hello.hasReportedContextTokens, !hello.hasContextSource,
                 hello.hasReason, hello.reason == .none else { throw HelperError.protocolFault }
-            selectedModel = hello.hasSelectedModel ? hello.selectedModel : "system"
+            selectedModel = hello.selectedModel
             if hello.inventoryOnly {
                 phase = .inventory
                 let root = hello.hasAssetRoot ? hello.assetRoot : nil
@@ -170,7 +170,7 @@ public actor HelperSession {
             if let context = status.contextTokens, context > 512,
                 let reported = status.reportedContextTokens, reported >= context,
                 let source = status.contextSource {
-                response.availability = .available; response.capabilities = status.supportsTools ? 3 : 1
+                response.availability = .available
                 response.contextTokens = context; response.reason = .none
                 response.reportedContextTokens = reported
                 response.contextSource = source.rawValue
@@ -184,7 +184,7 @@ public actor HelperSession {
                 }
                 if let name = ProviderMetadata.displayName(status.modelName) { response.modelName = name }
             } else {
-                response.availability = .unavailable; response.capabilities = 0
+                response.availability = .unavailable
                 response.reason = .modelUnavailable
             }
             try await transport.send(envelope(.hello(response)))
@@ -201,7 +201,6 @@ public actor HelperSession {
                 begin.hasInputBytes, begin.inputBytes > 0, begin.inputBytes <= Limits.input,
                 // A sanity bound on allocation, not a content limit.
                 begin.inputBytes <= UInt64(contextTokens) * 8,
-                (!begin.hasDeadlineRemainingMs || (1...60_000).contains(begin.deadlineRemainingMs)),
                 begin.hasMaxResponseTokens, (1...2048).contains(begin.maxResponseTokens) else { throw HelperError.protocolFault }
             operation = message.operationID; generation = message.generation
             expectedInput = begin.inputBytes
@@ -316,9 +315,9 @@ public actor HelperSession {
         var call = Asura_Model_V1_ToolCall()
         call.ordinal = toolOrdinal
         switch arguments {
-        case .execCmd(let command, let cwd, let timeout):
+        case .execCmd(let command, let cwd):
             var args = Asura_Model_V1_ExecCmd()
-            args.command = command; if let cwd {args.cwd = cwd}; args.timeoutSeconds = timeout
+            args.command = command; if let cwd {args.cwd = cwd}
             call.arguments = .execCmd(args)
         case .readAudit(let limit):
             var args = Asura_Model_V1_AuditRead()

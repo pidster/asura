@@ -15,8 +15,8 @@ Ctrl+D, Ctrl+S, Ctrl+T and Ctrl+V keys in this table work.
 | --- | --- |
 | Ctrl+Q or Ctrl+C | Exit; asks first when a draft or an unsent message exists |
 | Ctrl+D | Exit when the input box is empty; asks first when an unsent message exists |
-| Ctrl+S | Steer the active answer with the text in the input box |
-| Ctrl+T | Queue the text in the input box behind the active answer |
+| Ctrl+S | Queue the text in the input box, then steer the active answer with it |
+| Ctrl+T | Queue the text in the input box, the same as Enter |
 | Ctrl+V | Start paste capture |
 | Ctrl+P or Ctrl+N | Recall the previous or next input in the input box |
 | F6 | Browse responses, or return from the response browser |

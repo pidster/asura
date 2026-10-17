@@ -20,6 +20,8 @@ struct Server {
     hold: Arc<AtomicUsize>,
     /// Held requests whose peer closed its connection (helper stopped).
     released: Arc<AtomicUsize>,
+    /// Requests the server has started holding.
+    holding: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Server {
@@ -30,7 +32,13 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let hold = Arc::new(AtomicUsize::new(0));
         let released = Arc::new(AtomicUsize::new(0));
-        let (token, mode, closed) = (stop.clone(), hold.clone(), released.clone());
+        let holding = Arc::new(AtomicUsize::new(0));
+        let (token, mode, closed, held) = (
+            stop.clone(),
+            hold.clone(),
+            released.clone(),
+            holding.clone(),
+        );
         let task = thread::spawn(move || {
             // Test fixture bounds: at most 8 connections, 64 KiB requests,
             // a 120 s server lifetime and 50 ms stop checks.
@@ -39,9 +47,10 @@ impl Server {
             while !token.load(Ordering::Acquire) && Instant::now() < end && workers.len() < 8 {
                 match listener.accept() {
                     Ok((socket, _)) => {
-                        let (token, mode, closed) = (token.clone(), mode.clone(), closed.clone());
+                        let (token, mode, closed, held) =
+                            (token.clone(), mode.clone(), closed.clone(), held.clone());
                         workers.push(thread::spawn(move || {
-                            let _ = serve(socket, &token, &mode, &closed, end);
+                            let _ = serve(socket, &token, &mode, &closed, &held, end);
                         }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -59,6 +68,7 @@ impl Server {
             stop,
             hold,
             released,
+            holding,
             thread: Some(task),
         })
     }
@@ -76,6 +86,7 @@ fn serve(
     stop: &AtomicBool,
     hold: &AtomicUsize,
     released: &AtomicUsize,
+    holding: &AtomicUsize,
     end: Instant,
 ) -> std::io::Result<()> {
     socket.set_nonblocking(false)?;
@@ -114,6 +125,7 @@ fn serve(
     if held {
         // Hold without replying until the helper closes the connection or
         // the test stops the server.
+        holding.fetch_add(1, Ordering::AcqRel);
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
         let mut byte = [0; 1];
         while !stop.load(Ordering::Acquire) && Instant::now() < end {
@@ -337,6 +349,129 @@ pub(super) fn run() -> Result<()> {
         "PASS WS-01..04 integration: STARTING_MODEL and MODEL_OUTPUT visible, paced full \
          projection, hold ends the stalled Hello, immediate Resume runs once, cancel ends \
          the stalled output"
+    );
+    Ok(())
+}
+
+/// IQ2-R1 and MQ13 integration: Ctrl+S is one kind 18 input followed by an
+/// IQ2 promotion during the active turn. The real service and helper run
+/// against the loopback provider; the first turn's output is held so the
+/// promotion targets a live operation. Promotion commits (never
+/// `repair_required`), cancels the target for steering, and the replacement
+/// runs once in generation 2.
+pub(super) fn steer() -> Result<()> {
+    let server = Server::start()?;
+    let mut fixture = Fixture::new()?;
+    fixture.start()?;
+    wait_ready(&fixture, None)?;
+    let directory = fixture.home.join("project");
+    fs::create_dir(&directory)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let project = checked_id(
+        fixture
+            .attach()?
+            .register_project(
+                pb::ProjectRegister {
+                    request_id: Some(asura_platform::random_id().to_vec()),
+                    location: Some(directory.to_str().ok_or("fixture path")?.into()),
+                },
+                &|| false,
+            )?
+            .project_id,
+    )?;
+    for (key, value) in [
+        ("providers.ollama.endpoint", server.endpoint.as_str()),
+        ("model", "ollama:fixture"),
+    ] {
+        assert!(
+            fixture
+                .attach()?
+                .config(key, Some(value), &|| false)?
+                .error
+                .is_none()
+        );
+    }
+    // The first turn stalls on output, so it stays the active target.
+    server.hold.store(HOLD_CHAT, Ordering::Release);
+    let first = managed_submit_call(&fixture, new_input(project, "Hold the output"))?;
+    let first_id = checked_id(first.accepted_input_id)?;
+    let running = entry_until(&fixture, project, first_id, "first running", |entry| {
+        entry.state == Some(3)
+    })?;
+    let target = checked_id(running.operation_id.clone())?;
+    let generation = running.generation.ok_or("missing generation")?;
+    let conversation = running.conversation_id.clone().ok_or("missing lane")?;
+    // Ctrl+S, step 1: the steering text is an ordinary kind 18 input.
+    let queued = managed_submit_call(
+        &fixture,
+        pb::ConversationQueueSubmit {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            project_id: Some(project.to_vec()),
+            conversation_id: Some(conversation.clone()),
+            expected_generation: Some(generation),
+            new_conversation: Some(false),
+            prompt: Some("Steer: reply COMPLETE".into()),
+        },
+    )?;
+    let input = checked_id(queued.accepted_input_id.clone())?;
+    let entry = queued
+        .entries
+        .iter()
+        .find(|entry| entry.input_id.as_deref() == Some(input.as_slice()))
+        .ok_or("queued input absent")?;
+    assert_eq!((entry.kind, entry.state), (Some(1), Some(1)));
+    assert_eq!(entry.new_conversation, Some(false));
+    // Only once the first turn's output request is held is the
+    // replacement's own output answered.
+    let end = Instant::now() + Duration::from_secs(30);
+    while server.holding.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < end,
+            "first turn output was never requested"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    server.hold.store(0, Ordering::Release);
+    // Ctrl+S, step 2: IQ2 promotion of the accepted kind 18 row.
+    let promote = pb::ConversationQueueDecision {
+        request_id: Some(asura_platform::random_id().to_vec()),
+        input_id: Some(input.to_vec()),
+        action: Some(3),
+        target_operation_id: Some(target.to_vec()),
+        target_generation: Some(generation),
+    };
+    let promoted = fixture
+        .attach()?
+        .decide_conversation_input(promote.clone(), &|| false)
+        .map_err(|error| format!("promotion of a kind 18 input failed: {error}"))?;
+    let entry = promoted
+        .entries
+        .iter()
+        .find(|entry| entry.input_id.as_deref() == Some(input.as_slice()))
+        .ok_or("promoted input absent")?;
+    assert_eq!(entry.kind, Some(2));
+    assert_eq!(entry.target_operation_id, Some(target.to_vec()));
+    // An exact retry returns the same result and adds no second promotion.
+    let retried = fixture
+        .attach()?
+        .decide_conversation_input(promote, &|| false)?;
+    assert!(retried.entries.iter().any(|entry| {
+        entry.input_id.as_deref() == Some(input.as_slice()) && entry.kind == Some(2)
+    }));
+    let cancelled = observe(&fixture, target)?;
+    assert_eq!(cancelled.kind, Some(5), "steering cancels the target");
+    let replacement = entry_until(&fixture, project, input, "replacement settled", |entry| {
+        matches!(entry.state, Some(4 | 5))
+    })?;
+    assert_eq!(replacement.state, Some(4), "{replacement:?}");
+    assert_eq!(replacement.generation, Some(generation + 1));
+    assert_eq!(replacement.conversation_id, Some(conversation));
+    let first = queue_entry(&fixture, project, first_id)?;
+    assert_eq!(first.state, Some(5), "the steered turn is not complete");
+    fixture.stop()?;
+    println!(
+        "PASS IQ2-R1 integration: Ctrl+S kind 18 input promoted during the active turn, \
+         exact retry, steering cancel and one replacement in the next generation"
     );
     Ok(())
 }

@@ -18,7 +18,7 @@ fn hello(service: bool) -> pb::Envelope {
         inventory_only: None,
         models: Vec::new(),
         issues: Vec::new(),
-        selected_model: None,
+        selected_model: Some("system".into()),
         asset_root: None,
         endpoint: None,
         model_name: None,
@@ -26,7 +26,6 @@ fn hello(service: bool) -> pb::Envelope {
         schema_digest: Some(vec![2; 32]),
         max_frame_bytes: Some(65536),
         availability: Some(if service { 3 } else { 1 }),
-        capabilities: Some(if service { 0 } else { 1 }),
         context_tokens: (!service).then_some(4096),
         reported_context_tokens: (!service).then_some(4096),
         context_source: (!service).then_some(1),
@@ -53,7 +52,6 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
             envelope(Body::Begin(pb::Begin {
                 model: Some("system".into()),
                 input_bytes: Some(10),
-                deadline_remaining_ms: Some(60000),
                 max_response_tokens: Some(512),
                 enable_project_tools: None,
             })),
@@ -495,7 +493,6 @@ fn export_cross_language_fixtures() {
     );
     let mut local = hello(false);
     if let Some(Body::Hello(value)) = &mut local.body {
-        value.capabilities = Some(3);
         value.local_tool_destination = Some(true);
         value.supported_capabilities = Some(5);
         value.capability_source = Some(2);
@@ -552,10 +549,11 @@ fn export_cross_language_fixtures() {
         value.supported_capabilities = None;
         value.capability_source = Some(4);
     }
+    // Source 4 (support unknown) carries no mask and so grants no tools.
     write(
-        "unknown_support_with_tools.pb",
+        "unknown_support_without_mask.pb",
         "helper",
-        false,
+        true,
         local.encode_to_vec(),
     );
     for field in 13..=16 {
@@ -586,7 +584,6 @@ fn export_cross_language_fixtures() {
             pb::ExecCmd {
                 command: Some("printf fixture".into()),
                 cwd: None,
-                timeout_seconds: None,
             },
             true,
         ),
@@ -595,7 +592,6 @@ fn export_cross_language_fixtures() {
             pb::ExecCmd {
                 command: Some("é".repeat(4096)),
                 cwd: Some(".".into()),
-                timeout_seconds: Some(60),
             },
             true,
         ),
@@ -604,7 +600,6 @@ fn export_cross_language_fixtures() {
             pb::ExecCmd {
                 command: None,
                 cwd: None,
-                timeout_seconds: None,
             },
             false,
         ),
@@ -613,16 +608,6 @@ fn export_cross_language_fixtures() {
             pb::ExecCmd {
                 command: Some("pwd".into()),
                 cwd: Some("a/../b".into()),
-                timeout_seconds: Some(30),
-            },
-            false,
-        ),
-        (
-            "exec_cmd_timeout.pb",
-            pb::ExecCmd {
-                command: Some("pwd".into()),
-                cwd: None,
-                timeout_seconds: Some(61),
             },
             false,
         ),
@@ -751,7 +736,6 @@ fn export_cross_language_fixtures() {
             panic!()
         };
         value.availability = Some(availability);
-        value.capabilities = Some(0);
         value.context_tokens = None;
         value.reported_context_tokens = None;
         value.context_source = None;
@@ -1031,7 +1015,6 @@ fn provider_selection_is_bounded_and_asset_paths_never_come_from_helper() {
     assert!(encode_frame(&request, Direction::ServiceToHelper).is_err());
     let mut response = hello(false);
     if let Some(Body::Hello(v)) = &mut response.body {
-        v.capabilities = Some(3);
         v.selected_model = Some("coreai:fixture".into());
         v.context_source = Some(2);
     }
@@ -1062,7 +1045,6 @@ fn inventory_hello_is_metadata_only_and_has_its_own_row_bounds() {
     reply.selected_model = Some("system".into());
     reply.inventory_only = Some(true);
     reply.availability = Some(3);
-    reply.capabilities = Some(0);
     reply.context_tokens = None;
     reply.reported_context_tokens = None;
     reply.context_source = None;
@@ -1415,22 +1397,19 @@ fn audit_tool_requires_bounded_present_limit_and_helper_direction() {
 }
 
 #[test]
-fn exec_cmd_wire_requires_bounded_command_relative_cwd_and_deadline() {
+fn exec_cmd_wire_requires_bounded_command_relative_cwd_and_no_timeout() {
     let valid = pb::ExecCmd {
         command: Some("printf fixture".into()),
         cwd: None,
-        timeout_seconds: None,
     };
     for args in [
         valid.clone(),
         pb::ExecCmd {
             command: Some("é".repeat(4096)),
             cwd: Some(".".into()),
-            timeout_seconds: Some(60),
         },
         pb::ExecCmd {
             cwd: Some("src/subdir".into()),
-            timeout_seconds: Some(1),
             ..valid.clone()
         },
     ] {
@@ -1459,12 +1438,6 @@ fn exec_cmd_wire_requires_bounded_command_relative_cwd_and_deadline() {
             ..valid.clone()
         });
     }
-    for timeout_seconds in [Some(0), Some(61)] {
-        invalid.push(pb::ExecCmd {
-            timeout_seconds,
-            ..valid.clone()
-        });
-    }
     for args in invalid {
         let message = memory_call(pb::tool_call::Arguments::ExecCmd(args));
         assert!(decode_body(&message.encode_to_vec(), Direction::HelperToService).is_err());
@@ -1476,8 +1449,13 @@ fn exec_cmd_wire_requires_bounded_command_relative_cwd_and_deadline() {
     }
     .encode_to_vec();
     // ToolCall field 19, valid command x, then unknown nested field 100.
+    let base = bytes.clone();
     bytes.extend_from_slice(&[0xa2, 1, 11, 8, 1, 0x9a, 1, 6, 10, 1, b'x', 0xa0, 6, 1]);
     assert!(decode_body(&bytes, Direction::HelperToService).is_err());
+    // B2: removed `timeout_seconds` (ExecCmd field 3) is an unknown field.
+    let mut removed = base;
+    removed.extend_from_slice(&[0xa2, 1, 10, 8, 1, 0x9a, 1, 5, 10, 1, b'x', 0x18, 30]);
+    assert!(decode_body(&removed, Direction::HelperToService).is_err());
 }
 
 #[test]
@@ -1512,22 +1490,30 @@ fn failed_exec_cmd_wire_result_preserves_bounded_output_but_never_cursor() {
     }
 }
 
+/// A5: Begin has no time field; removed `deadline_remaining_ms` (field 3)
+/// is an unknown field and the Begin is rejected.
 #[test]
-fn begin_deadline_is_optional_but_explicit_values_remain_bounded() {
-    let mut message = envelope(Body::Begin(pb::Begin {
+fn begin_carries_no_deadline_and_removed_field_is_rejected() {
+    let begin = pb::Begin {
         model: Some("system".into()),
         input_bytes: Some(1),
-        deadline_remaining_ms: None,
         max_response_tokens: Some(512),
         enable_project_tools: None,
-    }));
+    };
+    let message = envelope(Body::Begin(begin.clone()));
     assert!(encode_frame(&message, Direction::ServiceToHelper).is_ok());
-    for deadline in [0, 60001] {
-        if let Some(Body::Begin(value)) = &mut message.body {
-            value.deadline_remaining_ms = Some(deadline);
-        }
-        assert!(encode_frame(&message, Direction::ServiceToHelper).is_err());
+    let mut body = begin.encode_to_vec();
+    body.extend_from_slice(&[0x18, 100]);
+    let mut bytes = pb::Envelope {
+        operation_id: Some(vec![7; 16]),
+        generation: Some(1),
+        body: None,
     }
+    .encode_to_vec();
+    bytes.push(0x5a);
+    bytes.push(body.len() as u8);
+    bytes.extend(body);
+    assert!(decode_body(&bytes, Direction::ServiceToHelper).is_err());
 }
 
 #[test]
@@ -1583,4 +1569,38 @@ fn inference_usage_preserves_zero_unknown_and_rejects_invalid_counts() {
         )
         .is_ok()
     );
+}
+
+/// B4: every Hello names its selector; a missing one never defaults to "system".
+#[test]
+fn hello_without_selected_model_is_rejected_in_both_directions() {
+    for (service, direction) in [
+        (true, Direction::ServiceToHelper),
+        (false, Direction::HelperToService),
+    ] {
+        let mut message = hello(service);
+        assert!(encode_frame(&message, direction).is_ok());
+        if let Some(Body::Hello(value)) = &mut message.body {
+            value.selected_model = None;
+        }
+        assert!(encode_frame(&message, direction).is_err());
+    }
+}
+
+/// B3: tool support comes from `supported_capabilities` bit 0 alone; a Hello
+/// with any mask shape is valid without a separate tool bit.
+#[test]
+fn tool_support_is_stated_only_by_the_capability_mask() {
+    for mask in [0, 1, 4, 5, 15] {
+        let mut message = hello(false);
+        if let Some(Body::Hello(value)) = &mut message.body {
+            value.supported_capabilities = Some(mask);
+            value.capability_source = Some(2);
+            value.local_tool_destination = Some(true);
+        }
+        assert!(
+            encode_frame(&message, Direction::HelperToService).is_ok(),
+            "{mask}"
+        );
+    }
 }

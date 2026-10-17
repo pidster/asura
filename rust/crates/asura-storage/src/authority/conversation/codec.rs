@@ -164,30 +164,6 @@ pub fn request_digest(request: Request<'_>) -> Result<Hash> {
             w.u64(expected_generation);
             w.string(prompt, MAX_PROMPT)?;
         }
-        Request::Queue {
-            project,
-            conversation,
-            target_operation,
-            target_generation,
-            kind,
-            prompt,
-        } => {
-            if project == [0; 16]
-                || conversation == [0; 16]
-                || target_operation == [0; 16]
-                || target_generation == 0
-                || prompt.is_empty()
-            {
-                return Err(ReplayError::Corrupt);
-            }
-            w.bytes(&12u16.to_be_bytes());
-            w.bytes(&project);
-            w.bytes(&conversation);
-            w.bytes(&target_operation);
-            w.u64(target_generation);
-            w.byte(kind as u8);
-            w.string(prompt, MAX_PROMPT)?;
-        }
         Request::QueueInput {
             project,
             conversation,
@@ -302,28 +278,10 @@ pub fn capitalize_project_name(name: &str) -> Result<String> {
     }
     Ok(result)
 }
-fn exec_cmd_parts(p: &ToolIntent) -> Result<(&str, &str)> {
-    let (command, cwd) = p.path.split_once('\0').ok_or(ReplayError::Corrupt)?;
-    if p.kind != EXEC_CMD_TOOL_KIND
-        || command.is_empty()
-        || command.len() > MAX_EXEC_CMD_COMMAND_BYTES
-        || cwd.is_empty()
-        || cwd.len() > MAX_EXEC_CMD_CWD_BYTES
-        || cwd.contains('\0')
-        || cwd.starts_with('/')
-        || cwd.split('/').any(|part| part == "..")
-        || !(1..=60_000).contains(&p.offset)
-        || !(1..=60).contains(&p.limit)
-        || p.offset > u64::from(p.limit) * 1000
-    {
-        return Err(ReplayError::Corrupt);
-    }
-    Ok((command, cwd))
-}
 /// The `asura.exec_cmd.job` identity of one exec_cmd call: the first 16 bytes of
 /// SHA-256 over ASCII `asura.exec_cmd.job`, one zero byte, the operation ID, the
 /// generation and the ordinal (big endian). An all-zero result becomes 1 in its
-/// final byte. Kind 14 exec_cmd intents and kind 22 share this derivation.
+/// final byte. Kind 22 and its job use this derivation.
 pub fn exec_cmd_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
     let mut hash = Sha256::new();
     hash.update(b"asura.exec_cmd.job\0");
@@ -337,22 +295,6 @@ pub fn exec_cmd_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
         id[15] = 1;
     }
     id
-}
-impl ToolIntent {
-    /// Stable identity for one admitted call, not permission to execute it again.
-    pub fn exec_cmd_job_id(&self) -> Result<Id> {
-        self.exec_cmd_arguments()?;
-        Ok(exec_cmd_job_id(
-            self.operation,
-            self.generation,
-            self.ordinal,
-        ))
-    }
-    /// Exact validated bytes; filesystem resolution remains the platform owner's task.
-    pub fn exec_cmd_arguments(&self) -> Result<(&str, &str)> {
-        valid_tool_intent(self)?;
-        exec_cmd_parts(self)
-    }
 }
 impl CreateNoteIdentity {
     pub fn derive(binding: [Id; 3], turn: Id, generation: u64, ordinal: u32) -> Result<Self> {
@@ -434,14 +376,6 @@ fn valid_tool_intent(p: &ToolIntent) -> Result<()> {
             && p.offset == 0
             && p.limit == 0
         {
-            Ok(())
-        } else {
-            Err(ReplayError::Corrupt)
-        };
-    }
-    if p.kind == EXEC_CMD_TOOL_KIND {
-        exec_cmd_parts(p)?;
-        return if p.operation != [0; 16] && p.generation > 0 && (1..=8).contains(&p.ordinal) {
             Ok(())
         } else {
             Err(ReplayError::Corrupt)
@@ -1100,18 +1034,6 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
         Record::InputQueued(p) => {
             w.bytes(&p.request);
             w.bytes(&p.digest);
-            w.bytes(&p.dispatch_request);
-            w.bytes(&p.project);
-            w.bytes(&p.conversation);
-            w.bytes(&p.target_operation);
-            w.u64(p.target_generation);
-            w.optional(p.previous);
-            w.byte(p.kind as u8);
-            w.string(&p.prompt, MAX_PROMPT)?;
-        }
-        Record::InputQueuedV2(p) => {
-            w.bytes(&p.request);
-            w.bytes(&p.digest);
             w.bytes(&p.input);
             w.bytes(&p.dispatch_request);
             w.bytes(&p.project);
@@ -1197,12 +1119,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.bytes(&p.configuration_digest);
             w.bytes(&p.instructions_digest);
             w.bytes(&p.input_digest);
-            let limit = if p.composition.is_some() {
-                MAX_COMPOSED_PRIOR
-            } else {
-                32
-            };
-            if p.prior_operations.len() > limit {
+            if p.prior_operations.len() > MAX_COMPOSED_PRIOR {
                 return Err(ReplayError::Limit);
             }
             w.bytes(&(p.prior_operations.len() as u16).to_be_bytes());
@@ -1212,15 +1129,14 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.string(&p.prompt, MAX_PROMPT)?;
             w.u32(p.reserved_output_tokens);
             w.u64(p.event_cursor);
-            if let Some(c) = &p.composition {
-                w.u32(c.omitted_turns);
-                w.bytes(&c.manifest_digest);
-                w.u32(c.composer_revision);
-                w.u32(c.window_tokens);
-                w.u32(c.output_reservation);
-                w.u32(c.overhead_tokens);
-                w.u32(c.bytes_per_token_milli);
-            }
+            let c = &p.composition;
+            w.u32(c.omitted_turns);
+            w.bytes(&c.manifest_digest);
+            w.u32(c.composer_revision);
+            w.u32(c.window_tokens);
+            w.u32(c.output_reservation);
+            w.u32(c.overhead_tokens);
+            w.u32(c.bytes_per_token_milli);
         }
         Record::StartAuthorized(p) => {
             w.bytes(&p.operation);
@@ -1257,14 +1173,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u64(p.generation);
             w.u32(p.ordinal);
             w.byte(p.kind);
-            w.string(
-                &p.path,
-                if p.kind == EXEC_CMD_TOOL_KIND {
-                    MAX_EXEC_CMD_INTENT_BYTES
-                } else {
-                    1024
-                },
-            )?;
+            w.string(&p.path, 1024)?;
             w.u64(p.offset);
             w.u32(p.limit);
         }
@@ -1348,7 +1257,7 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
         offset: 0,
     };
     let record = match kind {
-        18 => Record::InputQueuedV2(InputQueuedV2 {
+        18 => Record::InputQueued(InputQueued {
             request: r.array()?,
             digest: r.array()?,
             input: r.array()?,
@@ -1367,22 +1276,6 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             after: r.optional()?,
             expected_order_revision: r.u64()?,
             order_revision: r.u64()?,
-        }),
-        12 => Record::InputQueued(InputQueued {
-            request: r.array()?,
-            digest: r.array()?,
-            dispatch_request: r.array()?,
-            project: r.array()?,
-            conversation: r.array()?,
-            target_operation: r.array()?,
-            target_generation: r.u64()?,
-            previous: r.optional()?,
-            kind: match r.byte()? {
-                1 => InputKind::Queue,
-                2 => InputKind::Steer,
-                _ => return Err(ReplayError::Corrupt),
-            },
-            prompt: r.string(MAX_PROMPT)?,
         }),
         13 => Record::InputDecision(InputDecision {
             request: r.array()?,
@@ -1443,8 +1336,7 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             requested_name: r.string(128)?,
             name: r.string(128)?,
         }),
-        5 | 21 => {
-            let composed = kind == 21;
+        21 => {
             let request = r.array()?;
             let digest = r.array()?;
             let project = r.array()?;
@@ -1459,7 +1351,7 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             let instructions_digest = r.array()?;
             let input_digest = r.array()?;
             let count = u16::from_be_bytes(r.array()?) as usize;
-            if count > if composed { MAX_COMPOSED_PRIOR } else { 32 } {
+            if count > MAX_COMPOSED_PRIOR {
                 return Err(ReplayError::Limit);
             }
             let mut prior_operations = Vec::with_capacity(count);
@@ -1469,18 +1361,14 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             let prompt = r.string(MAX_PROMPT)?;
             let reserved_output_tokens = r.u32()?;
             let event_cursor = r.u64()?;
-            let composition = if composed {
-                Some(Composition {
-                    omitted_turns: r.u32()?,
-                    manifest_digest: r.array()?,
-                    composer_revision: r.u32()?,
-                    window_tokens: r.u32()?,
-                    output_reservation: r.u32()?,
-                    overhead_tokens: r.u32()?,
-                    bytes_per_token_milli: r.u32()?,
-                })
-            } else {
-                None
+            let composition = Composition {
+                omitted_turns: r.u32()?,
+                manifest_digest: r.array()?,
+                composer_revision: r.u32()?,
+                window_tokens: r.u32()?,
+                output_reservation: r.u32()?,
+                overhead_tokens: r.u32()?,
+                bytes_per_token_milli: r.u32()?,
             };
             Record::TurnAccepted(Box::new(TurnAccepted {
                 request,
@@ -1541,11 +1429,7 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 generation,
                 ordinal,
                 kind,
-                path: r.string(if kind == EXEC_CMD_TOOL_KIND {
-                    MAX_EXEC_CMD_INTENT_BYTES
-                } else {
-                    1024
-                })?,
+                path: r.string(1024)?,
                 offset: r.u64()?,
                 limit: r.u32()?,
             };
@@ -1915,8 +1799,10 @@ mod tests {
         *bytes.last_mut().unwrap() = 255;
         assert_eq!(decode_record(8, &bytes).unwrap_err(), ReplayError::Corrupt);
     }
-    fn exec_cmd() -> ToolIntent {
-        ToolIntent {
+    /// Kind 14 never carries exec_cmd (tool kind 16); only kind 22 admits it.
+    #[test]
+    fn kind_14_rejects_exec_cmd_tool_kind() {
+        let intent = ToolIntent {
             operation: [1; 16],
             generation: 1,
             ordinal: 1,
@@ -1924,128 +1810,31 @@ mod tests {
             path: "printf hello\0.".into(),
             offset: 1000,
             limit: 30,
-        }
-    }
-    #[test]
-    fn exec_cmd_exact_byte_bounds_and_kind_specific_encoding() {
-        let base = exec_cmd();
-        for cwd in [".", "./subdir", "a//b/", "a/./b"] {
-            let value = ToolIntent {
-                path: format!("echo hi\0{cwd}"),
-                ..base.clone()
-            };
-            let rec = Record::ToolIntent(value.clone());
-            assert_eq!(decode_record(14, &payload(&rec).unwrap()).unwrap(), rec);
-            assert_eq!(value.exec_cmd_arguments().unwrap(), ("echo hi", cwd));
-        }
-        let max = ToolIntent {
-            path: format!("{}\0{}", "x".repeat(8192), "y".repeat(1024)),
-            offset: 60_000,
-            limit: 60,
-            ..base.clone()
         };
-        let rec = Record::ToolIntent(max);
-        let bytes = payload(&rec).unwrap();
-        assert_eq!(decode_record(14, &bytes).unwrap(), rec);
-        let mut old = bytes.clone();
-        old[28] = 1;
-        assert_eq!(decode_record(14, &old).unwrap_err(), ReplayError::Limit);
-        for path in [
-            "no delimiter".into(),
-            "\0.".into(),
-            "x\0".into(),
-            "x\0a\0b".into(),
-            "x\0/absolute".into(),
-            "x\0../outside".into(),
-            "x\0a/../b".into(),
-            format!("{}\0.", "x".repeat(8193)),
-            format!("x\0{}", "y".repeat(1025)),
-            format!("{}\0.", "é".repeat(4097)),
-        ] {
-            assert_eq!(
-                valid_tool_intent(&ToolIntent {
-                    path,
-                    ..base.clone()
-                }),
-                Err(ReplayError::Corrupt)
-            );
-        }
-        for invalid in [
-            ToolIntent {
-                offset: 0,
-                ..base.clone()
-            },
-            ToolIntent {
-                offset: 60_001,
-                limit: 60,
-                ..base.clone()
-            },
-            ToolIntent {
-                offset: 1001,
-                limit: 1,
-                ..base.clone()
-            },
-            ToolIntent {
-                limit: 0,
-                ..base.clone()
-            },
-            ToolIntent {
-                limit: 61,
-                ..base.clone()
-            },
-            ToolIntent {
-                operation: [0; 16],
-                ..base.clone()
-            },
-            ToolIntent {
-                generation: 0,
-                ..base.clone()
-            },
-            ToolIntent {
-                ordinal: 9,
-                ..base.clone()
-            },
-        ] {
-            assert_eq!(invalid.exec_cmd_arguments(), Err(ReplayError::Corrupt));
-        }
-        // Existing record layout: operation16, generation8, ordinal4, kind1,
-        // then the existing length-prefixed string and timeout integers.
-        assert_eq!(bytes[28], 16);
-        assert_eq!(
-            &bytes[bytes.len() - 12..bytes.len() - 4],
-            &60_000u64.to_be_bytes()
-        );
-        assert_eq!(&bytes[bytes.len() - 4..], &60u32.to_be_bytes());
+        assert_eq!(valid_tool_intent(&intent), Err(ReplayError::Corrupt));
+        let record = Record::ToolIntent(intent.clone());
+        assert_eq!(payload(&record), Err(ReplayError::Corrupt));
+        // A hand-built kind 14 payload with tool kind 16 also fails decode.
+        let mut w = Writer(Vec::new());
+        w.bytes(&intent.operation);
+        w.u64(intent.generation);
+        w.u32(intent.ordinal);
+        w.byte(EXEC_CMD_TOOL_KIND);
+        w.string("printf hello", 1024).unwrap();
+        w.u64(0);
+        w.u32(0);
+        assert_eq!(decode_record(14, &w.0), Err(ReplayError::Corrupt));
     }
     #[test]
-    fn exec_cmd_job_identity_has_fixed_domain_and_does_not_depend_on_arguments() {
-        let base = exec_cmd();
+    fn exec_cmd_job_identity_has_fixed_domain() {
         let expected = [
             0x7e, 0x66, 0x8e, 0x9f, 0x8f, 0xb9, 0xa0, 0xd0, 0x12, 0x85, 0xb5, 0xc8, 0x42, 0x66,
             0x70, 0x02,
         ];
-        assert_eq!(base.exec_cmd_job_id().unwrap(), expected);
-        assert_eq!(
-            ToolIntent {
-                path: "different\0subdir".into(),
-                ..base.clone()
-            }
-            .exec_cmd_job_id()
-            .unwrap(),
-            expected
-        );
-        for changed in [
-            ToolIntent {
-                operation: [2; 16],
-                ..base.clone()
-            },
-            ToolIntent {
-                generation: 2,
-                ..base.clone()
-            },
-            ToolIntent { ordinal: 2, ..base },
-        ] {
-            assert_ne!(changed.exec_cmd_job_id().unwrap(), expected);
+        assert_eq!(exec_cmd_job_id([1; 16], 1, 1), expected);
+        for (operation, generation, ordinal) in [([2; 16], 1, 1), ([1; 16], 2, 1), ([1; 16], 1, 2)]
+        {
+            assert_ne!(exec_cmd_job_id(operation, generation, ordinal), expected);
         }
     }
 
@@ -3249,20 +3038,5 @@ mod tests {
         // Kind 23 has no string field: its size depends only on entry counts.
         let bytes = round23(settled());
         assert_eq!(bytes.len(), 72 + (101 + 9) + 101 + 6 + 4 + 20 + 8);
-    }
-    #[test]
-    fn j1t_01_exec_cmd_job_id_is_shared_by_kinds_14_and_22() {
-        let intent = exec_cmd();
-        assert_eq!(
-            exec_cmd_job_id(intent.operation, intent.generation, intent.ordinal),
-            intent.exec_cmd_job_id().unwrap()
-        );
-        assert_eq!(
-            exec_cmd_job_id([1; 16], 1, 1),
-            [
-                0x7e, 0x66, 0x8e, 0x9f, 0x8f, 0xb9, 0xa0, 0xd0, 0x12, 0x85, 0xb5, 0xc8, 0x42, 0x66,
-                0x70, 0x02,
-            ]
-        );
     }
 }

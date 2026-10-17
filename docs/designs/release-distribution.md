@@ -4,7 +4,11 @@ Status: proposed D7/I9 distribution design. [ADR-0008](../decisions/0008-homebre
 selects the existing `pidster/homebrew-tap` and prebuilt GitHub release pattern.
 The exact Asura archive layout, signing/notarization procedure, formula update
 automation and service handover remain open. No release is implemented or
-qualified.
+qualified. Upgrade, handover and migration sections are deferred until the first
+release (owner, 2026-10-17). Before that release, no compatibility with older
+builds or data is required. Live build-mismatch detection stays in force: a
+control protocol mismatch reports `incompatible_protocol`, and the service checks
+the helper's exact `build_id` and `schema_digest`.
 
 The [system architecture](system-architecture.md) owns standalone service
 startup and protocol negotiation. The [authority recovery design](persistence-recovery.md)
@@ -123,6 +127,10 @@ under [conversation admission](conversation-admission.md#automatic-initializatio
 partial or conflicting state requires repair. Homebrew itself is not a service
 supervisor.
 
+Deferred until the first release (owner, 2026-10-17): the upgrade, handover, downgrade and migration rules in the
+rest of this section and the upgrade admission state below. They describe the
+intended release behavior; they are not current requirements.
+
 An upgrade may make a new client executable available while the old service
 continues running. The client and service must exchange a bounded, stable
 maintenance handshake before any stateful request. It identifies the service
@@ -191,8 +199,9 @@ work across Homebrew cleanup until those cases pass.
 
 ### Upgrade admission state
 
-Proposed state view. Arrows show version and handover outcomes. A client never
-infers that an installed binary replaced a live service.
+Proposed state view, deferred until the first release (owner, 2026-10-17). Arrows show version and
+handover outcomes. A client never infers that an installed binary replaced a
+live service.
 
 ```mermaid
 stateDiagram-v2
@@ -213,11 +222,11 @@ stateDiagram-v2
 | --- | --- | --- |
 | HD1 | Clean supported macOS host installs from tap | Formula resolves the exact qualified artifact; version, signature, resources and no-state install behavior pass. |
 | HD2 | Unsupported architecture or macOS | Formula or binary rejects before service or authority creation. |
-| HD3 | Upgrade while an old service has active work | New client negotiates compatibility or reports UpgradePending; the drain barrier accounts for every accepted request before handover. |
-| HD4 | Service crash during handover | Sole-owner recovery replays original requests and tasks before new admission. |
+| HD3 | Upgrade while an old service has active work | Deferred until the first release (owner, 2026-10-17). New client negotiates compatibility or reports UpgradePending; the drain barrier accounts for every accepted request before handover. |
+| HD4 | Service crash during handover | Deferred until the first release (owner, 2026-10-17). Sole-owner recovery replays original requests and tasks before new admission. |
 | HD5 | Formula or download digest failure | Installation fails without changing `.asura` or the bound graph. |
 | HD6 | Uninstall then reinstall | User data persists; compatible reinstall reopens the original installation only after binding verification. |
-| HD7 | Older binary after authority schema migration | It rejects the unknown schema and does not write or roll back state. |
+| HD7 | Older binary after authority schema migration | Deferred until the first release (owner, 2026-10-17). It rejects the unknown schema and does not write or roll back state. |
 | HD8 | Formula test runs on an account with existing Asura state | Version checks create no socket, service or authority write, regardless of Homebrew's temporary `HOME`. |
 | HD9 | Relocated archive includes several executables or runtime resources | Manifest, exact shared build and private-protocol identities, signature and executable resource lookup pass from an installed keg without build-tree paths. |
 | HD10 | Release dry run or prepublication check fails | No tag, release asset or tap commit is changed; the previous formula remains installable. |

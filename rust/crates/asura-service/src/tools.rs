@@ -87,7 +87,6 @@ pub enum Arguments {
     ExecCmd {
         command: String,
         cwd: String,
-        timeout_seconds: u32,
     },
     ReadAudit {
         limit: u32,
@@ -173,11 +172,7 @@ impl Arguments {
                 };
             }
             Self::ObserveStatus | Self::ListTools => return Ok(()),
-            Self::ExecCmd {
-                command,
-                cwd,
-                timeout_seconds,
-            } => {
+            Self::ExecCmd { command, cwd } => {
                 return if !command.is_empty()
                     && command.len() <= 8192
                     && !command.contains('\0')
@@ -186,7 +181,6 @@ impl Arguments {
                     && !cwd.contains('\0')
                     && !cwd.starts_with('/')
                     && !cwd.split('/').any(|part| part == "..")
-                    && (1..=60).contains(timeout_seconds)
                 {
                     Ok(())
                 } else {
@@ -330,7 +324,6 @@ pub enum Rejection {
     Stale,
     Denied,
     InvalidArguments,
-    Expired,
     Limit,
     Busy,
     Cancelled,
@@ -388,25 +381,15 @@ pub fn validate_authority(
 /// Cancellation deliberately retains pending work until its worker settles.
 #[derive(Debug)]
 pub struct Budget {
-    deadline: Option<Instant>,
     admitted: u32,
     result_bytes: usize,
     pending: Option<Call>,
     cancelled: bool,
 }
 impl Budget {
-    pub fn new(deadline: Instant) -> Self {
-        Self {
-            deadline: Some(deadline),
-            admitted: 0,
-            result_bytes: 0,
-            pending: None,
-            cancelled: false,
-        }
-    }
+    /// The only budget: no time bound; cancellation ends admission.
     pub fn cancellation_driven() -> Self {
         Self {
-            deadline: None,
             admitted: 0,
             result_bytes: 0,
             pending: None,
@@ -418,10 +401,9 @@ impl Budget {
         call: Call,
         grant: &Grant,
         destination: &Destination,
-        now: Instant,
     ) -> Result<(), Rejection> {
         validate(&call, grant, destination)?;
-        self.reserve_slot(call, now)
+        self.reserve_slot(call)
     }
     /// Reserve only a bounded, semantically invalid proposal; never grants execution.
     pub fn reserve_rejected(
@@ -429,7 +411,6 @@ impl Budget {
         call: Call,
         grant: &Grant,
         destination: &Destination,
-        now: Instant,
     ) -> Result<(), Rejection> {
         validate_authority(&call, grant, destination)?;
         let bounded = match &call.arguments {
@@ -455,14 +436,11 @@ impl Budget {
         if !bounded || call.arguments.validate() != Err(Rejection::InvalidArguments) {
             return Err(Rejection::InvalidArguments);
         }
-        self.reserve_slot(call, now)
+        self.reserve_slot(call)
     }
-    fn reserve_slot(&mut self, call: Call, now: Instant) -> Result<(), Rejection> {
+    fn reserve_slot(&mut self, call: Call) -> Result<(), Rejection> {
         if self.cancelled {
             return Err(Rejection::Cancelled);
-        }
-        if self.deadline.is_some_and(|deadline| now >= deadline) {
-            return Err(Rejection::Expired);
         }
         if let Some(pending) = &self.pending {
             return Err(if pending.ordinal == call.ordinal && pending != &call {
@@ -526,7 +504,6 @@ mod tests {
             arguments: Arguments::ExecCmd {
                 command: "printf hello".into(),
                 cwd: ".".into(),
-                timeout_seconds: 30,
             },
         };
         assert_eq!(
@@ -540,19 +517,11 @@ mod tests {
             validate(&call, &grant, &Destination::Remote("approved".into())),
             Err(Rejection::Denied)
         );
-        for (command, cwd, timeout_seconds) in [
-            ("", ".", 1),
-            ("a\0b", ".", 1),
-            ("echo", "../x", 1),
-            ("echo", "/tmp", 1),
-            ("echo", ".", 0),
-            ("echo", ".", 61),
-        ] {
+        for (command, cwd) in [("", "."), ("a\0b", "."), ("echo", "../x"), ("echo", "/tmp")] {
             let mut invalid = call.clone();
             invalid.arguments = Arguments::ExecCmd {
                 command: command.into(),
                 cwd: cwd.into(),
-                timeout_seconds,
             };
             assert_eq!(
                 validate(&invalid, &grant, &Destination::Local),
@@ -562,7 +531,6 @@ mod tests {
     }
     #[test]
     fn rejected_arguments_consume_ordinal_and_never_authorize_execution() {
-        let now = Instant::now();
         let grant = Grant {
             operation: [1; 16],
             generation: 1,
@@ -572,7 +540,7 @@ mod tests {
             execute_authorized: false,
             remote_destination: None,
         };
-        let mut budget = Budget::new(now + Duration::from_secs(1));
+        let mut budget = Budget::cancellation_driven();
         let mut call = Call {
             operation: [1; 16],
             generation: 1,
@@ -588,27 +556,27 @@ mod tests {
             Err(Rejection::InvalidArguments)
         );
         budget
-            .reserve_rejected(call.clone(), &grant, &Destination::Local, now)
+            .reserve_rejected(call.clone(), &grant, &Destination::Local)
             .unwrap();
         assert_eq!(
-            budget.reserve_rejected(call.clone(), &grant, &Destination::Local, now),
+            budget.reserve_rejected(call.clone(), &grant, &Destination::Local),
             Err(Rejection::Busy)
         );
         budget.settle(&call, 0).unwrap();
         assert_eq!(
-            budget.reserve_rejected(call.clone(), &grant, &Destination::Local, now),
+            budget.reserve_rejected(call.clone(), &grant, &Destination::Local),
             Err(Rejection::Limit)
         );
         for ordinal in 2..=8 {
             call.ordinal = ordinal;
             budget
-                .reserve_rejected(call.clone(), &grant, &Destination::Local, now)
+                .reserve_rejected(call.clone(), &grant, &Destination::Local)
                 .unwrap();
             budget.settle(&call, 0).unwrap();
         }
         call.ordinal = 9;
         assert_eq!(
-            budget.reserve_rejected(call, &grant, &Destination::Local, now),
+            budget.reserve_rejected(call, &grant, &Destination::Local),
             Err(Rejection::Limit)
         );
     }
@@ -720,13 +688,11 @@ mod tests {
                     inode: 0,
                     boundary: asura_platform::StateBoundary::detached_for_test(),
                 },
-                Instant::now() + Duration::from_secs(1)
             ),
             Err(ExecutionError::Rejected(Rejection::Denied))
         );
     }
 
-    use std::time::Duration;
     fn fixture() -> (Call, Grant) {
         (
             Call {
@@ -855,17 +821,16 @@ mod tests {
     #[test]
     fn cancellation_driven_budget_admits_late_tools_but_enforces_cancel() {
         let (call, grant) = fixture();
-        let later = Instant::now() + std::time::Duration::from_secs(120);
         let mut budget = Budget::cancellation_driven();
         budget
-            .reserve(call.clone(), &grant, &Destination::Local, later)
+            .reserve(call.clone(), &grant, &Destination::Local)
             .unwrap();
         budget.settle(&call, 0).unwrap();
         budget.cancel();
         let mut next = call;
         next.ordinal = 2;
         assert_eq!(
-            budget.reserve(next, &grant, &Destination::Local, later),
+            budget.reserve(next, &grant, &Destination::Local),
             Err(Rejection::Cancelled)
         );
     }
@@ -873,19 +838,18 @@ mod tests {
     #[test]
     fn cancellation_and_invalid_results_retain_pending_slot() {
         let (call, grant) = fixture();
-        let now = Instant::now();
-        let mut budget = Budget::new(now + Duration::from_secs(60));
+        let mut budget = Budget::cancellation_driven();
         budget
-            .reserve(call.clone(), &grant, &Destination::Local, now)
+            .reserve(call.clone(), &grant, &Destination::Local)
             .unwrap();
         assert_eq!(
-            budget.reserve(call.clone(), &grant, &Destination::Local, now),
+            budget.reserve(call.clone(), &grant, &Destination::Local),
             Err(Rejection::Busy)
         );
         let mut changed = call.clone();
         changed.arguments = Arguments::ListDirectory { path: ".".into() };
         assert_eq!(
-            budget.reserve(changed, &grant, &Destination::Local, now),
+            budget.reserve(changed, &grant, &Destination::Local),
             Err(Rejection::IdentityConflict)
         );
         budget.cancel();
@@ -898,45 +862,38 @@ mod tests {
         budget.settle(&call, 0).unwrap();
         assert!(budget.is_settled());
         assert_eq!(
-            budget.reserve(call, &grant, &Destination::Local, now),
+            budget.reserve(call, &grant, &Destination::Local),
             Err(Rejection::Cancelled)
         );
     }
     #[test]
     fn aggregate_result_and_call_limits_cannot_expand_on_settlement() {
         let (mut call, grant) = fixture();
-        let now = Instant::now();
-        let mut budget = Budget::new(now + Duration::from_secs(60));
+        let mut budget = Budget::cancellation_driven();
         for ordinal in 1..=4 {
             call.ordinal = ordinal;
             budget
-                .reserve(call.clone(), &grant, &Destination::Local, now)
+                .reserve(call.clone(), &grant, &Destination::Local)
                 .unwrap();
             budget.settle(&call, MAX_RESULT_BYTES).unwrap();
         }
         call.ordinal = 5;
         assert_eq!(
-            budget.reserve(call.clone(), &grant, &Destination::Local, now),
+            budget.reserve(call.clone(), &grant, &Destination::Local),
             Err(Rejection::Limit)
         );
-        let mut budget = Budget::new(now + Duration::from_secs(60));
+        let mut budget = Budget::cancellation_driven();
         for ordinal in 1..=MAX_CALLS {
             call.ordinal = ordinal;
             budget
-                .reserve(call.clone(), &grant, &Destination::Local, now)
+                .reserve(call.clone(), &grant, &Destination::Local)
                 .unwrap();
             budget.settle(&call, 0).unwrap();
         }
         call.ordinal = MAX_CALLS + 1;
         assert_eq!(
-            budget.reserve(call.clone(), &grant, &Destination::Local, now),
+            budget.reserve(call.clone(), &grant, &Destination::Local),
             Err(Rejection::Limit)
-        );
-        let mut expired = Budget::new(now);
-        call.ordinal = 1;
-        assert_eq!(
-            expired.reserve(call, &grant, &Destination::Local, now),
-            Err(Rejection::Expired)
         );
     }
 }
@@ -966,8 +923,6 @@ struct Work {
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: std::thread::JoinHandle<Result<Output, ExecutionError>>,
     completion: crate::completion::Completion,
-    deadline: Instant,
-    deadline_reported: bool,
 }
 /// One service-owned execution slot. Its owner must retain this value until settled.
 #[derive(Default)]
@@ -984,11 +939,7 @@ impl Executor {
             if work.thread.is_finished() {
                 return Some(now);
             }
-            work.completion
-                .settlement_deadline(now)
-                .into_iter()
-                .chain((!work.deadline_reported).then_some(work.deadline))
-                .min()
+            work.completion.settlement_deadline(now)
         })
     }
 
@@ -1000,7 +951,6 @@ impl Executor {
         grant: Grant,
         destination: Destination,
         scope: ExecutionScope,
-        turn_deadline: Instant,
     ) -> Result<(), ExecutionError> {
         if self.work.is_some() {
             return Err(ExecutionError::Rejected(Rejection::Busy));
@@ -1019,12 +969,8 @@ impl Executor {
         if scope.project != grant.project {
             return Err(ExecutionError::Rejected(Rejection::Denied));
         }
-        let now = Instant::now();
-        if now >= turn_deadline {
-            return Err(ExecutionError::Rejected(Rejection::Expired));
-        }
-        let deadline = turn_deadline.min(now + std::time::Duration::from_secs(2));
-        self.spawn(deadline, move |cancelled| {
+        // No time bound: the read ends on completion or the turn's cancel.
+        self.spawn(move |cancelled| {
             if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(ExecutionError::Rejected(Rejection::Cancelled));
             }
@@ -1051,11 +997,11 @@ impl Executor {
                     offset,
                     limit,
                 } => project
-                    .read_project_page(&path, offset, limit as usize, deadline, cancelled)
+                    .read_project_page(&path, offset, limit as usize, cancelled)
                     .map(Output::File)
                     .map_err(ExecutionError::Host),
                 Arguments::ListDirectory { path } => project
-                    .list_project_directory(&path, deadline, cancelled)
+                    .list_project_directory(&path, cancelled)
                     .map(Output::Directory)
                     .map_err(ExecutionError::Host),
             }
@@ -1063,7 +1009,6 @@ impl Executor {
     }
     fn spawn(
         &mut self,
-        deadline: Instant,
         run: impl FnOnce(&std::sync::atomic::AtomicBool) -> Result<Output, ExecutionError>
         + Send
         + 'static,
@@ -1086,23 +1031,8 @@ impl Executor {
             cancelled,
             thread,
             completion,
-            deadline,
-            deadline_reported: false,
         });
         Ok(())
-    }
-    /// Expiry revokes continuation but does not release an unsettled worker slot.
-    pub fn expire(&mut self, now: Instant) -> bool {
-        let Some(work) = self.work.as_mut() else {
-            return false;
-        };
-        if now < work.deadline || work.deadline_reported {
-            return false;
-        }
-        work.deadline_reported = true;
-        work.cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
-        true
     }
     pub fn cancel(&self) {
         if let Some(work) = &self.work {
@@ -1135,16 +1065,13 @@ mod executor_tests {
         let (release, wait) = std::sync::mpsc::sync_channel(1);
         let mut executor = Executor::default();
         executor
-            .spawn(
-                Instant::now() + std::time::Duration::from_secs(2),
-                move |_| {
-                    wait.recv_timeout(std::time::Duration::from_secs(2))
-                        .unwrap();
-                    Err(ExecutionError::Host(
-                        asura_platform::ProjectReadError::Cancelled,
-                    ))
-                },
-            )
+            .spawn(move |_| {
+                wait.recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                Err(ExecutionError::Host(
+                    asura_platform::ProjectReadError::Cancelled,
+                ))
+            })
             .unwrap();
         executor.cancel();
         let pending = executor.poll();
@@ -1171,37 +1098,46 @@ mod executor_tests {
         );
         assert!(executor.is_settled());
     }
+    /// MT-D1: a stalled project read has no timer. Its slot stays held and
+    /// schedules no deadline; only cancel (or completion) ends it.
     #[test]
-    fn deadline_is_an_owner_event_and_does_not_release_the_host_slot() {
-        let (release, wait) = std::sync::mpsc::sync_channel(1);
-        let now = Instant::now();
-        let deadline = now + std::time::Duration::from_secs(2);
+    fn stalled_worker_schedules_no_deadline_and_ends_on_cancel() {
+        let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
         let mut executor = Executor::default();
         executor
-            .spawn(deadline, move |_| {
-                wait.recv().unwrap();
-                Ok(Output::File(asura_platform::ProjectPage {
-                    text: "late bytes".into(),
-                    next_offset: 10,
-                    truncated: false,
-                }))
+            .spawn(move |cancelled| {
+                // Stands in for a blocked read that checks its cancel flag.
+                while !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    if wait.try_recv().is_ok() {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                Err(ExecutionError::Host(
+                    asura_platform::ProjectReadError::Cancelled,
+                ))
             })
             .unwrap();
-        assert_eq!(executor.next_deadline(now), Some(deadline));
-        assert!(!executor.expire(now));
-        assert!(executor.expire(deadline));
-        assert!(!executor.expire(deadline));
-        assert!(!executor.is_settled());
+        let later = Instant::now() + std::time::Duration::from_secs(3600);
+        assert_eq!(executor.next_deadline(later), None);
         assert!(executor.poll().is_none());
-        assert_eq!(executor.next_deadline(deadline), None);
-        release.send(()).unwrap();
-        let end = Instant::now() + std::time::Duration::from_secs(1);
-        while !executor.work.as_ref().unwrap().thread.is_finished() {
-            assert!(Instant::now() < end);
+        assert!(!executor.is_settled());
+        executor.cancel();
+        let end = Instant::now() + std::time::Duration::from_secs(5);
+        let outcome = loop {
+            if let Some(result) = executor.poll() {
+                break result;
+            }
+            assert!(Instant::now() < end, "cancel did not end the stalled read");
             std::thread::yield_now();
-        }
-        assert!(executor.next_deadline(Instant::now()).is_some());
-        assert!(executor.poll().is_some());
+        };
+        drop(release);
+        assert_eq!(
+            outcome,
+            Err(ExecutionError::Host(
+                asura_platform::ProjectReadError::Cancelled
+            ))
+        );
         assert!(executor.is_settled());
     }
 }

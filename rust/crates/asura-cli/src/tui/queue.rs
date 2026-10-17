@@ -11,7 +11,6 @@ use std::{
 };
 #[derive(Clone, Debug)]
 pub(super) enum Request {
-    Enqueue(pb::ConversationEnqueue),
     Submit(pb::ConversationQueueSubmit),
     Reorder(pb::ConversationQueueReorder),
     List {
@@ -89,7 +88,6 @@ impl Worker {
                     // budget (J1-0); /cancel stops the wait.
                     let stop = || cancelled.load(Ordering::Acquire);
                     let result = match command {
-                        Request::Enqueue(request) => client.enqueue_conversation(request, &stop),
                         Request::Submit(request) => client.queue_conversation_input(request, &stop),
                         Request::Reorder(request) => {
                             client.reorder_conversation_input(request, &stop)

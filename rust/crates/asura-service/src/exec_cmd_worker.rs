@@ -190,7 +190,6 @@ impl Worker {
             job_id: intent.job,
             command: intent.command.clone(),
             cwd: Some(intent.cwd.clone()),
-            deadline: None,
             secrets,
         };
         let sink = handle.output_sink();
@@ -319,7 +318,6 @@ impl Worker {
                 }
                 Ok(Err(failure)) => {
                     let error = match active.stop {
-                        Some(StopReason::Deadline) => ExecCmdError::Deadline,
                         Some(_) => ExecCmdError::Cancelled,
                         None => failure.error,
                     };
@@ -643,7 +641,6 @@ fn mapped_result(
         return failed(intent, ExecCmdError::Protocol);
     }
     let status = match result.reason {
-        Some(StopReason::Deadline) => 5,
         Some(StopReason::OutputLimit) => 7,
         Some(StopReason::Cancelled | StopReason::LeaseEnded) => 6,
         None => 1,
@@ -667,7 +664,6 @@ pub(crate) fn failed(intent: &ExecCmdIntent, error: ExecCmdError) -> ToolResult 
     let (status, text) = match error {
         ExecCmdError::Invalid => (3, "exec_cmd_invalid_arguments"),
         ExecCmdError::Denied => (2, "exec_cmd_denied"),
-        ExecCmdError::Deadline => (5, "exec_cmd_timeout; effects may have occurred"),
         ExecCmdError::Cancelled => (6, "exec_cmd_cancelled; effects may have occurred"),
         ExecCmdError::Protocol | ExecCmdError::CleanupUnconfirmed => {
             (4, "exec_cmd_outcome_unconfirmed; effects may have occurred")

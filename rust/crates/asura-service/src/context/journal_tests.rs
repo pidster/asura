@@ -132,7 +132,7 @@ fn forty_turns_compose_within_the_window_and_reconstruct_after_replay() {
             prompt: prompt.clone(),
             reserved_output_tokens: 2048,
             event_cursor: 1,
-            composition: Some(composed.composition(budget)),
+            composition: composed.composition(budget),
         };
         for record in [
             journal::Record::TurnAccepted(Box::new(turn.clone())),
@@ -182,7 +182,7 @@ fn forty_turns_compose_within_the_window_and_reconstruct_after_replay() {
     let state = wait(&writer, writer::Command::Open).replay.unwrap();
     assert_eq!(state.conversations[&conversation].generation, 40);
     let late = &accepted_turns[39].0;
-    let composition = late.composition.unwrap();
+    let composition = late.composition;
     assert!(composition.omitted_turns > 0, "older turns were omitted");
     assert_eq!(
         late.prior_operations.len() as u32 + composition.omitted_turns,
@@ -190,7 +190,7 @@ fn forty_turns_compose_within_the_window_and_reconstruct_after_replay() {
     );
     drop(state);
     for (turn, input) in &accepted_turns {
-        let c = turn.composition.unwrap();
+        let c = turn.composition;
         let prepared = wait(
             &writer,
             writer::Command::Prepare {

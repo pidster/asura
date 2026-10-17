@@ -1644,8 +1644,8 @@ graph and descriptor, then runs the matching database method on its retained
 executor. The reply carries `memory_result`, preserving typed memory failures.
 Admission and graph attachment failures use the existing authority error enum.
 The six ordinary/eight total queue slots remain unchanged. The writer and the
-database call have no time bound (J1-0; owner, 2026-10-16); the tool deadline
-bounds only the caller's wait. Dropping a ticket drops result delivery; it does
+database call have no time bound (J1-0; owner, 2026-10-16). The caller's wait
+has no deadline either (owner, 2026-10-17); turn cancel, steering or shutdown ends it. Dropping a ticket drops result delivery; it does
 not start a replacement owner. The worker retains ownership during settlement.
 These read-only commands write no journal entry and authorize no note mutation.
 
@@ -1762,10 +1762,10 @@ or remote fallback in HM2. A failing memory read cannot trigger remote inference
 One logical turn retains the existing eight-call budget, one pending tool call,
 16 KiB result limit and 64 KiB aggregate result limit. The turn has no elapsed-time
 deadline: the [cancellation-driven turn lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
-replaced the earlier 60-second turn deadline. A memory call has two seconds from
-durable-intent acknowledgement. That is the ordinary tool deadline (L10), which
-the owner has queued for replacement
-([tool output views](tool-output-views.md#execution)). It shares the authority worker's six ordinary/eight total
+replaced the earlier 60-second turn deadline. A memory call has no deadline; the
+earlier two-second ordinary tool deadline (L10) is removed (owner, 2026-10-17;
+[tool output views](tool-output-views.md#execution)). It ends on completion,
+turn cancel, steering or shutdown. It shares the authority worker's six ordinary/eight total
 queue slots. There is no new worker thread, engine connection, retry loop or timer
 polling loop in a client or render path.
 
@@ -1891,7 +1891,7 @@ build path and retain the package identity checks.
 HM2-U1: test exact schema presence/direction, every invalid ID form, cursor absence,
 zero/maximum limits, offset overflow, UTF-8 boundaries, escaped preview output,
 result budget accounting, and fixed error mapping. Test all new durable kinds;
-legacy kinds must retain byte-compatible fixtures. Rejected kinds cannot replay
+existing kinds keep their exact byte fixtures. Rejected kinds cannot replay
 success. Test native schemas and capability-disabled absence for each adapter.
 
 HM2-I1: populate two scratch project contexts through the canonical adapter.
@@ -2123,13 +2123,13 @@ schema. Other projects, status, input editing and cancellation remain responsive
 The create worker may validate its own source internally; it cannot bypass another
 unresolved create. A source note from an unpublished operation is ineligible.
 
-The caller keeps intent acknowledgement plus two seconds (the L10 ordinary tool
-deadline, queued for replacement) as its own wait deadline; the turn itself has
-no elapsed-time deadline. Under [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound) that deadline no
-longer reaches the writer or database work: when it passes, the caller sets the
-create's cancel flag, which stops the cancellable put. The existing six
+The caller's wait has no deadline; the earlier L10 two-second wait is removed
+(owner, 2026-10-17), and the turn itself has no elapsed-time deadline. Under
+[journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)
+the writer and database work have no time bound either. A turn cancel, steering
+or shutdown sets the create's cancel flag, which stops the cancellable put. The existing six
 ordinary/eight total authority slots and retained settlement token remain in
-force. Cancellation or timeout after dispatch fences inference but does not assert
+force. Cancellation after dispatch fences inference but does not assert
 rollback. Retain the mutation ticket, tool slot and original metadata until actual
 worker settlement. Then resolve the exact original receipt with a separate
 recovery read that waits for the writer's real reply, even after the caller's
@@ -2230,7 +2230,7 @@ existing service repair state. Diagnostic output contains no note/source bodies.
 
 HM3-U1: identity domain separation and known-byte fixtures; same-call payload
 changes retain IDs but change digest; all codec/presence/size/source boundaries;
-legacy records unchanged; rejected create cannot replay success; recovered create
+existing records unchanged; rejected create cannot replay success; recovered create
 results allowed only for exact unresolved intent and exact success metadata.
 Test that read-only authority, an observation, a classifier, a remote destination,
 a disabled native capability and a caller-supplied boolean cannot issue an intent.

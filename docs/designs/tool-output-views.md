@@ -83,7 +83,7 @@ its classification under the principles above.
 
 | ID | Limit | Current value | Class | Owner after review |
 | --- | --- | --- | --- | --- |
-| L1 | exec_cmd timeout | 1–60 s, default 30 | Remove | Removed in J1 (owner, 2026-10-15, J1-Q3): a command ends on completion or turn cancel; `timeout_seconds` is accepted and ignored until J3. Then the job yield window only; jobs have no fixed lifetime (owner, 2026-10-14, J2a-1). Job closures are completion, cancel, revocation, restart and capture fault |
+| L1 | exec_cmd timeout | 1–60 s, default 30 | Remove | Removed in J1 (owner, 2026-10-15, J1-Q3): a command ends on completion or turn cancel; `timeout_seconds` is removed (owner, 2026-10-17). Then the job yield window only; jobs have no fixed lifetime (owner, 2026-10-14, J2a-1). Job closures are completion, cancel, revocation, restart and capture fault |
 | L2 | Setup budget | 2 s | Remove (owner, 2026-10-15) | Job setup ends on spawn, cancel or setup fault ([job closures](tool-job-controller.md#job-closures-and-wind-down-bounds)) |
 | L3 | Cleanup until unconfirmed | 2.5 s | Keep | exec_cmd tool |
 | L4 | TERM to KILL grace | 500 ms | Keep | exec_cmd tool; the person profile sets its own |
@@ -92,7 +92,7 @@ its classification under the principles above.
 | L7 | Scratch cleanup | 4096 entries, 32 levels | Keep | exec_cmd tool |
 | L8 | Live exec_cmd jobs | 1 per active turn | Replace | Job slots per service and per conversation |
 | L9 | Pending tool calls and executors | 1 each | Keep | Model tools |
-| L10 | Ordinary tool deadline | 2 s | Replace (owner, 2026-10-15: far too short) | Queued for the design that moves every tool to jobs ([job controller open decisions](tool-job-controller.md#open-decisions)) |
+| L10 | Ordinary tool deadline | 2 s | Removed (owner, 2026-10-17) | A non-exec tool call ends on completion, cancel, steering, shutdown or helper exit ([model tool execution](model-tool-execution.md#mt3-activation-completion)) |
 | L11 | Command and cwd | 8192 B and 1024 B | Keep | exec_cmd tool |
 | L12 | Private argv payload | 8704 B | Keep | exec_cmd tool |
 
@@ -127,7 +127,7 @@ its classification under the principles above.
 | ID | Limit | Current value | Class | Owner after review |
 | --- | --- | --- | --- | --- |
 | L29 | Frame | 64 KiB | Keep | Journal transport unit |
-| L30 | Journal capacity | 8 MiB, 32,768 frames | Replace (owner, 2026-10-15): the single 8 MiB file must not be the limit | Required follow-up journal design: known-size segment files with checkpoint snapshots and compaction, total size from a configurable quota and disk space ([conversation admission](conversation-admission.md#format-1-and-record-compatibility)). Current values stay until it lands |
+| L30 | Journal capacity | 8 MiB, 32,768 frames | Replace (owner, 2026-10-15): the single 8 MiB file must not be the limit | Required follow-up journal design: known-size segment files with checkpoint snapshots and compaction, total size from a configurable quota and disk space ([conversation admission](conversation-admission.md#format-1-and-record-kinds)). Current values stay until it lands |
 | L31 | Tool result text record | 16,384 B | Replace | Reference, digest and summary record |
 | L32 | exec_cmd intent payload | 9217 B | Keep | exec_cmd tool |
 | L33 | exec_cmd intent timeout | 1–60,000 ms | Remove | J1's ExecCmdIntent kind 22 records no timeout (owner, 2026-10-15, J1-Q3); the job intent records none either (owner, 2026-10-14, J2a-1). Older kind 14 records keep theirs. |
@@ -147,7 +147,7 @@ its classification under the principles above.
 | L42 | `get_note` page | 1–16,384, default 4096 | Keep ceiling; default becomes a composer choice | Memory tools |
 | L43 | Note sources | 32 | Keep | Memory tools |
 | L44 | Note body | 1–16,384 | Keep | Memory tools |
-| L45 | Store response and deadline | 32 records or 64 KiB; 2 s | Keep the response size; remove the 2 s store deadline (owner, 2026-10-16) | Memory store: queries and transactions end on completion, an engine error or the caller's cancel ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). The caller's L10 wait is separate |
+| L45 | Store response and deadline | 32 records or 64 KiB; 2 s | Keep the response size; remove the 2 s store deadline (owner, 2026-10-16) | Memory store: queries and transactions end on completion, an engine error or the caller's cancel ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). L10 is removed, so the caller's wait has no deadline either |
 | L46 | `read_audit` | 1–16 records | Keep | Audit tools |
 | L47 | Audit reply bytes | 16,384 in design; 15,000 in code | Keep | Audit tools |
 | L48 | Audit window, record, hydrate | 256; 4096 B; 256 KiB | Keep | Audit |

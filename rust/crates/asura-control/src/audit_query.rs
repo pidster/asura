@@ -80,7 +80,6 @@ pub(crate) fn reply(v: &pb::AuditReply) -> bool {
                     | "project_overlaps_asura_state"
                     | "invalid_request"
                     | "capacity_exhausted"
-                    | "storage_timeout"
                     | "authority_unavailable"
                     | "authority_repair_required"
                     | "installation_required"

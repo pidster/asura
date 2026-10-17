@@ -620,19 +620,6 @@ impl Client {
             _ => Err(Error::Protocol),
         }
     }
-    pub fn enqueue_conversation(
-        &mut self,
-        request: pb::ConversationEnqueue,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<pb::ConversationQueueReply> {
-        let expected = request.request_id.clone();
-        match self.mutation(pb::envelope::Body::ConversationEnqueue(request), cancelled)? {
-            pb::envelope::Body::ConversationQueueReply(reply) if reply.request_id == expected => {
-                Ok(reply)
-            }
-            _ => Err(Error::Protocol),
-        }
-    }
     pub fn queue_conversation_input(
         &mut self,
         request: pb::ConversationQueueSubmit,
@@ -704,27 +691,6 @@ impl Client {
             cancelled,
         )? {
             pb::envelope::Body::ConversationQueueReply(reply) if reply.request_id == expected => {
-                Ok(reply)
-            }
-            _ => Err(Error::Protocol),
-        }
-    }
-    /// Submit, including the service's journal acknowledgement. The wait has
-    /// no time bound (owner, 2026-10-16): `cancelled` or a lost connection
-    /// ends it as `OutcomeUnconfirmed`; the caller retries with the same ID.
-    pub fn submit_conversation(
-        &mut self,
-        request: pb::ConversationSubmit,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<pb::ConversationAccepted> {
-        let expected_generation = request.expected_generation.and_then(|n| n.checked_add(1));
-        let expected_conversation = request.conversation_id.clone();
-        match self.mutation(pb::envelope::Body::ConversationSubmit(request), cancelled)? {
-            pb::envelope::Body::ConversationAccepted(reply)
-                if reply.generation == expected_generation
-                    && (expected_conversation.is_none()
-                        || reply.conversation_id == expected_conversation) =>
-            {
                 Ok(reply)
             }
             _ => Err(Error::Protocol),
@@ -1326,7 +1292,6 @@ mod tests {
                         _ => pb::envelope::Body::InspectReply(pb::InspectReply {
                             lifecycle: Some(pb::Lifecycle::Serving as i32),
                             installation: Some(pb::InstallationState::Recovering as i32),
-                            unavailable_reason: None,
                             reason: Some(
                                 pb::InstallationInspectionReason::InspectionPending as i32,
                             ),

@@ -128,7 +128,7 @@ pub(crate) fn reason_name(reason: i32) -> &'static str {
         9 => "incomplete_tail",
         10 => "corrupt_authority",
         11 => "inspection_limit",
-        12 => "inspection_timeout",
+        12 => "inspection_cancelled",
         13 => "unsafe_authority",
         14 => "authority_changed",
         15 => "inspection_io",
@@ -394,9 +394,7 @@ pub fn entry_with_logs(
         .is_some_and(|a| a == "--asura-exec-cmd-guardian")
     {
         return match args.as_slice() {
-            [_, job, deadline, command] => {
-                asura_platform::exec_cmd::run_guardian(job, deadline, command)
-            }
+            [_, job, command] => asura_platform::exec_cmd::run_guardian(job, command),
             _ => 2,
         };
     }

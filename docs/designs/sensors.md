@@ -14,7 +14,8 @@ retention stay as data freshness and retention rules; they end no work.
 Reconnect backoff never stops. The design-only five-second persistence limit is
 removed. Implemented 2026-10-16 for the inspection client request. No reconnect
 code exists yet, so never-stopping backoff stays a design rule. The L10 tool
-deadline is unchanged and queued for the tool-adoption design.
+deadline is removed (owner, 2026-10-17); a tool call ends on completion, cancel
+or a fault.
 
 ## Purpose and first slice
 
@@ -400,9 +401,9 @@ evidence to the initial local-only sensor slice.
 - Tool owner: extend [model tool execution](model-tool-execution.md), which currently
   names `project_read_file` and `project_list_directory`. Reuse operation ID,
   generation and ordinal identity. Its 16 KiB result cap is stricter than the
-  generic sensor limits in this design. Its 2 s call deadline is the [ordinary tool deadline](tool-job-controller.md#open-decisions),
-  which a follow-up design replaces: a tool call ends on completion, cancel or a
-  fault (owner, 2026-10-15). Settle the status-observation descriptor name and typed payload in
+  generic sensor limits in this design. It has no call deadline: the
+  [ordinary tool deadline](model-tool-execution.md#mt3-activation-completion) is removed
+  (owner, 2026-10-17), and a tool call ends on completion, cancel or a fault. Settle the status-observation descriptor name and typed payload in
   the common registry. Do not create a parallel sensor executor or adapter loop.
 - Storage owner: assign observation/cursor/proposal records to the existing graph
   mutation boundary and reconcile their publication with canonical admission.
@@ -494,8 +495,8 @@ The stored observation retains project, source epoch and operation correlation.
 The common tool owner validates status-read and destination disclosure authority.
 The observation must be stored before the tool result is committed and exposed.
 A repeated tool identity resolves its original observation. The tool's 16 KiB
-result cap remains authoritative. Its two-second deadline is the [ordinary tool deadline](tool-job-controller.md#open-decisions);
-the follow-up design that replaces it ends the call on completion, cancel or a fault. No extra capture worker exists.
+result cap remains authoritative. The call has no deadline (owner, 2026-10-17);
+it ends on completion, cancel or a fault. No extra capture worker exists.
 
 ```mermaid
 flowchart TD
@@ -553,10 +554,9 @@ from canonical replay. No historical inactivity is inferred.
 The status tool adds ToolIntent kind 3 with empty path and zero offset/limit, under
 journal format 1. It uses the same ordinal budget and durable result record as
 project tools. Status capture waits for its observation commit before producing
-ToolResult. The code still applies the two-second [ordinary tool deadline](tool-job-controller.md#open-decisions), which
-produces a typed timeout if storage is slow; late evidence persistence cannot
-deliver a late tool result. The follow-up design removes that timeout; the call
-then ends on commit, cancellation or a fault. Cancellation follows
+ToolResult. The call has no deadline (owner, 2026-10-17); it ends on commit,
+cancellation or a fault. Evidence persistence after a cancel cannot deliver a
+late tool result. Cancellation follows
 the same common tool result path. Status metadata supplies no file-read grant.
 
 ### Coalesced journal activity checkpoints
@@ -822,8 +822,8 @@ this first packet. Discovery reports the read-only capability. Tool intent and
 result use the existing durable sequence and eight-call turn limit. Cancellation
 and generation changes discard pending delivery through the existing owner.
 There is no capture worker or query deadline. The bounded in-memory read ends on
-completion, cancellation or a fault, as the follow-up design that replaces the
-[ordinary tool deadline](tool-job-controller.md#open-decisions) requires. Serialized output must fit 16 KiB;
+completion, cancellation or a fault; the
+[ordinary tool deadline](model-tool-execution.md#mt3-activation-completion) is removed (owner, 2026-10-17). Serialized output must fit 16 KiB;
 overflow fails explicitly without publishing an incomplete JSON object.
 
 The result uses a fixed JSON structure, with numeric enum values accompanied by

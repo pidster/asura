@@ -235,8 +235,8 @@ Proposed mechanism: add one grouped model tool named `job` with six commands.
 | `cancel(job)` | Requests cancellation and returns the current state; it does not claim the process stopped. For a person job it returns `not_permitted` (PC10). |
 | `note(job, text)` | Adds a model note to the job (S1). The note is a model assertion, attributed to the model. |
 
-`wait` is exempt from the 2-second ordinary tool deadline
-([limit L10](tool-output-views.md#execution)). With no time given it stays
+No tool call has an ordinary tool deadline; limit
+[L10](tool-output-views.md#execution) is removed (owner, 2026-10-17). With no time given `wait` stays
 bounded by events: job end, new output and turn cancellation. `list`, `status`,
 `read` and `wait` also cover person jobs in the conversation (PC10).
 
@@ -556,7 +556,7 @@ When implemented, this design changes these existing contracts for jobs:
 | Existing clause | Change |
 | --- | --- |
 | exec_cmd: command stops at turn end, steering or generation invalidation | Only before handle delivery |
-| exec_cmd: `timeout_seconds` 1–60 (`tools.rs:189`); guardian rejects deadlines over 60 s (`guardian.rs:322`) | Removed. J1 removes the timeout and adds the guardian's no-deadline mode (J1-Q3); `timeout_seconds` is accepted and ignored until J3 removes it. Jobs have no lifetime (J2a-1) |
+| exec_cmd: `timeout_seconds` 1–60 (`tools.rs:189`); guardian rejects deadlines over 60 s (`guardian.rs:322`) | Removed. J1 removes the timeout and adds the guardian's no-deadline mode (J1-Q3); `timeout_seconds` and the guardian's numeric deadline mode are removed (owner, 2026-10-17). Jobs have no lifetime (J2a-1) |
 | Helper and control validation of `timeout_seconds` 1–60 (`swift/model-helper/Sources/HelperCore/ToolBridge.swift:185`, `asura-control/src/model.rs:394`) | `timeout_seconds` removed; `yield_seconds` validated instead |
 | exec_cmd: one exec_cmd worker per active turn (`conversation.rs:487`) and one active turn (`conversation.rs:584`), so one live exec_cmd job service-wide | Controller slots under the limits below |
 | exec_cmd intent: ToolIntent record kind 14 with tool kind 16 stores the timeout as 1–60,000 ms and 1–60 s (`asura-storage/src/authority/conversation/codec.rs:289-305`) | J1: ExecCmdIntent kind 22 with no timeout; J2: job intent record (R3) |
@@ -593,7 +593,7 @@ remain unless this table changes them.
 | Capture | One capture worker per job slot, each with a 512 KiB transfer queue (R4); a full queue stops reading that job's pipes until it drains | Follows live jobs |
 | Preview | None; until the composer exists, results carry no output text (PC12) | — |
 | `read` page | At most 8 KiB source bytes, within the existing 16 KiB result limit until the composer replaces it (L21) | 8 KiB |
-| `wait` | Ends on job end, new output or turn cancellation; optional model time; exempt from the 2 s ordinary tool deadline (L10) | — |
+| `wait` | Ends on job end, new output or turn cancellation; optional model time | — |
 | `list` | At most 8 jobs | 8 |
 | Job notice | At most 8 entries; command at most 8192 bytes; no byte cap (J5a) | 8 entries |
 | Page reads | 2 page-read workers (R4); 1 reserved for the model | 2 |
@@ -985,7 +985,7 @@ What later packets keep or replace:
   `CleanupUnconfirmed` state and the leader-exit notice. It reuses the J1
   capture worker, payload store, ledger and page pool unchanged. Kinds 22 and
   23 stay valid; J2 allocates its job records at the next free kinds.
-- **J3** removes `timeout_seconds` from the wire and the helper, switches
+- **J3** switches
   results to the reference-only kind, removes the J1 tails (L13, L17) and
   exposes pages to the model through `job read`.
 - **J4** exposes pages to the person through `JobRead`, `JobObserve` and the
@@ -999,7 +999,7 @@ What later packets keep or replace:
 | --- | --- | --- |
 | J1-Q1 | While a command runs, a slow or stalled capture only backpressures the producer. After a cancel trigger, the existing L3 bound of 2.5 s also covers capture settlement. If capture has not settled by then, the call records `capture_unconfirmed`, keeps its staging bytes as an unverified prefix, delivers its result, and retains the stuck capture worker. | [Settlement](#service-exec_cmd-worker-phases-and-settlement), [failure handling](#j1-failure-handling) |
 | J1-Q2 | When quota or disk space runs short, capture pauses: the service stops reading the pipes, and new calls return `busy`. An interim quota-pressure expiry deletes settled, unheld output, oldest last use first, as one class until J6. No output expires by age. The 64 MiB per-call stop is removed (J1d). | [Quota ledger](#quota-ledger) |
-| J1-Q3 | The exec_cmd 1–60 s timeout is removed in J1. A command ends on completion or turn cancel. `timeout_seconds` is accepted and ignored until J3 removes it. | [Timeout and setup removal](#j1-timeout-and-setup-budget-removal) |
+| J1-Q3 | The exec_cmd 1–60 s timeout is removed in J1. A command ends on completion or turn cancel. `timeout_seconds` was accepted and ignored; it is removed from the wire and helper ahead of J3 (owner, 2026-10-17). | [Timeout and setup removal](#j1-timeout-and-setup-budget-removal) |
 | J1-Q4 | The 2 s setup budget (L2) is removed in J1. Setup ends on spawn, cancel or a setup fault. | [Timeout and setup removal](#j1-timeout-and-setup-budget-removal) |
 | J1 retry | A paused capture retries with backoff starting at 1 s, with Fibonacci-increasing delays: 1, 1, 2, 3, 5, 8 s and so on, with no cap. It also retries at once, and restarts the sequence, on an event that may free space: a call settles, output expires, or the person acts. The retry never ends or refuses work. | [Quota ledger](#quota-ledger) |
 | J1-0 | Journal waits have no time bound: append, append observation, startup replay and the queue worker. An append waits for its write and sync; only an actual I/O error fences the journal. The service waits for the writer's real reply; a cancelled turn stops waiting and the late reply is applied. Queued jobs run in order. Beyond the 8-slot queue, requests get `busy`. Replay answers Inspect with a loading state. | [Prerequisite](#j1-prerequisite-journal-step-j1-0) |
@@ -1033,7 +1033,7 @@ exec_cmd call over today: kind 23 (a frame of at most 4,286 bytes) plus at most
 122 bytes by which kind 22 exceeds the kind 14 intent it replaces. This counts
 against the current single 8 MiB journal file. Until the required follow-up journal design for segment
 files, checkpoints and compaction lands
-([journal capacity follow-up](conversation-admission.md#format-1-and-record-compatibility)),
+([journal capacity follow-up](conversation-admission.md#format-1-and-record-kinds)),
 heavy exec_cmd use reaches journal capacity sooner, and capacity exhaustion keeps
 its existing explicit failure.
 
@@ -1060,9 +1060,9 @@ check, and ordinary-file validation.
 
 Required behavior (R3, EX4): J1 adds two additive format-1 kinds, allocated in
 delivery order. A J1 binary writes kind 22 for every new exec_cmd call and never
-writes kind 14 with tool kind 16. Replay still accepts kind 14 exec_cmd intents
-from older journals with their 1–60 s timeout fields
-(`codec.rs:289-305`). Kind 15 is unchanged. No record holds output text,
+writes kind 14 with tool kind 16. Replay rejects a kind 14 record that carries
+tool kind 16 (owner, 2026-10-17: no compatibility with older journals). Tool kind
+16 remains the in-memory tool record kind for a kind 22 intent. Kind 15 is unchanged. No record holds output text,
 a secret value or a digest of either.
 
 Encodings follow the existing codec: integers are big-endian, an ID is 16
@@ -1192,10 +1192,8 @@ Replay and the payload store derive its state:
 | Kind 23 `not_started` | None expected | No payload | Delete a stray staging file |
 | No kind 22 names the payload ID | Orphan file | None | Delete (identity violation) |
 
-Downgrade: a binary before J1 returns `UnsupportedFormat` for kind 22 or 23
-(`codec.rs:1007`) and refuses to open the journal. After the first J1 exec_cmd
-call, a downgrade needs a newer binary; the journal cannot be rewritten to
-remove the records. Kinds 18–21 set the same precedent. Format stays `1`.
+Format stays `1`. No compatibility with older binaries is required
+(owner, 2026-10-17).
 
 ### J1 timeout and setup budget removal
 
@@ -1218,17 +1216,25 @@ numbers are at commit `41eebfb`.
 | `exec_cmd_worker.rs:97-137` `start` | Takes a deadline; compares `intent.limit` with `timeout_seconds`; rejects an expired deadline; computes a 2 s setup deadline | No deadline argument. Compares kind 22 with the call's rewrite (G8). No expiry or setup deadline. |
 | `exec_cmd_worker.rs:146`, `:159` | Setup closure deadline checks | Removed; cancel checks stay |
 | `exec_cmd_worker.rs:205-240` | `next_deadline` and `poll` stop the job with `Deadline` | Removed. `cleanup_deadline` (L3, 2.5 s after a stop) stays. |
-| `conversation.rs:233` | `timeout_seconds` defaults to 30 | Parsed and kept in the call for identity; no effect |
+| `conversation.rs:233` | `timeout_seconds` defaults to 30 | Parsed and kept in the call for identity; no effect. Removed with the field (owner, 2026-10-17) |
 | `conversation.rs:2958-2975` | Builds the deadline and kind 14 from the timeout | Builds kind 22 from the rewrite; the exec_cmd tool's deadline is `None` |
 | `conversation.rs:388-398` `LiveTool::deadline` | `Instant` | `Option<Instant>`; `None` for exec_cmd |
-| `conversation.rs:2336` | `model_timeout` when `now >= tool.deadline` | Applies only to a tool with a deadline; never to exec_cmd |
+| `conversation.rs:2336` | `model_timeout` when `now >= tool.deadline` | Applied only to a tool with a deadline; never to exec_cmd. Later removed for every tool with L10 (owner, 2026-10-17) |
 | `conversation.rs:3357-3367` | Passes `tool.deadline` to the exec_cmd worker | No deadline |
 | `tools.rs:176-195`, `asura-control/src/model.rs:408`, `ToolBridge.swift:193-199` | Validate 1–60 | Unchanged until J3, so the protocol 0.1 contract is unchanged; the value has no effect |
 | `ToolBridge.swift:208` guide text | "Maximum command seconds, 1 through 60; omit for 30." | "Ignored. The command runs until it ends or the turn is cancelled." |
 
-The ordinary 2 s tool deadline (L10, `tools.rs:1139-1178`) is not changed by
-J1 (G21). It applies to the other tools until the tool adoption design
-replaces it. Page reads do not use `tools::Executor`.
+Follow-up (owner, 2026-10-17): the bounded guardian mode that the table keeps
+for platform tests is removed before J3. `ExecCmdRequest` has no deadline, the
+guardian has no numeric deadline argument, and `StopReason::Deadline` (status
+reason 1, `timeout`) is removed; reason 1 stays unassigned. The exec_cmd tool
+schema drops `timeout_seconds` (model ExecCmd field 3 is reserved), so the
+service and helper no longer parse, validate or default it.
+
+J1 did not change the ordinary 2 s tool deadline (L10) (G21). A later owner
+decision (2026-10-17) removes it for every tool: a non-exec tool call ends on
+completion, turn cancel, steering, shutdown or helper exit, and the service no
+longer fails a turn as `model_timeout`. Page reads do not use `tools::Executor`.
 
 ### J1 interfaces
 
@@ -1492,8 +1498,8 @@ call returns or the person cancels the turn.
 Proposed mechanism for the exec_cmd path of `ModelEvent::ToolCall`
 (`conversation.rs:2901-2990`):
 
-1. Parse the call as today. `timeout_seconds` keeps its validation and has no
-   effect.
+1. Parse the call as today. The call has no `timeout_seconds` (removed,
+   owner, 2026-10-17).
 2. Rewrite the command with `secrets::rewrite_command`. Scan the cwd in
    whole-buffer mode; a detected span refuses with `secret_in_cwd`. A rewritten
    command over 8,192 bytes refuses with `rewritten_command_too_long` (G6). The
@@ -1889,11 +1895,9 @@ later designs:
 1. **Other tools:** EX4 (owner, 2026-10-15) states that all tools use jobs. The
    earlier assumption that short typed tools remain synchronous no longer holds.
    A follow-up design must assign how project, memory and service tools adopt
-   the controller. It must also replace the 2-second ordinary tool deadline
-   (L10), which ends a call that has not finished within 2 seconds of its start
-   (`asura-service/src/tools.rs:1026`, `tools.rs:1139-1178`). The owner judged
-   it far too short (2026-10-15); under the owner's loop-closure rule a tool call
-   ends on completion, cancel or a fault, not on a fixed time.
+   the controller. The 2-second ordinary tool deadline (L10) is already removed
+   (owner, 2026-10-17): a tool call ends on completion, cancel or a fault, not on
+   a fixed time.
 2. **Job stall closure:** derived from tool-loop trace evidence under
    [tool output views rule 5](tool-output-views.md#tool-loop-trace-evidence).
 3. **Raw pages:** their encoding and the remaining RG-11 coverage (R5).

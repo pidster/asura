@@ -144,7 +144,6 @@ pub struct ProjectPage {
 pub enum ProjectReadError {
     InvalidArguments,
     Cancelled,
-    Deadline,
     UnsafePath,
     Changed,
     NotText,
@@ -159,11 +158,10 @@ impl ProjectIdentity {
         relative: &str,
         offset: u64,
         limit: usize,
-        deadline: std::time::Instant,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> std::result::Result<ProjectPage, ProjectReadError> {
         use std::os::unix::fs::FileExt;
-        project_check(deadline, cancelled)?;
+        project_check(cancelled)?;
         if limit == 0
             || limit > 16_384
             || offset > i64::MAX as u64
@@ -180,7 +178,7 @@ impl ProjectIdentity {
             .try_clone()
             .map_err(|_| ProjectReadError::Unavailable)?;
         for part in &parts[..parts.len() - 1] {
-            project_check(deadline, cancelled)?;
+            project_check(cancelled)?;
             parent = open_at(
                 parent.as_raw_fd(),
                 part,
@@ -189,7 +187,7 @@ impl ProjectIdentity {
             )
             .map_err(|_| ProjectReadError::UnsafePath)?;
         }
-        project_check(deadline, cancelled)?;
+        project_check(cancelled)?;
         let target = open_at(parent.as_raw_fd(), parts.last().unwrap(), libc::O_RDONLY, 0)
             .map_err(|_| ProjectReadError::UnsafePath)?;
         let before = stat_fd(target.as_raw_fd()).map_err(|_| ProjectReadError::Unavailable)?;
@@ -202,7 +200,7 @@ impl ProjectIdentity {
         let mut bytes = vec![0; limit + 1];
         let mut used = 0;
         while used < bytes.len() {
-            project_check(deadline, cancelled)?;
+            project_check(cancelled)?;
             let count = match file.read_at(&mut bytes[used..], offset + used as u64) {
                 Ok(count) => count,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -214,10 +212,9 @@ impl ProjectIdentity {
             used += count;
         }
         bytes.truncate(used);
-        project_check(deadline, cancelled)?;
+        project_check(cancelled)?;
         let after = stat_fd(file.as_raw_fd()).map_err(|_| ProjectReadError::Unavailable)?;
-        let current_parent =
-            self.reopen_project_directory(&parts[..parts.len() - 1], deadline, cancelled)?;
+        let current_parent = self.reopen_project_directory(&parts[..parts.len() - 1], cancelled)?;
         let named = stat_at(current_parent.as_raw_fd(), parts.last().unwrap())
             .map_err(|_| ProjectReadError::Changed)?;
         if before.st_dev != named.st_dev
@@ -232,7 +229,7 @@ impl ProjectIdentity {
             return Err(ProjectReadError::Changed);
         }
         self.validate().map_err(|_| ProjectReadError::Changed)?;
-        project_check(deadline, cancelled)?;
+        project_check(cancelled)?;
         let mut truncated = bytes.len() > limit;
         bytes.truncate(limit);
         if bytes.contains(&0) {
@@ -270,11 +267,10 @@ impl ProjectIdentity {
     pub fn list_project_directory(
         &self,
         relative: &str,
-        deadline: std::time::Instant,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> std::result::Result<ProjectListing, ProjectReadError> {
         use std::os::fd::IntoRawFd;
-        project_check(deadline, cancelled)?;
+        project_check(cancelled)?;
         self.validate().map_err(|_| ProjectReadError::Changed)?;
         // Open a fresh descriptor: dup would share the directory stream offset.
         let mut directory = open_at(
@@ -286,7 +282,7 @@ impl ProjectIdentity {
         .map_err(|_| ProjectReadError::Unavailable)?;
         if relative != "." {
             for part in project_parts(relative)? {
-                project_check(deadline, cancelled)?;
+                project_check(cancelled)?;
                 directory = open_at(
                     directory.as_raw_fd(),
                     &part,
@@ -322,7 +318,7 @@ impl ProjectIdentity {
         let mut bytes = 0usize;
         let mut truncated = false;
         loop {
-            project_check(deadline, cancelled)?;
+            project_check(cancelled)?;
             // SAFETY: __error points to thread-local errno. Reset distinguishes
             // end-of-directory from an actual readdir error.
             unsafe {
@@ -354,13 +350,13 @@ impl ProjectIdentity {
             names.push(name.to_owned());
         }
         self.validate().map_err(|_| ProjectReadError::Changed)?;
-        project_check(deadline, cancelled)?;
+        project_check(cancelled)?;
         let parts = if relative == "." {
             Vec::new()
         } else {
             project_parts(relative)?
         };
-        let current = self.reopen_project_directory(&parts, deadline, cancelled)?;
+        let current = self.reopen_project_directory(&parts, cancelled)?;
         let named = stat_fd(current.as_raw_fd()).map_err(|_| ProjectReadError::Changed)?;
         let after = stat_fd(raw).map_err(|_| ProjectReadError::Unavailable)?;
         if named.st_dev != before.st_dev
@@ -371,7 +367,7 @@ impl ProjectIdentity {
         {
             return Err(ProjectReadError::Changed);
         }
-        project_check(deadline, cancelled)?;
+        project_check(cancelled)?;
         names.sort();
         Ok(ProjectListing { names, truncated })
     }
@@ -381,7 +377,6 @@ impl ProjectIdentity {
     fn reopen_project_directory(
         &self,
         parts: &[CString],
-        deadline: std::time::Instant,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> std::result::Result<OwnedFd, ProjectReadError> {
         let mut directory = self
@@ -389,7 +384,7 @@ impl ProjectIdentity {
             .try_clone()
             .map_err(|_| ProjectReadError::Unavailable)?;
         for part in parts {
-            project_check(deadline, cancelled)?;
+            project_check(cancelled)?;
             directory = open_at(
                 directory.as_raw_fd(),
                 part,
@@ -402,15 +397,12 @@ impl ProjectIdentity {
     }
 }
 
+/// Project reads have no time bound; only the owner's cancel stops them.
 fn project_check(
-    deadline: std::time::Instant,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> std::result::Result<(), ProjectReadError> {
     if cancelled.load(std::sync::atomic::Ordering::Acquire) {
         return Err(ProjectReadError::Cancelled);
-    }
-    if std::time::Instant::now() >= deadline {
-        return Err(ProjectReadError::Deadline);
     }
     Ok(())
 }
@@ -435,10 +427,7 @@ fn project_parts(relative: &str) -> std::result::Result<Vec<CString>, ProjectRea
 #[cfg(test)]
 mod read_tests {
     use super::*;
-    use std::{
-        sync::atomic::AtomicBool,
-        time::{Duration, Instant},
-    };
+    use std::sync::atomic::AtomicBool;
     static NEXT_SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct Scratch(std::path::PathBuf);
     impl Scratch {
@@ -474,10 +463,7 @@ mod read_tests {
         std::fs::write(scratch.0.join("sample"), "abcédef").unwrap();
         let project = scratch.identity();
         let cancel = AtomicBool::new(false);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let page = project
-            .read_project_page("sample", 0, 4, deadline, &cancel)
-            .unwrap();
+        let page = project.read_project_page("sample", 0, 4, &cancel).unwrap();
         assert_eq!(
             page,
             ProjectPage {
@@ -486,9 +472,7 @@ mod read_tests {
                 truncated: true
             }
         );
-        let page = project
-            .read_project_page("sample", 3, 16, deadline, &cancel)
-            .unwrap();
+        let page = project.read_project_page("sample", 3, 16, &cancel).unwrap();
         assert_eq!(
             page,
             ProjectPage {
@@ -498,7 +482,7 @@ mod read_tests {
             }
         );
         assert_eq!(
-            project.read_project_page("sample", 3, 1, deadline, &cancel),
+            project.read_project_page("sample", 3, 1, &cancel),
             Err(ProjectReadError::Limit)
         );
     }
@@ -513,26 +497,20 @@ mod read_tests {
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         let project = scratch.identity();
         let cancel = AtomicBool::new(false);
-        let deadline = Instant::now() + Duration::from_secs(2);
         assert_eq!(
-            project.read_project_page("../sample", 0, 4, deadline, &cancel),
+            project.read_project_page("../sample", 0, 4, &cancel),
             Err(ProjectReadError::InvalidArguments)
         );
         for name in ["link", "fifo"] {
             assert_eq!(
-                project.read_project_page(name, 0, 4, deadline, &cancel),
+                project.read_project_page(name, 0, 4, &cancel),
                 Err(ProjectReadError::UnsafePath)
             );
         }
         cancel.store(true, std::sync::atomic::Ordering::Release);
         assert_eq!(
-            project.read_project_page("sample", 0, 4, deadline, &cancel),
+            project.read_project_page("sample", 0, 4, &cancel),
             Err(ProjectReadError::Cancelled)
-        );
-        cancel.store(false, std::sync::atomic::Ordering::Release);
-        assert_eq!(
-            project.read_project_page("sample", 0, 4, Instant::now(), &cancel),
-            Err(ProjectReadError::Deadline)
         );
     }
     #[test]
@@ -545,14 +523,11 @@ mod read_tests {
         symlink("/private/tmp", scratch.0.join("outside")).unwrap();
         let project = scratch.identity();
         let cancel = AtomicBool::new(false);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let listing = project
-            .list_project_directory(".", deadline, &cancel)
-            .unwrap();
+        let listing = project.list_project_directory(".", &cancel).unwrap();
         assert_eq!(listing.names.len(), 128);
         assert!(listing.truncated);
         assert_eq!(
-            project.list_project_directory("outside", deadline, &cancel),
+            project.list_project_directory("outside", &cancel),
             Err(ProjectReadError::UnsafePath)
         );
     }
@@ -566,20 +541,19 @@ mod read_tests {
             ProjectIdentity::open(root.to_str().unwrap(), &StateBoundary::detached_for_test())
                 .unwrap();
         let cancel = AtomicBool::new(false);
-        let deadline = Instant::now() + Duration::from_secs(2);
         assert_eq!(
-            project.read_project_page("binary", 0, 16, deadline, &cancel),
+            project.read_project_page("binary", 0, 16, &cancel),
             Err(ProjectReadError::NotText)
         );
         std::fs::rename(&root, scratch.0.join("old")).unwrap();
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("binary"), "replacement").unwrap();
         assert_eq!(
-            project.read_project_page("binary", 0, 16, deadline, &cancel),
+            project.read_project_page("binary", 0, 16, &cancel),
             Err(ProjectReadError::Changed)
         );
         assert_eq!(
-            project.list_project_directory(".", deadline, &cancel),
+            project.list_project_directory(".", &cancel),
             Err(ProjectReadError::Changed)
         );
     }

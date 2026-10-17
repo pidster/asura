@@ -150,8 +150,8 @@ and name revision, name, journal capacity, and request identity before append. I
 atomically appends and flushes one frame; only that commit changes the name.
 Replay requires an existing project, a valid digest/name, and a resulting
 name revision exactly one greater than the prior name revision. It rebuilds the
-name and request-result index. An unknown kind remains a hard replay error for
-older binaries, so rollout must upgrade the writer before using rename.
+name and request-result index. Replay rejects an unknown kind. No compatibility
+with older binaries is required (owner, 2026-10-17).
 
 Existing `ProjectRequestAlias` records still refer to immutable registration
 revision 1. Rename replay must not mutate that field or replace the original

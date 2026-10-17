@@ -71,13 +71,15 @@ ConfigReply and the Config capability. Replies contain a YAML value or a fixed
 safe error string. Preserve authenticated attachment, epoch and counter checks.
 The version number remains 0.1 until the owner's explicit instruction changes it.
 Message schemas and operations may evolve for authorized features under the normal
-design, ownership and testing gates; keep both endpoints and bindings consistent
-and document compatibility effects. Message changes do not themselves require
+design, ownership and testing gates; keep both endpoints and bindings consistent.
+No compatibility with older builds is required before the first release
+(owner, 2026-10-17). Message changes do not themselves require
 separate permission. See the canonical
 [engineering rule](../engineering.md#wire-protocol-change-authority).
-The owner selected wire version 0.1 on 2026-09-27; earlier development versions
-1.0, 1.1 and 1.2 are incompatible. The existing Protobuf package name is a schema
-identifier; the frame header controls protocol negotiation. Old endpoints reject the incompatible version; clients do not stop or replace them.
+The owner selected wire version 0.1 on 2026-09-27. The existing Protobuf package
+name is a schema identifier; the frame header carries the protocol version. A
+mismatch reports `incompatible_protocol`; clients do not stop or replace the
+other endpoint.
 
 One service config job may run at a time. Additional requests return busy. Sets also return busy while initial installation
 inspection retains its snapshot witness; gets remain available. This prevents

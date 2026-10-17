@@ -395,49 +395,24 @@ impl State {
     fn input_view(&self, input: Id, full: bool) -> Result<InputView> {
         let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
         let entry = state.inputs.get(&input).ok_or(Error::Invalid)?;
-        let (mut value, mut v2) = match self.record(entry.frame.clone())? {
-            Record::InputQueued(value) => (value, None),
-            Record::InputQueuedV2(p) => (
-                InputQueued {
-                    request: p.input,
-                    digest: p.digest,
-                    dispatch_request: p.dispatch_request,
-                    project: p.project,
-                    conversation: p.conversation,
-                    target_operation: [0; 16],
-                    target_generation: p.expected_generation,
-                    previous: None,
-                    kind: InputKind::Queue,
-                    prompt: p.prompt.clone(),
-                },
-                Some(p),
-            ),
-            _ => return Err(Error::RepairRequired),
+        let Record::InputQueued(mut value) = self.record(entry.frame.clone())? else {
+            return Err(Error::RepairRequired);
         };
-        // The original record retains the enqueue digest and prompt. Scheduling
-        // fields can change only through a durable promotion record.
-        value.kind = entry.kind;
-        value.target_operation = entry.target_operation;
-        value.target_generation = entry.target_generation;
-        value.previous = entry.previous;
+        // The record retains the enqueue digest and prompt. Scheduling fields
+        // change only through a durable promotion record.
         if !full && value.prompt.len() > 256 {
             let mut end = 256;
             while !value.prompt.is_char_boundary(end) {
                 end -= 1;
             }
             value.prompt.truncate(end);
-            if let Some(v2) = &mut v2 {
-                v2.prompt = value.prompt.clone();
-            }
         }
         Ok(InputView {
             input: value,
-            v2,
-            order_position: if entry.v2 {
-                Some(u32::try_from(entry.order_position).map_err(|_| Error::Limit)?)
-            } else {
-                None
-            },
+            kind: entry.kind,
+            target_operation: (entry.kind == InputKind::Steer).then_some(entry.target_operation),
+            target_generation: entry.target_generation,
+            order_position: u32::try_from(entry.order_position).map_err(|_| Error::Limit)?,
             status: state.input_status(input).ok_or(Error::RepairRequired)?,
             operation: state.input_operation(input),
             sequence: entry.sequence,
@@ -472,13 +447,7 @@ impl State {
                 entries.push(accepted_entry);
             }
         }
-        entries.sort_by_key(|q| {
-            (
-                q.conversation,
-                q.v2,
-                if q.v2 { q.order_position } else { q.sequence },
-            )
-        });
+        entries.sort_by_key(|q| (q.conversation, q.order_position));
         if entries.len() > MAX_INPUTS {
             if let Some(id) = accepted
                 && let Some(position) = entries.iter().position(|q| q.request == id)
@@ -713,8 +682,7 @@ impl State {
                                 )
                             ),
                             q.conversation,
-                            q.v2,
-                            if q.v2 { q.order_position } else { q.sequence },
+                            q.order_position,
                         )
                     });
                     entries.truncate(MAX_INPUTS);
@@ -723,100 +691,6 @@ impl State {
                     }
                 }
                 return Ok(reply);
-            }
-            Command::Enqueue {
-                request,
-                project,
-                conversation,
-                target_operation,
-                target_generation,
-                kind,
-                prompt,
-            } => {
-                let digest = request_digest(Request::Queue {
-                    project,
-                    conversation,
-                    target_operation,
-                    target_generation,
-                    kind,
-                    prompt: &prompt,
-                })
-                .map_err(|_| Error::Invalid)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                if let Some(prior) = state.requests.get(&request) {
-                    return if prior.digest == digest && prior.result == Outcome::Input(request) {
-                        self.queue_reply(request)
-                    } else {
-                        Err(Error::Conflict)
-                    };
-                }
-                if state.active_operation != Some(target_operation)
-                    || state.operations.get(&target_operation).is_none_or(|op| {
-                        op.conversation != conversation
-                            || op.generation != target_generation
-                            || op.terminal.is_some()
-                            || op.cancel.is_some()
-                    })
-                {
-                    return Err(Error::Conflict);
-                }
-                if state
-                    .inputs
-                    .values()
-                    .filter(|q| {
-                        matches!(
-                            state.input_status(q.request),
-                            Some(InputStatus::Queued | InputStatus::Held | InputStatus::Running)
-                        )
-                    })
-                    .count()
-                    >= MAX_INPUTS
-                {
-                    return Err(Error::Limit);
-                }
-                if kind == InputKind::Steer && state.steering_input(target_operation).is_some() {
-                    return Err(Error::Busy);
-                }
-                let previous = if kind == InputKind::Queue {
-                    state
-                        .inputs
-                        .values()
-                        .filter(|q| {
-                            q.conversation == conversation
-                                && q.kind == InputKind::Queue
-                                && matches!(
-                                    state.input_status(q.request),
-                                    Some(
-                                        InputStatus::Queued
-                                            | InputStatus::Held
-                                            | InputStatus::Running
-                                    )
-                                )
-                        })
-                        .max_by_key(|q| q.sequence)
-                        .map(|q| q.request)
-                } else {
-                    None
-                };
-                if kind == InputKind::Steer {
-                    self.steering_prompt(target_operation, &prompt)?;
-                }
-                let held = self.project(project)?;
-                held.validate().map_err(|_| Error::StaleProject)?;
-                self.append(Record::InputQueued(InputQueued {
-                    request,
-                    digest,
-                    dispatch_request: random_id(),
-                    project,
-                    conversation,
-                    target_operation,
-                    target_generation,
-                    previous,
-                    kind,
-                    prompt,
-                }))?;
-                held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
-                return self.queue_reply(request);
             }
             Command::QueueInput {
                 request,
@@ -872,7 +746,7 @@ impl State {
                 let held = self.project(project)?;
                 held.validate().map_err(|_| Error::StaleProject)?;
                 let revision = state.order_revision.checked_add(1).ok_or(Error::Limit)?;
-                self.append(Record::InputQueuedV2(InputQueuedV2 {
+                self.append(Record::InputQueued(InputQueued {
                     request,
                     digest,
                     input: random_id(),
@@ -939,18 +813,15 @@ impl State {
                     return Ok(reply);
                 }
                 let q = state.inputs.get(&input).ok_or(Error::Invalid)?;
-                if !q.v2
-                    || !matches!(
-                        state.input_status(input),
-                        Some(InputStatus::Queued | InputStatus::Held)
-                    )
-                {
+                if !matches!(
+                    state.input_status(input),
+                    Some(InputStatus::Queued | InputStatus::Held)
+                ) {
                     return Err(Error::Conflict);
                 }
                 if let Some(anchor) = after {
                     let p = state.inputs.get(&anchor).ok_or(Error::Invalid)?;
-                    if !p.v2
-                        || p.conversation != q.conversation
+                    if p.conversation != q.conversation
                         || !matches!(
                             state.input_status(anchor),
                             Some(InputStatus::Queued | InputStatus::Held)
@@ -1034,6 +905,7 @@ impl State {
                 }
                 let queued = state.inputs.get(&input).ok_or(Error::Invalid)?;
                 let project = queued.project;
+                // Every queued input is a kind 18 record.
                 let Record::InputQueued(original) = self.record(queued.frame.clone())? else {
                     return Err(Error::RepairRequired);
                 };
@@ -1066,10 +938,6 @@ impl State {
                         self.steering_prompt(q.target_operation, &value.prompt)?
                     }
                     Record::InputQueued(value) => value.prompt,
-                    Record::InputQueuedV2(value) if q.kind == InputKind::Steer => {
-                        self.steering_prompt(q.target_operation, &value.prompt)?
-                    }
-                    Record::InputQueuedV2(value) => value.prompt,
                     _ => return Err(Error::RepairRequired),
                 };
                 let mut reply = self.execute(Command::Prepare {

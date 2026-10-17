@@ -1,3 +1,6 @@
+use asura_storage::authority::conversation::{
+    ActiveBinding, FrameContext, PendingInit, Record, Request, encode_frame, request_digest,
+};
 use asura_storage::authority::{MAX_FRAME, MAX_JOURNAL, ReplayError, ReplayState, replay};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -5,11 +8,64 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const PENDING: &[u8] = include_bytes!("fixtures/pending.bin");
-const ACTIVE: &[u8] = include_bytes!("fixtures/active.bin");
+/// Kind 10 payload offsets inside its frame.
+const MODE: usize = 192;
+const CONFIGURATION_REVISION: usize = 193;
+const GRAPH: std::ops::Range<usize> = 233..249;
+fn frame(sequence: u64, prior: &[u8], generation: u64, record: &Record) -> Vec<u8> {
+    let mut prior_digest = [0; 32];
+    if !prior.is_empty() {
+        prior_digest.copy_from_slice(&prior[prior.len() - 40..prior.len() - 8]);
+    }
+    encode_frame(
+        &FrameContext {
+            installation_id: [0x11; 16],
+            transition_id: [sequence as u8; 16],
+            sequence,
+            prior_digest,
+            expected_revision: sequence - 1,
+            owner_generation: generation,
+        },
+        record,
+    )
+    .unwrap()
+}
+/// The canonical kind 10 initialization frame.
+static PENDING: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    frame(
+        1,
+        &[],
+        1,
+        &Record::PendingInit(PendingInit {
+            request: [0x22; 16],
+            digest: request_digest(Request::Initialize { mode: 1 }).unwrap(),
+            mode: 1,
+            configuration_revision: 1,
+            configuration_digest: [0x33; 32],
+            graph: [0x44; 16],
+        }),
+    )
+});
+/// Kind 10 followed by its kind 11 binding.
+static ACTIVE: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    let mut bytes = PENDING.clone();
+    bytes.extend(frame(
+        2,
+        &PENDING,
+        1,
+        &Record::ActiveBinding(ActiveBinding {
+            request: [0x22; 16],
+            generation: 1,
+            graph: [0x44; 16],
+            configuration_digest: [0x33; 32],
+        }),
+    ));
+    bytes
+});
 fn inspect(bytes: &[u8]) -> Result<asura_storage::authority::Replay, ReplayError> {
     replay(bytes, &AtomicBool::new(false))
 }
@@ -23,23 +79,11 @@ fn seal(frame: &mut [u8]) {
     frame[end..end + 32].copy_from_slice(&digest);
 }
 fn owner(previous: &[u8], sequence: u64, generation: u64) -> Vec<u8> {
-    let mut frame = PENDING[..144].to_vec();
-    frame.extend_from_slice(&[0; 32]);
-    frame.extend_from_slice(b"ASURAC01");
-    frame[10..12].copy_from_slice(&3u16.to_be_bytes());
-    frame[12..16].copy_from_slice(&184u32.to_be_bytes());
-    frame[16..24].copy_from_slice(&sequence.to_be_bytes());
-    frame[24..56].copy_from_slice(&previous[previous.len() - 40..previous.len() - 8]);
-    frame[72..88].fill(sequence as u8);
-    frame[120..128].copy_from_slice(&(sequence - 1).to_be_bytes());
-    frame[128..136].copy_from_slice(&sequence.to_be_bytes());
-    frame[136..144].copy_from_slice(&generation.to_be_bytes());
-    seal(&mut frame);
-    frame
+    frame(sequence, previous, generation, &Record::OwnerGeneration)
 }
 #[test]
 fn complete_pending_binding_and_historical_owner_replay() {
-    let pending = inspect(PENDING).unwrap();
+    let pending = inspect(&PENDING).unwrap();
     assert_eq!(pending.state, ReplayState::PendingInit);
     assert_eq!(pending.installation_id, [0x11; 16]);
     assert_eq!(
@@ -50,13 +94,13 @@ fn complete_pending_binding_and_historical_owner_replay() {
         ),
         (1, 1, None)
     );
-    let active = inspect(ACTIVE).unwrap();
+    let active = inspect(&ACTIVE).unwrap();
     assert_eq!(
         (active.state, active.revision, active.binding_generation),
         (ReplayState::ActiveBinding, 2, Some(1))
     );
-    for prefix in [PENDING, ACTIVE] {
-        let sequence = if prefix == PENDING { 2 } else { 3 };
+    for prefix in [&*PENDING, &*ACTIVE] {
+        let sequence = if prefix.len() == PENDING.len() { 2 } else { 3 };
         let mut journal = prefix.to_vec();
         journal.extend(owner(prefix, sequence, 2));
         let replay = inspect(&journal).unwrap();
@@ -92,7 +136,7 @@ fn valid_hashes_do_not_bypass_field_and_transition_rules() {
         (128, u64::MAX),
         (136, 0),
         (136, 2),
-        (145, 0),
+        (CONFIGURATION_REVISION, 0),
     ] {
         let mut bytes = PENDING.to_vec();
         bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
@@ -103,7 +147,7 @@ fn valid_hashes_do_not_bypass_field_and_transition_rules() {
             "field {offset}={value}"
         );
     }
-    for range in [24..56, 56..72, 72..88, 185..201] {
+    for range in [24..56, 56..72, 72..88, GRAPH] {
         let mut bytes = PENDING.to_vec();
         if range.start == 24 {
             bytes[range].fill(1);
@@ -113,20 +157,18 @@ fn valid_hashes_do_not_bypass_field_and_transition_rules() {
         seal(&mut bytes);
         assert_eq!(inspect(&bytes), Err(ReplayError::Corrupt));
     }
-    for mode in [0, 3, 255] {
+    // The request digest covers the mode, so a changed mode never replays.
+    for mode in [0, 2, 3, 255] {
         let mut bytes = PENDING.to_vec();
-        bytes[144] = mode;
+        bytes[MODE] = mode;
         seal(&mut bytes);
-        assert_eq!(inspect(&bytes), Err(ReplayError::Corrupt));
+        assert_eq!(inspect(&bytes), Err(ReplayError::Corrupt), "mode {mode}");
     }
-    let mut external = PENDING.to_vec();
-    external[144] = 2;
-    seal(&mut external);
-    assert!(inspect(&external).is_ok());
-    for offset in [56, 72, 136, 144, 152, 168] {
+    // Binding request, generation, graph and configuration must match kind 10.
+    for offset in [56, 72, 136, 144, 160, 168, 184] {
         let mut second = ACTIVE[PENDING.len()..].to_vec();
         if offset == 72 {
-            second[72..88].fill(1);
+            second[72..88].copy_from_slice(&PENDING[72..88]);
         } else {
             second[offset] ^= 1;
         }
@@ -140,18 +182,25 @@ fn valid_hashes_do_not_bypass_field_and_transition_rules() {
         );
     }
     let mut wrong_owner = PENDING.to_vec();
-    wrong_owner.extend(owner(PENDING, 2, 3));
+    wrong_owner.extend(owner(&PENDING, 2, 3));
     assert_eq!(inspect(&wrong_owner), Err(ReplayError::Corrupt));
 }
 #[test]
-fn unsupported_format_and_lengths_limits_and_cancellation() {
+fn removed_and_unknown_first_kinds_and_lengths_limits_and_cancellation() {
     let mut bytes = PENDING.to_vec();
     bytes[8..10].copy_from_slice(&2u16.to_be_bytes());
     assert_eq!(inspect(&bytes), Err(ReplayError::UnsupportedFormat));
-    bytes = PENDING.to_vec();
-    bytes[10..12].copy_from_slice(&4u16.to_be_bytes());
-    seal(&mut bytes);
-    assert_eq!(inspect(&bytes), Err(ReplayError::UnsupportedFormat));
+    // Removed diagnostic kinds 1 and 2, and any other non-10 first kind, never replay.
+    for kind in [1u16, 2, 3, 4, 11, 12, 5, 999] {
+        bytes = PENDING.to_vec();
+        bytes[10..12].copy_from_slice(&kind.to_be_bytes());
+        seal(&mut bytes);
+        assert_eq!(
+            inspect(&bytes),
+            Err(ReplayError::UnsupportedFormat),
+            "kind {kind}"
+        );
+    }
     for length in [0, 143, 183] {
         let mut bytes = PENDING.to_vec();
         bytes[12..16].copy_from_slice(&(length as u32).to_be_bytes());
@@ -162,14 +211,14 @@ fn unsupported_format_and_lengths_limits_and_cancellation() {
     assert_eq!(inspect(&bytes), Err(ReplayError::Limit));
     assert_eq!(inspect(&vec![0; MAX_JOURNAL + 1]), Err(ReplayError::Limit));
     assert_eq!(
-        replay(PENDING, &AtomicBool::new(true)),
+        replay(&PENDING, &AtomicBool::new(true)),
         Err(ReplayError::Cancelled)
     );
 }
 #[test]
 fn crash_writer_fixture() {
     let Some(root) = std::env::var_os("ASURA_REPLAY_CRASH_ROOT") else {
-        assert_eq!(inspect(ACTIVE).unwrap().state, ReplayState::ActiveBinding);
+        assert_eq!(inspect(&ACTIVE).unwrap().state, ReplayState::ActiveBinding);
         return;
     };
     let root = PathBuf::from(root);

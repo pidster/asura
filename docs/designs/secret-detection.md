@@ -128,7 +128,7 @@ secrets today:
 
 | Path | Current behavior | Consequence |
 | --- | --- | --- |
-| Model exec_cmd command | The tool validator checks length and NUL only (`asura-service/src/tools.rs:176-195`). ToolIntent kind 16 stores the exact command (`asura-storage/src/authority/conversation/types.rs:417`). | A secret in a command is journaled. |
+| Model exec_cmd command | The tool validator checks length and NUL only (`asura-service/src/tools.rs:176-195`). ToolIntent kind 16 stored the exact command (`asura-storage/src/authority/conversation/types.rs:417`). J1 replaced it with kind 22, and replay now rejects kind 14 carrying tool kind 16 (owner, 2026-10-17). | A secret in a command was journaled. |
 | Guardian argument vector | The command is an argument of the guardian (`asura-platform/src/exec_cmd.rs:258`) and of `/bin/sh -c` (`exec_cmd/guardian.rs:218-219`). | A secret in a command is visible in the process argument list for the command's lifetime. |
 | exec_cmd output | The capture ring keeps the last 8 KiB per stream (`exec_cmd/capture.rs:44-50`). `text()` returns the last 6144 bytes (`capture.rs:54-79`). | Raw output reaches the result. |
 | exec_cmd result | `render_text()` (`exec_cmd.rs:49-67`) builds the result text. `mapped_result` stores it in a ToolResult (`asura-service/src/exec_cmd_worker.rs:416-429`), whose `text` is journaled (`types.rs:436`). | Raw output is journaled and sent to the model, within 16 KiB per result (`tools.rs:9`). |

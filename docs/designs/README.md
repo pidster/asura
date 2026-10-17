@@ -37,7 +37,7 @@ own authorization and validation scope; it does not establish product readiness.
 | [Core harness](core-harness-brief.md) | Required and proposed lifecycle, admission, budget, context and model-session contracts for D3-D4. |
 | [Conversation admission](conversation-admission.md) | Format-1 authority, processing pipeline, durable conversation admission and queued input contracts; CA-A through CA-D implemented, listed fault qualification open. |
 | [Project names and rename](project-names.md) | Selected capitalized project display names and durable selected-project rename contract; implementation and focused runtime checks recorded, full acceptance matrix open. |
-| [Managed input queue](managed-input-queue.md) | Selected all-input queue, durable reorder, sequential dispatch, steering and compact composer projection; implemented, focused checks recorded, full validation matrix open. |
+| [Managed input queue](managed-input-queue.md) | Selected all-input queue, durable reorder, sequential dispatch, steering and compact composer projection; Ctrl+S and Ctrl+T write the same kind 18 record (owner, 2026-10-17); implemented, focused checks recorded, full validation matrix open. |
 | [Conversation restoration](conversation-restoration.md) | Selected project-scoped latest conversation restoration, explicit `/new`, bounded control reads and recovery checks. |
 | [Domain model](domain-model.md) | Proposed D0 identities, relationships and ownership; concrete schemas remain later design work. |
 | [Hybrid memory ontology](hybrid-memory-ontology.md) | Proposed file, document and graph memory, plan/task tracking, dependencies, typed built-in tools, authority boundaries, selected home paths and recovery checks. |
@@ -52,7 +52,7 @@ own authorization and validation scope; it does not establish product readiness.
 | [Persistence and recovery](persistence-recovery.md) | Proposed D3 local control-store, installation, graph-binding, registration and backup protocol for I1. |
 | [Production bootstrap and status](production-bootstrap-status.md) | Original bootstrap proposal with selected automatic setup, project registration and scoped status amendments. |
 | [Repository agent configuration](repository-agent-configuration.md) | Selected development-agent configuration, directory-scoped instructions and recorded configuration checks. |
-| [Release distribution](release-distribution.md) | Selected Homebrew tap direction and proposed artifact, formula, upgrade and I9 qualification contract. |
+| [Release distribution](release-distribution.md) | Selected Homebrew tap direction and proposed artifact, formula and I9 qualification contract; upgrade and handover deferred until the first release (owner, 2026-10-17). |
 | [Requirements and validation](requirements-validation.md) | Proposed D0 traceability from requirements to design owners, delivery increments and required evidence. |
 | [Runtime architecture](runtime-architecture.md) | Proposed process layout, asynchronous pipelines and coordination mechanisms. |
 | [Security policy](security-policy-brief.md) | Required capabilities and proposed authorization contract; policy and OS mechanisms remain open. |
@@ -72,7 +72,7 @@ own authorization and validation scope; it does not establish product readiness.
 | [User service and configuration](user-service-configuration.md) | Required user service, `$HOME/.asura/`, project-context and configuration behavior; concrete mechanisms remain open. |
 | [Validation strategy](validation-strategy.md) | Proposed D7 evidence plan for the first Protobuf bootstrap packet; broader I0 and release gates remain open. |
 | [YAML configuration commands](config-commands.md) | Typed YAML configuration display, get/set and scope contracts. |
-| [Bounded exec_cmd tool](exec-cmd-tool.md) | Implemented noninteractive exec_cmd contract, separate execution grant, confined process group and truthful cleanup limits; scoped native validation recorded 2026-09-28. |
+| [Bounded exec_cmd tool](exec-cmd-tool.md) | Implemented noninteractive exec_cmd contract with no timeout argument, separate execution grant, confined process group and truthful cleanup limits; scoped native validation recorded 2026-09-28. |
 | [Storage adapter ownership](storage-adapters.md) | File and SurrealDB persistence ownership and migration packets. |
 | [Event routing and readiness](event-routing.md) | Bounded priority inboxes, service readiness and recorded integration evidence. |
 | [Response activity and navigation](response-activity.md) | Implemented live tool activity and expandable response history, with recorded qualification on 2026-09-30. |

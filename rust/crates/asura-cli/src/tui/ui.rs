@@ -132,6 +132,9 @@ struct LocalInput {
     project: [u8; 16],
     text: String,
     state: LocalInputState,
+    /// Ctrl+S: the acknowledged active operation and generation to steer.
+    /// After the durable kind 18 receipt the TUI requests IQ2 promotion.
+    steer: Option<(Vec<u8>, u64)>,
 }
 pub struct App {
     editor: Editor,
@@ -518,43 +521,77 @@ impl App {
         self.queue_busy = true;
         self.notice = "Queue request pending; waiting for durable acknowledgement".into();
     }
-    fn queue_target(&mut self, kind: u32) -> Option<asura_control::pb::ConversationEnqueue> {
+    /// Ctrl+T and Ctrl+S stage the draft in the local outbox like Enter: one
+    /// kind 18 queued input (owner, 2026-10-17). Ctrl+S also names the
+    /// acknowledged active turn; its receipt then requests IQ2 promotion.
+    fn queue_input(&mut self, steer: bool) {
         let prompt = self.editor.text();
-        if self.queue_busy || self.queue_retained.is_some() {
-            self.notice = "Resolve pending queue request first; draft retained".into();
-            return None;
-        }
-        if !self.conversation_busy
-            || !self.conversation_cancellable
-            || self.active_operation.is_none()
-            || self.conversation_id.is_none()
-        {
-            self.notice = "No acknowledged active target; draft retained".into();
-            return None;
-        }
-        if self.view.connection != "connected" {
-            self.notice = "Disconnected; draft retained".into();
-            return None;
-        }
         if prompt.trim().is_empty() || prompt.starts_with('/') || prompt.len() > 32768 {
             self.notice = "Queue requires a nonempty text input of at most 32 KiB".into();
-            return None;
+            return;
         }
-        let project = self.selected_project?;
-        Some(asura_control::pb::ConversationEnqueue {
-            request_id: Some(asura_platform::random_id().to_vec()),
-            project_id: Some(project.to_vec()),
-            conversation_id: self.conversation_id.clone(),
-            target_operation_id: self.active_operation.clone(),
-            target_generation: Some(self.conversation_generation),
-            kind: Some(kind),
-            prompt: Some(prompt),
-        })
+        let target = if steer {
+            match (&self.active_operation, &self.conversation_id) {
+                (Some(operation), Some(_))
+                    if self.conversation_busy && self.conversation_cancellable =>
+                {
+                    Some((operation.clone(), self.conversation_generation))
+                }
+                _ => {
+                    self.notice = "No acknowledged active target; draft retained".into();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if self.stage_local_input(prompt, target) && steer {
+            self.notice =
+                "Pending local steering input; it replaces the response after its receipt".into();
+        }
     }
-    fn queue_input(&mut self, kind: u32) {
-        if let Some(request) = self.queue_target(kind) {
-            self.send_queue(super::queue::Request::Enqueue(request));
+    /// Stages exact text in the volatile outbox and clears the editor.
+    fn stage_local_input(&mut self, text: String, steer: Option<(Vec<u8>, u64)>) -> bool {
+        let Some(project) = self.selected_project else {
+            self.notice = "No project selected. Use /project add PATH".into();
+            return false;
+        };
+        if !self.restoration_ready && self.new_conversation_intent != Some(project) {
+            self.notice =
+                "Restore the conversation first; use /retry or /new. Draft retained".into();
+            return false;
         }
+        if self.local_outbox.len() >= 16 {
+            self.notice = "Local input queue is full; draft retained".into();
+            return false;
+        }
+        self.local_outbox.push(LocalInput {
+            request_id: asura_platform::random_id(),
+            project,
+            text,
+            state: LocalInputState::Waiting,
+            steer,
+        });
+        self.editor = Editor::new();
+        self.notice = "Pending local input; waiting for service receipt".into();
+        true
+    }
+    /// IQ2 promotion of an accepted kind 18 input (decision action 3). The
+    /// editor already holds a newer draft, so this request never clears it.
+    fn send_promotion(&mut self, input: Vec<u8>, operation: Vec<u8>, generation: u64) {
+        let request =
+            super::queue::Request::Decision(asura_control::pb::ConversationQueueDecision {
+                request_id: Some(asura_platform::random_id().to_vec()),
+                input_id: Some(input),
+                action: Some(3),
+                target_operation_id: Some(operation),
+                target_generation: Some(generation),
+            });
+        self.queue_retained = Some(request.clone());
+        self.queue_editor = None;
+        self.queue_request = Some(request);
+        self.queue_busy = true;
+        self.notice = "Steering: stopping the response to send this input".into();
     }
     pub(super) fn queue_finished(&mut self, update: super::queue::Update) {
         if matches!(
@@ -608,9 +645,15 @@ impl App {
                 self.queue_projection.advance_revision(reply.revision);
                 if reply.request_id.is_some() {
                     self.queue_retained = None;
+                    let promoted = matches!(
+                        &update.request,
+                        super::queue::Request::Decision(decision) if decision.action == Some(3)
+                    );
                     self.notice = if hold.is_some() {
                         "Model start stopped; input held (cancelled); Resume or Drop required"
                             .into()
+                    } else if promoted {
+                        "Steering: the response stops and this input replaces it".into()
                     } else {
                         "Input queued; waiting for model admission".into()
                     };
@@ -746,8 +789,22 @@ impl App {
                 self.conversation_id = entry.conversation_id.clone();
                 self.new_conversation_intent = None;
                 self.restoration_ready = true;
-                self.local_outbox.remove(index);
+                let row = self.local_outbox.remove(index);
                 self.notice = queue_input_notice(entry);
+                // Ctrl+S: promote the accepted row only while its exact
+                // target is still the acknowledged active turn.
+                if let (Some((operation, generation)), Some(input)) =
+                    (row.steer, entry.input_id.clone())
+                {
+                    if self.conversation_busy
+                        && self.active_operation.as_ref() == Some(&operation)
+                        && entry.conversation_id == self.conversation_id
+                    {
+                        self.send_promotion(input, operation, generation);
+                    } else {
+                        self.notice = "Turn ended before steering; input stays queued".into();
+                    }
+                }
             } else {
                 self.local_outbox[index].state = LocalInputState::Unconfirmed;
                 self.queue_retained = Some(update.request.clone());
@@ -1049,29 +1106,6 @@ impl App {
                     );
                 }
             }
-        }
-        if let Some(accepted) = update.accepted {
-            self.active_operation = accepted.operation_id.clone();
-            self.observed_model = None;
-            self.model_context = None;
-            self.retained_request = None;
-            self.conversation_id = accepted.conversation_id;
-            self.conversation_generation = accepted.generation.unwrap_or(0);
-            self.new_conversation_intent = None;
-            self.restoration_ready = true;
-            if let Some(draft) = self.conversation_draft.take() {
-                if self.conversation_editor_draft.take().as_deref()
-                    == Some(self.editor.text().as_str())
-                {
-                    self.editor = Editor::new();
-                }
-                self.append_response(draft, self.active_operation.clone());
-            }
-            self.notice = match self.turn_cancel {
-                None => "Generating · /cancel requests cancellation".into(),
-                Some(false) => CANCELLING.into(),
-                Some(true) => CANCELLED.into(),
-            };
         }
         if update.cancel_accepted && self.turn_cancel.is_some() {
             self.turn_cancel = Some(true);
@@ -1711,7 +1745,7 @@ impl App {
                     return false;
                 }
                 KeyCode::Char('s' | 't') => {
-                    self.queue_input(if key.code == KeyCode::Char('s') { 2 } else { 1 });
+                    self.queue_input(key.code == KeyCode::Char('s'));
                     return false;
                 }
                 KeyCode::Char('d') => {
@@ -1877,27 +1911,7 @@ impl App {
                 self.notice = "Conversation input exceeds 32 KiB; draft retained".into();
                 return false;
             }
-            let Some(project) = self.selected_project else {
-                self.notice = "No project selected. Use /project add PATH".into();
-                return false;
-            };
-            if !self.restoration_ready && self.new_conversation_intent != Some(project) {
-                self.notice =
-                    "Restore the conversation first; use /retry or /new. Draft retained".into();
-                return false;
-            }
-            if self.local_outbox.len() >= 16 {
-                self.notice = "Local input queue is full; draft retained".into();
-                return false;
-            }
-            self.local_outbox.push(LocalInput {
-                request_id: asura_platform::random_id(),
-                project,
-                text: draft,
-                state: LocalInputState::Waiting,
-            });
-            self.editor = Editor::new();
-            self.notice = "Pending local input; waiting for service receipt".into();
+            self.stage_local_input(draft, None);
             return false;
         }
         let mut command = draft.splitn(3, char::is_whitespace);
@@ -4822,6 +4836,7 @@ mod tests {
             project: [2; 16],
             text: "unsent".into(),
             state: LocalInputState::Waiting,
+            steer: None,
         });
         assert!(!key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(matches!(app.overlay, Some(Overlay::Exit(false))));
@@ -5371,22 +5386,14 @@ mod tests {
         key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.take_cancel_request());
         assert_eq!(app.notice, CANCELLING);
-        // Streaming updates carry the accepted turn; they keep the cancel state.
-        let accepted = asura_control::pb::ConversationAccepted {
-            operation_id: Some(vec![3; 16]),
-            conversation_id: Some(vec![2; 16]),
-            generation: Some(1),
-            cursor: Some(1),
-        };
+        // Streaming updates keep the cancel state.
         app.conversation_finished(super::super::conversation::Update {
-            accepted: Some(accepted.clone()),
             success: true,
             ..Default::default()
         });
         assert_eq!(app.notice, CANCELLING);
         assert!(render(&mut app, 100, 24).contains("Cancelling"));
         app.conversation_finished(super::super::conversation::Update {
-            accepted: Some(accepted),
             cancel_accepted: true,
             success: true,
             ..Default::default()
@@ -5466,8 +5473,10 @@ mod tests {
             input_id: Some(vec![4; 16]),
             project_id: Some(vec![1; 16]),
             conversation_id: Some(vec![2; 16]),
-            target_operation_id: Some(vec![3; 16]),
+            target_operation_id: None,
             target_generation: Some(1),
+            new_conversation: Some(false),
+            order_position: Some(1),
             kind: Some(1),
             state: Some(state),
             text: Some("follow up".into()),
@@ -5622,73 +5631,113 @@ mod tests {
         assert_eq!(app.local_outbox[1].state, LocalInputState::Waiting);
         assert!(render(&mut app, 100, 24).contains("Pending local"));
     }
+    /// MQ15: Ctrl+T stages one kind 18 input exactly as Enter does.
     #[test]
-    fn queue_acknowledgement_preserves_newer_draft_and_captured_request() {
+    fn ctrl_t_stages_a_queued_input_like_enter() {
         let mut app = working_queue_app();
         key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.draft(), "");
+        assert_eq!(app.local_outbox.len(), 1);
+        assert_eq!(app.local_outbox[0].steer, None);
         let request = app.take_queue_request(std::time::Instant::now()).unwrap();
-        let super::super::queue::Request::Enqueue(sent) = request.clone() else {
-            panic!("enqueue")
+        let super::super::queue::Request::Submit(sent) = &request else {
+            panic!("kind 18 queue submission expected")
         };
-        assert_eq!(sent.target_operation_id, Some(vec![3; 16]));
-        assert_eq!(sent.kind, Some(1));
-        app.insert(" newer");
-        app.queue_finished(super::super::queue::Update {
-            request,
-            outcome: Ok(asura_control::pb::ConversationQueueReply {
-                entries: vec![queue_entry(1)],
-                request_id: sent.request_id,
-                full_text: Some(false),
-                revision: Some(1),
-                pending: Some(false),
-                ..Default::default()
-            }),
-            done: true,
-        });
-        assert_eq!(app.draft(), "follow up newer");
-        assert!(app.queue_retained.is_none());
-        let screen = render(&mut app, 100, 24);
-        assert!(screen.contains("Queued"));
-        assert!(screen.contains("follow up"));
+        assert_eq!(sent.prompt.as_deref(), Some("follow up"));
+        assert_eq!(sent.conversation_id, Some(vec![2; 16]));
+        assert_eq!(sent.new_conversation, Some(false));
+        app.insert("newer");
+        acknowledge_local_input(&mut app, request, [2; 16]);
+        assert!(app.local_outbox.is_empty());
+        assert_eq!(app.draft(), "newer");
+        // No promotion follows an ordinary queued input.
+        assert!(app.take_queue_request(std::time::Instant::now()).is_none());
     }
+    /// MQ13 and IQ2-S1: Ctrl+S stages one kind 18 input; its durable receipt
+    /// requests IQ2 promotion of that exact row for the active target. A
+    /// lost reply retries the same promotion identity, never a second input.
     #[test]
-    fn queue_retry_preserves_original_identity_after_unknown_outcome() {
+    fn ctrl_s_promotes_its_accepted_row_while_the_target_is_active() {
         let mut app = working_queue_app();
-        app.queue_input(2);
-        let original = app.take_queue_request(std::time::Instant::now()).unwrap();
-        let super::super::queue::Request::Enqueue(sent) = original.clone() else {
-            panic!("enqueue")
+        key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(app.draft(), "");
+        assert_eq!(app.local_outbox[0].steer, Some((vec![3; 16], 1)));
+        let request = app.take_queue_request(std::time::Instant::now()).unwrap();
+        assert!(matches!(request, super::super::queue::Request::Submit(_)));
+        app.insert("newer");
+        acknowledge_local_input(&mut app, request, [2; 16]);
+        let promotion = app.take_queue_request(std::time::Instant::now()).unwrap();
+        let super::super::queue::Request::Decision(decision) = promotion.clone() else {
+            panic!("IQ2 promotion expected")
         };
+        assert_eq!(decision.action, Some(3));
+        assert_eq!(decision.input_id, Some(vec![77; 16]));
+        assert_eq!(decision.target_operation_id, Some(vec![3; 16]));
+        assert_eq!(decision.target_generation, Some(1));
         app.queue_finished(super::super::queue::Update {
-            request: original,
+            request: promotion,
             outcome: Err("outcome unconfirmed".into()),
             done: true,
         });
+        assert_eq!(
+            app.draft(),
+            "newer",
+            "the promotion never clears a newer draft"
+        );
         app.editor = Editor::new();
         app.insert("/retry");
         app.submit();
-        let super::super::queue::Request::Enqueue(retried) =
-            app.take_queue_request(std::time::Instant::now()).unwrap()
+        let Some(super::super::queue::Request::Decision(retried)) =
+            app.take_queue_request(std::time::Instant::now())
         else {
             panic!("retry")
         };
-        assert_eq!(sent, retried);
-        assert_eq!(retried.kind, Some(2));
+        assert_eq!(retried, decision);
+    }
+    /// MQ14: a receipt that arrives after the target settled sends no
+    /// promotion; the input stays queued in lane order.
+    #[test]
+    fn ctrl_s_receipt_after_the_target_settled_keeps_the_input_queued() {
+        let mut app = working_queue_app();
+        key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let request = app.take_queue_request(std::time::Instant::now()).unwrap();
+        app.conversation_busy = false;
+        app.active_operation = None;
+        acknowledge_local_input(&mut app, request, [2; 16]);
+        assert!(app.local_outbox.is_empty());
+        assert!(app.take_queue_request(std::time::Instant::now()).is_none());
+        assert_eq!(app.notice, "Turn ended before steering; input stays queued");
+    }
+    #[test]
+    fn ctrl_s_requires_an_acknowledged_active_target_and_keeps_the_draft() {
+        let mut app = working_queue_app();
+        app.active_operation = None;
+        key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(app.draft(), "follow up");
+        assert!(app.local_outbox.is_empty());
+        assert_eq!(app.notice, "No acknowledged active target; draft retained");
+        app.editor = Editor::new();
+        app.insert("/cancel");
+        key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.draft(), "/cancel", "a command is never queued as text");
+        assert!(app.local_outbox.is_empty());
     }
     #[test]
     fn definite_queue_rejection_retains_text_without_blocking_a_new_choice() {
         let mut app = working_queue_app();
-        app.queue_input(1);
+        app.queue_input(false);
         let request = app.take_queue_request(std::time::Instant::now()).unwrap();
         app.queue_finished(super::super::queue::Update {
             request,
             outcome: Err("capacity_exhausted; draft retained".into()),
             done: true,
         });
-        assert_eq!(app.draft(), "follow up");
+        assert_eq!(app.local_outbox[0].state, LocalInputState::Rejected);
+        assert_eq!(app.local_outbox[0].text, "follow up");
         assert!(app.queue_retained.is_none());
+        app.insert("another");
         app.submit();
-        assert_eq!(app.local_outbox.len(), 1);
+        assert_eq!(app.local_outbox.len(), 2);
         assert!(matches!(
             app.take_queue_request(std::time::Instant::now()),
             Some(super::super::queue::Request::Submit(_))
