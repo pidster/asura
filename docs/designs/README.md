@@ -77,6 +77,7 @@ own authorization and validation scope; it does not establish product readiness.
 | [Event routing and readiness](event-routing.md) | Bounded priority inboxes, service readiness and recorded integration evidence. |
 | [Response activity and navigation](response-activity.md) | Implemented live tool activity and expandable response history, with recorded qualification on 2026-09-30. |
 | [Consolidated parameterised tools](consolidated-tools.md) | Implemented typed grouped commands over canonical operation owners; validation recorded 2026-09-28. |
+| [Tool call records](tool-call-records.md) | Proposed 2026-10-17, owner-reviewed, not implemented: one kind 14 record per model tool call, including malformed calls, holding the redacted tool name and argument JSON (only copy, up to 64,000 bytes), operation, decision and fault; service is the only parser; replaces kinds 17 and 22; derived values recomputed on replay. |
 
 The [architecture and design plan](../plans/architecture-and-design.md) orders
 these artifacts. The [visual reading path](../decisions/README.md#visual-reading-path)
