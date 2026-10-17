@@ -59,17 +59,13 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 // Locality uncertainty disables tools only; ordinary discovery errors
                 // above still fail. Probes end on a reply, an error, cancellation,
                 // helper exit or shutdown; they have no time limit.
+                // The Ollama version is not checked (owner, 2026-10-17).
                 do {
-                    let version = try await metadata(session, request: URLRequest(url: settings.endpoint.appending(path: "api/version")), limit: 1024)
-                    struct Version: Decodable { let version: String }
-                    let value = try JSONDecoder().decode(Version.self, from: version)
-                    if qualifiedLocalRoutingVersion(value.version) {
-                        var localRequest = request
-                        localRequest.httpBody = try JSONEncoder().encode(["model": local])
-                        let localData = try await metadata(session, request: localRequest, limit: 65_536)
-                        if localMetadata(data), localMetadata(localData) {
-                            model.localToolModel = local
-                        }
+                    var localRequest = request
+                    localRequest.httpBody = try JSONEncoder().encode(["model": local])
+                    let localData = try await metadata(session, request: localRequest, limit: 65_536)
+                    if localMetadata(data), localMetadata(localData) {
+                        model.localToolModel = local
                     }
                 } catch is CancellationError { throw CancellationError() }
                 catch { try Task.checkCancellation() }
@@ -88,13 +84,6 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
             data.append(byte)
         }
         return data
-    }
-
-    static func qualifiedLocalRoutingVersion(_ version: String) -> Bool {
-        let parts = version.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 3, parts[0] == "0", parts[1] == "34",
-            let patch = UInt32(parts[2]) else { return false }
-        return patch >= 4
     }
 
     static func localReference(_ name: String) -> String? {

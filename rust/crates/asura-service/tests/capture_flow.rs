@@ -303,8 +303,6 @@ fn serve(
             socket,
             serde_json::json!({"capabilities": ["completion", "tools"], "model_info": {"fixture.context_length": 16384}}),
         )
-    } else if request.starts_with(b"GET /api/version ") {
-        respond(socket, serde_json::json!({"version": "0.34.4"}))
     } else if request.starts_with(b"POST /api/chat ") {
         let chat: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
         log.lock().unwrap().push(chat);

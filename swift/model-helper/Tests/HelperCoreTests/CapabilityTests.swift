@@ -18,17 +18,12 @@ import Testing
     #expect(throws: HelperError.self) { try CapabilityProfile(mask: 16, provenance: .configuration) }
 }
 
-@Test func ollamaLocalRoutingRejectsCloudUnknownVersionsAndRemoteMetadata() throws {
+@Test func ollamaLocalRoutingRejectsCloudAndRemoteMetadata() throws {
     #expect(OllamaLanguageModel.localReference("granite4.1:8b") == "granite4.1:8b:local")
     #expect(OllamaLanguageModel.localReference("model") == "model:latest:local")
     #expect(OllamaLanguageModel.localReference("model:8b:local") == "model:8b:local")
     for name in ["model:cloud", "model:8b-cloud", "model:cloud:local", "model:local:local"] {
         #expect(OllamaLanguageModel.localReference(name) == nil)
-    }
-    #expect(OllamaLanguageModel.qualifiedLocalRoutingVersion("0.34.4"))
-    #expect(OllamaLanguageModel.qualifiedLocalRoutingVersion("0.34.5"))
-    for version in ["0.34.3", "0.35.0", "1.0.0", "0.34.4-unknown", "garbage"] {
-        #expect(!OllamaLanguageModel.qualifiedLocalRoutingVersion(version))
     }
     #expect(OllamaLanguageModel.localMetadata(Data("{}".utf8)))
     for json in [#"{"remote_host":"https://ollama.com"}"#, #"{"remote_model":"cloud"}"#, #"{"remote_host":false}"#] {

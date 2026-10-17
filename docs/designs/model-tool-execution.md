@@ -682,8 +682,8 @@ flowchart TD
   project file through a recorded service tool intent/result, use status, reject
   outside access and settle owned children. Existing native system journey is the
   acceptance template. Text-only success alone does not qualify tool execution.
-- Ollama native project-tool proof uses verified local routing. Unknown versions,
-  cloud metadata, remote endpoints and changed-to-cloud tags must not receive tools.
+- Ollama native project-tool proof uses verified local routing. Cloud metadata,
+  remote endpoints and changed-to-cloud tags must not receive tools.
   Existing structured adapter tests do not establish remote authority.
 
 Root owns serial Swift/Cargo checks, packaging and native journeys. Missing model
@@ -700,15 +700,19 @@ unverified. The service also requires its selected Ollama endpoint to be numeric
 loopback and intersects this attestation with the native tools bit. On-device
 adapters use their canonical destination classification.
 
-Ollama discovery requires numeric loopback, version 0.34.4 or a later patch in
-0.34, no remote_host/remote_model metadata, and a successful local-only show.
+Ollama discovery requires numeric loopback, no remote_host/remote_model metadata,
+and a successful local-only show. It does not check the Ollama version (owner,
+2026-10-17); the earlier 0.34 range turned tools off on Ollama 0.40.5.
 Tool requests use the same model reference with the native `:local` source suffix,
 including all continuation requests carrying results. An ordinary model name gets
 an explicit `:latest` tag before the suffix when no tag is supplied. Explicit
-cloud references never qualify. Unknown versions or failed locality checks retain
-ordinary text capability; malformed ordinary discovery still fails. No inference
-retry occurs after failure. The version range remains narrow until upstream
-source or native evidence qualifies another minor version.
+cloud references never qualify. Failed locality checks retain ordinary text
+capability; malformed ordinary discovery still fails. No inference retry occurs
+after failure.
+
+The owner accepts the remaining risk: the local-only guarantee of the `:local`
+suffix was read from the 0.34.4 source below, and a later Ollama release could
+change it without notice. A failed local-only show still disables tools.
 
 [Ollama 0.34.4 model references](https://github.com/ollama/ollama/blob/v0.34.4/internal/modelref/modelref.go)
 and [chat routing](https://github.com/ollama/ollama/blob/v0.34.4/server/routes.go)
@@ -718,7 +722,7 @@ check-to-use race if a tag changes. This trusts the configured local Ollama daem
 as the execution endpoint; it does not attest an arbitrary malicious proxy.
 Discovery has no time limit (owner, 2026-10-16): it ends on the daemon's reply,
 an error, cancel, helper exit or shutdown. The 5-second Hello and `api/show`
-limits are removed; implemented 2026-10-16 (infinite URLSession timeouts). Each metadata response is limited to 64 KiB, version to 1 KiB, with cancellation closing its
+limits are removed; implemented 2026-10-16 (infinite URLSession timeouts). Each metadata response is limited to 64 KiB, with cancellation closing its
 URLSession. No additional daemon, credential or model acquisition is introduced.
 
 
@@ -760,7 +764,7 @@ runtime observations, not durable replay proof of a restarted provider.
 
 MT3 source handoff: the changed activation chart rendered with Mermaid CLI 12.0.0
 and was visually inspected. Unit additions cover required-capability filtering,
-unknown support, activation versus support, local-route metadata/version checks,
+unknown support, activation versus support, local-route metadata checks,
 Hello field direction, and service admission negotiation. The private bridge
 round-trip test covers all four provider selectors. Root must execute these tests
 and the native fixtures before reporting runtime qualification.

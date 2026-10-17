@@ -1519,8 +1519,6 @@ def rich_activity(fixture, source, multipass=False):
                     if request.startswith(b"POST /api/show "):
                         response = {"capabilities": ["completion", "tools"],
                                     "model_info": {"fixture.context_length": 8192}}
-                    elif request.startswith(b"GET /api/version "):
-                        response = {"version": "0.34.4"}
                     elif request.startswith(b"POST /api/chat "):
                         chat = json.loads(body[:length])
                         requests.append(chat)
@@ -1703,8 +1701,6 @@ def shell_capture(fixture, source):
                     if request.startswith(b"POST /api/show "):
                         response = {"capabilities": ["completion", "tools"],
                                     "model_info": {"fixture.context_length": 16384}}
-                    elif request.startswith(b"GET /api/version "):
-                        response = {"version": "0.34.4"}
                     elif request.startswith(b"POST /api/chat "):
                         chat = json.loads(body[:length])
                         for message in chat["messages"]:
