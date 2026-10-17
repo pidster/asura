@@ -49,8 +49,8 @@ const OPERATIONS: &[Definition] = &[
         description: "Inspect recent project audit metadata and logging health; records may have gaps.",
     },
     Definition {
-        name: "shell",
-        description: "Run one bounded command in the admitted project; returns output and exit status.",
+        name: "exec_cmd",
+        description: "Run one bounded /bin/sh -c command line in the admitted project; returns output and exit status.",
     },
     Definition {
         name: "memory_create_note",
@@ -73,8 +73,8 @@ pub const REGISTRY: &[Definition] = &[
         description: "Service commands: status, tools, audit(limit?). Read-only status, discovery and recent audit metadata.",
     },
     Definition {
-        name: "shell",
-        description: "Run one bounded command in the admitted project; returns output and exit status.",
+        name: "exec_cmd",
+        description: "Run one bounded /bin/sh -c command line in the admitted project; returns output and exit status.",
     },
 ];
 
@@ -84,7 +84,7 @@ pub enum Arguments {
         body: String,
         source_version: Option<String>,
     },
-    Shell {
+    ExecCmd {
         command: String,
         cwd: String,
         timeout_seconds: u32,
@@ -147,7 +147,7 @@ impl Arguments {
             Self::ObserveStatus => &OPERATIONS[2],
             Self::ListTools => &OPERATIONS[6],
             Self::ReadAudit { .. } => &OPERATIONS[7],
-            Self::Shell { .. } => &OPERATIONS[8],
+            Self::ExecCmd { .. } => &OPERATIONS[8],
             Self::MemoryListNotes { .. } => &OPERATIONS[3],
             Self::MemoryGetNote { .. } => &OPERATIONS[4],
             Self::MemoryNoteSources { .. } => &OPERATIONS[5],
@@ -173,7 +173,7 @@ impl Arguments {
                 };
             }
             Self::ObserveStatus | Self::ListTools => return Ok(()),
-            Self::Shell {
+            Self::ExecCmd {
                 command,
                 cwd,
                 timeout_seconds,
@@ -354,7 +354,7 @@ pub fn validate_authority(
         return Err(Rejection::Stale);
     }
     if grant.project == [0; 16]
-        || if matches!(call.arguments, Arguments::Shell { .. }) {
+        || if matches!(call.arguments, Arguments::ExecCmd { .. }) {
             !grant.execute_authorized
         } else if call.arguments.is_memory_create() {
             !grant.memory_write_authorized
@@ -367,7 +367,7 @@ pub fn validate_authority(
     if (call.arguments.is_memory()
         || matches!(
             call.arguments,
-            Arguments::ReadAudit { .. } | Arguments::Shell { .. }
+            Arguments::ReadAudit { .. } | Arguments::ExecCmd { .. }
         ))
         && matches!(destination, Destination::Remote(_))
     {
@@ -444,7 +444,7 @@ impl Budget {
             Arguments::ObserveStatus
             | Arguments::ListTools
             | Arguments::ReadAudit { .. }
-            | Arguments::Shell { .. } => false,
+            | Arguments::ExecCmd { .. } => false,
             Arguments::MemoryListNotes { after, .. } => {
                 after.as_ref().is_none_or(|s| s.len() <= MAX_PATH_BYTES)
             }
@@ -509,7 +509,7 @@ impl Budget {
 mod tests {
     use super::*;
     #[test]
-    fn shell_requires_separate_execution_grant_and_never_remote_disclosure() {
+    fn exec_cmd_requires_separate_execution_grant_and_never_remote_disclosure() {
         let mut grant = Grant {
             operation: [1; 16],
             generation: 1,
@@ -523,7 +523,7 @@ mod tests {
             operation: [1; 16],
             generation: 1,
             ordinal: 1,
-            arguments: Arguments::Shell {
+            arguments: Arguments::ExecCmd {
                 command: "printf hello".into(),
                 cwd: ".".into(),
                 timeout_seconds: 30,
@@ -549,7 +549,7 @@ mod tests {
             ("echo", ".", 61),
         ] {
             let mut invalid = call.clone();
-            invalid.arguments = Arguments::Shell {
+            invalid.arguments = Arguments::ExecCmd {
                 command: command.into(),
                 cwd: cwd.into(),
                 timeout_seconds,
@@ -1011,7 +1011,7 @@ impl Executor {
             Arguments::ObserveStatus
                 | Arguments::ListTools
                 | Arguments::ReadAudit { .. }
-                | Arguments::Shell { .. }
+                | Arguments::ExecCmd { .. }
         ) || call.arguments.is_memory()
         {
             return Err(ExecutionError::Rejected(Rejection::Denied));
@@ -1039,7 +1039,7 @@ impl Executor {
                 Arguments::ObserveStatus
                 | Arguments::ListTools
                 | Arguments::ReadAudit { .. }
-                | Arguments::Shell { .. }
+                | Arguments::ExecCmd { .. }
                 | Arguments::MemoryListNotes { .. }
                 | Arguments::MemoryGetNote { .. }
                 | Arguments::MemoryNoteSources { .. }
@@ -1213,7 +1213,7 @@ mod inventory_tests {
     fn inventory_uses_exact_registry_metadata_and_rejects_overflow() {
         assert_eq!(
             REGISTRY.iter().map(|tool| tool.name).collect::<Vec<_>>(),
-            ["project", "memory", "service", "shell"]
+            ["project", "memory", "service", "exec_cmd"]
         );
         let text = inventory_text().unwrap();
         assert_eq!(text.lines().count(), REGISTRY.len());

@@ -10,10 +10,11 @@ pub const OUTPUT_RESERVATION: u32 = 2048;
 pub const LEGACY_OUTPUT_RESERVATION: u32 = 512;
 pub const MAX_PROMPT: usize = 32 * 1024;
 pub const MAX_TEXT: usize = 60 * 1024;
-pub const SHELL_TOOL_KIND: u8 = 16;
-pub const MAX_SHELL_COMMAND_BYTES: usize = 8192;
-pub const MAX_SHELL_CWD_BYTES: usize = 1024;
-pub const MAX_SHELL_INTENT_BYTES: usize = MAX_SHELL_COMMAND_BYTES + 1 + MAX_SHELL_CWD_BYTES;
+pub const EXEC_CMD_TOOL_KIND: u8 = 16;
+pub const MAX_EXEC_CMD_COMMAND_BYTES: usize = 8192;
+pub const MAX_EXEC_CMD_CWD_BYTES: usize = 1024;
+pub const MAX_EXEC_CMD_INTENT_BYTES: usize =
+    MAX_EXEC_CMD_COMMAND_BYTES + 1 + MAX_EXEC_CMD_CWD_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameContext {
@@ -232,10 +233,10 @@ pub enum Record {
     MemoryCreateIntent(MemoryCreateIntent),
     ToolIntent(ToolIntent),
     ToolResult(ToolResult),
-    /// Kind 22 (J1): every new shell call. Kind 14 with tool kind 16 stays
+    /// Kind 22 (J1): every new exec_cmd call. Kind 14 with tool kind 16 stays
     /// readable for older journals and is never written by a J1 binary.
-    ShellIntent(Box<ShellIntent>),
-    /// Kind 23 (J1): capture facts of an admitted shell call, before kind 15.
+    ExecCmdIntent(Box<ExecCmdIntent>),
+    /// Kind 23 (J1): capture facts of an admitted exec_cmd call, before kind 15.
     CaptureSettled(Box<CaptureSettled>),
 }
 impl Record {
@@ -260,7 +261,7 @@ impl Record {
             Self::ToolIntent(_) => 14,
             Self::ToolResult(_) => 15,
             Self::InputPromoted(_) => 16,
-            Self::ShellIntent(_) => 22,
+            Self::ExecCmdIntent(_) => 22,
             Self::CaptureSettled(_) => 23,
         }
     }
@@ -448,7 +449,7 @@ pub struct ToolResult {
 /// Kind 22 field 4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum ShellDisposition {
+pub enum ExecCmdDisposition {
     Admitted = 1,
     Refused = 2,
     Busy = 3,
@@ -456,13 +457,13 @@ pub enum ShellDisposition {
 /// Kind 22 field 11, for a `busy` disposition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum ShellBusyReason {
+pub enum ExecCmdBusyReason {
     Quota = 1,
     CapturePaused = 2,
     PendingFull = 3,
     PayloadUnavailable = 4,
 }
-impl ShellBusyReason {
+impl ExecCmdBusyReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Quota => "quota",
@@ -474,7 +475,7 @@ impl ShellBusyReason {
 }
 /// Kind 22 fields 8–10 for a `refused` disposition. Never holds a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShellRefusal {
+pub struct ExecCmdRefusal {
     pub code: RefusalCode,
     pub kind: Option<SecretKind>,
     /// The 1-based word index, 1–4096.
@@ -482,23 +483,23 @@ pub struct ShellRefusal {
 }
 /// Initial capture reservation recorded by an admitted kind 22 (R1).
 pub const INITIAL_RESERVATION: u64 = 1024 * 1024;
-/// Kind 22, ShellIntent (J1). An admitted or busy record holds the rewritten
+/// Kind 22, ExecCmdIntent (J1). An admitted or busy record holds the rewritten
 /// command; a refused one holds the display-redacted command, cut at 8,192
 /// bytes with `command_truncated`. No field holds a secret value or a digest
 /// of one: `variables` lists the kind of variable `ASURA_SECRET_<i+1>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShellIntent {
+pub struct ExecCmdIntent {
     pub operation: Id,
     pub generation: u64,
     pub ordinal: u32,
-    pub disposition: ShellDisposition,
+    pub disposition: ExecCmdDisposition,
     pub command_truncated: bool,
     pub command: String,
     pub cwd: String,
-    pub refusal: Option<ShellRefusal>,
-    pub busy: Option<ShellBusyReason>,
+    pub refusal: Option<ExecCmdRefusal>,
+    pub busy: Option<ExecCmdBusyReason>,
     pub variables: Vec<SecretKind>,
-    /// Admitted: the `asura.shell.job` derivation; otherwise zero.
+    /// Admitted: the `asura.exec_cmd.job` derivation; otherwise zero.
     pub job: Id,
     /// Admitted: payload IDs for stdout and stderr; otherwise zero.
     pub stdout_payload: Id,
@@ -605,8 +606,8 @@ pub struct CaptureSettled {
 /// Replay facts of one kind 22 call: identities, settlement and journal
 /// sequences used as "last use" by the interim expiry (J1-Q2).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShellCall {
-    pub disposition: ShellDisposition,
+pub struct ExecCmdCall {
+    pub disposition: ExecCmdDisposition,
     pub job: Id,
     pub stdout_payload: Id,
     pub stderr_payload: Id,
@@ -614,10 +615,10 @@ pub struct ShellCall {
     /// Kind 22 fields 18–19; kind 23 must name the same rule set.
     pub rule_set_revision: u32,
     pub rule_set_digest: Hash,
-    pub settled: Option<ShellSettlement>,
+    pub settled: Option<ExecCmdSettlement>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShellSettlement {
+pub struct ExecCmdSettlement {
     pub state: CaptureState,
     pub reason: CaptureReason,
     pub sequence: u64,
@@ -641,8 +642,8 @@ pub struct ToolRecord {
     pub preview: Option<String>,
     pub truncated: Option<bool>,
     pub exit_code: Option<i32>,
-    /// Present for a kind 22 shell call (J1).
-    pub shell: Option<Box<ShellCall>>,
+    /// Present for a kind 22 exec_cmd call (J1).
+    pub exec_cmd: Option<Box<ExecCmdCall>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

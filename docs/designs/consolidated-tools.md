@@ -5,7 +5,7 @@ Status: implemented; validation recorded below, 2026-09-28.
 ## Public interface and ownership
 
 Expose four model tools through the existing shared native adapter: `project`,
-`memory`, `service` and `shell`. Each grouped tool has a typed command enum and
+`memory`, `service` and `exec_cmd`. Each grouped tool has a typed command enum and
 bounded optional arguments. The adapter rejects fields that do not belong to the
 selected command. It translates valid arguments into the existing typed private
 model protocol; service policy, budgets, journal records and storage ownership
@@ -22,7 +22,7 @@ remain in their existing owners. No string command interpreter is added.
 | service | status | none |
 | service | tools | none |
 | service | audit | limit defaults 16 |
-| shell | unchanged | command, cwd, timeout_seconds |
+| exec_cmd | unchanged | command, cwd, timeout_seconds |
 
 For example, `memory` receives `{ "command": "get_note", "version": "…" }`.
 Command enums carry meaningful names rather than another resource selector when

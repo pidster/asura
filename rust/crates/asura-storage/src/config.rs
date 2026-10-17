@@ -35,7 +35,7 @@ struct Config {
     #[serde(default, skip_serializing_if = "Retention::is_default")]
     retention: Retention,
 }
-/// Retained shell output (J1 quota ledger).
+/// Retained exec_cmd output (J1 quota ledger).
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Retention {

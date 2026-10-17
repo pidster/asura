@@ -5,7 +5,7 @@ mod state;
 mod types;
 
 pub use codec::{
-    capitalize_project_name, decode_record, encode_frame, request_digest, shell_job_id,
+    capitalize_project_name, decode_record, encode_frame, exec_cmd_job_id, request_digest,
 };
 pub use state::{Replay, replay};
 pub use types::*;

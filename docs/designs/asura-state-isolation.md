@@ -18,8 +18,8 @@ Verified behavior (code inspection, 2026-10-14, commit `26a10fc`):
   `ProjectIdentity::open` (`asura-platform/src/project_identity.rs:14-49`)
   checks spelling and opens each component with `O_NOFOLLOW`. Nothing compares
   the root with the Asura home `~/.asura` (`asura-storage/src/authority/writer/state.rs:1246-1295`).
-- The model's shell profile grants read, write and exec on `(subpath project)`
-  (`asura-platform/src/shell/guardian.rs:108-139`).
+- The model's exec_cmd profile grants read, write and exec on `(subpath project)`
+  (`asura-platform/src/exec_cmd/guardian.rs:108-139`).
 - Model file tools read under the pinned project root
   (`asura-service/src/tools.rs:1046-1056`).
 
@@ -47,8 +47,8 @@ Required behavior (owner, 2026-10-14, PX3 and the EX16 follow-up):
 | ID | Rule |
 | --- | --- |
 | SI1 | Registration rejects a project root that is the Asura home, lies inside it, or contains it. Overlap is decided by directory identity, never by path text. |
-| SI2 | A registered project that overlaps the Asura home is unavailable. It stays listed, marked with reason `project_overlaps_asura_state`. Every open fails, so no turn, shell call or file read can use it. Its journal records are kept. |
-| SI3 | Every shell profile denies reads, writes and execution under the Asura home, except the call's own scratch directory. |
+| SI2 | A registered project that overlaps the Asura home is unavailable. It stays listed, marked with reason `project_overlaps_asura_state`. Every open fails, so no turn, exec_cmd call or file read can use it. Its journal records are kept. |
+| SI3 | Every exec_cmd profile denies reads, writes and execution under the Asura home, except the call's own scratch directory. |
 | SI4 | Asura's state and control plane are reachable only through typed, authorized interfaces. No sandboxed process reaches them through the file system or the control socket. |
 | SI5 | Protocol stays `0.1`; journal format stays `1`. |
 
@@ -63,10 +63,10 @@ profile and project identity only.
 | Asura home identity and its ancestors | `asura-platform::runtime::RuntimeDirectory` | New `StateBoundary` value, computed at runtime open |
 | Overlap check on open and revalidation | `asura-platform::ProjectIdentity` | Opens take a `StateBoundary` |
 | Registration, reopen and listing | Storage authority writer (`writer/state.rs`) | Passes the runtime's boundary; maps the new error |
-| Shell setup, file tools and context observation | Conversation owner and context manager in `asura-service` | Carry the runtime's boundary in the execution and context scopes |
+| exec_cmd setup, file tools and context observation | Conversation owner and context manager in `asura-service` | Carry the runtime's boundary in the execution and context scopes |
 | Error code to clients | `asura-service/src/conversation.rs` `storage_error` | New code |
 | Reply validation | `asura-control` conversation, sensor and audit validators | Accept the code where the service can send it |
-| Shell profile | Guardian (`asura-platform/src/shell/guardian.rs`) | FD 10, deny rule, second overlap check |
+| exec_cmd profile | Guardian (`asura-platform/src/exec_cmd/guardian.rs`) | FD 10, deny rule, second overlap check |
 | Display | TUI and CLI project list | Shows the reason |
 
 No second identity check, registry or path normalizer is added.
@@ -150,7 +150,7 @@ Proposed mechanism:
   before any record is appended. An exact retry of a request that already
   succeeded for an overlapping project also returns it.
 - **Existing registrations (SI2):** `self.project(id)` fails with the new
-  error, so every admission, shell call, file read and project open fails.
+  error, so every admission, exec_cmd call, file read and project open fails.
   Listing already reports `current` from `self.project(id).is_ok()`
   (`state.rs:1126-1140`). For an overlapping entry, the listed `ProjectReply`
   keeps its registration fields, sets `current = false`, and sets its existing
@@ -203,7 +203,7 @@ sequenceDiagram
     Note over U,P: Every later use reopens the project with the same boundary
 ```
 
-## Shell profile
+## exec_cmd profile
 
 Proposed mechanism for SI3:
 
@@ -271,11 +271,11 @@ through `tests/tui_pty.py` against an isolated service.
 | SI-U5 | Unit | `storage_error` mapping, control validation of listed entries, and project list line | New code; a listed entry with the code and `current = false` is valid, with any other code or `current = true` invalid; `[unavailable: contains Asura state]` |
 | SI-I1 | Integration | Register the scratch home, its `.asura`, `.asura/tmp`, the scratch home's parent, `/`, `/System`, `/System/Volumes` and `/System/Volumes/Data` | Each returns `project_overlaps_asura_state`; nothing appended |
 | SI-I2 | Integration | Register a sibling of the scratch home and a subdirectory of the scratch home outside `.asura` | Both succeed |
-| SI-I3 | Integration | Journal fixture holding a registration of the scratch home | Listed unavailable with the reason; admission, shell and `read_file` fail with the code |
-| SI-I4 | Integration | Model shell with a valid project: read, write and exec under the Asura home; write and exec in scratch | Asura home denied; scratch works |
+| SI-I3 | Integration | Journal fixture holding a registration of the scratch home | Listed unavailable with the reason; admission, exec_cmd and `read_file` fail with the code |
+| SI-I4 | Integration | Model exec_cmd with a valid project: read, write and exec under the Asura home; write and exec in scratch | Asura home denied; scratch works |
 | SI-I5 | Integration | Same, through the `/System/Volumes/Data` spelling of the Asura home | Denied |
 | SI-I6 | Integration | Guardian started with FD 10 absent, not a directory, with wrong mode, and naming a directory that is not the scratch parent | First three `Protocol`, last `Denied`; no process runs in any case |
-| SI-I7 | Integration | Existing shell tool suite SH-I1 | Still passes |
+| SI-I7 | Integration | Existing exec_cmd tool suite SH-I1 | Still passes |
 | SI-I8 | Integration, firmlinked scratch | A scratch home created under `/Users/Shared`; register its `/System/Volumes/Data/Users/Shared/…` spelling and `/System/Volumes/Data/Users/Shared` | Both rejected; proves the overlap check crosses the `/Users` firmlink |
 | SI-E1 | End to end | TUI launched in the scratch home; accept the first-launch offer | Error shown; draft kept; no project selected |
 | SI-E2 | End to end | Project list containing an overlapping registration | Line shows the unavailable reason; selecting it shows the code |

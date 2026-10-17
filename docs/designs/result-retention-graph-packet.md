@@ -20,7 +20,7 @@ for conversations, turns, inference requests and evidence. It follows
 [conversation projections](conversation-projections.md),
 [graph memory evolution](graph-memory-evolution.md), the
 [hybrid ontology](hybrid-memory-ontology.md),
-[storage ownership](storage-adapters.md) and the [shell tool](shell-tool.md).
+[storage ownership](storage-adapters.md) and the [exec_cmd tool](exec-cmd-tool.md).
 
 Required behavior: the person can inspect actual tool activity during a turn.
 Later, the person or an admitted model can retrieve retained detail by identity.
@@ -48,7 +48,7 @@ started during this analysis.
 | `asura-storage/src/authority.rs` | The authority journal is bounded at 8 MiB and 32,768 frames. The graph cannot bypass this admission bound. |
 | `asura-storage/src/authority/conversation/types.rs` | Conversations and operations have existing IDs. Tool identity is operation, generation and ordinal. Durable tool results contain bounded text, status, continuation and truncation. |
 | `asura-service/src/tools.rs` | Model delivery allows 16 KiB per result and 64 KiB aggregate result text. Retained payload storage must not increase these model-delivery bounds implicitly. |
-| `shell-tool.md` and the existing shell owner | Shell output is drained fairly, with separate 8 KiB tail rings and a combined 64 MiB emitted-output limit. Existing results contain tails, not complete output. |
+| `exec-cmd-tool.md` and the existing exec_cmd owner | exec_cmd output is drained fairly, with separate 8 KiB tail rings and a combined 64 MiB emitted-output limit. Existing results contain tails, not complete output. |
 
 The installed SurrealDB 3.2.4 SDK exposes transaction commit/cancel handles and
 query/transaction timeouts. Existing code uses a parameterized transaction query.
@@ -117,7 +117,7 @@ The proposed [tool job controller](tool-job-controller.md#capture-watermark-and-
 extends this contract with reads of a running job's staging objects and up to
 four concurrent captures. Its review must update the limits below.
 
-Propose immutable raw-byte payloads per result stream. Shell has separate `stdout`
+Propose immutable raw-byte payloads per result stream. exec_cmd has separate `stdout`
 and `stderr` objects. A typed tool may also retain a `result` object containing
 its exact returned UTF-8 body. A service-generated descriptor connects streams
 to the exact call and result. It states encoding, byte count and SHA-256 digest.
@@ -173,12 +173,12 @@ derivation labels and collision/conflict rejection need the wire/codec review.
 
 | Boundary | Proposed limit and overload result |
 | --- | --- |
-| Shell retained bytes | No per-call or per-job cap; the shared installation quota applies (owner, 2026-10-14, J1d; PC7 for person jobs) |
+| exec_cmd retained bytes | No per-call or per-job cap; the shared installation quota applies (owner, 2026-10-14, J1d; PC7 for person jobs) |
 | Other tool result payload | 16 KiB per current returned body; future larger typed tools need separate admission |
 | Capture concurrency | One capture worker per job slot, each with a 512 KiB transfer queue (owner, 2026-10-14, R4) |
 | Capture transfer | Eight chunks of at most 64 KiB; 512 KiB queued bytes plus one active chunk |
 | Capture saturation | Backpressure: stop reading the pipes until the queue drains; no cancellation (owner, 2026-10-15, J1-Q1). After a cancel trigger, bytes that cannot be queued are discarded, counted and recorded; retention is then incomplete. Never silently drop bytes and claim completeness. |
-| Storage operation | No deadline for writes, sync, install or recovery steps (owner, 2026-10-15). A page read keeps its 2 s storage step (owner, 2026-10-14). After a cancel trigger, the shell cleanup bound of 2.5 s (L3) also covers capture settlement; an unsettled capture is recorded `unconfirmed` and its worker stays owned (J1-Q1). |
+| Storage operation | No deadline for writes, sync, install or recovery steps (owner, 2026-10-15). A page read keeps its 2 s storage step (owner, 2026-10-14). After a cancel trigger, the exec_cmd cleanup bound of 2.5 s (L3) also covers capture settlement; an unsettled capture is recorded `unconfirmed` and its worker stays owned (J1-Q1). |
 | Installation payload quota | Configurable, default 1 GiB retained bytes plus reservations; each capture reserves 1 MiB at intent and grows in 1 MiB steps (owner, 2026-10-14, R1; growing reservation selected 2026-10-13, [job retained output lifetime](tool-job-controller.md#retained-output-lifetime)) |
 | Recovery reserve | Fixed 16 MiB reserved for bounded descriptors and settlement; payload admission cannot consume it (owner, 2026-10-14, R1) |
 | Page concurrency | Two page-read workers, one reserved for the model (owner, 2026-10-14, R4); eight queued; ninth queued request returns `busy` |
@@ -518,7 +518,7 @@ storage behavior; they do not establish provider reasoning quality.
 
 | Case | Initial state and trigger | Required result | Test layers |
 | --- | --- | --- | --- |
-| RG-01 full capture | Shell emits interleaved streams larger than existing rings | Exact stdout/stderr bytes recover; prefixes/tails/previews cannot masquerade as originals | Unit: offsets, hashing, stream identity. Integration: real pipes and files. E2E: inspect live activity, restart, retrieve each stream and compare bytes. |
+| RG-01 full capture | exec_cmd emits interleaved streams larger than existing rings | Exact stdout/stderr bytes recover; prefixes/tails/previews cannot masquerade as originals | Unit: offsets, hashing, stream identity. Integration: real pipes and files. E2E: inspect live activity, restart, retrieve each stream and compare bytes. |
 | RG-02 partial capture | Output cap, cancellation, storage error or disconnect interrupts capture | Actual outcome and retained ranges/loss reason stay distinct; no invented missing count | Unit: every reason and boundary. Integration: inject each trigger. E2E: inspect partial result after restart without rerunning. |
 | RG-03 overload | Chunk queue fills or filesystem write stalls | While running: backpressure only, no cancellation, no loss. After a cancel trigger: a capture not settled within 2.5 s is recorded `unconfirmed`, the result is delivered and the worker stays owned (J1-Q1, owner, 2026-10-15). Memory remains bounded; controls remain responsive | Unit: queue/reservation admission and the post-cancel bound. Integration: stalled storage and full queue, before and after cancel. E2E: typing within 100 ms and Inspect within 100 ms under fixture load. |
 | RG-04 quota | Two reservations compete for remaining space, or disk fills after reservation | No over-reservation, protected evidence remains, effect cannot start without reservation | Unit: quota race. Integration: real constrained filesystem. E2E: visible admission failure and authorized cleanup. |

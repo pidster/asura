@@ -1,4 +1,4 @@
-use super::ShellError;
+use super::ExecCmdError;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Notice {
     pub kind: u8,
@@ -19,7 +19,7 @@ impl Notice {
         b[24..28].copy_from_slice(&self.value.to_be_bytes());
         b
     }
-    pub fn decode(b: &[u8], id: [u8; 16]) -> Result<Self, ShellError> {
+    pub fn decode(b: &[u8], id: [u8; 16]) -> Result<Self, ExecCmdError> {
         if b.len() != 32
             || &b[..4] != b"ASSH"
             || id == [0; 16]
@@ -28,14 +28,14 @@ impl Notice {
             || b[7] > 1
             || b[5] > 9
         {
-            return Err(ShellError::Protocol);
+            return Err(ExecCmdError::Protocol);
         }
         let n = Self {
             kind: b[4],
             reason: b[5],
             exit_kind: b[6],
             cleanup: b[7] == 1,
-            value: u32::from_be_bytes(b[24..28].try_into().map_err(|_| ShellError::Protocol)?),
+            value: u32::from_be_bytes(b[24..28].try_into().map_err(|_| ExecCmdError::Protocol)?),
         };
         let exit = match n.exit_kind {
             0 => n.value == 0,
@@ -53,7 +53,7 @@ impl Notice {
         if exit && shape {
             Ok(n)
         } else {
-            Err(ShellError::Protocol)
+            Err(ExecCmdError::Protocol)
         }
     }
 }

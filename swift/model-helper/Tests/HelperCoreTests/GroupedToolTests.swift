@@ -54,7 +54,7 @@ private actor GroupedCalls {
 }
 @Test func groupedSchemasAdvertiseOnlyTypedCommands() throws {
     let tools = makeProjectTools { _ in throw HelperError.unavailable }
-    #expect(tools.map(\.name) == ["project", "memory", "service", "shell"])
+    #expect(tools.map(\.name) == ["project", "memory", "service", "exec_cmd"])
     let commands = [["read_file", "list_directory"], ["list_notes", "get_note", "note_sources", "create_note"], ["status", "tools", "audit"]]
     for (tool, expected) in zip(tools.prefix(3), commands) {
         let schema = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(tool.parameters)) as? [String: Any])

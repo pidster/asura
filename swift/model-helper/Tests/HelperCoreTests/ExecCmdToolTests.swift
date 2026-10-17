@@ -3,16 +3,16 @@ import FoundationModels
 import Testing
 @testable import HelperCore
 
-private func shellEnvelope(_ args: Asura_Model_V1_Shell) -> Envelope {
-    var call = Asura_Model_V1_ToolCall(); call.ordinal = 1; call.shell = args
+private func execCmdEnvelope(_ args: Asura_Model_V1_ExecCmd) -> Envelope {
+    var call = Asura_Model_V1_ToolCall(); call.ordinal = 1; call.execCmd = args
     var message = Envelope(); message.operationID = Data(repeating: 7, count: 16)
     message.generation = 1; message.body = .toolCall(call)
     return message
 }
 
-@Test func shellNativeSchemaDefaultsAndFailureOutput() async throws {
-    let tool = ShellTool { args in
-        guard case .shell(let command, let cwd, let timeout) = args else { throw HelperError.protocolFault }
+@Test func execCmdNativeSchemaDefaultsAndFailureOutput() async throws {
+    let tool = ExecCmdTool { args in
+        guard case .execCmd(let command, let cwd, let timeout) = args else { throw HelperError.protocolFault }
         #expect(command == "printf fixture" && cwd == "." && timeout == 30)
         return ToolResult(status: .timeout, text: "stdout: partial\nstderr: deadline", truncated: true)
     }
@@ -25,8 +25,8 @@ private func shellEnvelope(_ args: Asura_Model_V1_Shell) -> Envelope {
     #expect(!ToolResult(status: .timeout, text: "private failed body").rendered.contains("private failed body"))
 }
 
-@Test func shellInvalidNativeArgumentsNeverReachService() async throws {
-    let tool = ShellTool { _ in Issue.record("invalid arguments reached service"); throw HelperError.protocolFault }
+@Test func execCmdInvalidNativeArgumentsNeverReachService() async throws {
+    let tool = ExecCmdTool { _ in Issue.record("invalid arguments reached service"); throw HelperError.protocolFault }
     for command in ["", "x\0y", String(repeating: "é", count: 4097)] {
         await #expect(throws: BackendFailure.self) { try await tool.call(arguments: .init(command: command, cwd: nil, timeout_seconds: nil)) }
     }
@@ -38,35 +38,35 @@ private func shellEnvelope(_ args: Asura_Model_V1_Shell) -> Envelope {
     }
 }
 
-@Test func shellWireBoundsPresenceUnknownFieldsAndDirection() throws {
-    var args = Asura_Model_V1_Shell(); args.command = "printf fixture"
-    let message = shellEnvelope(args)
+@Test func execCmdWireBoundsPresenceUnknownFieldsAndDirection() throws {
+    var args = Asura_Model_V1_ExecCmd(); args.command = "printf fixture"
+    let message = execCmdEnvelope(args)
     #expect(try Wire.decode(message.serializedData(), from: .helper) == message)
     #expect(throws: HelperError.self) { try Wire.decode(message.serializedData(), from: .service) }
-    #expect(throws: HelperError.self) { try Wire.decode(shellEnvelope(.init()).serializedData(), from: .helper) }
+    #expect(throws: HelperError.self) { try Wire.decode(execCmdEnvelope(.init()).serializedData(), from: .helper) }
     for command in ["", "x\0y", String(repeating: "é", count: 4097)] {
         var bad = args; bad.command = command
-        #expect(throws: HelperError.self) { try Wire.decode(shellEnvelope(bad).serializedData(), from: .helper) }
+        #expect(throws: HelperError.self) { try Wire.decode(execCmdEnvelope(bad).serializedData(), from: .helper) }
     }
     for cwd in ["", "/tmp", "..", "a/../b", "x\0y", String(repeating: "x", count: 1025)] {
         var bad = args; bad.cwd = cwd
-        #expect(throws: HelperError.self) { try Wire.decode(shellEnvelope(bad).serializedData(), from: .helper) }
+        #expect(throws: HelperError.self) { try Wire.decode(execCmdEnvelope(bad).serializedData(), from: .helper) }
     }
     for timeout in [UInt32(0), 61] {
         var bad = args; bad.timeoutSeconds = timeout
-        #expect(throws: HelperError.self) { try Wire.decode(shellEnvelope(bad).serializedData(), from: .helper) }
+        #expect(throws: HelperError.self) { try Wire.decode(execCmdEnvelope(bad).serializedData(), from: .helper) }
     }
     for timeout in [UInt32(1), 60] {
         var good = args; good.command = String(repeating: "é", count: 4096); good.cwd = "."; good.timeoutSeconds = timeout
-        let envelope = shellEnvelope(good)
+        let envelope = execCmdEnvelope(good)
         #expect(try Wire.decode(envelope.serializedData(), from: .helper) == envelope)
     }
     var raw = try args.serializedData(); raw.append(contentsOf: [0xa0, 6, 1])
-    let unknown = try Asura_Model_V1_Shell(serializedBytes: raw)
-    #expect(throws: HelperError.self) { try Wire.decode(shellEnvelope(unknown).serializedData(), from: .helper) }
+    let unknown = try Asura_Model_V1_ExecCmd(serializedBytes: raw)
+    #expect(throws: HelperError.self) { try Wire.decode(execCmdEnvelope(unknown).serializedData(), from: .helper) }
 }
 
-@Test func shellFailedWireResultMayContainBoundedTruncatedTextButNoCursor() throws {
+@Test func execCmdFailedWireResultMayContainBoundedTruncatedTextButNoCursor() throws {
     var result = Asura_Model_V1_ToolResult(); result.ordinal = 1; result.status = .timeout
     result.text = "stdout: partial\nstderr: deadline"; result.truncated = true
     var message = Envelope(); message.operationID = Data(repeating: 7, count: 16); message.generation = 1

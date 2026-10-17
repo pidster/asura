@@ -4,7 +4,7 @@
 //! a digest. Pure computation over at most one command.
 use super::stream::{RawSpan, redact_whole, scan_spans};
 use super::{RuleSet, SecretKind, detection};
-use crate::shell::split::{Analysis, ByteContext, Quoting, Role, analyze};
+use crate::exec_cmd::split::{Analysis, ByteContext, Quoting, Role, analyze};
 use std::collections::HashMap;
 use zeroize::Zeroizing;
 
@@ -32,7 +32,7 @@ impl SecretVariable {
     pub fn name(&self) -> String {
         format!("ASURA_SECRET_{}", self.number)
     }
-    /// Any number and value, to exercise `ShellRequest` validation.
+    /// Any number and value, to exercise `ExecCmdRequest` validation.
     #[cfg(test)]
     pub(crate) fn for_test(number: u8, value: &[u8]) -> Self {
         Self {
@@ -175,18 +175,18 @@ pub(crate) fn rewrite_with(
     }
 }
 
-/// The rewritten command limit: the rewrite must fit the shell command and
+/// The rewritten command limit: the rewrite must fit the exec_cmd command and
 /// intent record limits (J1, G6).
 pub const MAX_REWRITTEN_COMMAND_BYTES: usize = 8192;
 
-/// The model shell call path (J1): rewrites `command`, refuses a rewrite
+/// The model exec_cmd call path (J1): rewrites `command`, refuses a rewrite
 /// longer than [`MAX_REWRITTEN_COMMAND_BYTES`] with
 /// `rewritten_command_too_long`, and scans `cwd` in whole-buffer mode; a
 /// detected span refuses with `secret_in_cwd`. The person path reuses it.
-pub fn rewrite_shell_call(command: &str, cwd: &str) -> Result<Rewrite, Refusal> {
-    rewrite_shell_call_with(detection(), command, cwd)
+pub fn rewrite_exec_cmd_call(command: &str, cwd: &str) -> Result<Rewrite, Refusal> {
+    rewrite_exec_cmd_call_with(detection(), command, cwd)
 }
-pub(crate) fn rewrite_shell_call_with(
+pub(crate) fn rewrite_exec_cmd_call_with(
     rules: Result<&'static RuleSet, super::SelfCheckError>,
     command: &str,
     cwd: &str,

@@ -316,10 +316,10 @@ public actor HelperSession {
         var call = Asura_Model_V1_ToolCall()
         call.ordinal = toolOrdinal
         switch arguments {
-        case .shell(let command, let cwd, let timeout):
-            var args = Asura_Model_V1_Shell()
+        case .execCmd(let command, let cwd, let timeout):
+            var args = Asura_Model_V1_ExecCmd()
             args.command = command; if let cwd {args.cwd = cwd}; args.timeoutSeconds = timeout
-            call.arguments = .shell(args)
+            call.arguments = .execCmd(args)
         case .readAudit(let limit):
             var args = Asura_Model_V1_AuditRead()
             args.limit = limit

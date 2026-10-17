@@ -1,4 +1,4 @@
-use super::ShellError;
+use super::ExecCmdError;
 use crate::startup::{SpawnActions, SpawnAttributes};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -10,8 +10,12 @@ unsafe extern "C" {
         fd: i32,
     ) -> i32;
 }
-fn ok(n: i32) -> Result<(), ShellError> {
-    if n == 0 { Ok(()) } else { Err(ShellError::Io) }
+fn ok(n: i32) -> Result<(), ExecCmdError> {
+    if n == 0 {
+        Ok(())
+    } else {
+        Err(ExecCmdError::Io)
+    }
 }
 pub(super) fn interrupted() -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
@@ -22,59 +26,59 @@ pub(super) fn would_block() -> bool {
         Some(libc::EAGAIN) | Some(libc::EINTR)
     )
 }
-pub(super) fn nonblocking(fd: RawFd) -> Result<(), ShellError> {
+pub(super) fn nonblocking(fd: RawFd) -> Result<(), ExecCmdError> {
     // SAFETY: inspect and update flags on the caller-owned descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        Err(ShellError::Io)
+        Err(ExecCmdError::Io)
     } else {
         Ok(())
     }
 }
-pub(super) fn pipe(nonblocking_write: bool) -> Result<(OwnedFd, OwnedFd), ShellError> {
-    let (read, write) = crate::startup::pipe().map_err(|_| ShellError::Io)?;
+pub(super) fn pipe(nonblocking_write: bool) -> Result<(OwnedFd, OwnedFd), ExecCmdError> {
+    let (read, write) = crate::startup::pipe().map_err(|_| ExecCmdError::Io)?;
     nonblocking(read.as_raw_fd())?;
     if nonblocking_write {
         nonblocking(write.as_raw_fd())?;
     }
     Ok((read, write))
 }
-pub(super) fn monotonic_ns() -> Result<u64, ShellError> {
+pub(super) fn monotonic_ns() -> Result<u64, ExecCmdError> {
     // SAFETY: initialized output passed to the fixed monotonic clock.
     let mut t: libc::timespec = unsafe { std::mem::zeroed() };
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) } != 0
         || t.tv_sec < 0
         || t.tv_nsec < 0
     {
-        return Err(ShellError::Io);
+        return Err(ExecCmdError::Io);
     }
     (t.tv_sec as u64)
         .checked_mul(1_000_000_000)
         .and_then(|n| n.checked_add(t.tv_nsec as u64))
-        .ok_or(ShellError::Invalid)
+        .ok_or(ExecCmdError::Invalid)
 }
-pub(super) fn path(fd: RawFd) -> Result<String, ShellError> {
+pub(super) fn path(fd: RawFd) -> Result<String, ExecCmdError> {
     let mut value = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes to this live buffer.
     if unsafe { libc::fcntl(fd, libc::F_GETPATH, value.as_mut_ptr()) } != 0 {
-        return Err(ShellError::Denied);
+        return Err(ExecCmdError::Denied);
     }
     let end = value
         .iter()
         .position(|b| *b == 0)
-        .ok_or(ShellError::Denied)?;
-    let path = std::str::from_utf8(&value[..end]).map_err(|_| ShellError::Denied)?;
+        .ok_or(ExecCmdError::Denied)?;
+    let path = std::str::from_utf8(&value[..end]).map_err(|_| ExecCmdError::Denied)?;
     if !path.starts_with('/') || path.chars().any(char::is_control) {
-        return Err(ShellError::Denied);
+        return Err(ExecCmdError::Denied);
     }
     Ok(path.into())
 }
 /// One NUL-terminated environment entry in memory that is zeroed on drop.
 /// `CString` clears only its first byte when dropped, so it cannot hold a
 /// secret variable.
-fn env_entry(entry: &[u8]) -> Result<Zeroizing<Vec<u8>>, ShellError> {
+fn env_entry(entry: &[u8]) -> Result<Zeroizing<Vec<u8>>, ExecCmdError> {
     if entry.contains(&0) {
-        return Err(ShellError::Invalid);
+        return Err(ExecCmdError::Invalid);
     }
     let mut owned = Zeroizing::new(Vec::with_capacity(entry.len() + 1));
     owned.extend_from_slice(entry);
@@ -91,12 +95,12 @@ pub(super) fn launch(
     mappings: &[(RawFd, RawFd)],
     cwd: Option<RawFd>,
     group: bool,
-) -> Result<libc::pid_t, ShellError> {
-    let executable =
-        CString::new(executable.as_os_str().as_encoded_bytes()).map_err(|_| ShellError::Invalid)?;
+) -> Result<libc::pid_t, ExecCmdError> {
+    let executable = CString::new(executable.as_os_str().as_encoded_bytes())
+        .map_err(|_| ExecCmdError::Invalid)?;
     let args: Vec<CString> = args
         .iter()
-        .map(|s| CString::new(s.as_bytes()).map_err(|_| ShellError::Invalid))
+        .map(|s| CString::new(s.as_bytes()).map_err(|_| ExecCmdError::Invalid))
         .collect::<Result<_, _>>()?;
     let env: Vec<Zeroizing<Vec<u8>>> = env
         .iter()
@@ -117,7 +121,7 @@ pub(super) fn launch(
         // prevents sequential dup2 actions from clobbering later source FDs.
         let fd = unsafe { libc::fcntl(*source, libc::F_DUPFD_CLOEXEC, 20) };
         if fd < 0 {
-            return Err(ShellError::Io);
+            return Err(ExecCmdError::Io);
         }
         duplicates.push((unsafe { OwnedFd::from_raw_fd(fd) }, *target));
     }

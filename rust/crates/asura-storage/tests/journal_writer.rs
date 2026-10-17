@@ -1577,9 +1577,9 @@ fn j1_admit_and_start(
         .replay
         .unwrap()
 }
-fn j1_intent(installation: Id, ordinal: u32, disposition: ShellDisposition) -> ShellIntent {
+fn j1_intent(installation: Id, ordinal: u32, disposition: ExecCmdDisposition) -> ExecCmdIntent {
     use asura_storage::payload::{ObjectKind, payload_id};
-    let admitted = disposition == ShellDisposition::Admitted;
+    let admitted = disposition == ExecCmdDisposition::Admitted;
     let derived = |kind| {
         if admitted {
             payload_id(installation, [35; 16], 1, ordinal, kind)
@@ -1587,7 +1587,7 @@ fn j1_intent(installation: Id, ordinal: u32, disposition: ShellDisposition) -> S
             [0; 16]
         }
     };
-    ShellIntent {
+    ExecCmdIntent {
         operation: [35; 16],
         generation: 1,
         ordinal,
@@ -1599,7 +1599,7 @@ fn j1_intent(installation: Id, ordinal: u32, disposition: ShellDisposition) -> S
             "printf %s '[REDACTED:github-token]'".into()
         },
         cwd: ".".into(),
-        refusal: (!admitted).then_some(ShellRefusal {
+        refusal: (!admitted).then_some(ExecCmdRefusal {
             code: RefusalCode::SecretSingleQuoted,
             kind: Some(SecretKind::GithubToken),
             word: Some(3),
@@ -1611,7 +1611,7 @@ fn j1_intent(installation: Id, ordinal: u32, disposition: ShellDisposition) -> S
             Vec::new()
         },
         job: if admitted {
-            shell_job_id([35; 16], 1, ordinal)
+            exec_cmd_job_id([35; 16], 1, ordinal)
         } else {
             [0; 16]
         },
@@ -1632,7 +1632,7 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
     let installation = state.installation_id;
     let mut revision = state.revision;
     drop(state);
-    let intent = j1_intent(installation, 1, ShellDisposition::Admitted);
+    let intent = j1_intent(installation, 1, ExecCmdDisposition::Admitted);
     let settled = CaptureSettled {
         operation: [35; 16],
         generation: 1,
@@ -1677,7 +1677,7 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
         next_offset: None,
         truncated: false,
     };
-    let refused = j1_intent(installation, 2, ShellDisposition::Refused);
+    let refused = j1_intent(installation, 2, ExecCmdDisposition::Refused);
     let refused_result = ToolResult {
         ordinal: 2,
         status: 3,
@@ -1685,10 +1685,10 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
         ..result.clone()
     };
     for record in [
-        Record::ShellIntent(Box::new(intent.clone())),
+        Record::ExecCmdIntent(Box::new(intent.clone())),
         Record::CaptureSettled(Box::new(settled.clone())),
         Record::ToolResult(result),
-        Record::ShellIntent(Box::new(refused.clone())),
+        Record::ExecCmdIntent(Box::new(refused.clone())),
         Record::ToolResult(refused_result),
     ] {
         submit(&mut writer, &mut revision, record).unwrap();
@@ -1698,8 +1698,8 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
     let durable = journal_replay(&scratch);
     let tools = &durable.operations[&[35; 16]].tools;
     assert_eq!(tools.len(), 2);
-    let call = tools[0].shell.as_deref().unwrap();
-    assert_eq!(call.disposition, ShellDisposition::Admitted);
+    let call = tools[0].exec_cmd.as_deref().unwrap();
+    assert_eq!(call.disposition, ExecCmdDisposition::Admitted);
     assert_eq!(call.job, intent.job);
     assert_eq!(call.stdout_payload, intent.stdout_payload);
     let settlement = call.settled.as_ref().unwrap();
@@ -1711,8 +1711,8 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
     );
     assert_eq!(tools[0].result_status, Some(5));
     assert_eq!(
-        tools[1].shell.as_deref().unwrap().disposition,
-        ShellDisposition::Refused
+        tools[1].exec_cmd.as_deref().unwrap().disposition,
+        ExecCmdDisposition::Refused
     );
     assert_eq!(tools[1].result_status, Some(3));
     let intent_frame = tools[0].intent_frame.clone();
@@ -1730,9 +1730,9 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
     // Each verified frame range decodes to the appended record.
     let bytes = fs::read(scratch.0.join(".asura/state/control/slot-0.log")).unwrap();
     for (range, kind, expected) in [
-        (intent_frame, 22, Record::ShellIntent(Box::new(intent))),
+        (intent_frame, 22, Record::ExecCmdIntent(Box::new(intent))),
         (settled_frame, 23, Record::CaptureSettled(Box::new(settled))),
-        (refused_frame, 22, Record::ShellIntent(Box::new(refused))),
+        (refused_frame, 22, Record::ExecCmdIntent(Box::new(refused))),
     ] {
         let frame = &bytes[range];
         assert_eq!(u16::from_be_bytes([frame[10], frame[11]]), kind);
@@ -1772,7 +1772,11 @@ fn j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit() 
         .unwrap()
         .len()
     };
-    let shell = Record::ShellIntent(Box::new(j1_intent([1; 16], 1, ShellDisposition::Admitted)));
+    let exec_cmd = Record::ExecCmdIntent(Box::new(j1_intent(
+        [1; 16],
+        1,
+        ExecCmdDisposition::Admitted,
+    )));
     let status = Record::ToolIntent(ToolIntent {
         operation: [35; 16],
         generation: 1,
@@ -1785,8 +1789,9 @@ fn j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit() 
     let pending_tool = TERMINAL + RESULT + OWNER + CANCEL;
     // After the start: kind 22 alone fits by MARGIN bytes, but not with its
     // capture frame; the smaller kind 14 fits.
-    let started_end = asura_storage::authority::MAX_JOURNAL - pending_tool - size(&shell) - MARGIN;
-    assert!(size(&status) <= size(&shell) + MARGIN && MARGIN < CAPTURE);
+    let started_end =
+        asura_storage::authority::MAX_JOURNAL - pending_tool - size(&exec_cmd) - MARGIN;
+    assert!(size(&status) <= size(&exec_cmd) + MARGIN && MARGIN < CAPTURE);
     let padded_end = started_end
         - OWNER
         - size(&Record::TurnAccepted(Box::new(j1_turn(
@@ -1909,13 +1914,13 @@ fn j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit() 
     drop(started);
     let journal = scratch.0.join(".asura/state/control/slot-0.log");
     let before = fs::read(&journal).unwrap();
-    let shell = Record::ShellIntent(Box::new(j1_intent(
+    let exec_cmd = Record::ExecCmdIntent(Box::new(j1_intent(
         installation,
         1,
-        ShellDisposition::Admitted,
+        ExecCmdDisposition::Admitted,
     )));
     assert!(matches!(
-        submit(&mut writer, &mut revision, shell),
+        submit(&mut writer, &mut revision, exec_cmd),
         Err(Error::Invalid)
     ));
     assert_eq!(fs::read(&journal).unwrap(), before);
@@ -1928,10 +1933,10 @@ fn j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit() 
     assert_eq!(state.reserved_bytes, pending_tool);
     assert_eq!(
         asura_storage::authority::MAX_JOURNAL - state.end_offset - state.reserved_bytes,
-        size(&Record::ShellIntent(Box::new(j1_intent(
+        size(&Record::ExecCmdIntent(Box::new(j1_intent(
             installation,
             1,
-            ShellDisposition::Admitted
+            ExecCmdDisposition::Admitted
         )))) + MARGIN
             - size(&Record::ToolIntent(ToolIntent {
                 operation: [35; 16],

@@ -78,14 +78,14 @@ message ProjectListDirectory { optional string path = 1; }
 message ObserveStatus {}
 message ListTools {}
 message AuditRead { optional uint32 limit = 1; }
-message Shell { optional string command = 1; optional string cwd = 2; optional uint32 timeout_seconds = 3; }
+message ExecCmd { optional string command = 1; optional string cwd = 2; optional uint32 timeout_seconds = 3; }
 message MemoryListNotes { optional string after = 1; optional uint32 limit = 2; }
 message MemoryGetNote { optional string version = 1; optional uint64 offset = 2; optional uint32 limit = 3; }
 message MemoryNoteSources { optional string version = 1; }
 message MemoryCreateNote { optional string body = 1; optional string source_version = 2; }
 message ToolCall {
   optional uint32 ordinal = 1;
-  oneof arguments { ProjectReadFile read_file = 10; ProjectListDirectory list_directory = 11; ObserveStatus observe_status = 12; MemoryListNotes memory_list_notes = 13; MemoryGetNote memory_get_note = 14; MemoryNoteSources memory_note_sources = 15; MemoryCreateNote memory_create_note = 16; ListTools list_tools = 17; AuditRead read_audit = 18; Shell shell = 19; }
+  oneof arguments { ProjectReadFile read_file = 10; ProjectListDirectory list_directory = 11; ObserveStatus observe_status = 12; MemoryListNotes memory_list_notes = 13; MemoryGetNote memory_get_note = 14; MemoryNoteSources memory_note_sources = 15; MemoryCreateNote memory_create_note = 16; ListTools list_tools = 17; AuditRead read_audit = 18; ExecCmd exec_cmd = 19; }
 }
 message ToolResult { optional uint32 ordinal = 1; optional ToolStatus status = 2; optional string text = 3; optional uint64 next_offset = 4; optional bool truncated = 5; }
 

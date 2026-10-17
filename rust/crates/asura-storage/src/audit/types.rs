@@ -140,7 +140,7 @@ pub enum Tool {
     MemoryNoteSources = 6,
     ServiceListTools = 7,
     ServiceReadAudit = 8,
-    Shell = 9,
+    ExecCmd = 9,
     MemoryCreateNote = 10,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

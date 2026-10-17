@@ -238,7 +238,7 @@ pub(super) fn tool_finished(
     use crate::tools::Arguments as A;
     use asura_storage::audit::{Tool, ToolOutcome as O};
     let tool = match call.arguments {
-        A::Shell { .. } => Tool::Shell,
+        A::ExecCmd { .. } => Tool::ExecCmd,
         A::ReadFile { .. } => Tool::ProjectReadFile,
         A::ListDirectory { .. } => Tool::ProjectListDirectory,
         A::ObserveStatus => Tool::ServiceObserveStatus,

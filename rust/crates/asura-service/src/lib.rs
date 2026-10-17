@@ -7,8 +7,8 @@ mod context;
 mod context_manager;
 mod context_observer;
 mod conversation;
+mod exec_cmd_worker;
 mod payload_owner;
-mod shell_worker;
 // Real service fixtures share the canonical process-wide writer owner.
 #[cfg(test)]
 pub(crate) static TEST_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());

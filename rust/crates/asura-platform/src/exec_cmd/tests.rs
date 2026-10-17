@@ -1,8 +1,8 @@
 use super::*;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-fn request() -> ShellRequest {
-    ShellRequest {
+fn request() -> ExecCmdRequest {
+    ExecCmdRequest {
         job_id: [7; 16],
         command: "printf ok".into(),
         cwd: None,
@@ -16,7 +16,7 @@ fn arguments_reject_effects_outside_contract() {
     assert!(validate(&r).is_ok());
     for cwd in ["../other", "a/../b", "/tmp", "", "x\0y"] {
         r.cwd = Some(cwd.into());
-        assert_eq!(validate(&r), Err(ShellError::Invalid));
+        assert_eq!(validate(&r), Err(ExecCmdError::Invalid));
     }
     for cwd in [".", "./subdir", "a//b/"] {
         r.cwd = Some(cwd.into());
@@ -26,9 +26,9 @@ fn arguments_reject_effects_outside_contract() {
     r.command = "x".repeat(8192);
     assert!(validate(&r).is_ok());
     r.command.push('x');
-    assert_eq!(validate(&r), Err(ShellError::Invalid));
+    assert_eq!(validate(&r), Err(ExecCmdError::Invalid));
     r.command = "x\0y".into();
-    assert_eq!(validate(&r), Err(ShellError::Invalid));
+    assert_eq!(validate(&r), Err(ExecCmdError::Invalid));
 }
 /// The service-side half of SDU-13: the request's secret variables are
 /// checked before any descriptor or process work.
@@ -40,7 +40,7 @@ fn secret_variables_reject_numbers_duplicates_nul_and_size() {
         .collect();
     assert!(validate(&r).is_ok(), "16 values of 8192 bytes in total");
     r.secrets[15] = SecretVariable::for_test(16, &[b'v'; 513]);
-    assert_eq!(validate(&r), Err(ShellError::Invalid), "8193 bytes");
+    assert_eq!(validate(&r), Err(ExecCmdError::Invalid), "8193 bytes");
     for bad in [
         vec![SecretVariable::for_test(0, b"value")],
         vec![SecretVariable::for_test(17, b"value")],
@@ -52,7 +52,7 @@ fn secret_variables_reject_numbers_duplicates_nul_and_size() {
         vec![SecretVariable::for_test(1, &[b'v'; 8193])],
     ] {
         r.secrets = bad;
-        assert_eq!(validate(&r), Err(ShellError::Invalid));
+        assert_eq!(validate(&r), Err(ExecCmdError::Invalid));
     }
     r.secrets = vec![
         SecretVariable::for_test(3, b"a b\n$c"),
@@ -236,7 +236,7 @@ fn preparation_pins_cwd_and_cleanup_never_follows_symlink() {
     let project =
         ProjectIdentity::open(project.to_str().unwrap(), &runtime.state_boundary()).unwrap();
     let cancel = AtomicBool::new(false);
-    let mut prepared = match PreparedShell::prepare(runtime, &project, request(), &cancel) {
+    let mut prepared = match PreparedExecCmd::prepare(runtime, &project, request(), &cancel) {
         Ok(v) => v,
         Err(e) => panic!("{:?}", e.reason),
     };
@@ -261,7 +261,7 @@ fn spawn_rejects_replaced_project_and_retains_scratch() {
     fs::create_dir(&path).unwrap();
     let project = ProjectIdentity::open(path.to_str().unwrap(), &runtime.state_boundary()).unwrap();
     let cancel = AtomicBool::new(false);
-    let prepared = match PreparedShell::prepare(runtime, &project, request(), &cancel) {
+    let prepared = match PreparedExecCmd::prepare(runtime, &project, request(), &cancel) {
         Ok(v) => v,
         Err(e) => panic!("{:?}", e.reason),
     };
@@ -275,7 +275,7 @@ fn spawn_rejects_replaced_project_and_retains_scratch() {
         Err(e) => e,
         Ok(_) => panic!("replaced project spawned"),
     };
-    assert_eq!(failure.reason, ShellError::Denied);
+    assert_eq!(failure.reason, ExecCmdError::Denied);
     failure
         .cleanup
         .as_mut()
@@ -299,7 +299,7 @@ fn spawn_rejects_replaced_cwd_before_any_process() {
     let cancel = AtomicBool::new(false);
     let mut req = request();
     req.cwd = Some("./sub/".into());
-    let prepared = PreparedShell::prepare(runtime, &project, req, &cancel)
+    let prepared = PreparedExecCmd::prepare(runtime, &project, req, &cancel)
         .unwrap_or_else(|e| panic!("{:?}", e.reason));
     fs::rename(path.join("sub"), path.join("old-sub")).unwrap();
     fs::create_dir(path.join("sub")).unwrap();
@@ -311,7 +311,7 @@ fn spawn_rejects_replaced_cwd_before_any_process() {
         Err(e) => e,
         Ok(_) => panic!("replaced cwd spawned"),
     };
-    assert_eq!(failure.reason, ShellError::Denied);
+    assert_eq!(failure.reason, ExecCmdError::Denied);
     failure
         .cleanup
         .as_mut()
@@ -320,14 +320,14 @@ fn spawn_rejects_replaced_cwd_before_any_process() {
         .unwrap();
 }
 
-fn notice_fixture() -> (ShellJob, std::os::fd::OwnedFd) {
+fn notice_fixture() -> (ExecCmdJob, std::os::fd::OwnedFd) {
     let (read, write) = spawn::pipe(true).unwrap();
     let (out, ow) = spawn::pipe(false).unwrap();
     let (err, ew) = spawn::pipe(false).unwrap();
     drop(ow);
     drop(ew);
     (
-        ShellJob {
+        ExecCmdJob {
             pid: 0,
             reaped: true,
             lease: None,
@@ -371,12 +371,12 @@ fn duplicate_unknown_notice_cannot_prove_settlement() {
             32
         );
     }
-    assert_eq!(job.poll(Instant::now()), Err(ShellError::Protocol));
+    assert_eq!(job.poll(Instant::now()), Err(ExecCmdError::Protocol));
     assert!(!job.settled());
     assert!(job.result().is_none());
 }
 #[test]
-fn settled_setup_failure_is_never_a_successful_shell_exit() {
+fn settled_setup_failure_is_never_a_successful_exec_cmd_exit() {
     let (mut job, write) = notice_fixture();
     let n = Notice {
         kind: 3,
@@ -394,7 +394,7 @@ fn settled_setup_failure_is_never_a_successful_shell_exit() {
     job.poll(Instant::now()).unwrap();
     job.poll(Instant::now()).unwrap();
     let result = job.result().unwrap();
-    assert_eq!(result.failure, Some(ShellError::Denied));
+    assert_eq!(result.failure, Some(ExecCmdError::Denied));
     assert_eq!(result.exit_code, None);
     assert_eq!(result.signal, None);
 }
@@ -439,9 +439,9 @@ fn j1t_05_no_deadline_checks_cancel_only() {
     let cancel = AtomicBool::new(false);
     assert_eq!(check(None, &cancel), Ok(()));
     let past = Instant::now() - Duration::from_secs(1);
-    assert_eq!(check(Some(past), &cancel), Err(ShellError::Deadline));
+    assert_eq!(check(Some(past), &cancel), Err(ExecCmdError::Deadline));
     cancel.store(true, Ordering::Release);
-    assert_eq!(check(None, &cancel), Err(ShellError::Cancelled));
+    assert_eq!(check(None, &cancel), Err(ExecCmdError::Cancelled));
     let (mut job, _write) = notice_fixture();
     job.lease = None;
     let _ = job.poll(Instant::now() + Duration::from_secs(3600));

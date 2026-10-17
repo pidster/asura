@@ -186,7 +186,7 @@ Overlapping registrations cannot bypass filesystem limits or configured ancestor
 budgets. Distinct context IDs do not isolate physical writes to a shared location.
 D3-D4 must define conflict detection and coordination before operations can race
 there; I6 additionally requires an edit-conflict contract. Until then, file tools
-remain read-only; the shell tool may write only within the selected project and
+remain read-only; the exec_cmd tool may write only within the selected project and
 private scratch.
 
 ## Conversations, tasks and model input

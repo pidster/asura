@@ -2,7 +2,7 @@
 //! sandbox, real capture workers and the real payload store in private
 //! scratch homes. Each case ends with the raw-byte sweep.
 use asura_platform::RuntimeDirectory;
-use asura_platform::secrets::{SecretVariable, rewrite_shell_call};
+use asura_platform::secrets::{SecretVariable, rewrite_exec_cmd_call};
 use asura_service::test_support::{Job, Outcome, run_jobs};
 use asura_storage::authority::conversation::{CaptureReason, CaptureState, Id, LossReason};
 use asura_storage::payload::{
@@ -85,7 +85,7 @@ fn hex(id: Id) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn rewritten(command: &str) -> (String, Vec<SecretVariable>) {
-    let rewrite = rewrite_shell_call(command, ".").unwrap_or_else(|r| panic!("{r}"));
+    let rewrite = rewrite_exec_cmd_call(command, ".").unwrap_or_else(|r| panic!("{r}"));
     (rewrite.command, rewrite.variables)
 }
 /// Fixture secrets assembled at run time, so no token is committed.
@@ -875,9 +875,11 @@ type Case = (&'static str, fn() -> Result<()>);
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let [_, flag, id, deadline, command] = args.as_slice()
-        && flag == "--asura-shell-guardian"
+        && flag == "--asura-exec-cmd-guardian"
     {
-        std::process::exit(asura_platform::shell::run_guardian(id, deadline, command));
+        std::process::exit(asura_platform::exec_cmd::run_guardian(
+            id, deadline, command,
+        ));
     }
     let selected: Vec<&str> = args[1..]
         .iter()

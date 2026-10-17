@@ -1,4 +1,4 @@
-//! The model shell path at `ToolCall` (J1, SL3): rewrite before any record,
+//! The model exec_cmd path at `ToolCall` (J1, SL3): rewrite before any record,
 //! refusal records that never hold a value, admission and kind 22.
 use crate::capture_worker;
 use crate::tools::{self, Arguments};
@@ -16,15 +16,15 @@ use zeroize::{Zeroize, Zeroizing};
 pub(super) const WITHHELD: &str = "[withheld]";
 const MAX_CWD_BYTES: usize = 1024;
 
-/// A shell call after the rewrite step. The raw command is gone.
+/// An exec_cmd call after the rewrite step. The raw command is gone.
 pub(super) enum Prepared {
     Rewritten(Vec<SecretVariable>),
     Refused { refusal: Refusal, truncated: bool },
 }
 
-/// The live state of one shell call in the conversation owner.
-pub(super) struct ShellLive {
-    pub intent: journal::ShellIntent,
+/// The live state of one exec_cmd call in the conversation owner.
+pub(super) struct ExecCmdLive {
+    pub intent: journal::ExecCmdIntent,
     /// Secret variables, moved into the request at dispatch.
     pub secrets: Vec<SecretVariable>,
     pub victims: Vec<Victim>,
@@ -36,9 +36,9 @@ pub(super) struct ShellLive {
     /// pending-install list.
     pub capture: Option<capture_worker::Handle>,
 }
-impl ShellLive {
+impl ExecCmdLive {
     pub(super) fn admitted(&self) -> bool {
-        self.intent.disposition == journal::ShellDisposition::Admitted
+        self.intent.disposition == journal::ExecCmdDisposition::Admitted
     }
     /// An admitted call that never started: its reservation and victims return.
     pub(super) fn release_admission(&mut self) {
@@ -86,11 +86,11 @@ fn valid_cwd(cwd: &str) -> bool {
 /// refusal the call holds the display-redacted command and cwd. Returns the
 /// keyed digest of the secret values (or of the raw command when refused).
 pub(super) fn prepare(call: &mut tools::Call, key: &[u8; 32]) -> (Prepared, [u8; 32]) {
-    let Arguments::Shell { command, cwd, .. } = &mut call.arguments else {
-        unreachable!("shell call");
+    let Arguments::ExecCmd { command, cwd, .. } = &mut call.arguments else {
+        unreachable!("exec_cmd call");
     };
     let raw = Zeroizing::new(std::mem::take(command));
-    match secrets::rewrite_shell_call(&raw, cwd) {
+    match secrets::rewrite_exec_cmd_call(&raw, cwd) {
         Ok(rewrite) => {
             let values: Vec<&[u8]> = rewrite.variables.iter().map(|v| v.value()).collect();
             let digest = keyed(key, 1, &values);
@@ -138,15 +138,15 @@ pub(super) fn intent(
     call: &tools::Call,
     installation: journal::Id,
     prepared: &Prepared,
-    busy: Option<journal::ShellBusyReason>,
-) -> journal::ShellIntent {
-    let Arguments::Shell { command, cwd, .. } = &call.arguments else {
-        unreachable!("shell call");
+    busy: Option<journal::ExecCmdBusyReason>,
+) -> journal::ExecCmdIntent {
+    let Arguments::ExecCmd { command, cwd, .. } = &call.arguments else {
+        unreachable!("exec_cmd call");
     };
     let (disposition, refusal, truncated) = match prepared {
         Prepared::Refused { refusal, truncated } => (
-            journal::ShellDisposition::Refused,
-            Some(journal::ShellRefusal {
+            journal::ExecCmdDisposition::Refused,
+            Some(journal::ExecCmdRefusal {
                 code: refusal.code,
                 kind: refusal.kind,
                 word: refusal
@@ -156,10 +156,12 @@ pub(super) fn intent(
             }),
             *truncated,
         ),
-        Prepared::Rewritten(_) if busy.is_some() => (journal::ShellDisposition::Busy, None, false),
-        Prepared::Rewritten(_) => (journal::ShellDisposition::Admitted, None, false),
+        Prepared::Rewritten(_) if busy.is_some() => {
+            (journal::ExecCmdDisposition::Busy, None, false)
+        }
+        Prepared::Rewritten(_) => (journal::ExecCmdDisposition::Admitted, None, false),
     };
-    let admitted = disposition == journal::ShellDisposition::Admitted;
+    let admitted = disposition == journal::ExecCmdDisposition::Admitted;
     let variables = match prepared {
         Prepared::Rewritten(variables) if admitted => variables.iter().map(|v| v.kind()).collect(),
         _ => Vec::new(),
@@ -168,7 +170,7 @@ pub(super) fn intent(
     let (rule_set_revision, rule_set_digest) = rule_set(unavailable);
     let (job, stdout_payload, stderr_payload) = if admitted {
         (
-            journal::shell_job_id(call.operation, call.generation, call.ordinal),
+            journal::exec_cmd_job_id(call.operation, call.generation, call.ordinal),
             payload_id(
                 installation,
                 call.operation,
@@ -187,7 +189,7 @@ pub(super) fn intent(
     } else {
         ([0; 16], [0; 16], [0; 16])
     };
-    journal::ShellIntent {
+    journal::ExecCmdIntent {
         operation: call.operation,
         generation: call.generation,
         ordinal: call.ordinal,
@@ -212,15 +214,17 @@ pub(super) fn intent(
 }
 
 /// Kind 15 for a refused or busy call: status 3 with the refusal's display
-/// text (never a value), or status 4 with `shell_busy: <reason>`.
+/// text (never a value), or status 4 with `exec_cmd_busy: <reason>`.
 pub(super) fn precomputed_result(
     call: &tools::Call,
     prepared: &Prepared,
-    busy: Option<journal::ShellBusyReason>,
+    busy: Option<journal::ExecCmdBusyReason>,
 ) -> Option<journal::ToolResult> {
     let (status, text) = match (prepared, busy) {
         (Prepared::Refused { refusal, .. }, _) => (3, refusal.to_string()),
-        (Prepared::Rewritten(_), Some(reason)) => (4, format!("shell_busy: {}", reason.as_str())),
+        (Prepared::Rewritten(_), Some(reason)) => {
+            (4, format!("exec_cmd_busy: {}", reason.as_str()))
+        }
         (Prepared::Rewritten(_), None) => return None,
     };
     Some(journal::ToolResult {
@@ -235,7 +239,7 @@ pub(super) fn precomputed_result(
 }
 
 /// Kind 23 `not_started` for an admitted call that never dispatched.
-pub(super) fn not_started(intent: &journal::ShellIntent) -> journal::CaptureSettled {
+pub(super) fn not_started(intent: &journal::ExecCmdIntent) -> journal::CaptureSettled {
     journal::CaptureSettled {
         operation: intent.operation,
         generation: intent.generation,
@@ -265,7 +269,7 @@ mod tests {
             operation: [1; 16],
             generation: 1,
             ordinal: 1,
-            arguments: Arguments::Shell {
+            arguments: Arguments::ExecCmd {
                 command: command.into(),
                 cwd: cwd.into(),
                 timeout_seconds: 30,
@@ -275,9 +279,9 @@ mod tests {
     fn token() -> String {
         ["ghp_", &"aB3".repeat(12)].concat()
     }
-    fn shell_text(call: &tools::Call) -> (&str, &str) {
+    fn exec_cmd_text(call: &tools::Call) -> (&str, &str) {
         match &call.arguments {
-            Arguments::Shell { command, cwd, .. } => (command, cwd),
+            Arguments::ExecCmd { command, cwd, .. } => (command, cwd),
             _ => unreachable!(),
         }
     }
@@ -323,11 +327,11 @@ mod tests {
         };
         assert_eq!(refusal.code, RefusalCode::SecretSingleQuoted);
         assert!(*truncated);
-        let (command, _) = shell_text(&long);
+        let (command, _) = exec_cmd_text(&long);
         assert!(command.len() <= 8192 && command.len() >= 8190);
         assert!(!command.contains(&token()));
         let intent = intent(&long, [9; 16], &prepared, None);
-        assert_eq!(intent.disposition, journal::ShellDisposition::Refused);
+        assert_eq!(intent.disposition, journal::ExecCmdDisposition::Refused);
         assert!(intent.command_truncated);
         assert_eq!(intent.job, [0; 16]);
         assert!(intent.variables.is_empty());
@@ -346,7 +350,7 @@ mod tests {
             panic!("refused");
         };
         assert_eq!(refusal.code, RefusalCode::SecretInCwd);
-        let (command, cwd) = shell_text(&c);
+        let (command, cwd) = exec_cmd_text(&c);
         assert_eq!(command, "ls");
         assert!(!cwd.contains(&token()) && cwd.starts_with("dir/$ASURA_SECRET_"));
     }
@@ -357,9 +361,9 @@ mod tests {
         let mut c = call(&format!("printf '%s' \"{}\"", token()), "src");
         let (prepared, _) = prepare(&mut c, &[1; 32]);
         let admitted = intent(&c, [9; 16], &prepared, None);
-        assert_eq!(admitted.disposition, journal::ShellDisposition::Admitted);
+        assert_eq!(admitted.disposition, journal::ExecCmdDisposition::Admitted);
         assert_eq!(admitted.variables, vec![secrets::SecretKind::GithubToken]);
-        assert_eq!(admitted.job, journal::shell_job_id([1; 16], 1, 1));
+        assert_eq!(admitted.job, journal::exec_cmd_job_id([1; 16], 1, 1));
         assert_eq!(
             admitted.stdout_payload,
             payload_id([9; 16], [1; 16], 1, 1, ObjectKind::Stdout)
@@ -371,16 +375,16 @@ mod tests {
             &c,
             [9; 16],
             &prepared,
-            Some(journal::ShellBusyReason::Quota),
+            Some(journal::ExecCmdBusyReason::Quota),
         );
-        assert_eq!(busy.disposition, journal::ShellDisposition::Busy);
+        assert_eq!(busy.disposition, journal::ExecCmdDisposition::Busy);
         assert!(busy.variables.is_empty() && busy.job == [0; 16]);
         assert_eq!(busy.command, admitted.command);
         let result =
-            precomputed_result(&c, &prepared, Some(journal::ShellBusyReason::Quota)).unwrap();
+            precomputed_result(&c, &prepared, Some(journal::ExecCmdBusyReason::Quota)).unwrap();
         assert_eq!(
             (result.status, result.text.as_str()),
-            (4, "shell_busy: quota")
+            (4, "exec_cmd_busy: quota")
         );
     }
 }

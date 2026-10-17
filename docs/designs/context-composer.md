@@ -250,7 +250,7 @@ history, then the context block, then the current prompt.
 | --- | --- | --- |
 | Full | The whole source text | A prior turn's prompt and answer |
 | Excerpt | Named byte ranges with a disclosure line (tool output only) | `[stdout bytes 0–2047 and 98,304–100,351 of 100,352 shown; job 7f3a…c2]` |
-| Reference | One service-written line: identity, outcome, sizes, digest prefix, handle | `[turn 14: shell ran 3 times; answer 1,204 bytes; omitted for space]` |
+| Reference | One service-written line: identity, outcome, sizes, digest prefix, handle | `[turn 14: exec_cmd ran 3 times; answer 1,204 bytes; omitted for space]` |
 | Omitted | A count over a contiguous range | `[turns 1–9 omitted: 9 turns, 41 KiB]` |
 
 Rules (D6):

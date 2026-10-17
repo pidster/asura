@@ -1076,11 +1076,11 @@ fn sdu_11_rewrite_per_form() {
             .collect();
         assert_eq!(values_of(&result), expected_vars, "{command}");
         // The shell value of each word is unchanged once the variables expand.
-        let original: Vec<_> = crate::shell::split::tokens(&command)
+        let original: Vec<_> = crate::exec_cmd::split::tokens(&command)
             .into_iter()
             .map(|w| w.value)
             .collect();
-        let mut expanded: Vec<_> = crate::shell::split::tokens(&result.command)
+        let mut expanded: Vec<_> = crate::exec_cmd::split::tokens(&result.command)
             .into_iter()
             .map(|w| w.value)
             .collect();
@@ -1389,7 +1389,7 @@ fn named_rule_values_equal_the_capture_groups() {
 /// original length; the refusal holds no value.
 #[test]
 fn j1t_03_rewritten_command_length_limit() {
-    use super::rewrite::{MAX_REWRITTEN_COMMAND_BYTES, rewrite_shell_call_with};
+    use super::rewrite::{MAX_REWRITTEN_COMMAND_BYTES, rewrite_exec_cmd_call_with};
     let value = cat(&["Sup3r", "S3cret"]);
     let unit = cat(&["curl -u admin:", &value, " x;"]);
     let build = |rewritten_len: usize| {
@@ -1400,12 +1400,12 @@ fn j1t_03_rewritten_command_length_limit() {
     };
     let fits = build(MAX_REWRITTEN_COMMAND_BYTES);
     assert!(fits.len() < MAX_REWRITTEN_COMMAND_BYTES);
-    let rewrite = rewrite_shell_call_with(Ok(rules()), &fits, ".").unwrap();
+    let rewrite = rewrite_exec_cmd_call_with(Ok(rules()), &fits, ".").unwrap();
     assert_eq!(rewrite.command.len(), MAX_REWRITTEN_COMMAND_BYTES);
     assert_eq!(rewrite.variables.len(), 1);
     let over = build(MAX_REWRITTEN_COMMAND_BYTES + 1);
     assert!(over.len() <= MAX_REWRITTEN_COMMAND_BYTES);
-    let refusal = rewrite_shell_call_with(Ok(rules()), &over, ".").unwrap_err();
+    let refusal = rewrite_exec_cmd_call_with(Ok(rules()), &over, ".").unwrap_err();
     assert_eq!(refusal.code, RefusalCode::RewrittenCommandTooLong);
     assert_eq!(refusal.code.as_str(), "rewritten_command_too_long");
     assert!(!refusal.to_string().contains(&value));
@@ -1414,18 +1414,18 @@ fn j1t_03_rewritten_command_length_limit() {
 /// `secret_in_cwd`; a failed self-check refuses first.
 #[test]
 fn j1_cwd_secret_and_detection_unavailable_refuse() {
-    use super::rewrite::rewrite_shell_call_with;
+    use super::rewrite::rewrite_exec_cmd_call_with;
     let gh = github();
-    let refusal = rewrite_shell_call_with(Ok(rules()), "ls", &cat(&["dir/", &gh])).unwrap_err();
+    let refusal = rewrite_exec_cmd_call_with(Ok(rules()), "ls", &cat(&["dir/", &gh])).unwrap_err();
     assert_eq!(refusal.code, RefusalCode::SecretInCwd);
     assert_eq!(refusal.code.as_str(), "secret_in_cwd");
     assert!(!refusal.to_string().contains(&gh));
-    assert!(rewrite_shell_call_with(Ok(rules()), "ls", "src/bin").is_ok());
+    assert!(rewrite_exec_cmd_call_with(Ok(rules()), "ls", "src/bin").is_ok());
     let unavailable =
-        rewrite_shell_call_with(Err(super::SelfCheckError::Digest), "ls", ".").unwrap_err();
+        rewrite_exec_cmd_call_with(Err(super::SelfCheckError::Digest), "ls", ".").unwrap_err();
     assert_eq!(unavailable.code, RefusalCode::DetectionUnavailable);
     // The command refusal comes before the cwd scan.
     let quoted = cat(&["echo '", &gh, "'"]);
-    let refusal = rewrite_shell_call_with(Ok(rules()), &quoted, &gh).unwrap_err();
+    let refusal = rewrite_exec_cmd_call_with(Ok(rules()), &quoted, &gh).unwrap_err();
     assert_eq!(refusal.code, RefusalCode::SecretSingleQuoted);
 }

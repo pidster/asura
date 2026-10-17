@@ -302,13 +302,13 @@ pub fn capitalize_project_name(name: &str) -> Result<String> {
     }
     Ok(result)
 }
-fn shell_parts(p: &ToolIntent) -> Result<(&str, &str)> {
+fn exec_cmd_parts(p: &ToolIntent) -> Result<(&str, &str)> {
     let (command, cwd) = p.path.split_once('\0').ok_or(ReplayError::Corrupt)?;
-    if p.kind != SHELL_TOOL_KIND
+    if p.kind != EXEC_CMD_TOOL_KIND
         || command.is_empty()
-        || command.len() > MAX_SHELL_COMMAND_BYTES
+        || command.len() > MAX_EXEC_CMD_COMMAND_BYTES
         || cwd.is_empty()
-        || cwd.len() > MAX_SHELL_CWD_BYTES
+        || cwd.len() > MAX_EXEC_CMD_CWD_BYTES
         || cwd.contains('\0')
         || cwd.starts_with('/')
         || cwd.split('/').any(|part| part == "..")
@@ -320,13 +320,13 @@ fn shell_parts(p: &ToolIntent) -> Result<(&str, &str)> {
     }
     Ok((command, cwd))
 }
-/// The `asura.shell.job` identity of one shell call: the first 16 bytes of
-/// SHA-256 over ASCII `asura.shell.job`, one zero byte, the operation ID, the
+/// The `asura.exec_cmd.job` identity of one exec_cmd call: the first 16 bytes of
+/// SHA-256 over ASCII `asura.exec_cmd.job`, one zero byte, the operation ID, the
 /// generation and the ordinal (big endian). An all-zero result becomes 1 in its
-/// final byte. Kind 14 shell intents and kind 22 share this derivation.
-pub fn shell_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
+/// final byte. Kind 14 exec_cmd intents and kind 22 share this derivation.
+pub fn exec_cmd_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
     let mut hash = Sha256::new();
-    hash.update(b"asura.shell.job\0");
+    hash.update(b"asura.exec_cmd.job\0");
     hash.update(operation);
     hash.update(generation.to_be_bytes());
     hash.update(ordinal.to_be_bytes());
@@ -340,14 +340,18 @@ pub fn shell_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
 }
 impl ToolIntent {
     /// Stable identity for one admitted call, not permission to execute it again.
-    pub fn shell_job_id(&self) -> Result<Id> {
-        self.shell_arguments()?;
-        Ok(shell_job_id(self.operation, self.generation, self.ordinal))
+    pub fn exec_cmd_job_id(&self) -> Result<Id> {
+        self.exec_cmd_arguments()?;
+        Ok(exec_cmd_job_id(
+            self.operation,
+            self.generation,
+            self.ordinal,
+        ))
     }
     /// Exact validated bytes; filesystem resolution remains the platform owner's task.
-    pub fn shell_arguments(&self) -> Result<(&str, &str)> {
+    pub fn exec_cmd_arguments(&self) -> Result<(&str, &str)> {
         valid_tool_intent(self)?;
-        shell_parts(self)
+        exec_cmd_parts(self)
     }
 }
 impl CreateNoteIdentity {
@@ -435,8 +439,8 @@ fn valid_tool_intent(p: &ToolIntent) -> Result<()> {
             Err(ReplayError::Corrupt)
         };
     }
-    if p.kind == SHELL_TOOL_KIND {
-        shell_parts(p)?;
+    if p.kind == EXEC_CMD_TOOL_KIND {
+        exec_cmd_parts(p)?;
         return if p.operation != [0; 16] && p.generation > 0 && (1..=8).contains(&p.ordinal) {
             Ok(())
         } else {
@@ -685,30 +689,30 @@ fn origin_from(code: u8) -> Result<NumberOrigin> {
     })
 }
 /// Kind 22 variables, kind 23 numbers and span entries.
-const MAX_SHELL_VARIABLES: usize = 16;
+const MAX_EXEC_CMD_VARIABLES: usize = 16;
 const MAX_REFUSAL_WORD: u16 = 4096;
 const MAX_CAPTURE_SPANS: u64 = 64;
 const MAX_CAPTURE_NUMBER: u16 = 16_384;
 const MAX_CAPTURE_NUMBERS: usize = 256;
 const MIB: u64 = 1024 * 1024;
 /// Maximum kind 22 and 23 payloads (`tool-job-controller.md`, J1 records).
-pub(crate) const MAX_SHELL_INTENT_PAYLOAD: usize = 9_384;
+pub(crate) const MAX_EXEC_CMD_INTENT_PAYLOAD: usize = 9_384;
 pub(crate) const MAX_CAPTURE_SETTLED_PAYLOAD: usize = 4_102;
 
 fn valid_cwd(cwd: &str) -> bool {
     !cwd.is_empty()
-        && cwd.len() <= MAX_SHELL_CWD_BYTES
+        && cwd.len() <= MAX_EXEC_CMD_CWD_BYTES
         && !cwd.contains('\0')
         && !cwd.starts_with('/')
         && !cwd.split('/').any(|part| part == "..")
 }
-impl ShellIntent {
+impl ExecCmdIntent {
     /// Every kind 22 field rule that the record alone determines. Replay adds
     /// the state rules and recomputes the job and payload IDs.
     pub(crate) fn validate(&self) -> Result<()> {
-        let admitted = self.disposition == ShellDisposition::Admitted;
-        let refused = self.disposition == ShellDisposition::Refused;
-        let busy = self.disposition == ShellDisposition::Busy;
+        let admitted = self.disposition == ExecCmdDisposition::Admitted;
+        let refused = self.disposition == ExecCmdDisposition::Refused;
+        let busy = self.disposition == ExecCmdDisposition::Busy;
         let unavailable = self
             .refusal
             .is_some_and(|r| r.code == RefusalCode::DetectionUnavailable);
@@ -719,7 +723,7 @@ impl ShellIntent {
                 && (1..=8).contains(&self.ordinal)
                 && (!self.command_truncated || refused)
                 && !self.command.is_empty()
-                && self.command.len() <= MAX_SHELL_COMMAND_BYTES
+                && self.command.len() <= MAX_EXEC_CMD_COMMAND_BYTES
                 && !self.command.contains('\0')
                 && valid_cwd(&self.cwd)
                 && self.refusal.is_some() == refused
@@ -727,7 +731,7 @@ impl ShellIntent {
                     .refusal
                     .is_none_or(|r| r.word.is_none_or(|w| (1..=MAX_REFUSAL_WORD).contains(&w)))
                 && self.busy.is_some() == busy
-                && self.variables.len() <= MAX_SHELL_VARIABLES
+                && self.variables.len() <= MAX_EXEC_CMD_VARIABLES
                 && (admitted || self.variables.is_empty())
                 && if admitted {
                     !ids.contains(&[0; 16]) && self.initial_reservation == INITIAL_RESERVATION
@@ -824,13 +828,13 @@ fn require(ok: bool) -> Result<()> {
         Err(ReplayError::Corrupt)
     }
 }
-fn write_shell_intent(w: &mut Writer, p: &ShellIntent) -> Result<()> {
+fn write_exec_cmd_intent(w: &mut Writer, p: &ExecCmdIntent) -> Result<()> {
     p.validate()?;
-    shell_intent_fields(w, p);
+    exec_cmd_intent_fields(w, p);
     Ok(())
 }
 /// Kind 22 field order. Callers validate first; tests use it to build invalid bytes.
-fn shell_intent_fields(w: &mut Writer, p: &ShellIntent) {
+fn exec_cmd_intent_fields(w: &mut Writer, p: &ExecCmdIntent) {
     w.bytes(&p.operation);
     w.u64(p.generation);
     w.u32(p.ordinal);
@@ -856,14 +860,14 @@ fn shell_intent_fields(w: &mut Writer, p: &ShellIntent) {
     w.u32(p.rule_set_revision);
     w.bytes(&p.rule_set_digest);
 }
-fn read_shell_intent(r: &mut Reader<'_>) -> Result<ShellIntent> {
+fn read_exec_cmd_intent(r: &mut Reader<'_>) -> Result<ExecCmdIntent> {
     let operation = r.array()?;
     let generation = r.u64()?;
     let ordinal = r.u32()?;
     let disposition = match r.byte()? {
-        1 => ShellDisposition::Admitted,
-        2 => ShellDisposition::Refused,
-        3 => ShellDisposition::Busy,
+        1 => ExecCmdDisposition::Admitted,
+        2 => ExecCmdDisposition::Refused,
+        3 => ExecCmdDisposition::Busy,
         _ => return Err(ReplayError::Corrupt),
     };
     let command_truncated = match r.byte()? {
@@ -871,8 +875,8 @@ fn read_shell_intent(r: &mut Reader<'_>) -> Result<ShellIntent> {
         1 => true,
         _ => return Err(ReplayError::Corrupt),
     };
-    let command = r.bounded_string(MAX_SHELL_COMMAND_BYTES)?;
-    let cwd = r.bounded_string(MAX_SHELL_CWD_BYTES)?;
+    let command = r.bounded_string(MAX_EXEC_CMD_COMMAND_BYTES)?;
+    let cwd = r.bounded_string(MAX_EXEC_CMD_CWD_BYTES)?;
     let code = r.byte()?;
     let kind = match r.byte()? {
         0 => None,
@@ -886,7 +890,7 @@ fn read_shell_intent(r: &mut Reader<'_>) -> Result<ShellIntent> {
         require(kind.is_none() && word.is_none())?;
         None
     } else {
-        Some(ShellRefusal {
+        Some(ExecCmdRefusal {
             code: refusal_from(code)?,
             kind,
             word,
@@ -894,20 +898,20 @@ fn read_shell_intent(r: &mut Reader<'_>) -> Result<ShellIntent> {
     };
     let busy = match r.byte()? {
         0 => None,
-        1 => Some(ShellBusyReason::Quota),
-        2 => Some(ShellBusyReason::CapturePaused),
-        3 => Some(ShellBusyReason::PendingFull),
-        4 => Some(ShellBusyReason::PayloadUnavailable),
+        1 => Some(ExecCmdBusyReason::Quota),
+        2 => Some(ExecCmdBusyReason::CapturePaused),
+        3 => Some(ExecCmdBusyReason::PendingFull),
+        4 => Some(ExecCmdBusyReason::PayloadUnavailable),
         _ => return Err(ReplayError::Corrupt),
     };
     let count = r.byte()? as usize;
-    require(count <= MAX_SHELL_VARIABLES)?;
+    require(count <= MAX_EXEC_CMD_VARIABLES)?;
     let mut variables = Vec::with_capacity(count);
     for index in 0..count {
         require(r.byte()? as usize == index + 1)?;
         variables.push(kind_from(r.byte()?)?);
     }
-    let value = ShellIntent {
+    let value = ExecCmdIntent {
         operation,
         generation,
         ordinal,
@@ -1255,8 +1259,8 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.byte(p.kind);
             w.string(
                 &p.path,
-                if p.kind == SHELL_TOOL_KIND {
-                    MAX_SHELL_INTENT_BYTES
+                if p.kind == EXEC_CMD_TOOL_KIND {
+                    MAX_EXEC_CMD_INTENT_BYTES
                 } else {
                     1024
                 },
@@ -1288,7 +1292,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u32(p.charged_tokens);
             w.string(&p.text, MAX_TEXT)?;
         }
-        Record::ShellIntent(p) => write_shell_intent(&mut w, p)?,
+        Record::ExecCmdIntent(p) => write_exec_cmd_intent(&mut w, p)?,
         Record::CaptureSettled(p) => write_capture_settled(&mut w, p)?,
     }
     Ok(w.0)
@@ -1537,8 +1541,8 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 generation,
                 ordinal,
                 kind,
-                path: r.string(if kind == SHELL_TOOL_KIND {
-                    MAX_SHELL_INTENT_BYTES
+                path: r.string(if kind == EXEC_CMD_TOOL_KIND {
+                    MAX_EXEC_CMD_INTENT_BYTES
                 } else {
                     1024
                 })?,
@@ -1583,8 +1587,8 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             Record::MemoryCreateIntent(p)
         }
         22 => {
-            require(payload.len() <= MAX_SHELL_INTENT_PAYLOAD)?;
-            Record::ShellIntent(Box::new(read_shell_intent(&mut r)?))
+            require(payload.len() <= MAX_EXEC_CMD_INTENT_PAYLOAD)?;
+            Record::ExecCmdIntent(Box::new(read_exec_cmd_intent(&mut r)?))
         }
         23 => {
             require(payload.len() <= MAX_CAPTURE_SETTLED_PAYLOAD)?;
@@ -1911,20 +1915,20 @@ mod tests {
         *bytes.last_mut().unwrap() = 255;
         assert_eq!(decode_record(8, &bytes).unwrap_err(), ReplayError::Corrupt);
     }
-    fn shell() -> ToolIntent {
+    fn exec_cmd() -> ToolIntent {
         ToolIntent {
             operation: [1; 16],
             generation: 1,
             ordinal: 1,
-            kind: SHELL_TOOL_KIND,
+            kind: EXEC_CMD_TOOL_KIND,
             path: "printf hello\0.".into(),
             offset: 1000,
             limit: 30,
         }
     }
     #[test]
-    fn shell_exact_byte_bounds_and_kind_specific_encoding() {
-        let base = shell();
+    fn exec_cmd_exact_byte_bounds_and_kind_specific_encoding() {
+        let base = exec_cmd();
         for cwd in [".", "./subdir", "a//b/", "a/./b"] {
             let value = ToolIntent {
                 path: format!("echo hi\0{cwd}"),
@@ -1932,7 +1936,7 @@ mod tests {
             };
             let rec = Record::ToolIntent(value.clone());
             assert_eq!(decode_record(14, &payload(&rec).unwrap()).unwrap(), rec);
-            assert_eq!(value.shell_arguments().unwrap(), ("echo hi", cwd));
+            assert_eq!(value.exec_cmd_arguments().unwrap(), ("echo hi", cwd));
         }
         let max = ToolIntent {
             path: format!("{}\0{}", "x".repeat(8192), "y".repeat(1024)),
@@ -2002,7 +2006,7 @@ mod tests {
                 ..base.clone()
             },
         ] {
-            assert_eq!(invalid.shell_arguments(), Err(ReplayError::Corrupt));
+            assert_eq!(invalid.exec_cmd_arguments(), Err(ReplayError::Corrupt));
         }
         // Existing record layout: operation16, generation8, ordinal4, kind1,
         // then the existing length-prefixed string and timeout integers.
@@ -2014,19 +2018,19 @@ mod tests {
         assert_eq!(&bytes[bytes.len() - 4..], &60u32.to_be_bytes());
     }
     #[test]
-    fn shell_job_identity_has_fixed_domain_and_does_not_depend_on_arguments() {
-        let base = shell();
+    fn exec_cmd_job_identity_has_fixed_domain_and_does_not_depend_on_arguments() {
+        let base = exec_cmd();
         let expected = [
-            0xde, 0x83, 0x9f, 0x8c, 0xd1, 0xb3, 0xc7, 0xa2, 0x16, 0x14, 0x9a, 0xaa, 0x29, 0x03,
-            0x2f, 0xf6,
+            0x7e, 0x66, 0x8e, 0x9f, 0x8f, 0xb9, 0xa0, 0xd0, 0x12, 0x85, 0xb5, 0xc8, 0x42, 0x66,
+            0x70, 0x02,
         ];
-        assert_eq!(base.shell_job_id().unwrap(), expected);
+        assert_eq!(base.exec_cmd_job_id().unwrap(), expected);
         assert_eq!(
             ToolIntent {
                 path: "different\0subdir".into(),
                 ..base.clone()
             }
-            .shell_job_id()
+            .exec_cmd_job_id()
             .unwrap(),
             expected
         );
@@ -2041,17 +2045,17 @@ mod tests {
             },
             ToolIntent { ordinal: 2, ..base },
         ] {
-            assert_ne!(changed.shell_job_id().unwrap(), expected);
+            assert_ne!(changed.exec_cmd_job_id().unwrap(), expected);
         }
     }
 
     // J1T-01: kinds 22 and 23.
-    fn admitted() -> ShellIntent {
-        ShellIntent {
+    fn admitted() -> ExecCmdIntent {
+        ExecCmdIntent {
             operation: [1; 16],
             generation: 1,
             ordinal: 1,
-            disposition: ShellDisposition::Admitted,
+            disposition: ExecCmdDisposition::Admitted,
             command_truncated: false,
             command: "printf \"$ASURA_SECRET_1\"".into(),
             cwd: ".".into(),
@@ -2066,11 +2070,11 @@ mod tests {
             rule_set_digest: [5; 32],
         }
     }
-    fn refused(code: RefusalCode) -> ShellIntent {
+    fn refused(code: RefusalCode) -> ExecCmdIntent {
         let unavailable = code == RefusalCode::DetectionUnavailable;
-        ShellIntent {
-            disposition: ShellDisposition::Refused,
-            refusal: Some(ShellRefusal {
+        ExecCmdIntent {
+            disposition: ExecCmdDisposition::Refused,
+            refusal: Some(ExecCmdRefusal {
                 code,
                 kind: None,
                 word: None,
@@ -2085,28 +2089,28 @@ mod tests {
             ..admitted()
         }
     }
-    fn busy(reason: ShellBusyReason) -> ShellIntent {
-        ShellIntent {
-            disposition: ShellDisposition::Busy,
+    fn busy(reason: ExecCmdBusyReason) -> ExecCmdIntent {
+        ExecCmdIntent {
+            disposition: ExecCmdDisposition::Busy,
             refusal: None,
             busy: Some(reason),
             ..refused(RefusalCode::UnparsedCommand)
         }
     }
-    fn raw22(p: &ShellIntent) -> Vec<u8> {
+    fn raw22(p: &ExecCmdIntent) -> Vec<u8> {
         let mut w = Writer(Vec::new());
-        shell_intent_fields(&mut w, p);
+        exec_cmd_intent_fields(&mut w, p);
         w.0
     }
-    fn round22(p: ShellIntent) -> Vec<u8> {
-        let record = Record::ShellIntent(Box::new(p));
+    fn round22(p: ExecCmdIntent) -> Vec<u8> {
+        let record = Record::ExecCmdIntent(Box::new(p));
         let bytes = payload(&record).unwrap();
         assert_eq!(decode_record(22, &bytes).unwrap(), record);
         bytes
     }
     /// Invalid on encode and, written without validation, on decode.
-    fn invalid22(p: ShellIntent) {
-        let record = Record::ShellIntent(Box::new(p.clone()));
+    fn invalid22(p: ExecCmdIntent) {
+        let record = Record::ExecCmdIntent(Box::new(p.clone()));
         assert_eq!(payload(&record), Err(ReplayError::Corrupt), "{p:?}");
         assert_eq!(
             decode_record(22, &raw22(&p)),
@@ -2126,26 +2130,26 @@ mod tests {
     }
     #[test]
     fn j1t_01_kind_22_round_trips_every_bound_and_maximum_size() {
-        let max = ShellIntent {
+        let max = ExecCmdIntent {
             generation: u64::MAX,
             ordinal: 8,
-            command: "x".repeat(MAX_SHELL_COMMAND_BYTES),
-            cwd: "y".repeat(MAX_SHELL_CWD_BYTES),
+            command: "x".repeat(MAX_EXEC_CMD_COMMAND_BYTES),
+            cwd: "y".repeat(MAX_EXEC_CMD_CWD_BYTES),
             variables: SecretKind::ALL[..16].to_vec(),
             rule_set_revision: u32::MAX,
             ..admitted()
         };
         let bytes = round22(max.clone());
         assert_eq!(bytes.len(), 9_384);
-        assert_eq!(bytes.len(), MAX_SHELL_INTENT_PAYLOAD);
-        let frame = encode_frame(&context(), &Record::ShellIntent(Box::new(max))).unwrap();
+        assert_eq!(bytes.len(), MAX_EXEC_CMD_INTENT_PAYLOAD);
+        let frame = encode_frame(&context(), &Record::ExecCmdIntent(Box::new(max))).unwrap();
         assert_eq!(frame.len(), 9_568);
         // The largest refused record is the same size: refusal fields are fixed.
-        let refused_max = ShellIntent {
+        let refused_max = ExecCmdIntent {
             command_truncated: true,
-            command: "x".repeat(MAX_SHELL_COMMAND_BYTES),
-            cwd: "y".repeat(MAX_SHELL_CWD_BYTES),
-            refusal: Some(ShellRefusal {
+            command: "x".repeat(MAX_EXEC_CMD_COMMAND_BYTES),
+            cwd: "y".repeat(MAX_EXEC_CMD_CWD_BYTES),
+            refusal: Some(ExecCmdRefusal {
                 code: RefusalCode::SecretInCwd,
                 kind: Some(SecretKind::WifiPassword),
                 word: Some(4096),
@@ -2154,7 +2158,7 @@ mod tests {
         };
         assert_eq!(round22(refused_max).len(), 9_384 - 32);
         for ordinal in [1, 8] {
-            round22(ShellIntent {
+            round22(ExecCmdIntent {
                 ordinal,
                 ..admitted()
             });
@@ -2167,27 +2171,27 @@ mod tests {
             ("é", "..."),
             ("x", "a..b"),
         ] {
-            round22(ShellIntent {
+            round22(ExecCmdIntent {
                 command: command.into(),
                 cwd: cwd.into(),
                 ..admitted()
             });
         }
         for count in 0..=16 {
-            round22(ShellIntent {
+            round22(ExecCmdIntent {
                 variables: SecretKind::ALL[33 - count..].to_vec(),
                 ..admitted()
             });
         }
         for kind in SecretKind::ALL {
-            round22(ShellIntent {
+            round22(ExecCmdIntent {
                 variables: vec![kind; 16],
                 ..admitted()
             });
         }
         for code in REFUSALS {
             for truncated in [false, true] {
-                round22(ShellIntent {
+                round22(ExecCmdIntent {
                     command_truncated: truncated,
                     ..refused(code)
                 });
@@ -2195,8 +2199,8 @@ mod tests {
         }
         for kind in SecretKind::ALL {
             for word in [None, Some(1), Some(4096)] {
-                round22(ShellIntent {
-                    refusal: Some(ShellRefusal {
+                round22(ExecCmdIntent {
+                    refusal: Some(ExecCmdRefusal {
                         code: RefusalCode::ResidualSecret,
                         kind: Some(kind),
                         word,
@@ -2206,12 +2210,12 @@ mod tests {
             }
         }
         for reason in [
-            ShellBusyReason::Quota,
-            ShellBusyReason::CapturePaused,
-            ShellBusyReason::PendingFull,
-            ShellBusyReason::PayloadUnavailable,
+            ExecCmdBusyReason::Quota,
+            ExecCmdBusyReason::CapturePaused,
+            ExecCmdBusyReason::PendingFull,
+            ExecCmdBusyReason::PayloadUnavailable,
         ] {
-            let bytes = round22(ShellIntent {
+            let bytes = round22(ExecCmdIntent {
                 command: "x".into(),
                 ..busy(reason)
             });
@@ -2222,170 +2226,170 @@ mod tests {
     fn j1t_01_kind_22_rejects_each_invalid_field() {
         let a = admitted;
         let r = || refused(RefusalCode::UnparsedCommand);
-        let b = || busy(ShellBusyReason::Quota);
+        let b = || busy(ExecCmdBusyReason::Quota);
         let unavailable = || refused(RefusalCode::DetectionUnavailable);
         for p in [
-            ShellIntent {
+            ExecCmdIntent {
                 operation: [0; 16],
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 generation: 0,
                 ..a()
             },
-            ShellIntent { ordinal: 0, ..a() },
-            ShellIntent { ordinal: 9, ..a() },
-            ShellIntent {
+            ExecCmdIntent { ordinal: 0, ..a() },
+            ExecCmdIntent { ordinal: 9, ..a() },
+            ExecCmdIntent {
                 command_truncated: true,
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 command_truncated: true,
                 ..b()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 command: String::new(),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 command: "x".repeat(8193),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 command: "a\0b".into(),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 cwd: String::new(),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 cwd: "y".repeat(1025),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 cwd: "/absolute".into(),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 cwd: "..".into(),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 cwd: "a/../b".into(),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 cwd: "a/..".into(),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 cwd: "a\0b".into(),
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 refusal: None,
                 ..r()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 refusal: r().refusal,
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 refusal: r().refusal,
                 ..b()
             },
-            ShellIntent {
-                refusal: Some(ShellRefusal {
+            ExecCmdIntent {
+                refusal: Some(ExecCmdRefusal {
                     code: RefusalCode::UnparsedCommand,
                     kind: None,
                     word: Some(4097),
                 }),
                 ..r()
             },
-            ShellIntent { busy: None, ..b() },
-            ShellIntent {
-                busy: Some(ShellBusyReason::Quota),
+            ExecCmdIntent { busy: None, ..b() },
+            ExecCmdIntent {
+                busy: Some(ExecCmdBusyReason::Quota),
                 ..a()
             },
-            ShellIntent {
-                busy: Some(ShellBusyReason::Quota),
+            ExecCmdIntent {
+                busy: Some(ExecCmdBusyReason::Quota),
                 ..r()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 variables: vec![SecretKind::Jwt; 17],
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 variables: vec![SecretKind::Jwt],
                 ..r()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 variables: vec![SecretKind::Jwt],
                 ..b()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 job: [0; 16],
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 stdout_payload: [0; 16],
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 stderr_payload: [0; 16],
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 job: [2; 16],
                 ..r()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 stdout_payload: [3; 16],
                 ..b()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 stderr_payload: [4; 16],
                 ..r()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 initial_reservation: 0,
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 initial_reservation: 2 * INITIAL_RESERVATION,
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 initial_reservation: INITIAL_RESERVATION,
                 ..r()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 initial_reservation: INITIAL_RESERVATION,
                 ..b()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 rule_set_revision: 1,
                 ..unavailable()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 rule_set_digest: [5; 32],
                 ..unavailable()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 rule_set_revision: 0,
                 ..r()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 rule_set_digest: [0; 32],
                 ..r()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 rule_set_revision: 0,
                 rule_set_digest: [0; 32],
                 ..a()
             },
-            ShellIntent {
+            ExecCmdIntent {
                 rule_set_revision: 0,
                 rule_set_digest: [0; 32],
                 ..b()
@@ -2394,8 +2398,8 @@ mod tests {
             invalid22(p);
         }
         // Word 0 is "no word" on the wire, so `Some(0)` is an encode error only.
-        let zero_word = ShellIntent {
-            refusal: Some(ShellRefusal {
+        let zero_word = ExecCmdIntent {
+            refusal: Some(ExecCmdRefusal {
                 code: RefusalCode::UnparsedCommand,
                 kind: None,
                 word: Some(0),
@@ -2403,19 +2407,19 @@ mod tests {
             ..r()
         };
         assert_eq!(
-            payload(&Record::ShellIntent(Box::new(zero_word))),
+            payload(&Record::ExecCmdIntent(Box::new(zero_word))),
             Err(ReplayError::Corrupt)
         );
         // Wire-only values: offsets for command "x" (1 byte) and cwd "." (1 byte).
-        let base = |p: ShellIntent| {
-            raw22(&ShellIntent {
+        let base = |p: ExecCmdIntent| {
+            raw22(&ExecCmdIntent {
                 command: "x".into(),
                 cwd: ".".into(),
                 ..p
             })
         };
         let refusal_at = 38 + 1 + 1;
-        let wire: [(ShellIntent, usize, u8); 17] = [
+        let wire: [(ExecCmdIntent, usize, u8); 17] = [
             (a(), 28, 0),
             (a(), 28, 4),
             (r(), 29, 2),
@@ -3122,7 +3126,7 @@ mod tests {
             assert_eq!(refusal_code(variant), code);
             assert_eq!(REFUSALS[index], variant);
             // The stored byte, through the real encoder.
-            let bytes = round22(ShellIntent {
+            let bytes = round22(ExecCmdIntent {
                 command: "x".into(),
                 cwd: ".".into(),
                 ..refused(variant)
@@ -3175,7 +3179,7 @@ mod tests {
             assert_eq!(kind_code(kind), code);
             // Codes are the rule-set 1 positions of `SecretKind::ALL`.
             assert_eq!(SecretKind::ALL[index], kind);
-            let bytes = round22(ShellIntent {
+            let bytes = round22(ExecCmdIntent {
                 command: "x".into(),
                 cwd: ".".into(),
                 variables: vec![kind],
@@ -3206,9 +3210,9 @@ mod tests {
         ] {
             assert_eq!(state as u8, code);
         }
-        assert_eq!(ShellDisposition::Admitted as u8, 1);
-        assert_eq!(ShellDisposition::Refused as u8, 2);
-        assert_eq!(ShellDisposition::Busy as u8, 3);
+        assert_eq!(ExecCmdDisposition::Admitted as u8, 1);
+        assert_eq!(ExecCmdDisposition::Refused as u8, 2);
+        assert_eq!(ExecCmdDisposition::Busy as u8, 3);
         assert_eq!(CaptureReason::SettlementUnconfirmed as u8, 6);
     }
     #[test]
@@ -3217,7 +3221,7 @@ mod tests {
         // exists. Everything outside command and cwd is structural.
         let rewritten = "curl -H \"Authorization: Bearer $ASURA_SECRET_1\" https://example.test";
         for count in [0, 1, 16] {
-            let p = ShellIntent {
+            let p = ExecCmdIntent {
                 command: rewritten.into(),
                 cwd: "sub/dir".into(),
                 variables: vec![SecretKind::AuthHeader; count],
@@ -3247,17 +3251,17 @@ mod tests {
         assert_eq!(bytes.len(), 72 + (101 + 9) + 101 + 6 + 4 + 20 + 8);
     }
     #[test]
-    fn j1t_01_shell_job_id_is_shared_by_kinds_14_and_22() {
-        let intent = shell();
+    fn j1t_01_exec_cmd_job_id_is_shared_by_kinds_14_and_22() {
+        let intent = exec_cmd();
         assert_eq!(
-            shell_job_id(intent.operation, intent.generation, intent.ordinal),
-            intent.shell_job_id().unwrap()
+            exec_cmd_job_id(intent.operation, intent.generation, intent.ordinal),
+            intent.exec_cmd_job_id().unwrap()
         );
         assert_eq!(
-            shell_job_id([1; 16], 1, 1),
+            exec_cmd_job_id([1; 16], 1, 1),
             [
-                0xde, 0x83, 0x9f, 0x8c, 0xd1, 0xb3, 0xc7, 0xa2, 0x16, 0x14, 0x9a, 0xaa, 0x29, 0x03,
-                0x2f, 0xf6,
+                0x7e, 0x66, 0x8e, 0x9f, 0x8f, 0xb9, 0xa0, 0xd0, 0x12, 0x85, 0xb5, 0xc8, 0x42, 0x66,
+                0x70, 0x02,
             ]
         );
     }

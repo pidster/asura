@@ -11,8 +11,8 @@ the governing implementation packet before changing code.
   generation are the immediate path. Full PB0 cache publication, Swift smoke,
   portable-cache proof and custom-driver extension are deferred qualification.
   Do not introduce another wrapper, cache or process supervisor. The owner permits
-  the shell command cleanup helper within the existing platform process owner,
-  under [the shell design](../docs/designs/shell-tool.md). This exception does not
+  the exec_cmd cleanup helper within the existing platform process owner,
+  under [the exec_cmd design](../docs/designs/exec-cmd-tool.md). This exception does not
   permit a second service scheduler.
 - The standalone driver uses only the Rust standard library and required macOS
   process APIs. Do not add a crate dependency to that driver. PB0.2 introduces

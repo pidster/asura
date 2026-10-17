@@ -72,7 +72,7 @@ private func memoryEnvelope(_ arguments: Asura_Model_V1_ToolCall.OneOf_Arguments
         }
         return ToolResult(status: .invalidArguments, text: "", truncated: false)
     }
-    #expect(makeProjectTools(handler).map(\.name) == ["project", "memory", "service", "shell"])
+    #expect(makeProjectTools(handler).map(\.name) == ["project", "memory", "service", "exec_cmd"])
     let tools: [any Tool] = [MemoryListNotesTool(handler: handler), MemoryGetNoteTool(handler: handler), MemoryNoteSourcesTool(handler: handler)]
     for tool in tools {
         let schema = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(tool.parameters)) as? [String: Any])
@@ -129,7 +129,7 @@ func disabledToolsNeverAdvertiseMemoryDefinitions(selector: String) async throws
         snapshot: { _ in })
     let names = await probe.names
     #expect(names.count == 2)
-    #expect(Set(names[1]) == Set(["project", "memory", "service", "shell"]))
+    #expect(Set(names[1]) == Set(["project", "memory", "service", "exec_cmd"]))
 }
 
 @Test func inventoryToolHasEmptySchemaAndRequiresServiceResult() async throws {

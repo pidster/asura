@@ -1,4 +1,4 @@
-//! Native shell evidence uses only an owned scratch project and runtime.
+//! Native exec_cmd evidence uses only an owned scratch project and runtime.
 use super::*;
 use asura_storage::authority::conversation as journal;
 use std::io::Read;
@@ -8,21 +8,21 @@ const COMMAND: &str = "printf x >> effect.txt; cat proof.txt; printf stderr-proo
 fn recorded(
     fixture: &Fixture,
     operation: [u8; 16],
-) -> Result<(journal::ShellIntent, journal::ToolResult)> {
+) -> Result<(journal::ExecCmdIntent, journal::ToolResult)> {
     let mut bytes = Vec::new();
     fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
         .take(asura_storage::authority::MAX_JOURNAL as u64 + 1)
         .read_to_end(&mut bytes)?;
     let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
-        .map_err(|error| format!("shell replay: {error:?}"))?;
+        .map_err(|error| format!("exec_cmd replay: {error:?}"))?;
     let operation = replay
         .operations
         .get(&operation)
-        .ok_or("shell operation absent")?;
+        .ok_or("exec_cmd operation absent")?;
     assert_eq!(
         operation.tools.len(),
         1,
-        "exactly one shell invocation required"
+        "exactly one exec_cmd invocation required"
     );
     let tool = &operation.tools[0];
     assert_eq!(tool.kind, 16);
@@ -32,17 +32,17 @@ fn recorded(
             u16::from_be_bytes([frame[10], frame[11]]),
             &frame[144..frame.len() - 40],
         )
-        .map_err(|error| format!("shell record: {error:?}"))?)
+        .map_err(|error| format!("exec_cmd record: {error:?}"))?)
     };
-    // J1: every shell call records kind 22.
-    let journal::Record::ShellIntent(intent) = decode(tool.intent_frame.clone())? else {
-        return Err("shell intent variant".into());
+    // J1: every exec_cmd call records kind 22.
+    let journal::Record::ExecCmdIntent(intent) = decode(tool.intent_frame.clone())? else {
+        return Err("exec_cmd intent variant".into());
     };
     let intent = *intent;
     let journal::Record::ToolResult(result) =
-        decode(tool.result_frame.clone().ok_or("shell result absent")?)?
+        decode(tool.result_frame.clone().ok_or("exec_cmd result absent")?)?
     else {
-        return Err("shell result variant".into());
+        return Err("exec_cmd result variant".into());
     };
     assert!(result.text.len() <= 16384);
     assert!(result.next_offset.is_none());
@@ -54,11 +54,11 @@ pub(super) fn run(provider: &str) -> Result<()> {
     fixture.start()?;
     wait_ready(&fixture, None)?;
     select_native_tool_provider(&fixture, provider)?;
-    let directory = fixture.home.join("shell-project");
+    let directory = fixture.home.join("exec-cmd-project");
     fs::create_dir(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     let proof = format!(
-        "SHELL-PROOF-{:032x}",
+        "EXEC-CMD-PROOF-{:032x}",
         u128::from_ne_bytes(asura_platform::random_id())
     );
     fs::write(directory.join("proof.txt"), format!("{proof}\n"))?;
@@ -80,7 +80,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
         conversation_id: None,
         expected_generation: Some(0),
         prompt: Some(format!(
-            "Call shell exactly once with command `{COMMAND}`, cwd `.`, timeout_seconds 30. Then reply only with the proof token returned on stdout. Do not use other tools or repeat the command."
+            "Call exec_cmd exactly once with command `{COMMAND}`, cwd `.`, timeout_seconds 30. Then reply only with the proof token returned on stdout. Do not use other tools or repeat the command."
         )),
     };
     let accepted = fixture
@@ -91,7 +91,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
     if event.kind != Some(3) {
         fixture.print_model_diagnostics();
     }
-    assert_eq!(event.kind, Some(3), "native shell answer failed");
+    assert_eq!(event.kind, Some(3), "native exec_cmd answer failed");
     assert!(
         event.text.as_deref().unwrap_or_default().contains(&proof),
         "answer lacks scratch proof"
@@ -100,7 +100,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
         event
             .tools
             .iter()
-            .any(|tool| tool.name.as_deref() == Some("shell") && tool.status == Some(1))
+            .any(|tool| tool.name.as_deref() == Some("exec_cmd") && tool.status == Some(1))
     );
     assert_eq!(fs::read(directory.join("effect.txt"))?, b"x");
     let retry = fixture
@@ -113,7 +113,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
         (intent.command.as_str(), intent.cwd.as_str()),
         (COMMAND, ".")
     );
-    assert_eq!(intent.disposition, journal::ShellDisposition::Admitted);
+    assert_eq!(intent.disposition, journal::ExecCmdDisposition::Admitted);
     assert_eq!(result.status, 1);
     assert!(
         result.text.contains(&proof) && result.text.contains("stderr-proof"),
@@ -149,14 +149,14 @@ pub(super) fn run(provider: &str) -> Result<()> {
     assert_eq!(
         fs::read(directory.join("effect.txt"))?,
         b"x",
-        "retry repeated shell effect"
+        "retry repeated exec_cmd effect"
     );
     let (_, replayed_result) = recorded(&fixture, operation)?;
     assert_eq!(replayed_result.text, result.text);
     interrupted(&mut fixture, project, &directory, false)?;
     interrupted(&mut fixture, project, &directory, true)?;
     println!(
-        "PASS native {provider} shell proof, exact exit/stdout/stderr, one effect, durable result, exact retry/restart, timeout/cancel cleanup; fixture service stopped/reaped"
+        "PASS native {provider} exec_cmd proof, exact exit/stdout/stderr, one effect, durable result, exact retry/restart, timeout/cancel cleanup; fixture service stopped/reaped"
     );
     Ok(())
 }
@@ -178,14 +178,14 @@ fn interrupted(
     );
     let timeout = if cancel { 30 } else { 1 };
     let prompt = format!(
-        "Call shell exactly once with command `{command}`, cwd `.`, timeout_seconds {timeout}. After it returns reply only FINISHED. Do not use other tools or repeat the command."
+        "Call exec_cmd exactly once with command `{command}`, cwd `.`, timeout_seconds {timeout}. After it returns reply only FINISHED. Do not use other tools or repeat the command."
     );
     let accepted = submit(fixture, project, None, 0, &prompt)?;
     let operation = checked_id(accepted.operation_id)?;
     let deadline = Instant::now() + Duration::from_secs(60);
     while !directory.join(marker).is_file() {
         if Instant::now() >= deadline {
-            return Err("native shell spawn marker deadline".into());
+            return Err("native exec_cmd spawn marker deadline".into());
         }
         // Actual service control remains responsive while model/setup work is pending.
         fixture.attach()?.inspect_installation()?;
@@ -262,7 +262,10 @@ fn assert_group_absent(pid: i32) -> Result<()> {
         .ok_or("group probe stderr absent")?
         .take(1024)
         .read_to_string(&mut diagnostic)?;
-    assert!(!status.success(), "owned shell process group remains live");
+    assert!(
+        !status.success(),
+        "owned exec_cmd process group remains live"
+    );
     assert!(
         diagnostic.contains("No such process"),
         "group absence not established: {diagnostic}"

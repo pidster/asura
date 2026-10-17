@@ -1,9 +1,9 @@
-//! Derived recovery (J1): restart writes no record for a shell call. Replay
+//! Derived recovery (J1): restart writes no record for an exec_cmd call. Replay
 //! and the payload directories derive each call's capture state. Runs on the
 //! retained recovery worker with no time bound; shutdown cancels it between
 //! steps.
 use super::store::{Location, PayloadId, PayloadState, PayloadStore};
-use crate::authority::conversation::{CaptureState, Hash, Id, Replay, ShellDisposition};
+use crate::authority::conversation::{CaptureState, ExecCmdDisposition, Hash, Id, Replay};
 use asura_platform::payload_io::{PayloadDirectory, PayloadError, PayloadFile};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +28,7 @@ pub struct RecoveryReport {
     pub retained: u64,
 }
 
-/// Recovery failed: the payload store is unavailable, and shell admission
+/// Recovery failed: the payload store is unavailable, and exec_cmd admission
 /// answers `busy` with `payload_unavailable`.
 #[derive(Debug)]
 pub enum RecoveryError {
@@ -83,7 +83,7 @@ fn digest(file: &PayloadFile, cancel: &AtomicBool) -> Result<(u64, Hash), Recove
 /// and digest per stream.
 type Settled = (CaptureState, u64, [(u64, Option<Hash>); 2]);
 
-/// The replay facts recovery needs for one admitted shell call. Built from a
+/// The replay facts recovery needs for one admitted exec_cmd call. Built from a
 /// replay on the caller's thread, so the recovery worker never holds a
 /// replay snapshot (the journal writer allows only one retained snapshot).
 #[derive(Clone, Debug)]
@@ -95,15 +95,15 @@ pub struct Known {
     settled: Option<Settled>,
 }
 
-/// The shell calls a replay names, for [`recover_known`].
+/// The exec_cmd calls a replay names, for [`recover_known`].
 pub fn known_calls(replay: &Replay) -> Vec<Known> {
     let mut known = Vec::new();
     for (operation, op) in &replay.operations {
         for tool in &op.tools {
-            let Some(call) = tool.shell.as_deref() else {
+            let Some(call) = tool.exec_cmd.as_deref() else {
                 continue;
             };
-            if call.disposition != ShellDisposition::Admitted {
+            if call.disposition != ExecCmdDisposition::Admitted {
                 continue;
             }
             known.push(Known {

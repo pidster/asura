@@ -37,6 +37,7 @@ schemas and runtime mechanisms remain with their governing designs.
 | Steer | User input that durably cancels the active operation and replaces it with the original prompt plus a new instruction; it does not modify running inference |
 | Conversation restoration | TUI recovery of the selected project's most recent conversation and queue scope; see the [restoration design](designs/conversation-restoration.md) |
 | Sensor | Scoped source of observations; an observation is evidence, not an instruction, permission or accepted task; see the [sensor design](designs/sensors.md) |
+| `exec_cmd` | Model tool that runs one noninteractive `/bin/sh -c` command line in the selected project under the model execution profile; see the [exec_cmd tool design](designs/exec-cmd-tool.md) |
 | Tool job | Proposed conversation-scoped long-running tool effect whose output the service retains; see the [tool job controller](designs/tool-job-controller.md) |
 | Job handle | Opaque service-derived job ID used to reconnect to a tool job; it is not an access token |
 | Secret placeholder | The text `$ASURA_SECRET_<n>` that replaces a detected secret in stored job output and in a rewritten command; within one job the same value has the same number; see [secret detection](designs/secret-detection.md#placeholders-and-numbering) |

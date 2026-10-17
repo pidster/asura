@@ -582,8 +582,8 @@ fn export_cross_language_fixtures() {
     );
     for (name, args, accepted) in [
         (
-            "shell_default.pb",
-            pb::Shell {
+            "exec_cmd_default.pb",
+            pb::ExecCmd {
                 command: Some("printf fixture".into()),
                 cwd: None,
                 timeout_seconds: None,
@@ -591,8 +591,8 @@ fn export_cross_language_fixtures() {
             true,
         ),
         (
-            "shell_max.pb",
-            pb::Shell {
+            "exec_cmd_max.pb",
+            pb::ExecCmd {
                 command: Some("é".repeat(4096)),
                 cwd: Some(".".into()),
                 timeout_seconds: Some(60),
@@ -600,8 +600,8 @@ fn export_cross_language_fixtures() {
             true,
         ),
         (
-            "shell_missing_command.pb",
-            pb::Shell {
+            "exec_cmd_missing_command.pb",
+            pb::ExecCmd {
                 command: None,
                 cwd: None,
                 timeout_seconds: None,
@@ -609,8 +609,8 @@ fn export_cross_language_fixtures() {
             false,
         ),
         (
-            "shell_parent.pb",
-            pb::Shell {
+            "exec_cmd_parent.pb",
+            pb::ExecCmd {
                 command: Some("pwd".into()),
                 cwd: Some("a/../b".into()),
                 timeout_seconds: Some(30),
@@ -618,8 +618,8 @@ fn export_cross_language_fixtures() {
             false,
         ),
         (
-            "shell_timeout.pb",
-            pb::Shell {
+            "exec_cmd_timeout.pb",
+            pb::ExecCmd {
                 command: Some("pwd".into()),
                 cwd: None,
                 timeout_seconds: Some(61),
@@ -631,11 +631,11 @@ fn export_cross_language_fixtures() {
             name,
             "helper",
             accepted,
-            memory_call(pb::tool_call::Arguments::Shell(args)).encode_to_vec(),
+            memory_call(pb::tool_call::Arguments::ExecCmd(args)).encode_to_vec(),
         );
     }
     write(
-        "shell_failed_output.pb",
+        "exec_cmd_failed_output.pb",
         "service",
         true,
         envelope(Body::ToolResult(pb::ToolResult {
@@ -1415,26 +1415,26 @@ fn audit_tool_requires_bounded_present_limit_and_helper_direction() {
 }
 
 #[test]
-fn shell_wire_requires_bounded_command_relative_cwd_and_deadline() {
-    let valid = pb::Shell {
+fn exec_cmd_wire_requires_bounded_command_relative_cwd_and_deadline() {
+    let valid = pb::ExecCmd {
         command: Some("printf fixture".into()),
         cwd: None,
         timeout_seconds: None,
     };
     for args in [
         valid.clone(),
-        pb::Shell {
+        pb::ExecCmd {
             command: Some("é".repeat(4096)),
             cwd: Some(".".into()),
             timeout_seconds: Some(60),
         },
-        pb::Shell {
+        pb::ExecCmd {
             cwd: Some("src/subdir".into()),
             timeout_seconds: Some(1),
             ..valid.clone()
         },
     ] {
-        let message = memory_call(pb::tool_call::Arguments::Shell(args));
+        let message = memory_call(pb::tool_call::Arguments::ExecCmd(args));
         assert_eq!(
             decode_body(&message.encode_to_vec(), Direction::HelperToService).unwrap(),
             message
@@ -1448,25 +1448,25 @@ fn shell_wire_requires_bounded_command_relative_cwd_and_deadline() {
         Some("a\0b".into()),
         Some("é".repeat(4097)),
     ] {
-        invalid.push(pb::Shell {
+        invalid.push(pb::ExecCmd {
             command,
             ..valid.clone()
         });
     }
     for cwd in ["", "/tmp", "..", "src/../other", "a\0b", &"x".repeat(1025)] {
-        invalid.push(pb::Shell {
+        invalid.push(pb::ExecCmd {
             cwd: Some(cwd.into()),
             ..valid.clone()
         });
     }
     for timeout_seconds in [Some(0), Some(61)] {
-        invalid.push(pb::Shell {
+        invalid.push(pb::ExecCmd {
             timeout_seconds,
             ..valid.clone()
         });
     }
     for args in invalid {
-        let message = memory_call(pb::tool_call::Arguments::Shell(args));
+        let message = memory_call(pb::tool_call::Arguments::ExecCmd(args));
         assert!(decode_body(&message.encode_to_vec(), Direction::HelperToService).is_err());
     }
     let mut bytes = pb::Envelope {
@@ -1481,7 +1481,7 @@ fn shell_wire_requires_bounded_command_relative_cwd_and_deadline() {
 }
 
 #[test]
-fn failed_shell_wire_result_preserves_bounded_output_but_never_cursor() {
+fn failed_exec_cmd_wire_result_preserves_bounded_output_but_never_cursor() {
     let result = pb::ToolResult {
         ordinal: Some(1),
         status: Some(5),

@@ -62,8 +62,8 @@ Dependencies:
   capture contract, descriptors and page contract.
 - [Person command mode](person-command-mode.md): kind PCQ, the PC3
   environment allow-list and PCR19.
-- [Shell tool](shell-tool.md) and the platform shell owner
-  (`rust/crates/asura-platform/src/shell.rs`): spawn, guardian and fixed
+- [exec_cmd tool](exec-cmd-tool.md) and the platform exec_cmd owner
+  (`rust/crates/asura-platform/src/exec_cmd.rs`): spawn, guardian and fixed
   environment.
 
 ### Terms
@@ -128,17 +128,17 @@ secrets today:
 
 | Path | Current behavior | Consequence |
 | --- | --- | --- |
-| Model shell command | The tool validator checks length and NUL only (`asura-service/src/tools.rs:176-195`). ToolIntent kind 16 stores the exact command (`asura-storage/src/authority/conversation/types.rs:417`). | A secret in a command is journaled. |
-| Guardian argument vector | The command is an argument of the guardian (`asura-platform/src/shell.rs:258`) and of `/bin/sh -c` (`shell/guardian.rs:218-219`). | A secret in a command is visible in the process argument list for the command's lifetime. |
-| Shell output | The capture ring keeps the last 8 KiB per stream (`shell/capture.rs:44-50`). `text()` returns the last 6144 bytes (`capture.rs:54-79`). | Raw output reaches the result. |
-| Shell result | `render_text()` (`shell.rs:49-67`) builds the result text. `mapped_result` stores it in a ToolResult (`asura-service/src/shell_worker.rs:416-429`), whose `text` is journaled (`types.rs:436`). | Raw output is journaled and sent to the model, within 16 KiB per result (`tools.rs:9`). |
+| Model exec_cmd command | The tool validator checks length and NUL only (`asura-service/src/tools.rs:176-195`). ToolIntent kind 16 stores the exact command (`asura-storage/src/authority/conversation/types.rs:417`). | A secret in a command is journaled. |
+| Guardian argument vector | The command is an argument of the guardian (`asura-platform/src/exec_cmd.rs:258`) and of `/bin/sh -c` (`exec_cmd/guardian.rs:218-219`). | A secret in a command is visible in the process argument list for the command's lifetime. |
+| exec_cmd output | The capture ring keeps the last 8 KiB per stream (`exec_cmd/capture.rs:44-50`). `text()` returns the last 6144 bytes (`capture.rs:54-79`). | Raw output reaches the result. |
+| exec_cmd result | `render_text()` (`exec_cmd.rs:49-67`) builds the result text. `mapped_result` stores it in a ToolResult (`asura-service/src/exec_cmd_worker.rs:416-429`), whose `text` is journaled (`types.rs:436`). | Raw output is journaled and sent to the model, within 16 KiB per result (`tools.rs:9`). |
 | Planned retention | J1 retains each stream completely under a shared quota ([J1d](tool-job-controller.md#owner-decisions-of-2026-10-14)). | Without filtering, every secret a job prints would persist until expiry. |
-| Shell environment | The guardian builds a fixed five-entry environment (`shell/guardian.rs:221-227`) and launches itself with an empty environment (`shell.rs:279`). | No path exists for a per-execution variable. |
+| exec_cmd environment | The guardian builds a fixed five-entry environment (`exec_cmd/guardian.rs:221-227`) and launches itself with an empty environment (`exec_cmd.rs:279`). | No path exists for a per-execution variable. |
 
 Search for an existing owner (`rg -i "secret|redact"` over `rust/crates`)
 found only test fixtures. No splitter or tokenizer exists yet. The
 [person design](person-command-mode.md#command-display) proposes one canonical
-splitter, `asura-platform::shell::split`, ported from Wisp's `CommandSplitter`.
+splitter, `asura-platform::exec_cmd::split`, ported from Wisp's `CommandSplitter`.
 
 ## Required behavior
 
@@ -165,14 +165,14 @@ owner, and the platform spawn path.
 | Behavior | Canonical owner | Reason |
 | --- | --- | --- |
 | Rule set, predicates, streaming scanner, numbering, literal matcher, loss markers | New module `asura-platform::secrets` | `asura-storage` and `asura-service` both depend on `asura-platform`, so one owner is reachable from the capture worker and command admission. The module performs no I/O. |
-| Shell tokenizer and quoting contexts | `asura-platform::shell::split`, the splitter the person design proposes | One tokenizer serves command display and command rewrite. A second tokenizer would let display and rewrite disagree. |
+| Shell tokenizer and quoting contexts | `asura-platform::exec_cmd::split`, the splitter the person design proposes | One tokenizer serves command display and command rewrite. A second tokenizer would let display and rewrite disagree. |
 | Rewrite planner | `asura-platform::secrets::rewrite`, using the splitter's tokenizer | It combines the rule set with quoting contexts; both are in `asura-platform`. |
 | Per-job redaction state | Created by the job controller (`asura-service`) at admission; moved to the job slot's capture worker; dropped at settlement | The controller owns job lifetime and slots (TJ-O1). |
 | Scanning of output chunks | The job slot's capture worker, before the payload adapter hashes and stages bytes | R4 assigns one capture worker per slot. The scan is the worker's first stage. |
 | Hashing, staging, descriptors and pages | Existing payload adapter (`asura-storage`), unchanged except that it accepts only redacted chunks | The adapter's append API takes a `secrets::Redacted` value that only the scanner constructs, so the type system rejects raw bytes. |
 | Model command rewrite and refusal | Conversation owner, in tool validation before the intent append | The intent is the first record of a command. |
 | Person command rewrite and refusal | Conversation owner, in submit validation before the kind PCQ append | Kind PCQ is the first record of a person command. |
-| Secret variables through spawn | Platform shell owner and guardian | They own the environment and argument vector. |
+| Secret variables through spawn | Platform exec_cmd owner and guardian | They own the environment and argument vector. |
 
 Rejected owners:
 
@@ -523,7 +523,7 @@ releases them. Settlement, descriptors, pages and cursors bind that digest.
 Byte offsets count stored bytes. Nothing computes a digest of raw output or of
 a secret value, apart from the in-memory keyed number map.
 
-Proposed record fields. J1 allocates them as record kinds 22 (ShellIntent)
+Proposed record fields. J1 allocates them as record kinds 22 (ExecCmdIntent)
 and 23 (CaptureSettled); the
 [J1 records](tool-job-controller.md#j1-records-kinds-22-and-23) give the exact
 encodings. The journal format stays `1`. J1 records a later exact match of a
@@ -553,7 +553,7 @@ reader that finds such a descriptor from a test build treats it as unverified.
   readable.
 - **Model result in J1.** J1 keeps today's model result shape. Its tail text
   must come from the last 6144 bytes of the redacted stream, not from the raw
-  capture ring (`shell/capture.rs:54-79`).
+  capture ring (`exec_cmd/capture.rs:54-79`).
 - **Job facts.** Proposed: job results, notices and the job viewer state the
   replacement count and withheld bytes, for example "2 secrets replaced (best
   effort); 0 bytes withheld". Page replies carry the running counts.
@@ -746,7 +746,7 @@ sequenceDiagram
         Own->>J: intent or kind PCQ with rewritten command and names
         Own->>Ctl: admit job, values
         Ctl->>Cap: literals and first free number
-        Ctl->>Set: ShellRequest with rewritten command, values
+        Ctl->>Set: ExecCmdRequest with rewritten command, values
         Set->>G: posix_spawn, argv holds rewritten command, envp holds values
         Set->>Set: zeroize envp and request buffers
         G->>G: validate names 1..16 and sizes
@@ -761,22 +761,22 @@ sequenceDiagram
 
 ### Environment path
 
-Selected mechanism inside `asura-platform::shell`; the owner accepted the
+Selected mechanism inside `asura-platform::exec_cmd`; the owner accepted the
 preamble on 2026-10-15:
 
-- `ShellRequest` gains `secrets: Vec<SecretVariable>`, where each entry is a
+- `ExecCmdRequest` gains `secrets: Vec<SecretVariable>`, where each entry is a
   number of 1–16 and a `Zeroizing<Vec<u8>>` value with no NUL byte. The values
   total at most 8192 bytes, the command limit.
 - The slot setup worker passes the values to the guardian in the guardian's
   environment, as `ASURA_SECRET_<n>=<value>` entries of `spawn::launch`'s
-  `env` argument (today empty, `shell.rs:279`). The guardian argument vector
+  `env` argument (today empty, `exec_cmd.rs:279`). The guardian argument vector
   holds only the rewritten command, so `ps` shows no value. After
   `posix_spawn` returns, the setup worker zeroizes the `CString` buffers of the
   environment array and drops the request's values.
 - The guardian reads `ASURA_SECRET_<n>` entries from its own environment. It
   rejects any other name, a number outside 1–16, a duplicate, a NUL, or a total
   above 8192 bytes, with the existing setup failure notice. It appends the
-  entries to the fixed environment it builds today (`shell/guardian.rs:221-227`).
+  entries to the fixed environment it builds today (`exec_cmd/guardian.rs:221-227`).
   The model profile's environment is otherwise unchanged. The person profile
   adds them to its PC3 environment.
 - After copying the accepted values, and before any other setup step, the
@@ -917,7 +917,7 @@ reaches admission.
 Data handling:
 
 - Values live in `Zeroizing` buffers (`zeroize` crate) in the rewrite result,
-  the person secret store, `ShellRequest` and the spawn environment array.
+  the person secret store, `ExecCmdRequest` and the spawn environment array.
 - The Aho–Corasick automaton and the regex engine copy matched bytes into
   memory that cannot be zeroized; it is freed at settlement.
 - Audit records counts only: replacements, withheld bytes and refusal reason
@@ -978,7 +978,7 @@ on any fixture secret's raw bytes.
 | --- | --- | --- |
 | SDI-01 | A controlled writer prints a secret in pieces, each in a separate pipe write, waiting for the test's go-ahead byte between pieces | Stored stream holds the placeholder; `live` pages never show a piece; raw-byte sweep clean |
 | SDI-02 | A real process prints a private key, a long line over 64 KiB and binary data | Stored bytes as SDU-06, SDU-07 and SDU-09 specify; digest matches the stored bytes |
-| SDI-03 | Model shell command with a secret through the real conversation owner | Intent holds the rewritten command; guardian `ps` argument list holds no value; the command runs with the real value; raw-byte sweep clean |
+| SDI-03 | Model exec_cmd command with a secret through the real conversation owner | Intent holds the rewritten command; guardian `ps` argument list holds no value; the command runs with the real value; raw-byte sweep clean |
 | SDI-04 | Slow scanner: a test-support gate blocks the scanner while a producer floods output | Queue fills; pipe reads pause; producer blocks; nothing is lost after release; reactor and controls respond within 100 ms |
 | SDI-05 | A test-support throttle slows the scanner well below the producer's output rate for a long flood | Queue fills and pipe reads pause; the producer blocks; no byte is lost, no capture fault is recorded and the job is not cancelled; the job settles normally with complete redacted output; controls respond within 100 ms (AE-07) |
 | SDI-06 | Environment substitution: `printf '%s' "<secret>" > out.txt` rewritten and run | `out.txt` holds the real value; the captured output and records hold names only |
@@ -992,7 +992,7 @@ on any fixture secret's raw bytes.
 
 | ID | Case | Required result |
 | --- | --- | --- |
-| SDE-01 | Native model runs `cat` of a fixture `.env` through the shell tool (J1), then pages with `job read` (J3) | Model result and pages show placeholders; the TUI tool activity shows placeholders; raw-byte sweep clean |
+| SDE-01 | Native model runs `cat` of a fixture `.env` through the exec_cmd tool (J1), then pages with `job read` (J3) | Model result and pages show placeholders; the TUI tool activity shows placeholders; raw-byte sweep clean |
 | SDE-02 | Native model issues a command with a secret | The TUI shows the rewritten command; the command succeeds |
 | SDE-03 | Person types `!curl -H "Authorization: Bearer <token>" …` (P4) | The log header shows the placeholder; the job runs; the viewer shows placeholders; a single-quoted variant is refused and the draft is kept |
 | SDE-04 | Flood with secrets while the person types and opens the viewer | Typing and viewer controls respond within 100 ms (AE-07) |
@@ -1091,9 +1091,9 @@ flowchart TD
 
 | Slice | Delivers | Tests |
 | --- | --- | --- |
-| SL1 | `asura-platform::secrets` with the 47 rules, predicates, scanner states, literal matcher, numbering, loss markers; the tokenizer port in `shell::split`; the rewrite planner | SDU-01–SDU-12, SDU-15; SDM-01–SDM-03 |
-| SL2 | `ShellRequest` secret variables, environment construction, guardian validation and preamble, zeroization | SDU-13; SDI-06, SDI-07, SDI-09 |
-| SL3 | Inside J1: scanner on each capture worker before hashing; redaction fields in descriptors; loss markers; the model result tail from the redacted stream; model shell command rewrite and refusal before the intent | SDU-14; SDI-01–SDI-05, SDI-08, SDI-11; SDE-01 (shell result part), SDE-02, SDE-04; SDM-04 |
+| SL1 | `asura-platform::secrets` with the 47 rules, predicates, scanner states, literal matcher, numbering, loss markers; the tokenizer port in `exec_cmd::split`; the rewrite planner | SDU-01–SDU-12, SDU-15; SDM-01–SDM-03 |
+| SL2 | `ExecCmdRequest` secret variables, environment construction, guardian validation and preamble, zeroization | SDU-13; SDI-06, SDI-07, SDI-09 |
+| SL3 | Inside J1: scanner on each capture worker before hashing; redaction fields in descriptors; loss markers; the model result tail from the redacted stream; model exec_cmd command rewrite and refusal before the intent | SDU-14; SDI-01–SDI-05, SDI-08, SDI-11; SDE-01 (exec_cmd result part), SDE-02, SDE-04; SDM-04 |
 | SL4 | With J3 and J4: counts in job results, notices, pages and the viewer | SDE-01 (`job read` part), SDE-05 |
 | SL5 | With person packets: submit rewrite, `secret_unsafe` reply, secret store, kind PCQ variable list, the SO2 restart rule | SDI-10; SDE-03 |
 | SL6 | With the tool adoption design: whole-buffer scanning of typed tool results before their records | Defined by that design |
@@ -1167,7 +1167,7 @@ Implemented behavior, 2026-10-15. Code:
 - `secrets/rewrite.rs`: `rewrite`, `rewrite_command`, `display_redacted`,
   `SecretVariable`, `Refusal` and `RefusalCode`. `SecretVariable` holds its
   value in `Zeroizing` memory, and its `Debug` output omits the value.
-- `shell/split.rs`: the tokenizer port (`tokens`, `segments`,
+- `exec_cmd/split.rs`: the tokenizer port (`tokens`, `segments`,
   `substitutions`, `inner_scripts`) and `analyze`, which records each byte's
   quoting context, word, heredoc, substitution and inner-script flags.
 
@@ -1235,21 +1235,21 @@ slices.
 
 Implemented behavior, 2026-10-15. Code in `rust/crates/asura-platform`:
 
-- `shell.rs`: `ShellRequest::secrets` holds the rewrite's `SecretVariable`
+- `exec_cmd.rs`: `ExecCmdRequest::secrets` holds the rewrite's `SecretVariable`
   values; SL2 adds no second type. `validate` refuses a number outside 1–16,
   a repeated number, a NUL or more than 8192 value bytes in total with
-  `ShellError::Invalid`, before any descriptor work. `MAX_COMMAND_BYTES` names
+  `ExecCmdError::Invalid`, before any descriptor work. `MAX_COMMAND_BYTES` names
   the shared 8192-byte limit. The setup worker builds each
   `ASURA_SECRET_<n>=<value>` entry in `Zeroizing` memory and passes the
   entries as `spawn::launch`'s `env`.
-- `shell/spawn.rs`: `launch` takes environment entries as bytes. It copies
+- `exec_cmd/spawn.rs`: `launch` takes environment entries as bytes. It copies
   each entry into a NUL-terminated `Zeroizing<Vec<u8>>` instead of a
   `CString`, because a dropped `CString` clears only its first byte. The
   copies are zeroed when `launch` returns, after `posix_spawn` or on any
   failure.
-- `PreparedShell::spawn` clears `request.secrets` after `spawn_inner` returns,
+- `PreparedExecCmd::spawn` clears `request.secrets` after `spawn_inner` returns,
   on success and on failure, so each value is zeroed then.
-- `shell/guardian.rs`: the guardian validates its own environment first in
+- `exec_cmd/guardian.rs`: the guardian validates its own environment first in
   setup. It reads `environ` through `_NSGetEnviron` and refuses the set with the
   setup failure notice (reason 5, outcome `Unavailable`, no process) for any
   other name, a non-canonical or out-of-range number, a duplicate, a NUL, more
@@ -1274,15 +1274,15 @@ Refinements made during SL2:
   refuses a script above 8192 + 1280 bytes as a defensive check. The
   preamble is never in the guardian's own argument vector. With no secret
   variables, the script is the command unchanged, as the
-  [shell tool](shell-tool.md) contract states. With secret variables, the
+  [exec_cmd tool](exec-cmd-tool.md) contract states. With secret variables, the
   argument after `-c` is the preamble followed by the command.
 - **Test hook.** The `test-support` method
-  `PreparedShell::replace_secret_environment_for_test` sends raw entries that
+  `PreparedExecCmd::replace_secret_environment_for_test` sends raw entries that
   bypass the service check, so the guardian's own check runs on real
   processes.
 
 Verified behavior on the macOS 27 development host, Rust 1.98, `/bin/sh`
-GNU bash 3.2.57. Real-process cases run in the harness-free `shell_process`
+GNU bash 3.2.57. Real-process cases run in the harness-free `exec_cmd_process`
 qualification in private scratch homes. They use a fixture token assembled at
 run time and the real `rewrite_command`.
 
@@ -1329,7 +1329,7 @@ Implemented behavior, 2026-10-16, inside tool job packet J1. The code map,
 refinements and full test record are in the job controller's
 [J1 implementation](tool-job-controller.md#j1-implementation). SL3 parts:
 
-- **Command rewrite at `ToolCall`.** `secrets::rewrite_shell_call` rewrites
+- **Command rewrite at `ToolCall`.** `secrets::rewrite_exec_cmd_call` rewrites
   the model command, scans the cwd in whole-buffer mode (`secret_in_cwd`,
   code 14) and refuses a rewrite over 8,192 bytes (`rewritten_command_too_long`,
   code 13). The conversation owner calls it before any record; kind 22 holds
@@ -1363,7 +1363,7 @@ ends with the raw-byte sweep):
 | SDI-07 | `set` after a rewritten command stores `ASURA_SECRET_1=$ASURA_SECRET_1`; the value is replaced by literal matching (J1T-16) |
 | SDI-08 | The echoed value on stdout and stderr both store `$ASURA_SECRET_1`, number 1, origin command (J1T-17) |
 | SDI-11 | Four concurrent capture workers fed by real processes: independent numbering (each starts at 1) (J1T-18) |
-| SDE-01 (shell part) | A scripted loopback model issues `cat .env`: kind 15, the tool message the model received and the TUI activity show `GITHUB_TOKEN=$ASURA_SECRET_1` (J1T-24) |
+| SDE-01 (exec_cmd part) | A scripted loopback model issues `cat .env`: kind 15, the tool message the model received and the TUI activity show `GITHUB_TOKEN=$ASURA_SECRET_1` (J1T-24) |
 | SDE-02 | Fixture model: the TUI activity shows the rewritten command and the command ran with the real value; see J1T-25 for the native-model part |
 | SDE-04 (typing part) | See J1T-26 |
 | SDM-04 | Process maximum RSS grew 7.5 MiB for four workers, about 1.9 MiB each (acceptance 6 MiB); a measurement, not a runtime limit |

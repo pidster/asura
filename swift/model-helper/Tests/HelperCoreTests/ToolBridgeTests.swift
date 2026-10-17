@@ -35,7 +35,7 @@ func memoryCallbacksUseSameServiceResultAndCancellationBridge(selector: String) 
             .memoryListNotes(after: nil, limit: 8),
             .memoryListNotes(after: "", limit: 0),
             .memoryGetNote(version: "0123456789abcdef0123456789abcdef", offset: 4, limit: 32),
-            .memoryNoteSources(version: "0123456789abcdef0123456789abcdef"), .listTools, .readAudit(limit: 16), .shell(command: "printf fixture", cwd: ".", timeoutSeconds: 30)] as [ToolArguments] {
+            .memoryNoteSources(version: "0123456789abcdef0123456789abcdef"), .listTools, .readAudit(limit: 16), .execCmd(command: "printf fixture", cwd: ".", timeoutSeconds: 30)] as [ToolArguments] {
             try await toolCallbackJourney(cancel: cancel, selector: selector, arguments: arguments)
         }
     }
@@ -91,10 +91,10 @@ private func toolCallbackJourney(cancel: Bool, selector: String, arguments: Tool
     let call = try Wire.decode(#require(try await replies.next()), from: .helper)
     #expect(call.toolCall.ordinal == 1)
     switch arguments {
-    case .shell(let command, let cwd, let timeout):
-        #expect(call.toolCall.shell.command == command)
-        #expect(call.toolCall.shell.hasCwd == (cwd != nil) && call.toolCall.shell.cwd == (cwd ?? ""))
-        #expect(call.toolCall.shell.timeoutSeconds == timeout)
+    case .execCmd(let command, let cwd, let timeout):
+        #expect(call.toolCall.execCmd.command == command)
+        #expect(call.toolCall.execCmd.hasCwd == (cwd != nil) && call.toolCall.execCmd.cwd == (cwd ?? ""))
+        #expect(call.toolCall.execCmd.timeoutSeconds == timeout)
     case .readAudit(let limit):
         #expect(call.toolCall.readAudit.hasLimit && call.toolCall.readAudit.limit == limit)
     case .listTools:

@@ -2,7 +2,7 @@
 
 Status: reviewed by the owner, 2026-10-14 and 2026-10-15. Proposed on
 2026-10-13 because the [architecture](../architecture.md#security-boundaries)
-requires a threat model before execution is implemented, and the shell and memory
+requires a threat model before execution is implemented, and the exec_cmd and memory
 write tools shipped without one. The owner reviewed findings EX1–EX16 on
 2026-10-14 and revisited EX4, EX7, EX13 and EX15 on 2026-10-15. The owner
 approved the [person-typed commands](#person-typed-commands) section on
@@ -35,7 +35,7 @@ extends it to model-driven effects.
 
 In scope:
 
-- **Implemented:** the shell tool, memory note writes, project and memory reads
+- **Implemented:** the exec_cmd tool, memory note writes, project and memory reads
   by the model, and numeric-loopback model endpoints. Non-loopback endpoints
   have been refused since 2026-10-13 (EX7).
 - **Proposed:** [tool jobs](tool-job-controller.md) and remote providers through
@@ -110,18 +110,18 @@ to `rust/crates/` or `swift/model-helper/Sources/HelperCore/`. The
 
 | ID | Threat | Current mitigation (code) | Gap |
 | --- | --- | --- | --- |
-| EX1 | Injected content leads the model to write a persistent payload, such as a Git hook or build script, that the person later runs outside the sandbox | Writes confined to project and scratch (`asura-platform/src/shell/guardian.rs:158`; scratch re-allow `:152`). Each call is journaled as tool kind 16 inside ToolIntent (`asura-storage/src/authority/conversation/types.rs:401-412`). | The whole project, including `.git`, is writable. EX-V1 confirmed writes to `.git/hooks` (also nested), `.git/config` `hooksPath`, `Makefile`, `package.json`, `build.rs`, `.envrc` and `.cargo/config.toml`. Nothing separates a source edit from a write that executes later. |
-| EX2 | Shell exfiltrates data over the network | Profile has no network rule under `(deny default)` (`guardian.rs:158`) | None found. EX-V2 found TCP, UDP, raw, ICMP and Unix socket attempts denied. |
-| EX3 | Shell reads secrets outside the project | Read roots are system roots, project and scratch (`guardian.rs:125-135`). The environment is replaced (`:221-227`). The Asura home arrives at FD 10 (`:66-93`, `:199`), is checked separate from state (`:114-122`, `:203`) and is denied (`:151-156`). | EX-V3 found every outside read denied, including `/private/etc/hosts`, and a clean environment. Ancestor directories of each root allow metadata reads (`:137-149`), so `stat` reveals their names and attributes: a known minor leak. The design lists a developer directory root that the code omits, so `git init` fails. |
-| EX4 | Model reads project secrets such as `.env` and they persist in Asura records | Tool results are bounded to 16 KiB (`asura-service/src/tools.rs:9-10`); the journal is local and private | No secret detection. Raw commands are journaled (`types.rs:401-402`) and result text is journaled (`types.rs:415-423`), rendered by `asura-service/src/shell_worker.rs:400-429` and `asura-platform/src/shell.rs:49-67`. Tool jobs would retain each job's complete output under a shared quota (J1d, R1). |
-| EX5 | A tool process outlives its turn or bound | Own process group; TERM (`guardian.rs:316`), then KILL (`:325`) after 500 ms (`:38`) in the stop loop (`:280-387`). At most 256 members checked (`:400-420`). Unknown cleanup is reported after 2.5 s (`:360-376`). Scratch removal checks identity (`asura-platform/src/shell/cleanup.rs:86-126`). | EX-V5 killed same-group escapes. A `setsid` escapee survives cleanup. It stays confined, but it can write the project after the job settles, and cleanup reports confirmed while it lives. See [EX5 escape findings](#ex5-escape-findings). |
+| EX1 | Injected content leads the model to write a persistent payload, such as a Git hook or build script, that the person later runs outside the sandbox | Writes confined to project and scratch (`asura-platform/src/exec_cmd/guardian.rs:158`; scratch re-allow `:152`). Each call is journaled as tool kind 16 inside ToolIntent (`asura-storage/src/authority/conversation/types.rs:401-412`). | The whole project, including `.git`, is writable. EX-V1 confirmed writes to `.git/hooks` (also nested), `.git/config` `hooksPath`, `Makefile`, `package.json`, `build.rs`, `.envrc` and `.cargo/config.toml`. Nothing separates a source edit from a write that executes later. |
+| EX2 | exec_cmd exfiltrates data over the network | Profile has no network rule under `(deny default)` (`guardian.rs:158`) | None found. EX-V2 found TCP, UDP, raw, ICMP and Unix socket attempts denied. |
+| EX3 | exec_cmd reads secrets outside the project | Read roots are system roots, project and scratch (`guardian.rs:125-135`). The environment is replaced (`:221-227`). The Asura home arrives at FD 10 (`:66-93`, `:199`), is checked separate from state (`:114-122`, `:203`) and is denied (`:151-156`). | EX-V3 found every outside read denied, including `/private/etc/hosts`, and a clean environment. Ancestor directories of each root allow metadata reads (`:137-149`), so `stat` reveals their names and attributes: a known minor leak. The design lists a developer directory root that the code omits, so `git init` fails. |
+| EX4 | Model reads project secrets such as `.env` and they persist in Asura records | Tool results are bounded to 16 KiB (`asura-service/src/tools.rs:9-10`); the journal is local and private | No secret detection. Raw commands are journaled (`types.rs:401-402`) and result text is journaled (`types.rs:415-423`), rendered by `asura-service/src/exec_cmd_worker.rs:400-429` and `asura-platform/src/exec_cmd.rs:49-67`. Tool jobs would retain each job's complete output under a shared quota (J1d, R1). |
+| EX5 | A tool process outlives its turn or bound | Own process group; TERM (`guardian.rs:316`), then KILL (`:325`) after 500 ms (`:38`) in the stop loop (`:280-387`). At most 256 members checked (`:400-420`). Unknown cleanup is reported after 2.5 s (`:360-376`). Scratch removal checks identity (`asura-platform/src/exec_cmd/cleanup.rs:86-126`). | EX-V5 killed same-group escapes. A `setsid` escapee survives cleanup. It stays confined, but it can write the project after the job settles, and cleanup reports confirmed while it lives. See [EX5 escape findings](#ex5-escape-findings). |
 | EX6 | Injected content is written to memory and steers later sessions | Notes are labelled untrusted in instructions (`asura-service/src/conversation.rs:21`) and tool descriptions (`tools.rs:33`, `:37`, `:69`; `ToolBridge.swift:124`, `:138`, `:154`, `:233`). Only foreground turns get `memory_write_authorized` (`conversation.rs:206`). Notes are read only on request. | Notes are immutable and cannot be deleted. The person does not review model-written notes, and nothing marks them. |
 | EX7 | Conversation content leaves the device | Turn preparation refuses a non-loopback endpoint (`conversation.rs:1814-1819`). `/config set` refuses one (`asura-storage/src/config.rs:296-298`) under one rule (`:401-413`). The helper checks again (`OllamaBackend.swift:19`, `:58`). Tools need numeric loopback with helper attestation, except on-device providers (`asura-service/src/model_owner.rs:828-847`, `:835`; `endpoint_permitted` `:851-856`). | The endpoint grammar still accepts HTTPS hosts (`config.rs:398`), so an existing file can hold one; it loads but is refused at use. Before 2026-10-13 an HTTPS endpoint received instructions, prior prompts, prior final answers and the current prompt (`conversation.rs:1826-1838`). Prior final answers can quote project content from earlier local turns (inference from the history composition, not tested). |
 | EX8 | Remote endpoint impersonation or interception | System TLS validation; no redirects, cookies, cache or proxy (`OllamaBackend.swift:134-151`) | No credentials are sent today. Credential storage waits for EX14. |
 | EX9 | Same-UID process squats the loopback model port | Same-UID is one principal under D1 | A squatter receives prompts and tool results; accepted under D1, not mitigated |
-| EX10 | Execution is enabled for a model not qualified for it | Memory, audit and shell calls are denied for remote destinations (`tools.rs:365-372`); a remote destination must match the grant (`:374-379`) | The [shell design](shell-tool.md#implementation-evidence-2026-09-28) qualifies shell for the system model only. Code offers shell to every tool-capable provider (`ToolBridge.swift:77-85`, used at `Backend.swift:250`); project tools are allowed for on-device providers and Ollama (`asura-service/src/model.rs:236-245`). |
+| EX10 | Execution is enabled for a model not qualified for it | Memory, audit and exec_cmd calls are denied for remote destinations (`tools.rs:365-372`); a remote destination must match the grant (`:374-379`) | The [exec_cmd design](exec-cmd-tool.md#implementation-evidence-2026-09-28) qualifies exec_cmd for the system model only. Code offers exec_cmd to every tool-capable provider (`ToolBridge.swift:77-85`, used at `Backend.swift:250`); project tools are allowed for on-device providers and Ollama (`asura-service/src/model.rs:236-245`). |
 | EX11 | The person cannot turn execution off | — | `read_authorized` and `execute_authorized` are constant `true` and `remote_destination` is `None` (`conversation.rs:202-212`, `:211`). Only the build constant `ENABLE_PROJECT_TOOLS` (`:20`) disables tools. |
-| EX16 | The model reads or writes Asura's own state: journals, configuration, database and logs under `~/.asura` | Registration and every project open reject overlap with `~/.asura` by directory identity (`asura-platform/src/project_identity.rs:9-98`; `asura-storage/src/authority/writer/state.rs:394`, `:1275`; `conversation.rs:87`). The shell profile denies `~/.asura` except the call's scratch (`guardian.rs:151-156`). File tools walk each component under the pinned root (`project_identity.rs:176-194`) with `O_NOFOLLOW` (`asura-platform/src/runtime.rs:128-136`). A socket connect from the shell returns EPERM (tested 2026-10-14). | Fixed on 2026-10-14 under [Asura state isolation](asura-state-isolation.md) (PX3). Before the fix, at commit `26a10fc`, registration accepted `~/.asura`, a root inside it, or a root containing it such as `~`, and `read_file` reached `.asura/config.yaml`. Copies of the home on other mounts remain a [residual limit](asura-state-isolation.md#residual-limits). |
+| EX16 | The model reads or writes Asura's own state: journals, configuration, database and logs under `~/.asura` | Registration and every project open reject overlap with `~/.asura` by directory identity (`asura-platform/src/project_identity.rs:9-98`; `asura-storage/src/authority/writer/state.rs:394`, `:1275`; `conversation.rs:87`). The exec_cmd profile denies `~/.asura` except the call's scratch (`guardian.rs:151-156`). File tools walk each component under the pinned root (`project_identity.rs:176-194`) with `O_NOFOLLOW` (`asura-platform/src/runtime.rs:128-136`). A socket connect from an exec_cmd command returns EPERM (tested 2026-10-14). | Fixed on 2026-10-14 under [Asura state isolation](asura-state-isolation.md) (PX3). Before the fix, at commit `26a10fc`, registration accepted `~/.asura`, a root inside it, or a root containing it such as `~`, and `read_file` reached `.asura/config.yaml`. Copies of the home on other mounts remain a [residual limit](asura-state-isolation.md#residual-limits). |
 
 ### EX5 escape findings
 
@@ -171,8 +171,8 @@ Each entry gives the decision, the required outcome and where it is applied.
 3. **EX3 — accept as mitigated and verified (owner, 2026-10-14).** Ancestor
    folder metadata visibility is recorded as a known minor leak. The model
    profile must allow reads of the developer folder so the model can run Git.
-   This matches the developer root in the [shell design](shell-tool.md#authority-and-confinement)
-   and widens reads to the Xcode toolchain. Applied in the shell design.
+   This matches the developer root in the [exec_cmd design](exec-cmd-tool.md#authority-and-confinement)
+   and widens reads to the Xcode toolchain. Applied in the exec_cmd design.
 4. **EX4 — filter secrets at capture (owner, 2026-10-15).** First decided on
    2026-10-14, revisited and confirmed on 2026-10-15.
    - All tools use jobs; there are no legacy tools. This supersedes R3's
@@ -222,9 +222,9 @@ Each entry gives the decision, the required outcome and where it is applied.
 8. **EX8 — accept (owner, 2026-10-14).** Mitigated for credential-free
    endpoints. Credentials wait for EX14.
 9. **EX9 — accept as residual risk under D1 (owner, 2026-10-14).**
-10. **EX10 — qualify the others (owner, 2026-10-14).** Shell stays offered to
+10. **EX10 — qualify the others (owner, 2026-10-14).** exec_cmd stays offered to
     local tool-capable providers. Each needs SH-E1-style qualification before
-    J2: CoreAI, MLX and Ollama models. Applied in the shell design and as a J2
+    J2: CoreAI, MLX and Ollama models. Applied in the exec_cmd design and as a J2
     prerequisite.
 11. **EX11 — a person-controlled execution setting (owner, 2026-10-14).** A
     global default plus a per-project override; the default is on. A change is
@@ -294,9 +294,9 @@ layer. They did not drive a model or the TUI.
 
 | ID | Case | Result |
 | --- | --- | --- |
-| EX-V1 | Shell writes to `.git/hooks`, a nested `.git/hooks/`, `.git/config` `hooksPath`, `Makefile`, `package.json`, `build.rs`, `.envrc` and `.cargo/config.toml` | Run 2026-10-14. Every write succeeded, confirming the EX1 gap. `git init` failed because the developer folder is denied (EX3). PX-V2 holds the case for the PX1 outcome. |
-| EX-V2 | Shell attempts over TCP, UDP, raw sockets, ICMP and Unix sockets, including a stand-in for the control socket. Judge by a listener that receives nothing and by EPERM from the call, not by `curl`, which fails earlier when it cannot read its SSL configuration. | Run 2026-10-14. Every attempt was denied. |
-| EX-V3 | Shell reads of home secrets, `/private/var`, `/private/etc/hosts` and other projects | Run 2026-10-14. Every read was denied, and the environment was clean. `stat` of ancestor directories succeeds: the EX3 metadata leak. |
+| EX-V1 | exec_cmd writes to `.git/hooks`, a nested `.git/hooks/`, `.git/config` `hooksPath`, `Makefile`, `package.json`, `build.rs`, `.envrc` and `.cargo/config.toml` | Run 2026-10-14. Every write succeeded, confirming the EX1 gap. `git init` failed because the developer folder is denied (EX3). PX-V2 holds the case for the PX1 outcome. |
+| EX-V2 | exec_cmd attempts over TCP, UDP, raw sockets, ICMP and Unix sockets, including a stand-in for the control socket. Judge by a listener that receives nothing and by EPERM from the call, not by `curl`, which fails earlier when it cannot read its SSL configuration. | Run 2026-10-14. Every attempt was denied. |
+| EX-V3 | exec_cmd reads of home secrets, `/private/var`, `/private/etc/hosts` and other projects | Run 2026-10-14. Every read was denied, and the environment was clean. `stat` of ancestor directories succeeds: the EX3 metadata leak. |
 | EX-V4 | A planted instruction in a project file and in a memory note; observe model behavior | Not run. It needs a model qualified for tools (EX10) and the planted fixtures. Results apply to the model tested. |
 | EX-V5 | Double-fork, `setsid` and pipe-holding escapes; confirm confinement and cleanup | Run 2026-10-14. Same-group escapes were killed. The `setsid` escapee survived, stayed confined, wrote the project after settlement and left `cleanup_confirmed` true. The pipe-holding case is from code reading. The EX5 design must turn this into a passing case. |
 | EX-V6 | Endpoint request content captured; confirm only granted data classes leave | Not run. It needs a local HTTPS capture server with a test certificate. Under EX13 it becomes the grant check: file pages and tool results absent by default. |
@@ -304,7 +304,7 @@ layer. They did not drive a model or the TUI.
 | EX-V8 | A fixture secret in command output and in a command, for model and person origin | Required, not run. Retained streams, journal, model view and viewer hold placeholders only. The command runs with the real value through one variable, and the log holds only the variable name. A command that cannot be rewritten safely is refused with a reason. Detailed cases are in the [secret detection validation](secret-detection.md#validation). |
 | EX-V9 | `setsid`, double-fork and pipe-holding escapees under a job | Required, not run. Each escapee is detected and terminated, settlement completes, and cleanup is never reported confirmed while one lives. Detailed cases belong to the EX5 design. |
 | EX-V10 | The EX11 setting turned off globally and for one project | Required, not run. New execution is refused and live model jobs in scope are cancelled with a revocation reason. |
-| EX-V11 | Model shell runs `git status` and `git init` with the developer folder readable | Required, not run. Git runs; reads outside the roots stay denied. |
+| EX-V11 | Model exec_cmd runs `git status` and `git init` with the developer folder readable | Required, not run. Git runs; reads outside the roots stay denied. |
 
 ## Required follow-up designs
 
@@ -314,7 +314,7 @@ Each must be designed before its code. None is selected by this document.
 | --- | --- | --- |
 | Secret detection and redaction: rules, placeholders, command variables, capture integration. Selected 2026-10-15: [secret detection](secret-detection.md) | EX4, PX6, SD1–SD9 | Job packet J1; person command mode |
 | Escapee detection and termination | EX5 | Job packet J2 |
-| Shell qualification per local provider (SH-E1 style) | EX10 | Job packet J2 |
+| exec_cmd qualification per local provider (SH-E1 style) | EX10 | Job packet J2 |
 | Execution setting: global default and per-project override | EX11 | Revocation trigger TJ-14 |
 | Job-outlived-turn notice | EX12 | Client job packet J4 (proposed placement) |
 | Destination grant by data class and project | EX13, EX7 | Remote providers |
@@ -350,9 +350,9 @@ secrets replaced at capture under EX4.
 
 ### What changes
 
-The person, a trusted principal, runs a command through the shell path with a
+The person, a trusted principal, runs a command through the exec_cmd path with a
 person execution profile. The owner fixed its terms on 2026-10-13. Compared
-with the model's shell, a person command:
+with the model's exec_cmd tool, a person command:
 
 - has network access;
 - reads across the person's home, including `~/.ssh`;
@@ -385,7 +385,7 @@ flowchart TD
     subgraph Box["sandbox-exec: person profile, no timeout (PT8)"]
         Cmd["Command and children"]
     end
-    ModelWrites["Earlier model shell writes"] -.->|"PT2: hooks, build scripts"| Proj[("Project")]
+    ModelWrites["Earlier model exec_cmd writes"] -.->|"PT2: hooks, build scripts"| Proj[("Project")]
     Proj -->|"executed by the command"| Cmd
     Cmd -.->|"PT3: egress"| Net(("Network"))
     Cmd -.->|"read"| Home[("Home, incl. ~/.ssh")]
@@ -426,7 +426,7 @@ flowchart TD
 | PT8 | A command runs unattended: no timeout and the client has gone | Ctrl-C, `/cancel`, `/job cancel` from any TUI and service shutdown stop it. Guardian lease EOF stops it on service death. | By owner decision (PC5) a command keeps running after the TUI exits, as other accepted work does. It stays listed in `/jobs` for any TUI to cancel. Accepted. A `setsid` escapee is not stopped until the EX5 design is built. |
 
 The model cannot forge a person command. It has no control attachment, and its
-shell profile has no network access, so it cannot reach the control socket
+exec_cmd profile has no network access, so it cannot reach the control socket
 (EPERM, tested 2026-10-14). The notice states that the person ran the command
 and that the model did not. This prevents the model from treating the person's
 action as its own work.
@@ -463,7 +463,7 @@ are caught).
 | ID | Case |
 | --- | --- |
 | PX-V1 | Writes to `~/.zshrc`, `~/.ssh/config`, `~/.gitconfig` and `~/.asura` fail; writes to the project, `$TMPDIR` and an existing cache directory succeed |
-| PX-V2 | A model shell write to `.git/hooks/pre-commit`, a nested `.git/hooks/`, `.git/config` and `.envrc` fails; after person approval, the hook runs under `!git commit`; record what it can read, write and reach |
+| PX-V2 | A model exec_cmd write to `.git/hooks/pre-commit`, a nested `.git/hooks/`, `.git/config` and `.envrc` fails; after person approval, the hook runs under `!git commit`; record what it can read, write and reach |
 | PX-V9 | The model edits `build.rs` and `package.json`; the next `!cargo build` shows the change warning naming both files; a second command without new model writes shows none |
 | PX-V11 | An approved hook changes after approval; the next person command warns again before it runs, and Asura does not rely on the changed file |
 | PX-V10 | If sensitive read reporting is selected: `!cat ~/.ssh/known_hosts` fixture produces one audit event naming the path with no contents; a read outside the list produces none |
@@ -481,7 +481,7 @@ are caught).
    owner on 2026-10-14, together with EX1; the digest re-check was added on
    2026-10-15. Run-later paths are split into two kinds.
    - **Implicit-execution paths** run without the person asking to run project
-     code. The model's shell profile denies writes to them, and a change needs
+     code. The model's exec_cmd profile denies writes to them, and a change needs
      the person's approval. Initial list, for the approval design to confirm:
      `.git/hooks/` and any nested `.git/hooks/`, `.git/config`,
      `.gitattributes`, `.gitmodules`, `.envrc`, and `.cargo/config` and
@@ -513,9 +513,9 @@ are caught).
    person commands:
    - Project registration rejects a root that is `~/.asura`, lies inside it, or
      contains it, such as the home directory. The check compares retained
-     directory identities, not path text. This closes the model's shell and
+     directory identities, not path text. This closes the model's exec_cmd and
      file-tool paths with one owner.
-   - Every shell profile explicitly denies reads, writes and connections under
+   - Every exec_cmd profile explicitly denies reads, writes and connections under
      `~/.asura`, except the profile's own private scratch directory, which the
      guardian allows by its exact descriptor. The person profile needs this
      because it reads the home directory and has network access.

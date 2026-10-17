@@ -569,7 +569,7 @@ endpoints return only when EX13 and EX14 are built (EX7).
 | EX14 | Owner, 2026-10-14. One Keychain item per provider, read only by the model helper at request time. The service, journal and configuration hold only the provider name. The D1 [credential review](threat-model.md) runs with this work. |
 | EX15 | Owner, 2026-10-15. Per-provider spend ceilings, set by the person and admitted through the [ADR-0003](../decisions/0003-aggregate-budget-admission.md) aggregate budget as an exhaustion closure under [loop closure](loop-closure.md). The client asks the person before a turn whose estimated cost exceeds a set amount. |
 | EX8 | Owner, 2026-10-14. Accepted for credential-free endpoints; credentials wait for EX14. |
-| EX10 | Owner, 2026-10-14. Shell stays offered to local tool-capable providers; each needs SH-E1-style [qualification](shell-tool.md#threat-model-review-decisions--2026-10-14) before tool job packet J2. |
+| EX10 | Owner, 2026-10-14. exec_cmd stays offered to local tool-capable providers; each needs SH-E1-style [qualification](exec-cmd-tool.md#threat-model-review-decisions--2026-10-14) before tool job packet J2. |
 
 PX4 gives a remote destination the same person notices and `job read` pages as
 a local model. Whether those pages fall under the EX13 tool-results class, off

@@ -3,7 +3,7 @@
 Status: required capabilities with a proposed authorization contract.
 
 Open decisions: policy format, evaluator and macOS enforcement mechanisms.
-No policy format or evaluator is implemented. The [shell tool](shell-tool.md)
+No policy format or evaluator is implemented. The [exec_cmd tool](exec-cmd-tool.md)
 and Git observer apply fixed `sandbox-exec` profiles; those profiles are not a
 policy format or a selected general mechanism. Terms are defined in the
 [glossary](../glossary.md).

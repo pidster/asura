@@ -1,7 +1,7 @@
-//! One retained shell slot. Filesystem preparation/cleanup never run on the reactor.
+//! One retained exec_cmd slot. Filesystem preparation/cleanup never run on the reactor.
 //!
 //! J1 phases: `Setup` ends on spawn, a setup fault or cancel (no deadline,
-//! J1-Q4); `Running` ends when `ShellJob` settles (no deadline, J1-Q3);
+//! J1-Q4); `Running` ends when `ExecCmdJob` settles (no deadline, J1-Q3);
 //! `Cleanup` runs scratch cleanup while the capture worker flushes;
 //! `Finalizing` waits for the sealed capture report. After a cancel trigger
 //! the existing L3 bound of 2.5 s also covers capture settlement (J1-Q1).
@@ -13,14 +13,14 @@ use crate::{
 use asura_platform::{
     RuntimeDirectory,
     events::WakeSender,
-    secrets::SecretVariable,
-    shell::{
-        PreparedShell, ShellCleanup, ShellError, ShellFailure, ShellJob, ShellRequest, ShellResult,
-        StopReason, Tails, render_tail,
+    exec_cmd::{
+        ExecCmdCleanup, ExecCmdError, ExecCmdFailure, ExecCmdJob, ExecCmdRequest, ExecCmdResult,
+        PreparedExecCmd, StopReason, Tails, render_tail,
     },
+    secrets::SecretVariable,
 };
 use asura_storage::authority::conversation::{
-    CaptureReason, CaptureSettled, CaptureState, CaptureStream, ShellDisposition, ShellIntent,
+    CaptureReason, CaptureSettled, CaptureState, CaptureStream, ExecCmdDisposition, ExecCmdIntent,
     ToolResult,
 };
 use std::{
@@ -50,60 +50,60 @@ impl<T> ThreadWork<T> {
     }
 }
 struct Failure {
-    error: ShellError,
-    cleanup: Option<ShellCleanup>,
+    error: ExecCmdError,
+    cleanup: Option<ExecCmdCleanup>,
 }
-impl From<ShellFailure> for Failure {
-    fn from(f: ShellFailure) -> Self {
+impl From<ExecCmdFailure> for Failure {
+    fn from(f: ExecCmdFailure) -> Self {
         Self {
             error: f.reason,
             cleanup: f.cleanup,
         }
     }
 }
-type SetupResult = Result<ShellJob, Failure>;
+type SetupResult = Result<ExecCmdJob, Failure>;
 struct Cleaned {
-    token: Option<ShellCleanup>,
-    result: Result<(), ShellError>,
+    token: Option<ExecCmdCleanup>,
+    result: Result<(), ExecCmdError>,
 }
 enum Phase {
     Setup(ThreadWork<SetupResult>),
-    Running(ShellJob),
+    Running(ExecCmdJob),
     Cleanup(ThreadWork<Cleaned>),
     Finalizing,
     Repair {
-        _cleanup: Option<ShellCleanup>,
-        _job: Option<ShellJob>,
+        _cleanup: Option<ExecCmdCleanup>,
+        _job: Option<ExecCmdJob>,
     },
 }
 /// What the process did: a settled result, or a failure before or at setup.
 enum Process {
-    Settled(ShellResult),
-    Failed(ShellError),
+    Settled(ExecCmdResult),
+    Failed(ExecCmdError),
 }
 
-/// One shell call's dispatch: the committed kind 22, the rewritten call, the
+/// One exec_cmd call's dispatch: the committed kind 22, the rewritten call, the
 /// secret variables (moved into the request; spawn zeroizes them) and the
 /// capture worker's start.
 pub(crate) struct Dispatch {
     pub runtime: RuntimeDirectory,
     pub scope: tools::ExecutionScope,
     pub call: tools::Call,
-    pub intent: ShellIntent,
+    pub intent: ExecCmdIntent,
     pub secrets: Vec<SecretVariable>,
     pub capture: capture_worker::Start,
 }
 
 /// A settled call: kind 23, then kind 15, and the capture worker that
 /// outlives the call (installing, or abandoned after `unconfirmed`).
-pub(crate) struct ShellOutput {
+pub(crate) struct ExecCmdOutput {
     pub settled: CaptureSettled,
     pub result: ToolResult,
     pub capture: Option<capture_worker::Handle>,
 }
 
 struct Active {
-    intent: ShellIntent,
+    intent: ExecCmdIntent,
     phase: Option<Phase>,
     /// Set at the cancel trigger: L3 for cleanup and capture settlement.
     cleanup_deadline: Option<Instant>,
@@ -149,7 +149,7 @@ impl Worker {
             secrets,
             capture,
         } = dispatch;
-        let Arguments::Shell {
+        let Arguments::ExecCmd {
             command: proposed,
             cwd: proposed_cwd,
             ..
@@ -157,7 +157,7 @@ impl Worker {
         else {
             return Err(ExecutionError::Rejected(Rejection::Denied));
         };
-        if intent.disposition != ShellDisposition::Admitted
+        if intent.disposition != ExecCmdDisposition::Admitted
             || intent.command != *proposed
             || intent.cwd != *proposed_cwd
             || intent.operation != call.operation
@@ -178,7 +178,7 @@ impl Worker {
                 phase: Some(Phase::Finalizing),
                 cleanup_deadline: None,
                 stop: None,
-                process: Some(Process::Failed(ShellError::Unavailable)),
+                process: Some(Process::Failed(ExecCmdError::Unavailable)),
                 repair: false,
                 capture: None,
                 report: None,
@@ -186,7 +186,7 @@ impl Worker {
             });
             return Ok(());
         };
-        let request = ShellRequest {
+        let request = ExecCmdRequest {
             job_id: intent.job,
             command: intent.command.clone(),
             cwd: Some(intent.cwd.clone()),
@@ -194,25 +194,25 @@ impl Worker {
             secrets,
         };
         let sink = handle.output_sink();
-        let work = spawn("asura-shell-setup", self.wake.as_ref(), move |cancel| {
+        let work = spawn("asura-exec-cmd-setup", self.wake.as_ref(), move |cancel| {
             let failed = |error| Failure {
                 error,
                 cleanup: None,
             };
             // Setup checks only cancellation (J1-Q4).
             if cancel.load(Ordering::Acquire) {
-                return Err(failed(ShellError::Cancelled));
+                return Err(failed(ExecCmdError::Cancelled));
             }
             let executable =
-                std::env::current_exe().map_err(|_| failed(ShellError::Unavailable))?;
+                std::env::current_exe().map_err(|_| failed(ExecCmdError::Unavailable))?;
             let project = asura_platform::ProjectIdentity::open(&scope.path, &scope.boundary)
-                .map_err(|_| failed(ShellError::Denied))?;
+                .map_err(|_| failed(ExecCmdError::Denied))?;
             if project.device != scope.device || project.inode != scope.inode {
-                return Err(failed(ShellError::Denied));
+                return Err(failed(ExecCmdError::Denied));
             }
             #[cfg(feature = "test-support")]
             setup_gate(&runtime, cancel);
-            let prepared = PreparedShell::prepare(runtime, &project, request, cancel)
+            let prepared = PreparedExecCmd::prepare(runtime, &project, request, cancel)
                 .map_err(Failure::from)?;
             prepared
                 .spawn(&executable, cancel, sink)
@@ -228,7 +228,7 @@ impl Worker {
                     phase: Some(Phase::Finalizing),
                     cleanup_deadline: None,
                     stop: None,
-                    process: Some(Process::Failed(ShellError::Unavailable)),
+                    process: Some(Process::Failed(ExecCmdError::Unavailable)),
                     repair: false,
                     capture: Some(handle),
                     report: None,
@@ -301,7 +301,7 @@ impl Worker {
     /// Emits once, only after actual ownership and scratch cleanup settle,
     /// and after the sealed capture report or, after a cancel trigger, the
     /// L3 bound (J1-Q1).
-    pub(crate) fn poll(&mut self, now: Instant) -> Option<ShellOutput> {
+    pub(crate) fn poll(&mut self, now: Instant) -> Option<ExecCmdOutput> {
         let mut active = self.active.take()?;
         drain_capture(&mut active, now);
         let past_bound = active.cleanup_deadline.is_some_and(|d| now >= d);
@@ -319,8 +319,8 @@ impl Worker {
                 }
                 Ok(Err(failure)) => {
                     let error = match active.stop {
-                        Some(StopReason::Deadline) => ShellError::Deadline,
-                        Some(_) => ShellError::Cancelled,
+                        Some(StopReason::Deadline) => ExecCmdError::Deadline,
+                        Some(_) => ExecCmdError::Cancelled,
                         None => failure.error,
                     };
                     active.process = Some(Process::Failed(error));
@@ -330,7 +330,7 @@ impl Worker {
                     }
                     if let Some(token) = failure.cleanup {
                         self.cleanup(&mut active, token, now)
-                    } else if matches!(failure.error, ShellError::CleanupUnconfirmed) {
+                    } else if matches!(failure.error, ExecCmdError::CleanupUnconfirmed) {
                         active.repair = true;
                         Phase::Repair {
                             _cleanup: None,
@@ -351,7 +351,7 @@ impl Worker {
             Phase::Running(mut job) => {
                 if job.poll(now).is_err() {
                     if active.process.is_none() {
-                        active.process = Some(Process::Failed(ShellError::Protocol));
+                        active.process = Some(Process::Failed(ExecCmdError::Protocol));
                     }
                     job.stop(StopReason::Cancelled);
                     active.cleanup_deadline.get_or_insert(now + CLEANUP_BOUND);
@@ -426,25 +426,29 @@ impl Worker {
         self.active = Some(active);
         None
     }
-    fn cleanup(&self, active: &mut Active, token: ShellCleanup, now: Instant) -> Phase {
+    fn cleanup(&self, active: &mut Active, token: ExecCmdCleanup, now: Instant) -> Phase {
         let deadline = *active.cleanup_deadline.get_or_insert(now + CLEANUP_BOUND);
         // A failed thread spawn must not drop the unique cleanup token.
         // The reactor locks this handoff only if spawn failed: no thread exists
         // then, so no producer can hold the lock or block the reactor.
         let shared = Arc::new(std::sync::Mutex::new(Some(token)));
         let handoff = shared.clone();
-        match spawn("asura-shell-cleanup", self.wake.as_ref(), move |cancel| {
-            let mut token = handoff
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-                .expect("exclusive cleanup transfer");
-            let result = token.run(deadline, cancel);
-            Cleaned {
-                token: Some(token),
-                result,
-            }
-        }) {
+        match spawn(
+            "asura-exec-cmd-cleanup",
+            self.wake.as_ref(),
+            move |cancel| {
+                let mut token = handoff
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                    .expect("exclusive cleanup transfer");
+                let result = token.run(deadline, cancel);
+                Cleaned {
+                    token: Some(token),
+                    result,
+                }
+            },
+        ) {
             Ok(work) => Phase::Cleanup(work),
             Err(_) => {
                 active.repair = true;
@@ -457,12 +461,12 @@ impl Worker {
     }
 }
 
-/// Test-support setup gate (J1T-06): holds setup while `HOME/shell-hold-setup`
+/// Test-support setup gate (J1T-06): holds setup while `HOME/exec-cmd-hold-setup`
 /// exists; only cancellation releases it early.
 #[cfg(feature = "test-support")]
 fn setup_gate(runtime: &RuntimeDirectory, cancel: &AtomicBool) {
     if let Some(home) = runtime.scratch_home_for_test() {
-        while home.join("shell-hold-setup").exists() && !cancel.load(Ordering::Acquire) {
+        while home.join("exec-cmd-hold-setup").exists() && !cancel.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -477,11 +481,11 @@ fn drain_capture(active: &mut Active, now: Instant) {
         match message {
             Message::Sealed(report) => active.report = Some(report),
             Message::Fault(reason) => {
-                tracing::warn!(reason = reason.as_str(), "shell_capture_fault");
+                tracing::warn!(reason = reason.as_str(), "exec_cmd_capture_fault");
                 fault = true;
             }
             Message::Paused(reason) => {
-                tracing::info!(reason = ?reason, "shell_capture_paused");
+                tracing::info!(reason = ?reason, "exec_cmd_capture_paused");
             }
             _ => {}
         }
@@ -521,7 +525,7 @@ fn exit_facts(process: Option<&Process>) -> (u8, u32) {
 }
 
 /// Builds kind 23 and kind 15 for a settled call.
-fn output(mut active: Active) -> ShellOutput {
+fn output(mut active: Active) -> ExecCmdOutput {
     let (exit_kind, exit_value) = exit_facts(active.process.as_ref());
     let intent = &active.intent;
     let report = active.report.take();
@@ -608,7 +612,7 @@ fn output(mut active: Active) -> ShellOutput {
     let result = match active.process.as_ref() {
         Some(Process::Settled(result)) => mapped_result(intent, result, &tails, state),
         Some(Process::Failed(error)) => failed(intent, *error),
-        None => failed(intent, ShellError::Protocol),
+        None => failed(intent, ExecCmdError::Protocol),
     };
     let capture = active.capture.take();
     if state == CaptureState::Unconfirmed
@@ -616,7 +620,7 @@ fn output(mut active: Active) -> ShellOutput {
     {
         capture.abandon();
     }
-    ShellOutput {
+    ExecCmdOutput {
         settled,
         result,
         capture,
@@ -624,8 +628,8 @@ fn output(mut active: Active) -> ShellOutput {
 }
 
 fn mapped_result(
-    intent: &ShellIntent,
-    result: &ShellResult,
+    intent: &ExecCmdIntent,
+    result: &ExecCmdResult,
     tails: &Tails,
     capture: CaptureState,
 ) -> ToolResult {
@@ -636,7 +640,7 @@ fn mapped_result(
     if (result.exit_code.is_some() && result.signal.is_some())
         || (result.exit_code.is_none() && result.signal.is_none() && result.reason.is_none())
     {
-        return failed(intent, ShellError::Protocol);
+        return failed(intent, ExecCmdError::Protocol);
     }
     let status = match result.reason {
         Some(StopReason::Deadline) => 5,
@@ -646,7 +650,7 @@ fn mapped_result(
     };
     let text = result.render_text(tails, capture.as_str());
     if text.len() > 16_384 {
-        return failed(intent, ShellError::Protocol);
+        return failed(intent, ExecCmdError::Protocol);
     }
     ToolResult {
         operation: intent.operation,
@@ -659,16 +663,16 @@ fn mapped_result(
     }
 }
 
-pub(crate) fn failed(intent: &ShellIntent, error: ShellError) -> ToolResult {
+pub(crate) fn failed(intent: &ExecCmdIntent, error: ExecCmdError) -> ToolResult {
     let (status, text) = match error {
-        ShellError::Invalid => (3, "shell_invalid_arguments"),
-        ShellError::Denied => (2, "shell_denied"),
-        ShellError::Deadline => (5, "shell_timeout; effects may have occurred"),
-        ShellError::Cancelled => (6, "shell_cancelled; effects may have occurred"),
-        ShellError::Protocol | ShellError::CleanupUnconfirmed => {
-            (4, "shell_outcome_unconfirmed; effects may have occurred")
+        ExecCmdError::Invalid => (3, "exec_cmd_invalid_arguments"),
+        ExecCmdError::Denied => (2, "exec_cmd_denied"),
+        ExecCmdError::Deadline => (5, "exec_cmd_timeout; effects may have occurred"),
+        ExecCmdError::Cancelled => (6, "exec_cmd_cancelled; effects may have occurred"),
+        ExecCmdError::Protocol | ExecCmdError::CleanupUnconfirmed => {
+            (4, "exec_cmd_outcome_unconfirmed; effects may have occurred")
         }
-        ShellError::Unavailable | ShellError::Io => (4, "shell_unavailable"),
+        ExecCmdError::Unavailable | ExecCmdError::Io => (4, "exec_cmd_unavailable"),
     };
     ToolResult {
         operation: intent.operation,

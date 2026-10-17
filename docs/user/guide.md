@@ -324,7 +324,7 @@ by default Asura uses `http://127.0.0.1:11434`.
 
 Models can use four tools: `project` reads and lists project files, `memory`
 reads and creates notes, `service` reports status, tools and audit data, and
-`shell` runs one command in the project. The shell has no network access. A
+`exec_cmd` runs one command in the project. The exec_cmd tool has no network access. A
 command runs until it finishes or you stop the answer with `/cancel`; it has no
 time limit. `/tools` lists the tools. A listed tool is not
 always permitted for the current model or project.

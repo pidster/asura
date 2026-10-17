@@ -394,7 +394,7 @@ pub fn validate_semantics(
                 && match &v.arguments {
                     Some(pb::tool_call::Arguments::ObserveStatus(_)) => true,
                     Some(pb::tool_call::Arguments::ListTools(_)) => true,
-                    Some(pb::tool_call::Arguments::Shell(args)) => {
+                    Some(pb::tool_call::Arguments::ExecCmd(args)) => {
                         args.command
                             .as_ref()
                             .is_some_and(|c| !c.is_empty() && c.len() <= 8192 && !c.contains('\0'))

@@ -1545,16 +1545,16 @@ def rich_activity(fixture, source, multipass=False):
                                         "done": True, "done_reason": "stop",
                                         "prompt_eval_count": 16 * (len(requests) + 1), "eval_count": 2}
                         elif not multipass and len(requests) == 1:
-                            assert any(tool["function"]["name"] == "shell" for tool in chat["tools"])
+                            assert any(tool["function"]["name"] == "exec_cmd" for tool in chat["tools"])
                             response = {"message": {"role": "assistant", "content": "",
-                                        "tool_calls": [{"function": {"name": "shell", "arguments": {
+                                        "tool_calls": [{"function": {"name": "exec_cmd", "arguments": {
                                             "command": "sleep 1; printf fixture-result", "cwd": ".", "timeout_seconds": 5}}}]},
                                         "done": True, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}
                         else:
                             tool_messages = [message for message in chat["messages"] if message.get("role") == "tool"]
                             if multipass:
                                 assert len(tool_messages) == 3, tool_messages
-                                assert "shell" in tool_messages[-1]["content"], tool_messages[-1]
+                                assert "exec_cmd" in tool_messages[-1]["content"], tool_messages[-1]
                             else:
                                 assert any("fixture-result" in message.get("content", "")
                                            for message in tool_messages), chat["messages"]
@@ -1636,7 +1636,7 @@ def rich_activity(fixture, source, multipass=False):
         assert not errors, errors
 
 
-def shell_capture(fixture, source):
+def exec_cmd_capture(fixture, source):
     """J1/SL3 end-to-end through the real TUI, service, helper and a scripted
     loopback model: J1T-24 (placeholders in the result and activity),
     J1T-25 fixture part (the TUI shows the rewritten command; it runs),
@@ -1713,7 +1713,7 @@ def shell_capture(fixture, source):
                                      "done": True, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3}
                         else:
                             reply = {"message": {"role": "assistant", "content": "",
-                                                 "tool_calls": [{"function": {"name": "shell", "arguments": step}}]},
+                                                 "tool_calls": [{"function": {"name": "exec_cmd", "arguments": step}}]},
                                      "done": True, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}
                         peer.sendall(json.dumps(reply).encode() + b"\n")
                         continue
@@ -1725,7 +1725,7 @@ def shell_capture(fixture, source):
             if not stopped.is_set():
                 errors.append(error)
 
-    server = threading.Thread(target=serve, name="asura-shell-capture-fixture")
+    server = threading.Thread(target=serve, name="asura-exec-cmd-capture-fixture")
     server.start()
     trial = None
     home = fixture.root / "home"
@@ -1812,12 +1812,12 @@ def shell_capture(fixture, source):
         offset = len(trial.output)
         trial.send(b"Busy please.\r")
         end = time.monotonic() + 30
-        while not any("shell_busy: quota" in m for m in tool_messages):
+        while not any("exec_cmd_busy: quota" in m for m in tool_messages):
             assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
             trial.read(0.05)
         trial.until(b"COMPLETE", offset, plain=True, limit=30, reject="Incomplete response")
         assert not (project / "busy.txt").exists()
-        assert any("shell_busy: quota" in m for m in tool_messages), tool_messages[-3:]
+        assert any("exec_cmd_busy: quota" in m for m in tool_messages), tool_messages[-3:]
         (home / "payload-free-bytes").unlink()
         trial.send(b"\x01/quit\r")
         trial.finish()
@@ -2465,7 +2465,7 @@ def main():
     helpmode = len(sys.argv) == 3 and sys.argv[2] == "--help-mode"
     long_turns = len(sys.argv) == 3 and sys.argv[2] == "--long-conversation"
     waits = len(sys.argv) == 3 and sys.argv[2] == "--journal-waits"
-    capture = len(sys.argv) == 3 and sys.argv[2] == "--shell-capture"
+    capture = len(sys.argv) == 3 and sys.argv[2] == "--exec-cmd-capture"
     waits_client = len(sys.argv) == 3 and sys.argv[2] == "--client-waits"
     steps = len(sys.argv) == 3 and sys.argv[2] == "--waiting-steps"
     assert len(sys.argv) == 2 or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
@@ -2513,7 +2513,7 @@ def main():
             rich_activity(fixture, source, multipass)
             return
         if capture:
-            shell_capture(fixture, source)
+            exec_cmd_capture(fixture, source)
             return
         if steps:
             DEADLINE = time.monotonic() + 70

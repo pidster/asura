@@ -4,14 +4,14 @@
 mod audit_journey;
 #[path = "support/cancellation_driven_journey.rs"]
 mod cancellation_driven_journey;
+#[path = "support/exec_cmd_journey.rs"]
+mod exec_cmd_journey;
 #[path = "support/memory_create_journey.rs"]
 mod memory_create_journey;
 #[path = "support/memory_tools_journey.rs"]
 mod memory_tools_journey;
 #[path = "support/sensors_journey.rs"]
 mod sensors_journey;
-#[path = "support/shell_journey.rs"]
-mod shell_journey;
 #[path = "support/tools_inventory_journey.rs"]
 mod tools_inventory_journey;
 #[path = "support/waiting_step_journey.rs"]
@@ -2262,10 +2262,13 @@ fn child(home: &Path) -> Result<()> {
 }
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    if args.get(1).is_some_and(|a| a == "--asura-shell-guardian") {
+    if args
+        .get(1)
+        .is_some_and(|a| a == "--asura-exec-cmd-guardian")
+    {
         let code = match args.as_slice() {
             [_, _, job, deadline, command] => {
-                asura_platform::shell::run_guardian(job, deadline, command)
+                asura_platform::exec_cmd::run_guardian(job, deadline, command)
             }
             _ => 2,
         };
@@ -2281,18 +2284,18 @@ fn main() {
         waiting_step_journey::run()
     } else if args.iter().any(|a| a == "--long-inference") {
         cancellation_driven_journey::run()
-    } else if args.iter().any(|a| a == "--native-shell-tools") {
-        shell_journey::run("system")
-    } else if args.iter().any(|a| a == "--native-ollama-shell-tools") {
-        shell_journey::run("ollama")
+    } else if args.iter().any(|a| a == "--native-exec-cmd-tools") {
+        exec_cmd_journey::run("system")
+    } else if args.iter().any(|a| a == "--native-ollama-exec-cmd-tools") {
+        exec_cmd_journey::run("ollama")
     } else if args.iter().any(|a| a == "--native-ollama-audit-tools") {
         audit_journey::run(Some("ollama"))
-    } else if args.iter().any(|a| a == "--native-mlx-shell-tools") {
-        shell_journey::run("mlx")
+    } else if args.iter().any(|a| a == "--native-mlx-exec-cmd-tools") {
+        exec_cmd_journey::run("mlx")
     } else if args.iter().any(|a| a == "--native-mlx-audit-tools") {
         audit_journey::run(Some("mlx"))
-    } else if args.iter().any(|a| a == "--native-coreai-shell-tools") {
-        shell_journey::run("coreai")
+    } else if args.iter().any(|a| a == "--native-coreai-exec-cmd-tools") {
+        exec_cmd_journey::run("coreai")
     } else if args.iter().any(|a| a == "--native-coreai-audit-tools") {
         audit_journey::run(Some("coreai"))
     } else if args.iter().any(|a| a == "--audit") {

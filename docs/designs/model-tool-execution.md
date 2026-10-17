@@ -896,7 +896,7 @@ stopped by the fixtures.
 
 ## Command execution extension
 
-The selected [shell design](shell-tool.md) adds one noninteractive command tool.
+The selected [exec_cmd design](exec-cmd-tool.md) adds one noninteractive command tool.
 It requires a separate execution grant for an admitted foreground turn.
 The existing read grant does not authorize commands. The service retains execution,
 cleanup and durable result ownership through the same conversation pipeline.
@@ -908,7 +908,7 @@ The [turn lifetime policy](model-provider-integration.md#cancellation-driven-tur
 removes the fixed whole-turn expiry. The tool budget retains call count, total
 result bytes, one pending call, identity, generation and cancellation checks.
 Ordinary tool work receives its existing two-second deadline at tool admission.
-Shell receives its validated requested duration. Cached results revalidate exact
+exec_cmd receives its validated requested duration. Cached results revalidate exact
 call identity and current authority; elapsed turn time does not invalidate them.
 An expired live-tool deadline still prevents delivery. Tests must cover a late
 admission and cached result, plus cancellation and expired-tool rejection.

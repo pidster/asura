@@ -427,7 +427,7 @@ impl Replay {
                     intent_frame: frame,
                     result_frame: None,
                     result_bytes: 0,
-                    shell: None,
+                    exec_cmd: None,
                 });
             }
             Record::ToolIntent(p) => {
@@ -455,10 +455,10 @@ impl Replay {
                     intent_frame: frame,
                     result_frame: None,
                     result_bytes: 0,
-                    shell: None,
+                    exec_cmd: None,
                 });
             }
-            Record::ShellIntent(p) => self.shell_intent(*p, frame)?,
+            Record::ExecCmdIntent(p) => self.exec_cmd_intent(*p, frame)?,
             Record::CaptureSettled(p) => self.capture_settled(*p, frame)?,
             Record::ToolResult(p) => {
                 let owner = self.owner_generation;
@@ -475,19 +475,19 @@ impl Replay {
                 )?;
                 let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
                 require(tool.result_frame.is_none())?;
-                if let Some(shell) = &tool.shell {
+                if let Some(exec_cmd) = &tool.exec_cmd {
                     // J1 order: admitted 22, 23, 15; refused 22, 15 status 3;
                     // busy 22, 15 status 4.
-                    require(match shell.disposition {
-                        ShellDisposition::Admitted => shell.settled.is_some(),
-                        ShellDisposition::Refused => p.status == 3,
-                        ShellDisposition::Busy => p.status == 4,
+                    require(match exec_cmd.disposition {
+                        ExecCmdDisposition::Admitted => exec_cmd.settled.is_some(),
+                        ExecCmdDisposition::Refused => p.status == 3,
+                        ExecCmdDisposition::Busy => p.status == 4,
                     })?;
                 }
-                if tool.kind == SHELL_TOOL_KIND {
+                if tool.kind == EXEC_CMD_TOOL_KIND {
                     require(p.next_offset.is_none())?;
                 } else if p.status != 1 {
-                    // The structural codec cannot see the intent kind. Shell is
+                    // The structural codec cannot see the intent kind. exec_cmd is
                     // the sole exception for captured timeout/cancel/limit tails.
                     require(p.next_offset.is_none() && !p.truncated)?;
                 }
@@ -514,7 +514,7 @@ impl Replay {
                             p.text.len() <= tool.limit as usize
                                 && p.next_offset == tool.offset.checked_add(p.text.len() as u64)
                         }
-                        2 | SHELL_TOOL_KIND => p.next_offset.is_none(),
+                        2 | EXEC_CMD_TOOL_KIND => p.next_offset.is_none(),
                         3 | 6 | 8 | 12 | 14 | 15 => {
                             p.next_offset.is_none() && !p.truncated && p.text.len() <= 16_384
                         }
@@ -526,7 +526,7 @@ impl Replay {
                 tool.result_bytes = p.text.len();
                 tool.preview = Some(if matches!(tool.kind, 7 | 12) {
                     format!("captured {} bytes", p.text.len())
-                } else if tool.kind == SHELL_TOOL_KIND {
+                } else if tool.kind == EXEC_CMD_TOOL_KIND {
                     let output = p
                         .text
                         .split_once("\nstdout:\n")
@@ -538,7 +538,7 @@ impl Replay {
                     display_prefix(&p.text, 128)
                 });
                 tool.truncated = Some(p.truncated);
-                if tool.kind == SHELL_TOOL_KIND {
+                if tool.kind == EXEC_CMD_TOOL_KIND {
                     tool.exit_code = p
                         .text
                         .lines()
@@ -556,9 +556,9 @@ impl Replay {
     }
     /// Kind 22 follows the kind 14 admission rules. An admitted record's job
     /// and payload IDs must equal their derivations from this installation.
-    fn shell_intent(&mut self, p: ShellIntent, frame: Range<usize>) -> Result<()> {
+    fn exec_cmd_intent(&mut self, p: ExecCmdIntent, frame: Range<usize>) -> Result<()> {
         p.validate()?;
-        if p.disposition == ShellDisposition::Admitted {
+        if p.disposition == ExecCmdDisposition::Admitted {
             let payload = |kind| {
                 crate::payload::payload_id(
                     self.installation_id,
@@ -569,12 +569,12 @@ impl Replay {
                 )
             };
             require(
-                p.job == shell_job_id(p.operation, p.generation, p.ordinal)
+                p.job == exec_cmd_job_id(p.operation, p.generation, p.ordinal)
                     && p.stdout_payload == payload(crate::payload::ObjectKind::Stdout)
                     && p.stderr_payload == payload(crate::payload::ObjectKind::Stderr),
             )?;
         }
-        // ToolRecord, ShellCall and the bounded display prefix.
+        // ToolRecord, ExecCmdCall and the bounded display prefix.
         self.charge(1536)?;
         let sequence = next(self.sequence)?;
         let owner = self.owner_generation;
@@ -593,14 +593,14 @@ impl Replay {
             truncated: None,
             exit_code: None,
             create: None,
-            kind: SHELL_TOOL_KIND,
+            kind: EXEC_CMD_TOOL_KIND,
             offset: 0,
             limit: 0,
             result_status: None,
             intent_frame: frame,
             result_frame: None,
             result_bytes: 0,
-            shell: Some(Box::new(ShellCall {
+            exec_cmd: Some(Box::new(ExecCmdCall {
                 disposition: p.disposition,
                 job: p.job,
                 stdout_payload: p.stdout_payload,
@@ -623,14 +623,14 @@ impl Replay {
         require(op.owner_generation == owner && p.ordinal as usize == op.tools.len())?;
         let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
         require(tool.result_frame.is_none())?;
-        let shell = tool.shell.as_deref_mut().ok_or(ReplayError::Corrupt)?;
+        let exec_cmd = tool.exec_cmd.as_deref_mut().ok_or(ReplayError::Corrupt)?;
         require(
-            shell.disposition == ShellDisposition::Admitted
-                && shell.settled.is_none()
-                && shell.rule_set_revision == p.rule_set_revision
-                && shell.rule_set_digest == p.rule_set_digest,
+            exec_cmd.disposition == ExecCmdDisposition::Admitted
+                && exec_cmd.settled.is_none()
+                && exec_cmd.rule_set_revision == p.rule_set_revision
+                && exec_cmd.rule_set_digest == p.rule_set_digest,
         )?;
-        shell.settled = Some(ShellSettlement {
+        exec_cmd.settled = Some(ExecCmdSettlement {
             state: p.state,
             reason: p.reason,
             sequence,
@@ -1334,8 +1334,9 @@ impl Replay {
                 self.reserved_bytes += HEADER + TRAILER + 43 + 16_384;
                 self.reserved_frames += 1;
                 // An admitted kind 22 also holds room for its kind 23.
-                if tool.shell.as_deref().is_some_and(|shell| {
-                    shell.disposition == ShellDisposition::Admitted && shell.settled.is_none()
+                if tool.exec_cmd.as_deref().is_some_and(|exec_cmd| {
+                    exec_cmd.disposition == ExecCmdDisposition::Admitted
+                        && exec_cmd.settled.is_none()
                 }) {
                     self.reserved_bytes += CAPTURE_CAPACITY;
                     self.reserved_frames += 1;

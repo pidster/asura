@@ -1343,7 +1343,7 @@ qualification is not claimed.
 
 | Delivery | Evidence owner |
 | --- | --- |
-| Model tool activation and the bounded shell tool | [Model tools](../designs/model-tool-execution.md), [shell tool](../designs/shell-tool.md), [consolidated tools](../designs/consolidated-tools.md) |
+| Model tool activation and the bounded exec_cmd tool | [Model tools](../designs/model-tool-execution.md), [exec_cmd tool](../designs/exec-cmd-tool.md), [consolidated tools](../designs/consolidated-tools.md) |
 | Local and remote model providers | [Model providers](../designs/model-provider-integration.md) |
 | Managed input queue | [Managed input queue](../designs/managed-input-queue.md) |
 | Conversation restoration | [Conversation restoration](../designs/conversation-restoration.md) |

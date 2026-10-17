@@ -1,12 +1,12 @@
 use super::*;
 use asura_storage::authority::conversation::CaptureStream;
 
-fn intent() -> ShellIntent {
-    ShellIntent {
+fn intent() -> ExecCmdIntent {
+    ExecCmdIntent {
         operation: [1; 16],
         generation: 1,
         ordinal: 1,
-        disposition: ShellDisposition::Admitted,
+        disposition: ExecCmdDisposition::Admitted,
         command_truncated: false,
         command: "true".into(),
         cwd: ".".into(),
@@ -22,7 +22,7 @@ fn intent() -> ShellIntent {
     }
 }
 fn settled_process() -> Process {
-    Process::Settled(ShellResult {
+    Process::Settled(ExecCmdResult {
         failure: None,
         exit_code: Some(0),
         signal: None,
@@ -126,16 +126,16 @@ fn sealed_report_builds_kind_23_and_kind_15_from_redacted_tails() {
 #[test]
 fn j1t_06_setup_has_no_deadline() {
     let (release, blocked) = std::sync::mpsc::sync_channel::<()>(1);
-    let work = spawn("shell-setup-fixture", None, move |cancel| {
+    let work = spawn("exec-cmd-setup-fixture", None, move |cancel| {
         let _ = blocked.recv();
         if cancel.load(Ordering::Acquire) {
             Err(Failure {
-                error: ShellError::Cancelled,
+                error: ExecCmdError::Cancelled,
                 cleanup: None,
             })
         } else {
             Err(Failure {
-                error: ShellError::Unavailable,
+                error: ExecCmdError::Unavailable,
                 cleanup: None,
             })
         }
@@ -182,7 +182,7 @@ fn settled_setup_failures_never_become_successful_command_results() {
         stderr: String::new(),
         truncated: true,
     };
-    let mut result = ShellResult {
+    let mut result = ExecCmdResult {
         exit_code: None,
         signal: None,
         reason: None,
@@ -190,14 +190,14 @@ fn settled_setup_failures_never_become_successful_command_results() {
         cleanup_confirmed: true,
     };
     for (error, status) in [
-        (ShellError::Invalid, 3),
-        (ShellError::Denied, 2),
-        (ShellError::Deadline, 5),
-        (ShellError::Cancelled, 6),
-        (ShellError::Unavailable, 4),
-        (ShellError::Protocol, 4),
-        (ShellError::CleanupUnconfirmed, 4),
-        (ShellError::Io, 4),
+        (ExecCmdError::Invalid, 3),
+        (ExecCmdError::Denied, 2),
+        (ExecCmdError::Deadline, 5),
+        (ExecCmdError::Cancelled, 6),
+        (ExecCmdError::Unavailable, 4),
+        (ExecCmdError::Protocol, 4),
+        (ExecCmdError::CleanupUnconfirmed, 4),
+        (ExecCmdError::Io, 4),
     ] {
         result.failure = Some(error);
         let mapped = mapped_result(&intent(), &result, &tails, CaptureState::Complete);

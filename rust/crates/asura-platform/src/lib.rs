@@ -28,9 +28,9 @@ pub use authority::{
 pub use config::{PrivateFileError, PrivateFileSnapshot};
 mod lifetime;
 pub use lifetime::{ServiceLease, ServiceLifetime};
+pub mod exec_cmd;
 mod runtime;
 pub mod secrets;
-pub mod shell;
 mod startup;
 mod terminal;
 pub use runtime::{

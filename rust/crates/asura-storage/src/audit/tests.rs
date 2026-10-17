@@ -336,3 +336,16 @@ fn retention_decrease_removes_at_most_32_per_cycle_after_new_active_exists() {
     row.service_epoch = [2; 16];
     opened.store.append_batch(&[row], &cancel).unwrap();
 }
+
+#[test]
+fn exec_cmd_tool_label_round_trips_with_value_9() {
+    assert_eq!(
+        serde_json::to_string(&Tool::ExecCmd).unwrap(),
+        "\"exec_cmd\""
+    );
+    assert_eq!(
+        serde_json::from_str::<Tool>("\"exec_cmd\"").unwrap(),
+        Tool::ExecCmd
+    );
+    assert_eq!(Tool::ExecCmd as u32, 9);
+}

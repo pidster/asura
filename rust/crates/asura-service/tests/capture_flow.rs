@@ -183,10 +183,10 @@ fn id(value: Option<Vec<u8>>) -> Result<[u8; 16]> {
 
 // ------------------------------------------------------- scripted model
 
-/// One scripted model reply: a shell call, or the final answer.
+/// One scripted model reply: an exec_cmd call, or the final answer.
 #[derive(Clone)]
 enum Step {
-    Shell(String),
+    ExecCmd(String),
     Final,
 }
 struct Model {
@@ -311,9 +311,9 @@ fn serve(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
         )?;
         let response = match step {
-            Step::Shell(command) => serde_json::json!({
+            Step::ExecCmd(command) => serde_json::json!({
                 "message": {"role": "assistant", "content": "", "tool_calls": [
-                    {"function": {"name": "shell", "arguments": {"command": command, "cwd": "."}}}]},
+                    {"function": {"name": "exec_cmd", "arguments": {"command": command, "cwd": "."}}}]},
                 "done": true, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}),
             Step::Final => serde_json::json!({
                 "message": {"role": "assistant", "content": "COMPLETE"},
@@ -364,13 +364,13 @@ fn cancel(fixture: &Fixture, operation: [u8; 16]) -> Result<Duration> {
         .cancel_conversation(operation, 1, &|| false)?;
     Ok(started.elapsed())
 }
-/// The records of one operation's shell calls, decoded from the journal.
+/// The records of one operation's exec_cmd calls, decoded from the journal.
 struct Call {
-    intent: journal::ShellIntent,
+    intent: journal::ExecCmdIntent,
     settled: Option<journal::CaptureSettled>,
     result: Option<journal::ToolResult>,
 }
-fn shell_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
+fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
     let (bytes, replay) = fixture.journal()?;
     let op = replay
         .operations
@@ -386,10 +386,10 @@ fn shell_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
     };
     let mut out = Vec::new();
     for tool in &op.tools {
-        let journal::Record::ShellIntent(intent) = decode(tool.intent_frame.clone())? else {
+        let journal::Record::ExecCmdIntent(intent) = decode(tool.intent_frame.clone())? else {
             return Err("kind 22 expected".into());
         };
-        let settled = match tool.shell.as_ref().and_then(|s| s.settled.as_ref()) {
+        let settled = match tool.exec_cmd.as_ref().and_then(|s| s.settled.as_ref()) {
             Some(s) => match decode(s.frame.clone())? {
                 journal::Record::CaptureSettled(settled) => Some(*settled),
                 _ => return Err("kind 23 expected".into()),
@@ -475,8 +475,8 @@ fn setup(label: &str) -> Result<(Fixture, Model, [u8; 16], PathBuf)> {
 
 // ------------------------------------------------------------------ cases
 
-/// J1T-24 (SDE-01 shell part, transport level), J1T-14 (SDI-03), J1T-03
-/// integration and the refused forms: one turn of four shell calls.
+/// J1T-24 (SDE-01 exec_cmd part, transport level), J1T-14 (SDI-03), J1T-03
+/// integration and the refused forms: one turn of four exec_cmd calls.
 fn secrets_turn() -> Result<()> {
     let (fixture, model, project, directory) = setup("secrets")?;
     let first = token("Qr5");
@@ -486,11 +486,11 @@ fn secrets_turn() -> Result<()> {
         format!("GITHUB_TOKEN={first}\nPLAIN=value\n"),
     )?;
     model.script(&[
-        Step::Shell("cat .env".into()),
-        Step::Shell(format!(
+        Step::ExecCmd("cat .env".into()),
+        Step::ExecCmd(format!(
             "printf '%s' \"{second}\" > out.txt; sleep 2; printf done"
         )),
-        Step::Shell(format!("echo '{first}'")),
+        Step::ExecCmd(format!("echo '{first}'")),
         Step::Final,
     ]);
     let operation = submit(&fixture, project, "Run the fixture commands.")?;
@@ -525,11 +525,14 @@ fn secrets_turn() -> Result<()> {
             .unwrap_or("")
             .contains("ASURA_SECRET_1")
     );
-    let calls = shell_calls(&fixture, operation)?;
+    let calls = exec_cmd_calls(&fixture, operation)?;
     assert_eq!(calls.len(), 3);
     // 1. cat .env: placeholders in the result and in what the model saw.
     let cat = &calls[0];
-    assert_eq!(cat.intent.disposition, journal::ShellDisposition::Admitted);
+    assert_eq!(
+        cat.intent.disposition,
+        journal::ExecCmdDisposition::Admitted
+    );
     let settled = cat.settled.as_ref().ok_or("kind 23")?;
     assert_eq!(settled.state, CaptureState::Complete);
     let result = cat.result.as_ref().ok_or("kind 15")?;
@@ -563,7 +566,7 @@ fn secrets_turn() -> Result<()> {
     let quoted = &calls[2];
     assert_eq!(
         quoted.intent.disposition,
-        journal::ShellDisposition::Refused
+        journal::ExecCmdDisposition::Refused
     );
     assert_eq!(
         quoted.intent.refusal.map(|r| r.code),
@@ -581,7 +584,7 @@ fn secrets_turn() -> Result<()> {
     }
     assert!(messages[2].contains("single-quoted"));
     // The service stays available.
-    model.script(&[Step::Shell("printf after".into()), Step::Final]);
+    model.script(&[Step::ExecCmd("printf after".into()), Step::Final]);
     let next = submit(&fixture, project, "Again.")?;
     assert_eq!(
         finish(&fixture, next, Duration::from_secs(30))?.kind,
@@ -602,7 +605,7 @@ fn secrets_turn() -> Result<()> {
 /// J1T-05 integration: no 60 s limit; turn cancel stops a command.
 fn timeout_removed() -> Result<()> {
     let (fixture, model, project, directory) = setup("timeout")?;
-    model.script(&[Step::Shell("sleep 65; exit 7".into()), Step::Final]);
+    model.script(&[Step::ExecCmd("sleep 65; exit 7".into()), Step::Final]);
     let started = Instant::now();
     let operation = submit(&fixture, project, "Long.")?;
     // Controls respond while the command runs.
@@ -612,13 +615,13 @@ fn timeout_removed() -> Result<()> {
     })?;
     let event = finish(&fixture, operation, Duration::from_secs(120))?;
     assert_eq!(event.kind, Some(3));
-    let calls = shell_calls(&fixture, operation)?;
+    let calls = exec_cmd_calls(&fixture, operation)?;
     let result = calls[0].result.as_ref().ok_or("kind 15")?;
     assert_eq!(result.status, 1);
     assert!(result.text.contains("exit_code=7"), "{}", result.text);
     assert!(started.elapsed() >= Duration::from_secs(65));
     model.script(&[
-        Step::Shell("printf '%s' $$ > pid; sleep 300".into()),
+        Step::ExecCmd("printf '%s' $$ > pid; sleep 300".into()),
         Step::Final,
     ]);
     let operation = submit(&fixture, project, "Cancel me.")?;
@@ -628,7 +631,7 @@ fn timeout_removed() -> Result<()> {
     let latency = cancel(&fixture, operation)?;
     let event = finish(&fixture, operation, Duration::from_secs(20))?;
     assert_eq!(event.kind, Some(5), "{event:?}");
-    let calls = shell_calls(&fixture, operation)?;
+    let calls = exec_cmd_calls(&fixture, operation)?;
     assert_eq!(calls[0].result.as_ref().map(|r| r.status), Some(6));
     let pid: i32 = std::fs::read_to_string(directory.join("pid"))?.parse()?;
     // SAFETY: signal 0 only probes the (now absent) process group.
@@ -644,9 +647,9 @@ fn timeout_removed() -> Result<()> {
 /// held setup with `not_started`.
 fn setup_budget_removed() -> Result<()> {
     let (fixture, model, project, directory) = setup("setup")?;
-    let hold = fixture.home.join("shell-hold-setup");
+    let hold = fixture.home.join("exec-cmd-hold-setup");
     std::fs::write(&hold, b"")?;
-    model.script(&[Step::Shell("printf ran > marker".into()), Step::Final]);
+    model.script(&[Step::ExecCmd("printf ran > marker".into()), Step::Final]);
     let operation = submit(&fixture, project, "Held setup.")?;
     thread::sleep(Duration::from_millis(2600));
     assert!(!directory.join("marker").exists(), "setup is held");
@@ -660,7 +663,7 @@ fn setup_budget_removed() -> Result<()> {
         "spawned after a 2.6 s setup"
     );
     std::fs::write(&hold, b"")?;
-    model.script(&[Step::Shell("printf ran > marker2".into()), Step::Final]);
+    model.script(&[Step::ExecCmd("printf ran > marker2".into()), Step::Final]);
     let operation = submit(&fixture, project, "Held setup cancelled.")?;
     thread::sleep(Duration::from_millis(1500));
     cancel(&fixture, operation)?;
@@ -669,7 +672,7 @@ fn setup_budget_removed() -> Result<()> {
         Some(5)
     );
     std::fs::remove_file(&hold)?;
-    let calls = shell_calls(&fixture, operation)?;
+    let calls = exec_cmd_calls(&fixture, operation)?;
     let settled = calls[0].settled.as_ref().ok_or("kind 23")?;
     assert_eq!(settled.state, CaptureState::NotStarted);
     assert_eq!(calls[0].result.as_ref().map(|r| r.status), Some(6));
@@ -684,7 +687,7 @@ fn no_output_stop() -> Result<()> {
     let (fixture, model, project, _) = setup("big")?;
     let size = 80 * 1024 * 1024;
     model.script(&[
-        Step::Shell(format!(
+        Step::ExecCmd(format!(
             "/usr/bin/yes 0123456789abcdef | /usr/bin/head -c {size}"
         )),
         Step::Final,
@@ -694,7 +697,7 @@ fn no_output_stop() -> Result<()> {
         finish(&fixture, operation, Duration::from_secs(600))?.kind,
         Some(3)
     );
-    let calls = shell_calls(&fixture, operation)?;
+    let calls = exec_cmd_calls(&fixture, operation)?;
     let settled = calls[0].settled.as_ref().ok_or("kind 23")?;
     assert_eq!(settled.state, CaptureState::Complete);
     assert_eq!(settled.stdout.stored_bytes, size);
@@ -727,19 +730,25 @@ fn quota_busy() -> Result<()> {
     fixture.wait_ready()?;
     let (project, directory) = fixture.project("project")?;
     fixture.model(&model.endpoint)?;
-    model.script(&[Step::Shell("printf ran > marker".into()), Step::Final]);
+    model.script(&[Step::ExecCmd("printf ran > marker".into()), Step::Final]);
     let operation = submit(&fixture, project, "Busy.")?;
     assert_eq!(
         finish(&fixture, operation, Duration::from_secs(30))?.kind,
         Some(3)
     );
-    let calls = shell_calls(&fixture, operation)?;
-    assert_eq!(calls[0].intent.disposition, journal::ShellDisposition::Busy);
-    assert_eq!(calls[0].intent.busy, Some(journal::ShellBusyReason::Quota));
+    let calls = exec_cmd_calls(&fixture, operation)?;
+    assert_eq!(
+        calls[0].intent.disposition,
+        journal::ExecCmdDisposition::Busy
+    );
+    assert_eq!(
+        calls[0].intent.busy,
+        Some(journal::ExecCmdBusyReason::Quota)
+    );
     assert_eq!(calls[0].result.as_ref().map(|r| r.status), Some(4));
     assert!(!directory.join("marker").exists());
     let messages = model.tool_messages();
-    assert!(messages[0].contains("shell_busy: quota"), "{messages:?}");
+    assert!(messages[0].contains("exec_cmd_busy: quota"), "{messages:?}");
     println!("PASS J1T-08 visible busy: kind 22 busy quota, kind 15 status 4, nothing ran");
     Ok(())
 }
@@ -753,7 +762,7 @@ fn overload() -> Result<()> {
     std::fs::write(&gate, b"")?;
     let flood = "while :; do printf '%0200d\\n' 1; done";
     for round in 0..4 {
-        model.script(&[Step::Shell(flood.into()), Step::Final]);
+        model.script(&[Step::ExecCmd(flood.into()), Step::Final]);
         let operation = submit(&fixture, project, "Flood.")?;
         thread::sleep(Duration::from_millis(if round == 0 { 3000 } else { 800 }));
         let event = fixture.attach()?.observe_conversation(operation, 0)?;
@@ -770,7 +779,7 @@ fn overload() -> Result<()> {
             Some(5)
         );
         let settled_after = cancel_started.elapsed();
-        let calls = shell_calls(&fixture, operation)?;
+        let calls = exec_cmd_calls(&fixture, operation)?;
         let settled = calls[0].settled.as_ref().ok_or("kind 23")?;
         assert_eq!(settled.state, CaptureState::Unconfirmed);
         assert_eq!(settled.reason, CaptureReason::SettlementUnconfirmed);
@@ -782,22 +791,22 @@ fn overload() -> Result<()> {
             println!("J1T-21: unconfirmed settled {settled_after:?} after the cancel");
         }
     }
-    model.script(&[Step::Shell("printf ran".into()), Step::Final]);
+    model.script(&[Step::ExecCmd("printf ran".into()), Step::Final]);
     let operation = submit(&fixture, project, "Full list.")?;
     assert_eq!(
         finish(&fixture, operation, Duration::from_secs(20))?.kind,
         Some(3)
     );
-    let calls = shell_calls(&fixture, operation)?;
+    let calls = exec_cmd_calls(&fixture, operation)?;
     assert_eq!(
         calls[0].intent.busy,
-        Some(journal::ShellBusyReason::PendingFull)
+        Some(journal::ExecCmdBusyReason::PendingFull)
     );
     std::fs::remove_file(&gate)?;
     // Released workers abandon and leave the list; admission resumes.
     let mut admitted = false;
     for _ in 0..50 {
-        model.script(&[Step::Shell("printf ran".into()), Step::Final]);
+        model.script(&[Step::ExecCmd("printf ran".into()), Step::Final]);
         let operation = submit(&fixture, project, "After release.")?;
         finish(&fixture, operation, Duration::from_secs(20))?;
         if calls_admitted(&fixture, operation)? {
@@ -813,8 +822,8 @@ fn overload() -> Result<()> {
     Ok(())
 }
 fn calls_admitted(fixture: &Fixture, operation: [u8; 16]) -> Result<bool> {
-    Ok(shell_calls(fixture, operation)?[0].intent.disposition
-        == journal::ShellDisposition::Admitted)
+    Ok(exec_cmd_calls(fixture, operation)?[0].intent.disposition
+        == journal::ExecCmdDisposition::Admitted)
 }
 
 /// J1T-22 (RG-05): crashes at each point; recovery installs once and never
@@ -835,18 +844,18 @@ fn crash_points() -> Result<()> {
         std::fs::read_to_string(directory.join(name)).map_or(0, |s| s.len())
     };
     // (a) After kind 22, before spawn.
-    std::fs::write(fixture.home.join("shell-hold-setup"), b"")?;
-    model.script(&[Step::Shell("printf x >> a.txt".into()), Step::Final]);
+    std::fs::write(fixture.home.join("exec-cmd-hold-setup"), b"")?;
+    model.script(&[Step::ExecCmd("printf x >> a.txt".into()), Step::Final]);
     let a = submit(&fixture, project, "a")?;
     wait_for(Duration::from_secs(20), "kind 22", || {
-        shell_calls(&fixture, a).is_ok_and(|c| !c.is_empty())
+        exec_cmd_calls(&fixture, a).is_ok_and(|c| !c.is_empty())
     })?;
     restart(&mut fixture)?;
-    std::fs::remove_file(fixture.home.join("shell-hold-setup"))?;
+    std::fs::remove_file(fixture.home.join("exec-cmd-hold-setup"))?;
     assert_eq!(effects("a.txt"), 0, "never ran, never reruns");
     // (b) While running.
     model.script(&[
-        Step::Shell("printf x >> b.txt; printf partial; sleep 60".into()),
+        Step::ExecCmd("printf x >> b.txt; printf partial; sleep 60".into()),
         Step::Final,
     ]);
     let b = submit(&fixture, project, "b")?;
@@ -855,12 +864,12 @@ fn crash_points() -> Result<()> {
     restart(&mut fixture)?;
     // (c) After sealing, before kind 23 commits.
     model.script(&[
-        Step::Shell("printf x >> c.txt; printf sealed".into()),
+        Step::ExecCmd("printf x >> c.txt; printf sealed".into()),
         Step::Final,
     ]);
     let c = submit(&fixture, project, "c")?;
     wait_for(Duration::from_secs(20), "kind 22", || {
-        shell_calls(&fixture, c).is_ok_and(|found| !found.is_empty())
+        exec_cmd_calls(&fixture, c).is_ok_and(|found| !found.is_empty())
     })?;
     std::fs::write(fixture.home.join("journal-hold-appends"), b"")?;
     wait_for(Duration::from_secs(20), "command ran", || {
@@ -874,25 +883,25 @@ fn crash_points() -> Result<()> {
     // (d) After kind 23, install fails: recovery installs after the digest check.
     std::fs::write(fixture.home.join("payload-fault-install"), b"eio")?;
     model.script(&[
-        Step::Shell("printf x >> d.txt; printf installed-later".into()),
+        Step::ExecCmd("printf x >> d.txt; printf installed-later".into()),
         Step::Final,
     ]);
     let d = submit(&fixture, project, "d")?;
     assert_eq!(finish(&fixture, d, Duration::from_secs(30))?.kind, Some(3));
     std::fs::remove_file(fixture.home.join("payload-fault-install"))?;
-    let d_calls = shell_calls(&fixture, d)?;
+    let d_calls = exec_cmd_calls(&fixture, d)?;
     assert!(staging(&fixture, d_calls[0].intent.stdout_payload).exists());
     restart(&mut fixture)?;
     // (e) After kind 15.
     model.script(&[
-        Step::Shell("printf x >> e.txt; printf done".into()),
+        Step::ExecCmd("printf x >> e.txt; printf done".into()),
         Step::Final,
     ]);
     let e = submit(&fixture, project, "e")?;
     assert_eq!(finish(&fixture, e, Duration::from_secs(30))?.kind, Some(3));
     restart(&mut fixture)?;
     // Recovery is derived: wait until the store is ready (an admitted call).
-    model.script(&[Step::Shell("printf ready".into()), Step::Final]);
+    model.script(&[Step::ExecCmd("printf ready".into()), Step::Final]);
     let probe = submit(&fixture, project, "probe")?;
     finish(&fixture, probe, Duration::from_secs(30))?;
     for (name, count) in [
@@ -909,28 +918,28 @@ fn crash_points() -> Result<()> {
         let op = &replay.operations[&operation];
         let terminal = op.terminal.as_ref().ok_or("terminal")?;
         assert_eq!(terminal.kind, journal::TerminalKind::Interrupted, "{label}");
-        let call = op.tools[0].shell.as_ref().ok_or("shell")?;
+        let call = op.tools[0].exec_cmd.as_ref().ok_or("exec_cmd")?;
         assert!(
             call.settled.is_none(),
             "{label}: no record written at recovery"
         );
     }
     // (a) never staged; (b) and (c) keep unverified prefixes.
-    let ca = shell_calls(&fixture, a)?;
+    let ca = exec_cmd_calls(&fixture, a)?;
     assert!(!object(&fixture, ca[0].intent.stdout_payload).exists());
     for operation in [b, c] {
-        let call = &shell_calls(&fixture, operation)?[0];
+        let call = &exec_cmd_calls(&fixture, operation)?[0];
         assert!(staging(&fixture, call.intent.stdout_payload).exists());
         assert!(!object(&fixture, call.intent.stdout_payload).exists());
     }
     // (d) installed by recovery after the digest check.
-    let call = &shell_calls(&fixture, d)?[0];
+    let call = &exec_cmd_calls(&fixture, d)?[0];
     assert!(object(&fixture, call.intent.stdout_payload).exists());
     assert!(!staging(&fixture, call.intent.stdout_payload).exists());
     let stored = std::fs::read(object(&fixture, call.intent.stdout_payload))?;
     assert_eq!(stored, b"installed-later");
     // (e) intact.
-    let call = &shell_calls(&fixture, e)?[0];
+    let call = &exec_cmd_calls(&fixture, e)?[0];
     assert_eq!(
         std::fs::read(object(&fixture, call.intent.stdout_payload))?,
         b"done"
@@ -956,14 +965,17 @@ fn native() -> Result<()> {
         &fixture,
         project,
         &format!(
-            "Call shell exactly once with command `{command}`, cwd `.`. Then reply only with the number it printed. Do not use other tools."
+            "Call exec_cmd exactly once with command `{command}`, cwd `.`. Then reply only with the number it printed. Do not use other tools."
         ),
     )?;
     let event = finish(&fixture, operation, Duration::from_secs(180))?;
     assert_eq!(event.kind, Some(3), "{event:?}");
-    let calls = shell_calls(&fixture, operation)?;
-    let call = calls.first().ok_or("no shell call")?;
-    assert_eq!(call.intent.disposition, journal::ShellDisposition::Admitted);
+    let calls = exec_cmd_calls(&fixture, operation)?;
+    let call = calls.first().ok_or("no exec_cmd call")?;
+    assert_eq!(
+        call.intent.disposition,
+        journal::ExecCmdDisposition::Admitted
+    );
     assert!(
         call.intent.command.contains("ASURA_SECRET_1"),
         "{}",
@@ -990,11 +1002,11 @@ fn native() -> Result<()> {
     let long = submit(
         &fixture,
         project,
-        "Call shell exactly once with command `sleep 65; echo slept-65`, cwd `.`, timeout_seconds 60. Then reply only DONE. Do not use other tools.",
+        "Call exec_cmd exactly once with command `sleep 65; echo slept-65`, cwd `.`, timeout_seconds 60. Then reply only DONE. Do not use other tools.",
     )?;
     let event = finish(&fixture, long, Duration::from_secs(300))?;
     assert_eq!(event.kind, Some(3), "{event:?}");
-    let calls = shell_calls(&fixture, long)?;
+    let calls = exec_cmd_calls(&fixture, long)?;
     let result = calls[0].result.as_ref().ok_or("kind 15")?;
     assert_eq!(result.status, 1);
     assert!(result.text.contains("slept-65"));
@@ -1047,9 +1059,11 @@ type Case = (&'static str, fn() -> Result<()>);
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let [_, flag, job, deadline, command] = args.as_slice()
-        && flag == "--asura-shell-guardian"
+        && flag == "--asura-exec-cmd-guardian"
     {
-        std::process::exit(asura_platform::shell::run_guardian(job, deadline, command));
+        std::process::exit(asura_platform::exec_cmd::run_guardian(
+            job, deadline, command,
+        ));
     }
     if args.get(1).map(String::as_str) == Some("--capture-child") {
         if let Err(error) = child(Path::new(&args[2])) {

@@ -11,7 +11,7 @@ use crate::secrets::rewrite::MAX_SECRET_VARIABLES;
 use crate::{PollInterest, ProjectIdentity, RuntimeDirectory, StateBoundary};
 use capture::Capture;
 pub use capture::{DRAIN_BUDGET, OutputSink, READ_BUFFER, Stream, render_tail};
-pub use cleanup::ShellCleanup;
+pub use cleanup::ExecCmdCleanup;
 pub use guardian::run_guardian;
 use protocol::Notice;
 use std::ffi::CString;
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ShellError {
+pub enum ExecCmdError {
     Invalid,
     Denied,
     Deadline,
@@ -42,8 +42,8 @@ pub enum StopReason {
 /// Process facts of a settled job. Output is never kept here: the service's
 /// capture worker owns the redacted stream and its tails (J1, G10).
 #[derive(Clone, Debug)]
-pub struct ShellResult {
-    pub failure: Option<ShellError>,
+pub struct ExecCmdResult {
+    pub failure: Option<ExecCmdError>,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub reason: Option<StopReason>,
@@ -56,7 +56,7 @@ pub struct Tails {
     pub stderr: String,
     pub truncated: bool,
 }
-impl ShellResult {
+impl ExecCmdResult {
     /// Kind 15 text: today's shape, with the redacted tails and the capture
     /// state as `capture=<state>` at the end of the header line.
     pub fn render_text(&self, tails: &Tails, capture: &str) -> String {
@@ -81,12 +81,12 @@ impl ShellResult {
         )
     }
 }
-pub struct ShellFailure {
-    pub reason: ShellError,
-    pub cleanup: Option<ShellCleanup>,
+pub struct ExecCmdFailure {
+    pub reason: ExecCmdError,
+    pub cleanup: Option<ExecCmdCleanup>,
 }
-impl From<ShellError> for ShellFailure {
-    fn from(reason: ShellError) -> Self {
+impl From<ExecCmdError> for ExecCmdFailure {
+    fn from(reason: ExecCmdError) -> Self {
         Self {
             reason,
             cleanup: None,
@@ -96,7 +96,7 @@ impl From<ShellError> for ShellFailure {
 /// Commands and secret variables share the 8192-byte limit (secret detection,
 /// environment path).
 pub const MAX_COMMAND_BYTES: usize = 8192;
-/// One shell execution. `secrets` are the command's secret variables from the
+/// One exec_cmd execution. `secrets` are the command's secret variables from the
 /// rewrite: numbers 1–16, each distinct, values without NUL and at most
 /// [`MAX_COMMAND_BYTES`] in total. They reach the guardian only through its
 /// environment. No `Debug` is derived, and `SecretVariable`'s omits values.
@@ -105,15 +105,15 @@ pub const MAX_COMMAND_BYTES: usize = 8192;
 /// ends on completion or cancel, and setup checks only cancellation. `Some`
 /// remains only for platform qualification of the bounded guardian mode; J3
 /// removes it.
-pub struct ShellRequest {
+pub struct ExecCmdRequest {
     pub job_id: [u8; 16],
     pub command: String,
     pub cwd: Option<String>,
     pub deadline: Option<Instant>,
     pub secrets: Vec<SecretVariable>,
 }
-pub struct PreparedShell {
-    request: ShellRequest,
+pub struct PreparedExecCmd {
+    request: ExecCmdRequest,
     original_project: String,
     original_cwd: String,
     boundary: StateBoundary,
@@ -124,18 +124,18 @@ pub struct PreparedShell {
     omit_state_for_test: bool,
     #[cfg(feature = "test-support")]
     secret_environment_for_test: Option<Vec<Vec<u8>>>,
-    cleanup: Option<ShellCleanup>,
+    cleanup: Option<ExecCmdCleanup>,
 }
-fn check(deadline: Option<Instant>, cancel: &AtomicBool) -> Result<(), ShellError> {
+fn check(deadline: Option<Instant>, cancel: &AtomicBool) -> Result<(), ExecCmdError> {
     if cancel.load(Ordering::Acquire) {
-        Err(ShellError::Cancelled)
+        Err(ExecCmdError::Cancelled)
     } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        Err(ShellError::Deadline)
+        Err(ExecCmdError::Deadline)
     } else {
         Ok(())
     }
 }
-fn validate(request: &ShellRequest) -> Result<(), ShellError> {
+fn validate(request: &ExecCmdRequest) -> Result<(), ExecCmdError> {
     let cwd = request.cwd.as_deref().unwrap_or(".");
     if request.job_id == [0; 16]
         || request.command.is_empty()
@@ -147,12 +147,12 @@ fn validate(request: &ShellRequest) -> Result<(), ShellError> {
         || cwd.contains('\0')
         || cwd.split('/').any(|p| p == "..")
     {
-        return Err(ShellError::Invalid);
+        return Err(ExecCmdError::Invalid);
     }
     validate_secrets(&request.secrets)
 }
 /// The service-side check; the guardian repeats it on its environment.
-fn validate_secrets(secrets: &[SecretVariable]) -> Result<(), ShellError> {
+fn validate_secrets(secrets: &[SecretVariable]) -> Result<(), ExecCmdError> {
     let mut seen = [false; MAX_SECRET_VARIABLES + 1];
     let mut total = 0usize;
     for secret in secrets {
@@ -161,11 +161,11 @@ fn validate_secrets(secrets: &[SecretVariable]) -> Result<(), ShellError> {
             || std::mem::replace(&mut seen[number], true)
             || secret.value().contains(&0)
         {
-            return Err(ShellError::Invalid);
+            return Err(ExecCmdError::Invalid);
         }
         total += secret.value().len();
         if total > MAX_COMMAND_BYTES {
-            return Err(ShellError::Invalid);
+            return Err(ExecCmdError::Invalid);
         }
     }
     Ok(())
@@ -186,14 +186,14 @@ fn secret_environment(secrets: &[SecretVariable]) -> Vec<Zeroizing<Vec<u8>>> {
         })
         .collect()
 }
-impl PreparedShell {
+impl PreparedExecCmd {
     /// Blocking descriptor validation and scratch creation; retained setup worker only.
     pub fn prepare(
         runtime: RuntimeDirectory,
         project: &ProjectIdentity,
-        request: ShellRequest,
+        request: ExecCmdRequest,
         cancel: &AtomicBool,
-    ) -> Result<Self, ShellFailure> {
+    ) -> Result<Self, ExecCmdFailure> {
         validate(&request)?;
         let setup_deadline = request.deadline;
         check(setup_deadline, cancel)?;
@@ -201,8 +201,8 @@ impl PreparedShell {
         let boundary = project.boundary().clone();
         let project = project
             .process_directory()
-            .map_err(|_| ShellError::Denied)?;
-        let mut cwd = project.try_clone().map_err(|_| ShellError::Io)?;
+            .map_err(|_| ExecCmdError::Denied)?;
+        let mut cwd = project.try_clone().map_err(|_| ExecCmdError::Io)?;
         for part in request
             .cwd
             .as_deref()
@@ -211,18 +211,18 @@ impl PreparedShell {
             .filter(|s| !s.is_empty() && *s != ".")
         {
             check(setup_deadline, cancel)?;
-            let name = CString::new(part).map_err(|_| ShellError::Invalid)?;
+            let name = CString::new(part).map_err(|_| ExecCmdError::Invalid)?;
             cwd = open_at(
                 cwd.as_raw_fd(),
                 &name,
                 libc::O_RDONLY | libc::O_DIRECTORY,
                 0,
             )
-            .map_err(|_| ShellError::Denied)?;
+            .map_err(|_| ExecCmdError::Denied)?;
         }
         let original_cwd = spawn::path(cwd.as_raw_fd())?;
-        let (asura, _) = runtime.authority_root().map_err(|_| ShellError::Denied)?;
-        let cleanup = ShellCleanup::create(&runtime, request.job_id)?;
+        let (asura, _) = runtime.authority_root().map_err(|_| ExecCmdError::Denied)?;
+        let cleanup = ExecCmdCleanup::create(&runtime, request.job_id)?;
         let mut result = Self {
             request,
             original_project,
@@ -238,7 +238,7 @@ impl PreparedShell {
             cleanup: Some(cleanup),
         };
         if let Err(reason) = check(setup_deadline, cancel) {
-            return Err(ShellFailure {
+            return Err(ExecCmdFailure {
                 reason,
                 cleanup: result.cleanup.take(),
             });
@@ -259,7 +259,7 @@ impl PreparedShell {
     pub fn replace_secret_environment_for_test(&mut self, entries: Vec<Vec<u8>>) {
         self.secret_environment_for_test = Some(entries);
     }
-    /// After a successful spawn ownership always transfers to ShellJob.
+    /// After a successful spawn ownership always transfers to ExecCmdJob.
     /// The request's secret values are dropped (and zeroed) whether or not
     /// the spawn succeeds.
     /// `sink` receives the job's raw output on the reactor (J1).
@@ -268,12 +268,12 @@ impl PreparedShell {
         executable: &Path,
         cancel: &AtomicBool,
         sink: Box<dyn OutputSink>,
-    ) -> Result<ShellJob, ShellFailure> {
+    ) -> Result<ExecCmdJob, ExecCmdFailure> {
         let spawned = self.spawn_inner(executable, cancel, sink);
         self.request.secrets.clear();
         match spawned {
             Ok(job) => Ok(job),
-            Err(reason) => Err(ShellFailure {
+            Err(reason) => Err(ExecCmdFailure {
                 reason,
                 cleanup: self.cleanup.take(),
             }),
@@ -284,37 +284,41 @@ impl PreparedShell {
         executable: &Path,
         cancel: &AtomicBool,
         sink: Box<dyn OutputSink>,
-    ) -> Result<ShellJob, ShellError> {
+    ) -> Result<ExecCmdJob, ExecCmdError> {
         check(self.request.deadline, cancel)?;
         let current = ProjectIdentity::open(&self.original_project, &self.boundary)
-            .map_err(|_| ShellError::Denied)?;
-        let pinned = stat_fd(self.project.as_raw_fd()).map_err(|_| ShellError::Io)?;
+            .map_err(|_| ExecCmdError::Denied)?;
+        let pinned = stat_fd(self.project.as_raw_fd()).map_err(|_| ExecCmdError::Io)?;
         if current.device != pinned.st_dev as u64 || current.inode != pinned.st_ino {
-            return Err(ShellError::Denied);
+            return Err(ExecCmdError::Denied);
         }
         let current_cwd = ProjectIdentity::open(&self.original_cwd, &self.boundary)
-            .map_err(|_| ShellError::Denied)?;
-        let pinned_cwd = stat_fd(self.cwd.as_raw_fd()).map_err(|_| ShellError::Io)?;
+            .map_err(|_| ExecCmdError::Denied)?;
+        let pinned_cwd = stat_fd(self.cwd.as_raw_fd()).map_err(|_| ExecCmdError::Io)?;
         if current_cwd.device != pinned_cwd.st_dev as u64 || current_cwd.inode != pinned_cwd.st_ino
         {
-            return Err(ShellError::Denied);
+            return Err(ExecCmdError::Denied);
         }
         for fd in [&self.project, &self.cwd] {
             if stat_fd(fd.as_raw_fd())
-                .map_err(|_| ShellError::Io)?
+                .map_err(|_| ExecCmdError::Io)?
                 .st_nlink
                 == 0
             {
-                return Err(ShellError::Denied);
+                return Err(ExecCmdError::Denied);
             }
         }
-        let scratch = &self.cleanup.as_ref().ok_or(ShellError::Protocol)?.directory;
+        let scratch = &self
+            .cleanup
+            .as_ref()
+            .ok_or(ExecCmdError::Protocol)?
+            .directory;
         let (lease_read, lease_write) = spawn::pipe(true)?;
         let (status_read, status_write) = spawn::pipe(true)?;
         let (out_read, out_write) = spawn::pipe(false)?;
         let (err_read, err_write) = spawn::pipe(false)?;
         let null =
-            open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDWR, 0).map_err(|_| ShellError::Io)?;
+            open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDWR, 0).map_err(|_| ExecCmdError::Io)?;
         // No deadline: the guardian's no-deadline mode (J1-Q3).
         let deadline = match self.request.deadline {
             None => guardian::NO_DEADLINE.to_owned(),
@@ -324,20 +328,20 @@ impl PreparedShell {
                         .saturating_duration_since(Instant::now())
                         .as_nanos()
                         .try_into()
-                        .map_err(|_| ShellError::Invalid)?,
+                        .map_err(|_| ExecCmdError::Invalid)?,
                 )
-                .ok_or(ShellError::Invalid)?
+                .ok_or(ExecCmdError::Invalid)?
                 .to_string(),
         };
         let args = vec![
             executable.to_string_lossy().into_owned(),
-            "--asura-shell-guardian".into(),
+            "--asura-exec-cmd-guardian".into(),
             hex(self.request.job_id),
             deadline,
             self.request.command.clone(),
         ];
         if args.iter().map(|value| value.len() + 1).sum::<usize>() > 8704 {
-            return Err(ShellError::Invalid);
+            return Err(ExecCmdError::Invalid);
         }
         let mappings: &[_] = &[
             (null.as_raw_fd(), 0),
@@ -369,7 +373,7 @@ impl PreparedShell {
         drop(env);
         drop(environment);
         // Everything after this point is infallible and transfers the live child.
-        Ok(ShellJob {
+        Ok(ExecCmdJob {
             pid,
             reaped: false,
             lease: Some(lease_write),
@@ -394,7 +398,7 @@ impl PreparedShell {
 fn hex(id: [u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
-pub struct ShellJob {
+pub struct ExecCmdJob {
     pid: libc::pid_t,
     reaped: bool,
     lease: Option<OwnedFd>,
@@ -409,12 +413,12 @@ pub struct ShellJob {
     sink: Box<dyn OutputSink>,
     deadline: Option<Instant>,
     stop: Option<StopReason>,
-    cleanup: Option<ShellCleanup>,
+    cleanup: Option<ExecCmdCleanup>,
     job_id: [u8; 16],
     alternate: bool,
     fault: bool,
 }
-impl ShellJob {
+impl ExecCmdJob {
     #[cfg(feature = "test-support")]
     pub fn guardian_pid_for_test(&self) -> i32 {
         self.pid
@@ -462,7 +466,7 @@ impl ShellJob {
         }
         self.lease.take();
     }
-    pub fn poll(&mut self, now: Instant) -> Result<(), ShellError> {
+    pub fn poll(&mut self, now: Instant) -> Result<(), ExecCmdError> {
         if self.deadline.is_some_and(|deadline| now >= deadline) {
             self.stop(StopReason::Deadline)
         }
@@ -473,7 +477,7 @@ impl ShellJob {
         }
         result
     }
-    fn poll_inner(&mut self) -> Result<(), ShellError> {
+    fn poll_inner(&mut self) -> Result<(), ExecCmdError> {
         let (first, second) = if self.alternate {
             (&mut self.err, &mut self.out)
         } else {
@@ -495,7 +499,7 @@ impl ShellJob {
                 self.status_eof = true;
             } else if n > 0 {
                 if self.status_bytes.len() + n as usize > 128 {
-                    return Err(ShellError::Protocol);
+                    return Err(ExecCmdError::Protocol);
                 }
                 self.status_bytes.extend_from_slice(&buf[..n as usize]);
                 while self.status_bytes.len() >= 32 {
@@ -503,18 +507,18 @@ impl ShellJob {
                     self.status_bytes.drain(..32);
                     self.notices += 1;
                     if self.notices > 3 || self.terminal.is_some() {
-                        return Err(ShellError::Protocol);
+                        return Err(ExecCmdError::Protocol);
                     }
                     match notice.kind {
                         1 if !self.spawned && self.notices == 1 => self.spawned = true,
                         2 if self.spawned => self.terminal = Some(notice),
                         3 if !self.spawned && self.notices == 1 => self.terminal = Some(notice),
                         4 if self.spawned && self.notices == 2 => {}
-                        _ => return Err(ShellError::Protocol),
+                        _ => return Err(ExecCmdError::Protocol),
                     }
                 }
             } else if !spawn::would_block() {
-                return Err(ShellError::Io);
+                return Err(ExecCmdError::Io);
             }
         }
         if !self.reaped {
@@ -527,11 +531,11 @@ impl ShellJob {
                     self.fault = true;
                 }
             } else if n < 0 && !spawn::interrupted() {
-                return Err(ShellError::Io);
+                return Err(ExecCmdError::Io);
             }
         }
         if self.status_eof && (!self.status_bytes.is_empty() || self.terminal.is_none()) {
-            return Err(ShellError::Protocol);
+            return Err(ExecCmdError::Protocol);
         }
         Ok(())
     }
@@ -543,18 +547,18 @@ impl ShellJob {
             && self.terminal.is_some_and(|n| n.cleanup)
             && !self.fault
     }
-    pub fn result(&self) -> Option<ShellResult> {
+    pub fn result(&self) -> Option<ExecCmdResult> {
         if !self.settled() {
             return None;
         }
         let n = self.terminal?;
-        Some(ShellResult {
+        Some(ExecCmdResult {
             failure: if n.kind == 3 {
                 Some(match n.reason {
-                    7 => ShellError::Denied,
-                    8 => ShellError::Protocol,
-                    9 => ShellError::CleanupUnconfirmed,
-                    _ => ShellError::Unavailable,
+                    7 => ExecCmdError::Denied,
+                    8 => ExecCmdError::Protocol,
+                    9 => ExecCmdError::CleanupUnconfirmed,
+                    _ => ExecCmdError::Unavailable,
                 })
             } else {
                 None
@@ -571,7 +575,7 @@ impl ShellJob {
             cleanup_confirmed: true,
         })
     }
-    pub fn take_cleanup(&mut self) -> Option<ShellCleanup> {
+    pub fn take_cleanup(&mut self) -> Option<ExecCmdCleanup> {
         if self.settled() {
             self.cleanup.take()
         } else {

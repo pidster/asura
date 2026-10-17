@@ -1,7 +1,7 @@
-//! Reactor side of shell output capture (J1). Pipes are read without
+//! Reactor side of exec_cmd output capture (J1). Pipes are read without
 //! blocking and raw bytes go straight to the service's [`OutputSink`]; no raw
 //! ring or tail is kept here (G10).
-use super::{ShellError, spawn};
+use super::{ExecCmdError, spawn};
 use std::os::fd::{AsRawFd, OwnedFd};
 
 /// Which pipe a capture reads.
@@ -13,7 +13,7 @@ pub const READ_BUFFER: usize = 4096;
 /// Bytes drained per stream per dispatch (L14).
 pub const DRAIN_BUDGET: usize = 8192;
 
-/// Receives raw output for one shell job on the reactor. Every method is
+/// Receives raw output for one exec_cmd job on the reactor. Every method is
 /// called on the reactor and must not block.
 pub trait OutputSink: Send {
     /// Raw bytes the sink accepts now without blocking; 0 when full.
@@ -64,7 +64,7 @@ impl Capture {
         budget: usize,
         sink: &mut dyn OutputSink,
         stopping: bool,
-    ) -> Result<(), ShellError> {
+    ) -> Result<(), ExecCmdError> {
         let mut used = 0;
         let mut buffer = [0u8; READ_BUFFER];
         while !self.eof && used < budget {
@@ -87,7 +87,7 @@ impl Capture {
                 if spawn::would_block() {
                     break;
                 }
-                return Err(ShellError::Io);
+                return Err(ExecCmdError::Io);
             }
             let n = n as usize;
             used += n;

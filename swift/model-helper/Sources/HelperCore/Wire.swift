@@ -53,7 +53,7 @@ public enum Wire {
             case .memoryGetNote(let args): argumentsKnown = args.unknownFields.data.isEmpty
             case .memoryCreateNote(let args): argumentsKnown = args.unknownFields.data.isEmpty
             case .memoryNoteSources(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .shell(let args): argumentsKnown = args.unknownFields.data.isEmpty
+            case .execCmd(let args): argumentsKnown = args.unknownFields.data.isEmpty
             case .readAudit(let args): argumentsKnown = args.unknownFields.data.isEmpty
             case .listTools(let args): argumentsKnown = args.unknownFields.data.isEmpty
             case .readFile(let args): argumentsKnown = args.unknownFields.data.isEmpty
@@ -207,8 +207,8 @@ public enum Wire {
             try check(!service && v.hasOrdinal && (1...8).contains(v.ordinal))
             switch v.arguments {
             case .observeStatus: break
-            case .shell(let args):
-                try check(args.hasCommand && validShellArguments(command: args.command, cwd: args.hasCwd ? args.cwd : nil, timeoutSeconds: args.hasTimeoutSeconds ? args.timeoutSeconds : nil))
+            case .execCmd(let args):
+                try check(args.hasCommand && validExecCmdArguments(command: args.command, cwd: args.hasCwd ? args.cwd : nil, timeoutSeconds: args.hasTimeoutSeconds ? args.timeoutSeconds : nil))
             case .listTools: break
             case .readAudit(let args): try check(args.hasLimit && (1...16).contains(args.limit))
             case .memoryListNotes(let args):

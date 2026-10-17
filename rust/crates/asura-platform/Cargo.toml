@@ -17,7 +17,7 @@ sha2 = "=0.10.9"
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 
 [[test]]
-name = "shell_process"
-path = "tests/shell_process.rs"
+name = "exec_cmd_process"
+path = "tests/exec_cmd_process.rs"
 harness = false
 required-features = ["test-support"]

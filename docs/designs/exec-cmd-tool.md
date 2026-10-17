@@ -1,4 +1,4 @@
-# Bounded noninteractive shell tool
+# Bounded noninteractive exec_cmd tool
 
 Status: implemented, with scoped native process and system-model validation on
 2026-09-28. The evidence below defines the verified scope. Protocol numbering
@@ -11,9 +11,13 @@ is cancelled, and `timeout_seconds` is accepted and ignored. The timeout text
 below records the implemented contract until J1 lands; see
 [J1 timeout and setup budget removal](tool-job-controller.md#j1-timeout-and-setup-budget-removal).
 
+Renamed from `shell` to `exec_cmd` (owner, 2026-10-17). Names only; field
+numbers, record kinds and formats are unchanged. Model ToolCall field 19, tool
+kind 16, record kinds 14, 22 and 23, and audit tool value 9 keep their numbers.
+
 ## Scope and existing owners
 
-Expose one native model tool named `shell`. It runs one noninteractive command
+Expose one native model tool named `exec_cmd`. It runs one noninteractive command
 with `/bin/sh -c`, closed stdin, separate bounded stdout/stderr capture and an
 explicit exit outcome. It creates no interactive session, PTY, Send/Read interface,
 terminal pane, remote delegation or automatic command retry.
@@ -27,7 +31,7 @@ accumulation. Wisp source inspection is not Asura runtime evidence.
 | --- | --- |
 | Service tool registry and conversation owner | Schema, execution grant, admission, budgets, durable intent/result, cancellation and model delivery |
 | Platform process support | Verified descriptors and identities, spawn, sandbox, owned process group, lease guardian, readiness and reap |
-| Existing authority writer | Typed shell intent and result, duplicate detection and recovery projection |
+| Existing authority writer | Typed exec_cmd intent and result, duplicate detection and recovery projection |
 | Swift native tool adapters | Typed arguments and existing service callback only |
 | Existing service reactor | Fair readiness dispatch and deadlines; no blocking process or filesystem calls |
 
@@ -35,7 +39,7 @@ Extend `asura-platform` using `startup.rs` checked spawn/file actions,
 `model_process.rs` nonblocking pipe/reap patterns, `project_identity.rs` identity
 checks, `lifetime.rs` private lease pattern and `git_observer.rs` mandatory sandbox
 construction. Those components are reusable primitives; none currently implements
-a shell guardian. Do not copy a complete model owner or add a generic orchestrator.
+an exec_cmd guardian. Do not copy a complete model owner or add a generic orchestrator.
 
 ## Arguments, results and limits
 
@@ -52,12 +56,12 @@ wire fields require presence and strict unknown-field/direction validation. Root
 allocates free schema/tool-kind fields at integration; do not reuse inventory,
 audit or pending Memory create allocations.
 
-The existing eight-call limit and 64 KiB aggregate result limit apply. One shell
+The existing eight-call limit and 64 KiB aggregate result limit apply. One exec_cmd
 job may be live service-wide. It occupies the existing retained tool slot through
 setup, execution and cleanup; a second proposal gets Busy. No unbounded pending
-shell queue is introduced.
+exec_cmd queue is introduced.
 
-The shell replaces the ordinary two-second execution allowance with this explicit
+The exec_cmd replaces the ordinary two-second execution allowance with this explicit
 budget: setup has at most 2 seconds; command runtime is at most the selected
 timeout, independent of turn age; cleanup has at most 2.5 seconds before it becomes
 unconfirmed. Unsettled cleanup may remain retained beyond the command deadline;
@@ -85,25 +89,25 @@ truncated. A result never contains a continuation offset.
 A normal nonzero exit is a successfully executed tool with an explicit exit code;
 it is not a service failure. Timeout, cancellation and output-limit outcomes map
 to the corresponding existing ToolStatus and include bounded captured output under
-the shell-specific durable result contract. Missing sandbox, invalid identity,
+the exec-cmd-specific durable result contract. Missing sandbox, invalid identity,
 spawn failure and absent grant return fixed failure codes without fabricated exit
 status. A signalled leader records the signal, not a guessed exit code.
 
 ## Authority and confinement
 
 An admitted foreground user turn in a registered project receives a separate
-`execute_authorized` grant under this selected shell policy. This is not derived
+`execute_authorized` grant under this selected exec_cmd policy. This is not derived
 from `read_authorized`. Its immutable snapshot binds installation, project identity,
 turn operation and generation. Unaccepted input, observations, classifiers,
 background reconciliation and remote delegates receive no execution grant.
 
-Only qualified local model providers may propose shell calls. Apply the existing
+Only qualified local model providers may propose exec_cmd calls. Apply the existing
 supported/enabled native-tool intersection and local destination fence. The verified
 local Ollama fence remains mandatory. CoreAI qualification remains separate; a
-registered shell entry is not evidence its provider can call it successfully.
+registered exec_cmd entry is not evidence its provider can call it successfully.
 
 Recheck grant, owner generation, cancellation, project registration and retained
-project identity immediately before effect submission. The shell model cannot
+project identity immediately before effect submission. The exec_cmd model cannot
 choose another project, environment, executable shell, network policy or write root.
 Resolve cwd relative to a retained project directory with no symlink traversal;
 check the selected directory identity at spawn. A pathname/cwd check is not the
@@ -192,7 +196,7 @@ retains ownership; a timer never authorizes deletion or owner-lock release.
 
 ## Durable intent, result and restart
 
-Commit a typed shell intent before launching the guardian. It binds operation,
+Commit a typed exec_cmd intent before launching the guardian. It binds operation,
 generation, ordinal, project, a stable service-derived job ID, command/cwd digest,
 requested/effective timeout and the grant/project identity snapshot. Store bounded
 command/cwd data only where the existing private authority retention contract needs
@@ -205,7 +209,7 @@ another command. Commit the typed result only after its actual execution/cleanup
 outcome is known. Result persistence failure keeps the effect unconfirmed and never
 causes another spawn. Delivery to a model also requires current disclosure fences.
 
-On restart, an unresolved shell intent becomes interrupted/outcome-unconfirmed;
+On restart, an unresolved exec_cmd intent becomes interrupted/outcome-unconfirmed;
 it is never automatically executed again. The old guardian reacts to lease EOF.
 Do not reattach or signal by journaled PID. An interrupted result must say effects
 may have occurred. A newly started service must not assert old process-tree absence
@@ -214,7 +218,7 @@ boundary remain separate evidence. Do not promise rollback of files or child eff
 
 ```mermaid
 flowchart TD
-    Call[Native shell proposal] --> Grant{Local accepted turn and execution grant?}
+    Call[Native exec_cmd proposal] --> Grant{Local accepted turn and execution grant?}
     Grant -->|No| Denied[Reject without spawning]
     Grant -->|Yes| Args{Arguments, slot and budgets valid?}
     Args -->|No| Rejected[Fixed rejection]
@@ -241,20 +245,20 @@ public shell command or independent policy owner.
 
 ### Shared platform interface
 
-Add `asura-platform::shell` and a narrow module export. The root agent owns private
-CLI routing and service integration. `PreparedShell::prepare` runs on the retained
+Add `asura-platform::exec_cmd` and a narrow module export. The root agent owns private
+CLI routing and service integration. `PreparedExecCmd::prepare` runs on the retained
 setup worker. Inputs are the validated RuntimeDirectory, retained project identity,
 bounded command/cwd, job ID, absolute monotonic deadline and current executable.
 It validates/pins cwd, creates private scratch and capture/lease/status pipes, and
 returns the prepared owned descriptors. No command is started during preparation.
-`PreparedShell::spawn` performs the final identity/cancellation/deadline check and
+`PreparedExecCmd::spawn` performs the final identity/cancellation/deadline check and
 starts the private guardian through existing checked spawn actions.
 
-`ShellJob` owns the guardian PID, sole lease writer, nonblocking stdout/stderr/status
+`ExecCmdJob` owns the guardian PID, sole lease writer, nonblocking stdout/stderr/status
 readers, capture rings and cleanup state. It exposes readiness interests,
 `poll(now)`, `next_deadline()`, `stop(reason)`, `result()` and `settled()`. Root retains
 this object in the active turn until actual settlement. The existing service has
-one active turn; a retained shell setup/cleanup worker extends that owner. The
+one active turn; a retained exec_cmd setup/cleanup worker extends that owner. The
 file-read executor does not execute commands. Filesystem preparation/deletion remains in
 retained workers; poll performs only bounded nonblocking reads, status parsing and
 WNOHANG reap. It must not unlink scratch, read directories or block in Drop. After process
@@ -262,7 +266,7 @@ settlement, transfer the private scratch cleanup token to a retained cleanup
 worker; that worker alone calls the blocking validated cleanup operation.
 
 The guardian entrypoint is `run_guardian` in this same platform module. Root's CLI
-recognizes only the fixed private marker `--asura-shell-guardian` followed by job ID,
+recognizes only the fixed private marker `--asura-exec-cmd-guardian` followed by job ID,
 absolute monotonic deadline nanoseconds and command as separate argv elements.
 The parser never joins/reinterprets argv. Command size remains 8192 bytes; the total
 private argv payload is at most 8704 bytes. No user-supplied executable/profile/env
@@ -357,7 +361,7 @@ must prove allowed writes and denied outside writes/network with actual children
 profile syntax or inspection alone is not proof of enforcement.
 
 The implementation must qualify installed spawn/group/sandbox behavior before
-native model activation. Failed qualification keeps shell unavailable and reports
+native model activation. Failed qualification keeps exec_cmd unavailable and reports
 the concrete limitation; it does not add another supervisor or approval mechanism.
 
 ## Implementation packets and required evidence
@@ -370,7 +374,7 @@ encoding before their code. Routine implementation refinement is already authori
    group state, pipes, bounded capture, deadlines and cleanup. Reuse existing
    primitives and assign any internal executable-mode routing explicitly.
 2. Service/storage packet: execution grant, typed intent/result, duplicate/restart
-   projection, shell slot and existing reactor integration. Do not put process
+   projection, exec_cmd slot and existing reactor integration. Do not put process
    execution in the file-read worker or create a second conversation loop.
 3. Model packet: one canonical registry entry and native schemas through the existing
    service callback across qualified local providers; no direct Swift process calls.
@@ -405,20 +409,20 @@ reports each provider separately; mocked callbacks do not qualify native inferen
 
 ## Model wire packet
 
-Model ToolCall field 19 is Shell. Shell fields are required command string 1,
+Model ToolCall field 19 is ExecCmd. ExecCmd fields are required command string 1,
 optional cwd string 2 and optional timeout_seconds uint32 field 3. Command is
 1–8192 UTF-8 bytes with no NUL. Present cwd is 1–1024 UTF-8 bytes, must be relative,
 has no NUL or parent (`..`) component; `.` means the project root. Present timeout
 is 1–60 seconds; absence means 30. Rust and Swift strict codecs reject missing
 command, invalid bounds, forbidden cwd, unknown nested fields and wrong direction
-before any effect. The native shell function has optional cwd/timeout arguments
+before any effect. The native exec_cmd function has optional cwd/timeout arguments
 and supplies default timeout 30 through its existing service callback. It never
 executes a process in Swift.
 
 The shared private ToolResult permits bounded text and truncation on failure,
 but never a continuation offset on failure. The service's durable result owner
-permits nonempty failed text/truncation only for a matching shell intent; other
-tool policies remain unchanged. Shell's Swift adapter renders the fixed status
+permits nonempty failed text/truncation only for a matching exec_cmd intent; other
+tool policies remain unchanged. exec_cmd's Swift adapter renders the fixed status
 plus bounded service-owned body on failure so timeout/output-limit evidence remains
 visible. Other adapters retain their existing failed-result rendering. No new wire
 fields or version increment are needed.
@@ -441,10 +445,10 @@ command/cwd bytes or widening the grant.
 
 Offset stores effective runtime milliseconds 1–60000, no greater than limit*1000.
 Limit stores requested seconds 1–60, default 30. Existing accepted turn, registered
-project and owner records identify the admitted grant. A committed typed shell
+project and owner records identify the admitted grant. A committed typed exec_cmd
 intent is the durable evidence of the canonical service authorization check, never
 a restart execution grant. Derive job ID from the first 16 SHA-256 bytes of ASCII
-`asura.shell.job`, one zero byte, operation 16 bytes, generation big-endian u64 and
+`asura.exec_cmd.job`, one zero byte, operation 16 bytes, generation big-endian u64 and
 ordinal big-endian u32. Only if all 16 result bytes are zero, set the final byte to 1.
 The exact payload digest is derivable; do not store a duplicate snapshot.
 
@@ -452,21 +456,21 @@ ToolResult layout is unchanged. Structural decode permits truncation for statuse
 5,6,7 because the result has no tool kind. Replay permits this only for kind 16,
 with no continuation offset. Denied/invalid/unavailable statuses 2,3,4 cannot have
 truncation or continuation. Preserve every other tool's result restriction.
-Shell body is at most 16384 bytes and aggregate results at most 65536 bytes. An
+exec_cmd body is at most 16384 bytes and aggregate results at most 65536 bytes. An
 unresolved intent on restart remains interrupted with effects unknown. Never replay
 it automatically or infer rollback from a missing result.
 
 ```mermaid
 flowchart TD
-    Proposal[Typed shell proposal] --> Validate{Exact byte bounds and timeout valid?}
+    Proposal[Typed exec_cmd proposal] --> Validate{Exact byte bounds and timeout valid?}
     Validate -->|No| Reject[Reject before execution]
     Validate -->|Yes| Grant[Service checks local execution grant and project identity]
     Grant --> Intent[Commit kind 16 with command NUL cwd and timeout fields]
     Intent --> Identity[Derive stable job ID from operation generation ordinal]
-    Identity --> Effect[One retained shell job]
+    Identity --> Effect[One retained exec_cmd job]
     Effect --> Result[Commit bounded result without continuation]
     Result --> Replay{Matching durable intent kind?}
-    Replay -->|Shell 16| Shell[Allow captured body and truncation on success timeout cancel limit]
+    Replay -->|exec_cmd 16| exec_cmd[Allow captured body and truncation on success timeout cancel limit]
     Replay -->|Other| Existing[Preserve existing result restrictions]
     Restart[Restart unresolved intent] --> Unknown[Interrupted effects unknown; never launch]
 ```
@@ -489,15 +493,15 @@ iteration checks cancellation and its absolute deadline. An exhausted bound reta
 the cleanup token. No Drop implementation waits, joins, or deletes files.
 
 All fallible guardian spawn preparation precedes posix_spawn. Once spawn succeeds,
-the platform always returns the owned ShellJob, including a concurrent cancellation.
-A failed preparation returns ShellFailure with its optional retained scratch token.
+the platform always returns the owned ExecCmdJob, including a concurrent cancellation.
+A failed preparation returns ExecCmdFailure with its optional retained scratch token.
 A poll failure retains the job and initiates lease closure; it never loses process
 ownership. Deterministic wrapper tests hold setup/cleanup workers and verify reactor
 responsiveness, busy admission, cancellation, late settlement and wake ordering.
 
 ## Service wrapper packet
 
-The service `shell_worker` owns one retained stage: Setup, Running, Cleanup or
+The service `exec_cmd_worker` owns one retained stage: Setup, Running, Cleanup or
 Repair. Setup runs in one thread with a two-second logical deadline. It resolves
 the current executable, opens the admitted project and rechecks device/inode,
 then calls platform prepare/spawn. The absolute command deadline was fixed before
@@ -564,7 +568,7 @@ by the owner-approved Rust instruction exception.
 
 The escaped-session test demonstrates the documented containment limit; the test
 waits for its deliberately escaped process to exit. It does not prove that the
-cleanup helper can find arbitrary escaped descendants. Native shell inference is
+cleanup helper can find arbitrary escaped descendants. Native exec_cmd inference is
 qualified for the system model only. Other local adapters remain separately
 unqualified for this new tool. No cloud execution is enabled.
 
@@ -572,8 +576,8 @@ unqualified for this new tool. No cloud execution is enabled.
 ### Turn expiry removal — selected 2026-09-30
 
 The [cancellation-driven turn policy](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
-replaces reduction by a remaining whole-turn duration. A validated shell request
-retains its own 1–60 second duration, default 30. Shell cancellation, cleanup,
+replaces reduction by a remaining whole-turn duration. A validated exec_cmd request
+retains its own 1–60 second duration, default 30. exec_cmd cancellation, cleanup,
 process-group enforcement and recovery contracts remain unchanged.
 
 ### Threat model review decisions — 2026-10-14
@@ -591,7 +595,7 @@ mechanisms need design before code.
   operation Git needs must be backed by a real process test (threat model
   EX-V11). Ancestor-directory metadata visibility is recorded as a known minor
   leak.
-- **EX10, qualification of other providers (owner, 2026-10-14).** Shell stays
+- **EX10, qualification of other providers (owner, 2026-10-14).** exec_cmd stays
   offered to local tool-capable providers. Each needs SH-E1-style
   qualification, reported separately: CoreAI, MLX and Ollama models. This is a
   prerequisite of [tool job](tool-job-controller.md#delivery-dependencies)

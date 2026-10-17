@@ -87,7 +87,7 @@ impl Fixture {
             failure_reason: None,
             tool: Some(LiveTool {
                 create: None,
-                shell: None,
+                exec_cmd: None,
                 secret_digest: None,
                 memory_ticket: None,
                 rejected: false,
@@ -99,7 +99,7 @@ impl Fixture {
             }),
             tool_budget: budget,
             tool_executor: tools::Executor::default(),
-            shell_worker: crate::shell_worker::Worker::default(),
+            exec_cmd_worker: crate::exec_cmd_worker::Worker::default(),
             tool_cache: vec![],
             secret_key: zeroize::Zeroizing::new([3; 32]),
         };
@@ -524,7 +524,7 @@ fn invalid_semantic_path_is_durable_rejection_not_host_dispatch() {
         assert_eq!(tool_intent(&call, true).kind, if read { 4 } else { 5 });
         active.tool = Some(LiveTool {
             create: None,
-            shell: None,
+            exec_cmd: None,
             secret_digest: None,
             memory_ticket: None,
             rejected: true,
@@ -1043,7 +1043,7 @@ fn committed_tool_activity_is_observable_before_model_text() {
             intent_frame: 0..1,
             result_frame: None,
             result_bytes: 0,
-            shell: None,
+            exec_cmd: None,
         });
     assert!(fixture.owner.active.as_ref().unwrap().cursor > before);
     assert!(fixture.owner.active.as_ref().unwrap().snapshot.is_empty());
@@ -1149,24 +1149,24 @@ fn settled_measurements_cache_evicts_oldest_and_restart_stays_unknown() {
     assert!(inventory_fixture().owner.measurements.is_empty());
 }
 
-fn shell_call_of(active: &Active, command: &str) -> tools::Call {
+fn exec_cmd_call_of(active: &Active, command: &str) -> tools::Call {
     tools::Call {
         operation: active.turn.operation,
         generation: active.turn.generation,
         ordinal: 1,
-        arguments: tools::Arguments::Shell {
+        arguments: tools::Arguments::ExecCmd {
             command: command.into(),
             cwd: ".".into(),
             timeout_seconds: 30,
         },
     }
 }
-fn shell_token() -> String {
+fn exec_cmd_token() -> String {
     ["ghp_", &"xV7".repeat(12)].concat()
 }
-fn shell_text(call: &tools::Call) -> String {
+fn exec_cmd_text(call: &tools::Call) -> String {
     match &call.arguments {
-        tools::Arguments::Shell { command, cwd, .. } => format!("{command}\0{cwd}"),
+        tools::Arguments::ExecCmd { command, cwd, .. } => format!("{command}\0{cwd}"),
         _ => String::new(),
     }
 }
@@ -1188,13 +1188,16 @@ fn j1t_03_overlong_rewrite_is_a_recorded_refusal() {
         "f".repeat(8192 - 60 - unit.len() * 10 - 5 + 1)
     );
     assert!(long.len() <= 8192);
-    let call = shell_call_of(active, &long);
+    let call = exec_cmd_call_of(active, &long);
     Owner::tool_call(active, call, now, &fixture.owner.payloads, Some([9; 16]));
     let tool = active.tool.as_ref().expect("live tool");
-    let shell = tool.shell.as_ref().expect("shell");
-    assert_eq!(shell.intent.disposition, journal::ShellDisposition::Refused);
+    let exec_cmd = tool.exec_cmd.as_ref().expect("exec_cmd");
     assert_eq!(
-        shell.intent.refusal.map(|r| r.code),
+        exec_cmd.intent.disposition,
+        journal::ExecCmdDisposition::Refused
+    );
+    assert_eq!(
+        exec_cmd.intent.refusal.map(|r| r.code),
         Some(journal::RefusalCode::RewrittenCommandTooLong)
     );
     assert!(tool.rejected);
@@ -1209,7 +1212,7 @@ fn j1t_03_overlong_rewrite_is_a_recorded_refusal() {
     };
     let frame = journal::encode_frame(
         &context,
-        &journal::Record::ShellIntent(Box::new(shell.intent.clone())),
+        &journal::Record::ExecCmdIntent(Box::new(exec_cmd.intent.clone())),
     )
     .expect("kind 22 encodes");
     assert!(frame.len() <= 9568);
@@ -1223,26 +1226,26 @@ fn j1t_03_overlong_rewrite_is_a_recorded_refusal() {
 fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     let mut fixture = Fixture::new();
     let now = Instant::now();
-    let token = shell_token();
+    let token = exec_cmd_token();
     let raw = format!("printf '%s' \"{token}\" | wc -c");
     {
         let active = fixture.owner.active.as_mut().unwrap();
         active.tool = None;
         active.tool_budget = tools::Budget::new(now + Duration::from_secs(60));
-        let call = shell_call_of(active, &raw);
+        let call = exec_cmd_call_of(active, &raw);
         // No payload store is ready: the call is recorded busy, which
         // carries the rewrite too.
         Owner::tool_call(active, call, now, &fixture.owner.payloads, Some([9; 16]));
         let tool = active.tool.as_ref().unwrap();
-        assert!(!shell_text(&tool.call).contains(&token));
-        assert!(shell_text(&tool.call).contains("${ASURA_SECRET_1}"));
-        let shell = tool.shell.as_ref().unwrap();
+        assert!(!exec_cmd_text(&tool.call).contains(&token));
+        assert!(exec_cmd_text(&tool.call).contains("${ASURA_SECRET_1}"));
+        let exec_cmd = tool.exec_cmd.as_ref().unwrap();
         assert_eq!(
-            shell.intent.busy,
-            Some(journal::ShellBusyReason::PayloadUnavailable)
+            exec_cmd.intent.busy,
+            Some(journal::ExecCmdBusyReason::PayloadUnavailable)
         );
-        assert!(!shell.intent.command.contains(&token));
-        assert!(shell.secrets.is_empty(), "busy keeps no secret value");
+        assert!(!exec_cmd.intent.command.contains(&token));
+        assert!(exec_cmd.secrets.is_empty(), "busy keeps no secret value");
         assert!(tool.secret_digest.is_some());
     }
     fixture.acknowledge(Job::ToolIntent);
@@ -1262,25 +1265,25 @@ fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     let active = fixture.owner.active.as_mut().unwrap();
     assert_eq!(active.tool_cache.len(), 1);
     let (cached, digest, wire) = &active.tool_cache[0];
-    assert!(!shell_text(cached).contains(&token));
+    assert!(!exec_cmd_text(cached).contains(&token));
     assert!(digest.is_some());
     assert!(!wire.text.as_deref().unwrap_or("").contains(&token));
     // A repeated ordinal is compared by rewrite and keyed digest: the same
     // value matches the cache entry; a different value with the same rewrite
     // does not, and the owner treats it as a protocol fault.
     let other = ["ghp_", &"qQ2".repeat(12)].concat();
-    let mut same = shell_call_of(active, &raw);
-    let (_, same_digest) = shell_call::prepare(&mut same, &active.secret_key);
+    let mut same = exec_cmd_call_of(active, &raw);
+    let (_, same_digest) = exec_cmd_call::prepare(&mut same, &active.secret_key);
     assert_eq!(&same, cached);
     assert_eq!(Some(same_digest), *digest);
-    let mut different = shell_call_of(active, &format!("printf '%s' \"{other}\" | wc -c"));
-    let (_, different_digest) = shell_call::prepare(&mut different, &active.secret_key);
+    let mut different = exec_cmd_call_of(active, &format!("printf '%s' \"{other}\" | wc -c"));
+    let (_, different_digest) = exec_cmd_call::prepare(&mut different, &active.secret_key);
     assert_eq!(
         &different, cached,
         "the rewrite alone cannot tell them apart"
     );
     assert_ne!(Some(different_digest), *digest);
-    let different = shell_call_of(active, &format!("printf '%s' \"{other}\" | wc -c"));
+    let different = exec_cmd_call_of(active, &format!("printf '%s' \"{other}\" | wc -c"));
     Owner::tool_call(
         active,
         different,
@@ -1291,18 +1294,18 @@ fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     assert_eq!(active.failure_reason, Some("model_protocol_fault"));
 }
 
-/// J1T-05 unit (J1-Q3): a shell call has no tool deadline, so a result
+/// J1T-05 unit (J1-Q3): an exec_cmd call has no tool deadline, so a result
 /// committed long after it started never fails the turn as `model_timeout`;
 /// the ordinary tool deadline (L10) is unchanged.
 #[test]
-fn j1t_05_model_timeout_never_applies_to_shell() {
+fn j1t_05_model_timeout_never_applies_to_exec_cmd() {
     let mut fixture = Fixture::new();
     let now = Instant::now();
     {
         let active = fixture.owner.active.as_mut().unwrap();
         active.tool = None;
         active.tool_budget = tools::Budget::new(now + Duration::from_secs(3600));
-        let call = shell_call_of(active, "sleep 65");
+        let call = exec_cmd_call_of(active, "sleep 65");
         Owner::tool_call(active, call, now, &fixture.owner.payloads, Some([9; 16]));
         assert!(active.tool.as_ref().unwrap().deadline.is_none());
     }

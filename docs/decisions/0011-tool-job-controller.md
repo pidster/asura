@@ -6,7 +6,7 @@ design. Nothing is implemented.
 
 ## Context and decision
 
-The [shell tool](../designs/shell-tool.md) runs one command for at most 60 seconds
+The [exec_cmd tool](../designs/exec-cmd-tool.md) runs one command for at most 60 seconds
 within its turn. It returns bounded output tails directly into the model result.
 Long builds, tests and servers either fail the deadline or flood model context.
 
@@ -32,7 +32,7 @@ The owner selected three behaviors on 2026-10-12:
   sandbox and descendant limits still bound them. The person can see and cancel
   every live job.
 - Result retention must support reads while output is still arriving.
-- The shell contract that stops a command at turn end or steering is superseded
+- The exec_cmd contract that stops a command at turn end or steering is superseded
   for jobs when this design is implemented.
 
 ## Alternatives

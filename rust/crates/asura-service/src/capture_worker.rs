@@ -1,7 +1,7 @@
-//! One retained capture worker per admitted shell call (J1, SL3).
+//! One retained capture worker per admitted exec_cmd call (J1, SL3).
 //!
 //! The reactor side ([`Sink`]) receives raw pipe bytes from the platform
-//! `ShellJob` and moves them to the worker through a bounded transfer queue
+//! `ExecCmdJob` and moves them to the worker through a bounded transfer queue
 //! of 8 chunks of at most 64 KiB and 512 KiB in total, counting the bytes
 //! that wait on the reactor to form a chunk. It never blocks: `try_send`
 //! only. The worker scans each chunk, stages the redacted bytes, hashes them
@@ -9,10 +9,10 @@
 //! buffers and the scanner's carry; nothing raw reaches staging, records,
 //! logs or the model.
 use asura_platform::events::WakeSender;
+use asura_platform::exec_cmd::{OutputSink, READ_BUFFER};
 use asura_platform::secrets::{
     JobRedaction, JobSummary, LossSpan, NumberOrigin, Redacted, Stream, StreamStats,
 };
-use asura_platform::shell::{OutputSink, READ_BUFFER};
 use asura_storage::authority::conversation::{
     CaptureNumber, CaptureReason, CaptureState, CaptureStream, Hash, Id,
 };
@@ -191,7 +191,7 @@ struct SinkState {
     ended: [bool; 2],
 }
 /// The reactor-side handle of one capture's sink. Both the boxed sink given
-/// to `ShellJob` and the shell worker share it, on the reactor thread only,
+/// to `ExecCmdJob` and the exec_cmd worker share it, on the reactor thread only,
 /// so pending bytes keep moving after the job settles.
 #[derive(Clone)]
 pub(crate) struct SinkHandle {
@@ -395,7 +395,7 @@ impl Handle {
         }
         out
     }
-    /// A boxed sink for `ShellJob`, sharing this handle's state.
+    /// A boxed sink for `ExecCmdJob`, sharing this handle's state.
     pub(crate) fn output_sink(&self) -> Box<dyn OutputSink> {
         Box::new(Sink(self.sink.clone()))
     }

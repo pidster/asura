@@ -1,4 +1,4 @@
-use super::{MAX_COMMAND_BYTES, ShellError, protocol::Notice, spawn};
+use super::{ExecCmdError, MAX_COMMAND_BYTES, protocol::Notice, spawn};
 use crate::runtime::{open_at, stat_fd};
 use crate::secrets::rewrite::MAX_SECRET_VARIABLES;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -27,7 +27,7 @@ struct SecretEntry {
 /// refuses the whole set. Returns the entries ordered by number.
 fn secret_environment<'a>(
     entries: impl IntoIterator<Item = &'a [u8]>,
-) -> Result<Vec<SecretEntry>, ShellError> {
+) -> Result<Vec<SecretEntry>, ExecCmdError> {
     let mut accepted: Vec<SecretEntry> = Vec::new();
     let mut total = 0usize;
     for entry in entries {
@@ -35,32 +35,32 @@ fn secret_environment<'a>(
             continue;
         }
         if accepted.len() == MAX_SECRET_VARIABLES || entry.contains(&0) {
-            return Err(ShellError::Invalid);
+            return Err(ExecCmdError::Invalid);
         }
         let split = entry
             .iter()
             .position(|b| *b == b'=')
-            .ok_or(ShellError::Invalid)?;
+            .ok_or(ExecCmdError::Invalid)?;
         let (name, value) = (&entry[..split], &entry[split + 1..]);
         let digits = name
             .strip_prefix(SECRET_PREFIX)
-            .ok_or(ShellError::Invalid)?;
+            .ok_or(ExecCmdError::Invalid)?;
         if digits.is_empty()
             || digits.len() > 2
             || digits[0] == b'0'
             || !digits.iter().all(u8::is_ascii_digit)
         {
-            return Err(ShellError::Invalid);
+            return Err(ExecCmdError::Invalid);
         }
         let number = digits.iter().fold(0u8, |n, d| n * 10 + (d - b'0'));
         if usize::from(number) > MAX_SECRET_VARIABLES
             || accepted.iter().any(|seen| seen.number == number)
         {
-            return Err(ShellError::Invalid);
+            return Err(ExecCmdError::Invalid);
         }
         total += value.len();
         if total > MAX_COMMAND_BYTES {
-            return Err(ShellError::Invalid);
+            return Err(ExecCmdError::Invalid);
         }
         accepted.push(SecretEntry {
             number,
@@ -82,7 +82,7 @@ fn secret_environment<'a>(
 /// string becomes empty, so the kernel view ends its environment list there.
 /// Entries past the walk bound are not erased; such a set is always refused
 /// and the guardian then exits after its notice.
-fn own_secret_environment() -> Result<Vec<SecretEntry>, ShellError> {
+fn own_secret_environment() -> Result<Vec<SecretEntry>, ExecCmdError> {
     use zeroize::Zeroize;
     let mut walked: Vec<(*mut u8, usize)> = Vec::new();
     // SAFETY: _NSGetEnviron returns this process's `environ`, a NULL-terminated
@@ -156,7 +156,7 @@ impl CleanupSafety {
             last_clock: first_sample,
         }
     }
-    fn sample_clock(&mut self, sample: Result<u64, ShellError>) -> (u64, bool) {
+    fn sample_clock(&mut self, sample: Result<u64, ExecCmdError>) -> (u64, bool) {
         let fault = sample.is_err();
         let now = sample.unwrap_or_else(|_| self.last_clock.saturating_add(100_000_000));
         self.last_clock = now;
@@ -178,7 +178,7 @@ pub(super) const NO_DEADLINE: &str = "none";
 
 /// Parses the deadline argument: `none`, or monotonic nanoseconds no more
 /// than 60 s ahead of `now` (the bounded mode kept for qualification).
-fn parse_deadline(deadline_ns: &str, now: u64) -> Result<Option<u64>, ShellError> {
+fn parse_deadline(deadline_ns: &str, now: u64) -> Result<Option<u64>, ExecCmdError> {
     if deadline_ns == NO_DEADLINE {
         return Ok(None);
     }
@@ -186,13 +186,13 @@ fn parse_deadline(deadline_ns: &str, now: u64) -> Result<Option<u64>, ShellError
         || deadline_ns.len() > 20
         || !deadline_ns.bytes().all(|b| b.is_ascii_digit())
     {
-        return Err(ShellError::Invalid);
+        return Err(ExecCmdError::Invalid);
     }
     let deadline = deadline_ns
         .parse::<u64>()
-        .map_err(|_| ShellError::Invalid)?;
+        .map_err(|_| ExecCmdError::Invalid)?;
     if deadline <= now || deadline - now > 60_000_000_000 {
-        return Err(ShellError::Deadline);
+        return Err(ExecCmdError::Deadline);
     }
     Ok(Some(deadline))
 }
@@ -204,26 +204,26 @@ pub fn run_guardian(jobhex: &str, deadline_ns: &str, command: &str) -> i32 {
         Err(_) => 1,
     }
 }
-fn parse_id(s: &str) -> Result<[u8; 16], ShellError> {
+fn parse_id(s: &str) -> Result<[u8; 16], ExecCmdError> {
     if s.len() != 32
         || !s
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
-        return Err(ShellError::Invalid);
+        return Err(ExecCmdError::Invalid);
     }
     let mut id = [0; 16];
     for (i, b) in id.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| ShellError::Invalid)?;
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| ExecCmdError::Invalid)?;
     }
     if id == [0; 16] {
-        return Err(ShellError::Invalid);
+        return Err(ExecCmdError::Invalid);
     }
     Ok(id)
 }
-fn descriptors() -> Result<Vec<OwnedFd>, ShellError> {
+fn descriptors() -> Result<Vec<OwnedFd>, ExecCmdError> {
     for fd in 3..=10 {
-        let st = stat_fd(fd).map_err(|_| ShellError::Denied)?;
+        let st = stat_fd(fd).map_err(|_| ExecCmdError::Denied)?;
         // SAFETY: inspect access mode before assuming descriptor ownership.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         let access = if fd == 3 || fd >= 7 {
@@ -233,20 +233,20 @@ fn descriptors() -> Result<Vec<OwnedFd>, ShellError> {
         };
         if flags < 0 || flags & libc::O_ACCMODE != access || st.st_uid != unsafe { libc::geteuid() }
         {
-            return Err(ShellError::Denied);
+            return Err(ExecCmdError::Denied);
         }
         if fd <= 6 {
             if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
-                return Err(ShellError::Denied);
+                return Err(ExecCmdError::Denied);
             }
         } else if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_nlink == 0 {
-            return Err(ShellError::Denied);
+            return Err(ExecCmdError::Denied);
         }
         if (fd == 3 || fd == 4) && flags & libc::O_NONBLOCK == 0 {
-            return Err(ShellError::Denied);
+            return Err(ExecCmdError::Denied);
         }
         if fd >= 9 && st.st_mode & 0o777 != 0o700 {
-            return Err(ShellError::Denied);
+            return Err(ExecCmdError::Denied);
         }
     }
     // SAFETY: this private invocation exclusively receives the validated FDs.
@@ -254,13 +254,13 @@ fn descriptors() -> Result<Vec<OwnedFd>, ShellError> {
         .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
         .collect())
 }
-fn pinned_path(fd: i32) -> Result<String, ShellError> {
+fn pinned_path(fd: i32) -> Result<String, ExecCmdError> {
     let path = spawn::path(fd)?;
     let (device, inode) =
-        crate::project_identity::pinned_identity(&path).map_err(|_| ShellError::Denied)?;
-    let held = stat_fd(fd).map_err(|_| ShellError::Denied)?;
+        crate::project_identity::pinned_identity(&path).map_err(|_| ExecCmdError::Denied)?;
+    let held = stat_fd(fd).map_err(|_| ExecCmdError::Denied)?;
     if device != held.st_dev as u64 || inode != held.st_ino {
-        return Err(ShellError::Denied);
+        return Err(ExecCmdError::Denied);
     }
     Ok(path)
 }
@@ -269,17 +269,17 @@ fn within(path: &str, root: &str) -> bool {
     path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/')))
 }
 /// A path check inside the guardian. Storage's identity check is the authority.
-fn separate_from_state(project: &str, scratch: &str, asura: &str) -> Result<(), ShellError> {
+fn separate_from_state(project: &str, scratch: &str, asura: &str) -> Result<(), ExecCmdError> {
     if !scratch.starts_with(&format!("{asura}/tmp/"))
         || within(project, asura)
         || within(asura, project)
     {
-        return Err(ShellError::Denied);
+        return Err(ExecCmdError::Denied);
     }
     Ok(())
 }
-fn profile(project: &str, scratch: &str, asura: &str) -> Result<String, ShellError> {
-    let quote = |s: &str| crate::git_observer::quoted(s).map_err(|_| ShellError::Denied);
+fn profile(project: &str, scratch: &str, asura: &str) -> Result<String, ExecCmdError> {
+    let quote = |s: &str| crate::git_observer::quoted(s).map_err(|_| ExecCmdError::Denied);
     let roots = [
         "/bin",
         "/usr/bin",
@@ -318,20 +318,20 @@ fn profile(project: &str, scratch: &str, asura: &str) -> Result<String, ShellErr
         quote(scratch)?
     ))
 }
-fn notice(fd: i32, n: Notice, id: [u8; 16]) -> Result<(), ShellError> {
+fn notice(fd: i32, n: Notice, id: [u8; 16]) -> Result<(), ExecCmdError> {
     let bytes = n.encode(id);
     // SAFETY: bounded atomic write (<PIPE_BUF) to private nonblocking status pipe.
     let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
     if written == 32 {
         Ok(())
     } else {
-        Err(ShellError::Protocol)
+        Err(ExecCmdError::Protocol)
     }
 }
-fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellError> {
+fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ExecCmdError> {
     let id = parse_id(jobhex)?;
     if command.is_empty() || command.len() > MAX_COMMAND_BYTES || command.contains('\0') {
-        return Err(ShellError::Invalid);
+        return Err(ExecCmdError::Invalid);
     }
     let first_sample = spawn::monotonic_ns()?;
     let deadline = parse_deadline(deadline_ns, first_sample)?;
@@ -348,21 +348,21 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
         let scratch = pinned_path(9)?;
         let asura = pinned_path(10)?;
         if cwd != project && !cwd.starts_with(&format!("{project}/")) {
-            return Err(ShellError::Denied);
+            return Err(ExecCmdError::Denied);
         }
         separate_from_state(&project, &scratch, &asura)?;
         let profile = profile(&project, &scratch, &asura)?;
         if lease_reason(3)?.is_some() {
-            return Err(ShellError::Cancelled);
+            return Err(ExecCmdError::Cancelled);
         }
         // No-deadline mode skips the setup deadline check (J1-Q4).
         if let Some(deadline) = deadline
             && spawn::monotonic_ns()? >= deadline
         {
-            return Err(ShellError::Deadline);
+            return Err(ExecCmdError::Deadline);
         }
-        let null =
-            open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDONLY, 0).map_err(|_| ShellError::Io)?;
+        let null = open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDONLY, 0)
+            .map_err(|_| ExecCmdError::Io)?;
         // The preamble is added here, after both 8192-byte command checks;
         // the script is bounded by the command limit plus PREAMBLE_LIMIT.
         let script = format!(
@@ -370,7 +370,7 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
             preamble(secrets.iter().map(|secret| secret.number))
         );
         if script.len() > MAX_COMMAND_BYTES + PREAMBLE_LIMIT {
-            return Err(ShellError::Invalid);
+            return Err(ExecCmdError::Invalid);
         }
         let args = vec![
             "/usr/bin/sandbox-exec".into(),
@@ -409,8 +409,8 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
                 Notice {
                     kind: 3,
                     reason: match error {
-                        ShellError::Denied => 7,
-                        ShellError::Unavailable => 6,
+                        ExecCmdError::Denied => 7,
+                        ExecCmdError::Unavailable => 6,
                         _ => 5,
                     },
                     exit_kind: 0,
@@ -519,7 +519,7 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
                     return if report_ok {
                         Ok(())
                     } else {
-                        Err(ShellError::Protocol)
+                        Err(ExecCmdError::Protocol)
                     };
                 }
             }
@@ -552,7 +552,7 @@ fn guardian(jobhex: &str, deadline_ns: &str, command: &str) -> Result<(), ShellE
         }
     }
 }
-fn lease_reason(fd: i32) -> Result<Option<u8>, ShellError> {
+fn lease_reason(fd: i32) -> Result<Option<u8>, ExecCmdError> {
     let mut b = [0u8; 1];
     let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
     if n == 0 {
@@ -560,10 +560,10 @@ fn lease_reason(fd: i32) -> Result<Option<u8>, ShellError> {
     } else if n < 0 && spawn::would_block() {
         Ok(None)
     } else {
-        Err(ShellError::Protocol)
+        Err(ExecCmdError::Protocol)
     }
 }
-fn group_only_leader(pid: libc::pid_t) -> Result<bool, ShellError> {
+fn group_only_leader(pid: libc::pid_t) -> Result<bool, ExecCmdError> {
     let mut members = [0i32; 256];
     // SAFETY: bounded complete PID buffer. PROC_PGRP_ONLY=2 from installed SDK.
     let bytes = unsafe {
@@ -578,7 +578,7 @@ fn group_only_leader(pid: libc::pid_t) -> Result<bool, ShellError> {
         || bytes as usize >= std::mem::size_of_val(&members)
         || !(bytes as usize).is_multiple_of(4)
     {
-        return Err(ShellError::CleanupUnconfirmed);
+        return Err(ExecCmdError::CleanupUnconfirmed);
     }
     Ok(members[..bytes as usize / 4]
         .iter()
@@ -590,15 +590,15 @@ mod tests {
     use super::*;
     #[test]
     fn profile_denies_state_after_existing_rules_then_restores_scratch() {
-        let text = profile("/p", "/h/.asura/tmp/shell-1", "/h/.asura").unwrap();
+        let text = profile("/p", "/h/.asura/tmp/exec-cmd-1", "/h/.asura").unwrap();
         let deny = text
             .find("(deny file-read* file-write* process-exec file-map-executable (subpath \"/h/.asura\"))")
             .expect("state deny");
         let exec = text
-            .rfind("(allow process-exec file-map-executable file-read* (subpath \"/h/.asura/tmp/shell-1\"))")
+            .rfind("(allow process-exec file-map-executable file-read* (subpath \"/h/.asura/tmp/exec-cmd-1\"))")
             .expect("scratch exec");
         let write = text
-            .rfind("(allow file-write* (subpath \"/h/.asura/tmp/shell-1\"))")
+            .rfind("(allow file-write* (subpath \"/h/.asura/tmp/exec-cmd-1\"))")
             .expect("scratch write");
         let metadata = text
             .find("(allow file-read-metadata (literal \"/h/.asura\") (literal \"/h/.asura/tmp\"))")
@@ -613,7 +613,7 @@ mod tests {
         let quoted = profile("/p", "/h/.as\"ura/tmp/s", "/h/.as\"ura").unwrap();
         assert!(quoted.contains("(subpath \"/h/.as\\\"ura\")"));
     }
-    fn numbers(entries: &[&[u8]]) -> Result<Vec<u8>, ShellError> {
+    fn numbers(entries: &[&[u8]]) -> Result<Vec<u8>, ExecCmdError> {
         secret_environment(entries.iter().copied())
             .map(|accepted| accepted.iter().map(|s| s.number).collect())
     }
@@ -678,11 +678,15 @@ mod tests {
                 vec![half.as_slice(), other_half.as_slice()],
             ),
         ] {
-            assert_eq!(numbers(&entries), Err(ShellError::Invalid), "{label}");
+            assert_eq!(numbers(&entries), Err(ExecCmdError::Invalid), "{label}");
         }
         let mut seventeen = all.clone();
         seventeen.push(b"ASURA_SECRET_1=a");
-        assert_eq!(numbers(&seventeen), Err(ShellError::Invalid), "17 entries");
+        assert_eq!(
+            numbers(&seventeen),
+            Err(ExecCmdError::Invalid),
+            "17 entries"
+        );
     }
     #[test]
     fn preamble_holds_names_only_and_is_bounded() {
@@ -701,23 +705,23 @@ mod tests {
     #[test]
     fn guardian_path_check_rejects_every_overlap() {
         let asura = "/h/.asura";
-        let scratch = "/h/.asura/tmp/shell-1";
+        let scratch = "/h/.asura/tmp/exec-cmd-1";
         assert!(separate_from_state("/h/project", scratch, asura).is_ok());
         assert!(separate_from_state("/h/.asura-other", scratch, asura).is_ok());
         for project in ["/h/.asura", "/h/.asura/run", "/h", "/"] {
             assert_eq!(
                 separate_from_state(project, scratch, asura),
-                Err(ShellError::Denied),
+                Err(ExecCmdError::Denied),
                 "{project}"
             );
         }
         assert_eq!(
             separate_from_state("/h/project", "/h/project/tmp/x", asura),
-            Err(ShellError::Denied)
+            Err(ExecCmdError::Denied)
         );
         assert_eq!(
             separate_from_state("/h/project", "/h/.asura/tmpx/x", asura),
-            Err(ShellError::Denied)
+            Err(ExecCmdError::Denied)
         );
     }
     /// Defence in depth: even a project that contains the home cannot reach it
@@ -742,7 +746,7 @@ mod tests {
         std::fs::create_dir(&home).unwrap();
         let _remove = Remove(home.clone());
         let asura = home.join(".asura");
-        let scratch = asura.join("tmp/shell-1");
+        let scratch = asura.join("tmp/exec-cmd-1");
         std::fs::create_dir_all(&scratch).unwrap();
         for dir in [&home, &asura, &scratch] {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -797,11 +801,11 @@ mod tests {
         );
         assert_eq!(
             parse_deadline(&(now + 60_000_000_001).to_string(), now),
-            Err(ShellError::Deadline)
+            Err(ExecCmdError::Deadline)
         );
         assert_eq!(
             parse_deadline(&now.to_string(), now),
-            Err(ShellError::Deadline)
+            Err(ExecCmdError::Deadline)
         );
         for bad in [
             "",
@@ -815,7 +819,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_deadline(bad, now),
-                Err(ShellError::Invalid),
+                Err(ExecCmdError::Invalid),
                 "{bad:?}"
             );
         }
@@ -830,15 +834,18 @@ mod tests {
             (5_100_000_000, false)
         );
         assert_eq!(
-            safety.sample_clock(Err(ShellError::Io)),
+            safety.sample_clock(Err(ExecCmdError::Io)),
             (5_200_000_000, true)
         );
         assert_eq!(
-            safety.sample_clock(Err(ShellError::Io)),
+            safety.sample_clock(Err(ExecCmdError::Io)),
             (5_300_000_000, true)
         );
         let mut fresh = CleanupSafety::new(7);
-        assert_eq!(fresh.sample_clock(Err(ShellError::Io)), (100_000_007, true));
+        assert_eq!(
+            fresh.sample_clock(Err(ExecCmdError::Io)),
+            (100_000_007, true)
+        );
     }
     #[test]
     fn lost_child_fence_cannot_be_restored_by_recycled_pid_observation() {
@@ -854,11 +861,11 @@ mod tests {
     #[test]
     fn repeated_clock_failure_advances_cleanup_and_kills_only_owned_group() {
         let mut safety = CleanupSafety::new(1_000);
-        let (first, fault) = safety.sample_clock(Err(ShellError::Io));
+        let (first, fault) = safety.sample_clock(Err(ExecCmdError::Io));
         assert!(first >= 1_000);
         assert!(fault);
         assert!(safety.kill_due(fault, 0, false));
-        let (second, fault) = safety.sample_clock(Err(ShellError::Io));
+        let (second, fault) = safety.sample_clock(Err(ExecCmdError::Io));
         assert!(second > first);
         assert!(fault);
         assert!(!safety.kill_due(fault, 0, true));

@@ -183,7 +183,7 @@ only validated `run/` and optional `logs/` is `Uninitialized`. This classificati
 permits no initialization action in 3A. Missing records cannot prove first-ever use.
 If a valid journal exists, preserve the named areas without interpreting contents.
 This includes the selected `data/` classifier/model areas, including Core AI and
-MLX artifacts, and `payloads/`, the retained shell output that the
+MLX artifacts, and `payloads/`, the retained exec_cmd output that the
 [J1 payload store](tool-job-controller.md#j1-and-sl3-implementation-details) owns;
 their presence is not unknown root content. An unlisted root entry
 still produces `unknown_content`. Configuration and graph

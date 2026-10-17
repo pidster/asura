@@ -5,10 +5,10 @@ use asura_platform::RuntimeDirectory;
 use asura_platform::payload_io::gate::{self, Fault, Point};
 use asura_platform::secrets::{JobRedaction, Redacted, Stream, detection};
 use asura_storage::authority::conversation::{
-    ActiveBinding, CaptureReason, CaptureSettled, CaptureState, CaptureStream, Cause, Hash,
-    INITIAL_RESERVATION, Id, PendingInit, ProjectRegistered, Record, Replay, Request,
-    ShellDisposition, ShellIntent, StartAuthorized, TerminalKind, ToolResult, TurnAccepted,
-    TurnTerminal, encode_frame, replay, request_digest, shell_job_id,
+    ActiveBinding, CaptureReason, CaptureSettled, CaptureState, CaptureStream, Cause,
+    ExecCmdDisposition, ExecCmdIntent, Hash, INITIAL_RESERVATION, Id, PendingInit,
+    ProjectRegistered, Record, Replay, Request, StartAuthorized, TerminalKind, ToolResult,
+    TurnAccepted, TurnTerminal, encode_frame, exec_cmd_job_id, replay, request_digest,
 };
 use asura_storage::authority::conversation::{FrameContext, SecretKind};
 use asura_storage::payload::{
@@ -106,7 +106,7 @@ fn payloads(ordinal: u32) -> [Id; 2] {
     ]
 }
 fn call(ordinal: u32) -> Id {
-    shell_job_id(id(10), 1, ordinal)
+    exec_cmd_job_id(id(10), 1, ordinal)
 }
 fn admit(store: &PayloadStore, ordinal: u32) -> [Id; 2] {
     let victims = store
@@ -628,11 +628,11 @@ impl Journal {
     /// Kind 22 (admitted); returns its sequence.
     fn admitted(&mut self, ordinal: u32) -> u64 {
         let [stdout_payload, stderr_payload] = payloads(ordinal);
-        self.append(Record::ShellIntent(Box::new(ShellIntent {
+        self.append(Record::ExecCmdIntent(Box::new(ExecCmdIntent {
             operation: id(10),
             generation: 1,
             ordinal,
-            disposition: ShellDisposition::Admitted,
+            disposition: ExecCmdDisposition::Admitted,
             command_truncated: false,
             command: "printf \"$ASURA_SECRET_1\"".into(),
             cwd: ".".into(),

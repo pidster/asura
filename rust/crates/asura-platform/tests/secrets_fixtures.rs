@@ -271,8 +271,8 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
     for file in [
         "src/secrets/stream.rs",
         "src/secrets/rules.rs",
-        "src/shell/split.rs",
-        "src/shell.rs",
+        "src/exec_cmd/split.rs",
+        "src/exec_cmd.rs",
     ] {
         let text = std::fs::read(root.join(file)).unwrap_or_default();
         diff.extend_from_slice(

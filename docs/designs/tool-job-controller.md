@@ -20,7 +20,7 @@ governing J1 design. J1 also applies the
 [result retention packet](result-retention-graph-packet.md#review-decisions-and-delivery-dependencies)
 changes that the 2026-10-14 decisions record. The full review of findings
 EX1–EX16 (T1) was completed on 2026-10-15. J2 and the packets after it wait
-for EX5 escapee detection and termination and for EX10 shell qualification of
+for EX5 escapee detection and termination and for EX10 exec_cmd qualification of
 each local provider; see [threat model review](#threat-model-review-of-2026-10-15).
 Mechanisms marked "proposed" are engineering choices under the
 [iteration rules](../design-process.md#iteration-and-escalation), not owner
@@ -42,11 +42,11 @@ separately, from their first byte, while the job runs and after it settles.
 The controller therefore retains each stream from offset 0. It never keeps only
 a rolling tail. A capture that stops early keeps its contiguous prefix.
 
-This separates three things that the current [shell tool](shell-tool.md) couples:
+This separates three things that the current [exec_cmd tool](exec-cmd-tool.md) couples:
 process lifetime, output retention and model disclosure. Today one call blocks its
 turn for at most 60 seconds (`asura-service/src/tools.rs:189`), then returns up to
 6144 bytes from the end of each stream into the model result
-(`asura-platform/src/shell/capture.rs:72`).
+(`asura-platform/src/exec_cmd/capture.rs:72`).
 
 | Decision | Selected by the owner, 2026-10-12 |
 | --- | --- |
@@ -68,7 +68,7 @@ by the [context composer](context-composer.md) (conversation projections items 5
 | [PCR6, PCR11](person-command-mode.md#required-behavior), [PC5, PC7, PC8, PC9, PC10](person-command-mode.md#decisions) | Owner, 2026-10-13 and 2026-10-14 | Person-origin jobs: a person execution profile and grant, stop then kill at once on a second request, a 2 s stop grace, dispatch with no active turn in the conversation, model `cancel` of a person job returns `not_permitted`, and accepted work continues when a client goes away. |
 | [Person job controller amendments](person-command-mode.md#job-controller-amendments) | Proposed mechanisms | `JobCancel.kill`, `JobObserve.at_end`, origin and input ID on job records and replies, and person job ID derivation. J2 includes them. |
 | [Execution threat model review](execution-threat-model.md#owner-decisions) EX4, EX5, EX10, EX11, EX12 | Owner, 2026-10-14 and 2026-10-15 | See [threat model review of 2026-10-15](#threat-model-review-of-2026-10-15). |
-| [Asura state isolation](asura-state-isolation.md) (PX3, SI3) | Implemented, 2026-10-14 | Every shell profile denies `~/.asura` except the call's scratch. The guardian receives the Asura home at FD 10 (`asura-platform/src/shell/guardian.rs:199`); person extra roots use FDs 11–17. Jobs inherit this unchanged. |
+| [Asura state isolation](asura-state-isolation.md) (PX3, SI3) | Implemented, 2026-10-14 | Every exec_cmd profile denies `~/.asura` except the call's scratch. The guardian receives the Asura home at FD 10 (`asura-platform/src/exec_cmd/guardian.rs:199`); person extra roots use FDs 11–17. Jobs inherit this unchanged. |
 
 ### Threat model review of 2026-10-15
 
@@ -81,7 +81,7 @@ selected here.
 | --- | --- | --- |
 | EX4 | Owner, 2026-10-15. All tools use jobs; there are no legacy tools. Secrets are detected with Wisp's ported rules (SD1 corrects "rules plus a classifier"; no classifier) and replaced with placeholders at capture, before storage; secrets only. A secret in a command becomes a per-execution variable such as `$ASURA_SECRET_1`; the log keeps only its name; an unsafe rewrite is refused. | Supersedes R3's "legacy tools keep kind 15". The J1 capture path filters secrets under the [secret detection design](secret-detection.md). Retained streams, pages, journal records and both views hold placeholders. Job intent records the rewritten command. How other tools adopt jobs is a follow-up design. |
 | EX5 | Owner, 2026-10-14. Detect and terminate escapees reliably before J2: `setsid` and new-session escapes, pipe-holding escapees that block settlement, and false `cleanup_confirmed`. | J2 prerequisite. Without it a pipe-holding escapee could hold a slot indefinitely, since jobs have no lifetime (J2a-1). |
-| EX10 | Owner, 2026-10-14. Run SH-E1-style shell qualification for each local tool-capable provider (CoreAI, MLX, Ollama models) before J2. | J2 prerequisite. |
+| EX10 | Owner, 2026-10-14. Run SH-E1-style exec_cmd qualification for each local tool-capable provider (CoreAI, MLX, Ollama models) before J2. | J2 prerequisite. |
 | EX11 | Owner, 2026-10-14. A person execution setting: global default plus a per-project override, default on. A change is a revocation trigger: turning it off refuses new execution and cancels live model jobs in scope. | Added to [revocation triggers](#security-and-authority) and TJ-14. The setting needs its own design. |
 | EX12 | Owner, 2026-10-14. The client shows a visible notice whenever a job outlives its turn. | Added to [turn end](#turn-end-steering-cancellation-and-completion). Proposed placement: J4. |
 
@@ -134,15 +134,15 @@ scheduler or payload store.
 | Behavior | Canonical owner |
 | --- | --- |
 | Job admission, identity, lifecycle, slots, cancellation and notices | New job controller module inside the Rust service orchestrator, on the existing reactor |
-| Process spawn, sandbox, guardian, group cleanup and reap | Existing `asura-platform` shell owner and lease guardian, one instance per job slot |
-| Setup and cleanup isolation | Existing retained shell worker stages, one per job slot |
+| Process spawn, sandbox, guardian, group cleanup and reap | Existing `asura-platform` exec_cmd owner and lease guardian, one instance per job slot |
+| Setup and cleanup isolation | Existing retained exec_cmd worker stages, one per job slot |
 | Durable job intent, cancel request, settlement and retention records | Existing authority writer, with additive format-1 record kinds |
 | Output capture, staging, verified payloads, page reads and expiry | `asura-storage` retained payload adapter from the retention packet, amended below |
 | Model-facing `job` commands | Existing tool registry and grouped tool dispatcher |
 | Client job list, observe, cancel and retention commands | Existing control request handler, client worker pattern and TUI cached rendering |
 | Model session and native tool callbacks | Supervised Swift helper; it never receives payload paths or streams |
 
-Ownership transfer: today the shell worker lives in the turn's active state
+Ownership transfer: today the exec_cmd worker lives in the turn's active state
 (`asura-service/src/conversation.rs:487`), and the conversation owner holds one
 active turn (`conversation.rs:584`). Turn terminal and ToolResult publication
 wait for its settlement (`conversation.rs:3466`, `conversation.rs:3486`). Under this
@@ -160,14 +160,14 @@ flowchart LR
         Conv[Conversation owner and tool dispatcher]
         Ctrl[Control request handler]
         Ctl[Job controller and slots]
-        Plat[Platform shell owner and guardian]
+        Plat[Platform exec_cmd owner and guardian]
         Store[Payload adapter: staging and pages]
         J[(Authority journal)]
         P[(Retained payloads)]
     end
     Helper[Swift model helper]
     TUI[TUI client worker]
-    Helper -->|shell or job command| Conv
+    Helper -->|exec_cmd or job command| Conv
     Conv -->|admit, read, wait, cancel| Ctl
     TUI -->|JobList, JobRead, JobObserve, JobCancel| Ctrl
     Ctrl -->|scoped request| Ctl
@@ -186,9 +186,9 @@ flowchart LR
 
 ### Starting a job
 
-Proposed mechanism: every `shell` call runs as a job. `shell` gains an optional
+Proposed mechanism: every `exec_cmd` call runs as a job. `exec_cmd` gains an optional
 `yield_seconds` argument. It loses `timeout_seconds`, because jobs have no
-lifetime (J2a-1). Model field 3 of `Shell` (`contracts/model/v1/model.proto:79`)
+lifetime (J2a-1). Model field 3 of `ExecCmd` (`contracts/model/v1/model.proto:79`)
 becomes reserved, and a call that still sets it is rejected as invalid
 arguments. Other tools stay synchronous until they adopt the controller.
 
@@ -344,7 +344,7 @@ sequenceDiagram
     participant J as Authority journal
     participant G as Platform guardian
     participant S as Payload adapter
-    M->>C: shell(command, yield 10 s)
+    M->>C: exec_cmd(command, yield 10 s)
     C->>K: Check duplicate, slot and quota
     K->>J: Commit intent, quota and record reservations
     K->>K: Recheck grant and project identity
@@ -452,10 +452,10 @@ stateDiagram-v2
 
 Verified guardian behavior (code, commit `3cf424b`): when the leader exits, the
 guardian sends TERM to the group at once and KILL 500 ms later
-(`asura-platform/src/shell/guardian.rs:304-326`, `guardian.rs:37-38`). It reports
+(`asura-platform/src/exec_cmd/guardian.rs:304-326`, `guardian.rs:37-38`). It reports
 the exit only after the group is empty and the leader is reaped
 (`guardian.rs:327-347`). Its notices have kinds 1–4 only
-(`asura-platform/src/shell/protocol.rs:47-52`).
+(`asura-platform/src/exec_cmd/protocol.rs:47-52`).
 
 Required behavior (owner, 2026-10-14, J2b): the guardian adds notice kind 5,
 leader exited, sent when it observes the leader's exit and before the group's
@@ -497,7 +497,7 @@ operations. They never end a job's normal run and are not job closures.
 | Page read storage step | 2 s | Owner, 2026-10-14 |
 | Shutdown cleanup | 2 s | Owner, 2026-10-14 |
 
-The cleanup bound before `CleanupUnconfirmed` (2.5 s, shell limit L3, kept by
+The cleanup bound before `CleanupUnconfirmed` (2.5 s, exec_cmd limit L3, kept by
 the [limit review](tool-output-views.md#limit-review)) only decides when
 cleanup is reported as unconfirmed after the job has already ended.
 
@@ -505,7 +505,7 @@ Required behavior (owner, 2026-10-15): job setup and client observation have
 no time bound.
 
 - **Setup** ends when the process is spawned, on cancel, or on a setup fault.
-  The existing 2-second shell setup budget (L2) is removed in J1 (J1-Q4, owner,
+  The existing 2-second exec_cmd setup budget (L2) is removed in J1 (J1-Q4, owner,
   2026-10-15); see [J1 timeout and setup budget removal](#j1-timeout-and-setup-budget-removal).
 - **`JobObserve`** returns on new output past the client's offset, job
   settlement, client detach or cancel. It has no polling timer.
@@ -523,7 +523,7 @@ are selected mechanisms of this design.
    object owned by the job. The readable watermark is the written and reported
    byte count. It is not a durability claim. Pipe reads stay nonblocking reads
    on the reactor, as today: 8 KiB per stream per dispatch with a 4 KiB read
-   buffer (`asura-platform/src/shell.rs:378-385`, `shell/capture.rs:24-26`).
+   buffer (`asura-platform/src/exec_cmd.rs:378-385`, `exec_cmd/capture.rs:24-26`).
    Staging writes run on the job slot's capture worker, never on the reactor.
 2. **Live pages:** a page of a running job has state `live`. It binds job ID,
    stream and watermark, not a digest. An offset equal to the watermark returns
@@ -555,12 +555,12 @@ When implemented, this design changes these existing contracts for jobs:
 
 | Existing clause | Change |
 | --- | --- |
-| Shell: command stops at turn end, steering or generation invalidation | Only before handle delivery |
-| Shell: `timeout_seconds` 1–60 (`tools.rs:189`); guardian rejects deadlines over 60 s (`guardian.rs:322`) | Removed. J1 removes the timeout and adds the guardian's no-deadline mode (J1-Q3); `timeout_seconds` is accepted and ignored until J3 removes it. Jobs have no lifetime (J2a-1) |
+| exec_cmd: command stops at turn end, steering or generation invalidation | Only before handle delivery |
+| exec_cmd: `timeout_seconds` 1–60 (`tools.rs:189`); guardian rejects deadlines over 60 s (`guardian.rs:322`) | Removed. J1 removes the timeout and adds the guardian's no-deadline mode (J1-Q3); `timeout_seconds` is accepted and ignored until J3 removes it. Jobs have no lifetime (J2a-1) |
 | Helper and control validation of `timeout_seconds` 1–60 (`swift/model-helper/Sources/HelperCore/ToolBridge.swift:185`, `asura-control/src/model.rs:394`) | `timeout_seconds` removed; `yield_seconds` validated instead |
-| Shell: one shell worker per active turn (`conversation.rs:487`) and one active turn (`conversation.rs:584`), so one live shell job service-wide | Controller slots under the limits below |
-| Shell intent: ToolIntent record kind 14 with tool kind 16 stores the timeout as 1–60,000 ms and 1–60 s (`asura-storage/src/authority/conversation/codec.rs:289-305`) | J1: ShellIntent kind 22 with no timeout; J2: job intent record (R3) |
-| Shell result: end of each stream, at most 6144 bytes (`shell/capture.rs:72`) | No output text (PC12) |
+| exec_cmd: one exec_cmd worker per active turn (`conversation.rs:487`) and one active turn (`conversation.rs:584`), so one live exec_cmd job service-wide | Controller slots under the limits below |
+| exec_cmd intent: ToolIntent record kind 14 with tool kind 16 stores the timeout as 1–60,000 ms and 1–60 s (`asura-storage/src/authority/conversation/codec.rs:289-305`) | J1: ExecCmdIntent kind 22 with no timeout; J2: job intent record (R3) |
+| exec_cmd result: end of each stream, at most 6144 bytes (`exec_cmd/capture.rs:72`) | No output text (PC12) |
 | Model tools: ToolResult record kind 15 holds result text (`types.rs:415-423`) | All tools use jobs and the reference-only result kind (EX4, owner 2026-10-15, superseding R3's "legacy tools keep kind 15") |
 | Guardian: notices of kinds 1–4 (`protocol.rs:47-52`) | Adds kind 5, leader exited (J2b) |
 | Guardian: any byte on the lease pipe is a protocol fault (`guardian.rs:389-399`) | Stop-control bytes, below |
@@ -802,7 +802,7 @@ flowchart TD
 - **Stalled read:** a page request has a 2-second storage bound. Expiry of that
   bound returns `busy`; the retained read worker stays held until it settles.
 - **Journal unavailable:** the owner enters its existing repair path and cancels
-  all live jobs, as it cancels the shell today (`conversation.rs:3155-3166`).
+  all live jobs, as it cancels the exec_cmd job today (`conversation.rs:3155-3166`).
   Settlement records wait for repair and use their reserved capacity.
 - **Quota exhausted:** new jobs return `busy` with reason `quota`. Running jobs
   keep their reservations.
@@ -897,7 +897,7 @@ real model provider and the TUI PTY harness.
 | TJ-14 | Revocation triggers | Each trigger cancels the right jobs | Unregister, identity change; EX11 setting off globally and per project once it exists | — |
 | TJ-15 | Journal unavailable and full | Reserved settlement capacity | Writer fault during live job | Repair then settlement recorded |
 | TJ-16 | Graceful shutdown | Shutdown reason recorded | Settle within and beyond the 2 s bound | TUI-owned backend exit |
-| TJ-17 | Default shell behavior change | Short commands and commands over 60 s; `timeout_seconds` rejected | A command over 60 s runs to completion | Native model handles both |
+| TJ-17 | Default exec_cmd behavior change | Short commands and commands over 60 s; `timeout_seconds` rejected | A command over 60 s runs to completion | Native model handles both |
 | TJ-18 | Person navigates both streams from the start | Viewer state: Tab keeps positions, Home, End, follow | Pages from byte 0 of each stream while running and after settlement | PTY: open from `/jobs` and from an activity row, read both streams |
 | TJ-19 | Model reads both streams from the start | Separate cursors; the starting result does not advance them | `read` at 0 for `stdout` and `stderr`, running and settled | Native model reads `stderr` after `stdout` |
 | TJ-20 | Prefix retained after capture stop | Retained range reported | Capture fault keeps bytes from 0 | Viewer shows stop reason and range |
@@ -929,9 +929,9 @@ flowchart TD
     RP[Retention packet changes: G1, R1, R2, R4, R5] --> J1[J1: staging capture, secret filter, descriptors, text pages, quota]
     SD[EX4: secret detection slices SL1, SL2, implemented] --> J1
     ESC[EX5: escapee detection and termination] --> J2[J2: controller core with model and person origin]
-    QUAL[EX10: shell qualification per local provider] --> J2
+    QUAL[EX10: exec_cmd qualification per local provider] --> J2
     J1 --> J2
-    J2 --> J3[J3: model job tool and shell adoption]
+    J2 --> J3[J3: model job tool and exec_cmd adoption]
     J2 --> J4[J4: control API, TUI jobs and retention commands]
     J2 --> J6[J6: expiry, value classes and holds]
     J3 --> J5[J5: job notices in turn input]
@@ -943,9 +943,9 @@ flowchart TD
 
 | Packet | Delivers | Decisions it uses |
 | --- | --- | --- |
-| J1 | Retention item 3 under the existing shell: secret filtering at capture and command rewrite (EX4, SL3), incremental hashing, staging, settle-then-install, kinds 22 and 23, `live` and `unverified_prefix` text pages, quota and growing-reservation accounting with interim expiry, capture and page-read workers, and removal of the shell timeout and setup budget. The model result keeps its shape with redacted tails; full output is retained. Graph projection is excluded. See [J1 and SL3 implementation details](#j1-and-sl3-implementation-details). | G1, R1, R2, R3 (kinds 22, 23), R4, R5, R6, EX4, J1-Q1 to J1-Q4 |
-| J2 | Controller core: slots, job records, no lifetime, lease stop-control bytes, leader-exit notice, `CapturePaused` for quota and ENOSPC, revocation, journal outage, restart and shutdown, and the person-origin amendments. Driven by integration tests; the shell is not yet switched. | T1 (done), EX5, EX10, R3, J1d, J2a-1, J2a-2, J2b, J2c, J2d |
-| J3 | `shell` adoption with yield and no output text, removal of `timeout_seconds`, the `job` tool including `wait` and `note`, and reference-only results. Shipped together, because results carry no output text. | R3, R5, `job wait`, S1 |
+| J1 | Retention item 3 under the existing exec_cmd tool: secret filtering at capture and command rewrite (EX4, SL3), incremental hashing, staging, settle-then-install, kinds 22 and 23, `live` and `unverified_prefix` text pages, quota and growing-reservation accounting with interim expiry, capture and page-read workers, and removal of the exec_cmd timeout and setup budget. The model result keeps its shape with redacted tails; full output is retained. Graph projection is excluded. See [J1 and SL3 implementation details](#j1-and-sl3-implementation-details). | G1, R1, R2, R3 (kinds 22, 23), R4, R5, R6, EX4, J1-Q1 to J1-Q4 |
+| J2 | Controller core: slots, job records, no lifetime, lease stop-control bytes, leader-exit notice, `CapturePaused` for quota and ENOSPC, revocation, journal outage, restart and shutdown, and the person-origin amendments. Driven by integration tests; the exec_cmd tool is not yet switched. | T1 (done), EX5, EX10, R3, J1d, J2a-1, J2a-2, J2b, J2c, J2d |
+| J3 | `exec_cmd` adoption with yield and no output text, removal of `timeout_seconds`, the `job` tool including `wait` and `note`, and reference-only results. Shipped together, because results carry no output text. | R3, R5, `job wait`, S1 |
 | J4 | Control messages, `/jobs`, the viewer, cancel and kill, `at_end`, and `/job pin`, `unpin`, `delete` and `note`, with their command flowcharts | J2a-2, J4a, S1 |
 | J5 | Job notices before the prompt, bound by the turn input digest | J5a |
 | J6 | Automatic expiry with value classes, ages, tie-break and holds | S2 |
@@ -963,19 +963,19 @@ numbering remains `0.1`; journal format remains `1`.
 
 ### J1 scope
 
-J1 runs under today's shell tool: one shell call at a time, inside the turn
+J1 runs under today's exec_cmd tool: one exec_cmd call at a time, inside the turn
 that made it. It adds retained capture and secret filtering behind that call.
 It does not add the job controller, job handles or job tools.
 
 | Area | J1 delivers | Model-visible |
 | --- | --- | --- |
-| Command rewrite | SL3: the conversation owner rewrites the shell command at `ToolCall`, before any record. Unsafe forms are refused. | Yes: refusal results; the command runs through secret variables |
+| Command rewrite | SL3: the conversation owner rewrites the exec_cmd command at `ToolCall`, before any record. Unsafe forms are refused. | Yes: refusal results; the command runs through secret variables |
 | Capture | Scan, then stage, then hash each stream on a capture worker, with backpressure and the 512 KiB transfer queue | No |
 | Model result | Kind 15 keeps today's shape. Its tails come from the redacted stream, and its header gains the capture state. | Yes: placeholders in tails; `capture=` field |
-| Durable records | Kinds 22 (ShellIntent) and 23 (CaptureSettled); kind 15 unchanged | No |
+| Durable records | Kinds 22 (ExecCmdIntent) and 23 (CaptureSettled); kind 15 unchanged | No |
 | Settle, then install (R2) | Kind 23 commits before kind 15; payloads install after kind 23 | No |
 | Quota (R1, J1d) | Ledger, 1 MiB initial reservation, 1 MiB steps, interim quota-pressure expiry (J1-Q2), no 64 MiB stop | Yes: `busy` results |
-| Time bounds | The shell 1–60 s timeout (L1, J1-Q3) and the 2 s setup budget (L2, J1-Q4) are removed | Yes: commands run until they end or the turn is cancelled |
+| Time bounds | The exec_cmd 1–60 s timeout (L1, J1-Q3) and the 2 s setup budget (L2, J1-Q4) are removed | Yes: commands run until they end or the turn is cancelled |
 | Pages | Text pages with `live`, `complete`, `incomplete` and `unverified_prefix` states; 2 page-read workers | No: no consumer until J3 and J4 |
 | Recovery | Derived from kinds 22 and 23 and the payload directories; no recovery record | No |
 
@@ -997,9 +997,9 @@ What later packets keep or replace:
 
 | ID | Decision (owner, 2026-10-15) | Applied in |
 | --- | --- | --- |
-| J1-Q1 | While a command runs, a slow or stalled capture only backpressures the producer. After a cancel trigger, the existing L3 bound of 2.5 s also covers capture settlement. If capture has not settled by then, the call records `capture_unconfirmed`, keeps its staging bytes as an unverified prefix, delivers its result, and retains the stuck capture worker. | [Settlement](#service-shell-worker-phases-and-settlement), [failure handling](#j1-failure-handling) |
+| J1-Q1 | While a command runs, a slow or stalled capture only backpressures the producer. After a cancel trigger, the existing L3 bound of 2.5 s also covers capture settlement. If capture has not settled by then, the call records `capture_unconfirmed`, keeps its staging bytes as an unverified prefix, delivers its result, and retains the stuck capture worker. | [Settlement](#service-exec_cmd-worker-phases-and-settlement), [failure handling](#j1-failure-handling) |
 | J1-Q2 | When quota or disk space runs short, capture pauses: the service stops reading the pipes, and new calls return `busy`. An interim quota-pressure expiry deletes settled, unheld output, oldest last use first, as one class until J6. No output expires by age. The 64 MiB per-call stop is removed (J1d). | [Quota ledger](#quota-ledger) |
-| J1-Q3 | The shell 1–60 s timeout is removed in J1. A command ends on completion or turn cancel. `timeout_seconds` is accepted and ignored until J3 removes it. | [Timeout and setup removal](#j1-timeout-and-setup-budget-removal) |
+| J1-Q3 | The exec_cmd 1–60 s timeout is removed in J1. A command ends on completion or turn cancel. `timeout_seconds` is accepted and ignored until J3 removes it. | [Timeout and setup removal](#j1-timeout-and-setup-budget-removal) |
 | J1-Q4 | The 2 s setup budget (L2) is removed in J1. Setup ends on spawn, cancel or a setup fault. | [Timeout and setup removal](#j1-timeout-and-setup-budget-removal) |
 | J1 retry | A paused capture retries with backoff starting at 1 s, with Fibonacci-increasing delays: 1, 1, 2, 3, 5, 8 s and so on, with no cap. It also retries at once, and restarts the sequence, on an event that may free space: a call settles, output expires, or the person acts. The retry never ends or refuses work. | [Quota ledger](#quota-ledger) |
 | J1-0 | Journal waits have no time bound: append, append observation, startup replay and the queue worker. An append waits for its write and sync; only an actual I/O error fences the journal. The service waits for the writer's real reply; a cancelled turn stops waiting and the late reply is applied. Queued jobs run in order. Beyond the 8-slot queue, requests get `busy`. Replay answers Inspect with a loading state. | [Prerequisite](#j1-prerequisite-journal-step-j1-0) |
@@ -1010,7 +1010,7 @@ wind-down bounds remain in J1. No other timer ends or refuses J1 work.
 
 | Bound | Value | Applies to |
 | --- | --- | --- |
-| TERM to KILL grace (L4) | 500 ms | Model shell process group |
+| TERM to KILL grace (L4) | 500 ms | Model exec_cmd process group |
 | Cleanup until unconfirmed (L3) | 2.5 s from the cancel trigger | Process and scratch cleanup, as today; capture settlement after a cancel trigger (J1-Q1) |
 | Page read storage step | 2 s | One page read on a page-read worker |
 | Shutdown cleanup | 2 s | Pending installs and live captures at shutdown |
@@ -1029,12 +1029,12 @@ therefore never fences the journal and never fails the turn; only an actual
 I/O error does.
 
 Risk (owner, 2026-10-15): J1 adds at most about 5 KiB of journal bytes per
-shell call over today: kind 23 (a frame of at most 4,286 bytes) plus at most
+exec_cmd call over today: kind 23 (a frame of at most 4,286 bytes) plus at most
 122 bytes by which kind 22 exceeds the kind 14 intent it replaces. This counts
 against the current single 8 MiB journal file. Until the required follow-up journal design for segment
 files, checkpoints and compaction lands
 ([journal capacity follow-up](conversation-admission.md#format-1-and-record-compatibility)),
-heavy shell use reaches journal capacity sooner, and capacity exhaustion keeps
+heavy exec_cmd use reaches journal capacity sooner, and capacity exhaustion keeps
 its existing explicit failure.
 
 ### J1 ownership
@@ -1042,14 +1042,14 @@ its existing explicit failure.
 | Behavior | Owner in J1 | Code |
 | --- | --- | --- |
 | Command rewrite and refusal | Conversation owner at `ToolCall`, using `secrets::rewrite_command` | `asura-service/src/conversation.rs`, `asura-platform/src/secrets/rewrite.rs` |
-| Shell process, guardian, no-deadline mode | Platform shell owner | `asura-platform/src/shell.rs`, `shell/guardian.rs` |
-| Pipe reads and the reactor side of the sink | Platform `ShellJob` on the reactor | `shell.rs`, `shell/capture.rs` |
-| Scan, stage, hash, tail, growth, flush, install | One capture worker per shell call (new) | `asura-service/src/capture_worker.rs` |
+| exec_cmd process, guardian, no-deadline mode | Platform exec_cmd owner | `asura-platform/src/exec_cmd.rs`, `exec_cmd/guardian.rs` |
+| Pipe reads and the reactor side of the sink | Platform `ExecCmdJob` on the reactor | `exec_cmd.rs`, `exec_cmd/capture.rs` |
+| Scan, stage, hash, tail, growth, flush, install | One capture worker per exec_cmd call (new) | `asura-service/src/capture_worker.rs` |
 | File primitives on held descriptors | Platform payload I/O (new) | `asura-platform/src/payload_io.rs` |
 | Payload IDs, ledger, staging, pages, recovery | Storage payload store (new) | `asura-storage/src/payload/` |
 | Kinds 22 and 23, replay, `reserve()` | Authority codec, replay state and writer | `asura-storage/src/authority/conversation/{types,codec,state}.rs` |
 | Settlement order and the pending-install list | Conversation owner | `conversation.rs` |
-| Setup, running, finalizing and cleanup phases | Shell worker | `asura-service/src/shell_worker.rs` |
+| Setup, running, finalizing and cleanup phases | exec_cmd worker | `asura-service/src/exec_cmd_worker.rs` |
 
 Search for an existing owner found none for payload files, a quota ledger or
 pages. The journal I/O module (`asura-platform/src/journal_io.rs`) is the
@@ -1059,8 +1059,8 @@ check, and ordinary-file validation.
 ### J1 records: kinds 22 and 23
 
 Required behavior (R3, EX4): J1 adds two additive format-1 kinds, allocated in
-delivery order. A J1 binary writes kind 22 for every new shell call and never
-writes kind 14 with tool kind 16. Replay still accepts kind 14 shell intents
+delivery order. A J1 binary writes kind 22 for every new exec_cmd call and never
+writes kind 14 with tool kind 16. Replay still accepts kind 14 exec_cmd intents
 from older journals with their 1–60 s timeout fields
 (`codec.rs:289-305`). Kind 15 is unchanged. No record holds output text,
 a secret value or a digest of either.
@@ -1069,7 +1069,7 @@ Encodings follow the existing codec: integers are big-endian, an ID is 16
 bytes, a digest is 32 bytes, a string is a 4-byte length then UTF-8 bytes, and
 a flag is one byte, 0 or 1. Any other value is `Corrupt`.
 
-#### Kind 22: ShellIntent
+#### Kind 22: ExecCmdIntent
 
 | # | Field | Encoding | Bounds and rule |
 | --- | --- | --- | --- |
@@ -1086,7 +1086,7 @@ a flag is one byte, 0 or 1. Any other value is `Corrupt`.
 | 11 | busy reason | u8 | 0 unless busy; then 1 `quota`, 2 `capture_paused`, 3 `pending_full`, 4 `payload_unavailable` |
 | 12 | variable count | u8 | 0–16; 0 unless admitted |
 | 13 | variables | count × (u8 number, u8 kind) | Entry i has number i; kind 1–33. No value and no value digest. |
-| 14 | job ID | ID | Admitted: the existing `asura.shell.job` derivation (`codec.rs:309-323`). Otherwise zero. |
+| 14 | job ID | ID | Admitted: the existing `asura.exec_cmd.job` derivation (`codec.rs:309-323`). Otherwise zero. |
 | 15 | stdout payload | ID | Admitted: the [payload ID](#storage-payload-ids-ledger-staging-pages-and-recovery) for stream 1. Otherwise zero. |
 | 16 | stderr payload | ID | Admitted: the payload ID for stream 2. Otherwise zero. |
 | 17 | initial reservation | u64 | Admitted: 1,048,576. Otherwise 0. |
@@ -1160,7 +1160,7 @@ bytes.
 
 #### Replay order and reservation
 
-Required behavior (R2): the records of one admitted shell call appear in the
+Required behavior (R2): the records of one admitted exec_cmd call appear in the
 order kind 22, kind 23, kind 15.
 
 | Rule | Replay result when broken |
@@ -1179,7 +1179,7 @@ is an admitted kind 22 without kind 23. The existing result reservation of
 therefore accepted only when the journal can still hold kinds 23, 15 and the
 terminal.
 
-Derived recovery (proposed): restart writes no new record for a shell call.
+Derived recovery (proposed): restart writes no new record for an exec_cmd call.
 Replay and the payload store derive its state:
 
 | Journal state | Payload files | Derived capture | Startup action |
@@ -1193,36 +1193,36 @@ Replay and the payload store derive its state:
 | No kind 22 names the payload ID | Orphan file | None | Delete (identity violation) |
 
 Downgrade: a binary before J1 returns `UnsupportedFormat` for kind 22 or 23
-(`codec.rs:1007`) and refuses to open the journal. After the first J1 shell
+(`codec.rs:1007`) and refuses to open the journal. After the first J1 exec_cmd
 call, a downgrade needs a newer binary; the journal cannot be rewritten to
 remove the records. Kinds 18–21 set the same precedent. Format stays `1`.
 
 ### J1 timeout and setup budget removal
 
-Required behavior (J1-Q3, J1-Q4): the service passes no deadline to a shell
+Required behavior (J1-Q3, J1-Q4): the service passes no deadline to an exec_cmd
 call. Setup checks only cancellation. These code sites change; the line
 numbers are at commit `41eebfb`.
 
 | Site | Today | J1 |
 | --- | --- | --- |
-| `shell.rs:97` `ShellRequest::deadline` | `Instant` | `Option<Instant>`. The service always passes `None`. `Some` remains only for platform qualification tests of the bounded guardian mode, and J3 removes it. |
-| `shell.rs:115-123` `check` | Cancel or deadline | Cancel only when the deadline is `None` |
-| `shell.rs:184-186`, `:229`, `:274`, `:349` | 2 s setup deadline | Removed (J1-Q4); cancel checks stay |
-| `shell.rs:304-320` guardian argument | Monotonic deadline nanoseconds | The ASCII token `none` when the deadline is `None` |
-| `shell.rs:390`, `:420-431`, `:439-441` `ShellJob` | Stops at the deadline | `Option`; with `None` only the 100 ms poll tick remains |
-| `shell.rs:458-460` | 64 MiB combined stop | Removed (J1-Q2). `StopReason::OutputLimit` stays for decoding; nothing produces it. |
+| `exec_cmd.rs:97` `ExecCmdRequest::deadline` | `Instant` | `Option<Instant>`. The service always passes `None`. `Some` remains only for platform qualification tests of the bounded guardian mode, and J3 removes it. |
+| `exec_cmd.rs:115-123` `check` | Cancel or deadline | Cancel only when the deadline is `None` |
+| `exec_cmd.rs:184-186`, `:229`, `:274`, `:349` | 2 s setup deadline | Removed (J1-Q4); cancel checks stay |
+| `exec_cmd.rs:304-320` guardian argument | Monotonic deadline nanoseconds | The ASCII token `none` when the deadline is `None` |
+| `exec_cmd.rs:390`, `:420-431`, `:439-441` `ExecCmdJob` | Stops at the deadline | `Option`; with `None` only the 100 ms poll tick remains |
+| `exec_cmd.rs:458-460` | 64 MiB combined stop | Removed (J1-Q2). `StopReason::OutputLimit` stays for decoding; nothing produces it. |
 | `guardian.rs:309-323` | Rejects a deadline over 60 s | Accepts `none` (no-deadline mode). A numeric deadline keeps the 60 s rule. |
 | `guardian.rs:345` | Setup deadline check | Skipped in no-deadline mode |
 | `guardian.rs:145-166`, `:430` `CleanupSafety` | Seeds the clock-fault fallback with the deadline | Seeds it with the guardian's first clock sample; a failed sample advances 100 ms from the last one |
 | `guardian.rs:457-461` | Stops with reason 1 at the deadline | No-deadline mode never sets reason 1; lease closure and leader exit still stop the group |
-| `shell_worker.rs:97-137` `start` | Takes a deadline; compares `intent.limit` with `timeout_seconds`; rejects an expired deadline; computes a 2 s setup deadline | No deadline argument. Compares kind 22 with the call's rewrite (G8). No expiry or setup deadline. |
-| `shell_worker.rs:146`, `:159` | Setup closure deadline checks | Removed; cancel checks stay |
-| `shell_worker.rs:205-240` | `next_deadline` and `poll` stop the job with `Deadline` | Removed. `cleanup_deadline` (L3, 2.5 s after a stop) stays. |
+| `exec_cmd_worker.rs:97-137` `start` | Takes a deadline; compares `intent.limit` with `timeout_seconds`; rejects an expired deadline; computes a 2 s setup deadline | No deadline argument. Compares kind 22 with the call's rewrite (G8). No expiry or setup deadline. |
+| `exec_cmd_worker.rs:146`, `:159` | Setup closure deadline checks | Removed; cancel checks stay |
+| `exec_cmd_worker.rs:205-240` | `next_deadline` and `poll` stop the job with `Deadline` | Removed. `cleanup_deadline` (L3, 2.5 s after a stop) stays. |
 | `conversation.rs:233` | `timeout_seconds` defaults to 30 | Parsed and kept in the call for identity; no effect |
-| `conversation.rs:2958-2975` | Builds the deadline and kind 14 from the timeout | Builds kind 22 from the rewrite; the shell tool's deadline is `None` |
-| `conversation.rs:388-398` `LiveTool::deadline` | `Instant` | `Option<Instant>`; `None` for shell |
-| `conversation.rs:2336` | `model_timeout` when `now >= tool.deadline` | Applies only to a tool with a deadline; never to shell |
-| `conversation.rs:3357-3367` | Passes `tool.deadline` to the shell worker | No deadline |
+| `conversation.rs:2958-2975` | Builds the deadline and kind 14 from the timeout | Builds kind 22 from the rewrite; the exec_cmd tool's deadline is `None` |
+| `conversation.rs:388-398` `LiveTool::deadline` | `Instant` | `Option<Instant>`; `None` for exec_cmd |
+| `conversation.rs:2336` | `model_timeout` when `now >= tool.deadline` | Applies only to a tool with a deadline; never to exec_cmd |
+| `conversation.rs:3357-3367` | Passes `tool.deadline` to the exec_cmd worker | No deadline |
 | `tools.rs:176-195`, `asura-control/src/model.rs:408`, `ToolBridge.swift:193-199` | Validate 1–60 | Unchanged until J3, so the protocol 0.1 contract is unchanged; the value has no effect |
 | `ToolBridge.swift:208` guide text | "Maximum command seconds, 1 through 60; omit for 30." | "Ignored. The command runs until it ends or the turn is cancelled." |
 
@@ -1234,8 +1234,8 @@ replaces it. Page reads do not use `tools::Executor`.
 
 #### Platform: output sink and redacted tail
 
-Proposed mechanism (G10). `ShellJob` stops keeping the 8 KiB raw ring
-(`shell/capture.rs:44-50`). Each stream's reader sends raw bytes to a sink
+Proposed mechanism (G10). `ExecCmdJob` stops keeping the 8 KiB raw ring
+(`exec_cmd/capture.rs:44-50`). Each stream's reader sends raw bytes to a sink
 that the service supplies when it spawns the job:
 
 ```rust
@@ -1249,7 +1249,7 @@ pub trait OutputSink: Send {
 }
 ```
 
-- **Interest-based backpressure.** `ShellJob::interests()` omits a stream's
+- **Interest-based backpressure.** `ExecCmdJob::interests()` omits a stream's
   read interest while `room()` is below 4 KiB, the read buffer. The status pipe
   interest stays, so exit notices still arrive. `poll` drains at most
   `min(8 KiB, room())` per stream per dispatch (L14 unchanged). The capture
@@ -1260,10 +1260,10 @@ pub trait OutputSink: Send {
   first discarded byte, every later byte of that stream is discarded too, so a
   gap is never joined to a later tail. This lets the killed group reach EOF and
   settle while capture is stalled (J1-Q1).
-- **Raw tails removed.** `ShellJob::result()` returns process facts only. The
+- **Raw tails removed.** `ExecCmdJob::result()` returns process facts only. The
   pure function `render_tail(redacted: &[u8]) -> (String, bool)` keeps the
   current tail rule (last 6,144 bytes, control characters replaced,
-  `shell/capture.rs:54-79`) and runs over redacted bytes only.
+  `exec_cmd/capture.rs:54-79`) and runs over redacted bytes only.
   `render_text` takes the two rendered tails and the capture state and adds
   `capture=<state>` to its header line.
 
@@ -1286,7 +1286,7 @@ page-read and recovery workers, never on the reactor.
 | `free_bytes()` | `fstatfs` on the held root |
 | `list(directory, after, 128)` | One batch of at most 128 names after a cursor |
 
-The payload directories are inside `~/.asura`, which every shell profile
+The payload directories are inside `~/.asura`, which every exec_cmd profile
 denies (SI3), so a job cannot read or replace them.
 
 #### Storage: payload IDs, ledger, staging, pages and recovery
@@ -1369,7 +1369,7 @@ never across I/O.
 At service start a retained recovery worker rebuilds the ledger. It lists
 `staging/` and `objects/` in batches of 128 names, compares them with replay,
 and applies the [derived recovery](#replay-order-and-reservation) actions.
-Recovery has no time bound. Until it finishes, shell admission returns `busy`
+Recovery has no time bound. Until it finishes, exec_cmd admission returns `busy`
 with reason `payload_unavailable`. An unsafe object, such as a symbolic link,
 another owner or a non-regular file, makes the payload store unavailable; the
 same `busy` reason then applies.
@@ -1377,9 +1377,9 @@ same `busy` reason then applies.
 #### Service: capture worker
 
 Proposed mechanism. `asura-service/src/capture_worker.rs` runs one retained
-thread per admitted shell call. The shell worker starts it before setup; if
+thread per admitted exec_cmd call. The exec_cmd worker starts it before setup; if
 the thread cannot start, the call settles as `not_started` with
-`shell_unavailable`.
+`exec_cmd_unavailable`.
 
 - **Transfer queue (R4).** At most 8 chunks of at most 64 KiB and 512 KiB in
   total, including the reactor-side bytes that wait to form a chunk. The sink
@@ -1396,7 +1396,7 @@ the thread cannot start, the call settles as `not_started` with
   that stream to `detector_error` too. A panic inside `detector_error` is a
   capture fault with reason `detector_fault`. No path stages unchecked bytes.
 - **Faults.** A write, sync or create error other than `NoSpace` is a capture
-  fault (`storage_fault`). The worker asks the shell worker to stop the job,
+  fault (`storage_fault`). The worker asks the exec_cmd worker to stop the job,
   keeps the written prefix and counts later chunks as discarded.
 - **Finish.** When both streams reach EOF, the worker calls
   `JobRedaction::finish` for each stream and stages the result, syncs both
@@ -1427,7 +1427,7 @@ journal.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Live: Shell call admitted, 1 MiB reserved
+    [*] --> Live: exec_cmd call admitted, 1 MiB reserved
     state Live {
         [*] --> Opening
         Opening --> Capturing: Victims deleted, staging created
@@ -1455,15 +1455,15 @@ stateDiagram-v2
     Abandoned --> [*]: Staging kept as unverified prefix
 ```
 
-#### Service: shell worker phases and settlement
+#### Service: exec_cmd worker phases and settlement
 
-Proposed mechanism. The shell worker keeps one call per active turn. Its
+Proposed mechanism. The exec_cmd worker keeps one call per active turn. Its
 phases become:
 
 | Phase | Ends when |
 | --- | --- |
 | `Setup` | The process is spawned, setup fails, or the turn is cancelled (no deadline, J1-Q4) |
-| `Running` | `ShellJob` settles: leader reaped, group gone, both pipes at EOF, cleanup notice received |
+| `Running` | `ExecCmdJob` settles: leader reaped, group gone, both pipes at EOF, cleanup notice received |
 | `Cleanup` | Scratch cleanup runs; the capture worker flushes at the same time |
 | `Finalizing` | Scratch cleanup is done and the worker waits for the sealed report |
 
@@ -1479,7 +1479,7 @@ these holds:
 The output is a pair: the kind 23 record and the kind 15 result. The kind 15
 text uses `render_text` with the redacted tails from the report; an
 `unconfirmed` capture has empty tails. Process or scratch cleanup that passes
-its L3 bound keeps today's repair path (`shell_worker.rs:239-240`,
+its L3 bound keeps today's repair path (`exec_cmd_worker.rs:239-240`,
 `conversation.rs:3068-3074`); J2 replaces it with `CleanupUnconfirmed`.
 
 Cancel triggers in J1 are turn cancel, steering, turn failure, journal
@@ -1489,7 +1489,7 @@ call returns or the person cancels the turn.
 
 #### Service: conversation owner
 
-Proposed mechanism for the shell path of `ModelEvent::ToolCall`
+Proposed mechanism for the exec_cmd path of `ModelEvent::ToolCall`
 (`conversation.rs:2901-2990`):
 
 1. Parse the call as today. `timeout_seconds` keeps its validation and has no
@@ -1508,7 +1508,7 @@ Proposed mechanism for the shell path of `ModelEvent::ToolCall`
 4. Otherwise check admission: a free pending-install slot, no paused capture,
    a ready payload store and a 1 MiB reservation. A failure builds kind 22 with
    disposition `busy`; kind 15 follows with status 4 and text
-   `shell_busy: <reason>`.
+   `exec_cmd_busy: <reason>`.
 5. Otherwise build kind 22 with disposition `admitted`, the rewritten
    command, the variable list, the capture identity and the reservation.
 
@@ -1521,12 +1521,12 @@ Raw command handling (G8). The raw command is never retained after step 2:
   per turn, held in `Zeroizing` memory and dropped at turn end. The digest never
   leaves memory. This follows the person design's keyed digest for retries
   (SO2).
-- `shell_worker::start` compares kind 22's command and cwd with the
+- `exec_cmd_worker::start` compares kind 22's command and cwd with the
   `LiveTool` rewrite, not with the raw arguments.
-- The variables move into the `ShellRequest`; spawn zeroizes them as SL2
+- The variables move into the `ExecCmdRequest`; spawn zeroizes them as SL2
   implemented.
 
-Settlement order. After the shell worker returns its pair, the owner appends
+Settlement order. After the exec_cmd worker returns its pair, the owner appends
 kind 23. When kind 23 commits, the owner moves the capture worker to the
 pending-install list and sends `Install`. It then appends kind 15 and delivers
 the result to the helper. The turn never waits for installation.
@@ -1549,10 +1549,10 @@ sequenceDiagram
     participant M as Swift helper
     participant C as Conversation owner
     participant J as Authority journal
-    participant W as Shell worker and reactor
+    participant W as exec_cmd worker and reactor
     participant K as Capture worker
     participant S as Payload store
-    M->>C: ToolCall shell(command, cwd)
+    M->>C: ToolCall exec_cmd(command, cwd)
     C->>C: Rewrite command, scan cwd, check 8192 bytes
     alt Refused or busy
         C->>J: Kind 22 refused (display-redacted) or busy
@@ -1592,7 +1592,7 @@ sequenceDiagram
 | --- | --- | --- |
 | Turn cancelled after kind 22, before spawn | Setup stops; reservation released | Kind 23 `not_started`, kind 15 status 6 |
 | Rewrite refuses, including `rewritten_command_too_long` and `secret_in_cwd` | Nothing runs; model sees the reason | Kind 22 refused, kind 15 status 3 |
-| Detection self-check failed | Every shell call refused with `secret_detection_unavailable` | Kind 22 refused, revision 0 |
+| Detection self-check failed | Every exec_cmd call refused with `secret_detection_unavailable` | Kind 22 refused, revision 0 |
 | Quota short at admission and nothing expirable | `busy`, reason `quota` | Kind 22 busy, kind 15 status 4 |
 | Pending-install list full, capture paused, or payload store not ready | `busy` with that reason | Kind 22 busy, kind 15 status 4 |
 | Scanner or storage slower than the producer while running | Backpressure; nothing lost; no cancel (J1-Q1) | None until settlement |
@@ -1611,7 +1611,7 @@ sequenceDiagram
 | Journal append I/O error for kind 22, 23 or 15 | Journal fenced; today's storage-unavailable path; turn fails | Unchanged |
 | Crash or restart at any point | No rerun; [derived recovery](#replay-order-and-reservation) | None written at recovery |
 | Page read stalls | `busy` after the 2 s step; worker held until it returns | None |
-| Unsafe payload object at startup | Payload store unavailable; shell `busy` | Kind 22 busy |
+| Unsafe payload object at startup | Payload store unavailable; exec_cmd `busy` | Kind 22 busy |
 
 ### J1 asynchronous execution
 
@@ -1631,7 +1631,7 @@ Only known-size limits apply.
 
 | Resource | Limit | Overload result |
 | --- | --- | --- |
-| Shell calls | 1 per active turn, 1 active turn (unchanged) | Existing turn rules |
+| exec_cmd calls | 1 per active turn, 1 active turn (unchanged) | Existing turn rules |
 | Capture workers | 1 active plus 4 in the pending-install list | `busy`, `pending_full` |
 | Transfer queue | 8 chunks, 64 KiB each, 512 KiB in total per worker | Pipe reads stop |
 | Pipe reads | 8 KiB per stream per dispatch, 4 KiB buffer (L14, L15) | Next dispatch |
@@ -1664,7 +1664,7 @@ Each integration and end-to-end case ends with the
 | J1T-02 | Replay order matrix | Each disposition with and without kinds 23 and 15 and a terminal; every invalid order; derived states; `reserve()` sizes | Writer refuses kind 22 when the reservation cannot fit | — |
 | J1T-03 | Rewrite length (G6) | Rewrites to 8,192 and 8,193 bytes; display-redacted text over 8,192 is cut with the flag | Real owner records the refusal; the service stays available | SDE-02 uses an admitted rewrite |
 | J1T-04 | Raw command not retained (G8, G9) | Duplicate ordinal with a different secret value conflicts; equal values match | Memory inspection hook: `LiveTool` and `tool_cache` hold no raw command | — |
-| J1T-05 | Timeout removed (J1-Q3) | Guardian `none` parsing; `CleanupSafety` without a deadline; `model_timeout` never applies to shell | A command that runs 65 s completes with its exit code; turn cancel stops it | Native model run of a command longer than 60 s |
+| J1T-05 | Timeout removed (J1-Q3) | Guardian `none` parsing; `CleanupSafety` without a deadline; `model_timeout` never applies to exec_cmd | A command that runs 65 s completes with its exit code; turn cancel stops it | Native model run of a command longer than 60 s |
 | J1T-06 | Setup budget removed (J1-Q4) | Setup checks cancel only | A gated setup held over 2 s still spawns; cancel ends it | — |
 | J1T-07 | No 64 MiB stop (J1-Q2) | No `OutputLimit` producer | 80 MiB of output is retained whole under a 1 GiB quota | — |
 | J1T-08 | Quota race (RG-04) | Admission and growth race on the ledger; no over-reservation; victims held by reads skipped | Two calls in sequence fill a small quota; interim expiry order | Visible `busy` result |
@@ -1683,7 +1683,7 @@ Each integration and end-to-end case ends with the
 | J1T-21 | Overload (RG-03, J1-Q1) | Bound decision after a cancel trigger | A stalled write while running only backpressures; after cancel, `unconfirmed` at 2.5 s, result delivered, worker kept, list full gives `busy` | TUI typing within 100 ms |
 | J1T-22 | Crash points (RG-05) | Derived recovery table | Child-process abort after kind 22, while running, after sealing, after kind 23, between rename and directory sync, after kind 15; recovery installs once, never reruns | Restart and inspect the call |
 | J1T-23 | Detector panic | `catch_unwind` path; second panic | Test-support panic hook | — |
-| J1T-24 | Model shell result (SDE-01 shell part) | — | — | A fixture model endpoint issues `cat .env`; the result and TUI activity show placeholders |
+| J1T-24 | Model exec_cmd result (SDE-01 exec_cmd part) | — | — | A fixture model endpoint issues `cat .env`; the result and TUI activity show placeholders |
 | J1T-25 | Rewritten command shown (SDE-02) | — | — | Native model command with a secret; TUI shows the rewrite; the command succeeds |
 | J1T-26 | Flood while typing (SDE-04 typing part) | — | — | Typing responds within 100 ms during a secret flood; the viewer part waits for J4 |
 
@@ -1703,7 +1703,7 @@ claimed.
   or keeps an unverified prefix and never claims verified content.
 - One development host. `/bin/sh`, APFS and `sandbox-exec` behavior on other
   hosts is not claimed.
-- Concurrency above one live shell call is proven only at the worker layer
+- Concurrency above one live exec_cmd call is proven only at the worker layer
   (J1T-18), because J1 runs one call per turn and one active turn.
 - SDE-01 with a fixture model endpoint proves the transport and records, not
   a model's choice of commands.
@@ -1716,17 +1716,17 @@ Implemented behavior, 2026-10-16, with secret detection slice SL3. Code:
 
 | Owner | Code |
 | --- | --- |
-| Rewrite planner: `rewrite_shell_call` (rewrite, cwd scan, 8,192-byte check), refusal codes 13 and 14 | `asura-platform/src/secrets/rewrite.rs` |
-| `OutputSink`, interest-based backpressure, discard after cancel, `render_tail`; no raw ring; no 64 MiB stop; `ShellRequest::deadline: Option` | `asura-platform/src/shell.rs`, `shell/capture.rs` |
-| Guardian no-deadline mode (`none`), `CleanupSafety` seeded by the first clock sample | `asura-platform/src/shell/guardian.rs` |
+| Rewrite planner: `rewrite_exec_cmd_call` (rewrite, cwd scan, 8,192-byte check), refusal codes 13 and 14 | `asura-platform/src/secrets/rewrite.rs` |
+| `OutputSink`, interest-based backpressure, discard after cancel, `render_tail`; no raw ring; no 64 MiB stop; `ExecCmdRequest::deadline: Option` | `asura-platform/src/exec_cmd.rs`, `exec_cmd/capture.rs` |
+| Guardian no-deadline mode (`none`), `CleanupSafety` seeded by the first clock sample | `asura-platform/src/exec_cmd/guardian.rs` |
 | Payload file primitives on held descriptors, test-support fault gate | `asura-platform/src/payload_io.rs` |
 | `payloads/` accepted as a named root entry by the installation census | `asura-platform/src/authority.rs` |
-| Kinds 22 and 23: codec, replay order, `reserve()`, shared `shell_job_id` | `asura-storage/src/authority/conversation/{types,codec,state}.rs` |
+| Kinds 22 and 23: codec, replay order, `reserve()`, shared `exec_cmd_job_id` | `asura-storage/src/authority/conversation/{types,codec,state}.rs` |
 | Payload IDs, ledger and interim expiry, staging, pages, page-read pool, derived recovery | `asura-storage/src/payload/` |
 | `retention.quotaBytes` | `asura-storage/src/config.rs`, audit setting `retention.quotaBytes` |
 | Capture worker, transfer queue, pause and Fibonacci retry, detector panic path | `asura-service/src/capture_worker.rs` |
-| Shell worker phases with `Finalizing`, settlement after the L3 bound | `asura-service/src/shell_worker.rs` |
-| Rewrite at `ToolCall`, refusal and `busy` records, keyed duplicate digest, settle-then-install | `asura-service/src/conversation.rs`, `conversation/shell_call.rs` |
+| exec_cmd worker phases with `Finalizing`, settlement after the L3 bound | `asura-service/src/exec_cmd_worker.rs` |
+| Rewrite at `ToolCall`, refusal and `busy` records, keyed duplicate digest, settle-then-install | `asura-service/src/conversation.rs`, `conversation/exec_cmd_call.rs` |
 | Recovery worker, ready store, page pool, pending-install list | `asura-service/src/payload_owner.rs` |
 | Worker-layer harness (feature `test-support` only) | `asura-service/src/test_support.rs` |
 | Guide text for `timeout_seconds` | `swift/model-helper/Sources/HelperCore/ToolBridge.swift` |
@@ -1740,7 +1740,7 @@ Refinements made during J1 (engineering choices under the iteration rules):
   platform reader counts discarded bytes and tells the sink; the sink sends
   each stream's discard count with its EOF marker. The service keeps a handle
   to the sink's waiting bytes, so bytes that wait on the reactor keep moving to
-  the worker after `ShellJob` settles and before the producer side closes.
+  the worker after `ExecCmdJob` settles and before the producer side closes.
 - **Chunks.** Bytes that wait on the reactor merge into one chunk per stream
   of at most 64 KiB. With 8 chunks queued, `room()` is 0 as designed, so a
   stalled worker holds at most 8 chunks plus the pipe buffers.
@@ -1753,7 +1753,7 @@ Refinements made during J1 (engineering choices under the iteration rules):
   the fixed text `[withheld]` for both command and cwd (G9). A refused or busy
   call's precomputed kind 15 (status 3 or 4) stands even if the turn is
   cancelled before dispatch, as replay requires.
-- **Invalid shell arguments.** The control codec rejects them before the
+- **Invalid exec_cmd arguments.** The control codec rejects them before the
   owner; kind 22 cannot represent them, so the owner treats one as
   `model_protocol_fault`.
 - **Duplicate digest.** The keyed SHA-256 covers the secret values of an
@@ -1792,7 +1792,7 @@ Refinements made during J1 (engineering choices under the iteration rules):
 - **Test-support gates.** Files in a scratch home drive the gates:
   `capture-hold-scan`, `capture-throttle-scan` (microseconds per chunk),
   `capture-panic-scan` (`twice` also fails `detector_error`),
-  `shell-hold-setup`, `payload-fault-{create,write,sync,install}` and
+  `exec-cmd-hold-setup`, `payload-fault-{create,write,sync,install}` and
   `payload-free-bytes`. Production builds contain none of them.
 
 Verified behavior on the macOS 27 development host, Rust 1.98:
@@ -1801,36 +1801,36 @@ Verified behavior on the macOS 27 development host, Rust 1.98:
 | --- | --- | --- |
 | J1T-01 | `codec.rs` `j1t_01_*`; `journal_writer` `j1t_01_real_writer_appends_kinds_22_23_15_and_reopens` | Pass: every bound, 9,384/9,568 and 4,102/4,286 bytes, each invalid field `Corrupt`, fixed code tables |
 | J1T-02 | `authority_conversation` `j1t_02_*`; `journal_writer` `j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit` | Pass: 34 invalid orders `Corrupt`; `reserve()` adds 4,286 bytes until kind 23 |
-| J1T-03 | `secrets` `j1t_03_rewritten_command_length_limit`, `shell_call` `j1t_03_refused_display_is_cut_with_the_flag`; owner `tool_tests` `j1t_03_overlong_rewrite_is_a_recorded_refusal` | Pass at unit and owner layers. Through the fixture helper an 8 KiB command exceeds the helper's 8,192-token window before it reaches the service, so the service-level case uses the owner fixture |
-| J1T-04 | `shell_call` `j1t_04_*`; owner `tool_tests` `j1t_04_live_tool_and_cache_hold_no_raw_command` | Pass |
-| J1T-05 | `guardian` `j1t_05_*`, `shell` `j1t_05_no_deadline_checks_cancel_only`, owner `j1t_05_model_timeout_never_applies_to_shell`; `shell_process` (65 s, exit 3), `capture_flow timeout` (65 s through the owner, exit 7; turn cancel); `capture_flow native` (system model, 65 s) | Pass |
-| J1T-06 | `shell_worker` `j1t_06_setup_has_no_deadline`; `capture_flow setup` (setup held 2.6 s still spawned; cancel during setup gives `not_started`) | Pass |
-| J1T-07 | `shell` `j1t_07_no_output_limit_producer`; `shell_process` (70,000,000 bytes), `capture_flow big` (80 MiB stored whole) | Pass |
-| J1T-08 | `store.rs` `j1t_08_*` (race, order, holds, 128 cap); `capture_worker quota` (64 MiB quota, expiry, `expired` page); `capture_flow busy`; `tui_pty.py --shell-capture` | Pass |
+| J1T-03 | `secrets` `j1t_03_rewritten_command_length_limit`, `exec_cmd_call` `j1t_03_refused_display_is_cut_with_the_flag`; owner `tool_tests` `j1t_03_overlong_rewrite_is_a_recorded_refusal` | Pass at unit and owner layers. Through the fixture helper an 8 KiB command exceeds the helper's 8,192-token window before it reaches the service, so the service-level case uses the owner fixture |
+| J1T-04 | `exec_cmd_call` `j1t_04_*`; owner `tool_tests` `j1t_04_live_tool_and_cache_hold_no_raw_command` | Pass |
+| J1T-05 | `guardian` `j1t_05_*`, `exec_cmd` `j1t_05_no_deadline_checks_cancel_only`, owner `j1t_05_model_timeout_never_applies_to_exec_cmd`; `exec_cmd_process` (65 s, exit 3), `capture_flow timeout` (65 s through the owner, exit 7; turn cancel); `capture_flow native` (system model, 65 s) | Pass |
+| J1T-06 | `exec_cmd_worker` `j1t_06_setup_has_no_deadline`; `capture_flow setup` (setup held 2.6 s still spawned; cancel during setup gives `not_started`) | Pass |
+| J1T-07 | `exec_cmd` `j1t_07_no_output_limit_producer`; `exec_cmd_process` (70,000,000 bytes), `capture_flow big` (80 MiB stored whole) | Pass |
+| J1T-08 | `store.rs` `j1t_08_*` (race, order, holds, 128 cap); `capture_worker quota` (64 MiB quota, expiry, `expired` page); `capture_flow busy`; `tui_pty.py --exec-cmd-capture` | Pass |
 | J1T-09 | `capture_worker` `j1t_09_*` unit; `capture_worker disk` (160 MB APFS image from `hdiutil`), `capture_worker enospc` | Pass: paused under the reserve, resumed at the retry delay and at once on a space event, cancel while paused gives `enospc` |
 | J1T-10 | `pages.rs` and `payload_store` `j1t_10_*`; `capture_worker pages` | Pass |
 | J1T-11 | `payload_store` `j1t_11_*`; `capture_worker pages` (busy after 1.9–2 s, worker held) | Pass |
 | J1T-12 | `capture_worker split` | Pass |
 | J1T-13 | `capture_worker klb` | Pass |
 | J1T-14 | `capture_flow secrets` (kind 22 rewrite, ten `ps` samples, real value used) | Pass |
-| J1T-15 | `shell` `j1t_15_*`, `capture_worker` `j1t_15_sink_room_*`; `capture_worker gate`, `throttle`; `capture_flow overload` (Inspect and cancel under 100 ms) | Pass |
+| J1T-15 | `exec_cmd` `j1t_15_*`, `capture_worker` `j1t_15_sink_room_*`; `capture_worker gate`, `throttle`; `capture_flow overload` (Inspect and cancel under 100 ms) | Pass |
 | J1T-16, J1T-17 | `capture_worker cmd` | Pass |
 | J1T-18 | `capture_worker conc` | Pass |
 | J1T-19 | `payload_store` `j1t_19_*`; `capture_worker full` | Pass |
 | J1T-20 | codec state rules; `capture_worker partial` (write fault, discard after cancel) | Pass |
-| J1T-21 | `shell_worker` `j1t_21_bound_decision_after_a_cancel_trigger`; `capture_worker overload`, `capture_flow overload` (unconfirmed 2.52 s after the cancel, `pending_full`, list drains after release); `tui_pty.py --shell-capture` (typing during a stalled capture) | Pass |
-| J1T-22 | `payload_store` `j1t_22_*`; `capture_flow crash` (five crash points); `tui_pty.py --shell-capture` (restart and inspect) | Pass |
+| J1T-21 | `exec_cmd_worker` `j1t_21_bound_decision_after_a_cancel_trigger`; `capture_worker overload`, `capture_flow overload` (unconfirmed 2.52 s after the cancel, `pending_full`, list drains after release); `tui_pty.py --exec-cmd-capture` (typing during a stalled capture) | Pass |
+| J1T-22 | `payload_store` `j1t_22_*`; `capture_flow crash` (five crash points); `tui_pty.py --exec-cmd-capture` (restart and inspect) | Pass |
 | J1T-23 | `capture_worker panic` | Pass |
-| J1T-24 | `capture_flow secrets`; `tui_pty.py --shell-capture` | Pass with the scripted loopback model |
-| J1T-25 | `tui_pty.py --shell-capture` (fixture model); `capture_flow native` (system model) | Pass. The native run proves the rewrite was recorded and run; the TUI part used the fixture model |
-| J1T-26 | `tui_pty.py --shell-capture` | Pass |
+| J1T-24 | `capture_flow secrets`; `tui_pty.py --exec-cmd-capture` | Pass with the scripted loopback model |
+| J1T-25 | `tui_pty.py --exec-cmd-capture` (fixture model); `capture_flow native` (system model) | Pass. The native run proves the rewrite was recorded and run; the TUI part used the fixture model |
+| J1T-26 | `tui_pty.py --exec-cmd-capture` | Pass |
 
 Commands: `cargo test -p asura-service --all-features --test capture_worker`
 and `--test capture_flow` (each takes case names; `capture_flow native` runs
 only when named), `cargo test -p asura-platform --all-features --test
-shell_process`, and `python3 rust/crates/asura-cli/tests/tui_pty.py
-<lifecycle fixture> --shell-capture` with a fixture built by
-`cargo test --all-features` and the helper beside it. The `--shell-capture`
+exec_cmd_process`, and `python3 rust/crates/asura-cli/tests/tui_pty.py
+<lifecycle fixture> --exec-cmd-capture` with a fixture built by
+`cargo test --all-features` and the helper beside it. The `--exec-cmd-capture`
 PTY mode runs in the default lifecycle gate; the CLI's
 test build enables the service `test-support` gates it needs. Only
 `capture_flow native` stays opt-in: it needs the host's system model, whose
@@ -1866,7 +1866,7 @@ Proof limits added by the implementation:
 
 | Gap | Resolved in |
 | --- | --- |
-| G1 stall detection, G3 quota closure, G4 shell timeout, G5 setup budget | Owner decisions J1-Q1 to J1-Q4, the J1 retry decision and journal step J1-0 |
+| G1 stall detection, G3 quota closure, G4 exec_cmd timeout, G5 setup budget | Owner decisions J1-Q1 to J1-Q4, the J1 retry decision and journal step J1-0 |
 | G2, G16 stale bounds and readiness text | [Design verification](#design-verification) of 2026-10-15 |
 | G6 rewrite length, G8 identity and raw command, G9 refused intents | [Conversation owner](#service-conversation-owner) |
 | G7 record shapes, G15 `reserve()` | [Kinds 22 and 23](#j1-records-kinds-22-and-23) |
@@ -1925,7 +1925,7 @@ Local links and whitespace checks passed. This is design evidence only.
 Recorded on 2026-10-14: a readiness audit folded in the owner decisions of
 [tool output views](tool-output-views.md) and
 [person command mode](person-command-mode.md), and rechecked code facts by
-read-only inspection at commit `3cf424b`. It corrected the shell intent record
+read-only inspection at commit `3cf424b`. It corrected the exec_cmd intent record
 citation, which is tool kind 16 inside ToolIntent record kind 14, not record
 kind 16. The owner then resolved the audit's blocking decisions the same day;
 this revision records them and removes the job lifetime, the per-job cap and the

@@ -1,9 +1,9 @@
 //! Native process qualification; private guardian dispatch is identical to the CLI.
-use asura_platform::secrets::{SecretVariable, rewrite_command};
-use asura_platform::shell::{
-    OutputSink, PreparedShell, ShellError, ShellRequest, ShellResult, StopReason, Stream, Tails,
-    run_guardian,
+use asura_platform::exec_cmd::{
+    ExecCmdError, ExecCmdRequest, ExecCmdResult, OutputSink, PreparedExecCmd, StopReason, Stream,
+    Tails, run_guardian,
 };
+use asura_platform::secrets::{SecretVariable, rewrite_command};
 use asura_platform::{ProjectIdentity, RuntimeDirectory};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     if let [_, flag, id, deadline, command] = args.as_slice()
-        && flag == "--asura-shell-guardian"
+        && flag == "--asura-exec-cmd-guardian"
     {
         std::process::exit(run_guardian(id, deadline, command));
     }
@@ -35,7 +35,7 @@ fn main() {
         return;
     }
     qualification();
-    println!("shell process qualification passed");
+    println!("exec_cmd process qualification passed");
 }
 struct Fixture(PathBuf);
 impl Fixture {
@@ -102,15 +102,15 @@ impl OutputSink for Collected {
 }
 /// A settled job's facts plus the test sink's output.
 struct Outcome {
-    result: ShellResult,
+    result: ExecCmdResult,
     stdout: String,
     stderr: String,
     truncated: bool,
     total: [u64; 2],
 }
 impl std::ops::Deref for Outcome {
-    type Target = ShellResult;
-    fn deref(&self) -> &ShellResult {
+    type Target = ExecCmdResult;
+    fn deref(&self) -> &ExecCmdResult {
         &self.result
     }
 }
@@ -162,10 +162,10 @@ fn prepare_deadline(
     )
     .unwrap();
     let cancel = AtomicBool::new(false);
-    let p = PreparedShell::prepare(
+    let p = PreparedExecCmd::prepare(
         runtime,
         &project,
-        ShellRequest {
+        ExecCmdRequest {
             job_id: asura_platform::random_id(),
             command: command.into(),
             cwd: None,
@@ -202,7 +202,7 @@ fn settle(mut job: JobGuard, timeout: Duration, cancel: bool) -> Outcome {
     let end = started + timeout + Duration::from_secs(4);
     let mut cancelled = false;
     while !job.settled() {
-        assert!(Instant::now() < end, "shell failed to settle");
+        assert!(Instant::now() < end, "exec_cmd failed to settle");
         if cancel && !cancelled && started.elapsed() > Duration::from_millis(200) {
             job.stop(StopReason::Cancelled);
             cancelled = true;
@@ -258,12 +258,12 @@ fn qualification() {
     assert_eq!(result.stderr, "stderr");
     let result = run(
         &f.0,
-        "printf '%s|%s|%s' \"$HOME\" \"$TMPDIR\" \"${ASURA_SHELL_TEST_SECRET-unset}\"; printf ok > allowed",
+        "printf '%s|%s|%s' \"$HOME\" \"$TMPDIR\" \"${ASURA_EXEC_CMD_TEST_SECRET-unset}\"; printf ok > allowed",
         Duration::from_secs(5),
         false,
     );
     assert_eq!(result.exit_code, Some(0));
-    assert!(result.stdout.contains("/.asura/tmp/shell-"));
+    assert!(result.stdout.contains("/.asura/tmp/exec-cmd-"));
     assert!(result.stdout.ends_with("|unset"));
     assert_eq!(fs::read(f.0.join("project/allowed")).unwrap(), b"ok");
     let outside = f.0.join("forbidden");
@@ -422,21 +422,21 @@ fn guardian_refusals(home: &Path) {
     let open = |path: &Path| Some(OwnedFd::from(fs::File::open(path).unwrap()));
     // Descriptor faults stop the guardian before its first notice, as for FDs 3-9.
     for (label, state, expected) in [
-        ("absent", None, Err(ShellError::Protocol)),
+        ("absent", None, Err(ExecCmdError::Protocol)),
         (
             "not a directory",
             open(&home.join(".asura/secret")),
-            Err(ShellError::Protocol),
+            Err(ExecCmdError::Protocol),
         ),
         (
             "wrong mode",
             open(&home.join("project")),
-            Err(ShellError::Protocol),
+            Err(ExecCmdError::Protocol),
         ),
         (
             "not the scratch parent",
             open(&other),
-            Ok(Some(ShellError::Denied)),
+            Ok(Some(ExecCmdError::Denied)),
         ),
     ] {
         let runtime = RuntimeDirectory::scratch(home, true).unwrap();
@@ -446,10 +446,10 @@ fn guardian_refusals(home: &Path) {
         )
         .unwrap();
         let cancel = AtomicBool::new(false);
-        let mut prepared = PreparedShell::prepare(
+        let mut prepared = PreparedExecCmd::prepare(
             runtime,
             &project,
-            ShellRequest {
+            ExecCmdRequest {
                 job_id: asura_platform::random_id(),
                 command: "printf ran > refused-marker".into(),
                 cwd: None,
@@ -562,9 +562,9 @@ fn group_absent(path: &Path) {
     assert!(!group_exists(pid), "owned process group remains");
 }
 
-struct JobGuard(asura_platform::shell::ShellJob, Collected);
+struct JobGuard(asura_platform::exec_cmd::ExecCmdJob, Collected);
 impl std::ops::Deref for JobGuard {
-    type Target = asura_platform::shell::ShellJob;
+    type Target = asura_platform::exec_cmd::ExecCmdJob;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -688,10 +688,10 @@ fn secret_environment_refusals(home: &Path) {
         )
         .unwrap();
         let cancel = AtomicBool::new(false);
-        let mut prepared = PreparedShell::prepare(
+        let mut prepared = PreparedExecCmd::prepare(
             runtime,
             &project,
-            ShellRequest {
+            ExecCmdRequest {
                 job_id: asura_platform::random_id(),
                 command: "printf ran > secret-refused-marker".into(),
                 cwd: None,
@@ -711,7 +711,7 @@ fn secret_environment_refusals(home: &Path) {
             Ok(job) => JobGuard(job, collected),
             Err(mut failure) => {
                 assert_eq!(label, "NUL");
-                assert_eq!(failure.reason, ShellError::Invalid, "{label}");
+                assert_eq!(failure.reason, ExecCmdError::Invalid, "{label}");
                 failure
                     .cleanup
                     .as_mut()
@@ -732,7 +732,7 @@ fn secret_environment_refusals(home: &Path) {
             job.poll(Instant::now()).unwrap();
         }
         let result = job.result().unwrap();
-        assert_eq!(result.failure, Some(ShellError::Unavailable), "{label}");
+        assert_eq!(result.failure, Some(ExecCmdError::Unavailable), "{label}");
         assert_eq!(result.exit_code, None, "{label}");
         assert!(
             !home.join("project/secret-refused-marker").exists(),

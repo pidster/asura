@@ -6,7 +6,7 @@ public enum ToolArguments: Sendable {
     case observeStatus
     case listTools
     case readAudit(limit: UInt32)
-    case shell(command: String, cwd: String?, timeoutSeconds: UInt32)
+    case execCmd(command: String, cwd: String?, timeoutSeconds: UInt32)
     case memoryListNotes(after: String?, limit: UInt32)
     case memoryGetNote(version: String, offset: UInt64, limit: UInt32)
     case memoryNoteSources(version: String)
@@ -76,12 +76,12 @@ private struct ServiceStatusTool: Tool {
 }
 public func makeProjectTools(_ handler: @escaping ToolHandler, budget: ToolRoundBudget? = nil) -> [any Tool] {
     guard let budget else {
-        return [ProjectTool(handler: handler), MemoryTool(handler: handler), ServiceTool(handler: handler), ShellTool(handler: handler)]
+        return [ProjectTool(handler: handler), MemoryTool(handler: handler), ServiceTool(handler: handler), ExecCmdTool(handler: handler)]
     }
     return [BoundedNativeTool(base: ProjectTool(handler: handler), budget: budget),
         BoundedNativeTool(base: MemoryTool(handler: handler), budget: budget),
         BoundedNativeTool(base: ServiceTool(handler: handler), budget: budget),
-        BoundedNativeTool(base: ShellTool(handler: handler), budget: budget)]
+        BoundedNativeTool(base: ExecCmdTool(handler: handler), budget: budget)]
 }
 
 /// UTF-8 bytes of the project tool definitions the helper declares: names,
@@ -190,7 +190,7 @@ struct ServiceReadAuditTool: Tool {
 }
 
 /// Pure transport bounds shared by native proposals and private wire validation.
-func validShellArguments(command: String, cwd: String?, timeoutSeconds: UInt32?) -> Bool {
+func validExecCmdArguments(command: String, cwd: String?, timeoutSeconds: UInt32?) -> Bool {
     guard !command.isEmpty, command.utf8.count <= 8192, !command.contains("\0") else { return false }
     if let cwd {
         guard !cwd.isEmpty, cwd.utf8.count <= 1024, !cwd.hasPrefix("/"), !cwd.contains("\0"),
@@ -198,9 +198,9 @@ func validShellArguments(command: String, cwd: String?, timeoutSeconds: UInt32?)
     }
     return timeoutSeconds.map { (1...60).contains($0) } ?? true
 }
-struct ShellTool: Tool {
-    let name = "shell"
-    let description = "Run one noninteractive shell command in the admitted project and return bounded stdout, stderr and exit status. Stdin is closed. Execution is service-authorized and confined."
+struct ExecCmdTool: Tool {
+    let name = "exec_cmd"
+    let description = "Run one noninteractive /bin/sh -c command line in the admitted project and return bounded stdout, stderr and exit status. Stdin is closed. Execution is service-authorized and confined."
     let handler: ToolHandler
     @Generable struct Arguments {
         @Guide(description: "Command passed exactly to /bin/sh -c; 1 through 8192 UTF-8 bytes.") var command: String
@@ -209,10 +209,10 @@ struct ShellTool: Tool {
     }
     func call(arguments: Arguments) async throws -> String {
         guard let timeout = UInt32(exactly: arguments.timeout_seconds ?? 30),
-            validShellArguments(command: arguments.command, cwd: arguments.cwd, timeoutSeconds: timeout) else {
+            validExecCmdArguments(command: arguments.command, cwd: arguments.cwd, timeoutSeconds: timeout) else {
             throw BackendFailure(.inputLimit)
         }
-        let result = try await handler(.shell(command: arguments.command, cwd: arguments.cwd, timeoutSeconds: timeout))
+        let result = try await handler(.execCmd(command: arguments.command, cwd: arguments.cwd, timeoutSeconds: timeout))
         guard result.status != .success else {return result.rendered}
         return "Tool failed: \(result.status)\n\(result.text)\n[truncated: \(result.truncated)]"
     }

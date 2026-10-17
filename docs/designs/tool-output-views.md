@@ -83,18 +83,18 @@ its classification under the principles above.
 
 | ID | Limit | Current value | Class | Owner after review |
 | --- | --- | --- | --- | --- |
-| L1 | Shell timeout | 1–60 s, default 30 | Remove | Removed in J1 (owner, 2026-10-15, J1-Q3): a command ends on completion or turn cancel; `timeout_seconds` is accepted and ignored until J3. Then the job yield window only; jobs have no fixed lifetime (owner, 2026-10-14, J2a-1). Job closures are completion, cancel, revocation, restart and capture fault |
+| L1 | exec_cmd timeout | 1–60 s, default 30 | Remove | Removed in J1 (owner, 2026-10-15, J1-Q3): a command ends on completion or turn cancel; `timeout_seconds` is accepted and ignored until J3. Then the job yield window only; jobs have no fixed lifetime (owner, 2026-10-14, J2a-1). Job closures are completion, cancel, revocation, restart and capture fault |
 | L2 | Setup budget | 2 s | Remove (owner, 2026-10-15) | Job setup ends on spawn, cancel or setup fault ([job closures](tool-job-controller.md#job-closures-and-wind-down-bounds)) |
-| L3 | Cleanup until unconfirmed | 2.5 s | Keep | Shell tool |
-| L4 | TERM to KILL grace | 500 ms | Keep | Shell tool; the person profile sets its own |
+| L3 | Cleanup until unconfirmed | 2.5 s | Keep | exec_cmd tool |
+| L4 | TERM to KILL grace | 500 ms | Keep | exec_cmd tool; the person profile sets its own |
 | L5 | Guardian lease poll and clock step | 100 ms each | Keep | Platform guardian |
 | L6 | Group-membership scan | 256 process IDs | Keep | Platform guardian |
-| L7 | Scratch cleanup | 4096 entries, 32 levels | Keep | Shell tool |
-| L8 | Live shell jobs | 1 per active turn | Replace | Job slots per service and per conversation |
+| L7 | Scratch cleanup | 4096 entries, 32 levels | Keep | exec_cmd tool |
+| L8 | Live exec_cmd jobs | 1 per active turn | Replace | Job slots per service and per conversation |
 | L9 | Pending tool calls and executors | 1 each | Keep | Model tools |
 | L10 | Ordinary tool deadline | 2 s | Replace (owner, 2026-10-15: far too short) | Queued for the design that moves every tool to jobs ([job controller open decisions](tool-job-controller.md#open-decisions)) |
-| L11 | Command and cwd | 8192 B and 1024 B | Keep | Shell tool |
-| L12 | Private argv payload | 8704 B | Keep | Shell tool |
+| L11 | Command and cwd | 8192 B and 1024 B | Keep | exec_cmd tool |
+| L12 | Private argv payload | 8704 B | Keep | exec_cmd tool |
 
 ### Capture and output
 
@@ -105,7 +105,7 @@ its classification under the principles above.
 | L15 | Read buffer | 4 KiB | Keep | Capture |
 | L16 | Combined output cap | 64 MiB | Replace | One retention quota with pause and expiry in the job controller |
 | L17 | Rendered stream | 6144 B, most recent end | Remove | Model view by the composer; person view by display rules |
-| L18 | Metadata envelope | 512 B | Keep | Shell tool |
+| L18 | Metadata envelope | 512 B | Keep | exec_cmd tool |
 | L19 | Status channel | 128 B buffer, 32 B notices, 3 notices | Keep | Platform guardian |
 
 ### Result delivery to the model
@@ -129,8 +129,8 @@ its classification under the principles above.
 | L29 | Frame | 64 KiB | Keep | Journal transport unit |
 | L30 | Journal capacity | 8 MiB, 32,768 frames | Replace (owner, 2026-10-15): the single 8 MiB file must not be the limit | Required follow-up journal design: known-size segment files with checkpoint snapshots and compaction, total size from a configurable quota and disk space ([conversation admission](conversation-admission.md#format-1-and-record-compatibility)). Current values stay until it lands |
 | L31 | Tool result text record | 16,384 B | Replace | Reference, digest and summary record |
-| L32 | Shell intent payload | 9217 B | Keep | Shell tool |
-| L33 | Shell intent timeout | 1–60,000 ms | Remove | J1's ShellIntent kind 22 records no timeout (owner, 2026-10-15, J1-Q3); the job intent records none either (owner, 2026-10-14, J2a-1). Older kind 14 records keep theirs. |
+| L32 | exec_cmd intent payload | 9217 B | Keep | exec_cmd tool |
+| L33 | exec_cmd intent timeout | 1–60,000 ms | Remove | J1's ExecCmdIntent kind 22 records no timeout (owner, 2026-10-15, J1-Q3); the job intent records none either (owner, 2026-10-14, J2a-1). Older kind 14 records keep theirs. |
 | L34 | Record ordinal | 1–8 | Evidence | Follows L20 |
 | L35 | Journal owner memory | 16 MiB; writer 64 MiB | Keep | Journal owner |
 
@@ -157,8 +157,8 @@ its classification under the principles above.
 
 | Mismatch | Design | Code |
 | --- | --- | --- |
-| Shell job scope (L8) | One service-wide job (`shell-tool.md`) | One job per active turn (`conversation.rs:487`); the owner holds one active turn (`conversation.rs:584`), so both statements hold |
-| Truncation fields (L18) | `stdout_truncated` and `stderr_truncated` | One `truncated` field (`shell.rs:51`) |
+| exec_cmd job scope (L8) | One service-wide job (`exec-cmd-tool.md`) | One job per active turn (`conversation.rs:487`); the owner holds one active turn (`conversation.rs:584`), so both statements hold |
+| Truncation fields (L18) | `stdout_truncated` and `stderr_truncated` | One `truncated` field (`exec_cmd.rs:51`) |
 | Audit reply bytes (L47) | 16,384 | Stops at 15,000 (`audit_tools.rs:60`) |
 | Ollama context (L26) | No design | `min(capacity, 8192)` (`OllamaBackend.swift:130`) |
 
@@ -188,7 +188,7 @@ Each owner design must adopt these principles before implementing its part.
 | [Tool job controller](tool-job-controller.md) | Replace its fixed preview with a disclosure the composer sizes; until the composer exists, results carry no output text and the model pages with `job read` (owner, 2026-10-14, with PC12); hold one retention quota; result records carry references |
 | [Result retention packet](result-retention-graph-packet.md) | Align its 64 MiB per-call limit and capture concurrency with the single job quota |
 | [Model tools](model-tool-execution.md) | Move per-result and per-turn byte budgets to the composer; keep page ceilings |
-| [Shell tool](shell-tool.md) | Replace the tail ring, rendered size and 60 s timeout under jobs; fix the truncation-field mismatch |
+| [exec_cmd tool](exec-cmd-tool.md) | Replace the tail ring, rendered size and 60 s timeout under jobs; fix the truncation-field mismatch |
 | [Loop closure](loop-closure.md) | Record the trace-classifier direction for the tool-loop backstop |
 | [Person command mode](person-command-mode.md) | Drop its fixed notice and record sizes; use the two views |
 | [Execution threat model](execution-threat-model.md) | Update statements about journaled output size once records hold references |

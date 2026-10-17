@@ -1450,18 +1450,18 @@ fn inventory_results_replay_without_file_pagination_or_redispatch() {
     );
 }
 
-fn shell_intent(ordinal: u32) -> ToolIntent {
+fn exec_cmd_intent(ordinal: u32) -> ToolIntent {
     ToolIntent {
         operation: id(10),
         generation: 1,
         ordinal,
-        kind: SHELL_TOOL_KIND,
+        kind: EXEC_CMD_TOOL_KIND,
         path: "printf proof\0.".into(),
         offset: 1000,
         limit: 30,
     }
 }
-fn shell_result(ordinal: u32, status: u8) -> ToolResult {
+fn exec_cmd_result(ordinal: u32, status: u8) -> ToolResult {
     ToolResult {
         operation: id(10),
         generation: 1,
@@ -1473,21 +1473,21 @@ fn shell_result(ordinal: u32, status: u8) -> ToolResult {
     }
 }
 #[test]
-fn shell_captured_outcomes_bind_to_intent_and_preserve_other_tool_rules() {
+fn exec_cmd_captured_outcomes_bind_to_intent_and_preserve_other_tool_rules() {
     for status in [1, 5, 6, 7] {
         let mut journal = Journal::started();
-        journal.append(Record::ToolIntent(shell_intent(1)));
-        journal.append(Record::ToolResult(shell_result(1, status)));
+        journal.append(Record::ToolIntent(exec_cmd_intent(1)));
+        journal.append(Record::ToolResult(exec_cmd_result(1, status)));
         assert_eq!(
             inspect(&journal.bytes).unwrap().operations[&id(10)].tools[0].result_status,
             Some(status)
         );
     }
     let mut journal = Journal::started();
-    journal.append(Record::ToolIntent(shell_intent(1)));
+    journal.append(Record::ToolIntent(exec_cmd_intent(1)));
     journal.append(Record::ToolResult(ToolResult {
         next_offset: Some(1),
-        ..shell_result(1, 1)
+        ..exec_cmd_result(1, 1)
     }));
     assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
     for status in [5, 6, 7] {
@@ -1497,15 +1497,15 @@ fn shell_captured_outcomes_bind_to_intent_and_preserve_other_tool_rules() {
             path: String::new(),
             offset: 0,
             limit: 0,
-            ..shell_intent(1)
+            ..exec_cmd_intent(1)
         }));
-        journal.append(Record::ToolResult(shell_result(1, status)));
+        journal.append(Record::ToolResult(exec_cmd_result(1, status)));
         assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
     }
 }
 #[test]
-fn shell_unresolved_restart_has_no_result_or_new_execution_authority() {
-    let intent = shell_intent(1);
+fn exec_cmd_unresolved_restart_has_no_result_or_new_execution_authority() {
+    let intent = exec_cmd_intent(1);
     let mut journal = Journal::started();
     journal.append(Record::ToolIntent(intent.clone()));
     journal.append(Record::OwnerGeneration);
@@ -1534,20 +1534,20 @@ fn shell_unresolved_restart_has_no_result_or_new_execution_authority() {
     assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
 }
 #[test]
-fn shell_results_enforce_existing_aggregate_result_budget() {
+fn exec_cmd_results_enforce_existing_aggregate_result_budget() {
     let mut journal = Journal::started();
     for ordinal in 1..=4 {
-        journal.append(Record::ToolIntent(shell_intent(ordinal)));
+        journal.append(Record::ToolIntent(exec_cmd_intent(ordinal)));
         journal.append(Record::ToolResult(ToolResult {
             text: "x".repeat(16_384),
-            ..shell_result(ordinal, 5)
+            ..exec_cmd_result(ordinal, 5)
         }));
     }
     assert!(inspect(&journal.bytes).is_ok());
-    journal.append(Record::ToolIntent(shell_intent(5)));
+    journal.append(Record::ToolIntent(exec_cmd_intent(5)));
     journal.append(Record::ToolResult(ToolResult {
         text: "x".into(),
-        ..shell_result(5, 5)
+        ..exec_cmd_result(5, 5)
     }));
     assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
 }
@@ -1744,12 +1744,12 @@ fn old_owner_result_exception_cannot_resolve_an_ordinary_tool_or_wrong_create() 
 #[test]
 fn reopened_tool_display_projections_are_bounded_and_capture_stdout() {
     let mut journal = Journal::started();
-    let mut intent = shell_intent(1);
+    let mut intent = exec_cmd_intent(1);
     intent.path = format!("printf {}\0.", "界".repeat(100));
     journal.append(Record::ToolIntent(intent));
     journal.append(Record::ToolResult(ToolResult {
         text: format!("failure=None exit_code=17 signal=none reason=none truncated=true cleanup_confirmed=true\nstdout:\n{}\nstderr:\nwarning", "界".repeat(100)),
-        ..shell_result(1, 1)
+        ..exec_cmd_result(1, 1)
     }));
     let state = inspect(&journal.bytes).unwrap();
     let tool = &state.operations[&id(10)].tools[0];
@@ -1768,11 +1768,11 @@ fn reopened_tool_display_projections_are_bounded_and_capture_stdout() {
 const FRAME_OVERHEAD: usize = 144 + 40;
 const RESULT_CAPACITY: usize = FRAME_OVERHEAD + 43 + 16_384;
 const CAPTURE_CAPACITY: usize = FRAME_OVERHEAD + 4_102;
-fn shell22(ordinal: u32, disposition: ShellDisposition) -> ShellIntent {
+fn exec_cmd22(ordinal: u32, disposition: ExecCmdDisposition) -> ExecCmdIntent {
     use asura_storage::payload::{ObjectKind, payload_id};
-    let admitted = disposition == ShellDisposition::Admitted;
+    let admitted = disposition == ExecCmdDisposition::Admitted;
     let derived = |kind| payload_id(id(1), id(10), 1, ordinal, kind);
-    ShellIntent {
+    ExecCmdIntent {
         operation: id(10),
         generation: 1,
         ordinal,
@@ -1780,19 +1780,19 @@ fn shell22(ordinal: u32, disposition: ShellDisposition) -> ShellIntent {
         command_truncated: false,
         command: "printf \"$ASURA_SECRET_1\"".into(),
         cwd: ".".into(),
-        refusal: (disposition == ShellDisposition::Refused).then_some(ShellRefusal {
+        refusal: (disposition == ExecCmdDisposition::Refused).then_some(ExecCmdRefusal {
             code: RefusalCode::SecretSingleQuoted,
             kind: Some(SecretKind::GithubToken),
             word: Some(2),
         }),
-        busy: (disposition == ShellDisposition::Busy).then_some(ShellBusyReason::Quota),
+        busy: (disposition == ExecCmdDisposition::Busy).then_some(ExecCmdBusyReason::Quota),
         variables: if admitted {
             vec![SecretKind::GithubToken]
         } else {
             vec![]
         },
         job: if admitted {
-            shell_job_id(id(10), 1, ordinal)
+            exec_cmd_job_id(id(10), 1, ordinal)
         } else {
             [0; 16]
         },
@@ -1852,8 +1852,8 @@ fn result15(ordinal: u32, status: u8) -> ToolResult {
         truncated: false,
     }
 }
-fn r22(ordinal: u32, disposition: ShellDisposition) -> Record {
-    Record::ShellIntent(Box::new(shell22(ordinal, disposition)))
+fn r22(ordinal: u32, disposition: ExecCmdDisposition) -> Record {
+    Record::ExecCmdIntent(Box::new(exec_cmd22(ordinal, disposition)))
 }
 fn r23(ordinal: u32) -> Record {
     Record::CaptureSettled(Box::new(settled23(ordinal)))
@@ -1880,36 +1880,36 @@ fn started_with(records: impl IntoIterator<Item = Record>) -> Journal {
 }
 #[test]
 fn j1t_02_each_disposition_with_and_without_capture_result_and_terminal() {
-    use ShellDisposition::*;
-    let shell = |journal: &Journal| {
+    use ExecCmdDisposition::*;
+    let exec_cmd = |journal: &Journal| {
         let state = inspect(&journal.bytes).unwrap();
         state.operations[&id(10)].tools[0].clone()
     };
     // Admitted: 22, then 23, then 15, then a terminal.
     let journal = started_with([r22(1, Admitted)]);
-    let tool = shell(&journal);
-    let call = tool.shell.as_deref().unwrap();
-    assert_eq!(tool.kind, SHELL_TOOL_KIND);
+    let tool = exec_cmd(&journal);
+    let call = tool.exec_cmd.as_deref().unwrap();
+    assert_eq!(tool.kind, EXEC_CMD_TOOL_KIND);
     assert_eq!(tool.arguments, "printf \"$ASURA_SECRET_1\" cwd=.");
     assert_eq!((tool.offset, tool.limit), (0, 0));
     assert_eq!(call.disposition, Admitted);
-    assert_eq!(call.job, shell_job_id(id(10), 1, 1));
+    assert_eq!(call.job, exec_cmd_job_id(id(10), 1, 1));
     assert_eq!(call.intent_sequence, journal.sequence);
     assert!(call.settled.is_none() && tool.result_frame.is_none());
     let journal = started_with([r22(1, Admitted), r23(1)]);
-    let tool = shell(&journal);
-    let settled = tool.shell.as_deref().unwrap().settled.clone().unwrap();
+    let tool = exec_cmd(&journal);
+    let settled = tool.exec_cmd.as_deref().unwrap().settled.clone().unwrap();
     assert_eq!(settled.state, CaptureState::Complete);
     assert_eq!(settled.reason, CaptureReason::None);
     assert_eq!(settled.sequence, journal.sequence);
     assert_eq!(settled.streams, [(5, Some([22; 32])), (0, Some([22; 32]))]);
     assert!(tool.result_frame.is_none());
     let journal = started_with([r22(1, Admitted), r23(1), r15(1, 1)]);
-    let tool = shell(&journal);
+    let tool = exec_cmd(&journal);
     assert_eq!(tool.result_status, Some(1));
     assert_eq!(tool.exit_code, Some(3));
     assert_eq!(tool.preview.as_deref(), Some("hello"));
-    assert!(tool.shell.as_deref().unwrap().settled.is_some());
+    assert!(tool.exec_cmd.as_deref().unwrap().settled.is_some());
     for journal in [
         started_with([r22(1, Admitted), r23(1), r15(1, 1), complete()]),
         started_with([r22(1, Admitted), r23(1), r15(1, 5), failed()]),
@@ -1922,15 +1922,15 @@ fn j1t_02_each_disposition_with_and_without_capture_result_and_terminal() {
     // Refused and busy: 22 then 15 with status 3 or 4, then a terminal.
     for (disposition, status) in [(Refused, 3), (Busy, 4)] {
         let journal = started_with([r22(1, disposition)]);
-        let tool = shell(&journal);
-        let call = tool.shell.as_deref().unwrap();
+        let tool = exec_cmd(&journal);
+        let call = tool.exec_cmd.as_deref().unwrap();
         assert_eq!(call.disposition, disposition);
         assert_eq!(
             [call.job, call.stdout_payload, call.stderr_payload],
             [[0; 16]; 3]
         );
         let journal = started_with([r22(1, disposition), r15(1, status)]);
-        assert_eq!(shell(&journal).result_status, Some(status));
+        assert_eq!(exec_cmd(&journal).result_status, Some(status));
         for end in [complete(), failed()] {
             let journal = started_with([r22(1, disposition), r15(1, status), end]);
             assert!(
@@ -1942,12 +1942,12 @@ fn j1t_02_each_disposition_with_and_without_capture_result_and_terminal() {
         let journal = started_with([r22(1, disposition), failed()]);
         assert!(inspect(&journal.bytes).is_ok());
     }
-    // Calls follow one another; a legacy kind 14 shell keeps its rules.
+    // Calls follow one another; a legacy kind 14 exec_cmd keeps its rules.
     let journal = started_with([
         r22(1, Refused),
         r15(1, 3),
-        Record::ToolIntent(shell_intent(2)),
-        Record::ToolResult(shell_result(2, 1)),
+        Record::ToolIntent(exec_cmd_intent(2)),
+        Record::ToolResult(exec_cmd_result(2, 1)),
         r22(3, Admitted),
         r23(3),
         r15(3, 1),
@@ -1958,16 +1958,16 @@ fn j1t_02_each_disposition_with_and_without_capture_result_and_terminal() {
     let state = inspect(&journal.bytes).unwrap();
     let tools = &state.operations[&id(10)].tools;
     assert_eq!(tools.len(), 4);
-    assert!(tools[1].shell.is_none());
-    assert_eq!(tools[2].shell.as_deref().unwrap().disposition, Admitted);
+    assert!(tools[1].exec_cmd.is_none());
+    assert_eq!(tools[2].exec_cmd.as_deref().unwrap().disposition, Admitted);
 }
 #[test]
 fn j1t_02_every_invalid_order_is_corrupt() {
-    use ShellDisposition::*;
-    let mismatched = |change: fn(&mut ShellIntent)| {
-        let mut p = shell22(1, Admitted);
+    use ExecCmdDisposition::*;
+    let mismatched = |change: fn(&mut ExecCmdIntent)| {
+        let mut p = exec_cmd22(1, Admitted);
         change(&mut p);
-        Record::ShellIntent(Box::new(p))
+        Record::ExecCmdIntent(Box::new(p))
     };
     let other_rule_set = |change: fn(&mut CaptureSettled)| {
         let mut p = settled23(1);
@@ -2059,7 +2059,7 @@ fn j1t_02_every_invalid_order_is_corrupt() {
         (
             "job ID mismatch",
             Journal::started(),
-            vec![mismatched(|p| p.job = shell_job_id(id(10), 1, 2))],
+            vec![mismatched(|p| p.job = exec_cmd_job_id(id(10), 1, 2))],
         ),
         (
             "stdout ID mismatch",
@@ -2111,9 +2111,9 @@ fn j1t_02_every_invalid_order_is_corrupt() {
             vec![r22(1, Admitted), other_rule_set(|p| p.generation = 2)],
         ),
         (
-            "23 for a legacy kind 14 shell",
+            "23 for a legacy kind 14 exec_cmd",
             Journal::started(),
-            vec![Record::ToolIntent(shell_intent(1)), r23(1)],
+            vec![Record::ToolIntent(exec_cmd_intent(1)), r23(1)],
         ),
         (
             "22 skips an ordinal",
@@ -2197,20 +2197,20 @@ fn j1t_02_every_invalid_order_is_corrupt() {
 #[test]
 fn j1t_02_terminal_with_admitted_intent_lacking_capture_is_accepted() {
     let journal = started_with([
-        r22(1, ShellDisposition::Admitted),
+        r22(1, ExecCmdDisposition::Admitted),
         Record::OwnerGeneration,
         Record::TurnTerminal(terminal(TerminalKind::Interrupted, Cause::Restart, false)),
     ]);
     let state = inspect(&journal.bytes).unwrap();
     let tool = &state.operations[&id(10)].tools[0];
-    assert!(tool.shell.as_deref().unwrap().settled.is_none());
+    assert!(tool.exec_cmd.as_deref().unwrap().settled.is_none());
     assert!(tool.result_frame.is_none());
     assert_eq!(state.active_operation, None);
     for end in [
         failed(),
         Record::TurnTerminal(terminal(TerminalKind::Cancelled, Cause::UserCancel, false)),
     ] {
-        let mut journal = started_with([r22(1, ShellDisposition::Admitted)]);
+        let mut journal = started_with([r22(1, ExecCmdDisposition::Admitted)]);
         if matches!(&end, Record::TurnTerminal(t) if t.kind == TerminalKind::Cancelled) {
             journal.append(Record::CancelRequested(CancelRequested {
                 operation: id(10),
@@ -2222,7 +2222,7 @@ fn j1t_02_terminal_with_admitted_intent_lacking_capture_is_accepted() {
         let state = inspect(&journal.bytes).unwrap();
         assert!(
             state.operations[&id(10)].tools[0]
-                .shell
+                .exec_cmd
                 .as_deref()
                 .unwrap()
                 .settled
@@ -2232,7 +2232,7 @@ fn j1t_02_terminal_with_admitted_intent_lacking_capture_is_accepted() {
 }
 #[test]
 fn j1t_02_reserve_holds_one_capture_frame_until_kind_23() {
-    use ShellDisposition::*;
+    use ExecCmdDisposition::*;
     let reserved = |journal: &Journal| {
         let state = inspect(&journal.bytes).unwrap();
         (state.reserved_bytes, state.reserved_frames)
@@ -2257,9 +2257,9 @@ fn j1t_02_reserve_holds_one_capture_frame_until_kind_23() {
             (base + RESULT_CAPACITY, frames + 1)
         );
     }
-    // A legacy kind 14 shell keeps the result reservation only.
+    // A legacy kind 14 exec_cmd keeps the result reservation only.
     assert_eq!(
-        reserved(&started_with([Record::ToolIntent(shell_intent(1))])),
+        reserved(&started_with([Record::ToolIntent(exec_cmd_intent(1))])),
         (base + RESULT_CAPACITY, frames + 1)
     );
     // After restart the old operation keeps the capture frame for its terminal

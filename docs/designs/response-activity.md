@@ -40,7 +40,7 @@ cancelled or interrupted. A pending event may name the
 [waiting step](model-provider-integration.md#waiting-step-display--owner-2026-10-16),
 for example `Waiting: model output · Esc stops`. This is execution metadata, not private model reasoning.
 The selected extension adds bounded arguments and captured-result previews.
-Continuous shell output streaming remains outside this packet.
+Continuous exec_cmd output streaming remains outside this packet.
 
 Completed responses show a compact activity summary. F6 enters response navigation
 at the newest entry. Up/Down select a response; Home/End select oldest/newest.
@@ -284,7 +284,7 @@ large note bodies are not exposed; show version/body size references. Values
 come from typed service intents and committed results, not model assertions.
 Current-owner timing uses monotonic instants; replay can recover arguments and
 captured previews but cannot invent absent timing. Preview truncation is separate
-from stored-result truncation. Existing shell tails remain explicitly truncated.
+from stored-result truncation. Existing exec_cmd tails remain explicitly truncated.
 
 The replay projection caches bounded argument/result descriptions in ToolRecord,
 derived from verified journal bytes. This adds no filesystem access on the reactor
@@ -369,7 +369,7 @@ The same process journey verified durable replay, disconnect continuation and
 outside-project secret non-disclosure. The Swift SDK regression completed three
 small tool calls followed by a fourth inference request and final answer.
 
-Isolated PTY journeys passed live shell activity and a four-request tool sequence,
+Isolated PTY journeys passed live exec_cmd activity and a four-request tool sequence,
 including a denied file access, full response, measurements, history navigation,
 draft preservation and owned cleanup. Composer navigation also passed.
 The restored-history journey exposed an intermittent writer-admission race.

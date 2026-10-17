@@ -112,13 +112,13 @@ list. The `memory` tool also implements `create_note` for foreground local-model
 turns. It stores an immutable note and can link it to an existing source version
 in the same project. Write recovery uses durable intents and database receipts;
 native write qualification is recorded separately in the Memory design.
-The `shell` tool runs one noninteractive `/bin/sh` command in the selected project.
+The `exec_cmd` tool runs one noninteractive `/bin/sh` command in the selected project.
 It returns bounded stdout, stderr and exit status. `cwd` is project-relative;
 `timeout_seconds` defaults to 30 and accepts 1–60, within the remaining turn budget.
 The sandbox permits project and private scratch writes and denies network access.
-For example, ask: “Use shell to run pwd and git status --short.”
-The system-model shell journey is verified; other local adapters have shared
-contract tests but no shell-specific native qualification yet.
+For example, ask: “Use exec_cmd to run pwd and git status --short.”
+The system-model exec_cmd journey is verified; other local adapters have shared
+contract tests but no exec-cmd-specific native qualification yet.
 The service records tool results before continuing model generation.
 `/init` checks setup explicitly; it is not required for normal first use.
 Startup preserves existing unknown, incomplete or damaged state.
@@ -372,7 +372,7 @@ can retrieve an operation from the persistent journal; a past-session browser is
 not yet available.
 
 Models use four typed tools: `project` (file reads/listing), `memory` (note reads/creation),
-`service` (status/tools/audit), and `shell`. `/tools` displays their commands.
+`service` (status/tools/audit), and `exec_cmd`. `/tools` displays their commands.
 Each command keeps its existing permissions and durable operation records.
 
 The top bar reports the connection type, service uptime, sampled stored-memory

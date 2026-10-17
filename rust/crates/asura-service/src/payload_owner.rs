@@ -4,7 +4,7 @@
 use crate::capture_worker::{self, Message};
 use asura_platform::RuntimeDirectory;
 use asura_platform::events::WakeSender;
-use asura_storage::authority::conversation::{Replay, ShellBusyReason};
+use asura_storage::authority::conversation::{ExecCmdBusyReason, Replay};
 use asura_storage::payload::{PagePool, PayloadStore, RecoveryReport, known_calls, recover_known};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -102,21 +102,21 @@ impl Payloads {
             _ => None,
         }
     }
-    /// Shell admission checks before the 1 MiB reservation, in order: a free
+    /// exec_cmd admission checks before the 1 MiB reservation, in order: a free
     /// pending-install slot, no paused capture, a ready payload store.
     pub(crate) fn admission(
         &self,
         active_paused: bool,
-    ) -> Result<Arc<PayloadStore>, ShellBusyReason> {
+    ) -> Result<Arc<PayloadStore>, ExecCmdBusyReason> {
         if self.pending.len() >= PENDING_INSTALLS {
-            return Err(ShellBusyReason::PendingFull);
+            return Err(ExecCmdBusyReason::PendingFull);
         }
         if active_paused || self.pending.iter().any(|h| h.paused) {
-            return Err(ShellBusyReason::CapturePaused);
+            return Err(ExecCmdBusyReason::CapturePaused);
         }
         self.store()
             .cloned()
-            .ok_or(ShellBusyReason::PayloadUnavailable)
+            .ok_or(ExecCmdBusyReason::PayloadUnavailable)
     }
     /// Moves a worker that outlives its call onto the list.
     pub(crate) fn push_pending(&mut self, handle: capture_worker::Handle) {

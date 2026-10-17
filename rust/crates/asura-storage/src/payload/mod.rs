@@ -1,4 +1,4 @@
-//! Retained shell output payloads (J1): identities, the quota ledger, staging,
+//! Retained exec_cmd output payloads (J1): identities, the quota ledger, staging,
 //! text pages and derived recovery. The only caller of platform payload I/O.
 mod id;
 mod pages;

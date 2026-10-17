@@ -15,7 +15,7 @@ prompt last. This separates fields but does not select relevant evidence or rebu
 context from structured task state. Tool results within one inference session are
 not a durable cross-turn context composition strategy.
 
-The [shell tool](shell-tool.md) drains bounded output but retains separate tail
+The [exec_cmd tool](exec-cmd-tool.md) drains bounded output but retains separate tail
 rings. Its durable result is the captured tail, not the complete emitted output.
 Full recovery therefore requires new retained output storage. An audit log's
 rotation cannot define the lifetime of canonical results.
@@ -89,7 +89,7 @@ flowchart TD
 
 Each activity links to conversation, operation, generation and tool ordinal.
 Present the public grouped tool command and a bounded argument description, such
-as `shell find . -name "*.wisp"`. Show its real policy decision and reason, then
+as `exec_cmd find . -name "*.wisp"`. Show its real policy decision and reason, then
 its actual outcome: exit code, captured byte count, duration and optional preview.
 A model's assertion that a command is safe must never appear as a policy verdict.
 Missing facts stay unknown. This displays actions and outcomes, not private model

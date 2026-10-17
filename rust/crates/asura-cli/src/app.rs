@@ -389,10 +389,13 @@ pub fn entry_with_logs(
     log_resolve: fn() -> asura_platform::Result<std::fs::File>,
 ) -> i32 {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "--asura-shell-guardian") {
+    if args
+        .first()
+        .is_some_and(|a| a == "--asura-exec-cmd-guardian")
+    {
         return match args.as_slice() {
             [_, job, deadline, command] => {
-                asura_platform::shell::run_guardian(job, deadline, command)
+                asura_platform::exec_cmd::run_guardian(job, deadline, command)
             }
             _ => 2,
         };

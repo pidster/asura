@@ -185,7 +185,7 @@ fn acknowledged_committed_create_after_cancel_stays_success_but_is_not_delivered
     let result = mutation.result(MemoryCreateResult::Committed(receipt(&mutation.intent)), 6);
     active.tool = Some(LiveTool {
         create: Some(mutation),
-        shell: None,
+        exec_cmd: None,
         secret_digest: None,
         rejected: false,
         call,
@@ -264,7 +264,7 @@ fn pending_projection() -> Arc<journal::Replay> {
                 result_frame: None,
                 result_status: None,
                 result_bytes: 0,
-                shell: None,
+                exec_cmd: None,
             }],
         },
     );

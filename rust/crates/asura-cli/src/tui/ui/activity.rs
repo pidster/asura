@@ -394,7 +394,7 @@ mod tests {
             kind: Some(kind),
             tools: vec![pb::ToolProgress {
                 ordinal: Some(1),
-                name: Some("shell".into()),
+                name: Some("exec_cmd".into()),
                 state: Some(state),
                 status: (state == 2).then_some(1),
                 ..Default::default()
@@ -579,7 +579,7 @@ mod tests {
         app.active_operation = Some(vec![1; 16]);
         app.conversation_busy = true;
         apply(&mut app, event(1, 2, 1, 1));
-        assert!(draw(&mut app, 90, 25, "running").contains("shell · running"));
+        assert!(draw(&mut app, 90, 25, "running").contains("exec_cmd · running"));
         let mut heartbeat = event(1, 2, 1, 1);
         heartbeat.tools.clear();
         apply(&mut app, heartbeat);
@@ -587,11 +587,11 @@ mod tests {
         let mut complete = event(1, 3, 3, 2);
         complete.text = Some("Project inspection finished.".into());
         apply(&mut app, complete);
-        assert!(!draw(&mut app, 90, 25, "collapsed").contains("shell · complete"));
+        assert!(!draw(&mut app, 90, 25, "collapsed").contains("exec_cmd · complete"));
         app.insert("keep this draft");
         key(&mut app, KeyCode::F(6));
         key(&mut app, KeyCode::Enter);
-        assert!(draw(&mut app, 90, 25, "expanded").contains("shell · complete"));
+        assert!(draw(&mut app, 90, 25, "expanded").contains("exec_cmd · complete"));
         key(&mut app, KeyCode::Esc);
         assert_eq!(app.draft(), "keep this draft");
         app.conversation_busy = true;

@@ -1,21 +1,22 @@
 //! Worker-layer harness for J1 qualification (feature `test-support` only;
-//! never in production builds). It drives real shell workers and capture
+//! never in production builds). It drives real exec_cmd workers and capture
 //! workers on one test reactor, as the conversation owner does, without a
 //! journal: settlement and install follow the same order (R2).
 use crate::capture_worker;
-use crate::shell_worker::{Dispatch, Worker};
+use crate::exec_cmd_worker::{Dispatch, Worker};
 use crate::tools::{self, Arguments};
 use asura_platform::RuntimeDirectory;
 use asura_platform::secrets::{self, JobRedaction, SecretVariable};
 use asura_storage::authority::conversation::{
-    self as journal, CaptureSettled, CaptureState, Id, ShellDisposition, ShellIntent, ToolResult,
+    self as journal, CaptureSettled, CaptureState, ExecCmdDisposition, ExecCmdIntent, Id,
+    ToolResult,
 };
 use asura_storage::payload::{ObjectKind, Page, PageRequest, PayloadStore, payload_id, read_page};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// One shell call for the harness: an already rewritten command and its
-/// secret variables (use `secrets::rewrite_shell_call`).
+/// One exec_cmd call for the harness: an already rewritten command and its
+/// secret variables (use `secrets::rewrite_exec_cmd_call`).
 pub struct Job {
     pub command: String,
     pub secrets: Vec<SecretVariable>,
@@ -31,14 +32,14 @@ pub struct Outcome {
 
 struct Running {
     worker: Worker,
-    intent: ShellIntent,
+    intent: ExecCmdIntent,
     started: Instant,
     output: Option<Outcome>,
     capture: Option<capture_worker::Handle>,
     pages: Vec<Page>,
 }
 
-/// Runs `jobs` concurrently, each in its own shell worker and capture
+/// Runs `jobs` concurrently, each in its own exec_cmd worker and capture
 /// worker, in the project at `project`. With `probe_pages`, the stdout page
 /// at offset 0 is read on every reactor turn while a call is live.
 /// `cancel_after` cancels every call after that long. Returns after every
@@ -61,15 +62,15 @@ pub fn run_jobs(
     let mut running = Vec::new();
     for job in jobs {
         let operation = asura_platform::random_id();
-        let job_id = journal::shell_job_id(operation, 1, 1);
+        let job_id = journal::exec_cmd_job_id(operation, 1, 1);
         let victims = store
             .admit(installation, operation, 1, 1, job_id)
             .map_err(|_| "admission: quota".to_string())?;
-        let intent = ShellIntent {
+        let intent = ExecCmdIntent {
             operation,
             generation: 1,
             ordinal: 1,
-            disposition: ShellDisposition::Admitted,
+            disposition: ExecCmdDisposition::Admitted,
             command_truncated: false,
             command: job.command.clone(),
             cwd: ".".into(),
@@ -100,7 +101,7 @@ pub fn run_jobs(
                     operation,
                     generation: 1,
                     ordinal: 1,
-                    arguments: Arguments::Shell {
+                    arguments: Arguments::ExecCmd {
                         command: job.command,
                         cwd: ".".into(),
                         timeout_seconds: 30,
@@ -139,7 +140,7 @@ pub fn run_jobs(
             cancelled = true;
             for job in &mut running {
                 job.worker
-                    .cancel(asura_platform::shell::StopReason::Cancelled);
+                    .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             }
         }
         for job in &mut running {

@@ -10,7 +10,7 @@ mod stream;
 
 pub use rewrite::{
     MAX_REWRITTEN_COMMAND_BYTES, Refusal, RefusalCode, Rewrite, SecretVariable, display_redacted,
-    rewrite_command, rewrite_shell_call,
+    rewrite_command, rewrite_exec_cmd_call,
 };
 pub use rules::{RULE_SET_DIGEST, RULE_SET_REVISION, RuleSet, SelfCheckError};
 pub use stream::{

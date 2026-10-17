@@ -4,7 +4,7 @@
 //!
 //! Layout: `~/.asura/payloads/{staging,objects}/<32 hex>`, directories 0700,
 //! files 0600, on a local APFS volume. The directories are inside `~/.asura`,
-//! which every shell profile denies (SI3).
+//! which every exec_cmd profile denies (SI3).
 use crate::runtime::{open_at, stat_at, stat_fd, valid_stat, validate_acl};
 use crate::{Error, RuntimeDirectory, checked};
 use std::ffi::{CStr, CString};

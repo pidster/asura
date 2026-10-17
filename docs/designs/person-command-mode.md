@@ -35,7 +35,7 @@ Objectives:
 
 Non-goals: interactive stdin, a PTY, a persistent shell session, `!cd` that
 persists, remote hosts, automatic retry, an approval prompt, and any change to
-the model's shell tool contract or execution profile.
+the model's exec_cmd tool contract or execution profile.
 
 Dependencies:
 
@@ -43,7 +43,7 @@ Dependencies:
   settlement, client job API, job viewer and job notices.
 - [Tool output views](tool-output-views.md): one retained stream, separate person
   and model views, journal references.
-- [Shell tool](shell-tool.md): platform guardian, sandbox and process group.
+- [exec_cmd tool](exec-cmd-tool.md): platform guardian, sandbox and process group.
 - [Managed input queue](managed-input-queue.md) and
   [conversation admission](conversation-admission.md): lane order, format-1
   records and history.
@@ -67,7 +67,7 @@ two owner decisions: a `!` command is a tool job, and the
 | PCR3 | `!` at any other position is ordinary text. |
 | PCR4 | Backspace at position 0 leaves command mode and keeps the text. The prompt marker becomes `!` in command mode. |
 | PCR5 | In command mode the whole input box, including its half-block strips, uses command amber `#E8B577`. The marker and text are bold black `#000000`. A sent command's log line is a stripe in `#745A3C` with light text. |
-| PCR6 | A `!` command runs as a tool job with a person execution profile. It is a special case of the shell tool's execution path, not of the model's tool contract. |
+| PCR6 | A `!` command runs as a tool job with a person execution profile. It is a special case of the exec_cmd tool's execution path, not of the model's tool contract. |
 | PCR7 | The Seatbelt sandbox stays. Network access is allowed for person commands. |
 | PCR8 | The command receives the person's PATH and HOME, not the model's fixed PATH and scratch HOME. Reads are allowed across the person's home, including `~/.ssh`. |
 | PCR9 | The working directory is the TUI launch directory when it is inside the selected project; otherwise it is the project root. Each command runs in its own shell; `!cd` does not persist. |
@@ -82,7 +82,7 @@ two owner decisions: a `!` command is a tool job, and the
 | PCR18 | Before a person command runs, the TUI warns when the model changed build or test paths since the person's last command (PX1, owner 2026-10-14). Asura also re-checks the recorded digest of each approved implicit-execution file before relying on it, and warns again when it changed (PX1, EX1, owner 2026-10-15). The warning mechanism, approval flow and path list need their own design before P4. |
 | PCR19 | Secrets in output are detected at capture and replaced with placeholders before storage; the journal, retained streams, viewer and model see placeholders. Secrets only. A secret in the command becomes a per-execution variable such as `$ASURA_SECRET_1`, passed in the environment for that one execution and then dropped; the log keeps only its name. A command that cannot be rewritten safely under shell quoting is refused with a reason (PX6, EX4, owner 2026-10-15). Mechanism: [secret detection](secret-detection.md), slice SL5. |
 
-These decisions amend the [shell tool](shell-tool.md) for person origin only.
+These decisions amend the [exec_cmd tool](exec-cmd-tool.md) for person origin only.
 That design said toolchain and cache access "requires a subsequent scoped design
 refinement"; this document is that refinement. The model's profile, timeout,
 environment and grant are unchanged.
@@ -95,7 +95,7 @@ environment and grant are unchanged.
 | Person job | The tool job that runs a person command. Its origin is the person, not a model turn. |
 | Command mode | Composer state in which Enter submits a person command instead of a conversational message |
 | Person execution profile | Sandbox, environment, working directory and stop rules for a person job |
-| Model execution profile | The existing [shell tool](shell-tool.md#authority-and-confinement) profile |
+| Model execution profile | The existing [exec_cmd tool](exec-cmd-tool.md#authority-and-confinement) profile |
 | Person notice | The job notice entry for a settled person job, labelled as the person's action |
 
 ## Ownership
@@ -110,7 +110,7 @@ scheduler, queue, payload store or journal.
 | Submit transport | Existing serial queue sender | New typed request |
 | Validation, queue order, dispatch, person grant | Rust conversation owner (`asura-service/src/conversation.rs`) | New queue entry kind |
 | Job slot, setup, capture, retention, settlement, cancel | Job controller from J2 | Person origin: no yield window, no deadline, kill escalation |
-| Spawn, sandbox, guardian, process group | `asura-platform::shell` | Person profile, no-deadline mode, stop-control bytes |
+| Spawn, sandbox, guardian, process group | `asura-platform::exec_cmd` | Person profile, no-deadline mode, stop-control bytes |
 | Retained streams and pages | Payload adapter from J1 | None |
 | Durable records and replay | Storage authority writer (`asura-storage/src/authority`) | Format-1 kind PCQ; person origin on J2 job records |
 | Notice composition | Job notices from J5 | Person entry labels |
@@ -210,7 +210,7 @@ Required behavior (owner, 2026-10-14,
 composer shows each top-level command that `/bin/sh` will run. Proposed
 mechanism:
 
-- One canonical splitter, `asura-platform::shell::split`, ported from Wisp's
+- One canonical splitter, `asura-platform::exec_cmd::split`, ported from Wisp's
   `CommandSplitter`. It is a pure function with no I/O. It understands single
   and double quotes, backslash escapes, backslash-newline continuation, `$(…)`,
   backticks, `( … )` subshells, and the operators `;`, `&`, `&&`, `||`, `|` and
@@ -369,13 +369,13 @@ column is required behavior where marked PCR, otherwise a proposed mechanism.
 | TERM to KILL grace | 500 ms (`guardian.rs:38`) | 2 s (PC8). Kill request: immediate. |
 | Cleanup confirmation | Unconfirmed 2.5 s after stopping starts (`guardian.rs:360`) | Unconfirmed 2.5 s after KILL is sent |
 | Output | Two 8 KiB tail rings (`capture.rs:45`), rendered up to 6144 bytes each | Complete streams retained by the job controller (PCR14) |
-| Output growth | 64 MiB, then `output_limit` (`shell.rs:364`) | Job retention quota with growing reservation, expiry and `CapturePaused` |
-| Concurrency | One shell job per active turn (`conversation.rs:480`) | One job slot under the controller's limits; other turns and jobs continue (PC9) |
+| Output growth | 64 MiB, then `output_limit` (`exec_cmd.rs:364`) | Job retention quota with growing reservation, expiry and `CapturePaused` |
+| Concurrency | One exec_cmd job per active turn (`conversation.rs:480`) | One job slot under the controller's limits; other turns and jobs continue (PC9) |
 | Durable record | ToolIntent kind 16 and ToolResult with rendered text | Kind PCQ, then job intent and settlement with person origin |
 | Model disclosure | ToolResult in the same turn | Person notice on the next turn; output by the composer's view, or by `job read` until the composer exists (PC12) |
 | Audit | `ToolFinished` | Job audit events with origin `person` |
 
-The model column records today's shell tool. When J2 lands, model shell calls
+The model column records today's exec_cmd tool. When J2 lands, model exec_cmd calls
 also become jobs; their profile stays as listed.
 
 ### Environment and how PATH and HOME reach the service
@@ -429,7 +429,7 @@ Required behavior: PCR9. Proposed mechanism:
 - The TUI computes the directory with its existing `context_directory` rule
   (`ui.rs:1229`): the launch directory when it starts with the project root,
   otherwise the root. It sends the project-relative path, `.` for the root.
-- The path follows the shell tool's `cwd` contract: 1–1024 bytes, relative,
+- The path follows the exec_cmd tool's `cwd` contract: 1–1024 bytes, relative,
   no NUL and no `..` component.
 - The service resolves it under the retained project descriptor with no symlink
   traversal, as the model profile does. A launch directory reached through a
@@ -463,7 +463,7 @@ required root, such as the home directory, fails setup with
 
 The guardian receives each extra root as an inherited read-only directory
 descriptor at FDs 11 and above; FD 10 holds the Asura home under
-[state isolation](asura-state-isolation.md#shell-profile). It pins their identities before compiling the
+[state isolation](asura-state-isolation.md#exec_cmd-profile). It pins their identities before compiling the
 profile, as it already does for FDs 7–9 (`guardian.rs:66-98`, `guardian.rs:196-200`).
 
 ### Authority and grant
@@ -500,7 +500,7 @@ include them before this design is implemented.
 
 | Job controller rule | Person job |
 | --- | --- |
-| Started by a model `shell` call with a yield window | Started by dispatch of a kind-PCQ queue entry; no yield window and no starting ToolResult |
+| Started by a model `exec_cmd` call with a yield window | Started by dispatch of a kind-PCQ queue entry; no yield window and no starting ToolResult |
 | Handle delivery is the starting call's ToolResult | No handle delivery step. The client knows the job ID at queue acceptance, because it derives from the input ID. |
 | No job lifetime for any job (owner, 2026-10-14, J2a-1) | No deadline (PCR11). Closures are person stop and kill, revocation and shutdown; a client disconnect is not one (PC5). |
 | `CapturePaused` has no time expiry for any job (owner, 2026-10-14) | A paused person job waits for freed space, a person stop or another cancel trigger |
@@ -650,16 +650,16 @@ Replay rules:
 
 ### Platform changes
 
-Proposed mechanism inside `asura-platform::shell`. No new process type or
+Proposed mechanism inside `asura-platform::exec_cmd`. No new process type or
 supervisor is added.
 
 | Change | Detail |
 | --- | --- |
-| Profile selection | `ShellRequest` gains `profile: Model \| Person(PersonRoots)`. It carries no deadline ([J1-Q3](tool-job-controller.md#j1-timeout-and-setup-budget-removal)). The guardian argv gains a profile token after the job ID. Validated descriptors still authorize the entrypoint. |
+| Profile selection | `ExecCmdRequest` gains `profile: Model \| Person(PersonRoots)`. It carries no deadline ([J1-Q3](tool-job-controller.md#j1-timeout-and-setup-budget-removal)). The guardian argv gains a profile token after the job ID. Validated descriptors still authorize the entrypoint. |
 | No-deadline mode | Every job runs with deadline argument `0` (owner, 2026-10-14, J2a-1). The guardian skips the deadline check (`guardian.rs:186`) and keeps its 100 ms lease poll. Every other existing check stays for both profiles. |
 | Stop control | The lease pipe accepts single bytes: `T` starts TERM and the grace timer; `K` sends KILL at once. EOF still means service loss. Today any byte is a protocol fault (`guardian.rs:389-399`). At most 2 bytes are written, below `PIPE_BUF`. The job controller adopts the same bytes for model job cancel. |
 | Grace | Person profile: 2 s (PC8). The model keeps 500 ms. |
-| Notice reasons | Status notice reason values 10 person stop and 11 person kill in the existing 32-byte notice. The decoder rejects reasons above 9 today (`asura-platform/src/shell/protocol.rs:29`) and accepts kind-2 reasons 0–4 only (`protocol.rs:48`), so it must change with them. |
+| Notice reasons | Status notice reason values 10 person stop and 11 person kill in the existing 32-byte notice. The decoder rejects reasons above 9 today (`asura-platform/src/exec_cmd/protocol.rs:29`) and accepts kind-2 reasons 0–4 only (`protocol.rs:48`), so it must change with them. |
 | Environment | Built from the validated request: sanitized PATH, account HOME, `TMPDIR`, PC3 variables. Model environment unchanged. |
 | Extra roots | Read-only directory FDs 11–17 for `$TMPDIR` and existing cache directories; validated like FDs 7–9 |
 
@@ -1221,7 +1221,7 @@ threat model cases PX-V6, PX-V11 and PX-V12.
 - **Unsandboxed person commands.** Rejected by PCR7.
 - **Keep the model profile for person commands.** Rejected: toolchains, Git
   and network would fail, which defeats the feature.
-- **Run person commands on the shell tool's retained worker, outside the job
+- **Run person commands on the exec_cmd tool's retained worker, outside the job
   controller.** The first draft of this design. Rejected by the owner on
   2026-10-13: it kept only an 8 KiB tail per stream, so full output was lost.
 
