@@ -221,7 +221,7 @@ stateDiagram-v2
 
 | Case | Unit | Integration | End-to-end |
 | --- | --- | --- | --- |
-| MT01 schema | Exact names, typed arguments, path and numeric boundaries | Both model codecs reject malformed and wrong-direction calls | Invalid native request produces a visible failed tool event, no host action |
+| MT01 schema | Exact names, the single service argument parser, path and numeric boundaries (TCR-U04, TCR-U05) | Both model codecs reject oversize and wrong-direction `ToolCall` frames; a malformed argument text is a kind 14 `invalid_arguments` record, not a protocol fault (TCR-U14, TCR-I01) | Invalid native request produces a visible rejected tool event with its fault, no host action (TCR-E01) |
 | MT02 scope | Stale identity and missing grant denied | Held descriptors reject symlink/parent/replacement/FIFO access | A model cannot read outside the admitted project |
 | MT03 bounds | Call/result ceilings and retained pending slot | Stalled worker preserves status/cancel responsiveness and slot | TUI accepts edits within 100 ms during stalled tool execution |
 | MT04 lifecycle | Cancel before dispatch and stale result fencing | Intent/result commit faults, duplicate identity, crash boundaries | Disconnect/reconnect preserves one outcome; steering waits settlement |
@@ -239,7 +239,7 @@ Wisp's registry and typed read-tool arguments informed the adapter boundary.
 Wisp's synchronous file read inside its callback is not adopted. Local SDK
 inspection does not prove native runtime tool choice or cancellation quality.
 
-Journal kinds 14 (`ToolIntent`) and 15 (`ToolResult`) are implemented after queue
+Journal kinds 14 (`ToolCall` since 2026-10-18; `ToolIntent` before) and 15 (`ToolResult`) are implemented after queue
 kinds 12 and 13. The service projects committed tool progress through the shared
 conversation events. Private bridge fields and default read-only admission policy
 are selected below. The conversation owner retains lifecycle ownership.
@@ -251,6 +251,10 @@ Selected MT2 schema reservation. Envelope fields 20 and 21 carry `ToolCall` and
 retains the existing text-only path. ToolCall has ordinal field 1 and a oneof:
 read-file field 10 or list-directory field 11. Read-file fields are relative path
 1, byte offset 2 and byte limit 3. List-directory has relative path field 1.
+Superseded (2026-10-18, [tool call records](tool-call-records.md#wire-contract)):
+fields 10–19 and their argument messages are removed and reserved. `ToolCall`
+now holds ordinal 1 (1–9), name 2, arguments 3, arguments_bytes 4, name_bytes 5
+and source 6. `ToolResult` ordinal may be 9 only with status 7.
 ToolResult contains ordinal 1, status 2, bounded text 3, optional next offset 4
 and explicit truncated flag 5. Known status values distinguish success, denied,
 invalid arguments, unavailable, timeout, cancelled and resource limit.
@@ -328,14 +332,22 @@ caller limits and independent turn budgets. No generated prose is parsed as a to
 
 ### Durable tool record contract
 
-Selected format-1 additions. Kind 14 stores operation ID, generation, ordinal,
-tool kind (1 read, 2 list), relative path, offset and byte limit. A list uses
-zero offset and limit. Kind 15 stores operation ID, generation, ordinal, typed
+Selected format-1 additions. Since 2026-10-18 kind 14 is the
+[`ToolCall` record](tool-call-records.md#record-kind-14-toolcall): operation ID,
+generation, ordinal 1–9, redacted name and argument text, operation code,
+decision and fault. The earlier layout (tool kind, path, offset and byte limit)
+is retired. Kind 15 stores operation ID, generation, ordinal, typed
 status, text, optional continuation offset and truncation flag. Paths are at most
 1,024 bytes and results at most 16,384 bytes. Result text across a turn is at most
-65,536 bytes. Only ordinals 1 through 8 are valid.
+65,536 bytes. Kind 15 ordinals are 1 through 8; kind 14 ordinal 9 exists only
+with decision `limit`.
 
-Replay requires a started current operation without cancellation before an intent.
+Replay requires a started current operation before kind 14; after the
+operation's `CancelRequested`, kind 14 must have decision `cancelled`. Only a
+`run` call is followed by kind 15. Replay checks kind 15 against the record's
+codes only; it no longer compares a `read_file` or `get_note` page with the
+call's limit and offset, because those typed values are not record fields and
+replay never parses the redacted text again (TCR-D25).
 Only one unresolved intent may exist. Results match the last unresolved ordinal;
 they may settle after cancellation. A complete turn requires every tool result
 committed. Restart may interrupt a turn with an unresolved tool; no automatic
@@ -406,13 +418,14 @@ produce text. The engine owns structured history, shared tool wrappers, streamin
 output bounds and the per-turn inference-dispatch budget. Provider adapters own
 native request/response translation and discovery. They do not execute host tools.
 
-Numeric arguments which cannot fit the typed private schema fail the turn before
-host dispatch. They are never turned into success-shaped text returned locally
-to inference. A typed request reaches the canonical validator; malformed private
-frames fail the private channel. Visible turn failure is the minimum malformed-
-argument outcome; only durably admitted valid calls produce durable tool progress.
-This clarifies MT01's earlier stronger claim of a tool event for every invalid
-native argument, which cannot hold for an undecodable request.
+Revised 2026-10-18 ([tool call records](tool-call-records.md)): the helper
+forwards the tool name and `GeneratedContent.jsonString`; it does not parse or
+reject arguments. Every call that reaches the service is a kind 14 record, so a
+malformed argument produces a visible rejected tool event. A call that the SDK
+rejects before `Tool.call` (for example argument text that is not JSON, or an
+unregistered name on the system model, Core AI or MLX) still fails the turn
+with its diagnostic and leaves only the turn terminal. This is the stated proof
+limit of owner decision 2; TCR-Q1 measures it.
 
 ```mermaid
 flowchart TD
@@ -457,7 +470,8 @@ behavior until a provider supplies a truthful capacity and overflow contract.
 
 `service_observe_status` takes an empty typed argument object. Private ToolCall
 uses ObserveStatus at tag 12; journal ToolIntent uses kind 3 with empty path,
-zero offset and zero limit. It uses the same admitted task/project read grant,
+zero offset and zero limit. Superseded (2026-10-18): the call is the `service`
+tool with command `status`, recorded as kind 14 operation code 3. It uses the same admitted task/project read grant,
 eight-call limit, result-byte accounting, generation fences and cancellation
 as project reads; it has no execution deadline. Remote disclosure remains denied.
 
@@ -582,47 +596,66 @@ failure; classification alone does not repair SDK execution.
 
 ### Rejected semantic tool proposals
 
-A valid private frame can contain an unsafe relative path or invalid read range.
-These are ordinary tool argument rejections. The service reserves the next call
-ordinal, commits a rejected intent, then commits an empty invalid-arguments result
-before resuming the SDK. No host executor runs. Rejections consume the same
-eight-call budget. Undecodable frames, identity conflicts and invalid ordinals
-remain protocol faults.
+Required behavior (revised 2026-10-18 by [tool call records](tool-call-records.md)).
+The helper no longer reads the arguments. It sends the tool name and the
+argument JSON text. The service is the only argument parser. Every tool call
+that reaches the service in an admitted, started turn gets one kind 14
+`ToolCall` record, including a malformed, unknown, refused, busy, denied,
+over-limit or cancelled call. A malformed call is an ordinary rejected call,
+not a protocol fault.
 
-Journal format 1 adds intent kind 4 (rejected read) and 5 (rejected list), using the
-existing fields. Their original nonempty UTF-8 path is bounded to 1024 bytes;
-read limits remain 1–16384, while unsafe path syntax/read range are retained for
-audit. Kind 5 requires zero offset/limit. These records never authorize execution.
-Replay accepts only empty status-3 invalid-arguments results (or empty cancelled
-results during settlement), with no offset or truncation; success is
-corrupt. Existing executable kinds 1–3 retain their strict validation. Restart
-interrupts an unresolved rejected intent without executing it. Exact duplicates
-return the committed rejection after current identity/authority checks;
-changed arguments at an existing ordinal fail.
+- The service records the decision (`invalid_arguments`, `unknown_tool`,
+  `refused`, `busy`, `denied`, `limit` or `cancelled`) and the fault before any
+  host effect. No host executor runs for these decisions.
+- A call that does not run is complete when its kind 14 commits. No kind 15
+  follows (TCR-R5). The service renders the status and text sent to the helper
+  from the kind 14 codes, for example status 3 and
+  `invalid_arguments: missing_field`. The text never repeats model text.
+- Every recorded call consumes one of the turn's eight ordinals. A call that
+  does not run consumes no result bytes. The ninth proposal is recorded with
+  ordinal 9 and decision `limit`, receives status 7, and the helper then ends
+  the turn with `outputLimit` (TCR-D6, TCR-D9).
+- Helper faults remain protocol faults with no record (TCR-D7): a call before
+  StartAuthorized commits or with tools disabled, an ordinal that is not the
+  next one, a second call while one is pending, and a resend at a used ordinal
+  with different received name or arguments. An equal resend receives the same
+  result again.
+- Rejected intent kinds 4, 5 and 9–11 of the old kind 14 `ToolIntent` layout are
+  retired with that layout (TCR-O2).
+
+Status: selected design. The flowchart shows the service decision for one
+`ToolCall` frame. Arrows show the order of checks; each exit is a durable
+outcome or a protocol fault.
 
 ```mermaid
 flowchart TD
-    Frame[Decode bounded typed proposal] --> Identity{Identity and next ordinal valid?}
-    Identity -->|No| Fault[Protocol failure]
-    Identity -->|Yes| Args{Semantic arguments valid?}
-    Args -->|Yes| Normal[Existing authorized tool execution]
-    Args -->|No| Reserve[Reserve call budget without host dispatch]
-    Reserve --> Intent[Commit rejected intent kind 4 or 5]
-    Intent --> Result[Commit empty invalid-arguments result]
-    Intent -->|Cancel| Failed[Commit empty cancellation result]
-    Result --> Callback[Resume SDK with typed rejection]
-    Failed --> Settle[Settle turn without continuation]
+    Frame[ToolCall frame passes codec bounds] --> Identity{Started turn, next ordinal, no pending call?}
+    Identity -->|No| Fault[Protocol fault, no record]
+    Identity -->|Yes| Redact[Redact name and arguments]
+    Redact --> Parse{Registered name and valid arguments?}
+    Parse -->|No| Invalid[Kind 14 invalid_arguments or unknown_tool]
+    Parse -->|Yes| Grant{Grant, budget and exec_cmd admission pass?}
+    Grant -->|No| Other[Kind 14 denied, limit, refused or busy]
+    Grant -->|Yes| Run[Kind 14 run, then execute]
+    Run --> Result[Kind 23 if exec_cmd, then kind 15]
+    Invalid --> Rendered[Status and text rendered from kind 14 codes]
+    Other --> Rendered
+    Rendered --> Callback[Resume SDK with the rendered result]
+    Result --> Callback
 ```
 
 Tests cover ordinal consumption, denied host execution, acknowledgement before
-callback, exact duplicate rejection, success-result replay rejection and restart
-between rejected intent and result. Native PTY checks ordinary conversation after integration; it does not require
+callback, exact duplicate rejection and success-result replay rejection. The
+[tool call records validation](tool-call-records.md#validation) lists the cases
+since 2026-10-18 (TCR-U04, TCR-I01, TCR-E01). Native PTY checks ordinary conversation after integration; it does not require
 a model-selected invalid call. Native rejection qualification requires observing
 that call and its committed rejection. Until then, deterministic service and
 journal tests are the rejection-boundary evidence.
 
-This semantic rejection slice preserves private frame bounds: missing or empty
-paths, paths over 1024 bytes and read limits outside 1–16384 fail private decoding.
+Superseded (2026-10-18): missing or empty paths, paths over 1024 bytes and read
+limits outside 1–16384 are no longer private decoding faults. The service parser
+records them as `invalid_arguments` with fault `missing_field`, `unsafe_path` or
+`out_of_range`.
 
 The integrated correction passed 73 service unit tests and 21 conversation-journal
 tests on 2026-09-28. The native terminal journey passed ordinary chat, explicit
@@ -857,7 +890,8 @@ Model calls use the existing grant, local destination, ordinal,
 cancellation, eight-call and result-byte limits. Add an empty `ListTools` argument
 at model ToolCall field 17; field 16 is `MemoryCreateNote`.
 Durable ToolIntent kind 14 represents inventory with empty path, offset zero and
-limit zero; kinds 12 and 13 belong to Memory create.
+limit zero; kinds 12 and 13 belong to Memory create. Superseded (2026-10-18):
+`service` command `tools` is kind 14 operation code 4; fields 16–17 are removed.
 The service forms the result from the registry only after durable intent and
 publishes it only after durable result. No filesystem, database read, external
 request, model recursion or new thread is involved. Existing journal work retains

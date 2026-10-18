@@ -3,15 +3,14 @@
 //! workers on one test reactor, as the conversation owner does, without a
 //! journal: settlement and install follow the same order (R2).
 use crate::capture_worker;
-use crate::exec_cmd_worker::{Dispatch, Worker};
+use crate::exec_cmd_worker::{Dispatch, ExecCmdRun, Worker};
 use crate::tools::{self, Arguments};
 use asura_platform::RuntimeDirectory;
 use asura_platform::secrets::{self, JobRedaction, SecretVariable};
 use asura_storage::authority::conversation::{
-    self as journal, CaptureSettled, CaptureState, ExecCmdDisposition, ExecCmdIntent, Id,
-    ToolResult,
+    self as journal, CaptureSettled, CaptureState, Id, ToolResult,
 };
-use asura_storage::payload::{ObjectKind, Page, PageRequest, PayloadStore, payload_id, read_page};
+use asura_storage::payload::{Page, PageRequest, PayloadStore, read_page};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +31,7 @@ pub struct Outcome {
 
 struct Running {
     worker: Worker,
-    intent: ExecCmdIntent,
+    intent: ExecCmdRun,
     started: Instant,
     output: Option<Outcome>,
     capture: Option<capture_worker::Handle>,
@@ -66,24 +65,17 @@ pub fn run_jobs(
         let victims = store
             .admit(installation, operation, 1, 1, job_id)
             .map_err(|_| "admission: quota".to_string())?;
-        let intent = ExecCmdIntent {
+        let call = tools::Call {
             operation,
             generation: 1,
             ordinal: 1,
-            disposition: ExecCmdDisposition::Admitted,
-            command_truncated: false,
-            command: job.command.clone(),
-            cwd: ".".into(),
-            refusal: None,
-            busy: None,
-            variables: job.secrets.iter().map(|s| s.kind()).collect(),
-            job: job_id,
-            stdout_payload: payload_id(installation, operation, 1, 1, ObjectKind::Stdout),
-            stderr_payload: payload_id(installation, operation, 1, 1, ObjectKind::Stderr),
-            initial_reservation: journal::INITIAL_RESERVATION,
-            rule_set_revision: rules.revision(),
-            rule_set_digest: rules.digest(),
+            arguments: Arguments::ExecCmd {
+                command: job.command.clone(),
+                cwd: ".".into(),
+            },
         };
+        let intent =
+            ExecCmdRun::derive(installation, &call).ok_or_else(|| "exec_cmd call".to_string())?;
         let mut worker = Worker::default();
         worker.register(wake.clone());
         let redaction = JobRedaction::new(rules, &job.secrets);
@@ -97,15 +89,7 @@ pub fn run_jobs(
                     inode: identity.inode,
                     boundary: runtime.state_boundary(),
                 },
-                call: tools::Call {
-                    operation,
-                    generation: 1,
-                    ordinal: 1,
-                    arguments: Arguments::ExecCmd {
-                        command: job.command,
-                        cwd: ".".into(),
-                    },
-                },
+                call,
                 intent: intent.clone(),
                 secrets: job.secrets,
                 capture: capture_worker::Start {

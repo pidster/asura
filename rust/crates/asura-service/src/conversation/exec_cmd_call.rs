@@ -1,30 +1,17 @@
-//! The model exec_cmd path at `ToolCall` (J1, SL3): rewrite before any record,
-//! refusal records that never hold a value, admission and kind 22.
+//! The model exec_cmd path at `ToolCall` (J1, SL3): the rewrite happens before
+//! any record; a `run` call keeps its admission, variables and derived run
+//! identity live. The kind 14 record holds the rewritten command as the only
+//! copy (tool-call-records.md); job and payload IDs are derived (TCR-D23).
 use crate::capture_worker;
-use crate::tools::{self, Arguments};
-use asura_platform::secrets::{
-    self, MAX_REWRITTEN_COMMAND_BYTES, Refusal, RefusalCode, SecretVariable, display_redacted,
-};
+use crate::exec_cmd_worker::ExecCmdRun;
+use asura_platform::secrets::{Refusal, SecretVariable};
 use asura_storage::authority::conversation as journal;
-use asura_storage::payload::{ObjectKind, PayloadStore, Victim, payload_id};
-use sha2::{Digest, Sha256};
+use asura_storage::payload::{PayloadStore, Victim};
 use std::sync::Arc;
-use zeroize::{Zeroize, Zeroizing};
 
-/// The text recorded for a refused command or cwd when the rule set failed
-/// its self-check: nothing can be redacted, so nothing is kept (G9).
-pub(super) const WITHHELD: &str = "[withheld]";
-const MAX_CWD_BYTES: usize = 1024;
-
-/// An exec_cmd call after the rewrite step. The raw command is gone.
-pub(super) enum Prepared {
-    Rewritten(Vec<SecretVariable>),
-    Refused { refusal: Refusal, truncated: bool },
-}
-
-/// The live state of one exec_cmd call in the conversation owner.
+/// The live state of one `run` exec_cmd call in the conversation owner.
 pub(super) struct ExecCmdLive {
-    pub intent: journal::ExecCmdIntent,
+    pub run: ExecCmdRun,
     /// Secret variables, moved into the request at dispatch.
     pub secrets: Vec<SecretVariable>,
     pub victims: Vec<Victim>,
@@ -37,219 +24,39 @@ pub(super) struct ExecCmdLive {
     pub capture: Option<capture_worker::Handle>,
 }
 impl ExecCmdLive {
-    pub(super) fn admitted(&self) -> bool {
-        self.intent.disposition == journal::ExecCmdDisposition::Admitted
-    }
     /// An admitted call that never started: its reservation and victims return.
     pub(super) fn release_admission(&mut self) {
         if let Some(store) = self.store.take() {
             store.restore_victims(&self.victims);
-            store.release(self.intent.job);
+            store.release(self.run.job);
         }
         self.victims.clear();
         self.secrets.clear();
     }
 }
 
-/// Keyed SHA-256 for duplicate detection: never leaves memory (SO2).
-fn keyed(key: &[u8; 32], tag: u8, parts: &[&[u8]]) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(key);
-    hash.update([tag]);
-    for part in parts {
-        hash.update((part.len() as u64).to_be_bytes());
-        hash.update(part);
-    }
-    hash.finalize().into()
-}
-
-fn cut(text: &str, limit: usize) -> (String, bool) {
-    if text.len() <= limit {
-        return (text.to_owned(), false);
-    }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_owned(), true)
-}
-fn valid_cwd(cwd: &str) -> bool {
-    !cwd.is_empty()
-        && cwd.len() <= MAX_CWD_BYTES
-        && !cwd.starts_with('/')
-        && !cwd.contains('\0')
-        && !cwd.split('/').any(|part| part == "..")
-}
-
-/// Step 2: rewrites the command in place, scans the cwd and checks the
-/// 8,192-byte limit (the planner owns it). The raw command is zeroized; on
-/// refusal the call holds the display-redacted command and cwd. Returns the
-/// keyed digest of the secret values (or of the raw command when refused).
-pub(super) fn prepare(call: &mut tools::Call, key: &[u8; 32]) -> (Prepared, [u8; 32]) {
-    let Arguments::ExecCmd { command, cwd, .. } = &mut call.arguments else {
-        unreachable!("exec_cmd call");
-    };
-    let raw = Zeroizing::new(std::mem::take(command));
-    match secrets::rewrite_exec_cmd_call(&raw, cwd) {
-        Ok(rewrite) => {
-            let values: Vec<&[u8]> = rewrite.variables.iter().map(|v| v.value()).collect();
-            let digest = keyed(key, 1, &values);
-            *command = rewrite.command;
-            (Prepared::Rewritten(rewrite.variables), digest)
-        }
-        Err(refusal) => {
-            let digest = keyed(key, 2, &[raw.as_bytes()]);
-            let (display, truncated, display_cwd) = match secrets::detection() {
-                Ok(rules) => {
-                    let (display, truncated) =
-                        cut(&display_redacted(rules, &raw), MAX_REWRITTEN_COMMAND_BYTES);
-                    let (redacted_cwd, _) = cut(&display_redacted(rules, cwd), MAX_CWD_BYTES);
-                    let redacted_cwd = if valid_cwd(&redacted_cwd) {
-                        redacted_cwd
-                    } else {
-                        WITHHELD.into()
-                    };
-                    (display, truncated, redacted_cwd)
-                }
-                Err(_) => (WITHHELD.into(), false, WITHHELD.into()),
-            };
-            *command = if display.is_empty() || display.contains('\0') {
-                WITHHELD.into()
-            } else {
-                display
-            };
-            let mut old = std::mem::replace(cwd, display_cwd);
-            old.zeroize();
-            (Prepared::Refused { refusal, truncated }, digest)
-        }
+/// Kind 14 fields 21-23 for an SL3 refusal. Never holds a value.
+pub(super) fn refusal(refusal: &Refusal) -> journal::ExecCmdRefusal {
+    journal::ExecCmdRefusal {
+        code: refusal.code,
+        kind: refusal.kind,
+        word: refusal
+            .word
+            .and_then(|w| u16::try_from(w).ok())
+            .filter(|w| (1..=4096).contains(w)),
     }
 }
 
-fn rule_set(refused_unavailable: bool) -> (u32, journal::Hash) {
-    match secrets::detection() {
-        Ok(rules) if !refused_unavailable => (rules.revision(), rules.digest()),
-        _ => (0, [0; 32]),
-    }
-}
-
-/// Kind 22 for one call. `call` holds the rewritten (or display-redacted)
-/// command; no field holds a value or a value digest.
-pub(super) fn intent(
-    call: &tools::Call,
-    installation: journal::Id,
-    prepared: &Prepared,
-    busy: Option<journal::ExecCmdBusyReason>,
-) -> journal::ExecCmdIntent {
-    let Arguments::ExecCmd { command, cwd, .. } = &call.arguments else {
-        unreachable!("exec_cmd call");
-    };
-    let (disposition, refusal, truncated) = match prepared {
-        Prepared::Refused { refusal, truncated } => (
-            journal::ExecCmdDisposition::Refused,
-            Some(journal::ExecCmdRefusal {
-                code: refusal.code,
-                kind: refusal.kind,
-                word: refusal
-                    .word
-                    .and_then(|w| u16::try_from(w).ok())
-                    .filter(|w| (1..=4096).contains(w)),
-            }),
-            *truncated,
-        ),
-        Prepared::Rewritten(_) if busy.is_some() => {
-            (journal::ExecCmdDisposition::Busy, None, false)
-        }
-        Prepared::Rewritten(_) => (journal::ExecCmdDisposition::Admitted, None, false),
-    };
-    let admitted = disposition == journal::ExecCmdDisposition::Admitted;
-    let variables = match prepared {
-        Prepared::Rewritten(variables) if admitted => variables.iter().map(|v| v.kind()).collect(),
-        _ => Vec::new(),
-    };
-    let unavailable = refusal.is_some_and(|r| r.code == RefusalCode::DetectionUnavailable);
-    let (rule_set_revision, rule_set_digest) = rule_set(unavailable);
-    let (job, stdout_payload, stderr_payload) = if admitted {
-        (
-            journal::exec_cmd_job_id(call.operation, call.generation, call.ordinal),
-            payload_id(
-                installation,
-                call.operation,
-                call.generation,
-                call.ordinal,
-                ObjectKind::Stdout,
-            ),
-            payload_id(
-                installation,
-                call.operation,
-                call.generation,
-                call.ordinal,
-                ObjectKind::Stderr,
-            ),
-        )
-    } else {
-        ([0; 16], [0; 16], [0; 16])
-    };
-    journal::ExecCmdIntent {
-        operation: call.operation,
-        generation: call.generation,
-        ordinal: call.ordinal,
-        disposition,
-        command_truncated: truncated,
-        command: command.clone(),
-        cwd: cwd.clone(),
-        refusal,
-        busy: if admitted { None } else { busy },
-        variables,
-        job,
-        stdout_payload,
-        stderr_payload,
-        initial_reservation: if admitted {
-            journal::INITIAL_RESERVATION
-        } else {
-            0
-        },
-        rule_set_revision,
-        rule_set_digest,
-    }
-}
-
-/// Kind 15 for a refused or busy call: status 3 with the refusal's display
-/// text (never a value), or status 4 with `exec_cmd_busy: <reason>`.
-pub(super) fn precomputed_result(
-    call: &tools::Call,
-    prepared: &Prepared,
-    busy: Option<journal::ExecCmdBusyReason>,
-) -> Option<journal::ToolResult> {
-    let (status, text) = match (prepared, busy) {
-        (Prepared::Refused { refusal, .. }, _) => (3, refusal.to_string()),
-        (Prepared::Rewritten(_), Some(reason)) => {
-            (4, format!("exec_cmd_busy: {}", reason.as_str()))
-        }
-        (Prepared::Rewritten(_), None) => return None,
-    };
-    Some(journal::ToolResult {
-        operation: call.operation,
-        generation: call.generation,
-        ordinal: call.ordinal,
-        status,
-        text,
-        next_offset: None,
-        truncated: false,
-    })
-}
-
-/// Kind 23 `not_started` for an admitted call that never dispatched.
-pub(super) fn not_started(intent: &journal::ExecCmdIntent) -> journal::CaptureSettled {
+/// Kind 23 `not_started` for a `run` call that never dispatched.
+pub(super) fn not_started(run: &ExecCmdRun) -> journal::CaptureSettled {
     journal::CaptureSettled {
-        operation: intent.operation,
-        generation: intent.generation,
-        ordinal: intent.ordinal,
+        operation: run.operation,
+        generation: run.generation,
+        ordinal: run.ordinal,
         state: journal::CaptureState::NotStarted,
         reason: journal::CaptureReason::None,
         exit_kind: 0,
         exit_value: 0,
-        rule_set_revision: intent.rule_set_revision,
-        rule_set_digest: intent.rule_set_digest,
         stdout: journal::CaptureStream::default(),
         stderr: journal::CaptureStream::default(),
         distinct_numbers: 0,
@@ -264,126 +71,64 @@ pub(super) fn not_started(intent: &journal::ExecCmdIntent) -> journal::CaptureSe
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn call(command: &str, cwd: &str) -> tools::Call {
-        tools::Call {
+    use crate::tools::{self, Arguments};
+    use asura_storage::payload::{ObjectKind, payload_id};
+
+    /// TCR-U13 (live part): the live run identity uses the same storage
+    /// derivations that replay recomputes, for every ordinal.
+    #[test]
+    fn tcr_u13_live_run_identity_equals_storage_derivation() {
+        for ordinal in 1..=8 {
+            let call = tools::Call {
+                operation: [1; 16],
+                generation: 3,
+                ordinal,
+                arguments: Arguments::ExecCmd {
+                    command: "printf \"$ASURA_SECRET_1\"".into(),
+                    cwd: "src".into(),
+                },
+            };
+            let run = ExecCmdRun::derive([9; 16], &call).unwrap();
+            assert_eq!(run.job, journal::exec_cmd_job_id([1; 16], 3, ordinal));
+            assert_eq!(
+                run.stdout_payload,
+                payload_id([9; 16], [1; 16], 3, ordinal, ObjectKind::Stdout)
+            );
+            assert_eq!(
+                run.stderr_payload,
+                payload_id([9; 16], [1; 16], 3, ordinal, ObjectKind::Stderr)
+            );
+            assert_eq!(
+                (run.command.as_str(), run.cwd.as_str()),
+                ("printf \"$ASURA_SECRET_1\"", "src")
+            );
+            let settled = not_started(&run);
+            assert_eq!(
+                (settled.ordinal, settled.state),
+                (ordinal, journal::CaptureState::NotStarted)
+            );
+        }
+        let other = tools::Call {
             operation: [1; 16],
-            generation: 1,
+            generation: 3,
             ordinal: 1,
-            arguments: Arguments::ExecCmd {
-                command: command.into(),
-                cwd: cwd.into(),
-            },
-        }
-    }
-    fn token() -> String {
-        ["ghp_", &"aB3".repeat(12)].concat()
-    }
-    fn exec_cmd_text(call: &tools::Call) -> (&str, &str) {
-        match &call.arguments {
-            Arguments::ExecCmd { command, cwd, .. } => (command, cwd),
-            _ => unreachable!(),
-        }
-    }
-    /// J1T-04 unit (G8): the call keeps the rewrite; a repeated ordinal with
-    /// a different secret value has a different keyed digest; equal values
-    /// match. The digest depends on the per-turn key.
-    #[test]
-    fn j1t_04_rewrite_replaces_the_raw_command_and_keys_the_values() {
-        let key = [7; 32];
-        let other = ["ghp_", &"zY9".repeat(12)].concat();
-        let mut a = call(
-            &format!("curl -H \"Authorization: Bearer {}\" x", token()),
-            ".",
-        );
-        let mut b = call(
-            &format!("curl -H \"Authorization: Bearer {}\" x", token()),
-            ".",
-        );
-        let mut c = call(&format!("curl -H \"Authorization: Bearer {other}\" x"), ".");
-        let (pa, da) = prepare(&mut a, &key);
-        let (_, db) = prepare(&mut b, &key);
-        let (_, dc) = prepare(&mut c, &key);
-        assert!(matches!(pa, Prepared::Rewritten(ref v) if v.len() == 1));
-        assert_eq!(a, b);
-        assert_eq!(a, c, "the rewrite alone cannot tell the values apart");
-        assert_eq!(da, db);
-        assert_ne!(da, dc);
-        assert!(!format!("{a:?}").contains(&token()));
-        let mut d = call(
-            &format!("curl -H \"Authorization: Bearer {}\" x", token()),
-            ".",
-        );
-        assert_ne!(prepare(&mut d, &[8; 32]).1, da);
-    }
-    /// J1T-03 unit: a display-redacted refused command over 8,192 bytes is
-    /// cut at a UTF-8 boundary with the flag set; the record holds no value.
-    #[test]
-    fn j1t_03_refused_display_is_cut_with_the_flag() {
-        let mut long = call(&format!("echo '{}' {}", token(), "é".repeat(4200)), ".");
-        let (prepared, _) = prepare(&mut long, &[1; 32]);
-        let Prepared::Refused { refusal, truncated } = &prepared else {
-            panic!("refused");
+            arguments: Arguments::ListTools,
         };
-        assert_eq!(refusal.code, RefusalCode::SecretSingleQuoted);
-        assert!(*truncated);
-        let (command, _) = exec_cmd_text(&long);
-        assert!(command.len() <= 8192 && command.len() >= 8190);
-        assert!(!command.contains(&token()));
-        let intent = intent(&long, [9; 16], &prepared, None);
-        assert_eq!(intent.disposition, journal::ExecCmdDisposition::Refused);
-        assert!(intent.command_truncated);
-        assert_eq!(intent.job, [0; 16]);
-        assert!(intent.variables.is_empty());
-        let result = precomputed_result(&long, &prepared, None).unwrap();
-        assert_eq!(result.status, 3);
-        assert!(!result.text.contains(&token()));
-        let encoded = format!("{intent:?}{result:?}");
-        assert!(!encoded.contains(&token()));
+        assert!(ExecCmdRun::derive([9; 16], &other).is_none());
     }
-    /// The cwd is scanned: `secret_in_cwd` records a display-redacted cwd.
+    /// A refusal record keeps the code, kind and a bounded word index only.
     #[test]
-    fn secret_in_cwd_records_a_redacted_cwd() {
-        let mut c = call("ls", &format!("dir/{}", token()));
-        let (prepared, _) = prepare(&mut c, &[1; 32]);
-        let Prepared::Refused { refusal, .. } = &prepared else {
-            panic!("refused");
-        };
-        assert_eq!(refusal.code, RefusalCode::SecretInCwd);
-        let (command, cwd) = exec_cmd_text(&c);
-        assert_eq!(command, "ls");
-        assert!(!cwd.contains(&token()) && cwd.starts_with("dir/$ASURA_SECRET_"));
-    }
-    /// Admitted kind 22 carries the job and payload identities, the variable
-    /// kinds and the 1 MiB reservation; busy carries none of them.
-    #[test]
-    fn admitted_and_busy_intents() {
-        let mut c = call(&format!("printf '%s' \"{}\"", token()), "src");
-        let (prepared, _) = prepare(&mut c, &[1; 32]);
-        let admitted = intent(&c, [9; 16], &prepared, None);
-        assert_eq!(admitted.disposition, journal::ExecCmdDisposition::Admitted);
-        assert_eq!(admitted.variables, vec![secrets::SecretKind::GithubToken]);
-        assert_eq!(admitted.job, journal::exec_cmd_job_id([1; 16], 1, 1));
+    fn refusal_fields_hold_no_value() {
+        let token = ["ghp_", &"aB3".repeat(12)].concat();
+        let refused =
+            asura_platform::secrets::rewrite_exec_cmd_call(&format!("echo '{token}'"), ".")
+                .unwrap_err();
+        let fields = refusal(&refused);
         assert_eq!(
-            admitted.stdout_payload,
-            payload_id([9; 16], [1; 16], 1, 1, ObjectKind::Stdout)
+            fields.code,
+            asura_platform::secrets::RefusalCode::SecretSingleQuoted
         );
-        assert_eq!(admitted.initial_reservation, 1024 * 1024);
-        assert_eq!(admitted.rule_set_revision, 1);
-        assert!(precomputed_result(&c, &prepared, None).is_none());
-        let busy = intent(
-            &c,
-            [9; 16],
-            &prepared,
-            Some(journal::ExecCmdBusyReason::Quota),
-        );
-        assert_eq!(busy.disposition, journal::ExecCmdDisposition::Busy);
-        assert!(busy.variables.is_empty() && busy.job == [0; 16]);
-        assert_eq!(busy.command, admitted.command);
-        let result =
-            precomputed_result(&c, &prepared, Some(journal::ExecCmdBusyReason::Quota)).unwrap();
-        assert_eq!(
-            (result.status, result.text.as_str()),
-            (4, "exec_cmd_busy: quota")
-        );
+        assert!(fields.word.is_some_and(|w| (1..=4096).contains(&w)));
+        assert!(!format!("{fields:?}").contains(&token));
     }
 }

@@ -1,24 +1,16 @@
 use super::*;
 use asura_storage::authority::conversation::CaptureStream;
 
-fn intent() -> ExecCmdIntent {
-    ExecCmdIntent {
+fn intent() -> ExecCmdRun {
+    ExecCmdRun {
         operation: [1; 16],
         generation: 1,
         ordinal: 1,
-        disposition: ExecCmdDisposition::Admitted,
-        command_truncated: false,
         command: "true".into(),
         cwd: ".".into(),
-        refusal: None,
-        busy: None,
-        variables: Vec::new(),
         job: [2; 16],
         stdout_payload: [3; 16],
         stderr_payload: [4; 16],
-        initial_reservation: 1 << 20,
-        rule_set_revision: 1,
-        rule_set_digest: [5; 32],
     }
 }
 fn settled_process() -> Process {
@@ -110,7 +102,7 @@ fn sealed_report_builds_kind_23_and_kind_15_from_redacted_tails() {
     }));
     let output = worker.poll(now).expect("report present");
     assert_eq!(output.settled.state, CaptureState::Complete);
-    assert_eq!(output.settled.rule_set_digest, [5; 32]);
+    assert_eq!(output.settled.ordinal, 1);
     assert_eq!(output.result.status, 1);
     assert!(
         output

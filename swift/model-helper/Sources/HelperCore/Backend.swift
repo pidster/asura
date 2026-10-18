@@ -38,7 +38,7 @@ func modelFailureDiagnostic(_ error: any Error) -> String {
     else if let callback = error as? LanguageModelSession.ToolCallError {
         let code: Int
         switch callback.underlyingError {
-        case let backend as BackendFailure: code = backend.memoryArgumentDiagnostic ?? (100 + backend.reason.rawValue)
+        case let backend as BackendFailure: code = 100 + backend.reason.rawValue
         case let helper as HelperError:
             switch helper {
             case .protocolFault: code = 201
@@ -116,16 +116,7 @@ public struct Snapshot: Sendable {
 }
 public struct BackendFailure: Error, Sendable {
     public let reason: Reason
-    let memoryArgumentDiagnostic: Int?
-    public init(_ reason: Reason) { self.reason = reason; self.memoryArgumentDiagnostic = nil }
-    init(memoryCreateFaults: UInt8) {
-        self.reason = .inputLimit
-        self.memoryArgumentDiagnostic = 1000 + Int(memoryCreateFaults & 127)
-    }
-    init(memoryReadWriteFields: UInt8) {
-        self.reason = .inputLimit
-        self.memoryArgumentDiagnostic = 2000 + Int(memoryReadWriteFields & 3)
-    }
+    public init(_ reason: Reason) { self.reason = reason }
 }
 public protocol ModelBackend: Sendable {
     func status() async -> BackendStatus
@@ -188,6 +179,11 @@ public typealias NativeTokenCounter = @Sendable ([Transcript.Entry], [any Tool])
 
 /// One SDK conversation engine shared by all admitted native/custom adapters.
 public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
+    /// Builds the per-generation model with its observers. The tool handler is
+    /// the unguarded session handler, for adapters that must report a call the
+    /// SDK cannot dispatch (TCR-D17); it is nil when tools are disabled.
+    public typealias InstrumentationFactory = @Sendable (InferenceUsageObserver,
+        @escaping @Sendable (Snapshot) async throws -> Void, ToolHandler?) -> Model
     public let model: Model
     public let capabilityProfile: CapabilityProfile
     private let contextTokens: UInt32?
@@ -198,12 +194,12 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
     private let localToolDestination: Bool
     private let reportsUsage: Bool
     private let tokenCounter: NativeTokenCounter?
-    private let instrumentationFactory: (@Sendable (InferenceUsageObserver, @escaping @Sendable (Snapshot) async throws -> Void) -> Model)?
+    private let instrumentationFactory: InstrumentationFactory?
     public init(model: Model, contextTokens: UInt32?,
         reportedContextTokens: UInt32? = nil, contextSource: ContextCapacitySource? = nil,
         modelName: String, supportsTools: Bool,
         reportsUsage: Bool = false, localToolDestination: Bool = false, capabilityProfile: CapabilityProfile? = nil, tokenCounter: NativeTokenCounter? = nil,
-        instrumentationFactory: (@Sendable (InferenceUsageObserver, @escaping @Sendable (Snapshot) async throws -> Void) -> Model)? = nil) {
+        instrumentationFactory: InstrumentationFactory? = nil) {
         self.model = model; self.contextTokens = contextTokens
         self.reportedContextTokens = reportedContextTokens ?? contextTokens
         self.contextSource = contextSource; self.modelName = modelName
@@ -234,13 +230,13 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
         let entries = SystemBackend.history(input)
         let current = Transcript.Entry.prompt(.init(segments: [.text(.init(content: input.prompt))]))
         let requestUsage = InferenceUsageObserver(snapshot: snapshot)
-        let generationModel = instrumentationFactory?(requestUsage, snapshot) ?? model
+        let generationModel = instrumentationFactory?(requestUsage, snapshot, handler) ?? model
         let boundedModel = BoundedToolModel(base: generationModel, maximumTokens: Int(maximumTokens),
             toolsEnabled: handler != nil, usageObserver: requestUsage)
         do {
             let guardedHandler: ToolHandler?
             if let handler {
-                guardedHandler = { @Sendable (call: ToolArguments) async throws -> ToolResult in
+                guardedHandler = { @Sendable (call: ToolProposal) async throws -> ToolResult in
                     try await boundedModel.budget.requireSuccessfulInference()
                     return try await handler(call)
                 }

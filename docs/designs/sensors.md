@@ -552,7 +552,8 @@ observations, and starts a fresh idle interval with active foreground state seed
 from canonical replay. No historical inactivity is inferred.
 
 The status tool adds ToolIntent kind 3 with empty path and zero offset/limit, under
-journal format 1. It uses the same ordinal budget and durable result record as
+journal format 1. Superseded (2026-10-18): it is recorded as kind 14 `ToolCall`
+operation code 3 ([tool call records](tool-call-records.md#operation-codes)). It uses the same ordinal budget and durable result record as
 project tools. Status capture waits for its observation commit before producing
 ToolResult. The call has no deadline (owner, 2026-10-17); it ends on commit,
 cancellation or a fault. Evidence persistence after a cancel cannot deliver a

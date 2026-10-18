@@ -114,10 +114,10 @@ private struct FourPassModel: LanguageModel {
     let base = FourPassModel(probe: probe)
     let engine = FoundationBackend(model: base, contextTokens: 8192,
         modelName: "measured-fixture", supportsTools: true,
-        instrumentationFactory: { usage, _ in var model = base; model.usage = usage; return model })
+        instrumentationFactory: { usage, _, _ in var model = base; model.usage = usage; return model })
     var input = ModelInput(); input.instructions = "fixture"; input.prompt = "fixture"
-    try await engine.generateWithTools(input, maximumTokens: 2048, handler: { arguments in
-        guard case .listTools = arguments else { throw HelperError.protocolFault }
+    try await engine.generateWithTools(input, maximumTokens: 2048, handler: { proposal in
+        guard proposal.name == "service", proposal.arguments.contains("tools") else { throw HelperError.protocolFault }
         await probe.hostCalled()
         return ToolResult(status: .success, text: "fixture tools")
     }, snapshot: { await snapshots.record($0) })

@@ -260,7 +260,7 @@ public actor HelperSession {
                 do {
                     if enableTools, let toolBackend = backend as? any ToolModelBackend {
                         try await toolBackend.generateWithTools(input, maximumTokens: maximumTokens,
-                            handler: { arguments in try await owner.requestTool(arguments) },
+                            handler: { proposal in try await owner.requestTool(proposal) },
                             snapshot: { value in try await owner.snapshot(value) })
                     } else {
                         try await backend.generate(input, maximumTokens: maximumTokens) { value in
@@ -281,6 +281,7 @@ public actor HelperSession {
         case .toolResult(let result):
             guard phase == .running, projectToolsEnabled,
                 let pending = pendingTool, result.ordinal == pending.0,
+                result.ordinal < Limits.toolProposals || result.status == .limit,
                 toolResultBytes + result.text.utf8.count <= 65_536 else { throw HelperError.protocolFault }
             toolResultBytes += result.text.utf8.count
             finishTool(.success(ToolResult(status: result.status, text: result.text,
@@ -308,61 +309,42 @@ public actor HelperSession {
         pending.1.resume(with: result)
     }
 
-    private func requestTool(_ arguments: ToolArguments) async throws -> ToolResult {
+    /// Forwards one proposal unread: name and argument text, or their sizes when
+    /// over the wire limits (known-size exhaustion). Ordinals run 1-9; after the
+    /// result of ordinal 9 the turn fails with outputLimit (TCR-D6). The name
+    /// and arguments are never logged.
+    private func requestTool(_ proposal: ToolProposal) async throws -> ToolResult {
         guard phase == .running, pendingFailure == nil, projectToolsEnabled else { throw CancellationError() }
-        guard pendingTool == nil, toolOrdinal < 8 else { throw BackendFailure(.outputLimit) }
+        guard pendingTool == nil, toolOrdinal < Limits.toolProposals else { throw BackendFailure(.outputLimit) }
         toolOrdinal += 1
         var call = Asura_Model_V1_ToolCall()
         call.ordinal = toolOrdinal
-        switch arguments {
-        case .execCmd(let command, let cwd):
-            var args = Asura_Model_V1_ExecCmd()
-            args.command = command; if let cwd {args.cwd = cwd}
-            call.arguments = .execCmd(args)
-        case .readAudit(let limit):
-            var args = Asura_Model_V1_AuditRead()
-            args.limit = limit
-            call.arguments = .readAudit(args)
-        case .listTools:
-            call.arguments = .listTools(Asura_Model_V1_ListTools())
-        case .memoryListNotes(let after, let limit):
-            var args = Asura_Model_V1_MemoryListNotes()
-            if let after { args.after = after }
-            args.limit = limit
-            call.arguments = .memoryListNotes(args)
-        case .memoryGetNote(let version, let offset, let limit):
-            var args = Asura_Model_V1_MemoryGetNote()
-            args.version = version; args.offset = offset; args.limit = limit
-            call.arguments = .memoryGetNote(args)
-        case .memoryCreateNote(let body, let source):
-            var args = Asura_Model_V1_MemoryCreateNote()
-            args.body = body; if let source { args.sourceVersion = source }
-            call.arguments = .memoryCreateNote(args)
-        case .memoryNoteSources(let version):
-            var args = Asura_Model_V1_MemoryNoteSources()
-            args.version = version
-            call.arguments = .memoryNoteSources(args)
-        case .observeStatus:
-            call.arguments = .observeStatus(Asura_Model_V1_ObserveStatus())
-        case .readFile(let path, let offset, let limit):
-            var args = Asura_Model_V1_ProjectReadFile()
-            args.path = path; args.offset = offset; args.limit = limit
-            call.arguments = .readFile(args)
-        case .listDirectory(let path):
-            var args = Asura_Model_V1_ProjectListDirectory()
-            args.path = path
-            call.arguments = .listDirectory(args)
-        }
+        call.source = proposal.source
+        let nameBytes = proposal.name.utf8.count
+        if nameBytes <= Limits.toolName { call.name = proposal.name }
+        else { call.nameBytes = UInt32(clamping: nameBytes) }
+        let argumentBytes = proposal.arguments.utf8.count
+        if argumentBytes <= Limits.toolArguments { call.arguments = proposal.arguments }
+        else { call.argumentsBytes = UInt32(clamping: argumentBytes) }
         let requestOrdinal = toolOrdinal
         let message = envelope(.toolCall(call))
         try Wire.validate(message, from: .helper)
-        return try await withCheckedThrowingContinuation { continuation in
+        let result = try await withCheckedThrowingContinuation { continuation in
             pendingTool = (toolOrdinal, continuation)
             Task {
-                do { try await transport.send(message) }
+                // A ToolCall can hold 64,000 bytes of argument text, beyond the
+                // 4,096-byte control frame bound, so it travels on the ordered
+                // data queue (bounded at one frame plus 1,024 bytes).
+                do { try await transport.send(message, control: false) }
                 catch { finishTool(.failure(error), ordinal: requestOrdinal) }
             }
         }
+        if requestOrdinal == Limits.toolProposals {
+            // The over-limit proposal is recorded; the turn ends here.
+            await backendFailed(.outputLimit)
+            throw BackendFailure(.outputLimit)
+        }
+        return result
     }
 
     private func snapshot(_ value: Snapshot) async throws {

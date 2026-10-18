@@ -1,10 +1,11 @@
 use super::*;
-use crate::conversation::tool_tests::Fixture;
+use crate::conversation::tool_tests::{Fixture, decided, encodes, wire};
 use asura_storage::authority::writer::test_support::controlled_ticket;
+use asura_storage::memory;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-fn intent() -> journal::MemoryCreateIntent {
+fn prepared() -> (journal::CreateNoteCall, memory::PutNote) {
     memory::prepare_create(
         memory::Binding {
             installation_id: memory::Id::new([1; 16]).unwrap(),
@@ -19,13 +20,16 @@ fn intent() -> journal::MemoryCreateIntent {
         None,
     )
     .unwrap()
-    .0
 }
-fn receipt(intent: &journal::MemoryCreateIntent) -> memory::Receipt {
+fn intent() -> journal::CreateNoteCall {
+    prepared().0
+}
+fn receipt(intent: &journal::CreateNoteCall) -> memory::Receipt {
+    assert_eq!(*intent, prepared().0);
     memory::Receipt {
-        operation_id: memory::Id::new(intent.memory_operation).unwrap(),
-        command_sha256: intent.command_sha256,
-        version_id: memory::Id::new(intent.version).unwrap(),
+        operation_id: memory::Id::new(intent.identity.operation).unwrap(),
+        command_sha256: prepared().1.command_digest().unwrap(),
+        version_id: memory::Id::new(intent.identity.version).unwrap(),
         edge_id: None,
     }
 }
@@ -79,7 +83,8 @@ fn resolution_response_is_not_publication_until_job_really_settles() {
     controller.finish();
     let result = mutation.poll(&writer.0, 6).unwrap().unwrap();
     assert_eq!(result.status, 1);
-    assert_eq!(result.text, mutation.intent.success_text());
+    // TCR-D1: kind 15 stores no text for create_note.
+    assert!(result.text.is_empty());
     assert!(mutation.settled());
 }
 #[test]
@@ -154,12 +159,22 @@ fn shutdown_revokes_pending_create_in_same_drive_iteration() {
     assert!(cancel.load(Ordering::Acquire));
 }
 
+/// TCR-D1: a committed create's kind 15 has empty text; the result sent and
+/// cached is rendered from the derived identity. After cancel it is not sent.
 #[test]
 fn acknowledged_committed_create_after_cancel_stays_success_but_is_not_delivered() {
     let mut fixture = Fixture::new();
     let now = Instant::now();
+    let value = wire(
+        1,
+        "memory",
+        r#"{"command":"create_note","body":"remember me"}"#,
+    );
+    let mut tool = decided(&fixture.owner, &value);
+    // No replay binding is installed here: the decision is a denial; the
+    // committed run state is staged directly for the acknowledgement path.
     let active = fixture.owner.active.as_mut().unwrap();
-    let call = tools::Call {
+    tool.call = Some(tools::Call {
         operation: active.turn.operation,
         generation: 1,
         ordinal: 1,
@@ -167,29 +182,21 @@ fn acknowledged_committed_create_after_cancel_stays_success_but_is_not_delivered
             body: "remember me".into(),
             source_version: None,
         },
-    };
-    let mut budget = tools::Budget::cancellation_driven();
-    budget
-        .reserve(
-            call.clone(),
-            &tool_grant(&active.turn, true),
-            &tools::Destination::Local,
-        )
-        .unwrap();
-    active.tool_budget = budget;
+    });
+    tool.record.decision = journal::ToolDecision::Run;
+    encodes(&tool.record);
+    active.tool_budget = tools::Budget::cancellation_driven();
+    active.tool_budget.record(1).unwrap();
     let mutation = Mutation::new(intent());
     let result = mutation.result(MemoryCreateResult::Committed(receipt(&mutation.intent)), 6);
-    active.tool = Some(LiveTool {
-        create: Some(mutation),
-        exec_cmd: None,
-        secret_digest: None,
-        rejected: false,
-        call,
-        memory_ticket: None,
-        intent_committed: true,
-        dispatched: true,
-        result: Some(result.clone()),
-    });
+    assert!(result.text.is_empty());
+    let rendered = mutation.intent.success_text();
+    assert!(rendered.starts_with("operation=") && !rendered.contains("sha256"));
+    tool.create = Some(mutation);
+    tool.intent_committed = true;
+    tool.dispatched = true;
+    tool.result = Some(result.clone());
+    active.tool = Some(tool);
     active.cancel = Some(journal::Cause::UserCancel);
     fixture.owner.job_done(
         Job::ToolResult,
@@ -200,13 +207,9 @@ fn acknowledged_committed_create_after_cancel_stays_success_but_is_not_delivered
     assert_eq!(active.tool_cache[0].2.status, Some(1));
     assert_eq!(
         active.tool_cache[0].2.text.as_deref(),
-        Some(result.text.as_str())
+        Some(rendered.as_str())
     );
-    assert!(
-        !active
-            .model
-            .tool_test_has_delivery(tool_wire_result(&result))
-    );
+    assert!(active.model.tool_test_results().is_empty());
 }
 
 fn pending_projection() -> Arc<journal::Replay> {
@@ -247,15 +250,21 @@ fn pending_projection() -> Arc<journal::Replay> {
             cancel: None,
             terminal: None,
             tools: vec![journal::ToolRecord {
+                name: "memory".into(),
+                tool: Some(journal::RegisteredTool::Memory),
+                tool_operation: Some(journal::ToolOperation::CreateNote),
+                decision: journal::ToolDecision::Run,
+                fault: None,
+                busy: None,
+                refusal: None,
+                form: journal::ArgumentForm::Verbatim,
+                arguments_bytes: 0,
                 arguments: String::new(),
                 preview: None,
                 truncated: None,
                 exit_code: None,
-                kind: 12,
                 intent_frame: 0..1,
-                create: Some(Box::new(create)),
-                offset: 0,
-                limit: 0,
+                create: Some(create),
                 result_frame: None,
                 result_status: None,
                 result_bytes: 0,
@@ -449,12 +458,25 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
     )
     .unwrap();
     let revision = state.revision;
-    drop(state);
+    // The `run` kind 14 the decision path produces for this call.
+    fixture.owner.active.as_mut().unwrap().turn = turn.clone();
+    fixture.owner.replay = Some(state);
+    let record = decided(
+        &fixture.owner,
+        &wire(
+            1,
+            "memory",
+            r#"{"command":"create_note","body":"restart evidence"}"#,
+        ),
+    )
+    .record;
+    assert_eq!(record.decision, journal::ToolDecision::Run);
+    fixture.owner.replay = None;
     wait_writer(
         &writer.0,
         writer::Command::Append {
             expected_revision: revision,
-            record: journal::Record::MemoryCreateIntent(intent.clone()),
+            record: journal::Record::ToolCall(Box::new(record)),
             admission: None,
         },
     );
@@ -465,6 +487,7 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
             generation: 1,
             ordinal: 1,
             body: "restart evidence".into(),
+            source: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     )
@@ -501,6 +524,7 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
     let replay = fixture.owner.replay.as_ref().unwrap();
     let operation = &replay.operations[&turn.operation];
     assert_eq!(operation.tools[0].result_status, Some(1));
+    assert_eq!(operation.tools[0].create, Some(intent));
     assert_eq!(
         operation.terminal.as_ref().unwrap().kind,
         journal::TerminalKind::Interrupted
@@ -520,7 +544,8 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
     let frame = &bytes[result_frame];
     // Format 1 frame boundaries, as in the native journal proof harness.
     match journal::decode_record(15, &frame[144..frame.len() - 40]).unwrap() {
-        journal::Record::ToolResult(result) => assert_eq!(result.text, intent.success_text()),
+        // TCR-D1: the durable result stores no text; the identity is derived.
+        journal::Record::ToolResult(result) => assert!(result.text.is_empty()),
         _ => panic!("missing durable create result"),
     }
 }

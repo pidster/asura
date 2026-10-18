@@ -358,9 +358,29 @@ fn cancel(fixture: &Fixture, operation: [u8; 16]) -> Result<Duration> {
         .cancel_conversation(operation, 1, &|| false)?;
     Ok(started.elapsed())
 }
+/// Kind 14 decision of an exec_cmd call, as these cases read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Disposition {
+    Admitted,
+    Refused,
+    Busy,
+    Other(journal::ToolDecision),
+}
+/// One exec_cmd call as the journal states it: the kind 14 record (the only
+/// copy of the command) plus identities recomputed with the storage
+/// derivations (TCR-D23); nothing here is read from a retired kind 22.
+struct Intent {
+    disposition: Disposition,
+    command: String,
+    variables: Vec<journal::SecretKind>,
+    refusal: Option<journal::ExecCmdRefusal>,
+    busy: Option<journal::ExecCmdBusyReason>,
+    stdout_payload: [u8; 16],
+}
 /// The records of one operation's exec_cmd calls, decoded from the journal.
 struct Call {
-    intent: journal::ExecCmdIntent,
+    intent: Intent,
+    record: journal::ToolCall,
     settled: Option<journal::CaptureSettled>,
     result: Option<journal::ToolResult>,
 }
@@ -380,8 +400,8 @@ fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
     };
     let mut out = Vec::new();
     for tool in &op.tools {
-        let journal::Record::ExecCmdIntent(intent) = decode(tool.intent_frame.clone())? else {
-            return Err("kind 22 expected".into());
+        let journal::Record::ToolCall(record) = decode(tool.intent_frame.clone())? else {
+            return Err("kind 14 expected".into());
         };
         let settled = match tool.exec_cmd.as_ref().and_then(|s| s.settled.as_ref()) {
             Some(s) => match decode(s.frame.clone())? {
@@ -397,8 +417,36 @@ fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
             },
             None => None,
         };
+        let arguments: serde_json::Value =
+            serde_json::from_str(&record.arguments).unwrap_or_default();
+        let intent = Intent {
+            disposition: match record.decision {
+                journal::ToolDecision::Run => Disposition::Admitted,
+                journal::ToolDecision::Refused => Disposition::Refused,
+                journal::ToolDecision::Busy => Disposition::Busy,
+                other => Disposition::Other(other),
+            },
+            command: arguments["command"].as_str().unwrap_or_default().to_owned(),
+            variables: record.number_kinds.clone(),
+            refusal: record.refusal,
+            busy: record.busy,
+            stdout_payload: asura_storage::payload::payload_id(
+                replay.installation_id,
+                operation,
+                record.generation,
+                record.ordinal,
+                asura_storage::payload::ObjectKind::Stdout,
+            ),
+        };
+        if let Some(call) = tool.exec_cmd.as_deref() {
+            assert_eq!(
+                call.stdout_payload, intent.stdout_payload,
+                "derived payload ID"
+            );
+        }
         out.push(Call {
-            intent: *intent,
+            intent,
+            record: *record,
             settled,
             result,
         });
@@ -523,10 +571,7 @@ fn secrets_turn() -> Result<()> {
     assert_eq!(calls.len(), 3);
     // 1. cat .env: placeholders in the result and in what the model saw.
     let cat = &calls[0];
-    assert_eq!(
-        cat.intent.disposition,
-        journal::ExecCmdDisposition::Admitted
-    );
+    assert_eq!(cat.intent.disposition, Disposition::Admitted);
     let settled = cat.settled.as_ref().ok_or("kind 23")?;
     assert_eq!(settled.state, CaptureState::Complete);
     let result = cat.result.as_ref().ok_or("kind 15")?;
@@ -542,7 +587,7 @@ fn secrets_turn() -> Result<()> {
     let stored = std::fs::read(object(&fixture, cat.intent.stdout_payload))?;
     let digest: [u8; 32] = Sha256::digest(&stored).into();
     assert_eq!(settled.stdout.digest, Some(digest));
-    // 2. command secret: kind 22 holds the rewrite; the command used the value.
+    // 2. command secret: kind 14 holds the rewrite; the command used the value.
     let rewrite = &calls[1];
     assert!(
         rewrite.intent.command.contains("ASURA_SECRET_1"),
@@ -558,16 +603,15 @@ fn secrets_turn() -> Result<()> {
     std::fs::remove_file(directory.join("out.txt"))?;
     // 3. single quotes: refused, display-redacted command.
     let quoted = &calls[2];
-    assert_eq!(
-        quoted.intent.disposition,
-        journal::ExecCmdDisposition::Refused
-    );
+    assert_eq!(quoted.intent.disposition, Disposition::Refused);
     assert_eq!(
         quoted.intent.refusal.map(|r| r.code),
         Some(journal::RefusalCode::SecretSingleQuoted)
     );
     assert!(quoted.intent.command.contains("$ASURA_SECRET_"));
-    assert_eq!(quoted.result.as_ref().map(|r| r.status), Some(3));
+    // A call that does not run is complete at kind 14 (TCR-R5).
+    assert!(quoted.result.is_none());
+    assert_eq!(quoted.record.form, journal::ArgumentForm::Canonical);
     assert!(quoted.settled.is_none());
     // What the model saw.
     let messages = model.tool_messages();
@@ -591,7 +635,7 @@ fn secrets_turn() -> Result<()> {
     std::fs::remove_file(directory.join(".env"))?;
     sweep(&fixture.home, &[&first, &second])?;
     println!(
-        "PASS J1T-24/J1T-14 cat .env placeholders to the model, rewritten command in kind 22 and {ps_checks} ps checks, refusals recorded, raw-byte sweep clean"
+        "PASS J1T-24/J1T-14 cat .env placeholders to the model, rewritten command in kind 14 and {ps_checks} ps checks, refusals recorded, raw-byte sweep clean"
     );
     Ok(())
 }
@@ -731,19 +775,17 @@ fn quota_busy() -> Result<()> {
         Some(3)
     );
     let calls = exec_cmd_calls(&fixture, operation)?;
-    assert_eq!(
-        calls[0].intent.disposition,
-        journal::ExecCmdDisposition::Busy
-    );
+    assert_eq!(calls[0].intent.disposition, Disposition::Busy);
     assert_eq!(
         calls[0].intent.busy,
         Some(journal::ExecCmdBusyReason::Quota)
     );
-    assert_eq!(calls[0].result.as_ref().map(|r| r.status), Some(4));
+    // Busy is complete at kind 14; its status 4 text is rendered (TCR-D12).
+    assert!(calls[0].result.is_none());
     assert!(!directory.join("marker").exists());
     let messages = model.tool_messages();
     assert!(messages[0].contains("exec_cmd_busy: quota"), "{messages:?}");
-    println!("PASS J1T-08 visible busy: kind 22 busy quota, kind 15 status 4, nothing ran");
+    println!("PASS J1T-08 visible busy: kind 14 busy quota, no kind 15, nothing ran");
     Ok(())
 }
 
@@ -816,8 +858,7 @@ fn overload() -> Result<()> {
     Ok(())
 }
 fn calls_admitted(fixture: &Fixture, operation: [u8; 16]) -> Result<bool> {
-    Ok(exec_cmd_calls(fixture, operation)?[0].intent.disposition
-        == journal::ExecCmdDisposition::Admitted)
+    Ok(exec_cmd_calls(fixture, operation)?[0].intent.disposition == Disposition::Admitted)
 }
 
 /// J1T-22 (RG-05): crashes at each point; recovery installs once and never
@@ -837,11 +878,11 @@ fn crash_points() -> Result<()> {
     let effects = |name: &str| -> usize {
         std::fs::read_to_string(directory.join(name)).map_or(0, |s| s.len())
     };
-    // (a) After kind 22, before spawn.
+    // (a) After kind 14, before spawn.
     std::fs::write(fixture.home.join("exec-cmd-hold-setup"), b"")?;
     model.script(&[Step::ExecCmd("printf x >> a.txt".into()), Step::Final]);
     let a = submit(&fixture, project, "a")?;
-    wait_for(Duration::from_secs(20), "kind 22", || {
+    wait_for(Duration::from_secs(20), "kind 14", || {
         exec_cmd_calls(&fixture, a).is_ok_and(|c| !c.is_empty())
     })?;
     restart(&mut fixture)?;
@@ -862,7 +903,7 @@ fn crash_points() -> Result<()> {
         Step::Final,
     ]);
     let c = submit(&fixture, project, "c")?;
-    wait_for(Duration::from_secs(20), "kind 22", || {
+    wait_for(Duration::from_secs(20), "kind 14", || {
         exec_cmd_calls(&fixture, c).is_ok_and(|found| !found.is_empty())
     })?;
     std::fs::write(fixture.home.join("journal-hold-appends"), b"")?;
@@ -966,10 +1007,7 @@ fn native() -> Result<()> {
     assert_eq!(event.kind, Some(3), "{event:?}");
     let calls = exec_cmd_calls(&fixture, operation)?;
     let call = calls.first().ok_or("no exec_cmd call")?;
-    assert_eq!(
-        call.intent.disposition,
-        journal::ExecCmdDisposition::Admitted
-    );
+    assert_eq!(call.intent.disposition, Disposition::Admitted);
     assert!(
         call.intent.command.contains("ASURA_SECRET_1"),
         "{}",

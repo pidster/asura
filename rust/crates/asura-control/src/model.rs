@@ -17,6 +17,12 @@ pub const MAX_INPUT_BYTES: u64 = MAX_INPUT_CHUNKS * MAX_CHUNK_BYTES as u64;
 pub const MAX_HISTORY_ENTRIES: usize = 2048;
 /// Bound on the helper's reported tool definition size.
 pub const MAX_TOOL_SCHEMA_BYTES: u32 = 1024 * 1024;
+/// ToolCall name and argument text bounds (tool-call-records.md, wire
+/// contract). The argument bound equals the kind 14 record bound.
+pub const MAX_TOOL_NAME_BYTES: usize = 256;
+pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64_000;
+/// Ordinal 9 exists only for the over-limit proposal (status 7).
+pub const MAX_TOOL_ORDINAL: u32 = 9;
 /// Credit window for one direction; a sliding window for input.
 pub const CREDIT_WINDOW: u64 = 65_536;
 const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
@@ -377,63 +383,29 @@ pub fn validate_semantics(
         Body::SnapshotEnd(v) => {
             positive(v.revision, 1024) && count_bytes(v.count, v.total_bytes, MAX_SNAPSHOT_BYTES)
         }
+        // Unparsed proposals: the service is the only argument parser. Exactly
+        // one of name / name_bytes and of arguments / arguments_bytes; a size
+        // is sent only when the text exceeds its limit (known-size exhaustion).
         Body::ToolCall(v) => {
-            v.ordinal.is_some_and(|n| (1..=8).contains(&n))
-                && match &v.arguments {
-                    Some(pb::tool_call::Arguments::ObserveStatus(_)) => true,
-                    Some(pb::tool_call::Arguments::ListTools(_)) => true,
-                    Some(pb::tool_call::Arguments::ExecCmd(args)) => {
-                        args.command
-                            .as_ref()
-                            .is_some_and(|c| !c.is_empty() && c.len() <= 8192 && !c.contains('\0'))
-                            && args.cwd.as_ref().is_none_or(|p| {
-                                !p.is_empty()
-                                    && p.len() <= 1024
-                                    && !p.starts_with('/')
-                                    && !p.contains('\0')
-                                    && !p.split('/').any(|c| c == "..")
-                            })
-                    }
-
-                    Some(pb::tool_call::Arguments::ReadAudit(args)) => {
-                        args.limit.is_some_and(|n| (1..=16).contains(&n))
-                    }
-                    Some(pb::tool_call::Arguments::MemoryListNotes(args)) => {
-                        args.after.as_ref().is_none_or(|id| id.len() <= 1024)
-                            && args.limit.is_some()
-                    }
-                    Some(pb::tool_call::Arguments::MemoryGetNote(args)) => {
-                        args.version.as_ref().is_some_and(|id| id.len() <= 1024)
-                            && args.offset.is_some()
-                            && args.limit.is_some()
-                    }
-                    Some(pb::tool_call::Arguments::MemoryCreateNote(args)) => {
-                        args.body.as_ref().is_some_and(|body| body.len() <= 16_384)
-                            && args
-                                .source_version
-                                .as_ref()
-                                .is_none_or(|id| id.len() <= 1024)
-                    }
-                    Some(pb::tool_call::Arguments::MemoryNoteSources(args)) => {
-                        args.version.as_ref().is_some_and(|id| id.len() <= 1024)
-                    }
-                    Some(pb::tool_call::Arguments::ReadFile(args)) => {
-                        args.path
-                            .as_ref()
-                            .is_some_and(|p| !p.is_empty() && p.len() <= 1024)
-                            && args.offset.is_some()
-                            && args.limit.is_some_and(|n| (1..=16_384).contains(&n))
-                    }
-                    Some(pb::tool_call::Arguments::ListDirectory(args)) => args
-                        .path
-                        .as_ref()
-                        .is_some_and(|p| !p.is_empty() && p.len() <= 1024),
-                    None => false,
+            v.ordinal
+                .is_some_and(|n| (1..=MAX_TOOL_ORDINAL).contains(&n))
+                && match (&v.name, v.name_bytes) {
+                    (Some(name), None) => (1..=MAX_TOOL_NAME_BYTES).contains(&name.len()),
+                    (None, Some(bytes)) => bytes as usize > MAX_TOOL_NAME_BYTES,
+                    _ => false,
                 }
+                && match (&v.arguments, v.arguments_bytes) {
+                    (Some(text), None) => text.len() <= MAX_TOOL_ARGUMENT_BYTES,
+                    (None, Some(bytes)) => bytes as usize > MAX_TOOL_ARGUMENT_BYTES,
+                    _ => false,
+                }
+                && matches!(v.source, Some(1 | 2))
         }
         Body::ToolResult(v) => {
-            v.ordinal.is_some_and(|n| (1..=8).contains(&n))
+            v.ordinal
+                .is_some_and(|n| (1..=MAX_TOOL_ORDINAL).contains(&n))
                 && v.status.is_some_and(|n| (1..=7).contains(&n))
+                && (v.ordinal != Some(MAX_TOOL_ORDINAL) || v.status == Some(7))
                 && v.text.as_ref().is_some_and(|text| text.len() <= 16_384)
                 && v.truncated.is_some()
                 && (v.status == Some(1) || v.next_offset.is_none())

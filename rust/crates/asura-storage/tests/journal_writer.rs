@@ -871,6 +871,8 @@ impl Drop for SettledWriter {
 
 #[cfg(feature = "embedded-memory")]
 #[test]
+/// HM3 with TCR-D2: a `run` create_note kind 14, a put with the typed body,
+/// a lost response and restart, then resolution by the derived identity.
 fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() {
     use asura_storage::memory::{self, MemoryCreateResult};
     let _serial = TEST_WRITER.lock().unwrap();
@@ -981,11 +983,34 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
         None,
     )
     .unwrap();
+    // HM3 (TCR-D2): the `run` kind 14 is the authority; the identities are
+    // derived from the call, never read from the journal.
+    let arguments = "{\"command\":\"create_note\",\"body\":\"durable note\"}";
     state = wait(
         &mut writer
             .try_submit(Command::Append {
                 expected_revision: state.revision,
-                record: Record::MemoryCreateIntent(intent.clone()),
+                record: Record::ToolCall(Box::new(ToolCall {
+                    operation: [105; 16],
+                    generation: 1,
+                    ordinal: 1,
+                    source: ToolCallSource::GeneratedContent,
+                    name: "memory".into(),
+                    name_bytes: 6,
+                    tool_operation: Some(ToolOperation::CreateNote),
+                    decision: ToolDecision::Run,
+                    fault: None,
+                    busy: None,
+                    form: ArgumentForm::Verbatim,
+                    arguments_bytes: arguments.len() as u32,
+                    arguments: arguments.into(),
+                    number_kinds: vec![],
+                    unnumbered: 0,
+                    rule_set_revision: 1,
+                    rule_set_digest: [21; 32],
+                    command_cut: false,
+                    refusal: None,
+                })),
                 admission: None,
             })
             .unwrap(),
@@ -993,6 +1018,8 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
     .unwrap()
     .replay
     .unwrap();
+    assert_eq!(state.unresolved_creates().next(), Some(&intent));
+    assert_eq!(state.operations[&[105; 16]].tools[0].create, Some(intent));
     assert!(state.project_memory_blocked(project));
     assert!(matches!(
         wait(
@@ -1016,6 +1043,7 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
                 generation: 1,
                 ordinal: 1,
                 body: "durable note".into(),
+                source: None,
                 cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             })
             .unwrap(),
@@ -1038,21 +1066,6 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
     .unwrap()
     .unwrap();
     assert_eq!(absent, MemoryCreateResult::NotCommitted);
-    let bad = wait(
-        &mut writer
-            .try_submit(Command::MemoryCreate {
-                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                turn: [105; 16],
-                generation: 1,
-                ordinal: 1,
-                body: "changed".into(),
-            })
-            .unwrap(),
-    )
-    .unwrap()
-    .memory_create_result
-    .unwrap();
-    assert_eq!(bad, Err(memory::Error::IdempotencyConflict));
     let outcome = wait(
         &mut writer
             .try_submit(Command::MemoryCreate {
@@ -1061,6 +1074,7 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
                 generation: 1,
                 ordinal: 1,
                 body: "durable note".into(),
+                source: None,
             })
             .unwrap(),
     )
@@ -1068,7 +1082,29 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
     .memory_create_result
     .unwrap()
     .unwrap();
-    assert!(matches!(outcome, MemoryCreateResult::Committed(_)));
+    let MemoryCreateResult::Committed(receipt) = &outcome else {
+        panic!("committed");
+    };
+    assert_eq!(receipt.version_id.bytes(), intent.identity.version);
+    assert_eq!(receipt.operation_id.bytes(), intent.identity.operation);
+    // The journal holds no body digest (TCR-D2): the memory store's receipt
+    // is the one source, so a later put with another body conflicts with it.
+    let bad = wait(
+        &mut writer
+            .try_submit(Command::MemoryCreate {
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                turn: [105; 16],
+                generation: 1,
+                ordinal: 1,
+                body: "changed".into(),
+                source: None,
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .memory_create_result
+    .unwrap();
+    assert_eq!(bad, Err(memory::Error::IdempotencyConflict));
     // Lose the client response and restart before committing ToolResult.
     close(&mut writer);
     let mut writer = SettledWriter(WriterHandle::start(scratch.runtime()).unwrap());
@@ -1086,7 +1122,8 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
                     turn: [105; 16],
                     generation: 1,
                     ordinal: 1,
-                    body: "durable note".into()
+                    body: "durable note".into(),
+                    source: None,
                 })
                 .unwrap()
         ),
@@ -1115,7 +1152,8 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
                     generation: 1,
                     ordinal: 1,
                     status: 1,
-                    text: intent.success_text(),
+                    // TCR-D1: kind 15 of create_note stores no text.
+                    text: String::new(),
                     truncated: false,
                     next_offset: None,
                 }),
@@ -1147,6 +1185,22 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
         _ => panic!("expected page"),
     }
     close(&mut writer);
+    // The journal keeps no body digest and no derived identity (TCR-I03,
+    // TCR-O5); the memory store is their one source.
+    let journal = fs::read(scratch.0.join(".asura/state/control/slot-0.log")).unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        let body = Sha256::digest(b"durable note");
+        for value in [
+            &body[..],
+            &intent.identity.operation[..],
+            &intent.identity.object[..],
+            &intent.identity.version[..],
+            &intent.identity.edge[..],
+        ] {
+            assert!(!journal.windows(value.len()).any(|w| w == value));
+        }
+    }
 }
 
 /// SI-I1 and SI-I2: overlapping roots are refused before any append.
@@ -1585,53 +1639,66 @@ fn j1_admit_and_start(
         .replay
         .unwrap()
 }
-fn j1_intent(installation: Id, ordinal: u32, disposition: ExecCmdDisposition) -> ExecCmdIntent {
-    use asura_storage::payload::{ObjectKind, payload_id};
-    let admitted = disposition == ExecCmdDisposition::Admitted;
-    let derived = |kind| {
-        if admitted {
-            payload_id(installation, [35; 16], 1, ordinal, kind)
-        } else {
-            [0; 16]
-        }
+/// A kind 14 exec_cmd call at `ordinal`: `run`, or a refused call that holds
+/// the display-redacted command (cut at 8,192 bytes).
+fn j1_call(ordinal: u32, decision: ToolDecision) -> ToolCall {
+    let run = decision == ToolDecision::Run;
+    let arguments = if run {
+        "{\"command\":\"printf %s \\\"$ASURA_SECRET_1\\\"\",\"cwd\":\".\"}"
+    } else {
+        "{\"command\":\"printf %s '[REDACTED:github-token]'\",\"cwd\":\".\"}"
     };
-    ExecCmdIntent {
+    ToolCall {
         operation: [35; 16],
         generation: 1,
         ordinal,
-        disposition,
-        command_truncated: !admitted,
-        command: if admitted {
-            "printf %s \"$ASURA_SECRET_1\"".into()
-        } else {
-            "printf %s '[REDACTED:github-token]'".into()
-        },
-        cwd: ".".into(),
-        refusal: (!admitted).then_some(ExecCmdRefusal {
-            code: RefusalCode::SecretSingleQuoted,
-            kind: Some(SecretKind::GithubToken),
-            word: Some(3),
-        }),
+        source: ToolCallSource::GeneratedContent,
+        name: "exec_cmd".into(),
+        name_bytes: 8,
+        tool_operation: Some(ToolOperation::ExecCmd),
+        decision,
+        fault: None,
         busy: None,
-        variables: if admitted {
+        form: ArgumentForm::Canonical,
+        arguments_bytes: arguments.len() as u32,
+        arguments: arguments.into(),
+        number_kinds: if run {
             vec![SecretKind::GithubToken]
         } else {
             Vec::new()
         },
-        job: if admitted {
-            exec_cmd_job_id([35; 16], 1, ordinal)
-        } else {
-            [0; 16]
-        },
-        stdout_payload: derived(ObjectKind::Stdout),
-        stderr_payload: derived(ObjectKind::Stderr),
-        initial_reservation: if admitted { INITIAL_RESERVATION } else { 0 },
+        unnumbered: 0,
         rule_set_revision: 1,
         rule_set_digest: [39; 32],
+        command_cut: !run,
+        refusal: (!run).then_some(ExecCmdRefusal {
+            code: RefusalCode::SecretSingleQuoted,
+            kind: Some(SecretKind::GithubToken),
+            word: Some(3),
+        }),
     }
 }
+/// A `run` service status call, or the same call with another decision; both
+/// encode to the same size.
+fn j1_status(decision: ToolDecision) -> Record {
+    let arguments = "{\"command\":\"status\"}";
+    Record::ToolCall(Box::new(ToolCall {
+        name: "service".into(),
+        name_bytes: 7,
+        tool_operation: Some(ToolOperation::Status),
+        decision,
+        form: ArgumentForm::Verbatim,
+        arguments_bytes: arguments.len() as u32,
+        arguments: arguments.into(),
+        number_kinds: Vec::new(),
+        command_cut: false,
+        refusal: None,
+        ..j1_call(1, ToolDecision::Run)
+    }))
+}
 #[test]
-fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
+fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
+    use asura_storage::payload::{ObjectKind, payload_id};
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
     let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
@@ -1640,7 +1707,7 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
     let installation = state.installation_id;
     let mut revision = state.revision;
     drop(state);
-    let intent = j1_intent(installation, 1, ExecCmdDisposition::Admitted);
+    let call = j1_call(1, ToolDecision::Run);
     let settled = CaptureSettled {
         operation: [35; 16],
         generation: 1,
@@ -1649,8 +1716,6 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
         reason: CaptureReason::Quota,
         exit_kind: 2,
         exit_value: 15,
-        rule_set_revision: 1,
-        rule_set_digest: [39; 32],
         stdout: CaptureStream {
             observed_bytes: 40,
             stored_bytes: 33,
@@ -1685,32 +1750,32 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
         next_offset: None,
         truncated: false,
     };
-    let refused = j1_intent(installation, 2, ExecCmdDisposition::Refused);
-    let refused_result = ToolResult {
-        ordinal: 2,
-        status: 3,
-        text: "refused: secret_single_quoted".into(),
-        ..result.clone()
-    };
+    // The refused call is complete at its kind 14 (TCR-R5).
+    let refused = j1_call(2, ToolDecision::Refused);
     for record in [
-        Record::ExecCmdIntent(Box::new(intent.clone())),
+        Record::ToolCall(Box::new(call.clone())),
         Record::CaptureSettled(Box::new(settled.clone())),
         Record::ToolResult(result),
-        Record::ExecCmdIntent(Box::new(refused.clone())),
-        Record::ToolResult(refused_result),
+        Record::ToolCall(Box::new(refused.clone())),
     ] {
         submit(&mut writer, &mut revision, record).unwrap();
     }
     close(&mut writer);
-    // The journal on disk replays with both calls.
+    // The journal on disk replays with both calls and the derived identities.
     let durable = journal_replay(&scratch);
     let tools = &durable.operations[&[35; 16]].tools;
     assert_eq!(tools.len(), 2);
-    let call = tools[0].exec_cmd.as_deref().unwrap();
-    assert_eq!(call.disposition, ExecCmdDisposition::Admitted);
-    assert_eq!(call.job, intent.job);
-    assert_eq!(call.stdout_payload, intent.stdout_payload);
-    let settlement = call.settled.as_ref().unwrap();
+    let derived = tools[0].exec_cmd.as_deref().unwrap();
+    assert_eq!(derived.job, exec_cmd_job_id([35; 16], 1, 1));
+    assert_eq!(
+        derived.stdout_payload,
+        payload_id(installation, [35; 16], 1, 1, ObjectKind::Stdout)
+    );
+    assert_eq!(
+        derived.stderr_payload,
+        payload_id(installation, [35; 16], 1, 1, ObjectKind::Stderr)
+    );
+    let settlement = derived.settled.as_ref().unwrap();
     assert_eq!(settlement.state, CaptureState::Incomplete);
     assert_eq!(settlement.reason, CaptureReason::Quota);
     assert_eq!(
@@ -1718,11 +1783,8 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
         [(33, Some([40; 32])), (0, Some([41; 32]))]
     );
     assert_eq!(tools[0].result_status, Some(5));
-    assert_eq!(
-        tools[1].exec_cmd.as_deref().unwrap().disposition,
-        ExecCmdDisposition::Refused
-    );
-    assert_eq!(tools[1].result_status, Some(3));
+    assert_eq!(tools[1].decision, ToolDecision::Refused);
+    assert!(tools[1].exec_cmd.is_none() && tools[1].result_frame.is_none());
     let intent_frame = tools[0].intent_frame.clone();
     let settled_frame = settlement.frame.clone();
     let refused_frame = tools[1].intent_frame.clone();
@@ -1738,9 +1800,9 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
     // Each verified frame range decodes to the appended record.
     let bytes = fs::read(scratch.0.join(".asura/state/control/slot-0.log")).unwrap();
     for (range, kind, expected) in [
-        (intent_frame, 22, Record::ExecCmdIntent(Box::new(intent))),
+        (intent_frame, 14, Record::ToolCall(Box::new(call))),
         (settled_frame, 23, Record::CaptureSettled(Box::new(settled))),
-        (refused_frame, 22, Record::ExecCmdIntent(Box::new(refused))),
+        (refused_frame, 14, Record::ToolCall(Box::new(refused))),
     ] {
         let frame = &bytes[range];
         assert_eq!(u16::from_be_bytes([frame[10], frame[11]]), kind);
@@ -1750,56 +1812,38 @@ fn j1t_01_real_writer_appends_kinds_22_23_15_and_reopens() {
         );
     }
 }
-#[test]
-fn j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit() {
-    const FRAME: usize = 144 + 40;
-    const TERMINAL: usize = FRAME + 47 + MAX_TEXT;
-    const RESULT: usize = FRAME + 43 + 16_384;
-    const OWNER: usize = FRAME;
-    const CANCEL: usize = FRAME + 25;
-    const CAPTURE: usize = FRAME + 4_102;
-    const MARGIN: usize = 100;
-    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
-    let scratch = Scratch::new();
+const FRAME: usize = 144 + 40;
+const TERMINAL: usize = FRAME + 47 + MAX_TEXT;
+const RESULT: usize = FRAME + 43 + 16_384;
+const OWNER: usize = FRAME;
+const CANCEL: usize = FRAME + 25;
+const CAPTURE: usize = FRAME + 4_066;
+/// Frame sizes do not depend on the frame context.
+fn frame_size(record: &Record) -> usize {
+    encode_frame(
+        &FrameContext {
+            installation_id: [1; 16],
+            transition_id: [2; 16],
+            sequence: 2,
+            prior_digest: [0; 32],
+            expected_revision: 1,
+            owner_generation: 1,
+        },
+        record,
+    )
+    .unwrap()
+    .len()
+}
+/// A started turn on a journal padded so that exactly `free` bytes remain
+/// beyond the started turn's own reservation (terminal, owner and cancel).
+/// Returns the writer, the installation and the revision.
+fn j1_padded(scratch: &Scratch, free: usize) -> (WriterHandle, Id, u64) {
+    let size = frame_size;
     let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
-    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    let (project, configuration_digest) = j1_initialize(scratch, &mut writer);
     close(&mut writer);
-    // Frame sizes do not depend on the frame context.
-    let size = |record: &Record| {
-        encode_frame(
-            &FrameContext {
-                installation_id: [1; 16],
-                transition_id: [2; 16],
-                sequence: 2,
-                prior_digest: [0; 32],
-                expected_revision: 1,
-                owner_generation: 1,
-            },
-            record,
-        )
-        .unwrap()
-        .len()
-    };
-    let exec_cmd = Record::ExecCmdIntent(Box::new(j1_intent(
-        [1; 16],
-        1,
-        ExecCmdDisposition::Admitted,
-    )));
-    let status = Record::ToolIntent(ToolIntent {
-        operation: [35; 16],
-        generation: 1,
-        ordinal: 1,
-        kind: 3,
-        path: String::new(),
-        offset: 0,
-        limit: 0,
-    });
-    let pending_tool = TERMINAL + RESULT + OWNER + CANCEL;
-    // After the start: kind 22 alone fits by MARGIN bytes, but not with its
-    // capture frame; the smaller kind 14 fits.
-    let started_end =
-        asura_storage::authority::MAX_JOURNAL - pending_tool - size(&exec_cmd) - MARGIN;
-    assert!(size(&status) <= size(&exec_cmd) + MARGIN && MARGIN < CAPTURE);
+    let started_reserved = TERMINAL + OWNER + CANCEL;
+    let started_end = asura_storage::authority::MAX_JOURNAL - started_reserved - free;
     let padded_end = started_end
         - OWNER
         - size(&Record::TurnAccepted(Box::new(j1_turn(
@@ -1808,7 +1852,7 @@ fn j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit() 
         ))))
         - size(&j1_start());
     // Pad with completed turns written directly to the closed journal.
-    let state = journal_replay(&scratch);
+    let state = journal_replay(scratch);
     let mut file = JournalFile::open(scratch.runtime(), false).unwrap();
     let (mut sequence, mut digest, mut end) = (state.sequence, state.last_digest, state.end_offset);
     let owner_generation = state.owner_generation;
@@ -1920,46 +1964,90 @@ fn j1t_02_real_writer_refuses_kind_22_when_the_capture_reservation_cannot_fit() 
     let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
     let started = j1_admit_and_start(&mut writer, project, configuration_digest);
     assert_eq!(started.end_offset, started_end);
-    assert_eq!(started.reserved_bytes + RESULT, pending_tool);
+    assert_eq!(started.reserved_bytes, started_reserved);
     let installation = started.installation_id;
-    let mut revision = started.revision;
+    let revision = started.revision;
     drop(started);
+    (writer, installation, revision)
+}
+#[test]
+fn j1t_02_real_writer_refuses_a_run_exec_cmd_when_the_capture_reservation_cannot_fit() {
+    const MARGIN: usize = 100;
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let exec_cmd = || Record::ToolCall(Box::new(j1_call(1, ToolDecision::Run)));
+    let status = j1_status(ToolDecision::Run);
+    // The run exec_cmd kind 14 and its kind 15 fit by MARGIN bytes, but not
+    // with its capture frame; the smaller run status call fits.
+    assert!(frame_size(&status) <= frame_size(&exec_cmd()) + MARGIN && MARGIN < CAPTURE);
+    let free = frame_size(&exec_cmd()) + RESULT + MARGIN;
+    let (mut writer, _, mut revision) = j1_padded(&scratch, free);
     let journal = scratch.0.join(".asura/state/control/slot-0.log");
     let before = fs::read(&journal).unwrap();
-    let exec_cmd = Record::ExecCmdIntent(Box::new(j1_intent(
-        installation,
-        1,
-        ExecCmdDisposition::Admitted,
-    )));
     assert!(matches!(
-        submit(&mut writer, &mut revision, exec_cmd),
+        submit(&mut writer, &mut revision, exec_cmd()),
         Err(Error::Invalid)
     ));
     assert_eq!(fs::read(&journal).unwrap(), before);
-    // The smaller kind 14 still fits, so the capture frame refused kind 22.
-    submit(&mut writer, &mut revision, status).unwrap();
+    submit(&mut writer, &mut revision, status.clone()).unwrap();
     let state = wait(&mut writer.try_submit(Command::Open).unwrap())
         .unwrap()
         .replay
         .unwrap();
-    assert_eq!(state.reserved_bytes, pending_tool);
+    assert_eq!(state.reserved_bytes, TERMINAL + RESULT + OWNER + CANCEL);
     assert_eq!(
         asura_storage::authority::MAX_JOURNAL - state.end_offset - state.reserved_bytes,
-        size(&Record::ExecCmdIntent(Box::new(j1_intent(
-            installation,
-            1,
-            ExecCmdDisposition::Admitted
-        )))) + MARGIN
-            - size(&Record::ToolIntent(ToolIntent {
-                operation: [35; 16],
-                generation: 1,
-                ordinal: 1,
-                kind: 3,
-                path: String::new(),
-                offset: 0,
-                limit: 0,
-            }))
+        frame_size(&exec_cmd()) + MARGIN - frame_size(&status)
     );
     drop(state);
+    close(&mut writer);
+}
+/// TCR-I08 and TCR-D16: kind 14 fits but kind 15 and the terminal do not.
+/// The `run` record is refused with the writer's existing capacity error and
+/// changes nothing; the same call with a decision that does not run (same
+/// size) needs no result frame and is accepted, and the turn can still end.
+#[test]
+fn tcr_i08_run_kind_14_is_refused_when_its_result_cannot_fit() {
+    const MARGIN: usize = 100;
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let run = j1_status(ToolDecision::Run);
+    let denied = j1_status(ToolDecision::Denied);
+    assert_eq!(frame_size(&run), frame_size(&denied));
+    const { assert!(MARGIN < RESULT) };
+    let free = frame_size(&run) + RESULT - MARGIN;
+    let (mut writer, _, mut revision) = j1_padded(&scratch, free);
+    let journal = scratch.0.join(".asura/state/control/slot-0.log");
+    let before = fs::read(&journal).unwrap();
+    assert!(matches!(
+        submit(&mut writer, &mut revision, run),
+        Err(Error::Invalid)
+    ));
+    assert_eq!(fs::read(&journal).unwrap(), before);
+    submit(&mut writer, &mut revision, denied).unwrap();
+    let state = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    let tool = &state.operations[&[35; 16]].tools[0];
+    assert_eq!(tool.decision, ToolDecision::Denied);
+    assert_eq!(state.reserved_bytes, TERMINAL + OWNER + CANCEL);
+    drop(state);
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::TurnTerminal(TurnTerminal {
+            operation: [35; 16],
+            generation: 1,
+            kind: TerminalKind::Failed,
+            cause: Cause::ProviderFailure,
+            final_cursor: u64::MAX,
+            usage_known: false,
+            output_tokens: 0,
+            charged_tokens: OUTPUT_RESERVATION,
+            text: "x".repeat(MAX_TEXT),
+        }),
+    )
+    .unwrap();
     close(&mut writer);
 }

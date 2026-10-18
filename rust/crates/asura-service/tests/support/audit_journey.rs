@@ -273,7 +273,7 @@ pub(super) fn run(provider: Option<&str>) -> Result<()> {
             event
                 .tools
                 .iter()
-                .any(|t| t.name.as_deref() == Some("service_read_audit") && t.status == Some(1))
+                .any(|t| t.name.as_deref() == Some("service") && t.status == Some(1))
         );
         fixture.stop()?;
         verify_tool(&fixture, operation, projects[0])?;
@@ -344,7 +344,10 @@ fn verify_tool(fixture: &Fixture, operation: [u8; 16], project: [u8; 16]) -> Res
         .get(&operation)
         .ok_or("audit operation")?
         .tools;
-    let selected: Vec<_> = tools.iter().filter(|t| t.kind == 15).collect();
+    let selected: Vec<_> = tools
+        .iter()
+        .filter(|t| t.tool_operation == Some(j::ToolOperation::Audit))
+        .collect();
     assert_eq!(selected.len(), 1);
     let tool = selected[0];
     assert_eq!(tool.result_status, Some(1));
@@ -356,13 +359,20 @@ fn verify_tool(fixture: &Fixture, operation: [u8; 16], project: [u8; 16]) -> Res
         )
         .map_err(|e| format!("audit record:{e:?}"))?)
     };
-    let j::Record::ToolIntent(intent) = decode(tool.intent_frame.clone())? else {
+    let j::Record::ToolCall(intent) = decode(tool.intent_frame.clone())? else {
         return Err("audit intent variant".into());
     };
-    assert_eq!(intent.kind, 15);
-    assert_eq!(intent.path, "");
-    assert_eq!(intent.offset, 0);
-    assert_eq!(intent.limit, 16);
+    // The kind 14 arguments select no log path; the limit defaults to 16.
+    assert_eq!(intent.name, "service");
+    assert_eq!(intent.tool_operation, Some(j::ToolOperation::Audit));
+    let arguments: serde_json::Value = serde_json::from_str(&intent.arguments)?;
+    assert_eq!(arguments["command"].as_str(), Some("audit"));
+    assert!(arguments["limit"].as_u64().is_none_or(|limit| limit == 16));
+    assert!(
+        arguments
+            .as_object()
+            .is_some_and(|members| members.keys().all(|k| k == "command" || k == "limit"))
+    );
     let j::Record::ToolResult(result) = decode(tool.result_frame.clone().ok_or("audit result")?)?
     else {
         return Err("audit result variant".into());

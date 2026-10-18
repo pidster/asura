@@ -1531,7 +1531,7 @@ fn native_tools(provider: &str) -> Result<()> {
         event
             .tools
             .iter()
-            .any(|tool| tool.name.as_deref() == Some("project_read_file")
+            .any(|tool| tool.name.as_deref() == Some("project")
                 && tool.state == Some(2)
                 && tool.status == Some(1)),
         "no committed successful tool event"
@@ -1568,12 +1568,9 @@ fn native_tools(provider: &str) -> Result<()> {
         .map_err(|error| format!("tool journal replay: {error:?}"))?;
     let record = &replay.operations[&operation];
     assert!(!record.tools.is_empty());
-    assert!(
-        record
-            .tools
-            .iter()
-            .any(|tool| tool.kind == 1 && tool.result_status == Some(1))
-    );
+    assert!(record.tools.iter().any(|tool| tool.tool_operation
+        == Some(journal::ToolOperation::ReadFile)
+        && tool.result_status == Some(1)));
     let terminal = record.terminal.as_ref().expect("committed terminal");
     assert_eq!(terminal.charged_tokens, journal::OUTPUT_RESERVATION);
     assert!(!terminal.usage_known);
@@ -1613,11 +1610,12 @@ fn native_tools(provider: &str) -> Result<()> {
         status.reason
     );
     assert!(
-        status.tools.iter().any(
-            |tool| tool.name.as_deref() == Some("service_observe_status")
+        status
+            .tools
+            .iter()
+            .any(|tool| tool.name.as_deref() == Some("service")
                 && tool.state == Some(2)
-                && tool.status == Some(1)
-        ),
+                && tool.status == Some(1)),
         "missing persisted successful status tool result"
     );
     let denied = submit(

@@ -229,120 +229,23 @@ fn tool_grant(turn: &journal::TurnAccepted, foreground_user: bool) -> tools::Gra
         remote_destination: None,
     }
 }
-fn proposed_tool(
-    turn: &journal::TurnAccepted,
-    value: mp::ToolCall,
-) -> Result<tools::Call, tools::Rejection> {
-    let arguments = match value.arguments {
-        Some(mp::tool_call::Arguments::MemoryCreateNote(args)) => {
-            tools::Arguments::MemoryCreateNote {
-                body: args.body.ok_or(tools::Rejection::InvalidArguments)?,
-                source_version: args.source_version,
-            }
-        }
-        Some(mp::tool_call::Arguments::ReadFile(args)) => tools::Arguments::ReadFile {
-            path: args.path.ok_or(tools::Rejection::InvalidArguments)?,
-            offset: args.offset.ok_or(tools::Rejection::InvalidArguments)?,
-            limit: args.limit.ok_or(tools::Rejection::InvalidArguments)?,
-        },
-        Some(mp::tool_call::Arguments::ListDirectory(args)) => tools::Arguments::ListDirectory {
-            path: args.path.ok_or(tools::Rejection::InvalidArguments)?,
-        },
-        Some(mp::tool_call::Arguments::ExecCmd(args)) => tools::Arguments::ExecCmd {
-            command: args.command.ok_or(tools::Rejection::InvalidArguments)?,
-            cwd: args.cwd.unwrap_or_else(|| ".".into()),
-        },
-        Some(mp::tool_call::Arguments::ObserveStatus(_)) => tools::Arguments::ObserveStatus,
-        Some(mp::tool_call::Arguments::ListTools(_)) => tools::Arguments::ListTools,
-        Some(mp::tool_call::Arguments::ReadAudit(args)) => tools::Arguments::ReadAudit {
-            limit: args.limit.expect("validated limit"),
-        },
-        Some(mp::tool_call::Arguments::MemoryListNotes(args)) => {
-            tools::Arguments::MemoryListNotes {
-                after: args.after,
-                limit: args.limit.ok_or(tools::Rejection::InvalidArguments)?,
-            }
-        }
-        Some(mp::tool_call::Arguments::MemoryGetNote(args)) => tools::Arguments::MemoryGetNote {
-            version: args.version.ok_or(tools::Rejection::InvalidArguments)?,
-            offset: args.offset.ok_or(tools::Rejection::InvalidArguments)?,
-            limit: args.limit.ok_or(tools::Rejection::InvalidArguments)?,
-        },
-        Some(mp::tool_call::Arguments::MemoryNoteSources(args)) => {
-            tools::Arguments::MemoryNoteSources {
-                version: args.version.ok_or(tools::Rejection::InvalidArguments)?,
-            }
-        }
-        None => return Err(tools::Rejection::InvalidArguments),
-    };
-    let call = tools::Call {
-        operation: turn.operation,
-        generation: turn.generation,
-        ordinal: value.ordinal.ok_or(tools::Rejection::InvalidArguments)?,
-        arguments,
-    };
-    Ok(call)
-}
-fn validate_cached_tool(
-    prior: &tools::Call,
-    call: &tools::Call,
-    turn: &journal::TurnAccepted,
-    foreground_user: bool,
-) -> Result<(), tools::Rejection> {
-    if prior != call {
-        return Err(tools::Rejection::IdentityConflict);
+/// Keyed SHA-256 over one received `ToolCall`: name, argument text, sizes
+/// and source. It detects a resend at a used ordinal (TCR-D7). The key is
+/// random per turn and the digest never leaves memory; it is never recorded.
+fn received_digest(key: &[u8; 32], value: &mp::ToolCall) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(key);
+    for part in [value.name.as_deref(), value.arguments.as_deref()] {
+        hash.update([u8::from(part.is_some())]);
+        let bytes = part.unwrap_or_default().as_bytes();
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
     }
-    tools::validate_authority(
-        prior,
-        &tool_grant(turn, foreground_user),
-        &tools::Destination::Local,
-    )
-}
-fn tool_intent(call: &tools::Call, rejected: bool) -> journal::ToolIntent {
-    let (kind, path, offset, limit) = match &call.arguments {
-        tools::Arguments::MemoryCreateNote { .. } => (13, String::new(), 0, 0),
-        tools::Arguments::ReadFile {
-            path,
-            offset,
-            limit,
-        } => (1, path.clone(), *offset, *limit),
-        tools::Arguments::ListDirectory { path } => (2, path.clone(), 0, 0),
-        // exec_cmd is always kind 22 (J1). Kind 14 replay rejects tool kind
-        // 16, so a misrouted call fails its append instead of being journaled.
-        tools::Arguments::ExecCmd { .. } => (16, String::new(), 0, 0),
-        tools::Arguments::ObserveStatus => (3, String::new(), 0, 0),
-        tools::Arguments::ListTools => (14, String::new(), 0, 0),
-        tools::Arguments::ReadAudit { limit } => (15, String::new(), 0, *limit),
-        tools::Arguments::MemoryListNotes { after, limit } => {
-            (6, after.clone().unwrap_or_default(), 0, *limit)
-        }
-        tools::Arguments::MemoryGetNote {
-            version,
-            offset,
-            limit,
-        } => (7, version.clone(), *offset, *limit),
-        tools::Arguments::MemoryNoteSources { version } => (8, version.clone(), 0, 0),
-    };
-    journal::ToolIntent {
-        operation: call.operation,
-        generation: call.generation,
-        ordinal: call.ordinal,
-        kind: if rejected {
-            match kind {
-                1 => 4,
-                2 => 5,
-                6 => 9,
-                7 => 10,
-                8 => 11,
-                _ => kind,
-            }
-        } else {
-            kind
-        },
-        path,
-        offset,
-        limit,
-    }
+    hash.update(value.name_bytes.unwrap_or(0).to_be_bytes());
+    hash.update(value.arguments_bytes.unwrap_or(0).to_be_bytes());
+    hash.update(value.source.unwrap_or(0).to_be_bytes());
+    hash.finalize().into()
 }
 fn tool_result(
     call: &tools::Call,
@@ -396,20 +299,43 @@ fn tool_wire_result(value: &journal::ToolResult) -> mp::ToolResult {
     }
 }
 
+/// One call from its decision to its completion. The kind 14 record is
+/// decided before it is appended; a call that does not run is complete when
+/// that record commits (tool-call-records.md, record lifecycle).
 struct LiveTool {
+    ordinal: u32,
+    /// Keyed digest of the received call (TCR-D7); never leaves memory.
+    digest: [u8; 32],
+    /// The kind 14 record to append: the only copy of the redacted arguments.
+    record: journal::ToolCall,
+    /// The typed call of a `run` decision; for exec_cmd it holds the SL3
+    /// rewrite, so the raw command is never retained (G8).
+    call: Option<tools::Call>,
     create: Option<memory_create::Mutation>,
-    /// The exec_cmd call (J1): kind 22, secret variables, kind 23 and capture.
+    /// A `run` exec_cmd call (J1): secret variables, kind 23 and capture.
     exec_cmd: Option<Box<exec_cmd_call::ExecCmdLive>>,
-    /// Keyed digest of the exec_cmd call's secret values for duplicate
-    /// detection; never leaves memory (G8, SO2).
-    secret_digest: Option<[u8; 32]>,
-    rejected: bool,
-    /// The rewritten call for exec_cmd; the raw command is never retained.
-    call: tools::Call,
     memory_ticket: Option<writer::Ticket>,
     intent_committed: bool,
     dispatched: bool,
     result: Option<journal::ToolResult>,
+}
+impl LiveTool {
+    /// TCR-D8: a call not yet appended when cancel or turn end occurs is
+    /// recorded as `cancelled`. Its admission returns; nothing dispatches.
+    fn cancel_before_commit(&mut self) {
+        let record = &mut self.record;
+        record.decision = journal::ToolDecision::Cancelled;
+        record.fault = None;
+        record.busy = None;
+        record.refusal = None;
+        record.command_cut = false;
+        if let Some(exec_cmd) = &mut self.exec_cmd {
+            exec_cmd.release_admission();
+        }
+        self.exec_cmd = None;
+        self.create = None;
+        self.call = None;
+    }
 }
 /// Current-owner measurements. Restart leaves these absent rather than inventing history.
 #[derive(Clone)]
@@ -421,8 +347,8 @@ struct TurnMeasurements {
     output: Option<u64>,
     cached: Option<u64>,
     complete: bool,
-    tool_start: [Option<Instant>; 8],
-    tool_ms: [Option<u64>; 8],
+    tool_start: [Option<Instant>; 9],
+    tool_ms: [Option<u64>; 9],
 }
 impl Default for TurnMeasurements {
     fn default() -> Self {
@@ -434,8 +360,8 @@ impl Default for TurnMeasurements {
             output: None,
             cached: None,
             complete: true,
-            tool_start: [None; 8],
-            tool_ms: [None; 8],
+            tool_start: [None; 9],
+            tool_ms: [None; 9],
         }
     }
 }
@@ -501,8 +427,9 @@ struct Active {
     tool_budget: tools::Budget,
     tool_executor: tools::Executor,
     exec_cmd_worker: crate::exec_cmd_worker::Worker,
-    tool_cache: Vec<(tools::Call, Option<[u8; 32]>, mp::ToolResult)>,
-    /// Per-turn key for the exec_cmd duplicate digest; dropped at turn end.
+    /// Completed calls by ordinal: the received digest and the result sent.
+    tool_cache: Vec<(u32, [u8; 32], mp::ToolResult)>,
+    /// Per-turn key for the received-call digest; dropped at turn end.
     secret_key: zeroize::Zeroizing<[u8; 32]>,
 }
 impl Active {
@@ -724,8 +651,12 @@ impl Owner {
         let Some(tool) = &mut active.tool else {
             return;
         };
-        if !tool.call.arguments.is_memory()
-            || tool.call.arguments.is_memory_create()
+        // Only a committed `run` call has a typed call to capture.
+        let Some(call) = tool.call.clone() else {
+            return;
+        };
+        if !call.arguments.is_memory()
+            || call.arguments.is_memory_create()
             || !tool.intent_committed
             || !tool.dispatched
         {
@@ -734,7 +665,7 @@ impl Owner {
         // No time bound: the read ends on its reply or the turn's cancel.
         if active.cancel.is_some() || active.terminal.is_some() {
             tool.result = Some(tool_result(
-                &tool.call,
+                &call,
                 Err(tools::ExecutionError::Rejected(tools::Rejection::Cancelled)),
             ));
         }
@@ -744,7 +675,7 @@ impl Owner {
         {
             let mut result = match reply {
                 Ok(reply) => memory_tools::encode(
-                    &tool.call,
+                    &call,
                     reply
                         .memory_result
                         .unwrap_or(Err(asura_storage::memory::Error::Unavailable)),
@@ -753,24 +684,24 @@ impl Owner {
                     if error == writer::Error::RepairRequired {
                         self.unavailable = Some(storage_error(error));
                     }
-                    memory_tools::writer_error(&tool.call, error)
+                    memory_tools::writer_error(&call, error)
                 }
             };
             if !active.tools_enabled
                 || tools::validate_authority(
-                    &tool.call,
+                    &call,
                     &tool_grant(&active.turn, active.foreground_user),
                     &tools::Destination::Local,
                 )
                 .is_err()
             {
                 result = tool_result(
-                    &tool.call,
+                    &call,
                     Err(tools::ExecutionError::Rejected(tools::Rejection::Denied)),
                 );
             } else if result.text.len() > active.tool_budget.result_capacity() {
                 result = tool_result(
-                    &tool.call,
+                    &call,
                     Err(tools::ExecutionError::Rejected(tools::Rejection::Limit)),
                 );
             }
@@ -791,7 +722,11 @@ impl Owner {
             return;
         };
         let Some(tool) = &mut active.tool else { return };
-        let tools::Arguments::ReadAudit { limit } = tool.call.arguments else {
+        // Only a committed `run` call has a typed call to capture.
+        let Some(call) = tool.call.clone() else {
+            return;
+        };
+        let tools::Arguments::ReadAudit { limit } = call.arguments else {
             return;
         };
         if !tool.intent_committed || !tool.dispatched || tool.result.is_some() {
@@ -803,14 +738,14 @@ impl Owner {
             Some(tools::Rejection::Denied)
         } else {
             tools::validate(
-                &tool.call,
+                &call,
                 &tool_grant(&active.turn, active.foreground_user),
                 &tools::Destination::Local,
             )
             .err()
         };
         tool.result = Some(if let Some(reason) = rejection {
-            tool_result(&tool.call, Err(tools::ExecutionError::Rejected(reason)))
+            tool_result(&call, Err(tools::ExecutionError::Rejected(reason)))
         } else {
             let (_, text) = audit_tools::read(
                 &self.audit_records,
@@ -821,14 +756,14 @@ impl Owner {
             );
             if text.len() > active.tool_budget.result_capacity() {
                 tool_result(
-                    &tool.call,
+                    &call,
                     Err(tools::ExecutionError::Rejected(tools::Rejection::Limit)),
                 )
             } else {
                 journal::ToolResult {
-                    operation: tool.call.operation,
-                    generation: tool.call.generation,
-                    ordinal: tool.call.ordinal,
+                    operation: call.operation,
+                    generation: call.generation,
+                    ordinal: call.ordinal,
                     status: 1,
                     text,
                     next_offset: None,
@@ -844,7 +779,11 @@ impl Owner {
         let Some(tool) = &mut active.tool else {
             return;
         };
-        if !matches!(tool.call.arguments, tools::Arguments::ListTools)
+        // Only a committed `run` call has a typed call to capture.
+        let Some(call) = tool.call.clone() else {
+            return;
+        };
+        if !matches!(call.arguments, tools::Arguments::ListTools)
             || !tool.intent_committed
             || !tool.dispatched
             || tool.result.is_some()
@@ -857,7 +796,7 @@ impl Owner {
             Some(tools::Rejection::Denied)
         } else {
             tools::validate(
-                &tool.call,
+                &call,
                 &tool_grant(&active.turn, active.foreground_user),
                 &tools::Destination::Local,
             )
@@ -874,15 +813,15 @@ impl Owner {
             });
         tool.result = Some(match value {
             Ok(text) => journal::ToolResult {
-                operation: tool.call.operation,
-                generation: tool.call.generation,
-                ordinal: tool.call.ordinal,
+                operation: call.operation,
+                generation: call.generation,
+                ordinal: call.ordinal,
                 status: 1,
                 text,
                 next_offset: None,
                 truncated: false,
             },
-            Err(error) => tool_result(&tool.call, Err(tools::ExecutionError::Rejected(error))),
+            Err(error) => tool_result(&call, Err(tools::ExecutionError::Rejected(error))),
         });
     }
     fn capture_sensor_tool(&mut self, now: Instant) {
@@ -892,10 +831,14 @@ impl Owner {
         let Some(tool) = &mut active.tool else {
             return;
         };
+        // Only a committed `run` call has a typed call to capture.
+        let Some(call) = tool.call.clone() else {
+            return;
+        };
         if !tool.intent_committed
             || !tool.dispatched
             || tool.result.is_some()
-            || !matches!(tool.call.arguments, tools::Arguments::ObserveStatus)
+            || !matches!(call.arguments, tools::Arguments::ObserveStatus)
         {
             return;
         }
@@ -908,7 +851,7 @@ impl Owner {
         };
         if let Some(reason) = rejection {
             tool.result = Some(tool_result(
-                &tool.call,
+                &call,
                 Err(tools::ExecutionError::Rejected(reason)),
             ));
             return;
@@ -918,9 +861,9 @@ impl Owner {
         };
         match owner.capture_status(
             active.turn.project,
-            tool.call.operation,
-            tool.call.generation,
-            tool.call.ordinal,
+            call.operation,
+            call.generation,
+            call.ordinal,
             now,
             sensor_wall_ms(),
         ) {
@@ -946,16 +889,16 @@ impl Owner {
                 };
                 let project = hex(capture.observation.project);
                 let source_epoch = hex(capture.observation.source_epoch);
-                let operation = hex(tool.call.operation);
+                let operation = hex(call.operation);
                 let text = format!(
                     "{{\"observation_id\":\"{identity}\",\"project\":\"{project}\",\"source_epoch\":\"{source_epoch}\",\"operation\":\"{operation}\",\"generation\":{},\"ordinal\":{},\"lifecycle\":{lifecycle},\"installation\":{installation},\"reason\":{reason},\"observed_ms\":{},\"expires_ms\":{},\"background_admission\":\"standing_policy_required\"}}",
-                    tool.call.generation,
-                    tool.call.ordinal,
+                    call.generation,
+                    call.ordinal,
                     capture.observation.observed_ms,
                     capture.observation.expires_ms
                 );
                 let mut result = tool_result(
-                    &tool.call,
+                    &call,
                     Err(tools::ExecutionError::Rejected(tools::Rejection::Busy)),
                 );
                 result.status = if text.len() <= active.tool_budget.result_capacity() {
@@ -971,7 +914,7 @@ impl Owner {
             Ok(_) | Err(sensors::Error::Busy | sensors::Error::Unavailable) => {}
             Err(_) => {
                 tool.result = Some(tool_result(
-                    &tool.call,
+                    &call,
                     Err(tools::ExecutionError::Rejected(tools::Rejection::Stale)),
                 ));
             }
@@ -1221,10 +1164,13 @@ impl Owner {
                         .as_ref()
                         .and_then(|a| a.tool.as_ref())
                         .is_some_and(|tool| {
-                            matches!(
-                                tool.call.arguments,
-                                tools::Arguments::ListTools | tools::Arguments::ReadAudit { .. }
-                            ) && tool.result.is_some()
+                            tool.call.as_ref().is_some_and(|call| {
+                                matches!(
+                                    call.arguments,
+                                    tools::Arguments::ListTools
+                                        | tools::Arguments::ReadAudit { .. }
+                                )
+                            }) && tool.result.is_some()
                         }))
                 .then_some(now),
             )
@@ -2193,8 +2139,52 @@ impl Owner {
                 let active = self.active.as_mut().expect("active tool intent");
                 let tool = active.tool.as_mut().expect("pending tool");
                 tool.intent_committed = true;
-                active.measurements.tool_start[tool.call.ordinal as usize - 1] = Some(now);
+                active.measurements.tool_start[tool.ordinal as usize - 1] = Some(now);
                 active.cursor += 1;
+                // A call that does not run is complete when its kind 14
+                // commits: its result is rendered from the codes (TCR-R5).
+                let record = &tool.record;
+                if let Some((status, text)) = tools::not_run_result(
+                    record.decision,
+                    record.fault,
+                    record.busy,
+                    record.refusal,
+                ) {
+                    let tool = active.tool.take().expect("pending tool");
+                    let index = tool.ordinal as usize - 1;
+                    active.measurements.tool_ms[index] = Some(0);
+                    if let (Some(emitter), Some(operation)) =
+                        (&self.audit_emitter, tool.record.tool_operation)
+                    {
+                        let _ = emitter.try_emit(audit_tools::tool_finished(
+                            &active.turn,
+                            tool.ordinal,
+                            operation,
+                            status,
+                        ));
+                    }
+                    let wire = mp::ToolResult {
+                        ordinal: Some(tool.ordinal),
+                        status: Some(i32::from(status)),
+                        text: Some(text),
+                        next_offset: None,
+                        truncated: Some(false),
+                    };
+                    active
+                        .tool_cache
+                        .push((tool.ordinal, tool.digest, wire.clone()));
+                    if self.closing {
+                        active.revoke_create();
+                        active.cancel.get_or_insert(journal::Cause::ServiceShutdown);
+                    }
+                    // Once cancel or turn end is set no result is sent (TCR-D8).
+                    if active.cancel.is_none()
+                        && active.terminal.is_none()
+                        && let Err(message) = active.model.tool_result(wire)
+                    {
+                        Self::failed(active, message, now);
+                    }
+                }
             }
             Job::CaptureSettled => {
                 let active = self.active.as_mut().expect("active capture settlement");
@@ -2205,10 +2195,10 @@ impl Owner {
                 let sequence = self.replay.as_ref().map_or(0, |r| r.sequence);
                 if let Some(store) = &exec_cmd.store {
                     if settled.state == journal::CaptureState::NotStarted {
-                        store.release(exec_cmd.intent.job);
+                        store.release(exec_cmd.run.job);
                     } else {
                         store.settle(
-                            exec_cmd.intent.job,
+                            exec_cmd.run.job,
                             settled.state,
                             [
                                 (settled.stdout.stored_bytes, settled.stdout.digest),
@@ -2231,41 +2221,49 @@ impl Owner {
                 let active = self.active.as_mut().expect("active tool result");
                 let tool = active.tool.take().expect("pending tool");
                 let result = tool.result.expect("settled tool result");
-                let index = tool.call.ordinal as usize - 1;
+                let call = tool.call.expect("run call");
+                let index = call.ordinal as usize - 1;
                 active.measurements.tool_ms[index] =
                     active.measurements.tool_start[index].map(|start| {
                         now.saturating_duration_since(start)
                             .as_millis()
                             .min(u64::MAX as u128) as u64
                     });
-                if let Some(emitter) = &self.audit_emitter {
+                if let (Some(emitter), Some(operation)) =
+                    (&self.audit_emitter, tool.record.tool_operation)
+                {
                     let _ = emitter.try_emit(audit_tools::tool_finished(
                         &active.turn,
-                        &tool.call,
-                        &result,
+                        call.ordinal,
+                        operation,
+                        result.status,
                     ));
                 }
-                if active
-                    .tool_budget
-                    .settle(&tool.call, result.text.len())
-                    .is_err()
+                let mut wire = tool_wire_result(&result);
+                // TCR-D1: a created note's text is rendered from its derived
+                // identity; kind 15 stores none.
+                if let Some(create) = &tool.create
+                    && result.status == 1
                 {
+                    wire.text = Some(create.intent.success_text());
+                }
+                let sent = wire.text.as_deref().map_or(0, str::len);
+                if active.tool_budget.settle(sent).is_err() {
                     Self::failed(active, "model_protocol_fault", now);
                 } else {
-                    let wire = tool_wire_result(&result);
                     active
                         .tool_cache
-                        .push((tool.call.clone(), tool.secret_digest, wire.clone()));
+                        .push((call.ordinal, tool.digest, wire.clone()));
                     active.cursor += 1;
                     if self.closing {
                         // Shutdown ends the turn through its cancel path.
                         active.revoke_create();
                         active.cancel.get_or_insert(journal::Cause::ServiceShutdown);
                     }
-                    if tool.call.arguments.is_memory()
+                    if call.arguments.is_memory()
                         && (!active.tools_enabled
                             || tools::validate_authority(
-                                &tool.call,
+                                &call,
                                 &tool_grant(&active.turn, active.foreground_user),
                                 &tools::Destination::Local,
                             )
@@ -2277,7 +2275,7 @@ impl Owner {
                         && active.terminal.is_none()
                         && active.tools_enabled
                         && tools::validate_authority(
-                            &tool.call,
+                            &call,
                             &tool_grant(&active.turn, active.foreground_user),
                             &tools::Destination::Local,
                         )
@@ -2541,126 +2539,285 @@ impl Owner {
             text: active.snapshot.clone(),
         });
     }
-    /// One proposed tool call. An exec_cmd call is rewritten before any
-    /// comparison or record (SL3); the raw command is never retained (G8).
-    /// Refusal and `busy` are decided here, before kind 22.
+    /// One `ToolCall` from the helper (tool-call-records.md). Helper faults
+    /// (TCR-D7) fail the turn without a record; every other call is decided
+    /// here and becomes exactly one kind 14 record before any effect.
     fn tool_call(
         active: &mut Active,
-        mut call: tools::Call,
+        value: mp::ToolCall,
         now: Instant,
         payloads: &crate::payload_owner::Payloads,
-        installation: Option<journal::Id>,
+        replay: Option<&journal::Replay>,
     ) {
-        let exec_cmd = matches!(call.arguments, tools::Arguments::ExecCmd { .. });
-        let mut rejected = call.arguments.validate() == Err(tools::Rejection::InvalidArguments);
-        if exec_cmd && rejected {
-            // The control codec rejects these first; kind 22 cannot hold them.
-            Self::failed(active, "model_protocol_fault", now);
-            return;
-        }
-        let prepared = exec_cmd.then(|| exec_cmd_call::prepare(&mut call, &active.secret_key));
-        let digest = prepared.as_ref().map(|(_, digest)| *digest);
-        if let Some((prior, prior_digest, result)) = active
-            .tool_cache
-            .iter()
-            .find(|(prior, _, _)| prior.ordinal == call.ordinal)
-        {
-            if validate_cached_tool(prior, &call, &active.turn, active.foreground_user).is_err()
-                || *prior_digest != digest
-                || active.model.tool_result(result.clone()).is_err()
-            {
+        let ordinal = value.ordinal.unwrap_or(0);
+        let digest = received_digest(&active.secret_key, &value);
+        // A resend at a used ordinal: equal gets the same result, a different
+        // call is a helper fault.
+        if let Some((_, prior, wire)) = active.tool_cache.iter().find(|(o, _, _)| *o == ordinal) {
+            let resent = *prior == digest
+                && (active.cancel.is_some()
+                    || active.terminal.is_some()
+                    || active.model.tool_result(wire.clone()).is_ok());
+            if !resent {
                 Self::failed(active, "model_protocol_fault", now);
             }
             return;
         }
         if let Some(pending) = &active.tool {
-            if pending.call != call || pending.secret_digest != digest {
+            if pending.ordinal != ordinal || pending.digest != digest {
                 Self::failed(active, "model_protocol_fault", now);
             }
             return;
         }
-        let grant = tool_grant(&active.turn, active.foreground_user);
-        let reserved = if rejected {
-            active
-                .tool_budget
-                .reserve_rejected(call.clone(), &grant, &tools::Destination::Local)
-        } else {
-            active
-                .tool_budget
-                .reserve(call.clone(), &grant, &tools::Destination::Local)
-        };
-        if reserved.is_err() {
+        if ordinal != active.tool_budget.next_ordinal() {
             Self::failed(active, "model_protocol_fault", now);
             return;
         }
-        let mut result = rejected.then(|| {
-            tool_result(
-                &call,
-                Err(tools::ExecutionError::Rejected(
-                    tools::Rejection::InvalidArguments,
-                )),
-            )
-        });
-        let mut live = None;
-        if let Some((prepared, _)) = prepared {
-            let Some(installation) = installation else {
-                Self::failed(active, "model_protocol_fault", now);
-                return;
-            };
-            let job = journal::exec_cmd_job_id(call.operation, call.generation, call.ordinal);
-            let admission = match &prepared {
-                exec_cmd_call::Prepared::Refused { .. } => Err(None),
-                exec_cmd_call::Prepared::Rewritten(_) => payloads
-                    .admission(active.exec_cmd_worker.capture_paused())
-                    .and_then(|store| {
-                        store
-                            .admit(
-                                installation,
-                                call.operation,
-                                call.generation,
-                                call.ordinal,
-                                job,
-                            )
-                            .map(|victims| (store, victims))
-                            .map_err(|_| journal::ExecCmdBusyReason::Quota)
-                    })
-                    .map_err(Some),
-            };
-            let busy = admission.as_ref().err().copied().flatten();
-            let intent = exec_cmd_call::intent(&call, installation, &prepared, busy);
-            if let Some(precomputed) = exec_cmd_call::precomputed_result(&call, &prepared, busy) {
-                result = Some(precomputed);
-                rejected = true;
-            }
-            let (store, victims) = match admission {
-                Ok((store, victims)) => (Some(store), victims),
-                Err(_) => (None, Vec::new()),
-            };
-            let secrets = match prepared {
-                exec_cmd_call::Prepared::Rewritten(variables) if store.is_some() => variables,
-                _ => Vec::new(),
-            };
-            live = Some(Box::new(exec_cmd_call::ExecCmdLive {
-                intent,
-                secrets,
-                victims,
-                store,
-                settled: None,
-                settled_committed: false,
-                capture: None,
-            }));
+        let rules = asura_platform::secrets::detection();
+        let tool = Self::decide(active, &value, digest, payloads, replay, rules);
+        if ordinal <= tools::MAX_CALLS && active.tool_budget.record(ordinal).is_err() {
+            Self::failed(active, "model_protocol_fault", now);
+            return;
         }
-        active.tool = Some(LiveTool {
+        active.tool = Some(tool);
+    }
+    /// Redacts, parses and decides one received call (decision table,
+    /// TCR-D8..D12). Only a `run` decision carries a typed call. The raw name
+    /// and text are borrowed from the frame and dropped with it; the redacted
+    /// copy in the record is the only one kept.
+    fn decide(
+        active: &Active,
+        value: &mp::ToolCall,
+        digest: [u8; 32],
+        payloads: &crate::payload_owner::Payloads,
+        replay: Option<&journal::Replay>,
+        rules: Result<
+            &'static asura_platform::secrets::RuleSet,
+            asura_platform::secrets::SelfCheckError,
+        >,
+    ) -> LiveTool {
+        use asura_platform::secrets::{self, ArgumentsInput, ExecCmdCommand};
+        use journal::{ArgumentForm, NotRetainedReason, ToolDecision as D, ToolFault as F};
+        let ordinal = value.ordinal.unwrap_or(0);
+        let name = value.name.as_deref();
+        let text = value.arguments.as_deref();
+        let mut record = journal::ToolCall {
+            operation: active.turn.operation,
+            generation: active.turn.generation,
+            ordinal,
+            source: if value.source == Some(2) {
+                journal::ToolCallSource::ProviderJson
+            } else {
+                journal::ToolCallSource::GeneratedContent
+            },
+            name: String::new(),
+            name_bytes: name.map_or(value.name_bytes.unwrap_or(0), |n| n.len() as u32),
+            tool_operation: None,
+            decision: D::Refused,
+            fault: None,
+            busy: None,
+            form: ArgumentForm::NotRetained(NotRetainedReason::DetectionUnavailable),
+            arguments_bytes: text.map_or(value.arguments_bytes.unwrap_or(0), |t| t.len() as u32),
+            arguments: String::new(),
+            number_kinds: Vec::new(),
+            unnumbered: 0,
+            rule_set_revision: 0,
+            rule_set_digest: [0; 32],
+            command_cut: false,
+            refusal: None,
+        };
+        let mut tool = LiveTool {
+            ordinal,
+            digest,
+            record: record.clone(),
+            call: None,
             create: None,
-            exec_cmd: live,
-            secret_digest: digest,
+            exec_cmd: None,
             memory_ticket: None,
-            rejected,
-            call,
             intent_committed: false,
             dispatched: false,
-            result,
-        });
+            result: None,
+        };
+        let cancelled = active.cancel.is_some() || active.terminal.is_some();
+        // Fail closed: without a rule set nothing is retained (TCR-R3).
+        let Ok(rules) = rules else {
+            record.decision = if cancelled {
+                D::Cancelled
+            } else if ordinal > tools::MAX_CALLS {
+                D::Limit
+            } else {
+                D::Refused
+            };
+            tool.record = record;
+            return tool;
+        };
+        record.rule_set_revision = rules.revision();
+        record.rule_set_digest = rules.digest();
+        let parsed = tools::parse_call(name, text);
+        // SL3: the exec_cmd command is rewritten before the record.
+        let rewrite = match &parsed.arguments {
+            Ok(tools::Arguments::ExecCmd { command, cwd }) => {
+                Some(secrets::rewrite_exec_cmd_call(command, cwd))
+            }
+            _ => None,
+        };
+        let redacted = secrets::redact_arguments(
+            rules,
+            &ArgumentsInput {
+                name,
+                arguments: text,
+                exec_cmd: rewrite.as_ref().map(|rewrite| match rewrite {
+                    Ok(rewrite) => ExecCmdCommand::Rewritten {
+                        command: &rewrite.command,
+                        variables: &rewrite.variables,
+                    },
+                    Err(_) => ExecCmdCommand::Refused,
+                }),
+                exec_cmd_name: name == Some(journal::TOOL_NAMES[3]),
+            },
+        );
+        let name_retained = redacted.name.is_some();
+        record.name = redacted.name.unwrap_or_default();
+        record.form = match redacted.form {
+            secrets::ArgumentForm::Verbatim => ArgumentForm::Verbatim,
+            secrets::ArgumentForm::Canonical => ArgumentForm::Canonical,
+            secrets::ArgumentForm::Unparsed => ArgumentForm::Unparsed,
+            secrets::ArgumentForm::NotRetained(reason) => ArgumentForm::NotRetained(match reason {
+                secrets::NotRetained::Oversized => NotRetainedReason::Oversized,
+                secrets::NotRetained::DetectionUnavailable => {
+                    NotRetainedReason::DetectionUnavailable
+                }
+                secrets::NotRetained::UnverifiableEscape => NotRetainedReason::UnverifiableEscape,
+            }),
+        };
+        record.arguments = redacted.text;
+        record.number_kinds = redacted.number_kinds;
+        record.unnumbered = redacted.unnumbered;
+        let command_cut = redacted.command_cut;
+        // Faults the stored form adds: a name or text over its stored limit.
+        let mut fault = parsed.arguments.as_ref().err().copied();
+        let mut add = |f: F| {
+            if fault.is_none_or(|current| f < current) {
+                fault = Some(f);
+            }
+        };
+        if !name_retained {
+            add(F::NameOverLimit);
+        }
+        if record.form == ArgumentForm::NotRetained(NotRetainedReason::Oversized) {
+            add(F::ArgumentsOverLimit);
+        }
+        if name_retained
+            && !matches!(
+                record.form,
+                ArgumentForm::Unparsed
+                    | ArgumentForm::NotRetained(NotRetainedReason::UnverifiableEscape)
+            )
+            && text.is_some()
+        {
+            record.tool_operation = parsed.operation;
+        }
+        // The decision table, in order.
+        if cancelled {
+            record.decision = D::Cancelled;
+        } else if ordinal > tools::MAX_CALLS {
+            record.decision = D::Limit;
+        } else if let Some(fault) = fault {
+            record.decision = if fault == F::UnregisteredName {
+                D::UnknownTool
+            } else {
+                D::InvalidArguments
+            };
+            record.fault = Some(fault);
+        } else if let Ok(arguments) = parsed.arguments {
+            let mut call = tools::Call {
+                operation: active.turn.operation,
+                generation: active.turn.generation,
+                ordinal,
+                arguments,
+            };
+            let grant = tool_grant(&active.turn, active.foreground_user);
+            let capacity = active.tool_budget.result_capacity();
+            record.decision = if !active.tools_enabled
+                || tools::validate_authority(&call, &grant, &tools::Destination::Local).is_err()
+            {
+                D::Denied
+            } else if capacity == 0 || (call.arguments.is_memory_create() && capacity < 256) {
+                D::Limit
+            } else {
+                D::Run
+            };
+            if record.decision == D::Run && call.arguments.is_memory_create() {
+                match replay
+                    .ok_or(tools::Rejection::Denied)
+                    .and_then(|r| memory_create::prepare(r, &call, active.turn.project))
+                {
+                    Ok(create) => tool.create = Some(create),
+                    Err(_) => record.decision = D::Denied,
+                }
+            }
+            if record.decision == D::Run
+                && let Some(rewrite) = rewrite
+            {
+                match rewrite {
+                    Err(refusal) => {
+                        record.decision = D::Refused;
+                        record.refusal = Some(exec_cmd_call::refusal(&refusal));
+                        record.command_cut = command_cut;
+                    }
+                    Ok(rewrite) => {
+                        if let tools::Arguments::ExecCmd { command, .. } = &mut call.arguments {
+                            *command = rewrite.command;
+                        }
+                        let run = replay.and_then(|r| {
+                            crate::exec_cmd_worker::ExecCmdRun::derive(r.installation_id, &call)
+                        });
+                        let admission = run.as_ref().ok_or(None).and_then(|run| {
+                            payloads
+                                .admission(active.exec_cmd_worker.capture_paused())
+                                .and_then(|store| {
+                                    store
+                                        .admit(
+                                            replay.map_or([0; 16], |r| r.installation_id),
+                                            call.operation,
+                                            call.generation,
+                                            call.ordinal,
+                                            run.job,
+                                        )
+                                        .map(|victims| (store, victims))
+                                        .map_err(|_| journal::ExecCmdBusyReason::Quota)
+                                })
+                                .map_err(Some)
+                        });
+                        match (run, admission) {
+                            (Some(run), Ok((store, victims))) => {
+                                tool.exec_cmd = Some(Box::new(exec_cmd_call::ExecCmdLive {
+                                    run,
+                                    secrets: rewrite.variables,
+                                    victims,
+                                    store: Some(store),
+                                    settled: None,
+                                    settled_committed: false,
+                                    capture: None,
+                                }));
+                            }
+                            (_, Err(Some(reason))) => {
+                                record.decision = D::Busy;
+                                record.busy = Some(reason);
+                            }
+                            _ => record.decision = D::Denied,
+                        }
+                    }
+                }
+            }
+            if record.decision == D::Run {
+                tool.call = Some(call);
+            } else {
+                tool.create = None;
+            }
+        }
+        tool.record = record;
+        tool
     }
     /// A committed Hold of the input under preparation (action 4) cancels its
     /// helper and prevents TurnAccepted. Nothing about the turn is journaled;
@@ -2961,19 +3118,13 @@ impl Owner {
                     }
                 }
                 ModelEvent::ToolCall(call) => {
+                    // Before StartAuthorized commits or with tools disabled a
+                    // call is a helper fault, not a proposal (TCR-D7). After
+                    // cancel or turn end it is still recorded, as `cancelled`.
                     if !active.tools_enabled || !active.start_committed {
                         Self::failed(active, "model_protocol_fault", now);
-                    } else if active.cancel.is_none() && active.terminal.is_none() {
-                        match proposed_tool(&active.turn, call) {
-                            Ok(call) => Self::tool_call(
-                                active,
-                                call,
-                                now,
-                                &self.payloads,
-                                self.replay.as_ref().map(|r| r.installation_id),
-                            ),
-                            Err(_) => Self::failed(active, "model_protocol_fault", now),
-                        }
+                    } else {
+                        Self::tool_call(active, call, now, &self.payloads, self.replay.as_deref());
                     }
                 }
                 ModelEvent::Terminal {
@@ -2995,8 +3146,9 @@ impl Owner {
         if let Some(active) = &mut self.active
             && let Some(outcome) = active.tool_executor.poll()
             && let Some(tool) = &mut active.tool
+            && let Some(call) = &tool.call
         {
-            let mut result = tool_result(&tool.call, outcome);
+            let mut result = tool_result(call, outcome);
             if result.text.len() > active.tool_budget.result_capacity() {
                 result.status = 7;
                 result.text.clear();
@@ -3234,73 +3386,38 @@ impl Owner {
         }
         if let Some(tool) = &mut active.tool {
             if !tool.intent_committed {
-                if active.cancel.is_some() || active.terminal.is_some() {
-                    if let Some(exec_cmd) = &mut tool.exec_cmd {
-                        exec_cmd.release_admission();
-                    }
-                    active.tool = None;
-                } else {
-                    let record = if tool.call.arguments.is_memory_create() && !tool.rejected {
-                        if !active.foreground_user
-                            || !active.tools_enabled
-                            || active.tool_budget.result_capacity() < 256
-                        {
-                            Self::failed(active, "model_protocol_fault", now);
-                            return;
-                        }
-                        match self
-                            .replay
-                            .as_ref()
-                            .ok_or(tools::Rejection::Denied)
-                            .and_then(|r| {
-                                memory_create::prepare(r, &tool.call, active.turn.project)
-                            }) {
-                            Ok(create) => {
-                                let record =
-                                    journal::Record::MemoryCreateIntent(create.intent.clone());
-                                tool.create = Some(create);
-                                record
-                            }
-                            Err(_) => {
-                                Self::failed(active, "model_protocol_fault", now);
-                                return;
-                            }
-                        }
-                    } else if let Some(exec_cmd) = &tool.exec_cmd {
-                        // Kind 22 for every new exec_cmd call; never kind 14 (J1).
-                        journal::Record::ExecCmdIntent(Box::new(exec_cmd.intent.clone()))
-                    } else {
-                        journal::Record::ToolIntent(tool_intent(&tool.call, tool.rejected))
-                    };
-                    if let Err(e) = self.append(record, Job::ToolIntent, None) {
-                        self.unavailable = Some(storage_error(e));
-                    }
-                    return;
+                // Kind 7 (when the cancel must be recorded) committed above;
+                // now kind 14 `cancelled`, then the terminal (TCR-D8).
+                if (active.cancel.is_some() || active.terminal.is_some())
+                    && tool.record.decision != journal::ToolDecision::Cancelled
+                {
+                    tool.cancel_before_commit();
                 }
+                let record = journal::Record::ToolCall(Box::new(tool.record.clone()));
+                if let Err(e) = self.append(record, Job::ToolIntent, None) {
+                    self.unavailable = Some(storage_error(e));
+                }
+                return;
             } else {
+                // Only a `run` call remains after its kind 14 commits.
+                let Some(call) = tool.call.clone() else {
+                    return;
+                };
                 if !tool.dispatched {
                     tool.dispatched = true;
-                    let exec_cmd_precomputed = tool
-                        .exec_cmd
-                        .as_ref()
-                        .is_some_and(|exec_cmd| !exec_cmd.admitted());
-                    if (active.cancel.is_some() || active.terminal.is_some())
-                        && !exec_cmd_precomputed
-                    {
+                    if active.cancel.is_some() || active.terminal.is_some() {
                         tool.result = Some(tool_result(
-                            &tool.call,
+                            &call,
                             Err(tools::ExecutionError::Rejected(tools::Rejection::Cancelled)),
                         ));
-                        // Turn cancelled after kind 22, before spawn (J1).
+                        // Turn cancelled after kind 14, before spawn (J1).
                         if let Some(exec_cmd) = &mut tool.exec_cmd {
                             exec_cmd.release_admission();
-                            exec_cmd.settled = Some(exec_cmd_call::not_started(&exec_cmd.intent));
+                            exec_cmd.settled = Some(exec_cmd_call::not_started(&exec_cmd.run));
                         }
-                    } else if tool.rejected {
-                        // The precomputed rejection is committed without any host dispatch.
                     } else if let Some(exec_cmd) = &mut tool.exec_cmd {
                         let outcome = tools::validate(
-                            &tool.call,
+                            &call,
                             &tool_grant(&active.turn, active.foreground_user),
                             &tools::Destination::Local,
                         )
@@ -3334,12 +3451,12 @@ impl Owner {
                                         inode: project.inode,
                                         boundary: self.runtime.state_boundary(),
                                     },
-                                    call: tool.call.clone(),
-                                    intent: exec_cmd.intent.clone(),
+                                    call: call.clone(),
+                                    intent: exec_cmd.run.clone(),
                                     secrets: std::mem::take(&mut exec_cmd.secrets),
                                     capture: crate::capture_worker::Start {
                                         store,
-                                        call: exec_cmd.intent.job,
+                                        call: exec_cmd.run.job,
                                         victims: std::mem::take(&mut exec_cmd.victims),
                                         redaction,
                                         wake,
@@ -3349,24 +3466,24 @@ impl Owner {
                         });
                         if let Err(error) = outcome {
                             // Never started: `not_started` before the result.
-                            tool.result = Some(tool_result(&tool.call, Err(error)));
+                            tool.result = Some(tool_result(&call, Err(error)));
                             exec_cmd.release_admission();
-                            exec_cmd.settled = Some(exec_cmd_call::not_started(&exec_cmd.intent));
+                            exec_cmd.settled = Some(exec_cmd_call::not_started(&exec_cmd.run));
                         }
-                    } else if tool.call.arguments.is_memory_create() {
+                    } else if call.arguments.is_memory_create() {
                         let authorized = active.foreground_user
                             && active.tools_enabled
                             && tools::validate(
-                                &tool.call,
+                                &call,
                                 &tool_grant(&active.turn, active.foreground_user),
                                 &tools::Destination::Local,
                             )
                             .is_ok();
                         if !authorized {
                             tool.result = Some(journal::ToolResult {
-                                operation: tool.call.operation,
-                                generation: tool.call.generation,
-                                ordinal: tool.call.ordinal,
+                                operation: call.operation,
+                                generation: call.generation,
+                                ordinal: call.ordinal,
                                 status: 2,
                                 text: String::new(),
                                 truncated: false,
@@ -3375,26 +3492,24 @@ impl Owner {
                         } else if let (
                             Some(writer),
                             tools::Arguments::MemoryCreateNote { body, .. },
-                        ) = (&self.writer, &tool.call.arguments)
+                            Some(create),
+                        ) = (&self.writer, &call.arguments, tool.create.as_mut())
                         {
-                            tool.create
-                                .as_mut()
-                                .expect("committed create")
-                                .start(writer, body.clone());
+                            create.start(writer, body.clone());
                         } else {
                             self.unavailable = Some("memory_write_outcome_unconfirmed");
                         }
-                    } else if tool.call.arguments.is_memory() {
+                    } else if call.arguments.is_memory() {
                         let query = tools::validate(
-                            &tool.call,
+                            &call,
                             &tool_grant(&active.turn, active.foreground_user),
                             &tools::Destination::Local,
                         )
-                        .and_then(|()| tool.call.arguments.memory_query());
+                        .and_then(|()| call.arguments.memory_query());
                         match query {
                             Err(reason) => {
                                 tool.result = Some(tool_result(
-                                    &tool.call,
+                                    &call,
                                     Err(tools::ExecutionError::Rejected(reason)),
                                 ))
                             }
@@ -3411,17 +3526,16 @@ impl Owner {
                                 }) {
                                 Ok(ticket) => tool.memory_ticket = Some(ticket),
                                 Err(error) => {
-                                    tool.result =
-                                        Some(memory_tools::writer_error(&tool.call, error))
+                                    tool.result = Some(memory_tools::writer_error(&call, error))
                                 }
                             },
                         }
                     } else if matches!(
-                        tool.call.arguments,
+                        call.arguments,
                         tools::Arguments::ListTools | tools::Arguments::ReadAudit { .. }
                     ) {
                         // Static metadata is captured after intent by the canonical registry path.
-                    } else if matches!(tool.call.arguments, tools::Arguments::ObserveStatus) {
+                    } else if matches!(call.arguments, tools::Arguments::ObserveStatus) {
                         // The canonical sensor owner persists this capture asynchronously.
                     } else {
                         let project = self
@@ -3432,7 +3546,7 @@ impl Owner {
                             .ok_or(tools::ExecutionError::Rejected(tools::Rejection::Denied))
                             .and_then(|project| {
                                 active.tool_executor.start(
-                                    tool.call.clone(),
+                                    call.clone(),
                                     tool_grant(&active.turn, active.foreground_user),
                                     tools::Destination::Local,
                                     tools::ExecutionScope {
@@ -3445,13 +3559,12 @@ impl Owner {
                                 )
                             });
                         if let Err(error) = outcome {
-                            tool.result = Some(tool_result(&tool.call, Err(error)));
+                            tool.result = Some(tool_result(&call, Err(error)));
                         }
                     }
                 }
                 // Settle, then install (R2): kind 23 commits before kind 15.
                 if let Some(exec_cmd) = &tool.exec_cmd
-                    && exec_cmd.admitted()
                     && !exec_cmd.settled_committed
                 {
                     if let Some(settled) = &exec_cmd.settled
@@ -3513,6 +3626,8 @@ impl Owner {
             }
         }
     }
+    /// Projects kind 14 records (and their kind 15) for activity views
+    /// (TCR-D13, TCR-D26). The record stays the one source.
     fn tool_progress(&self, operation: journal::Id) -> Vec<pb::ToolProgress> {
         let Some(op) = self
             .replay
@@ -3521,57 +3636,61 @@ impl Owner {
         else {
             return Vec::new();
         };
+        let prefix = |text: &str, limit: usize| {
+            let mut end = text.len().min(limit);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[..end].to_owned()
+        };
         op.tools
             .iter()
             .enumerate()
-            .map(|(index, tool)| pb::ToolProgress {
-                ordinal: Some(index as u32 + 1),
-                name: Some(
-                    match tool.kind {
-                        1 | 4 => "project_read_file",
-                        2 | 5 => "project_list_directory",
-                        6 | 9 => "memory_list_notes",
-                        7 | 10 => "memory_get_note",
-                        8 | 11 => "memory_note_sources",
-                        12 | 13 => "memory_create_note",
-                        14 => "service_list_tools",
-                        15 => "service_read_audit",
-                        16 => "exec_cmd",
-                        _ => "service_observe_status",
-                    }
-                    .into(),
-                ),
-                state: Some(match tool.result_status {
-                    Some(1) => 2,
-                    Some(_) => 3,
-                    None if op.terminal.is_some() => 4,
-                    None => 1,
-                }),
-                status: tool.result_status.map(u32::from),
-                arguments: Some(tool.arguments.clone()),
-                policy_decision: Some(if matches!(tool.kind, 4 | 5 | 9 | 10 | 11 | 13) {
-                    3
-                } else if tool.result_status == Some(2) {
-                    2
-                } else {
-                    1
-                }),
-                elapsed_ms: self
-                    .active
-                    .as_ref()
-                    .filter(|a| a.turn.operation == operation)
-                    .map(|a| &a.measurements)
-                    .or_else(|| {
-                        self.measurements
-                            .iter()
-                            .find(|(id, _)| *id == operation)
-                            .map(|(_, m)| m)
-                    })
-                    .and_then(|m| m.tool_ms[index]),
-                result_bytes: tool.result_status.map(|_| tool.result_bytes as u64),
-                preview: tool.preview.clone(),
-                truncated: tool.truncated,
-                exit_code: tool.exit_code,
+            .map(|(index, tool)| {
+                let rendered =
+                    tools::not_run_result(tool.decision, tool.fault, tool.busy, tool.refusal);
+                pb::ToolProgress {
+                    ordinal: Some(index as u32 + 1),
+                    name: Some(prefix(&tool.name, 64)),
+                    state: Some(match (&rendered, tool.result_status) {
+                        (Some(_), _) | (None, Some(2..)) => 3,
+                        (None, Some(_)) => 2,
+                        (None, None) if op.terminal.is_some() => 4,
+                        (None, None) => 1,
+                    }),
+                    status: rendered
+                        .as_ref()
+                        .map(|(status, _)| u32::from(*status))
+                        .or(tool.result_status.map(u32::from)),
+                    arguments: Some(match tool.form.not_retained() {
+                        Some(reason) => format!(
+                            "[not retained: {}, {} bytes]",
+                            reason.as_str(),
+                            tool.arguments_bytes
+                        ),
+                        None => tool.arguments.clone(),
+                    }),
+                    policy_decision: Some(tool.decision as u32),
+                    fault: tool.fault.map(|fault| fault as u32),
+                    elapsed_ms: self
+                        .active
+                        .as_ref()
+                        .filter(|a| a.turn.operation == operation)
+                        .map(|a| &a.measurements)
+                        .or_else(|| {
+                            self.measurements
+                                .iter()
+                                .find(|(id, _)| *id == operation)
+                                .map(|(_, m)| m)
+                        })
+                        .and_then(|m| m.tool_ms[index]),
+                    result_bytes: tool.result_status.map(|_| tool.result_bytes as u64),
+                    preview: rendered
+                        .map(|(_, text)| prefix(&text, 128))
+                        .or_else(|| tool.preview.clone()),
+                    truncated: tool.truncated,
+                    exit_code: tool.exit_code,
+                }
             })
             .collect()
     }

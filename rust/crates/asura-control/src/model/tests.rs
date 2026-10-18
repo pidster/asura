@@ -117,14 +117,10 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
             HelperToService,
         ),
         (
-            envelope(Body::ToolCall(pb::ToolCall {
-                ordinal: Some(1),
-                arguments: Some(pb::tool_call::Arguments::ReadFile(pb::ProjectReadFile {
-                    path: Some("README.md".into()),
-                    offset: Some(0),
-                    limit: Some(1024),
-                })),
-            })),
+            envelope(Body::ToolCall(raw_call(
+                "project",
+                r#"{"command":"read_file","path":"README.md"}"#,
+            ))),
             HelperToService,
         ),
         (
@@ -556,68 +552,69 @@ fn export_cross_language_fixtures() {
         true,
         local.encode_to_vec(),
     );
-    for field in 13..=16 {
-        write(
-            &format!("memory_unknown_nested_{field}.pb"),
-            "helper",
-            false,
-            memory_unknown_nested(field),
-        );
-    }
-    let inventory = memory_call(pb::tool_call::Arguments::ListTools(pb::ListTools {}));
-    write("list_tools.pb", "helper", true, inventory.encode_to_vec());
-    write(
-        "list_tools_wrong_direction.pb",
-        "service",
-        false,
-        inventory.encode_to_vec(),
-    );
-    write(
-        "list_tools_nonempty.pb",
-        "helper",
-        false,
-        inventory_unknown_nested(),
-    );
-    for (name, args, accepted) in [
+    // Unparsed tool calls (tool-call-records.md): any argument text within
+    // the bound is accepted; sizes replace text only above the bound.
+    for (name, call, accepted) in [
         (
-            "exec_cmd_default.pb",
-            pb::ExecCmd {
-                command: Some("printf fixture".into()),
-                cwd: None,
+            "tool_call_exec_cmd.pb",
+            raw_call("exec_cmd", r#"{"command":"printf fixture"}"#),
+            true,
+        ),
+        ("tool_call_invalid_json.pb", raw_call("project", "{"), true),
+        (
+            "tool_call_unregistered.pb",
+            pb::ToolCall {
+                source: Some(2),
+                ..raw_call("delete_everything", "{}")
             },
             true,
         ),
         (
-            "exec_cmd_max.pb",
-            pb::ExecCmd {
-                command: Some("é".repeat(4096)),
-                cwd: Some(".".into()),
+            "tool_call_sizes_only.pb",
+            pb::ToolCall {
+                name: None,
+                name_bytes: Some(300),
+                arguments: None,
+                arguments_bytes: Some(70_000),
+                ..raw_call("x", "")
             },
             true,
         ),
         (
-            "exec_cmd_missing_command.pb",
-            pb::ExecCmd {
-                command: None,
-                cwd: None,
+            "tool_call_ordinal_nine.pb",
+            pb::ToolCall {
+                ordinal: Some(9),
+                ..raw_call("service", r#"{"command":"status"}"#)
+            },
+            true,
+        ),
+        (
+            "tool_call_ordinal_ten.pb",
+            pb::ToolCall {
+                ordinal: Some(10),
+                ..raw_call("service", "{}")
             },
             false,
         ),
         (
-            "exec_cmd_parent.pb",
-            pb::ExecCmd {
-                command: Some("pwd".into()),
-                cwd: Some("a/../b".into()),
+            "tool_call_both_text_and_size.pb",
+            pb::ToolCall {
+                arguments_bytes: Some(70_000),
+                ..raw_call("service", "{}")
             },
             false,
         ),
     ] {
-        write(
-            name,
-            "helper",
-            accepted,
-            memory_call(pb::tool_call::Arguments::ExecCmd(args)).encode_to_vec(),
-        );
+        let message = envelope(Body::ToolCall(call));
+        write(name, "helper", accepted, message.encode_to_vec());
+        if accepted {
+            write(
+                &name.replace(".pb", "_wrong_direction.pb"),
+                "service",
+                false,
+                message.encode_to_vec(),
+            );
+        }
     }
     write(
         "exec_cmd_failed_output.pb",
@@ -632,22 +629,6 @@ fn export_cross_language_fixtures() {
         }))
         .encode_to_vec(),
     );
-    for (name, message, accepted) in memory_fixtures() {
-        write(
-            &format!("memory_{name}.pb"),
-            "helper",
-            accepted,
-            message.encode_to_vec(),
-        );
-        if accepted {
-            write(
-                &format!("memory_{name}_wrong_direction.pb"),
-                "service",
-                false,
-                message.encode_to_vec(),
-            );
-        }
-    }
     for (message, direction) in fixtures() {
         let name = match message.body.as_ref().unwrap() {
             Body::Hello(_) => "hello",
@@ -896,29 +877,141 @@ fn export_cross_language_fixtures() {
     std::fs::write(directory.join("manifest.tsv"), manifest).unwrap();
 }
 
-#[test]
-fn typed_tool_calls_and_results_enforce_direction_and_bounds() {
-    let call = envelope(Body::ToolCall(pb::ToolCall {
+fn raw_call(name: &str, arguments: &str) -> pb::ToolCall {
+    pb::ToolCall {
         ordinal: Some(1),
-        arguments: Some(pb::tool_call::Arguments::ReadFile(pb::ProjectReadFile {
-            path: Some("src/main.rs".into()),
-            offset: Some(0),
-            limit: Some(1024),
-        })),
-    }));
-    assert!(encode_frame(&call, Direction::HelperToService).is_ok());
-    assert_eq!(
-        encode_frame(&call, Direction::ServiceToHelper),
-        Err(ProtocolError::WrongDirection)
-    );
-    let mut bad = call.clone();
-    if let Some(Body::ToolCall(v)) = &mut bad.body {
-        v.ordinal = Some(9);
+        name: Some(name.into()),
+        arguments: Some(arguments.into()),
+        arguments_bytes: None,
+        name_bytes: None,
+        source: Some(1),
     }
+}
+fn helper_accepts(call: pb::ToolCall) -> bool {
+    let message = envelope(Body::ToolCall(call));
+    let bytes = message.encode_to_vec();
+    let accepted = decode_body(&bytes, Direction::HelperToService).is_ok();
     assert_eq!(
-        encode_frame(&bad, Direction::HelperToService),
-        Err(ProtocolError::InvalidSemantics)
+        encode_frame(&message, Direction::HelperToService).is_ok(),
+        accepted
     );
+    // Never service to helper.
+    assert!(decode_body(&bytes, Direction::ServiceToHelper).is_err());
+    accepted
+}
+/// TCR-U14: the unparsed ToolCall is bounded: name 1-256 bytes or a size over
+/// 256, arguments 0-64,000 bytes or a size over 64,000, exactly one of each,
+/// ordinal 1-9 and a known source. Malformed argument text is not a codec
+/// fault: the service records it.
+#[test]
+fn tcr_u14_tool_call_bounds_and_sizes() {
+    let base = raw_call("project", "{");
+    for call in [
+        base.clone(),
+        raw_call("exec_cmd", ""),
+        raw_call("not_registered", "[1,2"),
+        raw_call(
+            &"n".repeat(MAX_TOOL_NAME_BYTES),
+            &"a".repeat(MAX_TOOL_ARGUMENT_BYTES),
+        ),
+        pb::ToolCall {
+            ordinal: Some(9),
+            source: Some(2),
+            ..base.clone()
+        },
+        pb::ToolCall {
+            name: None,
+            name_bytes: Some(257),
+            ..base.clone()
+        },
+        pb::ToolCall {
+            arguments: None,
+            arguments_bytes: Some(64_001),
+            ..base.clone()
+        },
+        pb::ToolCall {
+            arguments: None,
+            arguments_bytes: Some(u32::MAX),
+            name: None,
+            name_bytes: Some(u32::MAX),
+            ..base.clone()
+        },
+    ] {
+        assert!(helper_accepts(call.clone()), "{call:?}");
+    }
+    for call in [
+        pb::ToolCall {
+            ordinal: None,
+            ..base.clone()
+        },
+        pb::ToolCall {
+            ordinal: Some(0),
+            ..base.clone()
+        },
+        pb::ToolCall {
+            ordinal: Some(10),
+            ..base.clone()
+        },
+        raw_call("", "{}"),
+        raw_call(&"n".repeat(MAX_TOOL_NAME_BYTES + 1), "{}"),
+        raw_call("project", &"a".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)),
+        // Field 3 and field 4 both absent, or both present.
+        pb::ToolCall {
+            arguments: None,
+            ..base.clone()
+        },
+        pb::ToolCall {
+            arguments_bytes: Some(64_001),
+            ..base.clone()
+        },
+        // A size is sent only above the limit.
+        pb::ToolCall {
+            arguments: None,
+            arguments_bytes: Some(64_000),
+            ..base.clone()
+        },
+        pb::ToolCall {
+            name: None,
+            ..base.clone()
+        },
+        pb::ToolCall {
+            name_bytes: Some(300),
+            ..base.clone()
+        },
+        pb::ToolCall {
+            name: None,
+            name_bytes: Some(256),
+            ..base.clone()
+        },
+        pb::ToolCall {
+            source: None,
+            ..base.clone()
+        },
+        pb::ToolCall {
+            source: Some(3),
+            ..base.clone()
+        },
+    ] {
+        assert!(!helper_accepts(call.clone()), "{call:?}");
+    }
+    // A removed typed argument field (10-19) is an unknown, reserved field.
+    let mut bytes = pb::Envelope {
+        operation_id: Some(vec![7; 16]),
+        generation: Some(1),
+        body: None,
+    }
+    .encode_to_vec();
+    // ToolCall: ordinal 1, name "x", arguments "", source 1, then field 10 (len 0).
+    bytes.extend_from_slice(&[0xa2, 1, 11, 8, 1, 0x12, 1, b'x', 0x1a, 0, 0x30, 1, 0x52, 0]);
+    assert!(decode_body(&bytes, Direction::HelperToService).is_err());
+    bytes.truncate(bytes.len() - 2);
+    let len = bytes.len();
+    bytes[len - 10] = 9;
+    assert!(decode_body(&bytes, Direction::HelperToService).is_ok());
+}
+
+#[test]
+fn tool_results_enforce_direction_bounds_and_ordinal_nine_limit() {
     let result = envelope(Body::ToolResult(pb::ToolResult {
         ordinal: Some(1),
         status: Some(1),
@@ -947,6 +1040,28 @@ fn typed_tool_calls_and_results_enforce_direction_and_bounds() {
         encode_frame(&bad, Direction::ServiceToHelper),
         Err(ProtocolError::InvalidSemantics)
     );
+    // Ordinal 9 only with status 7 (TCR-D6); ordinal 10 never.
+    let nine = |status| {
+        envelope(Body::ToolResult(pb::ToolResult {
+            ordinal: Some(9),
+            status: Some(status),
+            text: Some("limit".into()),
+            next_offset: None,
+            truncated: Some(false),
+        }))
+    };
+    assert!(encode_frame(&nine(7), Direction::ServiceToHelper).is_ok());
+    for status in [1, 3, 6] {
+        assert_eq!(
+            encode_frame(&nine(status), Direction::ServiceToHelper),
+            Err(ProtocolError::InvalidSemantics)
+        );
+    }
+    if let Some(Body::ToolResult(v)) = &mut bad.body {
+        v.ordinal = Some(10);
+        v.status = Some(7);
+    }
+    assert!(encode_frame(&bad, Direction::ServiceToHelper).is_err());
 }
 
 #[test]
@@ -1109,353 +1224,6 @@ fn locality_and_declared_capabilities_have_strict_direction_and_scope() {
         value.model_capabilities = Some(0);
     }
     assert!(encode_frame(&helper, Direction::HelperToService).is_err());
-}
-
-fn memory_call(arguments: pb::tool_call::Arguments) -> pb::Envelope {
-    envelope(Body::ToolCall(pb::ToolCall {
-        ordinal: Some(1),
-        arguments: Some(arguments),
-    }))
-}
-fn memory_fixtures() -> Vec<(&'static str, pb::Envelope, bool)> {
-    use pb::tool_call::Arguments::*;
-    let id = "0123456789abcdef0123456789abcdef";
-    vec![
-        (
-            "create_plain",
-            memory_call(MemoryCreateNote(pb::MemoryCreateNote {
-                body: Some(" exact\nbody ".into()),
-                source_version: None,
-            })),
-            true,
-        ),
-        (
-            "create_source",
-            memory_call(MemoryCreateNote(pb::MemoryCreateNote {
-                body: Some("body".into()),
-                source_version: Some(id.into()),
-            })),
-            true,
-        ),
-        (
-            "create_bounded_invalid",
-            memory_call(MemoryCreateNote(pb::MemoryCreateNote {
-                body: Some(String::new()),
-                source_version: Some(String::new()),
-            })),
-            true,
-        ),
-        (
-            "create_max",
-            memory_call(MemoryCreateNote(pb::MemoryCreateNote {
-                body: Some("é".repeat(8192)),
-                source_version: Some("é".repeat(512)),
-            })),
-            true,
-        ),
-        (
-            "create_body_oversize",
-            memory_call(MemoryCreateNote(pb::MemoryCreateNote {
-                body: Some("é".repeat(8192) + "x"),
-                source_version: None,
-            })),
-            false,
-        ),
-        (
-            "create_source_oversize",
-            memory_call(MemoryCreateNote(pb::MemoryCreateNote {
-                body: Some("x".into()),
-                source_version: Some("x".repeat(1025)),
-            })),
-            false,
-        ),
-        (
-            "create_missing_body",
-            memory_call(MemoryCreateNote(pb::MemoryCreateNote {
-                body: None,
-                source_version: None,
-            })),
-            false,
-        ),
-        (
-            "list_first",
-            memory_call(MemoryListNotes(pb::MemoryListNotes {
-                after: None,
-                limit: Some(8),
-            })),
-            true,
-        ),
-        (
-            "list_empty_present",
-            memory_call(MemoryListNotes(pb::MemoryListNotes {
-                after: Some(String::new()),
-                limit: Some(0),
-            })),
-            true,
-        ),
-        (
-            "list_bounded_invalid",
-            memory_call(MemoryListNotes(pb::MemoryListNotes {
-                after: Some("é".repeat(512)),
-                limit: Some(u32::MAX),
-            })),
-            true,
-        ),
-        (
-            "list_oversize",
-            memory_call(MemoryListNotes(pb::MemoryListNotes {
-                after: Some("x".repeat(1025)),
-                limit: Some(1),
-            })),
-            false,
-        ),
-        (
-            "list_missing_limit",
-            memory_call(MemoryListNotes(pb::MemoryListNotes {
-                after: None,
-                limit: None,
-            })),
-            false,
-        ),
-        (
-            "get_valid",
-            memory_call(MemoryGetNote(pb::MemoryGetNote {
-                version: Some(id.into()),
-                offset: Some(0),
-                limit: Some(16384),
-            })),
-            true,
-        ),
-        (
-            "get_bounded_invalid",
-            memory_call(MemoryGetNote(pb::MemoryGetNote {
-                version: Some(String::new()),
-                offset: Some(u64::MAX),
-                limit: Some(u32::MAX),
-            })),
-            true,
-        ),
-        (
-            "get_missing_version",
-            memory_call(MemoryGetNote(pb::MemoryGetNote {
-                version: None,
-                offset: Some(0),
-                limit: Some(1),
-            })),
-            false,
-        ),
-        (
-            "get_missing_offset",
-            memory_call(MemoryGetNote(pb::MemoryGetNote {
-                version: Some(id.into()),
-                offset: None,
-                limit: Some(1),
-            })),
-            false,
-        ),
-        (
-            "get_missing_limit",
-            memory_call(MemoryGetNote(pb::MemoryGetNote {
-                version: Some(id.into()),
-                offset: Some(0),
-                limit: None,
-            })),
-            false,
-        ),
-        (
-            "get_oversize",
-            memory_call(MemoryGetNote(pb::MemoryGetNote {
-                version: Some("x".repeat(1025)),
-                offset: Some(0),
-                limit: Some(1),
-            })),
-            false,
-        ),
-        (
-            "sources_valid",
-            memory_call(MemoryNoteSources(pb::MemoryNoteSources {
-                version: Some(id.into()),
-            })),
-            true,
-        ),
-        (
-            "sources_bounded_invalid",
-            memory_call(MemoryNoteSources(pb::MemoryNoteSources {
-                version: Some(String::new()),
-            })),
-            true,
-        ),
-        (
-            "sources_missing_version",
-            memory_call(MemoryNoteSources(pb::MemoryNoteSources { version: None })),
-            false,
-        ),
-        (
-            "sources_oversize",
-            memory_call(MemoryNoteSources(pb::MemoryNoteSources {
-                version: Some("x".repeat(1025)),
-            })),
-            false,
-        ),
-    ]
-}
-#[test]
-fn memory_calls_preserve_semantic_rejections_and_reject_protocol_faults() {
-    for (name, message, accepted) in memory_fixtures() {
-        assert_eq!(
-            encode_frame(&message, Direction::HelperToService).is_ok(),
-            accepted,
-            "{name}"
-        );
-        assert_eq!(
-            decode_body(&message.encode_to_vec(), Direction::HelperToService).is_ok(),
-            accepted,
-            "{name}"
-        );
-        assert!(
-            decode_body(&message.encode_to_vec(), Direction::ServiceToHelper).is_err(),
-            "{name}"
-        );
-    }
-}
-
-fn memory_unknown_nested(field: u8) -> Vec<u8> {
-    let mut arguments = match field {
-        13 => vec![0x10, 8],
-        14 => vec![0x0a, 0, 0x10, 0, 0x18, 0],
-        15 | 16 => vec![0x0a, 0],
-        _ => unreachable!(),
-    };
-    arguments.extend_from_slice(&[0xa0, 0x06, 1]); // Unknown nested field 100.
-    let mut call = vec![8, 1];
-    let tag = u16::from(field) << 3 | 2;
-    if tag >= 128 {
-        call.extend_from_slice(&[(tag as u8 & 127) | 128, (tag >> 7) as u8]);
-    } else {
-        call.push(tag as u8);
-    }
-    call.push(u8::try_from(arguments.len()).unwrap());
-    call.extend(arguments);
-    let mut bytes = pb::Envelope {
-        operation_id: Some(vec![7; 16]),
-        generation: Some(1),
-        body: None,
-    }
-    .encode_to_vec();
-    bytes.extend_from_slice(&[0xa2, 1, u8::try_from(call.len()).unwrap()]);
-    bytes.extend(call);
-    bytes
-}
-#[test]
-fn memory_calls_reject_unknown_nested_fields_before_prost_discards_them() {
-    for field in 13..=16 {
-        assert!(decode_body(&memory_unknown_nested(field), Direction::HelperToService).is_err());
-    }
-}
-
-fn inventory_unknown_nested() -> Vec<u8> {
-    let mut bytes = pb::Envelope {
-        operation_id: Some(vec![7; 16]),
-        generation: Some(1),
-        body: None,
-    }
-    .encode_to_vec();
-    // ToolCall field 17 contains unknown field 1 in the empty ListTools message.
-    bytes.extend_from_slice(&[0xa2, 1, 7, 8, 1, 0x8a, 1, 2, 8, 1]);
-    bytes
-}
-
-#[test]
-fn inventory_tool_requires_empty_arguments_and_helper_direction() {
-    let mut message = memory_call(pb::tool_call::Arguments::ListTools(pb::ListTools {}));
-    assert_eq!(
-        decode_body(&message.encode_to_vec(), Direction::HelperToService).unwrap(),
-        message
-    );
-    assert!(decode_body(&message.encode_to_vec(), Direction::ServiceToHelper).is_err());
-    assert!(decode_body(&inventory_unknown_nested(), Direction::HelperToService).is_err());
-    if let Some(Body::ToolCall(call)) = &mut message.body {
-        call.ordinal = Some(9);
-    }
-    assert!(decode_body(&message.encode_to_vec(), Direction::HelperToService).is_err());
-}
-
-#[test]
-fn audit_tool_requires_bounded_present_limit_and_helper_direction() {
-    for limit in [Some(1), Some(16)] {
-        let message = memory_call(pb::tool_call::Arguments::ReadAudit(pb::AuditRead { limit }));
-        assert_eq!(
-            decode_body(&message.encode_to_vec(), Direction::HelperToService).unwrap(),
-            message
-        );
-        assert!(decode_body(&message.encode_to_vec(), Direction::ServiceToHelper).is_err());
-    }
-    for limit in [None, Some(0), Some(17)] {
-        let message = memory_call(pb::tool_call::Arguments::ReadAudit(pb::AuditRead { limit }));
-        assert!(decode_body(&message.encode_to_vec(), Direction::HelperToService).is_err());
-    }
-}
-
-#[test]
-fn exec_cmd_wire_requires_bounded_command_relative_cwd_and_no_timeout() {
-    let valid = pb::ExecCmd {
-        command: Some("printf fixture".into()),
-        cwd: None,
-    };
-    for args in [
-        valid.clone(),
-        pb::ExecCmd {
-            command: Some("é".repeat(4096)),
-            cwd: Some(".".into()),
-        },
-        pb::ExecCmd {
-            cwd: Some("src/subdir".into()),
-            ..valid.clone()
-        },
-    ] {
-        let message = memory_call(pb::tool_call::Arguments::ExecCmd(args));
-        assert_eq!(
-            decode_body(&message.encode_to_vec(), Direction::HelperToService).unwrap(),
-            message
-        );
-        assert!(decode_body(&message.encode_to_vec(), Direction::ServiceToHelper).is_err());
-    }
-    let mut invalid = Vec::new();
-    for command in [
-        None,
-        Some(String::new()),
-        Some("a\0b".into()),
-        Some("é".repeat(4097)),
-    ] {
-        invalid.push(pb::ExecCmd {
-            command,
-            ..valid.clone()
-        });
-    }
-    for cwd in ["", "/tmp", "..", "src/../other", "a\0b", &"x".repeat(1025)] {
-        invalid.push(pb::ExecCmd {
-            cwd: Some(cwd.into()),
-            ..valid.clone()
-        });
-    }
-    for args in invalid {
-        let message = memory_call(pb::tool_call::Arguments::ExecCmd(args));
-        assert!(decode_body(&message.encode_to_vec(), Direction::HelperToService).is_err());
-    }
-    let mut bytes = pb::Envelope {
-        operation_id: Some(vec![7; 16]),
-        generation: Some(1),
-        body: None,
-    }
-    .encode_to_vec();
-    // ToolCall field 19, valid command x, then unknown nested field 100.
-    let base = bytes.clone();
-    bytes.extend_from_slice(&[0xa2, 1, 11, 8, 1, 0x9a, 1, 6, 10, 1, b'x', 0xa0, 6, 1]);
-    assert!(decode_body(&bytes, Direction::HelperToService).is_err());
-    // B2: removed `timeout_seconds` (ExecCmd field 3) is an unknown field.
-    let mut removed = base;
-    removed.extend_from_slice(&[0xa2, 1, 10, 8, 1, 0x9a, 1, 5, 10, 1, b'x', 0x18, 30]);
-    assert!(decode_body(&removed, Direction::HelperToService).is_err());
 }
 
 #[test]

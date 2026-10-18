@@ -1,6 +1,6 @@
 //! HM3 retained mutation and readonly reconciliation on the canonical reactor.
 use super::*;
-use asura_storage::memory::{self, MemoryCreateResult};
+use asura_storage::memory::MemoryCreateResult;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -10,7 +10,11 @@ enum Phase {
     Done,
 }
 pub(super) struct Mutation {
-    pub intent: journal::MemoryCreateIntent,
+    /// The derived identity of the `run` create_note call (HM3, TCR-D2).
+    pub intent: journal::CreateNoteCall,
+    /// The optional source version of the service's parse; the body is
+    /// handed to `start` and never retained here.
+    source: Option<journal::Id>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     phase: Phase,
     ticket: Option<writer::Ticket>,
@@ -18,9 +22,14 @@ pub(super) struct Mutation {
     response_consumed: bool,
 }
 impl Mutation {
-    pub fn new(intent: journal::MemoryCreateIntent) -> Self {
+    /// A mutation that only resolves (restart recovery): no source is needed.
+    pub fn new(intent: journal::CreateNoteCall) -> Self {
+        Self::with_source(intent, None)
+    }
+    fn with_source(intent: journal::CreateNoteCall, source: Option<journal::Id>) -> Self {
         Self {
             intent,
+            source,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             phase: Phase::ResolveReady,
             ticket: None,
@@ -37,6 +46,7 @@ impl Mutation {
             generation: self.intent.generation,
             ordinal: self.intent.ordinal,
             body,
+            source: self.source,
             cancel: self.cancel.clone(),
         }) {
             Ok(ticket) => self.ticket = Some(ticket),
@@ -113,6 +123,8 @@ impl Mutation {
         }
         Ok(None)
     }
+    /// Kind 15 stores no text for create_note; the text sent to the helper
+    /// is rendered from the derived identity (TCR-D1).
     fn result(&self, outcome: MemoryCreateResult, absent_status: u8) -> journal::ToolResult {
         let committed = matches!(outcome, MemoryCreateResult::Committed(_));
         journal::ToolResult {
@@ -120,52 +132,42 @@ impl Mutation {
             generation: self.intent.generation,
             ordinal: self.intent.ordinal,
             status: if committed { 1 } else { absent_status },
-            text: if committed {
-                self.intent.success_text()
-            } else {
-                String::new()
-            },
+            text: String::new(),
             truncated: false,
             next_offset: None,
         }
     }
 }
 
+/// Derives the call identity for a `run` create_note decision. A binding or
+/// project that cannot be named is a denial before the record (TCR-D10).
 pub(super) fn prepare(
     replay: &journal::Replay,
     call: &tools::Call,
     project: journal::Id,
 ) -> Result<Mutation, tools::Rejection> {
-    let tools::Arguments::MemoryCreateNote {
-        body,
-        source_version,
-    } = &call.arguments
-    else {
+    let tools::Arguments::MemoryCreateNote { source_version, .. } = &call.arguments else {
         return Err(tools::Rejection::InvalidArguments);
     };
     call.arguments.validate()?;
-    let binding = memory::Binding {
-        installation_id: memory::Id::new(replay.installation_id)
-            .map_err(|_| tools::Rejection::Denied)?,
-        graph_id: memory::Id::new(replay.initialization.graph)
-            .map_err(|_| tools::Rejection::Denied)?,
-        init_operation_id: memory::Id::new(replay.initialization.request)
-            .map_err(|_| tools::Rejection::Denied)?,
-    };
-    let (intent, _) = memory::prepare_create(
-        binding,
-        memory::Id::new(project).map_err(|_| tools::Rejection::Denied)?,
+    let source = source_version
+        .as_deref()
+        .map(tools::memory_id)
+        .transpose()?
+        .map(|id| id.bytes());
+    let intent = journal::CreateNoteCall::derive(
+        [
+            replay.installation_id,
+            replay.initialization.graph,
+            replay.initialization.request,
+        ],
+        project,
         call.operation,
         call.generation,
         call.ordinal,
-        body.clone(),
-        source_version
-            .as_deref()
-            .map(tools::memory_id)
-            .transpose()?,
     )
-    .map_err(|_| tools::Rejection::InvalidArguments)?;
-    Ok(Mutation::new(intent))
+    .map_err(|_| tools::Rejection::Denied)?;
+    Ok(Mutation::with_source(intent, source))
 }
 impl Owner {
     pub(super) fn capture_memory_create(&mut self) {

@@ -4,10 +4,17 @@
 //! streaming scanner with its 64 KiB carry, literal matching, per-job
 //! numbering, loss markers and the command rewrite planner. The only system
 //! call is the per-job random key. Detection is best effort (SR8).
+mod arguments;
+pub mod json;
 pub mod rewrite;
 mod rules;
 mod stream;
 
+pub use arguments::{
+    ArgumentForm, ArgumentsInput, ExecCmdCommand, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_NUMBERS,
+    MAX_NAME_BYTES, MAX_STORED_NAME_BYTES, NotRetained, PlaceholderTokens, RedactedArguments,
+    WITHHELD_TEXT, placeholder_tokens, redact_arguments,
+};
 pub use rewrite::{
     MAX_REWRITTEN_COMMAND_BYTES, Refusal, RefusalCode, Rewrite, SecretVariable, display_redacted,
     rewrite_command, rewrite_exec_cmd_call,

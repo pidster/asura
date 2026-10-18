@@ -864,6 +864,9 @@ replaces the fixed whole-turn deadline. Existing response and byte budgets remai
 Output transmission is additionally capped at 4 MiB and 1,024 revisions. Retain
 at most two 60 KiB output snapshots plus the bounded transport staging. Reserve
 eight control frames of at most 4 KiB each so cancellation cannot wait on credit.
+A `ToolCall` travels on the ordered data queue (8 frames, at most 65,536 + 1,024
+bytes), because it may hold 64,000 bytes of argument text
+([tool call records](tool-call-records.md), TCR-D29).
 The receiver rejects an envelope larger than its frame bound before allocation.
 
 Swift uses a private serial IO queue with nonblocking descriptor reads/writes and

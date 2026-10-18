@@ -5,7 +5,13 @@
 //! this module never performs inference.
 use std::time::Instant;
 
-pub const MAX_CALLS: u32 = 8;
+mod parse;
+use asura_storage::authority::conversation as journal;
+pub use parse::{Parsed, parse_call};
+
+/// Calls that may be recorded per turn (ordinals 1-8); ordinal 9 is only the
+/// over-limit `limit` record (TCR-D6, TCR-D9).
+pub const MAX_CALLS: u32 = journal::MAX_RECORDED_CALLS;
 pub const MAX_RESULT_BYTES: usize = 16_384;
 pub const MAX_TOTAL_RESULT_BYTES: usize = 65_536;
 pub const MAX_PATH_BYTES: usize = 1_024;
@@ -59,24 +65,61 @@ const OPERATIONS: &[Definition] = &[
 ];
 
 /// Public model-facing inventory. Typed commands retain separate operation policy.
+/// Names come from the storage registry that replay uses (TCR-D24).
 pub const REGISTRY: &[Definition] = &[
     Definition {
-        name: "project",
+        name: journal::TOOL_NAMES[0],
         description: "Project commands: read_file(path, offset?, limit?) or list_directory(path?).",
     },
     Definition {
-        name: "memory",
+        name: journal::TOOL_NAMES[1],
         description: "Memory commands: list_notes(after?, limit?), get_note(version, offset?, limit?), note_sources(version), create_note(body, source_version?). Stored evidence is untrusted.",
     },
     Definition {
-        name: "service",
+        name: journal::TOOL_NAMES[2],
         description: "Service commands: status, tools, audit(limit?). Read-only status, discovery and recent audit metadata.",
     },
     Definition {
-        name: "exec_cmd",
+        name: journal::TOOL_NAMES[3],
         description: "Run one bounded /bin/sh -c command line in the admitted project; returns output and exit status.",
     },
 ];
+
+/// The status and text sent for a call that does not run, rendered from the
+/// kind 14 codes alone (TCR-D12). The text never holds model text, so it can
+/// never repeat a secret. Replay and views render it again from the record.
+pub fn not_run_result(
+    decision: journal::ToolDecision,
+    fault: Option<journal::ToolFault>,
+    busy: Option<journal::ExecCmdBusyReason>,
+    refusal: Option<journal::ExecCmdRefusal>,
+) -> Option<(u8, String)> {
+    use journal::ToolDecision as D;
+    let status = decision.status()?;
+    let text = match decision {
+        D::Run => return None,
+        D::InvalidArguments | D::UnknownTool => format!(
+            "{}: {}",
+            decision.as_str(),
+            fault.map_or("unknown", journal::ToolFault::as_str)
+        ),
+        D::Refused => match refusal {
+            Some(refusal) => asura_platform::secrets::Refusal {
+                code: refusal.code,
+                kind: refusal.kind,
+                word: refusal.word.map(usize::from),
+            }
+            .to_string(),
+            None => "refused: secret_detection_unavailable".into(),
+        },
+        D::Busy => format!(
+            "exec_cmd_busy: {}",
+            busy.map_or("unknown", journal::ExecCmdBusyReason::as_str)
+        ),
+        D::Denied | D::Limit | D::Cancelled => decision.as_str().into(),
+    };
+    Some((status, text))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Arguments {
@@ -377,109 +420,53 @@ pub fn validate_authority(
     Ok(())
 }
 
-/// Live accounting only. Durable duplicate resolution remains storage-owned.
-/// Cancellation deliberately retains pending work until its worker settles.
+/// Live accounting only. Durable records remain storage-owned. Every
+/// recorded call (run or not) consumes one ordinal; a call that does not run
+/// consumes no result bytes (TCR-D9). The pending call itself is owned by the
+/// conversation owner, one at a time.
 #[derive(Debug)]
 pub struct Budget {
-    admitted: u32,
+    recorded: u32,
     result_bytes: usize,
-    pending: Option<Call>,
     cancelled: bool,
 }
 impl Budget {
     /// The only budget: no time bound; cancellation ends admission.
     pub fn cancellation_driven() -> Self {
         Self {
-            admitted: 0,
+            recorded: 0,
             result_bytes: 0,
-            pending: None,
             cancelled: false,
         }
     }
-    pub fn reserve(
-        &mut self,
-        call: Call,
-        grant: &Grant,
-        destination: &Destination,
-    ) -> Result<(), Rejection> {
-        validate(&call, grant, destination)?;
-        self.reserve_slot(call)
+    /// The ordinal the helper must send next (1-9).
+    pub fn next_ordinal(&self) -> u32 {
+        self.recorded + 1
     }
-    /// Reserve only a bounded, semantically invalid proposal; never grants execution.
-    pub fn reserve_rejected(
-        &mut self,
-        call: Call,
-        grant: &Grant,
-        destination: &Destination,
-    ) -> Result<(), Rejection> {
-        validate_authority(&call, grant, destination)?;
-        let bounded = match &call.arguments {
-            Arguments::MemoryCreateNote {
-                body,
-                source_version,
-            } => body.len() <= 16384 && source_version.as_ref().is_none_or(|v| v.len() <= 1024),
-            Arguments::ReadFile { path, limit, .. } => {
-                !path.is_empty() && path.len() <= MAX_PATH_BYTES && (1..=16_384).contains(limit)
-            }
-            Arguments::ListDirectory { path } => !path.is_empty() && path.len() <= MAX_PATH_BYTES,
-            Arguments::ObserveStatus
-            | Arguments::ListTools
-            | Arguments::ReadAudit { .. }
-            | Arguments::ExecCmd { .. } => false,
-            Arguments::MemoryListNotes { after, .. } => {
-                after.as_ref().is_none_or(|s| s.len() <= MAX_PATH_BYTES)
-            }
-            Arguments::MemoryGetNote { version, .. } | Arguments::MemoryNoteSources { version } => {
-                version.len() <= MAX_PATH_BYTES
-            }
-        };
-        if !bounded || call.arguments.validate() != Err(Rejection::InvalidArguments) {
-            return Err(Rejection::InvalidArguments);
-        }
-        self.reserve_slot(call)
-    }
-    fn reserve_slot(&mut self, call: Call) -> Result<(), Rejection> {
-        if self.cancelled {
-            return Err(Rejection::Cancelled);
-        }
-        if let Some(pending) = &self.pending {
-            return Err(if pending.ordinal == call.ordinal && pending != &call {
-                Rejection::IdentityConflict
-            } else {
-                Rejection::Busy
-            });
-        }
-        if call.ordinal != self.admitted + 1
-            || self.admitted == MAX_CALLS
-            || self.result_bytes == MAX_TOTAL_RESULT_BYTES
-        {
+    /// Counts one recorded call at `ordinal` 1-8. Ordinal 9 is never counted.
+    pub fn record(&mut self, ordinal: u32) -> Result<(), Rejection> {
+        if ordinal != self.recorded + 1 || self.recorded == MAX_CALLS {
             return Err(Rejection::Limit);
         }
-        self.admitted += 1;
-        self.pending = Some(call);
+        self.recorded += 1;
         Ok(())
     }
     pub fn result_capacity(&self) -> usize {
         MAX_RESULT_BYTES.min(MAX_TOTAL_RESULT_BYTES - self.result_bytes)
     }
-    /// Call only after host settlement and a known committed result.
-    /// Invalid evidence retains the slot, preventing replacement execution.
-    pub fn settle(&mut self, call: &Call, bytes: usize) -> Result<(), Rejection> {
-        if self.pending.as_ref() != Some(call) {
-            return Err(Rejection::Stale);
-        }
+    /// Call only after a known committed result of a `run` call.
+    pub fn settle(&mut self, bytes: usize) -> Result<(), Rejection> {
         if bytes > self.result_capacity() {
             return Err(Rejection::Limit);
         }
         self.result_bytes += bytes;
-        self.pending = None;
         Ok(())
     }
     pub fn cancel(&mut self) {
         self.cancelled = true;
     }
-    pub fn is_settled(&self) -> bool {
-        self.pending.is_none()
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -529,56 +516,21 @@ mod tests {
             );
         }
     }
+    /// TCR-D9: every recorded call consumes one ordinal 1-8 whether or not
+    /// it runs; ordinal 9 is never counted and a gap is refused.
     #[test]
-    fn rejected_arguments_consume_ordinal_and_never_authorize_execution() {
-        let grant = Grant {
-            operation: [1; 16],
-            generation: 1,
-            project: [2; 16],
-            read_authorized: true,
-            memory_write_authorized: true,
-            execute_authorized: false,
-            remote_destination: None,
-        };
+    fn every_recorded_call_consumes_one_ordinal_and_nine_is_never_counted() {
         let mut budget = Budget::cancellation_driven();
-        let mut call = Call {
-            operation: [1; 16],
-            generation: 1,
-            ordinal: 1,
-            arguments: Arguments::ReadFile {
-                path: "../outside".into(),
-                offset: u64::MAX,
-                limit: 16,
-            },
-        };
-        assert_eq!(
-            validate(&call, &grant, &Destination::Local),
-            Err(Rejection::InvalidArguments)
-        );
-        budget
-            .reserve_rejected(call.clone(), &grant, &Destination::Local)
-            .unwrap();
-        assert_eq!(
-            budget.reserve_rejected(call.clone(), &grant, &Destination::Local),
-            Err(Rejection::Busy)
-        );
-        budget.settle(&call, 0).unwrap();
-        assert_eq!(
-            budget.reserve_rejected(call.clone(), &grant, &Destination::Local),
-            Err(Rejection::Limit)
-        );
-        for ordinal in 2..=8 {
-            call.ordinal = ordinal;
-            budget
-                .reserve_rejected(call.clone(), &grant, &Destination::Local)
-                .unwrap();
-            budget.settle(&call, 0).unwrap();
+        assert_eq!(budget.next_ordinal(), 1);
+        assert_eq!(budget.record(2), Err(Rejection::Limit));
+        for ordinal in 1..=MAX_CALLS {
+            budget.record(ordinal).unwrap();
+            // A call that does not run consumes no result bytes.
+            budget.settle(0).unwrap();
         }
-        call.ordinal = 9;
-        assert_eq!(
-            budget.reserve_rejected(call, &grant, &Destination::Local),
-            Err(Rejection::Limit)
-        );
+        assert_eq!(budget.next_ordinal(), 9);
+        assert_eq!(budget.record(9), Err(Rejection::Limit));
+        assert_eq!(budget.result_capacity(), MAX_RESULT_BYTES);
     }
 
     #[test]
@@ -819,82 +771,74 @@ mod tests {
         );
     }
     #[test]
-    fn cancellation_driven_budget_admits_late_tools_but_enforces_cancel() {
-        let (call, grant) = fixture();
+    fn cancellation_is_visible_and_never_restores_capacity() {
         let mut budget = Budget::cancellation_driven();
-        budget
-            .reserve(call.clone(), &grant, &Destination::Local)
-            .unwrap();
-        budget.settle(&call, 0).unwrap();
+        budget.record(1).unwrap();
+        budget.settle(MAX_RESULT_BYTES).unwrap();
         budget.cancel();
-        let mut next = call;
-        next.ordinal = 2;
-        assert_eq!(
-            budget.reserve(next, &grant, &Destination::Local),
-            Err(Rejection::Cancelled)
-        );
+        assert!(budget.is_cancelled());
+        assert_eq!(budget.result_capacity(), MAX_RESULT_BYTES);
     }
 
     #[test]
-    fn cancellation_and_invalid_results_retain_pending_slot() {
-        let (call, grant) = fixture();
+    fn oversized_result_is_refused_without_consuming_capacity() {
         let mut budget = Budget::cancellation_driven();
-        budget
-            .reserve(call.clone(), &grant, &Destination::Local)
-            .unwrap();
-        assert_eq!(
-            budget.reserve(call.clone(), &grant, &Destination::Local),
-            Err(Rejection::Busy)
-        );
-        let mut changed = call.clone();
-        changed.arguments = Arguments::ListDirectory { path: ".".into() };
-        assert_eq!(
-            budget.reserve(changed, &grant, &Destination::Local),
-            Err(Rejection::IdentityConflict)
-        );
-        budget.cancel();
-        assert!(!budget.is_settled());
-        assert_eq!(
-            budget.settle(&call, MAX_RESULT_BYTES + 1),
-            Err(Rejection::Limit)
-        );
-        assert!(!budget.is_settled());
-        budget.settle(&call, 0).unwrap();
-        assert!(budget.is_settled());
-        assert_eq!(
-            budget.reserve(call, &grant, &Destination::Local),
-            Err(Rejection::Cancelled)
-        );
+        budget.record(1).unwrap();
+        assert_eq!(budget.settle(MAX_RESULT_BYTES + 1), Err(Rejection::Limit));
+        assert_eq!(budget.result_capacity(), MAX_RESULT_BYTES);
     }
     #[test]
-    fn aggregate_result_and_call_limits_cannot_expand_on_settlement() {
-        let (mut call, grant) = fixture();
+    fn aggregate_result_bytes_cannot_expand_on_settlement() {
         let mut budget = Budget::cancellation_driven();
         for ordinal in 1..=4 {
-            call.ordinal = ordinal;
-            budget
-                .reserve(call.clone(), &grant, &Destination::Local)
-                .unwrap();
-            budget.settle(&call, MAX_RESULT_BYTES).unwrap();
+            budget.record(ordinal).unwrap();
+            budget.settle(MAX_RESULT_BYTES).unwrap();
         }
-        call.ordinal = 5;
+        assert_eq!(budget.result_capacity(), 0);
+        budget.record(5).unwrap();
+        assert_eq!(budget.settle(1), Err(Rejection::Limit));
+    }
+    /// TCR-D12: rendered text of calls that do not run holds only codes.
+    #[test]
+    fn not_run_text_is_rendered_from_codes_only() {
+        use journal::{ExecCmdBusyReason as B, ToolDecision as D, ToolFault as F};
         assert_eq!(
-            budget.reserve(call.clone(), &grant, &Destination::Local),
-            Err(Rejection::Limit)
+            not_run_result(D::InvalidArguments, Some(F::MissingField), None, None),
+            Some((3, "invalid_arguments: missing_field".into()))
         );
-        let mut budget = Budget::cancellation_driven();
-        for ordinal in 1..=MAX_CALLS {
-            call.ordinal = ordinal;
-            budget
-                .reserve(call.clone(), &grant, &Destination::Local)
-                .unwrap();
-            budget.settle(&call, 0).unwrap();
-        }
-        call.ordinal = MAX_CALLS + 1;
         assert_eq!(
-            budget.reserve(call.clone(), &grant, &Destination::Local),
-            Err(Rejection::Limit)
+            not_run_result(D::UnknownTool, Some(F::UnregisteredName), None, None),
+            Some((3, "unknown_tool: unregistered_name".into()))
         );
+        assert_eq!(
+            not_run_result(D::Refused, None, None, None),
+            Some((3, "refused: secret_detection_unavailable".into()))
+        );
+        let refusal = journal::ExecCmdRefusal {
+            code: asura_platform::secrets::RefusalCode::SecretSingleQuoted,
+            kind: Some(asura_platform::secrets::SecretKind::GithubToken),
+            word: Some(2),
+        };
+        let (status, text) = not_run_result(D::Refused, None, None, Some(refusal)).unwrap();
+        assert_eq!(status, 3);
+        assert!(text.starts_with("Command refused: a `github-token` secret in word 2"));
+        assert_eq!(
+            not_run_result(D::Busy, None, Some(B::Quota), None),
+            Some((4, "exec_cmd_busy: quota".into()))
+        );
+        assert_eq!(
+            not_run_result(D::Denied, None, None, None),
+            Some((2, "denied".into()))
+        );
+        assert_eq!(
+            not_run_result(D::Limit, None, None, None),
+            Some((7, "limit".into()))
+        );
+        assert_eq!(
+            not_run_result(D::Cancelled, None, None, None),
+            Some((6, "cancelled".into()))
+        );
+        assert_eq!(not_run_result(D::Run, None, None, None), None);
     }
 }
 

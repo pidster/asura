@@ -40,12 +40,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Command {
     #[cfg(feature = "embedded-memory")]
+    /// Put one note for a committed `run` create_note kind 14. The body and
+    /// optional source version come from the service's parse; the identities
+    /// are derived from the call (HM3, TCR-D2).
     MemoryCreate {
         cancel: Arc<AtomicBool>,
         turn: Id,
         generation: u64,
         ordinal: u32,
         body: String,
+        source: Option<Id>,
     },
     #[cfg(feature = "embedded-memory")]
     MemoryResolveCreate {
@@ -338,6 +342,7 @@ impl WriterHandle {
                 generation,
                 ordinal,
                 body,
+                source,
                 ..
             } => {
                 if *turn == [0; 16]
@@ -345,6 +350,7 @@ impl WriterHandle {
                     || !(1..=8).contains(ordinal)
                     || body.is_empty()
                     || body.len() > 16384
+                    || source.is_some_and(|source| source == [0; 16])
                 {
                     return Err(Error::Invalid);
                 }

@@ -31,6 +31,10 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
     public var supportsReasoning = false
     var inputObserver: OllamaInputObserver? = nil
     var usageObserver: InferenceUsageObserver? = nil
+    /// Session tool handler for a call whose name is not registered: the SDK
+    /// cannot dispatch it, so the adapter sends it for its record and then
+    /// fails the turn with protocolFault (TCR-D17).
+    var unregisteredToolHandler: ToolHandler? = nil
     public var capabilities: LanguageModelCapabilities {
         .init((supportsTools ? [.toolCalling] : []) + (supportsReasoning ? [.reasoning] : []))
     }
@@ -255,12 +259,12 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 guard message.role == "assistant" else { throw Failure.invalidResponse }
                 textBytes += message.content.utf8.count
                 calls += message.tool_calls?.count ?? 0
-                guard textBytes <= Limits.output, calls <= 8 else { throw Failure.limit }
+                // Nine calls: the ninth is recorded and then ends the turn (TCR-D6).
+                // Arguments are forwarded unread; the service applies the
+                // 64,000-byte limit and every argument rule (TCR-D17).
+                guard textBytes <= Limits.output, calls <= 9 else { throw Failure.limit }
                 for call in message.tool_calls ?? [] {
-                    guard !call.function.name.isEmpty, call.function.name.utf8.count <= 128,
-                          case .object = call.function.arguments,
-                          try JSONEncoder().encode(call.function.arguments).count <= 16_384
-                    else { throw Failure.invalidResponse }
+                    guard !call.function.name.isEmpty else { throw Failure.invalidResponse }
                 }
             }
             done = value.done == true
@@ -327,6 +331,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
             guard let maximumTokens = request.generationOptions.maximumResponseTokens,
                   (1...2048).contains(maximumTokens) else { throw Failure.limit }
             let hasTools = !request.enabledToolDefinitions.isEmpty
+            let registered = Set(request.enabledToolDefinitions.map(\.name))
             guard !hasTools || model.localToolModel != nil else { throw Failure.unsupported }
             let body = try JSONEncoder().encode(Request(model: model.localToolModel ?? settings.name,
                 messages: try messages(request.transcript), tools: tools.isEmpty ? nil : tools,
@@ -352,11 +357,20 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                         }
                         for call in message.tool_calls ?? [] {
                             guard model.supportsTools else { throw Failure.unsupported }
+                            let arguments = String(decoding: try JSONEncoder().encode(call.function.arguments), as: UTF8.self)
+                            guard registered.contains(call.function.name) else {
+                                // The SDK cannot return a result for this name. Send it
+                                // for its record, await the result, then fail the turn.
+                                if let handler = model.unregisteredToolHandler {
+                                    _ = try await handler(ToolProposal(name: call.function.name,
+                                        arguments: arguments, source: .providerJson))
+                                }
+                                throw BackendFailure(.protocolFault)
+                            }
                             ordinal += 1
-                            let arguments = try JSONEncoder().encode(call.function.arguments)
                             await channel.send(.toolCalls(action: .toolCall(
                                 id: "\(request.id.uuidString.lowercased())-\(ordinal)", name: call.function.name,
-                                action: .appendArguments(String(decoding: arguments, as: UTF8.self), tokenCount: 0))))
+                                action: .appendArguments(arguments, tokenCount: 0))))
                         }
                     }
                     if chunk.done == true, chunk.done_reason == "stop" || chunk.done_reason == "length" {

@@ -1841,6 +1841,215 @@ def exec_cmd_capture(fixture, source):
         assert not errors, errors
 
 
+def tool_call_records(fixture, source):
+    """Tool call records end to end through the real TUI, service, Swift helper
+    and a scripted loopback model (tool-call-records.md): TCR-E01 (the activity
+    shows the rejected call with its decision and fault, then the valid
+    result), TCR-E02 (activity and result show only placeholders; raw-byte
+    sweep) and TCR-E03 (restart during a running exec_cmd; the TUI shows the
+    call interrupted with its name and arguments; nothing runs again)."""
+    import threading
+
+    shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+    (fixture.root / "asura-model").chmod(0o700)
+    project = fixture.root / "project"
+    project.mkdir(mode=0o700)
+    (project / "README.md").write_text("E01-CONTENT\n")
+    secret = "ghp_" + "Rv4" * 12
+    (project / ".env").write_text(f"GITHUB_TOKEN={secret}\n")
+    script = []
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    listener.settimeout(0.1)
+    endpoint = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    stopped = threading.Event()
+    errors = []
+    tool_messages = []
+    chats = []
+
+    def serve():
+        end = time.monotonic() + 240
+        try:
+            while not stopped.is_set() and time.monotonic() < end:
+                try:
+                    peer, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                with peer:
+                    peer.settimeout(5)
+                    request = bytearray()
+                    header, body, length = b"", b"", 0
+                    while True:
+                        data = peer.recv(65536)
+                        if not data:
+                            break
+                        request.extend(data)
+                        if b"\r\n\r\n" in request:
+                            header, body = request.split(b"\r\n\r\n", 1)
+                            length = next((int(line.split(b":", 1)[1]) for line in header.split(b"\r\n")
+                                           if line.lower().startswith(b"content-length:")), 0)
+                            if len(body) >= length:
+                                break
+                    if request.startswith(b"POST /api/show "):
+                        payload = json.dumps({"capabilities": ["completion", "tools"],
+                                              "model_info": {"fixture.context_length": 16384}}).encode()
+                        peer.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+                    elif request.startswith(b"POST /api/chat "):
+                        chat = json.loads(body[:length])
+                        chats.append(chat)
+                        for message in chat["messages"]:
+                            if message.get("role") == "tool":
+                                tool_messages.append(message.get("content", ""))
+                        step = script.pop(0) if script else None
+                        peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                        if step is None:
+                            reply = {"message": {"role": "assistant", "content": "COMPLETE"},
+                                     "done": True, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3}
+                        else:
+                            name, arguments = step
+                            reply = {"message": {"role": "assistant", "content": "",
+                                                 "tool_calls": [{"function": {"name": name, "arguments": arguments}}]},
+                                     "done": True, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}
+                        peer.sendall(json.dumps(reply).encode() + b"\n")
+        except Exception as error:
+            if not stopped.is_set():
+                errors.append(error)
+
+    def run_backend():
+        out = (fixture.root / "foreground.out").open("ab")
+        err = (fixture.root / "foreground.err").open("ab")
+        backend = subprocess.Popen([str(fixture.binary), "service", "run"],
+            cwd=fixture.root, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+        fixture.started = True
+        end = time.monotonic() + remaining()
+        while True:
+            assert backend.poll() is None, "foreground fixture exited before serving"
+            code, data, _ = fixture.command("service", "status", "--json")
+            if code == 0 and json.loads(data)["service"] == "current":
+                return backend
+            assert time.monotonic() < end, "foreground service did not become ready"
+            time.sleep(0.01)
+
+    def attach_project(trial):
+        trial.resize(140, 45)
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+
+    def wait_chats(trial, count):
+        # The final answer is the last scripted request; then the terminal settles.
+        end = time.monotonic() + 40
+        while len(chats) < count:
+            assert time.monotonic() < end, ("model requests", len(chats), count)
+            trial.read(0.05)
+        trial.idle(1.5)
+
+    def expand_latest(trial, prompt):
+        trial.send(b"\x1b[17~")  # F6 response history.
+        trial.until(prompt.encode(), plain=True, limit=10)
+        trial.send(b"\r")
+        trial.until("▾ Activity".encode(), plain=True, limit=10)
+
+    server = threading.Thread(target=serve, name="asura-tool-call-records-fixture")
+    server.start()
+    trial = None
+    backend = None
+    try:
+        backend = run_backend()
+        trial = fixture.launch()
+        attach_project(trial)
+        for key, value in [("providers.ollama.endpoint", endpoint), ("model", "ollama:fixture")]:
+            trial.send(f"/config set {key} {value}\r".encode())
+            trial.until(f"Saved {key}".encode(), plain=True)
+            trial.send(b"\x1b")
+            trial.idle(0.1)
+        # TCR-E01: a malformed call, then the model's corrected call.
+        script[:] = [("project", {"command": "read_file"}),
+                     ("project", {"command": "read_file", "path": "README.md"}), None]
+        trial.send(b"Run E01.\r")
+        wait_chats(trial, 3)
+        expand_latest(trial, "Run E01.")
+        trial.until(b"invalid_arguments: missing_field", plain=True, limit=10)
+        trial.until(b"E01-CONTENT", plain=True, limit=10)
+        trial.idle(0.2)
+        screen = trial.screen.text()
+        assert "1. project · failed" in screen, screen
+        assert "2. project · complete" in screen and "service admitted" in screen, screen
+        assert any("invalid_arguments: missing_field" in m for m in tool_messages), tool_messages
+        assert any("E01-CONTENT" in m for m in tool_messages), tool_messages
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        print("PASS TCR-E01 TUI: rejected call shown as project + invalid_arguments: missing_field, then the valid result")
+        # TCR-E02: a secret in the command; only placeholders are shown.
+        script[:] = [("exec_cmd", {"command": f"printf '%s' \"{secret}\" > out.txt; cat .env"}), None]
+        trial.send(b"Run E02.\r")
+        wait_chats(trial, 5)
+        expand_latest(trial, "Run E02.")
+        trial.until(b"ASURA_SECRET_1", plain=True, limit=10)
+        trial.idle(0.2)
+        screen = trial.screen.text()
+        assert secret not in screen, "raw secret on screen"
+        assert "GITHUB_TOKEN=$ASURA_SECRET_1" in screen, screen
+        assert (project / "out.txt").read_text() == secret, "the rewritten command used the value"
+        (project / "out.txt").unlink()
+        assert all(secret not in m for m in tool_messages)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        print("PASS TCR-E02 TUI: activity and result show only placeholders")
+        # TCR-E03: crash the service during a running exec_cmd.
+        script[:] = [("exec_cmd", {"command": "printf x >> e03.txt; sleep 60"}), None]
+        trial.send(b"Run E03.\r")
+        end = time.monotonic() + 40
+        while not (project / "e03.txt").exists():
+            assert time.monotonic() < end, "E03 command did not start"
+            trial.read(0.05)
+        trial.idle(0.3)
+        backend.kill()
+        backend.wait(timeout=10)
+        trial.close()
+        fixture.active_trials.remove(trial)
+        trial = None
+        backend = run_backend()
+        trial = fixture.launch()
+        attach_project(trial)
+        expand_latest(trial, "Run E03.")
+        trial.until(b"interrupted", plain=True, limit=10)
+        trial.until(b"printf x >> e03.txt", plain=True, limit=10)
+        trial.idle(0.2)
+        screen = trial.screen.text()
+        assert "exec_cmd · interrupted" in screen, screen
+        time.sleep(1.0)
+        assert (project / "e03.txt").read_text() == "x", "the interrupted call ran again"
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        print("PASS TCR-E03 TUI: restart shows the call interrupted with name and arguments; nothing ran again")
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        (project / ".env").unlink()
+        for path in fixture.root.rglob("*"):
+            if path.is_file() and path.name not in ("asura-fixture", "asura-model"):
+                assert secret.encode() not in path.read_bytes(), f"raw secret in {path}"
+        assert not errors, errors
+        print("PASS TCR-E01/E02/E03 TUI tool call records, raw-byte sweep clean")
+    finally:
+        if trial is not None:
+            trial.close()
+        stopped.set()
+        server.join(timeout=3)
+        listener.close()
+        if backend is not None and backend.poll() is None:
+            try:
+                fixture.stop()
+                backend.wait(timeout=remaining())
+            except Exception:
+                backend.kill()
+                backend.wait(timeout=5)
+        assert not server.is_alive(), "fixture server cleanup unconfirmed"
+        assert not errors, errors
+
+
 def waiting_steps(fixture, source):
     """WS-01..04 end-to-end through the real TUI, service and Swift helper. A
     private loopback provider holds /api/show (Hello) and then /api/chat
@@ -2626,14 +2835,15 @@ def main():
     waits_client = len(sys.argv) == 3 and sys.argv[2] == "--client-waits"
     steps = len(sys.argv) == 3 and sys.argv[2] == "--waiting-steps"
     steer = len(sys.argv) == 3 and sys.argv[2] == "--queue-steer"
-    assert len(sys.argv) == 2 or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
+    records = len(sys.argv) == 3 and sys.argv[2] == "--tool-call-records"
+    assert len(sys.argv) == 2 or records or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
         DEADLINE = time.monotonic() + 160
     if activity or multipass:
         DEADLINE = time.monotonic() + 90
-    if capture:
+    if capture or records:
         DEADLINE = time.monotonic() + 240
     if long_turns:
         DEADLINE = time.monotonic() + 900
@@ -2672,6 +2882,9 @@ def main():
             return
         if capture:
             exec_cmd_capture(fixture, source)
+            return
+        if records:
+            tool_call_records(fixture, source)
             return
         if steps:
             DEADLINE = time.monotonic() + 70
@@ -2717,7 +2930,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture and not waits_client and not steps and not steer:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture and not records and not waits_client and not steps and not steer:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

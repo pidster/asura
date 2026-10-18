@@ -559,7 +559,7 @@ When implemented, this design changes these existing contracts for jobs:
 | exec_cmd: `timeout_seconds` 1–60 (`tools.rs:189`); guardian rejects deadlines over 60 s (`guardian.rs:322`) | Removed. J1 removes the timeout and adds the guardian's no-deadline mode (J1-Q3); `timeout_seconds` and the guardian's numeric deadline mode are removed (owner, 2026-10-17). Jobs have no lifetime (J2a-1) |
 | Helper and control validation of `timeout_seconds` 1–60 (`swift/model-helper/Sources/HelperCore/ToolBridge.swift:185`, `asura-control/src/model.rs:394`) | `timeout_seconds` removed; `yield_seconds` validated instead |
 | exec_cmd: one exec_cmd worker per active turn (`conversation.rs:487`) and one active turn (`conversation.rs:584`), so one live exec_cmd job service-wide | Controller slots under the limits below |
-| exec_cmd intent: ToolIntent record kind 14 with tool kind 16 stores the timeout as 1–60,000 ms and 1–60 s (`asura-storage/src/authority/conversation/codec.rs:289-305`) | J1: ExecCmdIntent kind 22 with no timeout; J2: job intent record (R3) |
+| exec_cmd intent: ToolIntent record kind 14 with tool kind 16 stores the timeout as 1–60,000 ms and 1–60 s (`asura-storage/src/authority/conversation/codec.rs:289-305`) | J1: kind 14 `ToolCall` with no timeout (kind 22 retired 2026-10-18); J2: job intent record (R3) |
 | exec_cmd result: end of each stream, at most 6144 bytes (`exec_cmd/capture.rs:72`) | No output text (PC12) |
 | Model tools: ToolResult record kind 15 holds result text (`types.rs:415-423`) | All tools use jobs and the reference-only result kind (EX4, owner 2026-10-15, superseding R3's "legacy tools keep kind 15") |
 | Guardian: notices of kinds 1–4 (`protocol.rs:47-52`) | Adds kind 5, leader exited (J2b) |
@@ -943,7 +943,7 @@ flowchart TD
 
 | Packet | Delivers | Decisions it uses |
 | --- | --- | --- |
-| J1 | Retention item 3 under the existing exec_cmd tool: secret filtering at capture and command rewrite (EX4, SL3), incremental hashing, staging, settle-then-install, kinds 22 and 23, `live` and `unverified_prefix` text pages, quota and growing-reservation accounting with interim expiry, capture and page-read workers, and removal of the exec_cmd timeout and setup budget. The model result keeps its shape with redacted tails; full output is retained. Graph projection is excluded. See [J1 and SL3 implementation details](#j1-and-sl3-implementation-details). | G1, R1, R2, R3 (kinds 22, 23), R4, R5, R6, EX4, J1-Q1 to J1-Q4 |
+| J1 | Retention item 3 under the existing exec_cmd tool: secret filtering at capture and command rewrite (EX4, SL3), incremental hashing, staging, settle-then-install, kinds 14 and 23 (kind 22 retired 2026-10-18), `live` and `unverified_prefix` text pages, quota and growing-reservation accounting with interim expiry, capture and page-read workers, and removal of the exec_cmd timeout and setup budget. The model result keeps its shape with redacted tails; full output is retained. Graph projection is excluded. See [J1 and SL3 implementation details](#j1-and-sl3-implementation-details). | G1, R1, R2, R3 (kinds 14, 23), R4, R5, R6, EX4, J1-Q1 to J1-Q4 |
 | J2 | Controller core: slots, job records, no lifetime, lease stop-control bytes, leader-exit notice, `CapturePaused` for quota and ENOSPC, revocation, journal outage, restart and shutdown, and the person-origin amendments. Driven by integration tests; the exec_cmd tool is not yet switched. | T1 (done), EX5, EX10, R3, J1d, J2a-1, J2a-2, J2b, J2c, J2d |
 | J3 | `exec_cmd` adoption with yield and no output text, removal of `timeout_seconds`, the `job` tool including `wait` and `note`, and reference-only results. Shipped together, because results carry no output text. | R3, R5, `job wait`, S1 |
 | J4 | Control messages, `/jobs`, the viewer, cancel and kill, `at_end`, and `/job pin`, `unpin`, `delete` and `note`, with their command flowcharts | J2a-2, J4a, S1 |
@@ -972,12 +972,12 @@ It does not add the job controller, job handles or job tools.
 | Command rewrite | SL3: the conversation owner rewrites the exec_cmd command at `ToolCall`, before any record. Unsafe forms are refused. | Yes: refusal results; the command runs through secret variables |
 | Capture | Scan, then stage, then hash each stream on a capture worker, with backpressure and the 512 KiB transfer queue | No |
 | Model result | Kind 15 keeps today's shape. Its tails come from the redacted stream, and its header gains the capture state. | Yes: placeholders in tails; `capture=` field |
-| Durable records | Kinds 22 (ExecCmdIntent) and 23 (CaptureSettled); kind 15 unchanged | No |
+| Durable records | Kind 14 `ToolCall` (replaced kind 22 on 2026-10-18) and kind 23 (CaptureSettled); kind 15 unchanged | No |
 | Settle, then install (R2) | Kind 23 commits before kind 15; payloads install after kind 23 | No |
 | Quota (R1, J1d) | Ledger, 1 MiB initial reservation, 1 MiB steps, interim quota-pressure expiry (J1-Q2), no 64 MiB stop | Yes: `busy` results |
 | Time bounds | The exec_cmd 1–60 s timeout (L1, J1-Q3) and the 2 s setup budget (L2, J1-Q4) are removed | Yes: commands run until they end or the turn is cancelled |
 | Pages | Text pages with `live`, `complete`, `incomplete` and `unverified_prefix` states; 2 page-read workers | No: no consumer until J3 and J4 |
-| Recovery | Derived from kinds 22 and 23 and the payload directories; no recovery record | No |
+| Recovery | Derived from kinds 14 and 23 and the payload directories; no recovery record | No |
 
 What later packets keep or replace:
 
@@ -1024,13 +1024,15 @@ backoff for a paused capture (owner, [quota ledger](#quota-ledger)).
 J1 depends on [journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)
 (owner, 2026-10-15), which is implemented first with its own tests J1-0-01 to
 J1-0-08. It removes the time bounds on journal appends, append observation,
-startup replay and the queue worker. A slow append of kind 22, 23 or 15
+startup replay and the queue worker. A slow append of kind 14, 23 or 15
 therefore never fences the journal and never fails the turn; only an actual
 I/O error does.
 
 Risk (owner, 2026-10-15): J1 adds at most about 5 KiB of journal bytes per
-exec_cmd call over today: kind 23 (a frame of at most 4,286 bytes) plus at most
-122 bytes by which kind 22 exceeds the kind 14 intent it replaces. This counts
+exec_cmd call over today: kind 23 (a frame of at most 4,250 bytes since
+2026-10-18). The kind 14 `ToolCall` record that replaced kind 22 holds the
+argument text once; its growth is bounded in
+[tool call records](tool-call-records.md#size-limits). This counts
 against the current single 8 MiB journal file. Until the required follow-up journal design for segment
 files, checkpoints and compaction lands
 ([journal capacity follow-up](conversation-admission.md#format-1-and-record-kinds)),
@@ -1056,48 +1058,46 @@ pages. The journal I/O module (`asura-platform/src/journal_io.rs`) is the
 pattern for `payload_io.rs`: held directory descriptors, an APFS and local
 check, and ordinary-file validation.
 
-### J1 records: kinds 22 and 23
+### J1 records: kinds 14 and 23
 
-Required behavior (R3, EX4): J1 adds two additive format-1 kinds, allocated in
-delivery order. A J1 binary writes kind 22 for every new exec_cmd call and never
-writes kind 14 with tool kind 16. Replay rejects a kind 14 record that carries
-tool kind 16 (owner, 2026-10-17: no compatibility with older journals). Tool kind
-16 remains the in-memory tool record kind for a kind 22 intent. Kind 15 is unchanged. No record holds output text,
-a secret value or a digest of either.
+Required behavior (R3, EX4; revised by [tool call records](tool-call-records.md),
+2026-10-18): every exec_cmd call is a kind 14 `ToolCall` record with
+operation code 10. Kind 22 `ExecCmdIntent` is retired; replay returns
+`UnsupportedFormat` for it. Kind 23 follows a kind 14 exec_cmd record with
+decision `run`. Kind 15 is unchanged and follows kind 23. No record holds
+output text, a secret value or a digest of either (owner, 2026-10-17: no
+compatibility with older journals).
 
 Encodings follow the existing codec: integers are big-endian, an ID is 16
 bytes, a digest is 32 bytes, a string is a 4-byte length then UTF-8 bytes, and
 a flag is one byte, 0 or 1. Any other value is `Corrupt`.
 
-#### Kind 22: ExecCmdIntent
+#### Kind 14 exec_cmd facts (formerly kind 22)
 
-| # | Field | Encoding | Bounds and rule |
-| --- | --- | --- | --- |
-| 1 | operation | ID | Not zero; the active operation |
-| 2 | generation | u64 | At least 1; the active generation |
-| 3 | ordinal | u32 | 1–8; the next tool ordinal |
-| 4 | disposition | u8 | 1 admitted, 2 refused, 3 busy |
-| 5 | flags | u8 | Bit 0: command truncated, refused only. Other bits 0. |
-| 6 | command | string | 1–8192 bytes, no NUL. Admitted or busy: the rewritten command. Refused: the display-redacted command. |
-| 7 | cwd | string | 1–1024 bytes, relative, no `..` part, no NUL, as kind 14. Refused for `secret_in_cwd`: display-redacted. |
-| 8 | refusal code | u8 | 0 unless refused; then 1–14 from the table below |
-| 9 | refusal kind | u8 | 0 or a secret kind code 1–33 |
-| 10 | refusal word | u16 | 0, or the 1-based word index 1–4096 |
-| 11 | busy reason | u8 | 0 unless busy; then 1 `quota`, 2 `capture_paused`, 3 `pending_full`, 4 `payload_unavailable` |
-| 12 | variable count | u8 | 0–16; 0 unless admitted |
-| 13 | variables | count × (u8 number, u8 kind) | Entry i has number i; kind 1–33. No value and no value digest. |
-| 14 | job ID | ID | Admitted: the existing `asura.exec_cmd.job` derivation (`codec.rs:309-323`). Otherwise zero. |
-| 15 | stdout payload | ID | Admitted: the [payload ID](#storage-payload-ids-ledger-staging-pages-and-recovery) for stream 1. Otherwise zero. |
-| 16 | stderr payload | ID | Admitted: the payload ID for stream 2. Otherwise zero. |
-| 17 | initial reservation | u64 | Admitted: 1,048,576. Otherwise 0. |
-| 18 | rule-set revision | u32 | The revision used (1). 0 only with refusal code 12. |
-| 19 | rule-set digest | 32 bytes | The digest of that revision. Zero only with refusal code 12. |
+The [kind 14 layout](tool-call-records.md#record-kind-14-toolcall) holds the
+exec_cmd call. The stored arguments are the only copy of the command and cwd:
+the `command` value is the SL3 rewrite, or the display-redacted command cut at
+8,192 bytes when the rewrite refuses. Kind 14 fields 20–23 hold the facts that
+the stored text cannot show:
 
-Replay recomputes fields 14–16 from the record and the frame's installation
-ID and rejects a mismatch as `Corrupt`. The maximum payload is 9,384 bytes:
-30 fixed, 8,196 command, 1,028 cwd, 6 refusal and busy, 32 variables, 48 IDs,
-8 reservation and 36 rule set. The maximum frame is 9,568 bytes, below the
-64 KiB frame.
+| Kind 14 field | Former kind 22 field | Rule |
+| --- | --- | --- |
+| 8 decision | 4 disposition | `run` (formerly admitted), `refused`, `busy` |
+| 10 busy reason | 11 busy reason | 1 `quota`, 2 `capture_paused`, 3 `pending_full`, 4 `payload_unavailable` |
+| 16 number kinds | 13 variables | Entries 1 to k are the kinds of the secret variables |
+| 18–19 rule set | 18–19 rule set | The revision and digest used; 0 and zero only when the rule set is unavailable |
+| 20 exec_cmd flags | 5 flags | Bit 0: command cut at 8,192 bytes (refused only) |
+| 21–23 refusal code, kind, word | 8–10 | As before |
+
+Replay recomputes the other former kind 22 fields; no record stores them:
+
+| Value | Derivation |
+| --- | --- |
+| Job ID | The `asura.exec_cmd.job` derivation from operation, generation and ordinal |
+| stdout and stderr payload IDs | The [payload ID](#storage-payload-ids-ledger-staging-pages-and-recovery) derivation with object kinds 1 and 2 and the frame's installation ID |
+| Initial reservation | The constant 1,048,576 for a `run` exec_cmd call |
+| Variable count k | The distinct placeholder numbers in the stored `command` |
+| Variable kinds | Kind 14 field 16 entries 1 to k |
 
 Refusal codes are the `RefusalCode` values of `secrets/rewrite.rs:63-76` in
 this order, then two J1 codes: 1 `placeholder_not_available`, 2
@@ -1114,23 +1114,26 @@ secret kind needs a new rule-set revision and a new code.
 
 | # | Field | Encoding | Bounds and rule |
 | --- | --- | --- | --- |
-| 1–3 | operation, generation, ordinal | ID, u64, u32 | Equal to an admitted kind 22 with no kind 23 or 15 yet |
+| 1–3 | operation, generation, ordinal | ID, u64, u32 | Equal to a kind 14 exec_cmd record with decision `run` and no kind 23 or 15 yet |
 | 4 | capture state | u8 | 1 `complete`, 2 `incomplete`, 3 `unconfirmed`, 4 `not_started` |
 | 5 | capture reason | u8 | 0 none, 1 `storage_fault`, 2 `quota`, 3 `enospc`, 4 `detector_fault`, 5 `discarded_after_cancel`, 6 `settlement_unconfirmed` |
 | 6 | exit kind | u8 | 0 unknown, 1 exited, 2 signalled |
 | 7 | exit value | u32 | 0 when unknown; 0–255 exited; 1–127 signalled |
 | 8 | redaction ran | u8 | Always 1 (SD9) |
-| 9 | rule-set revision | u32 | Equal to kind 22 field 18 |
-| 10 | rule-set digest | 32 bytes | Equal to kind 22 field 19 |
-| 11 | stdout facts | stream block | Below |
-| 12 | stderr facts | stream block | Below |
-| 13 | distinct numbers | u32 | 0–16,384 |
-| 14 | number count | u16 | 0–256, at most field 13 |
-| 15 | numbers | count × (u16 number, u8 kind, u8 origin) | Number 1–16,384 increasing; kind 1–33; origin 1 command, 2 output |
-| 16 | pause count | u32 | Pauses during the call (J2c facts) |
-| 17 | first pause | u64 | Milliseconds from capture start to the first pause; 0 if none |
-| 18 | paused total | u64 | Milliseconds paused in total; 0 if none |
-| 19 | final reservation | u64 | Bytes reserved at settlement; a multiple of 1 MiB |
+| 9 | stdout facts | stream block | Below |
+| 10 | stderr facts | stream block | Below |
+| 11 | distinct numbers | u32 | 0–16,384 |
+| 12 | number count | u16 | 0–256, at most field 11 |
+| 13 | numbers | count × (u16 number, u8 kind, u8 origin) | Number 1–16,384 increasing; kind 1–33; origin 1 command, 2 output |
+| 14 | pause count | u32 | Pauses during the call (J2c facts) |
+| 15 | first pause | u64 | Milliseconds from capture start to the first pause; 0 if none |
+| 16 | paused total | u64 | Milliseconds paused in total; 0 if none |
+| 17 | final reservation | u64 | Bytes reserved at settlement; a multiple of 1 MiB |
+
+Kind 23 holds no rule-set revision or digest (2026-10-18). The former fields
+9–10 repeated kind 14 fields 18–19. Replay reads the rule set of the capture
+from the kind 14 record, which must name a nonzero rule set for a `run`
+exec_cmd call (TCR-O5).
 
 Each stream block holds, in order: observed bytes (u64), stored bytes (u64),
 digest present (flag), digest (32 bytes, zero when absent), replacements,
@@ -1153,44 +1156,47 @@ first origin, command or output, and counts later exact matches as literal
 replacements (`secrets/stream.rs:91`, `stream.rs:129-132`). This refines the
 [secret detection metadata](secret-detection.md#digests-and-metadata) (G17).
 
-The maximum payload is 4,102 bytes: 72 fixed before the streams, 1,486 per
+The maximum payload is 4,066 bytes: 36 fixed before the streams, 1,486 per
 stream (101 fixed, 297 kind entries, 1,088 span entries), 1,030 for numbers,
-20 for pause facts and 8 for the reservation. The maximum frame is 4,286
-bytes.
+20 for pause facts and 8 for the reservation. The maximum frame is 4,250
+bytes. Removing the rule-set fields removed 36 bytes (a 4-byte revision and a
+32-byte digest).
 
 #### Replay order and reservation
 
-Required behavior (R2): the records of one admitted exec_cmd call appear in the
-order kind 22, kind 23, kind 15.
+Required behavior (R2): the records of one exec_cmd call with decision `run`
+appear in the order kind 14, kind 23, kind 15. An exec_cmd call that does not
+run (`refused`, `busy`, or any other decision) is complete at its kind 14; no
+kind 23 or kind 15 follows it (TCR-R5).
 
 | Rule | Replay result when broken |
 | --- | --- |
-| Kind 22 follows the same admission rules as kind 14 today: active operation and generation, next ordinal, no tool pending | `Corrupt` |
-| An admitted kind 22 needs kind 23 before kind 15 | `Corrupt` |
-| A refused or busy kind 22 is followed by kind 15 only, with status 3 (refused) or 4 (busy) | `Corrupt` |
-| Kind 23 matches a pending admitted kind 22 and appears once | `Corrupt` |
+| Kind 14 follows the [kind 14 replay rules](tool-call-records.md#replay-recovery-and-restart): active operation and generation, next ordinal, no tool pending | `Corrupt` |
+| A `run` exec_cmd kind 14 needs kind 23 before kind 15 | `Corrupt` |
+| A refused or busy exec_cmd kind 14 is followed by no kind 23 and no kind 15 | `Corrupt` |
+| Kind 23 matches a pending `run` exec_cmd kind 14 and appears once | `Corrupt` |
 | Kind 23 or kind 15 for the call after the operation's terminal | `Corrupt` |
-| A terminal while an admitted kind 22 lacks kind 23 | Accepted: the capture is interrupted |
+| A terminal while a `run` exec_cmd kind 14 lacks kind 23 | Accepted: the capture is interrupted |
 
-The writer's `reserve()` (`conversation/state.rs:1224-1268`) adds one frame of
-`HEADER + TRAILER + 4,102` bytes (4,286) while the active operation's last tool
-is an admitted kind 22 without kind 23. The existing result reservation of
-`HEADER + TRAILER + 43 + 16,384` bytes stays until kind 15. Kind 22 is
-therefore accepted only when the journal can still hold kinds 23, 15 and the
-terminal.
+The writer's `reserve()` (`conversation/state.rs`) adds one frame of
+`HEADER + TRAILER + 4,066` bytes (4,250) while the active operation's last tool
+is a `run` exec_cmd kind 14 without kind 23. The existing result reservation of
+`HEADER + TRAILER + 43 + 16,384` bytes stays until kind 15. A `run` exec_cmd
+kind 14 is therefore accepted only when the journal can still hold kinds 23,
+15 and the terminal (TCR-D16).
 
 Derived recovery (proposed): restart writes no new record for an exec_cmd call.
 Replay and the payload store derive its state:
 
 | Journal state | Payload files | Derived capture | Startup action |
 | --- | --- | --- | --- |
-| Admitted kind 22, no kind 23 | Staging may exist | Interrupted; pages `unverified_prefix` | None; eligible for interim expiry |
+| `run` exec_cmd kind 14, no kind 23 | Staging may exist | Interrupted; pages `unverified_prefix` | None; eligible for interim expiry |
 | Kind 23 `complete` or `incomplete`, object installed | Object | `complete` or `incomplete` | Check the object's length |
 | Kind 23 `complete` or `incomplete`, staging only | Staging | Same, after the check | Verify length and digest, then install. A mismatch makes the payload `corrupt`; the file stays for expiry. |
 | Kind 23 `complete` or `incomplete`, no file | None | `missing` | None |
 | Kind 23 `unconfirmed` | Staging may exist | Pages `unverified_prefix` | None; eligible for interim expiry |
 | Kind 23 `not_started` | None expected | No payload | Delete a stray staging file |
-| No kind 22 names the payload ID | Orphan file | None | Delete (identity violation) |
+| No `run` exec_cmd kind 14 derives the payload ID | Orphan file | None | Delete (identity violation) |
 
 Format stays `1`. No compatibility with older binaries is required
 (owner, 2026-10-17).
@@ -1213,11 +1219,11 @@ numbers are at commit `41eebfb`.
 | `guardian.rs:345` | Setup deadline check | Skipped in no-deadline mode |
 | `guardian.rs:145-166`, `:430` `CleanupSafety` | Seeds the clock-fault fallback with the deadline | Seeds it with the guardian's first clock sample; a failed sample advances 100 ms from the last one |
 | `guardian.rs:457-461` | Stops with reason 1 at the deadline | No-deadline mode never sets reason 1; lease closure and leader exit still stop the group |
-| `exec_cmd_worker.rs:97-137` `start` | Takes a deadline; compares `intent.limit` with `timeout_seconds`; rejects an expired deadline; computes a 2 s setup deadline | No deadline argument. Compares kind 22 with the call's rewrite (G8). No expiry or setup deadline. |
+| `exec_cmd_worker.rs:97-137` `start` | Takes a deadline; compares `intent.limit` with `timeout_seconds`; rejects an expired deadline; computes a 2 s setup deadline | No deadline argument. Compares the stored kind 14 command with the call's rewrite (G8). No expiry or setup deadline. |
 | `exec_cmd_worker.rs:146`, `:159` | Setup closure deadline checks | Removed; cancel checks stay |
 | `exec_cmd_worker.rs:205-240` | `next_deadline` and `poll` stop the job with `Deadline` | Removed. `cleanup_deadline` (L3, 2.5 s after a stop) stays. |
 | `conversation.rs:233` | `timeout_seconds` defaults to 30 | Parsed and kept in the call for identity; no effect. Removed with the field (owner, 2026-10-17) |
-| `conversation.rs:2958-2975` | Builds the deadline and kind 14 from the timeout | Builds kind 22 from the rewrite; the exec_cmd tool's deadline is `None` |
+| `conversation.rs:2958-2975` | Builds the deadline and kind 14 from the timeout | Builds kind 14 from the rewrite (kind 22 until 2026-10-18); the exec_cmd tool's deadline is `None` |
 | `conversation.rs:388-398` `LiveTool::deadline` | `Instant` | `Option<Instant>`; `None` for exec_cmd |
 | `conversation.rs:2336` | `model_timeout` when `now >= tool.deadline` | Applied only to a tool with a deadline; never to exec_cmd. Later removed for every tool with L10 (owner, 2026-10-17) |
 | `conversation.rs:3357-3367` | Passes `tool.deadline` to the exec_cmd worker | No deadline |
@@ -1342,7 +1348,7 @@ never across I/O.
   including unverified prefixes) plus reservations. A reservation starts at
   1 MiB at admission and grows in 1 MiB steps (R1). At settlement the
   reservation is released and the stored bytes are counted as retained.
-- **Admission.** On the reactor, before kind 22, the conversation owner asks
+- **Admission.** On the reactor, before kind 14, the conversation owner asks
   the ledger for 1 MiB. If free space is short, the ledger may count expirable
   bytes as available and mark those calls for deletion. The new capture worker
   deletes them before it creates its staging files. Otherwise the call is
@@ -1355,8 +1361,8 @@ never across I/O.
   (installed, or verified staging), or an unverified prefix whose operation has
   ended, that nothing holds. Holds in J1 are the current call's capture, a
   pending-install entry and an open page read. The order is oldest last use
-  first, with the journal sequence of kind 23 (or of kind 22 for an unverified
-  prefix) as last use; then larger size; then payload ID. Both streams of a
+  first, with the journal sequence of kind 23 (or of the `run` kind 14 for an
+  unverified prefix) as last use; then larger size; then payload ID. Both streams of a
   call expire together. Nothing expires by age. J1 writes no expiry record; a
   page of output that expired in the same service run returns `expired`, and
   after a restart `missing`. J6 replaces this with value classes and durable
@@ -1498,25 +1504,29 @@ call returns or the person cancels the turn.
 Proposed mechanism for the exec_cmd path of `ModelEvent::ToolCall`
 (`conversation.rs:2901-2990`):
 
-1. Parse the call as today. The call has no `timeout_seconds` (removed,
-   owner, 2026-10-17).
+1. Parse the call with the service's single argument parser
+   ([tool call records](tool-call-records.md#design-overview)). The call has no
+   `timeout_seconds` (removed, owner, 2026-10-17). A call that fails parsing
+   is a kind 14 record with decision `invalid_arguments`, not a protocol fault.
 2. Rewrite the command with `secrets::rewrite_command`. Scan the cwd in
    whole-buffer mode; a detected span refuses with `secret_in_cwd`. A rewritten
    command over 8,192 bytes refuses with `rewritten_command_too_long` (G6). The
    rewrite planner owns that check, so the person path reuses it. The check
    runs before encoding, so an oversized command can never fail the journal
    append and make the service storage-unavailable.
-3. On refusal, build kind 22 with disposition `refused`. Its command is
-   `display_redacted` (`secrets/rewrite.rs:168`); if that text exceeds 8,192
-   bytes, it is cut at the last UTF-8 boundary at or below 8,192 bytes and
-   flag bit 0 is set. Kind 15 follows with status 3 and the refusal's display
-   text, which never holds a value (G9).
+3. On refusal, build kind 14 with decision `refused` and refusal fields 21–23.
+   Its stored `command` is `display_redacted` (`secrets/rewrite.rs`); if that
+   text exceeds 8,192 bytes, it is cut at the last UTF-8 boundary at or below
+   8,192 bytes and flag bit 0 of field 20 is set. No kind 15 follows. The
+   service renders status 3 and the refusal's display text from fields 21–23;
+   the text never holds a value (G9).
 4. Otherwise check admission: a free pending-install slot, no paused capture,
-   a ready payload store and a 1 MiB reservation. A failure builds kind 22 with
-   disposition `busy`; kind 15 follows with status 4 and text
-   `exec_cmd_busy: <reason>`.
-5. Otherwise build kind 22 with disposition `admitted`, the rewritten
-   command, the variable list, the capture identity and the reservation.
+   a ready payload store and a 1 MiB reservation. A failure builds kind 14
+   with decision `busy` and busy reason field 10. No kind 15 follows. The
+   service renders status 4 and `exec_cmd_busy: <reason>`.
+5. Otherwise build kind 14 with decision `run`, the rewritten command in the
+   stored arguments and the variable kinds in field 16. Replay derives the
+   job ID, payload IDs and reservation.
 
 Raw command handling (G8). The raw command is never retained after step 2:
 
@@ -1527,7 +1537,7 @@ Raw command handling (G8). The raw command is never retained after step 2:
   per turn, held in `Zeroizing` memory and dropped at turn end. The digest never
   leaves memory. This follows the person design's keyed digest for retries
   (SO2).
-- `exec_cmd_worker::start` compares kind 22's command and cwd with the
+- `exec_cmd_worker::start` compares the stored command and cwd with the
   `LiveTool` rewrite, not with the raw arguments.
 - The variables move into the `ExecCmdRequest`; spawn zeroizes them as SL2
   implemented.
@@ -1561,12 +1571,11 @@ sequenceDiagram
     M->>C: ToolCall exec_cmd(command, cwd)
     C->>C: Rewrite command, scan cwd, check 8192 bytes
     alt Refused or busy
-        C->>J: Kind 22 refused (display-redacted) or busy
-        C->>J: Kind 15 status 3 or 4, no value
-        C-->>M: Refusal or busy result
+        C->>J: Kind 14 refused (display-redacted) or busy
+        C-->>M: Status 3 or 4 rendered from kind 14 codes, no value
     else Admitted
         C->>S: Reserve 1 MiB, mark expiry victims
-        C->>J: Kind 22: rewritten command, variable names, payload IDs
+        C->>J: Kind 14 run: rewritten command, variable kinds
         C->>W: start(rewrite, secret values)
         W->>K: Start worker with literals
         K->>S: Delete victims, create staging
@@ -1596,11 +1605,11 @@ sequenceDiagram
 
 | Case | Result | Record |
 | --- | --- | --- |
-| Turn cancelled after kind 22, before spawn | Setup stops; reservation released | Kind 23 `not_started`, kind 15 status 6 |
-| Rewrite refuses, including `rewritten_command_too_long` and `secret_in_cwd` | Nothing runs; model sees the reason | Kind 22 refused, kind 15 status 3 |
-| Detection self-check failed | Every exec_cmd call refused with `secret_detection_unavailable` | Kind 22 refused, revision 0 |
-| Quota short at admission and nothing expirable | `busy`, reason `quota` | Kind 22 busy, kind 15 status 4 |
-| Pending-install list full, capture paused, or payload store not ready | `busy` with that reason | Kind 22 busy, kind 15 status 4 |
+| Turn cancelled after kind 14 `run`, before spawn | Setup stops; reservation released | Kind 23 `not_started`, kind 15 status 6 |
+| Rewrite refuses, including `rewritten_command_too_long` and `secret_in_cwd` | Nothing runs; model sees the reason | Kind 14 refused; status 3 rendered, no kind 15 |
+| Detection self-check failed | Every exec_cmd call refused with `secret_detection_unavailable` | Kind 14 refused, argument form 4, rule-set revision 0 |
+| Quota short at admission and nothing expirable | `busy`, reason `quota` | Kind 14 busy; status 4 rendered, no kind 15 |
+| Pending-install list full, capture paused, or payload store not ready | `busy` with that reason | Kind 14 busy; status 4 rendered, no kind 15 |
 | Scanner or storage slower than the producer while running | Backpressure; nothing lost; no cancel (J1-Q1) | None until settlement |
 | Quota cannot grow, or free space under 16 MiB, while running | Pause; pipes not read; retry on a space event or after the Fibonacci delay (J1-Q2, J1 retry) | Pause facts in kind 23 |
 | `ENOSPC` on create or write | Pause, as above (R6) | Pause facts in kind 23 |
@@ -1612,12 +1621,12 @@ sequenceDiagram
 | No sealed report 2.5 s after a cancel trigger | Result delivered; worker kept in the pending-install list; staging is an unverified prefix | Kind 23 `unconfirmed` |
 | Process or scratch cleanup passes its L3 bound | Today's repair path, `authority_repair_required` | Unchanged |
 | Install fault | Staging kept; recovery installs after the digest check | None |
-| Journal append slow for kind 22, 23 or 15 | The append and its observation wait; no fence and no turn failure (J1-0). New writer requests beyond 8 slots get `busy` | None until it commits |
+| Journal append slow for kind 14, 23 or 15 | The append and its observation wait; no fence and no turn failure (J1-0). New writer requests beyond 8 slots get `busy` | None until it commits |
 | Journal capacity reached | Existing explicit capacity failure; J1 records add about 5 KiB per call until the segment journal follow-up | Unchanged |
-| Journal append I/O error for kind 22, 23 or 15 | Journal fenced; today's storage-unavailable path; turn fails | Unchanged |
+| Journal append I/O error for kind 14, 23 or 15 | Journal fenced; today's storage-unavailable path; turn fails | Unchanged |
 | Crash or restart at any point | No rerun; [derived recovery](#replay-order-and-reservation) | None written at recovery |
 | Page read stalls | `busy` after the 2 s step; worker held until it returns | None |
-| Unsafe payload object at startup | Payload store unavailable; exec_cmd `busy` | Kind 22 busy |
+| Unsafe payload object at startup | Payload store unavailable; exec_cmd `busy` | Kind 14 busy |
 
 ### J1 asynchronous execution
 
@@ -1627,7 +1636,7 @@ sequenceDiagram
 | AE-02 | Blocking calls: `openat`, `write`, `fsync`, `renameatx_np`, `unlinkat`, `fstatfs`, `pread` and directory listing. They run on the capture worker (one per call, at most 5 alive: 1 active and 4 pending), 2 page-read workers and 1 recovery worker. Setup and cleanup keep their retained workers. |
 | AE-03 | Known-size limits in the [table below](#j1-numeric-limits). Overload gives backpressure, a pause, `busy`, or a recorded discard after cancel; never an unbounded queue. |
 | AE-04 | J1 adds no time bound (owner), and J1-0 removes the journal append, observation, replay and queue-worker bounds. A paused capture retries on space events and on the uncapped Fibonacci backoff, which never ends work. Cancellation owners: turn cancel, steering, turn failure, journal unavailability, shutdown and capture faults. After a cancel trigger, the L3 bound decides `unconfirmed`; it states that the worker may still be running and keeps it. The page step returns `busy` and states that the read continues. |
-| AE-05 | No call reruns. Replay derives capture state from kinds 22 and 23; recovery completes installs after a digest check and keeps unverified prefixes labelled. |
+| AE-05 | No call reruns. Replay derives capture state from kinds 14 and 23; recovery completes installs after a digest check and keeps unverified prefixes labelled. |
 | AE-06 | Shutdown is a cancel trigger. Pending installs and live captures get the 2 s shutdown bound; unfinished installs complete at the next start. Abandoned workers keep their ownership until they exit. |
 | AE-07 | The [J1 tests](#j1-validation) run real processes, real storage on a constrained disk image, a gated and a throttled scanner, crash injection, and the TUI PTY harness with typing within 100 ms. |
 
@@ -1645,8 +1654,8 @@ Only known-size limits apply.
 | Worker messages | 8 per worker | The worker waits for the reactor to drain |
 | Command after rewrite | 8,192 bytes | `rewritten_command_too_long` |
 | Secret variables | 16 per command, 8,192 value bytes | `too_many_secrets`, `Invalid` |
-| Kind 22 | 9,384-byte payload, 9,568-byte frame | Not reachable: inputs are bounded first |
-| Kind 23 | 4,102-byte payload, 4,286-byte frame, reserved at kind 22 | Not reachable |
+| Kind 14 | 64,866-byte payload, 65,050-byte frame ([tool call records](tool-call-records.md#record-kind-14-toolcall)) | Text over 64,000 bytes is not retained |
+| Kind 23 | 4,066-byte payload, 4,250-byte frame, reserved at a `run` kind 14 | Not reachable |
 | Kind 15 text | 16,384 bytes (unchanged) | Existing status 7 |
 | Quota | 1 GiB default, 64 MiB minimum, effective value bounded by disk at start | `busy`, `quota`; pause |
 | Reservation | 1 MiB initial, 1 MiB steps | Pause |
@@ -1667,7 +1676,7 @@ Each integration and end-to-end case ends with the
 | ID | Case | Unit | Integration | End-to-end |
 | --- | --- | --- | --- | --- |
 | J1T-01 | Codecs (SDU-14) | Kinds 22 and 23 round trip at every bound and maximum size; each invalid field is `Corrupt`; no value or value digest field; code tables fixed | Real journal open after append | — |
-| J1T-02 | Replay order matrix | Each disposition with and without kinds 23 and 15 and a terminal; every invalid order; derived states; `reserve()` sizes | Writer refuses kind 22 when the reservation cannot fit | — |
+| J1T-02 | Replay order matrix | Each disposition with and without kinds 23 and 15 and a terminal; every invalid order; derived states; `reserve()` sizes | Writer refuses a `run` exec_cmd kind 14 when the reservation cannot fit | — |
 | J1T-03 | Rewrite length (G6) | Rewrites to 8,192 and 8,193 bytes; display-redacted text over 8,192 is cut with the flag | Real owner records the refusal; the service stays available | SDE-02 uses an admitted rewrite |
 | J1T-04 | Raw command not retained (G8, G9) | Duplicate ordinal with a different secret value conflicts; equal values match | Memory inspection hook: `LiveTool` and `tool_cache` hold no raw command | — |
 | J1T-05 | Timeout removed (J1-Q3) | Guardian `none` parsing; `CleanupSafety` without a deadline; `model_timeout` never applies to exec_cmd | A command that runs 65 s completes with its exit code; turn cancel stops it | Native model run of a command longer than 60 s |
@@ -1679,7 +1688,7 @@ Each integration and end-to-end case ends with the
 | J1T-11 | Page pool | Reserved model worker; 9th queued request `busy` | A blocked read returns `busy` after 2 s; the worker stays held | — |
 | J1T-12 | Split secrets (SDI-01) | — | A writer prints a secret in pieces; `live` pages never show a piece | — |
 | J1T-13 | Key, long line, binary (SDI-02) | — | Stored bytes as SDU-06, SDU-07, SDU-09; digest matches | — |
-| J1T-14 | Command secret (SDI-03) | — | Kind 22 holds the rewrite; `ps` holds no value; the command uses the real value | — |
+| J1T-14 | Command secret (SDI-03) | — | Kind 14 holds the rewrite in its stored `command`; `ps` holds no value; the command uses the real value | — |
 | J1T-15 | Gated and throttled scanner (SDI-04, SDI-05) | Sink `room()` and interests | Queue fills, pipe reads stop, producer blocks, nothing lost, no cancel; controls respond within 100 ms | — |
 | J1T-16 | `set` redacted (SDI-07 re-run) | — | `set` output stores the placeholder, not the value | — |
 | J1T-17 | Echo on both streams (SDI-08) | — | Both map to the variable's number | — |
@@ -1687,7 +1696,7 @@ Each integration and end-to-end case ends with the
 | J1T-19 | Full capture (RG-01) | Offsets, hashing, stream identity | Interleaved streams larger than the rings; stored bytes equal the redacted source | — |
 | J1T-20 | Partial capture (RG-02) | Each capture reason and state rule | Injected write fault, cancel, discard after cancel | — |
 | J1T-21 | Overload (RG-03, J1-Q1) | Bound decision after a cancel trigger | A stalled write while running only backpressures; after cancel, `unconfirmed` at 2.5 s, result delivered, worker kept, list full gives `busy` | TUI typing within 100 ms |
-| J1T-22 | Crash points (RG-05) | Derived recovery table | Child-process abort after kind 22, while running, after sealing, after kind 23, between rename and directory sync, after kind 15; recovery installs once, never reruns | Restart and inspect the call |
+| J1T-22 | Crash points (RG-05) | Derived recovery table | Child-process abort after kind 14 `run`, while running, after sealing, after kind 23, between rename and directory sync, after kind 15; recovery installs once, never reruns | Restart and inspect the call |
 | J1T-23 | Detector panic | `catch_unwind` path; second panic | Test-support panic hook | — |
 | J1T-24 | Model exec_cmd result (SDE-01 exec_cmd part) | — | — | A fixture model endpoint issues `cat .env`; the result and TUI activity show placeholders |
 | J1T-25 | Rewritten command shown (SDE-02) | — | — | Native model command with a secret; TUI shows the rewrite; the command succeeds |
@@ -1739,7 +1748,7 @@ Implemented behavior, 2026-10-16, with secret detection slice SL3. Code:
 
 Refinements made during J1 (engineering choices under the iteration rules):
 
-- **Kind 22 size.** The variables take 16 × 2 = 32 bytes, not 33. The maximum
+- **Kind 22 size.** Superseded: kind 22 is retired (2026-10-18). The variables took 16 × 2 = 32 bytes, not 33. The maximum
   payload is 9,384 bytes and the maximum frame 9,568 bytes, as stated above;
   tests assert both.
 - **Sink.** `OutputSink` gained `discard(stream, bytes)` and `flush()`. The
@@ -1756,12 +1765,12 @@ Refinements made during J1 (engineering choices under the iteration rules):
 - **Refused records.** The cwd of every refused record is display-redacted
   (identity when it holds no span) and cut to 1,024 bytes. If the rule set
   failed its self-check, nothing can be redacted, so the refused record holds
-  the fixed text `[withheld]` for both command and cwd (G9). A refused or busy
-  call's precomputed kind 15 (status 3 or 4) stands even if the turn is
-  cancelled before dispatch, as replay requires.
-- **Invalid exec_cmd arguments.** The control codec rejects them before the
-  owner; kind 22 cannot represent them, so the owner treats one as
-  `model_protocol_fault`.
+  the fixed text `[withheld]` for both command and cwd (G9). Since 2026-10-18 a
+  refused or busy call is complete at its kind 14 and has no kind 15; its
+  status 3 or 4 is rendered from the kind 14 codes.
+- **Invalid exec_cmd arguments.** Superseded (2026-10-18): the service parses
+  the argument text and records an invalid call as kind 14
+  `invalid_arguments`; it is no longer a `model_protocol_fault`.
 - **Duplicate digest.** The keyed SHA-256 covers the secret values of an
   admitted or busy call, and the raw command of a refused call. It never
   leaves memory; the per-turn key is zeroized at turn end. The raw command
@@ -1801,7 +1810,10 @@ Refinements made during J1 (engineering choices under the iteration rules):
   `exec-cmd-hold-setup`, `payload-fault-{create,write,sync,install}` and
   `payload-free-bytes`. Production builds contain none of them.
 
-Verified behavior on the macOS 27 development host, Rust 1.98:
+Verified behavior on the macOS 27 development host, Rust 1.98. These results
+predate the [tool call records](tool-call-records.md) change of 2026-10-18,
+which replaced kind 22 with kind 14 and shrank kind 23; the tool call records
+validation section records the evidence after that change.
 
 | ID | Evidence (unit; integration; end to end) | Result |
 | --- | --- | --- |
@@ -1875,7 +1887,7 @@ Proof limits added by the implementation:
 | G1 stall detection, G3 quota closure, G4 exec_cmd timeout, G5 setup budget | Owner decisions J1-Q1 to J1-Q4, the J1 retry decision and journal step J1-0 |
 | G2, G16 stale bounds and readiness text | [Design verification](#design-verification) of 2026-10-15 |
 | G6 rewrite length, G8 identity and raw command, G9 refused intents | [Conversation owner](#service-conversation-owner) |
-| G7 record shapes, G15 `reserve()` | [Kinds 22 and 23](#j1-records-kinds-22-and-23) |
+| G7 record shapes, G15 `reserve()` | [Kinds 14 and 23](#j1-records-kinds-14-and-23) |
 | G10 ring and sink, G14 payload I/O | [Platform interfaces](#platform-output-sink-and-redacted-tail) |
 | G11 install ownership | Pending-install list |
 | G12 pages without consumer, TV2 | [Proof limits](#j1-proof-limits) |

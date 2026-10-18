@@ -70,7 +70,7 @@ fn run_for(long: bool) -> Result<()> {
         event
             .tools
             .iter()
-            .any(|tool| tool.name.as_deref() == Some("service_list_tools")
+            .any(|tool| tool.name.as_deref() == Some("service")
                 && tool.state == Some(2)
                 && tool.status == Some(1))
     );
@@ -83,7 +83,10 @@ fn run_for(long: bool) -> Result<()> {
         .get(&operation)
         .ok_or("missing inventory operation")?
         .tools;
-    let inventory: Vec<_> = tools.iter().filter(|tool| tool.kind == 14).collect();
+    let inventory: Vec<_> = tools
+        .iter()
+        .filter(|tool| tool.tool_operation == Some(journal::ToolOperation::Tools))
+        .collect();
     assert_eq!(
         inventory.len(),
         1,

@@ -285,13 +285,27 @@ preview (128 UTF-8 bytes), truncated and exit_code. Rejected note content and
 large note bodies are not exposed; show version/body size references. Values
 come from typed service intents and committed results, not model assertions.
 Current-owner timing uses monotonic instants; replay can recover arguments and
-captured previews but cannot invent absent timing. Preview truncation is separate
+captured previews but cannot invent absent timing.
+
+Revision (2026-10-18, [tool call records](tool-call-records.md#context-composer-and-views),
+TCR-D13): each entry projects one kind 14 `ToolCall` record. `name` is a display
+prefix of at most 64 bytes of the stored redacted name, cut on a UTF-8 boundary
+(TCR-D26; empty when the name was not retained). `policy_decision` is the kind 14 decision code: 1 `run`, 2
+`invalid_arguments`, 3 `unknown_tool`, 4 `refused`, 5 `busy`, 6 `denied`, 7
+`limit`, 8 `cancelled`. New field 12 `fault` carries the fault code 1–15.
+`arguments` is a display prefix of at most 192 bytes of the stored argument
+text, or a service-written `[not retained: <reason>, <n> bytes]` when the text
+was not retained. For a call that does not run, `state` is 3 (failed), `status`
+is the rendered status, and `preview` is the rendered result text. The TUI
+shows a rejected call as `<name>  <decision>: <fault>`. At most nine entries
+are sent per event (ordinal 9 exists only for the over-limit record). These are
+projections; the kind 14 record stays the one source. Preview truncation is separate
 from stored-result truncation. Existing exec_cmd tails remain explicitly truncated.
 
 The replay projection caches bounded argument/result descriptions in ToolRecord,
 derived from verified journal bytes. This adds no filesystem access on the reactor
 and no new journal encoding. Charge the additional fixed memory against its existing
-16 MiB replay limit. At most eight tools are sent per event, with 192-byte arguments
+16 MiB replay limit. At most nine tools are sent per event (eight before 2026-10-18), with 192-byte arguments
 and 128-byte preview caps preserving room beside the existing 61,440-byte response.
 Strict wire validation and a maximal-frame regression must enforce that bound.
 The TUI sanitizes every string, displays running tools immediately, and expands
@@ -333,7 +347,7 @@ Arrows show existing execution events and bounded projection updates.
 
 ```mermaid
 flowchart TD
-    Intent[Durable typed tool intent] --> Running[Publish bounded arguments and admission state]
+    Intent[Durable kind 14 tool call record] --> Running[Publish redacted name, arguments and decision]
     Result[Durable tool outcome] --> Enrich[Publish bytes, captured preview and available timing]
     Usage[One fenced usage report per inference] --> Sum[Checked per-operation token totals]
     Running --> Event[Existing conversation event worker]

@@ -329,7 +329,28 @@ impl CreateNoteIdentity {
         })
     }
 }
-impl MemoryCreateIntent {
+impl CreateNoteCall {
+    /// Derives the call from the installation binding (TCR-D23).
+    pub fn derive(
+        binding: [Id; 3],
+        project: Id,
+        operation: Id,
+        generation: u64,
+        ordinal: u32,
+    ) -> Result<Self> {
+        if project == [0; 16] {
+            return Err(ReplayError::Corrupt);
+        }
+        Ok(Self {
+            operation,
+            generation,
+            ordinal,
+            project,
+            identity: CreateNoteIdentity::derive(binding, operation, generation, ordinal)?,
+        })
+    }
+    /// The text sent to the helper for a committed note (TCR-D1). Kind 15
+    /// stores no text for create_note; this is rendered from derived IDs.
     pub fn success_text(&self) -> String {
         let hex = |bytes: &[u8]| {
             bytes
@@ -338,129 +359,14 @@ impl MemoryCreateIntent {
                 .collect::<String>()
         };
         format!(
-            "operation={}\nobject={}\nversion={}\nsha256={}\n",
-            hex(&self.memory_operation),
-            hex(&self.object),
-            hex(&self.version),
-            hex(&self.body_sha256)
+            "operation={}\nobject={}\nversion={}\n",
+            hex(&self.identity.operation),
+            hex(&self.identity.object),
+            hex(&self.identity.version),
         )
-    }
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.operation == [0; 16]
-            || self.generation == 0
-            || !(1..=8).contains(&self.ordinal)
-            || [
-                self.project,
-                self.memory_operation,
-                self.object,
-                self.version,
-            ]
-            .contains(&[0; 16])
-            || !(1..=16_384).contains(&self.body_bytes)
-            || self
-                .source
-                .is_some_and(|(source, edge)| source == [0; 16] || edge == [0; 16])
-        {
-            return Err(ReplayError::Corrupt);
-        }
-        Ok(())
     }
 }
 
-fn valid_tool_intent(p: &ToolIntent) -> Result<()> {
-    if p.kind == 13 {
-        return if p.operation != [0; 16]
-            && p.generation > 0
-            && (1..=8).contains(&p.ordinal)
-            && p.path.is_empty()
-            && p.offset == 0
-            && p.limit == 0
-        {
-            Ok(())
-        } else {
-            Err(ReplayError::Corrupt)
-        };
-    }
-    if matches!(p.kind, 6..=11) {
-        let version = |value: &str| {
-            value.len() == 32
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                && value.bytes().any(|byte| byte != b'0')
-        };
-        let arguments = match p.kind {
-            6 => {
-                (p.path.is_empty() || version(&p.path))
-                    && p.offset == 0
-                    && (1..=8).contains(&p.limit)
-            }
-            7 => {
-                version(&p.path)
-                    && (1..=16_384).contains(&p.limit)
-                    && p.offset.checked_add(u64::from(p.limit)).is_some()
-            }
-            8 => version(&p.path) && p.offset == 0 && p.limit == 0,
-            9 => p.path.len() <= 1024 && p.offset == 0,
-            10 => p.path.len() <= 1024,
-            11 => p.path.len() <= 1024 && p.offset == 0 && p.limit == 0,
-            _ => false,
-        };
-        return if p.operation != [0; 16]
-            && p.generation > 0
-            && (1..=8).contains(&p.ordinal)
-            && arguments
-        {
-            Ok(())
-        } else {
-            Err(ReplayError::Corrupt)
-        };
-    }
-    if matches!(p.kind, 4 | 5) {
-        return if p.operation != [0; 16]
-            && p.generation > 0
-            && (1..=8).contains(&p.ordinal)
-            && !p.path.is_empty()
-            && p.path.len() <= 1024
-            && ((p.kind == 4 && (1..=16_384).contains(&p.limit))
-                || (p.kind == 5 && p.offset == 0 && p.limit == 0))
-        {
-            Ok(())
-        } else {
-            Err(ReplayError::Corrupt)
-        };
-    }
-    let path = (matches!(p.kind, 3 | 14 | 15) && p.path.is_empty())
-        || !matches!(p.kind, 3 | 14 | 15)
-            && !p.path.is_empty()
-            && p.path.len() <= 1024
-            && !p.path.chars().any(|c| c.is_control() || c == '\\')
-            && ((p.kind == 2 && p.path == ".")
-                || !p
-                    .path
-                    .split('/')
-                    .any(|c| c.is_empty() || c == "." || c == ".."));
-    let args = match p.kind {
-        1 => {
-            (1..=16_384).contains(&p.limit)
-                && p.offset
-                    .checked_add(u64::from(p.limit))
-                    .is_some_and(|end| end <= i64::MAX as u64)
-        }
-        2 | 3 | 14 => p.offset == 0 && p.limit == 0,
-        15 => p.offset == 0 && (1..=16).contains(&p.limit),
-        _ => false,
-    };
-    if p.operation == [0; 16]
-        || p.generation == 0
-        || !(1..=8).contains(&p.ordinal)
-        || !path
-        || !args
-    {
-        return Err(ReplayError::Corrupt);
-    }
-    Ok(())
-}
 fn valid_tool_result(p: &ToolResult) -> Result<()> {
     if p.operation == [0; 16]
         || p.generation == 0
@@ -622,63 +528,326 @@ fn origin_from(code: u8) -> Result<NumberOrigin> {
         _ => return Err(ReplayError::Corrupt),
     })
 }
-/// Kind 22 variables, kind 23 numbers and span entries.
+/// Kind 14 exec_cmd secret variables, refusal word, kind 23 numbers and spans.
 const MAX_EXEC_CMD_VARIABLES: usize = 16;
 const MAX_REFUSAL_WORD: u16 = 4096;
 const MAX_CAPTURE_SPANS: u64 = 64;
 const MAX_CAPTURE_NUMBER: u16 = 16_384;
 const MAX_CAPTURE_NUMBERS: usize = 256;
 const MIB: u64 = 1024 * 1024;
-/// Maximum kind 22 and 23 payloads (`tool-job-controller.md`, J1 records).
-pub(crate) const MAX_EXEC_CMD_INTENT_PAYLOAD: usize = 9_384;
-pub(crate) const MAX_CAPTURE_SETTLED_PAYLOAD: usize = 4_102;
+/// Maximum kind 23 payload (`tool-job-controller.md`, J1 records; TCR-D3).
+pub(crate) const MAX_CAPTURE_SETTLED_PAYLOAD: usize = 4_066;
+/// Kind 14: 98 bytes of fixed fields, a 512-byte name, 256 number kinds and
+/// 64,000 bytes of arguments (tool-call-records.md, TCR-U03).
+pub(crate) const MAX_TOOL_CALL_PAYLOAD: usize = 64_866;
 
-fn valid_cwd(cwd: &str) -> bool {
-    !cwd.is_empty()
-        && cwd.len() <= MAX_EXEC_CMD_CWD_BYTES
-        && !cwd.contains('\0')
-        && !cwd.starts_with('/')
-        && !cwd.split('/').any(|part| part == "..")
+fn source_code(source: ToolCallSource) -> u8 {
+    source as u8
 }
-impl ExecCmdIntent {
-    /// Every kind 22 field rule that the record alone determines. Replay adds
-    /// the state rules and recomputes the job and payload IDs.
+fn source_from(code: u8) -> Result<ToolCallSource> {
+    Ok(match code {
+        1 => ToolCallSource::GeneratedContent,
+        2 => ToolCallSource::ProviderJson,
+        _ => return Err(ReplayError::Corrupt),
+    })
+}
+fn busy_from(code: u8) -> Result<Option<ExecCmdBusyReason>> {
+    Ok(match code {
+        0 => None,
+        1 => Some(ExecCmdBusyReason::Quota),
+        2 => Some(ExecCmdBusyReason::CapturePaused),
+        3 => Some(ExecCmdBusyReason::PendingFull),
+        4 => Some(ExecCmdBusyReason::PayloadUnavailable),
+        _ => return Err(ReplayError::Corrupt),
+    })
+}
+fn form_from(form: u8, reason: u8) -> Result<ArgumentForm> {
+    Ok(match (form, reason) {
+        (1, 0) => ArgumentForm::Verbatim,
+        (2, 0) => ArgumentForm::Canonical,
+        (3, 0) => ArgumentForm::Unparsed,
+        (4, 1) => ArgumentForm::NotRetained(NotRetainedReason::Oversized),
+        (4, 2) => ArgumentForm::NotRetained(NotRetainedReason::DetectionUnavailable),
+        (4, 3) => ArgumentForm::NotRetained(NotRetainedReason::UnverifiableEscape),
+        _ => return Err(ReplayError::Corrupt),
+    })
+}
+impl ToolCall {
+    /// Every kind 14 field rule that the record alone determines, including
+    /// the derived registry lookup and the placeholder counts (TCR-D4,
+    /// TCR-D20). Replay adds the operation, ordinal and cancel rules.
     pub(crate) fn validate(&self) -> Result<()> {
-        let admitted = self.disposition == ExecCmdDisposition::Admitted;
-        let refused = self.disposition == ExecCmdDisposition::Refused;
-        let busy = self.disposition == ExecCmdDisposition::Busy;
-        let unavailable = self
-            .refusal
-            .is_some_and(|r| r.code == RefusalCode::DetectionUnavailable);
-        let ids = [self.job, self.stdout_payload, self.stderr_payload];
-        require(
-            self.operation != [0; 16]
-                && self.generation >= 1
-                && (1..=8).contains(&self.ordinal)
-                && (!self.command_truncated || refused)
-                && !self.command.is_empty()
-                && self.command.len() <= MAX_EXEC_CMD_COMMAND_BYTES
-                && !self.command.contains('\0')
-                && valid_cwd(&self.cwd)
-                && self.refusal.is_some() == refused
-                && self
-                    .refusal
-                    .is_none_or(|r| r.word.is_none_or(|w| (1..=MAX_REFUSAL_WORD).contains(&w)))
-                && self.busy.is_some() == busy
-                && self.variables.len() <= MAX_EXEC_CMD_VARIABLES
-                && (admitted || self.variables.is_empty())
-                && if admitted {
-                    !ids.contains(&[0; 16]) && self.initial_reservation == INITIAL_RESERVATION
+        use NotRetainedReason as R;
+        use ToolDecision as D;
+        use ToolFault as F;
+        let decision = self.decision;
+        let reason = self.form.not_retained();
+        let named = !self.name.is_empty();
+        let tool = RegisteredTool::lookup(&self.name);
+        let exec = self.tool_operation == Some(ToolOperation::ExecCmd);
+        let rules = self.rule_set_revision != 0;
+        let fault = self.fault;
+        let received_text = self.arguments_bytes as usize <= MAX_TOOL_ARGUMENTS;
+        let shape = self.operation != [0; 16]
+            && self.generation >= 1
+            && (1..=MAX_TOOL_CALL_ORDINAL).contains(&self.ordinal)
+            // Ordinal 9 is the over-limit record; after cancel or turn end it
+            // is `cancelled` like any other call (TCR-D30).
+            && (self.ordinal != MAX_TOOL_CALL_ORDINAL
+                || matches!(decision, D::Limit | D::Cancelled))
+            && self.name.len() <= MAX_STORED_TOOL_NAME
+            && self.name_bytes >= 1
+            && (!named || self.name_bytes as usize <= MAX_TOOL_NAME)
+            && match self.form {
+                ArgumentForm::NotRetained(_) => self.arguments.is_empty(),
+                _ => self.arguments.len() <= MAX_TOOL_ARGUMENTS,
+            }
+            && (received_text || reason == Some(R::Oversized))
+            && self.number_kinds.len() <= MAX_TOOL_NUMBERS;
+        // Operation: derived from a retained, registered name and parsed text.
+        let operation = match self.tool_operation {
+            None => true,
+            Some(op) => {
+                tool == Some(op.tool())
+                    && received_text
+                    && !matches!(
+                        self.form,
+                        ArgumentForm::Unparsed | ArgumentForm::NotRetained(R::UnverifiableEscape)
+                    )
+            }
+        };
+        let faults = match decision {
+            D::InvalidArguments => fault.is_some_and(|f| f != F::UnregisteredName),
+            D::UnknownTool => fault == Some(F::UnregisteredName),
+            _ => fault.is_none(),
+        } && match fault {
+            None => true,
+            Some(F::InvalidJson | F::JsonLimit | F::DuplicateKey) => {
+                matches!(
+                    self.form,
+                    ArgumentForm::Unparsed | ArgumentForm::NotRetained(_)
+                ) && self.tool_operation.is_none()
+            }
+            Some(F::NotObject) => self.tool_operation.is_none(),
+            Some(F::UnknownCommand) => {
+                self.tool_operation.is_none()
+                    && matches!(
+                        tool,
+                        Some(
+                            RegisteredTool::Project
+                                | RegisteredTool::Memory
+                                | RegisteredTool::Service
+                        )
+                    )
+            }
+            Some(
+                F::MissingField
+                | F::UnexpectedField
+                | F::WrongType
+                | F::OutOfRange
+                | F::UnsafePath
+                | F::InvalidVersionId,
+            ) => tool.is_some(),
+            Some(F::ArgumentsOverLimit) => reason == Some(R::Oversized),
+            Some(F::NameOverLimit) => !named,
+            Some(F::InvalidText) => true,
+            Some(F::UnregisteredName) => named && tool.is_none(),
+        } && (received_text
+            || decision != D::InvalidArguments
+            || fault == Some(F::ArgumentsOverLimit))
+            && (reason != Some(R::Oversized)
+                || decision != D::InvalidArguments
+                || fault.is_some_and(|f| f <= F::ArgumentsOverLimit))
+            && (self.form != ArgumentForm::Unparsed
+                || decision != D::InvalidArguments
+                || matches!(fault, Some(F::InvalidJson | F::JsonLimit | F::DuplicateKey)));
+        let decisions = match decision {
+            D::Run => {
+                self.tool_operation.is_some()
+                    && matches!(self.form, ArgumentForm::Verbatim | ArgumentForm::Canonical)
+                    && rules
+                    && (!exec
+                        || (self.form == ArgumentForm::Canonical
+                            && self.number_kinds.len() <= MAX_EXEC_CMD_VARIABLES))
+            }
+            D::UnknownTool => named && received_text,
+            D::Busy => exec && self.form == ArgumentForm::Canonical,
+            D::Refused => {
+                if rules {
+                    exec && self.form == ArgumentForm::Canonical && self.refusal.is_some()
                 } else {
-                    ids == [[0; 16]; 3] && self.initial_reservation == 0
+                    self.refusal.is_none()
                 }
-                && if unavailable {
-                    self.rule_set_revision == 0 && self.rule_set_digest == [0; 32]
-                } else {
-                    self.rule_set_revision >= 1 && self.rule_set_digest != [0; 32]
-                },
-        )
+            }
+            D::InvalidArguments | D::Denied | D::Limit | D::Cancelled => true,
+        } && match self.form {
+            ArgumentForm::Unparsed | ArgumentForm::NotRetained(R::UnverifiableEscape) => {
+                !matches!(decision, D::Run | D::UnknownTool | D::Busy)
+            }
+            ArgumentForm::NotRetained(R::Oversized) => decision != D::Run,
+            _ => true,
+        } && self.busy.is_some() == (decision == D::Busy)
+            && (named
+                || matches!(
+                    decision,
+                    D::InvalidArguments | D::Refused | D::Limit | D::Cancelled
+                ));
+        // Rule set: revision 0 only when the self-check failed; then nothing
+        // is retained or numbered.
+        let rule_set = (self.rule_set_digest == [0; 32]) == !rules
+            && if rules {
+                true
+            } else {
+                reason == Some(R::DetectionUnavailable)
+                    && !named
+                    && self.number_kinds.is_empty()
+                    && self.unnumbered == 0
+                    && self.tool_operation.is_none()
+                    && matches!(decision, D::Refused | D::Limit | D::Cancelled)
+            };
+        let refusal = match self.refusal {
+            None => !self.command_cut,
+            Some(r) => {
+                decision == D::Refused
+                    && exec
+                    && rules
+                    && r.code != RefusalCode::DetectionUnavailable
+                    && r.word.is_none_or(|w| (1..=MAX_REFUSAL_WORD).contains(&w))
+            }
+        };
+        // Placeholders (TCR-D4, TCR-D20): field 15 is the highest number in
+        // fields 5 and 14, every number up to it appears, field 17 counts the
+        // unnumbered tokens and no token has a leading zero.
+        let name_tokens = asura_platform::secrets::placeholder_tokens(&self.name);
+        let text_tokens = asura_platform::secrets::placeholder_tokens(&self.arguments);
+        let mut distinct = name_tokens.distinct.clone();
+        distinct.extend(&text_tokens.distinct);
+        distinct.sort_unstable();
+        distinct.dedup();
+        let highest = name_tokens.max.max(text_tokens.max) as usize;
+        let numbers = !name_tokens.malformed
+            && !text_tokens.malformed
+            && highest == self.number_kinds.len()
+            && distinct.len() == highest
+            && name_tokens.zero.checked_add(text_tokens.zero) == Some(self.unnumbered);
+        require(shape && operation && faults && decisions && rule_set && refusal && numbers)
     }
+}
+fn write_tool_call(w: &mut Writer, p: &ToolCall) -> Result<()> {
+    if p.arguments.len() > MAX_TOOL_ARGUMENTS || p.name.len() > MAX_STORED_TOOL_NAME {
+        return Err(ReplayError::Limit);
+    }
+    p.validate()?;
+    tool_call_fields(w, p);
+    Ok(())
+}
+/// Kind 14 field order. Callers validate first; tests use it to build invalid bytes.
+fn tool_call_fields(w: &mut Writer, p: &ToolCall) {
+    w.bytes(&p.operation);
+    w.u64(p.generation);
+    w.u32(p.ordinal);
+    w.byte(source_code(p.source));
+    w.u32(p.name.len() as u32);
+    w.bytes(p.name.as_bytes());
+    w.u32(p.name_bytes);
+    w.byte(p.tool_operation.map_or(0, |op| op as u8));
+    w.byte(p.decision as u8);
+    w.byte(p.fault.map_or(0, |f| f as u8));
+    w.byte(p.busy.map_or(0, |b| b as u8));
+    w.byte(p.form.code());
+    w.byte(p.form.not_retained().map_or(0, |r| r as u8));
+    w.u32(p.arguments_bytes);
+    w.u32(p.arguments.len() as u32);
+    w.bytes(p.arguments.as_bytes());
+    w.u16(p.number_kinds.len() as u16);
+    for kind in &p.number_kinds {
+        w.byte(kind_code(*kind));
+    }
+    w.u32(p.unnumbered);
+    w.u32(p.rule_set_revision);
+    w.bytes(&p.rule_set_digest);
+    w.byte(u8::from(p.command_cut));
+    w.byte(p.refusal.map_or(0, |r| refusal_code(r.code)));
+    w.byte(p.refusal.and_then(|r| r.kind).map_or(0, kind_code));
+    w.u16(p.refusal.and_then(|r| r.word).unwrap_or(0));
+}
+fn read_tool_call(r: &mut Reader<'_>) -> Result<ToolCall> {
+    let operation = r.array()?;
+    let generation = r.u64()?;
+    let ordinal = r.u32()?;
+    let source = source_from(r.byte()?)?;
+    let name = r.bounded_string(MAX_STORED_TOOL_NAME)?;
+    let name_bytes = r.u32()?;
+    let tool_operation = match r.byte()? {
+        0 => None,
+        code => Some(ToolOperation::from_code(code).ok_or(ReplayError::Corrupt)?),
+    };
+    let decision = ToolDecision::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+    let fault = match r.byte()? {
+        0 => None,
+        code => Some(ToolFault::from_code(code).ok_or(ReplayError::Corrupt)?),
+    };
+    let busy = busy_from(r.byte()?)?;
+    let form = r.byte()?;
+    let form = form_from(form, r.byte()?)?;
+    let arguments_bytes = r.u32()?;
+    let arguments = r.bounded_string(MAX_TOOL_ARGUMENTS)?;
+    let count = r.u16()? as usize;
+    require(count <= MAX_TOOL_NUMBERS)?;
+    let mut number_kinds = Vec::with_capacity(count);
+    for _ in 0..count {
+        number_kinds.push(kind_from(r.byte()?)?);
+    }
+    let unnumbered = r.u32()?;
+    let rule_set_revision = r.u32()?;
+    let rule_set_digest = r.array()?;
+    let command_cut = match r.byte()? {
+        0 => false,
+        1 => true,
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let code = r.byte()?;
+    let kind = match r.byte()? {
+        0 => None,
+        code => Some(kind_from(code)?),
+    };
+    let word = match r.u16()? {
+        0 => None,
+        word => Some(word),
+    };
+    let refusal = if code == 0 {
+        require(kind.is_none() && word.is_none())?;
+        None
+    } else {
+        Some(ExecCmdRefusal {
+            code: refusal_from(code)?,
+            kind,
+            word,
+        })
+    };
+    let value = ToolCall {
+        operation,
+        generation,
+        ordinal,
+        source,
+        name,
+        name_bytes,
+        tool_operation,
+        decision,
+        fault,
+        busy,
+        form,
+        arguments_bytes,
+        arguments,
+        number_kinds,
+        unnumbered,
+        rule_set_revision,
+        rule_set_digest,
+        command_cut,
+        refusal,
+    };
+    value.validate()?;
+    Ok(value)
 }
 fn valid_stream(s: &CaptureStream) -> bool {
     s.unnumbered_replacements <= s.replacements
@@ -695,7 +864,7 @@ fn valid_stream(s: &CaptureStream) -> bool {
 }
 impl CaptureSettled {
     /// Every kind 23 field rule that the record alone determines. Replay adds
-    /// equality with the pending admitted kind 22.
+    /// the pending `run` exec_cmd kind 14 that it settles.
     pub(crate) fn validate(&self) -> Result<()> {
         let streams = [&self.stdout, &self.stderr];
         let digests = streams.iter().all(|s| s.digest.is_some());
@@ -738,10 +907,6 @@ impl CaptureSettled {
                 && (1..=8).contains(&self.ordinal)
                 && state
                 && exit
-                // Kind 23 follows only an admitted kind 22, which always names
-                // a rule set; replay checks equality with that record.
-                && self.rule_set_revision >= 1
-                && self.rule_set_digest != [0; 32]
                 && streams.iter().all(|s| valid_stream(s))
                 && self.distinct_numbers <= u32::from(MAX_CAPTURE_NUMBER)
                 && self.numbers.len() <= MAX_CAPTURE_NUMBERS
@@ -761,110 +926,6 @@ fn require(ok: bool) -> Result<()> {
     } else {
         Err(ReplayError::Corrupt)
     }
-}
-fn write_exec_cmd_intent(w: &mut Writer, p: &ExecCmdIntent) -> Result<()> {
-    p.validate()?;
-    exec_cmd_intent_fields(w, p);
-    Ok(())
-}
-/// Kind 22 field order. Callers validate first; tests use it to build invalid bytes.
-fn exec_cmd_intent_fields(w: &mut Writer, p: &ExecCmdIntent) {
-    w.bytes(&p.operation);
-    w.u64(p.generation);
-    w.u32(p.ordinal);
-    w.byte(p.disposition as u8);
-    w.byte(u8::from(p.command_truncated));
-    w.u32(p.command.len() as u32);
-    w.bytes(p.command.as_bytes());
-    w.u32(p.cwd.len() as u32);
-    w.bytes(p.cwd.as_bytes());
-    w.byte(p.refusal.map_or(0, |r| refusal_code(r.code)));
-    w.byte(p.refusal.and_then(|r| r.kind).map_or(0, kind_code));
-    w.u16(p.refusal.and_then(|r| r.word).unwrap_or(0));
-    w.byte(p.busy.map_or(0, |b| b as u8));
-    w.byte(p.variables.len() as u8);
-    for (index, kind) in p.variables.iter().enumerate() {
-        w.byte(index as u8 + 1);
-        w.byte(kind_code(*kind));
-    }
-    w.bytes(&p.job);
-    w.bytes(&p.stdout_payload);
-    w.bytes(&p.stderr_payload);
-    w.u64(p.initial_reservation);
-    w.u32(p.rule_set_revision);
-    w.bytes(&p.rule_set_digest);
-}
-fn read_exec_cmd_intent(r: &mut Reader<'_>) -> Result<ExecCmdIntent> {
-    let operation = r.array()?;
-    let generation = r.u64()?;
-    let ordinal = r.u32()?;
-    let disposition = match r.byte()? {
-        1 => ExecCmdDisposition::Admitted,
-        2 => ExecCmdDisposition::Refused,
-        3 => ExecCmdDisposition::Busy,
-        _ => return Err(ReplayError::Corrupt),
-    };
-    let command_truncated = match r.byte()? {
-        0 => false,
-        1 => true,
-        _ => return Err(ReplayError::Corrupt),
-    };
-    let command = r.bounded_string(MAX_EXEC_CMD_COMMAND_BYTES)?;
-    let cwd = r.bounded_string(MAX_EXEC_CMD_CWD_BYTES)?;
-    let code = r.byte()?;
-    let kind = match r.byte()? {
-        0 => None,
-        code => Some(kind_from(code)?),
-    };
-    let word = match r.u16()? {
-        0 => None,
-        word => Some(word),
-    };
-    let refusal = if code == 0 {
-        require(kind.is_none() && word.is_none())?;
-        None
-    } else {
-        Some(ExecCmdRefusal {
-            code: refusal_from(code)?,
-            kind,
-            word,
-        })
-    };
-    let busy = match r.byte()? {
-        0 => None,
-        1 => Some(ExecCmdBusyReason::Quota),
-        2 => Some(ExecCmdBusyReason::CapturePaused),
-        3 => Some(ExecCmdBusyReason::PendingFull),
-        4 => Some(ExecCmdBusyReason::PayloadUnavailable),
-        _ => return Err(ReplayError::Corrupt),
-    };
-    let count = r.byte()? as usize;
-    require(count <= MAX_EXEC_CMD_VARIABLES)?;
-    let mut variables = Vec::with_capacity(count);
-    for index in 0..count {
-        require(r.byte()? as usize == index + 1)?;
-        variables.push(kind_from(r.byte()?)?);
-    }
-    let value = ExecCmdIntent {
-        operation,
-        generation,
-        ordinal,
-        disposition,
-        command_truncated,
-        command,
-        cwd,
-        refusal,
-        busy,
-        variables,
-        job: r.array()?,
-        stdout_payload: r.array()?,
-        stderr_payload: r.array()?,
-        initial_reservation: r.u64()?,
-        rule_set_revision: r.u32()?,
-        rule_set_digest: r.array()?,
-    };
-    value.validate()?;
-    Ok(value)
 }
 fn write_stream(w: &mut Writer, s: &CaptureStream) {
     w.u64(s.observed_bytes);
@@ -948,10 +1009,9 @@ fn capture_settled_fields(w: &mut Writer, p: &CaptureSettled) {
     w.byte(p.reason as u8);
     w.byte(p.exit_kind);
     w.u32(p.exit_value);
-    // Field 8, redaction ran: always 1 (SD9).
+    // Field 8, redaction ran: always 1 (SD9). The rule set is kind 14's
+    // fields 18-19 (TCR-D3).
     w.byte(1);
-    w.u32(p.rule_set_revision);
-    w.bytes(&p.rule_set_digest);
     write_stream(w, &p.stdout);
     write_stream(w, &p.stderr);
     w.u32(p.distinct_numbers);
@@ -990,8 +1050,6 @@ fn read_capture_settled(r: &mut Reader<'_>) -> Result<CaptureSettled> {
     let exit_kind = r.byte()?;
     let exit_value = r.u32()?;
     require(r.byte()? == 1)?;
-    let rule_set_revision = r.u32()?;
-    let rule_set_digest = r.array()?;
     let stdout = read_stream(r)?;
     let stderr = read_stream(r)?;
     let distinct_numbers = r.u32()?;
@@ -1013,8 +1071,6 @@ fn read_capture_settled(r: &mut Reader<'_>) -> Result<CaptureSettled> {
         reason,
         exit_kind,
         exit_value,
-        rule_set_revision,
-        rule_set_digest,
         stdout,
         stderr,
         distinct_numbers,
@@ -1149,34 +1205,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u64(p.generation);
             w.byte(p.cause as u8);
         }
-        Record::MemoryCreateIntent(p) => {
-            p.validate()?;
-            w.bytes(&p.operation);
-            w.u64(p.generation);
-            w.u32(p.ordinal);
-            w.bytes(&p.project);
-            w.bytes(&p.memory_operation);
-            w.bytes(&p.object);
-            w.bytes(&p.version);
-            w.u32(p.body_bytes);
-            w.bytes(&p.body_sha256);
-            w.byte(u8::from(p.source.is_some()));
-            if let Some((source, edge)) = p.source {
-                w.bytes(&source);
-                w.bytes(&edge);
-            }
-            w.bytes(&p.command_sha256);
-        }
-        Record::ToolIntent(p) => {
-            valid_tool_intent(p)?;
-            w.bytes(&p.operation);
-            w.u64(p.generation);
-            w.u32(p.ordinal);
-            w.byte(p.kind);
-            w.string(&p.path, 1024)?;
-            w.u64(p.offset);
-            w.u32(p.limit);
-        }
+        Record::ToolCall(p) => write_tool_call(&mut w, p)?,
         Record::ToolResult(p) => {
             valid_tool_result(p)?;
             w.bytes(&p.operation);
@@ -1201,7 +1230,6 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u32(p.charged_tokens);
             w.string(&p.text, MAX_TEXT)?;
         }
-        Record::ExecCmdIntent(p) => write_exec_cmd_intent(&mut w, p)?,
         Record::CaptureSettled(p) => write_capture_settled(&mut w, p)?,
     }
     Ok(w.0)
@@ -1420,21 +1448,8 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             text: r.string(MAX_TEXT)?,
         }),
         14 => {
-            let operation = r.array()?;
-            let generation = r.u64()?;
-            let ordinal = r.u32()?;
-            let kind = r.byte()?;
-            let value = ToolIntent {
-                operation,
-                generation,
-                ordinal,
-                kind,
-                path: r.string(1024)?,
-                offset: r.u64()?,
-                limit: r.u32()?,
-            };
-            valid_tool_intent(&value)?;
-            Record::ToolIntent(value)
+            require(payload.len() <= MAX_TOOL_CALL_PAYLOAD)?;
+            Record::ToolCall(Box::new(read_tool_call(&mut r)?))
         }
         15 => {
             let value = ToolResult {
@@ -1449,31 +1464,8 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             valid_tool_result(&value)?;
             Record::ToolResult(value)
         }
-        17 => {
-            let p = MemoryCreateIntent {
-                operation: r.array()?,
-                generation: r.u64()?,
-                ordinal: r.u32()?,
-                project: r.array()?,
-                memory_operation: r.array()?,
-                object: r.array()?,
-                version: r.array()?,
-                body_bytes: r.u32()?,
-                body_sha256: r.array()?,
-                source: if r.flag()? {
-                    Some((r.array()?, r.array()?))
-                } else {
-                    None
-                },
-                command_sha256: r.array()?,
-            };
-            p.validate()?;
-            Record::MemoryCreateIntent(p)
-        }
-        22 => {
-            require(payload.len() <= MAX_EXEC_CMD_INTENT_PAYLOAD)?;
-            Record::ExecCmdIntent(Box::new(read_exec_cmd_intent(&mut r)?))
-        }
+        // Kinds 17 and 22 are retired (TCR-O2); like any unknown kind they
+        // are UnsupportedFormat.
         23 => {
             require(payload.len() <= MAX_CAPTURE_SETTLED_PAYLOAD)?;
             Record::CaptureSettled(Box::new(read_capture_settled(&mut r)?))
@@ -1540,227 +1532,7 @@ mod tests {
             record
         );
     }
-    #[test]
-    fn status_tool_intent_has_no_path_or_file_arguments() {
-        let intent = ToolIntent {
-            operation: [1; 16],
-            generation: 1,
-            ordinal: 1,
-            kind: 3,
-            path: String::new(),
-            offset: 0,
-            limit: 0,
-        };
-        assert!(valid_tool_intent(&intent).is_ok());
-        let record = Record::ToolIntent(intent.clone());
-        assert_eq!(
-            decode_record(14, &payload(&record).unwrap()).unwrap(),
-            record
-        );
-        for invalid in [
-            ToolIntent {
-                path: ".".into(),
-                ..intent.clone()
-            },
-            ToolIntent {
-                path: "file".into(),
-                ..intent.clone()
-            },
-            ToolIntent {
-                offset: 1,
-                ..intent.clone()
-            },
-            ToolIntent {
-                limit: 1,
-                ..intent.clone()
-            },
-            ToolIntent {
-                kind: 4,
-                ..intent.clone()
-            },
-        ] {
-            assert_eq!(valid_tool_intent(&invalid), Err(ReplayError::Corrupt));
-        }
-    }
 
-    #[test]
-    fn memory_tool_intents_use_exact_ids_limits_and_rejection_encodings() {
-        let base = ToolIntent {
-            operation: [1; 16],
-            generation: 1,
-            ordinal: 1,
-            kind: 6,
-            path: String::new(),
-            offset: 0,
-            limit: 8,
-        };
-        let valid_id = "01".repeat(16);
-        for kind in 6..=11 {
-            let intent = ToolIntent {
-                kind,
-                path: if kind == 6 {
-                    String::new()
-                } else if kind <= 8 {
-                    valid_id.clone()
-                } else {
-                    "invalid\0\n".into()
-                },
-                offset: if kind == 10 { u64::MAX } else { 0 },
-                limit: match kind {
-                    6 => 8,
-                    7 => 16_384,
-                    9 | 10 => u32::MAX,
-                    _ => 0,
-                },
-                ..base.clone()
-            };
-            let record = Record::ToolIntent(intent);
-            assert_eq!(
-                decode_record(14, &payload(&record).unwrap()).unwrap(),
-                record
-            );
-        }
-        for kind in [6, 7, 8] {
-            for bad in [
-                "0".repeat(32),
-                "AA".repeat(16),
-                "01".repeat(15),
-                "01".repeat(17),
-                "../note".into(),
-            ] {
-                let intent = ToolIntent {
-                    kind,
-                    path: bad,
-                    limit: if kind == 8 { 0 } else { 1 },
-                    ..base.clone()
-                };
-                assert_eq!(valid_tool_intent(&intent), Err(ReplayError::Corrupt));
-            }
-        }
-        for limit in [0, 9, u32::MAX] {
-            assert_eq!(
-                valid_tool_intent(&ToolIntent {
-                    limit,
-                    ..base.clone()
-                }),
-                Err(ReplayError::Corrupt)
-            );
-        }
-        for invalid in [
-            ToolIntent {
-                kind: 7,
-                path: valid_id.clone(),
-                offset: u64::MAX,
-                limit: 1,
-                ..base.clone()
-            },
-            ToolIntent {
-                kind: 7,
-                path: valid_id.clone(),
-                limit: 16_385,
-                ..base.clone()
-            },
-            ToolIntent {
-                kind: 8,
-                path: valid_id,
-                offset: 1,
-                limit: 0,
-                ..base.clone()
-            },
-            ToolIntent {
-                kind: 9,
-                offset: 1,
-                ..base.clone()
-            },
-            ToolIntent {
-                kind: 10,
-                path: "x".repeat(1025),
-                ..base.clone()
-            },
-            ToolIntent {
-                kind: 11,
-                limit: 1,
-                ..base.clone()
-            },
-        ] {
-            assert_eq!(valid_tool_intent(&invalid), Err(ReplayError::Corrupt));
-        }
-    }
-    #[test]
-    fn audit_intent_is_bounded_and_cannot_select_a_log_path() {
-        let intent = ToolIntent {
-            operation: [1; 16],
-            generation: 1,
-            ordinal: 1,
-            kind: 15,
-            path: String::new(),
-            offset: 0,
-            limit: 16,
-        };
-        let record = Record::ToolIntent(intent.clone());
-        assert_eq!(
-            decode_record(14, &payload(&record).unwrap()).unwrap(),
-            record
-        );
-        for invalid in [
-            ToolIntent {
-                path: "audit.jsonl".into(),
-                ..intent.clone()
-            },
-            ToolIntent {
-                offset: 1,
-                ..intent.clone()
-            },
-            ToolIntent {
-                limit: 0,
-                ..intent.clone()
-            },
-            ToolIntent {
-                limit: 17,
-                ..intent
-            },
-        ] {
-            assert_eq!(valid_tool_intent(&invalid), Err(ReplayError::Corrupt));
-        }
-    }
-    #[test]
-    fn inventory_intent_accepts_only_empty_arguments_and_preserves_encoding() {
-        let intent = ToolIntent {
-            operation: [1; 16],
-            generation: 1,
-            ordinal: 1,
-            kind: 14,
-            path: String::new(),
-            offset: 0,
-            limit: 0,
-        };
-        let record = Record::ToolIntent(intent.clone());
-        assert_eq!(
-            decode_record(14, &payload(&record).unwrap()).unwrap(),
-            record
-        );
-        for invalid in [
-            ToolIntent {
-                path: "ignored".into(),
-                ..intent.clone()
-            },
-            ToolIntent {
-                offset: 1,
-                ..intent.clone()
-            },
-            ToolIntent {
-                limit: 1,
-                ..intent.clone()
-            },
-            ToolIntent {
-                kind: 12,
-                ..intent.clone()
-            },
-            ToolIntent { kind: 17, ..intent },
-        ] {
-            assert_eq!(valid_tool_intent(&invalid), Err(ReplayError::Corrupt));
-        }
-    }
     #[test]
     fn initialize_digest_has_exact_domain_and_big_endian_fields() {
         let mut expected = vec![0, 1, 1];
@@ -1799,32 +1571,6 @@ mod tests {
         *bytes.last_mut().unwrap() = 255;
         assert_eq!(decode_record(8, &bytes).unwrap_err(), ReplayError::Corrupt);
     }
-    /// Kind 14 never carries exec_cmd (tool kind 16); only kind 22 admits it.
-    #[test]
-    fn kind_14_rejects_exec_cmd_tool_kind() {
-        let intent = ToolIntent {
-            operation: [1; 16],
-            generation: 1,
-            ordinal: 1,
-            kind: EXEC_CMD_TOOL_KIND,
-            path: "printf hello\0.".into(),
-            offset: 1000,
-            limit: 30,
-        };
-        assert_eq!(valid_tool_intent(&intent), Err(ReplayError::Corrupt));
-        let record = Record::ToolIntent(intent.clone());
-        assert_eq!(payload(&record), Err(ReplayError::Corrupt));
-        // A hand-built kind 14 payload with tool kind 16 also fails decode.
-        let mut w = Writer(Vec::new());
-        w.bytes(&intent.operation);
-        w.u64(intent.generation);
-        w.u32(intent.ordinal);
-        w.byte(EXEC_CMD_TOOL_KIND);
-        w.string("printf hello", 1024).unwrap();
-        w.u64(0);
-        w.u32(0);
-        assert_eq!(decode_record(14, &w.0), Err(ReplayError::Corrupt));
-    }
     #[test]
     fn exec_cmd_job_identity_has_fixed_domain() {
         let expected = [
@@ -1838,73 +1584,540 @@ mod tests {
         }
     }
 
-    // J1T-01: kinds 22 and 23.
-    fn admitted() -> ExecCmdIntent {
-        ExecCmdIntent {
+    // TCR-U01..U03: kind 14 ToolCall.
+    fn run14() -> ToolCall {
+        ToolCall {
             operation: [1; 16],
             generation: 1,
             ordinal: 1,
-            disposition: ExecCmdDisposition::Admitted,
-            command_truncated: false,
-            command: "printf \"$ASURA_SECRET_1\"".into(),
-            cwd: ".".into(),
-            refusal: None,
+            source: ToolCallSource::GeneratedContent,
+            name: "exec_cmd".into(),
+            name_bytes: 8,
+            tool_operation: Some(ToolOperation::ExecCmd),
+            decision: ToolDecision::Run,
+            fault: None,
             busy: None,
-            variables: vec![SecretKind::GithubToken],
-            job: [2; 16],
-            stdout_payload: [3; 16],
-            stderr_payload: [4; 16],
-            initial_reservation: INITIAL_RESERVATION,
+            form: ArgumentForm::Canonical,
+            arguments_bytes: 48,
+            arguments: "{\"command\":\"printf \\\"$ASURA_SECRET_1\\\"\"}".into(),
+            number_kinds: vec![SecretKind::GithubToken],
+            unnumbered: 0,
             rule_set_revision: 1,
             rule_set_digest: [5; 32],
-        }
-    }
-    fn refused(code: RefusalCode) -> ExecCmdIntent {
-        let unavailable = code == RefusalCode::DetectionUnavailable;
-        ExecCmdIntent {
-            disposition: ExecCmdDisposition::Refused,
-            refusal: Some(ExecCmdRefusal {
-                code,
-                kind: None,
-                word: None,
-            }),
-            variables: vec![],
-            job: [0; 16],
-            stdout_payload: [0; 16],
-            stderr_payload: [0; 16],
-            initial_reservation: 0,
-            rule_set_revision: if unavailable { 0 } else { 1 },
-            rule_set_digest: if unavailable { [0; 32] } else { [5; 32] },
-            ..admitted()
-        }
-    }
-    fn busy(reason: ExecCmdBusyReason) -> ExecCmdIntent {
-        ExecCmdIntent {
-            disposition: ExecCmdDisposition::Busy,
+            command_cut: false,
             refusal: None,
-            busy: Some(reason),
-            ..refused(RefusalCode::UnparsedCommand)
         }
     }
-    fn raw22(p: &ExecCmdIntent) -> Vec<u8> {
+    fn refused14() -> ToolCall {
+        ToolCall {
+            decision: ToolDecision::Refused,
+            arguments: "{\"command\":\"echo $ASURA_SECRET_1\"}".into(),
+            refusal: Some(ExecCmdRefusal {
+                code: RefusalCode::SecretSingleQuoted,
+                kind: Some(SecretKind::GithubToken),
+                word: Some(2),
+            }),
+            ..run14()
+        }
+    }
+    fn invalid14() -> ToolCall {
+        ToolCall {
+            name: "project".into(),
+            name_bytes: 7,
+            tool_operation: Some(ToolOperation::ReadFile),
+            decision: ToolDecision::InvalidArguments,
+            fault: Some(ToolFault::MissingField),
+            form: ArgumentForm::Verbatim,
+            arguments_bytes: 24,
+            arguments: "{\"command\":\"read_file\"}".into(),
+            number_kinds: vec![],
+            ..run14()
+        }
+    }
+    fn raw14(p: &ToolCall) -> Vec<u8> {
         let mut w = Writer(Vec::new());
-        exec_cmd_intent_fields(&mut w, p);
+        tool_call_fields(&mut w, p);
         w.0
     }
-    fn round22(p: ExecCmdIntent) -> Vec<u8> {
-        let record = Record::ExecCmdIntent(Box::new(p));
+    fn round14(p: ToolCall) -> Vec<u8> {
+        let record = Record::ToolCall(Box::new(p));
         let bytes = payload(&record).unwrap();
-        assert_eq!(decode_record(22, &bytes).unwrap(), record);
+        assert_eq!(
+            bytes,
+            raw14(match &record {
+                Record::ToolCall(p) => p,
+                _ => unreachable!(),
+            })
+        );
+        assert_eq!(decode_record(14, &bytes).unwrap(), record);
         bytes
     }
-    /// Invalid on encode and, written without validation, on decode.
-    fn invalid22(p: ExecCmdIntent) {
-        let record = Record::ExecCmdIntent(Box::new(p.clone()));
-        assert_eq!(payload(&record), Err(ReplayError::Corrupt), "{p:?}");
+    fn invalid14_record(p: ToolCall) {
+        let record = Record::ToolCall(Box::new(p.clone()));
+        assert!(payload(&record).is_err(), "{p:?}");
         assert_eq!(
-            decode_record(22, &raw22(&p)),
+            decode_record(14, &raw14(&p)),
             Err(ReplayError::Corrupt),
             "{p:?}"
+        );
+    }
+    fn tokens(count: usize) -> String {
+        (1..=count).map(|n| format!("$ASURA_SECRET_{n} ")).collect()
+    }
+    /// TCR-U01: every field at each bound round trips through the real
+    /// encoder and decoder.
+    #[test]
+    fn tcr_u01_kind_14_round_trips_every_field_bound() {
+        round14(run14());
+        round14(refused14());
+        round14(invalid14());
+        for ordinal in 1..=8 {
+            round14(ToolCall { ordinal, ..run14() });
+        }
+        round14(ToolCall {
+            ordinal: 9,
+            decision: ToolDecision::Limit,
+            ..run14()
+        });
+        // After cancel or turn end, ordinal 9 is `cancelled` (TCR-D30).
+        round14(ToolCall {
+            ordinal: 9,
+            decision: ToolDecision::Cancelled,
+            ..run14()
+        });
+        round14(ToolCall {
+            generation: u64::MAX,
+            source: ToolCallSource::ProviderJson,
+            rule_set_revision: u32::MAX,
+            ..run14()
+        });
+        // Name not retained: empty name, any received size, operation none.
+        round14(ToolCall {
+            name: String::new(),
+            name_bytes: u32::MAX,
+            tool_operation: None,
+            decision: ToolDecision::InvalidArguments,
+            fault: Some(ToolFault::NameOverLimit),
+            form: ArgumentForm::Verbatim,
+            arguments: "{}".into(),
+            number_kinds: vec![],
+            ..run14()
+        });
+        // The longest stored name (redaction lengthened a received name).
+        let long = ToolCall {
+            name: "n".repeat(MAX_STORED_TOOL_NAME),
+            name_bytes: MAX_TOOL_NAME as u32,
+            tool_operation: None,
+            decision: ToolDecision::UnknownTool,
+            fault: Some(ToolFault::UnregisteredName),
+            form: ArgumentForm::Verbatim,
+            arguments: String::new(),
+            arguments_bytes: 0,
+            number_kinds: vec![],
+            ..run14()
+        };
+        round14(long.clone());
+        // Every decision with a consistent shape.
+        for (decision, fault, busy) in [
+            (
+                ToolDecision::InvalidArguments,
+                Some(ToolFault::WrongType),
+                None,
+            ),
+            (ToolDecision::Denied, None, None),
+            (ToolDecision::Limit, None, None),
+            (ToolDecision::Cancelled, None, None),
+        ] {
+            round14(ToolCall {
+                decision,
+                fault,
+                busy,
+                ..run14()
+            });
+        }
+        for busy in [
+            ExecCmdBusyReason::Quota,
+            ExecCmdBusyReason::CapturePaused,
+            ExecCmdBusyReason::PendingFull,
+            ExecCmdBusyReason::PayloadUnavailable,
+        ] {
+            let bytes = round14(ToolCall {
+                decision: ToolDecision::Busy,
+                busy: Some(busy),
+                ..run14()
+            });
+            assert_eq!(bytes[48], busy as u8);
+        }
+        // Every form and not-retained reason.
+        for form in [
+            ArgumentForm::Unparsed,
+            ArgumentForm::NotRetained(NotRetainedReason::UnverifiableEscape),
+        ] {
+            round14(ToolCall {
+                tool_operation: None,
+                fault: Some(ToolFault::InvalidJson),
+                form,
+                arguments: if form == ArgumentForm::Unparsed {
+                    "{\"command\"".into()
+                } else {
+                    String::new()
+                },
+                ..invalid14()
+            });
+        }
+        round14(ToolCall {
+            tool_operation: None,
+            fault: Some(ToolFault::ArgumentsOverLimit),
+            form: ArgumentForm::NotRetained(NotRetainedReason::Oversized),
+            arguments_bytes: u32::MAX,
+            arguments: String::new(),
+            ..invalid14()
+        });
+        // Rule set unavailable: nothing retained, decision refused.
+        round14(ToolCall {
+            name: String::new(),
+            tool_operation: None,
+            decision: ToolDecision::Refused,
+            form: ArgumentForm::NotRetained(NotRetainedReason::DetectionUnavailable),
+            arguments: String::new(),
+            number_kinds: vec![],
+            rule_set_revision: 0,
+            rule_set_digest: [0; 32],
+            ..run14()
+        });
+        // Refusal bounds and the cut flag.
+        round14(ToolCall {
+            command_cut: true,
+            refusal: Some(ExecCmdRefusal {
+                code: RefusalCode::RewrittenCommandTooLong,
+                kind: None,
+                word: Some(4096),
+            }),
+            ..refused14()
+        });
+        // Numbers: 256 numbered placeholders and unnumbered tokens.
+        let text = format!(
+            "{{\"body\":\"{}$ASURA_SECRET_0 ${{ASURA_SECRET_0}}\"}}",
+            tokens(256)
+        );
+        round14(ToolCall {
+            name: "memory".into(),
+            name_bytes: 6,
+            tool_operation: Some(ToolOperation::CreateNote),
+            arguments: text,
+            number_kinds: (0..256).map(|n| SecretKind::ALL[n % 33]).collect(),
+            unnumbered: 2,
+            ..run14()
+        });
+        // A placeholder in the name counts too.
+        round14(ToolCall {
+            name: "x$ASURA_SECRET_1".into(),
+            arguments: "{}".into(),
+            number_kinds: vec![SecretKind::Jwt],
+            ..long
+        });
+    }
+    /// TCR-U01: each out-of-range value, unknown code and inconsistent
+    /// combination is Corrupt.
+    #[test]
+    fn tcr_u01_kind_14_rejects_each_invalid_field() {
+        use ToolDecision as D;
+        use ToolFault as F;
+        for p in [
+            ToolCall {
+                operation: [0; 16],
+                ..run14()
+            },
+            ToolCall {
+                generation: 0,
+                ..run14()
+            },
+            ToolCall {
+                ordinal: 0,
+                ..run14()
+            },
+            ToolCall {
+                ordinal: 10,
+                ..run14()
+            },
+            // Ordinal 9 only with limit.
+            ToolCall {
+                ordinal: 9,
+                ..run14()
+            },
+            ToolCall {
+                name_bytes: 0,
+                ..run14()
+            },
+            // A retained name was received at most 256 bytes.
+            ToolCall {
+                name_bytes: 257,
+                ..run14()
+            },
+            // Operation must match the registry lookup of the name.
+            ToolCall {
+                tool_operation: Some(ToolOperation::ReadFile),
+                ..run14()
+            },
+            ToolCall {
+                name: "unknown".into(),
+                ..run14()
+            },
+            // Run needs an operation, a parsed form and a rule set.
+            ToolCall {
+                tool_operation: None,
+                ..run14()
+            },
+            ToolCall {
+                form: ArgumentForm::Unparsed,
+                ..run14()
+            },
+            // Faults only with invalid_arguments or unknown_tool.
+            ToolCall {
+                fault: Some(F::MissingField),
+                ..run14()
+            },
+            ToolCall {
+                fault: None,
+                ..invalid14()
+            },
+            ToolCall {
+                fault: Some(F::UnregisteredName),
+                ..invalid14()
+            },
+            ToolCall {
+                decision: D::UnknownTool,
+                ..invalid14()
+            },
+            // JSON faults need unparsed (or not retained) text and no operation.
+            ToolCall {
+                fault: Some(F::InvalidJson),
+                ..invalid14()
+            },
+            // Unknown command needs a grouped registered tool and no operation.
+            ToolCall {
+                fault: Some(F::UnknownCommand),
+                ..invalid14()
+            },
+            ToolCall {
+                fault: Some(F::ArgumentsOverLimit),
+                ..invalid14()
+            },
+            ToolCall {
+                fault: Some(F::NameOverLimit),
+                ..invalid14()
+            },
+            // Busy reason only with busy, and busy only for exec_cmd.
+            ToolCall {
+                busy: Some(ExecCmdBusyReason::Quota),
+                ..run14()
+            },
+            ToolCall {
+                decision: D::Busy,
+                ..run14()
+            },
+            ToolCall {
+                decision: D::Busy,
+                busy: Some(ExecCmdBusyReason::Quota),
+                ..invalid14()
+            },
+            // Form 4 holds no text; forms 1-3 at most 64,000 bytes.
+            ToolCall {
+                form: ArgumentForm::NotRetained(NotRetainedReason::Oversized),
+                fault: Some(F::ArgumentsOverLimit),
+                ..invalid14()
+            },
+            // Text over the limit was received only as a size.
+            ToolCall {
+                arguments_bytes: 64_001,
+                ..invalid14()
+            },
+            // Rule set: revision and digest are zero together, and zero only
+            // with detection_unavailable.
+            ToolCall {
+                rule_set_revision: 0,
+                ..run14()
+            },
+            ToolCall {
+                rule_set_digest: [0; 32],
+                ..run14()
+            },
+            // Refusal only on a refused exec_cmd; never detection unavailable.
+            ToolCall {
+                refusal: refused14().refusal,
+                ..run14()
+            },
+            ToolCall {
+                refusal: None,
+                ..refused14()
+            },
+            ToolCall {
+                refusal: Some(ExecCmdRefusal {
+                    code: RefusalCode::DetectionUnavailable,
+                    kind: None,
+                    word: None,
+                }),
+                ..refused14()
+            },
+            ToolCall {
+                refusal: Some(ExecCmdRefusal {
+                    code: RefusalCode::SecretSingleQuoted,
+                    kind: None,
+                    word: Some(4097),
+                }),
+                ..refused14()
+            },
+            ToolCall {
+                command_cut: true,
+                ..run14()
+            },
+            // Placeholder counts (TCR-D4, TCR-D20).
+            ToolCall {
+                number_kinds: vec![],
+                ..run14()
+            },
+            ToolCall {
+                number_kinds: vec![SecretKind::Jwt; 2],
+                ..run14()
+            },
+            ToolCall {
+                unnumbered: 1,
+                ..run14()
+            },
+            ToolCall {
+                arguments: "{\"command\":\"$ASURA_SECRET_2\"}".into(),
+                ..run14()
+            },
+            ToolCall {
+                arguments: "{\"command\":\"$ASURA_SECRET_01\"}".into(),
+                ..run14()
+            },
+            // A run exec_cmd has at most 16 variables.
+            ToolCall {
+                arguments: format!("{{\"command\":\"{}\"}}", tokens(17)),
+                number_kinds: vec![SecretKind::Jwt; 17],
+                ..run14()
+            },
+        ] {
+            invalid14_record(p);
+        }
+        // Unknown codes in each code byte, by offset in run14's bytes.
+        let base = raw14(&run14());
+        let name = 33 + 8;
+        let at = |field: usize| name + 4 + field;
+        for (offset, value) in [
+            (28, 0),
+            (28, 3),
+            (at(0), 11),
+            (at(1), 0),
+            (at(1), 9),
+            (at(2), 16),
+            (at(3), 5),
+            (at(4), 0),
+            (at(4), 5),
+            (at(5), 4),
+        ] {
+            let mut bytes = base.clone();
+            bytes[offset] = value;
+            assert_eq!(
+                decode_record(14, &bytes),
+                Err(ReplayError::Corrupt),
+                "offset {offset} value {value}"
+            );
+        }
+        // Form 4 needs a reason; forms 1-3 take none.
+        let mut bytes = base.clone();
+        bytes[at(5)] = 1;
+        assert_eq!(decode_record(14, &bytes), Err(ReplayError::Corrupt));
+        // Bad number kind, flag, refusal and trailing bytes.
+        let kinds = 59 + run14().arguments.len() + 2;
+        for (offset, value) in [(kinds, 0), (kinds, 34), (base.len() - 5, 2)] {
+            let mut bytes = base.clone();
+            bytes[offset] = value;
+            assert_eq!(decode_record(14, &bytes), Err(ReplayError::Corrupt));
+        }
+        let mut bytes = base.clone();
+        bytes.push(0);
+        assert_eq!(decode_record(14, &bytes), Err(ReplayError::Corrupt));
+        bytes.truncate(base.len() - 1);
+        assert_eq!(decode_record(14, &bytes), Err(ReplayError::Corrupt));
+        // Over-long strings decode as Corrupt.
+        let mut over = base.clone();
+        over[29..33].copy_from_slice(&513u32.to_be_bytes());
+        assert_eq!(decode_record(14, &over), Err(ReplayError::Corrupt));
+        let mut over = base;
+        over[55..59].copy_from_slice(&64_001u32.to_be_bytes());
+        assert_eq!(decode_record(14, &over), Err(ReplayError::Corrupt));
+    }
+    /// TCR-U02: retired kinds are UnsupportedFormat; the old kind 14 layout is
+    /// Corrupt.
+    #[test]
+    fn tcr_u02_retired_kinds_and_old_layout_are_rejected() {
+        for kind in [17, 22] {
+            assert_eq!(
+                decode_record(kind, &[]),
+                Err(ReplayError::UnsupportedFormat)
+            );
+            assert_eq!(
+                decode_record(kind, &[1; 200]),
+                Err(ReplayError::UnsupportedFormat)
+            );
+        }
+        // The retired ToolIntent layout: operation, generation, ordinal, tool
+        // kind, path, offset and limit.
+        for (kind, path, offset, limit) in [
+            (1u8, "src/main.rs", 0u64, 4096u32),
+            (2, ".", 0, 0),
+            (3, "", 0, 0),
+            (13, "", 0, 0),
+            (16, "printf hello", 1000, 30),
+        ] {
+            let mut w = Writer(Vec::new());
+            w.bytes(&[1; 16]);
+            w.u64(1);
+            w.u32(1);
+            w.byte(kind);
+            w.string(path, 1024).unwrap();
+            w.u64(offset);
+            w.u32(limit);
+            assert_eq!(
+                decode_record(14, &w.0),
+                Err(ReplayError::Corrupt),
+                "old kind 14 tool kind {kind}"
+            );
+        }
+    }
+    /// TCR-U03: the largest legal record is a 65,050-byte frame; one more
+    /// argument byte is refused by the encoder.
+    #[test]
+    fn tcr_u03_largest_kind_14_fits_one_frame() {
+        let prefix = format!("{{\"body\":\"{}", tokens(256));
+        let fill = MAX_TOOL_ARGUMENTS - prefix.len() - 2;
+        let text = format!("{prefix}{}\"}}", "a".repeat(fill));
+        assert_eq!(text.len(), MAX_TOOL_ARGUMENTS);
+        let largest = ToolCall {
+            name: "n".repeat(MAX_STORED_TOOL_NAME),
+            name_bytes: MAX_TOOL_NAME as u32,
+            tool_operation: None,
+            decision: ToolDecision::UnknownTool,
+            fault: Some(ToolFault::UnregisteredName),
+            form: ArgumentForm::Verbatim,
+            arguments_bytes: MAX_TOOL_ARGUMENTS as u32,
+            arguments: text.clone(),
+            number_kinds: vec![SecretKind::Jwt; MAX_TOOL_NUMBERS],
+            ..run14()
+        };
+        let bytes = round14(largest.clone());
+        assert_eq!(bytes.len(), MAX_TOOL_CALL_PAYLOAD);
+        assert_eq!(bytes.len(), 64_866);
+        let frame = encode_frame(&context(), &Record::ToolCall(Box::new(largest.clone()))).unwrap();
+        assert_eq!(frame.len(), 65_050);
+        assert!(frame.len() <= MAX_FRAME);
+        let mut over = largest;
+        over.arguments.insert(9, 'a');
+        assert_eq!(
+            encode_frame(&context(), &Record::ToolCall(Box::new(over))),
+            Err(ReplayError::Limit)
         );
     }
     fn context() -> FrameContext {
@@ -1916,342 +2129,6 @@ mod tests {
             expected_revision: 1,
             owner_generation: 1,
         }
-    }
-    #[test]
-    fn j1t_01_kind_22_round_trips_every_bound_and_maximum_size() {
-        let max = ExecCmdIntent {
-            generation: u64::MAX,
-            ordinal: 8,
-            command: "x".repeat(MAX_EXEC_CMD_COMMAND_BYTES),
-            cwd: "y".repeat(MAX_EXEC_CMD_CWD_BYTES),
-            variables: SecretKind::ALL[..16].to_vec(),
-            rule_set_revision: u32::MAX,
-            ..admitted()
-        };
-        let bytes = round22(max.clone());
-        assert_eq!(bytes.len(), 9_384);
-        assert_eq!(bytes.len(), MAX_EXEC_CMD_INTENT_PAYLOAD);
-        let frame = encode_frame(&context(), &Record::ExecCmdIntent(Box::new(max))).unwrap();
-        assert_eq!(frame.len(), 9_568);
-        // The largest refused record is the same size: refusal fields are fixed.
-        let refused_max = ExecCmdIntent {
-            command_truncated: true,
-            command: "x".repeat(MAX_EXEC_CMD_COMMAND_BYTES),
-            cwd: "y".repeat(MAX_EXEC_CMD_CWD_BYTES),
-            refusal: Some(ExecCmdRefusal {
-                code: RefusalCode::SecretInCwd,
-                kind: Some(SecretKind::WifiPassword),
-                word: Some(4096),
-            }),
-            ..refused(RefusalCode::SecretInCwd)
-        };
-        assert_eq!(round22(refused_max).len(), 9_384 - 32);
-        for ordinal in [1, 8] {
-            round22(ExecCmdIntent {
-                ordinal,
-                ..admitted()
-            });
-        }
-        for (command, cwd) in [
-            ("x", "."),
-            ("x", "a/b"),
-            ("x", "./subdir"),
-            ("x", "a//b/"),
-            ("é", "..."),
-            ("x", "a..b"),
-        ] {
-            round22(ExecCmdIntent {
-                command: command.into(),
-                cwd: cwd.into(),
-                ..admitted()
-            });
-        }
-        for count in 0..=16 {
-            round22(ExecCmdIntent {
-                variables: SecretKind::ALL[33 - count..].to_vec(),
-                ..admitted()
-            });
-        }
-        for kind in SecretKind::ALL {
-            round22(ExecCmdIntent {
-                variables: vec![kind; 16],
-                ..admitted()
-            });
-        }
-        for code in REFUSALS {
-            for truncated in [false, true] {
-                round22(ExecCmdIntent {
-                    command_truncated: truncated,
-                    ..refused(code)
-                });
-            }
-        }
-        for kind in SecretKind::ALL {
-            for word in [None, Some(1), Some(4096)] {
-                round22(ExecCmdIntent {
-                    refusal: Some(ExecCmdRefusal {
-                        code: RefusalCode::ResidualSecret,
-                        kind: Some(kind),
-                        word,
-                    }),
-                    ..refused(RefusalCode::ResidualSecret)
-                });
-            }
-        }
-        for reason in [
-            ExecCmdBusyReason::Quota,
-            ExecCmdBusyReason::CapturePaused,
-            ExecCmdBusyReason::PendingFull,
-            ExecCmdBusyReason::PayloadUnavailable,
-        ] {
-            let bytes = round22(ExecCmdIntent {
-                command: "x".into(),
-                ..busy(reason)
-            });
-            assert_eq!(bytes[38 + 1 + 1 + 4], reason as u8);
-        }
-    }
-    #[test]
-    fn j1t_01_kind_22_rejects_each_invalid_field() {
-        let a = admitted;
-        let r = || refused(RefusalCode::UnparsedCommand);
-        let b = || busy(ExecCmdBusyReason::Quota);
-        let unavailable = || refused(RefusalCode::DetectionUnavailable);
-        for p in [
-            ExecCmdIntent {
-                operation: [0; 16],
-                ..a()
-            },
-            ExecCmdIntent {
-                generation: 0,
-                ..a()
-            },
-            ExecCmdIntent { ordinal: 0, ..a() },
-            ExecCmdIntent { ordinal: 9, ..a() },
-            ExecCmdIntent {
-                command_truncated: true,
-                ..a()
-            },
-            ExecCmdIntent {
-                command_truncated: true,
-                ..b()
-            },
-            ExecCmdIntent {
-                command: String::new(),
-                ..a()
-            },
-            ExecCmdIntent {
-                command: "x".repeat(8193),
-                ..a()
-            },
-            ExecCmdIntent {
-                command: "a\0b".into(),
-                ..a()
-            },
-            ExecCmdIntent {
-                cwd: String::new(),
-                ..a()
-            },
-            ExecCmdIntent {
-                cwd: "y".repeat(1025),
-                ..a()
-            },
-            ExecCmdIntent {
-                cwd: "/absolute".into(),
-                ..a()
-            },
-            ExecCmdIntent {
-                cwd: "..".into(),
-                ..a()
-            },
-            ExecCmdIntent {
-                cwd: "a/../b".into(),
-                ..a()
-            },
-            ExecCmdIntent {
-                cwd: "a/..".into(),
-                ..a()
-            },
-            ExecCmdIntent {
-                cwd: "a\0b".into(),
-                ..a()
-            },
-            ExecCmdIntent {
-                refusal: None,
-                ..r()
-            },
-            ExecCmdIntent {
-                refusal: r().refusal,
-                ..a()
-            },
-            ExecCmdIntent {
-                refusal: r().refusal,
-                ..b()
-            },
-            ExecCmdIntent {
-                refusal: Some(ExecCmdRefusal {
-                    code: RefusalCode::UnparsedCommand,
-                    kind: None,
-                    word: Some(4097),
-                }),
-                ..r()
-            },
-            ExecCmdIntent { busy: None, ..b() },
-            ExecCmdIntent {
-                busy: Some(ExecCmdBusyReason::Quota),
-                ..a()
-            },
-            ExecCmdIntent {
-                busy: Some(ExecCmdBusyReason::Quota),
-                ..r()
-            },
-            ExecCmdIntent {
-                variables: vec![SecretKind::Jwt; 17],
-                ..a()
-            },
-            ExecCmdIntent {
-                variables: vec![SecretKind::Jwt],
-                ..r()
-            },
-            ExecCmdIntent {
-                variables: vec![SecretKind::Jwt],
-                ..b()
-            },
-            ExecCmdIntent {
-                job: [0; 16],
-                ..a()
-            },
-            ExecCmdIntent {
-                stdout_payload: [0; 16],
-                ..a()
-            },
-            ExecCmdIntent {
-                stderr_payload: [0; 16],
-                ..a()
-            },
-            ExecCmdIntent {
-                job: [2; 16],
-                ..r()
-            },
-            ExecCmdIntent {
-                stdout_payload: [3; 16],
-                ..b()
-            },
-            ExecCmdIntent {
-                stderr_payload: [4; 16],
-                ..r()
-            },
-            ExecCmdIntent {
-                initial_reservation: 0,
-                ..a()
-            },
-            ExecCmdIntent {
-                initial_reservation: 2 * INITIAL_RESERVATION,
-                ..a()
-            },
-            ExecCmdIntent {
-                initial_reservation: INITIAL_RESERVATION,
-                ..r()
-            },
-            ExecCmdIntent {
-                initial_reservation: INITIAL_RESERVATION,
-                ..b()
-            },
-            ExecCmdIntent {
-                rule_set_revision: 1,
-                ..unavailable()
-            },
-            ExecCmdIntent {
-                rule_set_digest: [5; 32],
-                ..unavailable()
-            },
-            ExecCmdIntent {
-                rule_set_revision: 0,
-                ..r()
-            },
-            ExecCmdIntent {
-                rule_set_digest: [0; 32],
-                ..r()
-            },
-            ExecCmdIntent {
-                rule_set_revision: 0,
-                rule_set_digest: [0; 32],
-                ..a()
-            },
-            ExecCmdIntent {
-                rule_set_revision: 0,
-                rule_set_digest: [0; 32],
-                ..b()
-            },
-        ] {
-            invalid22(p);
-        }
-        // Word 0 is "no word" on the wire, so `Some(0)` is an encode error only.
-        let zero_word = ExecCmdIntent {
-            refusal: Some(ExecCmdRefusal {
-                code: RefusalCode::UnparsedCommand,
-                kind: None,
-                word: Some(0),
-            }),
-            ..r()
-        };
-        assert_eq!(
-            payload(&Record::ExecCmdIntent(Box::new(zero_word))),
-            Err(ReplayError::Corrupt)
-        );
-        // Wire-only values: offsets for command "x" (1 byte) and cwd "." (1 byte).
-        let base = |p: ExecCmdIntent| {
-            raw22(&ExecCmdIntent {
-                command: "x".into(),
-                cwd: ".".into(),
-                ..p
-            })
-        };
-        let refusal_at = 38 + 1 + 1;
-        let wire: [(ExecCmdIntent, usize, u8); 17] = [
-            (a(), 28, 0),
-            (a(), 28, 4),
-            (r(), 29, 2),
-            (r(), 29, 3),
-            (a(), 29, 2),
-            (r(), refusal_at, 15),
-            (r(), refusal_at, 255),
-            (r(), refusal_at + 1, 34),
-            (a(), refusal_at + 1, 1),
-            (a(), refusal_at + 3, 1),
-            (b(), refusal_at + 4, 5),
-            (b(), refusal_at + 4, 0),
-            (a(), refusal_at + 5, 2),
-            (a(), refusal_at + 5, 17),
-            (a(), refusal_at + 6, 2),
-            (a(), refusal_at + 7, 0),
-            (a(), refusal_at + 7, 34),
-        ];
-        for (p, offset, value) in wire {
-            let mut bytes = base(p.clone());
-            assert!(decode_record(22, &bytes).is_ok(), "{p:?}");
-            bytes[offset] = value;
-            assert_eq!(
-                decode_record(22, &bytes),
-                Err(ReplayError::Corrupt),
-                "{offset} {value}"
-            );
-        }
-        let mut bytes = base(a());
-        bytes.push(0);
-        assert_eq!(decode_record(22, &bytes), Err(ReplayError::Corrupt));
-        let bytes = base(a());
-        assert_eq!(
-            decode_record(22, &bytes[..bytes.len() - 1]),
-            Err(ReplayError::Corrupt)
-        );
-        let mut bytes = base(a());
-        bytes[34] = 0xff;
-        assert_eq!(decode_record(22, &bytes), Err(ReplayError::Corrupt));
-        // A length over the field bound is `Corrupt`, not `Limit`.
-        let mut bytes = base(a());
-        bytes[30..34].copy_from_slice(&8193u32.to_be_bytes());
-        assert_eq!(decode_record(22, &bytes), Err(ReplayError::Corrupt));
     }
 
     fn stream() -> CaptureStream {
@@ -2280,8 +2157,6 @@ mod tests {
             reason: CaptureReason::None,
             exit_kind: 1,
             exit_value: 0,
-            rule_set_revision: 1,
-            rule_set_digest: [5; 32],
             stdout: stream(),
             stderr: CaptureStream {
                 kinds: vec![],
@@ -2356,7 +2231,6 @@ mod tests {
             ordinal: 8,
             exit_kind: 2,
             exit_value: 127,
-            rule_set_revision: u32::MAX,
             stdout: full_stream(),
             stderr: full_stream(),
             distinct_numbers: 16_384,
@@ -2374,11 +2248,11 @@ mod tests {
             ..settled()
         };
         let bytes = round23(max.clone());
-        assert_eq!(bytes.len(), 4_102);
+        assert_eq!(bytes.len(), 4_066);
         assert_eq!(bytes.len(), MAX_CAPTURE_SETTLED_PAYLOAD);
         let frame = encode_frame(&context(), &Record::CaptureSettled(Box::new(max))).unwrap();
-        assert_eq!(frame.len(), 4_286);
-        // Minimum: no kinds, spans or numbers; 72 + 2 × 101 + 6 + 20 + 8.
+        assert_eq!(frame.len(), 4_250);
+        // Minimum: no kinds, spans or numbers; 36 + 2 × 101 + 6 + 20 + 8.
         let min = CaptureSettled {
             stdout: CaptureStream {
                 kinds: vec![],
@@ -2391,7 +2265,7 @@ mod tests {
             final_reservation: 0,
             ..settled()
         };
-        assert_eq!(round23(min).len(), 308);
+        assert_eq!(round23(min).len(), 272);
         let without_digests = |s: CaptureStream| CaptureStream { digest: None, ..s };
         for (state, reason) in [
             (CaptureState::Complete, CaptureReason::None),
@@ -2473,8 +2347,8 @@ mod tests {
         }
         let digest = round23(settled());
         // The stdout digest field is the SHA-256 of stored bytes, present flag 1.
-        assert_eq!(digest[72 + 16], 1);
-        assert_eq!(&digest[72 + 17..72 + 49], &[6; 32]);
+        assert_eq!(digest[36 + 16], 1);
+        assert_eq!(&digest[36 + 17..36 + 49], &[6; 32]);
         assert_eq!(digest[35], 1, "redaction ran");
     }
     #[test]
@@ -2675,14 +2549,6 @@ mod tests {
                 ..s()
             },
             CaptureSettled {
-                rule_set_revision: 0,
-                ..s()
-            },
-            CaptureSettled {
-                rule_set_digest: [0; 32],
-                ..s()
-            },
-            CaptureSettled {
                 stdout: CaptureStream {
                     unnumbered_replacements: 2,
                     ..stream()
@@ -2798,12 +2664,12 @@ mod tests {
         ] {
             invalid23(p);
         }
-        // Wire-only values in the default record. stdout starts at 72 and has
+        // Wire-only values in the default record. stdout starts at 36 and has
         // one kind entry (110 bytes): kind count +73, loss count +83, span
         // count +99, degraded +100, discarded +101, EOF +109. stderr starts at
-        // 182 with no entries: EOF +100. Numbers follow at 283.
-        let stdout = 72;
-        let stderr = 182;
+        // 146 with no entries: EOF +100. Numbers follow at 247.
+        let stdout = 36;
+        let stderr = 146;
         let numbers_at = stderr + 101;
         let wire: [(usize, u8); 20] = [
             (28, 0),
@@ -2914,13 +2780,19 @@ mod tests {
             assert_eq!(variant.as_str(), *name);
             assert_eq!(refusal_code(variant), code);
             assert_eq!(REFUSALS[index], variant);
-            // The stored byte, through the real encoder.
-            let bytes = round22(ExecCmdIntent {
-                command: "x".into(),
-                cwd: ".".into(),
-                ..refused(variant)
-            });
-            assert_eq!(bytes[40], code);
+            // The stored byte, through the real encoder (kind 14 field 21).
+            // Detection unavailable never appears as a kind 14 refusal code.
+            if variant != RefusalCode::DetectionUnavailable {
+                let bytes = round14(ToolCall {
+                    refusal: Some(ExecCmdRefusal {
+                        code: variant,
+                        kind: None,
+                        word: None,
+                    }),
+                    ..refused14()
+                });
+                assert_eq!(bytes[bytes.len() - 4], code);
+            }
         }
         for code in [0, 15, 255] {
             assert_eq!(refusal_from(code), Err(ReplayError::Corrupt));
@@ -2968,13 +2840,13 @@ mod tests {
             assert_eq!(kind_code(kind), code);
             // Codes are the rule-set 1 positions of `SecretKind::ALL`.
             assert_eq!(SecretKind::ALL[index], kind);
-            let bytes = round22(ExecCmdIntent {
-                command: "x".into(),
-                cwd: ".".into(),
-                variables: vec![kind],
-                ..admitted()
-            });
-            assert_eq!(&bytes[46..48], &[1, code]);
+            let p = ToolCall {
+                number_kinds: vec![kind],
+                ..run14()
+            };
+            let at = 59 + p.arguments.len() + 2;
+            let bytes = round14(p);
+            assert_eq!(bytes[at], code);
         }
         for code in [0, 34, 255] {
             assert_eq!(kind_from(code), Err(ReplayError::Corrupt));
@@ -2999,44 +2871,109 @@ mod tests {
         ] {
             assert_eq!(state as u8, code);
         }
-        assert_eq!(ExecCmdDisposition::Admitted as u8, 1);
-        assert_eq!(ExecCmdDisposition::Refused as u8, 2);
-        assert_eq!(ExecCmdDisposition::Busy as u8, 3);
         assert_eq!(CaptureReason::SettlementUnconfirmed as u8, 6);
+        // Kind 14 code tables (tool-call-records.md).
+        let operations = [
+            "read_file",
+            "list_directory",
+            "status",
+            "tools",
+            "audit",
+            "list_notes",
+            "get_note",
+            "note_sources",
+            "create_note",
+            "exec_cmd",
+        ];
+        for (index, name) in operations.iter().enumerate() {
+            let op = ToolOperation::from_code(index as u8 + 1).unwrap();
+            assert_eq!((op as u8, op.as_str()), (index as u8 + 1, *name));
+        }
+        assert_eq!(ToolOperation::from_code(0), None);
+        assert_eq!(ToolOperation::from_code(11), None);
+        let decisions = [
+            ("run", None),
+            ("invalid_arguments", Some(3)),
+            ("unknown_tool", Some(3)),
+            ("refused", Some(3)),
+            ("busy", Some(4)),
+            ("denied", Some(2)),
+            ("limit", Some(7)),
+            ("cancelled", Some(6)),
+        ];
+        for (index, (name, status)) in decisions.iter().enumerate() {
+            let d = ToolDecision::from_code(index as u8 + 1).unwrap();
+            assert_eq!(
+                (d as u8, d.as_str(), d.status()),
+                (index as u8 + 1, *name, *status)
+            );
+        }
+        assert_eq!(ToolDecision::from_code(9), None);
+        let faults = [
+            "invalid_json",
+            "json_limit",
+            "not_object",
+            "duplicate_key",
+            "unknown_command",
+            "missing_field",
+            "unexpected_field",
+            "wrong_type",
+            "out_of_range",
+            "unsafe_path",
+            "invalid_version_id",
+            "arguments_over_limit",
+            "name_over_limit",
+            "invalid_text",
+            "unregistered_name",
+        ];
+        for (index, name) in faults.iter().enumerate() {
+            let f = ToolFault::from_code(index as u8 + 1).unwrap();
+            assert_eq!((f as u8, f.as_str()), (index as u8 + 1, *name));
+        }
+        assert_eq!(ToolFault::from_code(16), None);
+        for (code, reason) in [
+            (1, NotRetainedReason::Oversized),
+            (2, NotRetainedReason::DetectionUnavailable),
+            (3, NotRetainedReason::UnverifiableEscape),
+        ] {
+            assert_eq!(reason as u8, code);
+            assert_eq!(
+                form_from(4, code).unwrap(),
+                ArgumentForm::NotRetained(reason)
+            );
+        }
+        assert_eq!(ToolCallSource::GeneratedContent as u8, 1);
+        assert_eq!(ToolCallSource::ProviderJson as u8, 2);
+        assert_eq!(TOOL_NAMES, ["project", "memory", "service", "exec_cmd"]);
     }
     #[test]
     fn j1t_01_records_hold_no_value_or_value_digest() {
-        // Kind 22 holds the rewritten command; no other variable-length field
-        // exists. Everything outside command and cwd is structural.
-        let rewritten = "curl -H \"Authorization: Bearer $ASURA_SECRET_1\" https://example.test";
-        for count in [0, 1, 16] {
-            let p = ExecCmdIntent {
-                command: rewritten.into(),
-                cwd: "sub/dir".into(),
-                variables: vec![SecretKind::AuthHeader; count],
-                ..admitted()
+        // Kind 14 holds the rewritten command inside its only variable-length
+        // argument field; the number kinds are kind codes only and the only
+        // 32-byte field is the rule-set digest.
+        for count in [1, 16] {
+            let text = format!(
+                "{{\"command\":\"{}\"}}",
+                (1..=count)
+                    .map(|n| format!("\\\"$ASURA_SECRET_{n}\\\""))
+                    .collect::<String>()
+            );
+            let p = ToolCall {
+                arguments: text.clone(),
+                arguments_bytes: 64,
+                number_kinds: vec![SecretKind::AuthHeader; count],
+                ..run14()
             };
-            let bytes = round22(p.clone());
-            assert_eq!(
-                bytes.len(),
-                30 + 4 + rewritten.len() + 4 + 7 + 6 + 2 * count + 48 + 8 + 36
-            );
-            assert_eq!(&bytes[34..34 + rewritten.len()], rewritten.as_bytes());
-            assert_eq!(
-                &bytes[38 + rewritten.len()..45 + rewritten.len()],
-                b"sub/dir"
-            );
-            // Each variable entry is only (number, kind code).
-            let vars = 45 + rewritten.len() + 6;
-            for i in 0..count {
-                assert_eq!(&bytes[vars + 2 * i..vars + 2 * i + 2], &[i as u8 + 1, 26]);
-            }
-            // The only 32-byte field is the rule-set digest, which is not a
-            // value digest: it is the last field.
-            assert_eq!(&bytes[bytes.len() - 32..], &[5; 32]);
+            let bytes = round14(p);
+            assert_eq!(bytes.len(), 98 + 8 + text.len() + count);
+            assert_eq!(&bytes[59..59 + text.len()], text.as_bytes());
+            let kinds = 59 + text.len() + 2;
+            assert!(bytes[kinds..kinds + count].iter().all(|k| *k == 26));
+            let digest = kinds + count + 8;
+            assert_eq!(&bytes[digest..digest + 32], &[5; 32]);
         }
         // Kind 23 has no string field: its size depends only on entry counts.
         let bytes = round23(settled());
-        assert_eq!(bytes.len(), 72 + (101 + 9) + 101 + 6 + 4 + 20 + 8);
+        assert_eq!(bytes.len(), 36 + (101 + 9) + 101 + 6 + 4 + 20 + 8);
     }
 }

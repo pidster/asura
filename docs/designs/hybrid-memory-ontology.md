@@ -1769,7 +1769,9 @@ turn cancel, steering or shutdown. It shares the authority worker's six ordinary
 queue slots. There is no new worker thread, engine connection, retry loop or timer
 polling loop in a client or render path.
 
-The conversation owner records ToolIntent before submitting `MemoryRead`. It must
+The conversation owner records the call's kind 14 record (the `ToolIntent`
+layout until 2026-10-18; now the [tool call record](tool-call-records.md)) before
+submitting `MemoryRead`. It must
 recheck the cancellation/generation fence after that commit. It retains a distinct
 memory-read ticket and uses the existing completion wake to advance its event
 state. A read completion becomes a bounded result; the owner commits ToolResult
@@ -1832,7 +1834,10 @@ validation applies the exact ID, offset and limit rules before dispatch. Missing
 required fields or oversized strings remain protocol errors. No wire field is an
 authorization token. ToolResult uses its existing fields and status values.
 
-Extend journal ToolIntent kind values with explicit match arms: 6 list, 7 get,
+Superseded (2026-10-18): the kind 14 `ToolCall` record replaces these tool
+kinds with operation codes 6–8 and decisions; rejected proposals are records with
+decision `invalid_arguments`. Earlier text: extend journal ToolIntent kind values
+with explicit match arms: 6 list, 7 get,
 8 sources; 9 rejected list, 10 rejected get, 11 rejected sources. Do not use the
 existing arithmetic `kind + 3` shortcut for new tools. Kinds 1–5 retain their exact
 encoding and replay semantics. Existing ToolIntent fields have kind-specific
@@ -1974,6 +1979,16 @@ The tool creates one new object and one new version, with at most one direct
 same-project source. The current canonical `PutNote` transaction remains the only
 database mutation implementation.
 
+Revision (2026-10-18, [tool call records](tool-call-records.md)): journal kind
+17 `MemoryCreateIntent` is retired; replay returns `UnsupportedFormat` for it.
+The durable authorization evidence of a create is the kind 14 `ToolCall` record
+with operation code 9 and decision `run`. Its redacted argument text is the only
+journal copy of the call's arguments. The journal keeps no body size, body
+digest or command digest; the memory store is their one source. Replay derives
+the memory operation, object, version and edge IDs with
+`CreateNoteIdentity::derive` and the project from the turn's conversation. The
+sections below are updated where they described kind 17.
+
 ### User policy and native arguments
 
 An admitted user conversation turn in a registered project receives an explicit
@@ -1984,16 +1999,18 @@ per-call prompt is required. Unaccepted drafts, observations, sensors, classifie
 background reconciliation and remote delegates receive no such grant. Existing
 memory receipt reconciliation is recovery of an admitted write, not a new write grant.
 
-The committed `MemoryCreateIntent` is the durable authorization evidence. Only the
+The committed kind 14 `ToolCall` record with decision `run` and operation
+code 9 is the durable authorization evidence. Only the
 canonical service tool-admission gate may issue it, after validating the admitted
 user turn, its project, explicit memory-write permission, enabled native capability
 and verified local destination. The service validates capability and locality again
 immediately before dispatch. No model argument or writer command carries a grant
 boolean. Existing read authority alone cannot authorize creation of this record.
-The typed intent authorizes only its exact identities, hashes, source and admitted
-turn; it does not confer a reusable project-wide write capability.
+The record authorizes only the identities derived from its admitted turn,
+generation and ordinal; it does not confer a reusable project-wide write
+capability.
 
-The authority worker verifies the exact committed typed intent, accepted turn,
+The authority worker verifies the exact committed kind 14 record, accepted turn,
 registered project, current owner generation and cancellation/terminal state before
 effect. It does not reconstruct a grant from provider names, registration, source
 text or a caller assertion. After restart, an old intent authorizes receipt
@@ -2016,14 +2033,20 @@ not create a second database, storage thread or conversation loop. A repeated ca
 identity with identical arguments resolves the original operation. A changed body
 or source under that identity conflicts; it never creates another version.
 
-Success text has exactly four newline-terminated fields:
+Success text has exactly three newline-terminated fields (TCR-D1,
+2026-10-18; the former fourth field `sha256=<exact body digest>` is removed
+because the journal keeps no body digest):
 
 ```text
 operation=<memory operation ID>
 object=<new object ID>
 version=<new version ID>
-sha256=<exact body digest>
 ```
+
+The service renders this text from the derived identity and sends it to the
+helper. The kind 15 record of a create stores empty text, because every field
+is a derived value (TCR-O5). Replay requires empty text for every create result
+and renders the success text again from the derived identity.
 
 The source is already an argument; no source body appears in this response.
 The result has no `next_offset` and is not truncated. It stays below 256 bytes.
@@ -2045,44 +2068,32 @@ Changing payload must not change these identities. The domain roles prevent a no
 ID from being reused as a receipt or edge identity. Collisions cause a closed
 conflict; no existing object/version is overwritten.
 
-Before submitting a database write, commit `MemoryCreateIntent` as new journal
-record kind 17 in format 1. It is the durable ToolIntent for this mutation, not a
-second generic ToolIntent record. Confirm kind 17 remains unused at integration.
-The fixed payload contains, in order:
+Before submitting a database write, the conversation owner commits the kind 14
+`ToolCall` record with decision `run` (2026-10-18). Kind 17
+`MemoryCreateIntent` is retired: replay returns `UnsupportedFormat`. The record
+holds the redacted argument text, not a body length, body digest or command
+digest. Replay derives the identities from the binding (canonical
+initialization and ActiveBinding records), admitted turn, generation and
+ordinal, and the project from the turn's conversation. The journal retains no
+second copy of the body and no hash of it. A restart never reconstructs a
+missing body and never asks the model to regenerate it.
 
-| Field | Encoding |
-| --- | --- |
-| Turn operation, generation, ordinal | 16 bytes, u64, u32 |
-| Project | 16 bytes, equal to admitted turn project |
-| Memory operation, object, version | Three nonzero 16-byte IDs |
-| Body length and body SHA-256 | u32 in 1–16,384; 32 bytes |
-| Optional source and edge | One presence byte; if present, two nonzero 16-byte IDs |
-| PutNote command SHA-256 | 32 bytes |
-
-The codec uses the existing integer byte order and frame integrity rules. Binding
-comes from canonical initialization/ActiveBinding records. Replay verifies derived
-identities against that binding, admitted turn, generation and ordinal. The command
-digest is computed from the exact live `PutNote`, using its existing canonical
-digest owner, then stored in the intent. The independent journal retains metadata,
-not a second copy of note bodies. A restart never reconstructs a missing body from
-a hash or asks the model to regenerate it automatically.
-
-The replay projection adds `ToolRecord.kind=12` for an admitted create and retains
-its typed create specification. It applies the existing sequential ordinal,
-started-turn, eight-call and current-owner checks at intent admission. The rejected
-native proposal uses generic ToolIntent kind 13, with an empty path, zero offset
-and zero limit. It permits only invalid-argument, timeout or cancelled empty
-results, as with HM2 rejected proposals. Live duplicate validation retains the
-original bounded arguments. Restart never resumes inference or re-executes a
-rejected proposal, so rejected bodies need not be duplicated in the journal.
+The replay projection keeps the derived create identity on the tool record of
+a `run` create call. It applies the existing sequential ordinal, started-turn,
+eight-call and current-owner checks. A create call that does not run (for
+example `invalid_arguments` or `denied`) is complete at its kind 14 record; no
+kind 15 follows (TCR-R5). Live duplicate validation keeps a keyed digest of the
+received name and arguments in memory only. Restart never resumes inference or
+re-executes a call that did not run.
 
 ### Bound worker interface and transaction
 
 Add these typed commands to the existing authority writer:
 
-- `MemoryCreate { turn, generation, ordinal, body }` executes an already committed
-  typed create intent. The worker obtains project, binding, identities, source,
-  length and hashes from that exact journal intent, not caller-supplied metadata.
+- `MemoryCreate { turn, generation, ordinal, body, source_version }` executes an
+  already committed `run` create record. The worker derives project, binding and
+  identities from the journal; the body and optional source come from the
+  service's typed parse of the same call (TCR-D2).
 - `MemoryResolveCreate { turn, generation, ordinal }` verifies the original
   receipt and records. It accepts no replacement body and cannot invoke PutNote.
 
@@ -2090,8 +2101,8 @@ Both return a typed `memory_create_result` in the existing writer reply. Its
 outcomes are `Committed(Receipt)`, `NotCommitted`, or a typed failure/uncertainty.
 Neither the tool nor another adapter can directly initialize or open the graph.
 The writer checks registered project membership and the exact accepted, unresolved
-intent. Create additionally requires current owner/generation, no cancellation,
-no terminal state and the original body length/hash/PutNote digest. The service's
+record. Create additionally requires current owner/generation, no cancellation
+and no terminal state. The service's
 current capability/locality check precedes submission; the committed typed intent
 supplies the worker's exact durable authorization evidence. The worker rechecks
 its journal fences immediately before the database transaction. Recovery resolve permits a former
@@ -2101,8 +2112,12 @@ The canonical database operation validates an optional source in the same contex
 before submission and inside its existing transaction. It atomically creates the
 note, optional derived-from edge and receipt. There is no overwrite/upsert. Every
 stored field, source direction and binding is validated on receipt resolution.
-Specifically, verify receipt operation/digest/version/edge, note object/version/
-operation/context, body length/hash and the exact optional source/edge pair.
+Specifically (TCR-D2, 2026-10-18), resolve the receipt by the derived memory
+operation ID alone; verify that the receipt version equals the derived version
+and any receipt edge equals the derived edge; verify the note object, operation
+and context; verify the optional edge and its source note; and recompute the
+`PutNote` command digest from the stored note body and stored edge and compare
+it with the receipt's own command digest. No digest comes from the journal.
 Receipt-only existence is insufficient. A missing or corrupt referenced record
 returns uncertainty/repair, not success.
 
@@ -2153,10 +2168,10 @@ Journal result failure similarly retains the unpublished state and recovery iden
 ```mermaid
 flowchart TD
     Call[Native create-note proposal] --> Grant{Admitted local turn with write grant?}
-    Grant -->|No| Reject[Reject without database effect]
-    Grant -->|Yes| Args{Body, source and budgets valid?}
-    Args -->|No| Reject
-    Args -->|Yes| Intent[Commit typed intent with stable IDs and hashes]
+    Grant -->|No| Denied[Commit kind 14 denied; no database effect; no kind 15]
+    Grant -->|Yes| Args{Service parse: body, source and budgets valid?}
+    Args -->|No| Reject[Commit kind 14 invalid_arguments or limit; no kind 15]
+    Args -->|Yes| Intent[Commit kind 14 run; IDs derived on replay]
     Intent -->|Committed| Fence{Still current and not cancelled?}
     Fence -->|No| NoWrite[Commit not-executed outcome]
     Fence -->|Yes| Put[Submit atomic note, edge and receipt transaction]
@@ -2178,30 +2193,33 @@ flowchart TD
 
 ### Restart and durable result rules
 
-At startup, derive project publication gates from unresolved typed create intents
+At startup, derive project publication gates from unresolved `run` create
+records (kind 14, operation code 9, no kind 15)
 as part of journal replay, before accepting reads, new work or scheduling interrupted
 terminals. Do not derive these gates from volatile service state or database rows.
-Then enumerate those intents for receipt reconciliation. Process one receipt lookup
+Then enumerate those records for receipt reconciliation, with identities derived
+by `CreateNoteIdentity::derive`. Process one receipt lookup
 at a time on the retained worker.
-Replay limits unresolved create intents to 32; exceeding this is a resource-limit
+Replay limits unresolved create records to 32; exceeding this is a resource-limit
 failure, not permission to discard an intent. Each lookup waits for the real reply
 with no time bound (J1-0; owner, 2026-10-16).
 New service ownership does not authorize repeating a database write.
 
-After an owner-generation increment, permit ToolResult kind 15 for a projected
-kind-12 create from an older owner only to record its reconciled outcome. The
+After an owner-generation increment, permit ToolResult kind 15 for a `run`
+create record from an older owner only to record its reconciled outcome. The
 turn must remain nonterminal and the create must be unresolved. The frame uses
 the current owner generation while its payload identifies the original turn and
 call. Other tool kinds retain their existing same-owner requirement. This exception
 records recovered effect evidence; it never resumes a former model callback.
 
-A success for kind 12 must use the exact IDs/hash in its typed intent and the fixed
-success encoding above. Other statuses are limited to denied, unavailable, timeout,
-cancelled and resource limit, with empty text, absent offset and false truncation.
-Invalid arguments use rejected kind 13 before effect. Runtime code may record a
+A create result stores empty text for every status (TCR-D1, 2026-10-18); the
+success text above is rendered from the derived identity. Statuses are limited to
+success, denied, unavailable, timeout, cancelled and resource limit, with absent
+offset and false truncation. Invalid arguments are a kind 14 record with decision
+`invalid_arguments` before effect, with no kind 15. Runtime code may record a
 non-success after dispatch only following verified absence. Replay cannot prove a
 live database lookup; the canonical worker and receipt tests supply that evidence.
-An Interrupted/Restart terminal cannot precede resolution of a kind-12 create.
+An Interrupted/Restart terminal cannot precede resolution of a `run` create record.
 After its result is durable, record the ordinary interrupted terminal without
 restarting inference. Lost replies resolve to the original durable result.
 
@@ -2221,7 +2239,10 @@ existing service repair state. Diagnostic output contains no note/source bodies.
 2. Root's service packet owns write grants, proposal/intent mapping, retained mutation
    state, publication/recovery scheduling and progress presentation. Extend the
    existing tool lifecycle; do not put mutations in the file-read executor.
-3. The schema/provider packet adds ToolCall field 16 `memory_create_note` with
+3. Superseded (2026-10-18): ToolCall fields 10–19 are removed; the helper sends
+   the tool name and argument text and the service parses them
+   ([tool call records](tool-call-records.md#wire-contract)). Earlier text: the
+   schema/provider packet adds ToolCall field 16 `memory_create_note` with
    required string body field 1 and optional source-version string field 2.
    Keep wire 0.1. Bound source text to 1,024 bytes for semantic rejection and body
    to 16,384 bytes at the wire boundary. Empty present bodies receive semantic

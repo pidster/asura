@@ -8,7 +8,7 @@ const COMMAND: &str = "printf x >> effect.txt; cat proof.txt; printf stderr-proo
 fn recorded(
     fixture: &Fixture,
     operation: [u8; 16],
-) -> Result<(journal::ExecCmdIntent, journal::ToolResult)> {
+) -> Result<(journal::ToolCall, journal::ToolResult)> {
     let mut bytes = Vec::new();
     fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
         .take(asura_storage::authority::MAX_JOURNAL as u64 + 1)
@@ -25,7 +25,7 @@ fn recorded(
         "exactly one exec_cmd invocation required"
     );
     let tool = &operation.tools[0];
-    assert_eq!(tool.kind, 16);
+    assert_eq!(tool.tool_operation, Some(journal::ToolOperation::ExecCmd));
     let decode = |range: std::ops::Range<usize>| -> Result<journal::Record> {
         let frame = &bytes[range];
         Ok(journal::decode_record(
@@ -34,8 +34,8 @@ fn recorded(
         )
         .map_err(|error| format!("exec_cmd record: {error:?}"))?)
     };
-    // J1: every exec_cmd call records kind 22.
-    let journal::Record::ExecCmdIntent(intent) = decode(tool.intent_frame.clone())? else {
+    // Every exec_cmd call records one kind 14 ToolCall (tool-call-records.md).
+    let journal::Record::ToolCall(intent) = decode(tool.intent_frame.clone())? else {
         return Err("exec_cmd intent variant".into());
     };
     let intent = *intent;
@@ -111,11 +111,11 @@ pub(super) fn run(provider: &str) -> Result<()> {
     assert_eq!(retry.operation_id, accepted.operation_id);
     fixture.stop()?;
     let (intent, result) = recorded(&fixture, operation)?;
-    assert_eq!(
-        (intent.command.as_str(), intent.cwd.as_str()),
-        (COMMAND, ".")
-    );
-    assert_eq!(intent.disposition, journal::ExecCmdDisposition::Admitted);
+    // The stored canonical arguments are the only copy of the command.
+    let arguments: serde_json::Value = serde_json::from_str(&intent.arguments)?;
+    assert_eq!(arguments["command"].as_str(), Some(COMMAND));
+    assert!(arguments["cwd"].as_str().is_none_or(|cwd| cwd == "."));
+    assert_eq!(intent.decision, journal::ToolDecision::Run);
     assert_eq!(result.status, 1);
     assert!(
         result.text.contains(&proof) && result.text.contains("stderr-proof"),
@@ -187,6 +187,13 @@ fn interrupted(
     let deadline = Instant::now() + Duration::from_secs(60);
     while !directory.join(marker).is_file() {
         if Instant::now() >= deadline {
+            // Evidence for the failure: the recorded calls and turn state.
+            if let Ok(event) = observe(fixture, operation) {
+                eprintln!(
+                    "spawn marker deadline: kind={:?} reason={:?} tools={:?}",
+                    event.kind, event.reason, event.tools
+                );
+            }
             return Err("native exec_cmd spawn marker deadline".into());
         }
         // Actual service control remains responsive while model/setup work is pending.
@@ -206,7 +213,8 @@ fn interrupted(
     }
     fixture.stop()?;
     let (intent, result) = recorded(fixture, operation)?;
-    assert_eq!(intent.command, command);
+    let arguments: serde_json::Value = serde_json::from_str(&intent.arguments)?;
+    assert_eq!(arguments["command"].as_str(), Some(command.as_str()));
     assert_eq!(result.status, if cancel { 6 } else { 1 });
     assert!(result.text.contains(if cancel {
         "reason=cancelled"

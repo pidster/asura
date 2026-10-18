@@ -963,19 +963,95 @@ fn queue_rejects_stale_targets_duplicate_identity_and_overload() {
     assert!(inspect(&j.bytes).is_err());
 }
 
-fn tool_intent_value() -> ToolIntent {
-    ToolIntent {
-        operation: id(10),
-        generation: 1,
-        ordinal: 1,
-        kind: 1,
-        path: "README.md".into(),
-        offset: 0,
-        limit: 1024,
+// Kind 14 ToolCall fixtures (tool-call-records.md).
+const RULE_SET_DIGEST: Hash = [21; 32];
+const EXEC_ARGUMENTS: &str = "{\"command\":\"printf \\\"$ASURA_SECRET_1\\\"\",\"cwd\":\".\"}";
+fn default_arguments(op: ToolOperation) -> &'static str {
+    match op {
+        ToolOperation::ReadFile => "{\"command\":\"read_file\",\"path\":\"README.md\"}",
+        ToolOperation::ListDirectory => "{\"command\":\"list_directory\"}",
+        ToolOperation::Status => "{\"command\":\"status\"}",
+        ToolOperation::Tools => "{\"command\":\"tools\"}",
+        ToolOperation::Audit => "{\"command\":\"audit\"}",
+        ToolOperation::ListNotes => "{\"command\":\"list_notes\"}",
+        ToolOperation::GetNote => {
+            "{\"command\":\"get_note\",\"version\":\"01010101010101010101010101010101\"}"
+        }
+        ToolOperation::NoteSources => {
+            "{\"command\":\"note_sources\",\"version\":\"01010101010101010101010101010101\"}"
+        }
+        ToolOperation::CreateNote => "{\"command\":\"create_note\",\"body\":\"note\"}",
+        ToolOperation::ExecCmd => EXEC_ARGUMENTS,
     }
 }
-fn tool_intent() -> Record {
-    Record::ToolIntent(tool_intent_value())
+/// A `run` kind 14 of `op` at `ordinal`.
+fn run14(ordinal: u32, op: ToolOperation) -> ToolCall {
+    let name = op.tool().name();
+    let arguments = default_arguments(op);
+    let exec = op == ToolOperation::ExecCmd;
+    ToolCall {
+        operation: id(10),
+        generation: 1,
+        ordinal,
+        source: ToolCallSource::GeneratedContent,
+        name: name.into(),
+        name_bytes: name.len() as u32,
+        tool_operation: Some(op),
+        decision: ToolDecision::Run,
+        fault: None,
+        busy: None,
+        form: if exec {
+            ArgumentForm::Canonical
+        } else {
+            ArgumentForm::Verbatim
+        },
+        arguments_bytes: arguments.len() as u32,
+        arguments: arguments.into(),
+        number_kinds: if exec {
+            vec![SecretKind::GithubToken]
+        } else {
+            vec![]
+        },
+        unnumbered: 0,
+        rule_set_revision: 1,
+        rule_set_digest: RULE_SET_DIGEST,
+        command_cut: false,
+        refusal: None,
+    }
+}
+/// A kind 14 exec_cmd call with `decision` and its consistent codes.
+fn exec14(ordinal: u32, decision: ToolDecision) -> ToolCall {
+    let mut call = run14(ordinal, ToolOperation::ExecCmd);
+    call.decision = decision;
+    match decision {
+        ToolDecision::Busy => call.busy = Some(ExecCmdBusyReason::Quota),
+        ToolDecision::Refused => {
+            call.refusal = Some(ExecCmdRefusal {
+                code: RefusalCode::SecretSingleQuoted,
+                kind: Some(SecretKind::GithubToken),
+                word: Some(2),
+            })
+        }
+        ToolDecision::InvalidArguments => call.fault = Some(ToolFault::WrongType),
+        _ => {}
+    }
+    call
+}
+/// A `project` call with a missing required field: `invalid_arguments`.
+fn rejected14(ordinal: u32) -> ToolCall {
+    ToolCall {
+        decision: ToolDecision::InvalidArguments,
+        fault: Some(ToolFault::MissingField),
+        arguments: "{\"command\":\"read_file\"}".into(),
+        arguments_bytes: 23,
+        ..run14(ordinal, ToolOperation::ReadFile)
+    }
+}
+fn r14(call: ToolCall) -> Record {
+    Record::ToolCall(Box::new(call))
+}
+fn tool_call() -> Record {
+    r14(run14(1, ToolOperation::ReadFile))
 }
 fn tool_result() -> Record {
     Record::ToolResult(ToolResult {
@@ -988,14 +1064,31 @@ fn tool_result() -> Record {
         truncated: false,
     })
 }
+fn cancel_requested() -> Record {
+    Record::CancelRequested(CancelRequested {
+        operation: id(10),
+        generation: 1,
+        cause: Cause::UserCancel,
+    })
+}
+/// The frame range of the last appended record.
+fn last_frame(journal: &Journal) -> std::ops::Range<usize> {
+    let mut start = 0;
+    let mut end = 0;
+    while end < journal.bytes.len() {
+        start = end;
+        end += u32::from_be_bytes(journal.bytes[end + 12..end + 16].try_into().unwrap()) as usize;
+    }
+    start..end
+}
 #[test]
 fn tool_records_require_started_operation_and_commit_before_complete() {
     let mut premature = Journal::accepted();
-    premature.append(tool_intent());
+    premature.append(tool_call());
     assert_eq!(inspect(&premature.bytes).unwrap_err(), ReplayError::Corrupt);
     let mut j = Journal::started();
     let baseline = inspect(&j.bytes).unwrap().reserved_bytes;
-    j.append(tool_intent());
+    j.append(tool_call());
     let state = inspect(&j.bytes).unwrap();
     assert!(state.reserved_bytes >= baseline + 16_384);
     assert_eq!(state.operations[&id(10)].tools.len(), 1);
@@ -1007,7 +1100,7 @@ fn tool_records_require_started_operation_and_commit_before_complete() {
     assert_eq!(inspect(&j.bytes).unwrap_err(), ReplayError::Corrupt);
     // Construct a fresh chain instead of mutating its sequence after rejection.
     let mut j = Journal::started();
-    j.append(tool_intent());
+    j.append(tool_call());
     j.append(tool_result());
     let state = inspect(&j.bytes).unwrap();
     assert_eq!(state.operations[&id(10)].tools[0].result_status, Some(1));
@@ -1022,7 +1115,7 @@ fn tool_records_require_started_operation_and_commit_before_complete() {
 #[test]
 fn restart_interrupts_pending_tool_without_fabricating_result() {
     let mut j = Journal::started();
-    j.append(tool_intent());
+    j.append(tool_call());
     j.append(Record::OwnerGeneration);
     j.append(Record::TurnTerminal(terminal(
         TerminalKind::Interrupted,
@@ -1038,7 +1131,7 @@ fn restart_interrupts_pending_tool_without_fabricating_result() {
     );
     assert!(state.active_operation.is_none());
     let mut duplicate = Journal::started();
-    duplicate.append(tool_intent());
+    duplicate.append(tool_call());
     duplicate.append(tool_result());
     duplicate.append(tool_result());
     assert_eq!(inspect(&duplicate.bytes).unwrap_err(), ReplayError::Corrupt);
@@ -1046,15 +1139,7 @@ fn restart_interrupts_pending_tool_without_fabricating_result() {
 
 #[test]
 fn status_tool_result_replays_and_rejects_file_paging_or_oversized_payload() {
-    let intent = ToolIntent {
-        operation: id(10),
-        generation: 1,
-        ordinal: 1,
-        kind: 3,
-        path: String::new(),
-        offset: 0,
-        limit: 0,
-    };
+    let call = run14(1, ToolOperation::Status);
     let result = ToolResult {
         operation: id(10),
         generation: 1,
@@ -1065,11 +1150,13 @@ fn status_tool_result_replays_and_rejects_file_paging_or_oversized_payload() {
         truncated: false,
     };
     let mut valid = Journal::started();
-    valid.append(Record::ToolIntent(intent.clone()));
+    valid.append(r14(call.clone()));
     valid.append(Record::ToolResult(result.clone()));
     let replay = inspect(&valid.bytes).unwrap();
-    assert_eq!(replay.operations[&id(10)].tools[0].kind, 3);
-    assert_eq!(replay.operations[&id(10)].tools[0].result_status, Some(1));
+    let tool = &replay.operations[&id(10)].tools[0];
+    assert_eq!(tool.tool_operation, Some(ToolOperation::Status));
+    assert_eq!(tool.tool, Some(RegisteredTool::Service));
+    assert_eq!(tool.result_status, Some(1));
     valid.append(Record::TurnTerminal(terminal(
         TerminalKind::Complete,
         Cause::None,
@@ -1087,7 +1174,7 @@ fn status_tool_result_replays_and_rejects_file_paging_or_oversized_payload() {
         Ok(Record::ToolResult(result.clone()))
     );
     let mut interrupted = Journal::started();
-    interrupted.append(Record::ToolIntent(intent.clone()));
+    interrupted.append(r14(call.clone()));
     interrupted.append(Record::OwnerGeneration);
     interrupted.append(Record::TurnTerminal(terminal(
         TerminalKind::Interrupted,
@@ -1115,7 +1202,7 @@ fn status_tool_result_replays_and_rejects_file_paging_or_oversized_payload() {
         },
     ] {
         let mut journal = Journal::started();
-        journal.append(Record::ToolIntent(intent.clone()));
+        journal.append(r14(call.clone()));
         journal.append(Record::ToolResult(invalid));
         assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
     }
@@ -1141,100 +1228,99 @@ fn status_tool_result_replays_and_rejects_file_paging_or_oversized_payload() {
     );
 }
 
+/// TCR-R5 and TCR-D16: a call that does not run is complete when its kind 14
+/// commits. It holds no reservation, never takes a kind 15 or kind 23, and
+/// restart has nothing to interrupt.
 #[test]
-fn rejected_semantic_tool_intents_never_replay_success_or_host_data() {
-    for kind in [4, 5, 9, 10, 11] {
-        let intent = ToolIntent {
-            operation: id(10),
-            generation: 1,
-            ordinal: 1,
-            kind,
-            path: "../outside".into(),
-            offset: if matches!(kind, 4 | 10) { u64::MAX } else { 0 },
-            limit: if matches!(kind, 4 | 10) { 16 } else { 0 },
-        };
-        let result = ToolResult {
-            operation: id(10),
-            generation: 1,
-            ordinal: 1,
-            status: 3,
-            text: String::new(),
-            next_offset: None,
-            truncated: false,
-        };
-        for status in [3, 5, 6] {
-            let mut journal = Journal::started();
-            journal.append(Record::ToolIntent(intent.clone()));
-            journal.append(Record::ToolResult(ToolResult {
-                status,
-                ..result.clone()
-            }));
-            assert_eq!(
-                inspect(&journal.bytes).unwrap().operations[&id(10)].tools[0].result_status,
-                Some(status)
-            );
+fn calls_that_do_not_run_are_complete_at_kind_14() {
+    let not_run = [
+        rejected14(1),
+        exec14(1, ToolDecision::InvalidArguments),
+        exec14(1, ToolDecision::Refused),
+        exec14(1, ToolDecision::Busy),
+        exec14(1, ToolDecision::Denied),
+        exec14(1, ToolDecision::Limit),
+        exec14(1, ToolDecision::Cancelled),
+        ToolCall {
+            name: "unknown".into(),
+            name_bytes: 7,
+            tool_operation: None,
+            decision: ToolDecision::UnknownTool,
+            fault: Some(ToolFault::UnregisteredName),
+            form: ArgumentForm::Verbatim,
+            arguments: "{}".into(),
+            number_kinds: vec![],
+            ..run14(1, ToolOperation::ReadFile)
+        },
+    ];
+    let (base, frames) = {
+        let state = inspect(&Journal::started().bytes).unwrap();
+        (state.reserved_bytes, state.reserved_frames)
+    };
+    for call in not_run {
+        let decision = call.decision;
+        let mut journal = Journal::started();
+        if decision == ToolDecision::Cancelled {
+            journal.append(cancel_requested());
         }
-        for invalid in [
-            ToolResult {
-                status: 1,
-                ..result.clone()
-            },
-            ToolResult {
-                status: 4,
-                ..result.clone()
-            },
-            ToolResult {
-                text: "host data".into(),
-                ..result.clone()
-            },
-            ToolResult {
-                next_offset: Some(0),
-                ..result.clone()
-            },
-            ToolResult {
-                truncated: true,
-                ..result.clone()
-            },
-        ] {
+        let (cancel_base, cancel_frames) = {
+            let state = inspect(&journal.bytes).unwrap();
+            (state.reserved_bytes, state.reserved_frames)
+        };
+        journal.append(r14(call.clone()));
+        let state = inspect(&journal.bytes).unwrap();
+        let tool = &state.operations[&id(10)].tools[0];
+        assert_eq!(tool.decision, decision);
+        assert!(!tool.unresolved() && tool.result_frame.is_none() && tool.exec_cmd.is_none());
+        assert_eq!(
+            (state.reserved_bytes, state.reserved_frames),
+            (cancel_base, cancel_frames),
+            "{decision:?} holds no result frame"
+        );
+        if decision != ToolDecision::Cancelled {
+            assert_eq!((cancel_base, cancel_frames), (base, frames));
+            let mut complete = Journal::started();
+            complete.append(r14(call.clone()));
+            complete.append(Record::TurnTerminal(terminal(
+                TerminalKind::Complete,
+                Cause::None,
+                false,
+            )));
+            assert!(inspect(&complete.bytes).is_ok(), "{decision:?}");
+        }
+        for (name, follow) in [("15", Record::ToolResult(result15(1, 3))), ("23", r23(1))] {
             let mut journal = Journal::started();
-            journal.append(Record::ToolIntent(intent.clone()));
-            let frame = encode_frame(
-                &FrameContext {
-                    installation_id: id(1),
-                    transition_id: id(900),
-                    sequence: journal.sequence + 1,
-                    prior_digest: journal.digest,
-                    expected_revision: journal.sequence,
-                    owner_generation: journal.owner,
-                },
-                &Record::ToolResult(invalid),
-            );
-            // Shared codec may reject malformed failure results before replay.
-            if let Ok(frame) = frame {
-                journal.bytes.extend(frame);
-                assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
-            } else {
-                assert_eq!(frame.unwrap_err(), ReplayError::Corrupt);
+            if decision == ToolDecision::Cancelled {
+                journal.append(cancel_requested());
             }
+            journal.append(r14(call.clone()));
+            journal.append(follow);
+            assert_eq!(
+                inspect(&journal.bytes).unwrap_err(),
+                ReplayError::Corrupt,
+                "kind {name} after {decision:?}"
+            );
         }
-        let mut interrupted = Journal::started();
-        interrupted.append(Record::ToolIntent(intent));
-        interrupted.append(Record::OwnerGeneration);
-        interrupted.append(Record::TurnTerminal(terminal(
+        let mut restarted = Journal::started();
+        if decision == ToolDecision::Cancelled {
+            restarted.append(cancel_requested());
+        }
+        restarted.append(r14(call));
+        restarted.append(Record::OwnerGeneration);
+        restarted.append(Record::TurnTerminal(terminal(
             TerminalKind::Interrupted,
             Cause::Restart,
             false,
         )));
-        let replay = inspect(&interrupted.bytes).unwrap();
-        assert!(replay.operations[&id(10)].tools[0].result_frame.is_none());
-        assert_eq!(
-            replay.operations[&id(10)]
-                .terminal
-                .as_ref()
-                .unwrap()
-                .charged_tokens,
-            OUTPUT_RESERVATION
-        );
+        assert!(inspect(&restarted.bytes).is_ok());
+    }
+}
+trait IntoRecord {
+    fn into_record(self) -> Record;
+}
+impl IntoRecord for ToolCall {
+    fn into_record(self) -> Record {
+        r14(self)
     }
 }
 
@@ -1336,57 +1422,38 @@ fn explicit_promotion_clears_hold_with_exact_active_target() {
 
 #[test]
 fn memory_tool_replay_keeps_exact_results_and_rejects_inconsistent_pagination() {
-    for kind in [6, 7, 8] {
-        let intent = ToolIntent {
-            operation: id(10),
-            generation: 1,
-            ordinal: 1,
-            kind,
-            path: if kind == 6 {
-                String::new()
-            } else {
-                "01".repeat(16)
-            },
-            offset: if kind == 7 { 3 } else { 0 },
-            limit: match kind {
-                6 => 8,
-                7 => 10,
-                _ => 0,
-            },
-        };
+    for op in [
+        ToolOperation::ListNotes,
+        ToolOperation::GetNote,
+        ToolOperation::NoteSources,
+    ] {
+        let call = run14(1, op);
+        let get = op == ToolOperation::GetNote;
         let result = ToolResult {
             operation: id(10),
             generation: 1,
             ordinal: 1,
             status: 1,
             text: "€".into(),
-            next_offset: (kind == 7).then_some(6),
-            truncated: kind == 7,
+            next_offset: get.then_some(6),
+            truncated: get,
         };
         let mut journal = Journal::started();
-        journal.append(Record::ToolIntent(intent.clone()));
+        journal.append(r14(call.clone()));
         journal.append(Record::ToolResult(result.clone()));
         let state = inspect(&journal.bytes).unwrap();
         let tool = &state.operations[&id(10)].tools[0];
-        assert_eq!(tool.kind, kind);
+        assert_eq!(tool.tool_operation, Some(op));
+        assert_eq!(tool.tool, Some(RegisteredTool::Memory));
         assert_eq!(tool.result_status, Some(1));
         assert_eq!(tool.result_bytes, 3);
-        let invalid_results = if kind == 7 {
-            vec![
-                ToolResult {
-                    next_offset: Some(4),
-                    ..result.clone()
-                },
-                ToolResult {
-                    next_offset: None,
-                    ..result.clone()
-                },
-                ToolResult {
-                    text: "x".repeat(11),
-                    next_offset: Some(14),
-                    ..result.clone()
-                },
-            ]
+        // TCR-D25: a get_note page needs its continuation offset; replay no
+        // longer compares it with the call's limit and offset.
+        let invalid_results = if get {
+            vec![ToolResult {
+                next_offset: None,
+                ..result.clone()
+            }]
         } else {
             vec![
                 ToolResult {
@@ -1401,12 +1468,12 @@ fn memory_tool_replay_keeps_exact_results_and_rejects_inconsistent_pagination() 
         };
         for invalid in invalid_results {
             let mut journal = Journal::started();
-            journal.append(Record::ToolIntent(intent.clone()));
+            journal.append(r14(call.clone()));
             journal.append(Record::ToolResult(invalid));
             assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
         }
         let mut interrupted = Journal::started();
-        interrupted.append(Record::ToolIntent(intent));
+        interrupted.append(r14(call));
         interrupted.append(Record::OwnerGeneration);
         interrupted.append(Record::TurnTerminal(terminal(
             TerminalKind::Interrupted,
@@ -1423,15 +1490,7 @@ fn memory_tool_replay_keeps_exact_results_and_rejects_inconsistent_pagination() 
 
 #[test]
 fn inventory_results_replay_without_file_pagination_or_redispatch() {
-    let intent = ToolIntent {
-        operation: id(10),
-        generation: 1,
-        ordinal: 1,
-        kind: 14,
-        path: String::new(),
-        offset: 0,
-        limit: 0,
-    };
+    let call = run14(1, ToolOperation::Tools);
     let result = ToolResult {
         operation: id(10),
         generation: 1,
@@ -1442,10 +1501,13 @@ fn inventory_results_replay_without_file_pagination_or_redispatch() {
         truncated: false,
     };
     let mut journal = Journal::started();
-    journal.append(Record::ToolIntent(intent.clone()));
+    journal.append(r14(call.clone()));
     journal.append(Record::ToolResult(result.clone()));
     let replay = inspect(&journal.bytes).unwrap();
-    assert_eq!(replay.operations[&id(10)].tools[0].kind, 14);
+    assert_eq!(
+        replay.operations[&id(10)].tools[0].tool_operation,
+        Some(ToolOperation::Tools)
+    );
     assert_eq!(replay.operations[&id(10)].tools[0].result_status, Some(1));
     for invalid in [
         ToolResult {
@@ -1458,12 +1520,12 @@ fn inventory_results_replay_without_file_pagination_or_redispatch() {
         },
     ] {
         let mut journal = Journal::started();
-        journal.append(Record::ToolIntent(intent.clone()));
+        journal.append(r14(call.clone()));
         journal.append(Record::ToolResult(invalid));
         assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
     }
     let mut interrupted = Journal::started();
-    interrupted.append(Record::ToolIntent(intent));
+    interrupted.append(r14(call));
     interrupted.append(Record::OwnerGeneration);
     interrupted.append(Record::TurnTerminal(terminal(
         TerminalKind::Interrupted,
@@ -1475,21 +1537,6 @@ fn inventory_results_replay_without_file_pagination_or_redispatch() {
             .result_frame
             .is_none()
     );
-}
-
-/// A4: kind 14 never carries tool kind 16; exec_cmd uses kind 22 only.
-#[test]
-fn kind_14_exec_cmd_frame_is_rejected_even_with_valid_checksums() {
-    let mut journal = Journal::started();
-    let start = journal.bytes.len();
-    journal.append(tool_intent());
-    let mut frame = journal.bytes[start..].to_vec();
-    // Payload: operation 16, generation 8, ordinal 4, then the tool kind byte.
-    frame[144 + 28] = EXEC_CMD_TOOL_KIND;
-    seal(&mut frame);
-    journal.bytes.truncate(start);
-    journal.bytes.extend(frame);
-    assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
 }
 
 #[test]
@@ -1555,31 +1602,29 @@ fn response_accounting_uses_the_recorded_reservation() {
     }
 }
 
-fn create_intent() -> MemoryCreateIntent {
-    let ids = CreateNoteIdentity::derive([id(1), id(4), id(2)], id(10), 1, 1).unwrap();
-    MemoryCreateIntent {
+/// The derived call of a `run` create_note kind 14 at `ordinal` (HM3).
+fn create_call(ordinal: u32) -> CreateNoteCall {
+    CreateNoteCall::derive([id(1), id(4), id(2)], id(6), id(10), 1, ordinal).unwrap()
+}
+fn create_result(text: &str) -> Record {
+    Record::ToolResult(ToolResult {
         operation: id(10),
         generation: 1,
         ordinal: 1,
-        project: id(6),
-        memory_operation: ids.operation,
-        object: ids.object,
-        version: ids.version,
-        body_bytes: 4,
-        body_sha256: [44; 32],
-        source: Some((id(100), ids.edge)),
-        command_sha256: [45; 32],
-    }
+        status: 1,
+        text: text.into(),
+        truncated: false,
+        next_offset: None,
+    })
 }
 #[test]
-fn memory_create_replay_gates_publication_and_requires_exact_success() {
-    let intent = create_intent();
+fn memory_create_replay_gates_publication_and_requires_empty_success_text() {
     let mut journal = Journal::started();
-    journal.append(Record::MemoryCreateIntent(intent.clone()));
+    journal.append(r14(run14(1, ToolOperation::CreateNote)));
     let state = inspect(&journal.bytes).unwrap();
     assert!(state.project_memory_blocked(id(6)));
     assert!(!state.project_memory_blocked(id(99)));
-    assert_eq!(state.unresolved_creates().next(), Some(&intent));
+    assert_eq!(state.unresolved_creates().next(), Some(&create_call(1)));
     let before = journal.bytes.clone();
     journal.append(Record::TurnTerminal(terminal(
         TerminalKind::Interrupted,
@@ -1587,35 +1632,29 @@ fn memory_create_replay_gates_publication_and_requires_exact_success() {
         false,
     )));
     assert!(inspect(&journal.bytes).is_err());
+    // TCR-D1: kind 15 of create_note stores no text; any text is Corrupt,
+    // including the success text rendered from the derived identity.
+    for text in ["invented receipt".to_owned(), create_call(1).success_text()] {
+        journal.bytes = before.clone();
+        journal.sequence = state.sequence;
+        journal.digest = state.last_digest;
+        journal.append(create_result(&text));
+        assert!(inspect(&journal.bytes).is_err());
+    }
     journal.bytes = before;
-    journal.sequence -= 1;
+    journal.sequence = state.sequence;
     journal.digest = state.last_digest;
-    journal.append(Record::ToolResult(ToolResult {
-        operation: id(10),
-        generation: 1,
-        ordinal: 1,
-        status: 1,
-        text: "invented receipt".into(),
-        truncated: false,
-        next_offset: None,
-    }));
-    assert!(inspect(&journal.bytes).is_err());
+    journal.append(create_result(""));
+    let state = inspect(&journal.bytes).unwrap();
+    assert!(!state.project_memory_blocked(id(6)));
+    assert_eq!(state.unresolved_creates().count(), 0);
 }
 #[test]
-fn memory_create_old_owner_can_resolve_but_cannot_write_new_intent() {
-    let intent = create_intent();
+fn memory_create_old_owner_can_resolve_but_cannot_write_new_call() {
     let mut journal = Journal::started();
-    journal.append(Record::MemoryCreateIntent(intent.clone()));
+    journal.append(r14(run14(1, ToolOperation::CreateNote)));
     journal.append(Record::OwnerGeneration);
-    journal.append(Record::ToolResult(ToolResult {
-        operation: id(10),
-        generation: 1,
-        ordinal: 1,
-        status: 1,
-        text: intent.success_text(),
-        truncated: false,
-        next_offset: None,
-    }));
+    journal.append(create_result(""));
     let state = inspect(&journal.bytes).unwrap();
     assert!(!state.project_memory_blocked(id(6)));
     journal.append(Record::TurnTerminal(terminal(
@@ -1624,33 +1663,17 @@ fn memory_create_old_owner_can_resolve_but_cannot_write_new_intent() {
         false,
     )));
     assert!(inspect(&journal.bytes).is_ok());
-    for mutate in [0, 1, 2] {
-        let mut journal = Journal::started();
-        let mut intent = create_intent();
-        match mutate {
-            0 => intent.project = id(99),
-            1 => intent.memory_operation = id(98),
-            _ => {
-                journal.append(Record::OwnerGeneration);
-            }
-        }
-        journal.append(Record::MemoryCreateIntent(intent));
-        assert!(inspect(&journal.bytes).is_err());
-    }
+    // An old owner cannot record a new create.
+    let mut journal = Journal::started();
+    journal.append(Record::OwnerGeneration);
+    journal.append(r14(run14(1, ToolOperation::CreateNote)));
+    assert!(inspect(&journal.bytes).is_err());
 }
 
 #[test]
 fn old_owner_result_exception_cannot_resolve_an_ordinary_tool_or_wrong_create() {
     let mut journal = Journal::started();
-    journal.append(Record::ToolIntent(ToolIntent {
-        operation: id(10),
-        generation: 1,
-        ordinal: 1,
-        kind: 14,
-        path: String::new(),
-        offset: 0,
-        limit: 0,
-    }));
+    journal.append(r14(run14(1, ToolOperation::Tools)));
     journal.append(Record::OwnerGeneration);
     journal.append(Record::ToolResult(ToolResult {
         operation: id(10),
@@ -1663,16 +1686,15 @@ fn old_owner_result_exception_cannot_resolve_an_ordinary_tool_or_wrong_create() 
     }));
     assert!(inspect(&journal.bytes).is_err());
     for wrong_operation in [true, false] {
-        let intent = create_intent();
         let mut journal = Journal::started();
-        journal.append(Record::MemoryCreateIntent(intent.clone()));
+        journal.append(r14(run14(1, ToolOperation::CreateNote)));
         journal.append(Record::OwnerGeneration);
         journal.append(Record::ToolResult(ToolResult {
             operation: if wrong_operation { id(99) } else { id(10) },
             generation: 1,
             ordinal: if wrong_operation { 1 } else { 2 },
             status: 1,
-            text: intent.success_text(),
+            text: String::new(),
             truncated: false,
             next_offset: None,
         }));
@@ -1682,10 +1704,11 @@ fn old_owner_result_exception_cannot_resolve_an_ordinary_tool_or_wrong_create() 
 
 #[test]
 fn reopened_tool_display_projections_are_bounded_and_capture_stdout() {
-    let mut intent = exec_cmd22(1, ExecCmdDisposition::Admitted);
-    intent.command = format!("printf {}", "界".repeat(100));
+    let mut call = run14(1, ToolOperation::ExecCmd);
+    call.arguments = format!("{{\"command\":\"printf {}\"}}", "界".repeat(100));
+    call.number_kinds = vec![];
     let journal = started_with([
-        Record::ExecCmdIntent(Box::new(intent)),
+        r14(call),
         r23(1),
         Record::ToolResult(ToolResult {
             text: format!(
@@ -1698,6 +1721,7 @@ fn reopened_tool_display_projections_are_bounded_and_capture_stdout() {
     let state = inspect(&journal.bytes).unwrap();
     let tool = &state.operations[&id(10)].tools[0];
     assert!(tool.arguments.len() <= 192);
+    assert!(tool.arguments.starts_with("{\"command\":\"printf 界"));
     assert!(tool.preview.as_ref().unwrap().len() <= 128);
     assert!(tool.preview.as_ref().unwrap().starts_with("界"));
     assert_eq!(tool.exit_code, Some(17));
@@ -1708,53 +1732,10 @@ fn reopened_tool_display_projections_are_bounded_and_capture_stdout() {
     );
 }
 
-// J1T-02: kinds 22, 23 and 15 replay order and reservation.
+// J1T-02: kinds 14, 23 and 15 replay order and reservation.
 const FRAME_OVERHEAD: usize = 144 + 40;
 const RESULT_CAPACITY: usize = FRAME_OVERHEAD + 43 + 16_384;
-const CAPTURE_CAPACITY: usize = FRAME_OVERHEAD + 4_102;
-fn exec_cmd22(ordinal: u32, disposition: ExecCmdDisposition) -> ExecCmdIntent {
-    use asura_storage::payload::{ObjectKind, payload_id};
-    let admitted = disposition == ExecCmdDisposition::Admitted;
-    let derived = |kind| payload_id(id(1), id(10), 1, ordinal, kind);
-    ExecCmdIntent {
-        operation: id(10),
-        generation: 1,
-        ordinal,
-        disposition,
-        command_truncated: false,
-        command: "printf \"$ASURA_SECRET_1\"".into(),
-        cwd: ".".into(),
-        refusal: (disposition == ExecCmdDisposition::Refused).then_some(ExecCmdRefusal {
-            code: RefusalCode::SecretSingleQuoted,
-            kind: Some(SecretKind::GithubToken),
-            word: Some(2),
-        }),
-        busy: (disposition == ExecCmdDisposition::Busy).then_some(ExecCmdBusyReason::Quota),
-        variables: if admitted {
-            vec![SecretKind::GithubToken]
-        } else {
-            vec![]
-        },
-        job: if admitted {
-            exec_cmd_job_id(id(10), 1, ordinal)
-        } else {
-            [0; 16]
-        },
-        stdout_payload: if admitted {
-            derived(ObjectKind::Stdout)
-        } else {
-            [0; 16]
-        },
-        stderr_payload: if admitted {
-            derived(ObjectKind::Stderr)
-        } else {
-            [0; 16]
-        },
-        initial_reservation: if admitted { INITIAL_RESERVATION } else { 0 },
-        rule_set_revision: 1,
-        rule_set_digest: [21; 32],
-    }
-}
+const CAPTURE_CAPACITY: usize = FRAME_OVERHEAD + 4_066;
 fn stream23(stored: u64) -> CaptureStream {
     CaptureStream {
         observed_bytes: stored,
@@ -1773,8 +1754,6 @@ fn settled23(ordinal: u32) -> CaptureSettled {
         reason: CaptureReason::None,
         exit_kind: 1,
         exit_value: 3,
-        rule_set_revision: 1,
-        rule_set_digest: [21; 32],
         stdout: stream23(5),
         stderr: stream23(0),
         distinct_numbers: 0,
@@ -1796,8 +1775,8 @@ fn result15(ordinal: u32, status: u8) -> ToolResult {
         truncated: false,
     }
 }
-fn r22(ordinal: u32, disposition: ExecCmdDisposition) -> Record {
-    Record::ExecCmdIntent(Box::new(exec_cmd22(ordinal, disposition)))
+fn run_exec(ordinal: u32) -> Record {
+    r14(run14(ordinal, ToolOperation::ExecCmd))
 }
 fn r23(ordinal: u32) -> Record {
     Record::CaptureSettled(Box::new(settled23(ordinal)))
@@ -1823,24 +1802,22 @@ fn started_with(records: impl IntoIterator<Item = Record>) -> Journal {
     journal
 }
 #[test]
-fn j1t_02_each_disposition_with_and_without_capture_result_and_terminal() {
-    use ExecCmdDisposition::*;
+fn j1t_02_each_decision_with_and_without_capture_result_and_terminal() {
     let exec_cmd = |journal: &Journal| {
         let state = inspect(&journal.bytes).unwrap();
         state.operations[&id(10)].tools[0].clone()
     };
-    // Admitted: 22, then 23, then 15, then a terminal.
-    let journal = started_with([r22(1, Admitted)]);
+    // Run: 14, then 23, then 15, then a terminal.
+    let journal = started_with([run_exec(1)]);
     let tool = exec_cmd(&journal);
     let call = tool.exec_cmd.as_deref().unwrap();
-    assert_eq!(tool.kind, EXEC_CMD_TOOL_KIND);
-    assert_eq!(tool.arguments, "printf \"$ASURA_SECRET_1\" cwd=.");
-    assert_eq!((tool.offset, tool.limit), (0, 0));
-    assert_eq!(call.disposition, Admitted);
+    assert_eq!(tool.tool_operation, Some(ToolOperation::ExecCmd));
+    assert_eq!(tool.tool, Some(RegisteredTool::ExecCmd));
+    assert_eq!(tool.arguments, EXEC_ARGUMENTS);
     assert_eq!(call.job, exec_cmd_job_id(id(10), 1, 1));
     assert_eq!(call.intent_sequence, journal.sequence);
     assert!(call.settled.is_none() && tool.result_frame.is_none());
-    let journal = started_with([r22(1, Admitted), r23(1)]);
+    let journal = started_with([run_exec(1), r23(1)]);
     let tool = exec_cmd(&journal);
     let settled = tool.exec_cmd.as_deref().unwrap().settled.clone().unwrap();
     assert_eq!(settled.state, CaptureState::Complete);
@@ -1848,52 +1825,40 @@ fn j1t_02_each_disposition_with_and_without_capture_result_and_terminal() {
     assert_eq!(settled.sequence, journal.sequence);
     assert_eq!(settled.streams, [(5, Some([22; 32])), (0, Some([22; 32]))]);
     assert!(tool.result_frame.is_none());
-    let journal = started_with([r22(1, Admitted), r23(1), r15(1, 1)]);
+    let journal = started_with([run_exec(1), r23(1), r15(1, 1)]);
     let tool = exec_cmd(&journal);
     assert_eq!(tool.result_status, Some(1));
     assert_eq!(tool.exit_code, Some(3));
     assert_eq!(tool.preview.as_deref(), Some("hello"));
     assert!(tool.exec_cmd.as_deref().unwrap().settled.is_some());
     for journal in [
-        started_with([r22(1, Admitted), r23(1), r15(1, 1), complete()]),
-        started_with([r22(1, Admitted), r23(1), r15(1, 5), failed()]),
-        started_with([r22(1, Admitted), r23(1), failed()]),
+        started_with([run_exec(1), r23(1), r15(1, 1), complete()]),
+        started_with([run_exec(1), r23(1), r15(1, 5), failed()]),
+        started_with([run_exec(1), r23(1), failed()]),
     ] {
         let state = inspect(&journal.bytes).unwrap();
         assert!(state.operations[&id(10)].terminal.is_some());
         assert_eq!(state.active_operation, None);
     }
-    // Refused and busy: 22 then 15 with status 3 or 4, then a terminal.
-    for (disposition, status) in [(Refused, 3), (Busy, 4)] {
-        let journal = started_with([r22(1, disposition)]);
+    // Refused and busy: kind 14 only, then a terminal; no derived identities.
+    for decision in [ToolDecision::Refused, ToolDecision::Busy] {
+        let journal = started_with([r14(exec14(1, decision))]);
         let tool = exec_cmd(&journal);
-        let call = tool.exec_cmd.as_deref().unwrap();
-        assert_eq!(call.disposition, disposition);
-        assert_eq!(
-            [call.job, call.stdout_payload, call.stderr_payload],
-            [[0; 16]; 3]
-        );
-        let journal = started_with([r22(1, disposition), r15(1, status)]);
-        assert_eq!(exec_cmd(&journal).result_status, Some(status));
+        assert_eq!(tool.decision, decision);
+        assert!(tool.exec_cmd.is_none());
         for end in [complete(), failed()] {
-            let journal = started_with([r22(1, disposition), r15(1, status), end]);
+            let journal = started_with([r14(exec14(1, decision)), end]);
             assert!(
                 inspect(&journal.bytes).unwrap().operations[&id(10)]
                     .terminal
                     .is_some()
             );
         }
-        let journal = started_with([r22(1, disposition), failed()]);
-        assert!(inspect(&journal.bytes).is_ok());
     }
-    // Calls follow one another, including ordinary kind 14 tools.
+    // Calls follow one another, including ordinary tools.
     let journal = started_with([
-        r22(1, Refused),
-        r15(1, 3),
-        Record::ToolIntent(ToolIntent {
-            ordinal: 2,
-            ..tool_intent_value()
-        }),
+        r14(exec14(1, ToolDecision::Refused)),
+        r14(run14(2, ToolOperation::ReadFile)),
         Record::ToolResult(ToolResult {
             ordinal: 2,
             text: "observed".into(),
@@ -1901,219 +1866,127 @@ fn j1t_02_each_disposition_with_and_without_capture_result_and_terminal() {
             truncated: false,
             ..result15(2, 1)
         }),
-        r22(3, Admitted),
+        run_exec(3),
         r23(3),
         r15(3, 1),
-        r22(4, Busy),
-        r15(4, 4),
+        r14(exec14(4, ToolDecision::Busy)),
         complete(),
     ]);
     let state = inspect(&journal.bytes).unwrap();
     let tools = &state.operations[&id(10)].tools;
     assert_eq!(tools.len(), 4);
     assert!(tools[1].exec_cmd.is_none());
-    assert_eq!(tools[2].exec_cmd.as_deref().unwrap().disposition, Admitted);
+    assert!(tools[2].exec_cmd.is_some());
 }
 #[test]
 fn j1t_02_every_invalid_order_is_corrupt() {
-    use ExecCmdDisposition::*;
-    let mismatched = |change: fn(&mut ExecCmdIntent)| {
-        let mut p = exec_cmd22(1, Admitted);
-        change(&mut p);
-        Record::ExecCmdIntent(Box::new(p))
-    };
-    let other_rule_set = |change: fn(&mut CaptureSettled)| {
+    let other = |change: fn(&mut CaptureSettled)| {
         let mut p = settled23(1);
         change(&mut p);
         Record::CaptureSettled(Box::new(p))
     };
+    let refused = || r14(exec14(1, ToolDecision::Refused));
+    let busy = || r14(exec14(1, ToolDecision::Busy));
     let cases: Vec<(&str, Journal, Vec<Record>)> = vec![
-        ("23 before 22", Journal::started(), vec![r23(1)]),
+        ("23 before 14", Journal::started(), vec![r23(1)]),
         (
             "23 twice",
             Journal::started(),
-            vec![r22(1, Admitted), r23(1), r23(1)],
+            vec![run_exec(1), r23(1), r23(1)],
         ),
         (
             "15 before 23",
             Journal::started(),
-            vec![r22(1, Admitted), r15(1, 1)],
+            vec![run_exec(1), r15(1, 1)],
         ),
         (
             "15 status 3 before 23",
             Journal::started(),
-            vec![r22(1, Admitted), r15(1, 3)],
+            vec![run_exec(1), r15(1, 3)],
         ),
         (
             "23 after 15",
             Journal::started(),
-            vec![r22(1, Admitted), r23(1), r15(1, 1), r23(1)],
+            vec![run_exec(1), r23(1), r15(1, 1), r23(1)],
         ),
         (
             "23 after refused",
             Journal::started(),
-            vec![r22(1, Refused), r23(1)],
+            vec![refused(), r23(1)],
         ),
+        ("23 after busy", Journal::started(), vec![busy(), r23(1)]),
         (
-            "23 after busy",
+            "15 after refused",
             Journal::started(),
-            vec![r22(1, Busy), r23(1)],
+            vec![refused(), r15(1, 3)],
         ),
+        ("15 after busy", Journal::started(), vec![busy(), r15(1, 4)]),
         (
-            "refused then 15 status 1",
+            "14 after terminal",
             Journal::started(),
-            vec![r22(1, Refused), r15(1, 1)],
-        ),
-        (
-            "refused then 15 status 4",
-            Journal::started(),
-            vec![r22(1, Refused), r15(1, 4)],
-        ),
-        (
-            "busy then 15 status 3",
-            Journal::started(),
-            vec![r22(1, Busy), r15(1, 3)],
-        ),
-        (
-            "busy then 15 status 5",
-            Journal::started(),
-            vec![r22(1, Busy), r15(1, 5)],
-        ),
-        (
-            "22 after terminal",
-            Journal::started(),
-            vec![failed(), r22(1, Admitted)],
+            vec![failed(), run_exec(1)],
         ),
         (
             "23 after terminal",
             Journal::started(),
-            vec![r22(1, Admitted), failed(), r23(1)],
+            vec![run_exec(1), failed(), r23(1)],
         ),
         (
             "15 after terminal",
             Journal::started(),
-            vec![r22(1, Admitted), r23(1), failed(), r15(1, 1)],
-        ),
-        (
-            "15 after terminal, refused",
-            Journal::started(),
-            vec![r22(1, Refused), failed(), r15(1, 3)],
+            vec![run_exec(1), r23(1), failed(), r15(1, 1)],
         ),
         (
             "complete while 23 pending",
             Journal::started(),
-            vec![r22(1, Admitted), complete()],
+            vec![run_exec(1), complete()],
         ),
         (
             "complete while 15 pending",
             Journal::started(),
-            vec![r22(1, Admitted), r23(1), complete()],
-        ),
-        (
-            "job ID mismatch",
-            Journal::started(),
-            vec![mismatched(|p| p.job = exec_cmd_job_id(id(10), 1, 2))],
-        ),
-        (
-            "stdout ID mismatch",
-            Journal::started(),
-            vec![mismatched(|p| p.stdout_payload = p.stderr_payload)],
-        ),
-        (
-            "stderr ID mismatch",
-            Journal::started(),
-            vec![mismatched(|p| p.stderr_payload = [7; 16])],
-        ),
-        (
-            "IDs of another installation",
-            Journal::started(),
-            vec![mismatched(|p| {
-                p.stdout_payload = asura_storage::payload::payload_id(
-                    id(2),
-                    id(10),
-                    1,
-                    1,
-                    asura_storage::payload::ObjectKind::Stdout,
-                )
-            })],
-        ),
-        (
-            "23 rule-set revision differs",
-            Journal::started(),
-            vec![
-                r22(1, Admitted),
-                other_rule_set(|p| p.rule_set_revision = 2),
-            ],
-        ),
-        (
-            "23 rule-set digest differs",
-            Journal::started(),
-            vec![
-                r22(1, Admitted),
-                other_rule_set(|p| p.rule_set_digest = [9; 32]),
-            ],
+            vec![run_exec(1), r23(1), complete()],
         ),
         (
             "23 wrong ordinal",
             Journal::started(),
-            vec![r22(1, Admitted), other_rule_set(|p| p.ordinal = 2)],
+            vec![run_exec(1), other(|p| p.ordinal = 2)],
         ),
         (
             "23 wrong generation",
             Journal::started(),
-            vec![r22(1, Admitted), other_rule_set(|p| p.generation = 2)],
+            vec![run_exec(1), other(|p| p.generation = 2)],
         ),
         (
-            "23 for an ordinary kind 14 tool",
+            "23 for an ordinary tool",
             Journal::started(),
-            vec![tool_intent(), r23(1)],
+            vec![tool_call(), r23(1)],
         ),
+        ("14 skips an ordinal", Journal::started(), vec![run_exec(2)]),
         (
-            "22 skips an ordinal",
+            "14 while 15 pending",
             Journal::started(),
-            vec![r22(2, Admitted)],
+            vec![run_exec(1), r23(1), run_exec(2)],
         ),
+        ("14 before start", Journal::accepted(), vec![run_exec(1)]),
         (
-            "22 while 22 pending",
+            "run 14 after cancel",
             Journal::started(),
-            vec![r22(1, Refused), r22(2, Refused)],
+            vec![cancel_requested(), run_exec(1)],
         ),
         (
-            "22 while 15 pending",
+            "14 after restart",
             Journal::started(),
-            vec![r22(1, Admitted), r23(1), r22(2, Admitted)],
-        ),
-        (
-            "22 before start",
-            Journal::accepted(),
-            vec![r22(1, Admitted)],
-        ),
-        (
-            "22 after cancel",
-            Journal::started(),
-            vec![
-                Record::CancelRequested(CancelRequested {
-                    operation: id(10),
-                    generation: 1,
-                    cause: Cause::UserCancel,
-                }),
-                r22(1, Admitted),
-            ],
-        ),
-        (
-            "22 after restart",
-            Journal::started(),
-            vec![Record::OwnerGeneration, r22(1, Admitted)],
+            vec![Record::OwnerGeneration, run_exec(1)],
         ),
         (
             "23 after restart",
             Journal::started(),
-            vec![r22(1, Admitted), Record::OwnerGeneration, r23(1)],
+            vec![run_exec(1), Record::OwnerGeneration, r23(1)],
         ),
         (
             "15 after restart",
             Journal::started(),
-            vec![r22(1, Admitted), r23(1), Record::OwnerGeneration, r15(1, 1)],
+            vec![run_exec(1), r23(1), Record::OwnerGeneration, r15(1, 1)],
         ),
     ];
     for (name, mut journal, records) in cases {
@@ -2126,14 +1999,12 @@ fn j1t_02_every_invalid_order_is_corrupt() {
             "{name}"
         );
     }
-    // A ninth tool call.
+    // Eight recorded calls, then only a `limit` record at ordinal 9.
     let mut journal = Journal::started();
     for ordinal in 1..=8 {
-        journal.append(r22(ordinal, Refused));
-        journal.append(r15(ordinal, 3));
+        journal.append(r14(exec14(ordinal, ToolDecision::Refused)));
     }
     assert!(inspect(&journal.bytes).is_ok());
-    // A ninth ordinal cannot even be encoded.
     let ninth = FrameContext {
         installation_id: id(1),
         transition_id: id(99_999),
@@ -2143,14 +2014,28 @@ fn j1t_02_every_invalid_order_is_corrupt() {
         owner_generation: journal.owner,
     };
     assert_eq!(
-        encode_frame(&ninth, &r22(9, Refused)),
+        encode_frame(&ninth, &r14(exec14(9, ToolDecision::Refused))),
+        Err(ReplayError::Corrupt)
+    );
+    journal.append(r14(exec14(9, ToolDecision::Limit)));
+    assert!(inspect(&journal.bytes).is_ok());
+    // A tenth ordinal cannot even be encoded.
+    let tenth = FrameContext {
+        transition_id: id(99_998),
+        sequence: journal.sequence + 1,
+        prior_digest: journal.digest,
+        expected_revision: journal.sequence,
+        ..ninth
+    };
+    assert_eq!(
+        encode_frame(&tenth, &r14(exec14(10, ToolDecision::Limit))),
         Err(ReplayError::Corrupt)
     );
 }
 #[test]
-fn j1t_02_terminal_with_admitted_intent_lacking_capture_is_accepted() {
+fn j1t_02_terminal_with_run_call_lacking_capture_is_accepted() {
     let journal = started_with([
-        r22(1, ExecCmdDisposition::Admitted),
+        run_exec(1),
         Record::OwnerGeneration,
         Record::TurnTerminal(terminal(TerminalKind::Interrupted, Cause::Restart, false)),
     ]);
@@ -2159,19 +2044,18 @@ fn j1t_02_terminal_with_admitted_intent_lacking_capture_is_accepted() {
     assert!(tool.exec_cmd.as_deref().unwrap().settled.is_none());
     assert!(tool.result_frame.is_none());
     assert_eq!(state.active_operation, None);
-    for end in [
-        failed(),
-        Record::TurnTerminal(terminal(TerminalKind::Cancelled, Cause::UserCancel, false)),
-    ] {
-        let mut journal = started_with([r22(1, ExecCmdDisposition::Admitted)]);
-        if matches!(&end, Record::TurnTerminal(t) if t.kind == TerminalKind::Cancelled) {
-            journal.append(Record::CancelRequested(CancelRequested {
-                operation: id(10),
-                generation: 1,
-                cause: Cause::UserCancel,
-            }));
+    for cancelled in [false, true] {
+        let mut journal = started_with([run_exec(1)]);
+        if cancelled {
+            journal.append(cancel_requested());
+            journal.append(Record::TurnTerminal(terminal(
+                TerminalKind::Cancelled,
+                Cause::UserCancel,
+                false,
+            )));
+        } else {
+            journal.append(failed());
         }
-        journal.append(end);
         let state = inspect(&journal.bytes).unwrap();
         assert!(
             state.operations[&id(10)].tools[0]
@@ -2183,41 +2067,398 @@ fn j1t_02_terminal_with_admitted_intent_lacking_capture_is_accepted() {
         );
     }
 }
+/// TCR-D16: a `run` kind 14 holds kind 15 (and kind 23 for exec_cmd); a call
+/// that does not run holds nothing more.
 #[test]
 fn j1t_02_reserve_holds_one_capture_frame_until_kind_23() {
-    use ExecCmdDisposition::*;
     let reserved = |journal: &Journal| {
         let state = inspect(&journal.bytes).unwrap();
         (state.reserved_bytes, state.reserved_frames)
     };
     let (base, frames) = reserved(&Journal::started());
-    assert_eq!(CAPTURE_CAPACITY, 4_286);
+    assert_eq!(CAPTURE_CAPACITY, 4_250);
     assert_eq!(
-        reserved(&started_with([r22(1, Admitted)])),
+        reserved(&started_with([run_exec(1)])),
         (base + RESULT_CAPACITY + CAPTURE_CAPACITY, frames + 2)
     );
     assert_eq!(
-        reserved(&started_with([r22(1, Admitted), r23(1)])),
+        reserved(&started_with([run_exec(1), r23(1)])),
         (base + RESULT_CAPACITY, frames + 1)
     );
     assert_eq!(
-        reserved(&started_with([r22(1, Admitted), r23(1), r15(1, 1)])),
+        reserved(&started_with([run_exec(1), r23(1), r15(1, 1)])),
         (base, frames)
     );
-    for disposition in [Refused, Busy] {
+    for decision in [ToolDecision::Refused, ToolDecision::Busy] {
         assert_eq!(
-            reserved(&started_with([r22(1, disposition)])),
-            (base + RESULT_CAPACITY, frames + 1)
+            reserved(&started_with([r14(exec14(1, decision))])),
+            (base, frames)
         );
     }
-    // An ordinary kind 14 tool keeps the result reservation only.
+    // An ordinary run tool keeps the result reservation only.
     assert_eq!(
-        reserved(&started_with([tool_intent()])),
+        reserved(&started_with([tool_call()])),
         (base + RESULT_CAPACITY, frames + 1)
     );
     // After restart the old operation keeps the capture frame for its terminal
     // only while kind 23 is missing; no owner or cancel frames remain.
-    let journal = started_with([r22(1, Admitted), Record::OwnerGeneration]);
+    let journal = started_with([run_exec(1), Record::OwnerGeneration]);
     let state = inspect(&journal.bytes).unwrap();
     assert!(state.reserved_bytes >= RESULT_CAPACITY + CAPTURE_CAPACITY);
+}
+
+// TCR-U11: one broken journal per replay rule (tool-call-records.md, replay
+// table), each beside a valid twin. Record-alone rules are codec TCR-U01.
+fn expect_rule(name: &str, valid: Journal, broken: Journal) {
+    assert!(inspect(&valid.bytes).is_ok(), "{name}: valid twin");
+    assert_eq!(
+        inspect(&broken.bytes).unwrap_err(),
+        ReplayError::Corrupt,
+        "{name}: broken"
+    );
+}
+/// Replaces the payload of the last frame and reseals it, so only the replay
+/// rule (not the checksum) can reject it.
+fn tamper_last(journal: &mut Journal, change: impl FnOnce(&mut Vec<u8>)) {
+    let range = last_frame(journal);
+    let mut frame = journal.bytes[range.clone()].to_vec();
+    let mut payload = frame[144..frame.len() - 40].to_vec();
+    change(&mut payload);
+    assert_eq!(payload.len(), frame.len() - 184, "same-size tamper");
+    frame[144..144 + payload.len()].copy_from_slice(&payload);
+    seal(&mut frame);
+    journal.bytes.truncate(range.start);
+    journal.bytes.extend(frame);
+}
+#[test]
+fn tcr_u11_operation_is_active_with_the_record_and_owner_generation() {
+    expect_rule(
+        "record generation",
+        started_with([tool_call()]),
+        started_with([r14(ToolCall {
+            generation: 2,
+            ..run14(1, ToolOperation::ReadFile)
+        })]),
+    );
+    expect_rule(
+        "active operation",
+        started_with([tool_call()]),
+        started_with([r14(ToolCall {
+            operation: id(99),
+            ..run14(1, ToolOperation::ReadFile)
+        })]),
+    );
+    expect_rule(
+        "current owner generation",
+        started_with([rejected14(1).into_record()]),
+        started_with([Record::OwnerGeneration, rejected14(1).into_record()]),
+    );
+    let mut before_start = Journal::accepted();
+    before_start.append(rejected14(1).into_record());
+    expect_rule(
+        "started operation",
+        started_with([rejected14(1).into_record()]),
+        before_start,
+    );
+}
+#[test]
+fn tcr_u11_ordinal_is_next_and_every_earlier_run_has_kind_15() {
+    expect_rule(
+        "next ordinal",
+        started_with([rejected14(1).into_record()]),
+        started_with([rejected14(2).into_record()]),
+    );
+    expect_rule(
+        "no repeated ordinal",
+        started_with([rejected14(1).into_record(), rejected14(2).into_record()]),
+        started_with([rejected14(1).into_record(), rejected14(1).into_record()]),
+    );
+    expect_rule(
+        "earlier run has kind 15",
+        started_with([tool_call(), tool_result(), rejected14(2).into_record()]),
+        started_with([tool_call(), rejected14(2).into_record()]),
+    );
+}
+#[test]
+fn tcr_u11_ordinal_9_has_limit() {
+    let eight = || {
+        let mut journal = Journal::started();
+        for ordinal in 1..=8 {
+            journal.append(rejected14(ordinal).into_record());
+        }
+        journal
+    };
+    let mut valid = eight();
+    valid.append(r14(exec14(9, ToolDecision::Limit)));
+    // A `limit` record at ordinal 9 without eight earlier records skips ordinals.
+    expect_rule(
+        "ordinal 9 only after eight records",
+        valid,
+        started_with([r14(exec14(9, ToolDecision::Limit))]),
+    );
+    // Ordinal 9 with any other decision: forge the decision byte of a valid
+    // ordinal-9 record (exec_cmd name is 8 bytes; decision at offset 46).
+    let mut broken = eight();
+    broken.append(r14(exec14(9, ToolDecision::Limit)));
+    tamper_last(&mut broken, |payload| {
+        assert_eq!(payload[46], ToolDecision::Limit as u8);
+        payload[46] = ToolDecision::Denied as u8;
+    });
+    let mut valid = eight();
+    valid.append(r14(exec14(9, ToolDecision::Limit)));
+    expect_rule("ordinal 9 decision", valid, broken);
+}
+#[test]
+fn tcr_u11_after_cancel_requested_only_cancelled() {
+    for decision in [
+        ToolDecision::Run,
+        ToolDecision::InvalidArguments,
+        ToolDecision::Refused,
+        ToolDecision::Limit,
+    ] {
+        expect_rule(
+            &format!("{decision:?} after cancel"),
+            started_with([cancel_requested(), r14(exec14(1, ToolDecision::Cancelled))]),
+            started_with([cancel_requested(), r14(exec14(1, decision))]),
+        );
+    }
+    // Cancelled, then the terminal, in that order (TCR-I07 order).
+    let journal = started_with([
+        cancel_requested(),
+        r14(exec14(1, ToolDecision::Cancelled)),
+        Record::TurnTerminal(terminal(TerminalKind::Cancelled, Cause::UserCancel, false)),
+    ]);
+    assert!(inspect(&journal.bytes).is_ok());
+}
+#[test]
+fn tcr_u11_no_record_follows_the_terminal() {
+    expect_rule(
+        "record after terminal",
+        started_with([rejected14(1).into_record(), failed()]),
+        started_with([failed(), rejected14(1).into_record()]),
+    );
+}
+#[test]
+fn tcr_u11_derived_tool_and_codes_agree() {
+    // Replay recomputes the tool from the stored name.
+    let state = inspect(&started_with([tool_call()]).bytes).unwrap();
+    assert_eq!(
+        state.operations[&id(10)].tools[0].tool,
+        RegisteredTool::lookup("project")
+    );
+    // A resealed frame whose operation code names another tool's operation.
+    let mut broken = started_with([run_exec(1)]);
+    tamper_last(&mut broken, |payload| {
+        assert_eq!(payload[45], ToolOperation::ExecCmd as u8);
+        payload[45] = ToolOperation::ReadFile as u8;
+    });
+    expect_rule(
+        "operation of another tool",
+        started_with([run_exec(1)]),
+        broken,
+    );
+    // A registered name with fault unregistered_name.
+    let mut broken = started_with([rejected14(1).into_record()]);
+    tamper_last(&mut broken, |payload| {
+        let fault = 33 + "project".len() + 4 + 2;
+        assert_eq!(payload[fault], ToolFault::MissingField as u8);
+        payload[fault] = ToolFault::UnregisteredName as u8;
+    });
+    expect_rule(
+        "registered name with unknown_tool fault",
+        started_with([rejected14(1).into_record()]),
+        broken,
+    );
+}
+#[test]
+fn tcr_u11_field_15_matches_the_stored_placeholders() {
+    // Rename the stored placeholder 1 to 2 without changing field 15.
+    let mut broken = started_with([run_exec(1)]);
+    tamper_last(&mut broken, |payload| {
+        let at = payload
+            .windows(15)
+            .position(|w| w == b"$ASURA_SECRET_1")
+            .unwrap();
+        payload[at + 14] = b'2';
+    });
+    expect_rule("field 15", started_with([run_exec(1)]), broken);
+}
+#[test]
+fn tcr_u11_run_kinds_follow_their_record() {
+    expect_rule(
+        "run exec_cmd needs kind 23 before kind 15",
+        started_with([run_exec(1), r23(1), r15(1, 1)]),
+        started_with([run_exec(1), r15(1, 1)]),
+    );
+    expect_rule(
+        "another run takes kind 15 only",
+        started_with([tool_call(), tool_result()]),
+        started_with([tool_call(), r23(1)]),
+    );
+    expect_rule(
+        "a call that does not run takes no kind 15",
+        started_with([rejected14(1).into_record(), failed()]),
+        started_with([rejected14(1).into_record(), tool_result()]),
+    );
+    expect_rule(
+        "a call that does not run takes no kind 23",
+        started_with([r14(exec14(1, ToolDecision::Busy)), failed()]),
+        started_with([r14(exec14(1, ToolDecision::Busy)), r23(1)]),
+    );
+}
+/// TCR-U12: the cancel, ordinal-9 and kind-15 rules in one place.
+#[test]
+fn tcr_u12_cancel_limit_and_result_rules() {
+    // A record after CancelRequested is accepted only with `cancelled`.
+    assert!(
+        inspect(&started_with([cancel_requested(), r14(exec14(1, ToolDecision::Cancelled))]).bytes)
+            .is_ok()
+    );
+    assert_eq!(
+        inspect(&started_with([cancel_requested(), rejected14(1).into_record()]).bytes)
+            .unwrap_err(),
+        ReplayError::Corrupt
+    );
+    // Ordinal 9 is accepted only with `limit`, after eight records.
+    let mut journal = Journal::started();
+    for ordinal in 1..=8 {
+        journal.append(r14(exec14(ordinal, ToolDecision::Denied)));
+    }
+    journal.append(r14(exec14(9, ToolDecision::Limit)));
+    let state = inspect(&journal.bytes).unwrap();
+    assert_eq!(state.operations[&id(10)].tools.len(), 9);
+    assert_eq!(
+        state.operations[&id(10)].tools[8].decision,
+        ToolDecision::Limit
+    );
+    // A kind 15 after a call that does not run is Corrupt.
+    assert_eq!(
+        inspect(&started_with([rejected14(1).into_record(), tool_result()]).bytes).unwrap_err(),
+        ReplayError::Corrupt
+    );
+}
+/// TCR-U13 (storage part): replay recomputes the job, output payload and
+/// create_note identities with the same derivations the live path calls, and
+/// the variable count from the stored command.
+#[test]
+fn tcr_u13_replay_recomputes_derived_identities() {
+    use asura_storage::payload::{ObjectKind, payload_id};
+    let journal = started_with([
+        run_exec(1),
+        r23(1),
+        r15(1, 1),
+        r14(run14(2, ToolOperation::CreateNote)),
+    ]);
+    let state = inspect(&journal.bytes).unwrap();
+    let tools = &state.operations[&id(10)].tools;
+    let call = tools[0].exec_cmd.as_deref().unwrap();
+    assert_eq!(call.job, exec_cmd_job_id(id(10), 1, 1));
+    assert_eq!(
+        call.stdout_payload,
+        payload_id(id(1), id(10), 1, 1, ObjectKind::Stdout)
+    );
+    assert_eq!(
+        call.stderr_payload,
+        payload_id(id(1), id(10), 1, 1, ObjectKind::Stderr)
+    );
+    let Record::ToolCall(stored) = decode_record(
+        14,
+        &journal.bytes[tools[0].intent_frame.start + 144..tools[0].intent_frame.end - 40],
+    )
+    .unwrap() else {
+        panic!("kind 14");
+    };
+    let variables = asura_platform::secrets::placeholder_tokens(&stored.arguments)
+        .distinct
+        .len();
+    assert_eq!(variables, stored.number_kinds.len());
+    assert_eq!(variables, 1);
+    assert_eq!(tools[1].create, Some(create_call(2)));
+    assert!(tools[0].create.is_none() && tools[1].exec_cmd.is_none());
+    // Another installation derives other payload IDs.
+    assert_ne!(
+        call.stdout_payload,
+        payload_id(id(2), id(10), 1, 1, ObjectKind::Stdout)
+    );
+}
+/// TCR-U17: one source for each fact. Encoded kind 14, 15 and 23 payloads
+/// hold no copy of the arguments, no recomputed value and no body digest.
+#[test]
+fn tcr_u17_no_fact_is_stored_twice() {
+    use asura_storage::payload::{ObjectKind, payload_id};
+    use sha2::{Digest, Sha256};
+    let payload = |record: &Record| {
+        let frame = encode_frame(
+            &FrameContext {
+                installation_id: id(1),
+                transition_id: id(500),
+                sequence: 2,
+                prior_digest: [7; 32],
+                expected_revision: 1,
+                owner_generation: 1,
+            },
+            record,
+        )
+        .unwrap();
+        frame[144..frame.len() - 40].to_vec()
+    };
+    let contains = |haystack: &[u8], needle: &[u8]| {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    };
+    let body = "a private note body that only the memory store keeps";
+    let mut create = run14(2, ToolOperation::CreateNote);
+    create.arguments = format!("{{\"command\":\"create_note\",\"body\":\"{body}\"}}");
+    create.arguments_bytes = create.arguments.len() as u32;
+    let calls = [run14(1, ToolOperation::ExecCmd), create, rejected14(3)];
+    let results = [
+        payload(&r15(1, 1)),
+        payload(&create_result("")),
+        payload(&r23(1)),
+    ];
+    let job = exec_cmd_job_id(id(10), 1, 1);
+    let ids = create_call(2).identity;
+    let derived: Vec<Vec<u8>> = vec![
+        job.to_vec(),
+        payload_id(id(1), id(10), 1, 1, ObjectKind::Stdout).to_vec(),
+        payload_id(id(1), id(10), 1, 1, ObjectKind::Stderr).to_vec(),
+        ids.operation.to_vec(),
+        ids.object.to_vec(),
+        ids.version.to_vec(),
+        ids.edge.to_vec(),
+        Sha256::digest(body.as_bytes()).to_vec(),
+        INITIAL_RESERVATION.to_be_bytes().to_vec(),
+    ];
+    for call in &calls {
+        let bytes = payload(&r14(call.clone()));
+        for value in &derived {
+            assert!(!contains(&bytes, value), "kind 14 holds a derived value");
+        }
+        // The argument text appears exactly once, in field 14.
+        assert_eq!(
+            bytes
+                .windows(call.arguments.len())
+                .filter(|w| *w == call.arguments.as_bytes())
+                .count(),
+            1
+        );
+        for result in &results {
+            assert!(!contains(result, call.arguments.as_bytes()));
+            assert!(!contains(result, call.name.as_bytes()));
+        }
+    }
+    for result in &results {
+        for value in &derived[..8] {
+            assert!(!contains(result, value), "kind 15/23 holds a derived value");
+        }
+        // Kind 14's rule-set digest is never repeated (TCR-D3).
+        assert!(!contains(result, &RULE_SET_DIGEST));
+    }
+    // Kind 23 has no rule-set fields: 36 fixed bytes, two streams of 101 bytes
+    // (no kinds or spans), the number list header and the four counters.
+    assert_eq!(results[2].len(), 36 + 2 * 101 + 6 + 20 + 8);
+    // Kind 15 of create_note stores no text (TCR-D1).
+    let Ok(Record::ToolResult(stored)) = decode_record(15, &results[1]) else {
+        panic!("kind 15");
+    };
+    assert!(stored.text.is_empty());
 }

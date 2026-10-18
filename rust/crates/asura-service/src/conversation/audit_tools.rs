@@ -231,26 +231,30 @@ pub(super) fn finished(
         reason,
     }
 }
+/// One `ToolFinished` event per call with an operation code, run or not
+/// (TCR-D14). It cites the call by operation, generation and ordinal and
+/// never holds argument text.
 pub(super) fn tool_finished(
     turn: &asura_storage::authority::conversation::TurnAccepted,
-    call: &crate::tools::Call,
-    result: &asura_storage::authority::conversation::ToolResult,
+    ordinal: u32,
+    operation: asura_storage::authority::conversation::ToolOperation,
+    status: u8,
 ) -> Event {
-    use crate::tools::Arguments as A;
     use asura_storage::audit::{Tool, ToolOutcome as O};
-    let tool = match call.arguments {
-        A::ExecCmd { .. } => Tool::ExecCmd,
-        A::ReadFile { .. } => Tool::ProjectReadFile,
-        A::ListDirectory { .. } => Tool::ProjectListDirectory,
-        A::ObserveStatus => Tool::ServiceObserveStatus,
-        A::ListTools => Tool::ServiceListTools,
-        A::ReadAudit { .. } => Tool::ServiceReadAudit,
-        A::MemoryListNotes { .. } => Tool::MemoryListNotes,
-        A::MemoryGetNote { .. } => Tool::MemoryGetNote,
-        A::MemoryNoteSources { .. } => Tool::MemoryNoteSources,
-        A::MemoryCreateNote { .. } => Tool::MemoryCreateNote,
+    use asura_storage::authority::conversation::ToolOperation as Op;
+    let tool = match operation {
+        Op::ExecCmd => Tool::ExecCmd,
+        Op::ReadFile => Tool::ProjectReadFile,
+        Op::ListDirectory => Tool::ProjectListDirectory,
+        Op::Status => Tool::ServiceObserveStatus,
+        Op::Tools => Tool::ServiceListTools,
+        Op::Audit => Tool::ServiceReadAudit,
+        Op::ListNotes => Tool::MemoryListNotes,
+        Op::GetNote => Tool::MemoryGetNote,
+        Op::NoteSources => Tool::MemoryNoteSources,
+        Op::CreateNote => Tool::MemoryCreateNote,
     };
-    let outcome = match result.status {
+    let outcome = match status {
         1 => O::Success,
         2 => O::Denied,
         3 => O::InvalidArguments,
@@ -263,7 +267,7 @@ pub(super) fn tool_finished(
         project: turn.project,
         operation: turn.operation,
         generation: turn.generation,
-        ordinal: call.ordinal,
+        ordinal,
         tool,
         outcome,
     }

@@ -20,8 +20,7 @@ use asura_platform::{
     secrets::SecretVariable,
 };
 use asura_storage::authority::conversation::{
-    CaptureReason, CaptureSettled, CaptureState, CaptureStream, ExecCmdDisposition, ExecCmdIntent,
-    ToolResult,
+    self as journal, CaptureReason, CaptureSettled, CaptureState, CaptureStream, ToolResult,
 };
 use std::{
     sync::{
@@ -82,14 +81,56 @@ enum Process {
     Failed(ExecCmdError),
 }
 
-/// One exec_cmd call's dispatch: the committed kind 22, the rewritten call, the
-/// secret variables (moved into the request; spawn zeroizes them) and the
-/// capture worker's start.
+/// The live identity of one `run` exec_cmd call. Every value is derived from
+/// the installation and the call, never journaled (TCR-O5, TCR-D23); replay
+/// recomputes the same IDs with the same storage functions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExecCmdRun {
+    pub operation: journal::Id,
+    pub generation: u64,
+    pub ordinal: u32,
+    /// The SL3 rewrite: the command that runs, its secrets in variables.
+    pub command: String,
+    pub cwd: String,
+    pub job: journal::Id,
+    pub stdout_payload: journal::Id,
+    pub stderr_payload: journal::Id,
+}
+impl ExecCmdRun {
+    pub(crate) fn derive(installation: journal::Id, call: &tools::Call) -> Option<Self> {
+        let Arguments::ExecCmd { command, cwd } = &call.arguments else {
+            return None;
+        };
+        let payload = |kind| {
+            asura_storage::payload::payload_id(
+                installation,
+                call.operation,
+                call.generation,
+                call.ordinal,
+                kind,
+            )
+        };
+        Some(Self {
+            operation: call.operation,
+            generation: call.generation,
+            ordinal: call.ordinal,
+            command: command.clone(),
+            cwd: cwd.clone(),
+            job: journal::exec_cmd_job_id(call.operation, call.generation, call.ordinal),
+            stdout_payload: payload(asura_storage::payload::ObjectKind::Stdout),
+            stderr_payload: payload(asura_storage::payload::ObjectKind::Stderr),
+        })
+    }
+}
+
+/// One exec_cmd call's dispatch: the committed `run` kind 14, the rewritten
+/// call, the secret variables (moved into the request; spawn zeroizes them)
+/// and the capture worker's start.
 pub(crate) struct Dispatch {
     pub runtime: RuntimeDirectory,
     pub scope: tools::ExecutionScope,
     pub call: tools::Call,
-    pub intent: ExecCmdIntent,
+    pub intent: ExecCmdRun,
     pub secrets: Vec<SecretVariable>,
     pub capture: capture_worker::Start,
 }
@@ -103,7 +144,7 @@ pub(crate) struct ExecCmdOutput {
 }
 
 struct Active {
-    intent: ExecCmdIntent,
+    intent: ExecCmdRun,
     phase: Option<Phase>,
     /// Set at the cancel trigger: L3 for cleanup and capture settlement.
     cleanup_deadline: Option<Instant>,
@@ -134,9 +175,10 @@ impl Worker {
     pub(crate) fn wake(&self) -> Option<WakeSender> {
         self.wake.clone()
     }
-    /// Caller has committed this exact kind 22 and rechecked the execution
-    /// grant. The call carries the rewrite; it is compared with kind 22, not
-    /// with the raw arguments (G8). There is no deadline (J1-Q3, J1-Q4).
+    /// Caller has committed this call's `run` kind 14 and rechecked the
+    /// execution grant. The call carries the rewrite; it is compared with the
+    /// derived run identity, never the raw arguments (G8). There is no
+    /// deadline (J1-Q3, J1-Q4).
     pub(crate) fn start(&mut self, dispatch: Dispatch) -> Result<(), ExecutionError> {
         if self.active.is_some() {
             return Err(ExecutionError::Rejected(Rejection::Busy));
@@ -157,8 +199,7 @@ impl Worker {
         else {
             return Err(ExecutionError::Rejected(Rejection::Denied));
         };
-        if intent.disposition != ExecCmdDisposition::Admitted
-            || intent.command != *proposed
+        if intent.command != *proposed
             || intent.cwd != *proposed_cwd
             || intent.operation != call.operation
             || intent.generation != call.generation
@@ -581,8 +622,6 @@ fn output(mut active: Active) -> ExecCmdOutput {
         reason,
         exit_kind: if not_started { 0 } else { exit_kind },
         exit_value: if not_started { 0 } else { exit_value },
-        rule_set_revision: intent.rule_set_revision,
-        rule_set_digest: intent.rule_set_digest,
         stdout,
         stderr,
         distinct_numbers,
@@ -626,7 +665,7 @@ fn output(mut active: Active) -> ExecCmdOutput {
 }
 
 fn mapped_result(
-    intent: &ExecCmdIntent,
+    intent: &ExecCmdRun,
     result: &ExecCmdResult,
     tails: &Tails,
     capture: CaptureState,
@@ -660,7 +699,7 @@ fn mapped_result(
     }
 }
 
-pub(crate) fn failed(intent: &ExecCmdIntent, error: ExecCmdError) -> ToolResult {
+pub(crate) fn failed(intent: &ExecCmdRun, error: ExecCmdError) -> ToolResult {
     let (status, text) = match error {
         ExecCmdError::Invalid => (3, "exec_cmd_invalid_arguments"),
         ExecCmdError::Denied => (2, "exec_cmd_denied"),

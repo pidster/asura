@@ -11,9 +11,12 @@ is cancelled or the service shuts down; see
 [J1 timeout and setup budget removal](tool-job-controller.md#j1-timeout-and-setup-budget-removal).
 Current contract (owner, 2026-10-17): the tool schema has no `timeout_seconds`
 argument (model ExecCmd field 3 is reserved). The guardian has no numeric deadline
-mode, and status reason 1 (`timeout`) is unassigned. Replay rejects ToolIntent
-kind 14 that carries tool kind 16; exec_cmd is admitted only by kind 22
-ExecCmdIntent and settled by kind 23. The timeout, setup-budget and kind-16
+mode, and status reason 1 (`timeout`) is unassigned. Since 2026-10-18 the durable
+intent of every exec_cmd call is the kind 14 `ToolCall` record of
+[tool call records](tool-call-records.md): operation code 10, the redacted
+argument text holding the rewritten command and cwd, and the decision. Kind 22
+ExecCmdIntent is retired (replay returns `UnsupportedFormat`). A kind 14 with
+decision `run` is settled by kind 23 and then kind 15. The timeout, setup-budget and kind-16
 intent text below records the earlier implemented contract.
 
 Renamed from `shell` to `exec_cmd` (owner, 2026-10-17). Names only; field
@@ -439,11 +442,13 @@ selectors. Native execution qualification remains SH-E1.
 
 ## Durable encoding packet
 
-Superseded (owner, 2026-10-17): replay rejects ToolIntent kind 14 carrying tool
-kind 16. Kind 22 ExecCmdIntent admits exec_cmd and kind 23 settles it under the
-[J1 records](tool-job-controller.md#j1-records-kinds-22-and-23). Tool kind 16
-remains the record kind of a kind 22 intent in replay state. The text below
-records the earlier encoding.
+Superseded (owner, 2026-10-17, and 2026-10-18): the durable intent of an
+exec_cmd call is the kind 14 `ToolCall` record of
+[tool call records](tool-call-records.md#record-kind-14-toolcall) with
+operation code 10; kind 23 settles a call with decision `run` under the
+[J1 records](tool-job-controller.md#j1-records-kinds-14-and-23). The old kind 14
+`ToolIntent` layout with tool kind 16 and kind 22 `ExecCmdIntent` are retired.
+The text below records the earlier encoding.
 
 ToolIntent kind 16 uses the unchanged record layout. Its path contains the exact
 command (1–8192 UTF-8 bytes, no NUL), one NUL delimiter, then cwd (1–1024 UTF-8
@@ -472,15 +477,15 @@ it automatically or infer rollback from a missing result.
 
 ```mermaid
 flowchart TD
-    Proposal[Typed exec_cmd proposal] --> Validate{Exact command and cwd bounds valid?}
-    Validate -->|No| Reject[Reject before execution]
+    Proposal[exec_cmd ToolCall: name and argument text] --> Validate{Service parse: command and cwd valid?}
+    Validate -->|No| Reject[Commit kind 14 invalid_arguments; status 3; never executes]
     Validate -->|Yes| Grant[Service checks local execution grant and project identity]
-    Grant --> Intent[Commit kind 22 ExecCmdIntent for tool kind 16]
+    Grant --> Intent[Commit kind 14 ToolCall, decision run, operation code 10]
     Intent --> Identity[Derive stable job ID from operation generation ordinal]
     Identity --> Effect[One retained exec_cmd job]
     Effect --> Result[Commit bounded result without continuation]
     Result --> Replay{Matching durable intent kind?}
-    Replay -->|exec_cmd 16| exec_cmd[Allow captured body and truncation on success, cancel or limit]
+    Replay -->|exec_cmd, code 10| exec_cmd[Allow captured body and truncation on success, cancel or limit]
     Replay -->|Other| Existing[Preserve existing result restrictions]
     Restart[Restart unresolved intent] --> Unknown[Interrupted effects unknown; never launch]
 ```

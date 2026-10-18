@@ -390,7 +390,7 @@ async fn execute(database: &Database, command: Command) -> Result<Reply> {
             .await
             .map(Reply::Sources),
         Command::Resolve(operation, digest) => database
-            .resolve(operation, digest)
+            .resolve(operation, Some(digest))
             .await
             .map(Reply::Receipt),
     }

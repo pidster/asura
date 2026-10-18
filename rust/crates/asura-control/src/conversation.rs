@@ -263,18 +263,19 @@ pub(super) fn valid(body: &Body) -> bool {
                                 && s.input_tokens.is_some()
                                 && s.output_tokens.is_some()))
                 })
-                && v.tools.len() <= 8
+                // One entry per kind 14 record: up to 8 calls plus ordinal 9.
+                && v.tools.len() <= 9
                 && v.tools.iter().enumerate().all(|(index, tool)| {
                     tool.arguments.as_ref().is_none_or(|s| s.len() <= 192)
                         && tool.preview.as_ref().is_none_or(|s| s.len() <= 128)
-                        && tool.policy_decision.is_none_or(|n| (1..=3).contains(&n))
+                        // Kind 14 decision and fault codes (TCR-D13).
+                        && tool.policy_decision.is_none_or(|n| (1..=8).contains(&n))
+                        && tool.fault.is_none_or(|n| (1..=15).contains(&n))
                         && tool.result_bytes.is_none_or(|n| n <= 65_536)
                         && tool.ordinal == Some(index as u32 + 1)
-                        && tool.name.as_ref().is_some_and(|name| {
-                            !name.is_empty()
-                                && name.len() <= 64
-                                && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
-                        })
+                        // A display prefix of the redacted name as the model
+                        // sent it; empty when not retained (TCR-D26).
+                        && tool.name.as_ref().is_some_and(|name| name.len() <= 64)
                         && match tool.state {
                             Some(1 | 4) => tool.status.is_none(),
                             Some(2) => tool.status == Some(1),
@@ -851,15 +852,16 @@ mod tests {
             reason: Some(0),
             text: Some("a".repeat(61440)),
             usage_known: Some(false),
-            tools: (1..=8)
+            tools: (1..=9)
                 .map(|ordinal| pb::ToolProgress {
                     ordinal: Some(ordinal),
                     name: Some("a".repeat(64)),
+                    fault: Some(15),
                     state: Some(2),
                     status: Some(1),
                     arguments: Some("a".repeat(192)),
                     preview: Some("a".repeat(128)),
-                    policy_decision: Some(1),
+                    policy_decision: Some(8),
                     elapsed_ms: Some(u64::MAX),
                     result_bytes: Some(65536),
                     truncated: Some(true),

@@ -83,7 +83,7 @@ struct CallEntry {
     reservation: u64,
     /// Bytes counted as retained after settlement or recovery.
     retained: u64,
-    /// Journal sequence of kind 23 (or kind 22 for an unverified prefix).
+    /// Journal sequence of kind 23 (or kind 14 for an unverified prefix).
     last_use: u64,
     settled: bool,
     expirable: bool,
@@ -309,7 +309,7 @@ impl Ledger {
             self.space_event();
         }
     }
-    /// An admission that never started (cancelled or failed before kind 22
+    /// An admission that never started (cancelled or failed before kind 14
     /// committed): its victims are restored, uncounted as free again.
     pub fn restore_victims(&self, victims: &[Victim]) {
         let mut state = lock(self);

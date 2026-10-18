@@ -143,12 +143,12 @@ pub(super) fn run(provider: &str) -> Result<()> {
         let event = observe(&fixture, operation)?;
         let records = committed_tools(&fixture, operation)?;
         let output = event.text.as_deref().unwrap_or_default();
-        let expected_kind = match name {
-            "memory_list_notes" => 6,
-            "memory_get_note" => 7,
-            _ => 8,
+        let expected_operation = match name {
+            "memory_list_notes" => journal::ToolOperation::ListNotes,
+            "memory_get_note" => journal::ToolOperation::GetNote,
+            _ => journal::ToolOperation::NoteSources,
         };
-        let requested_path = if name == "memory_list_notes" {
+        let requested_version = if name == "memory_list_notes" {
             ""
         } else if status == 4 {
             &foreign
@@ -160,11 +160,20 @@ pub(super) fn run(provider: &str) -> Result<()> {
             "memory_get_note" => 1024,
             _ => 0,
         };
+        // The kind 14 arguments are the only copy; read them with the
+        // documented defaults (offset 0, list limit 8).
         let exact = records.iter().find(|(intent, result)| {
-            intent.kind == expected_kind
-                && intent.path == requested_path
-                && intent.offset == 0
-                && intent.limit == expected_limit
+            let arguments: serde_json::Value =
+                serde_json::from_str(&intent.arguments).unwrap_or_default();
+            let limit = arguments["limit"].as_u64().unwrap_or(match name {
+                "memory_list_notes" => 8,
+                "memory_get_note" => 4096,
+                _ => 0,
+            });
+            intent.tool_operation == Some(expected_operation)
+                && arguments["version"].as_str().unwrap_or("") == requested_version
+                && arguments["offset"].as_u64().unwrap_or(0) == 0
+                && limit == expected_limit
                 && result.status == status as u8
         });
         let expected_sources = format!(
@@ -181,7 +190,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
         } else if !event
             .tools
             .iter()
-            .any(|tool| tool.name.as_deref() == Some(name) && tool.status == Some(status))
+            .any(|tool| tool.name.as_deref() == Some("memory") && tool.status == Some(status))
         {
             Some("required real tool event absent")
         } else if output.contains("FOREIGN_MEMORY_SECRET")
@@ -275,13 +284,12 @@ fn diagnose(fixture: &Fixture, operation: [u8; 16], event: &pb::ConversationEven
             match journal::decode_record(kind, &frame[144..frame.len() - 40])
                 .map_err(|e| format!("diagnostic record:{e:?}"))?
             {
-                journal::Record::ToolIntent(intent) => eprintln!(
-                    "memory fixture intent kind={} ordinal={} offset={} limit={} argument={:?}",
-                    intent.kind,
+                journal::Record::ToolCall(intent) => eprintln!(
+                    "memory fixture call ordinal={} decision={:?} fault={:?} arguments={:?}",
                     intent.ordinal,
-                    intent.offset,
-                    intent.limit,
-                    intent.path.chars().take(1024).collect::<String>()
+                    intent.decision,
+                    intent.fault,
+                    intent.arguments.chars().take(1024).collect::<String>()
                 ),
                 journal::Record::ToolResult(result) => eprintln!(
                     "memory fixture result status={} text={:?}",
@@ -298,7 +306,7 @@ fn diagnose(fixture: &Fixture, operation: [u8; 16], event: &pb::ConversationEven
 fn committed_tools(
     fixture: &Fixture,
     operation: [u8; 16],
-) -> Result<Vec<(journal::ToolIntent, journal::ToolResult)>> {
+) -> Result<Vec<(journal::ToolCall, journal::ToolResult)>> {
     use std::io::Read;
     let mut bytes = Vec::new();
     fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
@@ -330,10 +338,10 @@ fn committed_tools(
             )
             .map_err(|e| format!("evidence decode:{e:?}").into())
         };
-        if let (journal::Record::ToolIntent(intent), journal::Record::ToolResult(result)) =
+        if let (journal::Record::ToolCall(intent), journal::Record::ToolResult(result)) =
             (decode(tool.intent_frame.clone())?, decode(result_range)?)
         {
-            records.push((intent, result));
+            records.push((*intent, result));
         }
     }
     Ok(records)

@@ -506,7 +506,7 @@ impl State {
         turn: Id,
         generation: u64,
         ordinal: u32,
-        body: Option<String>,
+        body: Option<(String, Option<Id>)>,
         cancel: &AtomicBool,
     ) -> Result<Reply> {
         let replay = self.replay.as_ref().ok_or(Error::NotInitialized)?;
@@ -515,7 +515,7 @@ impl State {
             .checked_sub(1)
             .and_then(|index| op.tools.get(index as usize))
             .ok_or(Error::Invalid)?;
-        let intent = tool.create.as_deref().ok_or(Error::Invalid)?.clone();
+        let intent = tool.create.ok_or(Error::Invalid)?;
         if op.generation != generation
             || intent.operation != turn
             || intent.ordinal != ordinal
@@ -542,7 +542,14 @@ impl State {
                 .map_err(|_| Error::Invalid)?,
         };
         let command = body
-            .map(|body| crate::memory::create::command_for_intent(binding, &intent, body))
+            .map(|(body, source)| {
+                crate::memory::create::command_for_call(
+                    binding,
+                    &intent,
+                    body,
+                    source.map(crate::memory::Id::new).transpose()?,
+                )
+            })
             .transpose();
         self.connect_graph(false)?;
         let graph = self.graph.as_ref().ok_or(Error::Unavailable)?;
@@ -626,9 +633,16 @@ impl State {
                 generation,
                 ordinal,
                 body,
+                source,
                 cancel,
             } => {
-                return self.memory_create(turn, generation, ordinal, Some(body), &cancel);
+                return self.memory_create(
+                    turn,
+                    generation,
+                    ordinal,
+                    Some((body, source)),
+                    &cancel,
+                );
             }
             #[cfg(feature = "embedded-memory")]
             Command::MemoryResolveCreate {

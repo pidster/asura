@@ -1,15 +1,21 @@
 # Consolidated parameterised tools
 
-Status: implemented; validation recorded below, 2026-09-28.
+Status: implemented; validation recorded below, 2026-09-28. Revised
+2026-10-18 by [tool call records](tool-call-records.md): the helper no longer
+parses or rejects arguments; the service is the only argument parser.
 
 ## Public interface and ownership
 
 Expose four model tools through the existing shared native adapter: `project`,
 `memory`, `service` and `exec_cmd`. Each grouped tool has a typed command enum and
-bounded optional arguments. The adapter rejects fields that do not belong to the
-selected command. It translates valid arguments into the existing typed private
-model protocol; service policy, budgets, journal records and storage ownership
-remain in their existing owners. No string command interpreter is added.
+bounded optional arguments, declared as each tool's generation schema
+(`parameters`). Since 2026-10-18 each tool takes its arguments as
+`GeneratedContent` and keeps that schema unchanged, so guided generation is
+unchanged. `Tool.call` forwards the tool name and `arguments.jsonString` to the
+service in a `ToolCall` and returns the service's result text, including the
+text of a rejection. The helper does not parse, translate or reject arguments.
+Service policy, budgets, journal records and storage ownership remain in their
+existing owners. No string command interpreter is added.
 
 | Tool | Commands | Parameters |
 | --- | --- | --- |
@@ -34,62 +40,66 @@ four tools and their commands; existing `/audit` remains available.
 
 The Rust service registry owns public discovery. Keep its internal operation
 metadata separate: durable activity and audit records continue to identify the
-exact operation, such as memory_get_note. Existing journal kind numbers and model
-wire variants retain their meaning. Protocol stays 0.1 and journal format stays 1.
+exact operation through the kind 14 operation code, such as 7 `get_note`
+([operation codes](tool-call-records.md#operation-codes)). Model `ToolCall`
+fields 10–19 are removed and reserved (2026-10-18). Protocol stays 0.1 and journal format stays 1.
 The helper exposes only grouped names, without duplicate per-operation advertised
-tools. The per-operation wrappers may remain internal translators so their tested
-schema semantics can be reused; they cannot independently bypass the shared
-handler. No compatibility with older builds is required (owner, 2026-10-17).
+tools. The per-operation translators are removed with the helper's parsing. No compatibility with older builds is required (owner, 2026-10-17).
 
 ## Validation and failure handling
 
-The shared adapter bounds UTF-8 strings and converts integer parameters without
-loss. It rejects missing required arguments, negative/overflowed numbers and
-extraneous command parameters before contacting the service. The service remains
-the authority for scope, detailed limits, locality and permission checks. Grouping
-read/write operations never grants write access from a read grant. `create_note`
-requires a body of 1–16,384 UTF-8 bytes and accepts an optional source version.
-It rejects version, after, offset and limit. Read commands reject body and
-source_version. The service enforces HM3's separate write grant, verified local
-destination, durable intent, receipt resolution and publication rules.
-Malformed creation field combinations and write fields on read commands receive
-fixed correction guidance without contacting the service.
-The shared native proposal gate bounds valid and invalid callbacks;
-the existing inference-pass, token and deadline limits remain in force. See the
-provider design for the gate and failure contract.
+Required behavior (2026-10-18). The service parses the argument text with its
+single parser in `asura-service/src/tools.rs`. It rejects a missing required
+argument, a wrong type, a negative or overflowed number, an unknown command and
+an extraneous command parameter. Each rejection is a kind 14 `ToolCall` record
+with decision `invalid_arguments` and a fault code, and the model receives a
+status-3 result such as `invalid_arguments: missing_field`. The model may correct
+the call within the turn's eight calls. The service remains the authority for
+scope, detailed limits, locality and permission checks. Grouping read and write
+operations never grants write access from a read grant. `create_note` requires a
+body of 1–16,384 UTF-8 bytes and accepts an optional source version. It rejects
+version, after, offset and limit. Read commands reject body and source_version.
+The service enforces HM3's separate write grant, verified local destination,
+durable record, receipt resolution and publication rules. The helper's fixed
+memory correction guidance is removed; the service's rendered text replaces it.
+
+A call that the SDK rejects before `Tool.call` (argument text that is not JSON,
+or an unregistered name) does not reach the service on the system model, Core AI
+or MLX. It fails the turn with its diagnostic (owner decision 2 of
+[tool call records](tool-call-records.md#owner-decisions-2026-10-17)).
 
 Grouping adds no workers, queues, timers or I/O operations. HM3 defines the note
-mutation through the existing storage owner. Tool callbacks retain
-existing deadlines, cancellation, per-turn eight-call and byte budgets. All local
+mutation through the existing storage owner. Tool callbacks retain cancellation,
+the per-turn eight-call limit and byte budgets; they have no deadline. All local
 model classes use the same generated schemas and adapter. Cloud activation is
 unchanged. Stored evidence remains untrusted; it cannot select another command or
 grant access. An invalid grouped proposal cannot fall back to a shell command.
 
 ### Selected command flow
 
-Arrows show proposal validation and canonical dispatch.
+Status: selected design (revised 2026-10-18). Arrows show the call path from the
+model to the result; the service makes every decision.
 
 ```mermaid
 flowchart TD
-    Model[Model proposes grouped tool] --> Command{Known typed command?}
-    Command -->|No| Reject[Reject without host execution]
-    Command -->|Yes| Fields{Required fields and no unrelated parameters?}
-    Fields -->|No| Reject
-    Reject -->|Malformed Memory arguments: bounded correction| Model
-    Fields -->|Yes| Translate[Translate to existing typed operation]
-    Translate --> Grant[Service checks scope, locality, grant and budget]
-    Grant -->|Denied| Result[Return bounded result]
-    Grant -->|Allowed| Intent[Commit existing durable intent]
-    Intent --> Owner[Canonical tool owner executes]
-    Owner --> Commit[Commit bounded result]
+    Model[Model proposes grouped tool] --> Helper[Helper forwards name and jsonString]
+    Helper --> Parse{Service parse: known command, required fields, no unrelated parameters?}
+    Parse -->|No| Invalid[Kind 14 invalid_arguments; status 3 rendered]
+    Parse -->|Yes| Grant[Service checks scope, locality, grant and budget]
+    Grant -->|Denied or limit| Rejected[Kind 14 denied or limit; status rendered]
+    Grant -->|Allowed| Run[Commit kind 14 run]
+    Run --> Owner[Canonical tool owner executes]
+    Owner --> Commit[Commit kind 15 result]
+    Invalid --> Result[Return result text to the SDK]
+    Rejected --> Result
     Commit --> Result
     Result --> Model
 ```
 
 ## Required evidence
 
-Unit tests must verify command translation, defaults, invalid combinations, enum
-schemas, exactly four advertised tool names, public registry consistency and
+Unit tests must verify the service parser's command readings, defaults, invalid
+combinations and fault codes (TCR-U04, TCR-U05), enum schemas, exactly four advertised tool names, public registry consistency and
 unchanged per-operation grants. Shared callback integration must retain existing
 local-provider coverage and cancellation behavior. Native system and local Ollama
 journeys must call grouped discovery and memory reads with exact committed results.

@@ -14,8 +14,8 @@ packet J1; see [SL3 implementation](#sl3-implementation). SL4–SL6 are not impl
 Protocol numbering remains `0.1`; journal format remains `1`.
 
 Readiness: slice SL3 is implemented inside tool job packet J1. Its
-implementation details, including record kinds 22 and 23, are in the job
-controller's
+implementation details, including record kind 23 and the exec_cmd facts of
+kind 14 (which replaced kind 22 on 2026-10-18), are in the job controller's
 [J1 and SL3 implementation details](tool-job-controller.md#j1-and-sl3-implementation-details)
 and [J1 implementation](tool-job-controller.md#j1-implementation). No owner
 decision remains open. SL5 waits only for the person command packets. The SD8
@@ -128,7 +128,7 @@ secrets today:
 
 | Path | Current behavior | Consequence |
 | --- | --- | --- |
-| Model exec_cmd command | The tool validator checks length and NUL only (`asura-service/src/tools.rs:176-195`). ToolIntent kind 16 stored the exact command (`asura-storage/src/authority/conversation/types.rs:417`). J1 replaced it with kind 22, and replay now rejects kind 14 carrying tool kind 16 (owner, 2026-10-17). | A secret in a command was journaled. |
+| Model exec_cmd command | The tool validator checks length and NUL only (`asura-service/src/tools.rs:176-195`). ToolIntent kind 16 stored the exact command (`asura-storage/src/authority/conversation/types.rs:417`). J1 replaced it with kind 22. [Tool call records](tool-call-records.md) then replaced kind 22 with the kind 14 `ToolCall` record (2026-10-18), which stores the rewritten command in its redacted argument text. | A secret in a command was journaled. |
 | Guardian argument vector | The command is an argument of the guardian (`asura-platform/src/exec_cmd.rs:258`) and of `/bin/sh -c` (`exec_cmd/guardian.rs:218-219`). | A secret in a command is visible in the process argument list for the command's lifetime. |
 | exec_cmd output | The capture ring keeps the last 8 KiB per stream (`exec_cmd/capture.rs:44-50`). `text()` returns the last 6144 bytes (`capture.rs:54-79`). | Raw output reaches the result. |
 | exec_cmd result | `render_text()` (`exec_cmd.rs:49-67`) builds the result text. `mapped_result` stores it in a ToolResult (`asura-service/src/exec_cmd_worker.rs:416-429`), whose `text` is journaled (`types.rs:436`). | Raw output is journaled and sent to the model, within 16 KiB per result (`tools.rs:9`). |
@@ -523,16 +523,19 @@ releases them. Settlement, descriptors, pages and cursors bind that digest.
 Byte offsets count stored bytes. Nothing computes a digest of raw output or of
 a secret value, apart from the in-memory keyed number map.
 
-Proposed record fields. J1 allocates them as record kinds 22 (ExecCmdIntent)
-and 23 (CaptureSettled); the
-[J1 records](tool-job-controller.md#j1-records-kinds-22-and-23) give the exact
-encodings. The journal format stays `1`. J1 records a later exact match of a
+Proposed record fields. J1 allocated them as record kinds 22 (ExecCmdIntent)
+and 23 (CaptureSettled). Since 2026-10-18 the kind 14 `ToolCall` record holds
+the job intent facts (kind 22 is retired) and kind 23 no longer repeats the
+rule set; the
+[J1 records](tool-job-controller.md#j1-records-kinds-14-and-23) and
+[tool call records](tool-call-records.md#record-kind-14-toolcall) give the
+exact encodings. The journal format stays `1`. J1 records a later exact match of a
 known value as a literal replacement count per stream, not as a third number
 origin, so "propagated" below is a count.
 
 | Record | Added fields, in order |
 | --- | --- |
-| Job intent | Secret variables: at most 16 entries of number and kind. No value or value digest. |
+| Job intent (kind 14 `ToolCall` for model exec_cmd) | Secret variables: at most 16 entries of kind, in number order (kind 14 field 16 entries 1 to k; k is derived from the stored command). Rule-set revision and digest (fields 18–19). No value or value digest. |
 | Kind PCQ | The same secret variable list (SL5) |
 | Descriptor, per stream | Redaction ran (always true for new captures); rule-set revision and digest; observed bytes (raw count); stored bytes; replacements; unnumbered replacements; per-kind counts, at most 48 entries; loss span count, withheld bytes and the first 64 spans; degraded flag |
 | Job settlement | Numbers by kind and origin (command, output, propagated) for the first 256 numbers; total distinct numbers |
@@ -810,6 +813,55 @@ Rejected for the guardian path: a dedicated descriptor carrying the values.
 It would keep them out of the guardian's environment, but `sh` still holds them
 in its own, so the exposure class does not change. It would add a descriptor
 protocol beyond the person design's FDs 11–17.
+
+## Tool call argument redaction
+
+Required behavior (2026-10-18, [tool call records](tool-call-records.md)
+TCR-R3, TCR-D4, TCR-D5). Every model tool call is recorded as one kind 14
+`ToolCall` record. The record holds the tool name and the argument JSON text
+after redaction. `secrets::redact_arguments` produces both. The conversation
+owner calls it on every call before the record. The function never stores or
+logs raw text.
+
+- **Rule set.** The function uses the rule set in whole-buffer mode, as
+  `display_redacted` does. If the rule set failed its self-check, no text is
+  kept: argument form 4, reason `detection_unavailable`, decision `refused`.
+- **Scope.** It scans the name, every JSON key and every JSON string value.
+  It does not scan numbers, booleans or null. It also scans the raw text as
+  one buffer, because some rules need the text around a value; every value
+  found by any scan is replaced wherever it occurs in a key or string
+  (TCR-D19). A string with withheld bytes is stored as `[withheld]`; unparsed
+  text with withheld bytes is not retained (TCR-D21).
+- **Numbering.** Numbers follow [placeholders and numbering](#placeholders-and-numbering)
+  within one call. For exec_cmd, the SL3 rewrite's secrets take 1 to k; other
+  values take k+1 onward in order of first appearance, name first. Numbers
+  are assigned after the choice of stored form and after any command cut, so
+  they are contiguous (TCR-D22). A per-call
+  random key keys the number map. After 256 distinct values in one call, a new
+  value becomes `$ASURA_SECRET_0`.
+- **Model-written placeholders (TCR-D4).** A placeholder token that the model
+  wrote (`$ASURA_SECRET_<digits>` or `${ASURA_SECRET_<digits>}`) in the name,
+  a key, a string value or unparsed text becomes the unnumbered form
+  (`$ASURA_SECRET_0` or `${ASURA_SECRET_0}`). The record counts it with the
+  inserted unnumbered placeholders. Replay can therefore check that every
+  numbered placeholder was inserted by the redactor. SL3 still refuses a
+  model-written placeholder in an exec_cmd command with
+  `placeholder_not_available`; the refused command is stored display-redacted
+  with this replacement.
+- **Forms.** The function keeps the verbatim text when its redacted form
+  parses to the same JSON value as the canonical redacted form. Otherwise it
+  keeps the canonical form. exec_cmd always keeps the canonical form. Text
+  that is not JSON is kept display-redacted, unless a backslash escape could
+  hide a match; then it is not kept. The
+  [redaction algorithm](tool-call-records.md#redaction-algorithm) is the
+  canonical flowchart.
+- **One JSON parser (TCR-D5).** `secrets::json` is the strict RFC 8259 parser.
+  It keeps member order and number lexemes, rejects duplicate keys, and limits
+  depth to 32 and keys plus values to 4,096. The redactor uses it for the
+  canonical form. The service's typed argument reader reads its parsed value.
+  No crate dependency is added.
+- **Memory.** Raw text, typed values and the per-call key are held in
+  zeroizing buffers and cleared after the decision.
 
 ## Asynchronous execution
 
@@ -1332,8 +1384,10 @@ refinements and full test record are in the job controller's
 - **Command rewrite at `ToolCall`.** `secrets::rewrite_exec_cmd_call` rewrites
   the model command, scans the cwd in whole-buffer mode (`secret_in_cwd`,
   code 14) and refuses a rewrite over 8,192 bytes (`rewritten_command_too_long`,
-  code 13). The conversation owner calls it before any record; kind 22 holds
-  the rewrite, or the display-redacted command when refused. The raw command
+  code 13). The conversation owner calls it before any record; kind 22 held
+  the rewrite, or the display-redacted command when refused. Since 2026-10-18
+  the stored `command` value of the kind 14 argument text holds it
+  ([argument redaction](#tool-call-argument-redaction)). The raw command
   is zeroized after the rewrite and never retained.
 - **Scanner on the capture worker.** Each chunk is scanned with
   `JobRedaction::scan` inside `catch_unwind` before staging and hashing.
@@ -1354,10 +1408,10 @@ ends with the raw-byte sweep):
 
 | Check | Result |
 | --- | --- |
-| SDU-14 | Kinds 22 and 23 round trip at every bound and the maximum sizes; each invalid field is `Corrupt`; fixed code tables; no value field (J1T-01) |
+| SDU-14 | (Before 2026-10-18) Kinds 22 and 23 round trip at every bound and the maximum sizes; each invalid field is `Corrupt`; fixed code tables; no value field (J1T-01) |
 | SDI-01 | A secret printed in three pipe writes 0.4 s apart: 19 `live` pages read during the call showed no piece; the stored stream holds `$ASURA_SECRET_1` (J1T-12) |
 | SDI-02 | A private key block, a 70 KiB line and 256 binary bytes: one key placeholder, one `line_over_limit` marker for 71,680 bytes, binary bytes unchanged, digest equal to the stored object (J1T-13) |
-| SDI-03 | Through the real owner and helper: kind 22 holds `"${ASURA_SECRET_1}"`, variables list one `github-token`; ten `ps -axww` samples during the call held no value; the command wrote the real value (J1T-14) |
+| SDI-03 | (Before 2026-10-18; TCR-I02 repeats it for kind 14) Through the real owner and helper: kind 22 holds `"${ASURA_SECRET_1}"`, variables list one `github-token`; ten `ps -axww` samples during the call held no value; the command wrote the real value (J1T-14) |
 | SDI-04 | Scanner gate held: the producer blocked after about 60 KB (8 queued chunks plus the pipe); after release all 804,000 bytes were stored, no discard, no cancel (J1T-15) |
 | SDI-05 | Scanner throttled to 3 ms per chunk: complete, every byte stored, no fault (J1T-15) |
 | SDI-07 | `set` after a rewritten command stores `ASURA_SECRET_1=$ASURA_SECRET_1`; the value is replaced by literal matching (J1T-16) |

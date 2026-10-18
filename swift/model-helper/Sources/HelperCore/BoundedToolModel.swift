@@ -10,7 +10,6 @@ public enum ToolRoundLimits {
 /// Budget state belongs to one admitted turn, even if the framework caches executors.
 public actor ToolRoundBudget {
     private var used = 0
-    private var nativeProposals = 0
     private var remaining: Int
     private let toolsEnabled: Bool
     private var failure: BackendFailure?
@@ -61,14 +60,16 @@ public actor ToolRoundBudget {
         try Task.checkCancellation()
         if let failure { throw failure }
     }
+    /// A native proposal waits for its inference to settle. The session owns
+    /// the ordinal policy: it sends the ninth proposal for its record and then
+    /// ends the turn (TCR-D6).
     public func reserveNativeProposal() async throws {
         try await requireSuccessfulInference()
-        guard toolsEnabled, nativeProposals < 8 else {
+        guard toolsEnabled else {
             let error = BackendFailure(.outputLimit)
             record(error)
             throw error
         }
-        nativeProposals += 1
     }
     private func cancelWaiter(_ id: UUID) {
         waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())

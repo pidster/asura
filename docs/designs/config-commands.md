@@ -523,6 +523,9 @@ uses the same projection/filter as control. Native capability, local destination
 read grant, cancellation, ordinal and result budgets still apply. Durable ToolIntent
 kind 15 uses empty path, offset 0 and limit 1–16; kinds 12/13 remain HM3 and 14 inventory.
 This is a tool-kind allocation, not a change to journal record-kind 15 ToolResult.
+Superseded (2026-10-18): ToolCall field 18 is removed; `service` command `audit`
+is recorded as kind 14 `ToolCall` operation code 5, and invalid limits are kind 14
+`invalid_arguments` records ([tool call records](tool-call-records.md)).
 Recheck allocations at integration; protocol remains 0.1 and journal format remains 1.
 
 `service_read_audit` returns at most 16 project-matching entries, newest first, with

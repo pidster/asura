@@ -63,24 +63,36 @@ impl Activity {
                     Some(4) => "interrupted",
                     _ => "unknown",
                 };
+                // The name as the model sent it (redacted), or a marker when the
+                // service did not retain it (TCR-D13).
+                let name = match tool.name.as_deref() {
+                    Some("") | None => "[name not retained]".to_owned(),
+                    Some(name) => literal(name, 64),
+                };
                 text.push_str(&format!(
-                    "\n  ⚙ {}. {} · {state}",
+                    "\n  ⚙ {}. {name} · {state}",
                     tool.ordinal.unwrap_or(0),
-                    literal(tool.name.as_deref().unwrap_or("unknown"), 64)
                 ));
                 if let Some(arguments) = &tool.arguments {
                     text.push_str(&format!("\n    {}", literal(arguments, 192)));
                 }
                 if let Some(policy) = tool.policy_decision {
-                    text.push_str(&format!(
-                        "\n    · {}",
-                        match policy {
-                            1 => "service admitted",
-                            2 => "access denied",
-                            3 => "arguments rejected",
-                            _ => "admission unknown",
-                        }
-                    ));
+                    // Kind 14 decision codes; a rejected call shows its fault.
+                    let decision = match policy {
+                        1 => "service admitted",
+                        2 => "invalid_arguments",
+                        3 => "unknown_tool",
+                        4 => "refused",
+                        5 => "busy",
+                        6 => "access denied",
+                        7 => "call limit",
+                        8 => "cancelled before decision",
+                        _ => "admission unknown",
+                    };
+                    match tool.fault.and_then(fault_label) {
+                        Some(fault) => text.push_str(&format!("\n    · {decision}: {fault}")),
+                        None => text.push_str(&format!("\n    · {decision}")),
+                    }
                 }
                 if tool.state == Some(3) {
                     text.push_str(&format!(
@@ -124,6 +136,27 @@ impl Activity {
     }
 }
 
+/// Kind 14 fault codes (tool-call-records.md, faults).
+fn fault_label(code: u32) -> Option<&'static str> {
+    Some(match code {
+        1 => "invalid_json",
+        2 => "json_limit",
+        3 => "not_object",
+        4 => "duplicate_key",
+        5 => "unknown_command",
+        6 => "missing_field",
+        7 => "unexpected_field",
+        8 => "wrong_type",
+        9 => "out_of_range",
+        10 => "unsafe_path",
+        11 => "invalid_version_id",
+        12 => "arguments_over_limit",
+        13 => "name_over_limit",
+        14 => "invalid_text",
+        15 => "unregistered_name",
+        _ => return None,
+    })
+}
 /// Waiting step labels for an accepted turn (lowercase, after `Waiting:`).
 fn wait_label(step: i32) -> Option<&'static str> {
     match step {
@@ -260,7 +293,7 @@ impl App {
         entry.statistics = event.statistics;
         entry.unavailable = false;
         if !event.tools.is_empty() || entry.kind != 1 {
-            entry.tools = event.tools.iter().take(8).cloned().collect();
+            entry.tools = event.tools.iter().take(9).cloned().collect();
         }
         Some(index)
     }
@@ -555,7 +588,7 @@ mod tests {
         let mut record = event(1, 2, 4, 3).tools.remove(0);
         record.arguments = Some("arg\n\u{1b}[31m".repeat(100));
         record.preview = Some("preview\n\u{1b}[31m".repeat(100));
-        record.policy_decision = Some(2);
+        record.policy_decision = Some(6);
         record.truncated = Some(true);
         record.exit_code = Some(-1);
         let activity = Activity {
@@ -571,6 +604,66 @@ mod tests {
         assert!(!display.contains('\u{1b}'));
         assert!(display.len() < 700);
         assert_eq!(grouped_count(u64::MAX), "18,446,744,073,709,551,615");
+    }
+    /// TCR-D13 / TCR-E01 view: a rejected call shows its decision and fault;
+    /// a text that was not retained shows only its size and reason; a name
+    /// that was not retained shows a marker, never a guess.
+    #[test]
+    fn rejected_calls_show_decision_fault_and_never_guess_content() {
+        let rejected = pb::ToolProgress {
+            ordinal: Some(1),
+            name: Some("project".into()),
+            state: Some(3),
+            status: Some(3),
+            arguments: Some(r#"{"command":"read_file"}"#.into()),
+            policy_decision: Some(2),
+            fault: Some(6),
+            preview: Some("invalid_arguments: missing_field".into()),
+            ..Default::default()
+        };
+        let oversized = pb::ToolProgress {
+            ordinal: Some(2),
+            name: Some(String::new()),
+            state: Some(3),
+            status: Some(3),
+            arguments: Some("[not retained: oversized, 70000 bytes]".into()),
+            policy_decision: Some(2),
+            fault: Some(12),
+            ..Default::default()
+        };
+        let valid = pb::ToolProgress {
+            ordinal: Some(3),
+            name: Some("project".into()),
+            state: Some(2),
+            status: Some(1),
+            arguments: Some(r#"{"command":"read_file","path":"README.md"}"#.into()),
+            policy_decision: Some(1),
+            ..Default::default()
+        };
+        let activity = Activity {
+            tools: vec![rejected, oversized, valid],
+            expanded: true,
+            kind: 3,
+            ..Default::default()
+        };
+        let display = activity.display();
+        assert!(display.contains("1. project · failed"), "{display}");
+        assert!(
+            display.contains("· invalid_arguments: missing_field"),
+            "{display}"
+        );
+        assert!(
+            display.contains("2. [name not retained] · failed"),
+            "{display}"
+        );
+        assert!(display.contains("[not retained: oversized, 70000 bytes]"));
+        assert!(display.contains("· invalid_arguments: arguments_over_limit"));
+        assert!(display.contains("3. project · complete"));
+        assert!(display.contains("· service admitted"));
+        for (code, label) in [(1, "invalid_json"), (15, "unregistered_name")] {
+            assert_eq!(fault_label(code), Some(label));
+        }
+        assert_eq!(fault_label(16), None);
     }
     #[test]
     fn live_pending_activity_survives_heartbeats_and_collapses_on_completion() {

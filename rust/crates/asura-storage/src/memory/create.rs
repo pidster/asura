@@ -1,6 +1,8 @@
-//! HM3 identity preparation. Authority comes from the committed typed intent.
+//! HM3 identity preparation. Authority comes from the committed kind 14
+//! `run` record; every identity is derived, never read from the journal (HM3,
+//! TCR-D2, TCR-D23).
 use super::types::*;
-use crate::authority::conversation::{CreateNoteIdentity, MemoryCreateIntent};
+use crate::authority::conversation::CreateNoteCall;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemoryCreateResult {
@@ -8,6 +10,7 @@ pub enum MemoryCreateResult {
     NotCommitted,
 }
 
+/// Derives the call identity and the put command for one create_note call.
 pub fn prepare_create(
     binding: Binding,
     project: Id,
@@ -16,69 +19,65 @@ pub fn prepare_create(
     ordinal: u32,
     body: String,
     source_version: Option<Id>,
-) -> Result<(MemoryCreateIntent, PutNote)> {
+) -> Result<(CreateNoteCall, PutNote)> {
     if body.is_empty() || body.len() > MAX_BODY {
         return Err(Error::InvalidInput);
     }
-    let ids = CreateNoteIdentity::derive(
+    let call = CreateNoteCall::derive(
         [
             binding.installation_id.bytes(),
             binding.graph_id.bytes(),
             binding.init_operation_id.bytes(),
         ],
+        project.bytes(),
         turn,
         generation,
         ordinal,
     )
     .map_err(|_| Error::InvalidInput)?;
-    let command = PutNote {
+    let command = command_for_call(binding, &call, body, source_version)?;
+    Ok((call, command))
+}
+
+/// The put command for a derived call: the derived identities plus the typed
+/// body and source of the service's parse. A call derived under another
+/// binding is an idempotency conflict.
+pub(crate) fn command_for_call(
+    binding: Binding,
+    call: &CreateNoteCall,
+    body: String,
+    source_version: Option<Id>,
+) -> Result<PutNote> {
+    if body.is_empty() || body.len() > MAX_BODY {
+        return Err(Error::InvalidInput);
+    }
+    let expected = CreateNoteCall::derive(
+        [
+            binding.installation_id.bytes(),
+            binding.graph_id.bytes(),
+            binding.init_operation_id.bytes(),
+        ],
+        call.project,
+        call.operation,
+        call.generation,
+        call.ordinal,
+    )
+    .map_err(|_| Error::InvalidInput)?;
+    if expected != *call {
+        return Err(Error::IdempotencyConflict);
+    }
+    let ids = call.identity;
+    Ok(PutNote {
         binding,
-        context_id: project,
+        context_id: Id::new(call.project)?,
         object_id: Id::new(ids.object)?,
         version_id: Id::new(ids.version)?,
         operation_id: Id::new(ids.operation)?,
         body,
-        source: source_version.map(|source| (source, Id::new(ids.edge).expect("derived nonzero"))),
-    };
-    let intent = MemoryCreateIntent {
-        operation: turn,
-        generation,
-        ordinal,
-        project: project.bytes(),
-        memory_operation: ids.operation,
-        object: ids.object,
-        version: ids.version,
-        body_bytes: command.body.len() as u32,
-        body_sha256: digest(command.body.as_bytes()),
-        source: command
-            .source
-            .map(|(source, edge)| (source.bytes(), edge.bytes())),
-        command_sha256: command.command_digest()?,
-    };
-    Ok((intent, command))
-}
-
-pub(crate) fn command_for_intent(
-    binding: Binding,
-    intent: &MemoryCreateIntent,
-    body: String,
-) -> Result<PutNote> {
-    let (actual, command) = prepare_create(
-        binding,
-        Id::new(intent.project)?,
-        intent.operation,
-        intent.generation,
-        intent.ordinal,
-        body,
-        intent
-            .source
-            .map(|(source, _)| Id::new(source))
+        source: source_version
+            .map(|source| Ok::<_, Error>((source, Id::new(ids.edge)?)))
             .transpose()?,
-    )?;
-    if actual != *intent {
-        return Err(Error::IdempotencyConflict);
-    }
-    Ok(command)
+    })
 }
 
 #[cfg(test)]
@@ -113,15 +112,19 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(a.memory_operation, b.memory_operation);
-        assert_eq!(a.version, b.version);
-        assert_ne!(a.command_sha256, b.command_sha256);
+        // Identities are derived from the call alone; the body is not part of
+        // them, so the journal needs no body digest (TCR-D2).
+        assert_eq!(a, b);
         assert_eq!(
-            command_for_intent(binding(), &a, "first".into()).unwrap(),
+            command_for_call(binding(), &a, "first".into(), None).unwrap(),
             command
         );
+        let other = Binding {
+            graph_id: Id::new([9; 16]).unwrap(),
+            ..binding()
+        };
         assert_eq!(
-            command_for_intent(binding(), &a, "second".into()),
+            command_for_call(other, &a, "first".into(), None),
             Err(Error::IdempotencyConflict)
         );
         assert!(

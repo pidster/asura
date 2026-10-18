@@ -433,6 +433,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--journal-waits"),
         Some("--client-waits"),
         Some("--exec-cmd-capture"),
+        Some("--tool-call-records"),
         Some("--waiting-steps"),
         Some("--queue-steer"),
     ] {

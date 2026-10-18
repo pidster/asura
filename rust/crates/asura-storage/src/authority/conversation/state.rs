@@ -59,20 +59,6 @@ fn display_prefix(text: &str, limit: usize) -> String {
     }
     text[..end].to_owned()
 }
-fn display_arguments(p: &ToolIntent) -> String {
-    let text = match p.kind {
-        1 => format!("read_file {} offset={} limit={}", p.path, p.offset, p.limit),
-        2 => format!("list_directory {}", p.path),
-        3 => "status".into(),
-        6 => format!("list_notes after={} limit={}", p.path, p.limit),
-        7 => format!("get_note {} offset={} limit={}", p.path, p.offset, p.limit),
-        8 => format!("note_sources {}", p.path),
-        14 => "tools".into(),
-        15 => format!("audit limit={}", p.limit),
-        _ => "invalid arguments".into(),
-    };
-    display_prefix(&text, 192)
-}
 impl Replay {
     /// Return the effective display name and independent name revision.
     pub fn project_name(&self, project: Id) -> Option<(String, u64)> {
@@ -124,12 +110,13 @@ impl Replay {
         entries.truncate(limit);
         entries
     }
-    pub fn unresolved_creates(&self) -> impl Iterator<Item = &MemoryCreateIntent> {
+    /// `run` create_note calls without kind 15, with their derived identity.
+    pub fn unresolved_creates(&self) -> impl Iterator<Item = &CreateNoteCall> {
         self.operations
             .values()
             .flat_map(|op| op.tools.iter())
             .filter(|tool| tool.result_frame.is_none())
-            .filter_map(|tool| tool.create.as_deref())
+            .filter_map(|tool| tool.create.as_ref())
     }
     pub fn project_memory_blocked(&self, project: Id) -> bool {
         self.unresolved_creates()
@@ -183,9 +170,7 @@ impl Replay {
                             && result.generation == op.generation
                             && result.ordinal as usize == op.tools.len()
                             && op.tools.last().is_some_and(|tool| {
-                                tool.kind == 12
-                                    && tool.create.is_some()
-                                    && tool.result_frame.is_none()
+                                tool.create.is_some() && tool.result_frame.is_none()
                             })
                     }),
                     _ => false,
@@ -365,94 +350,7 @@ impl Replay {
                 require(op.cancel.is_none())?;
                 op.cancel = Some(p.cause);
             }
-            Record::MemoryCreateIntent(p) => {
-                if self.unresolved_creates().count() >= 32 {
-                    return Err(ReplayError::Limit);
-                }
-                p.validate()?;
-                let identity = CreateNoteIdentity::derive(
-                    [
-                        self.installation_id,
-                        self.initialization.graph,
-                        self.initialization.request,
-                    ],
-                    p.operation,
-                    p.generation,
-                    p.ordinal,
-                )?;
-                require(
-                    p.memory_operation == identity.operation
-                        && p.object == identity.object
-                        && p.version == identity.version
-                        && p.source.is_none_or(|(_, edge)| edge == identity.edge),
-                )?;
-                let op = self
-                    .operations
-                    .get(&p.operation)
-                    .ok_or(ReplayError::Corrupt)?;
-                require(
-                    self.conversations
-                        .get(&op.conversation)
-                        .is_some_and(|c| c.project == p.project)
-                        && self.projects.contains_key(&p.project)
-                        && !self.project_memory_blocked(p.project),
-                )?;
-                self.charge(1024)?;
-                let owner = self.owner_generation;
-                let op = self.operation_mut(p.operation, p.generation)?;
-                require(
-                    op.owner_generation == owner
-                        && op.helper.is_some()
-                        && op.cancel.is_none()
-                        && p.ordinal as usize == op.tools.len() + 1
-                        && op.tools.len() < 8
-                        && op.tools.iter().all(|t| t.result_frame.is_some()),
-                )?;
-                op.tools.push(ToolRecord {
-                    arguments: format!("create_note body_bytes={}", p.body_bytes),
-                    preview: None,
-                    truncated: None,
-                    exit_code: None,
-                    create: Some(Box::new(p)),
-                    kind: 12,
-                    offset: 0,
-                    limit: 0,
-                    result_status: None,
-                    intent_frame: frame,
-                    result_frame: None,
-                    result_bytes: 0,
-                    exec_cmd: None,
-                });
-            }
-            Record::ToolIntent(p) => {
-                self.charge(1024)?;
-                let owner = self.owner_generation;
-                let op = self.operation_mut(p.operation, p.generation)?;
-                require(
-                    op.owner_generation == owner
-                        && op.helper.is_some()
-                        && op.cancel.is_none()
-                        && p.ordinal as usize == op.tools.len() + 1
-                        && op.tools.len() < 8
-                        && op.tools.iter().all(|t| t.result_frame.is_some()),
-                )?;
-                op.tools.push(ToolRecord {
-                    arguments: display_arguments(&p),
-                    preview: None,
-                    truncated: None,
-                    exit_code: None,
-                    create: None,
-                    kind: p.kind,
-                    offset: p.offset,
-                    limit: p.limit,
-                    result_status: None,
-                    intent_frame: frame,
-                    result_frame: None,
-                    result_bytes: 0,
-                    exec_cmd: None,
-                });
-            }
-            Record::ExecCmdIntent(p) => self.exec_cmd_intent(*p, frame)?,
+            Record::ToolCall(p) => self.tool_call(*p, frame)?,
             Record::CaptureSettled(p) => self.capture_settled(*p, frame)?,
             Record::ToolResult(p) => {
                 let owner = self.owner_generation;
@@ -461,78 +359,62 @@ impl Replay {
                 require(
                     op.owner_generation == owner
                         || op.tools.last().is_some_and(|tool| {
-                            tool.kind == 12 && tool.create.is_some() && tool.result_frame.is_none()
+                            tool.create.is_some() && tool.result_frame.is_none()
                         }),
                 )?;
                 require(
                     op.tools.iter().map(|t| t.result_bytes).sum::<usize>() + p.text.len() <= 65_536,
                 )?;
                 let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
-                require(tool.result_frame.is_none())?;
-                if tool.kind == EXEC_CMD_TOOL_KIND {
-                    // Only kind 22 creates tool kind 16, so its call state exists.
-                    // J1 order: admitted 22, 23, 15; refused 22, 15 status 3;
-                    // busy 22, 15 status 4.
-                    let exec_cmd = tool.exec_cmd.as_deref().ok_or(ReplayError::Corrupt)?;
-                    require(match exec_cmd.disposition {
-                        ExecCmdDisposition::Admitted => exec_cmd.settled.is_some(),
-                        ExecCmdDisposition::Refused => p.status == 3,
-                        ExecCmdDisposition::Busy => p.status == 4,
-                    })?;
-                    require(p.next_offset.is_none())?;
-                } else if p.status != 1 {
-                    // The structural codec cannot see the intent kind. exec_cmd is
-                    // the sole exception for captured timeout/cancel/limit tails.
-                    require(p.next_offset.is_none() && !p.truncated)?;
-                }
-                if tool.kind == 12 {
-                    let intent = tool.create.as_ref().ok_or(ReplayError::Corrupt)?;
-                    require(p.next_offset.is_none() && !p.truncated)?;
-                    require(if p.status == 1 {
-                        p.text == intent.success_text()
-                    } else {
-                        matches!(p.status, 2 | 4 | 5 | 6 | 7) && p.text.is_empty()
-                    })?;
-                }
-                if matches!(tool.kind, 4 | 5 | 9 | 10 | 11 | 13) {
-                    require(
-                        matches!(p.status, 3 | 5 | 6)
+                // Only a `run` call is followed by kind 15 (TCR-R5).
+                require(tool.unresolved())?;
+                let operation = tool.tool_operation.ok_or(ReplayError::Corrupt)?;
+                match operation {
+                    // J1 order: run 14, 23, 15.
+                    ToolOperation::ExecCmd => require(
+                        tool.exec_cmd
+                            .as_deref()
+                            .is_some_and(|call| call.settled.is_some())
+                            && p.next_offset.is_none(),
+                    )?,
+                    // TCR-D1: the text is rendered from the derived identity.
+                    ToolOperation::CreateNote => require(
+                        p.next_offset.is_none()
+                            && !p.truncated
                             && p.text.is_empty()
-                            && p.next_offset.is_none()
-                            && !p.truncated,
-                    )?;
-                }
-                if p.status == 1 {
-                    require(match tool.kind {
-                        1 | 7 => {
-                            p.text.len() <= tool.limit as usize
-                                && p.next_offset == tool.offset.checked_add(p.text.len() as u64)
-                        }
-                        2 | EXEC_CMD_TOOL_KIND => p.next_offset.is_none(),
-                        3 | 6 | 8 | 12 | 14 | 15 => {
-                            p.next_offset.is_none() && !p.truncated && p.text.len() <= 16_384
-                        }
-                        _ => false,
-                    })?;
+                            && matches!(p.status, 1 | 2 | 4 | 5 | 6 | 7),
+                    )?,
+                    // The structural codec cannot see the operation. exec_cmd is
+                    // the sole exception for captured timeout/cancel/limit tails.
+                    _ if p.status != 1 => require(p.next_offset.is_none() && !p.truncated)?,
+                    // TCR-D25: no limit or offset comparison; replay never parses
+                    // the stored arguments again.
+                    ToolOperation::ReadFile | ToolOperation::GetNote => {
+                        require(p.next_offset.is_some())?
+                    }
+                    ToolOperation::ListDirectory => require(p.next_offset.is_none())?,
+                    _ => require(p.next_offset.is_none() && !p.truncated)?,
                 }
                 tool.result_frame = Some(frame);
                 tool.result_status = Some(p.status);
                 tool.result_bytes = p.text.len();
-                tool.preview = Some(if matches!(tool.kind, 7 | 12) {
-                    format!("captured {} bytes", p.text.len())
-                } else if tool.kind == EXEC_CMD_TOOL_KIND {
-                    let output = p
-                        .text
-                        .split_once("\nstdout:\n")
-                        .map(|(_, body)| body)
-                        .unwrap_or("");
-                    let (stdout, stderr) = output.split_once("\nstderr:\n").unwrap_or((output, ""));
-                    display_prefix(if stdout.is_empty() { stderr } else { stdout }, 128)
-                } else {
-                    display_prefix(&p.text, 128)
+                tool.preview = Some(match operation {
+                    ToolOperation::GetNote => format!("captured {} bytes", p.text.len()),
+                    ToolOperation::CreateNote => String::new(),
+                    ToolOperation::ExecCmd => {
+                        let output = p
+                            .text
+                            .split_once("\nstdout:\n")
+                            .map(|(_, body)| body)
+                            .unwrap_or("");
+                        let (stdout, stderr) =
+                            output.split_once("\nstderr:\n").unwrap_or((output, ""));
+                        display_prefix(if stdout.is_empty() { stderr } else { stdout }, 128)
+                    }
+                    _ => display_prefix(&p.text, 128),
                 });
                 tool.truncated = Some(p.truncated);
-                if tool.kind == EXEC_CMD_TOOL_KIND {
+                if operation == ToolOperation::ExecCmd {
                     tool.exit_code = p
                         .text
                         .lines()
@@ -548,11 +430,41 @@ impl Replay {
         }
         Ok(())
     }
-    /// Kind 22 follows the kind 14 ordering rules. An admitted record's job
-    /// and payload IDs must equal their derivations from this installation.
-    fn exec_cmd_intent(&mut self, p: ExecCmdIntent, frame: Range<usize>) -> Result<()> {
-        p.validate()?;
-        if p.disposition == ExecCmdDisposition::Admitted {
+    /// Kind 14 (tool-call-records.md, replay rules). `decode_record` has
+    /// validated the record alone; replay adds the operation, ordinal and cancel
+    /// rules and recomputes the derived identities (TCR-O5).
+    fn tool_call(&mut self, p: ToolCall, frame: Range<usize>) -> Result<()> {
+        let run = p.decision == ToolDecision::Run;
+        let create = if run && p.tool_operation == Some(ToolOperation::CreateNote) {
+            if self.unresolved_creates().count() >= 32 {
+                return Err(ReplayError::Limit);
+            }
+            let op = self
+                .operations
+                .get(&p.operation)
+                .ok_or(ReplayError::Corrupt)?;
+            let project = self
+                .conversations
+                .get(&op.conversation)
+                .ok_or(ReplayError::Corrupt)?
+                .project;
+            require(self.projects.contains_key(&project) && !self.project_memory_blocked(project))?;
+            Some(CreateNoteCall::derive(
+                [
+                    self.installation_id,
+                    self.initialization.graph,
+                    self.initialization.request,
+                ],
+                project,
+                p.operation,
+                p.generation,
+                p.ordinal,
+            )?)
+        } else {
+            None
+        };
+        let sequence = next(self.sequence)?;
+        let exec_cmd = (run && p.tool_operation == Some(ToolOperation::ExecCmd)).then(|| {
             let payload = |kind| {
                 crate::payload::payload_id(
                     self.installation_id,
@@ -562,52 +474,49 @@ impl Replay {
                     kind,
                 )
             };
-            require(
-                p.job == exec_cmd_job_id(p.operation, p.generation, p.ordinal)
-                    && p.stdout_payload == payload(crate::payload::ObjectKind::Stdout)
-                    && p.stderr_payload == payload(crate::payload::ObjectKind::Stderr),
-            )?;
-        }
-        // ToolRecord, ExecCmdCall and the bounded display prefix.
-        self.charge(1536)?;
-        let sequence = next(self.sequence)?;
+            Box::new(ExecCmdCall {
+                job: exec_cmd_job_id(p.operation, p.generation, p.ordinal),
+                stdout_payload: payload(crate::payload::ObjectKind::Stdout),
+                stderr_payload: payload(crate::payload::ObjectKind::Stderr),
+                intent_sequence: sequence,
+                settled: None,
+            })
+        });
+        // ToolRecord, derived identities, the name and the display prefix.
+        self.charge(1536 + p.name.len())?;
         let owner = self.owner_generation;
         let op = self.operation_mut(p.operation, p.generation)?;
         require(
             op.owner_generation == owner
                 && op.helper.is_some()
-                && op.cancel.is_none()
                 && p.ordinal as usize == op.tools.len() + 1
-                && op.tools.len() < 8
-                && op.tools.iter().all(|t| t.result_frame.is_some()),
+                && op.tools.iter().all(|t| !t.unresolved())
+                && (op.cancel.is_none() || p.decision == ToolDecision::Cancelled),
         )?;
         op.tools.push(ToolRecord {
-            arguments: display_prefix(&format!("{} cwd={}", p.command, p.cwd), 192),
-            preview: None,
-            truncated: None,
-            exit_code: None,
-            create: None,
-            kind: EXEC_CMD_TOOL_KIND,
-            offset: 0,
-            limit: 0,
+            tool: RegisteredTool::lookup(&p.name),
+            arguments: display_prefix(&p.arguments, 192),
+            name: p.name,
+            tool_operation: p.tool_operation,
+            decision: p.decision,
+            fault: p.fault,
+            busy: p.busy,
+            refusal: p.refusal,
+            form: p.form,
+            arguments_bytes: p.arguments_bytes,
             result_status: None,
             intent_frame: frame,
             result_frame: None,
             result_bytes: 0,
-            exec_cmd: Some(Box::new(ExecCmdCall {
-                disposition: p.disposition,
-                job: p.job,
-                stdout_payload: p.stdout_payload,
-                stderr_payload: p.stderr_payload,
-                intent_sequence: sequence,
-                rule_set_revision: p.rule_set_revision,
-                rule_set_digest: p.rule_set_digest,
-                settled: None,
-            })),
+            preview: None,
+            truncated: None,
+            exit_code: None,
+            create,
+            exec_cmd,
         });
         Ok(())
     }
-    /// Kind 23 settles the pending admitted kind 22, once, before kind 15.
+    /// Kind 23 settles the pending `run` exec_cmd kind 14, once, before kind 15.
     fn capture_settled(&mut self, p: CaptureSettled, frame: Range<usize>) -> Result<()> {
         p.validate()?;
         self.charge(256)?;
@@ -618,12 +527,7 @@ impl Replay {
         let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
         require(tool.result_frame.is_none())?;
         let exec_cmd = tool.exec_cmd.as_deref_mut().ok_or(ReplayError::Corrupt)?;
-        require(
-            exec_cmd.disposition == ExecCmdDisposition::Admitted
-                && exec_cmd.settled.is_none()
-                && exec_cmd.rule_set_revision == p.rule_set_revision
-                && exec_cmd.rule_set_digest == p.rule_set_digest,
-        )?;
+        require(exec_cmd.settled.is_none())?;
         exec_cmd.settled = Some(ExecCmdSettlement {
             state: p.state,
             reason: p.reason,
@@ -1113,7 +1017,7 @@ impl Replay {
         require(
             op.tools
                 .iter()
-                .all(|tool| tool.kind != 12 || tool.result_frame.is_some()),
+                .all(|tool| tool.create.is_none() || tool.result_frame.is_some()),
         )?;
         if p.usage_known {
             require(
@@ -1127,8 +1031,10 @@ impl Replay {
         }
         match p.kind {
             TerminalKind::Complete => require(
+                // Every `run` call has its kind 15; a call that does not run is
+                // complete at kind 14 (TCR-R5).
                 op.helper.is_some()
-                    && op.tools.iter().all(|t| t.result_frame.is_some())
+                    && op.tools.iter().all(|t| !t.unresolved())
                     && op.cancel.is_none()
                     && p.cause == Cause::None
                     && !p.text.is_empty()
@@ -1167,14 +1073,16 @@ impl Replay {
             let op = self.operations.get(&id).ok_or(ReplayError::Corrupt)?;
             self.reserved_bytes = TERMINAL_CAPACITY;
             self.reserved_frames = 1;
-            if let Some(tool) = op.tools.last().filter(|tool| tool.result_frame.is_none()) {
+            // A `run` kind 14 holds its kind 15 and, for exec_cmd, its kind 23
+            // (TCR-D16). A call that does not run holds nothing more.
+            if let Some(tool) = op.tools.last().filter(|tool| tool.unresolved()) {
                 self.reserved_bytes += HEADER + TRAILER + 43 + 16_384;
                 self.reserved_frames += 1;
-                // An admitted kind 22 also holds room for its kind 23.
-                if tool.exec_cmd.as_deref().is_some_and(|exec_cmd| {
-                    exec_cmd.disposition == ExecCmdDisposition::Admitted
-                        && exec_cmd.settled.is_none()
-                }) {
+                if tool
+                    .exec_cmd
+                    .as_deref()
+                    .is_some_and(|exec_cmd| exec_cmd.settled.is_none())
+                {
                     self.reserved_bytes += CAPTURE_CAPACITY;
                     self.reserved_frames += 1;
                 }

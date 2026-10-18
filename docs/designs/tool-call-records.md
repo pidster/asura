@@ -1,8 +1,11 @@
 # Tool call records
 
-Status: proposed design, 2026-10-17; not implemented. The owner reviewed it on
-2026-10-17 and decided the questions in
-[owner decisions](#owner-decisions-2026-10-17).
+Status: implemented 2026-10-18; verified for the scope and
+environments in [verified evidence](#verified-evidence-2026-10-18). The
+owner reviewed it on 2026-10-17 and decided the questions in
+[owner decisions](#owner-decisions-2026-10-17). The
+[implementation refinements](#implementation-refinements-2026-10-18) close the
+gaps found while reading the code; they change no owner decision.
 
 Scope: one journal record for every tool call the model proposes, including
 malformed calls. The record holds the tool name and the arguments as the
@@ -46,7 +49,7 @@ Non-goals:
 - Recovery of old journals (TCR-O2).
 - Journal capacity. The single 8 MiB journal file is addressed by the
   segmented-journal backlog item
-  ([journal capacity follow-up](conversation-admission.md#format-1-and-record-compatibility)),
+  ([journal capacity follow-up](conversation-admission.md#format-1-and-record-kinds)),
   not by a second store.
 
 Dependencies:
@@ -115,6 +118,7 @@ platform secrets.
 | Bound and check the `ToolCall` frame | Model codec | `rust/crates/asura-control/src/model.rs` |
 | Parse the argument text into typed arguments (the only parser) | Service tool contract | `rust/crates/asura-service/src/tools.rs` (replaces `proposed_tool`) |
 | Redact the name and arguments | Platform secrets | `asura-platform/src/secrets/` (new `redact_arguments`) |
+| Parse JSON text strictly (one parser for the redactor and the argument reader) | Platform secrets | `asura-platform/src/secrets/json.rs` (new, TCR-D5) |
 | Rewrite exec_cmd commands (SL3) | Platform secrets, called by the conversation owner | `secrets/rewrite.rs`, `conversation/exec_cmd_call.rs` |
 | Decide, reserve budget, commit the record, dispatch | Conversation owner | `asura-service/src/conversation.rs` |
 | Render the result text of a call that does not run | Conversation owner, from the kind 14 codes | `asura-service/src/conversation.rs` |
@@ -122,8 +126,9 @@ platform secrets.
 | Show calls in activity and audit views | Service projection, then TUI | `conversation.rs` (`ToolProgress`), `asura-cli/src/tui/ui/activity.rs` |
 | Place earlier calls in model input | Context composer | [Context composer](context-composer.md) |
 
-Existing owners are reused. The only new code owner is the argument redactor
-in platform secrets. A search found no other owner for it.
+Existing owners are reused. The only new code owners are the argument redactor
+and the strict JSON parser in platform secrets. A search found no other owner
+for them.
 
 ## Design overview
 
@@ -141,17 +146,26 @@ the content and sends `name` and `arguments.jsonString` to the service. The
 tool then returns the result text to the SDK, including the text of a
 rejection.
 
-The helper also keeps three capture rules:
+The helper also keeps five capture rules:
 
 1. The Ollama adapter checks each name against the four registered names. For
-   another name, it sends a `ToolCall` with that name and the argument JSON.
-   After the result arrives, it fails the turn with `protocolFault`, because
-   the SDK cannot return a result for an unregistered tool.
+   another name, it sends a `ToolCall` with that name, the argument JSON and
+   source `provider_json`. After the result arrives, it fails the turn with
+   `protocolFault`, because the SDK cannot return a result for an unregistered
+   tool. The adapter has no argument-size guard of its own; the service
+   applies the 64,000-byte limit. One provider stream may hold up to 9 calls
+   (TCR-D17).
 2. The ninth proposal in a turn is sent with ordinal 9. After its result, the
    helper fails the turn with `outputLimit`. Ordinal 9 exists only for this
-   record.
+   record. The wire `ToolResult` accepts ordinal 9 only with status 7; kind 15
+   ordinals stay 1–8 (TCR-D6).
 3. The helper does not log the name or the arguments. The existing diagnostic
    keeps only shape classes and sizes.
+4. A result that is not a success returns `Tool failed: <status>`, a newline
+   and the service text to the SDK, so the model sees the rejection text
+   (TCR-D18).
+5. The helper keeps no argument parsing: the fixed memory-guidance path and
+   its diagnostic codes are removed (TCR-D18).
 
 Proof limit (owner decision 2): some calls fail inside the SDK before
 `Tool.call`. Examples are argument text that is not valid JSON, and an
@@ -159,6 +173,29 @@ unregistered name from the system model, Core AI or MLX executors. The helper
 cannot see these calls. The turn fails as today with its diagnostic, and the
 journal keeps only the turn terminal. Validation case TCR-Q1 measures which
 failures reach `Tool.call`.
+
+#### TCR-Q1 measured result (2026-10-18)
+
+Verified behavior. A scripted SDK executor sent each form to the four real
+tools with `GeneratedContent` arguments (Xcode 27.1 SDK, macOS 27,
+`ToolCallQualificationTests.tcrQ1MalformedFormsAgainstGeneratedContentTools`).
+The system model, Core AI and MLX executors use the same SDK path; the model
+itself cannot be made to emit these forms on demand.
+
+| Form sent by the executor | Reaches `Tool.call` | `jsonString` seen by the tool |
+| --- | --- | --- |
+| Missing required field | Yes | The members as sent |
+| Wrong type (`"offset":"zero"`) | Yes | The members as sent; member order can differ |
+| Unknown command value | Yes | As sent |
+| Unexpected extra member | Yes | As sent |
+| Truncated JSON | Yes | Repaired by the SDK: the incomplete member is dropped |
+| Duplicate key | Yes | The first value; the duplicate is dropped |
+| Text that is not JSON | No | The SDK fails first (`generated_content_invalid_json`) |
+| Unregistered name | No | The SDK fails first (`generated_content_invalid_json`); the Ollama adapter covers its own path (TCR-D17) |
+
+Consequence: on the SDK path the service never sees `invalid_json` or
+`duplicate_key` for text the SDK repairs; it records the repaired form
+(TCR-D27).
 
 ### Encoding choice: JSON text
 
@@ -212,6 +249,17 @@ The service scans the name, every JSON key and every JSON string value. It
 does not scan numbers, booleans or null, because they cannot hold the text the
 rules match.
 
+A placeholder token that the model wrote (`$ASURA_SECRET_<digits>` or
+`${ASURA_SECRET_<digits>}`) in the name, a key, a string value or unparsed text
+becomes the unnumbered form (`$ASURA_SECRET_0` or `${ASURA_SECRET_0}`) and is
+counted in field 17. Every numbered placeholder in a record is therefore one
+that the redactor inserted (TCR-D4).
+
+The strict JSON parser lives in platform secrets (`secrets::json`). The
+redactor uses it for the canonical form, and the service's typed argument
+reader reads its parsed value. There is one JSON parser and one argument
+parser; no crate dependency is added (TCR-D5).
+
 ### Redaction algorithm
 
 Selected design. Arrows show the order of checks. Every path ends in one of
@@ -224,10 +272,10 @@ flowchart TD
     Rules -->|Yes| Size{"Text present?"}
     Size -->|"No: arguments_bytes only"| Over["Form 4: not retained, oversized. Decision invalid_arguments"]
     Size -->|Yes| Parse{"Strict JSON parse within limits?"}
-    Parse -->|Yes| Canon["C: redact every key and string. exec_cmd command becomes the SL3 rewrite"]
+    Parse -->|Yes| Canon["C: redact every key and string; model placeholders become unnumbered. exec_cmd command becomes the SL3 rewrite"]
     Canon --> Exec{"exec_cmd?"}
     Exec -->|Yes| StoreC["Form 2: canonical C"]
-    Exec -->|No| Verb["V: display_redacted over the whole text"]
+    Exec -->|No| Verb["V: display_redacted over the whole text, same numbers"]
     Verb --> Same{"V parses and equals C?"}
     Same -->|Yes| StoreV["Form 1: verbatim V"]
     Same -->|No| StoreC
@@ -257,9 +305,14 @@ Rules for the algorithm:
 - **exec_cmd.** The `command` value is the SL3 rewrite when the rewrite
   succeeds. It is the display-redacted command, cut at 8,192 bytes, when the
   rewrite refuses. The record therefore holds the command that ran, with its
-  secrets moved to variables. A refused cwd is display-redacted or
-  `[withheld]`, as kind 22 does today. The stored arguments are the only copy
-  of the command and cwd.
+  secrets moved to variables. A refused cwd is redacted like any other string
+  value. The stored arguments are the only copy of the command and cwd.
+- **Whole-text scan.** The redactor also scans the raw text as one buffer and
+  replaces every detected value wherever it occurs in a key or string
+  (TCR-D19). A string with withheld bytes is stored as `[withheld]` (TCR-D21).
+- **Numbering.** Placeholder numbers follow first appearance over the name,
+  then the stored text, after the C or V choice and after any command cut
+  (TCR-D22). A placeholder token is defined in TCR-D20.
 - **Unparsed text.** An escape can hide a secret from the raw-text scan. When
   the text holds a backslash escape, the redactor also scans a best-effort
   unescaped copy. Any match in that copy withholds the text.
@@ -322,7 +375,7 @@ then UTF-8, flags as one byte 0 or 1. Any other value is `Corrupt`.
 | --- | --- | --- | --- |
 | 1 | operation | ID | Not zero; the active operation |
 | 2 | generation | u64 | At least 1; the active generation |
-| 3 | ordinal | u32 | 1–9; 9 only with decision `limit` |
+| 3 | ordinal | u32 | 1–9; 9 only with decision `limit`, or `cancelled` after cancel or turn end (TCR-D30) |
 | 4 | source | u8 | 1 `generated_content`, 2 `provider_json` |
 | 5 | name | string | 0–512 bytes, redacted. Empty only when the name was not retained |
 | 6 | name bytes | u32 | Received name size, at least 1 |
@@ -336,7 +389,7 @@ then UTF-8, flags as one byte 0 or 1. Any other value is `Corrupt`.
 | 14 | arguments | string | Forms 1–3: 0–64,000 bytes. Form 4: empty |
 | 15 | number count | u16 | 0–256 distinct numbered placeholders in fields 5 and 14 |
 | 16 | number kinds | count × u8 | Entry i is the secret kind (1–33) of `$ASURA_SECRET_<i>` |
-| 17 | unnumbered | u32 | Occurrences of `$ASURA_SECRET_0` inserted |
+| 17 | unnumbered | u32 | Occurrences of the unnumbered placeholder in fields 5 and 14: values past the 256th and model-written placeholder tokens (TCR-D4) |
 | 18 | rule-set revision | u32 | The revision used. 0 only with reason `detection_unavailable` |
 | 19 | rule-set digest | 32 bytes | The digest of that revision. Zero only with revision 0 |
 | 20 | exec_cmd flags | u8 | Bit 0: command cut at 8,192 bytes (refused only). Other bits 0. 0 unless operation exec_cmd |
@@ -366,6 +419,7 @@ facts and the frame's installation ID.
 | Secret variable count k | The distinct placeholder numbers in the stored `command`; SL3 step 1 refuses model-written placeholders, so every placeholder in an admitted command is a variable | Kind 22 field 12 |
 | Secret variable kinds | Field 16 entries 1 to k | Kind 22 field 13 |
 | create_note memory operation, object, version and edge IDs | `CreateNoteIdentity::derive` from the binding, operation, generation and ordinal | Kind 17 |
+| create_note success text sent to the helper | The derived IDs: `operation=`, `object=`, `version=` lines. Kind 15 of a create stores empty text (TCR-D1). | Kind 15 text |
 | create_note project | The turn's conversation | Kind 17 |
 | Result status and text of a call that does not run | Fields 8–12 and 20–23, through fixed code tables | Kind 15 |
 
@@ -376,8 +430,8 @@ facts and the frame's installation ID.
 | 14 | New layout above. The old `ToolIntent` layout and its tool kinds 1–16 are gone. |
 | 17 `MemoryCreateIntent` | Retired. Its IDs are derived. Its body size, body digest and command digest are dropped; the memory store is their one source. Decoding returns `UnsupportedFormat`. |
 | 22 `ExecCmdIntent` | Retired. Kind 14 fields 20–23 hold its facts; the rest are derived. Decoding returns `UnsupportedFormat`. |
-| 23 `CaptureSettled` | Kept. It follows a kind 14 exec_cmd record with decision `run`. Its rule-set fields 9–10 repeat kind 14 fields 18–19; the J1 design must remove them and read the rule set from kind 14. |
-| 15 `ToolResult` | Layout kept. Written only after a call that runs. |
+| 23 `CaptureSettled` | Kept and changed. It follows a kind 14 exec_cmd record with decision `run`. Its rule-set fields 9–10 are removed (they repeated kind 14 fields 18–19); replay reads the rule set from kind 14. The maximum payload is 4,066 bytes ([kind 23](tool-job-controller.md#kind-23-capturesettled), TCR-D3). |
+| 15 `ToolResult` | Layout kept. Written only after a call that runs. A create_note result stores empty text (TCR-D1). |
 
 An old development journal does not open. The service reports
 `UnsupportedFormat` or `Corrupt` and changes nothing. The person removes the
@@ -421,10 +475,26 @@ must not decide a call again.
 | 8 | `cancelled` | Cancel or turn end before the decision was committed | No | 6 |
 
 For a call that does not run, the conversation owner renders the result text
-from the code tables, for example `invalid_arguments: missing_field`. The text
-never repeats model text, so it cannot repeat a secret. A refused exec_cmd
-renders today's refusal text from fields 21–23. The rendered text is not
-stored; replay and the composer render it again from the same fields.
+from the code tables. The text never repeats model text, so it cannot repeat a
+secret. The rendered text is not stored; replay and the views render it again
+from the same fields (TCR-D12).
+
+| Decision | Rendered status | Rendered text |
+| --- | --- | --- |
+| `invalid_arguments` | 3 | `invalid_arguments: <fault>`, for example `invalid_arguments: missing_field` |
+| `unknown_tool` | 3 | `unknown_tool: unregistered_name` |
+| `refused`, exec_cmd secret refusal | 3 | Today's refusal text from fields 21–23 |
+| `refused`, rule set unavailable | 3 | `refused: secret_detection_unavailable` |
+| `busy` | 4 | `exec_cmd_busy: <reason>` from field 10 |
+| `denied` | 2 | `denied` |
+| `limit` | 7 | `limit` |
+| `cancelled` | 6 | `cancelled` |
+
+A grant failure (no foreground person for `create_note`, missing read or
+execute authority, or an unavailable memory binding) is decided before the
+record as `denied` (TCR-D10). When the turn's result bytes are used up, a new
+call is `limit` and the turn continues; a `create_note` call that would run
+needs at least 256 bytes of result capacity, else `limit` (TCR-D9).
 
 ### Faults
 
@@ -446,7 +516,20 @@ stored; replay and the composer render it again from the same fields.
 | 14 | `invalid_text` (NUL or other forbidden byte) |
 | 15 | `unregistered_name` (with `unknown_tool` only) |
 
-The parser reports the first fault it finds, in the order of this table.
+The parser reports the lowest fault code that applies (TCR-D11):
+
+- Faults 1–4 come from the strict JSON parse of present argument text.
+- Faults 5–11 need a registered name.
+- Fault 12 applies when the argument text is absent (over the limit).
+- Fault 13 applies when the name is absent (over the limit).
+- Fault 14 applies to a NUL or control byte in the name or in the exec_cmd
+  `command` value. A path with such a byte is fault 10.
+- Fault 15 applies when the name is retained, holds valid text and is not
+  registered.
+
+Fault 15 gives decision `unknown_tool`; faults 1–14 give `invalid_arguments`.
+The operation code is 0 when the name is not registered or not retained, the
+text is unparsed, or `command` is missing or unknown.
 
 ### Data model
 
@@ -534,6 +617,11 @@ Rules shown by the diagram:
 - A cancel after `Committed` follows the existing cancellation path of the
   tool. A cancel before it produces decision `cancelled`, so the call still has
   a record.
+- A call that reaches the service after cancel or turn end is set also gets
+  decision `cancelled`. When the cancel must be recorded, kind 7 commits first,
+  then kind 14 `cancelled`, then the terminal. Once cancel or turn end is set,
+  the service sends no `ToolResult`; status 6 is the rendered text for replay
+  and views (TCR-D8).
 
 ## Call flow
 
@@ -584,15 +672,20 @@ Replay accepts kind 14 under these rules. A broken rule is `Corrupt`.
 | --- |
 | The operation is active, with the record's generation and the current owner generation. |
 | The ordinal is the next ordinal. Every earlier `run` call of the operation has its kind 15. |
-| Ordinal 9 has decision `limit`. |
+| Ordinal 9 has decision `limit`, or `cancelled` after cancel or turn end (TCR-D30). |
 | A record after the operation's `CancelRequested` has decision `cancelled`. No record follows the terminal. |
 | The derived tool, operation code, decision, fault, form and exec_cmd fields agree with the tables above. A `run` decision needs a registered tool and a nonzero operation code. |
-| Field 15 equals the highest placeholder number in fields 5 and 14. For an admitted exec_cmd call, the derived variable count is at most 16. |
+| Field 15 equals the highest placeholder number in fields 5 and 14, and every number from 1 to field 15 appears. Field 17 equals the number of unnumbered placeholder tokens in fields 5 and 14 (TCR-D4). For an admitted exec_cmd call, the derived variable count is at most 16. |
+| A `run` exec_cmd record names a nonzero rule set (fields 18–19); kind 23 has no rule-set fields of its own (TCR-D3). |
+| A create_note kind 15 holds empty text (TCR-D1). |
 | A `run` exec_cmd record needs kind 23 before kind 15. Another `run` record needs kind 15 only. A record that does not run is followed by no kind 15 or kind 23. |
 
 The writer's `reserve()` accepts kind 14 only when the journal can still hold
-the record, kind 23 when the call could be a `run` exec_cmd, kind 15 and the
-terminal. This extends the J1 rule to every call.
+the record and the frames that must follow it (TCR-D16). After a `run` record
+it holds kind 15, kind 23 for exec_cmd, and the terminal. A call that does not
+run holds nothing beyond the terminal, because no kind 15 follows it. TCR-I08
+uses a `run` call. An append over capacity returns the writer's existing error
+and changes nothing. This extends the J1 rule to every call.
 
 Crash and restart:
 
@@ -606,17 +699,26 @@ Crash and restart:
 | After kind 15 | Complete call | None |
 
 A helper that resends a `ToolCall` with an ordinal already seen is compared by
-a keyed digest over the received name and arguments. The key is random per
-turn and the digest stays in memory; it is never recorded. An equal call gets
-the same result again. A different call is an identity conflict and a protocol
-fault; it is a helper fault, not a model proposal, so it gets no record.
+a keyed digest over the received name, arguments, sizes and source. The key is
+random per turn and the digest stays in memory; it is never recorded. An equal
+call gets the same result again. A different call is an identity conflict and a
+protocol fault; it is a helper fault, not a model proposal, so it gets no
+record.
+
+These are also helper faults with no record and `model_protocol_fault`
+(TCR-D7): a `ToolCall` before StartAuthorized commits or with tools disabled;
+an ordinal that is not the next one (a gap, or above 9); and a second call
+while one is pending.
 
 ## Context composer and views
 
 The record is evidence. It is never an instruction or a permission.
 
-**Context composer.** The composer reads the redacted name, the operation
-code, the decision and the stored text. For a `run` call it pairs them with
+**Context composer.** Not delivered in this slice (TCR-D15, proof limit):
+today earlier tool calls never enter later input, and this change keeps that.
+The [context composer](context-composer.md) candidate records state these
+rules for the stage that places tool records. The composer reads the redacted
+name, the operation code, the decision and the stored text. For a `run` call it pairs them with
 kind 15. For another call it renders the result text from the codes. It may
 place an earlier call in model input as a tool-call entry only when the form
 is 1 or 2: that text parses as JSON and can become `GeneratedContent`. For
@@ -628,17 +730,26 @@ Argument text is model-produced and is placed inside the untrusted-data label
 [context composer](context-composer.md); today, earlier tool calls do not
 enter later input.
 
-**TUI activity.** `ToolProgress.name` carries the redacted name as the model
-sent it. `ToolProgress.arguments` carries a display prefix of at most 192
-bytes of the stored text, as today. `ToolProgress.policy_decision` carries the
-decision code. The TUI shows a rejected call with its decision and fault, for
-example `project  invalid_arguments: missing_field`. A text that was not
-retained shows its size and reason, never a guess at the content. These are
-projections; the record stays the one source.
+**TUI activity** (TCR-D13). The control event carries at most 9
+`ToolProgress` entries. `ToolProgress.name` carries a display prefix of at most
+64 bytes of the stored redacted name (TCR-D26), empty when the name was not
+retained.
+`ToolProgress.arguments` carries a display prefix of at most 192 bytes of the
+stored text, as today, or the service-written `[not retained: <reason>, <n>
+bytes]` for form 4. `ToolProgress.policy_decision` carries the decision code
+1–8. New field 12 `ToolProgress.fault` carries the fault code 1–15. For a call
+that does not run, `state` is 3 (failed), `status` is the rendered status and
+`preview` is the rendered result text. The TUI shows a rejected call with its
+decision and fault, for example `project  invalid_arguments: missing_field`. A
+text that was not retained shows its size and reason, never a guess at the
+content. These are projections; the record stays the one source.
 
 **Audit inspection.** `service_read_audit` and `/audit` keep their own records.
 They may cite a call by operation, generation and ordinal. They do not copy
-argument text.
+argument text. The service emits a `ToolFinished` audit event for every call
+with a nonzero operation code, whether it ran or not, with the rendered status
+as its outcome. A call with operation code 0 emits no tool audit event, because
+the audit tool table has no entry for it (TCR-D14).
 
 ## Asynchronous execution
 
@@ -688,6 +799,9 @@ Mapping to [AE-01–AE-07](../engineering.md#asynchronous-execution-and-recovery
 | Journal I/O error on kind 14 | No dispatch; the existing service-unavailable path |
 | Cancel before commit | Record with `cancelled`; status-6 result; then the terminal |
 | Helper resends a different call at a used ordinal | Protocol fault; no new record |
+| Ordinal gap, call while another is pending, or call before StartAuthorized | Protocol fault; no record (TCR-D7) |
+| Turn result bytes used up | Record with `limit`; status-7 result; the turn continues (TCR-D9) |
+| Grant lacks the permission | Record with `denied`; status-2 result (TCR-D10) |
 
 ## Validation
 
@@ -750,6 +864,47 @@ real service, helper and TUI, with a scripted loopback provider unless named.
 | TCR-P1 | Parse and redact 64,000 bytes of worst-case JSON on the reactor: 99th percentile at most 5 ms. A miss is a defect to fix, not a runtime limit. |
 | TCR-P2 | Journal bytes per call for the scripted E01–E02 workloads, reported against the 8 MiB journal file. |
 
+## Verified evidence (2026-10-18)
+
+Verified behavior on the macOS 27 development host (Xcode 27.1 SDK, Ollama
+0.40.5 with `granite4.1:8b`). Test names are the evidence; this section does
+not restate their assertions.
+
+| ID | Evidence |
+| --- | --- |
+| TCR-U01–U03 | `asura-storage` codec `tcr_u01_*`, `tcr_u02_*`, `tcr_u03_largest_kind_14_fits_one_frame` (64,866-byte payload, 65,050-byte frame) |
+| TCR-U04, U05 | `asura-service` `tools::parse::tests::tcr_u04_*`, `tcr_u05_*` |
+| TCR-U06–U09 | `asura-platform` `secrets::arguments::tests::tcr_u06_*`…`tcr_u09_*`, plus TCR-D4, D19–D22 cases |
+| TCR-U10, U16 | `asura-service` `conversation::tool_tests::tcr_u10_*`, `tcr_u16_*` |
+| TCR-U11–U13 | `asura-storage` `authority_conversation` `tcr_u11_*`, `tcr_u12_*`, `tcr_u13_*`; service `tcr_u13_*` and `exec_cmd_call` `tcr_u13_*` |
+| TCR-U14 | `asura-control` `model::tests::tcr_u14_tool_call_bounds_and_sizes` |
+| TCR-U15 | Swift `groupedToolsForwardNameAndExactJSONString`, `ninthProposalIsSentThenTheTurnFailsWithOutputLimit`, `oversizedNameAndArgumentsSendSizesOnly` |
+| TCR-U17 | `asura-storage` `authority_conversation` `tcr_u17_no_fact_is_stored_twice` |
+| TCR-I01–I07, I09 | `asura-service` test binary `tool_call_flow` (real service, real helper, scripted loopback provider); owner-level `tool_tests` `tcr_i01_*`, `tcr_i07_*` |
+| TCR-I08 | `asura-storage` `journal_writer` `tcr_i08_run_kind_14_is_refused_when_its_result_cannot_fit` |
+| TCR-I09 helper part | Swift `ollamaUnregisteredNameIsSentForItsRecordThenFailsTheTurn` |
+| TCR-I10 | `tool_tests` `tcr_i10_resend_is_compared_by_keyed_digest` (conversation owner with deterministic writer acknowledgements; the real helper never resends) |
+| TCR-E01–E03 | `tui_pty.py --tool-call-records` through `asura-cli` `lifecycle`; service parts in `tool_call_flow` |
+| TCR-E04 | `conversation_flow --native-exec-cmd-tools` (system model): pass, one run. `--native-ollama-exec-cmd-tools` (`granite4.1:8b`): 2 of 5 runs pass; 2 runs stopped at the interrupted-call sub-case because the model did not run the command within the 60-second harness wait, 1 run because the model altered the requested command text. The exec_cmd proof part passed in all 5 runs. The two wait failures predate the added diagnostic, so their recorded calls were not captured; this remains a proof limit |
+| TCR-P1 | `cargo run --release -p asura-platform --example tcr_p1`: p50 4.30 ms, p99 4.77–4.80 ms over two runs (limit 5 ms; margin about 4 percent) |
+| TCR-P2 | `tool_call_flow`: E01 kind 14 frames 313 and 334 bytes (0.0077 percent of 8 MiB); E02 kind 14 358 bytes, kind 15 370 bytes |
+| TCR-Q1 | [Measured result](#tcr-q1-measured-result-2026-10-18) |
+
+Proof limits:
+
+- Context composer placement of earlier calls is not delivered (TCR-D15).
+- TCR-I06 and TCR-I07 reach "cancel before commit" by holding a concurrent
+  writer mutation; with an idle writer the append is submitted at once.
+- The status-observation kind 15 text includes the operation ID in hex; kind
+  15 layout is unchanged in this slice (CCR4 owns it).
+- Malformed calls are not forced from live models; TCR-Q1 measures the SDK
+  path with a scripted executor. TCR-D27 and TCR-D28 record what "received
+  text" means on each path.
+- The `[withheld]` path for a string is tested by injecting the flag; a real
+  withheld scan needs a key block over 64 KiB, which 64,000 bytes cannot hold.
+- The `ToolCall` before StartAuthorized helper fault (TCR-D7) has no unit test;
+  the check is a single guard in the conversation owner's event loop.
+
 ## Alternatives considered
 
 | Alternative | Reason rejected |
@@ -764,8 +919,10 @@ real service, helper and TUI, with a scripted loopback provider unless named.
 
 ## Designs to update with the implementation
 
-The design gate requires these documents to agree before code changes. This
-document does not edit them.
+The design gate requires these documents to agree before code changes. Done
+2026-10-18: each document below, plus
+[response activity](response-activity.md), the glossary and the designs index,
+now agrees with this design and its refinements.
 
 - [Model tool execution](model-tool-execution.md): rejected semantic tool
   proposals and MT01; malformed calls are now records, not protocol faults;
@@ -783,6 +940,45 @@ document does not edit them.
 - [Exec_cmd tool](exec-cmd-tool.md): durable intent.
 - [Conversation admission](conversation-admission.md): the kind table.
 - [Context composer](context-composer.md): candidate records.
+
+## Implementation refinements (2026-10-18)
+
+Required behavior. These refinements close gaps found when the design was read
+against the code on 2026-10-18. Each keeps the owner rules and owner decisions.
+The sections above apply them.
+
+| ID | Refinement | Reason |
+| --- | --- | --- |
+| TCR-D1 | Kind 15 of a `run` create_note call stores empty text. The service renders the text sent to the helper from the derived `CreateNoteIdentity`: `operation=<hex>`, `object=<hex>` and `version=<hex>` lines. The `sha256=` line is removed. Replay requires empty text for every create_note result. Live result-byte accounting counts the rendered text sent. | TCR-I03 allows no body digest in the journal; derived IDs are not stored (TCR-O5, TCR-U17). |
+| TCR-D2 | The memory store resolves a create by the derived memory operation ID alone. It checks that the receipt version equals the derived version and any receipt edge equals the derived edge. It checks the note's object and operation IDs. It recomputes the command digest from the stored note body and stored edge and compares it with the receipt's own digest. Live creation builds `PutNote` from the derived identity and the typed body and source of the service's parse. `MemoryCreate` carries the body and optional source version; `MemoryResolveCreate` carries only turn, generation and ordinal. | Kind 17, its body digest and its command digest are retired; the memory store is their one source. |
+| TCR-D3 | Kind 23 loses rule-set fields 9–10; the later fields move up by two. Its maximum payload is 4,066 bytes and its maximum frame 4,250 bytes. Replay takes the rule set from kind 14 fields 18–19. A `run` exec_cmd kind 14 must name a nonzero rule set. | The fields repeated kind 14 (TCR-O5). |
+| TCR-D4 | A model-written placeholder token (`$ASURA_SECRET_<digits>` or `${ASURA_SECRET_<digits>}`) in the name, a key, a string value or unparsed text becomes the unnumbered form and is counted in field 17. Replay checks: field 15 is the highest number in fields 5 and 14; every number from 1 to field 15 appears; field 17 equals the number of unnumbered tokens. SL3 still refuses a model-written placeholder in an exec_cmd command (`placeholder_not_available`); the refused command is stored display-redacted with this replacement. | Without it, replay could not tell an inserted placeholder from model text, and the number check would fail. |
+| TCR-D5 | One strict RFC 8259 JSON parser (member order, number lexemes, duplicate keys, depth 32, 4,096 keys and values) lives in platform secrets as `secrets::json`. The redactor uses it for the canonical form; the service's typed argument reader in `tools.rs` reads the parsed value. No crate dependency is added. | The redactor and the argument reader both need a JSON reading; one parser prevents disagreement. |
+| TCR-D6 | Wire `ToolCall` ordinal is 1–9. Wire `ToolResult` ordinal is 1–9, and 9 only with status 7. Kind 15 ordinal stays 1–8. The Swift helper sends the ninth proposal and fails the turn with `outputLimit` after its result. | Ordinal 9 exists only for the over-limit record. |
+| TCR-D7 | These are helper faults with no record and `model_protocol_fault`: a `ToolCall` before StartAuthorized commits or with tools disabled; an ordinal that is not the next one (a gap, a repeat while pending, or above 9); a second call while one is pending; a resend at a used ordinal whose keyed digest over the received name, arguments, sizes and source differs. An equal resend gets the same result again. | They are helper protocol faults, not model proposals. |
+| TCR-D8 | A call that reaches the service after cancel or turn end is set, or whose kind 14 is not yet appended when cancel or turn end occurs, gets kind 14 `cancelled`. When the cancel must be recorded, kind 7 commits first, then kind 14 `cancelled`, then the terminal. Once cancel or turn end is set, the service sends no `ToolResult` (the existing rule); status 6 is the rendered text for replay and views. | TCR-R1 requires a record for a cancelled call; the helper is already stopping. |
+| TCR-D9 | Every recorded call consumes one ordinal (1–8). A call that does not run consumes zero result bytes. Ordinal 9 is recorded only as `limit`. When the turn's result bytes are used up, a new call gets `limit` (status 7) and the turn continues. A `run` create_note call needs at least 256 bytes of result capacity, else `limit`. | Defines the budget for calls that do not run. |
+| TCR-D10 | Grant failures (no foreground person for `create_note`, missing read or execute authority) are decided before the record as `denied`, status 2. A failure to prepare the memory create (binding unavailable) is also `denied`. | The decision must exist before the record commits. |
+| TCR-D11 | Faults 1–4 come from the JSON parse of present text; faults 5–11 need a registered name; fault 12 applies when the text is absent; fault 13 when the name is absent; fault 14 for a NUL or control byte in the name or in the exec_cmd `command`; fault 15 when the name is retained, holds valid text and is not registered. The lowest code that applies wins (TCR-U04). Fault 15 gives `unknown_tool`; faults 1–14 give `invalid_arguments`. Operation code 0 when the name is not registered or retained, the text is unparsed, or `command` is missing or unknown. | Makes "first fault in table order" exact. |
+| TCR-D12 | The rendered text of a call that does not run never holds model text: `invalid_arguments: <fault>`; `unknown_tool: unregistered_name`; a refused exec_cmd gives today's refusal text from fields 21–23; `refused: secret_detection_unavailable`; `exec_cmd_busy: <reason>`; `denied`; `limit`; `cancelled`. Status: 3 for `invalid_arguments`, `unknown_tool` and `refused`; 4 `busy`; 2 `denied`; 7 `limit`; 6 `cancelled`. | Fixes the code-to-text table so replay and views render the same text. |
+| TCR-D13 | Control `ToolProgress`: up to 9 entries; `name` is the stored redacted name (a display prefix of at most 64 bytes, TCR-D26; empty when not retained); `policy_decision` is the decision code 1–8; new field 12 `fault` (1–15); `arguments` is a display prefix of at most 192 bytes of the stored text, or `[not retained: <reason>, <n> bytes]` for form 4; `preview` of a call that does not run is the rendered result text; its `state` is 3 with the rendered status. The TUI shows `<name>  <decision>: <fault>` for a rejected call. | The earlier name, decision and count rules could not hold model-sent names, nine calls or the new decisions. |
+| TCR-D14 | `ToolFinished` audit events are emitted for every call with a nonzero operation code, run or not, with the rendered status. A call with operation code 0 emits none. No audit event holds argument text. | The audit tool table has no entry for an unknown operation. |
+| TCR-D15 | This delivery does not place earlier tool calls in model input; today they never enter later input. The context composer's candidate records state the placement rules for the stage that places tool records. | Proof limit: composer placement belongs to the composer stages. |
+| TCR-D16 | `reserve()` after a `run` kind 14 holds kind 15, kind 23 for exec_cmd, and the terminal. A call that does not run holds nothing more. TCR-I08 uses a `run` call. An append over capacity returns the writer's existing error and changes nothing. | A call that does not run has no kind 15 to reserve. |
+| TCR-D17 | The Ollama adapter removes its 16,384-byte argument guard (the service applies the 64,000-byte limit) and allows 9 calls per stream. It sends an unregistered name as a `ToolCall` with source `provider_json`; after its result, the turn fails with `protocolFault`. | The service is the only argument parser and owns the limit. |
+| TCR-D18 | A result that is not a success returns `Tool failed: <status>`, a newline and the service text to the SDK. `BoundedNativeTool`'s fixed memory-guidance path and the memory argument diagnostic codes are removed. | The model must see the rejection text; Swift does no parsing. |
+| TCR-D19 | The redactor also scans the whole raw text, because some rules need the text around a value (for example a key and its value). Every value found by any scan (each key and string alone, the whole raw text, the name, the exec_cmd variables) joins one per-call value set. Every occurrence of every value in every key and string is replaced, by literal match as the job scanner does for command secrets. C and V are then built from that set. A value that crosses JSON syntax cannot appear in C and makes V differ, so C is stored. | Scanning each string alone misses context-dependent rules such as assigned secrets. |
+| TCR-D20 | A placeholder token is `ASURA_SECRET_` followed by one or more ASCII digits, directly after `$` or `${`. An inserted number has no leading zero. Replay counts the tokens in fields 5 and 14 exactly; a token with a leading zero is `Corrupt`. | Makes the TCR-D4 replay check exact. |
+| TCR-D21 | When the scanner withholds bytes inside a string (a key block over its limit, or a detector fault), the redactor stores that whole string as `[withheld]`. A withheld name becomes `[withheld]`. Unparsed text with withheld bytes is not retained, reason `detection_unavailable`, while the rule-set revision stays nonzero. | Withheld bytes have no span to replace; the value must not be kept. |
+| TCR-D22 | Numbers are assigned in first-appearance order over the name, then the stored text. Numbering happens after the choice between C and V and after the 8,192-byte cut of a refused command. The cut never splits a placeholder; it moves back to the start of the token. A rewritten exec_cmd command keeps numbers 1 to k, because they are the variable names the command runs with. | Field 15 and the replay check need contiguous numbers. |
+| TCR-D23 | Storage owns the derivations that the live path and replay both use: `exec_cmd_job_id`, `payload_id` with object kinds 1 and 2, and `CreateNoteIdentity::derive`. The service calls them and never stores their results. | One owner for each recomputed value (TCR-O5, TCR-U13). |
+| TCR-D24 | Storage defines the four registered names (`project`, `memory`, `service`, `exec_cmd`). The service registry uses these constants. | Replay needs the registry lookup without a dependency on the service. |
+| TCR-D25 | Kind 15 replay no longer compares a `read_file` or `get_note` result with the call's limit and offset. Those typed values are not record fields, and replay never parses the redacted text again. A success result of these two operations may carry `next_offset`; other operations may not. | Replay must not decide a call again (operation codes). |
+| TCR-D26 | `ToolProgress.name` is a display prefix of at most 64 bytes of the stored redacted name, cut on a UTF-8 boundary. | Nine entries with 512-byte names would not fit the 65,536-byte control frame beside the 61,440-byte response text. The journal keeps the full name. |
+| TCR-D27 | On the SDK path the received argument text is `GeneratedContent.jsonString`: the SDK's own serialization, with its separators and a member order that can differ between instances. Form 1 stores that text, not the model's tokens. The SDK repairs truncated text and drops duplicate keys before `Tool.call` (TCR-Q1). | Proof limit: the model's raw tokens never reach the helper. |
+| TCR-D28 | On the Ollama path the provider has already parsed the model output into a JSON value. The adapter forwards that value re-encoded by `JSONEncoder` (source `provider_json`): key order, duplicate keys and number lexemes of the provider's text are not preserved. | Proof limit: the provider API delivers a parsed object, not text. |
+| TCR-D29 | The helper sends `ToolCall` on its ordered data queue, not the 4,096-byte control queue, because a call may hold 64,000 bytes. The data queue is bounded (8 frames, 65,536 + 1,024 bytes); a full queue fails the turn with `limit`, a known-size bound. | The earlier control-queue send failed every call over 4 KiB with `helper_limit`. |
+| TCR-D30 | A ninth proposal that arrives after cancel or turn end is recorded as `cancelled`, like any other call at that point; otherwise ordinal 9 is `limit`. Replay accepts ordinal 9 with `limit` or `cancelled`. | "Ordinal 9 has `limit`" and "after `CancelRequested` only `cancelled`" both apply to that call; recording it keeps TCR-R1. |
 
 ## Owner decisions (2026-10-17)
 

@@ -3,6 +3,30 @@ use super::*;
 use asura_storage::{authority::conversation as journal, memory};
 use std::{io::Read, sync::atomic::AtomicBool};
 
+/// One native create as the durable evidence states it: the derived call
+/// identity (recomputed by replay, never stored), the put command the store
+/// must hold and the body's digest (kept by the store only, TCR-D2).
+#[derive(Clone)]
+struct Created {
+    call: journal::CreateNoteCall,
+    command: memory::PutNote,
+    source: Option<[u8; 16]>,
+    body_sha256: [u8; 32],
+}
+impl Created {
+    fn operation(&self) -> [u8; 16] {
+        self.call.operation
+    }
+    fn version(&self) -> [u8; 16] {
+        self.call.identity.version
+    }
+    fn object(&self) -> [u8; 16] {
+        self.call.identity.object
+    }
+}
+fn arguments(call: &journal::ToolCall) -> serde_json::Value {
+    serde_json::from_str(&call.arguments).unwrap_or_default()
+}
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -66,7 +90,7 @@ fn diagnose(fixture: &Fixture, operation: [u8; 16], event: &pb::ConversationEven
     for tool in event.tools.iter().take(8) {
         // Names come from the closed service registry. Never emit model text or arguments.
         let name = match tool.name.as_deref() {
-            Some("memory_create_note") => "memory_create_note",
+            Some("memory") => "memory_create_note",
             Some("memory_get_note") => "memory_get_note",
             Some("memory_note_sources") => "memory_note_sources",
             _ => "other",
@@ -81,16 +105,15 @@ fn diagnose(fixture: &Fixture, operation: [u8; 16], event: &pb::ConversationEven
             if let Some(record) = state.operations.get(&operation) {
                 for (index, tool) in record.tools.iter().take(8).enumerate() {
                     eprintln!(
-                        "HM3 durable ordinal={} kind={} status={:?} result_present={} result_bytes={} create_body_bytes={:?} create_has_source={}",
+                        "HM3 durable ordinal={} operation={:?} decision={:?} fault={:?} status={:?} result_present={} result_bytes={} create_derived={}",
                         index + 1,
-                        tool.kind,
+                        tool.tool_operation,
+                        tool.decision,
+                        tool.fault,
                         tool.result_status,
                         tool.result_frame.is_some(),
                         tool.result_bytes,
-                        tool.create.as_ref().map(|value| value.body_bytes),
-                        tool.create
-                            .as_ref()
-                            .is_some_and(|value| value.source.is_some())
+                        tool.create.is_some()
                     );
                 }
             } else {
@@ -105,27 +128,23 @@ fn diagnose_read_arguments(
     expected: [u8; 16],
 ) {
     for (index, (record, _)) in evidence.iter().take(8).enumerate() {
-        let journal::Record::ToolIntent(intent) = record else {
+        let journal::Record::ToolCall(intent) = record else {
             continue;
         };
-        // Rejected proposals retain canonical argument metadata. Emit predicates only.
-        let version = intent.path.as_bytes();
+        // Emit predicates over the stored arguments only, never their text.
+        let arguments = arguments(intent);
+        let version = arguments["version"].as_str().unwrap_or("").as_bytes();
         eprintln!(
-            "HM3 read arguments ordinal={} kind={} version_length={} version_lowerhex={} version_nonzero={} expected_version_match={} limit_in_range={} offset_plus_limit_valid={} offset_zero={}",
+            "HM3 read arguments ordinal={} operation={:?} version_length={} version_lowerhex={} expected_version_match={} limit={:?} offset={:?}",
             index + 1,
-            intent.kind,
+            intent.tool_operation,
             version.len(),
             version
                 .iter()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)),
-            version.iter().any(|byte| *byte != b'0'),
-            intent.path == hex(&expected),
-            (1..=16384).contains(&intent.limit),
-            intent
-                .offset
-                .checked_add(u64::from(intent.limit))
-                .is_some_and(|end| end <= i64::MAX as u64),
-            intent.offset == 0,
+            version == hex(&expected).as_bytes(),
+            arguments["limit"].as_u64(),
+            arguments["offset"].as_u64(),
         );
     }
 }
@@ -153,7 +172,7 @@ fn create(
     project: [u8; 16],
     body: &str,
     source: Option<[u8; 16]>,
-) -> Result<(journal::MemoryCreateIntent, pb::ConversationEvent)> {
+) -> Result<(Created, pb::ConversationEvent)> {
     let source_arg = source
         .map(|id| format!(", source_version {}", hex(&id)))
         .unwrap_or_default();
@@ -184,21 +203,17 @@ fn create(
         );
         return Err("HM3 expected exactly one tool call".into());
     }
-    let (journal::Record::MemoryCreateIntent(intent), result) = &records[0] else {
-        diagnose(
-            fixture,
-            operation,
-            &event,
-            if source.is_some() {
-                "create-derived"
-            } else {
-                "create-source"
-            },
-        );
-        return Err("HM3 native create intent missing".into());
+    let step = if source.is_some() {
+        "create-derived"
+    } else {
+        "create-source"
+    };
+    let (journal::Record::ToolCall(intent), result) = &records[0] else {
+        diagnose(fixture, operation, &event, step);
+        return Err("HM3 native create record missing".into());
     };
     let (_, state) = replay(fixture)?;
-    let (expected, _) = memory::prepare_create(
+    let (expected, command) = memory::prepare_create(
         binding(&state)?,
         memory::Id::new(project)?,
         operation,
@@ -207,35 +222,25 @@ fn create(
         body.into(),
         source.map(memory::Id::new).transpose()?,
     )?;
-    let text = format!(
-        "operation={}\nobject={}\nversion={}\nsha256={}\n",
-        hex(&expected.memory_operation),
-        hex(&expected.object),
-        hex(&expected.version),
-        hex(&expected.body_sha256)
-    );
-    if intent != &expected
+    let derived = state.operations[&operation].tools[0].create;
+    let stored = arguments(intent);
+    // Kind 14 is the only copy of the body; kind 15 stores no text (TCR-D1).
+    if intent.tool_operation != Some(journal::ToolOperation::CreateNote)
+        || intent.decision != journal::ToolDecision::Run
+        || stored["body"].as_str() != Some(body)
+        || derived != Some(expected)
         || result.status != 1
-        || result.text != text
+        || !result.text.is_empty()
         || result.next_offset.is_some()
         || result.truncated
     {
-        diagnose(
-            fixture,
-            operation,
-            &event,
-            if source.is_some() {
-                "create-derived"
-            } else {
-                "create-source"
-            },
-        );
+        diagnose(fixture, operation, &event, step);
         return Err("HM3 exact durable creation evidence mismatch".into());
     }
     if !event
         .tools
         .iter()
-        .any(|t| t.name.as_deref() == Some("memory_create_note") && t.status == Some(1))
+        .any(|t| t.name.as_deref() == Some("memory") && t.status == Some(1))
     {
         diagnose(
             fixture,
@@ -249,7 +254,16 @@ fn create(
         );
         return Err("HM3 missing successful native tool progress".into());
     }
-    Ok((intent.clone(), event))
+    use sha2::{Digest, Sha256};
+    Ok((
+        Created {
+            call: expected,
+            command,
+            source,
+            body_sha256: Sha256::digest(body.as_bytes()).into(),
+        },
+        event,
+    ))
 }
 fn read(
     fixture: &Fixture,
@@ -285,16 +299,17 @@ fn read(
         )
         .into());
     }
-    let (journal::Record::ToolIntent(intent), result) = &evidence[0] else {
+    let (journal::Record::ToolCall(intent), result) = &evidence[0] else {
         diagnose(fixture, pair.0, &pair.1, step);
         diagnose_read_arguments(&evidence, version);
         return Err("HM3 read intent absent".into());
     };
     let (status, text) = body.map_or((4, "memory_note_not_found"), |body| (1, body));
-    if intent.kind != 7
-        || intent.path != hex(&version)
-        || intent.offset != 0
-        || intent.limit != 4096
+    let stored = arguments(intent);
+    if intent.tool_operation != Some(journal::ToolOperation::GetNote)
+        || stored["version"].as_str() != Some(hex(&version).as_str())
+        || stored["offset"].as_u64().unwrap_or(0) != 0
+        || stored["limit"].as_u64().unwrap_or(4096) != 4096
         || result.status != status
         || result.text != text
         || result.next_offset != body.map(|value| value.len() as u64)
@@ -322,7 +337,7 @@ fn verify_database(
     fixture: &Fixture,
     project: [u8; 16],
     foreign: [u8; 16],
-    notes: &[(journal::MemoryCreateIntent, String)],
+    notes: &[(Created, String)],
 ) -> Result<()> {
     if fixture.child.is_some() {
         return Err("HM3 database inspection requires stopped service".into());
@@ -332,28 +347,28 @@ fn verify_database(
     let (mut database, ready) = memory::Memory::open(fixture.home.clone(), binding.clone())?;
     let result = (|| {
         wait(ready)?;
-        for (intent, body) in notes {
-            let receipt = wait(database.resolve(
-                memory::Id::new(intent.memory_operation)?,
-                intent.command_sha256,
-            )?)?;
-            if receipt.operation_id.bytes() != intent.memory_operation
-                || receipt.version_id.bytes() != intent.version
-                || receipt.command_sha256 != intent.command_sha256
-                || receipt.edge_id.map(|id| id.bytes()) != intent.source.map(|(_, edge)| edge)
+        for (created, body) in notes {
+            let digest = created.command.command_digest()?;
+            let receipt =
+                wait(database.resolve(memory::Id::new(created.call.identity.operation)?, digest)?)?;
+            if receipt.operation_id.bytes() != created.call.identity.operation
+                || receipt.version_id.bytes() != created.version()
+                || receipt.command_sha256 != digest
+                || receipt.edge_id.map(|id| id.bytes())
+                    != created.source.map(|_| created.call.identity.edge)
             {
                 return Err("HM3 exact receipt mismatch".into());
             }
             let note = wait(database.get_note(
                 binding.clone(),
                 memory::Id::new(project)?,
-                memory::Id::new(intent.version)?,
+                memory::Id::new(created.version())?,
             )?)?;
             if note.body != *body
-                || note.version_id.bytes() != intent.version
-                || note.object_id.bytes() != intent.object
-                || note.operation_id.bytes() != intent.memory_operation
-                || note.body_sha256 != intent.body_sha256
+                || note.version_id.bytes() != created.version()
+                || note.object_id.bytes() != created.object()
+                || note.operation_id.bytes() != created.call.identity.operation
+                || note.body_sha256 != created.body_sha256
                 || note.binding != binding
                 || note.context_id.bytes() != project
             {
@@ -362,13 +377,13 @@ fn verify_database(
             let sources = wait(database.get_sources(
                 binding.clone(),
                 memory::Id::new(project)?,
-                memory::Id::new(intent.version)?,
+                memory::Id::new(created.version())?,
             )?)?;
             if sources
                 .iter()
                 .map(|n| n.version_id.bytes())
                 .collect::<Vec<_>>()
-                != intent.source.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+                != created.source.iter().copied().collect::<Vec<_>>()
             {
                 return Err("HM3 exact source edge mismatch".into());
             }
@@ -438,19 +453,19 @@ pub(super) fn run(provider: &str) -> Result<()> {
         u128::from_ne_bytes(asura_platform::random_id())
     );
     let (source, source_event) = create(&fixture, projects[0], &body, None)?;
-    let (note, note_event) = create(&fixture, projects[0], &derived, Some(source.version))?;
+    let (note, note_event) = create(&fixture, projects[0], &derived, Some(source.version()))?;
     let mut saved = vec![
-        (source.operation, source_event),
-        (note.operation, note_event),
+        (source.operation(), source_event),
+        (note.operation(), note_event),
     ];
-    saved.push(read(&fixture, projects[0], source.version, Some(&body))?);
-    saved.push(read(&fixture, projects[0], note.version, Some(&derived))?);
+    saved.push(read(&fixture, projects[0], source.version(), Some(&body))?);
+    saved.push(read(&fixture, projects[0], note.version(), Some(&derived))?);
     let sources = run_turn(
         &fixture,
         projects[0],
         &format!(
             "Call memory exactly once with command note_sources and version {}. Report the exact source ID. Do not use other tools.",
-            hex(&note.version)
+            hex(&note.version())
         ),
         "read-sources",
     )?;
@@ -459,18 +474,18 @@ pub(super) fn run(provider: &str) -> Result<()> {
         diagnose(&fixture, sources.0, &sources.1, "read-sources");
         return Err(format!("HM3 expected one source read, actual={}", evidence.len()).into());
     }
-    let (journal::Record::ToolIntent(intent), result) = &evidence[0] else {
+    let (journal::Record::ToolCall(intent), result) = &evidence[0] else {
         diagnose(&fixture, sources.0, &sources.1, "read-sources");
         return Err("HM3 source read intent absent".into());
     };
     let expected = format!(
         "sources=1\nversion={} object={} sha256={}\n",
-        hex(&source.version),
-        hex(&source.object),
+        hex(&source.version()),
+        hex(&source.object()),
         hex(&source.body_sha256)
     );
-    if intent.kind != 8
-        || intent.path != hex(&note.version)
+    if intent.tool_operation != Some(journal::ToolOperation::NoteSources)
+        || arguments(intent)["version"].as_str() != Some(hex(&note.version()).as_str())
         || result.status != 1
         || result.text != expected
         || result.truncated
@@ -480,7 +495,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
         return Err("HM3 exact native source evidence mismatch".into());
     }
     saved.push(sources);
-    let foreign_read = read(&fixture, projects[1], source.version, None)?;
+    let foreign_read = read(&fixture, projects[1], source.version(), None)?;
     if foreign_read
         .1
         .text
@@ -499,7 +514,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
     );
     let denied_prompt = format!(
         "Call memory exactly once with command create_note and body exactly {foreign_body:?}, source_version {}. Preserve the body bytes exactly. Do not call any other tool. Report the tool result.",
-        hex(&source.version)
+        hex(&source.version())
     );
     let denied = run_turn(
         &fixture,
@@ -516,12 +531,13 @@ pub(super) fn run(provider: &str) -> Result<()> {
         )
         .into());
     }
-    let (journal::Record::MemoryCreateIntent(intent), result) = &evidence[0] else {
+    let (journal::Record::ToolCall(intent), result) = &evidence[0] else {
         diagnose(&fixture, denied.0, &denied.1, "create-foreign-source");
         return Err("HM3 denied source intent absent".into());
     };
-    if intent.project != projects[1]
-        || intent.source.map(|(id, _)| id) != Some(source.version)
+    let denied_call = replay(&fixture)?.1.operations[&denied.0].tools[0].create;
+    if denied_call.map(|call| call.project) != Some(projects[1])
+        || arguments(intent)["source_version"].as_str() != Some(hex(&source.version()).as_str())
         || result.status != 4
         || !result.text.is_empty()
         || result.truncated

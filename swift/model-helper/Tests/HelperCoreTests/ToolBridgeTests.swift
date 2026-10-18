@@ -4,7 +4,7 @@ import Testing
 @testable import HelperCore
 
 private struct ToolScript: ToolModelBackend {
-    let arguments: ToolArguments
+    let proposals: [ToolProposal]
     let source: ContextCapacitySource
     func status() async -> BackendStatus { BackendStatus(contextTokens: 4096,
         reportedContextTokens: 4096, contextSource: source, supportsTools: true,
@@ -16,32 +16,97 @@ private struct ToolScript: ToolModelBackend {
     func generateWithTools(_ input: ModelInput, maximumTokens: UInt32, handler: @escaping ToolHandler,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await snapshot(Snapshot(text: "", inputContext: (123, 4096)))
-        let result = try await handler(arguments)
-        try await snapshot(Snapshot(text: result.text, usageTokens: 1))
+        var text = ""
+        for proposal in proposals { text = try await handler(proposal).text }
+        try await snapshot(Snapshot(text: text, usageTokens: 1))
     }
 }
 
+/// TCR-U15 (transport part): every provider path forwards the name and the
+/// exact argument text with its source; the result text returns unchanged.
 @Test(arguments: [false, true], ["system", "coreai:fixture", "mlx:fixture", "ollama:fixture"])
 func toolCallbackWaitsForServiceResultOrCancellation(cancel: Bool, selector: String) async throws {
-    try await toolCallbackJourney(cancel: cancel, selector: selector, arguments: .readFile(path: "README.md", offset: 0, limit: 1024))
+    try await toolCallbackJourney(cancel: cancel, selector: selector,
+        proposal: ToolProposal(name: "project", arguments: #"{"command":"read_file","path":"README.md"}"#,
+            source: .generatedContent))
 }
 
 @Test(arguments: ["system", "coreai:fixture", "mlx:fixture", "ollama:fixture"])
-func memoryCallbacksUseSameServiceResultAndCancellationBridge(selector: String) async throws {
+func everyToolNameAndMalformedTextUseTheSameServiceBridge(selector: String) async throws {
     for cancel in [false, true] {
-        for arguments in [.memoryCreateNote(body: " exact\nbody ", sourceVersion: nil),
-            .memoryCreateNote(body: "", sourceVersion: "invalid"),
-            .memoryCreateNote(body: "note", sourceVersion: "0123456789abcdef0123456789abcdef"),
-            .memoryListNotes(after: nil, limit: 8),
-            .memoryListNotes(after: "", limit: 0),
-            .memoryGetNote(version: "0123456789abcdef0123456789abcdef", offset: 4, limit: 32),
-            .memoryNoteSources(version: "0123456789abcdef0123456789abcdef"), .listTools, .readAudit(limit: 16), .execCmd(command: "printf fixture", cwd: ".")] as [ToolArguments] {
-            try await toolCallbackJourney(cancel: cancel, selector: selector, arguments: arguments)
+        for proposal in [
+            ToolProposal(name: "memory", arguments: #"{"command":"create_note","body":" exact\nbody "}"#, source: .generatedContent),
+            ToolProposal(name: "memory", arguments: #"{"command":"get_note"}"#, source: .generatedContent),
+            ToolProposal(name: "service", arguments: #"{"command":"audit","limit":99}"#, source: .generatedContent),
+            ToolProposal(name: "exec_cmd", arguments: #"{"command":"printf fixture","cwd":"."}"#, source: .generatedContent),
+            ToolProposal(name: "project", arguments: "not json {", source: .providerJson),
+            ToolProposal(name: "unregistered_tool", arguments: "", source: .providerJson)
+        ] {
+            try await toolCallbackJourney(cancel: cancel, selector: selector, proposal: proposal)
         }
     }
 }
 
-private func toolCallbackJourney(cancel: Bool, selector: String, arguments: ToolArguments) async throws {
+/// TCR-U15: the ninth proposal is sent with ordinal 9 and, after its LIMIT
+/// result, the turn fails with outputLimit; no tenth proposal is sent.
+@Test func ninthProposalIsSentThenTheTurnFailsWithOutputLimit() async throws {
+    let proposals = (1...10).map { _ in
+        ToolProposal(name: "service", arguments: #"{"command":"status"}"#, source: .generatedContent)
+    }
+    let channel = try await openToolSession(selector: "system", proposals: proposals)
+    defer { channel.close() }
+    for ordinal in UInt32(1)...9 {
+        let call = try await channel.nextToolCall()
+        #expect(call.ordinal == ordinal && call.name == "service" && call.source == .generatedContent)
+        var result = Asura_Model_V1_ToolResult(); result.ordinal = ordinal
+        result.status = ordinal == 9 ? .limit : .success; result.text = ordinal == 9 ? "limit" : "ok"
+        result.truncated = false
+        try await channel.send(.toolResult(result))
+    }
+    let terminal = try await channel.terminal()
+    #expect(terminal.outcome == .failed && terminal.reason == .outputLimit)
+    #expect(channel.unexpectedToolCalls == 0)
+}
+
+/// The helper rejects a non-LIMIT result for ordinal 9 as a protocol fault.
+@Test func ninthResultMustBeLimit() throws {
+    var result = Asura_Model_V1_ToolResult(); result.ordinal = 9; result.status = .success
+    result.text = ""; result.truncated = false
+    var message = Envelope(); message.operationID = Data(repeating: 7, count: 16); message.generation = 1
+    message.body = .toolResult(result)
+    #expect(throws: HelperError.self) { try Wire.validate(message, from: .service) }
+    result.status = .limit; message.body = .toolResult(result)
+    try Wire.validate(message, from: .service)
+    result.ordinal = 10; message.body = .toolResult(result)
+    #expect(throws: HelperError.self) { try Wire.validate(message, from: .service) }
+}
+
+/// TCR-U15: a name over 256 bytes and argument text over 64,000 bytes are sent
+/// as sizes only (known-size exhaustion); the text never crosses the wire.
+@Test func oversizedNameAndArgumentsSendSizesOnly() async throws {
+    let longName = String(repeating: "n", count: 257)
+    let longArguments = #"{"command":"create_note","body":""# + String(repeating: "é", count: 32_000) + #""}"#
+    let channel = try await openToolSession(selector: "system", proposals: [
+        ToolProposal(name: longName, arguments: #"{}"#, source: .generatedContent),
+        ToolProposal(name: "memory", arguments: longArguments, source: .generatedContent),
+        ToolProposal(name: String(repeating: "m", count: 256),
+            arguments: String(repeating: "x", count: 64_000), source: .generatedContent)])
+    defer { channel.close() }
+    let first = try await channel.nextToolCall()
+    #expect(!first.hasName && first.nameBytes == 257 && first.arguments == "{}" && !first.hasArgumentsBytes)
+    try await channel.reply(1, .invalidArguments, "invalid_arguments: name_over_limit")
+    let second = try await channel.nextToolCall()
+    #expect(second.name == "memory" && !second.hasArguments
+        && second.argumentsBytes == UInt32(longArguments.utf8.count))
+    try await channel.reply(2, .invalidArguments, "invalid_arguments: arguments_over_limit")
+    let third = try await channel.nextToolCall()
+    #expect(third.name.utf8.count == 256 && third.arguments.utf8.count == 64_000)
+    try await channel.reply(3, .success, "ok")
+    let terminal = try await channel.terminal()
+    #expect(terminal.outcome == .complete)
+}
+
+private func toolCallbackJourney(cancel: Bool, selector: String, proposal: ToolProposal) async throws {
     var fds: [Int32] = [-1, -1]
     #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
     let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
@@ -54,7 +119,7 @@ private func toolCallbackJourney(cancel: Bool, selector: String, arguments: Tool
         else if selected.hasPrefix("mlx:") { source = .mlx }
         else if selected.hasPrefix("ollama:") { source = .ollama }
         else { source = .system }
-        return ToolScript(arguments: arguments, source: source)
+        return ToolScript(proposals: [proposal], source: source)
     }, buildID: identity, schemaDigest: identity)
     let running = Task { await session.run() }
     defer { running.cancel() }
@@ -90,29 +155,10 @@ private func toolCallbackJourney(cancel: Bool, selector: String, arguments: Tool
     #expect(measurement.contextMeasured.capacityTokens == 4096)
     let call = try Wire.decode(#require(try await replies.next()), from: .helper)
     #expect(call.toolCall.ordinal == 1)
-    switch arguments {
-    case .execCmd(let command, let cwd):
-        #expect(call.toolCall.execCmd.command == command)
-        #expect(call.toolCall.execCmd.hasCwd == (cwd != nil) && call.toolCall.execCmd.cwd == (cwd ?? ""))
-        #expect(call.toolCall.execCmd.unknownFields.data.isEmpty)
-    case .readAudit(let limit):
-        #expect(call.toolCall.readAudit.hasLimit && call.toolCall.readAudit.limit == limit)
-    case .listTools:
-        guard case .listTools = call.toolCall.arguments else { Issue.record("wrong inventory argument variant"); return }
-    case .readFile(let path, let offset, let limit):
-        #expect(call.toolCall.readFile.path == path && call.toolCall.readFile.offset == offset && call.toolCall.readFile.limit == limit)
-    case .memoryListNotes(let after, let limit):
-        #expect(call.toolCall.memoryListNotes.hasAfter == (after != nil))
-        #expect(call.toolCall.memoryListNotes.after == (after ?? "") && call.toolCall.memoryListNotes.limit == limit)
-    case .memoryGetNote(let version, let offset, let limit):
-        #expect(call.toolCall.memoryGetNote.version == version && call.toolCall.memoryGetNote.offset == offset && call.toolCall.memoryGetNote.limit == limit)
-    case .memoryCreateNote(let body, let source):
-        #expect(call.toolCall.memoryCreateNote.hasBody && call.toolCall.memoryCreateNote.body == body)
-        #expect(call.toolCall.memoryCreateNote.hasSourceVersion == (source != nil))
-        #expect(call.toolCall.memoryCreateNote.sourceVersion == (source ?? ""))
-    case .memoryNoteSources(let version): #expect(call.toolCall.memoryNoteSources.version == version)
-    default: Issue.record("unexpected scripted tool")
-    }
+    #expect(call.toolCall.name == proposal.name && call.toolCall.arguments == proposal.arguments)
+    #expect(call.toolCall.source == proposal.source)
+    #expect(!call.toolCall.hasNameBytes && !call.toolCall.hasArgumentsBytes)
+    #expect(call.toolCall.unknownFields.data.isEmpty)
     if cancel {
         var message = Asura_Model_V1_Cancel(); message.reason = .user
         try await service.send(scoped(.cancel(message)))
@@ -136,15 +182,121 @@ private func toolCallbackJourney(cancel: Bool, selector: String, arguments: Tool
     service.close(); helper.close(); await running.value
 }
 
-@Test func toolWireRejectsWrongDirectionsAndUnknownNestedFields() throws {
-    var args = Asura_Model_V1_ProjectReadFile(); args.path = "file"; args.offset = 0; args.limit = 1024
-    var call = Asura_Model_V1_ToolCall(); call.ordinal = 1; call.readFile = args
+@Test func toolWireRejectsWrongDirectionsBoundsAndUnknownFields() throws {
+    var call = Asura_Model_V1_ToolCall(); call.ordinal = 1; call.name = "project"
+    call.arguments = #"{"command":"read_file"}"#; call.source = .generatedContent
     var envelope = Envelope(); envelope.operationID = Data(repeating: 1, count: 16)
     envelope.generation = 1; envelope.body = .toolCall(call)
     try Wire.validate(envelope, from: .helper)
     #expect(throws: (any Error).self) { try Wire.validate(envelope, from: .service) }
-    var raw = try args.serializedData(); raw.append(contentsOf: [0xa0, 0x06, 0x01])
-    call.readFile = try Asura_Model_V1_ProjectReadFile(serializedBytes: raw)
+    func rejected(_ change: (inout Asura_Model_V1_ToolCall) -> Void) {
+        var bad = call; change(&bad); envelope.body = .toolCall(bad)
+        #expect(throws: HelperError.self) { try Wire.validate(envelope, from: .helper) }
+    }
+    func accepted(_ change: (inout Asura_Model_V1_ToolCall) -> Void) throws {
+        var good = call; change(&good); envelope.body = .toolCall(good)
+        try Wire.validate(envelope, from: .helper)
+    }
+    try accepted { $0.ordinal = 9 }
+    try accepted { $0.arguments = "" }
+    try accepted { $0.arguments = String(repeating: "x", count: 64_000) }
+    try accepted { $0.name = String(repeating: "n", count: 256) }
+    try accepted { $0.clearName(); $0.nameBytes = 257 }
+    try accepted { $0.clearArguments(); $0.argumentsBytes = 64_001 }
+    try accepted { $0.source = .providerJson }
+    rejected { $0.ordinal = 0 }
+    rejected { $0.ordinal = 10 }
+    rejected { $0.name = "" }
+    rejected { $0.name = String(repeating: "n", count: 257) }
+    rejected { $0.arguments = String(repeating: "x", count: 64_001) }
+    rejected { $0.clearName() }
+    rejected { $0.clearArguments() }
+    rejected { $0.nameBytes = 300 }
+    rejected { $0.argumentsBytes = 70_000 }
+    rejected { $0.clearName(); $0.nameBytes = 256 }
+    rejected { $0.clearArguments(); $0.argumentsBytes = 64_000 }
+    rejected { $0.clearSource() }
+    rejected { $0.source = .unspecified }
+    // Removed typed argument field 10 (read_file) is now unknown and rejected.
     envelope.body = .toolCall(call)
+    var raw = try call.serializedData(); raw.append(contentsOf: [0x52, 0x00])
+    let stale = try Asura_Model_V1_ToolCall(serializedBytes: raw)
+    envelope.body = .toolCall(stale)
     #expect(throws: (any Error).self) { _ = try Wire.decode(envelope.serializedData(), from: .helper) }
+}
+
+/// A scripted session over a socket pair: the service side of one turn.
+final class ToolSessionChannel: @unchecked Sendable {
+    let helper: Transport
+    let service: Transport
+    var replies: AsyncThrowingStream<Data, any Error>.AsyncIterator
+    let running: Task<Void, Never>
+    var unexpectedToolCalls = 0
+    init(helper: Transport, service: Transport, running: Task<Void, Never>) {
+        self.helper = helper; self.service = service; self.running = running
+        replies = service.frames.makeAsyncIterator()
+    }
+    func scoped(_ body: Envelope.OneOf_Body) -> Envelope {
+        var value = Envelope(); value.operationID = Data(repeating: 7, count: 16)
+        value.generation = 1; value.body = body; return value
+    }
+    func send(_ body: Envelope.OneOf_Body) async throws { try await service.send(scoped(body)) }
+    func next() async throws -> Envelope { try Wire.decode(#require(try await replies.next()), from: .helper) }
+    func nextToolCall() async throws -> Asura_Model_V1_ToolCall {
+        while true {
+            let message = try await next()
+            if case .toolCall(let call) = message.body { return call }
+            if case .terminal = message.body { throw HelperError.closed }
+        }
+    }
+    func reply(_ ordinal: UInt32, _ status: Asura_Model_V1_ToolStatus, _ text: String) async throws {
+        var result = Asura_Model_V1_ToolResult(); result.ordinal = ordinal; result.status = status
+        result.text = text; result.truncated = false
+        try await send(.toolResult(result))
+    }
+    func terminal() async throws -> Asura_Model_V1_Terminal {
+        while true {
+            let message = try await next()
+            switch message.body {
+            case .terminal(let value): return value
+            case .toolCall: unexpectedToolCalls += 1
+            default: break
+            }
+        }
+    }
+    func close() { service.close(); helper.close(); running.cancel() }
+}
+
+/// Opens a turn with tools enabled whose backend proposes `proposals` in order.
+func openToolSession(selector: String, proposals: [ToolProposal]) async throws -> ToolSessionChannel {
+    var fds: [Int32] = [-1, -1]
+    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+    let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
+    let identity = Data(repeating: 1, count: 32)
+    let session = HelperSession(transport: helper, factory: { _, _, _, _ in
+        ToolScript(proposals: proposals, source: .system)
+    }, buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    let channel = ToolSessionChannel(helper: helper, service: service, running: running)
+    var hello = Asura_Model_V1_Hello()
+    hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
+    hello.availability = .unknown; hello.reason = .none; hello.selectedModel = selector
+    var helloEnvelope = Envelope(); helloEnvelope.body = .hello(hello)
+    try await service.send(helloEnvelope)
+    _ = try await channel.next()
+    var input = ModelInput(); input.instructions = ""; input.prompt = "tools"
+    let data = try input.serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = selector; begin.inputBytes = UInt64(data.count)
+    begin.maxResponseTokens = 512; begin.enableProjectTools = true
+    try await channel.send(.begin(begin)); _ = try await channel.next()
+    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+    chunk.ordinal = 0; chunk.revision = 0; chunk.data = data
+    try await channel.send(.chunk(chunk))
+    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(data.count)
+    try await channel.send(.inputEnd(end)); _ = try await channel.next()
+    var credit = Asura_Model_V1_Credit(); credit.transferID = 2; credit.direction = .output
+    credit.acceptedBytes = 0; credit.grantedBytes = 65_536
+    try await channel.send(.start(.init()))
+    try await channel.send(.credit(credit))
+    return channel
 }

@@ -3,7 +3,7 @@
 //! retained recovery worker with no time bound; shutdown cancels it between
 //! steps.
 use super::store::{Location, PayloadId, PayloadState, PayloadStore};
-use crate::authority::conversation::{CaptureState, ExecCmdDisposition, Hash, Id, Replay};
+use crate::authority::conversation::{CaptureState, Hash, Id, Replay};
 use asura_platform::payload_io::{PayloadDirectory, PayloadError, PayloadFile};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,7 +20,7 @@ pub struct RecoveryReport {
     pub missing: u32,
     /// Unverified prefixes kept (interrupted or `unconfirmed`).
     pub unverified: u32,
-    /// Files no kind 22 names, deleted (identity violation).
+    /// Files no `run` exec_cmd kind 14 names, deleted (identity violation).
     pub orphans_deleted: u32,
     /// Stray staging files of `not_started` calls or of installed objects, deleted.
     pub strays_deleted: u32,
@@ -100,12 +100,10 @@ pub fn known_calls(replay: &Replay) -> Vec<Known> {
     let mut known = Vec::new();
     for (operation, op) in &replay.operations {
         for tool in &op.tools {
+            // Only a `run` exec_cmd kind 14 has derived job and payload IDs.
             let Some(call) = tool.exec_cmd.as_deref() else {
                 continue;
             };
-            if call.disposition != ExecCmdDisposition::Admitted {
-                continue;
-            }
             known.push(Known {
                 call: call.job,
                 operation: *operation,
@@ -144,7 +142,7 @@ pub fn recover_known(
     let mut objects = list_all(store, PayloadDirectory::Objects, cancel)?;
     let mut report = RecoveryReport::default();
     let named: BTreeSet<PayloadId> = known.iter().flat_map(|k| k.payloads).collect();
-    // Orphans: no kind 22 names them.
+    // Orphans: no `run` exec_cmd kind 14 names them.
     for (directory, files) in [
         (PayloadDirectory::Staging, &mut staging),
         (PayloadDirectory::Objects, &mut objects),
@@ -239,7 +237,7 @@ pub fn recover_known(
                 }
             }
             // Interrupted (no kind 23) or `unconfirmed`: an unverified prefix.
-            // Its last use is the kind 22 sequence.
+            // Its last use is the kind 14 sequence.
             None | Some((CaptureState::Unconfirmed, _, _)) => {
                 for (index, id) in call.payloads.into_iter().enumerate() {
                     let (location, bytes) = if let Some(bytes) = staging.get(&id).copied() {

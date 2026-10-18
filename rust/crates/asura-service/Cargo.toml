@@ -39,6 +39,12 @@ harness = false
 required-features = ["test-support"]
 
 [[test]]
+name = "tool_call_flow"
+path = "tests/tool_call_flow.rs"
+harness = false
+required-features = ["test-support"]
+
+[[test]]
 name = "conversation_flow"
 path = "tests/conversation_flow.rs"
 harness = false

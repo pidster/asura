@@ -8,9 +8,6 @@ pub const MAX_CONVERSATIONS: usize = 256;
 pub const OUTPUT_RESERVATION: u32 = 2048;
 pub const MAX_PROMPT: usize = 32 * 1024;
 pub const MAX_TEXT: usize = 60 * 1024;
-pub const EXEC_CMD_TOOL_KIND: u8 = 16;
-pub const MAX_EXEC_CMD_COMMAND_BYTES: usize = 8192;
-pub const MAX_EXEC_CMD_CWD_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameContext {
@@ -217,12 +214,10 @@ pub enum Record {
     InputReordered(InputReordered),
     InputDecision(InputDecision),
     InputPromoted(InputPromoted),
-    MemoryCreateIntent(MemoryCreateIntent),
-    ToolIntent(ToolIntent),
+    /// Kind 14: one model tool call, the only copy of its arguments.
+    ToolCall(Box<ToolCall>),
     ToolResult(ToolResult),
-    /// Kind 22 (J1): every exec_cmd call. Kind 14 never carries tool kind 16.
-    ExecCmdIntent(Box<ExecCmdIntent>),
-    /// Kind 23 (J1): capture facts of an admitted exec_cmd call, before kind 15.
+    /// Kind 23 (J1): capture facts of a `run` exec_cmd call, before kind 15.
     CaptureSettled(Box<CaptureSettled>),
 }
 impl Record {
@@ -241,11 +236,9 @@ impl Record {
             Self::InputQueued(_) => 18,
             Self::InputReordered(_) => 19,
             Self::InputDecision(_) => 13,
-            Self::MemoryCreateIntent(_) => 17,
-            Self::ToolIntent(_) => 14,
+            Self::ToolCall(_) => 14,
             Self::ToolResult(_) => 15,
             Self::InputPromoted(_) => 16,
-            Self::ExecCmdIntent(_) => 22,
             Self::CaptureSettled(_) => 23,
         }
     }
@@ -389,22 +382,299 @@ pub struct QueuedInput {
     pub order_position: u64,
 }
 
+/// The four registered model-facing tool names (TCR-D24). Replay looks a
+/// stored name up here; the service registry uses these constants.
+pub const TOOL_NAMES: [&str; 4] = ["project", "memory", "service", "exec_cmd"];
+/// Kind 14 bounds (tool-call-records.md, size limits).
+pub const MAX_TOOL_ARGUMENTS: usize = 64_000;
+pub const MAX_TOOL_NAME: usize = 256;
+pub const MAX_STORED_TOOL_NAME: usize = 512;
+pub const MAX_TOOL_NUMBERS: usize = 256;
+/// Ordinal 9 exists only for the over-limit `limit` record.
+pub const MAX_TOOL_CALL_ORDINAL: u32 = 9;
+/// Calls that may run or be rejected per turn; kind 15 ordinals stay 1-8.
+pub const MAX_RECORDED_CALLS: u32 = 8;
+/// A refused exec_cmd command is cut at this size (field 20 bit 0).
+pub const MAX_REFUSED_COMMAND_BYTES: usize = 8192;
+
+/// A registered model-facing tool: the replay lookup of kind 14 field 5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisteredTool {
+    Project,
+    Memory,
+    Service,
+    ExecCmd,
+}
+impl RegisteredTool {
+    /// The registry lookup. An empty (not retained) name is unregistered.
+    pub fn lookup(name: &str) -> Option<Self> {
+        match TOOL_NAMES.iter().position(|n| *n == name)? {
+            0 => Some(Self::Project),
+            1 => Some(Self::Memory),
+            2 => Some(Self::Service),
+            _ => Some(Self::ExecCmd),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        TOOL_NAMES[self as usize]
+    }
+}
+/// Kind 14 field 4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ToolCallSource {
+    GeneratedContent = 1,
+    ProviderJson = 2,
+}
+/// Kind 14 field 7: the [operation table](tool-call-records.md#operation-codes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ToolOperation {
+    ReadFile = 1,
+    ListDirectory = 2,
+    Status = 3,
+    Tools = 4,
+    Audit = 5,
+    ListNotes = 6,
+    GetNote = 7,
+    NoteSources = 8,
+    CreateNote = 9,
+    ExecCmd = 10,
+}
+impl ToolOperation {
+    pub const ALL: [Self; 10] = [
+        Self::ReadFile,
+        Self::ListDirectory,
+        Self::Status,
+        Self::Tools,
+        Self::Audit,
+        Self::ListNotes,
+        Self::GetNote,
+        Self::NoteSources,
+        Self::CreateNote,
+        Self::ExecCmd,
+    ];
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
+    }
+    pub fn tool(self) -> RegisteredTool {
+        match self {
+            Self::ReadFile | Self::ListDirectory => RegisteredTool::Project,
+            Self::Status | Self::Tools | Self::Audit => RegisteredTool::Service,
+            Self::ListNotes | Self::GetNote | Self::NoteSources | Self::CreateNote => {
+                RegisteredTool::Memory
+            }
+            Self::ExecCmd => RegisteredTool::ExecCmd,
+        }
+    }
+    /// The model-facing command name (exec_cmd has none of its own).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadFile => "read_file",
+            Self::ListDirectory => "list_directory",
+            Self::Status => "status",
+            Self::Tools => "tools",
+            Self::Audit => "audit",
+            Self::ListNotes => "list_notes",
+            Self::GetNote => "get_note",
+            Self::NoteSources => "note_sources",
+            Self::CreateNote => "create_note",
+            Self::ExecCmd => "exec_cmd",
+        }
+    }
+}
+/// Kind 14 field 8: the [decision table](tool-call-records.md#decisions).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ToolDecision {
+    Run = 1,
+    InvalidArguments = 2,
+    UnknownTool = 3,
+    Refused = 4,
+    Busy = 5,
+    Denied = 6,
+    Limit = 7,
+    Cancelled = 8,
+}
+impl ToolDecision {
+    pub const ALL: [Self; 8] = [
+        Self::Run,
+        Self::InvalidArguments,
+        Self::UnknownTool,
+        Self::Refused,
+        Self::Busy,
+        Self::Denied,
+        Self::Limit,
+        Self::Cancelled,
+    ];
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::InvalidArguments => "invalid_arguments",
+            Self::UnknownTool => "unknown_tool",
+            Self::Refused => "refused",
+            Self::Busy => "busy",
+            Self::Denied => "denied",
+            Self::Limit => "limit",
+            Self::Cancelled => "cancelled",
+        }
+    }
+    /// The status sent to the helper for a call that does not run (TCR-D12).
+    pub fn status(self) -> Option<u8> {
+        match self {
+            Self::Run => None,
+            Self::InvalidArguments | Self::UnknownTool | Self::Refused => Some(3),
+            Self::Busy => Some(4),
+            Self::Denied => Some(2),
+            Self::Limit => Some(7),
+            Self::Cancelled => Some(6),
+        }
+    }
+}
+/// Kind 14 field 9: the [fault table](tool-call-records.md#faults). The lowest
+/// code that applies wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ToolFault {
+    InvalidJson = 1,
+    JsonLimit = 2,
+    NotObject = 3,
+    DuplicateKey = 4,
+    UnknownCommand = 5,
+    MissingField = 6,
+    UnexpectedField = 7,
+    WrongType = 8,
+    OutOfRange = 9,
+    UnsafePath = 10,
+    InvalidVersionId = 11,
+    ArgumentsOverLimit = 12,
+    NameOverLimit = 13,
+    InvalidText = 14,
+    UnregisteredName = 15,
+}
+impl ToolFault {
+    pub const ALL: [Self; 15] = [
+        Self::InvalidJson,
+        Self::JsonLimit,
+        Self::NotObject,
+        Self::DuplicateKey,
+        Self::UnknownCommand,
+        Self::MissingField,
+        Self::UnexpectedField,
+        Self::WrongType,
+        Self::OutOfRange,
+        Self::UnsafePath,
+        Self::InvalidVersionId,
+        Self::ArgumentsOverLimit,
+        Self::NameOverLimit,
+        Self::InvalidText,
+        Self::UnregisteredName,
+    ];
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidJson => "invalid_json",
+            Self::JsonLimit => "json_limit",
+            Self::NotObject => "not_object",
+            Self::DuplicateKey => "duplicate_key",
+            Self::UnknownCommand => "unknown_command",
+            Self::MissingField => "missing_field",
+            Self::UnexpectedField => "unexpected_field",
+            Self::WrongType => "wrong_type",
+            Self::OutOfRange => "out_of_range",
+            Self::UnsafePath => "unsafe_path",
+            Self::InvalidVersionId => "invalid_version_id",
+            Self::ArgumentsOverLimit => "arguments_over_limit",
+            Self::NameOverLimit => "name_over_limit",
+            Self::InvalidText => "invalid_text",
+            Self::UnregisteredName => "unregistered_name",
+        }
+    }
+}
+/// Kind 14 field 12: why the argument text is not retained (form 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NotRetainedReason {
+    Oversized = 1,
+    DetectionUnavailable = 2,
+    UnverifiableEscape = 3,
+}
+impl NotRetainedReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Oversized => "oversized",
+            Self::DetectionUnavailable => "detection_unavailable",
+            Self::UnverifiableEscape => "unverifiable_escape",
+        }
+    }
+}
+/// Kind 14 fields 11-12.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgumentForm {
+    Verbatim,
+    Canonical,
+    Unparsed,
+    NotRetained(NotRetainedReason),
+}
+impl ArgumentForm {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Verbatim => 1,
+            Self::Canonical => 2,
+            Self::Unparsed => 3,
+            Self::NotRetained(_) => 4,
+        }
+    }
+    pub fn not_retained(self) -> Option<NotRetainedReason> {
+        match self {
+            Self::NotRetained(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+/// Kind 14, ToolCall (tool-call-records.md). One record for every tool call
+/// that reaches the service in an admitted, started turn. The redacted name
+/// and argument text are the only copy of the arguments. The record never
+/// authorizes execution; derived values are recomputed on replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// Format-1 kinds: 1 file, 2 directory, 3 status, 4–5 rejected file/directory;
-/// 6 memory list, 7 memory get, 8 memory sources, 9–11 their rejected proposals.
-/// Kind 15 is bounded recent audit inspection.
-/// Kind 16 stores exact command + NUL + cwd in path, effective milliseconds in
-/// offset, and requested timeout seconds in limit. It never authorizes replay.
-/// Kind 14 is static tool inventory; kinds 12–13 are reserved for memory creation.
-/// For memory kinds `path` stores a version/cursor ID, never a filesystem path.
-pub struct ToolIntent {
+pub struct ToolCall {
     pub operation: Id,
     pub generation: u64,
+    /// 1-9; 9 only with decision `limit`.
     pub ordinal: u32,
-    pub kind: u8,
-    pub path: String,
-    pub offset: u64,
-    pub limit: u32,
+    pub source: ToolCallSource,
+    /// Redacted name, 0-512 bytes; empty only when not retained.
+    pub name: String,
+    /// Received name size, at least 1.
+    pub name_bytes: u32,
+    pub tool_operation: Option<ToolOperation>,
+    pub decision: ToolDecision,
+    /// Set only with `invalid_arguments` or `unknown_tool`.
+    pub fault: Option<ToolFault>,
+    /// Set only with `busy`.
+    pub busy: Option<ExecCmdBusyReason>,
+    pub form: ArgumentForm,
+    /// Received argument size.
+    pub arguments_bytes: u32,
+    /// Forms 1-3: 0-64,000 bytes; form 4: empty.
+    pub arguments: String,
+    /// Entry i is the secret kind of `$ASURA_SECRET_<i+1>` in fields 5 and 14.
+    pub number_kinds: Vec<SecretKind>,
+    /// Occurrences of the unnumbered placeholder in fields 5 and 14.
+    pub unnumbered: u32,
+    /// The rule set used; 0 and zero only with reason `detection_unavailable`
+    /// from a failed rule-set self-check.
+    pub rule_set_revision: u32,
+    pub rule_set_digest: Hash,
+    /// Field 20 bit 0: a refused exec_cmd command was cut at 8,192 bytes.
+    pub command_cut: bool,
+    /// Fields 21-23: an exec_cmd secret refusal. Never holds a value.
+    pub refusal: Option<ExecCmdRefusal>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolResult {
@@ -416,15 +686,7 @@ pub struct ToolResult {
     pub next_offset: Option<u64>,
     pub truncated: bool,
 }
-/// Kind 22 field 4.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ExecCmdDisposition {
-    Admitted = 1,
-    Refused = 2,
-    Busy = 3,
-}
-/// Kind 22 field 11, for a `busy` disposition.
+/// Kind 14 field 10, for a `busy` decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ExecCmdBusyReason {
@@ -443,43 +705,17 @@ impl ExecCmdBusyReason {
         }
     }
 }
-/// Kind 22 fields 8–10 for a `refused` disposition. Never holds a value.
+/// Kind 14 fields 21-23 for a refused exec_cmd call. Never holds a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecCmdRefusal {
     pub code: RefusalCode,
     pub kind: Option<SecretKind>,
-    /// The 1-based word index, 1–4096.
+    /// The 1-based word index, 1-4096.
     pub word: Option<u16>,
 }
-/// Initial capture reservation recorded by an admitted kind 22 (R1).
+/// Initial capture reservation of a `run` exec_cmd call: a constant, never
+/// stored (TCR-O5).
 pub const INITIAL_RESERVATION: u64 = 1024 * 1024;
-/// Kind 22, ExecCmdIntent (J1). An admitted or busy record holds the rewritten
-/// command; a refused one holds the display-redacted command, cut at 8,192
-/// bytes with `command_truncated`. No field holds a secret value or a digest
-/// of one: `variables` lists the kind of variable `ASURA_SECRET_<i+1>`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecCmdIntent {
-    pub operation: Id,
-    pub generation: u64,
-    pub ordinal: u32,
-    pub disposition: ExecCmdDisposition,
-    pub command_truncated: bool,
-    pub command: String,
-    pub cwd: String,
-    pub refusal: Option<ExecCmdRefusal>,
-    pub busy: Option<ExecCmdBusyReason>,
-    pub variables: Vec<SecretKind>,
-    /// Admitted: the `asura.exec_cmd.job` derivation; otherwise zero.
-    pub job: Id,
-    /// Admitted: payload IDs for stdout and stderr; otherwise zero.
-    pub stdout_payload: Id,
-    pub stderr_payload: Id,
-    /// Admitted: [`INITIAL_RESERVATION`]; otherwise 0.
-    pub initial_reservation: u64,
-    /// The rule set used; 0 and zero only with `secret_detection_unavailable`.
-    pub rule_set_revision: u32,
-    pub rule_set_digest: Hash,
-}
 /// Kind 23 field 4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -562,8 +798,6 @@ pub struct CaptureSettled {
     /// 0 unknown, 1 exited, 2 signalled.
     pub exit_kind: u8,
     pub exit_value: u32,
-    pub rule_set_revision: u32,
-    pub rule_set_digest: Hash,
     pub stdout: CaptureStream,
     pub stderr: CaptureStream,
     pub distinct_numbers: u32,
@@ -573,18 +807,15 @@ pub struct CaptureSettled {
     pub paused_ms: u64,
     pub final_reservation: u64,
 }
-/// Replay facts of one kind 22 call: identities, settlement and journal
-/// sequences used as "last use" by the interim expiry (J1-Q2).
+/// Replay facts of one `run` exec_cmd call: identities derived from the
+/// installation and the call (TCR-D23), settlement and the journal sequence
+/// used as "last use" by the interim expiry (J1-Q2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecCmdCall {
-    pub disposition: ExecCmdDisposition,
     pub job: Id,
     pub stdout_payload: Id,
     pub stderr_payload: Id,
     pub intent_sequence: u64,
-    /// Kind 22 fields 18–19; kind 23 must name the same rule set.
-    pub rule_set_revision: u32,
-    pub rule_set_digest: Hash,
     pub settled: Option<ExecCmdSettlement>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -597,23 +828,40 @@ pub struct ExecCmdSettlement {
     pub frame: Range<usize>,
 }
 
+/// Replay projection of one kind 14 call and its later records. Bounded
+/// display projections of verified records, never authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolRecord {
-    pub create: Option<Box<MemoryCreateIntent>>,
-    pub kind: u8,
-    pub offset: u64,
-    pub limit: u32,
+    /// The stored redacted name (at most 512 bytes; empty when not retained).
+    pub name: String,
+    /// Derived: the registry lookup of the name.
+    pub tool: Option<RegisteredTool>,
+    pub tool_operation: Option<ToolOperation>,
+    pub decision: ToolDecision,
+    pub fault: Option<ToolFault>,
+    pub busy: Option<ExecCmdBusyReason>,
+    pub refusal: Option<ExecCmdRefusal>,
+    pub form: ArgumentForm,
+    pub arguments_bytes: u32,
+    /// A display prefix of at most 192 bytes of the stored argument text.
+    pub arguments: String,
     pub result_status: Option<u8>,
     pub intent_frame: Range<usize>,
     pub result_frame: Option<Range<usize>>,
     pub result_bytes: usize,
-    /// Bounded display projections of verified format-1 records, not authority.
-    pub arguments: String,
     pub preview: Option<String>,
     pub truncated: Option<bool>,
     pub exit_code: Option<i32>,
-    /// Present exactly when `kind` is 16: only kind 22 creates an exec_cmd call.
+    /// Derived identity of a `run` create_note call.
+    pub create: Option<CreateNoteCall>,
+    /// Derived identities and settlement of a `run` exec_cmd call.
     pub exec_cmd: Option<Box<ExecCmdCall>>,
+}
+impl ToolRecord {
+    /// A `run` call whose kind 15 is not yet committed.
+    pub fn unresolved(&self) -> bool {
+        self.decision == ToolDecision::Run && self.result_frame.is_none()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -625,20 +873,16 @@ pub struct InputPromoted {
     pub target_generation: u64,
 }
 
-/// Durable authorization evidence for one immutable note creation, not replay permission.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MemoryCreateIntent {
+/// A `run` create_note call: the turn identity, its project and the derived
+/// memory identities. Recomputed on replay from the binding and the call,
+/// never stored (TCR-O5, HM3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateNoteCall {
     pub operation: Id,
     pub generation: u64,
     pub ordinal: u32,
     pub project: Id,
-    pub memory_operation: Id,
-    pub object: Id,
-    pub version: Id,
-    pub body_bytes: u32,
-    pub body_sha256: Hash,
-    pub source: Option<(Id, Id)>,
-    pub command_sha256: Hash,
+    pub identity: CreateNoteIdentity,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateNoteIdentity {

@@ -271,8 +271,20 @@ graph. The earlier diagnostic initialization kinds 1 and 2 are removed, and repl
 rejects a stream that starts with any other kind. Kind 3 keeps its OwnerGeneration
 meaning; kinds 4 through 9 add the conversation transitions below. Later amendments
 add kinds 13–23 for queue decisions, tools, promotion, Memory create, the managed
-queue, project rename, composed turns and exec_cmd. Kinds 1, 2, 5 and 12 are
-unassigned. Never reinterpret an existing kind based on payload length.
+queue, project rename, composed turns and exec_cmd. Kinds 1, 2, 5, 12, 17 and
+22 are unassigned. Never reinterpret an existing kind based on payload length.
+
+Tool record kinds after the [tool call records](tool-call-records.md) change
+(2026-10-18). Replay returns `UnsupportedFormat` for a retired kind and
+`Corrupt` for a kind 14 record in the old `ToolIntent` layout.
+
+| Kind | Record | State |
+| --- | --- | --- |
+| 14 | `ToolCall` | New layout in place: one record per model tool call, including malformed calls; the redacted name and argument text, operation code, decision and fault. See [record kind 14](tool-call-records.md#record-kind-14-toolcall). |
+| 15 | `ToolResult` | Layout kept. Written only after a kind 14 with decision `run`. |
+| 17 | `MemoryCreateIntent` | Retired. Create identities are derived on replay. |
+| 22 | `ExecCmdIntent` | Retired. Kind 14 fields 20–23 hold the exec_cmd facts; the rest are derived. |
+| 23 | `CaptureSettled` | Changed: rule-set fields 9–10 removed; follows a `run` exec_cmd kind 14. See [kind 23](tool-job-controller.md#kind-23-capturesettled). |
 
 Public inspection validates all transitions before returning the installation
 summary. It must not skip unsupported kinds or return a valid prefix after an
@@ -585,7 +597,7 @@ Required behavior (owner, 2026-10-15). No journal wait has a time bound:
 - **Overload.** Beyond the writer's 8-slot queue, a request gets `busy`. The
   reactor stays responsive throughout.
 
-Tool job packet J1 depends on this step for its kind 22, 23 and 15 records
+Tool job packet J1 depends on this step for its kind 14, 23 and 15 records
 ([J1 prerequisite](tool-job-controller.md#j1-prerequisite-journal-step-j1-0)).
 
 Code changes (commit `41eebfb`):

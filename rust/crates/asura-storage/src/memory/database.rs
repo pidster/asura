@@ -167,7 +167,10 @@ impl Database {
         self.check_binding(&command.binding)?;
         let command_digest = command.command_digest()?;
         self.verify().await?;
-        match self.resolve(command.operation_id, command_digest).await {
+        match self
+            .resolve(command.operation_id, Some(command_digest))
+            .await
+        {
             Ok(receipt) => return Ok(receipt),
             Err(Error::NotFound) => (),
             Err(error) => return Err(error),
@@ -221,7 +224,10 @@ impl Database {
             .map_err(|_| Error::OutcomeUnconfirmed)?
             .check()
             .map_err(|_| Error::OutcomeUnconfirmed)?;
-        confirmed_receipt(self.resolve(command.operation_id, command_digest).await)
+        confirmed_receipt(
+            self.resolve(command.operation_id, Some(command_digest))
+                .await,
+        )
     }
     pub(crate) async fn read(&self, context: Id, query: ReadNotes) -> Result<ReadResult> {
         query.validate()?;
@@ -365,19 +371,22 @@ impl Database {
         Ok(result)
     }
     /// Resolve an immutable create only after the serialized mutation has settled.
-    /// A receipt is evidence only when its full note and edge agree with the intent.
+    /// The receipt is found by the derived memory operation ID alone (TCR-D2).
+    /// It is evidence only when its note and edge agree with the derived
+    /// identities and its own command digest agrees with the stored note.
     pub(crate) async fn resolve_create(
         &self,
-        intent: &crate::authority::conversation::MemoryCreateIntent,
+        call: &crate::authority::conversation::CreateNoteCall,
     ) -> Result<super::MemoryCreateResult> {
         use super::MemoryCreateResult;
-        let operation = Id::new(intent.memory_operation)?;
-        let receipt = match self.resolve(operation, intent.command_sha256).await {
+        let ids = call.identity;
+        let operation = Id::new(ids.operation)?;
+        let version = Id::new(ids.version)?;
+        let receipt = match self.resolve(operation, None).await {
             Ok(value) => value,
             Err(Error::NotFound) => {
                 // Missing receipt is absence only if no partial effect exists.
-                // These identities are immutable and unique to this intent.
-                let version = Id::new(intent.version)?;
+                // These identities are immutable and unique to this call.
                 let mut rows = self.db.query("SELECT id FROM $note_id; SELECT id FROM memory_link WHERE operation_id = $operation OR in = $note_id LIMIT 1;")
                     .bind(("note_id", record("memory_note", version)))
                     .bind(("operation", operation.hex()))
@@ -391,10 +400,9 @@ impl Database {
             }
             Err(error) => return Err(error),
         };
-        let version = Id::new(intent.version)?;
-        let context = Id::new(intent.project)?;
+        let context = Id::new(call.project)?;
         if receipt.version_id != version
-            || receipt.edge_id.map(Id::bytes) != intent.source.map(|(_, edge)| edge)
+            || receipt.edge_id.is_some_and(|edge| edge.bytes() != ids.edge)
         {
             return Err(Error::InvalidRecord);
         }
@@ -408,14 +416,9 @@ impl Database {
                     e
                 }
             })?;
-        if note.object_id.bytes() != intent.object
-            || note.operation_id != operation
-            || note.body.len() != intent.body_bytes as usize
-            || note.body_sha256 != intent.body_sha256
-        {
+        if note.object_id.bytes() != ids.object || note.operation_id != operation {
             return Err(Error::InvalidRecord);
         }
-        super::create::command_for_intent(self.binding.clone(), intent, note.body)?;
         let mut rows = self
             .db
             .query("SELECT * FROM memory_link WHERE in = $note_id LIMIT 2;")
@@ -425,41 +428,55 @@ impl Database {
             .check()
             .map_err(|_| Error::Unavailable)?;
         let mut edges: Vec<Object> = rows.take(0).map_err(|_| Error::InvalidRecord)?;
-        if edges.len() != usize::from(intent.source.is_some()) {
+        if edges.len() != usize::from(receipt.edge_id.is_some()) {
             return Err(Error::InvalidRecord);
         }
-        if let Some((source, expected_edge)) = intent.source {
-            let source = Id::new(source)?;
-            let mut edge = edges.remove(0);
-            exact_one(&mut edge, "schema_version")?;
-            equal_string(
-                &mut edge,
-                "installation_id",
-                &self.binding.installation_id.hex(),
-            )?;
-            equal_string(&mut edge, "context_id", &context.hex())?;
-            equal_string(&mut edge, "operation_id", &operation.hex())?;
-            equal_string(&mut edge, "kind", "derived_from")?;
-            if take::<RecordId>(&mut edge, "id")? != record("memory_link", Id::new(expected_edge)?)
-                || take::<RecordId>(&mut edge, "in")? != record("memory_note", version)
-                || take::<RecordId>(&mut edge, "out")? != record("memory_note", source)
-                || !edge.is_empty()
-            {
-                return Err(Error::InvalidRecord);
+        let source = match receipt.edge_id {
+            None => None,
+            Some(expected_edge) => {
+                let mut edge = edges.remove(0);
+                exact_one(&mut edge, "schema_version")?;
+                equal_string(
+                    &mut edge,
+                    "installation_id",
+                    &self.binding.installation_id.hex(),
+                )?;
+                equal_string(&mut edge, "context_id", &context.hex())?;
+                equal_string(&mut edge, "operation_id", &operation.hex())?;
+                equal_string(&mut edge, "kind", "derived_from")?;
+                if take::<RecordId>(&mut edge, "id")? != record("memory_link", expected_edge)
+                    || take::<RecordId>(&mut edge, "in")? != record("memory_note", version)
+                {
+                    return Err(Error::InvalidRecord);
+                }
+                let source = record_id(take::<RecordId>(&mut edge, "out")?, "memory_note")?;
+                if !edge.is_empty() {
+                    return Err(Error::InvalidRecord);
+                }
+                self.get(self.binding.clone(), context, source)
+                    .await
+                    .map_err(|e| {
+                        if e == Error::NotFound {
+                            Error::InvalidRecord
+                        } else {
+                            e
+                        }
+                    })?;
+                Some(source)
             }
-            self.get(self.binding.clone(), context, source)
-                .await
-                .map_err(|e| {
-                    if e == Error::NotFound {
-                        Error::InvalidRecord
-                    } else {
-                        e
-                    }
-                })?;
+        };
+        // The receipt's own digest must describe the stored note and edge.
+        let command =
+            super::create::command_for_call(self.binding.clone(), call, note.body, source)?;
+        if command.command_digest()? != receipt.command_sha256 {
+            return Err(Error::InvalidRecord);
         }
         Ok(MemoryCreateResult::Committed(receipt))
     }
-    pub(crate) async fn resolve(&self, operation: Id, hash: [u8; 32]) -> Result<Receipt> {
+    /// The receipt of `operation`. With `hash`, a different stored command
+    /// digest is an idempotency conflict; without it, the stored digest is
+    /// returned for the caller to check.
+    pub(crate) async fn resolve(&self, operation: Id, hash: Option<[u8; 32]>) -> Result<Receipt> {
         self.verify().await?;
         let mut rows = self
             .db
@@ -488,7 +505,7 @@ impl Database {
             &self.binding.installation_id.hex(),
         )?;
         let command_sha256 = parse_hex::<32>(&take::<String>(&mut value, "command_sha256")?)?;
-        if command_sha256 != hash {
+        if hash.is_some_and(|hash| command_sha256 != hash) {
             return Err(Error::IdempotencyConflict);
         }
         let version_id = Id::parse(&take::<String>(&mut value, "version_id")?)?;

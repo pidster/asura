@@ -5,10 +5,10 @@ use asura_platform::RuntimeDirectory;
 use asura_platform::payload_io::gate::{self, Fault, Point};
 use asura_platform::secrets::{JobRedaction, Redacted, Stream, detection};
 use asura_storage::authority::conversation::{
-    ActiveBinding, CaptureReason, CaptureSettled, CaptureState, CaptureStream, Cause, Composition,
-    ExecCmdDisposition, ExecCmdIntent, Hash, INITIAL_RESERVATION, Id, PendingInit,
-    ProjectRegistered, Record, Replay, Request, StartAuthorized, TerminalKind, ToolResult,
-    TurnAccepted, TurnTerminal, encode_frame, exec_cmd_job_id, replay, request_digest,
+    ActiveBinding, ArgumentForm, CaptureReason, CaptureSettled, CaptureState, CaptureStream, Cause,
+    Composition, Hash, INITIAL_RESERVATION, Id, PendingInit, ProjectRegistered, Record, Replay,
+    Request, StartAuthorized, TerminalKind, ToolCall, ToolCallSource, ToolDecision, ToolOperation,
+    ToolResult, TurnAccepted, TurnTerminal, encode_frame, exec_cmd_job_id, replay, request_digest,
 };
 use asura_storage::authority::conversation::{FrameContext, SecretKind};
 use asura_storage::payload::{
@@ -625,26 +625,29 @@ impl Journal {
         }));
         j
     }
-    /// Kind 22 (admitted); returns its sequence.
+    /// A `run` exec_cmd kind 14; returns its sequence. Replay derives the
+    /// job and payload IDs from it (TCR-D23).
     fn admitted(&mut self, ordinal: u32) -> u64 {
-        let [stdout_payload, stderr_payload] = payloads(ordinal);
-        self.append(Record::ExecCmdIntent(Box::new(ExecCmdIntent {
+        self.append(Record::ToolCall(Box::new(ToolCall {
             operation: id(10),
             generation: 1,
             ordinal,
-            disposition: ExecCmdDisposition::Admitted,
-            command_truncated: false,
-            command: "printf \"$ASURA_SECRET_1\"".into(),
-            cwd: ".".into(),
-            refusal: None,
+            source: ToolCallSource::GeneratedContent,
+            name: "exec_cmd".into(),
+            name_bytes: 8,
+            tool_operation: Some(ToolOperation::ExecCmd),
+            decision: ToolDecision::Run,
+            fault: None,
             busy: None,
-            variables: vec![SecretKind::GithubToken],
-            job: call(ordinal),
-            stdout_payload,
-            stderr_payload,
-            initial_reservation: INITIAL_RESERVATION,
+            form: ArgumentForm::Canonical,
+            arguments_bytes: 40,
+            arguments: "{\"command\":\"printf \\\"$ASURA_SECRET_1\\\"\",\"cwd\":\".\"}".into(),
+            number_kinds: vec![SecretKind::GithubToken],
+            unnumbered: 0,
             rule_set_revision: 1,
             rule_set_digest: [21; 32],
+            command_cut: false,
+            refusal: None,
         })))
     }
     /// Kind 23 then kind 15; returns the kind 23 sequence.
@@ -675,8 +678,6 @@ impl Journal {
             reason,
             exit_kind,
             exit_value,
-            rule_set_revision: 1,
-            rule_set_digest: [21; 32],
             stdout: stream(streams[0]),
             stderr: stream(streams[1]),
             distinct_numbers: 0,

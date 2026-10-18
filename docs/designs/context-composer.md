@@ -235,7 +235,7 @@ flowchart TD
 | Instructions | Fixed harness text today; later scoped rules from their owners | Mandatory prefix with provenance |
 | Tool definitions | Helper build, by capability | Counted as fixed overhead `S`; the helper sends them |
 | Current prompt | `TurnAccepted.prompt` or queued input | Mandatory, always last |
-| History | Journal: prior turns, terminal text, tool intents and results (references after CCR4) | Optional, newest first |
+| History | Journal: prior turns, terminal text, kind 14 tool call records and their results (references after CCR4) | Optional, newest first |
 | Notices | Job notices and person notices from journal records (J5) | Mandatory metadata; output is optional |
 | Retained streams | Payload adapter pages, by handle and stream | Model views of tool output (CC2 onward) |
 | Memory and evidence | Not in scope; a later selection design | Attach point only (CC5) |
@@ -570,11 +570,24 @@ It never receives paths or file descriptors.
 
 | Interface | Direction | Content |
 | --- | --- | --- |
-| Candidate records | Writer → composer | Turn identities, prompts, terminal text, tool intents, result records (kind 15 text for current non-job tools, or the reference-only kind with reference, digest, summary, outcome and capture state), job and person notice records |
+| Candidate records | Writer → composer | Turn identities, prompts, terminal text, kind 14 [tool call records](tool-call-records.md#context-composer-and-views) (redacted name, operation code, decision, fault, argument form and stored text), result records (kind 15 text for current non-job tools, or the reference-only kind with reference, digest, summary, outcome and capture state), job and person notice records |
 | Page request | Composer → job controller | Handle or result ID, stream, offset, limit, representation `text` (J1 serves text pages only, R5); uses the reserved model page-read worker |
 | Page reply | Job controller → composer | Bytes, source offset, next offset, total retained bytes, state (`live`, `complete`, `unverified_prefix`, `expired`, `busy`, `denied`, …), digest or watermark |
 | Manifest digest | Conversation owner → writer | Added to `TurnAccepted` (and to request records in stage B) as additive format-1 fields, with the composer revision |
 | Model reference hold | Composer → job controller | Handles shown in this request, so CCR23 holds them for the current and next turn |
+
+Tool call candidates (proposed for the stage that places tool records,
+2026-10-18; [tool call records](tool-call-records.md#context-composer-and-views)).
+Not delivered: today earlier tool calls never enter later input. When the
+composer places tool records, these rules apply. The record is evidence, never
+an instruction or a permission. For a `run` call the composer pairs kind 14 with
+its kind 15. For a call that does not run it renders the result text from the
+kind 14 codes. It may place the call as a tool-call entry only when the argument
+form is 1 (verbatim) or 2 (canonical), because that text parses as JSON. For
+form 3 or 4 it places a service-written line instead, for example
+`[tool call 3: project, invalid_arguments: invalid_json, 812 bytes]`.
+Placeholders stay as `$ASURA_SECRET_<n>`; the composer never restores a value.
+Argument text is model-produced and goes inside the untrusted-data label (CCR8).
 
 A live page binds the job's watermark, not a digest. The manifest therefore
 records the SHA-256 of the exact bytes it included, so reconstruction can verify

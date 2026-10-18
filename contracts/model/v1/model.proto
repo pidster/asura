@@ -72,21 +72,24 @@ message Terminal { optional Outcome outcome = 1; optional uint64 last_revision =
 message ModelInput { optional string instructions = 1; repeated HistoryTurn history = 2; optional string prompt = 3; }
 message HistoryTurn { optional Role role = 1; optional string text = 2; }
 
-// Typed proposals only. The service owns grants, host execution and durable outcomes.
+// Unparsed proposals. The service is the only argument parser and owns grants,
+// host execution and durable outcomes (tool-call-records.md).
 enum ToolStatus { TOOL_STATUS_UNSPECIFIED = 0; TOOL_STATUS_SUCCESS = 1; TOOL_STATUS_DENIED = 2; TOOL_STATUS_INVALID_ARGUMENTS = 3; TOOL_STATUS_UNAVAILABLE = 4; TOOL_STATUS_TIMEOUT = 5; TOOL_STATUS_CANCELLED = 6; TOOL_STATUS_LIMIT = 7; }
-message ProjectReadFile { optional string path = 1; optional uint64 offset = 2; optional uint32 limit = 3; }
-message ProjectListDirectory { optional string path = 1; }
-message ObserveStatus {}
-message ListTools {}
-message AuditRead { optional uint32 limit = 1; }
-message ExecCmd { optional string command = 1; optional string cwd = 2; reserved 3; }
-message MemoryListNotes { optional string after = 1; optional uint32 limit = 2; }
-message MemoryGetNote { optional string version = 1; optional uint64 offset = 2; optional uint32 limit = 3; }
-message MemoryNoteSources { optional string version = 1; }
-message MemoryCreateNote { optional string body = 1; optional string source_version = 2; }
+enum ToolCallSource { TOOL_CALL_SOURCE_UNSPECIFIED = 0; TOOL_CALL_SOURCE_GENERATED_CONTENT = 1; TOOL_CALL_SOURCE_PROVIDER_JSON = 2; }
 message ToolCall {
+  // 1-9; 9 only for the over-limit proposal.
   optional uint32 ordinal = 1;
-  oneof arguments { ProjectReadFile read_file = 10; ProjectListDirectory list_directory = 11; ObserveStatus observe_status = 12; MemoryListNotes memory_list_notes = 13; MemoryGetNote memory_get_note = 14; MemoryNoteSources memory_note_sources = 15; MemoryCreateNote memory_create_note = 16; ListTools list_tools = 17; AuditRead read_audit = 18; ExecCmd exec_cmd = 19; }
+  // 1-256 bytes; absent when longer, then name_bytes is set.
+  optional string name = 2;
+  // 0-64,000 bytes of argument JSON text as received; absent when longer.
+  optional string arguments = 3;
+  // Received argument size; set only when arguments is absent.
+  optional uint32 arguments_bytes = 4;
+  // Received name size; set only when name is absent.
+  optional uint32 name_bytes = 5;
+  optional ToolCallSource source = 6;
+  // Typed argument messages were removed (owner, 2026-10-17).
+  reserved 10 to 19;
 }
 message ToolResult { optional uint32 ordinal = 1; optional ToolStatus status = 2; optional string text = 3; optional uint64 next_offset = 4; optional bool truncated = 5; }
 

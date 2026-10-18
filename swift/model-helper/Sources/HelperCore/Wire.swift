@@ -20,6 +20,11 @@ public enum Limits {
     public static let output = 61_440
     public static let chunk = 16_384
     public static let cumulativeOutput = 4 * 1024 * 1024
+    /// Tool proposals per turn: 8 recorded calls plus the over-limit ninth (TCR-D6).
+    public static let toolProposals: UInt32 = 9
+    /// Wire bounds of one forwarded proposal (tool-call-records.md, wire contract).
+    public static let toolName = 256
+    public static let toolArguments = 64_000
 }
 
 /// Canonical decoding does not grant admission. Unknown fields are explicitly rejected.
@@ -45,22 +50,7 @@ public enum Wire {
         case .cancel(let v): known = v.unknownFields.data.isEmpty
         case .snapshotEnd(let v): known = v.unknownFields.data.isEmpty
         case .terminal(let v): known = v.unknownFields.data.isEmpty
-        case .toolCall(let v):
-            let argumentsKnown: Bool
-            switch v.arguments {
-            case .observeStatus(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .memoryListNotes(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .memoryGetNote(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .memoryCreateNote(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .memoryNoteSources(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .execCmd(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .readAudit(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .listTools(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .readFile(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case .listDirectory(let args): argumentsKnown = args.unknownFields.data.isEmpty
-            case nil: argumentsKnown = false
-            }
-            known = v.unknownFields.data.isEmpty && argumentsKnown
+        case .toolCall(let v): known = v.unknownFields.data.isEmpty
         case .toolResult(let v): known = v.unknownFields.data.isEmpty
         }
         guard known, try message.serializedData() == data else { throw HelperError.protocolFault }
@@ -202,31 +192,17 @@ public enum Wire {
             try check(!service && v.hasRevision && (1...1024).contains(v.revision) && v.hasCount && v.hasTotalBytes
                 && counts(v.count, v.totalBytes, 61_440))
         case .toolCall(let v):
-            try check(!service && v.hasOrdinal && (1...8).contains(v.ordinal))
-            switch v.arguments {
-            case .observeStatus: break
-            case .execCmd(let args):
-                try check(args.hasCommand && validExecCmdArguments(command: args.command, cwd: args.hasCwd ? args.cwd : nil))
-            case .listTools: break
-            case .readAudit(let args): try check(args.hasLimit && (1...16).contains(args.limit))
-            case .memoryListNotes(let args):
-                try check((!args.hasAfter || args.after.utf8.count <= 1024) && args.hasLimit)
-            case .memoryGetNote(let args):
-                try check(args.hasVersion && args.version.utf8.count <= 1024 && args.hasOffset && args.hasLimit)
-            case .memoryCreateNote(let args):
-                try check(args.hasBody && args.body.utf8.count <= 16_384
-                    && (!args.hasSourceVersion || args.sourceVersion.utf8.count <= 1024))
-            case .memoryNoteSources(let args):
-                try check(args.hasVersion && args.version.utf8.count <= 1024)
-            case .readFile(let args):
-                try check(args.hasPath && !args.path.isEmpty && args.path.utf8.count <= 1024
-                    && args.hasOffset && args.hasLimit && (1...16_384).contains(args.limit))
-            case .listDirectory(let args):
-                try check(args.hasPath && !args.path.isEmpty && args.path.utf8.count <= 1024)
-            case nil: throw HelperError.protocolFault
-            }
+            // Exactly one of name / name_bytes and of arguments / arguments_bytes.
+            try check(!service && v.hasOrdinal && (1...Limits.toolProposals).contains(v.ordinal)
+                && v.hasSource && (v.source == .generatedContent || v.source == .providerJson)
+                && v.hasName != v.hasNameBytes && v.hasArguments != v.hasArgumentsBytes
+                && (!v.hasName || (!v.name.isEmpty && v.name.utf8.count <= Limits.toolName))
+                && (!v.hasNameBytes || v.nameBytes > UInt32(Limits.toolName))
+                && (!v.hasArguments || v.arguments.utf8.count <= Limits.toolArguments)
+                && (!v.hasArgumentsBytes || v.argumentsBytes > UInt32(Limits.toolArguments)))
         case .toolResult(let v):
-            try check(service && v.hasOrdinal && (1...8).contains(v.ordinal)
+            try check(service && v.hasOrdinal && (1...Limits.toolProposals).contains(v.ordinal)
+                && (v.ordinal < Limits.toolProposals || v.status == .limit)
                 && v.hasStatus && (1...7).contains(v.status.rawValue)
                 && v.hasText && v.text.utf8.count <= 16_384 && v.hasTruncated)
             if v.status != .success { try check(!v.hasNextOffset) }

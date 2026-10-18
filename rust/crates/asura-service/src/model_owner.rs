@@ -927,6 +927,29 @@ impl ModelOwner {
         value.pending_tool = Some(1);
         value
     }
+    /// An owner whose helper has settled (no child, no cleanup).
+    pub(crate) fn settled_test_fixture() -> Self {
+        tests::owner(Phase::Settled)
+    }
+    /// As if the helper had just sent the `ToolCall` at `ordinal`.
+    pub(crate) fn tool_test_pending(&mut self, ordinal: u32) {
+        self.pending_tool = Some(ordinal);
+    }
+    /// Every ToolResult queued for the helper, in order.
+    pub(crate) fn tool_test_results(&self) -> Vec<pb::ToolResult> {
+        self.outgoing
+            .iter()
+            .filter_map(|frame| {
+                match model::decode_body(&frame[4..], Direction::ServiceToHelper)
+                    .ok()?
+                    .body
+                {
+                    Some(Body::ToolResult(result)) => Some(result),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
     pub(crate) fn tool_test_has_delivery(&self, result: pb::ToolResult) -> bool {
         let frame = model::encode_frame(
             &pb::Envelope {
@@ -1624,11 +1647,11 @@ mod tests {
             .receive(
                 message(Body::ToolCall(pb::ToolCall {
                     ordinal: Some(1),
-                    arguments: Some(pb::tool_call::Arguments::ListDirectory(
-                        pb::ProjectListDirectory {
-                            path: Some(".".into()),
-                        },
-                    )),
+                    name: Some("project".into()),
+                    arguments: Some(r#"{"command":"list_directory"}"#.into()),
+                    arguments_bytes: None,
+                    name_bytes: None,
+                    source: Some(1),
                 })),
                 &mut events,
             )
