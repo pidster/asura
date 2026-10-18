@@ -613,7 +613,6 @@ impl Journal {
             input_digest: [12; 32],
             prior_operations: vec![],
             prompt: "hello".into(),
-            reserved_output_tokens: 2048,
             event_cursor: 1,
             composition: Composition::default(),
         })));
@@ -707,7 +706,6 @@ impl Journal {
             final_cursor: u64::MAX,
             usage_known: false,
             output_tokens: 0,
-            charged_tokens: 2048,
             text: "reply".into(),
         }));
     }

@@ -1759,8 +1759,9 @@ or remote fallback in HM2. A failing memory read cannot trigger remote inference
 
 ### Dispatch, cancellation and settlement
 
-One logical turn retains the existing eight-call budget, one pending tool call,
-16 KiB result limit and 64 KiB aggregate result limit. The turn has no elapsed-time
+One logical turn retains the existing 200-call limit, one pending tool call and
+16 KiB result limit; it has no per-turn aggregate result limit (owner, 2026-10-18;
+[tool call records](tool-call-records.md)). The turn has no elapsed-time
 deadline: the [cancellation-driven turn lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
 replaced the earlier 60-second turn deadline. A memory call has no deadline; the
 earlier two-second ordinary tool deadline (L10) is removed (owner, 2026-10-17;
@@ -1798,7 +1799,7 @@ contract completes. Disconnecting a client does not cancel admitted work.
 flowchart TD
     Call[Native typed memory call] --> Grant{Current grant and local enabled provider?}
     Grant -->|No| Deny[Reject without memory access]
-    Grant -->|Yes| Validate{Arguments and turn budgets valid?}
+    Grant -->|Yes| Validate{Arguments valid and call within the turn limit?}
     Validate -->|No| Reject[Commit bounded rejection]
     Validate -->|Yes| Intent[Commit tool intent]
     Intent --> Fence{Generation and cancellation fence current?}
@@ -1921,7 +1922,8 @@ durable records and no foreign-context secret in outputs. Repeat native adapter
 journeys for CoreAI, MLX and verified local Ollama when their native qualification
 is available; a passing system journey cannot qualify another provider.
 Use separate admitted turns for list, read and source inspection. Each turn retains
-the existing output reservation and inference-pass limits.
+the existing [per-request output caps](turn-usage-helper.md#request-caps-and-admission)
+and 200-call limit.
 A disabled-tool model must receive no memory definitions. Listing and selecting a
 model cannot grant memory access. No cloud endpoint participates.
 
@@ -2026,8 +2028,8 @@ local provider destination are mandatory. HM2's local Ollama fence remains manda
 localhost alone is insufficient. No remote provider may use this mutation, even if
 another operation has a remote read-disclosure grant.
 
-One accepted tool call creates at most one note. Existing eight-call limits bound
-new note bodies to at most 128 KiB per logical turn. One mutation may be in flight
+One accepted tool call creates at most one note. The existing 200-call limit
+bounds new note bodies to at most 3,200 KiB per logical turn (owner, 2026-10-18). One mutation may be in flight
 service-wide. The pending mutation occupies the existing single tool slot. It does
 not create a second database, storage thread or conversation loop. A repeated call
 identity with identical arguments resolves the original operation. A changed body
@@ -2080,7 +2082,7 @@ missing body and never asks the model to regenerate it.
 
 The replay projection keeps the derived create identity on the tool record of
 a `run` create call. It applies the existing sequential ordinal, started-turn,
-eight-call and current-owner checks. A create call that does not run (for
+200-call and current-owner checks. A create call that does not run (for
 example `invalid_arguments` or `denied`) is complete at its kind 14 record; no
 kind 15 follows (TCR-R5). Live duplicate validation keeps a keyed digest of the
 received name and arguments in memory only. Restart never resumes inference or
@@ -2310,7 +2312,8 @@ is unknown. A resolution failure retains the journal publication gate and report
 
 Startup builds this state from unresolved typed intents before scheduling any
 Interrupted terminal or new inference. It persists the reconciled ToolResult first,
-then the existing Interrupted terminal, charging the recorded output reservation.
+then the existing Interrupted terminal with unknown usage and no charge (owner,
+2026-10-18; [turn usage](turn-usage-helper.md#request-caps-and-admission)).
 A committed intent cancelled before effect dispatch records an empty cancelled
 result without invoking mutation. Foreground accepted user turns have a separate
 memory-write grant; background sensor/classifier observations never obtain it.
@@ -2382,9 +2385,10 @@ Validation on macOS 27 arm64:
 
 Native model proposals are not deterministic. Earlier attempts supplied invalid
 arguments, which were rejected. Improved field guidance and fixed correction
-feedback used the then-current three-pass, 2,048-token and eight-proposal limits.
-The [turn budget correction](turn-usage-helper.md#turn-budget-and-request-admission)
-has since replaced the three-pass limit.
+feedback used the then-current (historical) three-pass, 2,048-token turn and
+eight-proposal limits. The [request caps](turn-usage-helper.md#request-caps-and-admission)
+have since replaced the three-pass limit, removed the turn token budget and raised
+the call limit to 200 (owner, 2026-10-18).
 The adapter never repairs arguments itself or sends rejected fields to storage.
 These checks qualify the named model/bundle combinations, not every local model.
 

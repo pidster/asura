@@ -108,7 +108,6 @@ fn terminal(kind: journal::TerminalKind) -> journal::TurnTerminal {
         final_cursor: u64::MAX,
         usage_known: true,
         output_tokens: 0,
-        charged_tokens: 0,
         text: String::new(),
     }
 }

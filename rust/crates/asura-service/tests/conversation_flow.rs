@@ -1572,8 +1572,8 @@ fn native_tools(provider: &str) -> Result<()> {
         == Some(journal::ToolOperation::ReadFile)
         && tool.result_status == Some(1)));
     let terminal = record.terminal.as_ref().expect("committed terminal");
-    assert_eq!(terminal.charged_tokens, journal::OUTPUT_RESERVATION);
     assert!(!terminal.usage_known);
+    assert_eq!(terminal.output_tokens, 0);
     fixture
         .start()
         .map_err(|e| format!("native-tools service start: {e}"))?;

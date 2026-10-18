@@ -824,7 +824,6 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
                 input_digest: [61; 32],
                 prior_operations: vec![],
                 prompt: prompt.into(),
-                reserved_output_tokens: j::OUTPUT_RESERVATION,
                 event_cursor: 1,
                 // Every earlier fixture turn completed and is omitted.
                 composition: j::Composition {
@@ -887,7 +886,6 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
                     final_cursor: u64::MAX,
                     usage_known: true,
                     output_tokens: 1,
-                    charged_tokens: 1,
                     text: "fixture completed".into(),
                 }),
                 None,
@@ -1040,7 +1038,6 @@ fn queue_reorder_fixture(verify: bool) -> Result<()> {
                 input_digest: [61; 32],
                 prior_operations: vec![],
                 prompt: prompt.into(),
-                reserved_output_tokens: j::OUTPUT_RESERVATION,
                 event_cursor: 1,
                 composition: j::Composition::default(),
             })),
@@ -1067,7 +1064,6 @@ fn queue_reorder_fixture(verify: bool) -> Result<()> {
                 final_cursor: u64::MAX,
                 usage_known: true,
                 output_tokens: 0,
-                charged_tokens: 0,
                 text: "fixture failure".into(),
             }),
             None,

@@ -201,21 +201,19 @@ fn terminal_event(turn: &journal::TurnTerminal) -> pb::ConversationEvent {
     }
 }
 /// Helper output counters describe one SDK response, not aggregate tool inference.
-fn terminal_accounting(
-    started: bool,
-    tools_enabled: bool,
-    reported: Option<u64>,
-    reservation: u32,
-) -> (bool, u32, u32) {
+/// Terminal usage: known zero before Start; unknown for a tool-enabled turn;
+/// the plain-text count when reported (wire-bounded by the per-request cap).
+/// No turn reservation or charge exists (owner, 2026-10-18).
+fn terminal_accounting(started: bool, tools_enabled: bool, reported: Option<u64>) -> (bool, u32) {
     if !started {
-        return (true, 0, 0);
+        return (true, 0);
     }
     if tools_enabled {
-        return (false, 0, reservation);
+        return (false, 0);
     }
-    match reported {
-        Some(tokens) => (true, tokens as u32, tokens as u32),
-        None => (false, 0, reservation),
+    match reported.and_then(|tokens| u32::try_from(tokens).ok()) {
+        Some(tokens) => (true, tokens),
+        None => (false, 0),
     }
 }
 fn tool_grant(turn: &journal::TurnAccepted, foreground_user: bool) -> tools::Grant {
@@ -347,9 +345,11 @@ struct TurnMeasurements {
     output: Option<u64>,
     cached: Option<u64>,
     complete: bool,
-    tool_start: [Option<Instant>; 9],
-    tool_ms: [Option<u64>; 9],
+    /// Indexed by ordinal - 1; bounded by the over-limit ordinal (201 slots).
+    tool_start: [Option<Instant>; TOOL_SLOTS],
+    tool_ms: [Option<u64>; TOOL_SLOTS],
 }
+const TOOL_SLOTS: usize = journal::MAX_TOOL_CALL_ORDINAL as usize;
 impl Default for TurnMeasurements {
     fn default() -> Self {
         Self {
@@ -360,14 +360,14 @@ impl Default for TurnMeasurements {
             output: None,
             cached: None,
             complete: true,
-            tool_start: [None; 9],
-            tool_ms: [None; 9],
+            tool_start: [None; TOOL_SLOTS],
+            tool_ms: [None; TOOL_SLOTS],
         }
     }
 }
 impl TurnMeasurements {
     fn record(&mut self, value: &mp::InferenceUsage) {
-        self.count += 1;
+        self.count = self.count.saturating_add(1);
         if let Some(n) = value.input_tokens {
             self.input = self.input.unwrap_or(0).checked_add(n);
         }
@@ -1736,7 +1736,6 @@ impl Owner {
             input_digest: [0; 32],
             prior_operations: Vec::new(),
             prompt,
-            reserved_output_tokens: journal::OUTPUT_RESERVATION,
             event_cursor: 1,
             // Replaced by the composer's record before acceptance.
             composition: journal::Composition::default(),
@@ -1917,7 +1916,6 @@ impl Owner {
             }
             Job::RecoverCreateResult => {
                 let intent = &self.create_recovery.as_ref().expect("recovery").intent;
-                let op = &self.replay.as_ref().expect("replay").operations[&intent.operation];
                 let terminal = journal::TurnTerminal {
                     operation: intent.operation,
                     generation: intent.generation,
@@ -1926,7 +1924,6 @@ impl Owner {
                     final_cursor: u64::MAX,
                     usage_known: false,
                     output_tokens: 0,
-                    charged_tokens: op.reserved_output_tokens,
                     text: String::new(),
                 };
                 if let Err(error) = self.append(
@@ -2506,12 +2503,8 @@ impl Owner {
             return;
         }
         // A per-step provider count cannot establish aggregate tool-round usage.
-        let (usage_known, output_tokens, charged_tokens) = terminal_accounting(
-            active.start_committed,
-            active.tools_enabled,
-            usage_tokens,
-            active.turn.reserved_output_tokens,
-        );
+        let (usage_known, output_tokens) =
+            terminal_accounting(active.start_committed, active.tools_enabled, usage_tokens);
         let kind = if active.cancel.is_some() {
             journal::TerminalKind::Cancelled
         } else if outcome == 1 && !active.snapshot.is_empty() {
@@ -2535,7 +2528,6 @@ impl Owner {
             final_cursor: u64::MAX,
             usage_known,
             output_tokens,
-            charged_tokens,
             text: active.snapshot.clone(),
         });
     }
@@ -2737,13 +2729,12 @@ impl Owner {
                 arguments,
             };
             let grant = tool_grant(&active.turn, active.foreground_user);
-            let capacity = active.tool_budget.result_capacity();
+            // No result-byte total limits a call (owner, 2026-10-18); only
+            // the over-limit ordinal is `limit` (TCR-D9).
             record.decision = if !active.tools_enabled
                 || tools::validate_authority(&call, &grant, &tools::Destination::Local).is_err()
             {
                 D::Denied
-            } else if capacity == 0 || (call.arguments.is_memory_create() && capacity < 256) {
-                D::Limit
             } else {
                 D::Run
             };
@@ -2837,7 +2828,6 @@ impl Owner {
             final_cursor: u64::MAX,
             usage_known: true,
             output_tokens: 0,
-            charged_tokens: 0,
             text: String::new(),
         });
         active.model.cancel(1, now);
@@ -2880,11 +2870,6 @@ impl Owner {
             final_cursor: u64::MAX,
             usage_known: !active.start_committed,
             output_tokens: 0,
-            charged_tokens: if active.start_committed {
-                active.turn.reserved_output_tokens
-            } else {
-                0
-            },
             text: active.snapshot.clone(),
         });
         active.model.cancel(4, now);
@@ -3053,7 +3038,8 @@ impl Owner {
                     };
                     let budget = crate::context::Budget {
                         window_tokens: context_tokens,
-                        output_reservation: active.turn.reserved_output_tokens,
+                        // R: room for one request's cap, not a turn total.
+                        output_reservation: asura_control::model::MAX_RESPONSE_TOKENS,
                         overhead_tokens: if active.tools_enabled {
                             tool_schema_bytes
                         } else {
@@ -3373,11 +3359,6 @@ impl Owner {
                         final_cursor: u64::MAX,
                         usage_known: !active.start_committed,
                         output_tokens: 0,
-                        charged_tokens: if active.start_committed {
-                            active.turn.reserved_output_tokens
-                        } else {
-                            0
-                        },
                         text: active.snapshot.clone(),
                     });
                 terminal.kind = journal::TerminalKind::Cancelled;
@@ -3643,9 +3624,16 @@ impl Owner {
             }
             text[..end].to_owned()
         };
+        // The most recent records only (TCR-D31): consecutive ordinals that
+        // end at the operation's latest ordinal.
+        let first = op
+            .tools
+            .len()
+            .saturating_sub(asura_control::MAX_TOOL_PROGRESS_ENTRIES);
         op.tools
             .iter()
             .enumerate()
+            .skip(first)
             .map(|(index, tool)| {
                 let rendered =
                     tools::not_run_result(tool.decision, tool.fault, tool.busy, tool.refusal);
@@ -3875,7 +3863,6 @@ mod observation_tests {
         replay.operations.insert(
             [6; 16],
             journal::Operation {
-                reserved_output_tokens: 512,
                 conversation: [7; 16],
                 generation: 4,
                 task: [8; 16],
@@ -3889,7 +3876,6 @@ mod observation_tests {
                     cause: journal::Cause::None,
                     usage_known: true,
                     output_tokens: 1,
-                    charged_tokens: 1,
                     frame: 0..1,
                 }),
                 tools: Vec::new(),
@@ -3954,21 +3940,17 @@ mod observation_tests {
     }
     #[test]
     fn aggregate_tool_accounting_never_trusts_per_step_provider_counts() {
-        for reported in [None, Some(0), Some(1), Some(56), Some(512)] {
-            assert_eq!(
-                terminal_accounting(true, true, reported, 512),
-                (false, 0, 512)
-            );
-            assert_eq!(
-                terminal_accounting(false, true, reported, 512),
-                (true, 0, 0)
-            );
+        // No turn reservation or charge (owner, 2026-10-18).
+        for reported in [None, Some(0), Some(1), Some(56), Some(2048)] {
+            assert_eq!(terminal_accounting(true, true, reported), (false, 0));
+            assert_eq!(terminal_accounting(false, true, reported), (true, 0));
         }
+        assert_eq!(terminal_accounting(true, false, Some(17)), (true, 17));
+        assert_eq!(terminal_accounting(true, false, None), (false, 0));
         assert_eq!(
-            terminal_accounting(true, false, Some(17), 512),
-            (true, 17, 17)
+            terminal_accounting(true, false, Some(u64::from(u32::MAX) + 1)),
+            (false, 0)
         );
-        assert_eq!(terminal_accounting(true, false, None, 512), (false, 0, 512));
     }
 }
 

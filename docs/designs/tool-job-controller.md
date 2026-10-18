@@ -601,9 +601,10 @@ remain unless this table changes them.
 | Client page | `JobRead` and `JobObserve` return at most 8 KiB source bytes | 8 KiB |
 | Journal reservations | Cancel request and settlement frames reserved at intent; at most one cancel request record per job | — |
 
-Existing turn limits remain. Each `job` command counts toward the eight tool calls
-of a turn (L20, kept until trace evidence selects a closure) and the 64 KiB
-aggregate result limit (L22, kept until the composer replaces it).
+Existing turn limits remain. Each `job` command counts toward the 200 tool calls
+of a turn (L20; owner, 2026-10-18). Its result is subject to the 16 KiB
+per-result limit (L21). The per-turn aggregate result limit (L22) is removed
+(owner, 2026-10-18). See [tool call records](tool-call-records.md).
 
 ### Model results
 

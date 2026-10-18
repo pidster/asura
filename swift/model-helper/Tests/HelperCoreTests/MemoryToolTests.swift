@@ -73,13 +73,16 @@ func disabledToolsNeverAdvertiseMemoryDefinitions(selector: String) async throws
 
 /// The SDK may correct a rejected memory call: the rejected proposal reaches
 /// the service unread, the service text returns to the model, and the next
-/// proposal is the corrected one. The token budget still bounds the loop.
+/// proposal is the corrected one. No token total or request count exists
+/// (owner, 2026-10-18): the session's proposal limit bounds the loop, which
+/// this probe applies as `HelperSession.requestTool` does.
 private actor MemoryCorrectionProbe {
     var dispatches = 0
     var proposals: [ToolProposal] = []
     func next() -> Int { dispatches += 1; return dispatches }
-    func received(_ proposal: ToolProposal) -> ToolResult {
+    func received(_ proposal: ToolProposal) throws -> ToolResult {
         proposals.append(proposal)
+        if proposals.count == Int(Limits.toolProposals) { throw BackendFailure(.outputLimit) }
         if proposal.arguments.contains("corrected note") {
             return ToolResult(status: .success, text: "created")
         }
@@ -111,23 +114,24 @@ private struct CorrectingMemoryModel: LanguageModel {
     }
 }
 @Test(arguments: [false, true])
-func sdkCanCorrectMemoryArgumentsWithinExistingInferenceBudget(alwaysInvalid: Bool) async throws {
+func sdkCanCorrectMemoryArgumentsWithinTheProposalLimit(alwaysInvalid: Bool) async throws {
     let probe = MemoryCorrectionProbe()
     let backend = FoundationBackend(model: CorrectingMemoryModel(probe: probe, alwaysInvalid: alwaysInvalid),
         contextTokens: 8192, modelName: "correction-fixture", supportsTools: true)
     var input = ModelInput(); input.instructions = "Use memory."; input.prompt = "Store a note."
     do {
         try await backend.generateWithTools(input, maximumTokens: 2048,
-            handler: { await probe.received($0) }, snapshot: { _ in })
+            handler: { try await probe.received($0) }, snapshot: { _ in })
         #expect(!alwaysInvalid)
-    } catch let error as BackendFailure {
-        #expect(alwaysInvalid && error.reason == .outputLimit)
+    } catch let error as LanguageModelSession.ToolCallError {
+        // The over-limit proposal ends the turn through the tool callback.
+        #expect(alwaysInvalid && (error.underlyingError as? BackendFailure)?.reason == .outputLimit)
     }
-    #expect(await probe.dispatches == 3)
+    #expect(await probe.dispatches == (alwaysInvalid ? Int(Limits.toolProposals) : 3))
     let proposals = await probe.proposals
     #expect(proposals.allSatisfy { $0.name == "memory" && $0.source == .generatedContent })
     // The rejected text reaches the service exactly as generated (no Swift parsing).
     let first = try JSONSerialization.jsonObject(with: Data(try #require(proposals.first).arguments.utf8)) as? NSDictionary
     #expect(first == ["command": "create_note", "version": "unused", "limit": 4096] as NSDictionary)
-    #expect(proposals.count == (alwaysInvalid ? 3 : 2))
+    #expect(proposals.count == (alwaysInvalid ? Int(Limits.toolProposals) : 2))
 }

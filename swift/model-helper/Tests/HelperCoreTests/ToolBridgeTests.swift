@@ -47,19 +47,24 @@ func everyToolNameAndMalformedTextUseTheSameServiceBridge(selector: String) asyn
     }
 }
 
-/// TCR-U15: the ninth proposal is sent with ordinal 9 and, after its LIMIT
-/// result, the turn fails with outputLimit; no tenth proposal is sent.
-@Test func ninthProposalIsSentThenTheTurnFailsWithOutputLimit() async throws {
-    let proposals = (1...10).map { _ in
+/// TCR-U15 (owner, 2026-10-18): 200 proposals run with 4,000-byte results
+/// (800,000 bytes, far above the removed 65,536-byte turn total; the test's
+/// service transport sends results on its 4,096-byte control queue); the 201st is sent with ordinal 201 and, after its
+/// LIMIT result, the turn fails with outputLimit; no further proposal is sent.
+@Test func overLimitProposalIsSentThenTheTurnFailsWithOutputLimit() async throws {
+    #expect(Limits.recordedToolCalls == 200 && Limits.toolProposals == 201)
+    let proposals = (1...(Limits.toolProposals + 1)).map { _ in
         ToolProposal(name: "service", arguments: #"{"command":"status"}"#, source: .generatedContent)
     }
     let channel = try await openToolSession(selector: "system", proposals: proposals)
     defer { channel.close() }
-    for ordinal in UInt32(1)...9 {
+    let full = String(repeating: "x", count: 4_000)
+    for ordinal in UInt32(1)...Limits.toolProposals {
         let call = try await channel.nextToolCall()
         #expect(call.ordinal == ordinal && call.name == "service" && call.source == .generatedContent)
+        let over = ordinal == Limits.toolProposals
         var result = Asura_Model_V1_ToolResult(); result.ordinal = ordinal
-        result.status = ordinal == 9 ? .limit : .success; result.text = ordinal == 9 ? "limit" : "ok"
+        result.status = over ? .limit : .success; result.text = over ? "limit" : full
         result.truncated = false
         try await channel.send(.toolResult(result))
     }
@@ -68,16 +73,22 @@ func everyToolNameAndMalformedTextUseTheSameServiceBridge(selector: String) asyn
     #expect(channel.unexpectedToolCalls == 0)
 }
 
-/// The helper rejects a non-LIMIT result for ordinal 9 as a protocol fault.
-@Test func ninthResultMustBeLimit() throws {
-    var result = Asura_Model_V1_ToolResult(); result.ordinal = 9; result.status = .success
+/// The helper rejects a non-LIMIT result for the over-limit ordinal as a
+/// protocol fault; recorded ordinals accept any status.
+@Test func overLimitResultMustBeLimit() throws {
+    var recorded = Asura_Model_V1_ToolResult(); recorded.ordinal = Limits.recordedToolCalls
+    recorded.status = .success; recorded.text = ""; recorded.truncated = false
+    var accepted = Envelope(); accepted.operationID = Data(repeating: 7, count: 16); accepted.generation = 1
+    accepted.body = .toolResult(recorded)
+    try Wire.validate(accepted, from: .service)
+    var result = Asura_Model_V1_ToolResult(); result.ordinal = Limits.toolProposals; result.status = .success
     result.text = ""; result.truncated = false
     var message = Envelope(); message.operationID = Data(repeating: 7, count: 16); message.generation = 1
     message.body = .toolResult(result)
     #expect(throws: HelperError.self) { try Wire.validate(message, from: .service) }
     result.status = .limit; message.body = .toolResult(result)
     try Wire.validate(message, from: .service)
-    result.ordinal = 10; message.body = .toolResult(result)
+    result.ordinal = Limits.toolProposals + 1; message.body = .toolResult(result)
     #expect(throws: HelperError.self) { try Wire.validate(message, from: .service) }
 }
 
@@ -197,7 +208,7 @@ private func toolCallbackJourney(cancel: Bool, selector: String, proposal: ToolP
         var good = call; change(&good); envelope.body = .toolCall(good)
         try Wire.validate(envelope, from: .helper)
     }
-    try accepted { $0.ordinal = 9 }
+    try accepted { $0.ordinal = Limits.toolProposals }
     try accepted { $0.arguments = "" }
     try accepted { $0.arguments = String(repeating: "x", count: 64_000) }
     try accepted { $0.name = String(repeating: "n", count: 256) }
@@ -205,7 +216,7 @@ private func toolCallbackJourney(cancel: Bool, selector: String, proposal: ToolP
     try accepted { $0.clearArguments(); $0.argumentsBytes = 64_001 }
     try accepted { $0.source = .providerJson }
     rejected { $0.ordinal = 0 }
-    rejected { $0.ordinal = 10 }
+    rejected { $0.ordinal = Limits.toolProposals + 1 }
     rejected { $0.name = "" }
     rejected { $0.name = String(repeating: "n", count: 257) }
     rejected { $0.arguments = String(repeating: "x", count: 64_001) }

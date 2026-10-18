@@ -10,6 +10,10 @@ pub mod pb {
 
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const HEADER_BYTES: usize = 12;
+/// `ConversationEvent.tools` carries at most this many entries: the most recent
+/// tool calls of the turn (tool-call-records.md TCR-D31). The count keeps the
+/// TCR-D26 frame proof beside the 61,440-byte response text.
+pub const MAX_TOOL_PROGRESS_ENTRIES: usize = 9;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     BadMagic,

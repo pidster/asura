@@ -2,10 +2,11 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-Every admission reserves exactly 2,048 tokens; replay rejects any other
-reservation (owner, 2026-10-17). Tool requests are capped at 1,024 tokens first
-and 512 thereafter, at most 64 per turn, under the
-[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Earlier
+Each model request has its own output cap. A tool-enabled turn's first request
+is capped at 1,024 tokens and each later request at 512, or at the caller's cap
+if smaller. A plain-text turn makes one request at the caller's cap, at most 2,048.
+There is no per-turn output budget, reservation or request count (owner,
+2026-10-18; [request caps](turn-usage-helper.md#request-caps-and-admission)). Earlier
 numerical examples and validation evidence below describe that earlier packet.
 
 Implementation update, 2026-10-12: committed code supersedes these parts of the
@@ -269,7 +270,7 @@ They use explicit messages in the evolving 0.1 schemas.
 | --- | --- | --- |
 | Active helper generations | 1 per service initially | Reject additional admission as busy; no hidden waiting queue. |
 | Input including instructions and scoped history | 64 KiB UTF-8 and the model's measured token window minus 2,048 response tokens | Reject overflow before the start permit; preserve the draft. |
-| Generation response | 2,048 tokens and 60 KiB UTF-8 | Cancel on byte overflow and mark output incomplete. |
+| Generation response | 2,048 tokens per request (no per-turn total; owner, 2026-10-18) and 60 KiB UTF-8 | Cancel on byte overflow and mark output incomplete. |
 | Private model-channel frame / chunk payload | 64 KiB / 16 KiB | Reject excessive lengths before allocation. |
 | Input and output credit windows | 64 KiB each | Pause data transfer at zero credit; continue control processing. |
 | Helper startup and identity handshake | No time limit (owner, 2026-10-16) | The step ends on the next message, helper exit, protocol fault, cancel or shutdown. On a fault, cancel or shutdown, close the channel, terminate and reap only the owned child. |
@@ -434,7 +435,8 @@ Reason values are 0 none, 1 model_unavailable, 2 input_limit, 3 output_limit,
 4 context_limit, 5 timeout, 6 refusal, 7 cancelled, 8 protocol_fault,
 9 helper_failed, 10 internal_error, 11 interrupted, and 12 result_expired.
 The control event maps helper reasons to the same meanings. Unknown critical
-values reject; absent usage stays unknown and does not refund reserved tokens.
+values reject; absent usage stays unknown. There is no turn token reservation to
+refund (owner, 2026-10-18).
 Control frames are processed while waiting for data credit. Use the existing
 D2 rule that late credit or chunks after terminal are a protocol fault.
 
@@ -495,10 +497,11 @@ in-memory task or write a separate conversation authority file.
 
 Deliver the authority prerequisite first through the existing storage owner:
 project registration, conversation identity/context generation, idempotent model
-admission, 2,048-token reservation, cancellation intent, terminal outcome and
+admission, cancellation intent, terminal outcome and
 restart interruption. Extend the canonical journal format with these records,
 its writer and replay rules. Preserve the existing frame/digest/durability
-contract, define crash points and retain unknown usage charges after interruption.
+contract, define crash points and record unknown usage, with no charge, after
+interruption (owner, 2026-10-18).
 The current journal explicitly requires a newly supported format for new record
 kinds; the 0.1 software/protocol numbering instruction does not waive that on-disk
 compatibility rule. Root must reconcile that format amendment with D3 before code.

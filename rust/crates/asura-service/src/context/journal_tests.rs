@@ -130,7 +130,6 @@ fn forty_turns_compose_within_the_window_and_reconstruct_after_replay() {
             input_digest: Sha256::digest(&composed.input).into(),
             prior_operations: composed.shown.clone(),
             prompt: prompt.clone(),
-            reserved_output_tokens: 2048,
             event_cursor: 1,
             composition: composed.composition(budget),
         };
@@ -150,7 +149,6 @@ fn forty_turns_compose_within_the_window_and_reconstruct_after_replay() {
                 final_cursor: u64::MAX,
                 usage_known: true,
                 output_tokens: 12,
-                charged_tokens: 12,
                 text: format!("answer {generation}: {}", "words ".repeat(60)),
             }),
         ] {

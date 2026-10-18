@@ -20,25 +20,25 @@ private actor UsageSnapshots {
     let request = UUID()
     try await observer.begin(request, cap: 512)
     try await observer.measure(request, input: 0, output: 0)
-    #expect(try await observer.settle(request, succeeded: true) == 0)
+    try await observer.settle(request, succeeded: true)
     #expect(await snapshots.starts == [1])
     #expect(await snapshots.reports == [RequestUsage(ordinal: 1, inputTokens: 0, outputTokens: 0, complete: true)])
 }
 
-@Test func missingAndFailedUsageDoNotInventCountersOrRefunds() async throws {
+@Test func missingAndFailedUsageDoNotInventCounters() async throws {
     let snapshots = UsageSnapshots()
     let observer = InferenceUsageObserver { await snapshots.record($0) }
     let unknown = UUID()
     try await observer.begin(unknown, cap: 512)
-    #expect(try await observer.settle(unknown, succeeded: true) == nil)
+    try await observer.settle(unknown, succeeded: true)
     let partial = UUID()
     try await observer.begin(partial, cap: 512)
     try await observer.measure(partial, input: nil, output: 5)
-    #expect(try await observer.settle(partial, succeeded: true) == 5)
+    try await observer.settle(partial, succeeded: true)
     let failed = UUID()
     try await observer.begin(failed, cap: 512)
     try await observer.measure(failed, input: 10, output: 7, cached: 3)
-    #expect(try await observer.settle(failed, succeeded: false) == nil)
+    try await observer.settle(failed, succeeded: false)
     #expect(await snapshots.reports == [RequestUsage(ordinal: 1),
         RequestUsage(ordinal: 2, outputTokens: 5),
         RequestUsage(ordinal: 3, inputTokens: 10, outputTokens: 7, cachedInputTokens: 3)])
@@ -55,26 +55,24 @@ private actor UsageSnapshots {
     await #expect(throws: BackendFailure.self) { try await observer.measure(request, input: 3, output: 1, cached: 4) }
     try await observer.measure(request, input: 3, output: 1)
     await #expect(throws: BackendFailure.self) { try await observer.measure(request, input: 3, output: 1) }
-    _ = try await observer.settle(request, succeeded: true)
-    await #expect(throws: BackendFailure.self) { _ = try await observer.settle(request, succeeded: true) }
+    try await observer.settle(request, succeeded: true)
+    await #expect(throws: BackendFailure.self) { try await observer.settle(request, succeeded: true) }
     #expect(await snapshots.reports.count == 1)
 }
 
-@Test func unknownAndFailedAllocationsRemainConservativelyCharged() async throws {
-    let unknown = ToolRoundBudget()
-    #expect(try await unknown.reserve() == 1024); await unknown.finishInference()
-    #expect(try await unknown.reserve() == 512); await unknown.finishInference()
-    #expect(try await unknown.reserve() == 512); await unknown.finishInference()
-    await #expect(throws: BackendFailure.self) { _ = try await unknown.reserve() }
+/// UH10, UH12 (owner, 2026-10-18): requests have per-request caps only; no
+/// request count or token total refuses one, and a failure stops admission.
+@Test func requestsKeepPerRequestCapsWithoutCountOrTurnTotal() async throws {
+    let budget = ToolRoundBudget()
+    #expect(try await budget.reserve() == 1024); await budget.finishInference()
+    for _ in 2...100 {
+        #expect(try await budget.reserve() == 512); await budget.finishInference()
+    }
+    #expect(await budget.recordedFailure() == nil)
     let failed = ToolRoundBudget(maximumTokens: 512)
     _ = try await failed.reserve()
-    await failed.finishInference(BackendFailure(.cancelled), measuredOutput: 1)
+    await failed.finishInference(BackendFailure(.cancelled))
     await #expect(throws: BackendFailure.self) { _ = try await failed.reserve() }
-    let oversized = ToolRoundBudget(maximumTokens: 20)
-    _ = try await oversized.reserve()
-    await oversized.finishInference(measuredOutput: 21)
-    #expect(await oversized.recordedFailure()?.reason == Reason.protocolFault)
-    await #expect(throws: BackendFailure.self) { _ = try await oversized.reserve() }
 }
 
 private actor FourPassProbe {
@@ -108,7 +106,7 @@ private struct FourPassModel: LanguageModel {
     }
 }
 
-@Test func threeMeasuredToolPassesAllowFourthFinalResponseWithinTurnReservation() async throws {
+@Test func threeMeasuredToolPassesAllowFourthFinalResponse() async throws {
     let probe = FourPassProbe()
     let snapshots = UsageSnapshots()
     let base = FourPassModel(probe: probe)

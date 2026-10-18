@@ -316,7 +316,8 @@ impl Event {
                 nonzero(project)
                     && nonzero(operation)
                     && *generation > 0
-                    && (1..=8).contains(ordinal)
+                    // Every recorded call, including the over-limit record.
+                    && (1..=crate::authority::conversation::MAX_TOOL_CALL_ORDINAL).contains(ordinal)
             }
         };
         if valid { Ok(()) } else { Err(Error::Invalid) }

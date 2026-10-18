@@ -5,7 +5,6 @@ pub type Id = [u8; 16];
 pub type Hash = [u8; 32];
 pub const MAX_PROJECTS: usize = 64;
 pub const MAX_CONVERSATIONS: usize = 256;
-pub const OUTPUT_RESERVATION: u32 = 2048;
 pub const MAX_PROMPT: usize = 32 * 1024;
 pub const MAX_TEXT: usize = 60 * 1024;
 
@@ -132,7 +131,6 @@ pub struct TurnAccepted {
     pub input_digest: Hash,
     pub prior_operations: Vec<Id>,
     pub prompt: String,
-    pub reserved_output_tokens: u32,
     pub event_cursor: u64,
     /// The context composer's record; every accepted turn carries one (kind 21).
     pub composition: Composition,
@@ -195,7 +193,6 @@ pub struct TurnTerminal {
     pub final_cursor: u64,
     pub usage_known: bool,
     pub output_tokens: u32,
-    pub charged_tokens: u32,
     pub text: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,7 +285,6 @@ pub struct Conversation {
 /// frame range from the same immutable journal bytes when a response is needed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Operation {
-    pub reserved_output_tokens: u32,
     pub conversation: Id,
     pub generation: u64,
     pub task: Id,
@@ -306,7 +302,6 @@ pub struct Terminal {
     pub cause: Cause,
     pub usage_known: bool,
     pub output_tokens: u32,
-    pub charged_tokens: u32,
     pub frame: Range<usize>,
 }
 
@@ -390,10 +385,12 @@ pub const MAX_TOOL_ARGUMENTS: usize = 64_000;
 pub const MAX_TOOL_NAME: usize = 256;
 pub const MAX_STORED_TOOL_NAME: usize = 512;
 pub const MAX_TOOL_NUMBERS: usize = 256;
-/// Ordinal 9 exists only for the over-limit `limit` record.
-pub const MAX_TOOL_CALL_ORDINAL: u32 = 9;
-/// Calls that may run or be rejected per turn; kind 15 ordinals stay 1-8.
-pub const MAX_RECORDED_CALLS: u32 = 8;
+/// Calls that may run or be rejected per turn; kind 15 ordinals are
+/// 1..=MAX_RECORDED_CALLS (owner, 2026-10-18; tool-call-records.md TCR-D32).
+pub const MAX_RECORDED_CALLS: u32 = 200;
+/// The ordinal after the last recorded call exists only for the over-limit
+/// `limit` record (or `cancelled`, TCR-D30).
+pub const MAX_TOOL_CALL_ORDINAL: u32 = MAX_RECORDED_CALLS + 1;
 /// A refused exec_cmd command is cut at this size (field 20 bit 0).
 pub const MAX_REFUSED_COMMAND_BYTES: usize = 8192;
 
@@ -645,7 +642,7 @@ impl ArgumentForm {
 pub struct ToolCall {
     pub operation: Id,
     pub generation: u64,
-    /// 1-9; 9 only with decision `limit`.
+    /// 1..=MAX_TOOL_CALL_ORDINAL; the last only with decision `limit` or `cancelled`.
     pub ordinal: u32,
     pub source: ToolCallSource,
     /// Redacted name, 0-512 bytes; empty only when not retained.

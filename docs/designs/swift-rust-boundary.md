@@ -2,10 +2,11 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-Every admission reserves exactly 2,048 tokens; replay rejects any other
-reservation (owner, 2026-10-17). Tool requests are capped at 1,024 tokens first
-and 512 thereafter, at most 64 per turn, under the
-[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Earlier
+Each model request has its own output cap. A tool-enabled turn's first request
+is capped at 1,024 tokens and each later request at 512, or at the caller's cap
+if smaller. A plain-text turn makes one request at the caller's cap, at most 2,048.
+There is no per-turn output budget, reservation or request count (owner,
+2026-10-18; [request caps](turn-usage-helper.md#request-caps-and-admission)). Earlier
 numerical examples and validation evidence below describe that earlier packet.
 
 Status: proposed D2 design for I0 and I3. Rust and Swift are selected languages;
@@ -776,14 +777,14 @@ Every conversation input follows the existing service pipeline: decode, validate
 normalize, route, admit, execute, and publish. The existing lifecycle reactor
 continues to dispatch validated control messages. One conversation owner supplies
 admitted model operations to this adapter. It retains project/context identity,
-configuration revision, token reservation, cancellation intent and durable outcome.
+configuration revision, cancellation intent and durable outcome.
 There is no client-to-helper route and no second lifecycle dispatcher.
 
 The adapter receives an already admitted operation, never raw TUI syntax. It owns
 transport validation and process observations. Only the conversation owner can
 settle those observations into a durable user-visible result. A helper terminal
 message is evidence, not a durable acknowledgement. In particular, a model refusal,
-crash or cancellation cannot silently release an unknown token charge.
+crash or cancellation cannot report unmeasured usage as known.
 
 ### Helper session and input contract
 
@@ -808,8 +809,9 @@ assembling the input transfer and before requesting the start permit.
 Use the SDK's structured transcript/prompt representation to preserve roles;
 never concatenate history with invented role delimiters. Token counting and
 context preparation occur after the serialized start permit, inside the admitted
-operation budget. Reject input when measured context plus the admitted Begin output
-reservation (2,048 for new turns) exceeds the model's reported capacity. An unavailable counter or context
+operation budget. Reject input when measured context plus the admitted Begin
+`max_response_tokens` (2,048, a per-request output cap rather than a turn total)
+exceeds the model's reported capacity. An unavailable counter or context
 size is explicit unavailability, not permission to send unchecked history.
 
 ### Private wire completion and capability report
@@ -833,8 +835,8 @@ context capacity and supplies reason model_unavailable. `selected_model` (field 
 is required in every Hello in both directions (owner, 2026-10-17). All Hello
 scalar fields except conditional context capacity require presence. Terminal
 `usage_known` requires presence; when false, `usage_tokens` must be absent. When
-true, `usage_tokens` must be present and zero is valid. Unknown usage retains the
-reservation under the admission contract.
+true, `usage_tokens` must be present and zero is valid. Unknown usage records no
+charge; there is no turn token reservation (owner, 2026-10-18).
 `usage_tokens` means measured generated output tokens, excluding input tokens.
 Its wire bound is 2,048; the operation owner also checks the admitted Begin limit.
 Tokenization estimates must not be reported as measured generation usage.

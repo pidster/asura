@@ -1,12 +1,15 @@
 # First conversation: durable admission and recovery
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
-supersedes this packet's earlier 256/128/128 allocations. Every admission
-reserves exactly 2,048 output tokens; replay rejects any other reservation
-(owner, 2026-10-17). Tool requests are capped at 1,024 tokens first
-and 512 thereafter, at most 64 per turn, under the
-[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Earlier
-validation evidence below describes the earlier packet.
+supersedes this packet's earlier 256/128/128 allocations. Turn limit change
+(owner, 2026-10-18): “We found these types of tool and turn limits to be
+profoundly limiting in Wisp.” An admission reserves no output tokens. Kind 21
+has no reserved-output-tokens field and kind 8 has no charged-tokens field; the
+schemas changed in place. Each model request has its own
+[request cap](turn-usage-helper.md#request-caps-and-admission): 1,024 tokens
+first and 512 thereafter for tool requests, or the caller's 2,048 cap if
+smaller, with no request count. Earlier validation evidence below describes the
+earlier packet.
 
 Status: CA-A through CA-D implemented. The storage validation subset below
 passed on 2026-09-27. The owner authorized conversation execution and the shared
@@ -30,7 +33,7 @@ Deliver one active text generation per service and one project per conversation.
 Tools were outside this packet; [model tools](model-tool-execution.md) defines
 current tool behavior. The initial provider is the admitted `system` model. One submitted
 turn creates one task and one model operation. Both have durable identities.
-The task has one operation and a 2,048-output-token budget. This packet does not
+The task has one operation and no output-token budget. This packet does not
 implement multi-step scheduling, remote providers, conversation branching, history
 editing, retention deletion or journal compaction.
 
@@ -354,10 +357,10 @@ include the complete state/result/event obligation described below.
 | 3 OwnerGeneration | no payload | Previous owner generation plus 1; durable before any new dispatch |
 | 4 ProjectRegistered | request ID, request digest, project ID, location string, device u64, inode u64, registry revision u64, visibility u8 | First project revision 1, visibility 1 closed; records original result and pinned association |
 | 9 ProjectRequestAlias | request ID, request digest, original location string, existing project ID, registry revision u64 | Existing same-object association; records idempotent result for a new request without another project |
-| 21 TurnAccepted | request ID, request digest, project ID, original conversation ID optional, expected generation u64, conversation ID, generation u64, task ID, model-operation ID, model string, configuration digest, instructions digest, input digest, prior-operation ID list, prompt string, reserved-output-tokens u32, event cursor u64, then the required composition (see [graph memory evolution](graph-memory-evolution.md)) | Registry and expected generation verified; atomically creates conversation when needed, accepts task/operation, reserves exactly 2,048 tokens and records acceptance cursor 1. Kind 5, the earlier form without composition, is removed |
+| 21 TurnAccepted | request ID, request digest, project ID, original conversation ID optional, expected generation u64, conversation ID, generation u64, task ID, model-operation ID, model string, configuration digest, instructions digest, input digest, prior-operation ID list, prompt string, event cursor u64, then the required composition (see [graph memory evolution](graph-memory-evolution.md)) | Registry and expected generation verified; atomically creates conversation when needed, accepts task/operation and records acceptance cursor 1. It reserves no output tokens (owner, 2026-10-18). Kind 5, the earlier form without composition, is removed |
 | 6 StartAuthorized | model-operation ID, conversation generation u64, helper-instance ID, input digest | Accepted operation, no cancel/terminal and same owner generation; one dispatch permit only |
 | 7 CancelRequested | model-operation ID, conversation generation u64, cause u8 | Cause 1 user, 2 deadline, 3 output limit, 4 service shutdown; one intent per operation, existing intent wins |
-| 8 TurnTerminal | model-operation ID, conversation generation u64, terminal kind u8, cause u8, final cursor u64, usage-known u8, output-tokens u32, charged-tokens u32, text string | Kind 1 complete, 2 failed, 3 cancelled, 4 interrupted; only once, helper settled where applicable; terminal task/operation, accounting and final event commit atomically |
+| 8 TurnTerminal | model-operation ID, conversation generation u64, terminal kind u8, cause u8, final cursor u64, usage-known u8, output-tokens u32, text string | Kind 1 complete, 2 failed, 3 cancelled, 4 interrupted; only once, helper settled where applicable; terminal task/operation, accounting and final event commit atomically |
 
 Location is at most 4096 UTF-8 bytes. Model identity is at most 1024 bytes. Prompt
 is nonempty and at most 32 KiB. The prior-operation list names the complete turns
@@ -378,7 +381,7 @@ designed here. Until it lands, the limits above apply. No overwrite or deletion 
 Terminal cause values are closed: 0 none, 1 user cancel, 2 deadline, 3 output limit,
 4 service shutdown, 5 provider failure, 6 protocol failure, 7 restart, 8 authority
 failure, 9 input/context limit. Complete requires cause 0, valid terminal metadata and no committed cancel intent.
-A complete response can have unknown usage; it retains the full 2,048-token charge.
+A complete response can have unknown usage; no token charge exists.
 Unknown usage requires output-tokens 0 plus usage-known 0; the flag prevents that
 placeholder from being reported as measured zero. Before-start terminal usage is
 known zero. A restart terminal requires interrupted kind and cause 7. Terminal
@@ -417,7 +420,7 @@ No successful recovery or automatic space reclamation is claimed in that case.
    wait for durability before delivering its one-use permit to the identified helper.
    Recheck a committed cancel intent before sending the permit. If the selected
    adapter has a native input counter, the helper validates its measured window
-   with 2,048 output tokens reserved. Otherwise, input usage stays unknown and the
+   with room for one request's output cap (2,048). Otherwise, input usage stays unknown and the
    provider must enforce context overflow under its provider contract.
    A context/counting failure becomes a durable failed terminal with known zero
    output usage when the helper confirms no generation started.
@@ -446,7 +449,7 @@ sequenceDiagram
     participant J as Journal worker
     participant H as Model helper
     C->>A: Queue input with original request ID and scoped prompt
-    A->>J: TurnAccepted with 2,048-token reservation for the dispatch ID
+    A->>J: TurnAccepted for the dispatch ID
     J-->>A: Durable acceptance
     A-->>C: Running queue projection
     alt Cancel wins before dispatch
@@ -496,24 +499,23 @@ volatile revisions. `after_cursor == u64::MAX` returns the same terminal result.
 
 ## Budget and terminal outcomes
 
-The 2,048-token reservation bounds output generation for this one-operation task.
-Input-window accounting is separate and is measured after the durable start permit,
-before generation, as selected by D2. The
-helper limit and reservation use the same value. This packet creates no money
-budget or fabricated provider billing estimate.
+A turn has no output-token budget (owner, 2026-10-18). Each model request has
+its own cap; the [request caps](turn-usage-helper.md#request-caps-and-admission)
+define them. Input-window accounting is separate and is measured after the
+durable start permit, before generation, as selected by D2. This packet creates
+no money budget or fabricated provider billing estimate.
 
-| Terminal condition | Charged output tokens | History and recovery |
+| Terminal condition | Recorded output usage | History and recovery |
 | --- | --- | --- |
-| Complete with validated known count 0 through 2,048 | Actual count; release unused reservation | Complete text becomes history after durable terminal commit |
-| Complete with unknown count | 2,048, usage unknown | Complete text becomes history after durable terminal commit; no measured usage is invented |
+| Complete plain-text turn with a validated known count (at most the request cap, 2,048) | Actual count, usage known | Complete text becomes history after durable terminal commit |
+| Complete with unknown count, including every tool-enabled turn | 0, usage unknown | Complete text becomes history after durable terminal commit; no measured usage is invented |
 | Cancel/failure before any StartAuthorized record | 0, usage known | No helper generation was permitted |
-| Started operation with validated known terminal count | Actual count 0 through 2,048 | Incomplete text excluded from history |
-| Started operation with unknown count, crash or uncertain permit delivery | 2,048, usage unknown | Full reservation remains charged; never infer zero usage |
-| Count above 2,048 or invalid terminal metadata | 2,048, usage unknown and failed result | Protocol failure; no complete-history publication |
+| Started operation with validated known terminal count | Actual count, usage known | Incomplete text excluded from history |
+| Started operation with unknown count, crash or uncertain permit delivery | 0, usage unknown | Never infer zero usage |
+| Count above the request cap or invalid terminal metadata | 0, usage unknown and failed result | Protocol failure; no complete-history publication |
 
-Retained unknown charges are conservative accounting, not a claim of measured
-usage. Restart cannot restore them to available task budget. A new user turn is
-a new task with its own explicit budget; no interrupted task is silently retried.
+Unknown usage is not a claim of measured usage. A new user turn is a new task;
+no interrupted task is silently retried.
 Task status reflects terminal failure/cancellation/interruption, not an apparently
 successful empty response. Parent task scheduling remains outside this packet.
 
@@ -556,7 +558,7 @@ A full journal or uncertain writer leaves independently safe read-only status us
 The replay result exposes one canonical internal state: sequence, end offset,
 last frame digest, authority revision, owner generation, initialization intent and
 binding, project/location index, request-result index, conversation generations,
-accepted task/operation records, reservation accounting and terminal event offsets.
+accepted task/operation records, usage accounting and terminal event offsets.
 Do not build a second parser in the service. Keep prompt/response bodies on disk
 by validated frame offsets; decode at most one bounded response buffer per read.
 Replay format 1 into bounded indexes using the existing 16 MiB allocation budget.
@@ -572,8 +574,8 @@ an old witness and leave permanent `authority_changed` status.
 
 After successful replay, append and flush OwnerGeneration. Before accepting new
 work, settle every previously nonterminal operation as Interrupted. An operation
-with no durable StartAuthorized record charges zero. A durable start record charges
-2,048 with unknown usage unless an already committed terminal record supplies usage.
+with no durable StartAuthorized record records known zero usage. A durable start
+record records unknown usage unless an already committed terminal record supplies usage.
 Recovery never starts a model, reuses an old permit or appends a second terminal
 for a completed operation. The helper owner must settle any process it can identify
 as still owned before permitting replacement; uncertain child lifetime blocks
@@ -783,7 +785,7 @@ No model permit may be enabled before the writer and recovery checks below pass.
 | --- | --- | --- | --- |
 | CA01 format | Header stays 1; first record must be kind 10; reject unknown versions, removed kinds 1, 2, 5 and 12, and other unknown kinds | Kind-10/11 frames from the canonical encoder pass every-byte damage, every-boundary truncation and writer-death checks; conversation file survives reopen and public inspection | A journal that starts with another kind is reported unsupported, never converted |
 | CA02 initialization/project | Original request mapping, identity, revision and visibility | PendingInit/ActiveBinding fault boundaries; pinned directory replacement | Explicit initialize/register/restart resolves original IDs |
-| CA03 admission | Duplicate ID, changed digest, generation mismatch, limits and 2,048 reservation | Real journal commit before scripted helper permit | Lost acceptance reply and reconnect produce one operation |
+| CA03 admission | Duplicate ID, changed digest, generation mismatch and limits; kind 21 has no reservation field | Real journal commit before scripted helper permit | Lost acceptance reply and reconnect produce one operation |
 | CA04 cancel race | Cancel before/after permit, stale helper, duplicate intent | Gate each append/flush and helper start boundary | Cancel acknowledgement remains distinct from terminal settlement |
 | CA05 completion | Usage limits, provisional/complete distinction, terminal cursor | Kill before/after terminal flush; preserve complete response only after commit | Reconnect displays original complete or interrupted result |
 | CA06 restart | Started versus never-started charge and no re-execution | Real child/service death with durable or incomplete frames | Restart reports Interrupted without another model call |
@@ -913,7 +915,7 @@ across the service, each at most 32 KiB UTF-8. Busy storage rejects before
 acceptance; clients retain text. Existing cancellation capacity remains
 reserved. Each dispatch uses the
 [cancellation-driven turn lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30).
-It keeps the current output reservation and one active operation limit.
+It keeps the per-request output caps and one active operation limit.
 
 InputQueuedV2 stores its original request/digest, a service-generated input ID,
 a fresh internal dispatch request ID, project, conversation, expected generation,

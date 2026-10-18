@@ -59,7 +59,8 @@ fn entry(v: &pb::AuditEntry) -> bool {
                     && v.requested_generation.is_none()
                     && v.current_generation.is_none()
                     && v.generation.is_some_and(|n| n > 0)
-                    && v.ordinal.is_some_and(|n| (1..=8).contains(&n))
+                    && v.ordinal
+                        .is_some_and(|n| (1..=crate::model::MAX_TOOL_ORDINAL).contains(&n))
                     && v.tool.is_some_and(|n| (1..=10).contains(&n))
                     && v.outcome.is_some_and(|n| (1..=7).contains(&n))
                     && v.reason == Some(0)

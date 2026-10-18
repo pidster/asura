@@ -40,7 +40,10 @@ public actor InferenceUsageObserver {
 
     func begin(_ id: UUID, cap: Int) async throws {
         try Task.checkCancellation()
-        guard active == nil, ordinal < 64, (1...2048).contains(cap) else { throw BackendFailure(.protocolFault) }
+        // No request count per turn (owner, 2026-10-18); UInt32 exhaustion is a fault.
+        guard active == nil, ordinal < UInt32.max, (1...Int(Limits.maximumResponseTokens)).contains(cap) else {
+            throw BackendFailure(.protocolFault)
+        }
         ordinal += 1
         active = Active(id: id, ordinal: ordinal, cap: cap)
         try await snapshot(Snapshot(text: "", inferenceStartedOrdinal: ordinal))
@@ -63,13 +66,13 @@ public actor InferenceUsageObserver {
         current.measured = true; active = current
     }
     /// Settlement is awaited before inference waiters can admit tools or another request.
-    func settle(_ id: UUID, succeeded: Bool) async throws -> UInt64? {
+    /// It releases no tokens: a turn has no token total (owner, 2026-10-18).
+    func settle(_ id: UUID, succeeded: Bool) async throws {
         guard let current = active, current.id == id else { throw BackendFailure(.protocolFault) }
         active = nil
         let report = RequestUsage(ordinal: current.ordinal, inputTokens: current.input,
             outputTokens: current.output, cachedInputTokens: current.cached,
             complete: succeeded && current.input != nil && current.output != nil)
         try await snapshot(Snapshot(text: "", inferenceUsage: report))
-        return succeeded ? current.output : nil
     }
 }

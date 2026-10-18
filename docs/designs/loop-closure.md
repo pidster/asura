@@ -12,10 +12,11 @@ queue or store. Protocol numbering remains `0.1`; journal format remains `1`.
 ## Purpose and scope
 
 Every repeating activity in Asura must decide whether to go again or stop. Today
-each loop embeds its own stopping rule. The current model turn loop stops on a
-hard-coded output token total, and an exhausted total fails the turn without an
-answer. That single number conflates runaway prevention, per-request safety and
-spend. The [model-sized limits](#model-sized-limits) requirement removes it.
+each loop embeds its own stopping rule. The model turn loop used to stop on a
+hard-coded output token total, and an exhausted total failed the turn without an
+answer. That single number conflated runaway prevention, per-request safety and
+spend. The owner removed it, with the request count and the turn result-byte
+total, on 2026-10-18 (see [turn limit change](#turn-limit-change-owner-2026-10-18)).
 
 This design names the primitives that end loops, separates them from interrupts,
 and defines permanent and temporary endings. A later per-loop mapping must select
@@ -30,8 +31,8 @@ the wire schema, and plan or task loops. Each needs the mapping or a later desig
 
 Required behavior (owner, 2026-10-13):
 
-- Token limits must not be hard-coded. The current 2,048-token figures in the
-  helper, wire validation and turn budget are implementation, not design input.
+- Token limits must not be hard-coded. The current 2,048-token per-request
+  figures in the helper and wire validation are implementation, not design input.
   Designs must not rely on them.
 - A fixed numeric limit applies only in a **known-size exhaustion closure**: the
   exhausted quantity has a size that Asura knows and fixes, such as its own
@@ -328,6 +329,30 @@ Separately, `Wire.swift` and `Session.swift` validate `maxResponseTokens` agains
 a hard-coded range. Model-sized caps therefore need a schema change within
 protocol 0.1, with the range taken from the capacity record.
 
+## Turn limit change (owner, 2026-10-18)
+
+Required behavior. The owner said: “We found these types of tool and turn limits
+to be profoundly limiting in Wisp.” The turn loop changes as follows:
+
+- A turn records up to 200 tool calls. The 201st proposal is recorded as `limit`
+  and the turn ends ([tool call records](tool-call-records.md#turn-limit-change-owner-2026-10-18)).
+- No request count limits a turn. The 64-request cap is removed.
+- No turn output-token total, refund or durable reservation exists. Each request
+  keeps its own cap ([request caps](turn-usage-helper.md#request-caps-and-admission)).
+- No per-turn tool-result byte total exists. Each result keeps 16 KiB.
+
+A turn therefore ends by these closures and interrupts: the model completes; the
+201st proposal; cancel or steer; the model's context window fills; provider
+failure; helper exit or protocol fault; journal exhaustion; shutdown or restart.
+A full context window is a provider failure, not a wait. The helper maps the
+SDK's `contextSizeExceeded` error to the `context_limit` turn failure, both
+before generation and when a later request in the turn overflows. Before this
+change, an overflow raised inside the bounded executor was reported as an
+internal error; the executor now records it as `context_limit` (Swift test
+`contextWindowFullMidTurnFailsWithContextLimit`). The Ollama server truncates its prompt to the requested context size
+instead of failing (provider documentation claim, not verified live here); the
+turn then continues until another closure applies, at most the 201st proposal.
+
 ## Current loops
 
 Proposed scope for the per-loop mapping. The current column records implemented
@@ -336,8 +361,8 @@ behavior; it is not the target.
 | Loop | Owner today | Current closures | Current interrupts |
 | --- | --- | --- | --- |
 | One model request | Model helper | Exhaustion: hard-coded per-request output cap (to be model-sized) | Cancel, steer |
-| Requests within a turn | Model helper | Completion; exhaustion: hard-coded token total (2,048, to be removed) and 64 requests | Cancel, steer |
-| Tool calls within a turn | Service | Exhaustion: 8 calls, 16 KiB per result, 64 KiB total | Cancel, steer |
+| Requests within a turn | Model helper | Completion; the tool-call limit below; context window full (provider context error); provider failure; helper exit. No request count and no token total (owner, 2026-10-18) | Cancel, steer |
+| Tool calls within a turn | Service | Exhaustion: 200 calls (the 201st is recorded as `limit` and ends the turn), 16 KiB per result; journal full. No turn result-byte total (owner, 2026-10-18) | Cancel, steer |
 | Tool job (designed, not implemented) | Service | Completion; capture fault. No lifetime deadline (owner, 2026-10-14). Temporary ending `CapturePaused` on quota or ENOSPC, with no time expiry. A stall closure will come from tool-loop trace evidence. `job wait` ends on events or an optional model time. See [job closures](tool-job-controller.md#job-closures-and-wind-down-bounds). | Cancel, person stop and kill, revocation, restart |
 | Retry and reconnect | Service and client | Exhaustion: attempt limits | Cancel, drain |
 
@@ -410,7 +435,8 @@ Open decisions for the per-loop mapping:
 Owner direction (2026-10-13): the closure that guarantees a turn's tool loop
 ends is derived from evidence. Asura logs tool-loop traces and builds a
 classifier first; see [tool-loop trace evidence](tool-output-views.md#tool-loop-trace-evidence).
-The current 8-call and 64-request limits stay until that work selects closures.
+The 200-call limit stays until that work selects closures; the owner removed
+the request limit on 2026-10-18.
 
 Alternatives considered: a single hard-coded per-turn token total (current;
 conflates concerns, ignores model size and fails without an answer); closures embedded in each loop's control

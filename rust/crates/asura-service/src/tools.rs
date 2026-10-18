@@ -9,11 +9,14 @@ mod parse;
 use asura_storage::authority::conversation as journal;
 pub use parse::{Parsed, parse_call};
 
-/// Calls that may be recorded per turn (ordinals 1-8); ordinal 9 is only the
-/// over-limit `limit` record (TCR-D6, TCR-D9).
+/// Calls that may be recorded per turn; the next ordinal is only the
+/// over-limit `limit` record (TCR-D6, TCR-D9; owner, 2026-10-18).
 pub const MAX_CALLS: u32 = journal::MAX_RECORDED_CALLS;
+// The wire codec and the journal must agree on the call limit (TCR-D32).
+const _: () = assert!(MAX_CALLS == asura_control::model::MAX_RECORDED_TOOL_CALLS);
+const _: () = assert!(journal::MAX_TOOL_CALL_ORDINAL == asura_control::model::MAX_TOOL_ORDINAL);
+/// Each result's limit. A turn has no result-byte total (owner, 2026-10-18).
 pub const MAX_RESULT_BYTES: usize = 16_384;
-pub const MAX_TOTAL_RESULT_BYTES: usize = 65_536;
 pub const MAX_PATH_BYTES: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -421,13 +424,13 @@ pub fn validate_authority(
 }
 
 /// Live accounting only. Durable records remain storage-owned. Every
-/// recorded call (run or not) consumes one ordinal; a call that does not run
-/// consumes no result bytes (TCR-D9). The pending call itself is owned by the
-/// conversation owner, one at a time.
+/// recorded call (run or not) consumes one ordinal (TCR-D9). A turn has no
+/// result-byte total; each result keeps `MAX_RESULT_BYTES` (owner,
+/// 2026-10-18). The pending call itself is owned by the conversation owner,
+/// one at a time.
 #[derive(Debug)]
 pub struct Budget {
     recorded: u32,
-    result_bytes: usize,
     cancelled: bool,
 }
 impl Budget {
@@ -435,15 +438,15 @@ impl Budget {
     pub fn cancellation_driven() -> Self {
         Self {
             recorded: 0,
-            result_bytes: 0,
             cancelled: false,
         }
     }
-    /// The ordinal the helper must send next (1-9).
+    /// The ordinal the helper must send next (1 to the over-limit ordinal).
     pub fn next_ordinal(&self) -> u32 {
         self.recorded + 1
     }
-    /// Counts one recorded call at `ordinal` 1-8. Ordinal 9 is never counted.
+    /// Counts one recorded call at `ordinal` 1..=MAX_CALLS. The over-limit
+    /// ordinal is never counted.
     pub fn record(&mut self, ordinal: u32) -> Result<(), Rejection> {
         if ordinal != self.recorded + 1 || self.recorded == MAX_CALLS {
             return Err(Rejection::Limit);
@@ -451,15 +454,16 @@ impl Budget {
         self.recorded += 1;
         Ok(())
     }
+    /// The bytes one result may hold. No turn total reduces it.
     pub fn result_capacity(&self) -> usize {
-        MAX_RESULT_BYTES.min(MAX_TOTAL_RESULT_BYTES - self.result_bytes)
+        MAX_RESULT_BYTES
     }
-    /// Call only after a known committed result of a `run` call.
+    /// Call only after a known committed result of a `run` call. Refuses a
+    /// result over the per-result limit.
     pub fn settle(&mut self, bytes: usize) -> Result<(), Rejection> {
         if bytes > self.result_capacity() {
             return Err(Rejection::Limit);
         }
-        self.result_bytes += bytes;
         Ok(())
     }
     pub fn cancel(&mut self) {
@@ -516,20 +520,23 @@ mod tests {
             );
         }
     }
-    /// TCR-D9: every recorded call consumes one ordinal 1-8 whether or not
-    /// it runs; ordinal 9 is never counted and a gap is refused.
+    /// TCR-D9, TCR-U18: every recorded call consumes one ordinal 1-200
+    /// whether or not it runs; the over-limit ordinal 201 is never counted and
+    /// a gap is refused (owner, 2026-10-18).
     #[test]
-    fn every_recorded_call_consumes_one_ordinal_and_nine_is_never_counted() {
+    fn every_recorded_call_consumes_one_ordinal_and_the_over_limit_ordinal_is_never_counted() {
+        assert_eq!(MAX_CALLS, 200);
         let mut budget = Budget::cancellation_driven();
         assert_eq!(budget.next_ordinal(), 1);
         assert_eq!(budget.record(2), Err(Rejection::Limit));
         for ordinal in 1..=MAX_CALLS {
             budget.record(ordinal).unwrap();
-            // A call that does not run consumes no result bytes.
-            budget.settle(0).unwrap();
         }
-        assert_eq!(budget.next_ordinal(), 9);
-        assert_eq!(budget.record(9), Err(Rejection::Limit));
+        assert_eq!(budget.next_ordinal(), journal::MAX_TOOL_CALL_ORDINAL);
+        assert_eq!(
+            budget.record(journal::MAX_TOOL_CALL_ORDINAL),
+            Err(Rejection::Limit)
+        );
         assert_eq!(budget.result_capacity(), MAX_RESULT_BYTES);
     }
 
@@ -787,16 +794,17 @@ mod tests {
         assert_eq!(budget.settle(MAX_RESULT_BYTES + 1), Err(Rejection::Limit));
         assert_eq!(budget.result_capacity(), MAX_RESULT_BYTES);
     }
+    /// TCR-U18: a turn has no result-byte total (owner, 2026-10-18). Every
+    /// recorded call can settle a full 16 KiB result, far beyond 64 KiB.
     #[test]
-    fn aggregate_result_bytes_cannot_expand_on_settlement() {
+    fn full_results_for_every_call_have_no_turn_total() {
         let mut budget = Budget::cancellation_driven();
-        for ordinal in 1..=4 {
+        for ordinal in 1..=MAX_CALLS {
             budget.record(ordinal).unwrap();
+            assert_eq!(budget.result_capacity(), MAX_RESULT_BYTES);
             budget.settle(MAX_RESULT_BYTES).unwrap();
         }
-        assert_eq!(budget.result_capacity(), 0);
-        budget.record(5).unwrap();
-        assert_eq!(budget.settle(1), Err(Rejection::Limit));
+        assert_eq!(budget.settle(MAX_RESULT_BYTES + 1), Err(Rejection::Limit));
     }
     /// TCR-D12: rendered text of calls that do not run holds only codes.
     #[test]

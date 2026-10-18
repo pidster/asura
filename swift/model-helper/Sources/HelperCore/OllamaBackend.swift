@@ -233,7 +233,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
 
     /// Record accumulation is bounded before JSON decoding, including missing-newline responses.
     struct StreamState {
-        var maximumTokens = 2048
+        var maximumTokens = Int(Limits.maximumResponseTokens)
         var line = Data()
         var total = 0
         var textBytes = 0
@@ -259,10 +259,11 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 guard message.role == "assistant" else { throw Failure.invalidResponse }
                 textBytes += message.content.utf8.count
                 calls += message.tool_calls?.count ?? 0
-                // Nine calls: the ninth is recorded and then ends the turn (TCR-D6).
+                // Every proposal up to the over-limit one is forwarded; the session
+                // records the last and then ends the turn (TCR-D6).
                 // Arguments are forwarded unread; the service applies the
                 // 64,000-byte limit and every argument rule (TCR-D17).
-                guard textBytes <= Limits.output, calls <= 9 else { throw Failure.limit }
+                guard textBytes <= Limits.output, calls <= Int(Limits.toolProposals) else { throw Failure.limit }
                 for call in message.tool_calls ?? [] {
                     guard !call.function.name.isEmpty else { throw Failure.invalidResponse }
                 }
@@ -329,7 +330,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                     parameters: try JSONDecoder().decode(JSON.self, from: JSONEncoder().encode(tool.parameters))))
             }
             guard let maximumTokens = request.generationOptions.maximumResponseTokens,
-                  (1...2048).contains(maximumTokens) else { throw Failure.limit }
+                  (1...Int(Limits.maximumResponseTokens)).contains(maximumTokens) else { throw Failure.limit }
             let hasTools = !request.enabledToolDefinitions.isEmpty
             let registered = Set(request.enabledToolDefinitions.map(\.name))
             guard !hasTools || model.localToolModel != nil else { throw Failure.unsupported }

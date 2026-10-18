@@ -20,8 +20,13 @@ public enum Limits {
     public static let output = 61_440
     public static let chunk = 16_384
     public static let cumulativeOutput = 4 * 1024 * 1024
-    /// Tool proposals per turn: 8 recorded calls plus the over-limit ninth (TCR-D6).
-    public static let toolProposals: UInt32 = 9
+    /// Tool calls a turn may record (owner, 2026-10-18; tool-call-records.md TCR-D32).
+    public static let recordedToolCalls: UInt32 = 200
+    /// Tool proposals per turn: the recorded calls plus the one over-limit proposal (TCR-D6).
+    public static let toolProposals: UInt32 = recordedToolCalls + 1
+    /// Per-request output-token ceiling: the largest Begin cap and plain-text
+    /// terminal usage. Not a turn total (owner, 2026-10-18).
+    public static let maximumResponseTokens: UInt32 = 2048
     /// Wire bounds of one forwarded proposal (tool-call-records.md, wire contract).
     public static let toolName = 256
     public static let toolArguments = 64_000
@@ -84,7 +89,7 @@ public enum Wire {
         }
         switch body {
         case .inferenceUsage(let v):
-            try check(!service && v.hasRequestOrdinal && (1...64).contains(v.requestOrdinal) && v.hasComplete
+            try check(!service && v.hasRequestOrdinal && v.requestOrdinal >= 1 && v.hasComplete
                 && (!v.hasInputTokens || v.inputTokens <= 1_000_000_000)
                 && (!v.hasOutputTokens || v.outputTokens <= 1_000_000_000)
                 && (!v.hasCachedInputTokens || (v.hasInputTokens && v.cachedInputTokens <= v.inputTokens))
@@ -171,7 +176,7 @@ public enum Wire {
             }
         case .begin(let v):
             try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...Limits.input).contains(v.inputBytes)
-                && v.hasMaxResponseTokens && (1...2048).contains(v.maxResponseTokens))
+                && v.hasMaxResponseTokens && (1...Limits.maximumResponseTokens).contains(v.maxResponseTokens))
         case .chunk(let v):
             try check(v.hasTransferID && v.hasDirection && transfer(v.transferID, v.direction)
                 && v.direction == (service ? .input : .output) && v.hasData && !v.data.isEmpty && v.data.count <= Limits.chunk
@@ -207,7 +212,7 @@ public enum Wire {
                 && v.hasText && v.text.utf8.count <= 16_384 && v.hasTruncated)
             if v.status != .success { try check(!v.hasNextOffset) }
         case .terminal(let v):
-            try check(!service && v.hasUsageKnown && (v.usageKnown ? v.hasUsageTokens && v.usageTokens <= 2048 : !v.hasUsageTokens)
+            try check(!service && v.hasUsageKnown && (v.usageKnown ? v.hasUsageTokens && v.usageTokens <= UInt64(Limits.maximumResponseTokens) : !v.hasUsageTokens)
                 && v.hasLastRevision && v.lastRevision <= 1024 && v.hasCount && v.hasTotalBytes
                 && counts(v.count, v.totalBytes, 4 * 1024 * 1024) && v.hasOutcome && v.hasReason)
             if v.outcome == .complete { try check(v.lastRevision > 0 && v.reason == .none) }

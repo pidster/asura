@@ -949,7 +949,7 @@ fn tcr_u14_tool_call_bounds_and_sizes() {
             ..base.clone()
         },
         pb::ToolCall {
-            ordinal: Some(10),
+            ordinal: Some(MAX_TOOL_ORDINAL + 1),
             ..base.clone()
         },
         raw_call("", "{}"),
@@ -1011,7 +1011,7 @@ fn tcr_u14_tool_call_bounds_and_sizes() {
 }
 
 #[test]
-fn tool_results_enforce_direction_bounds_and_ordinal_nine_limit() {
+fn tool_results_enforce_direction_bounds_and_over_limit_ordinal() {
     let result = envelope(Body::ToolResult(pb::ToolResult {
         ordinal: Some(1),
         status: Some(1),
@@ -1040,25 +1040,35 @@ fn tool_results_enforce_direction_bounds_and_ordinal_nine_limit() {
         encode_frame(&bad, Direction::ServiceToHelper),
         Err(ProtocolError::InvalidSemantics)
     );
-    // Ordinal 9 only with status 7 (TCR-D6); ordinal 10 never.
-    let nine = |status| {
+    // Ordinals 1..=200 with any status; the over-limit ordinal only with
+    // status 7 (TCR-D6, owner 2026-10-18); never beyond it.
+    for ordinal in [1, MAX_RECORDED_TOOL_CALLS] {
+        let mut recorded = result.clone();
+        if let Some(Body::ToolResult(v)) = &mut recorded.body {
+            v.ordinal = Some(ordinal);
+            v.status = Some(3);
+            v.next_offset = None;
+        }
+        assert!(encode_frame(&recorded, Direction::ServiceToHelper).is_ok());
+    }
+    let over = |status| {
         envelope(Body::ToolResult(pb::ToolResult {
-            ordinal: Some(9),
+            ordinal: Some(MAX_TOOL_ORDINAL),
             status: Some(status),
             text: Some("limit".into()),
             next_offset: None,
             truncated: Some(false),
         }))
     };
-    assert!(encode_frame(&nine(7), Direction::ServiceToHelper).is_ok());
+    assert!(encode_frame(&over(7), Direction::ServiceToHelper).is_ok());
     for status in [1, 3, 6] {
         assert_eq!(
-            encode_frame(&nine(status), Direction::ServiceToHelper),
+            encode_frame(&over(status), Direction::ServiceToHelper),
             Err(ProtocolError::InvalidSemantics)
         );
     }
     if let Some(Body::ToolResult(v)) = &mut bad.body {
-        v.ordinal = Some(10);
+        v.ordinal = Some(MAX_TOOL_ORDINAL + 1);
         v.status = Some(7);
     }
     assert!(encode_frame(&bad, Direction::ServiceToHelper).is_err());
@@ -1300,9 +1310,23 @@ fn inference_usage_preserves_zero_unknown_and_rejects_invalid_counts() {
         message
     );
     assert!(encode_frame(&message, Direction::ServiceToHelper).is_err());
+    // No request count per turn (owner, 2026-10-18): any ordinal from 1.
+    for ordinal in [65, 1000, u32::MAX] {
+        let late = pb::InferenceUsage {
+            request_ordinal: Some(ordinal),
+            ..value
+        };
+        assert!(
+            encode_frame(
+                &envelope(Body::InferenceUsage(late)),
+                Direction::HelperToService
+            )
+            .is_ok()
+        );
+    }
     for invalid in [
         pb::InferenceUsage {
-            request_ordinal: Some(65),
+            request_ordinal: Some(0),
             ..value
         },
         pb::InferenceUsage {

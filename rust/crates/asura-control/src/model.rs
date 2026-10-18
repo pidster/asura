@@ -21,8 +21,14 @@ pub const MAX_TOOL_SCHEMA_BYTES: u32 = 1024 * 1024;
 /// contract). The argument bound equals the kind 14 record bound.
 pub const MAX_TOOL_NAME_BYTES: usize = 256;
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64_000;
-/// Ordinal 9 exists only for the over-limit proposal (status 7).
-pub const MAX_TOOL_ORDINAL: u32 = 9;
+/// Tool calls a turn may record (owner, 2026-10-18; tool-call-records.md
+/// TCR-D32). The service asserts this equals the journal's limit.
+pub const MAX_RECORDED_TOOL_CALLS: u32 = 200;
+/// The next ordinal exists only for the over-limit proposal (status 7).
+pub const MAX_TOOL_ORDINAL: u32 = MAX_RECORDED_TOOL_CALLS + 1;
+/// Per-request output-token ceiling: the `Begin` cap the service sends and the
+/// largest plain-text terminal usage. Not a turn total (owner, 2026-10-18).
+pub const MAX_RESPONSE_TOKENS: u32 = 2048;
 /// Credit window for one direction; a sliding window for input.
 pub const CREDIT_WINDOW: u64 = 65_536;
 const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
@@ -343,7 +349,8 @@ pub fn validate_semantics(
             matches!((v.input_tokens, v.capacity_tokens), (Some(n), Some(c)) if c > 0 && n <= c)
         }
         Body::InferenceUsage(v) => {
-            v.request_ordinal.is_some_and(|n| (1..=64).contains(&n))
+            // Consecutive from 1; no request count per turn (owner, 2026-10-18).
+            v.request_ordinal.is_some_and(|n| n >= 1)
                 && v.input_tokens.is_none_or(|n| n <= 1_000_000_000)
                 && v.output_tokens.is_none_or(|n| n <= 1_000_000_000)
                 && v.cached_input_tokens
@@ -356,7 +363,7 @@ pub fn validate_semantics(
             v.model.as_deref().is_some_and(selector)
                 && positive(v.input_bytes, MAX_INPUT_BYTES)
                 && v.max_response_tokens
-                    .is_some_and(|n| (1..=2048).contains(&n))
+                    .is_some_and(|n| (1..=MAX_RESPONSE_TOKENS).contains(&n))
         }
         Body::Chunk(v) => {
             transfer(v.transfer_id, v.direction)
@@ -413,7 +420,9 @@ pub fn validate_semantics(
         Body::Terminal(v) => {
             let usage = match v.usage_known {
                 Some(false) => v.usage_tokens.is_none(),
-                Some(true) => v.usage_tokens.is_some_and(|tokens| tokens <= 2048),
+                Some(true) => v
+                    .usage_tokens
+                    .is_some_and(|tokens| tokens <= u64::from(MAX_RESPONSE_TOKENS)),
                 None => false,
             };
             usage

@@ -2,16 +2,17 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-Every admission reserves exactly 2,048 tokens; replay rejects any other
-reservation (owner, 2026-10-17). Tool requests are capped at 1,024 tokens first
-and 512 thereafter, at most 64 per turn, under the
-[turn budget](turn-usage-helper.md#turn-budget-and-request-admission). Earlier
+Each model request has its own output cap. A tool-enabled turn's first request
+is capped at 1,024 tokens and each later request at 512, or at the caller's cap
+if smaller. A plain-text turn makes one request at the caller's cap, at most 2,048.
+There is no per-turn output budget, reservation or request count (owner,
+2026-10-18; [request caps](turn-usage-helper.md#request-caps-and-admission)). Earlier
 numerical examples and validation evidence below describe that earlier packet.
 
 Owner requirement, 2026-10-13: Asura will integrate local and remote models
 through the OpenAI API specification. Token limits must not be hard-coded; each
 model's context and output capacity sets its token bounds. The 2,048-token
-figures above are current implementation to be replaced under
+per-request cap above is current implementation to be replaced under
 [model-sized limits](loop-closure.md#model-sized-limits). The owner selected both
 the Chat Completions and Responses surfaces, capacity in the configuration file
 with sensible defaults, and probe, test, person confirmation and configuration
@@ -153,10 +154,10 @@ termination/reap. Adapter retries are disabled; cancellation invalidates its ses
 | NDJSON record | 64 KiB before decoding |
 | Total response | 4 MiB |
 | Response text | 60 KiB per generation |
-| Tool calls | 8 per generation; shared turn budget may be stricter |
+| Tool calls | 201 per provider stream: the turn's 200 recorded calls plus the over-limit ordinal 201 ([tool call records](tool-call-records.md); owner, 2026-10-18) |
 | Tool arguments | 16 KiB per call |
 | Ollama context request | At most 8,192 tokens, selected after `/api/show` discovery; reported maximum and effective request capacity are separate observations |
-| Output request | At most 2,048 tokens, the per-request cap from the turn budget |
+| Output request | At most 2,048 tokens, the [per-request cap](turn-usage-helper.md#request-caps-and-admission) |
 
 Read network bytes incrementally and reject before growing the record buffer beyond
 its limit. HTTP error bodies are not logged or retained. Invalid or redirected
@@ -288,7 +289,7 @@ flowchart TD
 - MP2-L4 native: installed MLX/CoreAI assets produce a real response and a native
   tool callback through the common service grant/result cycle. Each model needs its
   own recorded evidence; one provider's success does not qualify another.
-- MP2-L5 native: output budget, cancellation and missing-tool capability fail
+- MP2-L5 native: per-request output cap, cancellation and missing-tool capability fail
   truthfully. Input context/usage stay unknown if no actual measurement exists.
 
 Initial investigation found installed SDK and cached pinned source for these APIs,
@@ -303,7 +304,7 @@ Discovery must return a positive integer model-info key ending in `.context_leng
 Conflicting values use the smallest reported maximum. The request context is the smaller
 of that maximum and 8,192 tokens; Hello reports both values and the discovery source.
 Missing capacity fails unavailable. `num_predict` comes from the common engine's
-current request, between 1 and 2,048, so tool continuations preserve remaining budget.
+current request's cap, between 1 and 2,048; each tool continuation has its own cap.
 Stream usage above that request limit fails. Discovery keeps its resource bounds;
 the [endpoint configuration contract](#mp2-endpoint-configuration-handoff) governs
 local HTTP and remote HTTPS selection.
@@ -761,34 +762,37 @@ sizes, and the fields that must be omitted. It contains no argument values.
 
 One wrapper around each advertised native tool uses the existing turn-local
 ToolRoundBudget. Before adapter validation, it waits for the current inference
-result, checks cancellation and reserves one of eight native proposals. Valid
+result, checks cancellation and reserves one of 201 native proposals: the turn's 200
+recorded calls plus the over-limit ordinal 201 (owner, 2026-10-18). Valid
 and locally rejected proposals consume this same bound. The service independently
-retains its eight admitted-operation limit. Exhaustion records output-limit;
-it does not return another correction. The wrapper forwards the original schema,
+retains its 200-call limit and records ordinal 201 with decision `limit`. After
+the ordinal-201 result the helper fails the turn with output-limit; it does not
+return another correction. The wrapper forwards the original schema,
 name and description. It cannot expose an additional tool or grant authority.
-The existing inference allocations (1024 first, 512 later, at most 64 requests
-under the [turn budget](turn-usage-helper.md#turn-budget-and-request-admission)),
-2048 total reservation, callback-waiter bound and output bounds
-remain unchanged. No retry
+The existing per-request output caps (1,024 first, 512 later, under the
+[request caps](turn-usage-helper.md#request-caps-and-admission)), callback-waiter
+bound and output bounds remain unchanged. A turn has no request count or token
+total (owner, 2026-10-18). No retry
 scheduler or extra model dispatch owner is added; the SDK decides whether to
 correct its proposal within those limits.
 
 ```mermaid
 flowchart TD
     Proposal[Native proposal] --> Gate[Wait for successful inference and check cancellation]
-    Gate --> Budget{Fewer than eight proposals?}
+    Gate --> Budget{Fewer than 201 proposals?}
     Budget -->|No| Limit[Fail with output limit]
     Budget -->|Yes| Reserve[Reserve one proposal]
     Reserve --> Validate[Validate grouped arguments]
     Validate -->|Recoverable memory shape error| Hint[Return fixed correction with no service call]
-    Hint --> SDK[Existing SDK loop and inference budget]
+    Hint --> SDK[Existing SDK loop and per-request output caps]
     Validate -->|Valid| Service[Existing typed service handler and authority]
+    Service -->|Ordinal 201: limit result| Limit
     Validate -->|Other failure| Fail[Retain existing failure]
 ```
 
 Tests must prove malformed creation followed by a valid creation reaches the host
-once, across the SDK loop; repeated correction cannot exceed the 2,048-token turn
-budget or eight proposals; failed inference and cancellation cannot return a
+once, across the SDK loop; repeated correction cannot exceed the per-request
+output caps or 201 proposals; failed inference and cancellation cannot return a
 correction or invoke the host; and rejected fields remain rejected without their
 values appearing in feedback. All four public tool names and schemas stay intact.
 

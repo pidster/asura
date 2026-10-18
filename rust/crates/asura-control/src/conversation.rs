@@ -1,5 +1,5 @@
 //! Runtime-free validation of setup and conversation commands.
-use crate::{id, pb, text};
+use crate::{MAX_TOOL_PROGRESS_ENTRIES, id, pb, text};
 use pb::envelope::Body;
 pub(super) fn handles(body: &Body) -> bool {
     matches!(
@@ -252,9 +252,9 @@ pub(super) fn valid(body: &Body) -> bool {
                     }
                 })
                 && v.statistics.as_ref().is_none_or(|s| {
-                    s.request_count.is_some_and(|n| n <= 64)
-                        && s.input_tokens.is_none_or(|n| n <= 64_000_000_000)
-                        && s.output_tokens.is_none_or(|n| n <= 64_000_000_000)
+                    // No request count or token total per turn (owner,
+                    // 2026-10-18): the counts are bounded only by their types.
+                    s.request_count.is_some()
                         && s.cached_input_tokens
                             .is_none_or(|n| s.input_tokens.is_some_and(|i| n <= i))
                         && s.complete.is_some()
@@ -263,8 +263,16 @@ pub(super) fn valid(body: &Body) -> bool {
                                 && s.input_tokens.is_some()
                                 && s.output_tokens.is_some()))
                 })
-                // One entry per kind 14 record: up to 8 calls plus ordinal 9.
-                && v.tools.len() <= 9
+                // The most recent kind 14 records: consecutive ordinals that
+                // end at most at the over-limit ordinal (TCR-D31).
+                && v.tools.len() <= MAX_TOOL_PROGRESS_ENTRIES
+                && v.tools.first().is_none_or(|first| {
+                    first.ordinal.is_some_and(|n| {
+                        n >= 1
+                            && u64::from(n) + v.tools.len() as u64
+                                <= u64::from(crate::model::MAX_TOOL_ORDINAL) + 1
+                    })
+                })
                 && v.tools.iter().enumerate().all(|(index, tool)| {
                     tool.arguments.as_ref().is_none_or(|s| s.len() <= 192)
                         && tool.preview.as_ref().is_none_or(|s| s.len() <= 128)
@@ -272,7 +280,8 @@ pub(super) fn valid(body: &Body) -> bool {
                         && tool.policy_decision.is_none_or(|n| (1..=8).contains(&n))
                         && tool.fault.is_none_or(|n| (1..=15).contains(&n))
                         && tool.result_bytes.is_none_or(|n| n <= 65_536)
-                        && tool.ordinal == Some(index as u32 + 1)
+                        && tool.ordinal
+                            == v.tools[0].ordinal.map(|first| first + index as u32)
                         // A display prefix of the redacted name as the model
                         // sent it; empty when not retained (TCR-D26).
                         && tool.name.as_ref().is_some_and(|name| name.len() <= 64)
@@ -852,7 +861,9 @@ mod tests {
             reason: Some(0),
             text: Some("a".repeat(61440)),
             usage_known: Some(false),
-            tools: (1..=9)
+            // The most recent window, ending at the over-limit ordinal (TCR-D31).
+            tools: (crate::model::MAX_TOOL_ORDINAL + 1 - MAX_TOOL_PROGRESS_ENTRIES as u32
+                ..=crate::model::MAX_TOOL_ORDINAL)
                 .map(|ordinal| pb::ToolProgress {
                     ordinal: Some(ordinal),
                     name: Some("a".repeat(64)),
@@ -870,10 +881,11 @@ mod tests {
                 .collect(),
             statistics: Some(pb::TurnStatistics {
                 elapsed_ms: Some(u64::MAX),
-                request_count: Some(64),
-                input_tokens: Some(64_000_000_000),
-                output_tokens: Some(64_000_000_000),
-                cached_input_tokens: Some(64_000_000_000),
+                // No request count or token total (owner, 2026-10-18).
+                request_count: Some(u32::MAX),
+                input_tokens: Some(u64::MAX),
+                output_tokens: Some(u64::MAX),
+                cached_input_tokens: Some(u64::MAX),
                 complete: Some(true),
             }),
             ..Default::default()
@@ -891,5 +903,36 @@ mod tests {
             v.tools[0].arguments = Some("a".repeat(193));
         }
         assert!(!valid(invalid.body.as_ref().unwrap()));
+        // TCR-U19: more entries, a gap, a first ordinal of 0 or an ordinal past
+        // the over-limit ordinal are rejected; a window starting at 1 passes.
+        let tools = |event: &pb::Envelope| match event.body.as_ref() {
+            Some(Body::ConversationEvent(v)) => v.tools.clone(),
+            _ => unreachable!(),
+        };
+        let with = |tools: Vec<pb::ToolProgress>| {
+            let mut changed = message.clone();
+            if let Some(Body::ConversationEvent(v)) = changed.body.as_mut() {
+                v.tools = tools;
+            }
+            valid(changed.body.as_ref().unwrap())
+        };
+        let window = tools(&message);
+        let renumber = |first: u32, count: usize| {
+            (0..count)
+                .map(|i| pb::ToolProgress {
+                    ordinal: Some(first + i as u32),
+                    ..window[0].clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(with(renumber(1, MAX_TOOL_PROGRESS_ENTRIES)));
+        assert!(with(renumber(150, 3)));
+        assert!(with(Vec::new()));
+        assert!(!with(renumber(1, MAX_TOOL_PROGRESS_ENTRIES + 1)));
+        assert!(!with(renumber(0, 2)));
+        assert!(!with(renumber(crate::model::MAX_TOOL_ORDINAL, 2)));
+        let mut gap = renumber(5, 3);
+        gap[2].ordinal = Some(8);
+        assert!(!with(gap));
     }
 }

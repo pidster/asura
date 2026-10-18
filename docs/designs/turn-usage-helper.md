@@ -10,6 +10,12 @@ Owner requirement, 2026-10-13: token limits must not be hard-coded. The fixed
 token figures in this design describe the current implementation and will be
 replaced by [model-sized limits](loop-closure.md#model-sized-limits).
 
+Owner decision, 2026-10-18: “We found these types of tool and turn limits to be
+profoundly limiting in Wisp.” The helper no longer limits the number of requests
+in a turn and no longer keeps a turn output-token budget. The 64-request cap, the
+2,048-token turn total, its refunds and the durable turn reservation are removed.
+Each request keeps its own output cap. See [request caps and admission](#request-caps-and-admission).
+
 ## Scope and ownership
 
 The Swift helper observes actual SDK executor requests in `BoundedToolModel`.
@@ -19,8 +25,8 @@ Provider adapters supply measured counters from the request they execute.
 It does not coalesce reports with replacement response text.
 
 This packet adds no scheduler, model invocation, tokenization call, provider probe,
-filesystem read, dependency or public tool. Context occupancy, reserved token
-budgets and differences between session totals cannot supply usage counters.
+filesystem read, dependency or public tool. Context occupancy, request token
+caps and differences between session totals cannot supply usage counters.
 The protocol remains 0.1; the journal remains format 1.
 
 ## Installed API evidence
@@ -46,11 +52,12 @@ cached usage rather than use its existing synthetic SDK cached count of zero.
 
 ## Request and report contract
 
-Each executor invocation admitted by the existing budget receives one ordinal,
+Each executor invocation admitted under the request caps receives one ordinal,
 starting at 1. The observer holds at most one active UUID, ordinal and counter tuple.
 Overlapping invocations fail with the existing protocol failure; no second lane
-or unbounded map is created. The independent three-pass limit is removed under the budget contract below.
-The 2048-token turn reservation and eight native proposals remain mandatory.
+or unbounded map is created. No request count or turn token total limits admission
+(owner, 2026-10-18). The 200-call tool limit of
+[tool call records](tool-call-records.md#size-limits) still applies.
 
 `Snapshot` gains an optional usage report and an optional request-start ordinal.
 These callbacks carry empty text and no text usage or context measurement.
@@ -62,7 +69,7 @@ The parent adds private envelope field 23, `InferenceUsage`, with:
 
 | Field | Meaning |
 | --- | --- |
-| request_ordinal | Consecutive request identity within the operation, 1–64 |
+| request_ordinal | Consecutive request identity within the operation, starting at 1; any `uint32` value |
 | input_tokens | Optional actual request input count, at most 1,000,000,000 |
 | output_tokens | Optional actual request output count, at most 1,000,000,000 |
 | cached_input_tokens | Optional measured cached input count; requires input and cannot exceed it |
@@ -75,56 +82,63 @@ missing counts. Invalid provider counts cause provider protocol failure and an
 incomplete report with those invalid counts omitted.
 
 Reports carry the existing operation and generation fence. The session enforces
-consecutive ordinals, at most 64 reports and at most one unsettled request.
-It rejects duplicates, missing start markers, invalid bounds and reports after
-terminal. A normally completed request emits exactly one report before the next
-request starts. No additional inference runs to collect missing statistics.
+consecutive ordinals and at most one unsettled request. The ordinal is a `uint32`.
+A request after ordinal 4,294,967,295 fails with the protocol failure; this is a
+known-size exhaustion that a turn does not reach in practice. The session rejects
+duplicates, missing start markers, invalid bounds and reports after terminal.
+A normally completed request emits exactly one report before the next request
+starts. No additional inference runs to collect missing statistics.
 
-## Turn budget and request admission
+## Request caps and admission
 
-The former three fixed allocations prevented a fourth request even when earlier
-requests used few tokens. The request wrapper removes that independent pass cap.
-It retains the 2048-token turn budget and eight native tool proposals.
-One turn can produce at most 64 request reports; a 65th request fails with the
-existing output-limit result before provider dispatch.
+Selected design (owner, 2026-10-18). The request wrapper admits any number of
+requests in a turn. It keeps no turn output-token total, refunds nothing and has
+no remaining-budget check. The 64-request cap and the 2,048-token turn budget are
+removed. A turn ends by [loop closure](loop-closure.md#current-loops): the model
+completes, the 201st tool proposal is recorded, the person cancels or steers, the
+context window fills, the provider fails, the helper exits or the service stops.
 
-For tool-enabled generation, the first request has a cap of at most 1024 tokens.
-Each later request has a cap of at most 512 tokens. The actual cap is the minimum
-of that value, the caller's requested cap and the remaining turn budget.
-Plain text retains one full requested allocation and cannot dispatch twice.
-An empty remaining budget rejects further requests.
+Each request keeps its own output cap. The caller's cap is the `Begin`
+`max_response_tokens` value. The service sends its per-request ceiling,
+`MAX_RESPONSE_TOKENS` (2,048); the wire accepts 1–2,048.
 
-Admission provisionally subtracts the actual cap. After successful settlement,
-a validated provider output count can refund `cap - measured output`.
-The output count must be nonnegative, at most the admitted cap and associated
-with this active request. This preserves the invariant that measured charged
-output plus active and unknown reservations cannot exceed 2048.
-A missing output count, failed request, cancellation, malformed count or count
-above the request cap grants no refund. No text-length estimate, context count,
-session-total difference or caller promise can release tokens.
+- **Tool-enabled generation:** the first request has a cap of at most 1,024 tokens.
+  Each later request has a cap of at most 512 tokens. The actual cap is the minimum
+  of that value, the caller's cap and the cap that the SDK requests.
+- **Plain text:** one request has the minimum of the caller's cap and the SDK
+  request cap. A second plain-text dispatch fails with the output-limit result
+  before provider I/O.
 
-The observer returns the validated successful output count to the existing budget
-owner before `finishInference` releases tool waiters. It creates no second budget
-owner. A report can be incomplete because input is unknown while output still
-permits a validated refund. The reserved 2048-token service grant is unchanged;
-this packet does not add tokens or silently issue a new reservation.
+The usage observer still checks each measured output count against that request's
+cap. A count above the cap is a provider protocol failure. A measured count no
+longer releases tokens, because no turn total exists. Per-request usage reports
+remain; the service sums them for the turn statistics display.
 
-### Budget decision — selected design
+### Request admission — selected design
 
-Arrows show admission and settlement decisions within the existing executor.
+Arrows show admission decisions within the existing executor. No path counts
+requests or tokens across the turn.
 
 ```mermaid
 flowchart TD
-    Request[SDK request] --> Bounds{Under 64 requests and remaining budget positive?}
-    Bounds -->|No| Reject[Reject before provider dispatch]
-    Bounds -->|Yes| Reserve[Charge bounded request cap]
-    Reserve --> Provider[Existing provider executor]
-    Provider --> Settlement{Successful with valid measured output within cap?}
-    Settlement -->|Yes| Refund[Refund cap minus measured output]
-    Settlement -->|No| Keep[Keep full provisional charge]
-    Refund --> Report[Report request usage then release waiters]
-    Keep --> Report
-    Report --> Next[SDK may request next pass within existing limits]
+    Request[SDK request] --> Failed{Earlier failure recorded or cancelled?}
+    Failed -->|Yes| Reject[Reject before provider dispatch]
+    Failed -->|No| Mode{Tools enabled?}
+    Mode -->|No| Plain{First plain-text request?}
+    Plain -->|No| Reject
+    Plain -->|Yes| PlainCap[Cap = min of caller cap and SDK cap]
+    Mode -->|Yes| First{First request of the turn?}
+    First -->|Yes| FirstCap[Cap = min of 1,024, caller cap and SDK cap]
+    First -->|No| LaterCap[Cap = min of 512, caller cap and SDK cap]
+    PlainCap --> Provider[Existing provider executor]
+    FirstCap --> Provider
+    LaterCap --> Provider
+    Provider --> Check{Measured output within the request cap?}
+    Check -->|Yes or unknown| Report[Report request usage then release waiters]
+    Check -->|No| Fault[Record provider protocol failure]
+    Fault --> Report
+    Provider -->|Context window full| Full[Record context limit; turn fails]
+    Report --> Next[SDK may request the next pass]
 ```
 
 ## Settlement and cancellation
@@ -196,9 +210,8 @@ A pending native model cannot prevent the client or service processing controls.
 
 Reports contain integers and existing operation identities only. They cannot
 include prompts, tool arguments, output text, model metadata or provider errors.
-Counter observations grant no tool authority. The service retains its durable
-2048-token reservation; validated output counts can release unused provisional
-allocations within the helper's existing turn-local budget.
+Counter observations grant no tool authority and release no tokens. The service
+keeps no durable token reservation (owner, 2026-10-18).
 The service owns persistence and reconnect semantics. This helper packet has no
 cross-session usage cache. A helper crash leaves unfinished usage unknown.
 
@@ -215,9 +228,12 @@ cross-session usage cache. A helper crash leaves unfinished usage unknown.
 | UH07 | Duplicate report, overlapping start or invalid counter arrives | Existing protocol failure; no duplicated or invented statistics |
 | UH08 | Text streams before usage settlement | Full replacement response retained; report is delivered without replacing text |
 | UH09 | Slow reader saturates existing transport | Explicit bounded failure; no additional task, queue or hidden drop |
-| UH10 | Three small measured tool passes precede a fourth final response | Fourth request dispatches; total charged output remains within 2048 and native proposals within eight |
-| UH11 | Output count is unknown, exceeds cap or belongs to another request | No refund; unknown reservation retains full charge; invalid counts fail |
-| UH12 | Cancellation occurs after reservation | No refund; no later request reaches provider |
+| UH10 | Tool-enabled turn dispatches 100 requests with the caller cap 2,048 | Every request dispatches; caps are 1,024 then 512; ordinals 1–100 are reported in order; no request-count or turn-total failure |
+| UH11 | Output count exceeds the request cap or belongs to another request | Provider protocol failure; no later request reaches the provider |
+| UH12 | Cancellation occurs while a request is admitted | No later request reaches the provider |
+| UH13 | Caller cap is smaller than the pass cap | Every request uses the caller cap; the sum across requests can exceed the caller cap |
+| UH14 | Plain-text turn requests a second dispatch | Second dispatch fails with the output-limit result before provider I/O |
+| UH15 | A later tool-turn request finds the context window full | The executor records `context_limit`; the turn fails with the context limit and no further request dispatches |
 
 Unit checks exercise observer request identity, zero, partial counts, invalid
 bounds, multiple passes and failure. Real-socket helper integration checks UH05,

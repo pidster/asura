@@ -43,10 +43,12 @@ impl Activity {
             }
         };
         let expanded = self.active() || self.expanded;
+        // The event carries the most recent calls only (TCR-D31); the last
+        // ordinal is the turn's call count.
         let mut text = format!(
             "{} Activity · {state} · {} tools",
             if expanded { "▾" } else { "▸" },
-            self.tools.len()
+            self.tools.last().and_then(|tool| tool.ordinal).unwrap_or(0)
         );
         if let Some(statistics) = &self.statistics {
             text.push_str(&format!(
@@ -293,7 +295,12 @@ impl App {
         entry.statistics = event.statistics;
         entry.unavailable = false;
         if !event.tools.is_empty() || entry.kind != 1 {
-            entry.tools = event.tools.iter().take(9).cloned().collect();
+            entry.tools = event
+                .tools
+                .iter()
+                .take(asura_control::MAX_TOOL_PROGRESS_ENTRIES)
+                .cloned()
+                .collect();
         }
         Some(index)
     }
@@ -834,6 +841,7 @@ mod tests {
         assert_eq!(app.activity[0].tools.len(), 8);
         app.activity[0].expanded = true;
         let text = app.activity[0].display();
+        assert!(text.contains("· 8 tools"), "{text}");
         for state in [
             "denied",
             "invalid",
@@ -845,5 +853,37 @@ mod tests {
         ] {
             assert!(text.contains(state), "{state}: {text}");
         }
+    }
+    /// TCR-D31 (owner change, 2026-10-18): a long turn's event carries the most
+    /// recent window; the header counts every call from the last ordinal.
+    #[test]
+    fn long_turn_window_shows_recent_calls_and_the_full_count() {
+        let mut app = App::new();
+        app.active_operation = Some(vec![1; 16]);
+        app.retained_request = Some(super::super::super::conversation::Request::Setup(
+            crate::conversation::Command::Observe([2; 16]),
+        ));
+        let last = asura_control::model::MAX_TOOL_ORDINAL;
+        let first = last + 1 - asura_control::MAX_TOOL_PROGRESS_ENTRIES as u32;
+        let mut complete = event(2, 3, 4, 3);
+        complete.tools = (first..=last)
+            .map(|ordinal| pb::ToolProgress {
+                ordinal: Some(ordinal),
+                name: Some("service".into()),
+                state: Some(if ordinal == last { 3 } else { 2 }),
+                status: Some(if ordinal == last { 7 } else { 1 }),
+                ..Default::default()
+            })
+            .collect();
+        apply(&mut app, complete);
+        app.activity[0].expanded = true;
+        let text = app.activity[0].display();
+        assert!(text.contains(&format!("· {last} tools")), "{text}");
+        assert!(text.contains(&format!("⚙ {first}. service")), "{text}");
+        assert!(text.contains(&format!("⚙ {last}. service")), "{text}");
+        assert!(
+            !text.contains(&format!("⚙ {}. service", first - 1)),
+            "{text}"
+        );
     }
 }

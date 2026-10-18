@@ -47,7 +47,7 @@ started during this analysis.
 | `asura-storage/src/memory/owner.rs` | Scratch qualification owns one engine with eight queued requests and retained cancellation/settlement state. Bound production work must extend its existing authority integration. |
 | `asura-storage/src/authority.rs` | The authority journal is bounded at 8 MiB and 32,768 frames. The graph cannot bypass this admission bound. |
 | `asura-storage/src/authority/conversation/types.rs` | Conversations and operations have existing IDs. Tool identity is operation, generation and ordinal. Durable tool results contain bounded text, status, continuation and truncation. |
-| `asura-service/src/tools.rs` | Model delivery allows 16 KiB per result and 64 KiB aggregate result text. Retained payload storage must not increase these model-delivery bounds implicitly. |
+| `asura-service/src/tools.rs` | Model delivery allows 16 KiB per result; the per-turn aggregate limit is removed (owner, 2026-10-18). Retained payload storage must not increase these model-delivery bounds implicitly. |
 | `exec-cmd-tool.md` and the existing exec_cmd owner | exec_cmd output is drained fairly, with separate 8 KiB tail rings and a combined 64 MiB emitted-output limit. Existing results contain tails, not complete output. |
 
 The installed SurrealDB 3.2.4 SDK exposes transaction commit/cancel handles and

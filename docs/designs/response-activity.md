@@ -7,6 +7,13 @@ Owner requirement, 2026-10-13: token limits must not be hard-coded. The fixed
 token figures in this design describe the current implementation and will be
 replaced by [model-sized limits](loop-closure.md#model-sized-limits).
 
+Owner change, 2026-10-18: “We found these types of tool and turn limits to be
+profoundly limiting in Wisp.” A turn no longer reserves 2,048 output tokens, has
+no token total, refunds or request count, and records up to 200 tool calls.
+Each request keeps its [request cap](turn-usage-helper.md#request-caps-and-admission).
+The sections below state the current rules; dated evidence keeps the values it
+tested.
+
 The selected 2026-09-30 extension below adds richer live feedback and turn
 measurements. The [conversation projection direction](conversation-projections.md)
 also proposes recoverable full results and recomposable model context. Those later
@@ -15,7 +22,8 @@ extensions remain design work.
 ## Ownership and data
 
 The service owns tool execution and durable intent/result records. Existing
-`ConversationEvent.tools` carries a cumulative snapshot of at most eight tools.
+`ConversationEvent.tools` carries a snapshot of at most nine tools: the most
+recent calls of the turn (TCR-D31, owner change 2026-10-18).
 Each entry contains ordinal, name, state and result status. Tool acknowledgements
 advance the event cursor independently of generated text. The TUI consumes these
 snapshots through its existing conversation worker, including pending events.
@@ -81,8 +89,8 @@ flowchart TD
 
 No file, network, model or blocking operation runs in render/key handlers. No new
 worker or polling timer is added. Existing conversation cancellation, wakeup and
-backpressure contracts remain authoritative. Metadata is limited to eight entries
-per response with names limited to 64 bytes, plus scalar state/identity/cursor.
+backpressure contracts remain authoritative. Metadata is limited to nine tool
+entries per event (the most recent calls) with names limited to 64 bytes, plus scalar state/identity/cursor.
 The eight response limit and existing prompt/output bounds remain unchanged.
 Evicting an old response also evicts its metadata. Navigation clamps after eviction
 or resize. Strings pass through existing terminal-control sanitization.
@@ -97,23 +105,22 @@ Run CLI unit and lifecycle checks, focused service coverage, lint and final buil
 
 ## Response limits and truthful completion
 
-Selected correction: new admissions reserve 2,048 output tokens. Tool inference
-requests use a first-request cap of 1,024 and continuation caps of 512.
-The 2026-09-30 extension removes the independent three-request limit and releases
-unused reservations only from verified successful output counts. The service uses
-the selected cancellation-driven turn lifetime and retains its
-eight-tool limit and 61,440-byte response bound. Limits remain
+Selected correction (owner, 2026-10-18): a turn has no output-token reservation
+or total. Tool inference requests use a first-request cap of 1,024 and
+continuation caps of 512, or the caller's cap if smaller. No request count limits
+a turn. The service uses the selected cancellation-driven turn lifetime and
+retains its 200-call tool limit and 61,440-byte response bound. Limits remain
 necessary; reaching one must preserve received text and mark the response incomplete.
 The TUI retains every received response byte within the wire bound, sanitizes control
 characters and permits scrolling through the complete retained text.
 
-Every turn reserves exactly 2,048 output tokens. Replay rejects any other
-reservation, including the earlier 512-token value (owner, 2026-10-17: no
-compatibility with older journals). Replay validates each terminal charge against
-its turn's reservation. Recovery charges the recorded reservation if usage is unknown. Journal
-format remains 1 and protocol remains 0.1. Model wire limits permit up to 2,048;
-per-turn enforcement still uses the actual Begin reservation. Context checks reserve
-the actual requested output budget before generation. Small contexts reject excessive
+Kind 21 records no output-token reservation and the terminal records no charge
+(owner, 2026-10-18; schema changed in place, no compatibility with older
+journals). A terminal records usage as known or unknown; unknown usage records
+zero output tokens. Recovery records unknown usage. Journal format remains 1 and
+protocol remains 0.1. The service sends the per-request ceiling of 2,048 as the
+`Begin` cap; the model wire permits 1 to 2,048. Context checks keep room for one
+request's cap before generation. Small contexts reject excessive
 input with context-limit status rather than silently clipping context or output.
 
 The Ollama adapter inspects its finish reason. A length stop preserves the delivered
@@ -126,7 +133,7 @@ removed the explicit generation deadline (2026-10-16); Begin has no deadline
 field (owner, 2026-10-17).
 
 Validation includes natural and length stops, final-chunk text preservation, wrapped
-executor failure, exact pass allocations, rejection of a non-2,048 reservation, and a
+executor failure, exact pass allocations, more than 64 requests in one turn, and a
 native local Ollama post-tool response longer than 128 tokens with an expected ending.
 No heuristic based on punctuation decides whether an answer is complete.
 
@@ -141,7 +148,7 @@ flowchart TD
     Finish -->|Length limit| Partial[Preserve text and report output limit]
     Finish -->|Unknown or malformed| Failed[Preserve text and report failure]
     Cancel[Cancellation, helper exit or shutdown] --> Failed
-    Complete --> Commit[Commit terminal result with recorded turn budget]
+    Complete --> Commit[Commit terminal result with known or unknown usage]
     Partial --> Commit
     Failed --> Commit
     Commit --> UI[Retain full received text and show outcome]
@@ -155,14 +162,13 @@ The adapter emits valid final-chunk text before classifying the finish. The shar
 wrapper retains typed errors for both tool and plain-text inference. Plain-text
 inference uses one dispatch with the admitted maximum, not the tool-pass split.
 
-The turn-local executor budget starts with the actual Begin token reservation.
-Each tool dispatch reserves the smallest of its pass cap (1,024 first, 512 later),
-the caller's cap and the remaining reservation before provider I/O. Only verified
-measured output from a successful request refunds unused reservation. Zero
-remaining tokens or a 65th tool dispatch fails before provider I/O. Plain-text
-dispatch reserves its actual admitted maximum once.
+The turn-local executor state keeps no token total (owner, 2026-10-18). Each
+tool dispatch uses the smallest of its pass cap (1,024 first, 512 later), the
+caller's cap and the SDK request cap. No request count or remaining budget
+refuses a dispatch. Plain-text dispatch uses its admitted maximum once; a second
+plain-text dispatch fails before provider I/O.
 The first typed executor failure is retained through SDK error wrapping; cancellation
-still takes priority. Tests cover small remaining reservations and separate turns.
+still takes priority. Tests cover small caller caps, many requests and separate turns.
 
 The installed SDK drops buffered response text if its executor throws. For a typed
 executor failure, the bounded adapter therefore records the failure and returns
@@ -172,7 +178,7 @@ current inference dispatch to settle and check its recorded failure before calli
 the service. The existing turn-local actor retains at most eight cancellation-aware
 callback continuations; overload rejects before host effects. Cancellation removes
 its waiter. Every success, typed failure, other failure and cancellation settles
-this gate. Further inference reservations reject the retained failure. Tests prove
+this gate. Further inference dispatches reject the retained failure. Tests prove
 partial text is delivered, failed inference cannot invoke a native host handler,
 and cancelled waiters leave no retained callback.
 
@@ -298,14 +304,16 @@ text, or a service-written `[not retained: <reason>, <n> bytes]` when the text
 was not retained. For a call that does not run, `state` is 3 (failed), `status`
 is the rendered status, and `preview` is the rendered result text. The TUI
 shows a rejected call as `<name>  <decision>: <fault>`. At most nine entries
-are sent per event (ordinal 9 exists only for the over-limit record). These are
+are sent per event: the most recent calls, with consecutive ordinals that end at
+the latest ordinal, at most 201 (TCR-D31, owner change 2026-10-18). The TUI shows
+the latest ordinal as the call count. These are
 projections; the kind 14 record stays the one source. Preview truncation is separate
 from stored-result truncation. Existing exec_cmd tails remain explicitly truncated.
 
 The replay projection caches bounded argument/result descriptions in ToolRecord,
 derived from verified journal bytes. This adds no filesystem access on the reactor
 and no new journal encoding. Charge the additional fixed memory against its existing
-16 MiB replay limit. At most nine tools are sent per event (eight before 2026-10-18), with 192-byte arguments
+16 MiB replay limit. At most nine tools are sent per event (the most recent nine since 2026-10-18), with 192-byte arguments
 and 128-byte preview caps preserving room beside the existing 61,440-byte response.
 Strict wire validation and a maximal-frame regression must enforce that bound.
 The TUI sanitizes every string, displays running tools immediately, and expands
@@ -319,10 +327,11 @@ Live observations report elapsed time without incrementing cursor for time alone
 At most eight current-owner operation summaries are retained for terminal replay;
 restart leaves measurements absent. This explicitly does not persist new statistics
 in format-1 records. That belongs to the result/graph storage packet. Token IO is
-informational and does not replace existing durable charge accounting.
+informational; no durable token charge exists (owner, 2026-10-18).
 
 Private InferenceUsage reports use envelope field 23 and consecutive request
-ordinals 1–64. Each optional count is at most 1,000,000,000; cached input requires
+ordinals starting at 1, with no upper count (owner, 2026-10-18). Each optional
+count is at most 1,000,000,000; cached input requires
 measured input and cannot exceed it. Every settled request reports once; absent
 counts remain unknown. Service totals sum measured counts with checked arithmetic
 and mark them partial unless all reported requests completed with both counts.
@@ -330,14 +339,15 @@ Channel loss/cancellation with an unreported active inference makes totals parti
 The [helper usage design](turn-usage-helper.md) defines actual provider observations,
 start-marker cancellation settlement and conservative unknown counts. System,
 CoreAI and MLX cannot claim per-request counts from opaque SDK events; Ollama can.
-No counter comes from context occupancy, byte estimates or budget reservations.
+No counter comes from context occupancy, byte estimates or request caps.
+`TurnStatistics.request_count` has no cap beyond its `uint32` type, and token
+sums are checked `uint64` additions; an overflow makes the sum unknown.
 
-The observed failure after three tool passes requires correcting the fixed pass
-allocation guard. Keep the 2,048-token turn budget, first tool-pass cap 1,024,
-later-pass cap 512 and eight native proposals. Remove the independent three-pass
-limit. Only verified actual output from a successful request refunds unused
-reservation; unknown, failed and cancelled requests consume their reservation.
-The helper design specifies request identity, counter checks and release ordering.
+The observed failure after three tool passes required correcting the fixed pass
+allocation guard. Keep the first tool-pass cap 1,024 and the later-pass cap 512.
+The independent three-pass limit, the 2,048-token turn budget, its refunds and
+the 64-request cap are removed (owner, 2026-10-18). A turn records up to 200 tool
+calls. The helper design specifies request identity, counter checks and release ordering.
 Plain-text generation keeps its single admitted request. This introduces no retry
 and does not repeat earlier tool effects.
 

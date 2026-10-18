@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 
 type Result<T> = std::result::Result<T, ReplayError>;
-const TERMINAL_CAPACITY: usize = HEADER + TRAILER + 47 + MAX_TEXT;
+const TERMINAL_CAPACITY: usize = HEADER + TRAILER + 43 + MAX_TEXT;
 const START_CAPACITY: usize = HEADER + TRAILER + 72;
 const CANCEL_CAPACITY: usize = HEADER + TRAILER + 25;
 const OWNER_CAPACITY: usize = HEADER + TRAILER;
@@ -362,9 +362,7 @@ impl Replay {
                             tool.create.is_some() && tool.result_frame.is_none()
                         }),
                 )?;
-                require(
-                    op.tools.iter().map(|t| t.result_bytes).sum::<usize>() + p.text.len() <= 65_536,
-                )?;
+                // No turn result-byte total (owner, 2026-10-18).
                 let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
                 // Only a `run` call is followed by kind 15 (TCR-R5).
                 require(tool.unresolved())?;
@@ -557,11 +555,7 @@ impl Replay {
                     && self.input_ready(input.request),
             )?;
         }
-        require(
-            p.reserved_output_tokens == OUTPUT_RESERVATION
-                && p.event_cursor == 1
-                && !p.model.is_empty(),
-        )?;
+        require(p.event_cursor == 1 && !p.model.is_empty())?;
         require(
             p.digest
                 == request_digest(Request::Submit {
@@ -649,7 +643,6 @@ impl Replay {
         self.operations.insert(
             p.operation,
             Operation {
-                reserved_output_tokens: p.reserved_output_tokens,
                 conversation: p.conversation,
                 generation: p.generation,
                 task: p.task,
@@ -1019,12 +1012,10 @@ impl Replay {
                 .iter()
                 .all(|tool| tool.create.is_none() || tool.result_frame.is_some()),
         )?;
-        if p.usage_known {
-            require(
-                p.output_tokens <= op.reserved_output_tokens && p.charged_tokens == p.output_tokens,
-            )?;
-        } else {
-            require(p.output_tokens == 0 && p.charged_tokens == op.reserved_output_tokens)?;
+        // No turn token reservation exists (owner, 2026-10-18): known usage
+        // is any count; unknown usage records zero.
+        if !p.usage_known {
+            require(p.output_tokens == 0)?;
         }
         if op.helper.is_none() {
             require(p.usage_known && p.output_tokens == 0)?;
@@ -1060,7 +1051,6 @@ impl Replay {
             cause: p.cause,
             usage_known: p.usage_known,
             output_tokens: p.output_tokens,
-            charged_tokens: p.charged_tokens,
             frame,
         });
         self.active_operation = None;
@@ -1262,7 +1252,6 @@ mod restoration_tests {
             },
         );
         let op = |conversation, frame| Operation {
-            reserved_output_tokens: 512,
             conversation,
             generation: 1,
             task: [11; 16],

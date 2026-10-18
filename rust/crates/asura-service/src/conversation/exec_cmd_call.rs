@@ -78,7 +78,7 @@ mod tests {
     /// derivations that replay recomputes, for every ordinal.
     #[test]
     fn tcr_u13_live_run_identity_equals_storage_derivation() {
-        for ordinal in 1..=8 {
+        for ordinal in 1..=tools::MAX_CALLS {
             let call = tools::Call {
                 operation: [1; 16],
                 generation: 3,

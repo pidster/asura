@@ -437,10 +437,10 @@ fn different_initialization_request_preserves_pending_state() {
 #[test]
 fn initialization_registration_admission_and_restart_are_durable() {
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
-    initialization_registration_admission_and_restart_with_budget(OUTPUT_RESERVATION);
+    initialization_registration_admission_and_restart_with_budget();
 }
 #[cfg(feature = "embedded-memory")]
-fn initialization_registration_admission_and_restart_with_budget(reservation: u32) {
+fn initialization_registration_admission_and_restart_with_budget() {
     let scratch = Scratch::new();
     let runtime = scratch.runtime();
     let mut writer = WriterHandle::start(runtime.clone()).unwrap();
@@ -544,7 +544,6 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
         input_digest: [18; 32],
         prior_operations: Vec::new(),
         prompt: "hello".into(),
-        reserved_output_tokens: reservation,
         event_cursor: 1,
         composition: Composition::default(),
     };
@@ -648,7 +647,7 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
     let terminal = recovered.operations[&[16; 16]].terminal.as_ref().unwrap();
     assert_eq!(terminal.kind, TerminalKind::Interrupted);
     assert!(terminal.usage_known);
-    assert_eq!(terminal.charged_tokens, 0);
+    assert_eq!(terminal.output_tokens, 0);
     let read = wait(
         &mut writer
             .try_submit(Command::ReadRecord {
@@ -785,7 +784,7 @@ fn initialization_registration_admission_and_restart_with_budget(reservation: u3
     let terminal = recovered.operations[&[23; 16]].terminal.as_ref().unwrap();
     assert_eq!(terminal.kind, TerminalKind::Interrupted);
     assert!(!terminal.usage_known);
-    assert_eq!(terminal.charged_tokens, reservation);
+    assert_eq!(terminal.output_tokens, 0);
     close(&mut writer);
     let db = scratch.0.join(".asura/db");
     fs::rename(&db, scratch.0.join("saved-db")).unwrap();
@@ -931,7 +930,6 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
         input_digest: [107; 32],
         prior_operations: vec![],
         prompt: "remember".into(),
-        reserved_output_tokens: 2048,
         event_cursor: 1,
         composition: Composition::default(),
     };
@@ -1593,7 +1591,6 @@ fn j1_turn(project: Id, configuration_digest: Hash) -> TurnAccepted {
         input_digest: [37; 32],
         prior_operations: Vec::new(),
         prompt: "hello".into(),
-        reserved_output_tokens: OUTPUT_RESERVATION,
         event_cursor: 1,
         composition: Composition::default(),
     }
@@ -1813,7 +1810,7 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     }
 }
 const FRAME: usize = 144 + 40;
-const TERMINAL: usize = FRAME + 47 + MAX_TEXT;
+const TERMINAL: usize = FRAME + 43 + MAX_TEXT;
 const RESULT: usize = FRAME + 43 + 16_384;
 const OWNER: usize = FRAME;
 const CANCEL: usize = FRAME + 25;
@@ -1905,7 +1902,6 @@ fn j1_padded(scratch: &Scratch, free: usize) -> (WriterHandle, Id, u64) {
                 input_digest: [2; 32],
                 prior_operations: Vec::new(),
                 prompt: "pad".into(),
-                reserved_output_tokens: OUTPUT_RESERVATION,
                 event_cursor: 1,
                 // Every earlier padding turn completed and is omitted.
                 composition: Composition {
@@ -1928,7 +1924,6 @@ fn j1_padded(scratch: &Scratch, free: usize) -> (WriterHandle, Id, u64) {
                     final_cursor: u64::MAX,
                     usage_known: true,
                     output_tokens: 0,
-                    charged_tokens: 0,
                     text: "x".repeat(text),
                 })
             },
@@ -1937,12 +1932,12 @@ fn j1_padded(scratch: &Scratch, free: usize) -> (WriterHandle, Id, u64) {
     // The fixed part of a later turn: accepted, start and an empty terminal.
     let base = {
         let (accepted, start, _) = turn(2);
-        size(&accepted) + size(&start) + FRAME + 47
+        size(&accepted) + size(&start) + FRAME + 43
     };
     let mut generation = 1;
     while end < padded_end {
         let (accepted, start, terminal) = turn(generation);
-        let fixed = size(&accepted) + size(&start) + FRAME + 47;
+        let fixed = size(&accepted) + size(&start) + FRAME + 43;
         let remaining = padded_end - end;
         let text = if generation == 1 || remaining > fixed + MAX_TEXT + base {
             MAX_TEXT
@@ -2044,7 +2039,6 @@ fn tcr_i08_run_kind_14_is_refused_when_its_result_cannot_fit() {
             final_cursor: u64::MAX,
             usage_known: false,
             output_tokens: 0,
-            charged_tokens: OUTPUT_RESERVATION,
             text: "x".repeat(MAX_TEXT),
         }),
     )

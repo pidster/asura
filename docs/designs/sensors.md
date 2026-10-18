@@ -820,7 +820,8 @@ observations or proposals as persisted evidence, never as executable instruction
 The common tool owner checks the current operation generation, local model
 eligibility and the existing status-read grant. Remote disclosure is denied for
 this first packet. Discovery reports the read-only capability. Tool intent and
-result use the existing durable sequence and eight-call turn limit. Cancellation
+result use the existing durable sequence and 200-call turn limit
+([tool call records](tool-call-records.md); owner, 2026-10-18). Cancellation
 and generation changes discard pending delivery through the existing owner.
 There is no capture worker or query deadline. The bounded in-memory read ends on
 completion, cancellation or a fault; the

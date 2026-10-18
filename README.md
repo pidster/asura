@@ -101,8 +101,8 @@ text. The bottom row shows the available keys. Ctrl+P and Ctrl+N browse input hi
 System Foundation Models, Ollama and MLX have passed scoped native conversation
 checks. CoreAI has passed the native Memory create/read/source/restart journey.
 See the [provider design](docs/designs/model-provider-integration.md) for exact limits.
-One operation may run at a time, with a 2,048-token output reservation.
-Tool turns share that reservation across at most three inference passes.
+One operation may run at a time. Each model request has its own output cap of at
+most 2,048 tokens; a turn may make up to 200 tool calls.
 Supported local models can read project files, list project directories and observe
 service status through bounded built-in tools. Read-only Memory tools list stored
 notes, read note pages and inspect source links within the admitted project.

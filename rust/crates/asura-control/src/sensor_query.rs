@@ -18,7 +18,8 @@ fn observation(v: &pb::SensorObservation) -> bool {
     let status = v.lifecycle.is_some_and(|n| n <= 32)
         && v.installation.is_some_and(|n| n <= 32)
         && v.status_reason.is_some_and(|n| n <= 128)
-        && v.ordinal.is_some_and(|n| (1..=8).contains(&n));
+        && v.ordinal
+            .is_some_and(|n| (1..=crate::model::MAX_RECORDED_TOOL_CALLS).contains(&n));
     id(&v.id)
         && id(&v.source_epoch)
         && v.sequence.is_some_and(|n| n > 0)

@@ -212,7 +212,6 @@ impl State {
             let op = &self.replay.as_ref().expect("replay").operations[&id];
             let generation = op.generation;
             let started = op.helper.is_some();
-            let reserved_output_tokens = op.reserved_output_tokens;
             self.append(Record::TurnTerminal(TurnTerminal {
                 operation: id,
                 generation,
@@ -221,7 +220,6 @@ impl State {
                 final_cursor: u64::MAX,
                 usage_known: !started,
                 output_tokens: 0,
-                charged_tokens: if started { reserved_output_tokens } else { 0 },
                 text: String::new(),
             }))?;
         }

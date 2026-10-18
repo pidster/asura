@@ -111,7 +111,6 @@ fn turn() -> TurnAccepted {
         input_digest: [12; 32],
         prior_operations: vec![],
         prompt: "hello".into(),
-        reserved_output_tokens: OUTPUT_RESERVATION,
         event_cursor: 1,
         composition: Composition::default(),
     }
@@ -133,7 +132,6 @@ fn terminal(kind: TerminalKind, cause: Cause, known: bool) -> TurnTerminal {
         final_cursor: u64::MAX,
         usage_known: known,
         output_tokens: if known { 12 } else { 0 },
-        charged_tokens: if known { 12 } else { OUTPUT_RESERVATION },
         text: "reply".into(),
     }
 }
@@ -158,8 +156,9 @@ fn roundtrip_requests_terminal_offsets_and_unknown_complete_usage() {
         }
     );
     let t = s.operations[&id(10)].terminal.as_ref().unwrap();
+    // No turn reservation exists: unknown usage records zero output.
     assert!(!t.usage_known);
-    assert_eq!(t.charged_tokens, OUTPUT_RESERVATION);
+    assert_eq!(t.output_tokens, 0);
     let frame = &j.bytes[t.frame.clone()];
     let Record::TurnTerminal(decoded) = decode_record(8, &frame[144..frame.len() - 40]).unwrap()
     else {
@@ -183,19 +182,12 @@ fn restart_never_reuses_permit_and_charges_conservatively() {
         let mut p = terminal(TerminalKind::Interrupted, Cause::Restart, !started);
         if !started {
             p.output_tokens = 0;
-            p.charged_tokens = 0;
         }
         j.append(Record::TurnTerminal(p));
         let s = inspect(&j.bytes).unwrap();
         assert_eq!(s.active_operation, None);
-        assert_eq!(
-            s.operations[&id(10)]
-                .terminal
-                .as_ref()
-                .unwrap()
-                .charged_tokens,
-            if started { OUTPUT_RESERVATION } else { 0 }
-        );
+        let t = s.operations[&id(10)].terminal.as_ref().unwrap();
+        assert_eq!((t.usage_known, t.output_tokens), (!started, 0));
     }
     let mut j = Journal::accepted();
     j.append(Record::OwnerGeneration);
@@ -250,9 +242,6 @@ fn reconstructed_digests_ids_and_generations_reject_forgery() {
     cases.push(q);
     let mut q = p.clone();
     q.generation = 2;
-    cases.push(q);
-    let mut q = p.clone();
-    q.reserved_output_tokens = 511;
     cases.push(q);
     let mut q = p.clone();
     q.request = id(5);
@@ -774,7 +763,6 @@ fn committed_failure_or_cancellation_keeps_successors_eligible() {
             final_cursor: u64::MAX,
             usage_known: true,
             output_tokens: 0,
-            charged_tokens: 0,
             text: String::new(),
         }));
         let state = inspect(&j.bytes).unwrap();
@@ -1125,10 +1113,7 @@ fn restart_interrupts_pending_tool_without_fabricating_result() {
     let state = inspect(&j.bytes).unwrap();
     let operation = &state.operations[&id(10)];
     assert!(operation.tools[0].result_frame.is_none());
-    assert_eq!(
-        operation.terminal.as_ref().unwrap().charged_tokens,
-        OUTPUT_RESERVATION
-    );
+    assert!(!operation.terminal.as_ref().unwrap().usage_known);
     assert!(state.active_operation.is_none());
     let mut duplicate = Journal::started();
     duplicate.append(tool_call());
@@ -1183,13 +1168,12 @@ fn status_tool_result_replays_and_rejects_file_paging_or_oversized_payload() {
     )));
     let replay = inspect(&interrupted.bytes).unwrap();
     assert!(replay.operations[&id(10)].tools[0].result_frame.is_none());
-    assert_eq!(
-        replay.operations[&id(10)]
+    assert!(
+        !replay.operations[&id(10)]
             .terminal
             .as_ref()
             .unwrap()
-            .charged_tokens,
-        OUTPUT_RESERVATION
+            .usage_known
     );
     for invalid in [
         ToolResult {
@@ -1539,67 +1523,49 @@ fn inventory_results_replay_without_file_pagination_or_redispatch() {
     );
 }
 
+/// No turn token reservation exists (owner, 2026-10-18): kind 21 has no
+/// reservation field and kind 8 no charge. Known usage is any count, beyond
+/// the former 2,048 total; unknown usage must record zero output.
 #[test]
-fn response_accounting_uses_the_recorded_reservation() {
-    assert_eq!(OUTPUT_RESERVATION, 2048);
-    for reservation in [OUTPUT_RESERVATION] {
-        for known in [false, true] {
-            let mut journal = Journal::base();
-            let mut admitted = turn();
-            admitted.reserved_output_tokens = reservation;
-            journal.append(Record::TurnAccepted(Box::new(admitted)));
-            journal.append(start());
-            let mut result = terminal(TerminalKind::Complete, Cause::None, known);
-            result.output_tokens = if known { reservation } else { 0 };
-            result.charged_tokens = reservation;
-            journal.append(Record::TurnTerminal(result));
-            let state = inspect(&journal.bytes).unwrap();
-            let operation = &state.operations[&id(10)];
-            assert_eq!(operation.reserved_output_tokens, reservation);
-            assert_eq!(
-                operation.terminal.as_ref().unwrap().charged_tokens,
-                reservation
-            );
-        }
-        for (known, output, charged) in [(true, reservation + 1, reservation + 1), (false, 0, 512)]
-        {
-            let mut journal = Journal::base();
-            let mut admitted = turn();
-            admitted.reserved_output_tokens = reservation;
-            journal.append(Record::TurnAccepted(Box::new(admitted)));
-            journal.append(start());
-            let mut result = terminal(TerminalKind::Complete, Cause::None, known);
-            result.output_tokens = output;
-            result.charged_tokens = charged;
-            journal.append(Record::TurnTerminal(result));
-            assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
-        }
+fn response_accounting_has_no_turn_reservation() {
+    for (known, output) in [
+        (true, 0),
+        (true, 2048),
+        (true, 2049),
+        (true, u32::MAX),
+        (false, 0),
+    ] {
         let mut journal = Journal::base();
-        let mut admitted = turn();
-        admitted.reserved_output_tokens = reservation;
-        journal.append(Record::TurnAccepted(Box::new(admitted)));
+        journal.append(Record::TurnAccepted(Box::new(turn())));
         journal.append(start());
-        journal.append(Record::OwnerGeneration);
-        let mut interrupted = terminal(TerminalKind::Interrupted, Cause::Restart, false);
-        interrupted.charged_tokens = reservation;
-        journal.append(Record::TurnTerminal(interrupted));
-        assert_eq!(
-            inspect(&journal.bytes).unwrap().operations[&id(10)]
-                .terminal
-                .as_ref()
-                .unwrap()
-                .charged_tokens,
-            reservation
-        );
+        let mut result = terminal(TerminalKind::Complete, Cause::None, known);
+        result.output_tokens = output;
+        journal.append(Record::TurnTerminal(result));
+        let state = inspect(&journal.bytes).unwrap();
+        let t = state.operations[&id(10)].terminal.as_ref().unwrap();
+        assert_eq!((t.usage_known, t.output_tokens), (known, output));
     }
-    // The removed 512 reservation is rejected like any other value.
-    for invalid in [0, 511, 512, 513, 1024, 2047, 2049, u32::MAX] {
-        let mut journal = Journal::base();
-        let mut admitted = turn();
-        admitted.reserved_output_tokens = invalid;
-        journal.append(Record::TurnAccepted(Box::new(admitted)));
-        assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
-    }
+    let mut journal = Journal::base();
+    journal.append(Record::TurnAccepted(Box::new(turn())));
+    journal.append(start());
+    let mut result = terminal(TerminalKind::Complete, Cause::None, false);
+    result.output_tokens = 1;
+    journal.append(Record::TurnTerminal(result));
+    assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
+    let mut journal = Journal::base();
+    journal.append(Record::TurnAccepted(Box::new(turn())));
+    journal.append(start());
+    journal.append(Record::OwnerGeneration);
+    journal.append(Record::TurnTerminal(terminal(
+        TerminalKind::Interrupted,
+        Cause::Restart,
+        false,
+    )));
+    let t = inspect(&journal.bytes).unwrap().operations[&id(10)]
+        .terminal
+        .clone()
+        .unwrap();
+    assert_eq!((t.usage_known, t.output_tokens), (false, 0));
 }
 
 /// The derived call of a `run` create_note kind 14 at `ordinal` (HM3).
@@ -1999,13 +1965,13 @@ fn j1t_02_every_invalid_order_is_corrupt() {
             "{name}"
         );
     }
-    // Eight recorded calls, then only a `limit` record at ordinal 9.
+    // All recorded calls, then only a `limit` record at the over-limit ordinal.
     let mut journal = Journal::started();
-    for ordinal in 1..=8 {
+    for ordinal in 1..=MAX_RECORDED_CALLS {
         journal.append(r14(exec14(ordinal, ToolDecision::Refused)));
     }
     assert!(inspect(&journal.bytes).is_ok());
-    let ninth = FrameContext {
+    let over_limit = FrameContext {
         installation_id: id(1),
         transition_id: id(99_999),
         sequence: journal.sequence + 1,
@@ -2014,21 +1980,27 @@ fn j1t_02_every_invalid_order_is_corrupt() {
         owner_generation: journal.owner,
     };
     assert_eq!(
-        encode_frame(&ninth, &r14(exec14(9, ToolDecision::Refused))),
+        encode_frame(
+            &over_limit,
+            &r14(exec14(MAX_TOOL_CALL_ORDINAL, ToolDecision::Refused))
+        ),
         Err(ReplayError::Corrupt)
     );
-    journal.append(r14(exec14(9, ToolDecision::Limit)));
+    journal.append(r14(exec14(MAX_TOOL_CALL_ORDINAL, ToolDecision::Limit)));
     assert!(inspect(&journal.bytes).is_ok());
-    // A tenth ordinal cannot even be encoded.
-    let tenth = FrameContext {
+    // An ordinal past the over-limit ordinal cannot even be encoded.
+    let beyond = FrameContext {
         transition_id: id(99_998),
         sequence: journal.sequence + 1,
         prior_digest: journal.digest,
         expected_revision: journal.sequence,
-        ..ninth
+        ..over_limit
     };
     assert_eq!(
-        encode_frame(&tenth, &r14(exec14(10, ToolDecision::Limit))),
+        encode_frame(
+            &beyond,
+            &r14(exec14(MAX_TOOL_CALL_ORDINAL + 1, ToolDecision::Limit))
+        ),
         Err(ReplayError::Corrupt)
     );
 }
@@ -2180,33 +2152,33 @@ fn tcr_u11_ordinal_is_next_and_every_earlier_run_has_kind_15() {
     );
 }
 #[test]
-fn tcr_u11_ordinal_9_has_limit() {
-    let eight = || {
+fn tcr_u11_over_limit_ordinal_has_limit() {
+    let all = || {
         let mut journal = Journal::started();
-        for ordinal in 1..=8 {
+        for ordinal in 1..=MAX_RECORDED_CALLS {
             journal.append(rejected14(ordinal).into_record());
         }
         journal
     };
-    let mut valid = eight();
-    valid.append(r14(exec14(9, ToolDecision::Limit)));
-    // A `limit` record at ordinal 9 without eight earlier records skips ordinals.
+    let mut valid = all();
+    valid.append(r14(exec14(MAX_TOOL_CALL_ORDINAL, ToolDecision::Limit)));
+    // A `limit` record at the over-limit ordinal without the earlier records skips ordinals.
     expect_rule(
-        "ordinal 9 only after eight records",
+        "over-limit ordinal only after every recorded call",
         valid,
-        started_with([r14(exec14(9, ToolDecision::Limit))]),
+        started_with([r14(exec14(MAX_TOOL_CALL_ORDINAL, ToolDecision::Limit))]),
     );
-    // Ordinal 9 with any other decision: forge the decision byte of a valid
-    // ordinal-9 record (exec_cmd name is 8 bytes; decision at offset 46).
-    let mut broken = eight();
-    broken.append(r14(exec14(9, ToolDecision::Limit)));
+    // The over-limit ordinal with any other decision: forge the decision byte of a valid
+    // over-limit record (exec_cmd name is 8 bytes; decision at offset 46).
+    let mut broken = all();
+    broken.append(r14(exec14(MAX_TOOL_CALL_ORDINAL, ToolDecision::Limit)));
     tamper_last(&mut broken, |payload| {
         assert_eq!(payload[46], ToolDecision::Limit as u8);
         payload[46] = ToolDecision::Denied as u8;
     });
-    let mut valid = eight();
-    valid.append(r14(exec14(9, ToolDecision::Limit)));
-    expect_rule("ordinal 9 decision", valid, broken);
+    let mut valid = all();
+    valid.append(r14(exec14(MAX_TOOL_CALL_ORDINAL, ToolDecision::Limit)));
+    expect_rule("over-limit ordinal decision", valid, broken);
 }
 #[test]
 fn tcr_u11_after_cancel_requested_only_cancelled() {
@@ -2306,7 +2278,7 @@ fn tcr_u11_run_kinds_follow_their_record() {
         started_with([r14(exec14(1, ToolDecision::Busy)), r23(1)]),
     );
 }
-/// TCR-U12: the cancel, ordinal-9 and kind-15 rules in one place.
+/// TCR-U12: the cancel, over-limit ordinal and kind-15 rules in one place.
 #[test]
 fn tcr_u12_cancel_limit_and_result_rules() {
     // A record after CancelRequested is accepted only with `cancelled`.
@@ -2319,16 +2291,19 @@ fn tcr_u12_cancel_limit_and_result_rules() {
             .unwrap_err(),
         ReplayError::Corrupt
     );
-    // Ordinal 9 is accepted only with `limit`, after eight records.
+    // The over-limit ordinal is accepted only with `limit`, after every recorded call.
     let mut journal = Journal::started();
-    for ordinal in 1..=8 {
+    for ordinal in 1..=MAX_RECORDED_CALLS {
         journal.append(r14(exec14(ordinal, ToolDecision::Denied)));
     }
-    journal.append(r14(exec14(9, ToolDecision::Limit)));
+    journal.append(r14(exec14(MAX_TOOL_CALL_ORDINAL, ToolDecision::Limit)));
     let state = inspect(&journal.bytes).unwrap();
-    assert_eq!(state.operations[&id(10)].tools.len(), 9);
     assert_eq!(
-        state.operations[&id(10)].tools[8].decision,
+        state.operations[&id(10)].tools.len(),
+        MAX_TOOL_CALL_ORDINAL as usize
+    );
+    assert_eq!(
+        state.operations[&id(10)].tools[MAX_RECORDED_CALLS as usize].decision,
         ToolDecision::Limit
     );
     // A kind 15 after a call that does not run is Corrupt.
@@ -2461,4 +2436,33 @@ fn tcr_u17_no_fact_is_stored_twice() {
         panic!("kind 15");
     };
     assert!(stored.text.is_empty());
+}
+
+/// TCR-I11 (storage part; owner, 2026-10-18): every recorded call runs with a
+/// full 16 KiB result, far beyond the removed 65,536-byte turn total; replay
+/// accepts all of them and the over-limit `limit` record.
+#[test]
+fn tcr_i11_replay_accepts_every_call_with_full_results_and_no_turn_total() {
+    let mut journal = Journal::started();
+    let text = "r".repeat(16_384);
+    for ordinal in 1..=MAX_RECORDED_CALLS {
+        journal.append(r14(run14(ordinal, ToolOperation::ReadFile)));
+        journal.append(Record::ToolResult(ToolResult {
+            ordinal,
+            text: text.clone(),
+            next_offset: Some(u64::from(ordinal) * 16_384),
+            ..match tool_result() {
+                Record::ToolResult(result) => result,
+                _ => unreachable!(),
+            }
+        }));
+    }
+    journal.append(r14(exec14(MAX_TOOL_CALL_ORDINAL, ToolDecision::Limit)));
+    journal.append(complete());
+    let state = inspect(&journal.bytes).unwrap();
+    let op = &state.operations[&id(10)];
+    assert_eq!(op.tools.len(), MAX_TOOL_CALL_ORDINAL as usize);
+    let total: usize = op.tools.iter().map(|tool| tool.result_bytes).sum();
+    assert_eq!(total, MAX_RECORDED_CALLS as usize * 16_384);
+    assert!(total > 65_536);
 }

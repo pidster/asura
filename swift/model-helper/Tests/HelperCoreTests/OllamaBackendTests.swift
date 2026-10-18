@@ -99,8 +99,9 @@ private func consume(_ text: String, state: inout OllamaLanguageModel.StreamStat
     }
     var calls = OllamaLanguageModel.StreamState()
     let line = #"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"project_read_file","arguments":{"path":"README.md"}}}]}}"# + "\n"
-    for _ in 0..<9 { try consume(line, state: &calls) }
-    #expect(calls.calls == 9)
+    // One stream may hold every proposal up to the over-limit one (TCR-D17).
+    for _ in 0..<Limits.toolProposals { try consume(line, state: &calls) }
+    #expect(calls.calls == Int(Limits.toolProposals))
     #expect(throws: OllamaLanguageModel.Failure.limit) { try consume(line, state: &calls) }
 }
 

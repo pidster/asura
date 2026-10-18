@@ -301,7 +301,7 @@ impl CreateNoteIdentity {
         if binding.contains(&[0; 16])
             || turn == [0; 16]
             || generation == 0
-            || !(1..=8).contains(&ordinal)
+            || !(1..=MAX_RECORDED_CALLS).contains(&ordinal)
         {
             return Err(ReplayError::Corrupt);
         }
@@ -370,7 +370,7 @@ impl CreateNoteCall {
 fn valid_tool_result(p: &ToolResult) -> Result<()> {
     if p.operation == [0; 16]
         || p.generation == 0
-        || !(1..=8).contains(&p.ordinal)
+        || !(1..=MAX_RECORDED_CALLS).contains(&p.ordinal)
         || !(1..=7).contains(&p.status)
         || p.text.len() > 16_384
         || (p.status != 1 && p.next_offset.is_some())
@@ -591,7 +591,7 @@ impl ToolCall {
         let shape = self.operation != [0; 16]
             && self.generation >= 1
             && (1..=MAX_TOOL_CALL_ORDINAL).contains(&self.ordinal)
-            // Ordinal 9 is the over-limit record; after cancel or turn end it
+            // The last ordinal is the over-limit record; after cancel or turn end it
             // is `cancelled` like any other call (TCR-D30).
             && (self.ordinal != MAX_TOOL_CALL_ORDINAL
                 || matches!(decision, D::Limit | D::Cancelled))
@@ -904,7 +904,7 @@ impl CaptureSettled {
         require(
             self.operation != [0; 16]
                 && self.generation >= 1
-                && (1..=8).contains(&self.ordinal)
+                && (1..=MAX_RECORDED_CALLS).contains(&self.ordinal)
                 && state
                 && exit
                 && streams.iter().all(|s| valid_stream(s))
@@ -1183,7 +1183,6 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
                 w.bytes(id);
             }
             w.string(&p.prompt, MAX_PROMPT)?;
-            w.u32(p.reserved_output_tokens);
             w.u64(p.event_cursor);
             let c = &p.composition;
             w.u32(c.omitted_turns);
@@ -1227,7 +1226,6 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u64(p.final_cursor);
             w.byte(u8::from(p.usage_known));
             w.u32(p.output_tokens);
-            w.u32(p.charged_tokens);
             w.string(&p.text, MAX_TEXT)?;
         }
         Record::CaptureSettled(p) => write_capture_settled(&mut w, p)?,
@@ -1387,7 +1385,6 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 prior_operations.push(r.array()?);
             }
             let prompt = r.string(MAX_PROMPT)?;
-            let reserved_output_tokens = r.u32()?;
             let event_cursor = r.u64()?;
             let composition = Composition {
                 omitted_turns: r.u32()?,
@@ -1414,7 +1411,6 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 input_digest,
                 prior_operations,
                 prompt,
-                reserved_output_tokens,
                 event_cursor,
                 composition,
             }))
@@ -1444,7 +1440,6 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             final_cursor: r.u64()?,
             usage_known: r.flag()?,
             output_tokens: r.u32()?,
-            charged_tokens: r.u32()?,
             text: r.string(MAX_TEXT)?,
         }),
         14 => {
@@ -1557,7 +1552,6 @@ mod tests {
             final_cursor: u64::MAX,
             usage_known: false,
             output_tokens: 0,
-            charged_tokens: 512,
             text: "x".into(),
         });
         let mut bytes = payload(&terminal).unwrap();
@@ -1671,17 +1665,18 @@ mod tests {
         round14(run14());
         round14(refused14());
         round14(invalid14());
-        for ordinal in 1..=8 {
+        // Every recorded ordinal round trips with any decision (owner, 2026-10-18).
+        for ordinal in 1..=MAX_RECORDED_CALLS {
             round14(ToolCall { ordinal, ..run14() });
         }
         round14(ToolCall {
-            ordinal: 9,
+            ordinal: MAX_TOOL_CALL_ORDINAL,
             decision: ToolDecision::Limit,
             ..run14()
         });
-        // After cancel or turn end, ordinal 9 is `cancelled` (TCR-D30).
+        // After cancel or turn end, the over-limit ordinal is `cancelled` (TCR-D30).
         round14(ToolCall {
-            ordinal: 9,
+            ordinal: MAX_TOOL_CALL_ORDINAL,
             decision: ToolDecision::Cancelled,
             ..run14()
         });
@@ -1837,12 +1832,12 @@ mod tests {
                 ..run14()
             },
             ToolCall {
-                ordinal: 10,
+                ordinal: MAX_TOOL_CALL_ORDINAL + 1,
                 ..run14()
             },
-            // Ordinal 9 only with limit.
+            // The over-limit ordinal only with limit or cancelled.
             ToolCall {
-                ordinal: 9,
+                ordinal: MAX_TOOL_CALL_ORDINAL,
                 ..run14()
             },
             ToolCall {
@@ -2407,7 +2402,10 @@ mod tests {
                 ..s()
             },
             CaptureSettled { ordinal: 0, ..s() },
-            CaptureSettled { ordinal: 9, ..s() },
+            CaptureSettled {
+                ordinal: MAX_RECORDED_CALLS + 1,
+                ..s()
+            },
             CaptureSettled {
                 reason: CaptureReason::StorageFault,
                 ..s()

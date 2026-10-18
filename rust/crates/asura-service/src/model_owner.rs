@@ -302,7 +302,8 @@ impl ModelOwner {
         self.queue(Body::Begin(pb::Begin {
             model: Some(self.selection.model.clone()),
             input_bytes: Some(input.len() as u64),
-            max_response_tokens: Some(asura_storage::authority::conversation::OUTPUT_RESERVATION),
+            // The per-request ceiling, not a turn budget (owner, 2026-10-18).
+            max_response_tokens: Some(asura_control::model::MAX_RESPONSE_TOKENS),
             enable_project_tools: enable_tools.then_some(true),
         }))?;
         self.input = Some(input);
@@ -760,11 +761,15 @@ impl ModelOwner {
             Body::InferenceUsage(value)
                 if self.phase == Phase::Running || self.phase == Phase::Draining =>
             {
-                if value.request_ordinal != Some(self.usage_reports + 1) || self.usage_reports >= 64
-                {
+                // Consecutive ordinals with no per-turn request count (owner,
+                // 2026-10-18); exhausting u32 is a known-size protocol fault.
+                let Some(next) = self.usage_reports.checked_add(1) else {
+                    return Err("model_protocol_fault");
+                };
+                if value.request_ordinal != Some(next) {
                     return Err("model_protocol_fault");
                 }
-                self.usage_reports += 1;
+                self.usage_reports = next;
                 events.push(ModelEvent::InferenceUsage(value));
             }
             Body::ContextMeasured(value)
@@ -949,6 +954,12 @@ impl ModelOwner {
                 }
             })
             .collect()
+    }
+    /// Takes every queued ToolResult, as the transport would write them.
+    pub(crate) fn tool_test_drain_results(&mut self) -> Vec<pb::ToolResult> {
+        let results = self.tool_test_results();
+        self.outgoing.clear();
+        results
     }
     pub(crate) fn tool_test_has_delivery(&self, result: pb::ToolResult) -> bool {
         let frame = model::encode_frame(

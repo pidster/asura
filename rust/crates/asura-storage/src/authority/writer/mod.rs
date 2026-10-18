@@ -347,7 +347,7 @@ impl WriterHandle {
             } => {
                 if *turn == [0; 16]
                     || *generation == 0
-                    || !(1..=8).contains(ordinal)
+                    || !(1..=MAX_RECORDED_CALLS).contains(ordinal)
                     || body.is_empty()
                     || body.len() > 16384
                     || source.is_some_and(|source| source == [0; 16])
@@ -361,7 +361,10 @@ impl WriterHandle {
                 generation,
                 ordinal,
             } => {
-                if *turn == [0; 16] || *generation == 0 || !(1..=8).contains(ordinal) {
+                if *turn == [0; 16]
+                    || *generation == 0
+                    || !(1..=MAX_RECORDED_CALLS).contains(ordinal)
+                {
                     return Err(Error::Invalid);
                 }
             }

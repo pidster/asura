@@ -2,13 +2,14 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-Every admission reserves exactly 2,048 tokens; replay rejects any other
-reservation (owner, 2026-10-17). The implemented
-[per-request usage and budget correction](turn-usage-helper.md#turn-budget-and-request-admission)
-removes the independent three-pass cap: first request at most 1,024 tokens, later
-requests at most 512, refunds only from verified successful output counts and at
-most 64 requests. Earlier numerical examples and validation evidence below
-describe that earlier packet.
+Turn limit change (owner, 2026-10-18): “We found these types of tool and turn
+limits to be profoundly limiting in Wisp.” A turn has no token reservation, no
+token total, no refunds and no request count. Each request keeps its
+[request cap](turn-usage-helper.md#request-caps-and-admission): first request at
+most 1,024 tokens, later requests at most 512, or the caller's cap if smaller.
+A turn records up to 200 tool calls and has no result-byte total
+([tool call records](tool-call-records.md#turn-limit-change-owner-2026-10-18)).
+Earlier numerical examples and validation evidence below describe earlier packets.
 
 Status: implemented and activated for the `system` model selection. On 2026-09-28,
 the isolated native journey passed file reading, directed service status,
@@ -113,8 +114,9 @@ The shared validator must reject remote disclosure without it, even for read-onl
 operations. Adding remote providers requires their authentication, disclosure and
 policy design; MT1 does not silently authorize project egress.
 
-Initial service limits are one active tool worker, one pending call, eight calls
-per logical turn, 16 KiB per read result and 64 KiB aggregate result bytes per turn.
+Service limits are one active tool worker, one pending call, 200 recorded calls
+per logical turn plus one over-limit record, and 16 KiB per result. A turn has no
+aggregate result-byte limit (owner, 2026-10-18; earlier eight calls and 64 KiB).
 An ordinary tool call has no deadline (owner, 2026-10-17; removes limit L10 in
 [tool output views](tool-output-views.md#execution)). It ends on completion,
 turn cancel, steering, service shutdown or helper exit; the service never fails
@@ -301,8 +303,8 @@ and the installed macOS 27 `GenerationOptions` declarations.
 
 ### Aggregate inference bound for MT2
 
-Superseded: the current budget is defined by the
-[turn usage helper](turn-usage-helper.md#turn-budget-and-request-admission).
+Superseded: the current request caps are defined by the
+[turn usage helper](turn-usage-helper.md#request-caps-and-admission).
 This section records the earlier MT2 refinement. Wrap each provider's `LanguageModelExecutor`
 with a per-turn dispatch counter. The wrapper delegates to the existing executor;
 it does not run another model loop. The installed macOS 27 SDK exposes both
@@ -334,13 +336,13 @@ caller limits and independent turn budgets. No generated prose is parsed as a to
 
 Selected format-1 additions. Since 2026-10-18 kind 14 is the
 [`ToolCall` record](tool-call-records.md#record-kind-14-toolcall): operation ID,
-generation, ordinal 1–9, redacted name and argument text, operation code,
+generation, ordinal 1–201, redacted name and argument text, operation code,
 decision and fault. The earlier layout (tool kind, path, offset and byte limit)
 is retired. Kind 15 stores operation ID, generation, ordinal, typed
 status, text, optional continuation offset and truncation flag. Paths are at most
-1,024 bytes and results at most 16,384 bytes. Result text across a turn is at most
-65,536 bytes. Kind 15 ordinals are 1 through 8; kind 14 ordinal 9 exists only
-with decision `limit`.
+1,024 bytes and results at most 16,384 bytes. A turn has no result-text total
+(owner, 2026-10-18). Kind 15 ordinals are 1 through 200; kind 14 ordinal 201
+exists only with decision `limit` (or `cancelled`, TCR-D30).
 
 Replay requires a started current operation before kind 14; after the
 operation's `CancelRequested`, kind 14 must have decision `cancelled`. Only a
@@ -362,12 +364,12 @@ MT2 durable records and common progress events are implemented. MT3 system-only
 activation passed the integrated checks and native scratch-project journey listed
 below. Additional provider activations require their own native evidence.
 
-The service must enforce conservative accounting itself: after any tool-enabled
-inference starts, per-step helper usage is ignored and the turn charges its full
-recorded reservation (2,048 for new turns) with aggregate usage marked unknown. This applies even if
-no tool is selected. Before Start the charge remains zero. The executor wrapper
-admits requests under the turn budget: 1,024 tokens first, 512 later and at most
-64 requests. Each supported provider must
+The service records conservative usage itself: after any tool-enabled inference
+starts, per-step helper usage does not become the terminal usage, and the
+terminal marks usage unknown. This applies even if no tool is selected. Before
+Start the terminal records known zero usage. No token charge or reservation
+exists (owner, 2026-10-18). The executor wrapper caps each request at 1,024
+tokens first and 512 later, with no request count. Each supported provider must
 implement the same structured tool callbacks and enforce the passed output cap;
 provider inventory alone never enables tools.
 
@@ -472,7 +474,7 @@ behavior until a provider supplies a truthful capacity and overflow contract.
 uses ObserveStatus at tag 12; journal ToolIntent uses kind 3 with empty path,
 zero offset and zero limit. Superseded (2026-10-18): the call is the `service`
 tool with command `status`, recorded as kind 14 operation code 3. It uses the same admitted task/project read grant,
-eight-call limit, result-byte accounting, generation fences and cancellation
+200-call limit, per-result byte limit, generation fences and cancellation
 as project reads; it has no execution deadline. Remote disclosure remains denied.
 
 The service sensor owner captures the cached status and stores its typed
@@ -611,10 +613,9 @@ not a protocol fault.
   follows (TCR-R5). The service renders the status and text sent to the helper
   from the kind 14 codes, for example status 3 and
   `invalid_arguments: missing_field`. The text never repeats model text.
-- Every recorded call consumes one of the turn's eight ordinals. A call that
-  does not run consumes no result bytes. The ninth proposal is recorded with
-  ordinal 9 and decision `limit`, receives status 7, and the helper then ends
-  the turn with `outputLimit` (TCR-D6, TCR-D9).
+- Every recorded call consumes one of the turn's 200 ordinals. The 201st
+  proposal is recorded with ordinal 201 and decision `limit`, receives status 7,
+  and the helper then ends the turn with `outputLimit` (TCR-D6, TCR-D9).
 - Helper faults remain protocol faults with no record (TCR-D7): a call before
   StartAuthorized commits or with tools disabled, an ordinal that is not the
   next one, a second call while one is pending, and a resend at a used ordinal
@@ -693,11 +694,11 @@ the verified local route described below. Numeric loopback alone is not proof of
 local inference because a daemon can forward.
 
 No additional work queue or blocking call is introduced. Existing provider load
-workers, Hello without a time limit (owner, 2026-10-16), cancellation-driven turn, one pending callback, eight tool calls,
+workers, Hello without a time limit (owner, 2026-10-16), cancellation-driven turn, one pending callback, 200 tool calls,
 host workers without a deadline (owner, 2026-10-17), retained cancellation and
 cleanup rules apply. Native
-inference requests are capped at 1,024 tokens first and 512 later, at most 64 per
-turn, within the 2,048-token reservation.
+inference requests are capped at 1,024 tokens first and 512 later, with no
+request count or turn token total (owner, 2026-10-18).
 
 ### MT3 activation decision
 
@@ -887,7 +888,7 @@ and completion, and uses the existing padded, scrollable result panel. Invalid
 arguments retain the draft. Escape closes the panel; repeated use is harmless.
 
 Model calls use the existing grant, local destination, ordinal,
-cancellation, eight-call and result-byte limits. Add an empty `ListTools` argument
+cancellation, 200-call and per-result byte limits. Add an empty `ListTools` argument
 at model ToolCall field 17; field 16 is `MemoryCreateNote`.
 Durable ToolIntent kind 14 represents inventory with empty path, offset zero and
 limit zero; kinds 12 and 13 belong to Memory create. Superseded (2026-10-18):
@@ -957,8 +958,9 @@ cleanup and durable result ownership through the same conversation pipeline.
 ### Cancellation-driven turns — selected 2026-09-30
 
 The [turn lifetime policy](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
-removes the fixed whole-turn expiry. The tool budget retains call count, total
-result bytes, one pending call, identity, generation and cancellation checks.
+removes the fixed whole-turn expiry. The tool budget retains the call count,
+one pending call, identity, generation and cancellation checks; the total
+result-byte check is removed (owner, 2026-10-18).
 Ordinary tool work and exec_cmd have no deadline (owner, 2026-10-17). Cached
 results revalidate exact call identity and current authority; elapsed turn time
 does not invalidate them. Cancellation prevents delivery. Tests must cover a late

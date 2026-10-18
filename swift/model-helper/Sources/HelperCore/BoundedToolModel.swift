@@ -1,36 +1,32 @@
 import Foundation
 import FoundationModels
 
+/// Per-request output caps. A turn has no request count and no token total
+/// (owner, 2026-10-18; turn-usage-helper.md, request caps and admission).
 public enum ToolRoundLimits {
     public static let firstAllocation = 1024
     public static let continuationAllocation = 512
-    public static let maximumRequests = 64
 }
 
-/// Budget state belongs to one admitted turn, even if the framework caches executors.
+/// Request state belongs to one admitted turn, even if the framework caches executors.
 public actor ToolRoundBudget {
     private var used = 0
-    private var remaining: Int
+    /// The caller's per-request cap (the Begin limit), never a turn total.
+    private let callerCap: Int
     private let toolsEnabled: Bool
     private var failure: BackendFailure?
     private var inferenceActive = false
-    private var activeAllocation: Int?
     private var waiters: [UUID: CheckedContinuation<Void, any Error>] = [:]
-    public init(maximumTokens: Int = 2048, toolsEnabled: Bool = true) {
-        remaining = min(max(0, maximumTokens), 2048)
+    public init(maximumTokens: Int = Int(Limits.maximumResponseTokens), toolsEnabled: Bool = true) {
+        callerCap = min(max(0, maximumTokens), Int(Limits.maximumResponseTokens))
         self.toolsEnabled = toolsEnabled
     }
     public func record(_ error: BackendFailure) {
         if failure == nil { failure = error }
     }
     public func recordedFailure() -> BackendFailure? { failure }
-    public func finishInference(_ error: BackendFailure? = nil, measuredOutput: UInt64? = nil) {
+    public func finishInference(_ error: BackendFailure? = nil) {
         if let error { record(error) }
-        if let measuredOutput, let allocation = activeAllocation, error == nil, failure == nil {
-            if measuredOutput <= UInt64(allocation) { remaining += allocation - Int(measuredOutput) }
-            else { record(BackendFailure(.protocolFault)) }
-        }
-        activeAllocation = nil
         inferenceActive = false
         let pending = waiters.values
         waiters.removeAll()
@@ -61,8 +57,8 @@ public actor ToolRoundBudget {
         if let failure { throw failure }
     }
     /// A native proposal waits for its inference to settle. The session owns
-    /// the ordinal policy: it sends the ninth proposal for its record and then
-    /// ends the turn (TCR-D6).
+    /// the ordinal policy: it sends the over-limit proposal for its record and
+    /// then ends the turn (TCR-D6).
     public func reserveNativeProposal() async throws {
         try await requireSuccessfulInference()
         guard toolsEnabled else {
@@ -75,10 +71,12 @@ public actor ToolRoundBudget {
         waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
     }
     func pendingCallbacks() -> Int { waiters.count }
+    /// Admits one request and returns its output cap. Tool-enabled turns admit
+    /// any number of requests; plain text admits one (owner, 2026-10-18).
     public func reserve(requestedMaximum: Int? = nil) throws -> Int {
         try Task.checkCancellation()
         if let failure { throw failure }
-        guard remaining > 0, used < (toolsEnabled ? ToolRoundLimits.maximumRequests : 1) else {
+        guard callerCap > 0, toolsEnabled || used == 0 else {
             let error = BackendFailure(.outputLimit)
             record(error)
             throw error
@@ -86,13 +84,12 @@ public actor ToolRoundBudget {
         guard !inferenceActive else {
             let error = BackendFailure(.protocolFault); record(error); throw error
         }
-        let requested = requestedMaximum ?? remaining
+        let requested = requestedMaximum ?? callerCap
         guard requested > 0 else { throw BackendFailure(.outputLimit) }
-        let passLimit = toolsEnabled ? (used == 0 ? ToolRoundLimits.firstAllocation : ToolRoundLimits.continuationAllocation) : remaining
-        let allocation = min(remaining, passLimit, requested)
-        used += 1
-        remaining -= allocation
-        inferenceActive = true; activeAllocation = allocation
+        let passLimit = toolsEnabled ? (used == 0 ? ToolRoundLimits.firstAllocation : ToolRoundLimits.continuationAllocation) : callerCap
+        let allocation = min(callerCap, passLimit, requested)
+        used = used == Int.max ? used : used + 1
+        inferenceActive = true
         return allocation
     }
 
@@ -104,7 +101,7 @@ public struct BoundedToolModel<Base: LanguageModel>: LanguageModel {
     public let base: Base
     public let budget: ToolRoundBudget
     public let usageObserver: InferenceUsageObserver?
-    public init(base: Base, maximumTokens: Int = 2048, toolsEnabled: Bool = true, usageObserver: InferenceUsageObserver? = nil) {
+    public init(base: Base, maximumTokens: Int = Int(Limits.maximumResponseTokens), toolsEnabled: Bool = true, usageObserver: InferenceUsageObserver? = nil) {
         self.base = base; self.usageObserver = usageObserver
         self.budget = ToolRoundBudget(maximumTokens: maximumTokens, toolsEnabled: toolsEnabled)
     }
@@ -117,6 +114,15 @@ public struct BoundedToolModel<Base: LanguageModel>: LanguageModel {
         private let underlying: Base.Executor
         public init(configuration: Configuration) throws {
             underlying = try Base.Executor(configuration: configuration)
+        }
+        /// A full context window ends the turn as a context limit, not an
+        /// internal error (loop closure; owner, 2026-10-18).
+        static func typed(_ error: any Error) -> BackendFailure {
+            if let failure = error as? BackendFailure { return failure }
+            if let error = error as? LanguageModelError, case .contextSizeExceeded = error {
+                return BackendFailure(.contextLimit)
+            }
+            return BackendFailure(.internalError)
         }
         public func respond(to request: LanguageModelExecutorGenerationRequest, model: Model,
             streamingInto channel: LanguageModelExecutorGenerationChannel) async throws {
@@ -131,15 +137,14 @@ public struct BoundedToolModel<Base: LanguageModel>: LanguageModel {
             var failure: (any Error)?
             do { try await underlying.respond(to: bounded, model: model.base, streamingInto: channel) }
             catch { failure = error }
-            var measuredOutput: UInt64?
-            do { measuredOutput = try await model.usageObserver?.settle(request.id, succeeded: failure == nil) }
+            do { try await model.usageObserver?.settle(request.id, succeeded: failure == nil) }
             catch { if failure == nil { failure = error } }
             if let failure {
-                await model.budget.finishInference((failure as? BackendFailure) ?? BackendFailure(.internalError))
+                await model.budget.finishInference(Self.typed(failure))
                 // Preserve typed failures while letting the SDK drain already buffered text.
                 if !(failure is BackendFailure) { throw failure }
             } else {
-                await model.budget.finishInference(measuredOutput: measuredOutput)
+                await model.budget.finishInference()
             }
         }
     }

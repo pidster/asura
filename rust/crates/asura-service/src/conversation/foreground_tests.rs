@@ -146,7 +146,6 @@ fn active_projection(owner: &Owner) -> Arc<journal::Replay> {
     replay.operations.insert(
         active.turn.operation,
         journal::Operation {
-            reserved_output_tokens: active.turn.reserved_output_tokens,
             conversation: active.turn.conversation,
             generation: active.turn.generation,
             task: active.turn.task,

@@ -34,7 +34,6 @@ impl Fixture {
             input_digest: [9; 32],
             prior_operations: vec![],
             prompt: "observe status".into(),
-            reserved_output_tokens: 2048,
             event_cursor: 1,
             composition: journal::Composition::default(),
         };
@@ -291,10 +290,10 @@ fn result_acknowledgement_after_cancel_never_delivers() {
             1,
             "acknowledged result stays available for durable replay"
         );
-        // The committed result bytes are accounted.
+        // No turn total: the next result keeps the full per-result limit.
         assert_eq!(
             active.tool_budget.result_capacity(),
-            tools::MAX_RESULT_BYTES.min(tools::MAX_TOTAL_RESULT_BYTES - result.text.len())
+            tools::MAX_RESULT_BYTES
         );
         assert!(active.tool.is_none());
     }
@@ -638,7 +637,7 @@ fn invalid_semantic_path_is_durable_rejection_not_host_dispatch() {
     }
 }
 
-/// Decision table: unknown tool, denied create and the two `limit` causes.
+/// Decision table: unknown tool, denied create and the one `limit` cause.
 #[test]
 fn unknown_denied_and_limit_decisions_render_from_codes() {
     // unknown_tool
@@ -675,52 +674,41 @@ fn unknown_denied_and_limit_decisions_render_from_codes() {
     assert!(fixture.active().tool.as_ref().unwrap().create.is_none());
     fixture.acknowledge(Job::ToolIntent);
     assert_eq!(sent(&mut fixture), vec![sent_result(1, 2, "denied")]);
-    // limit: ordinal 9 is recorded only as `limit`
+    // limit: only the over-limit ordinal 201 is recorded as `limit`
+    // (owner, 2026-10-18).
+    let over = journal::MAX_TOOL_CALL_ORDINAL;
     let mut fixture = Fixture::new();
     fresh_turn(&mut fixture);
-    for ordinal in 1..=8 {
+    for ordinal in 1..=tools::MAX_CALLS {
         fixture.active().tool_budget.record(ordinal).unwrap();
     }
-    propose(&mut fixture, wire(9, "service", r#"{"command":"status"}"#));
+    propose(
+        &mut fixture,
+        wire(over, "service", r#"{"command":"status"}"#),
+    );
     let record = pending_record(&mut fixture);
     assert_eq!(
         (record.ordinal, record.decision),
-        (9, journal::ToolDecision::Limit)
+        (over, journal::ToolDecision::Limit)
     );
     fixture.acknowledge(Job::ToolIntent);
-    assert_eq!(sent(&mut fixture), vec![sent_result(9, 7, "limit")]);
-    // limit: result bytes used up; the turn continues
+    assert_eq!(sent(&mut fixture), vec![sent_result(over, 7, "limit")]);
+    // No result-byte total: after far more than 64 KiB of results, the last
+    // recorded call still runs.
     let mut fixture = Fixture::new();
     fresh_turn(&mut fixture);
-    for ordinal in 1..=4 {
+    for ordinal in 1..=tools::MAX_CALLS - 1 {
         let budget = &mut fixture.active().tool_budget;
         budget.record(ordinal).unwrap();
         budget.settle(tools::MAX_RESULT_BYTES).unwrap();
     }
-    propose(&mut fixture, wire(5, "service", r#"{"command":"status"}"#));
-    assert_eq!(
-        pending_record(&mut fixture).decision,
-        journal::ToolDecision::Limit
-    );
-    fixture.acknowledge(Job::ToolIntent);
-    assert_eq!(sent(&mut fixture), vec![sent_result(5, 7, "limit")]);
-    assert!(fixture.active().terminal.is_none());
-    // limit: create_note needs 256 bytes of result capacity
-    let mut fixture = Fixture::new();
-    fresh_turn(&mut fixture);
-    let budget = &mut fixture.active().tool_budget;
-    budget.record(1).unwrap();
-    for _ in 0..3 {
-        budget.settle(tools::MAX_RESULT_BYTES).unwrap();
-    }
-    budget.settle(tools::MAX_RESULT_BYTES - 100).unwrap();
     propose(
         &mut fixture,
-        wire(2, "memory", r#"{"command":"create_note","body":"note"}"#),
+        wire(tools::MAX_CALLS, "service", r#"{"command":"status"}"#),
     );
     assert_eq!(
         pending_record(&mut fixture).decision,
-        journal::ToolDecision::Limit
+        journal::ToolDecision::Run
     );
 }
 
@@ -882,7 +870,11 @@ fn tcr_u10_rule_set_unavailable_retains_nothing_and_refuses() {
     ] {
         for (ordinal, cancelled, expected) in [
             (1, false, journal::ToolDecision::Refused),
-            (9, false, journal::ToolDecision::Limit),
+            (
+                journal::MAX_TOOL_CALL_ORDINAL,
+                false,
+                journal::ToolDecision::Limit,
+            ),
             (1, true, journal::ToolDecision::Cancelled),
         ] {
             let mut fixture = Fixture::new();
@@ -1213,7 +1205,6 @@ fn install_recorded_memory_cancel(fixture: &mut Fixture) {
     replay.operations.insert(
         active.turn.operation,
         journal::Operation {
-            reserved_output_tokens: 2048,
             conversation: active.turn.conversation,
             generation: active.turn.generation,
             task: active.turn.task,
@@ -1647,7 +1638,6 @@ impl Journaled {
         turn.project = project;
         turn.prompt = "observe".into();
         turn.configuration_digest = prepared.configuration_digest;
-        turn.reserved_output_tokens = 2048;
         turn.digest = journal::request_digest(journal::Request::Submit {
             project,
             conversation: None,
@@ -1829,6 +1819,81 @@ fn tcr_i01_real_journal_holds_rejected_record_without_result() {
     assert_eq!(op.tools.len(), 2);
     assert!(op.tools[0].result_frame.is_none());
     assert_eq!(op.tools[1].result_status, Some(1));
+}
+
+/// TCR-I11 (owner part, real journal; owner, 2026-10-18): 200 calls run and
+/// commit their results, with far more than the former 64 KiB of result
+/// text; the 201st is recorded only as `limit` and receives status 7.
+#[test]
+fn tcr_i11_two_hundred_calls_run_and_the_next_is_limit() {
+    let mut journaled = Journaled::new();
+    let mut result_bytes = 0;
+    for ordinal in 1..=tools::MAX_CALLS {
+        propose(
+            &mut journaled,
+            wire(ordinal, "service", r#"{"command":"tools"}"#),
+        );
+        assert_eq!(
+            journaled.active().tool.as_ref().map(|t| t.record.decision),
+            Some(journal::ToolDecision::Run),
+            "ordinal {ordinal}"
+        );
+        journaled.owner.drive(Instant::now());
+        assert!(journaled.settle() == "tool_call");
+        journaled.owner.drive(Instant::now());
+        journaled.owner.capture_inventory_tool();
+        journaled.owner.drive(Instant::now());
+        assert!(journaled.settle() == "tool_result");
+        journaled.owner.drive(Instant::now());
+        // The transport writes each result; the bounded queue never fills.
+        let delivered = journaled.active().model.tool_test_drain_results();
+        let failure = journaled.active().failure_reason;
+        let last = delivered
+            .last()
+            .unwrap_or_else(|| panic!("ordinal {ordinal}: no result, {failure:?}"));
+        assert_eq!((last.ordinal, last.status), (Some(ordinal), Some(1)));
+        result_bytes += last.text.as_ref().unwrap().len();
+    }
+    assert!(result_bytes > 65_536, "{result_bytes} result bytes");
+    let over = journal::MAX_TOOL_CALL_ORDINAL;
+    propose(
+        &mut journaled,
+        wire(over, "service", r#"{"command":"tools"}"#),
+    );
+    journaled.owner.drive(Instant::now());
+    assert!(journaled.settle() == "tool_call");
+    journaled.owner.drive(Instant::now());
+    assert_eq!(
+        sent(&mut journaled).last(),
+        Some(&sent_result(over, 7, "limit"))
+    );
+    let replay = journaled.owner.replay.clone().unwrap();
+    let op = &replay.operations[&journaled.owner.active.as_ref().unwrap().turn.operation];
+    assert_eq!(op.tools.len(), over as usize);
+    assert!(
+        op.tools[..tools::MAX_CALLS as usize]
+            .iter()
+            .all(
+                |tool| tool.decision == journal::ToolDecision::Run && tool.result_status == Some(1)
+            )
+    );
+    assert_eq!(
+        op.tools[over as usize - 1].decision,
+        journal::ToolDecision::Limit
+    );
+    // TCR-D31: the activity event carries the most recent window only.
+    let operation = journaled.owner.active.as_ref().unwrap().turn.operation;
+    let reply = journaled
+        .owner
+        .observe(pb::Envelope::default(), operation, 0)
+        .unwrap();
+    let Some(Body::ConversationEvent(event)) = reply.body else {
+        panic!("activity event");
+    };
+    let ordinals: Vec<_> = event.tools.iter().map(|t| t.ordinal.unwrap()).collect();
+    let first = over + 1 - asura_control::MAX_TOOL_PROGRESS_ENTRIES as u32;
+    assert_eq!(ordinals, (first..=over).collect::<Vec<_>>());
+    assert_eq!(event.tools.last().unwrap().policy_decision, Some(7));
 }
 
 /// TCR-U13 (service part, real journal): replay recomputes the same exec_cmd

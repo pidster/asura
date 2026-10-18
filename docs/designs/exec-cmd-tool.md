@@ -64,7 +64,8 @@ wire fields require presence and strict unknown-field/direction validation. Root
 allocates free schema/tool-kind fields at integration; do not reuse inventory,
 audit or pending Memory create allocations.
 
-The existing eight-call limit and 64 KiB aggregate result limit apply. One exec_cmd
+The existing 200-call turn limit and 16 KiB per-result limit apply (owner,
+2026-10-18; [tool call records](tool-call-records.md)). One exec_cmd
 job may be live service-wide. It occupies the existing retained tool slot through
 setup, execution and cleanup; a second proposal gets Busy. No unbounded pending
 exec_cmd queue is introduced.
@@ -471,7 +472,8 @@ ToolResult layout is unchanged. Structural decode permits truncation for statuse
 5,6,7 because the result has no tool kind. Replay permits this only for kind 16,
 with no continuation offset. Denied/invalid/unavailable statuses 2,3,4 cannot have
 truncation or continuation. Preserve every other tool's result restriction.
-exec_cmd body is at most 16384 bytes and aggregate results at most 65536 bytes. An
+exec_cmd body is at most 16384 bytes; there is no per-turn aggregate result limit
+(owner, 2026-10-18). An
 unresolved intent on restart remains interrupted with effects unknown. Never replay
 it automatically or infer rollback from a missing result.
 
@@ -496,8 +498,8 @@ and exact round-trip layout. Job ID tests use fixed vectors, deterministic resul
 and changes to each input.
 SH-DI1 uses real journal replay with an accepted/helper-started turn. It covers
 captured timeout/cancel/limit, forbidden continuation, unchanged other-tool rules,
-changed arguments under one identity, unresolved owner-restart intent and 64 KiB
-aggregate bounds. Native no-duplicate effect and cleanup remain SH-I2/E1 service
+changed arguments under one identity, unresolved owner-restart intent and 16 KiB
+per-result bounds. Native no-duplicate effect and cleanup remain SH-I2/E1 service
 and platform evidence; codec tests cannot prove them.
 
 ### Retained service wrapper and cleanup bounds

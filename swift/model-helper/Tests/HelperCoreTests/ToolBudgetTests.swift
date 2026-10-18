@@ -21,26 +21,25 @@ private struct ProbeModel: LanguageModel {
         }
     }
 }
-@Test func toolInferenceRoundsCannotExceedDurableReservation() async throws {
+/// UH10 (owner, 2026-10-18): a tool turn dispatches more than the former 64
+/// requests and more than the former 2,048-token total; each request keeps its cap.
+@Test func toolInferenceRequestsHaveNoCountOrTurnTokenTotal() async throws {
     let probe = DispatchProbe()
     let model = BoundedToolModel(base: ProbeModel(probe: probe))
     let executor = try BoundedToolModel<ProbeModel>.Executor(configuration: 0)
     let request = LanguageModelExecutorGenerationRequest(id: UUID(), transcript: Transcript(entries: []),
         enabledTools: [], generationOptions: GenerationOptions(maximumResponseTokens: 2048),
         contextOptions: ContextOptions(), metadata: [:])
-    for _ in 0..<3 {
+    for _ in 0..<100 {
         try await executor.respond(to: request, model: model, streamingInto: .init())
     }
-    do {
-        try await executor.respond(to: request, model: model, streamingInto: .init())
-        Issue.record("fourth inference dispatch reached provider")
-    } catch let failure as BackendFailure { #expect(failure.reason == .outputLimit) }
     let limits = await probe.limits
-    #expect(limits == [1024, 512, 512])
-    #expect(limits.compactMap { $0 }.reduce(0,+) <= 2048)
+    #expect(limits == [1024] + Array(repeating: 512, count: 99))
+    #expect(limits.compactMap { $0 }.reduce(0, +) > 2048)
+    #expect(await model.budget.recordedFailure() == nil)
     let secondTurn = BoundedToolModel(base: ProbeModel(probe: probe))
     try await executor.respond(to: request, model: secondTurn, streamingInto: .init())
-    #expect(await probe.limits.count == 4)
+    #expect(await probe.limits.last == 1024)
 }
 
 @Test func genericEngineDeniesUnadvertisedToolsBeforeProviderDispatch() async throws {
@@ -108,19 +107,18 @@ private struct ProbeModel: LanguageModel {
 }
 
 
-@Test func smallCallerCapsStillHaveARequestResourceBound() async throws {
+/// UH13: a small caller cap bounds every request; the requests together can
+/// exceed it, because no turn total exists (owner, 2026-10-18).
+@Test func smallCallerCapsBoundEveryRequestWithoutATurnTotal() async throws {
     let probe = DispatchProbe()
     let model = BoundedToolModel(base: ProbeModel(probe: probe))
     let executor = try BoundedToolModel<ProbeModel>.Executor(configuration: 0)
     let request = LanguageModelExecutorGenerationRequest(id: UUID(), transcript: Transcript(entries: []),
         enabledTools: [], generationOptions: GenerationOptions(maximumResponseTokens: 20),
         contextOptions: ContextOptions(), metadata: [:])
-    for _ in 0..<64 { try await executor.respond(to: request, model: model, streamingInto: .init()) }
-    await #expect(throws: BackendFailure.self) {
-        try await executor.respond(to: request, model: model, streamingInto: .init())
-    }
-    #expect(await probe.limits == Array(repeating: 20, count: 64))
-    #expect(await probe.limits.compactMap { $0 }.reduce(0, +) <= 2048)
+    for _ in 0..<200 { try await executor.respond(to: request, model: model, streamingInto: .init()) }
+    #expect(await probe.limits == Array(repeating: 20, count: 200))
+    #expect(await probe.limits.compactMap { $0 }.reduce(0, +) == 4000)
 }
 
 
@@ -135,22 +133,20 @@ private struct ProbeModel: LanguageModel {
 }
 
 
-@Test func actualTurnReservationLimitsEveryExecutorPass() async throws {
+@Test func callerCapLimitsEveryExecutorPassWithoutATurnTotal() async throws {
     let probe = DispatchProbe()
-    let model = BoundedToolModel(base: ProbeModel(probe: probe), maximumTokens: 512)
+    let model = BoundedToolModel(base: ProbeModel(probe: probe), maximumTokens: 300)
     let executor = try BoundedToolModel<ProbeModel>.Executor(configuration: 0)
     let request = LanguageModelExecutorGenerationRequest(id: UUID(), transcript: Transcript(entries: []),
         enabledTools: [], generationOptions: GenerationOptions(maximumResponseTokens: 2048),
         contextOptions: ContextOptions(), metadata: [:])
-    try await executor.respond(to: request, model: model, streamingInto: .init())
-    await #expect(throws: BackendFailure.self) {
-        try await executor.respond(to: request, model: model, streamingInto: .init())
-    }
-    #expect(await probe.limits == [512])
-    #expect(await model.budget.recordedFailure()?.reason == .outputLimit)
+    for _ in 0..<3 { try await executor.respond(to: request, model: model, streamingInto: .init()) }
+    #expect(await probe.limits == [300, 300, 300])
+    #expect(await model.budget.recordedFailure() == nil)
 }
 
-@Test func plainTextUsesOneFullReservationAndCannotDispatchTwice() async throws {
+/// UH14: plain text dispatches once at the caller cap.
+@Test func plainTextUsesOneCallerCapAndCannotDispatchTwice() async throws {
     let budget = ToolRoundBudget(maximumTokens: 2048, toolsEnabled: false)
     #expect(try await budget.reserve() == 2048)
     await #expect(throws: BackendFailure.self) { try await budget.reserve() }
@@ -303,4 +299,46 @@ private func waitForCallbacks(_ count: Int, in budget: ToolRoundBudget) async th
     let nested = LanguageModelSession.ToolCallError(tool: tool, underlyingError: HelperError.protocolFault)
     #expect(modelFailureDiagnostic(LanguageModelSession.ToolCallError(tool: tool, underlyingError: nested))
         == "asura_model_failure tool_callback 0\n")
+}
+
+private actor ContextProbe {
+    var passes = 0
+    func next() -> Int { passes += 1; return passes }
+}
+/// The first request proposes a tool; the second finds the context window full.
+private struct FullContextModel: LanguageModel {
+    let probe: ContextProbe
+    var capabilities: LanguageModelCapabilities { .init([.toolCalling]) }
+    var executorConfiguration: Int { 0 }
+    struct Executor: LanguageModelExecutor {
+        typealias Configuration = Int
+        typealias Model = FullContextModel
+        init(configuration: Int) {}
+        func respond(to request: LanguageModelExecutorGenerationRequest, model: Model,
+            streamingInto channel: LanguageModelExecutorGenerationChannel) async throws {
+            if await model.probe.next() == 1 {
+                await channel.send(.toolCalls(action: .toolCall(id: "fill", name: "service",
+                    action: .appendArguments(#"{"command":"tools"}"#, tokenCount: 10))))
+                return
+            }
+            throw LanguageModelError.contextSizeExceeded(.init(contextSize: 100, tokenCount: 101,
+                debugDescription: "full", metadata: [:]))
+        }
+    }
+}
+/// Loop closure (owner, 2026-10-18): with no request count or token total, a
+/// context window that fills mid-turn ends the turn with a context-limit
+/// failure; it does not hang or dispatch another request.
+@Test func contextWindowFullMidTurnFailsWithContextLimit() async throws {
+    let probe = ContextProbe()
+    let engine = FoundationBackend(model: FullContextModel(probe: probe), contextTokens: 8192,
+        modelName: "full-context-fixture", supportsTools: true)
+    var input = ModelInput(); input.instructions = "fixture"; input.prompt = "fixture"
+    do {
+        try await engine.generateWithTools(input, maximumTokens: 2048, handler: { _ in
+            ToolResult(status: .success, text: "fixture tools")
+        }, snapshot: { _ in })
+        Issue.record("full context completed")
+    } catch let failure as BackendFailure { #expect(failure.reason == .contextLimit) }
+    #expect(await probe.passes == 2)
 }

@@ -98,7 +98,7 @@ impl Observation {
             ) if *operation != [0; 16]
                 && *generation > 0
                 && *ordinal > 0
-                && *ordinal <= 8
+                && *ordinal <= crate::authority::conversation::MAX_RECORDED_CALLS
                 && (0..=32).contains(lifecycle)
                 && (0..=32).contains(installation)
                 && (0..=128).contains(reason) =>

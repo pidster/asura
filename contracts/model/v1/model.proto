@@ -77,7 +77,7 @@ message HistoryTurn { optional Role role = 1; optional string text = 2; }
 enum ToolStatus { TOOL_STATUS_UNSPECIFIED = 0; TOOL_STATUS_SUCCESS = 1; TOOL_STATUS_DENIED = 2; TOOL_STATUS_INVALID_ARGUMENTS = 3; TOOL_STATUS_UNAVAILABLE = 4; TOOL_STATUS_TIMEOUT = 5; TOOL_STATUS_CANCELLED = 6; TOOL_STATUS_LIMIT = 7; }
 enum ToolCallSource { TOOL_CALL_SOURCE_UNSPECIFIED = 0; TOOL_CALL_SOURCE_GENERATED_CONTENT = 1; TOOL_CALL_SOURCE_PROVIDER_JSON = 2; }
 message ToolCall {
-  // 1-9; 9 only for the over-limit proposal.
+  // 1-201; 201 only for the over-limit proposal (owner, 2026-10-18).
   optional uint32 ordinal = 1;
   // 1-256 bytes; absent when longer, then name_bytes is set.
   optional string name = 2;

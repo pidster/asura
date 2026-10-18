@@ -239,7 +239,6 @@ fn pending_projection() -> Arc<journal::Replay> {
     replay.operations.insert(
         create.operation,
         journal::Operation {
-            reserved_output_tokens: 2048,
             conversation: [5; 16],
             generation: 1,
             task: [6; 16],
@@ -411,7 +410,6 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
     turn.project = project;
     turn.prompt = "remember".into();
     turn.configuration_digest = prepared.configuration_digest;
-    turn.reserved_output_tokens = 2048;
     turn.digest = journal::request_digest(journal::Request::Submit {
         project,
         conversation: None,
@@ -529,7 +527,7 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
         operation.terminal.as_ref().unwrap().kind,
         journal::TerminalKind::Interrupted
     );
-    assert_eq!(operation.terminal.as_ref().unwrap().charged_tokens, 2048);
+    assert!(!operation.terminal.as_ref().unwrap().usage_known);
     assert!(!replay.project_memory_blocked(project));
     let result_frame = operation.tools[0].result_frame.clone().unwrap();
     fixture.owner.shutdown();

@@ -24,7 +24,6 @@ public actor HelperSession {
     private var maximumTokens: UInt32 = 512
     private var projectToolsEnabled = false
     private var toolOrdinal: UInt32 = 0
-    private var toolResultBytes = 0
     private var pendingTool: (UInt32, CheckedContinuation<ToolResult, any Error>)?
     private var modelTask: Task<Void, Never>?
     private var timer: Task<Void, Never>?
@@ -201,7 +200,7 @@ public actor HelperSession {
                 begin.hasInputBytes, begin.inputBytes > 0, begin.inputBytes <= Limits.input,
                 // A sanity bound on allocation, not a content limit.
                 begin.inputBytes <= UInt64(contextTokens) * 8,
-                begin.hasMaxResponseTokens, (1...2048).contains(begin.maxResponseTokens) else { throw HelperError.protocolFault }
+                begin.hasMaxResponseTokens, (1...Limits.maximumResponseTokens).contains(begin.maxResponseTokens) else { throw HelperError.protocolFault }
             operation = message.operationID; generation = message.generation
             expectedInput = begin.inputBytes
             maximumTokens = begin.maxResponseTokens
@@ -281,9 +280,8 @@ public actor HelperSession {
         case .toolResult(let result):
             guard phase == .running, projectToolsEnabled,
                 let pending = pendingTool, result.ordinal == pending.0,
-                result.ordinal < Limits.toolProposals || result.status == .limit,
-                toolResultBytes + result.text.utf8.count <= 65_536 else { throw HelperError.protocolFault }
-            toolResultBytes += result.text.utf8.count
+                // No turn result-byte total (owner, 2026-10-18); Wire bounds each result.
+                result.ordinal < Limits.toolProposals || result.status == .limit else { throw HelperError.protocolFault }
             finishTool(.success(ToolResult(status: result.status, text: result.text,
                 nextOffset: result.hasNextOffset ? result.nextOffset : nil, truncated: result.truncated)))
         case .credit(let credit):
@@ -310,8 +308,9 @@ public actor HelperSession {
     }
 
     /// Forwards one proposal unread: name and argument text, or their sizes when
-    /// over the wire limits (known-size exhaustion). Ordinals run 1-9; after the
-    /// result of ordinal 9 the turn fails with outputLimit (TCR-D6). The name
+    /// over the wire limits (known-size exhaustion). Ordinals run 1 through
+    /// Limits.toolProposals; after the result of the last, over-limit ordinal the
+    /// turn fails with outputLimit (TCR-D6). The name
     /// and arguments are never logged.
     private func requestTool(_ proposal: ToolProposal) async throws -> ToolResult {
         guard phase == .running, pendingFailure == nil, projectToolsEnabled else { throw CancellationError() }
@@ -352,7 +351,8 @@ public actor HelperSession {
         if let ordinal = value.inferenceStartedOrdinal {
             guard value.text.isEmpty, value.usageTokens == nil, value.inputContext == nil,
                 value.inferenceUsage == nil, activeInferenceOrdinal == nil,
-                settledInferenceOrdinal < 64, ordinal == settledInferenceOrdinal + 1 else { throw HelperError.protocolFault }
+                // No request count per turn (owner, 2026-10-18); UInt32 exhaustion is a fault.
+                settledInferenceOrdinal < UInt32.max, ordinal == settledInferenceOrdinal + 1 else { throw HelperError.protocolFault }
             activeInferenceOrdinal = ordinal
             return
         }

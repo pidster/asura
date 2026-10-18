@@ -54,7 +54,8 @@ argument, a wrong type, a negative or overflowed number, an unknown command and
 an extraneous command parameter. Each rejection is a kind 14 `ToolCall` record
 with decision `invalid_arguments` and a fault code, and the model receives a
 status-3 result such as `invalid_arguments: missing_field`. The model may correct
-the call within the turn's eight calls. The service remains the authority for
+the call within the turn's 200 calls
+([tool call records](tool-call-records.md); owner, 2026-10-18). The service remains the authority for
 scope, detailed limits, locality and permission checks. Grouping read and write
 operations never grants write access from a read grant. `create_note` requires a
 body of 1–16,384 UTF-8 bytes and accepts an optional source version. It rejects
@@ -70,7 +71,7 @@ or MLX. It fails the turn with its diagnostic (owner decision 2 of
 
 Grouping adds no workers, queues, timers or I/O operations. HM3 defines the note
 mutation through the existing storage owner. Tool callbacks retain cancellation,
-the per-turn eight-call limit and byte budgets; they have no deadline. All local
+the per-turn 200-call limit and the 16 KiB per-result limit; they have no deadline. All local
 model classes use the same generated schemas and adapter. Cloud activation is
 unchanged. Stored evidence remains untrusted; it cannot select another command or
 grant access. An invalid grouped proposal cannot fall back to a shell command.
