@@ -341,7 +341,7 @@ fn finish(
 ) -> Result<pb::ConversationEvent> {
     let end = Instant::now() + limit;
     loop {
-        let event = fixture.attach()?.observe_conversation(operation, 0)?;
+        let event = fixture.attach()?.observe_conversation(operation, 0, 0)?;
         if matches!(event.kind, Some(3..=6)) {
             return Ok(event);
         }
@@ -801,7 +801,7 @@ fn overload() -> Result<()> {
         model.script(&[Step::ExecCmd(flood.into()), Step::Final]);
         let operation = submit(&fixture, project, "Flood.")?;
         thread::sleep(Duration::from_millis(if round == 0 { 3000 } else { 800 }));
-        let event = fixture.attach()?.observe_conversation(operation, 0)?;
+        let event = fixture.attach()?.observe_conversation(operation, 0, 0)?;
         assert!(!matches!(event.kind, Some(3..=6)), "running, not cancelled");
         within_100ms("inspect during a stalled capture", || {
             Ok(fixture.attach()?.inspect()?)

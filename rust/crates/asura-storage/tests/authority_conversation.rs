@@ -132,6 +132,7 @@ fn terminal(kind: TerminalKind, cause: Cause, known: bool) -> TurnTerminal {
         final_cursor: u64::MAX,
         usage_known: known,
         output_tokens: if known { 12 } else { 0 },
+        text_offset: 0,
         text: "reply".into(),
     }
 }
@@ -763,6 +764,7 @@ fn committed_failure_or_cancellation_keeps_successors_eligible() {
             final_cursor: u64::MAX,
             usage_known: true,
             output_tokens: 0,
+            text_offset: 0,
             text: String::new(),
         }));
         let state = inspect(&j.bytes).unwrap();
@@ -2465,4 +2467,138 @@ fn tcr_i11_replay_accepts_every_call_with_full_results_and_no_turn_total() {
     let total: usize = op.tools.iter().map(|tool| tool.result_bytes).sum();
     assert_eq!(total, MAX_RECORDED_CALLS as usize * 16_384);
     assert!(total > 65_536);
+}
+
+// ---------------------------------------------------------- response text
+// response-text-transfer.md: kind 24 segments and the kind 8 tail.
+
+fn segment(offset: u64, text: &str) -> Record {
+    Record::ResponseText(ResponseText {
+        operation: id(10),
+        generation: 1,
+        offset,
+        text: text.into(),
+    })
+}
+fn tail(kind: TerminalKind, cause: Cause, offset: u64, text: &str) -> Record {
+    Record::TurnTerminal(TurnTerminal {
+        text_offset: offset,
+        text: text.into(),
+        ..terminal(kind, cause, false)
+    })
+}
+
+/// RT-03: a response far above 61,440 bytes replays from kind 24 segments and
+/// the kind 8 tail; replay keeps frame pieces, not text.
+#[test]
+fn rt03_long_response_replays_from_segments_and_tail() {
+    let mut j = Journal::started();
+    let full = MAX_TEXT as u64;
+    for n in 0..5 {
+        j.append(segment(n * full, &"a".repeat(MAX_TEXT)));
+    }
+    j.append(tail(TerminalKind::Complete, Cause::None, 5 * full, "end"));
+    let state = inspect(&j.bytes).unwrap();
+    let op = &state.operations[&id(10)];
+    assert_eq!(op.response.len, 5 * full + 3);
+    assert_eq!(op.response.pieces.len(), 6);
+    assert_eq!(op.response.pieces[5].start, 5 * full);
+    assert!(op.terminal.is_some());
+}
+
+/// RT-04 in the journal: a later segment keeps a shorter prefix; the cut
+/// pieces shrink and later pieces are dropped.
+#[test]
+fn rt04_segment_offset_cuts_the_journaled_response() {
+    let mut j = Journal::started();
+    j.append(segment(0, "first text"));
+    j.append(segment(10, " more"));
+    j.append(segment(5, "rewritten"));
+    j.append(tail(TerminalKind::Complete, Cause::None, 3, ""));
+    let op = &inspect(&j.bytes).unwrap().operations[&id(10)];
+    assert_eq!(op.response.len, 3);
+    assert_eq!(op.response.pieces.len(), 1);
+    assert_eq!(op.response.pieces[0].kept, 3);
+}
+
+/// RT-09: invalid kind 24 and kind 8 offsets reject the whole journal.
+#[test]
+fn rt09_invalid_response_offsets_and_states_reject() {
+    // Offset above the journaled length.
+    let mut j = Journal::started();
+    j.append(segment(1, "x"));
+    assert!(inspect(&j.bytes).is_err());
+    // A no-op segment.
+    let mut j = Journal::started();
+    j.append(segment(0, "x"));
+    j.append(segment(1, ""));
+    assert!(inspect(&j.bytes).is_err());
+    // Before StartAuthorized.
+    let mut j = Journal::accepted();
+    j.append(segment(0, "x"));
+    assert!(inspect(&j.bytes).is_err());
+    // Wrong generation.
+    let mut j = Journal::started();
+    j.append(Record::ResponseText(ResponseText {
+        operation: id(10),
+        generation: 2,
+        offset: 0,
+        text: "x".into(),
+    }));
+    assert!(inspect(&j.bytes).is_err());
+    // After the terminal.
+    let mut j = Journal::started();
+    j.append(tail(TerminalKind::Complete, Cause::None, 0, "done"));
+    j.append(segment(4, "x"));
+    assert!(inspect(&j.bytes).is_err());
+    // Terminal tail offset above the journaled length.
+    let mut j = Journal::started();
+    j.append(segment(0, "abc"));
+    j.append(tail(TerminalKind::Complete, Cause::None, 4, "d"));
+    assert!(inspect(&j.bytes).is_err());
+    // Complete with an empty whole response.
+    let mut j = Journal::started();
+    j.append(segment(0, "abc"));
+    j.append(tail(TerminalKind::Complete, Cause::None, 0, ""));
+    assert!(inspect(&j.bytes).is_err());
+    // Complete with only kind 24 text and an empty tail is valid.
+    let mut j = Journal::started();
+    j.append(segment(0, "abc"));
+    j.append(tail(TerminalKind::Complete, Cause::None, 3, ""));
+    assert_eq!(
+        inspect(&j.bytes).unwrap().operations[&id(10)].response.len,
+        3
+    );
+    // An oversized segment does not encode.
+    assert!(
+        encode_frame(
+            &FrameContext {
+                installation_id: id(1),
+                transition_id: id(2),
+                sequence: 1,
+                prior_digest: [0; 32],
+                expected_revision: 0,
+                owner_generation: 1,
+            },
+            &segment(0, &"x".repeat(MAX_TEXT + 1)),
+        )
+        .is_err()
+    );
+}
+
+/// RT-08 in replay: a restart terminal keeps the journaled prefix; a segment
+/// from the earlier owner generation after restart rejects.
+#[test]
+fn rt08_restart_keeps_the_journaled_prefix() {
+    let mut j = Journal::started();
+    j.append(segment(0, "partial"));
+    j.append(Record::OwnerGeneration);
+    let mut stale = Journal::started();
+    stale.append(segment(0, "partial"));
+    stale.append(Record::OwnerGeneration);
+    stale.append(segment(7, " more"));
+    assert!(inspect(&stale.bytes).is_err());
+    j.append(tail(TerminalKind::Interrupted, Cause::Restart, 7, ""));
+    let op = &inspect(&j.bytes).unwrap().operations[&id(10)];
+    assert_eq!(op.response.len, 7);
 }

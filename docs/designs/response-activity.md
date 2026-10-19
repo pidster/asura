@@ -109,10 +109,12 @@ Selected correction (owner, 2026-10-18): a turn has no output-token reservation
 or total. Tool inference requests use a first-request cap of 1,024 and
 continuation caps of 512, or the caller's cap if smaller. No request count limits
 a turn. The service uses the selected cancellation-driven turn lifetime and
-retains its 200-call tool limit and 61,440-byte response bound. Limits remain
-necessary; reaching one must preserve received text and mark the response incomplete.
-The TUI retains every received response byte within the wire bound, sanitizes control
-characters and permits scrolling through the complete retained text.
+retains its 200-call tool limit. No response byte, revision or transmitted-output
+total exists (owner, 2026-10-18); [response text transfer](response-text-transfer.md)
+carries a response of any length in windows of at most 61,440 bytes. A remaining
+limit, such as journal capacity, must preserve received text and mark the response
+incomplete. The TUI assembles and retains every received response byte, sanitizes
+control characters and permits scrolling through the complete retained text.
 
 Kind 21 records no output-token reservation and the terminal records no charge
 (owner, 2026-10-18; schema changed in place, no compatibility with older
@@ -235,7 +237,10 @@ literal HTML visible as text; do not interpret it. Keep the established response
 gutter, marker, wrapping, scrolling and palette. Styling must not inject terminal
 control sequences.
 
-An event supplies at most 61,440 response bytes. The presentation cache retains
+An event supplies a window of at most 61,440 response bytes; the conversation
+worker assembles the windows into the whole response
+([observation windows](response-text-transfer.md#control-observation-windows)).
+The presentation cache retains
 at most eight responses and at most 65,536 emitted bytes per response. If rich
 presentation exceeds that bound, show the complete sanitized original response
 literally. A malformed or unfinished Markdown fragment also remains visible.
@@ -314,7 +319,7 @@ The replay projection caches bounded argument/result descriptions in ToolRecord,
 derived from verified journal bytes. This adds no filesystem access on the reactor
 and no new journal encoding. Charge the additional fixed memory against its existing
 16 MiB replay limit. At most nine tools are sent per event (the most recent nine since 2026-10-18), with 192-byte arguments
-and 128-byte preview caps preserving room beside the existing 61,440-byte response.
+and 128-byte preview caps preserving room beside the 61,440-byte response window.
 Strict wire validation and a maximal-frame regression must enforce that bound.
 The TUI sanitizes every string, displays running tools immediately, and expands
 committed outcomes/previews in response history. It cannot label execution safe

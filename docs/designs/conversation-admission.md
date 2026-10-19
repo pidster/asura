@@ -274,8 +274,9 @@ graph. The earlier diagnostic initialization kinds 1 and 2 are removed, and repl
 rejects a stream that starts with any other kind. Kind 3 keeps its OwnerGeneration
 meaning; kinds 4 through 9 add the conversation transitions below. Later amendments
 add kinds 13–23 for queue decisions, tools, promotion, Memory create, the managed
-queue, project rename, composed turns and exec_cmd. Kinds 1, 2, 5, 12, 17 and
-22 are unassigned. Never reinterpret an existing kind based on payload length.
+queue, project rename, composed turns and exec_cmd, and kind 24 for response text
+segments ([response text transfer](response-text-transfer.md#journal-records)).
+Kinds 1, 2, 5, 12, 17 and 22 are unassigned. Never reinterpret an existing kind based on payload length.
 
 Tool record kinds after the [tool call records](tool-call-records.md) change
 (2026-10-18). Replay returns `UnsupportedFormat` for a retired kind and
@@ -360,12 +361,14 @@ include the complete state/result/event obligation described below.
 | 21 TurnAccepted | request ID, request digest, project ID, original conversation ID optional, expected generation u64, conversation ID, generation u64, task ID, model-operation ID, model string, configuration digest, instructions digest, input digest, prior-operation ID list, prompt string, event cursor u64, then the required composition (see [graph memory evolution](graph-memory-evolution.md)) | Registry and expected generation verified; atomically creates conversation when needed, accepts task/operation and records acceptance cursor 1. It reserves no output tokens (owner, 2026-10-18). Kind 5, the earlier form without composition, is removed |
 | 6 StartAuthorized | model-operation ID, conversation generation u64, helper-instance ID, input digest | Accepted operation, no cancel/terminal and same owner generation; one dispatch permit only |
 | 7 CancelRequested | model-operation ID, conversation generation u64, cause u8 | Cause 1 user, 2 deadline, 3 output limit, 4 service shutdown; one intent per operation, existing intent wins |
-| 8 TurnTerminal | model-operation ID, conversation generation u64, terminal kind u8, cause u8, final cursor u64, usage-known u8, output-tokens u32, text string | Kind 1 complete, 2 failed, 3 cancelled, 4 interrupted; only once, helper settled where applicable; terminal task/operation, accounting and final event commit atomically |
+| 24 ResponseText | model-operation ID, conversation generation u64, offset u64, text string | Accepted, started, nonterminal operation of the current owner generation; keeps `offset` bytes of the journaled response (at most its length) and appends text of at most 61,440 bytes; must change the text ([response text transfer](response-text-transfer.md#journal-records)) |
+| 8 TurnTerminal | model-operation ID, conversation generation u64, terminal kind u8, cause u8, final cursor u64, usage-known u8, output-tokens u32, text offset u64, text string | Kind 1 complete, 2 failed, 3 cancelled, 4 interrupted; only once, helper settled where applicable; keeps `text offset` bytes of the journaled response and appends the text tail; terminal task/operation, accounting and final event commit atomically |
 
 Location is at most 4096 UTF-8 bytes. Model identity is at most 1024 bytes. Prompt
 is nonempty and at most 32 KiB. The prior-operation list names the complete turns
 in the same conversation that the composition shows; the composition accounts for
-the omitted ones. Terminal text is at most 60 KiB.
+the omitted ones. The kind 8 text tail and each kind 24 segment are at most
+61,440 bytes; a response has no total size other than journal capacity.
 Maximum frame remains 64 KiB including overhead; encode and check the entire
 frame before append. At most 64 registered projects and 256 conversations are
 admitted in this slice. Journal bounds remain 8 MiB and 32,768 frames. At most
@@ -384,8 +387,9 @@ failure, 9 input/context limit. Complete requires cause 0, valid terminal metada
 A complete response can have unknown usage; no token charge exists.
 Unknown usage requires output-tokens 0 plus usage-known 0; the flag prevents that
 placeholder from being reported as measured zero. Before-start terminal usage is
-known zero. A restart terminal requires interrupted kind and cause 7. Terminal
-text may be empty; complete text must be nonempty. Generation, model-operation ID
+known zero. A restart terminal requires interrupted kind and cause 7 and keeps the
+journaled response as its prefix. Terminal text may be empty; the complete
+response (kind 24 segments plus the terminal tail) must be nonempty. Generation, model-operation ID
 and task mapping must match TurnAccepted. Cancel and start records are forbidden
 after terminal. A cancellation arriving during terminal append waits for that
 append's known outcome, then returns already-terminal or follows recovery; it
@@ -394,6 +398,9 @@ cannot append an intent behind a completed operation.
 The serialized writer reserves capacity for terminal closure before accepting a
 turn: maximum terminal frame plus one start frame, one cancel frame and one owner
 frame. New normal records cannot consume that reserved byte/frame capacity.
+Kind 24 segments are normal records. When capacity rejects one, the service
+records cancel cause 3 and the reserved terminal frame keeps the journaled
+response plus at most 61,440 tail bytes.
 The replay-memory bound reserves those future frame bytes and the conservative
 per-transition index allocation charge as well. Normal records cannot consume
 that memory reserve. A terminal commit releases unused capacity, not records.

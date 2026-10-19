@@ -58,7 +58,6 @@ private func consume(_ text: String, state: inout OllamaLanguageModel.StreamStat
 @Test func ollamaStreamRequiresDoneAndNeverCompletesOnEarlyEOF() throws {
     var state = OllamaLanguageModel.StreamState()
     try consume(#"{"message":{"role":"assistant","content":"hello"},"done":false}"# + "\n", state: &state)
-    #expect(state.textBytes == 5)
     #expect(throws: OllamaLanguageModel.Failure.incomplete) { try state.finish() }
     try consume(#"{"done":true,"prompt_eval_count":12,"eval_count":1}"#, state: &state)
     let final = try state.finish()
@@ -92,10 +91,12 @@ private func consume(_ text: String, state: inout OllamaLanguageModel.StreamStat
     var aggregate = OllamaLanguageModel.StreamState()
     aggregate.total = 4 * 1024 * 1024
     #expect(throws: OllamaLanguageModel.Failure.limit) { try aggregate.consume(10) }
+    // No response text total (owner, 2026-10-18): 100,000 bytes of content
+    // in one request stay within the per-request stream bound.
     var text = OllamaLanguageModel.StreamState()
-    text.textBytes = Limits.output
-    #expect(throws: OllamaLanguageModel.Failure.limit) {
-        try consume(#"{"message":{"role":"assistant","content":"x"}}"# + "\n", state: &text)
+    let piece = String(repeating: "x", count: 50_000)
+    for _ in 0..<2 {
+        try consume(#"{"message":{"role":"assistant","content":""# + piece + #""}}"# + "\n", state: &text)
     }
     var calls = OllamaLanguageModel.StreamState()
     let line = #"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"project_read_file","arguments":{"path":"README.md"}}}]}}"# + "\n"

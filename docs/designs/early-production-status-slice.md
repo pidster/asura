@@ -716,7 +716,7 @@ retained unconfirmed queue request and reuses its original identity.
 The local outbox retains each input's original request ID and text until a
 durable receipt. A worker performs bounded
 attach/request calls outside the terminal loop. Worker notifications wake
-completion handling through the event dispatcher. A mutex mailbox coalesces snapshots into one value, at most 60 KiB. The
+completion handling through the event dispatcher. A mutex mailbox coalesces updates into one value that holds the assembled response ([response text transfer](response-text-transfer.md#control-observation-windows)). The
 conversation worker's attach, request and initialization calls have no deadline
 (owner, 2026-10-16), and its journal-backed mutations have no client budget
 ([journal step J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)). Each call ends on reply, cancellation or disconnect.

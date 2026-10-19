@@ -67,7 +67,10 @@ message InputEnd { optional uint64 count = 1; optional uint64 total_bytes = 2; }
 message Ready {}
 message Start {}
 message Cancel { optional CancelReason reason = 1; }
-message SnapshotEnd { optional uint64 revision = 1; optional uint64 count = 2; optional uint64 total_bytes = 3; }
+// One output revision: keep `offset` bytes of the committed response, then
+// append this transfer's `total_bytes` (at most 61,440). Revisions have no
+// upper bound (response-text-transfer.md).
+message SnapshotEnd { optional uint64 revision = 1; optional uint64 count = 2; optional uint64 total_bytes = 3; optional uint64 offset = 4; }
 message Terminal { optional Outcome outcome = 1; optional uint64 last_revision = 2; optional uint64 count = 3; optional uint64 total_bytes = 4; optional uint64 usage_tokens = 5; optional bool usage_known = 6; optional Reason reason = 7; }
 message ModelInput { optional string instructions = 1; repeated HistoryTurn history = 2; optional string prompt = 3; }
 message HistoryTurn { optional Role role = 1; optional string text = 2; }

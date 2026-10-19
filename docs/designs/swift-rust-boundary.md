@@ -848,12 +848,15 @@ covers exact source bytes. Every required scalar uses explicit proto3 presence.
 Reject unknown critical enums, wrong direction, repeated start, wrong generation,
 late terminal data and bounds violations. No diagnostics or prompts enter argv.
 
-Input is the encoded ModelInput in the ordered input transfer. Output remains
-UTF-8 replacement snapshots: a completed SnapshotEnd permits replacement of the
-previous provisional content. Never append an SDK snapshot as though it were a
-delta. The adapter may coalesce complete revisions before publication. Final
-success requires the final revision and a valid Terminal with matching cumulative
-chunk and byte counts. A failed or interrupted prefix is never committed history.
+Input is the encoded ModelInput in the ordered input transfer. Output is a
+sequence of UTF-8 revisions: a completed SnapshotEnd keeps its `offset` bytes of
+the previous provisional content and appends the transfer's bytes, at most
+61,440 per revision ([response text transfer](response-text-transfer.md#model-channel-revisions)).
+The helper derives each revision from the SDK snapshot; it never appends an SDK
+snapshot as though it were a delta. The adapter may coalesce complete revisions
+before publication. Final success requires the final revision and a valid
+Terminal with matching cumulative chunk and byte counts. A failed or interrupted
+prefix is never committed history.
 
 ### Numeric execution and settlement
 
@@ -862,9 +865,11 @@ active helper. The handshake and input transfer have no time limit (owner,
 2026-10-16). Each ends on the next message, helper exit, a protocol fault,
 cancellation or shutdown. The
 [cancellation-driven policy](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30)
-replaces the fixed whole-turn deadline. Existing response and byte budgets remain.
-Output transmission is additionally capped at 4 MiB and 1,024 revisions. Retain
-at most two 60 KiB output snapshots plus the bounded transport staging. Reserve
+replaces the fixed whole-turn deadline. The per-request token cap remains.
+Output transmission has no revision or cumulative byte total (owner, 2026-10-18).
+The helper retains the committed text, the newest SDK snapshot and one revision
+of at most 61,440 bytes plus the bounded transport staging; the service withholds
+the next revision's credit while 122,880 or more bytes wait for its journal. Reserve
 eight control frames of at most 4 KiB each so cancellation cannot wait on credit.
 A `ToolCall` travels on the ordered data queue (8 frames, at most 65,536 + 1,024
 bytes), because it may hold 64,000 bytes of argument text
@@ -959,7 +964,7 @@ user decision when those contracts are implemented as selected.
 ### D2 acceptance checkpoints
 
 Run model-free Swift unit tests for malformed frames, partial IO, duplicate fields,
-role validation, snapshot replacement, queue limits and cancellation races. Run
+role validation, revision application, queue limits and cancellation races. Run
 Rust unit tests for credit arithmetic, identity checks and generation invalidation.
 Then exchange generated messages between real Rust and Swift processes with a
 scripted SDK substitute. Cover wrong identity, a blocked reader, hung inference,
@@ -1029,8 +1034,8 @@ flowchart TD
     Admit --> Permit{"Admission and start permit valid?"}
     Permit -->|No| Reject
     Permit -->|Yes| Model["Swift session with no tools"]
-    Model --> Evidence["Validate snapshots and terminal evidence"]
-    Evidence -->|Validated snapshot| Preview["Publish provisional replacement"]
+    Model --> Evidence["Validate revisions and terminal evidence"]
+    Evidence -->|Validated revision| Preview["Publish provisional revision"]
     Evidence -->|Terminal evidence| Settle["Conversation owner settles durable outcome"]
     Settle --> Publish["Publish terminal state"]
     Route --> Cancel["Existing cancellation pipeline"]
@@ -1066,7 +1071,7 @@ shutdown. Cancellation is checked between 64 KiB reads and immediately before sp
 call retains the slot; it cannot block the reactor or permit replacement work.
 The preparation result transfers one owned child to the reactor. The reactor
 polls at most 64 KiB of channel and diagnostic input per pass, with at most eight
-published observations. Only complete snapshots replace provisional output.
+published observations. Only complete revisions change provisional output.
 The diagnostic ring retains the most recent 64 KiB and records discarded bytes.
 A channel fault starts the same bounded child settlement as cancellation. The
 service must retain this owner through drain until preparation and reaping finish.

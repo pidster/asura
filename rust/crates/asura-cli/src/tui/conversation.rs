@@ -113,13 +113,12 @@ fn restore(
         if text.len() > 32768 {
             return Err("Conversation prompt exceeds limit".into());
         }
+        // The whole response, assembled from windows of at most 61,440
+        // bytes; a response has no size total (response-text-transfer.md).
         let event = client
-            .observe_conversation(operation, 0)
+            .read_response(operation, &mut asura_client::ResponseAssembly::default())
             .map_err(|e| e.to_string())?;
-        if event.generation != Some(turn_generation)
-            || !matches!(event.kind, Some(1..=6))
-            || event.text.as_ref().is_some_and(|value| value.len() > 61440)
-        {
+        if event.generation != Some(turn_generation) || !matches!(event.kind, Some(1..=6)) {
             return Err("Conversation observation changed identity".into());
         }
         turns.push(RestoredTurn {
@@ -136,26 +135,35 @@ fn restore(
 }
 // Each transport call remains bounded by Client. Turn age does not terminate
 // subscription; the existing owner keeps the worker slot until it settles.
+/// Each event carries one window; the worker assembles the whole response
+/// and publishes it (response-text-transfer.md). `observe` takes the cursor,
+/// the held byte count, the generation and a cancel request.
 fn observe_until_terminal(
     stopped: &AtomicBool,
     cancellation: &AtomicBool,
     mut generation: u64,
-    mut observe: impl FnMut(u64, u64, bool) -> Result<Option<pb::ConversationEvent>, String>,
+    mut observe: impl FnMut(u64, u64, u64, bool) -> Result<Option<pb::ConversationEvent>, String>,
     mut publish: impl FnMut(Update),
 ) -> Result<(), String> {
-    let mut cursor = 0;
+    let mut assembly = asura_client::ResponseAssembly::default();
     while !stopped.load(Ordering::Acquire) {
         let cancel = generation > 0 && cancellation.swap(false, Ordering::AcqRel);
-        if let Some(event) = observe(cursor, generation, cancel)? {
+        if let Some(event) = observe(assembly.cursor(), assembly.held(), generation, cancel)? {
             generation = event.generation.unwrap_or(generation);
-            cursor = event.cursor.unwrap_or(cursor);
-            let done = matches!(event.kind, Some(3..=6));
-            publish(Update {
-                event: Some(event),
-                success: true,
-                done,
-                ..Default::default()
-            });
+            assembly
+                .apply(&event)
+                .map_err(|_| "Invalid conversation observation".to_string())?;
+            let done = assembly.done();
+            // A terminal kind is published only with its whole response, so
+            // the UI never settles a turn on a partial terminal text.
+            if done || !matches!(event.kind, Some(3..=6)) {
+                publish(Update {
+                    event: Some(assembly.whole(event)),
+                    success: true,
+                    done,
+                    ..Default::default()
+                });
+            }
             if done {
                 return Ok(());
             }
@@ -284,13 +292,13 @@ impl Worker {
                         &stopped,
                         &cancellation,
                         generation,
-                        |cursor, generation, cancel| {
+                        |cursor, held, generation, cancel| {
                             if cancel {
                                 // The reply follows the durable CancelRequested record (J1-0).
                                 client.cancel_conversation(operation, generation, &|| stopped.load(Ordering::Acquire)).map_err(|e| format!("Cancel outcome unconfirmed: {e}"))?;
                                 publish(Update { cancel_accepted: true, success: true, ..Default::default() });
                             }
-                            match client.observe_conversation(operation, cursor) {
+                            match client.observe_conversation(operation, cursor, held) {
                                 Ok(event) => Ok(Some(event)),
                                 Err(_) => {
                                     client = attach().map_err(|e| format!("Disconnected: {e}. Use /observe {}", crate::conversation::hex(&operation)))?;
@@ -383,14 +391,18 @@ mod tests {
             &stopped,
             &cancellation,
             0,
-            |cursor, generation, cancel| {
+            |cursor, _, generation, cancel| {
                 assert!(!cancel);
                 assert_eq!(generation, if cursor == 0 { 0 } else { 7 });
+                let text = if cursor == 2 { "complete" } else { "pending" };
                 Ok(Some(pb::ConversationEvent {
                     generation: Some(7),
                     cursor: Some(cursor + 1),
                     kind: Some(if cursor == 2 { 3 } else { 2 }),
-                    text: Some(if cursor == 2 { "complete" } else { "pending" }.into()),
+                    text: Some(text.into()),
+                    // Each window replaces the held text.
+                    text_offset: Some(0),
+                    text_bytes: Some(text.len() as u64),
                     ..Default::default()
                 }))
             },
@@ -415,7 +427,7 @@ mod tests {
             &stopped,
             &cancellation,
             0,
-            |cursor, generation, cancel| {
+            |cursor, _, generation, cancel| {
                 calls += 1;
                 if calls == 1 {
                     assert_eq!(generation, 0);
@@ -438,6 +450,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls, 2);
+    }
+
+    /// RT-03 (TUI worker): a 200,000-byte response arrives in windows of at
+    /// most 61,440 bytes; the worker asks for each next window by its held
+    /// count and publishes the whole response.
+    #[test]
+    fn rt03_worker_assembles_a_response_larger_than_one_window() {
+        let full: String = "a😀é".repeat(200_000 / 7);
+        let stopped = AtomicBool::new(false);
+        let cancellation = AtomicBool::new(false);
+        let mut updates = Vec::new();
+        let mut requests = Vec::new();
+        observe_until_terminal(
+            &stopped,
+            &cancellation,
+            0,
+            |cursor, held, _, _| {
+                requests.push((cursor, held));
+                let start = held as usize;
+                let mut end = (start + 61_440).min(full.len());
+                while !full.is_char_boundary(end) {
+                    end -= 1;
+                }
+                Ok(Some(pb::ConversationEvent {
+                    generation: Some(1),
+                    cursor: Some(u64::MAX),
+                    kind: Some(3),
+                    text: Some(full[start..end].into()),
+                    text_offset: Some(held),
+                    text_bytes: Some(full.len() as u64),
+                    ..Default::default()
+                }))
+            },
+            |update| updates.push(update),
+        )
+        .unwrap();
+        assert!(requests.len() >= full.len() / 61_440);
+        assert_eq!(requests[1], (u64::MAX, requests[1].1));
+        // Partial terminal windows are not published.
+        assert_eq!(updates.len(), 1);
+        let last = updates.last().unwrap();
+        assert!(last.done);
+        assert_eq!(
+            last.event.as_ref().unwrap().text.as_deref(),
+            Some(full.as_str())
+        );
     }
 
     #[test]

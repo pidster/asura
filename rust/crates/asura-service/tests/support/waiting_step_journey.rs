@@ -320,7 +320,7 @@ pub(super) fn run() -> Result<()> {
     let end = Instant::now() + Duration::from_secs(60);
     let mut client = fixture.attach()?;
     loop {
-        let event = client.observe_conversation(operation, 0)?;
+        let event = client.observe_conversation(operation, 0, 0)?;
         if event.waiting_step == Some(pb::ConversationWaitStep::ModelOutput as i32) {
             assert_eq!(event.kind, Some(1));
             break;

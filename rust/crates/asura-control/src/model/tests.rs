@@ -113,6 +113,7 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
                 revision: Some(1),
                 count: Some(1),
                 total_bytes: Some(10),
+                offset: Some(0),
             })),
             HelperToService,
         ),
@@ -424,8 +425,10 @@ fn export_cross_language_fixtures() {
         ),
         (
             "usage_bad_ordinal",
+            // No request count per turn (owner, 2026-10-18): ordinal 0 is
+            // the invalid one; 65 is valid since commit 6e22c27.
             pb::InferenceUsage {
-                request_ordinal: Some(65),
+                request_ordinal: Some(0),
                 complete: Some(false),
                 ..Default::default()
             },
@@ -589,9 +592,10 @@ fn export_cross_language_fixtures() {
             true,
         ),
         (
-            "tool_call_ordinal_ten.pb",
+            // Ordinals run 1-201 since the owner's 2026-10-18 change.
+            "tool_call_ordinal_202.pb",
             pb::ToolCall {
-                ordinal: Some(10),
+                ordinal: Some(MAX_TOOL_ORDINAL + 1),
                 ..raw_call("service", "{}")
             },
             false,
@@ -658,12 +662,14 @@ fn export_cross_language_fixtures() {
             message.encode_to_vec(),
         );
     }
+    // No revision or cumulative output total (owner, 2026-10-18): more than
+    // 1,024 revisions and more than 4 MiB (RT-01, RT-02).
     for usage in [0, 512, 2048] {
         let message = envelope(Body::Terminal(pb::Terminal {
             outcome: Some(1),
-            last_revision: Some(1024),
-            count: Some(256),
-            total_bytes: Some(MAX_OUTPUT_BYTES),
+            last_revision: Some(5_000),
+            count: Some(512),
+            total_bytes: Some(8 * 1024 * 1024),
             usage_tokens: Some(usage),
             usage_known: Some(true),
             reason: Some(0),
@@ -675,6 +681,46 @@ fn export_cross_language_fixtures() {
             message.encode_to_vec(),
         );
     }
+    for (name, revision, total, offset, accepted) in [
+        (
+            "helper_snapshot_end_revision_5000.pb",
+            5_000,
+            MAX_REVISION_BYTES,
+            Some(9_000_000),
+            true,
+        ),
+        ("helper_snapshot_end_truncation.pb", 2, 0, Some(3), true),
+        (
+            "helper_snapshot_end_over_revision.pb",
+            2,
+            MAX_REVISION_BYTES + 1,
+            Some(0),
+            false,
+        ),
+        ("helper_snapshot_end_no_offset.pb", 2, 10, None, false),
+    ] {
+        let count = total.div_ceil(MAX_CHUNK_BYTES as u64);
+        let message = envelope(Body::SnapshotEnd(pb::SnapshotEnd {
+            revision: Some(revision),
+            count: Some(count),
+            total_bytes: Some(total),
+            offset,
+        }));
+        write(name, "helper", accepted, message.encode_to_vec());
+    }
+    let message = envelope(Body::Chunk(pb::Chunk {
+        transfer_id: Some(5_001),
+        direction: Some(2),
+        ordinal: Some(3),
+        data: Some(vec![b'x'; MAX_CHUNK_BYTES]),
+        revision: Some(5_000),
+    }));
+    write(
+        "helper_chunk_revision_5000.pb",
+        "helper",
+        true,
+        message.encode_to_vec(),
+    );
     let mut message = envelope(Body::Start(pb::Start {}));
     message.generation = Some(u64::MAX);
     write(

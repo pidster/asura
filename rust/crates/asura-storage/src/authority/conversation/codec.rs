@@ -1226,9 +1226,17 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u64(p.final_cursor);
             w.byte(u8::from(p.usage_known));
             w.u32(p.output_tokens);
+            w.u64(p.text_offset);
             w.string(&p.text, MAX_TEXT)?;
         }
         Record::CaptureSettled(p) => write_capture_settled(&mut w, p)?,
+        Record::ResponseText(p) => {
+            require(!p.text.is_empty() || p.offset > 0)?;
+            w.bytes(&p.operation);
+            w.u64(p.generation);
+            w.u64(p.offset);
+            w.string(&p.text, MAX_TEXT)?;
+        }
     }
     Ok(w.0)
 }
@@ -1440,8 +1448,19 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             final_cursor: r.u64()?,
             usage_known: r.flag()?,
             output_tokens: r.u32()?,
+            text_offset: r.u64()?,
             text: r.string(MAX_TEXT)?,
         }),
+        24 => {
+            let value = ResponseText {
+                operation: r.array()?,
+                generation: r.u64()?,
+                offset: r.u64()?,
+                text: r.string(MAX_TEXT)?,
+            };
+            require(!value.text.is_empty() || value.offset > 0)?;
+            Record::ResponseText(value)
+        }
         14 => {
             require(payload.len() <= MAX_TOOL_CALL_PAYLOAD)?;
             Record::ToolCall(Box::new(read_tool_call(&mut r)?))
@@ -1552,6 +1571,7 @@ mod tests {
             final_cursor: u64::MAX,
             usage_known: false,
             output_tokens: 0,
+            text_offset: 0,
             text: "x".into(),
         });
         let mut bytes = payload(&terminal).unwrap();

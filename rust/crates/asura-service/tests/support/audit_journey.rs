@@ -98,6 +98,7 @@ fn seed(fixture: &Fixture, projects: &[[u8; 16]]) -> Result<()> {
                         final_cursor: u64::MAX,
                         usage_known: true,
                         output_tokens: 0,
+                        text_offset: 0,
                         text: String::new(),
                     }),
                     admission: None,

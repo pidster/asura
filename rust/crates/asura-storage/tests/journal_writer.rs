@@ -1810,7 +1810,7 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     }
 }
 const FRAME: usize = 144 + 40;
-const TERMINAL: usize = FRAME + 43 + MAX_TEXT;
+const TERMINAL: usize = FRAME + 51 + MAX_TEXT;
 const RESULT: usize = FRAME + 43 + 16_384;
 const OWNER: usize = FRAME;
 const CANCEL: usize = FRAME + 25;
@@ -1924,6 +1924,7 @@ fn j1_padded(scratch: &Scratch, free: usize) -> (WriterHandle, Id, u64) {
                     final_cursor: u64::MAX,
                     usage_known: true,
                     output_tokens: 0,
+                    text_offset: 0,
                     text: "x".repeat(text),
                 })
             },
@@ -1932,12 +1933,12 @@ fn j1_padded(scratch: &Scratch, free: usize) -> (WriterHandle, Id, u64) {
     // The fixed part of a later turn: accepted, start and an empty terminal.
     let base = {
         let (accepted, start, _) = turn(2);
-        size(&accepted) + size(&start) + FRAME + 43
+        size(&accepted) + size(&start) + FRAME + 51
     };
     let mut generation = 1;
     while end < padded_end {
         let (accepted, start, terminal) = turn(generation);
-        let fixed = size(&accepted) + size(&start) + FRAME + 43;
+        let fixed = size(&accepted) + size(&start) + FRAME + 51;
         let remaining = padded_end - end;
         let text = if generation == 1 || remaining > fixed + MAX_TEXT + base {
             MAX_TEXT
@@ -2039,7 +2040,211 @@ fn tcr_i08_run_kind_14_is_refused_when_its_result_cannot_fit() {
             final_cursor: u64::MAX,
             usage_known: false,
             output_tokens: 0,
+            text_offset: 0,
             text: "x".repeat(MAX_TEXT),
+        }),
+    )
+    .unwrap();
+    close(&mut writer);
+}
+
+// ---------------------------------------------------------- response text
+// response-text-transfer.md: kind 24 segments, windows, history and restart.
+
+fn rt_segment(offset: u64, text: String) -> Record {
+    Record::ResponseText(ResponseText {
+        operation: [35; 16],
+        generation: 1,
+        offset,
+        text,
+    })
+}
+fn rt_read(writer: &mut WriterHandle, offset: u64) -> (u64, String, u64) {
+    let reply = wait(
+        &mut writer
+            .try_submit(Command::ReadResponse {
+                operation: [35; 16],
+                offset,
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    let Some(Record::TurnTerminal(terminal)) = reply.record else {
+        panic!("terminal expected");
+    };
+    (
+        terminal.text_offset,
+        terminal.text,
+        reply.response_bytes.unwrap(),
+    )
+}
+
+/// RT-03 and RT-08 through the real writer: a 200,000-byte multibyte response
+/// in kind 24 segments and a tail reads back whole in windows of at most
+/// 61,440 bytes cut on character boundaries; history gets the whole text; a
+/// restart keeps the journaled prefix.
+#[test]
+fn rt03_rt08_real_writer_segments_windows_history_and_restart_prefix() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    let state = j1_admit_and_start(&mut writer, project, configuration_digest);
+    let mut revision = state.revision;
+    drop(state);
+    // Three-byte characters, so byte offsets can fall inside a character.
+    let full: String = "é漢a".repeat(200_000 / 6);
+    let mut journaled = 0usize;
+    while full.len() - journaled > MAX_TEXT {
+        let mut end = journaled + MAX_TEXT;
+        while !full.is_char_boundary(end) {
+            end -= 1;
+        }
+        submit(
+            &mut writer,
+            &mut revision,
+            rt_segment(journaled as u64, full[journaled..end].into()),
+        )
+        .unwrap();
+        journaled = end;
+    }
+    // A cut rewrites the last journaled characters; the tail completes it.
+    let mut cut = journaled - 10;
+    while !full.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::TurnTerminal(TurnTerminal {
+            operation: [35; 16],
+            generation: 1,
+            kind: TerminalKind::Complete,
+            cause: Cause::None,
+            final_cursor: u64::MAX,
+            usage_known: false,
+            output_tokens: 0,
+            text_offset: cut as u64,
+            text: full[cut..].into(),
+        }),
+    )
+    .unwrap();
+    // Windows: an offset inside a character starts at its boundary.
+    let mut assembled = String::new();
+    let mut offset = 1u64; // inside the first two-byte character
+    loop {
+        let (start, text, total) = rt_read(&mut writer, offset);
+        assert_eq!(total as usize, full.len());
+        assert!(text.len() <= MAX_TEXT);
+        assert!(start as usize <= assembled.len().max(1));
+        assembled.truncate(start as usize);
+        assembled.push_str(&text);
+        if assembled.len() == full.len() {
+            break;
+        }
+        assert!(!text.is_empty());
+        offset = assembled.len() as u64;
+    }
+    assert_eq!(assembled, full);
+    // History carries the whole response for the composer.
+    let prepared = wait(
+        &mut writer
+            .try_submit(Command::Prepare {
+                project,
+                conversation: Some([33; 16]),
+                expected_generation: 1,
+                prompt: "next".into(),
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .prepared
+    .unwrap();
+    assert_eq!(prepared.history.len(), 1);
+    assert_eq!(prepared.history[0].1.text, full);
+    assert_eq!(prepared.history[0].1.text_offset, 0);
+    close(&mut writer);
+
+    // RT-08: a second turn journals a prefix, then the service restarts.
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    let state = j1_admit_and_start(&mut writer, project, configuration_digest);
+    let mut revision = state.revision;
+    drop(state);
+    submit(
+        &mut writer,
+        &mut revision,
+        rt_segment(0, "x".repeat(MAX_TEXT)),
+    )
+    .unwrap();
+    submit(
+        &mut writer,
+        &mut revision,
+        rt_segment(MAX_TEXT as u64, "yz".into()),
+    )
+    .unwrap();
+    close(&mut writer);
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let recovered = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    let op = &recovered.operations[&[35; 16]];
+    assert_eq!(
+        op.terminal.as_ref().unwrap().kind,
+        TerminalKind::Interrupted
+    );
+    assert_eq!(op.response.len, MAX_TEXT as u64 + 2);
+    drop(recovered);
+    let (start, text, total) = rt_read(&mut writer, MAX_TEXT as u64);
+    assert_eq!(
+        (start, text.as_str(), total),
+        (MAX_TEXT as u64, "yz", MAX_TEXT as u64 + 2)
+    );
+    close(&mut writer);
+}
+
+/// RT-07 in the writer: a kind 24 segment that does not fit beside the
+/// terminal reservation is refused without a write; the reserved terminal
+/// still commits the journaled prefix and its tail.
+#[test]
+fn rt07_segment_beyond_capacity_is_refused_and_terminal_still_commits() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let segment = rt_segment(0, "s".repeat(MAX_TEXT));
+    let free = frame_size(&segment) - 1;
+    let (mut writer, _, mut revision) = j1_padded(&scratch, free);
+    let journal = scratch.0.join(".asura/state/control/slot-0.log");
+    let before = fs::read(&journal).unwrap();
+    assert!(matches!(
+        submit(&mut writer, &mut revision, segment),
+        Err(Error::Invalid | Error::Limit)
+    ));
+    assert_eq!(fs::read(&journal).unwrap(), before);
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::CancelRequested(CancelRequested {
+            operation: [35; 16],
+            generation: 1,
+            cause: Cause::OutputLimit,
+        }),
+    )
+    .unwrap();
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::TurnTerminal(TurnTerminal {
+            operation: [35; 16],
+            generation: 1,
+            kind: TerminalKind::Cancelled,
+            cause: Cause::OutputLimit,
+            final_cursor: u64::MAX,
+            usage_known: false,
+            output_tokens: 0,
+            text_offset: 0,
+            text: "t".repeat(MAX_TEXT),
         }),
     )
     .unwrap();

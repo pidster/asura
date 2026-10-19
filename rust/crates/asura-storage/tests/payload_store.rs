@@ -706,6 +706,7 @@ impl Journal {
             final_cursor: u64::MAX,
             usage_known: false,
             output_tokens: 0,
+            text_offset: 0,
             text: "reply".into(),
         }));
     }

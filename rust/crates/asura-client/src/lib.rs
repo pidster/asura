@@ -10,6 +10,8 @@ use std::{
     os::fd::AsRawFd,
     time::Duration,
 };
+mod response;
+pub use response::ResponseAssembly;
 
 /// What ends a client wait besides the reply or a lost connection: the
 /// person's cancel or exit (owner, 2026-10-16). It is checked at the pacing
@@ -748,16 +750,19 @@ impl Client {
             _ => Err(Error::Protocol),
         }
     }
+    /// One observation; `text_offset` is the count of response bytes held.
     pub fn observe_conversation(
         &mut self,
         operation: [u8; 16],
         after_cursor: u64,
+        text_offset: u64,
     ) -> Result<pb::ConversationEvent> {
         match self.request(pb::envelope::Body::ConversationObserve(
             pb::ConversationObserve {
                 operation_id: Some(operation.to_vec()),
                 after_cursor: Some(after_cursor),
                 wait_ms: Some(1000),
+                text_offset: Some(text_offset),
             },
         ))? {
             pb::envelope::Body::ConversationEvent(reply)
@@ -767,6 +772,22 @@ impl Client {
                 Ok(reply)
             }
             _ => Err(Error::Protocol),
+        }
+    }
+    /// Observes `operation` until `assembly` holds the whole current
+    /// response, then returns the last event carrying it whole. Each request
+    /// ends on its reply, `cancel` or a lost connection.
+    pub fn read_response(
+        &mut self,
+        operation: [u8; 16],
+        assembly: &mut ResponseAssembly,
+    ) -> Result<pb::ConversationEvent> {
+        loop {
+            let event = self.observe_conversation(operation, assembly.cursor(), assembly.held())?;
+            assembly.apply(&event)?;
+            if assembly.complete() {
+                return Ok(assembly.whole(event));
+            }
         }
     }
     /// The service acknowledges a live cancel after its durable record, so the

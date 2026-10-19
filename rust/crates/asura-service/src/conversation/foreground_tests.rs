@@ -146,6 +146,7 @@ fn active_projection(owner: &Owner) -> Arc<journal::Replay> {
     replay.operations.insert(
         active.turn.operation,
         journal::Operation {
+            response: Default::default(),
             conversation: active.turn.conversation,
             generation: active.turn.generation,
             task: active.turn.task,
@@ -174,6 +175,7 @@ fn active_observation_and_cancel_bypass_pending_foreground_reads() {
         .request(
             envelope(
                 Body::ConversationObserve(pb::ConversationObserve {
+                    text_offset: None,
                     operation_id: Some(vec![4; 16]),
                     after_cursor: Some(0),
                     wait_ms: Some(0),

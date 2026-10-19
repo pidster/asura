@@ -236,7 +236,6 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
         var maximumTokens = Int(Limits.maximumResponseTokens)
         var line = Data()
         var total = 0
-        var textBytes = 0
         var calls = 0
         var done = false
         mutating func consume(_ byte: UInt8) throws -> Chunk? {
@@ -257,13 +256,14 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                   value.eval_count.map({ (0...maximumTokens).contains($0) }) ?? true else { throw Failure.invalidResponse }
             if let message = value.message {
                 guard message.role == "assistant" else { throw Failure.invalidResponse }
-                textBytes += message.content.utf8.count
                 calls += message.tool_calls?.count ?? 0
                 // Every proposal up to the over-limit one is forwarded; the session
                 // records the last and then ends the turn (TCR-D6).
                 // Arguments are forwarded unread; the service applies the
                 // 64,000-byte limit and every argument rule (TCR-D17).
-                guard textBytes <= Limits.output, calls <= Int(Limits.toolProposals) else { throw Failure.limit }
+                // No response text total (owner, 2026-10-18); the per-request
+                // stream bound above and the token cap bound one request.
+                guard calls <= Int(Limits.toolProposals) else { throw Failure.limit }
                 for call in message.tool_calls ?? [] {
                     guard !call.function.name.isEmpty else { throw Failure.invalidResponse }
                 }

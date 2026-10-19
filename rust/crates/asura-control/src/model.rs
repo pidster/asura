@@ -31,8 +31,10 @@ pub const MAX_TOOL_ORDINAL: u32 = MAX_RECORDED_TOOL_CALLS + 1;
 pub const MAX_RESPONSE_TOKENS: u32 = 2048;
 /// Credit window for one direction; a sliding window for input.
 pub const CREDIT_WINDOW: u64 = 65_536;
-const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_SNAPSHOT_BYTES: u64 = 60 * 1024;
+/// Bytes one output revision appends: a per-transfer bound, not a response
+/// total. Revisions and cumulative output have no upper bound (owner,
+/// 2026-10-18; response-text-transfer.md).
+pub const MAX_REVISION_BYTES: u64 = 61_440;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     ServiceToHelper,
@@ -141,7 +143,7 @@ fn count_bytes(count: Option<u64>, bytes: Option<u64>, max: u64) -> bool {
 fn transfer(id: Option<u64>, direction: Option<i32>) -> bool {
     match direction {
         Some(1) => id == Some(1),
-        Some(2) => id.is_some_and(|v| (2..=1025).contains(&v)),
+        Some(2) => id.is_some_and(|v| v >= 2),
         _ => false,
     }
 }
@@ -373,13 +375,14 @@ pub fn validate_semantics(
                 && if v.direction == Some(1) {
                     v.revision == Some(0) && v.ordinal.is_some_and(|n| n < MAX_INPUT_CHUNKS)
                 } else {
-                    positive(v.revision, 1024) && v.ordinal.is_some_and(|n| n < MAX_SNAPSHOT_BYTES)
+                    positive(v.revision, u64::MAX - 1)
+                        && v.ordinal.is_some_and(|n| n < MAX_REVISION_BYTES)
                 }
         }
         Body::Credit(v) => {
             transfer(v.transfer_id, v.direction)
                 && v.direction == Some(if service { 2 } else { 1 })
-                && matches!((v.accepted_bytes,v.granted_bytes), (Some(a),Some(g)) if a <= if service { MAX_SNAPSHOT_BYTES } else { MAX_INPUT_BYTES } && g >= a && g - a <= CREDIT_WINDOW)
+                && matches!((v.accepted_bytes,v.granted_bytes), (Some(a),Some(g)) if a <= if service { MAX_REVISION_BYTES } else { MAX_INPUT_BYTES } && g >= a && g - a <= CREDIT_WINDOW)
         }
         Body::InputEnd(v) => {
             positive(v.count, MAX_INPUT_CHUNKS)
@@ -388,7 +391,9 @@ pub fn validate_semantics(
         Body::Ready(_) | Body::Start(_) => true,
         Body::Cancel(v) => v.reason.is_some_and(|n| (1..=4).contains(&n)),
         Body::SnapshotEnd(v) => {
-            positive(v.revision, 1024) && count_bytes(v.count, v.total_bytes, MAX_SNAPSHOT_BYTES)
+            positive(v.revision, u64::MAX - 1)
+                && count_bytes(v.count, v.total_bytes, MAX_REVISION_BYTES)
+                && v.offset.is_some()
         }
         // Unparsed proposals: the service is the only argument parser. Exactly
         // one of name / name_bytes and of arguments / arguments_bytes; a size
@@ -426,10 +431,10 @@ pub fn validate_semantics(
                 None => false,
             };
             usage
-                && v.last_revision.is_some_and(|n| n <= 1024)
-                && count_bytes(v.count, v.total_bytes, MAX_OUTPUT_BYTES)
+                && v.last_revision.is_some()
+                && count_bytes(v.count, v.total_bytes, u64::MAX)
                 && match v.outcome {
-                    Some(1) => positive(v.last_revision, 1024) && v.reason == Some(0),
+                    Some(1) => positive(v.last_revision, u64::MAX) && v.reason == Some(0),
                     Some(2 | 3) => v.reason.is_some_and(|n| (1..=12).contains(&n)),
                     _ => false,
                 }

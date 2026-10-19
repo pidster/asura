@@ -6,6 +6,8 @@ pub type Hash = [u8; 32];
 pub const MAX_PROJECTS: usize = 64;
 pub const MAX_CONVERSATIONS: usize = 256;
 pub const MAX_PROMPT: usize = 32 * 1024;
+/// Response text in one kind 24 segment or one kind 8 tail: a per-frame bound,
+/// not a response total (response-text-transfer.md).
 pub const MAX_TEXT: usize = 60 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +195,18 @@ pub struct TurnTerminal {
     pub final_cursor: u64,
     pub usage_known: bool,
     pub output_tokens: u32,
+    /// Bytes of the journaled response (kind 24 segments) that `text` follows.
+    pub text_offset: u64,
+    /// The response tail, at most `MAX_TEXT` bytes.
+    pub text: String,
+}
+/// Kind 24: one segment of an active response. Keep `offset` bytes of the
+/// journaled response, then append `text` (response-text-transfer.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseText {
+    pub operation: Id,
+    pub generation: u64,
+    pub offset: u64,
     pub text: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +230,8 @@ pub enum Record {
     ToolResult(ToolResult),
     /// Kind 23 (J1): capture facts of a `run` exec_cmd call, before kind 15.
     CaptureSettled(Box<CaptureSettled>),
+    /// Kind 24: one response text segment.
+    ResponseText(ResponseText),
 }
 impl Record {
     pub fn kind(&self) -> u16 {
@@ -237,6 +253,7 @@ impl Record {
             Self::ToolResult(_) => 15,
             Self::InputPromoted(_) => 16,
             Self::CaptureSettled(_) => 23,
+            Self::ResponseText(_) => 24,
         }
     }
 }
@@ -295,6 +312,43 @@ pub struct Operation {
     pub cancel: Option<Cause>,
     pub terminal: Option<Terminal>,
     pub tools: Vec<ToolRecord>,
+    /// The journaled response: kind 24 segments, then the kind 8 tail.
+    pub response: Response,
+}
+/// `kept` bytes of the text in the kind 24 or kind 8 frame at `frame`, at
+/// byte `start` of the response. Replay clones no text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponsePiece {
+    pub start: u64,
+    pub kept: u64,
+    pub frame: Range<usize>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Response {
+    pub len: u64,
+    pub pieces: Vec<ResponsePiece>,
+}
+impl Response {
+    /// Keep `offset` bytes, then append `appended` bytes held in `frame`.
+    /// Returns `None` when `offset` exceeds the length.
+    pub fn apply(&mut self, offset: u64, appended: u64, frame: Range<usize>) -> Option<()> {
+        if offset > self.len {
+            return None;
+        }
+        self.pieces.retain(|piece| piece.start < offset);
+        if let Some(last) = self.pieces.last_mut() {
+            last.kept = last.kept.min(offset - last.start);
+        }
+        if appended > 0 {
+            self.pieces.push(ResponsePiece {
+                start: offset,
+                kept: appended,
+                frame,
+            });
+        }
+        self.len = offset.checked_add(appended)?;
+        Some(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Terminal {

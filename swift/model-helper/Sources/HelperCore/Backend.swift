@@ -261,7 +261,6 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
             let stream = session.streamResponse(to: input.prompt, options: GenerationOptions(maximumResponseTokens: Int(maximumTokens)), contextOptions: contextOptions)
             for try await value in stream {
                 try Task.checkCancellation()
-                guard value.content.utf8.count <= Limits.output else { throw BackendFailure(.outputLimit) }
                 let total = reportsUsage ? UInt64(exactly: value.usage.output.totalTokenCount) : nil
                 if let total, total > UInt64(maximumTokens) { throw BackendFailure(.outputLimit) }
                 try await snapshot(Snapshot(text: value.content, usageTokens: handler == nil ? total : nil))

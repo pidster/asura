@@ -200,10 +200,12 @@ fn checked_id(id: Option<Vec<u8>>) -> Result<[u8; 16]> {
 }
 fn observe(fixture: &Fixture, operation: [u8; 16]) -> Result<pb::ConversationEvent> {
     let end = Instant::now() + Duration::from_secs(75);
-    let mut cursor = 0;
+    // Windows assemble the whole response (response-text-transfer.md).
+    let mut assembly = asura_client::ResponseAssembly::default();
     let mut client = fixture.attach()?;
     while Instant::now() < end {
-        let event = match client.observe_conversation(operation, cursor) {
+        let event = match client.observe_conversation(operation, assembly.cursor(), assembly.held())
+        {
             Ok(event) => event,
             Err(asura_client::Error::Remote(_, message)) if message == "conversation_busy" => {
                 thread::sleep(Duration::from_millis(10));
@@ -211,9 +213,12 @@ fn observe(fixture: &Fixture, operation: [u8; 16]) -> Result<pb::ConversationEve
             }
             Err(error) => return Err(error.into()),
         };
-        cursor = event.cursor.ok_or("missing cursor")?;
-        if matches!(event.kind, Some(3..=6)) {
-            return Ok(event);
+        assembly.apply(&event)?;
+        if assembly.done() {
+            return Ok(assembly.whole(event));
+        }
+        if !assembly.complete() {
+            continue;
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -437,7 +442,7 @@ fn journey(native: bool) -> Result<()> {
             checked_id(receipt.accepted_input_id.clone())?,
         )?;
         let operation = checked_id(accepted.operation_id.clone())?;
-        let before_repeat = fixture.attach()?.observe_conversation(operation, 0)?;
+        let before_repeat = fixture.attach()?.observe_conversation(operation, 0, 0)?;
         assert!(
             matches!(before_repeat.kind, Some(1 | 2)),
             "need active admission to prove idempotent replay bypasses busy"
@@ -1337,7 +1342,7 @@ fn crash_recovery(
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut client = fixture.attach()?;
     loop {
-        let event = client.observe_conversation(operation, 0)?;
+        let event = client.observe_conversation(operation, 0, 0)?;
         if event.kind == Some(2) {
             break;
         }
@@ -1350,7 +1355,7 @@ fn crash_recovery(
         thread::sleep(Duration::from_millis(10));
     }
     let witness = helper_witness(fixture)?;
-    let latest = client.observe_conversation(operation, 0)?;
+    let latest = client.observe_conversation(operation, 0, 0)?;
     if matches!(latest.kind, Some(3..=6)) {
         return Err("operation completed before witnessed crash".into());
     }

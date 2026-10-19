@@ -80,6 +80,7 @@ impl State {
             project_name_revision: None,
             project_name_changed: None,
             stale_project_name_revision: false,
+            response_bytes: None,
         }
     }
     fn config(&self) -> Result<crate::config::ConversationSnapshot> {
@@ -102,6 +103,56 @@ impl State {
         let kind = u16::from_be_bytes([bytes[10], bytes[11]]);
         decode_record(kind, &bytes[HEADER..bytes.len() - TRAILER])
             .map_err(|_| Error::RepairRequired)
+    }
+    /// Bytes `lo..hi` of a journaled response, rebuilt from its pieces. A piece
+    /// cut inside a UTF-8 character is damage.
+    fn response_bytes(&self, response: &Response, lo: u64, hi: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(hi.saturating_sub(lo) as usize);
+        for piece in &response.pieces {
+            let end = piece.start + piece.kept;
+            if end <= lo || piece.start >= hi {
+                continue;
+            }
+            let text = match self.record(piece.frame.clone())? {
+                Record::ResponseText(segment) => segment.text,
+                Record::TurnTerminal(terminal) => terminal.text,
+                _ => return Err(Error::RepairRequired),
+            };
+            let kept = usize::try_from(piece.kept).map_err(|_| Error::RepairRequired)?;
+            if kept > text.len() || !text.is_char_boundary(kept) {
+                return Err(Error::RepairRequired);
+            }
+            let from = (lo.max(piece.start) - piece.start) as usize;
+            let to = (hi.min(end) - piece.start) as usize;
+            out.extend_from_slice(&text.as_bytes()[from..to]);
+        }
+        Ok(out)
+    }
+    /// The whole journaled response.
+    pub(super) fn response_text(&self, response: &Response) -> Result<String> {
+        String::from_utf8(self.response_bytes(response, 0, response.len)?)
+            .map_err(|_| Error::RepairRequired)
+    }
+    /// At most `MAX_TEXT` bytes from the largest character boundary not after
+    /// `offset`. Returns the window start and text.
+    fn response_window(&self, response: &Response, offset: u64) -> Result<(u64, String)> {
+        let requested = offset.min(response.len);
+        let lo = requested.saturating_sub(3);
+        let fetched_end = response.len.min(requested + MAX_TEXT as u64 + 1);
+        let bytes = self.response_bytes(response, lo, fetched_end)?;
+        let continuation = |index: usize| bytes.get(index).is_some_and(|b| b & 0xC0 == 0x80);
+        let mut start = (requested - lo) as usize;
+        while start > 0 && continuation(start) {
+            start -= 1;
+        }
+        let window_end = response.len.min(lo + start as u64 + MAX_TEXT as u64);
+        let mut end = (window_end - lo) as usize;
+        while end > start && continuation(end) {
+            end -= 1;
+        }
+        let text =
+            String::from_utf8(bytes[start..end].to_vec()).map_err(|_| Error::RepairRequired)?;
+        Ok((lo + start as u64, text))
     }
     /// Appends one record. The write and sync have no time bound (J1-0); only
     /// an actual I/O or validation error fences the writer.
@@ -212,6 +263,8 @@ impl State {
             let op = &self.replay.as_ref().expect("replay").operations[&id];
             let generation = op.generation;
             let started = op.helper.is_some();
+            // The interrupted operation keeps its journaled response prefix.
+            let text_offset = op.response.len;
             self.append(Record::TurnTerminal(TurnTerminal {
                 operation: id,
                 generation,
@@ -220,6 +273,7 @@ impl State {
                 final_cursor: u64::MAX,
                 usage_known: !started,
                 output_tokens: 0,
+                text_offset,
                 text: String::new(),
             }))?;
         }
@@ -1000,6 +1054,21 @@ impl State {
                 reply.record = Some(self.record(range)?);
                 return Ok(reply);
             }
+            Command::ReadResponse { operation, offset } => {
+                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
+                let op = state.operations.get(&operation).ok_or(Error::Invalid)?;
+                let terminal = op.terminal.as_ref().ok_or(Error::Invalid)?;
+                let Record::TurnTerminal(mut record) = self.record(terminal.frame.clone())? else {
+                    return Err(Error::RepairRequired);
+                };
+                let (start, text) = self.response_window(&op.response, offset)?;
+                record.text_offset = start;
+                record.text = text;
+                let mut reply = self.reply();
+                reply.response_bytes = Some(op.response.len);
+                reply.record = Some(Record::TurnTerminal(record));
+                return Ok(reply);
+            }
             Command::History {
                 project,
                 conversation,
@@ -1259,11 +1328,14 @@ impl State {
                         else {
                             return Err(Error::RepairRequired);
                         };
-                        let Record::TurnTerminal(terminal) =
+                        let Record::TurnTerminal(mut terminal) =
                             self.record(op.terminal.as_ref().expect("complete").frame.clone())?
                         else {
                             return Err(Error::RepairRequired);
                         };
+                        // The whole response: kind 24 segments and the tail.
+                        terminal.text = self.response_text(&op.response)?;
+                        terminal.text_offset = 0;
                         history.push((*accepted, terminal));
                     }
                 } else if expected_generation != 0 {

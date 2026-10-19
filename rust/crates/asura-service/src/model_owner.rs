@@ -48,8 +48,11 @@ pub(crate) enum ModelEvent {
         capacity_tokens: u32,
     },
     Ready,
-    Snapshot {
+    /// One validated revision: keep `offset` bytes, append `text`
+    /// (response-text-transfer.md).
+    Revision {
         revision: u64,
+        offset: u64,
         text: String,
     },
     Terminal {
@@ -119,11 +122,17 @@ pub(crate) struct ModelOwner {
     input_sent: u64,
     input_accepted: u64,
     input_granted: u64,
+    /// The current output transfer's bytes: at most one revision.
     snapshot: Vec<u8>,
     revision: u64,
     chunks: u64,
     total_chunks: u64,
     total_bytes: u64,
+    /// The conversation owner withholds the next revision's credit while
+    /// its journal backlog is large (response-text-transfer.md).
+    output_paused: bool,
+    /// The transfer whose credit is granted; the next is owed while paused.
+    credited: u64,
     terminal_seen: bool,
     faulted: bool,
     tools_enabled: bool,
@@ -266,6 +275,8 @@ impl ModelOwner {
             chunks: 0,
             total_chunks: 0,
             total_bytes: 0,
+            output_paused: false,
+            credited: 0,
             terminal_seen: false,
             faulted: false,
             tools_enabled: false,
@@ -330,8 +341,26 @@ impl ModelOwner {
         }
         self.queue(Body::Start(pb::Start {}))?;
         self.credit(2)?;
+        self.credited = 2;
         self.phase = Phase::Running;
         Ok(())
+    }
+    /// Withhold or release the next revision's credit; called on every
+    /// conversation pass, so a credit refused by a full queue is retried. A
+    /// transfer already credited completes; nothing waits on a timer.
+    pub(crate) fn set_output_paused(&mut self, paused: bool) {
+        self.output_paused = paused;
+        self.release_credit();
+    }
+    fn release_credit(&mut self) {
+        let next = self.revision + 2;
+        if !self.output_paused
+            && self.phase == Phase::Running
+            && self.credited < next
+            && self.credit(next).is_ok()
+        {
+            self.credited = next;
+        }
     }
     pub(crate) fn cancel(&mut self, reason: i32, now: Instant) {
         if self.phase == Phase::Settled || self.phase == Phase::Draining {
@@ -784,17 +813,18 @@ impl ModelOwner {
                 });
             }
             Body::Chunk(chunk) if self.phase == Phase::Running || self.phase == Phase::Draining => {
+                // Data only within credit, at most one revision per transfer.
+                // No revision or cumulative output total (owner, 2026-10-18).
                 if chunk.transfer_id != Some(self.revision + 2)
+                    || self.credited != self.revision + 2
                     || chunk.revision != Some(self.revision + 1)
                     || chunk.ordinal != Some(self.chunks)
                 {
                     return Err("model_protocol_fault");
                 }
                 let data = chunk.data.unwrap();
-                if self.snapshot.len() + data.len() > 60 * 1024
-                    || self.total_bytes + data.len() as u64 > 4 * 1024 * 1024
-                {
-                    return Err("model_output_limit");
+                if (self.snapshot.len() + data.len()) as u64 > model::MAX_REVISION_BYTES {
+                    return Err("model_protocol_fault");
                 }
                 self.snapshot.extend_from_slice(&data);
                 self.chunks += 1;
@@ -812,16 +842,18 @@ impl ModelOwner {
                 }
                 self.revision += 1;
                 self.chunks = 0;
+                // The kept prefix ends on a character boundary, so the
+                // appended bytes are UTF-8 by themselves.
                 let text = String::from_utf8(std::mem::take(&mut self.snapshot))
                     .map_err(|_| "model_protocol_fault")?;
                 if self.phase == Phase::Running {
-                    events.push(ModelEvent::Snapshot {
+                    // The conversation owner releases the next credit after
+                    // it applies this revision (`set_output_paused`).
+                    events.push(ModelEvent::Revision {
                         revision: self.revision,
+                        offset: end.offset.ok_or("model_protocol_fault")?,
                         text,
                     });
-                    if self.revision < 1024 {
-                        self.credit(self.revision + 2)?;
-                    }
                 }
             }
             Body::Terminal(terminal)
@@ -936,6 +968,14 @@ impl ModelOwner {
     pub(crate) fn settled_test_fixture() -> Self {
         tests::owner(Phase::Settled)
     }
+    /// As if `revision` revisions had been received; the next is owed credit.
+    pub(crate) fn response_test_revision(&mut self, revision: u64) {
+        self.revision = revision;
+    }
+    /// Output transfer credits queued for the helper; drains the queue.
+    pub(crate) fn response_test_credits(&mut self) -> Vec<u64> {
+        tests::output_credits(self)
+    }
     /// As if the helper had just sent the `ToolCall` at `ordinal`.
     pub(crate) fn tool_test_pending(&mut self, ordinal: u32) {
         self.pending_tool = Some(ordinal);
@@ -1043,6 +1083,8 @@ mod tests {
             chunks: 0,
             total_chunks: 0,
             total_bytes: 0,
+            output_paused: false,
+            credited: 2,
             terminal_seen: false,
             faulted: false,
             tools_enabled: false,
@@ -1072,11 +1114,127 @@ mod tests {
         })
     }
     fn end(text: &str, revision: u64, count: u64) -> Body {
+        end_at(text, revision, count, 0)
+    }
+    fn end_at(text: &str, revision: u64, count: u64, offset: u64) -> Body {
         Body::SnapshotEnd(pb::SnapshotEnd {
             revision: Some(revision),
             count: Some(count),
             total_bytes: Some(text.len() as u64),
+            offset: Some(offset),
         })
+    }
+    /// Credits queued for output transfers, in order; drains the queue.
+    pub(super) fn output_credits(owner: &mut ModelOwner) -> Vec<u64> {
+        let mut codec = ModelCodec::new();
+        let mut credits = Vec::new();
+        for frame in owner.outgoing.drain(..) {
+            codec.push(&frame).unwrap();
+            if let Some(Body::Credit(credit)) = codec
+                .next_frame(Direction::ServiceToHelper)
+                .unwrap()
+                .unwrap()
+                .body
+                && credit.direction == Some(2)
+            {
+                credits.push(credit.transfer_id.unwrap());
+            }
+        }
+        credits
+    }
+    /// RT-01 and RT-02: more than 1,024 revisions and more than 4 MiB of
+    /// transmitted output are accepted and reconciled by the terminal.
+    #[test]
+    fn rt01_rt02_revisions_and_output_have_no_total() {
+        let mut owner = owner(Phase::Running);
+        let mut events = Vec::new();
+        let piece = "x".repeat(16_384);
+        let mut chunks = 0;
+        let mut bytes = 0;
+        for revision in 1..=1_100u64 {
+            // Every tenth revision carries a full 61,440-byte transfer.
+            let parts = if revision % 10 == 0 { 4 } else { 1 };
+            let mut text = String::new();
+            for ordinal in 0..parts {
+                let data = if ordinal == 3 {
+                    &piece[..12_288]
+                } else {
+                    &piece[..]
+                };
+                owner
+                    .receive(message(chunk(data, revision, ordinal)), &mut events)
+                    .unwrap();
+                text.push_str(data);
+            }
+            owner
+                .receive(message(end_at(&text, revision, parts, 0)), &mut events)
+                .unwrap();
+            owner.set_output_paused(false);
+            chunks += parts;
+            bytes += text.len() as u64;
+            assert_eq!(output_credits(&mut owner), vec![revision + 2]);
+        }
+        assert!(bytes > 4 * 1024 * 1024);
+        assert_eq!(events.len(), 1_100);
+        assert!(matches!(
+            events.last(),
+            Some(ModelEvent::Revision { revision: 1_100, offset: 0, text }) if text.len() == 61_440
+        ));
+        owner
+            .receive(
+                message(Body::Terminal(pb::Terminal {
+                    outcome: Some(1),
+                    last_revision: Some(1_100),
+                    count: Some(chunks),
+                    total_bytes: Some(bytes),
+                    usage_known: Some(false),
+                    usage_tokens: None,
+                    reason: Some(0),
+                })),
+                &mut events,
+            )
+            .unwrap();
+        assert!(owner.terminal_seen);
+    }
+    /// RT-05: while paused, the next transfer gets no credit and data for it
+    /// is a fault; releasing the pause grants exactly that credit.
+    #[test]
+    fn rt05_paused_output_withholds_the_next_credit() {
+        let mut model = owner(Phase::Running);
+        let mut events = Vec::new();
+        model
+            .receive(message(chunk("abc", 1, 0)), &mut events)
+            .unwrap();
+        model
+            .receive(message(end_at("abc", 1, 1, 0)), &mut events)
+            .unwrap();
+        // No credit until the conversation owner decides.
+        assert!(output_credits(&mut model).is_empty());
+        model.set_output_paused(true);
+        assert!(output_credits(&mut model).is_empty());
+        let mut early = owner(Phase::Running);
+        early.revision = 1;
+        early.output_paused = true;
+        early.credited = 2;
+        assert!(
+            early
+                .receive(message(chunk("d", 2, 0)), &mut events)
+                .is_err()
+        );
+        model.set_output_paused(false);
+        assert_eq!(output_credits(&mut model), vec![3]);
+        model.set_output_paused(false);
+        assert!(output_credits(&mut model).is_empty());
+        model
+            .receive(message(chunk("d", 2, 0)), &mut events)
+            .unwrap();
+        model
+            .receive(message(end_at("d", 2, 1, 3)), &mut events)
+            .unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(ModelEvent::Revision { revision: 2, offset: 3, text }) if text == "d"
+        ));
     }
     /// B3: tool availability comes from `supported_capabilities` bit 0 alone.
     #[test]
@@ -1291,9 +1449,10 @@ mod tests {
             owner
                 .receive(message(end(text, rev, 1)), &mut events)
                 .unwrap();
+            owner.set_output_paused(false);
         }
         assert!(
-            matches!(&events[1],ModelEvent::Snapshot{revision:2,text} if text=="a complete response")
+            matches!(&events[1],ModelEvent::Revision{revision:2,text,..} if text=="a complete response")
         );
         let terminal = pb::Terminal {
             outcome: Some(1),
@@ -1751,7 +1910,7 @@ mod tests {
         owner
             .receive(message(measured.clone()), &mut events)
             .unwrap();
-        assert!(matches!(&events[0], ModelEvent::Snapshot { text, .. } if text == "text"));
+        assert!(matches!(&events[0], ModelEvent::Revision { text, .. } if text == "text"));
         assert!(matches!(
             &events[1],
             ModelEvent::ContextMeasured {
@@ -1764,20 +1923,24 @@ mod tests {
     #[test]
     fn coalesced_frames_rearm_until_terminal_consumed() {
         let mut owner = owner(Phase::Running);
-        for revision in 1..=5 {
-            for body in [chunk("x", revision, 0), end("x", revision, 1)] {
-                owner.incoming.extend(
-                    model::encode_frame(&message(body), Direction::HelperToService).unwrap(),
-                );
-            }
+        // One credited revision of nine one-byte chunks: more than the eight
+        // frames one pass consumes. Each later revision needs a new credit.
+        let bodies =
+            (0..9)
+                .map(|ordinal| chunk("x", 1, ordinal))
+                .chain([end(&"x".repeat(9), 1, 9)]);
+        for body in bodies {
+            owner
+                .incoming
+                .extend(model::encode_frame(&message(body), Direction::HelperToService).unwrap());
         }
         owner.incoming.extend(
             model::encode_frame(
                 &message(Body::Terminal(pb::Terminal {
                     outcome: Some(1),
-                    last_revision: Some(5),
-                    count: Some(5),
-                    total_bytes: Some(5),
+                    last_revision: Some(1),
+                    count: Some(9),
+                    total_bytes: Some(9),
                     usage_tokens: None,
                     usage_known: Some(false),
                     reason: Some(0),
@@ -1788,11 +1951,14 @@ mod tests {
         );
         let mut events = Vec::new();
         owner.consume_input(&mut events).unwrap();
-        assert_eq!(events.len(), 4);
+        assert!(events.is_empty());
+        assert_eq!(owner.chunks, 8);
         let now = Instant::now();
         assert_eq!(owner.next_deadline(now), Some(now));
-        events.clear();
         owner.consume_input(&mut events).unwrap();
+        assert!(
+            matches!(&events[0], ModelEvent::Revision { revision: 1, text, .. } if text.len() == 9)
+        );
         assert!(owner.terminal_seen);
         assert!(!owner.buffered_work());
     }

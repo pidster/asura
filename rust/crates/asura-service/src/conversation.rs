@@ -3,6 +3,7 @@ mod audit_tools;
 mod exec_cmd_call;
 mod memory_create;
 mod memory_tools;
+mod response;
 use crate::model_owner::{ModelOwner, PackageIdentity};
 use crate::{sensors, tools};
 use asura_control::{model::pb as mp, pb};
@@ -160,13 +161,15 @@ fn wait_step(active: &Active) -> Option<pb::ConversationWaitStep> {
         (false, HelperStep::Preparing) => Some(Step::PreparingModel),
         (false, HelperStep::Hello) => Some(Step::StartingModel),
         (true, HelperStep::Input) => Some(Step::SendingInput),
-        (true, HelperStep::Running) if active.snapshot.is_empty() && active.tool.is_none() => {
+        (true, HelperStep::Running) if active.response.is_empty() && active.tool.is_none() => {
             Some(Step::ModelOutput)
         }
         _ => None,
     }
 }
-fn terminal_event(turn: &journal::TurnTerminal) -> pb::ConversationEvent {
+/// A terminal event with one response window (response-text-transfer.md):
+/// `turn` holds the window as its text and `text_offset`.
+fn terminal_event(turn: &journal::TurnTerminal, text_bytes: u64) -> pb::ConversationEvent {
     pb::ConversationEvent {
         // A terminal turn waits on nothing; steps are never journaled.
         waiting_step: None,
@@ -193,6 +196,8 @@ fn terminal_event(turn: &journal::TurnTerminal) -> pb::ConversationEvent {
             _ => 9,
         }),
         text: Some(turn.text.clone()),
+        text_offset: Some(turn.text_offset),
+        text_bytes: Some(text_bytes),
         usage_known: Some(turn.usage_known),
         usage_tokens: turn.usage_known.then_some(u64::from(turn.output_tokens)),
         tools: Vec::new(),
@@ -417,7 +422,8 @@ struct Active {
     capabilities: crate::model::CapabilityProfile,
     activation: [crate::model::Activation; 4],
     helper: journal::Id,
-    snapshot: String,
+    /// The response, its journaled prefix and recent cuts.
+    response: response::Response,
     cursor: u64,
     cancel: Option<journal::Cause>,
     cancel_replies: Vec<pb::Envelope>,
@@ -493,6 +499,8 @@ enum Job {
     ToolIntent,
     CaptureSettled,
     ToolResult,
+    /// One kind 24 response segment (response-text-transfer.md).
+    ResponseText,
     RecoverCreateResult,
     RecoverCreateFinish,
     Read(pb::Envelope),
@@ -1319,9 +1327,13 @@ impl Owner {
         let wait = match request.body.as_ref() {
             Some(Body::ConversationObserve(value)) if value.wait_ms.unwrap_or(0) > 0 => {
                 self.active.as_ref().is_some_and(|active| {
+                    let after = value.after_cursor.unwrap_or(0);
                     active.turn.operation == id(&value.operation_id)
                         && active.accepted
-                        && active.cursor <= value.after_cursor.unwrap_or(0)
+                        && active.cursor <= after
+                        && active
+                            .response
+                            .caught_up(after, value.text_offset.unwrap_or(0))
                 }) || self.terminal_read_wait(id(&value.operation_id)).is_some()
             }
             Some(Body::ConversationQueueList(value))
@@ -1360,6 +1372,7 @@ impl Owner {
                     request.clone(),
                     id(&value.operation_id),
                     value.after_cursor.unwrap(),
+                    value.text_offset.unwrap_or(0),
                 );
             }
             Body::ResolveInitialization(value) => {
@@ -1577,17 +1590,24 @@ impl Owner {
             }),
         )
     }
+    /// `held` is the count of response bytes the client holds; the reply
+    /// carries one window (response-text-transfer.md).
     fn observe(
         &mut self,
         request: pb::Envelope,
         operation: journal::Id,
         after: u64,
+        held: u64,
     ) -> Option<pb::Envelope> {
         if let Some(active) = &self.active
             && active.accepted
             && active.turn.operation == operation
         {
-            let snapshot = active.cursor > after && !active.snapshot.is_empty();
+            let (start, window) = active.response.window(after, held);
+            // A caught-up client gets a pending heartbeat; a window also
+            // tells a client to truncate a cut response.
+            let snapshot =
+                active.cursor > 1 && after < u64::MAX && !(window.is_empty() && start == held);
             return Some(reply(
                 request,
                 Body::ConversationEvent(pb::ConversationEvent {
@@ -1599,8 +1619,9 @@ impl Owner {
                         .then(|| wait_step(active))
                         .flatten()
                         .map(|step| step as i32),
-                    text: (active.cursor > after && !active.snapshot.is_empty())
-                        .then(|| active.snapshot.clone()),
+                    text: snapshot.then(|| window.to_owned()),
+                    text_offset: snapshot.then_some(start),
+                    text_bytes: snapshot.then_some(active.response.len() as u64),
                     reason: Some(0),
                     usage_tokens: None,
                     usage_known: None,
@@ -1626,12 +1647,15 @@ impl Owner {
         else {
             return Some(error(request, "unknown_operation"));
         };
-        let Some(terminal) = &op.terminal else {
+        if op.terminal.is_none() {
             return Some(error(request, "operation_recovering"));
-        };
+        }
+        // The journal keeps no cut history: only a client already reading the
+        // terminal response continues from its held count.
         match self.submit(
-            writer::Command::ReadRecord {
-                range: terminal.frame.clone(),
+            writer::Command::ReadResponse {
+                operation,
+                offset: if after == u64::MAX { held } else { 0 },
             },
             Job::Read(request.clone()),
         ) {
@@ -1772,7 +1796,7 @@ impl Owner {
             capabilities: Default::default(),
             activation: [crate::model::Activation::Unknown; 4],
             helper: asura_platform::random_id(),
-            snapshot: String::new(),
+            response: Default::default(),
             cursor: 1,
             cancel: None,
             cancel_replies: Vec::new(),
@@ -1877,6 +1901,20 @@ impl Owner {
                     | Job::ReadPrompt(request)
                     | Job::Read(request)
                     | Job::QueueList(request) => self.out.push_back(error(request, message)),
+                    // The journal cannot hold the segment (known-size
+                    // exhaustion): keep the prefix plus one tail and cancel
+                    // with output_limit (response-text-transfer.md, RT-07).
+                    Job::ResponseText
+                        if matches!(cause, writer::Error::Limit | writer::Error::Invalid) =>
+                    {
+                        if let Some(active) = &mut self.active {
+                            active.cursor += 1;
+                            active.response.exhaust(active.cursor);
+                            active.model.set_output_paused(false);
+                            active.cancel.get_or_insert(journal::Cause::OutputLimit);
+                            active.revoke_create();
+                        }
+                    }
                     _ => {
                         self.unavailable = Some(message);
                         if let Some(active) = &mut self.active {
@@ -1916,6 +1954,12 @@ impl Owner {
             }
             Job::RecoverCreateResult => {
                 let intent = &self.create_recovery.as_ref().expect("recovery").intent;
+                // The interrupted operation keeps its journaled response.
+                let text_offset = self
+                    .replay
+                    .as_ref()
+                    .and_then(|r| r.operations.get(&intent.operation))
+                    .map_or(0, |op| op.response.len);
                 let terminal = journal::TurnTerminal {
                     operation: intent.operation,
                     generation: intent.generation,
@@ -1924,6 +1968,7 @@ impl Owner {
                     final_cursor: u64::MAX,
                     usage_known: false,
                     output_tokens: 0,
+                    text_offset,
                     text: String::new(),
                 };
                 if let Err(error) = self.append(
@@ -2119,6 +2164,11 @@ impl Owner {
                 {
                     Self::failed(active, message, now);
                 }
+            }
+            Job::ResponseText => {
+                let active = self.active.as_mut().expect("active response");
+                active.response.committed();
+                active.model.set_output_paused(active.response.paused());
             }
             Job::Cancel => {
                 let active = self.active.as_mut().expect("active cancel");
@@ -2463,7 +2513,8 @@ impl Owner {
             Job::Read(request) => {
                 self.out.push_back(match value.record {
                     Some(journal::Record::TurnTerminal(terminal)) => {
-                        let mut event = terminal_event(&terminal);
+                        let mut event =
+                            terminal_event(&terminal, value.response_bytes.unwrap_or(0));
                         event.model_context = self
                             .model_context
                             .iter()
@@ -2493,7 +2544,7 @@ impl Owner {
             stage = "terminal",
             outcome,
             reason,
-            snapshot_bytes = active.snapshot.len(),
+            response_bytes = active.response.len(),
             inference_requests = active.measurements.count,
             measured_output_tokens = ?active.measurements.output,
             tools_enabled = active.tools_enabled,
@@ -2507,13 +2558,13 @@ impl Owner {
             terminal_accounting(active.start_committed, active.tools_enabled, usage_tokens);
         let kind = if active.cancel.is_some() {
             journal::TerminalKind::Cancelled
-        } else if outcome == 1 && !active.snapshot.is_empty() {
+        } else if outcome == 1 && !active.response.is_empty() {
             journal::TerminalKind::Complete
         } else {
             journal::TerminalKind::Failed
         };
         let cause = active.cancel.unwrap_or(match reason {
-            0 if !active.snapshot.is_empty() => journal::Cause::None,
+            0 if !active.response.is_empty() => journal::Cause::None,
             2 | 4 => journal::Cause::InputLimit,
             3 => journal::Cause::OutputLimit,
             5 => journal::Cause::Deadline,
@@ -2528,7 +2579,9 @@ impl Owner {
             final_cursor: u64::MAX,
             usage_known,
             output_tokens,
-            text: active.snapshot.clone(),
+            // Filled from the response when the terminal is appended.
+            text_offset: 0,
+            text: String::new(),
         });
     }
     /// One `ToolCall` from the helper (tool-call-records.md). Helper faults
@@ -2828,6 +2881,7 @@ impl Owner {
             final_cursor: u64::MAX,
             usage_known: true,
             output_tokens: 0,
+            text_offset: 0,
             text: String::new(),
         });
         active.model.cancel(1, now);
@@ -2870,7 +2924,8 @@ impl Owner {
             final_cursor: u64::MAX,
             usage_known: !active.start_committed,
             output_tokens: 0,
-            text: active.snapshot.clone(),
+            text_offset: 0,
+            text: String::new(),
         });
         active.model.cancel(4, now);
         active.tool_executor.cancel();
@@ -2926,8 +2981,11 @@ impl Owner {
                         }
                         continue;
                     }
+                    let held = value.text_offset.unwrap_or(0);
                     let unchanged = self.active.as_ref().is_some_and(|active| {
-                        active.turn.operation == operation && active.cursor <= after
+                        active.turn.operation == operation
+                            && active.cursor <= after
+                            && active.response.caught_up(after, held)
                     });
                     if unchanged && now < deadline {
                         self.observations.push((request, deadline));
@@ -3097,10 +3155,16 @@ impl Owner {
                         .record(&active.turn.model, active.input.len(), input_tokens);
                 }
                 ModelEvent::Ready => active.ready = true,
-                ModelEvent::Snapshot { revision, text } => {
+                ModelEvent::Revision {
+                    revision,
+                    offset,
+                    text,
+                } => {
                     if active.cancel.is_none() {
                         active.cursor = active.cursor.max(revision) + 1;
-                        active.snapshot = text;
+                        if let Err(message) = active.response.revise(offset, &text, active.cursor) {
+                            Self::failed(active, message, now);
+                        }
                     }
                 }
                 ModelEvent::ToolCall(call) => {
@@ -3241,6 +3305,9 @@ impl Owner {
         let Some(active) = &mut self.active else {
             return;
         };
+        // The next revision's credit only while fewer than 122,880 bytes wait
+        // for the journal, decided after this pass's revisions applied.
+        active.model.set_output_paused(active.response.paused());
         if self.closing {
             active.revoke_create();
             active.cancel.get_or_insert(journal::Cause::ServiceShutdown);
@@ -3359,11 +3426,28 @@ impl Owner {
                         final_cursor: u64::MAX,
                         usage_known: !active.start_committed,
                         output_tokens: 0,
-                        text: active.snapshot.clone(),
+                        text_offset: 0,
+                        text: String::new(),
                     });
                 terminal.kind = journal::TerminalKind::Cancelled;
                 terminal.cause = cause;
             }
+        }
+        // Journal the response while its tail exceeds one kind 8 frame. The
+        // helper's next revision credit waits while the backlog is large.
+        if active.start_committed
+            && let Some((offset, text)) = active.response.next_segment()
+        {
+            let record = journal::Record::ResponseText(journal::ResponseText {
+                operation,
+                generation,
+                offset,
+                text,
+            });
+            if let Err(e) = self.append(record, Job::ResponseText, None) {
+                self.unavailable = Some(storage_error(e));
+            }
+            return;
         }
         if let Some(tool) = &mut active.tool {
             if !tool.intent_committed {
@@ -3588,11 +3672,17 @@ impl Owner {
                 .and_then(|tool| tool.memory_ticket.as_ref())
                 .is_none_or(writer::Ticket::is_settled)
         {
-            if let Some(terminal) = active.terminal.clone()
-                && let Err(e) =
-                    self.append(journal::Record::TurnTerminal(terminal), Job::Finish, None)
+            // The tail follows the journaled prefix; segments commit first.
+            if let Some(mut terminal) = active.terminal.clone()
+                && let Some((text_offset, text)) = active.response.tail()
             {
-                self.unavailable = Some(storage_error(e));
+                terminal.text_offset = text_offset;
+                terminal.text = text;
+                if let Err(e) =
+                    self.append(journal::Record::TurnTerminal(terminal), Job::Finish, None)
+                {
+                    self.unavailable = Some(storage_error(e));
+                }
             }
         } else if active.ready && !active.start_committed && active.cancel.is_none() {
             active.ready = false;
@@ -3863,6 +3953,7 @@ mod observation_tests {
         replay.operations.insert(
             [6; 16],
             journal::Operation {
+                response: Default::default(),
                 conversation: [7; 16],
                 generation: 4,
                 task: [8; 16],
@@ -3887,6 +3978,7 @@ mod observation_tests {
             attachment_id: Some(vec![2; 16]),
             request_counter: Some(1),
             body: Some(Body::ConversationObserve(pb::ConversationObserve {
+                text_offset: None,
                 operation_id: Some(vec![6; 16]),
                 after_cursor: Some(19),
                 wait_ms: Some(1000),

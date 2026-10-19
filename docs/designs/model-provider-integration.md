@@ -152,8 +152,8 @@ termination/reap. Adapter retries are disabled; cancellation invalidates its ses
 | Generation request | No time limit: no whole-turn expiry, network inactivity bound or resource bound (owner, 2026-10-16) |
 | Encoded request | 256 KiB including transcript and tool schemas |
 | NDJSON record | 64 KiB before decoding |
-| Total response | 4 MiB |
-| Response text | 60 KiB per generation |
+| NDJSON stream | 4 MiB per HTTP request, a parser bound (L28 in [tool output views](tool-output-views.md#result-delivery-to-the-model)); no per-operation output total (owner, 2026-10-18) |
+| Response text | No byte total; the 2,048-token request cap bounds each request, and revisions of at most 61,440 bytes carry it ([response text transfer](response-text-transfer.md)) |
 | Tool calls | 201 per provider stream: the turn's 200 recorded calls plus the over-limit ordinal 201 ([tool call records](tool-call-records.md); owner, 2026-10-18) |
 | Tool arguments | 16 KiB per call |
 | Ollama context request | At most 8,192 tokens, selected after `/api/show` discovery; reported maximum and effective request capacity are separate observations |

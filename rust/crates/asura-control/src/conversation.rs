@@ -1,5 +1,5 @@
 //! Runtime-free validation of setup and conversation commands.
-use crate::{MAX_TOOL_PROGRESS_ENTRIES, id, pb, text};
+use crate::{MAX_RESPONSE_WINDOW_BYTES, MAX_TOOL_PROGRESS_ENTRIES, id, pb, text};
 use pb::envelope::Body;
 pub(super) fn handles(body: &Body) -> bool {
     matches!(
@@ -296,26 +296,35 @@ pub(super) fn valid(body: &Body) -> bool {
             let step = v
                 .waiting_step
                 .is_none_or(|step| v.kind == Some(1) && (3..=4).contains(&step));
+            // One response window: keep text_offset bytes, append text, giving
+            // text_bytes (response-text-transfer.md). No response total exists.
+            let window = matches!(
+                (&v.text, v.text_offset, v.text_bytes),
+                (Some(text), Some(offset), Some(total))
+                    if text.len() <= MAX_RESPONSE_WINDOW_BYTES
+                        && offset.checked_add(text.len() as u64).is_some_and(|end| end <= total)
+            );
             base && step
                 && match v.kind {
                     Some(1) => {
                         v.text.is_none()
+                            && v.text_offset.is_none()
+                            && v.text_bytes.is_none()
                             && v.usage_known.is_none()
                             && v.usage_tokens.is_none()
                             && v.reason == Some(0)
                     }
                     Some(2) => {
                         v.cursor.is_some_and(|n| n > 1 && n < u64::MAX)
-                            && v.text.as_ref().is_some_and(|s| s.len() <= 61440)
+                            && window
                             && v.reason == Some(0)
                             && v.usage_known.is_none()
                             && v.usage_tokens.is_none()
                     }
                     Some(3..=6) => {
                         v.cursor == Some(u64::MAX)
-                            && v.text.as_ref().is_some_and(|s| {
-                                s.len() <= 61440 && (v.kind != Some(3) || !s.is_empty())
-                            })
+                            && window
+                            && (v.kind != Some(3) || v.text_bytes.is_some_and(|n| n > 0))
                             && (v.kind != Some(3) || v.reason == Some(0))
                             && match v.usage_known {
                                 Some(true) => v.usage_tokens.is_some_and(|n| n <= 2048),
@@ -576,6 +585,8 @@ mod tests {
             usage_tokens: None,
             usage_known: Some(false),
             tools: Vec::new(),
+            text_offset: Some(0),
+            text_bytes: Some(8),
         };
         assert!(valid(&Body::ConversationEvent(event.clone())));
         for changed in [
@@ -831,6 +842,8 @@ mod tests {
             cursor: Some(u64::MAX),
             kind: Some(5),
             text: Some(String::new()),
+            text_offset: Some(0),
+            text_bytes: Some(0),
             usage_known: Some(false),
             waiting_step: Some(4),
             ..event
@@ -853,13 +866,16 @@ mod tests {
     }
     #[test]
     fn maximum_activity_frame_retains_complete_response_and_signed_exit() {
+        // RT-10: a full window with the largest offset and total varints.
         let event = pb::ConversationEvent {
             operation_id: Some(vec![1; 16]),
             generation: Some(1),
             cursor: Some(u64::MAX),
             kind: Some(3),
             reason: Some(0),
-            text: Some("a".repeat(61440)),
+            text: Some("a".repeat(MAX_RESPONSE_WINDOW_BYTES)),
+            text_offset: Some(u64::MAX - MAX_RESPONSE_WINDOW_BYTES as u64),
+            text_bytes: Some(u64::MAX),
             usage_known: Some(false),
             // The most recent window, ending at the over-limit ordinal (TCR-D31).
             tools: (crate::model::MAX_TOOL_ORDINAL + 1 - MAX_TOOL_PROGRESS_ENTRIES as u32
@@ -934,5 +950,74 @@ mod tests {
         let mut gap = renumber(5, 3);
         gap[2].ordinal = Some(8);
         assert!(!with(gap));
+    }
+    /// RT-03 and RT-04 (wire): a window keeps `text_offset` bytes and appends
+    /// at most 61,440; no response total exists.
+    #[test]
+    fn response_windows_are_bounded_per_event_not_per_response() {
+        let event = pb::ConversationEvent {
+            operation_id: Some(vec![1; 16]),
+            generation: Some(1),
+            cursor: Some(5),
+            kind: Some(2),
+            reason: Some(0),
+            text: Some("b".repeat(MAX_RESPONSE_WINDOW_BYTES)),
+            text_offset: Some(4 * 1024 * 1024),
+            text_bytes: Some(10 * 1024 * 1024),
+            ..Default::default()
+        };
+        assert!(valid(&Body::ConversationEvent(event.clone())));
+        for changed in [
+            pb::ConversationEvent {
+                text: Some("b".repeat(MAX_RESPONSE_WINDOW_BYTES + 1)),
+                ..event.clone()
+            },
+            pb::ConversationEvent {
+                text_offset: None,
+                ..event.clone()
+            },
+            pb::ConversationEvent {
+                text_bytes: Some(4 * 1024 * 1024 + 10),
+                ..event.clone()
+            },
+            pb::ConversationEvent {
+                text_offset: Some(u64::MAX),
+                text_bytes: Some(u64::MAX),
+                ..event.clone()
+            },
+            // A pending event carries no window.
+            pb::ConversationEvent {
+                kind: Some(1),
+                ..event.clone()
+            },
+            // Complete needs a nonempty response, not a nonempty window.
+            pb::ConversationEvent {
+                kind: Some(3),
+                cursor: Some(u64::MAX),
+                text: Some(String::new()),
+                text_offset: Some(0),
+                text_bytes: Some(0),
+                usage_known: Some(false),
+                ..event.clone()
+            },
+        ] {
+            assert!(!valid(&Body::ConversationEvent(changed)));
+        }
+        assert!(valid(&Body::ConversationEvent(pb::ConversationEvent {
+            kind: Some(3),
+            cursor: Some(u64::MAX),
+            text: Some(String::new()),
+            text_offset: Some(70_000),
+            text_bytes: Some(70_000),
+            usage_known: Some(false),
+            ..event
+        })));
+        let observe = pb::ConversationObserve {
+            operation_id: Some(vec![1; 16]),
+            after_cursor: Some(u64::MAX),
+            wait_ms: Some(0),
+            text_offset: Some(9 * 1024 * 1024),
+        };
+        assert!(valid(&Body::ConversationObserve(observe)));
     }
 }

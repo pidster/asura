@@ -122,6 +122,15 @@ private func outputCredit(_ id: UInt64) -> Envelope {
     credit.transferID = id; credit.direction = .output; credit.acceptedBytes = 0; credit.grantedBytes = 65_536
     return scoped(.credit(credit))
 }
+/// Applies one revision as the service does: keep `offset` bytes of the
+/// response, then append the transfer's bytes (response-text-transfer.md).
+private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _ delta: inout Data) -> String {
+    #expect(end.hasOffset && end.offset <= UInt64(response.count))
+    #expect(end.totalBytes == UInt64(delta.count) && delta.count <= Limits.revisionBytes)
+    response.removeSubrange(Int(end.offset)..<response.count)
+    response.append(delta); delta.removeAll()
+    return String(decoding: response, as: UTF8.self)
+}
 
 @Test func realSocketPipelineRequiresStartAndPublishesReplacement() async throws {
     let (helper, service) = try pair()
@@ -155,6 +164,7 @@ private func outputCredit(_ id: UInt64) -> Envelope {
     try await service.send(scoped(.start(.init())))
     try await service.send(outputCredit(2))
     var text = Data()
+    var response = Data()
     var finalText = ""
     var terminal: Asura_Model_V1_Terminal?
     while let raw = try await replies.next() {
@@ -162,7 +172,7 @@ private func outputCredit(_ id: UInt64) -> Envelope {
         switch frame.body {
         case .chunk(let v): text.append(v.data)
         case .snapshotEnd(let v):
-            finalText = String(decoding: text, as: UTF8.self); text.removeAll()
+            finalText = revise(&response, v, &text)
             do { try await service.send(outputCredit(v.revision + 2)) }
             catch HelperError.closed {
                 // The final snapshot may be followed by Terminal and EOF already buffered.
@@ -352,14 +362,14 @@ private actor Burst: ModelBackend {
     }
     // No output credit was granted during the burst. Resume only after all snapshots exist.
     try await service.send(outputCredit(2))
-    var text = Data(); var snapshots = 0; var last = ""
+    var text = Data(); var response = Data(); var snapshots = 0; var last = ""
     var terminal: Asura_Model_V1_Terminal?
     while let bytes = try await replies.next() {
         let frame = try Wire.decode(bytes)
         switch frame.body {
         case .chunk(let v): text.append(v.data)
         case .snapshotEnd(let v):
-            snapshots += 1; last = String(decoding: text, as: UTF8.self); text.removeAll()
+            snapshots += 1; last = revise(&response, v, &text)
             if last != "snapshot-99" { try await service.send(outputCredit(v.revision + 2)) }
         case .terminal(let v): terminal = v
         default: Issue.record("unexpected output")
@@ -499,15 +509,14 @@ func backendFailureDrainsBoundedSnapshotsOrStopsAtExistingBoundary(_ action: Str
         var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
         try await service.send(scoped(.cancel(cancel)))
     }
-    var partial = Data(); var snapshots: [String] = []
+    var partial = Data(); var response = Data(); var snapshots: [String] = []
     var terminal: Asura_Model_V1_Terminal?
     while let raw = try await replies.next() {
         let frame = try Wire.decode(raw)
         switch frame.body {
         case .chunk(let value): partial.append(value.data)
         case .snapshotEnd(let value):
-            #expect(value.totalBytes == UInt64(partial.count))
-            snapshots.append(String(decoding: partial, as: UTF8.self)); partial.removeAll()
+            snapshots.append(revise(&response, value, &partial))
             if snapshots.count == 1 { try await service.send(outputCredit(value.revision + 2)) }
         case .terminal(let value): terminal = value
         default: Issue.record("unexpected failure-drain frame")
@@ -521,7 +530,8 @@ func backendFailureDrainsBoundedSnapshotsOrStopsAtExistingBoundary(_ action: Str
         #expect(result.outcome == .failed)
         #expect(result.reason == .outputLimit)
         #expect(result.lastRevision == 2)
-        #expect(result.totalBytes == 26)
+        // "first partial", then "nal partial" after the shared "fi".
+        #expect(result.totalBytes == 24)
     } else {
         #expect(snapshots.isEmpty)
         #expect(result.totalBytes == 0)
@@ -722,6 +732,7 @@ func lateInputMeasurementPreservesOutputAndRejectsDuplicate(_ duplicate: Bool) a
     try await service.send(scoped(.start(.init())))
     try await service.send(outputCredit(2))
     var text = Data()
+    var response = Data()
     var finalText = ""
     var measurementCount = 0
     var terminal: Asura_Model_V1_Terminal?
@@ -730,7 +741,7 @@ func lateInputMeasurementPreservesOutputAndRejectsDuplicate(_ duplicate: Bool) a
         switch frame.body {
         case .chunk(let v): text.append(v.data)
         case .snapshotEnd(let v):
-            finalText = String(decoding: text, as: UTF8.self); text.removeAll()
+            finalText = revise(&response, v, &text)
             do { try await service.send(outputCredit(v.revision + 2)) }
             catch HelperError.closed {
                 // The final snapshot may be followed by Terminal and EOF already buffered.
@@ -855,4 +866,138 @@ func usageReportsPreserveTextAndCancellationHasOneReportBeforeTerminal(mode: Str
     #expect(Int(bytes) > names)
     #expect(bytes <= Limits.toolSchemaBytes)
     #expect(projectToolSchemaBytes() == bytes)
+}
+
+
+// ---------------------------------------------------------- response text
+// response-text-transfer.md: revisions with an offset; no revision, response
+// or transmitted-output total.
+
+/// Emits `texts` in order. With `gate`, each waits until the test service has
+/// consumed the previous revision, so every snapshot becomes one revision.
+private actor RevisionBackend: ModelBackend {
+    let texts: [String]
+    let gate: Bool
+    var consumed = 0
+    init(texts: [String], gate: Bool) { self.texts = texts; self.gate = gate }
+    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
+    func consume() { consumed += 1 }
+    func generate(_ input: ModelInput, maximumTokens: UInt32,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        for (index, text) in texts.enumerated() {
+            while gate && consumed < index { try await Task.sleep(for: .milliseconds(1)) }
+            try await snapshot(Snapshot(text: text))
+        }
+    }
+}
+
+/// Runs one generation to its terminal with prompt credit after each revision.
+/// Returns the applied response, every SnapshotEnd and the terminal.
+private func runRevisions(_ backend: RevisionBackend) async throws
+    -> (String, [Asura_Model_V1_SnapshotEnd], Asura_Model_V1_Terminal) {
+    let (helper, service) = try pair()
+    defer { helper.close(); service.close() }
+    let identity = Data(repeating: 1, count: 32)
+    let session = HelperSession(transport: helper, backend: backend, buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    defer { running.cancel() }
+    var replies = service.frames.makeAsyncIterator()
+    try await service.send(hello(identity)); _ = try await replies.next()
+    var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
+    let bytes = try input.serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
+    begin.maxResponseTokens = 2048
+    try await service.send(scoped(.begin(begin))); _ = try await replies.next()
+    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+    chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
+    try await service.send(scoped(.chunk(chunk)), control: false)
+    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(bytes.count)
+    try await service.send(scoped(.inputEnd(end)), control: false); _ = try await replies.next()
+    try await service.send(scoped(.start(.init())))
+    try await service.send(outputCredit(2))
+    var delta = Data(); var response = Data(); var text = ""
+    var ends: [Asura_Model_V1_SnapshotEnd] = []
+    var received: UInt64 = 0
+    while let raw = try await replies.next() {
+        let frame = try Wire.decode(raw)
+        switch frame.body {
+        case .chunk(let value):
+            #expect(value.revision == UInt64(ends.count + 1))
+            delta.append(value.data); received += UInt64(value.data.count)
+        case .snapshotEnd(let value):
+            #expect(value.revision == UInt64(ends.count + 1))
+            ends.append(value); text = revise(&response, value, &delta)
+            await backend.consume()
+            do { try await service.send(outputCredit(value.revision + 2)) } catch HelperError.closed {}
+        case .terminal(let value):
+            #expect(value.totalBytes == received)
+            #expect(value.lastRevision == UInt64(ends.count))
+            await running.value
+            return (text, ends, value)
+        default: Issue.record("unexpected revision frame")
+        }
+    }
+    throw HelperError.closed
+}
+
+/// RT-01: more than 1,024 revisions are transmitted and validated.
+@Test func rt01MoreThan1024RevisionsAreTransmitted() async throws {
+    let texts = (1...1_100).map { String(repeating: "r", count: $0) }
+    let (text, ends, terminal) = try await runRevisions(RevisionBackend(texts: texts, gate: true))
+    #expect(ends.count == 1_100)
+    #expect(ends.last.map { $0.revision == 1_100 && $0.offset == 1_099 && $0.totalBytes == 1 } == true)
+    #expect(text == texts.last)
+    #expect(terminal.outcome == .complete)
+    #expect(terminal.lastRevision == 1_100)
+    // The receiver's validation accepts revision 1,100 and transfer 1,101.
+    try Wire.validate(scoped(.snapshotEnd(ends.last!)), from: .helper)
+}
+
+/// RT-02 and RT-03 (helper side): a 4.5 MB multibyte response is split into
+/// revisions of at most 61,440 bytes cut on character boundaries; more than
+/// 4 MiB is transmitted and the receiver rebuilds the response whole.
+@Test func rt02LargeResponseSplitsIntoBoundedRevisions() async throws {
+    // Seven-byte units, so 61,440-byte revisions fall inside characters.
+    let full = String(repeating: "a😀é", count: 4_500_000 / 7)
+    let (text, ends, terminal) = try await runRevisions(RevisionBackend(texts: [full], gate: false))
+    #expect(text == full)
+    #expect(terminal.outcome == .complete)
+    #expect(terminal.totalBytes == UInt64(full.utf8.count))
+    #expect(terminal.totalBytes > 4 * 1024 * 1024)
+    #expect(ends.count >= (full.utf8.count + Limits.revisionBytes - 1) / Limits.revisionBytes)
+    #expect(ends.allSatisfy { $0.totalBytes <= UInt64(Limits.revisionBytes) })
+    // Each revision continues where the previous one ended.
+    var expected: UInt64 = 0
+    for end in ends { #expect(end.offset == expected); expected += end.totalBytes }
+}
+
+/// RT-04 (helper side): a rewritten snapshot keeps only the shared prefix.
+@Test func rt04RewriteKeepsSharedPrefix() async throws {
+    let (text, ends, terminal) = try await runRevisions(
+        RevisionBackend(texts: ["hello world", "hello there", "hello"], gate: true))
+    #expect(text == "hello")
+    #expect(ends.map(\.offset) == [0, 6, 5])
+    #expect(ends.map(\.totalBytes) == [11, 5, 0])
+    #expect(terminal.outcome == .complete)
+}
+
+/// RT-01 and RT-02 (wire): revisions, transfer IDs and cumulative counts have
+/// no upper bound; one revision still holds at most 61,440 bytes.
+@Test func rt01WireAcceptsUnboundedRevisionsAndTotals() throws {
+    var end = Asura_Model_V1_SnapshotEnd()
+    end.revision = 5_000; end.count = 4; end.totalBytes = 61_440; end.offset = 10_000_000
+    try Wire.validate(scoped(.snapshotEnd(end)), from: .helper)
+    end.totalBytes = 61_441
+    #expect(throws: HelperError.self) { try Wire.validate(scoped(.snapshotEnd(end)), from: .helper) }
+    end.totalBytes = 1; end.count = 1; end.clearOffset()
+    #expect(throws: HelperError.self) { try Wire.validate(scoped(.snapshotEnd(end)), from: .helper) }
+    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 5_001; chunk.direction = .output
+    chunk.ordinal = 3; chunk.revision = 5_000; chunk.data = Data([1])
+    try Wire.validate(scoped(.chunk(chunk)), from: .helper)
+    var terminal = Asura_Model_V1_Terminal()
+    terminal.outcome = .complete; terminal.reason = .none; terminal.usageKnown = false
+    terminal.lastRevision = 5_000; terminal.count = 1_000; terminal.totalBytes = 10 * 1024 * 1024
+    try Wire.validate(scoped(.terminal(terminal)), from: .helper)
+    terminal.totalBytes = UInt64.max
+    #expect(throws: HelperError.self) { try Wire.validate(scoped(.terminal(terminal)), from: .helper) }
 }

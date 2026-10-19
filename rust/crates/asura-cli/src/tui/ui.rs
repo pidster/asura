@@ -1130,7 +1130,8 @@ impl App {
             if event.kind != Some(1)
                 && let Some((_, response)) = self.transcript.get_mut(response_index)
             {
-                *response = literal_multiline(event.text.as_deref().unwrap_or_default(), 61440);
+                *response =
+                    literal_multiline(event.text.as_deref().unwrap_or_default(), usize::MAX);
                 if matches!(event.kind, Some(4..=6)) {
                     response.push_str(&format!(
                         "\n[Incomplete: {}]",
@@ -1213,8 +1214,10 @@ impl App {
                 if turn.event.kind != Some(1)
                     && let Some((_, response)) = self.transcript.get_mut(index)
                 {
-                    *response =
-                        literal_multiline(turn.event.text.as_deref().unwrap_or_default(), 61440);
+                    *response = literal_multiline(
+                        turn.event.text.as_deref().unwrap_or_default(),
+                        usize::MAX,
+                    );
                     if matches!(turn.event.kind, Some(4..=6)) {
                         response.push_str(&format!(
                             "\n[Incomplete: {}]",
@@ -5030,7 +5033,11 @@ mod tests {
                 cursor: Some(u64::MAX),
                 generation: Some(1),
                 kind: Some(6),
-                text: Some("Partial".into()),
+                // RT-03 (TUI): the whole assembled response is shown, with
+                // no 61,440-byte cut (response-text-transfer.md).
+                text: Some(format!("Partial{}", "é".repeat(100_000))),
+                text_offset: Some(0),
+                text_bytes: Some(200_007),
                 reason: Some(11),
                 usage_tokens: None,
                 usage_known: Some(false),
@@ -5046,6 +5053,11 @@ mod tests {
             ..Default::default()
         });
         assert!(app.transcript[0].1.contains("[Incomplete: interrupted]"));
+        assert!(
+            app.transcript[0]
+                .1
+                .starts_with(&format!("Partial{}", "é".repeat(100_000)))
+        );
         assert!(!app.conversation_busy);
         assert!(render(&mut app, 100, 24).contains("Native variant"));
     }

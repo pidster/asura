@@ -62,7 +62,7 @@ impl Fixture {
                 crate::model::Activation::Disabled,
             ],
             helper: [10; 16],
-            snapshot: String::new(),
+            response: Default::default(),
             cursor: 2,
             cancel: None,
             cancel_replies: vec![],
@@ -157,6 +157,7 @@ impl Fixture {
                 project_name_revision: None,
                 project_name_changed: None,
                 stale_project_name_revision: false,
+                response_bytes: None,
             }),
             Instant::now(),
         );
@@ -503,7 +504,10 @@ fn helper_settlement_cancellation_preserves_first_service_failure() {
     ] {
         let mut fixture = Fixture::new();
         let active = fixture.owner.active.as_mut().unwrap();
-        active.snapshot = "retained partial response".into();
+        active
+            .response
+            .revise(0, "retained partial response", 3)
+            .unwrap();
         Owner::failed(active, message, Instant::now());
         let original = active.terminal.clone().unwrap();
         assert_eq!(original.cause, cause);
@@ -1074,6 +1078,7 @@ pub(super) fn memory_reply() -> writer::Reply {
         project_name_revision: None,
         project_name_changed: None,
         stale_project_name_revision: false,
+        response_bytes: None,
     }
 }
 #[test]
@@ -1205,6 +1210,7 @@ fn install_recorded_memory_cancel(fixture: &mut Fixture) {
     replay.operations.insert(
         active.turn.operation,
         journal::Operation {
+            response: Default::default(),
             conversation: active.turn.conversation,
             generation: active.turn.generation,
             task: active.turn.task,
@@ -1329,10 +1335,10 @@ fn committed_tool_activity_is_observable_before_model_text() {
         .tools
         .push(tool_record("service", journal::ToolDecision::Run));
     assert!(fixture.active().cursor > before);
-    assert!(fixture.active().snapshot.is_empty());
+    assert!(fixture.active().response.is_empty());
     let reply = fixture
         .owner
-        .observe(pb::Envelope::default(), operation, before)
+        .observe(pb::Envelope::default(), operation, before, 0)
         .unwrap();
     let Some(Body::ConversationEvent(event)) = reply.body else {
         panic!("activity event");
@@ -1355,7 +1361,7 @@ fn committed_tool_activity_is_observable_before_model_text() {
         .result_status = Some(1);
     let reply = fixture
         .owner
-        .observe(pb::Envelope::default(), operation, before)
+        .observe(pb::Envelope::default(), operation, before, 0)
         .unwrap();
     let Some(Body::ConversationEvent(event)) = reply.body else {
         panic!("completed tool event");
@@ -1390,7 +1396,7 @@ fn rejected_call_projection_uses_codes_and_never_guesses_text() {
         .extend([rejected, oversized]);
     let reply = fixture
         .owner
-        .observe(pb::Envelope::default(), operation, 0)
+        .observe(pb::Envelope::default(), operation, 0, 0)
         .unwrap();
     let Some(Body::ConversationEvent(event)) = reply.body else {
         panic!("activity event");
@@ -1548,6 +1554,7 @@ fn j1t_05_late_tool_result_never_fails_the_turn() {
             project_name_revision: None,
             project_name_changed: None,
             stale_project_name_revision: false,
+            response_bytes: None,
         }),
         now + Duration::from_secs(120),
     );
@@ -1698,6 +1705,7 @@ impl Journaled {
             Job::ToolIntent => "tool_call",
             Job::ToolResult => "tool_result",
             Job::Finish => "finish",
+            Job::ResponseText => "response_text",
             _ => "other",
         };
         assert!(reply.is_ok(), "{tag}: {:?}", reply.as_ref().err());
@@ -1885,7 +1893,7 @@ fn tcr_i11_two_hundred_calls_run_and_the_next_is_limit() {
     let operation = journaled.owner.active.as_ref().unwrap().turn.operation;
     let reply = journaled
         .owner
-        .observe(pb::Envelope::default(), operation, 0)
+        .observe(pb::Envelope::default(), operation, 0, 0)
         .unwrap();
     let Some(Body::ConversationEvent(event)) = reply.body else {
         panic!("activity event");
@@ -1991,4 +1999,109 @@ fn aggregate_measurements_fail_closed_on_arithmetic_overflow() {
     });
     assert_eq!(m.input, None);
     assert!(!m.complete);
+}
+
+// ---------------------------------------------------------- response text
+// response-text-transfer.md: kind 24 segments, the kind 8 tail and the
+// output pause, through the real owner and a real private journal.
+
+/// RT-05 (owner, real journal): with 184,320 unjournaled bytes the helper's
+/// next credit is withheld while kind 24 segments commit; it is released once
+/// fewer than 122,880 bytes wait; the terminal tail completes the response.
+#[test]
+fn rt05_backlog_journals_segments_and_withholds_credit_until_they_commit() {
+    const SEGMENT: usize = 61_440;
+    let mut journaled = Journaled::new();
+    let active = journaled.active();
+    active.model.response_test_revision(1);
+    active.cursor += 1;
+    let full = "a😀é".repeat(3 * SEGMENT / 7);
+    active.response.revise(0, &full, active.cursor).unwrap();
+    let mut segments = 0;
+    let mut released = Vec::new();
+    loop {
+        journaled.owner.drive(Instant::now());
+        let segment_pending = journaled.owner.pending.is_some();
+        let active = journaled.active();
+        // The unjournaled tail never exceeds two pauses' worth plus a revision.
+        let backlog = active.response.backlog();
+        assert!(backlog <= 3 * SEGMENT);
+        let credits = active.model.response_test_credits();
+        // No credit while 122,880 or more bytes wait for the journal.
+        assert!(
+            backlog < 2 * SEGMENT || credits.is_empty(),
+            "credit at {backlog}"
+        );
+        released.extend(credits);
+        if !segment_pending {
+            break;
+        }
+        assert_eq!(journaled.settle(), "response_text");
+        let active = journaled.active();
+        let backlog = active.response.backlog();
+        let credits = active.model.response_test_credits();
+        assert!(
+            backlog < 2 * SEGMENT || credits.is_empty(),
+            "credit at {backlog}"
+        );
+        released.extend(credits);
+        segments += 1;
+    }
+    assert_eq!(segments, 2);
+    assert_eq!(released, vec![3]);
+    let active = journaled.active();
+    assert!(active.response.backlog() <= SEGMENT);
+    Owner::helper_terminal(active, 1, 0, None);
+    active.model = ModelOwner::settled_test_fixture();
+    journaled.owner.drive(Instant::now());
+    assert_eq!(journaled.settle(), "finish");
+    let records = journaled.records();
+    let mut offsets = Vec::new();
+    let mut rebuilt = String::new();
+    for record in &records {
+        match record {
+            journal::Record::ResponseText(segment) => {
+                offsets.push(segment.offset);
+                rebuilt.truncate(segment.offset as usize);
+                rebuilt.push_str(&segment.text);
+            }
+            journal::Record::TurnTerminal(terminal) => {
+                assert_eq!(terminal.kind, journal::TerminalKind::Complete);
+                rebuilt.truncate(terminal.text_offset as usize);
+                rebuilt.push_str(&terminal.text);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(offsets.len(), 2);
+    assert_eq!(offsets[0], 0);
+    assert_eq!(rebuilt, full);
+}
+
+/// RT-07 (owner): a kind 24 segment refused for journal capacity ends the
+/// turn with cancel cause `output_limit`; the response keeps the journaled
+/// prefix plus one tail and observers see a cut.
+#[test]
+fn rt07_refused_segment_cancels_with_output_limit_and_keeps_one_tail() {
+    let mut fixture = Fixture::new();
+    let active = fixture.active();
+    active.cursor += 1;
+    active
+        .response
+        .revise(0, &"x".repeat(200_000), active.cursor)
+        .unwrap();
+    assert!(active.response.next_segment().is_some());
+    let cursor = active.cursor;
+    fixture
+        .owner
+        .job_done(Job::ResponseText, Err(writer::Error::Limit), Instant::now());
+    assert!(fixture.owner.unavailable.is_none());
+    let active = fixture.active();
+    assert_eq!(active.cancel, Some(journal::Cause::OutputLimit));
+    assert_eq!(active.response.len(), 61_440);
+    assert!(active.cursor > cursor);
+    assert_eq!(active.response.tail().unwrap().0, 0);
+    // A client that held all 200,000 bytes is told to truncate.
+    let (start, text) = active.response.window(cursor, 200_000);
+    assert_eq!((start, text), (61_440, ""));
 }

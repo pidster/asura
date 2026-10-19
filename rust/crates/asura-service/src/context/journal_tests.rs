@@ -149,6 +149,7 @@ fn forty_turns_compose_within_the_window_and_reconstruct_after_replay() {
                 final_cursor: u64::MAX,
                 usage_known: true,
                 output_tokens: 12,
+                text_offset: 0,
                 text: format!("answer {generation}: {}", "words ".repeat(60)),
             }),
         ] {

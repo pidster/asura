@@ -12,8 +12,11 @@ pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const HEADER_BYTES: usize = 12;
 /// `ConversationEvent.tools` carries at most this many entries: the most recent
 /// tool calls of the turn (tool-call-records.md TCR-D31). The count keeps the
-/// TCR-D26 frame proof beside the 61,440-byte response text.
+/// TCR-D26 frame proof beside the response window.
 pub const MAX_TOOL_PROGRESS_ENTRIES: usize = 9;
+/// Response bytes in one `ConversationEvent` window: a per-event bound, not a
+/// response total (response-text-transfer.md).
+pub const MAX_RESPONSE_WINDOW_BYTES: usize = 61_440;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     BadMagic,

@@ -2,7 +2,8 @@
 //! Swift helper, a scripted loopback Ollama endpoint, the real conversation
 //! owner, journal, payload and memory stores, in private scratch homes. Each
 //! case ends with a raw-byte sweep for the secrets it used.
-//! Cases: TCR-I01..I07, TCR-I09, TCR-E01..E03 (service part) and TCR-P2.
+//! Cases: TCR-I01..I07, TCR-I09, TCR-E01..E03 (service part), TCR-P2 and
+//! the response text transfer cases RT-03, RT-05 and RT-06 (integration).
 #[path = "support/queue_submit.rs"]
 mod queue_submit;
 use asura_client::Client;
@@ -194,6 +195,9 @@ enum Step {
     Call(String, Value),
     /// The final answer.
     Final,
+    /// The final answer with this text, streamed in NDJSON records of at most
+    /// 40,000 bytes of content.
+    Text(String),
     /// On receipt, create `create` (if any), then answer `then` only once
     /// `release` no longer exists. A test-harness hold, not product code.
     Held {
@@ -349,6 +353,22 @@ fn serve(
         socket.write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
         )?;
+        if let Step::Text(text) = &step {
+            let mut start = 0;
+            while start < text.len() {
+                let mut end = (start + 40_000).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let line = json!({"message": {"role": "assistant", "content": &text[start..end]},
+                    "done": false});
+                socket.write_all(format!("{line}\n").as_bytes())?;
+                start = end;
+            }
+            let done = json!({"message": {"role": "assistant", "content": ""},
+                "done": true, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3});
+            return socket.write_all(format!("{done}\n").as_bytes());
+        }
         let response = match step {
             Step::Call(name, arguments) => json!({
                 "message": {"role": "assistant", "content": "", "tool_calls": [
@@ -377,7 +397,7 @@ fn finish(
 ) -> Result<pb::ConversationEvent> {
     let end = Instant::now() + limit;
     loop {
-        let event = fixture.attach()?.observe_conversation(operation, 0)?;
+        let event = fixture.attach()?.observe_conversation(operation, 0, 0)?;
         if matches!(event.kind, Some(3..=6)) {
             return Ok(event);
         }
@@ -838,7 +858,7 @@ fn restarts() -> Result<()> {
             op.tools[0].result_frame.is_none(),
             "{label}: no kind 15 written"
         );
-        let event = fixture.attach()?.observe_conversation(operation, 0)?;
+        let event = fixture.attach()?.observe_conversation(operation, 0, 0)?;
         assert_eq!(event.kind, Some(6), "{label} {event:?}");
         let tool = &event.tools[0];
         assert_eq!(tool.state, Some(4), "{label} interrupted");
@@ -867,12 +887,12 @@ fn restarts() -> Result<()> {
         finish(&fixture, i05, Duration::from_secs(60))?.kind,
         Some(3)
     );
-    let before = fixture.attach()?.observe_conversation(i05, 0)?;
+    let before = fixture.attach()?.observe_conversation(i05, 0, 0)?;
     fixture.stop()?;
     let (bytes_before, _) = fixture.journal()?;
     fixture.start()?;
     fixture.wait_ready()?;
-    let after = fixture.attach()?.observe_conversation(i05, 0)?;
+    let after = fixture.attach()?.observe_conversation(i05, 0, 0)?;
     fixture.stop()?;
     let (bytes_after, replay) = fixture.journal()?;
     assert!(
@@ -961,7 +981,9 @@ fn held_append_and_cancel() -> Result<()> {
         let mut client = fixture.attach()?;
         within_100ms("Inspect", || Ok(client.inspect()?))?;
         let mut client = fixture.attach()?;
-        let event = within_100ms("observe", || Ok(client.observe_conversation(operation, 0)?))?;
+        let event = within_100ms("observe", || {
+            Ok(client.observe_conversation(operation, 0, 0)?)
+        })?;
         assert!(
             !matches!(event.kind, Some(3..=6)),
             "no time limit ended the turn"
@@ -1048,6 +1070,115 @@ fn unregistered_name() -> Result<()> {
     Ok(())
 }
 
+/// RT-03, RT-05 and RT-06 (integration): a 1,000,000-byte answer through the
+/// real Swift helper and service. While journal appends are held, the
+/// service holds at most 184,320 unjournaled response bytes and the helper
+/// waits for credit; after release the answer reaches the journal whole, in
+/// kind 24 segments and a kind 8 tail. A client that did not observe during
+/// the turn assembles it whole from windows of at most 61,440 bytes, each in
+/// one control frame of at most 64 KiB, also after a service restart.
+fn long_response() -> Result<()> {
+    let (mut fixture, model, project, _) = setup("response")?;
+    let full: String = "a😀é".repeat(1_000_000 / 7);
+    model.script(&[Step::Text(full.clone())]);
+    let hold = fixture.home.join("journal-hold-appends");
+    let operation = submit(&fixture, project, "RT-03")?;
+    // Hold appends once the first revision arrives.
+    let mut held_bytes = 0;
+    wait_for(Duration::from_secs(60), "first revision", || {
+        let event = fixture
+            .attach()
+            .and_then(|mut client| Ok(client.observe_conversation(operation, 0, 0)?));
+        if let Ok(event) = event
+            && let Some(bytes) = event.text_bytes
+            && bytes > 0
+        {
+            held_bytes = bytes;
+            let _ = std::fs::write(&hold, b"");
+            return true;
+        }
+        false
+    })?;
+    // While appends are held the response the service holds stays bounded.
+    let held_at = Instant::now();
+    let mut largest = 0;
+    while held_at.elapsed() < Duration::from_secs(2) {
+        let event = fixture.attach()?.observe_conversation(operation, 0, 0)?;
+        assert!(!matches!(event.kind, Some(3..=6)), "completed while held");
+        largest = largest.max(event.text_bytes.unwrap_or(0));
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (_, replay) = fixture.journal()?;
+    let journaled = replay.operations[&operation].response.len;
+    assert!(
+        largest <= journaled + 184_320,
+        "service held {largest} bytes with {journaled} journaled"
+    );
+    assert!(largest < full.len() as u64);
+    std::fs::remove_file(&hold)?;
+    let mut finished = None;
+    wait_for(Duration::from_secs(120), "terminal", || {
+        let replay = fixture.journal().map(|(_, replay)| replay);
+        finished = replay
+            .ok()
+            .and_then(|r| r.operations[&operation].terminal.clone());
+        finished.is_some()
+    })?;
+    // A late client assembles the whole answer from bounded windows.
+    let read = |fixture: &Fixture| -> Result<(String, usize)> {
+        let mut client = fixture.attach()?;
+        let mut assembly = asura_client::ResponseAssembly::default();
+        let mut windows = 0;
+        loop {
+            let event =
+                client.observe_conversation(operation, assembly.cursor(), assembly.held())?;
+            let envelope = pb::Envelope {
+                body: Some(pb::envelope::Body::ConversationEvent(event.clone())),
+                ..Default::default()
+            };
+            // One control frame of at most 64 KiB.
+            let frame = asura_control::encode_frame(&envelope)
+                .map_err(|e| format!("event frame: {e:?}"))?;
+            assert!(frame.len() <= asura_control::MAX_FRAME_BYTES + asura_control::HEADER_BYTES);
+            assert!(event.text.as_ref().map_or(0, String::len) <= 61_440);
+            assembly.apply(&event)?;
+            windows += 1;
+            if assembly.done() {
+                assert_eq!(event.kind, Some(3), "{:?}", event.reason);
+                return Ok((assembly.text().to_owned(), windows));
+            }
+        }
+    };
+    let (text, windows) = read(&fixture)?;
+    assert!(
+        text == full,
+        "assembled {} of {} bytes",
+        text.len(),
+        full.len()
+    );
+    assert!(windows >= full.len() / 61_440);
+    let (bytes, replay) = fixture.journal()?;
+    let op = &replay.operations[&operation];
+    assert_eq!(op.response.len, full.len() as u64);
+    let segments = frames(&bytes[op.accepted_frame.start..])?
+        .into_iter()
+        .filter(|(_, record)| {
+            matches!(record, journal::Record::ResponseText(p) if p.operation == operation)
+        })
+        .count();
+    assert!(segments >= full.len() / 61_440 - 1, "{segments} segments");
+    // The journal is the source after a restart.
+    fixture.stop()?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    assert!(read(&fixture)?.0 == full);
+    println!(
+        "PASS RT-03/RT-05/RT-06 integration: {} bytes in {segments} kind 24 segments; at most {largest} bytes held while appends stalled; {windows} windows",
+        full.len()
+    );
+    Ok(())
+}
+
 fn child(home: &Path) -> Result<()> {
     asura_platform::journal_gate::install_file_gate(home);
     tracing_subscriber::fmt()
@@ -1081,13 +1212,14 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 6] = [
+    let cases: [Case; 7] = [
         ("malformed", malformed_then_valid),
         ("secret", exec_cmd_secret),
         ("create", create_note_body),
         ("unregistered", unregistered_name),
         ("held", held_append_and_cancel),
         ("restart", restarts),
+        ("response", long_response),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

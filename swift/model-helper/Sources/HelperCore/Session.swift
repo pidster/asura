@@ -37,8 +37,16 @@ public actor HelperSession {
     private var measuredContext = false
     private var settledInferenceOrdinal: UInt32 = 0
     private var activeInferenceOrdinal: UInt32?
-    private var latest: Snapshot?
+    /// The response text as the service holds it after the last SnapshotEnd.
+    private var committed = Data()
+    /// The newest SDK text not yet committed; `targetVersion` changes with it.
+    private var target: Data?
+    private var targetVersion: UInt64 = 0
+    /// One revision in flight: at most `Limits.revisionBytes` after `transmitOffset`.
     private var transmitting: Data?
+    private var transmitOffset = 0
+    private var transmitEnd = 0
+    private var transmitVersion: UInt64 = 0
     private var transfer: UInt64 = 2
     private var revision: UInt64 = 0
     private var transferChunks: UInt64 = 0
@@ -376,8 +384,8 @@ public actor HelperSession {
             try await transport.send(envelope(.contextMeasured(measured)))
             return
         }
-        guard value.text.utf8.count <= Limits.output else { throw BackendFailure(.outputLimit) }
-        latest = value
+        // No response size, revision or transmitted-byte total (owner, 2026-10-18).
+        target = Data(value.text.utf8); targetVersion &+= 1; usage = value.usageTokens
         try await pump()
     }
     private func backendCancelled(taskCancelled: Bool) async {
@@ -397,7 +405,7 @@ public actor HelperSession {
     private func completed() async {
         guard phase == .running else { return }
         backendFinished = true
-        if revision == 0 && latest == nil { latest = Snapshot(text: "") }
+        if revision == 0 && target == nil { target = Data(); targetVersion &+= 1 }
         do { try await pump() } catch { await fail(.outputLimit, cancelled: false) }
     }
 
@@ -407,22 +415,31 @@ public actor HelperSession {
         defer { pumping = false }
         while phase == .running {
             if transmitting == nil {
-                guard let next = latest else {
+                guard let next = target else {
                     if backendFinished {
                         try await terminal(pendingFailure == nil ? .complete : .failed,
                             reason: pendingFailure ?? .none)
                     }
                     return
                 }
-                guard revision < 1024 else { throw BackendFailure(.outputLimit) }
-                latest = nil; revision += 1; transferChunks = 0
-                transmitting = Data(next.text.utf8); usage = next.usageTokens
+                let prefix = Self.sharedPrefix(committed, next)
+                // An unchanged text needs no revision; the first is always sent.
+                if revision > 0 && prefix == committed.count && prefix == next.count {
+                    target = nil
+                    continue
+                }
+                var end = min(next.count, prefix + Limits.revisionBytes)
+                while end < next.count && end > prefix && next[end] & 0xC0 == 0x80 { end -= 1 }
+                guard revision < UInt64.max - 1 else { throw HelperError.protocolFault }
+                revision += 1; transferChunks = 0
+                transmitting = next.subdata(in: prefix..<end)
+                transmitOffset = prefix; transmitEnd = end; transmitVersion = targetVersion
             }
             guard let bytes = transmitting, var ledger = ledgers[transfer] else { throw HelperError.protocolFault }
             while ledger.sent < UInt64(bytes.count) {
                 guard ledger.granted > ledger.sent else { return }
                 let count = min(Limits.chunk, Int(ledger.granted - ledger.sent), bytes.count - Int(ledger.sent))
-                guard totalBytes + UInt64(count) <= UInt64(Limits.cumulativeOutput) else { throw BackendFailure(.outputLimit) }
+                guard totalBytes <= UInt64.max - UInt64(count), totalChunks < UInt64.max else { throw HelperError.protocolFault }
                 var chunk = Asura_Model_V1_Chunk()
                 chunk.transferID = transfer; chunk.direction = .output
                 chunk.ordinal = transferChunks; chunk.revision = revision
@@ -435,13 +452,35 @@ public actor HelperSession {
             }
             var end = Asura_Model_V1_SnapshotEnd()
             end.revision = revision; end.count = transferChunks; end.totalBytes = UInt64(bytes.count)
+            end.offset = UInt64(transmitOffset)
             let old = transfer
             transfer += 1
             ledgers = [old: ledger, transfer: Ledger()]
+            committed.removeSubrange(transmitOffset..<committed.count)
+            committed.append(bytes)
+            // The whole target is committed unless a newer snapshot replaced it.
+            if transmitVersion == targetVersion, let current = target, transmitEnd == current.count {
+                target = nil
+            }
             transmitting = nil
             // Keep SnapshotEnd ordered after the data it terminates.
             try await transport.send(envelope(.snapshotEnd(end)), control: false)
         }
+    }
+
+    /// Length of the common prefix, backed off to a UTF-8 character boundary
+    /// in both texts.
+    static func sharedPrefix(_ a: Data, _ b: Data) -> Int {
+        var n = 0
+        let limit = min(a.count, b.count)
+        a.withUnsafeBytes { x in
+            b.withUnsafeBytes { y in
+                while n < limit && x[n] == y[n] { n += 1 }
+            }
+        }
+        func inside(_ data: Data, _ index: Int) -> Bool { index < data.count && data[index] & 0xC0 == 0x80 }
+        while n > 0 && (inside(a, n) || inside(b, n)) { n -= 1 }
+        return n
     }
 
     private func terminal(_ outcome: Asura_Model_V1_Outcome, reason: Reason) async throws {
@@ -453,7 +492,7 @@ public actor HelperSession {
             activeInferenceOrdinal = nil; settledInferenceOrdinal = ordinal
             try await transport.send(envelope(.inferenceUsage(RequestUsage(ordinal: ordinal).wire)))
         }
-        latest = nil; transmitting = nil; inputData.removeAll(); decodedInput = nil
+        target = nil; transmitting = nil; inputData.removeAll(); decodedInput = nil
         var end = Asura_Model_V1_Terminal()
         end.outcome = outcome; end.lastRevision = revision
         end.count = totalChunks; end.totalBytes = totalBytes; end.reason = reason

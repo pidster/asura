@@ -158,7 +158,7 @@ pub(super) fn run() -> Result<()> {
     let mut helper = None;
     loop {
         assert!(Instant::now() < end, "long inference fixture deadline");
-        let event = fixture.attach()?.observe_conversation(operation, 0)?;
+        let event = fixture.attach()?.observe_conversation(operation, 0, 0)?;
         if generation_started.elapsed() > Duration::from_secs(61) && !checked_control {
             assert!(
                 !matches!(event.kind, Some(3..=6)),

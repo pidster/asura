@@ -52,6 +52,7 @@ fn response(outcome: MemoryCreateResult) -> writer::Reply {
         project_name_revision: None,
         project_name_changed: None,
         stale_project_name_revision: false,
+        response_bytes: None,
     }
 }
 struct Writer(writer::WriterHandle);
@@ -239,6 +240,7 @@ fn pending_projection() -> Arc<journal::Replay> {
     replay.operations.insert(
         create.operation,
         journal::Operation {
+            response: Default::default(),
             conversation: [5; 16],
             generation: 1,
             task: [6; 16],

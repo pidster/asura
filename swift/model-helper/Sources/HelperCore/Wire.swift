@@ -17,9 +17,11 @@ public enum Limits {
     public static let creditWindow: UInt64 = 65_536
     public static let historyEntries = 2048
     public static let toolSchemaBytes: UInt32 = 1_048_576
-    public static let output = 61_440
+    /// Bytes one output revision appends: a per-transfer bound, not a
+    /// response total. Revisions and cumulative output have no upper bound
+    /// (owner, 2026-10-18; response-text-transfer.md).
+    public static let revisionBytes = 61_440
     public static let chunk = 16_384
-    public static let cumulativeOutput = 4 * 1024 * 1024
     /// Tool calls a turn may record (owner, 2026-10-18; tool-call-records.md TCR-D32).
     public static let recordedToolCalls: UInt32 = 200
     /// Tool proposals per turn: the recorded calls plus the one over-limit proposal (TCR-D6).
@@ -76,10 +78,10 @@ public enum Wire {
         }
         func counts(_ count: UInt64, _ bytes: UInt64, _ max: UInt64) -> Bool {
             bytes <= max && count <= bytes && (count == 0) == (bytes == 0)
-                && (bytes == 0 || count >= (bytes + 16_383) / 16_384)
+                && count >= bytes / 16_384 + (bytes % 16_384 == 0 ? 0 : 1)
         }
         func transfer(_ id: UInt64, _ direction: Asura_Model_V1_TransferDirection) -> Bool {
-            direction == .input ? id == 1 : direction == .output && (2...1025).contains(id)
+            direction == .input ? id == 1 : direction == .output && id >= 2
         }
         if case .hello = body {
             try check(!value.hasOperationID && !value.hasGeneration)
@@ -181,11 +183,12 @@ public enum Wire {
             try check(v.hasTransferID && v.hasDirection && transfer(v.transferID, v.direction)
                 && v.direction == (service ? .input : .output) && v.hasData && !v.data.isEmpty && v.data.count <= Limits.chunk
                 && v.hasRevision && v.hasOrdinal)
-            try check(service ? v.revision == 0 && v.ordinal < 65_536 : (1...1024).contains(v.revision) && v.ordinal < 61_440)
+            try check(service ? v.revision == 0 && v.ordinal < 65_536
+                : v.revision >= 1 && v.revision < UInt64.max && v.ordinal < UInt64(Limits.revisionBytes))
         case .credit(let v):
             try check(v.hasTransferID && v.hasDirection && transfer(v.transferID, v.direction)
                 && v.direction == (service ? .output : .input) && v.hasAcceptedBytes && v.hasGrantedBytes
-                && v.acceptedBytes <= (service ? 61_440 : Limits.input) && v.grantedBytes >= v.acceptedBytes
+                && v.acceptedBytes <= (service ? UInt64(Limits.revisionBytes) : Limits.input) && v.grantedBytes >= v.acceptedBytes
                 && v.grantedBytes - v.acceptedBytes <= Limits.creditWindow)
         case .inputEnd(let v):
             try check(service && v.hasCount && v.count > 0 && v.count <= 65_536 && v.hasTotalBytes
@@ -194,8 +197,9 @@ public enum Wire {
         case .start: try check(service)
         case .cancel(let v): try check(service && v.hasReason && (1...4).contains(v.reason.rawValue))
         case .snapshotEnd(let v):
-            try check(!service && v.hasRevision && (1...1024).contains(v.revision) && v.hasCount && v.hasTotalBytes
-                && counts(v.count, v.totalBytes, 61_440))
+            try check(!service && v.hasRevision && v.revision >= 1 && v.revision < UInt64.max
+                && v.hasCount && v.hasTotalBytes && v.hasOffset
+                && counts(v.count, v.totalBytes, UInt64(Limits.revisionBytes)))
         case .toolCall(let v):
             // Exactly one of name / name_bytes and of arguments / arguments_bytes.
             try check(!service && v.hasOrdinal && (1...Limits.toolProposals).contains(v.ordinal)
@@ -213,8 +217,8 @@ public enum Wire {
             if v.status != .success { try check(!v.hasNextOffset) }
         case .terminal(let v):
             try check(!service && v.hasUsageKnown && (v.usageKnown ? v.hasUsageTokens && v.usageTokens <= UInt64(Limits.maximumResponseTokens) : !v.hasUsageTokens)
-                && v.hasLastRevision && v.lastRevision <= 1024 && v.hasCount && v.hasTotalBytes
-                && counts(v.count, v.totalBytes, 4 * 1024 * 1024) && v.hasOutcome && v.hasReason)
+                && v.hasLastRevision && v.hasCount && v.hasTotalBytes
+                && counts(v.count, v.totalBytes, UInt64.max) && v.hasOutcome && v.hasReason)
             if v.outcome == .complete { try check(v.lastRevision > 0 && v.reason == .none) }
             else { try check((v.outcome == .failed || v.outcome == .cancelled) && (1...12).contains(v.reason.rawValue)) }
         }

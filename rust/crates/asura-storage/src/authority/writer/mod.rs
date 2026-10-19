@@ -133,6 +133,13 @@ pub enum Command {
     ReadRecord {
         range: Range<usize>,
     },
+    /// One window of a terminal operation's response: the kind 8 record with
+    /// `text` replaced by at most `MAX_TEXT` bytes starting at the largest
+    /// character boundary not after `offset` (response-text-transfer.md).
+    ReadResponse {
+        operation: Id,
+        offset: u64,
+    },
     History {
         project: Id,
         conversation: Option<Id>,
@@ -181,6 +188,8 @@ pub struct Reply {
     pub project_name_revision: Option<u64>,
     pub project_name_changed: Option<bool>,
     pub stale_project_name_revision: bool,
+    /// The whole response length for `ReadResponse`.
+    pub response_bytes: Option<u64>,
 }
 #[derive(Clone, Debug)]
 pub struct HistoryPage {
@@ -585,6 +594,7 @@ mod tests {
             project_name_revision: None,
             project_name_changed: None,
             stale_project_name_revision: false,
+            response_bytes: None,
         }
     }
     fn control() -> Command {

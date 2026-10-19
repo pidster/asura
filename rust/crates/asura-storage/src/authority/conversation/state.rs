@@ -5,7 +5,9 @@ use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 
 type Result<T> = std::result::Result<T, ReplayError>;
-const TERMINAL_CAPACITY: usize = HEADER + TRAILER + 43 + MAX_TEXT;
+const TERMINAL_CAPACITY: usize = HEADER + TRAILER + 51 + MAX_TEXT;
+/// Replay memory charged for each stored response piece.
+const PIECE_CHARGE: usize = 64;
 const START_CAPACITY: usize = HEADER + TRAILER + 72;
 const CANCEL_CAPACITY: usize = HEADER + TRAILER + 25;
 const OWNER_CAPACITY: usize = HEADER + TRAILER;
@@ -425,6 +427,17 @@ impl Replay {
                 }
             }
             Record::TurnTerminal(p) => self.terminal(p, frame)?,
+            Record::ResponseText(p) => {
+                // Kind 24: an accepted, started, nonterminal operation of
+                // this owner generation (response-text-transfer.md).
+                let op = self.operation_mut(p.operation, p.generation)?;
+                require(op.helper.is_some())?;
+                require(p.offset < op.response.len || !p.text.is_empty())?;
+                op.response
+                    .apply(p.offset, p.text.len() as u64, frame)
+                    .ok_or(ReplayError::Corrupt)?;
+                self.charge(PIECE_CHARGE)?;
+            }
         }
         Ok(())
     }
@@ -653,6 +666,7 @@ impl Replay {
                 cancel: None,
                 terminal: None,
                 tools: Vec::new(),
+                response: Response::default(),
             },
         );
         self.active_operation = Some(p.operation);
@@ -1020,6 +1034,11 @@ impl Replay {
         if op.helper.is_none() {
             require(p.usage_known && p.output_tokens == 0)?;
         }
+        // The tail follows `text_offset` bytes of the journaled response.
+        let mut response = op.response.clone();
+        response
+            .apply(p.text_offset, p.text.len() as u64, frame.clone())
+            .ok_or(ReplayError::Corrupt)?;
         match p.kind {
             TerminalKind::Complete => require(
                 // Every `run` call has its kind 15; a call that does not run is
@@ -1028,7 +1047,7 @@ impl Replay {
                     && op.tools.iter().all(|t| !t.unresolved())
                     && op.cancel.is_none()
                     && p.cause == Cause::None
-                    && !p.text.is_empty()
+                    && response.len > 0
                     && op.owner_generation == owner,
             )?,
             TerminalKind::Interrupted => {
@@ -1053,8 +1072,9 @@ impl Replay {
             output_tokens: p.output_tokens,
             frame,
         });
+        op.response = response;
         self.active_operation = None;
-        Ok(())
+        self.charge(PIECE_CHARGE)
     }
     fn reserve(&mut self) -> Result<()> {
         self.reserved_bytes = 0;
@@ -1262,6 +1282,7 @@ mod restoration_tests {
             cancel: None,
             terminal: None,
             tools: Vec::new(),
+            response: Response::default(),
         };
         // ID order is opposite acceptance order, and a later other-project
         // admission cannot displace this project's selected conversation.

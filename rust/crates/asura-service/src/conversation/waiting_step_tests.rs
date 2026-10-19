@@ -81,9 +81,9 @@ fn ws01_each_owner_state_maps_to_its_step() {
     }
     let mut fixture = owner_at(Some(HelperStep::Running), true);
     let active = fixture.owner.active.as_mut().unwrap();
-    active.snapshot = "first text".into();
+    active.response.revise(0, "first text", 3).unwrap();
     assert_eq!(wait_step(active), None);
-    active.snapshot.clear();
+    active.response.revise(0, "", 4).unwrap();
     active.cancel = Some(journal::Cause::UserCancel);
     assert_eq!(wait_step(active), None);
     active.cancel = None;
@@ -108,6 +108,7 @@ fn terminal(kind: journal::TerminalKind) -> journal::TurnTerminal {
         final_cursor: u64::MAX,
         usage_known: true,
         output_tokens: 0,
+        text_offset: 0,
         text: String::new(),
     }
 }
@@ -121,25 +122,26 @@ fn ws02_pending_event_carries_the_step_and_text_removes_it() {
             operation_id: Some(OPERATION.to_vec()),
             after_cursor: Some(2),
             wait_ms: Some(0),
+            text_offset: None,
         }))
     };
-    let pending = event(fixture.owner.observe(observe(), OPERATION, 2).unwrap());
+    let pending = event(fixture.owner.observe(observe(), OPERATION, 2, 0).unwrap());
     assert_eq!(pending.kind, Some(1));
     assert_eq!(pending.waiting_step, Some(Step::ModelOutput as i32));
     fixture.owner.active.as_mut().unwrap().model =
         ModelOwner::step_test_fixture(Some(HelperStep::Input));
-    let sending = event(fixture.owner.observe(observe(), OPERATION, 2).unwrap());
+    let sending = event(fixture.owner.observe(observe(), OPERATION, 2, 0).unwrap());
     assert_eq!(sending.waiting_step, Some(Step::SendingInput as i32));
     fixture.owner.active.as_mut().unwrap().model =
         ModelOwner::step_test_fixture(Some(HelperStep::Running));
     let active = fixture.owner.active.as_mut().unwrap();
-    active.snapshot = "partial".into();
+    active.response.revise(0, "partial", 3).unwrap();
     active.cursor = 3;
-    let snapshot = event(fixture.owner.observe(observe(), OPERATION, 2).unwrap());
+    let snapshot = event(fixture.owner.observe(observe(), OPERATION, 2, 0).unwrap());
     assert_eq!(snapshot.kind, Some(2));
     assert_eq!(snapshot.waiting_step, None);
     // An equal-cursor heartbeat after text names no step.
-    let heartbeat = event(fixture.owner.observe(observe(), OPERATION, 3).unwrap());
+    let heartbeat = event(fixture.owner.observe(observe(), OPERATION, 3, 7).unwrap());
     assert_eq!(heartbeat.kind, Some(1));
     assert_eq!(heartbeat.waiting_step, None);
 }
