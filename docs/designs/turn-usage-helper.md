@@ -14,7 +14,12 @@ Owner decision, 2026-10-18: “We found these types of tool and turn limits to b
 profoundly limiting in Wisp.” The helper no longer limits the number of requests
 in a turn and no longer keeps a turn output-token budget. The 64-request cap, the
 2,048-token turn total, its refunds and the durable turn reservation are removed.
-Each request keeps its own output cap. See [request caps and admission](#request-caps-and-admission).
+
+Owner decision, 2026-10-19: “Model's own limit.” No request has an Asura output
+cap. Each inference request writes until the model stops or its context window
+is full. The 1,024 first-request cap, the 512 later-request cap, the caller's
+`Begin` cap and the 2,048 per-request ceiling are removed. See
+[request admission](#request-admission).
 
 ## Scope and ownership
 
@@ -52,7 +57,7 @@ cached usage rather than use its existing synthetic SDK cached count of zero.
 
 ## Request and report contract
 
-Each executor invocation admitted under the request caps receives one ordinal,
+Each executor invocation that [request admission](#request-admission) admits receives one ordinal,
 starting at 1. The observer holds at most one active UUID, ordinal and counter tuple.
 Overlapping invocations fail with the existing protocol failure; no second lane
 or unbounded map is created. No request count or turn token total limits admission
@@ -89,35 +94,62 @@ duplicates, missing start markers, invalid bounds and reports after terminal.
 A normally completed request emits exactly one report before the next request
 starts. No additional inference runs to collect missing statistics.
 
-## Request caps and admission
+## Request admission
 
-Selected design (owner, 2026-10-18). The request wrapper admits any number of
-requests in a turn. It keeps no turn output-token total, refunds nothing and has
-no remaining-budget check. The 64-request cap and the 2,048-token turn budget are
-removed. A turn ends by [loop closure](loop-closure.md#current-loops): the model
-completes, the 201st tool proposal is recorded, the person cancels or steers, the
-context window fills, the provider fails, the helper exits or the service stops.
+Selected design (owner, 2026-10-18; output caps removed by the owner,
+2026-10-19). The request wrapper admits any number of requests in a tool-enabled
+turn. It keeps no turn output-token total, no per-request output cap and no
+remaining-budget check. A turn ends by [loop closure](loop-closure.md#current-loops):
+the model completes, the 201st tool proposal is recorded, the person cancels or
+steers, the context window fills, the provider fails, the helper exits or the
+service stops.
 
-Each request keeps its own output cap. The caller's cap is the `Begin`
-`max_response_tokens` value. The service sends its per-request ceiling,
-`MAX_RESPONSE_TOKENS` (2,048); the wire accepts 1–2,048.
+`Begin` carries no output-token value; field 4 is reserved. The executor wrapper
+sets `GenerationOptions.maximumResponseTokens` on each request so that no Asura
+value can stop the model before its context window is full:
 
-- **Tool-enabled generation:** the first request has a cap of at most 1,024 tokens.
-  Each later request has a cap of at most 512 tokens. The actual cap is the minimum
-  of that value, the caller's cap and the cap that the SDK requests.
-- **Plain text:** one request has the minimum of the caller's cap and the SDK
-  request cap. A second plain-text dispatch fails with the output-limit result
-  before provider I/O.
+| Provider | Request option | Reason |
+| --- | --- | --- |
+| System (Apple FoundationModels) | `nil` | The framework then writes until the model stops or reports `contextSizeExceeded`. |
+| Ollama | The adapter ignores the option and sends `num_predict: -1` | Ollama documents −1 as “infinite generation” and as the default. Asura sends it explicitly so that a Modelfile `PARAMETER num_predict` cannot add a cap. |
+| CoreAI and MLX | The model's effective context window `E`, from Hello | With `nil`, the pinned adapters substitute their own defaults: CoreAI 512 tokens (2,048 for reasoning models) and MLX 4,096. A value of `E` cannot stop output before the window is full, because the input also occupies the window. |
 
-The usage observer still checks each measured output count against that request's
-cap. A count above the cap is a provider protocol failure. A measured count no
-longer releases tokens, because no turn total exists. Per-request usage reports
-remain; the service sums them for the turn statistics display.
+- **Tool-enabled generation:** every request is admitted while no earlier
+  failure is recorded and no other request is active.
+- **Plain text:** one request is admitted. A plain-text turn has no tool
+  continuation, so a second dispatch can only be an SDK retry that repeats the
+  answer. The second dispatch fails with the output-limit result before provider
+  I/O. This rule did not exist only for the removed cap, so it stays.
+
+A full context window ends the run cleanly with `context_limit`. The received
+text stays as the response prefix:
+
+- FoundationModels `LanguageModelError.contextSizeExceeded` maps to `context_limit`.
+- Ollama `done_reason: "length"` maps to `context_limit`. With `num_predict: -1`,
+  `shift: false` and `truncate: false`, a length stop can only mean a full window.
+  Ollama 0.40.5 was checked on 2026-10-19: with `num_ctx` 256 and no
+  `num_predict`, the stream ended with `done_reason: "length"`,
+  `prompt_eval_count` 30 and `eval_count` 226 (sum 256).
+- CoreAI and MLX end at their own window behavior. This design adds no check for
+  them; native qualification of that end state is not recorded.
+
+The usage observer checks each measured count only against the 1,000,000,000
+counter bound. No count can exceed a request cap, because none exists. The
+plain-text terminal usage uses the same 1,000,000,000 validity bound. The Ollama
+adapter also rejects an `eval_count` above the request's `num_ctx`, because
+output cannot exceed the window. Per-request usage reports remain; the service
+sums them for the turn statistics display. Unknown counters stay unknown.
+
+The [context composer](context-composer.md#per-request-budget-algorithm) leaves
+room for the answer with its output reservation `R`. That reservation is a
+composition target, not an output cap: the model is not stopped at `R`. When a
+token counter exists (system model), the helper fails with `context_limit` only
+when the exact input count leaves no room for one output token.
 
 ### Request admission — selected design
 
 Arrows show admission decisions within the existing executor. No path counts
-requests or tokens across the turn.
+requests or tokens across the turn, and no path applies an output cap.
 
 ```mermaid
 flowchart TD
@@ -126,18 +158,17 @@ flowchart TD
     Failed -->|No| Mode{Tools enabled?}
     Mode -->|No| Plain{First plain-text request?}
     Plain -->|No| Reject
-    Plain -->|Yes| PlainCap[Cap = min of caller cap and SDK cap]
-    Mode -->|Yes| First{First request of the turn?}
-    First -->|Yes| FirstCap[Cap = min of 1,024, caller cap and SDK cap]
-    First -->|No| LaterCap[Cap = min of 512, caller cap and SDK cap]
-    PlainCap --> Provider[Existing provider executor]
-    FirstCap --> Provider
-    LaterCap --> Provider
-    Provider --> Check{Measured output within the request cap?}
+    Plain -->|Yes| Option
+    Mode -->|Yes| Option{Provider}
+    Option -->|System or Ollama| Unset[maximumResponseTokens = nil]
+    Option -->|CoreAI or MLX| Window[maximumResponseTokens = window E]
+    Unset --> Provider[Existing provider executor<br/>Ollama sends num_predict -1]
+    Window --> Provider
+    Provider --> Check{Measured counts valid?}
     Check -->|Yes or unknown| Report[Report request usage then release waiters]
     Check -->|No| Fault[Record provider protocol failure]
     Fault --> Report
-    Provider -->|Context window full| Full[Record context limit; turn fails]
+    Provider -->|Context window full:<br/>contextSizeExceeded or Ollama length| Full[Record context_limit; keep text; turn ends]
     Report --> Next[SDK may request the next pass]
 ```
 
@@ -228,12 +259,14 @@ cross-session usage cache. A helper crash leaves unfinished usage unknown.
 | UH07 | Duplicate report, overlapping start or invalid counter arrives | Existing protocol failure; no duplicated or invented statistics |
 | UH08 | Text streams before usage settlement | Full replacement response retained; report is delivered without replacing text |
 | UH09 | Slow reader saturates existing transport | Explicit bounded failure; no additional task, queue or hidden drop |
-| UH10 | Tool-enabled turn dispatches 100 requests with the caller cap 2,048 | Every request dispatches; caps are 1,024 then 512; ordinals 1–100 are reported in order; no request-count or turn-total failure |
-| UH11 | Output count exceeds the request cap or belongs to another request | Provider protocol failure; no later request reaches the provider |
+| UH10 | Tool-enabled turn dispatches 100 requests | Every request dispatches with no Asura output cap; ordinals 1–100 are reported in order; no request-count or turn-total failure |
+| UH11 | Output count exceeds 1,000,000,000, Ollama `eval_count` exceeds `num_ctx`, or a count belongs to another request | Provider protocol failure; no later request reaches the provider |
 | UH12 | Cancellation occurs while a request is admitted | No later request reaches the provider |
-| UH13 | Caller cap is smaller than the pass cap | Every request uses the caller cap; the sum across requests can exceed the caller cap |
+| UH13 | Requests reach the executor wrapper | System and Ollama requests carry `maximumResponseTokens = nil`; CoreAI and MLX requests carry the window `E`; the Ollama body has `num_predict: -1`; `Begin` has no output-token field |
 | UH14 | Plain-text turn requests a second dispatch | Second dispatch fails with the output-limit result before provider I/O |
 | UH15 | A later tool-turn request finds the context window full | The executor records `context_limit`; the turn fails with the context limit and no further request dispatches |
+| UH16 | Ollama ends a stream with `done_reason: "length"` | Delivered text is kept; the request fails with `context_limit`, not output-limit |
+| UH17 | Plain-text answer longer than 2,048 tokens, or tool-turn answer longer than 512 tokens after a tool call | The answer completes whole with a natural stop; usage records the actual count |
 
 Unit checks exercise observer request identity, zero, partial counts, invalid
 bounds, multiple passes and failure. Real-socket helper integration checks UH05,

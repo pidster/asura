@@ -47,6 +47,7 @@ enum MLXProvider {
             capabilities: profile.native,
             weightsLocation: { _ in directory }, load: { _, _ in container })
         return FoundationBackend(model: model, contextTokens: capacity, contextSource: .mlx,
-            modelName: "mlx:\(name)", supportsTools: supportsTools, capabilityProfile: profile)
+            modelName: "mlx:\(name)", supportsTools: supportsTools, capabilityProfile: profile,
+            responseTokensFromWindow: true)
     }
 }

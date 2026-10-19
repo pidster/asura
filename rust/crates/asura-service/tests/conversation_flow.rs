@@ -1564,7 +1564,8 @@ fn native_tools(provider: &str) -> Result<()> {
         assert_eq!(stats.complete, Some(true));
         assert!(stats.request_count.is_some_and(|n| (2..=64).contains(&n)));
         assert!(stats.input_tokens.is_some_and(|n| n > 0));
-        assert!(stats.output_tokens.is_some_and(|n| n > 0 && n <= 2048));
+        // No request output cap (owner, 2026-10-19): any positive measured sum.
+        assert!(stats.output_tokens.is_some_and(|n| n > 0));
         assert_eq!(stats.cached_input_tokens, None);
         assert!(stats.elapsed_ms.is_some());
         println!(

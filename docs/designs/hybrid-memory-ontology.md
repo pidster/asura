@@ -1922,8 +1922,8 @@ durable records and no foreign-context secret in outputs. Repeat native adapter
 journeys for CoreAI, MLX and verified local Ollama when their native qualification
 is available; a passing system journey cannot qualify another provider.
 Use separate admitted turns for list, read and source inspection. Each turn retains
-the existing [per-request output caps](turn-usage-helper.md#request-caps-and-admission)
-and 200-call limit.
+the 200-call limit; no request has an output cap (owner, 2026-10-19;
+[request admission](turn-usage-helper.md#request-admission)).
 A disabled-tool model must receive no memory definitions. Listing and selecting a
 model cannot grant memory access. No cloud endpoint participates.
 
@@ -2313,7 +2313,7 @@ is unknown. A resolution failure retains the journal publication gate and report
 Startup builds this state from unresolved typed intents before scheduling any
 Interrupted terminal or new inference. It persists the reconciled ToolResult first,
 then the existing Interrupted terminal with unknown usage and no charge (owner,
-2026-10-18; [turn usage](turn-usage-helper.md#request-caps-and-admission)).
+2026-10-18; [turn usage](turn-usage-helper.md#request-admission)).
 A committed intent cancelled before effect dispatch records an empty cancelled
 result without invoking mutation. Foreground accepted user turns have a separate
 memory-write grant; background sensor/classifier observations never obtain it.
@@ -2386,9 +2386,10 @@ Validation on macOS 27 arm64:
 Native model proposals are not deterministic. Earlier attempts supplied invalid
 arguments, which were rejected. Improved field guidance and fixed correction
 feedback used the then-current (historical) three-pass, 2,048-token turn and
-eight-proposal limits. The [request caps](turn-usage-helper.md#request-caps-and-admission)
-have since replaced the three-pass limit, removed the turn token budget and raised
-the call limit to 200 (owner, 2026-10-18).
+eight-proposal limits. [Request admission](turn-usage-helper.md#request-admission)
+has since replaced the three-pass limit, removed the turn token budget and raised
+the call limit to 200 (owner, 2026-10-18), then removed the per-request output
+caps (owner, 2026-10-19).
 The adapter never repairs arguments itself or sends rejected fields to storage.
 These checks qualify the named model/bundle combinations, not every local model.
 

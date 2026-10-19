@@ -201,8 +201,7 @@ private actor InventoryFlag {
 private actor InventoryBackend: ModelBackend {
     var generations = 0
     func status() async -> BackendStatus { BackendStatus(contextTokens: nil) }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-                  snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         generations += 1; throw HelperError.unavailable
     }
 }

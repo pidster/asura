@@ -2,18 +2,20 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-Each model request has its own output cap. A tool-enabled turn's first request
-is capped at 1,024 tokens and each later request at 512, or at the caller's cap
-if smaller. A plain-text turn makes one request at the caller's cap, at most 2,048.
-There is no per-turn output budget, reservation or request count (owner,
-2026-10-18; [request caps](turn-usage-helper.md#request-caps-and-admission)). Earlier
-numerical examples and validation evidence below describe that earlier packet.
+No model request has an Asura output cap (owner, 2026-10-19: “Model's own
+limit”). Each request writes until the model stops or its context window is
+full; a full window ends the request with `context_limit`. The 1,024 and 512
+tool-request caps, the caller's `Begin` cap and the 2,048 per-request ceiling
+are removed. A plain-text turn still makes one request. There is no per-turn
+output budget, reservation or request count (owner, 2026-10-18;
+[request admission](turn-usage-helper.md#request-admission)). Earlier numerical
+examples and validation evidence below describe earlier packets.
 
 Owner requirement, 2026-10-13: Asura will integrate local and remote models
 through the OpenAI API specification. Token limits must not be hard-coded; each
 model's context and output capacity sets its token bounds. The 2,048-token
-per-request cap above is current implementation to be replaced under
-[model-sized limits](loop-closure.md#model-sized-limits). The owner selected both
+per-request cap is removed (owner, 2026-10-19); the model's context window is the
+only output bound under [model-sized limits](loop-closure.md#model-sized-limits). The owner selected both
 the Chat Completions and Responses surfaces, capacity in the configuration file
 with sensible defaults, and probe, test, person confirmation and configuration
 only when neither a per-model entry nor a default applies. This design must
@@ -153,11 +155,11 @@ termination/reap. Adapter retries are disabled; cancellation invalidates its ses
 | Encoded request | 256 KiB including transcript and tool schemas |
 | NDJSON record | 64 KiB before decoding |
 | NDJSON stream | 4 MiB per HTTP request, a parser bound (L28 in [tool output views](tool-output-views.md#result-delivery-to-the-model)); no per-operation output total (owner, 2026-10-18) |
-| Response text | No byte total; the 2,048-token request cap bounds each request, and revisions of at most 61,440 bytes carry it ([response text transfer](response-text-transfer.md)) |
+| Response text | No byte or token total; the model's context window bounds each request, and revisions of at most 61,440 bytes carry it ([response text transfer](response-text-transfer.md)) |
 | Tool calls | 201 per provider stream: the turn's 200 recorded calls plus the over-limit ordinal 201 ([tool call records](tool-call-records.md); owner, 2026-10-18) |
 | Tool arguments | 16 KiB per call |
 | Ollama context request | At most 8,192 tokens, selected after `/api/show` discovery; reported maximum and effective request capacity are separate observations |
-| Output request | At most 2,048 tokens, the [per-request cap](turn-usage-helper.md#request-caps-and-admission) |
+| Output request | No Asura cap: `num_predict: -1`; the request's `num_ctx` window bounds output, and a full window (`done_reason: "length"`) ends it with `context_limit` ([request admission](turn-usage-helper.md#request-admission); owner, 2026-10-19) |
 
 Read network bytes incrementally and reject before growing the record buffer beyond
 its limit. HTTP error bodies are not logged or retained. Invalid or redirected
@@ -289,8 +291,10 @@ flowchart TD
 - MP2-L4 native: installed MLX/CoreAI assets produce a real response and a native
   tool callback through the common service grant/result cycle. Each model needs its
   own recorded evidence; one provider's success does not qualify another.
-- MP2-L5 native: per-request output cap, cancellation and missing-tool capability fail
-  truthfully. Input context/usage stay unknown if no actual measurement exists.
+- MP2-L5 native: a full context window (`context_limit`), cancellation and
+  missing-tool capability fail truthfully. Requests carry the context window as
+  `maximumResponseTokens`, so the adapter's own small default cannot stop output
+  (owner, 2026-10-19). Input context/usage stay unknown if no actual measurement exists.
 
 Initial investigation found installed SDK and cached pinned source for these APIs,
 an MLX asset in Wisp's store, and no CoreAI bundle in the inspected standard stores.
@@ -303,9 +307,12 @@ its native path. The recorded checks below are the current runtime evidence.
 Discovery must return a positive integer model-info key ending in `.context_length`.
 Conflicting values use the smallest reported maximum. The request context is the smaller
 of that maximum and 8,192 tokens; Hello reports both values and the discovery source.
-Missing capacity fails unavailable. `num_predict` comes from the common engine's
-current request's cap, between 1 and 2,048; each tool continuation has its own cap.
-Stream usage above that request limit fails. Discovery keeps its resource bounds;
+Missing capacity fails unavailable. Every request sends `num_predict: -1`
+(owner, 2026-10-19). Ollama documents −1 as “infinite generation”; sending it
+explicitly prevents a Modelfile `PARAMETER num_predict` from adding a cap. With
+`shift: false` and `truncate: false`, a stream that fills `num_ctx` ends with
+`done_reason: "length"`, which the adapter maps to `context_limit` and not to
+output-limit. An `eval_count` above `num_ctx` is an invalid response. Discovery keeps its resource bounds;
 the [endpoint configuration contract](#mp2-endpoint-configuration-handoff) governs
 local HTTP and remote HTTPS selection.
 
@@ -769,9 +776,9 @@ retains its 200-call limit and records ordinal 201 with decision `limit`. After
 the ordinal-201 result the helper fails the turn with output-limit; it does not
 return another correction. The wrapper forwards the original schema,
 name and description. It cannot expose an additional tool or grant authority.
-The existing per-request output caps (1,024 first, 512 later, under the
-[request caps](turn-usage-helper.md#request-caps-and-admission)), callback-waiter
-bound and output bounds remain unchanged. A turn has no request count or token
+No per-request output cap applies (owner, 2026-10-19;
+[request admission](turn-usage-helper.md#request-admission)). The callback-waiter
+bound and output transfer bounds remain unchanged. A turn has no request count or token
 total (owner, 2026-10-18). No retry
 scheduler or extra model dispatch owner is added; the SDK decides whether to
 correct its proposal within those limits.
@@ -784,15 +791,14 @@ flowchart TD
     Budget -->|Yes| Reserve[Reserve one proposal]
     Reserve --> Validate[Validate grouped arguments]
     Validate -->|Recoverable memory shape error| Hint[Return fixed correction with no service call]
-    Hint --> SDK[Existing SDK loop and per-request output caps]
+    Hint --> SDK[Existing SDK loop; no output cap]
     Validate -->|Valid| Service[Existing typed service handler and authority]
     Service -->|Ordinal 201: limit result| Limit
     Validate -->|Other failure| Fail[Retain existing failure]
 ```
 
 Tests must prove malformed creation followed by a valid creation reaches the host
-once, across the SDK loop; repeated correction cannot exceed the per-request
-output caps or 201 proposals; failed inference and cancellation cannot return a
+once, across the SDK loop; repeated correction cannot exceed 201 proposals; failed inference and cancellation cannot return a
 correction or invoke the host; and rejected fields remain rejected without their
 values appearing in feedback. All four public tool names and schemas stay intact.
 

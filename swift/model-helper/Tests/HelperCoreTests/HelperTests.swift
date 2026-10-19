@@ -57,7 +57,7 @@ private actor Scripted: ModelBackend {
     let capacity: UInt32
     init(capacity: UInt32 = 4096) { self.capacity = capacity }
     func status() async -> BackendStatus { BackendStatus(contextTokens: capacity, reportedContextTokens: capacity, contextSource: .system) }
-    func generate(_ input: ModelInput, maximumTokens: UInt32, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         calls += 1
         try await snapshot(Snapshot(text: "first"))
         await Task.yield()
@@ -150,7 +150,7 @@ private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = UInt64(data.count); begin.maxResponseTokens = 512
+    begin.inputBytes = UInt64(data.count)
     try await service.send(scoped(.begin(begin)))
     #expect(try Wire.decode(#require(try await replies.next())).credit.transferID == 1)
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
@@ -209,7 +209,7 @@ private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _
     var input = ModelInput(); input.instructions = String(repeating: "x", count: 200_000); input.prompt = "fixture"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = UInt64(data.count); begin.maxResponseTokens = 512
+    begin.inputBytes = UInt64(data.count)
     try await service.send(scoped(.begin(begin)))
     let first = try Wire.decode(#require(try await replies.next())).credit
     #expect(first.acceptedBytes == 0 && first.grantedBytes == Limits.creditWindow)
@@ -249,7 +249,7 @@ private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _
     try await service.send(hello(identity))
     _ = try Wire.decode(#require(try await replies.next()))
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = 8_001; begin.maxResponseTokens = 512
+    begin.inputBytes = 8_001
     try await service.send(scoped(.begin(begin)))
     var credited = false
     while let raw = try await replies.next() {
@@ -310,7 +310,6 @@ private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _
     try await service.send(hello(identity))
     _ = try await replies.next()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = 20
-    begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin)))
     _ = try await replies.next()
     var cancel = Asura_Model_V1_Cancel(); cancel.reason = .user
@@ -326,8 +325,7 @@ private func revise(_ response: inout Data, _ end: Asura_Model_V1_SnapshotEnd, _
 private actor Burst: ModelBackend {
     var produced = 0
     func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         for index in 0..<100 {
             try await snapshot(Snapshot(text: "snapshot-\(index)", usageTokens: 100))
             produced += 1
@@ -347,7 +345,6 @@ private actor Burst: ModelBackend {
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -398,7 +395,6 @@ private actor Burst: ModelBackend {
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -429,8 +425,7 @@ private actor Burst: ModelBackend {
 
 private struct UnsolicitedCancellationBackend: ModelBackend {
     func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         #expect(!Task.isCancelled)
         throw CancellationError()
     }
@@ -448,7 +443,6 @@ private struct UnsolicitedCancellationBackend: ModelBackend {
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    begin.maxResponseTokens = 512
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -466,8 +460,7 @@ private struct UnsolicitedCancellationBackend: ModelBackend {
 
 private struct PartialFailureBackend: ModelBackend {
     func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await snapshot(Snapshot(text: "first partial"))
         try await snapshot(Snapshot(text: "final partial", usageTokens: 19))
         throw BackendFailure(.outputLimit)
@@ -488,7 +481,6 @@ func backendFailureDrainsBoundedSnapshotsOrStopsAtExistingBoundary(_ action: Str
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    begin.maxResponseTokens = 2048
     let clock = ContinuousClock(); let started = clock.now
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
@@ -561,8 +553,7 @@ private actor CancellableGeneration: ModelBackend {
     func status() async -> BackendStatus {
         BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system)
     }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         started = true
         do { try await Task.sleep(for: .seconds(30)) }
         catch { cancelled = true; throw error }
@@ -587,7 +578,7 @@ private actor CancellableGeneration: ModelBackend {
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = UInt64(bytes.count); begin.maxResponseTokens = 512
+    begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -619,7 +610,7 @@ private actor CancellableGeneration: ModelBackend {
 /// Begin has no deadline field; the removed field 3 is an unknown field.
 @Test func beginCarriesNoDeadlineAndRemovedFieldIsRejected() throws {
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = 10; begin.maxResponseTokens = 512
+    begin.inputBytes = 10
     try Wire.validate(scoped(.begin(begin)), from: .service)
     var raw = try begin.serializedData(); raw.append(contentsOf: [0x18, 0xd0, 0x0f])
     let stale = try Asura_Model_V1_Begin(serializedBytes: raw)
@@ -666,7 +657,7 @@ func stalledTransferAndReadyHandoffWaitUntilCancel(ready: Bool) async throws {
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = UInt64(bytes.count); begin.maxResponseTokens = 512
+    begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     if ready {
         var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
@@ -692,8 +683,7 @@ private struct LateMeasured: ModelBackend {
     func status() async -> BackendStatus {
         BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system)
     }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await snapshot(Snapshot(text: "preserved response"))
         try await snapshot(Snapshot(text: "", inputContext: (700, 4096)))
         if duplicate { try await snapshot(Snapshot(text: "", inputContext: (700, 4096))) }
@@ -719,7 +709,7 @@ func lateInputMeasurementPreservesOutputAndRejectsDuplicate(_ duplicate: Bool) a
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = UInt64(data.count); begin.maxResponseTokens = 512
+    begin.inputBytes = UInt64(data.count)
     try await service.send(scoped(.begin(begin)))
     #expect(try Wire.decode(#require(try await replies.next())).credit.transferID == 1)
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
@@ -772,8 +762,7 @@ private actor UsageSocketBackend: ModelBackend {
     func status() async -> BackendStatus {
         BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system)
     }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await snapshot(Snapshot(text: "", inferenceStartedOrdinal: 1))
         started = true
         if mode == "cancel" {
@@ -805,7 +794,7 @@ func usageReportsPreserveTextAndCancellationHasOneReportBeforeTerminal(mode: Str
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"
-    begin.inputBytes = UInt64(bytes.count); begin.maxResponseTokens = 512
+    begin.inputBytes = UInt64(bytes.count)
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
@@ -882,8 +871,7 @@ private actor RevisionBackend: ModelBackend {
     init(texts: [String], gate: Bool) { self.texts = texts; self.gate = gate }
     func status() async -> BackendStatus { BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system) }
     func consume() { consumed += 1 }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         for (index, text) in texts.enumerated() {
             while gate && consumed < index { try await Task.sleep(for: .milliseconds(1)) }
             try await snapshot(Snapshot(text: text))
@@ -906,7 +894,6 @@ private func runRevisions(_ backend: RevisionBackend) async throws
     var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
     let bytes = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
-    begin.maxResponseTokens = 2048
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes

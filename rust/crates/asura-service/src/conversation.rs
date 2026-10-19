@@ -3289,8 +3289,8 @@ impl Owner {
                     };
                     let budget = crate::context::Budget {
                         window_tokens: context_tokens,
-                        // R: room for one request's cap, not a turn total.
-                        output_reservation: asura_control::model::MAX_RESPONSE_TOKENS,
+                        // R: answer room in the window, not an output cap.
+                        output_reservation: crate::context::output_reservation(context_tokens),
                         overhead_tokens: if active.tools_enabled {
                             tool_schema_bytes
                         } else {

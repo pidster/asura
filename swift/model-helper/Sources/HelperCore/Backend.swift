@@ -120,7 +120,7 @@ public struct BackendFailure: Error, Sendable {
 }
 public protocol ModelBackend: Sendable {
     func status() async -> BackendStatus
-    func generate(_ input: ModelInput, maximumTokens: UInt32, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws
 }
 
 /// System inference adapter. Tool callbacks proxy to the service; no host IO.
@@ -166,12 +166,12 @@ public struct SystemBackend: ToolModelBackend {
                 return transcript + schemas
             })
     }
-    public func generate(_ input: ModelInput, maximumTokens: UInt32, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await engine().generate(input, maximumTokens: maximumTokens, snapshot: snapshot)
+    public func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await engine().generate(input, snapshot: snapshot)
     }
-    public func generateWithTools(_ input: ModelInput, maximumTokens: UInt32, handler: @escaping ToolHandler,
+    public func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await engine().generateWithTools(input, maximumTokens: maximumTokens, handler: handler, snapshot: snapshot)
+        try await engine().generateWithTools(input, handler: handler, snapshot: snapshot)
     }
 }
 
@@ -195,11 +195,14 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
     private let reportsUsage: Bool
     private let tokenCounter: NativeTokenCounter?
     private let instrumentationFactory: InstrumentationFactory?
+    /// True for adapters that replace a nil response limit with their own small
+    /// default (CoreAI, MLX); they receive the context window instead.
+    private let responseTokensFromWindow: Bool
     public init(model: Model, contextTokens: UInt32?,
         reportedContextTokens: UInt32? = nil, contextSource: ContextCapacitySource? = nil,
         modelName: String, supportsTools: Bool,
         reportsUsage: Bool = false, localToolDestination: Bool = false, capabilityProfile: CapabilityProfile? = nil, tokenCounter: NativeTokenCounter? = nil,
-        instrumentationFactory: InstrumentationFactory? = nil) {
+        instrumentationFactory: InstrumentationFactory? = nil, responseTokensFromWindow: Bool = false) {
         self.model = model; self.contextTokens = contextTokens
         self.reportedContextTokens = reportedContextTokens ?? contextTokens
         self.contextSource = contextSource; self.modelName = modelName
@@ -209,29 +212,33 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
         self.localToolDestination = localToolDestination
         self.reportsUsage = reportsUsage; self.tokenCounter = tokenCounter
         self.instrumentationFactory = instrumentationFactory
+        self.responseTokensFromWindow = responseTokensFromWindow
     }
     public func status() async -> BackendStatus {
         BackendStatus(contextTokens: contextTokens, reportedContextTokens: reportedContextTokens,
             contextSource: contextSource, modelName: modelName, supportsTools: supportsTools,
             localToolDestination: localToolDestination, capabilityProfile: capabilityProfile)
     }
-    public func generate(_ input: ModelInput, maximumTokens: UInt32, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await generateSession(input, maximumTokens: maximumTokens, handler: nil, snapshot: snapshot)
+    public func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await generateSession(input, handler: nil, snapshot: snapshot)
     }
-    public func generateWithTools(_ input: ModelInput, maximumTokens: UInt32, handler: @escaping ToolHandler,
+    public func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         guard supportsTools else { throw BackendFailure(.modelUnavailable) }
         try capabilityProfile.require([.toolCalling])
-        try await generateSession(input, maximumTokens: maximumTokens, handler: handler, snapshot: snapshot)
+        try await generateSession(input, handler: handler, snapshot: snapshot)
     }
-    private func generateSession(_ input: ModelInput, maximumTokens: UInt32, handler: ToolHandler?,
+    private func generateSession(_ input: ModelInput, handler: ToolHandler?,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try Task.checkCancellation()
         let entries = SystemBackend.history(input)
         let current = Transcript.Entry.prompt(.init(segments: [.text(.init(content: input.prompt))]))
         let requestUsage = InferenceUsageObserver(snapshot: snapshot)
         let generationModel = instrumentationFactory?(requestUsage, snapshot, handler) ?? model
-        let boundedModel = BoundedToolModel(base: generationModel, maximumTokens: Int(maximumTokens),
+        // No Asura output cap (owner, 2026-10-19). Adapters whose nil means a
+        // small library default receive the window, which cannot bind first.
+        let responseTokens = responseTokensFromWindow ? contextTokens.map { Int($0) } : nil
+        let boundedModel = BoundedToolModel(base: generationModel, responseTokens: responseTokens,
             toolsEnabled: handler != nil, usageObserver: requestUsage)
         do {
             let guardedHandler: ToolHandler?
@@ -249,7 +256,9 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
                 try Task.checkCancellation()
                 guard let measured = UInt32(exactly: count) else { throw BackendFailure(.contextLimit) }
                 if let capacity = contextTokens {
-                    guard capacity >= maximumTokens, measured <= capacity - maximumTokens else { throw BackendFailure(.contextLimit) }
+                    // The composer reserves answer room; here the exact count
+                    // must leave room for at least one output token.
+                    guard measured < capacity else { throw BackendFailure(.contextLimit) }
                     try await snapshot(Snapshot(text: "", inputContext: (measured, capacity)))
                 }
             }
@@ -258,11 +267,12 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
             // The SDK session owns inference; retain it through every async stream exit.
             defer { withExtendedLifetime(session) {} }
             let contextOptions = ContextOptions(reasoningLevel: capabilityProfile.reasoningDisabled ? .custom("no_think") : nil)
-            let stream = session.streamResponse(to: input.prompt, options: GenerationOptions(maximumResponseTokens: Int(maximumTokens)), contextOptions: contextOptions)
+            let stream = session.streamResponse(to: input.prompt, options: GenerationOptions(maximumResponseTokens: responseTokens), contextOptions: contextOptions)
             for try await value in stream {
                 try Task.checkCancellation()
-                let total = reportsUsage ? UInt64(exactly: value.usage.output.totalTokenCount) : nil
-                if let total, total > UInt64(maximumTokens) { throw BackendFailure(.outputLimit) }
+                // A count above the counter validity bound stays unknown.
+                let total = reportsUsage ? UInt64(exactly: value.usage.output.totalTokenCount)
+                    .flatMap { $0 <= Limits.countedTokens ? $0 : nil } : nil
                 try await snapshot(Snapshot(text: value.content, usageTokens: handler == nil ? total : nil))
             }
             if let failure = await boundedModel.budget.recordedFailure() { throw failure }

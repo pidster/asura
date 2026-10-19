@@ -52,7 +52,6 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
             envelope(Body::Begin(pb::Begin {
                 model: Some("system".into()),
                 input_bytes: Some(10),
-                max_response_tokens: Some(512),
                 enable_project_tools: None,
             })),
             ServiceToHelper,
@@ -234,7 +233,13 @@ fn semantic_presence_direction_identity_and_usage() {
     let Some(Body::Terminal(terminal)) = message.body.as_mut() else {
         panic!()
     };
-    terminal.usage_tokens = Some(2049);
+    // No output cap (owner, 2026-10-19): only the counter validity bound applies.
+    terminal.usage_tokens = Some(5_000);
+    assert!(validate_semantics(&message, direction).is_ok());
+    let Some(Body::Terminal(terminal)) = message.body.as_mut() else {
+        panic!()
+    };
+    terminal.usage_tokens = Some(MAX_COUNTED_TOKENS + 1);
     assert!(validate_semantics(&message, direction).is_err());
 }
 #[test]
@@ -280,7 +285,6 @@ fn input_transfer_bounds_follow_chunk_count_not_a_content_limit() {
         envelope(Body::Begin(pb::Begin {
             model: Some("system".into()),
             input_bytes: Some(bytes),
-            max_response_tokens: Some(2048),
             ..Default::default()
         }))
     };
@@ -664,7 +668,7 @@ fn export_cross_language_fixtures() {
     }
     // No revision or cumulative output total (owner, 2026-10-18): more than
     // 1,024 revisions and more than 4 MiB (RT-01, RT-02).
-    for usage in [0, 512, 2048] {
+    for usage in [0, 2049, MAX_COUNTED_TOKENS] {
         let message = envelope(Body::Terminal(pb::Terminal {
             outcome: Some(1),
             last_revision: Some(5_000),
@@ -910,7 +914,7 @@ fn export_cross_language_fixtures() {
         last_revision: Some(1),
         count: Some(1),
         total_bytes: Some(1),
-        usage_tokens: Some(2049),
+        usage_tokens: Some(MAX_COUNTED_TOKENS + 1),
         usage_known: Some(true),
         reason: Some(0),
     }));
@@ -1314,30 +1318,32 @@ fn failed_exec_cmd_wire_result_preserves_bounded_output_but_never_cursor() {
     }
 }
 
-/// A5: Begin has no time field; removed `deadline_remaining_ms` (field 3)
-/// is an unknown field and the Begin is rejected.
+/// A5: Begin has no time field and no output cap; removed
+/// `deadline_remaining_ms` (field 3) and `max_response_tokens` (field 4,
+/// owner, 2026-10-19) are unknown fields and the Begin is rejected.
 #[test]
 fn begin_carries_no_deadline_and_removed_field_is_rejected() {
     let begin = pb::Begin {
         model: Some("system".into()),
         input_bytes: Some(1),
-        max_response_tokens: Some(512),
         enable_project_tools: None,
     };
     let message = envelope(Body::Begin(begin.clone()));
     assert!(encode_frame(&message, Direction::ServiceToHelper).is_ok());
-    let mut body = begin.encode_to_vec();
-    body.extend_from_slice(&[0x18, 100]);
-    let mut bytes = pb::Envelope {
-        operation_id: Some(vec![7; 16]),
-        generation: Some(1),
-        body: None,
+    for removed in [&[0x18, 100][..], &[0x20, 0x80, 0x10][..]] {
+        let mut body = begin.encode_to_vec();
+        body.extend_from_slice(removed);
+        let mut bytes = pb::Envelope {
+            operation_id: Some(vec![7; 16]),
+            generation: Some(1),
+            body: None,
+        }
+        .encode_to_vec();
+        bytes.push(0x5a);
+        bytes.push(body.len() as u8);
+        bytes.extend(body);
+        assert!(decode_body(&bytes, Direction::ServiceToHelper).is_err());
     }
-    .encode_to_vec();
-    bytes.push(0x5a);
-    bytes.push(body.len() as u8);
-    bytes.extend(body);
-    assert!(decode_body(&bytes, Direction::ServiceToHelper).is_err());
 }
 
 #[test]

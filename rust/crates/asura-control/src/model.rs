@@ -26,9 +26,10 @@ pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64_000;
 pub const MAX_RECORDED_TOOL_CALLS: u32 = 200;
 /// The next ordinal exists only for the over-limit proposal (status 7).
 pub const MAX_TOOL_ORDINAL: u32 = MAX_RECORDED_TOOL_CALLS + 1;
-/// Per-request output-token ceiling: the `Begin` cap the service sends and the
-/// largest plain-text terminal usage. Not a turn total (owner, 2026-10-18).
-pub const MAX_RESPONSE_TOKENS: u32 = 2048;
+/// Validity bound of one measured token counter (usage reports and terminal
+/// usage). Not an output cap: no request has one (owner, 2026-10-19;
+/// turn-usage-helper.md, request admission).
+pub const MAX_COUNTED_TOKENS: u64 = 1_000_000_000;
 /// Credit window for one direction; a sliding window for input.
 pub const CREDIT_WINDOW: u64 = 65_536;
 /// Bytes one output revision appends: a per-transfer bound, not a response
@@ -353,8 +354,8 @@ pub fn validate_semantics(
         Body::InferenceUsage(v) => {
             // Consecutive from 1; no request count per turn (owner, 2026-10-18).
             v.request_ordinal.is_some_and(|n| n >= 1)
-                && v.input_tokens.is_none_or(|n| n <= 1_000_000_000)
-                && v.output_tokens.is_none_or(|n| n <= 1_000_000_000)
+                && v.input_tokens.is_none_or(|n| n <= MAX_COUNTED_TOKENS)
+                && v.output_tokens.is_none_or(|n| n <= MAX_COUNTED_TOKENS)
                 && v.cached_input_tokens
                     .is_none_or(|n| v.input_tokens.is_some_and(|i| n <= i))
                 && matches!(v.complete, Some(false) | Some(true))
@@ -362,10 +363,8 @@ pub fn validate_semantics(
                     || (v.input_tokens.is_some() && v.output_tokens.is_some()))
         }
         Body::Begin(v) => {
-            v.model.as_deref().is_some_and(selector)
-                && positive(v.input_bytes, MAX_INPUT_BYTES)
-                && v.max_response_tokens
-                    .is_some_and(|n| (1..=MAX_RESPONSE_TOKENS).contains(&n))
+            // No output cap crosses the wire (owner, 2026-10-19).
+            v.model.as_deref().is_some_and(selector) && positive(v.input_bytes, MAX_INPUT_BYTES)
         }
         Body::Chunk(v) => {
             transfer(v.transfer_id, v.direction)
@@ -427,7 +426,7 @@ pub fn validate_semantics(
                 Some(false) => v.usage_tokens.is_none(),
                 Some(true) => v
                     .usage_tokens
-                    .is_some_and(|tokens| tokens <= u64::from(MAX_RESPONSE_TOKENS)),
+                    .is_some_and(|tokens| tokens <= MAX_COUNTED_TOKENS),
                 None => false,
             };
             usage

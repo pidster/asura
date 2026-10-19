@@ -22,8 +22,7 @@ import Testing
 private struct NamedProvider: ModelBackend {
     let name: String
     func status() async -> BackendStatus { .init(contextTokens: 8192, reportedContextTokens: 8192, contextSource: .mlx, modelName: name) }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         throw BackendFailure(.modelUnavailable)
     }
 }
@@ -53,7 +52,6 @@ private struct NamedProvider: ModelBackend {
     #expect(!reply.hello.hasModelName)
     var begin = Asura_Model_V1_Begin()
     begin.model = selector; begin.inputBytes = 10
-    begin.maxResponseTokens = 512
     frame = Envelope(); frame.operationID = Data(repeating: 7, count: 16); frame.generation = 1
     frame.body = .begin(begin)
     try await service.send(frame)

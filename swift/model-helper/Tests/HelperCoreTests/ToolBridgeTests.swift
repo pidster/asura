@@ -9,11 +9,10 @@ private struct ToolScript: ToolModelBackend {
     func status() async -> BackendStatus { BackendStatus(contextTokens: 4096,
         reportedContextTokens: 4096, contextSource: source, supportsTools: true,
         capabilityProfile: try! CapabilityProfile(mask: 1, provenance: .runtime)) }
-    func generate(_ input: ModelInput, maximumTokens: UInt32,
-        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         throw HelperError.unavailable
     }
-    func generateWithTools(_ input: ModelInput, maximumTokens: UInt32, handler: @escaping ToolHandler,
+    func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await snapshot(Snapshot(text: "", inputContext: (123, 4096)))
         var text = ""
@@ -150,7 +149,7 @@ private func toolCallbackJourney(cancel: Bool, selector: String, proposal: ToolP
     var input = ModelInput(); input.instructions = ""; input.prompt = "read file"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = selector; begin.inputBytes = UInt64(data.count)
-    begin.maxResponseTokens = 512; begin.enableProjectTools = true
+    begin.enableProjectTools = true
     try await service.send(scoped(.begin(begin))); _ = try await replies.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = data
@@ -298,7 +297,7 @@ func openToolSession(selector: String, proposals: [ToolProposal]) async throws -
     var input = ModelInput(); input.instructions = ""; input.prompt = "tools"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = selector; begin.inputBytes = UInt64(data.count)
-    begin.maxResponseTokens = 512; begin.enableProjectTools = true
+    begin.enableProjectTools = true
     try await channel.send(.begin(begin)); _ = try await channel.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = data

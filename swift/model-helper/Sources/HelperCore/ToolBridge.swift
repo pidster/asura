@@ -34,7 +34,7 @@ public struct ToolResult: Sendable {
 }
 public typealias ToolHandler = @Sendable (ToolProposal) async throws -> ToolResult
 public protocol ToolModelBackend: ModelBackend {
-    func generateWithTools(_ input: ModelInput, maximumTokens: UInt32, handler: @escaping ToolHandler,
+    func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws
 }
 

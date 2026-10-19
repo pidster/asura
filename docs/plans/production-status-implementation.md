@@ -1352,7 +1352,7 @@ qualification is not claimed.
 | Project names and rename | [Project names](../designs/project-names.md) |
 | Service status pane | [Service status pane](../designs/service-status-pane.md) |
 | Commit `d4baaf4` (2026-09-30): queue recovery, model lifetimes, context telemetry and composer navigation | [Managed input queue](../designs/managed-input-queue.md), [model context telemetry](../designs/model-context-telemetry.md), [composer editor navigation](../designs/composer-editor-navigation.md) |
-| Commit `0bd82d8` (2026-10-12): rich tool activity and per-request inference usage | [Response activity](../designs/response-activity.md#recorded-qualification--2026-09-30), [turn usage helper](../designs/turn-usage-helper.md#turn-budget-and-request-admission) |
+| Commit `0bd82d8` (2026-10-12): rich tool activity and per-request inference usage | [Response activity](../designs/response-activity.md#recorded-qualification--2026-09-30), [turn usage helper](../designs/turn-usage-helper.md#request-admission) |
 
 Commit `0bd82d8` replaces the three-pass tool limit with a 2,048-token turn
 budget. The first inference request receives at most 1,024 tokens, each later

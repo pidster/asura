@@ -5,10 +5,10 @@ supersedes this packet's earlier 256/128/128 allocations. Turn limit change
 (owner, 2026-10-18): “We found these types of tool and turn limits to be
 profoundly limiting in Wisp.” An admission reserves no output tokens. Kind 21
 has no reserved-output-tokens field and kind 8 has no charged-tokens field; the
-schemas changed in place. Each model request has its own
-[request cap](turn-usage-helper.md#request-caps-and-admission): 1,024 tokens
-first and 512 thereafter for tool requests, or the caller's 2,048 cap if
-smaller, with no request count. Earlier validation evidence below describes the
+schemas changed in place. No model request has an output cap (owner,
+2026-10-19: “Model's own limit”); each request writes until the model stops or
+its context window is full, with no request count
+([request admission](turn-usage-helper.md#request-admission)). Earlier validation evidence below describes the
 earlier packet.
 
 Status: CA-A through CA-D implemented. The storage validation subset below
@@ -431,8 +431,10 @@ No successful recovery or automatic space reclamation is claimed in that case.
 5. Serialize cancellation against start authorization. Append StartAuthorized and
    wait for durability before delivering its one-use permit to the identified helper.
    Recheck a committed cancel intent before sending the permit. If the selected
-   adapter has a native input counter, the helper validates its measured window
-   with room for one request's output cap (2,048). Otherwise, input usage stays unknown and the
+   adapter has a native input counter, the helper rejects a measured input that
+   leaves no room for one output token (owner, 2026-10-19). The
+   [context composer](context-composer.md#output-reservation-r) leaves
+   `⌊window ÷ 4⌋` tokens for the answer; that is not an output cap. Otherwise, input usage stays unknown and the
    provider must enforce context overflow under its provider contract.
    A context/counting failure becomes a durable failed terminal with known zero
    output usage when the helper confirms no generation started.
@@ -511,20 +513,20 @@ volatile revisions. `after_cursor == u64::MAX` returns the same terminal result.
 
 ## Budget and terminal outcomes
 
-A turn has no output-token budget (owner, 2026-10-18). Each model request has
-its own cap; the [request caps](turn-usage-helper.md#request-caps-and-admission)
-define them. Input-window accounting is separate and is measured after the
+A turn has no output-token budget (owner, 2026-10-18). No model request has an
+output cap (owner, 2026-10-19;
+[request admission](turn-usage-helper.md#request-admission)). Input-window accounting is separate and is measured after the
 durable start permit, before generation, as selected by D2. This packet creates
 no money budget or fabricated provider billing estimate.
 
 | Terminal condition | Recorded output usage | History and recovery |
 | --- | --- | --- |
-| Complete plain-text turn with a validated known count (at most the request cap, 2,048) | Actual count, usage known | Complete text becomes history after durable terminal commit |
+| Complete plain-text turn with a validated known count (at most the 1,000,000,000 counter validity bound) | Actual count, usage known | Complete text becomes history after durable terminal commit |
 | Complete with unknown count, including every tool-enabled turn | 0, usage unknown | Complete text becomes history after durable terminal commit; no measured usage is invented |
 | Cancel/failure before any StartAuthorized record | 0, usage known | No helper generation was permitted |
 | Started operation with validated known terminal count | Actual count, usage known | Incomplete text excluded from history |
 | Started operation with unknown count, crash or uncertain permit delivery | 0, usage unknown | Never infer zero usage |
-| Count above the request cap or invalid terminal metadata | 0, usage unknown and failed result | Protocol failure; no complete-history publication |
+| Count above 1,000,000,000 or invalid terminal metadata | 0, usage unknown and failed result | Protocol failure; no complete-history publication |
 
 Unknown usage is not a claim of measured usage. A new user turn is a new task;
 no interrupted task is silently retried.
@@ -927,7 +929,7 @@ across the service, each at most 32 KiB UTF-8. Busy storage rejects before
 acceptance; clients retain text. Existing cancellation capacity remains
 reserved. Each dispatch uses the
 [cancellation-driven turn lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30).
-It keeps the per-request output caps and one active operation limit.
+It keeps one active operation limit and no per-request output cap (owner, 2026-10-19).
 
 InputQueuedV2 stores its original request/digest, a service-generated input ID,
 a fresh internal dispatch request ID, project, conversation, expected generation,

@@ -193,7 +193,9 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
         var truncate = false
         var shift = false
         var options: Options
-        struct Options: Encodable { var num_ctx: UInt32; var num_predict: Int }
+        /// `num_predict` is always -1, Ollama's “infinite generation”: no Asura
+        /// output cap, and no Modelfile default can add one (owner, 2026-10-19).
+        struct Options: Encodable { var num_ctx: UInt32; var num_predict = -1 }
     }
     struct Chunk: Decodable {
         var message: Message?
@@ -233,7 +235,8 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
 
     /// Record accumulation is bounded before JSON decoding, including missing-newline responses.
     struct StreamState {
-        var maximumTokens = Int(Limits.maximumResponseTokens)
+        /// The request window: output cannot exceed it, so a larger count is invalid.
+        var contextTokens = 0
         var line = Data()
         var total = 0
         var calls = 0
@@ -253,7 +256,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
             line.removeAll(keepingCapacity: true)
             guard value.error == nil else { throw Failure.unavailable }
             guard value.prompt_eval_count.map({ $0 >= 0 }) ?? true,
-                  value.eval_count.map({ (0...maximumTokens).contains($0) }) ?? true else { throw Failure.invalidResponse }
+                  value.eval_count.map({ (0...contextTokens).contains($0) }) ?? true else { throw Failure.invalidResponse }
             if let message = value.message {
                 guard message.role == "assistant" else { throw Failure.invalidResponse }
                 calls += message.tool_calls?.count ?? 0
@@ -261,8 +264,8 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 // records the last and then ends the turn (TCR-D6).
                 // Arguments are forwarded unread; the service applies the
                 // 64,000-byte limit and every argument rule (TCR-D17).
-                // No response text total (owner, 2026-10-18); the per-request
-                // stream bound above and the token cap bound one request.
+                // No response text total (owner, 2026-10-18) and no token cap
+                // (owner, 2026-10-19); the stream bound above and the window bound one request.
                 guard calls <= Int(Limits.toolProposals) else { throw Failure.limit }
                 for call in message.tool_calls ?? [] {
                     guard !call.function.name.isEmpty else { throw Failure.invalidResponse }
@@ -278,35 +281,31 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
         }
     }
 
-    /// Text is delivered before finish classification, including a length-limited
-    /// final record. Unknown reasons cannot manufacture successful completion.
-    static func deliver(_ chunk: Chunk, maximumTokens: Int,
-        emit: (Chunk) async throws -> Void) async throws {
+    /// Text is delivered before finish classification, including the final
+    /// record of a full window. With `num_predict: -1`, `shift: false` and
+    /// `truncate: false`, a length stop can only mean the context window is
+    /// full, so it is a context limit (owner, 2026-10-19). Unknown or missing
+    /// reasons cannot manufacture successful completion.
+    static func deliver(_ chunk: Chunk, emit: (Chunk) async throws -> Void) async throws {
         try await emit(chunk)
         guard chunk.done == true else { return }
         switch chunk.done_reason {
         case "stop": return
-        case "length": throw BackendFailure(.outputLimit)
-        case nil, "":
-            if let count = chunk.eval_count, count >= maximumTokens {
-                throw BackendFailure(.outputLimit)
-            }
-            throw Failure.invalidResponse
+        case "length": throw BackendFailure(.contextLimit)
         default: throw Failure.invalidResponse
         }
     }
 
-    static func deliverToExecutor(_ chunk: Chunk, maximumTokens: Int,
-        emit: (Chunk) async throws -> Void) async throws {
-        do { try await deliver(chunk, maximumTokens: maximumTokens, emit: emit) }
+    static func deliverToExecutor(_ chunk: Chunk, emit: (Chunk) async throws -> Void) async throws {
+        do { try await deliver(chunk, emit: emit) }
         catch Failure.invalidResponse { throw BackendFailure(.protocolFault) }
     }
 
-    /// A recognized completion can measure input even when output hit its limit.
-    static func deliverMeasuredToExecutor(_ chunk: Chunk, maximumTokens: Int,
+    /// A recognized completion can measure input even when the window filled.
+    static func deliverMeasuredToExecutor(_ chunk: Chunk,
         requestID: UUID, capacity: UInt32, observer: OllamaInputObserver?,
         emit: (Chunk) async throws -> Void) async throws {
-        try await deliverToExecutor(chunk, maximumTokens: maximumTokens) { value in
+        try await deliverToExecutor(chunk) { value in
             try await emit(value)
             if value.done == true, value.done_reason == "stop" || value.done_reason == "length" {
                 try await observer?.complete(requestID, inputTokens: value.prompt_eval_count, capacity: capacity)
@@ -329,14 +328,12 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 ToolSpec(function: .init(name: tool.name, description: tool.description,
                     parameters: try JSONDecoder().decode(JSON.self, from: JSONEncoder().encode(tool.parameters))))
             }
-            guard let maximumTokens = request.generationOptions.maximumResponseTokens,
-                  (1...Int(Limits.maximumResponseTokens)).contains(maximumTokens) else { throw Failure.limit }
             let hasTools = !request.enabledToolDefinitions.isEmpty
             let registered = Set(request.enabledToolDefinitions.map(\.name))
             guard !hasTools || model.localToolModel != nil else { throw Failure.unsupported }
             let body = try JSONEncoder().encode(Request(model: model.localToolModel ?? settings.name,
                 messages: try messages(request.transcript), tools: tools.isEmpty ? nil : tools,
-                options: .init(num_ctx: model.contextTokens, num_predict: maximumTokens)))
+                options: .init(num_ctx: model.contextTokens)))
             guard body.count <= 262_144 else { throw Failure.limit }
             let session = session()
             defer { session.invalidateAndCancel() }
@@ -348,7 +345,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 http.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 let (bytes, response) = try await session.bytes(for: http)
                 guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw Failure.unavailable }
-                var state = StreamState(maximumTokens: maximumTokens)
+                var state = StreamState(contextTokens: Int(model.contextTokens))
                 var ordinal = 0
                 func emit(_ chunk: Chunk) async throws {
                     try Task.checkCancellation()
@@ -384,7 +381,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                     }
                 }
                 func deliverMeasured(_ chunk: Chunk) async throws {
-                    try await deliverMeasuredToExecutor(chunk, maximumTokens: maximumTokens,
+                    try await deliverMeasuredToExecutor(chunk,
                         requestID: request.id, capacity: model.contextTokens, observer: model.inputObserver,
                         emit: emit)
                 }

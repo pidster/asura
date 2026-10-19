@@ -27,7 +27,8 @@ no per-turn or per-operation total replaces the removed ones.
 
 Non-goals: the journal capacity (8 MiB, 32,768 frames; L30 in
 [tool output views](tool-output-views.md#journal-and-records)) and the
-[segmented journal](segmented-journal.md) that replaces it; the per-request output-token cap (2,048); the
+[segmented journal](segmented-journal.md) that replaces it; the per-request output-token cap (2,048, since
+removed by the owner on 2026-10-19; see [request admission](turn-usage-helper.md#request-admission)); the
 Ollama per-request stream parser bound (4 MiB, L28); control and model frame
 sizes; tool call limits; Markdown presentation limits.
 
@@ -262,8 +263,9 @@ characters before display.
 | RT-09 | Replay rejects an invalid kind 24 or kind 8 offset | Offset above length, terminal operation, wrong generation, no-op record | — | — |
 | RT-10 | The maximum event frame stays within 64 KiB | Event with a 61,440-byte window, both new fields and nine tools encodes within the frame | — | — |
 
-Live-model journeys cannot force a response above 61,440 bytes with the 2,048
-token per-request cap; RT-03 uses the scripted loopback endpoint through the real
+Live-model journeys could not force a response above 61,440 bytes under the
+2,048-token per-request cap that applied when this design was qualified (removed,
+owner, 2026-10-19); RT-03 uses the scripted loopback endpoint through the real
 helper. The TUI PTY gate exercises the changed worker and display path with
 short responses only.
 

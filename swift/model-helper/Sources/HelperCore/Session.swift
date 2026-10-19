@@ -21,7 +21,6 @@ public actor HelperSession {
     private var contextTokens: UInt32 = 0
     private var inputChunks: UInt64 = 0
     private var decodedInput: ModelInput?
-    private var maximumTokens: UInt32 = 512
     private var projectToolsEnabled = false
     private var toolOrdinal: UInt32 = 0
     private var pendingTool: (UInt32, CheckedContinuation<ToolResult, any Error>)?
@@ -207,11 +206,9 @@ public actor HelperSession {
             guard case .begin(let begin) = body, begin.hasModel, begin.model == selectedModel,
                 begin.hasInputBytes, begin.inputBytes > 0, begin.inputBytes <= Limits.input,
                 // A sanity bound on allocation, not a content limit.
-                begin.inputBytes <= UInt64(contextTokens) * 8,
-                begin.hasMaxResponseTokens, (1...Limits.maximumResponseTokens).contains(begin.maxResponseTokens) else { throw HelperError.protocolFault }
+                begin.inputBytes <= UInt64(contextTokens) * 8 else { throw HelperError.protocolFault }
             operation = message.operationID; generation = message.generation
             expectedInput = begin.inputBytes
-            maximumTokens = begin.maxResponseTokens
             projectToolsEnabled = begin.hasEnableProjectTools && begin.enableProjectTools
             if let capabilities {
                 activation = Dictionary(uniqueKeysWithValues: ModelCapability.allCases.map {
@@ -260,17 +257,16 @@ public actor HelperSession {
             guard phase == .ready, let input = decodedInput else { throw HelperError.protocolFault }
             decodedInput = nil; phase = .running
             guard let backend = self.backend else { throw HelperError.unavailable }
-            let maximumTokens = self.maximumTokens
             let owner = self
             let enableTools = projectToolsEnabled
             modelTask = Task {
                 do {
                     if enableTools, let toolBackend = backend as? any ToolModelBackend {
-                        try await toolBackend.generateWithTools(input, maximumTokens: maximumTokens,
+                        try await toolBackend.generateWithTools(input,
                             handler: { proposal in try await owner.requestTool(proposal) },
                             snapshot: { value in try await owner.snapshot(value) })
                     } else {
-                        try await backend.generate(input, maximumTokens: maximumTokens) { value in
+                        try await backend.generate(input) { value in
                             try await owner.snapshot(value)
                         }
                     }

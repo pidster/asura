@@ -313,8 +313,8 @@ impl ModelOwner {
         self.queue(Body::Begin(pb::Begin {
             model: Some(self.selection.model.clone()),
             input_bytes: Some(input.len() as u64),
-            // The per-request ceiling, not a turn budget (owner, 2026-10-18).
-            max_response_tokens: Some(asura_control::model::MAX_RESPONSE_TOKENS),
+            // No output cap: the model writes until it stops or its window is
+            // full (owner, 2026-10-19; turn-usage-helper.md, request admission).
             enable_project_tools: enable_tools.then_some(true),
         }))?;
         self.input = Some(input);
@@ -1413,9 +1413,10 @@ mod tests {
     fn owner_with_ready() -> ModelOwner {
         owner(Phase::Ready)
     }
-    /// HW-03: Begin never sends `deadline_remaining_ms`.
+    /// HW-03: Begin never sends `deadline_remaining_ms`; UH13: nor an output
+    /// cap (owner, 2026-10-19).
     #[test]
-    fn hw03_begin_sends_no_generation_deadline() {
+    fn hw03_begin_sends_no_generation_deadline_or_output_cap() {
         let mut owner = owner(Phase::Available);
         let input = model::encode_input(&pb::ModelInput {
             instructions: Some(String::new()),
@@ -1434,8 +1435,17 @@ mod tests {
         let Some(Body::Begin(begin)) = envelope.body else {
             panic!("expected Begin")
         };
-        // Begin has no time field; generation ends only on Cancel.
-        assert_eq!(begin.max_response_tokens, Some(2048));
+        // Begin has no time field and no output cap; the whole message is
+        // the model, the input size and the tool flag.
+        assert_eq!(
+            begin,
+            pb::Begin {
+                model: begin.model.clone(),
+                input_bytes: Some(begin.input_bytes.unwrap()),
+                enable_project_tools: None,
+            }
+        );
+        assert!(begin.model.is_some());
     }
 
     #[test]

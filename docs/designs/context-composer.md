@@ -54,8 +54,8 @@ to the working tree at that date.
 | History is every prior completed turn of the conversation, in generation order. Each turn contributes its accepted prompt and its terminal text. Tool calls and tool results from earlier turns never enter later input. | `conversation.rs:1826-1838`; `asura-storage/src/authority/writer/state.rs:1406-1438` |
 | The journal writer selects history on its retained worker during `Prepare`. It fails with `Limit` (reported as `capacity_exhausted`) above 32 prior turns or above 64 KiB of prompt plus terminal text. | `state.rs:1418`, `state.rs:1434`; `conversation.rs:89` |
 | The wire check allows at most 32 history entries, a 32 KiB prompt and 64 KiB of input. Each turn adds two entries, so a conversation with 17 to 32 prior turns passes the writer and then fails `encode_input` with `context_limit`. | `asura-control/src/model.rs:13`, `model.rs:491`, `model.rs:507`; `conversation.rs:1851` |
-| `TurnAccepted` binds the instruction digest, the encoded input digest and the prior operation IDs. This is the only record of what was sent. Its 2,048-token output reservation field is removed (owner, 2026-10-18; [request caps](turn-usage-helper.md#request-caps-and-admission)). | `conversation.rs:1874-1878`; `asura-storage/src/authority/conversation/types.rs:7` |
-| The effective capacity arrives in the helper's Hello before durable acceptance. The service fails the turn with `context_limit` only when capacity is not larger than the per-request output cap (`max_response_tokens`). It does not compare capacity with the input size. | `conversation.rs:2862`; `TurnAccepted` is appended at `conversation.rs:3227` |
+| `TurnAccepted` binds the instruction digest, the encoded input digest and the prior operation IDs. This is the only record of what was sent. Its 2,048-token output reservation field is removed (owner, 2026-10-18; [request caps](turn-usage-helper.md#request-admission)). | `conversation.rs:1874-1878`; `asura-storage/src/authority/conversation/types.rs:7` |
+| The effective capacity arrives in the helper's Hello before durable acceptance. Superseded by CC1 and the owner decision of 2026-10-19: the composer fails the turn with `context_limit` when its input budget `B = E − R − S` is not positive or the mandatory segments do not fit. `R` is `⌊E ÷ 4⌋` (D3 refinement); no per-request output cap exists. | `conversation.rs:2862`; `TurnAccepted` is appended at `conversation.rs:3227` |
 | When tools are not available, the service replaces the instructions after Hello and recomputes both digests before acceptance. | `conversation.rs:2836-2850` |
 
 ### Transfer and helper
@@ -64,10 +64,10 @@ to the working tree at that date.
 | --- | --- |
 | The service sends input in 16 KiB chunks under one 64 KiB credit grant. | `asura-service/src/model_owner.rs:668-680` |
 | The helper grants exactly one input credit of 65,536 bytes. Output already uses a sliding credit window that the receiver advances. | `Session.swift:213-216`; `Session.swift:280-289`, `Session.swift:433-434`; `Wire.swift:186-191` |
-| The helper rejects input above 65,536 bytes and per-request output caps outside 1–2,048 tokens. | `swift/model-helper/Sources/HelperCore/Wire.swift:14`, `Wire.swift:177-179`; `Session.swift:197-199` |
-| The service sends `max_response_tokens` equal to the per-request constant `MAX_RESPONSE_TOKENS` (2,048); it is not a turn total (owner, 2026-10-18). | `model_owner.rs:280` |
+| The helper rejects input above 65,536 bytes. Its per-request output-cap check (1–2,048 tokens) is removed with the `Begin` field (owner, 2026-10-19). | `swift/model-helper/Sources/HelperCore/Wire.swift:14`, `Wire.swift:177-179`; `Session.swift:197-199` |
+| Removed (owner, 2026-10-19): the service sent `max_response_tokens` equal to `MAX_RESPONSE_TOKENS` (2,048). `Begin` field 4 is now reserved; no output-token value crosses the wire ([request admission](turn-usage-helper.md#request-admission)). | `model_owner.rs` |
 | The helper maps instructions, history and prompt into an SDK transcript in that order. | `Backend.swift:150-162`, `Backend.swift:234-235` |
-| When a token counter exists (system model), the helper counts the whole input and fails with `contextLimit` when it exceeds capacity minus the output cap. | `Backend.swift:251-258` |
+| When a token counter exists (system model), the helper counts the whole input and fails with `contextLimit` when the count leaves no room for one output token (owner, 2026-10-19; previously capacity minus the output cap). | `Backend.swift:251-258` |
 | Within a turn, one SDK `LanguageModelSession` owns the transcript. Tool calls and results are appended by the SDK across its requests; the service cannot change that transcript. A turn has no request count limit (owner, 2026-10-18). | `Backend.swift:260`; `BoundedToolModel.swift:5-7`, `BoundedToolModel.swift:21` |
 | The Ollama backend clamps the effective context to `min(capacity, 8192)` (L26). | `OllamaBackend.swift:130` |
 
@@ -147,7 +147,7 @@ mechanism this design applies for it. The sections below give the detail.
 | --- | --- | --- |
 | D1 | A new `context` module in `asura-service`, called by the conversation owner, replaces the current builder. Its core is pure. Storage keeps no selection policy. | [Ownership](#ownership). The writer's `Prepare` returns candidates and no longer applies the 32-turn and 64 KiB rule. |
 | D2 | Bytes per token are learned per model from measured input tokens (context telemetry), with a safety margin. An unmeasured model uses 1 token per byte. | [Token conversion](#token-conversion) |
-| D3 | The output reservation is the per-request output space in the context window, not a turn budget. It is a per-model value in the capacity record, defaulting to `min(maximum output, window ÷ 4)`. Keep 2,048 until the capacity record exists. | `R` in the [budget](#per-request-budget-algorithm) |
+| D3 | The output reservation is the per-request output space in the context window, not a turn budget. It is a per-model value in the capacity record, defaulting to `min(maximum output, window ÷ 4)`. Refined 2026-10-19 under the owner's removal of output caps: Asura has no maximum output, so `R = ⌊E ÷ 4⌋` now; see [output reservation](#output-reservation-r). | `R` in the [budget](#per-request-budget-algorithm) |
 | D4 | Stage B (the service owns the request loop and recomposes per request) is the target; stage A (view sizing at the tool callback) comes first. | [Recomposition during tool loops](#recomposition-during-tool-loops). Stage B implies loop closure decision 6, which remains formally open. |
 | D5 | The manifest is a payload object with its digest in the journal. Before J1, `TurnAccepted` carries the manifest digest and the composer revision, and, under N1, the budget inputs. | [Composition manifest](#composition-manifest) |
 | D6 | History is reduced by mechanical fidelity levels (full, reference, omitted), newest first. Model-written summaries need a separate design. | [Segments and fidelity](#segments-and-fidelity) |
@@ -306,9 +306,9 @@ Symbols:
 
 - `E`: window tokens for this operation (the smaller of the capacity record and
   Hello's effective capacity).
-- `R`: output reservation tokens (D3): the output space one request needs in the
-  context window, not a turn budget. 2,048 (`MAX_RESPONSE_TOKENS`) until the
-  capacity record exists.
+- `R`: output reservation tokens (D3): room left for the answer in the context
+  window, not a turn budget and not an output cap. `R = ⌊E ÷ 4⌋`
+  ([output reservation](#output-reservation-r)).
 - `S`: fixed overhead tokens for tool definitions, from the helper build's
   measured schema size, converted at one token per byte.
 - `B = E − R − S`: input token budget.
@@ -349,6 +349,40 @@ Steps:
 Ties break by generation, then request ordinal, then tool ordinal, then stream
 (`stdout` before `stderr`). No step reads a clock, an environment variable or a
 mutable file. Equal inputs therefore produce equal bytes.
+
+#### Output reservation R
+
+Design refinement, 2026-10-19, under the owner's decision “Model's own limit”:
+no model request has an Asura output cap. Each request writes until the model
+stops or its context window is full
+([request admission](turn-usage-helper.md#request-admission)). The composer
+still leaves room for the answer:
+
+- `R = ⌊E ÷ 4⌋`, where `E` is the window for this operation. The conversation
+  owner computes `R` through `context::output_reservation` and records it in
+  the turn's budget inputs (N1), so replay reads the value that was used.
+- `R` is a composition target. The composer never fills more than `E − R − S`
+  tokens with input. The helper does not receive `R`, and the model is not
+  stopped at `R`. A long answer can use the whole free window; a full window
+  ends the request with `context_limit`.
+
+Reasons for the rule:
+
+1. It is the existing D3 default, `min(maximum output, window ÷ 4)`, with the
+   maximum output term removed, because Asura no longer has one. No new owner
+   decision is needed.
+2. It scales with the model. A fixed reserve would take most of a small window
+   or waste a large one. The system model (4,096 tokens) reserves 1,024 tokens,
+   which gives input more room than the old 2,048. The Ollama window clamp
+   (8,192) reserves 2,048, as before.
+3. Input keeps at least three quarters of the window, so history stays useful.
+4. A larger answer is still possible. The reserve only limits how much the
+   composer adds; it limits nothing the model writes.
+
+The calibration fallback of one token per byte overestimates tokens, so
+estimation errors usually leave more answer room than `R`. When the estimate is
+too low, the helper's exact count (system model) still rejects only an input
+that leaves no room for one output token.
 
 #### CC-F1: budget decision flow
 
@@ -772,7 +806,7 @@ removed, an Ollama model's window in CC1 is at most 8,192 tokens.
 
 | Dependency | Needed for | Status for this design |
 | --- | --- | --- |
-| Capacity record (loop closure, provider design) | `E` and `R` from configuration | Stubbed in CC1 by Hello's effective capacity (implemented) and the per-request `R` of 2,048 |
+| Capacity record (loop closure, provider design) | `E` and `R` from configuration | Stubbed in CC1 by Hello's effective capacity (implemented); `R = ⌊E ÷ 4⌋` (refined 2026-10-19) |
 | Context telemetry (`ContextMeasured`) | Calibration (D2) | Implemented for the system model and Ollama's first request |
 | J1: retention item 3 (G1) | Model views from retained streams; manifest bodies | Needed by CC2. CC1 does not use it. |
 | J3: job tool, reference-only results | Disclosures with handles; reference results | Needed by CC2 |
@@ -845,7 +879,8 @@ decisions, except item 8, which the owner selected.
 - The `context` module with the pure core, D6 fidelity and the context block.
 - The writer's `Prepare` returns candidates; the 32-turn and 64 KiB rules go.
 - Calibration (D2) with the 1-byte fallback.
-- `W = B × k` with `R = 2,048` and `E` from Hello.
+- `W = B × k` with `E` from Hello. CC1 used `R = 2,048`; the owner decision of
+  2026-10-19 changes it to `R = ⌊E ÷ 4⌋`.
 - Streamed input transfer (D7): windowed input credit, `Begin` sanity bound,
   removal of the 64 KiB input and 32-entry wire checks in Rust and Swift.
 - `TurnAccepted` binds the manifest digest, composer revision and budget inputs (D5, N1).
@@ -885,7 +920,7 @@ flowchart TD
     LC6["Loop closure decision 6<br/>(open)"] --> CC4
     CC4 --> CC5["CC5: memory and evidence"]
     Sel["Memory selection design"] --> CC5
-    CapRec["Capacity record<br/>(provider design)"] -.->|"replaces Hello stub and<br/>per-request R = 2,048"| CC2
+    CapRec["Capacity record<br/>(provider design)"] -.->|"replaces Hello stub;<br/>R = window ÷ 4 until then"| CC2
 ```
 
 The dashed edge is optional: the capacity record can land at any slice and
@@ -921,6 +956,7 @@ Ollama.
 | CC-U16 | CC1 | Credit ledger states | Grant, send, accept, cancel | Never sends beyond the grant; window at most 65,536; cancel stops sending |
 | CC-U17 | CC2 | D8 rule table | Failure, success, running, interrupted outcomes | Allocation order matches the table |
 | CC-U18 | CC1 | `Begin` sizes at, above and far above the sanity bound | Helper validation | Accepts at the bound; rejects above it before allocation |
+| CC-U19 | CC1 | Windows 4,096, 8,192 and 128,000 | Compute `R` and compose | `R` is 1,024, 2,048 and 32,000; the recorded budget inputs carry that `R`; no constant output reservation remains (owner, 2026-10-19) |
 
 ### Integration
 

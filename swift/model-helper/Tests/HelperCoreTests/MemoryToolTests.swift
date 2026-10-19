@@ -30,10 +30,9 @@ func disabledToolsNeverAdvertiseMemoryDefinitions(selector: String) async throws
     let backend = FoundationBackend(model: DefinitionModel(probe: probe), contextTokens: 4096,
         modelName: selector, supportsTools: true)
     var input = ModelInput(); input.instructions = "Answer briefly."; input.prompt = "Hello"
-    try await backend.generate(input, maximumTokens: 512, snapshot: { _ in })
+    try await backend.generate(input, snapshot: { _ in })
     #expect(await probe.names == [[]])
-    try await backend.generateWithTools(input, maximumTokens: 512,
-        handler: { _ in Issue.record("scripted model did not request a tool"); throw HelperError.unavailable },
+    try await backend.generateWithTools(input, handler: { _ in Issue.record("scripted model did not request a tool"); throw HelperError.unavailable },
         snapshot: { _ in })
     let names = await probe.names
     #expect(names.count == 2)
@@ -120,8 +119,7 @@ func sdkCanCorrectMemoryArgumentsWithinTheProposalLimit(alwaysInvalid: Bool) asy
         contextTokens: 8192, modelName: "correction-fixture", supportsTools: true)
     var input = ModelInput(); input.instructions = "Use memory."; input.prompt = "Store a note."
     do {
-        try await backend.generateWithTools(input, maximumTokens: 2048,
-            handler: { try await probe.received($0) }, snapshot: { _ in })
+        try await backend.generateWithTools(input, handler: { try await probe.received($0) }, snapshot: { _ in })
         #expect(!alwaysInvalid)
     } catch let error as LanguageModelSession.ToolCallError {
         // The over-limit proposal ends the turn through the tool callback.

@@ -186,3 +186,25 @@ fn calibration_holds_a_bounded_number_of_models() {
         (2400, true)
     );
 }
+
+/// CC-U19 (owner, 2026-10-19): the output reservation is a quarter of the
+/// window, recorded in the turn's budget inputs; no constant reservation.
+#[test]
+fn output_reservation_is_a_quarter_of_the_window_and_is_recorded() {
+    assert_eq!(output_reservation(4096), 1024);
+    assert_eq!(output_reservation(8192), 2048);
+    assert_eq!(output_reservation(128_000), 32_000);
+    assert_eq!(output_reservation(3), 0);
+    for window in [4096, 8192, 128_000] {
+        let budget = Budget {
+            window_tokens: window,
+            output_reservation: output_reservation(window),
+            overhead_tokens: 0,
+            bytes_per_token_milli: 1000,
+        };
+        let composed = compose("rules", "now?", &[turn(1, 10)], budget).unwrap();
+        let recorded = composed.composition(budget);
+        assert_eq!(recorded.window_tokens, window);
+        assert_eq!(recorded.output_reservation, window / 4);
+    }
+}

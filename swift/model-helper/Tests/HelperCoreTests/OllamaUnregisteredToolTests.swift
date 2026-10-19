@@ -113,7 +113,7 @@ final class OllamaFixtureServer: @unchecked Sendable {
     var input = ModelInput(); input.instructions = ""; input.prompt = "tools"
     let data = try input.serializedData()
     var begin = Asura_Model_V1_Begin(); begin.model = "ollama:fixture"; begin.inputBytes = UInt64(data.count)
-    begin.maxResponseTokens = 512; begin.enableProjectTools = true
+    begin.enableProjectTools = true
     try await channel.send(.begin(begin)); _ = try await channel.next()
     var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
     chunk.ordinal = 0; chunk.revision = 0; chunk.data = data

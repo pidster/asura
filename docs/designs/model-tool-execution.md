@@ -4,9 +4,11 @@ Response-budget update, 2026-09-28: the [response activity contract](response-ac
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
 Turn limit change (owner, 2026-10-18): “We found these types of tool and turn
 limits to be profoundly limiting in Wisp.” A turn has no token reservation, no
-token total, no refunds and no request count. Each request keeps its
-[request cap](turn-usage-helper.md#request-caps-and-admission): first request at
-most 1,024 tokens, later requests at most 512, or the caller's cap if smaller.
+token total, no refunds and no request count. Owner decision, 2026-10-19
+(“Model's own limit”): no request has an output cap. Each request writes until
+the model stops or its context window is full; the 1,024 first-request cap, the
+512 later-request cap and the caller's cap are removed
+([request admission](turn-usage-helper.md#request-admission)).
 A turn records up to 200 tool calls and has no result-byte total
 ([tool call records](tool-call-records.md#turn-limit-change-owner-2026-10-18)).
 Earlier numerical examples and validation evidence below describe earlier packets.
@@ -303,8 +305,9 @@ and the installed macOS 27 `GenerationOptions` declarations.
 
 ### Aggregate inference bound for MT2
 
-Superseded: the current request caps are defined by the
-[turn usage helper](turn-usage-helper.md#request-caps-and-admission).
+Superseded: [request admission](turn-usage-helper.md#request-admission) in the
+turn usage helper defines current requests, which have no output cap (owner,
+2026-10-19).
 This section records the earlier MT2 refinement. Wrap each provider's `LanguageModelExecutor`
 with a per-turn dispatch counter. The wrapper delegates to the existing executor;
 it does not run another model loop. The installed macOS 27 SDK exposes both
@@ -368,10 +371,10 @@ The service records conservative usage itself: after any tool-enabled inference
 starts, per-step helper usage does not become the terminal usage, and the
 terminal marks usage unknown. This applies even if no tool is selected. Before
 Start the terminal records known zero usage. No token charge or reservation
-exists (owner, 2026-10-18). The executor wrapper caps each request at 1,024
-tokens first and 512 later, with no request count. Each supported provider must
-implement the same structured tool callbacks and enforce the passed output cap;
-provider inventory alone never enables tools.
+exists (owner, 2026-10-18). The executor wrapper applies no output cap and no
+request count (owner, 2026-10-19). Each supported provider must implement the
+same structured tool callbacks and end a request at a full context window with
+`context_limit`; provider inventory alone never enables tools.
 
 The host worker has no deadline and no reactor timer (owner, 2026-10-17); the
 earlier two-second deadline is removed. A turn cancel, steering or shutdown
@@ -431,7 +434,7 @@ limit of owner decision 2; TCR-Q1 measures it.
 
 ```mermaid
 flowchart TD
-    Select[Resolve admitted provider and disclosure policy] --> Cap{Native tool capability and enforced output cap?}
+    Select[Resolve admitted provider and disclosure policy] --> Cap{Native tool capability?}
     Cap -->|No| Unavailable[Do not enable tools or parse generated prose]
     Cap -->|Yes| Accept[Persist accepted task and reserved budget]
     Accept --> Start[Commit Start before inference]
@@ -697,8 +700,8 @@ No additional work queue or blocking call is introduced. Existing provider load
 workers, Hello without a time limit (owner, 2026-10-16), cancellation-driven turn, one pending callback, 200 tool calls,
 host workers without a deadline (owner, 2026-10-17), retained cancellation and
 cleanup rules apply. Native
-inference requests are capped at 1,024 tokens first and 512 later, with no
-request count or turn token total (owner, 2026-10-18).
+inference requests have no output cap (owner, 2026-10-19), no request count and
+no turn token total (owner, 2026-10-18).
 
 ### MT3 activation decision
 

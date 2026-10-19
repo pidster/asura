@@ -72,8 +72,7 @@ private func measure(_ value: Q1Case) async -> (reached: Bool, outcome: String, 
     var input = ModelInput(); input.instructions = "q1"; input.prompt = "q1"
     var outcome = "complete"
     do {
-        try await backend.generateWithTools(input, maximumTokens: 2048,
-            handler: { await probe.received($0) }, snapshot: { _ in })
+        try await backend.generateWithTools(input, handler: { await probe.received($0) }, snapshot: { _ in })
     } catch let error as BackendFailure {
         outcome = "backend_failure:\(error.reason)"
     } catch {

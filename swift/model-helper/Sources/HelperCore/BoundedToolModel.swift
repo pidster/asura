@@ -1,24 +1,16 @@
 import Foundation
 import FoundationModels
 
-/// Per-request output caps. A turn has no request count and no token total
-/// (owner, 2026-10-18; turn-usage-helper.md, request caps and admission).
-public enum ToolRoundLimits {
-    public static let firstAllocation = 1024
-    public static let continuationAllocation = 512
-}
-
 /// Request state belongs to one admitted turn, even if the framework caches executors.
+/// A turn has no request count and no token total (owner, 2026-10-18), and a
+/// request has no output cap (owner, 2026-10-19; turn-usage-helper.md, request admission).
 public actor ToolRoundBudget {
     private var used = 0
-    /// The caller's per-request cap (the Begin limit), never a turn total.
-    private let callerCap: Int
     private let toolsEnabled: Bool
     private var failure: BackendFailure?
     private var inferenceActive = false
     private var waiters: [UUID: CheckedContinuation<Void, any Error>] = [:]
-    public init(maximumTokens: Int = Int(Limits.maximumResponseTokens), toolsEnabled: Bool = true) {
-        callerCap = min(max(0, maximumTokens), Int(Limits.maximumResponseTokens))
+    public init(toolsEnabled: Bool = true) {
         self.toolsEnabled = toolsEnabled
     }
     public func record(_ error: BackendFailure) {
@@ -71,12 +63,14 @@ public actor ToolRoundBudget {
         waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
     }
     func pendingCallbacks() -> Int { waiters.count }
-    /// Admits one request and returns its output cap. Tool-enabled turns admit
-    /// any number of requests; plain text admits one (owner, 2026-10-18).
-    public func reserve(requestedMaximum: Int? = nil) throws -> Int {
+    /// Admits one request. Tool-enabled turns admit any number of requests;
+    /// plain text admits one, because it has no tool continuation and a second
+    /// dispatch would repeat the answer (owner, 2026-10-18). No output cap is
+    /// allocated (owner, 2026-10-19).
+    public func reserve() throws {
         try Task.checkCancellation()
         if let failure { throw failure }
-        guard callerCap > 0, toolsEnabled || used == 0 else {
+        guard toolsEnabled || used == 0 else {
             let error = BackendFailure(.outputLimit)
             record(error)
             throw error
@@ -84,26 +78,25 @@ public actor ToolRoundBudget {
         guard !inferenceActive else {
             let error = BackendFailure(.protocolFault); record(error); throw error
         }
-        let requested = requestedMaximum ?? callerCap
-        guard requested > 0 else { throw BackendFailure(.outputLimit) }
-        let passLimit = toolsEnabled ? (used == 0 ? ToolRoundLimits.firstAllocation : ToolRoundLimits.continuationAllocation) : callerCap
-        let allocation = min(callerCap, passLimit, requested)
         used = used == Int.max ? used : used + 1
         inferenceActive = true
-        return allocation
     }
 
 }
 
 /// Intercepts every SDK inference dispatch without adding another model loop.
-/// Use only with providers whose executor enforces maximumResponseTokens.
+/// It sets no Asura output cap: `responseTokens` is `nil` for providers that
+/// then write until the model stops or the window is full, or the context
+/// window for adapters whose `nil` means a small library default (owner,
+/// 2026-10-19; turn-usage-helper.md, request admission).
 public struct BoundedToolModel<Base: LanguageModel>: LanguageModel {
     public let base: Base
     public let budget: ToolRoundBudget
     public let usageObserver: InferenceUsageObserver?
-    public init(base: Base, maximumTokens: Int = Int(Limits.maximumResponseTokens), toolsEnabled: Bool = true, usageObserver: InferenceUsageObserver? = nil) {
-        self.base = base; self.usageObserver = usageObserver
-        self.budget = ToolRoundBudget(maximumTokens: maximumTokens, toolsEnabled: toolsEnabled)
+    public let responseTokens: Int?
+    public init(base: Base, responseTokens: Int? = nil, toolsEnabled: Bool = true, usageObserver: InferenceUsageObserver? = nil) {
+        self.base = base; self.usageObserver = usageObserver; self.responseTokens = responseTokens
+        self.budget = ToolRoundBudget(toolsEnabled: toolsEnabled)
     }
     public var capabilities: LanguageModelCapabilities { base.capabilities }
     public var executorConfiguration: Base.Executor.Configuration { base.executorConfiguration }
@@ -126,10 +119,10 @@ public struct BoundedToolModel<Base: LanguageModel>: LanguageModel {
         }
         public func respond(to request: LanguageModelExecutorGenerationRequest, model: Model,
             streamingInto channel: LanguageModelExecutorGenerationChannel) async throws {
-            let allocation = try await model.budget.reserve(requestedMaximum: request.generationOptions.maximumResponseTokens)
+            try await model.budget.reserve()
             var bounded = request
-            bounded.generationOptions.maximumResponseTokens = allocation
-            do { try await model.usageObserver?.begin(request.id, cap: allocation) }
+            bounded.generationOptions.maximumResponseTokens = model.responseTokens
+            do { try await model.usageObserver?.begin(request.id) }
             catch {
                 await model.budget.finishInference((error as? BackendFailure) ?? BackendFailure(.internalError))
                 throw error

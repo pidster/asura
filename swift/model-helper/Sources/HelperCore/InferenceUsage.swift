@@ -27,7 +27,6 @@ public actor InferenceUsageObserver {
     private struct Active {
         let id: UUID
         let ordinal: UInt32
-        let cap: Int
         var input: UInt64?
         var output: UInt64?
         var cached: UInt64?
@@ -38,28 +37,28 @@ public actor InferenceUsageObserver {
     private let snapshot: @Sendable (Snapshot) async throws -> Void
     public init(snapshot: @escaping @Sendable (Snapshot) async throws -> Void) { self.snapshot = snapshot }
 
-    func begin(_ id: UUID, cap: Int) async throws {
+    func begin(_ id: UUID) async throws {
         try Task.checkCancellation()
         // No request count per turn (owner, 2026-10-18); UInt32 exhaustion is a fault.
-        guard active == nil, ordinal < UInt32.max, (1...Int(Limits.maximumResponseTokens)).contains(cap) else {
+        guard active == nil, ordinal < UInt32.max else {
             throw BackendFailure(.protocolFault)
         }
         ordinal += 1
-        active = Active(id: id, ordinal: ordinal, cap: cap)
+        active = Active(id: id, ordinal: ordinal)
         try await snapshot(Snapshot(text: "", inferenceStartedOrdinal: ordinal))
     }
     func measure(_ id: UUID, input: Int?, output: Int?, cached: Int? = nil) throws {
         guard var current = active, current.id == id, !current.measured else { throw BackendFailure(.protocolFault) }
         func checked(_ value: Int?) throws -> UInt64? {
             guard let value else { return nil }
-            guard (0...1_000_000_000).contains(value) else { throw BackendFailure(.protocolFault) }
+            guard value >= 0, UInt64(value) <= Limits.countedTokens else { throw BackendFailure(.protocolFault) }
             return UInt64(value)
         }
         let measuredInput = try checked(input)
         let measuredOutput = try checked(output)
         let measuredCached = try checked(cached)
-        guard measuredOutput.map({ $0 <= UInt64(current.cap) }) ?? true,
-            measuredCached.map({ measuredInput != nil && $0 <= measuredInput! }) ?? true else {
+        // No request output cap exists (owner, 2026-10-19); counts are only validated.
+        guard measuredCached.map({ measuredInput != nil && $0 <= measuredInput! }) ?? true else {
             throw BackendFailure(.protocolFault)
         }
         current.input = measuredInput; current.output = measuredOutput; current.cached = measuredCached

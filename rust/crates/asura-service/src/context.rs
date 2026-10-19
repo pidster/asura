@@ -25,6 +25,14 @@ pub(crate) struct Candidate {
     pub answer: String,
 }
 
+/// `R = ⌊E ÷ 4⌋`: room the composer leaves for the answer (D3 refinement,
+/// owner decision 2026-10-19, context-composer.md "Output reservation R").
+/// A composition target, not an output cap: the helper never receives it and
+/// the model writes until it stops or the window is full.
+pub(crate) fn output_reservation(window_tokens: u32) -> u32 {
+    window_tokens / 4
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Budget {
     pub window_tokens: u32,

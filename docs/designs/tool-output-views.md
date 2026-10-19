@@ -11,7 +11,9 @@ Owner change, 2026-10-18: “We found these types of tool and turn limits to be
 profoundly limiting in Wisp.” L20 becomes 200 calls, L34 becomes 1–201, L22 and
 L25 are removed and L24 loses its turn total. L23 is removed with L22. The
 [tool call records](tool-call-records.md#turn-limit-change-owner-2026-10-18) and
-[request caps](turn-usage-helper.md#request-caps-and-admission) own the details.
+[request admission](turn-usage-helper.md#request-admission) own the details.
+Owner decision, 2026-10-19 (“Model's own limit”): L24 is removed; no request has
+an output cap.
 
 ## Purpose
 
@@ -122,7 +124,7 @@ its classification under the principles above.
 | L21 | Per-result bytes | 16,384 | Remove | Composer for the model view; journal references for records |
 | L22 | Result bytes per turn | None (removed, owner, 2026-10-18; was 65,536) | Removed | — |
 | L23 | Memory-create headroom | None (removed with L22, owner, 2026-10-18; was 256 B) | Removed | — |
-| L24 | Request caps | Per request: 1024 first, then 512, or the caller's cap (2048 ceiling); no turn total (owner, 2026-10-18; the 2048 turn reservation is removed) | Model-sized | Capacity record |
+| L24 | Request caps | None (removed, owner, 2026-10-19; was 1024 first, then 512, or the caller's cap with a 2048 ceiling). The model writes until it stops or its window is full | Removed | — |
 | L25 | Inference requests per turn | None (removed, owner, 2026-10-18; was 64) | Removed | — |
 | L26 | Ollama context clamp | min(capacity, 8192) | Model-sized | Capacity record (rule 6) |
 | L27 | Model input, history, prompt | 64 KiB; 32 entries; 32 KiB | Remove | Composer; transfer chunking stays fixed |

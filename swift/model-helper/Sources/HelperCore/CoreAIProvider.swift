@@ -21,6 +21,7 @@ enum CoreAIProvider {
         try Task.checkCancellation()
         let model = try await CoreAILanguageModel(resourcesAt: directory)
         return FoundationBackend(model: model, contextTokens: capacity, contextSource: .coreai,
-            modelName: "coreai:\(name)", supportsTools: model.capabilities.contains(.toolCalling))
+            modelName: "coreai:\(name)", supportsTools: model.capabilities.contains(.toolCalling),
+            responseTokensFromWindow: true)
     }
 }

@@ -10,7 +10,9 @@ replaced by [model-sized limits](loop-closure.md#model-sized-limits).
 Owner change, 2026-10-18: “We found these types of tool and turn limits to be
 profoundly limiting in Wisp.” A turn no longer reserves 2,048 output tokens, has
 no token total, refunds or request count, and records up to 200 tool calls.
-Each request keeps its [request cap](turn-usage-helper.md#request-caps-and-admission).
+Owner decision, 2026-10-19: “Model's own limit.” No request has an output cap;
+each request writes until the model stops or its context window is full
+([request admission](turn-usage-helper.md#request-admission)).
 The sections below state the current rules; dated evidence keeps the values it
 tested.
 
@@ -106,9 +108,10 @@ Run CLI unit and lifecycle checks, focused service coverage, lint and final buil
 ## Response limits and truthful completion
 
 Selected correction (owner, 2026-10-18): a turn has no output-token reservation
-or total. Tool inference requests use a first-request cap of 1,024 and
-continuation caps of 512, or the caller's cap if smaller. No request count limits
-a turn. The service uses the selected cancellation-driven turn lifetime and
+or total. No request count limits a turn. Owner decision, 2026-10-19: no
+inference request has an output cap; the 1,024 first-request cap, the 512
+continuation cap and the caller's cap are removed. A request writes until the
+model stops or its context window is full. The service uses the selected cancellation-driven turn lifetime and
 retains its 200-call tool limit. No response byte, revision or transmitted-output
 total exists (owner, 2026-10-18); [response text transfer](response-text-transfer.md)
 carries a response of any length in windows of at most 61,440 bytes. A remaining
@@ -120,13 +123,15 @@ Kind 21 records no output-token reservation and the terminal records no charge
 (owner, 2026-10-18; schema changed in place, no compatibility with older
 journals). A terminal records usage as known or unknown; unknown usage records
 zero output tokens. Recovery records unknown usage. Journal format remains 1 and
-protocol remains 0.1. The service sends the per-request ceiling of 2,048 as the
-`Begin` cap; the model wire permits 1 to 2,048. Context checks keep room for one
-request's cap before generation. Small contexts reject excessive
-input with context-limit status rather than silently clipping context or output.
+protocol remains 0.1. `Begin` carries no output cap; its field 4 is reserved
+(owner, 2026-10-19). The [context composer](context-composer.md#output-reservation-r)
+leaves `⌊window ÷ 4⌋` tokens for the answer. That reserve is not an output cap.
+Small contexts reject excessive input with context-limit status rather than
+silently clipping context or output.
 
 The Ollama adapter inspects its finish reason. A length stop preserves the delivered
-prefix and reports output-limit. A natural stop reports completion. Unsupported or
+prefix and reports context-limit, because with `num_predict: -1` only a full
+context window produces it (owner, 2026-10-19). A natural stop reports completion. Unsupported or
 ambiguous finish reasons fail explicitly rather than claiming completion. The shared
 bounded executor records a typed failure in its turn-local budget state, so SDK error
 wrapping cannot turn output-limit into success or an unrelated error. Cancellation
@@ -135,8 +140,8 @@ removed the explicit generation deadline (2026-10-16); Begin has no deadline
 field (owner, 2026-10-17).
 
 Validation includes natural and length stops, final-chunk text preservation, wrapped
-executor failure, exact pass allocations, more than 64 requests in one turn, and a
-native local Ollama post-tool response longer than 128 tokens with an expected ending.
+executor failure, uncapped request options, more than 64 requests in one turn, and a
+native local Ollama post-tool response longer than 512 tokens with an expected ending.
 No heuristic based on punctuation decides whether an answer is complete.
 
 ### Selected completion flow
@@ -147,7 +152,7 @@ Arrows describe provider finish classification and durable publication.
 flowchart TD
     Stream[Receive bounded response text] --> Finish{Provider finish reason}
     Finish -->|Natural stop| Complete[Report complete]
-    Finish -->|Length limit| Partial[Preserve text and report output limit]
+    Finish -->|Length: context window full| Partial[Preserve text and report context limit]
     Finish -->|Unknown or malformed| Failed[Preserve text and report failure]
     Cancel[Cancellation, helper exit or shutdown] --> Failed
     Complete --> Commit[Commit terminal result with known or unknown usage]
@@ -157,20 +162,19 @@ flowchart TD
     UI --> Browse[Scroll response and inspect activity]
 ```
 
-Ollama `stop` is a natural stop, including tool-call responses. `length` is an
-output limit. A missing or empty reason with eval_count at the requested cap is
-also an output limit; otherwise it is invalid-response. Unknown reasons are invalid.
+Ollama `stop` is a natural stop, including tool-call responses. `length` is a
+full context window and reports context-limit (owner, 2026-10-19). A missing or
+empty reason is invalid-response. Unknown reasons are invalid.
 The adapter emits valid final-chunk text before classifying the finish. The shared
 wrapper retains typed errors for both tool and plain-text inference. Plain-text
-inference uses one dispatch with the admitted maximum, not the tool-pass split.
+inference uses one dispatch with no output cap.
 
-The turn-local executor state keeps no token total (owner, 2026-10-18). Each
-tool dispatch uses the smallest of its pass cap (1,024 first, 512 later), the
-caller's cap and the SDK request cap. No request count or remaining budget
-refuses a dispatch. Plain-text dispatch uses its admitted maximum once; a second
-plain-text dispatch fails before provider I/O.
+The turn-local executor state keeps no token total (owner, 2026-10-18) and sets
+no output cap (owner, 2026-10-19). No request count or remaining budget refuses
+a dispatch. Plain-text dispatch runs once; a second plain-text dispatch fails
+before provider I/O.
 The first typed executor failure is retained through SDK error wrapping; cancellation
-still takes priority. Tests cover small caller caps, many requests and separate turns.
+still takes priority. Tests cover uncapped request options, many requests and separate turns.
 
 The installed SDK drops buffered response text if its executor throws. For a typed
 executor failure, the bounded adapter therefore records the failure and returns
@@ -344,13 +348,13 @@ Channel loss/cancellation with an unreported active inference makes totals parti
 The [helper usage design](turn-usage-helper.md) defines actual provider observations,
 start-marker cancellation settlement and conservative unknown counts. System,
 CoreAI and MLX cannot claim per-request counts from opaque SDK events; Ollama can.
-No counter comes from context occupancy, byte estimates or request caps.
+No counter comes from context occupancy or byte estimates.
 `TurnStatistics.request_count` has no cap beyond its `uint32` type, and token
 sums are checked `uint64` additions; an overflow makes the sum unknown.
 
 The observed failure after three tool passes required correcting the fixed pass
-allocation guard. Keep the first tool-pass cap 1,024 and the later-pass cap 512.
-The independent three-pass limit, the 2,048-token turn budget, its refunds and
+allocation guard. The first tool-pass cap of 1,024 and the later-pass cap of 512
+are removed (owner, 2026-10-19). The independent three-pass limit, the 2,048-token turn budget, its refunds and
 the 64-request cap are removed (owner, 2026-10-18). A turn records up to 200 tool
 calls. The helper design specifies request identity, counter checks and release ordering.
 Plain-text generation keeps its single admitted request. This introduces no retry

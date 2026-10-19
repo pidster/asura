@@ -18,7 +18,7 @@ private actor UsageSnapshots {
     let snapshots = UsageSnapshots()
     let observer = InferenceUsageObserver { await snapshots.record($0) }
     let request = UUID()
-    try await observer.begin(request, cap: 512)
+    try await observer.begin(request)
     try await observer.measure(request, input: 0, output: 0)
     try await observer.settle(request, succeeded: true)
     #expect(await snapshots.starts == [1])
@@ -29,14 +29,14 @@ private actor UsageSnapshots {
     let snapshots = UsageSnapshots()
     let observer = InferenceUsageObserver { await snapshots.record($0) }
     let unknown = UUID()
-    try await observer.begin(unknown, cap: 512)
+    try await observer.begin(unknown)
     try await observer.settle(unknown, succeeded: true)
     let partial = UUID()
-    try await observer.begin(partial, cap: 512)
+    try await observer.begin(partial)
     try await observer.measure(partial, input: nil, output: 5)
     try await observer.settle(partial, succeeded: true)
     let failed = UUID()
-    try await observer.begin(failed, cap: 512)
+    try await observer.begin(failed)
     try await observer.measure(failed, input: 10, output: 7, cached: 3)
     try await observer.settle(failed, succeeded: false)
     #expect(await snapshots.reports == [RequestUsage(ordinal: 1),
@@ -48,9 +48,9 @@ private actor UsageSnapshots {
     let snapshots = UsageSnapshots()
     let observer = InferenceUsageObserver { await snapshots.record($0) }
     let request = UUID()
-    try await observer.begin(request, cap: 20)
+    try await observer.begin(request)
     await #expect(throws: BackendFailure.self) { try await observer.measure(UUID(), input: 1, output: 1) }
-    await #expect(throws: BackendFailure.self) { try await observer.measure(request, input: 1, output: 21) }
+    await #expect(throws: BackendFailure.self) { try await observer.measure(request, input: 1, output: 1_000_000_001) }
     await #expect(throws: BackendFailure.self) { try await observer.measure(request, input: 1_000_000_001, output: 1) }
     await #expect(throws: BackendFailure.self) { try await observer.measure(request, input: 3, output: 1, cached: 4) }
     try await observer.measure(request, input: 3, output: 1)
@@ -60,26 +60,25 @@ private actor UsageSnapshots {
     #expect(await snapshots.reports.count == 1)
 }
 
-/// UH10, UH12 (owner, 2026-10-18): requests have per-request caps only; no
-/// request count or token total refuses one, and a failure stops admission.
-@Test func requestsKeepPerRequestCapsWithoutCountOrTurnTotal() async throws {
+/// UH10, UH12 (owner, 2026-10-18 and 2026-10-19): no output cap, request
+/// count or token total refuses a request, and a failure stops admission.
+@Test func requestsAdmitWithoutCapCountOrTurnTotal() async throws {
     let budget = ToolRoundBudget()
-    #expect(try await budget.reserve() == 1024); await budget.finishInference()
-    for _ in 2...100 {
-        #expect(try await budget.reserve() == 512); await budget.finishInference()
+    for _ in 1...100 {
+        try await budget.reserve(); await budget.finishInference()
     }
     #expect(await budget.recordedFailure() == nil)
-    let failed = ToolRoundBudget(maximumTokens: 512)
-    _ = try await failed.reserve()
+    let failed = ToolRoundBudget()
+    try await failed.reserve()
     await failed.finishInference(BackendFailure(.cancelled))
-    await #expect(throws: BackendFailure.self) { _ = try await failed.reserve() }
+    await #expect(throws: BackendFailure.self) { try await failed.reserve() }
 }
 
 private actor FourPassProbe {
     var passes = 0
-    var caps: [Int] = []
+    var caps: [Int?] = []
     var hostCalls = 0
-    func next(_ cap: Int) -> Int { passes += 1; caps.append(cap); return passes }
+    func next(_ cap: Int?) -> Int { passes += 1; caps.append(cap); return passes }
     func hostCalled() { hostCalls += 1 }
 }
 private struct FourPassModel: LanguageModel {
@@ -93,7 +92,7 @@ private struct FourPassModel: LanguageModel {
         init(configuration: Int) {}
         func respond(to request: LanguageModelExecutorGenerationRequest, model: Model,
             streamingInto channel: LanguageModelExecutorGenerationChannel) async throws {
-            let cap = try #require(request.generationOptions.maximumResponseTokens)
+            let cap = request.generationOptions.maximumResponseTokens
             let pass = await model.probe.next(cap)
             if pass <= 3 {
                 await channel.send(.toolCalls(action: .toolCall(id: "fixture-\(pass)", name: "service",
@@ -114,14 +113,15 @@ private struct FourPassModel: LanguageModel {
         modelName: "measured-fixture", supportsTools: true,
         instrumentationFactory: { usage, _, _ in var model = base; model.usage = usage; return model })
     var input = ModelInput(); input.instructions = "fixture"; input.prompt = "fixture"
-    try await engine.generateWithTools(input, maximumTokens: 2048, handler: { proposal in
+    try await engine.generateWithTools(input, handler: { proposal in
         guard proposal.name == "service", proposal.arguments.contains("tools") else { throw HelperError.protocolFault }
         await probe.hostCalled()
         return ToolResult(status: .success, text: "fixture tools")
     }, snapshot: { await snapshots.record($0) })
     #expect(await probe.passes == 4)
     #expect(await probe.hostCalls == 3)
-    #expect(await probe.caps == [1024, 512, 512, 512])
+    // UH13: no Asura output cap on any pass (owner, 2026-10-19).
+    #expect(await probe.caps == [nil, nil, nil, nil])
     #expect(await snapshots.starts == [1, 2, 3, 4])
     let reports = await snapshots.reports
     #expect(reports.map(\.ordinal) == [1, 2, 3, 4])
@@ -141,5 +141,31 @@ private struct FourPassModel: LanguageModel {
     message.inferenceUsage.cachedInputTokens = 1
     #expect(throws: HelperError.self) { try Wire.validate(message, from: .helper) }
     message.inferenceUsage.clearCachedInputTokens(); message.inferenceUsage.outputTokens = 1_000_000_001
+    #expect(throws: HelperError.self) { try Wire.validate(message, from: .helper) }
+}
+
+/// Owner, 2026-10-19: Begin carries no output cap (field 4 is reserved and an
+/// old cap is an unknown field), and terminal usage is bounded only by the
+/// counter validity bound, not by a request cap.
+@Test func wireCarriesNoOutputCapAndAcceptsLargeUsage() throws {
+    var begin = Asura_Model_V1_Begin()
+    begin.model = "system"; begin.inputBytes = 10
+    var message = Envelope(); message.operationID = Data(repeating: 1, count: 16); message.generation = 1
+    message.body = .begin(begin)
+    try Wire.validate(message, from: .service)
+    // Begin field 4 as a varint (2,048), as the removed cap was sent.
+    let withCap = try Asura_Model_V1_Begin(serializedBytes: try begin.serializedData() + Data([0x20, 0x80, 0x10]))
+    message.body = .begin(withCap)
+    let encoded = try message.serializedData()
+    #expect(throws: (any Error).self) { _ = try Wire.decode(encoded, from: .service) }
+
+    var terminal = Asura_Model_V1_Terminal()
+    terminal.outcome = .complete; terminal.reason = .none; terminal.lastRevision = 1
+    terminal.count = 0; terminal.totalBytes = 0; terminal.usageKnown = true
+    terminal.usageTokens = 5_000
+    message.body = .terminal(terminal)
+    try Wire.validate(message, from: .helper)
+    terminal.usageTokens = Limits.countedTokens + 1
+    message.body = .terminal(terminal)
     #expect(throws: HelperError.self) { try Wire.validate(message, from: .helper) }
 }

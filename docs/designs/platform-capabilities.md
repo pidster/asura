@@ -2,12 +2,14 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-Each model request has its own output cap. A tool-enabled turn's first request
-is capped at 1,024 tokens and each later request at 512, or at the caller's cap
-if smaller. A plain-text turn makes one request at the caller's cap, at most 2,048.
-There is no per-turn output budget, reservation or request count (owner,
-2026-10-18; [request caps](turn-usage-helper.md#request-caps-and-admission)). Earlier
-numerical examples and validation evidence below describe that earlier packet.
+No model request has an Asura output cap (owner, 2026-10-19: “Model's own
+limit”). Each request writes until the model stops or its context window is
+full; a full window ends the request with `context_limit`. The 1,024 and 512
+tool-request caps, the caller's `Begin` cap and the 2,048 per-request ceiling
+are removed. A plain-text turn still makes one request. There is no per-turn
+output budget, reservation or request count (owner, 2026-10-18;
+[request admission](turn-usage-helper.md#request-admission)). Earlier numerical
+examples and validation evidence below describe earlier packets.
 
 Implementation update, 2026-10-12: committed code supersedes these parts of the
 dated proposals below; the proposals remain as their record.
@@ -254,7 +256,7 @@ The path is relative to the SDK's `System/Library/Frameworks` directory.
 | `ResponseStream.Snapshot`, line 2191 | Treat content as a snapshot, not an independent text delta. | Do not assume snapshots are append-only. |
 | `ResponseStream.AsyncIterator.next`, line 2240 | Await generation outside the service control reactor. | An async signature does not prove bounded cancellation or memory use. |
 | `SystemLanguageModel.tokenCount`, lines 410–434; `contextSize`, line 445 | Check context capacity before generation and reserve response capacity. | Counting can fail or stall and requires the operation deadline. |
-| `GenerationOptions.maximumResponseTokens`, line 3211 | Apply the admitted output-token bound. | Also enforce a separate UTF-8 byte limit. |
+| `GenerationOptions.maximumResponseTokens`, line 3211 | Superseded (owner, 2026-10-19): the system request passes `nil`, so no Asura output-token bound applies. | The model stops naturally or at `contextSizeExceeded`. |
 | `LanguageModelSession.Error.concurrentRequests`, line 2027 | Serialize generation per session. | Do not retry a concurrent operation automatically. |
 
 No external inference, dependency installation, compilation or runtime model
@@ -269,8 +271,8 @@ They use explicit messages in the evolving 0.1 schemas.
 | Resource or operation | Proposed limit | Required failure behavior |
 | --- | --- | --- |
 | Active helper generations | 1 per service initially | Reject additional admission as busy; no hidden waiting queue. |
-| Input including instructions and scoped history | 64 KiB UTF-8 and the model's measured token window minus 2,048 response tokens | Reject overflow before the start permit; preserve the draft. |
-| Generation response | 2,048 tokens per request; no per-turn or per-operation byte, revision or transmitted-output total (owner, 2026-10-18). Each output revision transfers at most 61,440 bytes ([response text transfer](response-text-transfer.md)) | A response of any length is delivered whole; journal capacity exhaustion cancels with `output_limit` and keeps the journaled prefix. |
+| Input including instructions and scoped history | 64 KiB UTF-8 and the model's measured token window minus 2,048 response tokens (superseded: the [context composer](context-composer.md#output-reservation-r) reserves `⌊window ÷ 4⌋`; the helper rejects only input that leaves no output room) | Reject overflow before the start permit; preserve the draft. |
+| Generation response | No token cap per request (owner, 2026-10-19): the model writes until it stops or its window is full. No per-turn or per-operation byte, revision or transmitted-output total (owner, 2026-10-18). Each output revision transfers at most 61,440 bytes ([response text transfer](response-text-transfer.md)) | A response of any length is delivered whole; journal capacity exhaustion cancels with `output_limit` and keeps the journaled prefix. |
 | Private model-channel frame / chunk payload | 64 KiB / 16 KiB | Reject excessive lengths before allocation. |
 | Input and output credit windows | 64 KiB each | Pause data transfer at zero credit; continue control processing. |
 | Helper startup and identity handshake | No time limit (owner, 2026-10-16) | The step ends on the next message, helper exit, protocol fault, cancel or shutdown. On a fault, cancel or shutdown, close the channel, terminate and reap only the owned child. |
@@ -414,7 +416,7 @@ The identity and credit rules in the canonical D2 design continue to apply.
 | Body field | Message and numbered fields | Meaning |
 | --- | --- | --- |
 | 10 | Hello: build_id bytes 1; schema_digest bytes 2; max_frame_bytes uint32 3; later fields in [model tools](model-tool-execution.md#selected-provider-handshake) | Build and schema identities are exactly 32 bytes and must match before input. `selected_model` (field 9) is required in every Hello; field 5 is reserved. |
-| 11 | Begin: model string 1; input_bytes uint64 2; field 3 reserved; max_response_tokens uint32 4 | Selected provider, at most 64 KiB input; generation uses the [cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30). Field 3, the earlier `deadline_remaining_ms`, is removed and reserved (owner, 2026-10-17). |
+| 11 | Begin: model string 1; input_bytes uint64 2; fields 3 and 4 reserved; enable_project_tools bool 5 | Selected provider, at most 64 KiB input; generation uses the [cancellation-driven lifetime](model-provider-integration.md#cancellation-driven-turn-lifetime--selected-2026-09-30). Field 3, the earlier `deadline_remaining_ms`, is removed and reserved (owner, 2026-10-17). Field 4, the earlier `max_response_tokens`, is removed and reserved (owner, 2026-10-19). |
 | 12 | Chunk: transfer_id uint64 1; direction enum 2; ordinal uint64 3; data bytes 4; revision uint64 5 | Directions 1 input and 2 output. Nonempty payload at most 16 KiB. Output revisions have no upper bound; an output transfer holds at most 61,440 bytes. |
 | 13 | Credit: transfer_id uint64 1; direction enum 2; accepted_bytes uint64 3; granted_bytes uint64 4 | Cumulative credit under the existing D2 ledger, never over the 64 KiB window. |
 | 14 | InputEnd: count uint64 1; total_bytes uint64 2 | Exact match to accepted input chunks. |

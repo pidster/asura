@@ -328,7 +328,9 @@ pub(super) fn valid(body: &Body) -> bool {
                             && (v.kind != Some(3) || v.text_bytes.is_some_and(|n| n > 0))
                             && (v.kind != Some(3) || v.reason == Some(0))
                             && match v.usage_known {
-                                Some(true) => v.usage_tokens.is_some_and(|n| n <= 2048),
+                                Some(true) => v
+                                    .usage_tokens
+                                    .is_some_and(|n| n <= crate::model::MAX_COUNTED_TOKENS),
                                 Some(false) => v.usage_tokens.is_none(),
                                 None => false,
                             }
@@ -616,12 +618,18 @@ mod tests {
             },
             pb::ConversationEvent {
                 usage_known: Some(true),
-                usage_tokens: Some(2049),
-                ..event
+                usage_tokens: Some(crate::model::MAX_COUNTED_TOKENS + 1),
+                ..event.clone()
             },
         ] {
             assert!(!valid(&Body::ConversationEvent(changed)));
         }
+        // No output cap (owner, 2026-10-19): a count above the former 2,048 is valid.
+        assert!(valid(&Body::ConversationEvent(pb::ConversationEvent {
+            usage_known: Some(true),
+            usage_tokens: Some(5_000),
+            ..event
+        })));
     }
     #[test]
     fn project_pages_and_error_exclusivity() {

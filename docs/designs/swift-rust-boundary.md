@@ -2,12 +2,14 @@
 
 Response-budget update, 2026-09-28: the [response activity contract](response-activity.md#response-limits-and-truthful-completion)
 supersedes this packet's earlier 512-token budget and 256/128/128 allocations.
-Each model request has its own output cap. A tool-enabled turn's first request
-is capped at 1,024 tokens and each later request at 512, or at the caller's cap
-if smaller. A plain-text turn makes one request at the caller's cap, at most 2,048.
-There is no per-turn output budget, reservation or request count (owner,
-2026-10-18; [request caps](turn-usage-helper.md#request-caps-and-admission)). Earlier
-numerical examples and validation evidence below describe that earlier packet.
+No model request has an Asura output cap (owner, 2026-10-19: “Model's own
+limit”). Each request writes until the model stops or its context window is
+full; a full window ends the request with `context_limit`. The 1,024 and 512
+tool-request caps, the caller's `Begin` cap and the 2,048 per-request ceiling
+are removed. A plain-text turn still makes one request. There is no per-turn
+output budget, reservation or request count (owner, 2026-10-18;
+[request admission](turn-usage-helper.md#request-admission)). Earlier numerical
+examples and validation evidence below describe earlier packets.
 
 Status: proposed D2 design for I0 and I3. Rust and Swift are selected languages;
 Ratatui and the Rust chat backend are selected. The Rust-owned local-model
@@ -809,9 +811,11 @@ assembling the input transfer and before requesting the start permit.
 Use the SDK's structured transcript/prompt representation to preserve roles;
 never concatenate history with invented role delimiters. Token counting and
 context preparation occur after the serialized start permit, inside the admitted
-operation budget. Reject input when measured context plus the admitted Begin
-`max_response_tokens` (2,048, a per-request output cap rather than a turn total)
-exceeds the model's reported capacity. An unavailable counter or context
+operation budget. Reject input when the measured context leaves no room for one
+output token in the model's reported capacity. `Begin` carries no output-token
+value; field 4, the earlier `max_response_tokens`, is reserved (owner,
+2026-10-19). The service's [context composer](context-composer.md#output-reservation-r)
+leaves room for the answer; the model writes until it stops or the window is full. An unavailable counter or context
 size is explicit unavailability, not permission to send unchecked history.
 
 ### Private wire completion and capability report
@@ -838,7 +842,8 @@ scalar fields except conditional context capacity require presence. Terminal
 true, `usage_tokens` must be present and zero is valid. Unknown usage records no
 charge; there is no turn token reservation (owner, 2026-10-18).
 `usage_tokens` means measured generated output tokens, excluding input tokens.
-Its wire bound is 2,048; the operation owner also checks the admitted Begin limit.
+Its wire bound is 1,000,000,000, a counter validity bound shared with
+`InferenceUsage`, not an output cap (owner, 2026-10-19).
 Tokenization estimates must not be reported as measured generation usage.
 
 Both peers send Hello before any Begin. Hello alone uses absent operation identity;

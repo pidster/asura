@@ -26,9 +26,10 @@ public enum Limits {
     public static let recordedToolCalls: UInt32 = 200
     /// Tool proposals per turn: the recorded calls plus the one over-limit proposal (TCR-D6).
     public static let toolProposals: UInt32 = recordedToolCalls + 1
-    /// Per-request output-token ceiling: the largest Begin cap and plain-text
-    /// terminal usage. Not a turn total (owner, 2026-10-18).
-    public static let maximumResponseTokens: UInt32 = 2048
+    /// Validity bound of one measured token counter (usage reports and
+    /// terminal usage). Not an output cap: requests have none (owner,
+    /// 2026-10-19; turn-usage-helper.md, request admission).
+    public static let countedTokens: UInt64 = 1_000_000_000
     /// Wire bounds of one forwarded proposal (tool-call-records.md, wire contract).
     public static let toolName = 256
     public static let toolArguments = 64_000
@@ -92,8 +93,8 @@ public enum Wire {
         switch body {
         case .inferenceUsage(let v):
             try check(!service && v.hasRequestOrdinal && v.requestOrdinal >= 1 && v.hasComplete
-                && (!v.hasInputTokens || v.inputTokens <= 1_000_000_000)
-                && (!v.hasOutputTokens || v.outputTokens <= 1_000_000_000)
+                && (!v.hasInputTokens || v.inputTokens <= Limits.countedTokens)
+                && (!v.hasOutputTokens || v.outputTokens <= Limits.countedTokens)
                 && (!v.hasCachedInputTokens || (v.hasInputTokens && v.cachedInputTokens <= v.inputTokens))
                 && (!v.complete || (v.hasInputTokens && v.hasOutputTokens)))
         case .contextMeasured(let v):
@@ -177,8 +178,7 @@ public enum Wire {
                     && v.reason == .modelUnavailable)
             }
         case .begin(let v):
-            try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...Limits.input).contains(v.inputBytes)
-                && v.hasMaxResponseTokens && (1...Limits.maximumResponseTokens).contains(v.maxResponseTokens))
+            try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...Limits.input).contains(v.inputBytes))
         case .chunk(let v):
             try check(v.hasTransferID && v.hasDirection && transfer(v.transferID, v.direction)
                 && v.direction == (service ? .input : .output) && v.hasData && !v.data.isEmpty && v.data.count <= Limits.chunk
@@ -216,7 +216,7 @@ public enum Wire {
                 && v.hasText && v.text.utf8.count <= 16_384 && v.hasTruncated)
             if v.status != .success { try check(!v.hasNextOffset) }
         case .terminal(let v):
-            try check(!service && v.hasUsageKnown && (v.usageKnown ? v.hasUsageTokens && v.usageTokens <= UInt64(Limits.maximumResponseTokens) : !v.hasUsageTokens)
+            try check(!service && v.hasUsageKnown && (v.usageKnown ? v.hasUsageTokens && v.usageTokens <= Limits.countedTokens : !v.hasUsageTokens)
                 && v.hasLastRevision && v.hasCount && v.hasTotalBytes
                 && counts(v.count, v.totalBytes, UInt64.max) && v.hasOutcome && v.hasReason)
             if v.outcome == .complete { try check(v.lastRevision > 0 && v.reason == .none) }

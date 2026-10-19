@@ -31,9 +31,9 @@ the wire schema, and plan or task loops. Each needs the mapping or a later desig
 
 Required behavior (owner, 2026-10-13):
 
-- Token limits must not be hard-coded. The current 2,048-token per-request
-  figures in the helper and wire validation are implementation, not design input.
-  Designs must not rely on them.
+- Token limits must not be hard-coded. The 2,048-token per-request figures that
+  were in the helper and wire validation are removed (owner, 2026-10-19); no
+  request has an Asura output cap. Designs must not rely on them.
 - A fixed numeric limit applies only in a **known-size exhaustion closure**: the
   exhausted quantity has a size that Asura knows and fixes, such as its own
   buffers, frame limits, call counts or captured bytes.
@@ -53,9 +53,11 @@ Required behavior (owner, 2026-10-13):
 
 Proposed mechanism: the provider owner resolves a model capacity record before
 admission. It holds the context window and maximum output tokens, each with its
-source: per-model configuration, configuration default, or person-confirmed probe. The turn
-owner derives each request's output cap from that record and the measured input
-size. A probed value must not set a bound until the person confirms it.
+source: per-model configuration, configuration default, or person-confirmed probe. The
+context composer derives its output reservation from the window in that record
+([output reservation](context-composer.md#output-reservation-r)). Asura sets no
+output cap (owner, 2026-10-19): a request writes until the model stops or the
+window is full. A probed value must not set a bound until the person confirms it.
 
 ### Capacity resolution flow
 
@@ -76,7 +78,7 @@ flowchart TD
     Ask -->|values entered| Write
     Ask -->|cancelled| Refuse["Refuse admission: capacity unknown"]
     Write --> Use
-    Use --> Cap["Derive per-request caps from<br/>capacity and measured input"]
+    Use --> Cap["Derive the composer's output<br/>reservation from the window"]
 ```
 
 Open decisions for the [model provider design](model-provider-integration.md):
@@ -337,8 +339,9 @@ to be profoundly limiting in Wisp.” The turn loop changes as follows:
 - A turn records up to 200 tool calls. The 201st proposal is recorded as `limit`
   and the turn ends ([tool call records](tool-call-records.md#turn-limit-change-owner-2026-10-18)).
 - No request count limits a turn. The 64-request cap is removed.
-- No turn output-token total, refund or durable reservation exists. Each request
-  keeps its own cap ([request caps](turn-usage-helper.md#request-caps-and-admission)).
+- No turn output-token total, refund or durable reservation exists. No request
+  has an output cap (owner, 2026-10-19;
+  [request admission](turn-usage-helper.md#request-admission)).
 - No per-turn tool-result byte total exists. Each result keeps 16 KiB.
 
 A turn therefore ends by these closures and interrupts: the model completes; the
@@ -360,7 +363,7 @@ behavior; it is not the target.
 
 | Loop | Owner today | Current closures | Current interrupts |
 | --- | --- | --- | --- |
-| One model request | Model helper | Exhaustion: hard-coded per-request output cap (to be model-sized) | Cancel, steer |
+| One model request | Model helper | Completion; context window full (`context_limit`). No output cap (owner, 2026-10-19) | Cancel, steer |
 | Requests within a turn | Model helper | Completion; the tool-call limit below; context window full (provider context error); provider failure; helper exit. No request count and no token total (owner, 2026-10-18) | Cancel, steer |
 | Tool calls within a turn | Service | Exhaustion: 200 calls (the 201st is recorded as `limit` and ends the turn), 16 KiB per result; journal full. No turn result-byte total (owner, 2026-10-18) | Cancel, steer |
 | Tool job (designed, not implemented) | Service | Completion; capture fault. No lifetime deadline (owner, 2026-10-14). Temporary ending `CapturePaused` on quota or ENOSPC, with no time expiry. A stall closure will come from tool-loop trace evidence. `job wait` ends on events or an optional model time. See [job closures](tool-job-controller.md#job-closures-and-wind-down-bounds). | Cancel, person stop and kill, revocation, restart |
@@ -407,7 +410,7 @@ Status: required coverage for the implementation that adopts this design.
 | LC-10 | Full volume during a job shows the suspension chain and recovers when space returns | | | Yes |
 | LC-11 | Drain and restart produce the documented permanent endings | | Yes | Yes |
 | LC-12 | Token caps follow the selected model's capacity record; no token limit is hard-coded | Yes | Yes | |
-| LC-13 | Two models with different capacities receive different request caps in one installation | | Yes | Yes |
+| LC-13 | Two models with different capacities receive different composer output reservations in one installation; neither request carries an output cap | | Yes | Yes |
 
 ## Decisions
 

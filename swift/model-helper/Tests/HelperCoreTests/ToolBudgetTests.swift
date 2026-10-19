@@ -21,8 +21,9 @@ private struct ProbeModel: LanguageModel {
         }
     }
 }
-/// UH10 (owner, 2026-10-18): a tool turn dispatches more than the former 64
-/// requests and more than the former 2,048-token total; each request keeps its cap.
+/// UH10, UH13 (owner, 2026-10-18 and 2026-10-19): a tool turn dispatches more
+/// than the former 64 requests, and no request carries an Asura output cap,
+/// even when the SDK request asks for one.
 @Test func toolInferenceRequestsHaveNoCountOrTurnTokenTotal() async throws {
     let probe = DispatchProbe()
     let model = BoundedToolModel(base: ProbeModel(probe: probe))
@@ -33,13 +34,8 @@ private struct ProbeModel: LanguageModel {
     for _ in 0..<100 {
         try await executor.respond(to: request, model: model, streamingInto: .init())
     }
-    let limits = await probe.limits
-    #expect(limits == [1024] + Array(repeating: 512, count: 99))
-    #expect(limits.compactMap { $0 }.reduce(0, +) > 2048)
+    #expect(await probe.limits == Array(repeating: nil, count: 100))
     #expect(await model.budget.recordedFailure() == nil)
-    let secondTurn = BoundedToolModel(base: ProbeModel(probe: probe))
-    try await executor.respond(to: request, model: secondTurn, streamingInto: .init())
-    #expect(await probe.limits.last == 1024)
 }
 
 @Test func genericEngineDeniesUnadvertisedToolsBeforeProviderDispatch() async throws {
@@ -49,8 +45,7 @@ private struct ProbeModel: LanguageModel {
     let status = await engine.status()
     #expect(status.contextTokens == nil && !status.supportsTools)
     do {
-        try await engine.generateWithTools(ModelInput(), maximumTokens: 512,
-            handler: { _ in Issue.record("unsupported tool reached host"); throw HelperError.unavailable },
+        try await engine.generateWithTools(ModelInput(), handler: { _ in Issue.record("unsupported tool reached host"); throw HelperError.unavailable },
             snapshot: { _ in Issue.record("unsupported provider emitted output") })
         Issue.record("unsupported tools were accepted")
     } catch let failure as BackendFailure { #expect(failure.reason == .modelUnavailable) }
@@ -63,12 +58,36 @@ private struct ProbeModel: LanguageModel {
         modelName: "counted", supportsTools: true, tokenCounter: { _, _ in 4096 })
     var input = ModelInput(); input.instructions = "test"; input.prompt = "test"
     do {
-        try await engine.generate(input, maximumTokens: 512, snapshot: { _ in
+        try await engine.generate(input, snapshot: { _ in
             Issue.record("overfull context emitted output")
         })
         Issue.record("overfull context reached inference")
     } catch let failure as BackendFailure { #expect(failure.reason == .contextLimit) }
     #expect(await probe.limits.isEmpty)
+}
+
+/// Owner, 2026-10-19: the helper reserves no output cap from the window. An
+/// exact count that leaves one token of room dispatches, with no output cap.
+@Test func genericEngineDispatchesInputThatLeavesOutputRoom() async throws {
+    let probe = DispatchProbe()
+    let engine = FoundationBackend(model: ProbeModel(probe: probe), contextTokens: 4096,
+        modelName: "counted", supportsTools: true, tokenCounter: { _, _ in 4095 })
+    var input = ModelInput(); input.instructions = "test"; input.prompt = "test"
+    // The probe writes no text, so the SDK reports no response; only dispatch matters.
+    try? await engine.generate(input, snapshot: { _ in })
+    #expect(await probe.limits == [nil])
+}
+
+/// UH13: adapters whose nil limit means a small library default (CoreAI, MLX)
+/// receive the context window, which cannot stop output before the window fills.
+@Test func windowSizedAdaptersReceiveTheContextWindow() async throws {
+    let probe = DispatchProbe()
+    let engine = FoundationBackend(model: ProbeModel(probe: probe), contextTokens: 32_768,
+        modelName: "windowed", supportsTools: false, responseTokensFromWindow: true)
+    var input = ModelInput(); input.instructions = "test"; input.prompt = "test"
+    // The probe writes no text, so the SDK reports no response; only dispatch matters.
+    try? await engine.generate(input, snapshot: { _ in })
+    #expect(await probe.limits == [32_768])
 }
 
 @Test func diagnosticDoesNotIncludeProviderDescriptionsOrMetadata() {
@@ -89,8 +108,7 @@ private struct ProbeModel: LanguageModel {
         modelName: "native-text-only", supportsTools: true)
     #expect(!(await engine.status()).supportsTools)
     do {
-        try await engine.generateWithTools(ModelInput(), maximumTokens: 512,
-            handler: { _ in Issue.record("unsupported native tools reached host"); throw HelperError.unavailable },
+        try await engine.generateWithTools(ModelInput(), handler: { _ in Issue.record("unsupported native tools reached host"); throw HelperError.unavailable },
             snapshot: { _ in Issue.record("unsupported native tools emitted output") })
         Issue.record("adapter flag overrode native capabilities")
     } catch let failure as BackendFailure { #expect(failure.reason == .modelUnavailable) }
@@ -107,18 +125,16 @@ private struct ProbeModel: LanguageModel {
 }
 
 
-/// UH13: a small caller cap bounds every request; the requests together can
-/// exceed it, because no turn total exists (owner, 2026-10-18).
-@Test func smallCallerCapsBoundEveryRequestWithoutATurnTotal() async throws {
+/// UH13: a window-sized option replaces any SDK-requested value on every request.
+@Test func windowSizedOptionReplacesEveryRequestedLimit() async throws {
     let probe = DispatchProbe()
-    let model = BoundedToolModel(base: ProbeModel(probe: probe))
+    let model = BoundedToolModel(base: ProbeModel(probe: probe), responseTokens: 8192)
     let executor = try BoundedToolModel<ProbeModel>.Executor(configuration: 0)
     let request = LanguageModelExecutorGenerationRequest(id: UUID(), transcript: Transcript(entries: []),
         enabledTools: [], generationOptions: GenerationOptions(maximumResponseTokens: 20),
         contextOptions: ContextOptions(), metadata: [:])
     for _ in 0..<200 { try await executor.respond(to: request, model: model, streamingInto: .init()) }
-    #expect(await probe.limits == Array(repeating: 20, count: 200))
-    #expect(await probe.limits.compactMap { $0 }.reduce(0, +) == 4000)
+    #expect(await probe.limits == Array(repeating: 8192, count: 200))
 }
 
 
@@ -133,25 +149,15 @@ private struct ProbeModel: LanguageModel {
 }
 
 
-@Test func callerCapLimitsEveryExecutorPassWithoutATurnTotal() async throws {
-    let probe = DispatchProbe()
-    let model = BoundedToolModel(base: ProbeModel(probe: probe), maximumTokens: 300)
-    let executor = try BoundedToolModel<ProbeModel>.Executor(configuration: 0)
-    let request = LanguageModelExecutorGenerationRequest(id: UUID(), transcript: Transcript(entries: []),
-        enabledTools: [], generationOptions: GenerationOptions(maximumResponseTokens: 2048),
-        contextOptions: ContextOptions(), metadata: [:])
-    for _ in 0..<3 { try await executor.respond(to: request, model: model, streamingInto: .init()) }
-    #expect(await probe.limits == [300, 300, 300])
-    #expect(await model.budget.recordedFailure() == nil)
-}
-
-/// UH14: plain text dispatches once at the caller cap.
-@Test func plainTextUsesOneCallerCapAndCannotDispatchTwice() async throws {
-    let budget = ToolRoundBudget(maximumTokens: 2048, toolsEnabled: false)
-    #expect(try await budget.reserve() == 2048)
-    await #expect(throws: BackendFailure.self) { try await budget.reserve() }
-    let separate = ToolRoundBudget(maximumTokens: 7, toolsEnabled: false)
-    #expect(try await separate.reserve() == 7)
+/// UH14: plain text dispatches once; a second dispatch fails with output-limit.
+@Test func plainTextDispatchesOnceAndCannotDispatchTwice() async throws {
+    let budget = ToolRoundBudget(toolsEnabled: false)
+    try await budget.reserve()
+    await budget.finishInference()
+    do { try await budget.reserve(); Issue.record("second plain-text dispatch admitted") }
+    catch let error as BackendFailure { #expect(error.reason == .outputLimit) }
+    let separate = ToolRoundBudget(toolsEnabled: false)
+    try await separate.reserve()
 }
 
 private struct TypedLimitModel: LanguageModel {
@@ -169,7 +175,7 @@ private struct TypedLimitModel: LanguageModel {
                 await channel.send(.toolCalls(action: .toolCall(id: "failed-call", name: "service",
                     action: .appendArguments(#"{"command":"status"}"#, tokenCount: 2))))
             }
-            throw BackendFailure(.outputLimit)
+            throw BackendFailure(.contextLimit)
         }
     }
 }
@@ -183,23 +189,21 @@ private actor PartialSnapshots {
         modelName: "limit-fixture", supportsTools: false)
     var input = ModelInput(); input.instructions = "test"; input.prompt = "test"
     do {
-        try await engine.generate(input, maximumTokens: 2048, snapshot: { await snapshots.add($0.text) })
+        try await engine.generate(input, snapshot: { await snapshots.add($0.text) })
         Issue.record("executor limit incorrectly completed")
-    } catch let error as BackendFailure { #expect(error.reason == .outputLimit) }
+    } catch let error as BackendFailure { #expect(error.reason == .contextLimit) }
     #expect(await snapshots.texts.contains("final partial content"))
 }
 
-@Test func nativeContextCheckReservesRequestedOutputTokens() async throws {
+/// Owner, 2026-10-19: the native check no longer reserves 2,048 output tokens.
+/// Input that previously failed (2,500 of 4,096) now dispatches with no cap.
+@Test func nativeContextCheckReservesNoOutputCap() async throws {
     let probe = DispatchProbe()
     let engine = FoundationBackend(model: ProbeModel(probe: probe), contextTokens: 4096,
         modelName: "counted", supportsTools: false, tokenCounter: { _, _ in 2500 })
-    do {
-        try await engine.generate(ModelInput(), maximumTokens: 2048, snapshot: { _ in
-            Issue.record("insufficient output capacity emitted content")
-        })
-        Issue.record("insufficient output capacity reached inference")
-    } catch let error as BackendFailure { #expect(error.reason == .contextLimit) }
-    #expect(await probe.limits.isEmpty)
+    // The probe writes no text, so the SDK reports no response; only dispatch matters.
+    try? await engine.generate(ModelInput(), snapshot: { _ in })
+    #expect(await probe.limits == [nil])
 }
 
 
@@ -212,7 +216,7 @@ private func waitForCallbacks(_ count: Int, in budget: ToolRoundBudget) async th
 }
 @Test func failedInferenceRejectsWaitingCallbacksAndFurtherPasses() async throws {
     let budget = ToolRoundBudget()
-    _ = try await budget.reserve()
+    try await budget.reserve()
     let callback = Task { try await budget.requireSuccessfulInference() }
     defer { callback.cancel() }
     try await waitForCallbacks(1, in: budget)
@@ -223,7 +227,7 @@ private func waitForCallbacks(_ count: Int, in budget: ToolRoundBudget) async th
     await #expect(throws: BackendFailure.self) { try await budget.reserve() }
 }
 @Test func callbackGateCancellationDoesNotRetainWaiters() async throws {
-    let budget = ToolRoundBudget(); _ = try await budget.reserve()
+    let budget = ToolRoundBudget(); try await budget.reserve()
     let callback = Task { try await budget.requireSuccessfulInference() }
     try await waitForCallbacks(1, in: budget)
     callback.cancel()
@@ -239,19 +243,19 @@ private func waitForCallbacks(_ count: Int, in budget: ToolRoundBudget) async th
         modelName: "failed-tool-fixture", supportsTools: true)
     var input = ModelInput(); input.instructions = "test"; input.prompt = "test"
     do {
-        try await engine.generateWithTools(input, maximumTokens: 2048, handler: { _ in
+        try await engine.generateWithTools(input, handler: { _ in
             await calls.add("host effect")
             return ToolResult(status: .success, text: "must not execute")
         }, snapshot: { await snapshots.add($0.text) })
         Issue.record("failed inference completed")
-    } catch let error as BackendFailure { #expect(error.reason == .outputLimit) }
+    } catch let error as BackendFailure { #expect(error.reason == .contextLimit) }
     #expect(await calls.texts.isEmpty)
     #expect(await snapshots.texts.contains("final partial content"))
 }
 
 
 @Test func ninthPendingNativeCallbackFailsBeforeHostEffects() async throws {
-    let budget = ToolRoundBudget(); _ = try await budget.reserve()
+    let budget = ToolRoundBudget(); try await budget.reserve()
     var tasks: [Task<Void, any Error>] = []
     defer { for task in tasks { task.cancel() } }
     for count in 1...8 {
@@ -267,7 +271,7 @@ private func waitForCallbacks(_ count: Int, in budget: ToolRoundBudget) async th
     #expect(await budget.pendingCallbacks() == 0)
 }
 @Test func cancellationBeforeCallbackRegistrationRetainsNothing() async throws {
-    let budget = ToolRoundBudget(); _ = try await budget.reserve()
+    let budget = ToolRoundBudget(); try await budget.reserve()
     let task = Task { try await budget.requireSuccessfulInference() }
     task.cancel()
     await #expect(throws: CancellationError.self) { try await task.value }
@@ -335,7 +339,7 @@ private struct FullContextModel: LanguageModel {
         modelName: "full-context-fixture", supportsTools: true)
     var input = ModelInput(); input.instructions = "fixture"; input.prompt = "fixture"
     do {
-        try await engine.generateWithTools(input, maximumTokens: 2048, handler: { _ in
+        try await engine.generateWithTools(input, handler: { _ in
             ToolResult(status: .success, text: "fixture tools")
         }, snapshot: { _ in })
         Issue.record("full context completed")

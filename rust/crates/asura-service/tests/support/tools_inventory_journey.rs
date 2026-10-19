@@ -42,7 +42,7 @@ fn run_for(long: bool) -> Result<()> {
         None,
         0,
         if long {
-            "Call service with command tools exactly once. Then write at least 180 words describing the listed tools, and end with the exact final marker ACTIVITY-RESPONSE-COMPLETE. Do not call other tools."
+            "Call service with command tools exactly once. Then write at least 700 words describing each listed tool in detail, and end with the exact final marker ACTIVITY-RESPONSE-COMPLETE. Do not call other tools."
         } else {
             "Call service with command tools exactly once to inspect the registered tools. After it succeeds, reply only READY. Do not reproduce the inventory."
         },
@@ -55,9 +55,25 @@ fn run_for(long: bool) -> Result<()> {
     assert_eq!(event.kind, Some(3), "native inventory turn failed");
     let text = event.text.as_deref().unwrap_or_default();
     if long {
+        // No request output cap (owner, 2026-10-19): the post-tool answer is
+        // longer than the removed 512-token later-request cap and ends whole.
         assert!(
-            text.split_whitespace().count() >= 150,
+            text.split_whitespace().count() >= 450,
             "post-tool answer too short: {text}"
+        );
+        let stats = event
+            .statistics
+            .as_ref()
+            .ok_or("native Ollama request measurements absent")?;
+        assert!(
+            stats.output_tokens.is_some_and(|n| n > 600),
+            "post-tool output not above the removed cap: {stats:?}"
+        );
+        println!(
+            "PASS long post-tool answer: words={} output_tokens={:?} requests={:?}",
+            text.split_whitespace().count(),
+            stats.output_tokens,
+            stats.request_count
         );
         assert!(
             text.trim_end().ends_with("ACTIVITY-RESPONSE-COMPLETE"),
@@ -114,7 +130,22 @@ fn run_for(long: bool) -> Result<()> {
     wait_ready(&fixture, None)?;
     let recovered = observe(&fixture, operation)?;
     assert_eq!(recovered.text, event.text);
-    assert_eq!(recovered.tools, event.tools);
+    // Restart leaves live measurements absent rather than inventing history.
+    let without_elapsed = |tools: &[pb::ToolProgress]| {
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                tool.elapsed_ms = None;
+                tool
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        without_elapsed(&recovered.tools),
+        without_elapsed(&event.tools)
+    );
+    assert!(recovered.tools.iter().all(|tool| tool.elapsed_ms.is_none()));
     fixture.stop()?;
     println!(
         "PASS native tool inventory, exact canonical durable metadata, restart replay and cleanup"
