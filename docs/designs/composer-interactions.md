@@ -37,7 +37,10 @@ Enter applies, and Escape closes without applying. Very small terminals keep the
 editor and hint visible and may clip the list to remaining space. No subtraction
 may overflow when the terminal shrinks.
 
-The project list uses the existing bounded project registry. It shows stale entries
+The project list uses the client's project window of at most 64 entries and
+fetches the next or previous page at its edges
+([CF06b](command-flows.md#cf06b-project-list-and-local-selection)); the number
+of projects has no total (owner, 2026-10-19). It shows stale entries
 as unavailable. Both `/project select` and list selection use the same transition.
 An active conversation blocks switching projects under the existing contract.
 A successful change resets conversation and telemetry scope and preserves the draft.

@@ -280,18 +280,26 @@ flowchart TD
 
 Implemented read, selection and rename branches. Selection does not establish
 authority. Selection requires idle conversation, queue and local-outbox state.
-The ID must name a current registry entry. Success clears the conversation view
+The ID must name a current project entry, from the client window or an exact `only` read. Success clears the conversation view
 and starts restoration for the new project. Rename sends the listed name revision.
 
 ```mermaid
 flowchart TD
-    List["/project list or CLI equivalent"] --> Pages["Read at most 8 pages of at most 8 entries"]
+    List["/project list or CLI equivalent"] --> Pages["Read pages of at most 8 entries"]
     Pages -->|Error| Error["Show error and retain draft"]
     Pages -->|Empty| Empty["Show no projects and add instruction"]
     Pages -->|Entries| Rows["Show IDs, locations and stale markers"]
+    Rows --> More{"Next cursor, and CLI or TUI window below 64 entries?"}
+    More -->|Yes| Pages
+    More -->|"No, more exist"| Hint["TUI: show 'More: /project list after ID'"]
+    More -->|"No cursor"| Done["List complete"]
     Choose["/project select ID"] --> ID{"Valid nonzero 32-digit hexadecimal ID?"}
     ID -->|No| Error
-    ID -->|Yes| Guard{"Idle and current registry entry?"}
+    ID -->|Yes| Window{"ID in the client window?"}
+    Window -->|No| Exact["ProjectList with only = ID"]
+    Exact -->|"Not found or error"| Error
+    Exact -->|Found| Guard
+    Window -->|Yes| Guard{"Idle and current entry?"}
     Guard -->|No| Error
     Guard -->|Yes| Local["Select locally; clear view and restore"]
     Local --> Later["Service validates project when submitting"]
@@ -305,8 +313,23 @@ runs on readiness, new service epochs and successful registration. Failure does
 not trigger automatic discovery retries. The creation offer appears at most once
 per TUI session. Complete project lists update the same display registry.
 Project confirmation preserves an existing composer draft. Successful setup clears
-only the unchanged submitted command. Registry capacity is 64 projects; eight
-pages cover that limit. No command initializes Git or modifies project contents.
+only the unchanged submitted command. No command initializes Git or modifies
+project contents.
+
+Project paging (proposed, 2026-10-19). The owner removed the 64-project total.
+The list has no page total; each page keeps its 8-entry and 40 KiB bounds. The
+client keeps a **project window** of at most 64 entries (8 pages) plus the
+selected project. `/project list` fills the window from the first page; when
+more projects exist it prints `More: /project list after ID`, and
+`/project list after ID` fills the window from that cursor. The picker opened
+with Enter fetches the next page (`after`) or the previous page (`before`, in
+descending order) when the selection reaches an edge, and drops the page at the
+other end. The CLI `asura project list` prints every page as it arrives; Ctrl-C
+stops the wait. `/project select ID` for an ID outside the window first reads
+that one project with `only`. Each read is one request with no time bound; the
+person's cancel or a lost connection ends it. Validation: SJ-37 in the
+[segmented journal](segmented-journal.md#validation), plus client unit cases
+for window edges, cursor order and `only`.
 
 ## CF07: Configuration reads and writes
 

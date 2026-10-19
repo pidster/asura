@@ -206,7 +206,7 @@ Extend version-0.1 control operations through the canonical schema owner:
 | InitializeInstallation | request ID, mode `embedded`, expected authority revision 0 | Installation ID, graph ID, pending/completed phase and authority revision |
 | ResolveInitialization | original request ID and request digest | Original pending or committed result; unknown request never creates state |
 | ProjectRegister | request ID, absolute location string | Project ID, registry revision 1, canonical location and current/stale association status |
-| ProjectList | optional after-project ID, limit 1 through 8 | Ordered page of at most eight project IDs/locations/states and next cursor; complete response at most 40 KiB |
+| ProjectList | optional after-project ID or before-project ID (not both), optional exact project ID `only`, limit 1 through 8 | Ordered page of at most eight project IDs/locations/states and next cursor; complete response at most 40 KiB. The page count has no bound (owner, 2026-10-19); `before` pages in descending ID order; `only` returns that one project or none. Defined by the [segmented journal](segmented-journal.md#read-commands) |
 
 The initialization request digest covers command kind, embedded mode and expected
 revision. The service records configuration revision 1 plus its validated digest
@@ -370,16 +370,20 @@ in the same conversation that the composition shows; the composition accounts fo
 the omitted ones. The kind 8 text tail and each kind 24 segment are at most
 61,440 bytes; a response has no total size other than journal capacity.
 Maximum frame remains 64 KiB including overhead; encode and check the entire
-frame before append. At most 64 registered projects and 256 conversations are
-admitted in this slice. Journal bounds remain 8 MiB and 32,768 frames. At most
+frame before append. The earlier totals of 64 registered projects and 256
+conversations are removed (owner, 2026-10-19): registrations and conversations
+have no lifetime total. The [segmented journal](segmented-journal.md#checkpoint-content)
+bounds how many stay in memory and serves the rest from its index. Journal
+bounds remain 8 MiB and 32,768 frames until that design is implemented. At most
 one operation is nonterminal.
 
 Required follow-up design (owner, 2026-10-15): the single 8 MiB file must not
 remain the journal's limit. The owner chose to keep a separate file journal,
 not SurrealDB, and to move to known-size segment files with checkpoint
 snapshots and compaction. Total size comes from a configurable quota and
-available disk space. A separate journal design must define it; it is not
-designed here. Until it lands, the limits above apply. No overwrite or deletion makes space at a limit.
+available disk space. The proposed [segmented journal](segmented-journal.md)
+defines it. Until it is implemented, the limits above apply. No overwrite or
+deletion makes space at a limit.
 
 Terminal cause values are closed: 0 none, 1 user cancel, 2 deadline, 3 output limit,
 4 service shutdown, 5 provider failure, 6 protocol failure, 7 restart, 8 authority
@@ -797,7 +801,7 @@ No model permit may be enabled before the writer and recovery checks below pass.
 | CA05 completion | Usage limits, provisional/complete distinction, terminal cursor | Kill before/after terminal flush; preserve complete response only after commit | Reconnect displays original complete or interrupted result |
 | CA06 restart | Started versus never-started charge and no re-execution | Real child/service death with durable or incomplete frames | Restart reports Interrupted without another model call |
 | CA07 journal failure | Reserved closure capacity, short writes, zero write and stalled write | Real scratch disk/flush failures, identity swaps, stalled worker and owner retention | Inspect/Stop and TUI input remain responsive, unknown outcomes explicit |
-| CA08 bounds | 64 projects, 256 conversations, 8 MiB/32768 frame limits, eight-slot queue | Saturation and 16 MiB replay allocation measurement | Capacity exhaustion preserves draft and existing outcomes |
+| CA08 bounds | No project or conversation total (SJ-35, SJ-36), 8 MiB/32768 frame limits until the segmented journal, eight-slot queue | Saturation and 16 MiB replay allocation measurement | Capacity exhaustion preserves draft and existing outcomes |
 | CA09 live model | Model selection and result validation | Real helper transport and cancellation, no tools | Supported macOS model completes a scoped turn with durable history |
 
 Target TUI/control response under a stalled storage/helper dependency is 100 ms

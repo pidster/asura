@@ -26,8 +26,8 @@ bounded segments. Each frame keeps its 64 KiB bound. Per-item bounds stay;
 no per-turn or per-operation total replaces the removed ones.
 
 Non-goals: the journal capacity (8 MiB, 32,768 frames; L30 in
-[tool output views](tool-output-views.md#journal-and-records)) and its required
-follow-up segment-file design; the per-request output-token cap (2,048); the
+[tool output views](tool-output-views.md#journal-and-records)) and the
+[segmented journal](segmented-journal.md) that replaces it; the per-request output-token cap (2,048); the
 Ollama per-request stream parser bound (4 MiB, L28); control and model frame
 sizes; tool call limits; Markdown presentation limits.
 
@@ -284,4 +284,6 @@ short responses only.
   client cannot grow service memory.
 
 Open: the journal capacity remains the effective bound on response size until
-the follow-up journal design replaces the single 8 MiB file (L30).
+the proposed [segmented journal](segmented-journal.md) replaces the single 8 MiB
+file (L30). That design bounds one response by the journal quota and by 65,536
+pieces (about 3.75 GiB of full pieces).

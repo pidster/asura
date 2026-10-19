@@ -21,8 +21,16 @@ the working directory or an environment override. Tests use scratch runtime root
 | `audit.maxFileBytes` | Integer, 1 through 1099511627776 | `10485760` |
 | `audit` | Mapping of all three audit fields | Defaults above |
 | `retention.quotaBytes` | Integer, 67108864 (64 MiB, proposed) through 1099511627776 (1 TiB, proposed). Values outside the range are `config_invalid_value`. The service reads it at start; the effective quota is the smaller of this value and retained bytes plus free disk space minus the 16 MiB recovery reserve ([J1 quota ledger](tool-job-controller.md#quota-ledger)) | `1073741824` (1 GiB, owner R1) |
+| `journal.quotaBytes` | Integer, 67108864 (64 MiB) through 1099511627776 (1 TiB). Values outside the range are `config_invalid_value`. A successful set applies at once; the effective quota is the smaller of this value and journal bytes plus free disk space minus the 16 MiB disk floor ([segmented journal](segmented-journal.md#quota-and-disk-space)). Separate from `retention.quotaBytes` (owner, 2026-10-19) | `4294967296` (4 GiB, owner, 2026-10-19) |
 | `providers.mlx.models` | Up to 64 exact asset keys, each with a bounded capability list; see below | Empty mapping |
 | `providers.ollama.endpoint` | ASCII URL, at most 2048 bytes; numeric-loopback host over HTTP or HTTPS. Set rejects other hosts with `config_remote_endpoint_restricted` under the [loopback restriction](model-provider-integration.md#loopback-endpoint-restriction--selected-2026-10-13) | `http://127.0.0.1:11434` at inference admission |
+
+The owner accepted `journal.quotaBytes`, its range and its 4 GiB default on
+2026-10-19. The configuration owner adds the key in the same change that
+implements the [segmented journal](segmented-journal.md#configuration); until
+then it is not accepted on the wire and the single-file journal bounds apply.
+Like `retention`, `journal` is written only when set away from its default.
+Validation case SJ-14 covers its bounds and immediate effect.
 
 `/config` without arguments returns the complete effective configuration as YAML,
 including audit defaults and omitting an unset model. It uses the same bounded
@@ -37,7 +45,7 @@ text as one YAML value. Quoted model names are supported; `true` is a boolean,
 not a model name. `set audit` requires all three fields. Unknown keys, duplicates,
 nulls, custom tags, invalid types and bounds are errors. No deletion syntax is selected.
 Standard YAML scalar tags are accepted only when their resulting type matches
-the setting schema. The persisted root permits optional model, audit, providers and retention fields (retention is written only when set away from its default, J1); audit fields may be
+the setting schema. The persisted root permits optional model, audit, providers, retention and journal fields (retention is written only when set away from its default, J1); audit fields may be
 omitted to inherit defaults. Invalid existing files are errors, never overwritten.
 An absent or empty file uses defaults. Successful writes emit the complete
 normalized mapping; comments and original formatting are not preserved.

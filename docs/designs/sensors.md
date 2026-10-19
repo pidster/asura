@@ -446,7 +446,8 @@ provider adapters cannot call the sensor owner directly.
 
 Each project has one typed persisted state. It contains at most 64 observations
 and eight proposals; each proposal references at most 32 observations. At most
-64 project states are resident. Source and payload are closed enums: foreground
+64 project states are resident; see [resident project states](#resident-project-states)
+for which ones when more projects exist (proposed, 2026-10-19). Source and payload are closed enums: foreground
 activity, inactivity and service status. Payloads contain identifiers, generation,
 counts and status enums; they contain no prompt, path, credential or arbitrary
 instruction. Each encoded project state is at most 128 KiB. Source epoch, source
@@ -570,7 +571,8 @@ observation, not an audit event stream. The journal preserves every operation.
 Restart starts a fresh source epoch and records a current checkpoint before the
 idle timer can fire. Sensor persistence failures disable that project's intake
 and are logged; they do not disable foreground conversations. The service keeps
-at most 64 project sensor owners. No new executable queue is introduced.
+at most 64 resident project sensor owners; other projects' states stay in the
+database. No new executable queue is introduced.
 
 Sensor write errors trigger one serialized load through the same writer. An exact
 saved write confirms success. An unchanged previous revision permits one retry
@@ -591,6 +593,66 @@ Replay checkpoint discovery examines at most 64 operation index entries per
 reactor turn. A cursor resumes the scan on an immediate timer; completed scans
 are reused until the journal revision changes. The checkpoint map retains at most
 64 registered projects. Foreground events remain ahead of this bounded work.
+The [segmented journal](segmented-journal.md#concurrency-and-the-writer-gate)
+replaces this scan; see [resident project states](#resident-project-states).
+
+### Resident project states
+
+Proposed (2026-10-19). The owner removed the 64-project registration total. The
+sensor owner keeps its 64-state memory bound as a cache. The design below
+implements Option A of
+[OD-SJ-5](segmented-journal.md#od-sj-5-which-projects-keep-sensor-state-in-memory),
+selected by the owner on 2026-10-19.
+
+- **Activity source.** The replay scan is removed. Each journal append reply
+  names the project, conversation, operation and sequence it touched. The
+  conversation owner passes that activity to the sensor owner as the coalesced
+  checkpoint. No operation index is scanned.
+- **Start.** The journal's recent project set (the 64 projects with the newest
+  activity) seeds the resident states. Each is loaded through the serialized
+  writer, as today, and gets a fresh source epoch and checkpoint.
+- **Admission of a new project.** Activity for a non-resident project loads its
+  state. If 64 states are resident, the owner evicts one first.
+- **Eviction.** Only a settled state may leave memory: its idle observation has
+  fired, it has no pending or uncertain write, and no held proposal awaits
+  revalidation. Among settled states, the one with the oldest activity leaves
+  first, then the lowest project ID. Eviction writes nothing new.
+- **No evictable state.** The activity is kept as one pending checkpoint per
+  project in a queue of at most 64 projects, newest activity replacing older
+  activity for the same project. When that queue is full, the oldest pending
+  project's activity is dropped and counted; a later activity for it records a
+  current checkpoint. A state becomes evictable when its write settles or its
+  idle observation fires; the queue is then served. Only one turn runs at a
+  time, so more than 64 unsettled states needs 64 projects with active writes.
+- **Inspection.** `SensorsInspect` for a non-resident project loads its state
+  through the writer and returns it; it does not make the project resident.
+- **Closures.** Loading, eviction and the pending queue have no time bound.
+  Each wait ends on the writer reply, shutdown or a held state.
+
+Proposed flow for one activity record. Arrows are decisions.
+
+```mermaid
+flowchart TD
+    Act["Append reply: project, operation, sequence"] --> Res{"Project state resident?"}
+    Res -->|Yes| Apply["Coalesce checkpoint into resident state"]
+    Res -->|No| Room{"Fewer than 64 resident?"}
+    Room -->|Yes| Load["Load state through the writer"]
+    Room -->|No| Evict{"A settled state exists?"}
+    Evict -->|Yes| Out["Evict oldest settled state"]
+    Out --> Load
+    Evict -->|No| Pend{"Pending queue below 64 projects?"}
+    Pend -->|Yes| Queue["Keep newest activity for this project"]
+    Pend -->|No| Drop["Drop oldest pending activity, count it"]
+    Drop --> Queue
+    Queue -->|"A state settles"| Evict
+    Load -->|Loaded| Apply
+    Load -->|"Load failed"| Hold["Hold this project's intake, as today"]
+```
+
+Validation: SJ-39 in the [segmented journal](segmented-journal.md#validation),
+plus unit cases for eviction order, the pending queue bound and inspection of
+a non-resident project, and a service integration case with 100 projects that
+records activity in turn.
 
 ### Earlier validation checkpoint
 

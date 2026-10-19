@@ -50,6 +50,10 @@ schemas and runtime mechanisms remain with their governing designs.
 | Loss marker | Text in a stored stream that replaces bytes the secret scanner could not check, stating their size and reason; see [secret detection](designs/secret-detection.md#loss-markers) |
 | Secret rule set | Asura's port of Wisp's secret-detection rules, identified by a revision and digest that each capture descriptor records; see [secret detection](designs/secret-detection.md#rule-set) |
 | Loop closure | Ending condition a loop evaluates over its own streams, such as exhaustion, stall or an owner-approved deadline; distinct from an interrupt, which comes from outside the loop; see [loop closure](designs/loop-closure.md) |
+| Journal segment file | One authority journal file of complete format-1 frames, at most 8 MiB and 32,768 frames; never deleted; see the [segmented journal](designs/segmented-journal.md) |
+| Journal checkpoint | Derived file holding the live replay state at one frame sequence and the list of index runs; replay starts from it; see the [segmented journal](designs/segmented-journal.md#checkpoints) |
+| Index run | Derived, immutable file of sorted index entries that address settled history by frame locator; it holds no text; see the [segmented journal](designs/segmented-journal.md#index-runs-and-compaction) |
+| Journal quota | Total byte limit for journal files, from `journal.quotaBytes` and free disk space; at the limit new work is held, nothing is deleted; see the [segmented journal](designs/segmented-journal.md#quota-and-disk-space) |
 | Waiting step | Live, unjournaled label for what a pending turn waits on, such as preparing or starting the model; display only, it never ends work; see [waiting step display](designs/model-provider-integration.md#waiting-step-display--owner-2026-10-16) |
 | Permanent or temporary ending | A permanent ending is terminal; a temporary ending suspends a loop with a named resume condition, resolver and expiry |
 

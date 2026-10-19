@@ -76,10 +76,8 @@ Non-goals:
   owns their records.
 - Changes to authority, grants or tool behavior. A record grants nothing.
 - Recovery of old journals (TCR-O2).
-- Journal capacity. The single 8 MiB journal file is addressed by the
-  segmented-journal backlog item
-  ([journal capacity follow-up](conversation-admission.md#format-1-and-record-kinds)),
-  not by a second store.
+- Journal capacity. The proposed [segmented journal](segmented-journal.md)
+  replaces the single 8 MiB journal file; this design adds no second store.
 
 Dependencies:
 
@@ -394,8 +392,9 @@ records are a few hundred bytes. A turn of large calls can therefore fill the
 single 8 MiB journal file. The writer then refuses the append with its existing
 `Limit` error (`capacity_exhausted`). The conversation owner cancels the helper
 and reports the journal unavailable; restart records the turn `Interrupted`.
-That is a known-size exhaustion closure, not a hang. The segmented-journal
-backlog item owns the journal capacity; this design adds no second store.
+That is a known-size exhaustion closure, not a hang. The
+[segmented journal](segmented-journal.md) owns the journal capacity; it lets a
+turn's call records span segment files (case SJ-28). This design adds no second store.
 
 ## Record: kind 14 `ToolCall`
 

@@ -259,8 +259,10 @@ The command has no filesystem effect and no model or tool execution. It does not
 grant access to project content. Log project ID and result code, not the new name,
 unless the audit contract explicitly authorizes content logging.
 
-Existing limits remain: 64 projects, 40 KiB project-list reply, 64 KiB journal
-frame and 8 MiB journal. The 128-byte name and one-writer command keep one rename
+Existing limits remain: 40 KiB project-list reply, 64 KiB journal frame and the
+8 MiB journal until the [segmented journal](segmented-journal.md) replaces it.
+The 64-project total is removed (owner, 2026-10-19); the list pages without a
+total ([CF06b](command-flows.md#cf06b-project-list-and-local-selection)). The 128-byte name and one-writer command keep one rename
 within those bounds. A full journal rejects the mutation without altering the
 effective name. A rename does not extend project-list pagination by name; pages
 still use project IDs, so concurrent renames cannot skip or duplicate IDs.

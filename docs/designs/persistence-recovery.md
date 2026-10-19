@@ -6,7 +6,9 @@ append-only ordinary-file authority journal. Frame format, durability behavior,
 compaction, schema versions and fault limits still need review and qualification.
 The format-1 journal, read-only stage 3A inspection and the single-slot writer are
 implemented; see the [conversation amendment](conversation-admission.md).
-Compaction, slot switching, backup and the qualification items below remain open. Later D3-D4 work
+The proposed [segmented journal](segmented-journal.md) replaces the single file,
+the slot-switch proposal and the 8 MiB bound with segment files, checkpoints and
+index-run compaction. Backup and the qualification items below remain open. Later D3-D4 work
 must extend the same authority contract to the full task/action ledger.
 
 The [first conversation amendment](conversation-admission.md) extends format 1
@@ -154,7 +156,9 @@ results; the CLI renders them. No Swift helper or separate process is added.
 Reuse the foundation's supported local APFS home and runtime ownership contract.
 Do not treat its local checkpoint evidence as complete filesystem qualification.
 
-Select `state/control/slot-0.log` for the initial authority stream. Stage 3A supports
+Select `state/control/slot-0.log` for the initial authority stream. The proposed
+[segmented journal layout](segmented-journal.md#on-disk-layout) replaces it when
+implemented; `slot-0.log` then becomes `unsupported_layout`, with no migration. Stage 3A supports
 format 1 with slot 0 only. Any `slot-1.log`, checkpoint, switch record or other
 control-area entry returns `unsupported_layout` without choosing a newer slot.
 Later compaction must version and qualify its layout before enabling it. The
@@ -248,7 +252,10 @@ as `GraphUnavailable` with `graph_verification_unavailable`. It never reports
 ### Bounds, interruption and preservation
 
 Maximum journal size is 8 MiB, frame size 64 KiB and frame count 32,768. Maximum
-replay allocation is 16 MiB, including the bounded operation-ID index. Read in
+replay allocation is 16 MiB, including the bounded operation-ID index. The proposed
+[segmented journal](segmented-journal.md#limits) makes 8 MiB and 32,768 frames
+per-segment-file bounds and keeps the 16 MiB replay allocation independent of
+total journal size. Read in
 chunks no larger than 64 KiB. Inspect frame lengths before allocation. Exceeding
 any bound returns `inspection_limit`; it cannot authorize partial-state use.
 
@@ -467,6 +474,13 @@ flowchart TD
 ```
 
 ## Compaction and backup
+
+Superseded (2026-10-19): the two-slot checkpoint and SWITCH proposal in this
+section and its state view are replaced by the proposed
+[segmented journal](segmented-journal.md#appends-and-rolls): known-size segment
+files, a checkpoint at every roll, immutable index runs and run compaction that
+never removes frames. The backup paragraph below remains open; the segmented
+design lists the files a backup needs. The original proposal follows for history.
 
 The journal cannot grow without bound. Propose two pre-created ordinary-file
 slots. The active slot contains the current append log. While holding the sole
