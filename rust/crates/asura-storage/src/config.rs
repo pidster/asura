@@ -34,6 +34,8 @@ struct Config {
     providers: Providers,
     #[serde(default, skip_serializing_if = "Retention::is_default")]
     retention: Retention,
+    #[serde(default, skip_serializing_if = "Journal::is_default")]
+    journal: Journal,
 }
 /// Retained exec_cmd output (J1 quota ledger).
 #[derive(Serialize, Deserialize)]
@@ -55,6 +57,36 @@ impl Default for Retention {
 impl Retention {
     fn is_default(&self) -> bool {
         self.quota_bytes == quota_bytes()
+    }
+}
+const MIB: u64 = 1024 * 1024;
+/// Smallest accepted `journal.quotaBytes` (64 MiB; segmented journal).
+pub const JOURNAL_MIN_QUOTA: u64 = 64 * MIB;
+/// Largest accepted `journal.quotaBytes` (1 TiB).
+pub const JOURNAL_MAX_QUOTA: u64 = 1024 * 1024 * MIB;
+/// `journal.quotaBytes` when absent (4 GiB; owner, 2026-10-19, OD-SJ-1).
+pub const JOURNAL_DEFAULT_QUOTA: u64 = 4096 * MIB;
+/// Segmented authority journal quota, separate from `retention`
+/// (owner, 2026-10-19, OD-SJ-4).
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    #[serde(default = "journal_quota_bytes", rename = "quotaBytes")]
+    quota_bytes: u64,
+}
+fn journal_quota_bytes() -> u64 {
+    JOURNAL_DEFAULT_QUOTA
+}
+impl Default for Journal {
+    fn default() -> Self {
+        Self {
+            quota_bytes: journal_quota_bytes(),
+        }
+    }
+}
+impl Journal {
+    fn is_default(&self) -> bool {
+        self.quota_bytes == journal_quota_bytes()
     }
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -249,6 +281,7 @@ impl Config {
             || !(1..=1_099_511_627_776).contains(&self.audit.max_file_bytes)
             || !(crate::payload::MIN_QUOTA..=crate::payload::MAX_QUOTA)
                 .contains(&self.retention.quota_bytes)
+            || !(JOURNAL_MIN_QUOTA..=JOURNAL_MAX_QUOTA).contains(&self.journal.quota_bytes)
         {
             return Err("config_invalid_value");
         }
@@ -297,6 +330,8 @@ impl Config {
             "audit.maxFileBytes" => yaml(&self.audit.max_file_bytes),
             "retention" => yaml(&RetentionView(&self.retention)),
             "retention.quotaBytes" => yaml(&self.retention.quota_bytes),
+            "journal" => yaml(&self.journal),
+            "journal.quotaBytes" => yaml(&self.journal.quota_bytes),
             _ => Err("config_unknown_key"),
         }
     }
@@ -353,6 +388,19 @@ impl Config {
             }
             "retention.quotaBytes" => {
                 self.retention.quota_bytes = value.as_u64().ok_or("config_invalid_value")?
+            }
+            "journal" => {
+                let Value::Mapping(ref fields) = value else {
+                    return Err("config_invalid_value");
+                };
+                if fields.len() != 1 || !fields.contains_key(Value::String("quotaBytes".into())) {
+                    return Err("config_invalid_value");
+                }
+                self.journal =
+                    serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
+            }
+            "journal.quotaBytes" => {
+                self.journal.quota_bytes = value.as_u64().ok_or("config_invalid_value")?
             }
             _ => return Err("config_unknown_key"),
         }
@@ -461,12 +509,22 @@ fn yaml(value: &impl Serialize) -> Result<String> {
     serde_yaml_ng::to_string(value).map_err(|_| "config_encode_failed")
 }
 
+/// A completed config operation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reply {
+    /// The effective YAML value of the key after the operation.
+    pub value_yaml: String,
+    /// The new effective `journal.quotaBytes` after a persisted set of
+    /// `journal` or `journal.quotaBytes`, which applies at once; else `None`.
+    pub journal_quota: Option<u64>,
+}
+
 pub fn execute(
     runtime: RuntimeDirectory,
     key: &str,
     value: Option<&str>,
     cancel: &AtomicBool,
-) -> Result<String> {
+) -> Result<Reply> {
     if !(key.is_empty() && value.is_none())
         && !matches!(
             key,
@@ -482,6 +540,8 @@ pub fn execute(
                 | "providers.mlx.models"
                 | "retention"
                 | "retention.quotaBytes"
+                | "journal"
+                | "journal.quotaBytes"
         )
     {
         return Err("config_unknown_key");
@@ -490,16 +550,23 @@ pub fn execute(
     // or the owner's cancel.
     let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     let mut config = Config::read(&snapshot.bytes)?;
+    let mut journal_quota = None;
     if let Some(value) = value {
         config.set(key, value)?;
         let serialized = yaml(&config)?;
         snapshot
             .replace(serialized.as_bytes(), cancel)
             .map_err(file_error)?;
+        if matches!(key, "journal" | "journal.quotaBytes") {
+            journal_quota = Some(config.journal.quota_bytes);
+        }
     } else if cancel.load(Ordering::Acquire) {
         return Err("config_cancelled");
     }
-    config.get(key)
+    Ok(Reply {
+        value_yaml: config.get(key)?,
+        journal_quota,
+    })
 }
 
 /// The effective `retention.quotaBytes` (J1). Read once at service start on
@@ -507,6 +574,14 @@ pub fn execute(
 pub fn retention_quota(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result<u64> {
     let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     Ok(Config::read(&snapshot.bytes)?.retention.quota_bytes)
+}
+
+/// The effective `journal.quotaBytes` (segmented journal), read with the same
+/// bounded read pipeline on the caller's worker. The work has no time bound;
+/// it ends on completion, an error or cancel.
+pub fn journal_quota(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result<u64> {
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
+    Ok(Config::read(&snapshot.bytes)?.journal.quota_bytes)
 }
 
 /// Startup-only typed audit settings from the canonical validated YAML snapshot.
@@ -592,7 +667,9 @@ mod tests {
             .unwrap();
         let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
         let cancel = AtomicBool::new(false);
-        let call = |key, value| execute(runtime.clone(), key, value, &cancel);
+        let call = |key, value| {
+            execute(runtime.clone(), key, value, &cancel).map(|reply| reply.value_yaml)
+        };
         assert_eq!(call("audit.enabled", None).unwrap(), "true\n");
         call("model", Some("provider:model")).unwrap();
         call("audit.keepFiles", Some("8")).unwrap();
@@ -959,5 +1036,239 @@ mod tests {
         assert_eq!(again.retention.quota_bytes, 1_099_511_627_776);
         assert!(Config::read(b"retention: {quotaBytes: 1}").is_err());
         assert!(Config::read(b"retention: {other: 1}").is_err());
+    }
+    /// SJ-14 unit layer: `journal.quotaBytes` defaults to 4 GiB, accepts
+    /// 64 MiB through 1 TiB, and is persisted only away from the default.
+    #[test]
+    fn journal_quota_bytes_default_bounds_and_persistence() {
+        assert_eq!(JOURNAL_MIN_QUOTA, 67_108_864);
+        assert_eq!(JOURNAL_MAX_QUOTA, 1_099_511_627_776);
+        assert_eq!(JOURNAL_DEFAULT_QUOTA, 4_294_967_296);
+        let mut config = Config::read(b"").unwrap();
+        assert_eq!(config.get("journal.quotaBytes").unwrap(), "4294967296\n");
+        assert_eq!(config.get("journal").unwrap(), "quotaBytes: 4294967296\n");
+        assert!(!yaml(&config).unwrap().contains("journal"));
+        for bad in [
+            "67108863",
+            "1099511627777",
+            "0",
+            "-1",
+            "true",
+            "'67108864'",
+            "null",
+            "[67108864]",
+            "{quotaBytes: 67108864}",
+            "!tag 67108864",
+        ] {
+            assert!(
+                Config::default().set("journal.quotaBytes", bad).is_err(),
+                "accepted {bad}"
+            );
+        }
+        for bad in ["67108863", "1099511627777", "-1", "true", "'1'"] {
+            assert_eq!(
+                Config::default().set("journal.quotaBytes", bad),
+                Err("config_invalid_value"),
+                "{bad}"
+            );
+        }
+        config.set("journal.quotaBytes", "67108864").unwrap();
+        assert_eq!(config.get("journal.quotaBytes").unwrap(), "67108864\n");
+        config.set("journal.quotaBytes", "1099511627776").unwrap();
+        let text = yaml(&config).unwrap();
+        assert!(
+            text.contains("journal:\n  quotaBytes: 1099511627776\n"),
+            "{text}"
+        );
+        assert!(!text.contains("retention"), "{text}");
+        let again = Config::read(text.as_bytes()).unwrap();
+        assert_eq!(again.journal.quota_bytes, 1_099_511_627_776);
+        assert_eq!(again.retention.quota_bytes, crate::payload::DEFAULT_QUOTA);
+        assert!(
+            config
+                .get("")
+                .unwrap()
+                .contains("journal:\n  quotaBytes: 1099511627776\n")
+        );
+        // Back at the default, the mapping is omitted again.
+        config.set("journal.quotaBytes", "4294967296").unwrap();
+        assert!(!yaml(&config).unwrap().contains("journal"));
+        // The mapping set requires exactly its one field.
+        config.set("journal", "{quotaBytes: 134217728}").unwrap();
+        assert_eq!(config.get("journal").unwrap(), "quotaBytes: 134217728\n");
+        for bad in [
+            "{}",
+            "{quotaBytes: 67108863}",
+            "{quotaBytes: 1099511627777}",
+            "{quotaBytes: 134217728, other: 1}",
+            "{other: 1}",
+            "{quotaBytes: true}",
+            "{quotaBytes: null}",
+            "134217728",
+            "null",
+        ] {
+            assert!(
+                Config::default().set("journal", bad).is_err(),
+                "accepted {bad}"
+            );
+        }
+        assert_eq!(
+            Config::default().set("journal.other", "1"),
+            Err("config_unknown_key")
+        );
+        // Stored documents obey the same bounds and closed schema.
+        for document in [
+            "journal: {quotaBytes: 67108863}",
+            "journal: {quotaBytes: 1099511627777}",
+            "journal: {quotaBytes: '67108864'}",
+            "journal: {quotaBytes: null}",
+            "journal: {quotaBytes: 67108864, quotaBytes: 67108864}",
+            "journal: {other: 1}",
+            "journal: null",
+            "journal: 67108864",
+        ] {
+            assert!(
+                Config::read(document.as_bytes()).is_err(),
+                "accepted {document}"
+            );
+        }
+        assert_eq!(
+            Config::read(b"journal: {}").unwrap().journal.quota_bytes,
+            JOURNAL_DEFAULT_QUOTA
+        );
+        assert_eq!(
+            Config::read(b"journal: {quotaBytes: !!int 67108864}")
+                .unwrap()
+                .journal
+                .quota_bytes,
+            JOURNAL_MIN_QUOTA
+        );
+    }
+    /// SJ-14 unit layer against a scratch runtime: `journal_quota` reads the
+    /// default and set values, `execute` reports the applied quota only for a
+    /// persisted journal set, and invalid stored values are never overwritten.
+    #[test]
+    fn journal_quota_reads_scratch_runtime_and_reports_applied_sets() {
+        use std::os::unix::fs::DirBuilderExt;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Scratch(
+            format!(
+                "/private/tmp/asura-jq-{:x}",
+                u128::from_ne_bytes(asura_platform::random_id())
+            )
+            .into(),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root.0)
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
+        let cancel = AtomicBool::new(false);
+        let call = |key, value| execute(runtime.clone(), key, value, &cancel);
+        assert_eq!(
+            journal_quota(runtime.clone(), &cancel),
+            Ok(JOURNAL_DEFAULT_QUOTA)
+        );
+        assert_eq!(
+            call("journal.quotaBytes", None),
+            Ok(Reply {
+                value_yaml: "4294967296\n".into(),
+                journal_quota: None
+            })
+        );
+        let file = root.0.join(".asura/config.yaml");
+        // An unrelated set persists without the default journal mapping and
+        // reports no journal change.
+        assert_eq!(
+            call("audit.keepFiles", Some("7")).unwrap().journal_quota,
+            None
+        );
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("journal"));
+        assert_eq!(
+            call("journal.quotaBytes", Some("67108864")),
+            Ok(Reply {
+                value_yaml: "67108864\n".into(),
+                journal_quota: Some(JOURNAL_MIN_QUOTA)
+            })
+        );
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("journal:\n  quotaBytes: 67108864\n")
+        );
+        assert_eq!(
+            journal_quota(runtime.clone(), &cancel),
+            Ok(JOURNAL_MIN_QUOTA)
+        );
+        assert_eq!(
+            call("journal", Some("{quotaBytes: 1099511627776}")),
+            Ok(Reply {
+                value_yaml: "quotaBytes: 1099511627776\n".into(),
+                journal_quota: Some(JOURNAL_MAX_QUOTA)
+            })
+        );
+        assert_eq!(
+            journal_quota(runtime.clone(), &cancel),
+            Ok(JOURNAL_MAX_QUOTA)
+        );
+        assert!(
+            call("", None)
+                .unwrap()
+                .value_yaml
+                .contains("journal:\n  quotaBytes: 1099511627776\n")
+        );
+        // Rejected sets leave the file and the reported quota unchanged.
+        let before = std::fs::read(&file).unwrap();
+        for (key, value) in [
+            ("journal.quotaBytes", "67108863"),
+            ("journal.quotaBytes", "1099511627777"),
+            ("journal", "{other: 1}"),
+            ("journal.other", "1"),
+        ] {
+            assert!(call(key, Some(value)).is_err(), "accepted {key}: {value}");
+        }
+        assert_eq!(call("journal.other", None), Err("config_unknown_key"));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        // Setting the default removes the mapping from the file.
+        assert_eq!(
+            call("journal.quotaBytes", Some("4294967296"))
+                .unwrap()
+                .journal_quota,
+            Some(JOURNAL_DEFAULT_QUOTA)
+        );
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("journal"));
+        // An invalid stored value is an error for every reader and is never
+        // overwritten by a set.
+        std::fs::write(&file, b"journal: {quotaBytes: 67108863}\n").unwrap();
+        let invalid = std::fs::read(&file).unwrap();
+        assert_eq!(
+            journal_quota(runtime.clone(), &cancel),
+            Err("config_invalid_value")
+        );
+        assert_eq!(
+            call("journal.quotaBytes", None),
+            Err("config_invalid_value")
+        );
+        assert_eq!(
+            call("journal.quotaBytes", Some("67108864")),
+            Err("config_invalid_value")
+        );
+        std::fs::write(&file, b"journal: {quotaBytes: 67108864, other: 1}\n").unwrap();
+        let unknown = std::fs::read(&file).unwrap();
+        assert_eq!(
+            journal_quota(runtime.clone(), &cancel),
+            Err("config_invalid_schema")
+        );
+        assert!(call("model", Some("replacement")).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), unknown);
+        assert_ne!(unknown, invalid);
+        // Cancellation ends the read.
+        let cancelled = AtomicBool::new(true);
+        assert!(journal_quota(runtime.clone(), &cancelled).is_err());
     }
 }

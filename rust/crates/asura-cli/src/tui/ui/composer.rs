@@ -25,9 +25,22 @@ impl App {
         if self.picker_models_pending {
             self.models_cancel = true;
         }
+        if matches!(self.picker, Some(Picker::Projects { .. })) {
+            self.stop_edge_read();
+        }
         self.picker = None;
     }
     pub(super) fn select_project(&mut self, id: [u8; 16]) -> bool {
+        let row = self.project_row(id).cloned();
+        self.select_project_row(id, row)
+    }
+    /// The selection guard and transition (CF06b). `row` comes from the
+    /// window, the selected project, or an exact `only` read.
+    pub(super) fn select_project_row(
+        &mut self,
+        id: [u8; 16],
+        row: Option<asura_control::pb::ProjectReply>,
+    ) -> bool {
         if self.conversation_busy
             || self.retained_request.is_some()
             || self.queue_busy
@@ -37,10 +50,7 @@ impl App {
             self.notice = "Finish active work before changing project".into();
             return false;
         }
-        let row = self.projects.as_ref().and_then(|rows| {
-            rows.iter()
-                .find(|row| row.project_id.as_deref() == Some(id.as_slice()))
-        });
+        let row = row.as_ref();
         if row.is_none_or(|row| row.current != Some(true)) {
             self.notice = if row.is_some_and(crate::conversation::overlaps_asura_state) {
                 format!(
@@ -52,6 +62,7 @@ impl App {
             };
             return false;
         }
+        self.paging.selected_row = (!self.in_window(id)).then(|| row.cloned()).flatten();
         self.selected_project = Some(id);
         self.conversation_id = None;
         self.conversation_generation = 0;
@@ -268,6 +279,13 @@ impl App {
                         }
                     }
                     self.picker = Some(Picker::Projects { selected, rows });
+                    // CF06b: the selection reached an edge of the window.
+                    if matches!(
+                        key.code,
+                        KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
+                    ) {
+                        self.request_edge_page(selected, count);
+                    }
                 }
                 Picker::Models {
                     mut selected,

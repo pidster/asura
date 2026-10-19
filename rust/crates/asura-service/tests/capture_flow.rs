@@ -120,7 +120,7 @@ impl Fixture {
         Ok(())
     }
     fn journal(&self) -> Result<(Vec<u8>, journal::Replay)> {
-        let bytes = std::fs::read(self.home.join(".asura/state/control/slot-0.log"))?;
+        let bytes = asura_storage::authority::fixture::journal_bytes(&self.home)?;
         let replay = journal::replay(&bytes, &AtomicBool::new(false))
             .map_err(|e| format!("replay: {e:?}"))?;
         Ok((bytes, replay))
@@ -390,28 +390,29 @@ fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
         .operations
         .get(&operation)
         .ok_or("operation absent")?;
-    let decode = |range: std::ops::Range<usize>| -> Result<journal::Record> {
-        let frame = &bytes[range];
-        Ok(journal::decode_record(
-            u16::from_be_bytes([frame[10], frame[11]]),
-            &frame[144..frame.len() - 40],
-        )
-        .map_err(|e| format!("decode: {e:?}"))?)
-    };
+    let decode =
+        |range: asura_storage::authority::conversation::Locator| -> Result<journal::Record> {
+            let frame = &bytes[range.range()];
+            Ok(journal::decode_record(
+                u16::from_be_bytes([frame[10], frame[11]]),
+                &frame[144..frame.len() - 40],
+            )
+            .map_err(|e| format!("decode: {e:?}"))?)
+        };
     let mut out = Vec::new();
     for tool in &op.tools {
-        let journal::Record::ToolCall(record) = decode(tool.intent_frame.clone())? else {
+        let journal::Record::ToolCall(record) = decode(tool.intent_frame)? else {
             return Err("kind 14 expected".into());
         };
         let settled = match tool.exec_cmd.as_ref().and_then(|s| s.settled.as_ref()) {
-            Some(s) => match decode(s.frame.clone())? {
+            Some(s) => match decode(s.frame)? {
                 journal::Record::CaptureSettled(settled) => Some(*settled),
                 _ => return Err("kind 23 expected".into()),
             },
             None => None,
         };
         let result = match &tool.result_frame {
-            Some(frame) => match decode(frame.clone())? {
+            Some(frame) => match decode(*frame)? {
                 journal::Record::ToolResult(result) => Some(result),
                 _ => return Err("kind 15 expected".into()),
             },
@@ -1047,7 +1048,7 @@ fn native() -> Result<()> {
     // Sweep everything except the journal; in the journal, only the turn's
     // own accepted prompt frame holds the value.
     let (bytes, replay) = fixture.journal()?;
-    let prompt = replay.operations[&operation].accepted_frame.clone();
+    let prompt = replay.operations[&operation].accepted_frame;
     let mut start = 0;
     while let Some(found) = bytes[start..]
         .windows(secret.len())
@@ -1055,7 +1056,7 @@ fn native() -> Result<()> {
     {
         let at = start + found;
         assert!(
-            prompt.contains(&at),
+            prompt.range().contains(&at),
             "value outside the prompt frame at {at}"
         );
         start = at + 1;

@@ -15,7 +15,7 @@ keep the command and key tables in the format that design defines.
 | Document | Contents |
 | --- | --- |
 | [User guide](guide.md) | Task-oriented guide: start Asura, send messages, use the queue, projects, conversations, models and configuration. |
-| [Commands reference](commands.md) | Every slash command with its exact syntax, grouped by purpose. |
+| [Commands reference](commands.md) | Every slash command with its exact syntax, grouped by purpose, and the journal space messages. |
 | [Keys reference](keys.md) | Every key, organised by area: input box, queue, log, response browser, status bar, lists, panels and paste capture. |
 
 Return to the [documentation index](../README.md).

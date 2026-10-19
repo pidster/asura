@@ -98,6 +98,14 @@ impl Response {
             self.stable = end.min(self.pending_floor).min(self.text.len());
         }
     }
+    /// The journal held the pending segment at its quota: nothing was
+    /// written; the same bytes are offered again when the hold ends.
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+    pub(super) fn refused(&mut self) {
+        self.pending = None;
+    }
     /// The journal refused the pending segment for capacity: keep what it
     /// holds plus one tail, and tell observers through a cut.
     pub(super) fn exhaust(&mut self, cursor: u64) {

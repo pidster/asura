@@ -1,4 +1,5 @@
-use asura_platform::{JournalFile, ProjectIdentity, RuntimeDirectory, random_id};
+use asura_platform::{JournalDirectory, JournalName, ProjectIdentity, RuntimeDirectory, random_id};
+use asura_storage::authority::journal::ROLL_RESERVE;
 use asura_storage::authority::{conversation::*, writer::*};
 use std::sync::atomic::AtomicBool;
 use std::{
@@ -179,7 +180,9 @@ fn project_rename_preserves_registration_alias_and_exact_retry_across_restart() 
     )
     .unwrap();
     assert_eq!(
-        alias.replay.as_ref().unwrap().projects[&project].registry_revision,
+        alias.replay.as_ref().unwrap().projects[&project]
+            .registration
+            .registry_revision,
         1
     );
     assert_eq!(
@@ -196,7 +199,9 @@ fn project_rename_preserves_registration_alias_and_exact_retry_across_restart() 
         Some(("Second name".into(), 2))
     );
     assert_eq!(
-        restored.replay.as_ref().unwrap().projects[&project].registry_revision,
+        restored.replay.as_ref().unwrap().projects[&project]
+            .registration
+            .registry_revision,
         1
     );
     drop(restored);
@@ -349,15 +354,21 @@ fn descriptor_append_reopens_and_rejects_replacement_without_truncation() {
     let scratch = Scratch::new();
     let runtime = scratch.runtime();
     let bytes = pending();
-    let mut file = JournalFile::open(runtime.clone(), true).unwrap();
-    file.append(0, &bytes).unwrap();
-    assert!(JournalFile::open(runtime.clone(), false).is_err());
-    assert_eq!(file.read_all(&AtomicBool::new(false)).unwrap(), bytes);
-    assert_eq!(file.read_all(&AtomicBool::new(false)).unwrap(), bytes);
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let mut file = JournalDirectory::open(runtime.clone(), true, cancel.clone()).unwrap();
+    file.create(JournalName::Segment(1)).unwrap();
+    file.append(1, 0, &bytes).unwrap();
+    assert!(JournalDirectory::open(runtime.clone(), false, cancel.clone()).is_err());
+    let mut read = vec![0; bytes.len()];
+    file.read_at(JournalName::Segment(1), 0, &mut read).unwrap();
+    assert_eq!(read, bytes);
     drop(file);
-    let mut file = JournalFile::open(runtime, false).unwrap();
-    assert_eq!(file.read_all(&AtomicBool::new(false)).unwrap(), bytes);
-    let path = scratch.0.join(".asura/state/control/slot-0.log");
+    let mut file = JournalDirectory::open(runtime, false, cancel).unwrap();
+    file.read_at(JournalName::Segment(1), 0, &mut read).unwrap();
+    assert_eq!(read, bytes);
+    let path = scratch
+        .0
+        .join(".asura/state/control/seg-0000000000000001.log");
     fs::rename(&path, path.with_extension("saved")).unwrap();
     fs::OpenOptions::new()
         .write(true)
@@ -365,7 +376,7 @@ fn descriptor_append_reopens_and_rejects_replacement_without_truncation() {
         .mode(0o600)
         .open(&path)
         .unwrap();
-    assert!(file.append(bytes.len(), &[1]).is_err());
+    assert!(file.append(1, bytes.len() as u64, &[1]).is_err());
     assert_eq!(fs::read(path.with_extension("saved")).unwrap(), bytes);
 }
 #[test]
@@ -388,17 +399,20 @@ fn writer_preserves_incomplete_tail_and_does_not_recreate_missing_authority() {
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
     let runtime = scratch.runtime();
-    let mut file = JournalFile::open(runtime.clone(), true).unwrap();
     let mut bytes = pending();
     bytes.extend_from_slice(b"ASU");
-    file.append(0, &bytes).unwrap();
-    drop(file);
+    seed(&runtime, &bytes);
     let mut writer = WriterHandle::start(runtime).unwrap();
     let result = wait(&mut writer.try_submit(Command::Open).unwrap());
     assert!(matches!(result, Err(Error::RepairRequired)));
     close(&mut writer);
     assert_eq!(
-        fs::read(scratch.0.join(".asura/state/control/slot-0.log")).unwrap(),
+        fs::read(
+            scratch
+                .0
+                .join(".asura/state/control/seg-0000000000000001.log")
+        )
+        .unwrap(),
         bytes
     );
 }
@@ -409,16 +423,16 @@ fn different_initialization_request_preserves_pending_state() {
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
     let runtime = scratch.runtime();
-    let mut file = JournalFile::open(runtime.clone(), true).unwrap();
-    file.append(0, &pending()).unwrap();
-    drop(file);
+    seed(&runtime.clone(), &pending());
     let mut writer = WriterHandle::start(runtime).unwrap();
     let state = wait(&mut writer.try_submit(Command::Open).unwrap())
         .unwrap()
         .replay
         .unwrap();
     assert!(state.binding.is_none());
-    let journal = scratch.0.join(".asura/state/control/slot-0.log");
+    let journal = scratch
+        .0
+        .join(".asura/state/control/seg-0000000000000001.log");
     let before = fs::read(&journal).unwrap();
     assert!(matches!(
         wait(
@@ -468,7 +482,9 @@ fn initialization_registration_admission_and_restart_with_budget() {
     .replay
     .unwrap();
     assert_eq!(init.revision, duplicate.revision);
-    let journal = scratch.0.join(".asura/state/control/slot-0.log");
+    let journal = scratch
+        .0
+        .join(".asura/state/control/seg-0000000000000001.log");
     let before = fs::read(&journal).unwrap();
     assert!(matches!(
         wait(
@@ -651,7 +667,7 @@ fn initialization_registration_admission_and_restart_with_budget() {
     let read = wait(
         &mut writer
             .try_submit(Command::ReadRecord {
-                range: terminal.frame.clone(),
+                locator: terminal.frame,
             })
             .unwrap(),
     )
@@ -802,9 +818,7 @@ fn retained_snapshot_generations_apply_backpressure_before_writes() {
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
     let runtime = scratch.runtime();
-    let mut file = JournalFile::open(runtime.clone(), true).unwrap();
-    file.append(0, &pending()).unwrap();
-    drop(file);
+    seed(&runtime.clone(), &pending());
     let mut writer = WriterHandle::start(runtime).unwrap();
     let first = wait(&mut writer.try_submit(Command::Open).unwrap())
         .unwrap()
@@ -822,7 +836,9 @@ fn retained_snapshot_generations_apply_backpressure_before_writes() {
     .unwrap()
     .replay
     .unwrap();
-    let path = scratch.0.join(".asura/state/control/slot-0.log");
+    let path = scratch
+        .0
+        .join(".asura/state/control/seg-0000000000000001.log");
     let before = fs::read(&path).unwrap();
     let command = || Command::Append {
         expected_revision: second.revision,
@@ -1185,7 +1201,12 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
     close(&mut writer);
     // The journal keeps no body digest and no derived identity (TCR-I03,
     // TCR-O5); the memory store is their one source.
-    let journal = fs::read(scratch.0.join(".asura/state/control/slot-0.log")).unwrap();
+    let journal = fs::read(
+        scratch
+            .0
+            .join(".asura/state/control/seg-0000000000000001.log"),
+    )
+    .unwrap();
     {
         use sha2::{Digest, Sha256};
         let body = Sha256::digest(b"durable note");
@@ -1321,14 +1342,15 @@ fn existing_overlapping_registration_is_listed_unavailable() {
         &mut writer
             .try_submit(Command::Projects {
                 after: None,
+                before: None,
                 limit: 8,
             })
             .unwrap(),
     )
     .unwrap();
     assert_eq!(listed.projects.len(), 1);
-    assert_eq!(listed.projects[0].0.project, project);
-    assert_eq!(listed.projects[0].1, Some(Error::OverlapsAsuraState));
+    assert_eq!(listed.projects[0].registration.project, project);
+    assert_eq!(listed.projects[0].error, Some(Error::OverlapsAsuraState));
     drop(listed);
     assert!(matches!(
         wait(&mut writer.try_submit(register(&location)).unwrap()),
@@ -1360,9 +1382,7 @@ fn existing_overlapping_registration_is_listed_unavailable() {
 }
 
 fn open_pending(scratch: &Scratch) -> (WriterHandle, std::sync::Arc<Replay>) {
-    let mut file = JournalFile::open(scratch.runtime(), true).unwrap();
-    file.append(0, &pending()).unwrap();
-    drop(file);
+    seed(&scratch.runtime(), &pending());
     let writer = WriterHandle::start(scratch.runtime()).unwrap();
     let state = wait(&mut writer.try_submit(Command::Open).unwrap())
         .unwrap()
@@ -1377,8 +1397,24 @@ fn owner_generation(revision: u64) -> Command {
         admission: None,
     }
 }
+/// A journal of `bytes` in segment file 1, as the writer leaves it.
+fn seed(runtime: &RuntimeDirectory, bytes: &[u8]) {
+    let mut directory = JournalDirectory::open(
+        runtime.clone(),
+        true,
+        std::sync::Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    directory.create(JournalName::Segment(1)).unwrap();
+    directory.append(1, 0, bytes).unwrap();
+}
 fn journal_replay(scratch: &Scratch) -> Replay {
-    let bytes = fs::read(scratch.0.join(".asura/state/control/slot-0.log")).unwrap();
+    let bytes = fs::read(
+        scratch
+            .0
+            .join(".asura/state/control/seg-0000000000000001.log"),
+    )
+    .unwrap();
     replay(&bytes, &AtomicBool::new(false)).unwrap()
 }
 #[test]
@@ -1386,9 +1422,7 @@ fn j1_0_01_gated_real_append_holds_five_seconds_then_commits() {
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
     let gate = asura_platform::journal_gate::JournalGate::new(&scratch.0);
-    let mut file = JournalFile::open(scratch.runtime(), true).unwrap();
-    file.append(0, &pending()).unwrap();
-    drop(file);
+    seed(&scratch.runtime(), &pending());
     let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
     gate.hold_appends();
     // Open replays, then appends OwnerGeneration through the held gate.
@@ -1453,6 +1487,7 @@ fn j1_0_06_gated_append_requests_beyond_eight_slots_are_busy() {
     assert!(matches!(
         writer.try_submit(Command::Projects {
             after: None,
+            before: None,
             limit: 1
         }),
         Err(Error::Busy)
@@ -1494,9 +1529,7 @@ fn j1_0_04_gated_replay_holds_until_shutdown_cancels_it() {
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
     let gate = asura_platform::journal_gate::JournalGate::new(&scratch.0);
-    let mut file = JournalFile::open(scratch.runtime(), true).unwrap();
-    file.append(0, &pending()).unwrap();
-    drop(file);
+    seed(&scratch.runtime(), &pending());
     let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
     gate.hold_reads();
     let mut ticket = writer.try_submit(Command::Open).unwrap();
@@ -1782,9 +1815,9 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     assert_eq!(tools[0].result_status, Some(5));
     assert_eq!(tools[1].decision, ToolDecision::Refused);
     assert!(tools[1].exec_cmd.is_none() && tools[1].result_frame.is_none());
-    let intent_frame = tools[0].intent_frame.clone();
-    let settled_frame = settlement.frame.clone();
-    let refused_frame = tools[1].intent_frame.clone();
+    let intent_frame = tools[0].intent_frame;
+    let settled_frame = settlement.frame;
+    let refused_frame = tools[1].intent_frame;
     // A restarted writer reopens the journal and reads each record back.
     let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
     let reopened = wait(&mut writer.try_submit(Command::Open).unwrap())
@@ -1795,13 +1828,19 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     drop(reopened);
     close(&mut writer);
     // Each verified frame range decodes to the appended record.
-    let bytes = fs::read(scratch.0.join(".asura/state/control/slot-0.log")).unwrap();
+    let bytes = fs::read(
+        scratch
+            .0
+            .join(".asura/state/control/seg-0000000000000001.log"),
+    )
+    .unwrap();
     for (range, kind, expected) in [
         (intent_frame, 14, Record::ToolCall(Box::new(call))),
         (settled_frame, 23, Record::CaptureSettled(Box::new(settled))),
         (refused_frame, 14, Record::ToolCall(Box::new(refused))),
     ] {
-        let frame = &bytes[range];
+        assert_eq!(range.segment, 1);
+        let frame = &bytes[range.range()];
         assert_eq!(u16::from_be_bytes([frame[10], frame[11]]), kind);
         assert_eq!(
             decode_record(kind, &frame[144..frame.len() - 40]).unwrap(),
@@ -1815,236 +1854,116 @@ const RESULT: usize = FRAME + 43 + 16_384;
 const OWNER: usize = FRAME;
 const CANCEL: usize = FRAME + 25;
 const CAPTURE: usize = FRAME + 4_066;
-/// Frame sizes do not depend on the frame context.
-fn frame_size(record: &Record) -> usize {
-    encode_frame(
-        &FrameContext {
-            installation_id: [1; 16],
-            transition_id: [2; 16],
-            sequence: 2,
-            prior_digest: [0; 32],
-            expected_revision: 1,
-            owner_generation: 1,
-        },
-        record,
-    )
-    .unwrap()
-    .len()
+/// Bytes of every segment file: frames are the only authority.
+fn segment_bytes(scratch: &Scratch) -> u64 {
+    fs::read_dir(scratch.0.join(".asura/state/control"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .map(|entry| entry.metadata().unwrap().len())
+        .sum()
 }
-/// A started turn on a journal padded so that exactly `free` bytes remain
-/// beyond the started turn's own reservation (terminal, owner and cancel).
-/// Returns the writer, the installation and the revision.
-fn j1_padded(scratch: &Scratch, free: usize) -> (WriterHandle, Id, u64) {
-    let size = frame_size;
+/// A started turn with `journal.quotaBytes` set so that exactly `room` bytes
+/// remain for closure reservations beyond the 32 MiB roll reserve.
+/// Returns the writer, the installation, the revision and the reservation.
+fn j1_quota_room(scratch: &Scratch, room: usize) -> (WriterHandle, Id, u64, usize) {
     let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
     let (project, configuration_digest) = j1_initialize(scratch, &mut writer);
-    close(&mut writer);
-    let started_reserved = TERMINAL + OWNER + CANCEL;
-    let started_end = asura_storage::authority::MAX_JOURNAL - started_reserved - free;
-    let padded_end = started_end
-        - OWNER
-        - size(&Record::TurnAccepted(Box::new(j1_turn(
-            project,
-            configuration_digest,
-        ))))
-        - size(&j1_start());
-    // Pad with completed turns written directly to the closed journal.
-    let state = journal_replay(scratch);
-    let mut file = JournalFile::open(scratch.runtime(), false).unwrap();
-    let (mut sequence, mut digest, mut end) = (state.sequence, state.last_digest, state.end_offset);
-    let owner_generation = state.owner_generation;
-    let mut push = |record: Record, file: &mut JournalFile, end: &mut usize| {
-        let frame = encode_frame(
-            &FrameContext {
-                installation_id: state.installation_id,
-                transition_id: random_id(),
-                sequence: sequence + 1,
-                prior_digest: digest,
-                expected_revision: sequence,
-                owner_generation,
-            },
-            &record,
-        )
-        .unwrap();
-        file.append(*end, &frame).unwrap();
-        digest.copy_from_slice(&frame[frame.len() - 40..frame.len() - 8]);
-        sequence += 1;
-        *end += frame.len();
-    };
-    let pad = |n: u64| {
-        let mut id = [0xa5; 16];
-        id[8..].copy_from_slice(&n.to_be_bytes());
-        id
-    };
-    let conversation = pad(0);
-    let turn = |generation: u64| {
-        let original = (generation > 1).then_some(conversation);
-        (
-            Record::TurnAccepted(Box::new(TurnAccepted {
-                request: pad(generation * 4 + 1),
-                digest: request_digest(Request::Submit {
-                    project,
-                    conversation: original,
-                    expected_generation: generation - 1,
-                    prompt: "pad",
-                })
-                .unwrap(),
-                project,
-                original_conversation: original,
-                expected_generation: generation - 1,
-                conversation,
-                generation,
-                task: pad(generation * 4 + 2),
-                operation: pad(generation * 4 + 3),
-                model: "system".into(),
-                configuration_digest,
-                instructions_digest: [1; 32],
-                input_digest: [2; 32],
-                prior_operations: Vec::new(),
-                prompt: "pad".into(),
-                event_cursor: 1,
-                // Every earlier padding turn completed and is omitted.
-                composition: Composition {
-                    omitted_turns: (generation - 1) as u32,
-                    ..Composition::default()
-                },
-            })),
-            Record::StartAuthorized(StartAuthorized {
-                operation: pad(generation * 4 + 3),
-                generation,
-                helper: pad(generation * 4 + 4),
-                input_digest: [2; 32],
-            }),
-            move |text: usize| {
-                Record::TurnTerminal(TurnTerminal {
-                    operation: pad(generation * 4 + 3),
-                    generation,
-                    kind: TerminalKind::Complete,
-                    cause: Cause::None,
-                    final_cursor: u64::MAX,
-                    usage_known: true,
-                    output_tokens: 0,
-                    text_offset: 0,
-                    text: "x".repeat(text),
-                })
-            },
-        )
-    };
-    // The fixed part of a later turn: accepted, start and an empty terminal.
-    let base = {
-        let (accepted, start, _) = turn(2);
-        size(&accepted) + size(&start) + FRAME + 51
-    };
-    let mut generation = 1;
-    while end < padded_end {
-        let (accepted, start, terminal) = turn(generation);
-        let fixed = size(&accepted) + size(&start) + FRAME + 51;
-        let remaining = padded_end - end;
-        let text = if generation == 1 || remaining > fixed + MAX_TEXT + base {
-            MAX_TEXT
-        } else if remaining - fixed <= MAX_TEXT {
-            remaining - fixed
-        } else {
-            // Leave exactly one later turn with a 1-byte text.
-            remaining - fixed - base - 1
-        };
-        assert!((1..=MAX_TEXT).contains(&text));
-        push(accepted, &mut file, &mut end);
-        push(start, &mut file, &mut end);
-        push(terminal(text), &mut file, &mut end);
-        generation += 1;
-    }
-    assert_eq!(end, padded_end);
-    drop(file);
-    // The restarted writer appends its owner generation, then the turn.
-    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
     let started = j1_admit_and_start(&mut writer, project, configuration_digest);
-    assert_eq!(started.end_offset, started_end);
-    assert_eq!(started.reserved_bytes, started_reserved);
-    let installation = started.installation_id;
-    let revision = started.revision;
-    drop(started);
-    (writer, installation, revision)
-}
-#[test]
-fn j1t_02_real_writer_refuses_a_run_exec_cmd_when_the_capture_reservation_cannot_fit() {
-    const MARGIN: usize = 100;
-    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
-    let scratch = Scratch::new();
-    let exec_cmd = || Record::ToolCall(Box::new(j1_call(1, ToolDecision::Run)));
-    let status = j1_status(ToolDecision::Run);
-    // The run exec_cmd kind 14 and its kind 15 fit by MARGIN bytes, but not
-    // with its capture frame; the smaller run status call fits.
-    assert!(frame_size(&status) <= frame_size(&exec_cmd()) + MARGIN && MARGIN < CAPTURE);
-    let free = frame_size(&exec_cmd()) + RESULT + MARGIN;
-    let (mut writer, _, mut revision) = j1_padded(&scratch, free);
-    let journal = scratch.0.join(".asura/state/control/slot-0.log");
-    let before = fs::read(&journal).unwrap();
-    assert!(matches!(
-        submit(&mut writer, &mut revision, exec_cmd()),
-        Err(Error::Invalid)
-    ));
-    assert_eq!(fs::read(&journal).unwrap(), before);
-    submit(&mut writer, &mut revision, status.clone()).unwrap();
-    let state = wait(&mut writer.try_submit(Command::Open).unwrap())
-        .unwrap()
-        .replay
-        .unwrap();
-    assert_eq!(state.reserved_bytes, TERMINAL + RESULT + OWNER + CANCEL);
-    assert_eq!(
-        asura_storage::authority::MAX_JOURNAL - state.end_offset - state.reserved_bytes,
-        frame_size(&exec_cmd()) + MARGIN - frame_size(&status)
+    let (installation, revision, reserved) = (
+        started.installation_id,
+        started.revision,
+        started.reserved_bytes,
     );
-    drop(state);
-    close(&mut writer);
+    drop(started);
+    let status = wait(&mut writer.try_submit(Command::JournalStatus).unwrap())
+        .unwrap()
+        .status
+        .unwrap();
+    wait(
+        &mut writer
+            .try_submit(Command::SetQuota {
+                bytes: status.usage + ROLL_RESERVE + room as u64,
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    (writer, installation, revision, reserved)
 }
-/// TCR-I08 and TCR-D16: kind 14 fits but kind 15 and the terminal do not.
-/// The `run` record is refused with the writer's existing capacity error and
-/// changes nothing; the same call with a decision that does not run (same
-/// size) needs no result frame and is accepted, and the turn can still end.
+/// J1T-02, TCR-I08 and TCR-D16 at the journal quota (SJ-15): a `run` kind
+/// 14 whose kind 15 (and kind 23) reservation does not fit is held with
+/// `journal_quota` and changes nothing; a call that does not run needs no
+/// result reservation and commits; closure records still commit.
 #[test]
-fn tcr_i08_run_kind_14_is_refused_when_its_result_cannot_fit() {
+fn j1t_02_tcr_i08_run_call_is_held_when_its_reservation_cannot_fit() {
     const MARGIN: usize = 100;
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
-    let run = j1_status(ToolDecision::Run);
+    let Record::ToolCall(mut second) = j1_status(ToolDecision::Run) else {
+        unreachable!()
+    };
+    second.ordinal = 2;
+    let run = Record::ToolCall(second);
     let denied = j1_status(ToolDecision::Denied);
-    assert_eq!(frame_size(&run), frame_size(&denied));
-    const { assert!(MARGIN < RESULT) };
-    let free = frame_size(&run) + RESULT - MARGIN;
-    let (mut writer, _, mut revision) = j1_padded(&scratch, free);
-    let journal = scratch.0.join(".asura/state/control/slot-0.log");
-    let before = fs::read(&journal).unwrap();
+    let exec_cmd = Record::ToolCall(Box::new(j1_call(2, ToolDecision::Run)));
+    let (mut writer, _, mut revision, reserved) =
+        j1_quota_room(&scratch, TERMINAL + OWNER + CANCEL + MARGIN);
+    assert_eq!(reserved, TERMINAL + OWNER + CANCEL);
+    // The run call would reserve its kind 15 (and an exec_cmd its kind 23).
+    const { assert!(MARGIN < RESULT && MARGIN < CAPTURE) };
+    let segment = scratch.0.join(".asura/state/control");
+    let size = |_: &std::path::PathBuf| segment_bytes(&scratch);
+    // A call that does not run fits: it reserves nothing more.
+    submit(&mut writer, &mut revision, denied).unwrap();
+    let before = size(&segment);
     assert!(matches!(
         submit(&mut writer, &mut revision, run),
-        Err(Error::Invalid)
+        Err(Error::JournalQuota)
     ));
-    assert_eq!(fs::read(&journal).unwrap(), before);
-    submit(&mut writer, &mut revision, denied).unwrap();
-    let state = wait(&mut writer.try_submit(Command::Open).unwrap())
-        .unwrap()
-        .replay
-        .unwrap();
-    let tool = &state.operations[&[35; 16]].tools[0];
-    assert_eq!(tool.decision, ToolDecision::Denied);
-    assert_eq!(state.reserved_bytes, TERMINAL + OWNER + CANCEL);
-    drop(state);
+    assert_eq!(size(&segment), before);
+    // Held: every normal record waits, nothing is written.
+    assert!(matches!(
+        submit(&mut writer, &mut revision, exec_cmd),
+        Err(Error::JournalQuota)
+    ));
+    assert_eq!(size(&segment), before);
+    assert_eq!(writer.status().held, Some(HoldReason::Quota));
+    // Closure records always fit: cancel and terminal commit while held.
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::CancelRequested(CancelRequested {
+            operation: [35; 16],
+            generation: 1,
+            cause: Cause::UserCancel,
+        }),
+    )
+    .unwrap();
     submit(
         &mut writer,
         &mut revision,
         Record::TurnTerminal(TurnTerminal {
             operation: [35; 16],
             generation: 1,
-            kind: TerminalKind::Failed,
-            cause: Cause::ProviderFailure,
+            kind: TerminalKind::Cancelled,
+            cause: Cause::UserCancel,
             final_cursor: u64::MAX,
             usage_known: false,
             output_tokens: 0,
             text_offset: 0,
-            text: "x".repeat(MAX_TEXT),
+            text: String::new(),
         }),
     )
     .unwrap();
+    assert!(size(&segment) > before);
+    // Raising the quota ends the hold at once.
+    wait(
+        &mut writer
+            .try_submit(Command::SetQuota { bytes: 1 << 40 })
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(writer.status().held, None);
     close(&mut writer);
 }
 
@@ -2205,23 +2124,22 @@ fn rt03_rt08_real_writer_segments_windows_history_and_restart_prefix() {
     close(&mut writer);
 }
 
-/// RT-07 in the writer: a kind 24 segment that does not fit beside the
-/// terminal reservation is refused without a write; the reserved terminal
-/// still commits the journaled prefix and its tail.
+/// RT-07 at the journal quota (SJ-16 integration): a kind 24 segment that
+/// would use the closure reservation is held with `journal_quota` and
+/// changes nothing; cancel and the terminal (closure records) still commit
+/// the journaled prefix and its tail.
 #[test]
-fn rt07_segment_beyond_capacity_is_refused_and_terminal_still_commits() {
+fn rt07_segment_beyond_the_quota_is_held_and_terminal_still_commits() {
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
     let scratch = Scratch::new();
     let segment = rt_segment(0, "s".repeat(MAX_TEXT));
-    let free = frame_size(&segment) - 1;
-    let (mut writer, _, mut revision) = j1_padded(&scratch, free);
-    let journal = scratch.0.join(".asura/state/control/slot-0.log");
-    let before = fs::read(&journal).unwrap();
+    let (mut writer, _, mut revision, _) = j1_quota_room(&scratch, TERMINAL + OWNER + CANCEL - 1);
+    let before = segment_bytes(&scratch);
     assert!(matches!(
         submit(&mut writer, &mut revision, segment),
-        Err(Error::Invalid | Error::Limit)
+        Err(Error::JournalQuota)
     ));
-    assert_eq!(fs::read(&journal).unwrap(), before);
+    assert_eq!(segment_bytes(&scratch), before);
     submit(
         &mut writer,
         &mut revision,

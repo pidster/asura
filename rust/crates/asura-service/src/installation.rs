@@ -1,6 +1,7 @@
 //! Read-only installation scanning. Only the service reactor publishes results.
 use asura_control::pb::{self, InstallationInspectionReason as Reason, InstallationState as State};
 use asura_platform::{AuthorityError, AuthoritySource, RuntimeDirectory};
+use asura_storage::authority::journal::{Failure, Journal, Opened};
 use asura_storage::authority::{self, ReplayError, ReplayState};
 use std::sync::{
     Arc,
@@ -76,32 +77,48 @@ pub(crate) fn scan(runtime: RuntimeDirectory, cancelled: Arc<AtomicBool>) -> Can
         witness: Some(scan.witness),
     }
 }
-fn scan_source(source: AuthoritySource, cancelled: &AtomicBool) -> pb::InspectInstallationReply {
-    let mut reader = match source {
+fn scan_source(
+    source: AuthoritySource,
+    cancelled: &Arc<AtomicBool>,
+) -> pb::InspectInstallationReply {
+    let reader = match source {
         AuthoritySource::RuntimeOnly => return snapshot(State::Uninitialized, Reason::RuntimeOnly),
         AuthoritySource::Remnants => return failure(Reason::InstallationRemnants),
         AuthoritySource::UnsupportedLayout => return failure(Reason::UnsupportedLayout),
         AuthoritySource::Journal(reader) => reader,
     };
-    let bytes = match reader.read_all(cancelled) {
-        Ok(bytes) => bytes,
+    let directory = match reader.directory(cancelled.clone()) {
+        Ok(directory) => directory,
         Err(error) => return platform_failure(error),
     };
-    let replay = authority::replay(&bytes, cancelled);
+    // The read-only scan: one checkpoint and the tail; it never writes.
+    let opened = Journal::open(directory, false, cancelled);
     if let Err(error) = reader.validate() {
         return platform_failure(error);
     }
-    let replay = match replay {
-        Ok(replay) => replay,
+    let replay = match opened {
+        Ok(Opened::Journal(journal)) => authority::summary(journal.state()),
+        Ok(Opened::Empty(_)) => return failure(Reason::InstallationRemnants),
         Err(error) => {
-            return failure(match error {
-                ReplayError::Empty => Reason::InstallationRemnants,
-                ReplayError::IncompleteTail => Reason::IncompleteTail,
-                ReplayError::UnsupportedFormat => Reason::UnsupportedFormat,
-                ReplayError::Corrupt => Reason::CorruptAuthority,
-                ReplayError::Limit => Reason::InspectionLimit,
-                ReplayError::Cancelled => Reason::InspectionCancelled,
-            });
+            return match error {
+                Failure::RebuildPending => {
+                    snapshot(State::Recovering, Reason::CheckpointRebuildPending)
+                }
+                Failure::Cancelled => failure(Reason::InspectionCancelled),
+                Failure::Unsafe => failure(Reason::UnsafeAuthority),
+                Failure::OwnerBusy | Failure::Io => failure(Reason::InspectionIo),
+                Failure::UnsupportedLayout => failure(Reason::UnsupportedLayout),
+                Failure::Remnants => failure(Reason::InstallationRemnants),
+                Failure::Replay(error) => failure(match error {
+                    ReplayError::Empty => Reason::InstallationRemnants,
+                    ReplayError::IncompleteTail => Reason::IncompleteTail,
+                    ReplayError::UnsupportedFormat => Reason::UnsupportedFormat,
+                    ReplayError::Corrupt => Reason::CorruptAuthority,
+                    ReplayError::Limit => Reason::InspectionLimit,
+                    ReplayError::Cancelled => Reason::InspectionCancelled,
+                }),
+                _ => failure(Reason::CorruptAuthority),
+            };
         }
     };
     if reader.has_unknown_root_content() {
@@ -488,7 +505,11 @@ mod tests {
                     .create_new(true)
                     .write(true)
                     .mode(0o600)
-                    .open(scratch.0.join(".asura/state/control/slot-0.log"))
+                    .open(
+                        scratch
+                            .0
+                            .join(".asura/state/control/seg-0000000000000001.log"),
+                    )
                     .unwrap();
                 file.write_all(&asura_storage::authority::fixture::initialization_journal(
                     false,

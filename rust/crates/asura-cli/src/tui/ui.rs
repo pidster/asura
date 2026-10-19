@@ -3,6 +3,7 @@ mod activity;
 mod composer;
 mod help_mode;
 mod markdown;
+mod paging;
 use super::editor::{CommandHeader, Editor, MAX_DRAFT_BYTES};
 use composer::{Focus, Picker, selection_style};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -177,7 +178,9 @@ pub struct App {
     conversation_draft: Option<String>,
     conversation_editor_draft: Option<String>,
     selected_project: Option<[u8; 16]>,
+    /// The project window (CF06b): at most 64 consecutive entries.
     projects: Option<Vec<asura_control::pb::ProjectReply>>,
+    paging: paging::Paging,
     launch_directory: Option<String>,
     project_discovery_started: bool,
     project_offer_seen: bool,
@@ -277,6 +280,7 @@ impl App {
             conversation_editor_draft: None,
             selected_project: None,
             projects: None,
+            paging: paging::Paging::default(),
             launch_directory: None,
             project_discovery_started: false,
             project_offer_seen: false,
@@ -1032,27 +1036,45 @@ impl App {
             self.project_offer = Some(path);
         }
         if let Some(mut projects) = update.projects {
-            if let Some(previous) = &self.projects {
-                for project in &mut projects {
-                    if let Some(known) = previous
-                        .iter()
-                        .find(|known| known.project_id == project.project_id)
-                        && known.name_revision.unwrap_or(0) > project.name_revision.unwrap_or(0)
-                    {
-                        project.name = known.name.clone();
-                        project.name_revision = known.name_revision;
-                    }
+            let mut known_rows = update.known_rows;
+            for project in projects.iter_mut().chain(known_rows.iter_mut()) {
+                if let Some(known) = project
+                    .project_id
+                    .as_deref()
+                    .and_then(|id| id.try_into().ok())
+                    .and_then(|id| self.project_row(id))
+                    && known.name_revision.unwrap_or(0) > project.name_revision.unwrap_or(0)
+                {
+                    project.name = known.name.clone();
+                    project.name_revision = known.name_revision;
                 }
             }
-            let still_current = self.selected_project.is_some_and(|id| {
-                projects.iter().any(|p| {
-                    p.project_id.as_deref() == Some(id.as_slice()) && p.current == Some(true)
-                })
+            let listed = |id: [u8; 16], rows: &[asura_control::pb::ProjectReply]| {
+                rows.iter()
+                    .find(|p| p.project_id.as_deref() == Some(id.as_slice()))
+                    .cloned()
+            };
+            // A window with nothing before or after it is the whole registry.
+            // Otherwise the selected project stays known when it is outside.
+            let complete = !update.more_before && !update.more_after;
+            let selected_row = self.selected_project.and_then(|id| {
+                listed(id, &projects)
+                    .or_else(|| listed(id, &known_rows))
+                    .or_else(|| (!complete).then(|| self.project_row(id).cloned()).flatten())
             });
+            let still_current = selected_row
+                .as_ref()
+                .is_some_and(|row| row.current == Some(true));
             if !(update.preserve_project_selection && still_current)
                 && self.selected_project != update.project
             {
                 self.selected_project = update.project;
+                self.paging.selected_row = update.project.and_then(|id| {
+                    listed(id, &projects)
+                        .is_none()
+                        .then(|| listed(id, &known_rows))
+                        .flatten()
+                });
                 self.conversation_id = None;
                 self.conversation_generation = 0;
                 self.new_conversation_intent = None;
@@ -1064,13 +1086,23 @@ impl App {
                 self.activity.clear();
                 self.model_context = None;
                 if self.selected_project.is_some() && !update.other_matches.is_empty() {
-                    self.notice = launch_match_hint(&projects, &update.other_matches);
+                    let mut named = projects.clone();
+                    named.extend(known_rows.iter().cloned());
+                    self.notice = launch_match_hint(&named, &update.other_matches);
                 }
+            } else if let Some(id) = self.selected_project
+                && listed(id, &projects).is_none()
+            {
+                self.paging.selected_row = selected_row;
             }
             if !projects.is_empty() {
                 self.project_offer = None;
             }
-            self.projects = Some(projects);
+            self.set_project_window(crate::conversation::Window {
+                rows: projects,
+                more_before: update.more_before,
+                more_after: update.more_after,
+            });
         } else if let Some(project) = update.project
             && self.selected_project != Some(project)
         {
@@ -1317,9 +1349,9 @@ impl App {
             return None;
         }
         let project = self.selected_project?;
-        let registered = self.projects.as_ref()?.iter().find(|p| {
-            p.project_id.as_deref() == Some(project.as_slice()) && p.current == Some(true)
-        })?;
+        let registered = self
+            .project_row(project)
+            .filter(|p| p.current == Some(true))?;
         registered.location.as_ref()?;
         Some(super::context::Scope {
             project,
@@ -1348,14 +1380,9 @@ impl App {
     }
 
     fn context_directory(&self) -> Option<&str> {
-        let root = self.selected_project.and_then(|id| {
-            self.projects
-                .as_ref()?
-                .iter()
-                .find(|project| project.project_id.as_deref() == Some(id.as_slice()))?
-                .location
-                .as_deref()
-        });
+        let root = self
+            .selected_project
+            .and_then(|id| self.project_row(id)?.location.as_deref());
         match (self.launch_directory.as_deref(), root) {
             (Some(launch), Some(root)) if std::path::Path::new(launch).starts_with(root) => {
                 Some(launch)
@@ -1366,13 +1393,7 @@ impl App {
     }
 
     fn project_name(&self, id: [u8; 16]) -> String {
-        self.projects
-            .as_ref()
-            .and_then(|projects| {
-                projects
-                    .iter()
-                    .find(|project| project.project_id.as_deref() == Some(id.as_slice()))
-            })
+        self.project_row(id)
             .map(project_label)
             .unwrap_or_else(|| crate::conversation::hex(&id[..4]))
     }
@@ -1388,7 +1409,7 @@ impl App {
         let reply = match update.outcome {
             super::project_admin::Outcome::Definite(error) => {
                 self.project_admin_retained = None;
-                self.notice = format!("Project rename rejected: {error}; draft retained");
+                self.notice = crate::conversation::rejection("Project rename rejected", &error);
                 return;
             }
             super::project_admin::Outcome::Unconfirmed(error) => {
@@ -1412,7 +1433,7 @@ impl App {
         let Some(project) = project else {
             if let Some(error) = reply.error {
                 self.project_admin_retained = None;
-                self.notice = format!("Project rename rejected: {error}; draft retained");
+                self.notice = crate::conversation::rejection("Project rename rejected", &error);
             } else {
                 self.project_admin_retained = Some(request.clone());
                 self.notice = "Project rename reply incomplete; use /retry".into();
@@ -1425,10 +1446,8 @@ impl App {
             return;
         }
         let mut newer_projection = false;
-        if let Some(rows) = &mut self.projects
-            && let Some(row) = rows
-                .iter_mut()
-                .find(|row| row.project_id.as_deref() == target)
+        if let Some(id) = target.and_then(|id| <[u8; 16]>::try_from(id).ok())
+            && let Some(row) = self.project_row_mut(id)
         {
             if project.name_revision.unwrap_or(0) >= row.name_revision.unwrap_or(0) {
                 *row = project.clone();
@@ -1441,7 +1460,7 @@ impl App {
             self.notice = if error == "stale_project_name_revision" {
                 "Project name changed elsewhere; current name shown. Draft retained".into()
             } else {
-                format!("Project rename rejected: {error}; draft retained")
+                crate::conversation::rejection("Project rename rejected", &error)
             };
             return;
         }
@@ -1866,6 +1885,11 @@ impl App {
                 self.editor = Editor::new();
             }
             self.notice = "Project request wait stopped; the rename may still be applied".into();
+        } else if !(self.conversation_busy && self.conversation_cancellable)
+            && self.stop_select_read()
+        {
+            // The `only` read for /project select has no time bound; the
+            // person's cancel stops it and the draft stays.
         } else if self.queue_busy && !(self.conversation_busy && self.conversation_cancellable) {
             // The queue wait has no timer (J1-0); /cancel stops only the wait.
             self.queue_cancel = true;
@@ -2108,11 +2132,19 @@ impl App {
             use crate::conversation::Command;
             let request=match (name,action,arg) {
                 ("/init","","")=>Ok(Command::Initialize(asura_platform::random_id())),
-                ("/project","list","")=>Ok(Command::List),
+                ("/project","list","")=>Ok(Command::List(None)),
+                ("/project","list",rest)=>match rest.split_once(char::is_whitespace) {
+                    Some(("after", id)) => crate::conversation::parse_id(id.trim()).map(|id| Command::List(Some(id))),
+                    _ => Err("Use /project list or /project list after ID; draft retained".into()),
+                },
                 ("/project","add",path) if !path.is_empty()=>Ok(Command::Register(asura_platform::random_id(),path.into())),
-                ("/project","select",id)=>match crate::conversation::parse_id(id){Ok(id)=>{if self.select_project(id) { self.editor=Editor::new(); } return false},Err(e)=>Err(e)},
+                ("/project","select",id)=>match crate::conversation::parse_id(id){
+                    // An ID outside the window is read with `only` first (CF06b).
+                    Ok(id) if self.project_row(id).is_none() => { self.select_outside_window(id, draft.clone()); return false },
+                    Ok(id)=>{if self.select_project(id) { self.editor=Editor::new(); } return false},
+                    Err(e)=>Err(e)},
                 ("/observe",id,"")=>crate::conversation::parse_id(id).map(Command::Observe),
-                _=>Err("Use /init, /project add PATH, /project list, /project select ID, /project rename NAME, or /observe ID".into()),
+                _=>Err("Use /init, /project add PATH, /project list [after ID], /project select ID, /project rename NAME, or /observe ID".into()),
             };
             match request {
                 Ok(request) => self.start_conversation_request(
@@ -3478,6 +3510,70 @@ mod tests {
         assert_eq!(app.draft(), "/project rename my project");
     }
 
+    /// SJ-15 (TUI): rename and registration rejected for a journal hold
+    /// show the journal notices and keep the draft.
+    #[test]
+    fn journal_hold_rejections_show_notices_and_keep_the_draft() {
+        let mut app = App::new();
+        app.projects = Some(vec![asura_control::pb::ProjectReply {
+            project_id: Some(vec![1; 16]),
+            location: Some("/work/asura".into()),
+            registry_revision: Some(1),
+            current: Some(true),
+            ..Default::default()
+        }]);
+        app.selected_project = Some([1; 16]);
+        app.view.epoch = Some(crate::conversation::hex(&[9; 16]));
+        app.insert("/project rename held");
+        app.submit();
+        let request = app.take_project_admin_request().unwrap();
+        app.project_admin_finished(super::super::project_admin::Update {
+            request: request.clone(),
+            outcome: super::super::project_admin::Outcome::Definite("journal_quota".into()),
+            service_epoch: None,
+            settled: true,
+        });
+        assert_eq!(
+            app.notice,
+            "Journal space is full. Raise journal.quotaBytes or free disk space. Draft retained."
+        );
+        assert_eq!(app.draft(), "/project rename held");
+        app.project_admin_finished(super::super::project_admin::Update {
+            request,
+            outcome: super::super::project_admin::Outcome::Reply(Box::new(
+                asura_control::pb::ProjectRenameReply {
+                    error: Some("journal_disk_space".into()),
+                    ..Default::default()
+                },
+            )),
+            service_epoch: Some([9; 16]),
+            settled: true,
+        });
+        assert_eq!(
+            app.notice,
+            "Disk space is low for the journal. Draft retained."
+        );
+        assert_eq!(app.draft(), "/project rename held");
+        // Registration: the worker's error message is the notice; the
+        // draft stays in the editor.
+        app.editor = Editor::new();
+        app.insert("/project add /work/new");
+        app.submit();
+        assert!(matches!(
+            app.take_conversation_request(),
+            Some(super::super::conversation::Request::Setup(
+                crate::conversation::Command::Register(..)
+            ))
+        ));
+        app.conversation_finished(super::super::conversation::Update {
+            message: Some(crate::conversation::service_error("journal_quota")),
+            done: true,
+            ..Default::default()
+        });
+        assert_eq!(app.notice, crate::conversation::JOURNAL_QUOTA_NOTICE);
+        assert_eq!(app.draft(), "/project add /work/new");
+    }
+
     #[test]
     fn project_rename_late_result_updates_only_target_and_uncertain_retry_keeps_id() {
         let mut app = App::new();
@@ -4580,7 +4676,7 @@ mod tests {
         for request in [
             None,
             Some(Request::DiscoverProject),
-            Some(Request::Setup(Command::List)),
+            Some(Request::Setup(Command::List(None))),
         ] {
             let mut app = App::new();
             if let Some(request) = request {

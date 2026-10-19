@@ -316,7 +316,7 @@ Project confirmation preserves an existing composer draft. Successful setup clea
 only the unchanged submitted command. No command initializes Git or modifies
 project contents.
 
-Project paging (proposed, 2026-10-19). The owner removed the 64-project total.
+Project paging (implemented 2026-10-19). The owner removed the 64-project total.
 The list has no page total; each page keeps its 8-entry and 40 KiB bounds. The
 client keeps a **project window** of at most 64 entries (8 pages) plus the
 selected project. `/project list` fills the window from the first page; when
@@ -327,9 +327,16 @@ descending order) when the selection reaches an edge, and drops the page at the
 other end. The CLI `asura project list` prints every page as it arrives; Ctrl-C
 stops the wait. `/project select ID` for an ID outside the window first reads
 that one project with `only`. Each read is one request with no time bound; the
-person's cancel or a lost connection ends it. Validation: SJ-37 in the
-[segmented journal](segmented-journal.md#validation), plus client unit cases
-for window edges, cursor order and `only`.
+person's cancel or a lost connection ends it. Implementation details: TUI
+discovery reads every page and keeps the first 64 entries plus any entry that
+contains the launch directory, so a match beyond entry 64 is still found. A
+selected project outside the window stays selected as its own row; a complete
+window without it means it is gone. `/project list` keeps CF09's rule that setup
+and discovery queue no cancellation; the `only` read for `/project select` stops
+on `/cancel` or Escape. The picker asks for at most `min(8, 64 − window)`
+entries, so the window never exceeds 64 when the 40 KiB bound shortens pages.
+Validation: SJ-37 in the [segmented journal](segmented-journal.md#validation),
+plus client unit cases for window edges, cursor order and `only`.
 
 ## CF07: Configuration reads and writes
 

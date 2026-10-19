@@ -1,12 +1,12 @@
 # Segmented authority journal
 
-Status: Accepted (2026-10-19). This design replaces the single 8 MiB authority
-journal file with known-size segment files, checkpoint snapshots, sorted index
-runs and run compaction. It also removes the 64-project and 256-conversation
-lifetime totals. It is not implemented. Until it is implemented, the
-single-file limits in [conversation admission](conversation-admission.md#format-1-and-record-kinds)
-and [persistence and recovery](persistence-recovery.md#bounds-interruption-and-preservation)
-still apply. The owner answered OD-SJ-1 to OD-SJ-5 on 2026-10-19; see
+Status: Implemented (2026-10-19), accepted the same day. This design replaces
+the single 8 MiB authority journal file with known-size segment files,
+checkpoint snapshots, sorted index runs and run compaction. It also removes the
+64-project and 256-conversation lifetime totals. The
+[validation status](#validation-status-2026-10-19) lists the evidence and the
+remaining gaps; [implementation refinements](#implementation-refinements-2026-10-19)
+record SJ-D12 to SJ-D27. The owner answered OD-SJ-1 to OD-SJ-5 on 2026-10-19; see
 [owner decisions](#owner-decisions-2026-10-19).
 Journal format stays **1** and the wire protocol stays **0.1**.
 
@@ -533,23 +533,23 @@ stateDiagram-v2
 | Tag | Key: ID, discriminator | Value | Emitted |
 | --- | --- | --- | --- |
 | `R` request | Request ID, 0 | Command kind u16, request digest, locator of the result frame | Roll after commit |
-| `G` generated ID | Conversation, task, operation or input ID, 0 | Entity kind u8, locator of the creating frame | Roll after commit |
+| `G` generated ID | Installation, graph, task, operation, input or dispatch-request ID, 0 (SJ-D16) | Entity kind u8, locator of the creating frame | Roll after commit |
 | `O` operation | Operation ID, 0 | Conversation, generation, terminal kind, cause, response length, piece count, call count, accepted and terminal locators | Roll after terminal |
 | `P` response piece | Operation ID, start offset | Kept length, locator of the kind 24 or kind 8 frame | With `O` |
 | `C` tool call | Operation ID, ordinal | Decision, kind 14, kind 15 and kind 23 locators (zero when absent) | With `O` |
-| `T` turn | Conversation ID, generation | Operation ID, terminal kind, accepted locator | With `O` |
+| `T` turn | Conversation ID, generation | Operation ID, terminal kind, accepted locator, completed turns through this generation (SJ-D12) | With `O` |
 | `I` input | Input ID, 0 | Status, kind 18 locator, promotion locator, dispatched operation | Roll after the input settles |
-| `X` payload | Payload ID, 0 | Operation ID, ordinal, kind 23 locator, last-use sequence | With `O` |
+| `X` payload | Payload ID, 0 | Operation ID, generation, ordinal, kind 14 locator, kind 23 locator, last-use sequence | With `O` |
 | `S` segment | Segment first sequence, 0 | Last sequence, byte length, last frame digest | Roll that seals it |
 | `J` project | Project ID, 0 | Device, inode, visibility, kind 4 locator | Roll after registration |
 | `N` project name | Project ID, name revision | Kind 20 locator | Roll after rename |
 | `D` project identity | Device and inode as 16 bytes, 0 | Project ID | Roll after registration |
 | `V` conversation | Conversation ID, 0 | Project ID, locator of the creating frame | Roll after creation |
 | `K` project conversation | Project ID, creation sequence | Conversation ID | Roll after creation |
-| `A` project activity | Project ID, accepted sequence | Conversation ID, operation ID | Roll after acceptance |
+| `A` project activity | Project ID, accepted sequence | Conversation ID, operation ID, generation | Roll after acceptance |
 
-`G` covers task, operation and input IDs; `J` and `V` cover project and
-conversation IDs for the generated-ID check. The newest entry under a prefix
+`G` covers installation, graph, task, operation, input and dispatch-request
+IDs; `J` and `V` cover project and conversation IDs for the generated-ID check. The newest entry under a prefix
 gives a current value: the highest `N` revision is the current name, the
 highest `T` generation the conversation generation, and the highest `A`
 sequence the project's latest conversation. Every key is written once, so the
@@ -757,8 +757,8 @@ runs. Typical journals have fewer than 10 runs.
 | --- | --- |
 | `ReadRecord { range }` | Becomes `ReadRecord { locator }`. The locator must be one that the live state, delta or an index entry names. |
 | `ReadResponse { operation, offset }` | `O` gives the length and piece count. The worker finds the last `P` entry with start at most `offset` and reads frames until the 61,440-byte window is full. Pieces in different segment files are read in order. |
-| `History { conversation, before, limit ≤ 8 }` | Searches `T` entries in each run and the delta below `before`, merges them newest first and returns `limit + 1` to set `has_more`. |
-| `Prepare` | Returns completed prior turns newest first, from `T`, `O` and `P`, until the next turn would pass 8 MiB of prompt and response text. Older turns are reported as omitted. The [context composer](context-composer.md#cc1-implementation-details) already omits turns that do not fit `W`. |
+| `History { conversation, before, limit ≤ 8 }` | `before` is the accepted frame sequence of the oldest entry shown (SJ-D14); the `A` entry for it gives the generation. Searches `T` entries in each run and the delta below that generation, adds the active turn on the first page, merges them newest first and returns `limit + 1` to set `has_more`. |
+| `Prepare` | Returns completed prior turns newest first, from `T`, `O` and `P`, until the next turn would pass 8 MiB of prompt and response text. Older turns are reported as `omitted` (SJ-D23). The [context composer](context-composer.md#cc1-implementation-details) already omits turns that do not fit `W`. |
 | `ReadPrompt { operation }` | `O` gives the accepted locator. |
 | Tool-call replay | `C` entries give the kind 14, 15 and 23 locators for a terminal operation; the active operation's records are in the live state. |
 | New `Lookup { operation }` | Returns the `O` facts of any operation. The service uses it where it reads `replay.operations` for a non-live operation. |
@@ -799,8 +799,10 @@ each roll, before each merge and on each resume check.
 
 The ledger keeps the roll reserve (32 MiB) for closure records. A **normal
 record** is any record except kind 8 `TurnTerminal`, kind 7 `CancelRequested`,
-kind 6 `StartAuthorized` for an already accepted operation, and kind 3
-`OwnerGeneration`. The existing closure reservation in `reserve()` still holds
+kind 6 `StartAuthorized` for an already accepted operation, kind 3
+`OwnerGeneration`, the pending `run` call's kind 23 and kind 15, and a kind 14
+with decision `cancelled` (SJ-D18). A normal record fits when its bytes, the
+roll reserve and the closure reservation after the record (SJ-D19) fit. The existing closure reservation in `reserve()` still holds
 the bytes of those closure frames for the active operation and unresolved inputs.
 
 ### Quota decision
@@ -839,7 +841,8 @@ a normal record and the reserves fit again.
 The worker checks again at once when the configuration owner changes the
 quota, when the payload store reports removed files, or when the person asks
 for status. Between events it checks free space after 1, 1, 2, 3, 5, 8 seconds
-and so on, each the sum of the two before, with no cap. This is pacing; it
+and so on, each the sum of the two before, at most 60 seconds apart (owner,
+2026-10-19), so space freed outside Asura is seen within a minute. This is pacing; it
 never ends or refuses work. Shutdown ends the held state.
 
 Behavior for new work while held (required): queue input, project registration,
@@ -976,7 +979,7 @@ segment file.
 | `conversation.rs:1047` sensor loop over `replay.projects` | First 64 registered projects | The sensor owner's resident set |
 | `conversation/audit_tools.rs:176` project check | `state.projects.contains_key` | Recent project set, otherwise `Project { project }` |
 | `asura-cli/src/conversation.rs:206-267` project pages | Reads up to 8 pages | Reads pages on demand; see [CF06b](command-flows.md#cf06b-project-list-and-local-selection) |
-| `conversation.rs:1646`, `:1675`, `:2955` operation observe | `replay.operations.get` | Live or delta first; otherwise `Lookup { operation }` |
+| `conversation.rs:1646`, `:1675`, `:2955` operation observe | `replay.operations.get` | Live or delta first; otherwise `ReadResponse` reads it through `O`, `P` and `C`; cancel of such an operation answers `unknown_operation` (SJ-D22) |
 | `conversation.rs:1961`, `:3404`, `:3706` | Active-operation facts | Unchanged: the active operation is always live |
 | `conversation.rs:2008` registration reply | `replay.requests.get` | Uses the writer reply's outcome |
 | `asura-service/src/payload_owner.rs` recovery | Replay-wide exec_cmd facts | `PayloadFacts` in batches of 128 |
@@ -1034,11 +1037,15 @@ command and waits for the ticket.
 
 ## Operations
 
-- Logs: one info event per roll (segment sequence, run size, checkpoint size,
-  usage) and per merge; one warning when the journal enters or leaves the held
-  state. Logs never contain record text.
-- Status: `JournalStatus` feeds the service status pane and a later control
-  field. Protocol stays 0.1; adding a reply field follows the normal schema rules.
+- Logs: one info event per roll (usage, runs, segments) and per merge; one
+  warning when the journal enters or leaves the held state (with usage and the
+  effective quota). The service writes them from the published status. Logs
+  never contain record text.
+- Status: the writer publishes `JournalStatus` (usage, effective and
+  configured quota, hold state, runs, segments, roll and merge counts) for the
+  service without a ticket; the service logs roll, merge and hold changes. The
+  status pane and a control field do not show it yet (open). Protocol stays
+  0.1; adding a reply field follows the normal schema rules.
 - Backup: a consistent copy needs every segment file and the two kept
   checkpoints with their runs. Derived files can be omitted and rebuilt. The
   backup design remains open in [persistence and recovery](persistence-recovery.md#compaction-and-backup).
@@ -1131,6 +1138,60 @@ where a large response is needed.
 | SJ-39 | Sensor residency | Resident set bound, eviction only of settled idle states | 100 active projects in turn: at most 64 resident; evicted state reloads; no observation lost | — |
 | SJ-40 | Checkpoint of recent sets | Recent sets after load equal genesis replay (part of SJ-05) | — | — |
 
+### Validation status (2026-10-19)
+
+Delivered evidence by layer. "Unit" uses the pure codecs and the journal
+driver on in-memory files (`authority/index.rs`, `index/run.rs`,
+`journal/tests.rs`); "integration" uses real files, the real writer and the
+real service (`asura-storage/tests/segmented_journal.rs`, `journal_writer.rs`,
+`asura-platform` journal tests, `asura-service` `tool_call_flow pause` and
+`roll`, `sensor_residency_tests.rs`); "end to end" uses the real TUI, CLI and
+service over the PTY gate (`tui_pty.py --segmented-journal` and
+`--segmented-restore`).
+
+| ID | Unit | Integration | End to end |
+| --- | --- | --- | --- |
+| SJ-01 | Name parser (`sj01_names_parse_exactly`) | Census faults (`sj_f18_census_rejects…`), `slot-0.log` scan | `slot-0.log` home reports `unsupported_layout` |
+| SJ-02 | Byte, frame-count and delta-charge rolls | 20 MiB response rolls; files end on frame boundaries | — |
+| SJ-03 | Chain across files; swapped file rejected | Three or more files replay after restart | — |
+| SJ-04 | Crash at each of six roll points recovers | Service killed while a roll is held at its checkpoint sync restarts, removes the tmp file, interrupts the turn and runs the next | Not run through the TUI (gap) |
+| SJ-05 | Checkpoint plus tail equals genesis replay for generated journals | Rebuild after removing every derived file reads the same response | — |
+| SJ-06 | Extra checkpoint content is `Corrupt`; derived values recompute | — | — |
+| SJ-07 | Damaged newest checkpoint falls back; the next roll replaces it | — | — |
+| SJ-08 | Rebuild emits the same runs and checkpoints; read-only scan reports `checkpoint_rebuild_pending` | Rebuild through the real writer | TUI shows the loading state while the held writer rebuilds, then the conversation (the service shows `inspection_pending` until the writer opens) |
+| SJ-09 | Replay charge independent of the number of segment files | Startup time recorded (SJ-29); peak resident memory not measured (gap) | — |
+| SJ-10 | `T` entries merge delta and runs newest first | 20 MiB response windows, `Prepare`, history pages, prompt and tool-call reads before and after restart | Relaunch restores an old conversation (SJ-38) |
+| SJ-11 | Merge equals union; lookups equal before and after | Merges interleave with commands on real files and retire inputs | — |
+| SJ-12 | Duplicate keys across runs or within a page are `Corrupt` | — (unit only) | — |
+| SJ-13 | A run's generated ID is not reused | — (unit only) | — |
+| SJ-14 | Key bounds and default (configuration owner) | `journal.quotaBytes` set makes the writer recheck at once (pause case) | `/config set journal.quotaBytes` then the hold notice without restart |
+| SJ-15 | Normal held, closure admitted, reserve arithmetic | Quota and disk holds: nothing written, closures commit, raising the quota or freeing space resumes | TUI shows "Disk space is low for the journal." and keeps the input |
+| SJ-16 | Pause rendering (client unit) | Real helper: output pauses with the paused step, resumes whole; cancel during the pause keeps the journaled prefix | TUI paused display not run end to end (gap; client unit case) |
+| SJ-17 | Floor arithmetic; ENOSPC with the size unchanged holds | APFS disk image: the floor holds before a roll; freeing space resumes; with the disk full an append inside the preallocated segment commits (F_PREALLOCATE honoured) | — |
+| SJ-18 | Short newest file is an incomplete tail; short sealed file is damage | Torn newest segment on real files: repair required, files unchanged | — |
+| SJ-19 | Damaged sealed frame fails the lookup | Damaged sealed frame on real files: the read fails and the writer is fenced | — |
+| SJ-20 | Missing interior segment is damage | Same on real files | — |
+| SJ-21 | Damaged run page fails the lookup | Damaged run on real files: selection or the read fails | — |
+| SJ-22 | — | A second writer process gets `OwnerBusy` | — |
+| SJ-23 | — | Roll held 5 s at its checkpoint sync: admission and status do not wait, no fence; service Inspect within 100 ms | TUI typing during a held roll not run (gap) |
+| SJ-24 | Commands run before the next merge step (worker loop) | Merges on real files while commands run | — |
+| SJ-25 | — | Shutdown during a held roll; restart recovers | Stop from the TUI during a roll not run (gap) |
+| SJ-26 | Read-only open never writes | Inspection of each damage fixture leaves the files unchanged | — |
+| SJ-27 | — | 20 MiB response across files, before and after restart and rebuild | — |
+| SJ-28 | — | 200 tool-call records of about 64 KiB across files | — |
+| SJ-29 | — | 40 MiB by default (`ASURA_SJ29_MIB` raises it): startup time recorded; 1 GiB not run by default (gap) | — |
+| SJ-30 | Lowered piece bound refuses the next piece | Service maps `Limit` to `output_limit` (RT-07 path) | — |
+| SJ-31 | — | Every suite uses scratch homes; the integration file asserts it | PTY fixtures use scratch homes |
+| SJ-32 | Derived files hold no response marker | Same on real files | — |
+| SJ-33 | Frame, checkpoint and run version 1; protocol 0.1 unchanged | — | — |
+| SJ-34 | — | `PayloadFacts` after rolls finds every call | Payload recovery uses it at startup (service journeys) |
+| SJ-35 | 1,000 registrations; recent set 64; `D` rejects a duplicate | 300 registrations across rolls and a restart; alias | `asura project add` succeeds beyond 64 |
+| SJ-36 | 10,000 conversations; eviction order; old conversation continues; restart keeps generations | — (unit only) | — |
+| SJ-37 | Page merge in ID order; `only` read | Pages without gaps or duplicates across a rename and a roll; descending pages; `only` | CLI prints 201; TUI `More:` hint, `/project list after ID`, picker reads the next page, selection of entry 150 |
+| SJ-38 | Highest `A` gives the latest conversation | Restoration for a project outside the recent set | Relaunch in that project restores its conversation |
+| SJ-39 | Eviction order and queue bound (sensor owner) | 100 projects: at most 64 resident; inspection of a non-resident state; every in-run activity recorded after settling | — |
+| SJ-40 | Recent sets equal genesis replay (with SJ-05) | — | — |
+
 Environment: macOS 27 development host, local APFS, real service, real Swift
 helper with the scripted loopback endpoint for SJ-27. Process-death tests show
 process-crash behavior only. Physical power loss is not qualified.
@@ -1152,6 +1213,30 @@ Selected by engineering judgment within the owner direction:
 | SJ-D9 | Single-response bound of 65,536 pieces | No bound (the active piece list would grow without limit in memory) |
 | SJ-D10 | `Prepare` stops at 8 MiB of history text | Unbounded candidate list |
 | SJ-D11 | A `lock` file holds the writer `flock` | Locking the changing active segment |
+
+## Implementation refinements (2026-10-19)
+
+Engineering refinements made while implementing, within the owner
+direction. Each keeps one source of truth: the frames.
+
+| ID | Refinement | Reason |
+| --- | --- | --- |
+| SJ-D12 | A `T` value also holds `completed`: the conversation's completed turns through that generation. The conversation entry of the recent set holds the same count. | The kind 21 rule counts every completed prior turn. Without the count, accepting a turn in a conversation outside the recent set would scan all its `T` entries. Replay maintains the count per frame; SJ-05 proves it equals genesis replay. |
+| SJ-D13 | Replay checks registration identity by device and inode (`D`) only; the location-uniqueness check is removed. | No index addresses locations. The writer opens the path and checks `D` before it writes; a different directory at an old path is a new project, and the old entry lists as stale. |
+| SJ-D14 | The history cursor (`before_accepted_frame`) and each history entry's `accepted_frame` carry the accepted frame's sequence. | Byte offsets name no file. The `A` key (project, accepted sequence) finds the cursor's turn exactly. The protocol field keeps its number and type. |
+| SJ-D15 | The delta keeps operations that became terminal since the checkpoint whole, charged at 64 bytes per piece; the roll generates their `O`, `P`, `C`, `T` and `X` entries. | Bounds memory as the replay budget states, and keeps one representation of a terminal operation until its run is written. |
+| SJ-D16 | `G` covers installation, graph, task, operation, input and dispatch-request IDs. A dispatch request ID is never accepted as another command's request ID. | Keeps today's rule that an input's dispatch request is used only by its kind 21, without keeping every input in memory. |
+| SJ-D17 | A checkpoint stores the active operation's tool calls as frame locators (kind 14, 23 and 15). Loading rebuilds the display projection, the tool lookup and the derived identities from those frames. | Derived files hold no argument or result text (SJ-32). At most 201 calls are read, through locators, not by a scan. |
+| SJ-D18 | Closure records are kind 8, 7, 6 and 3, plus the pending `run` call's kind 23 and kind 15 and a kind 14 `cancelled`. | The closure reservation already holds the bytes of the pending call's kind 23 and kind 15. A cancel during a pause must record a cancelled call before its terminal (TCR-D8). |
+| SJ-D19 | The quota check of a normal record uses the closure reservation after the record. | A `run` kind 14 reserves its kind 15 and kind 23 (TCR-D16); at the quota it is held before execution, as the pause requires. |
+| SJ-D20 | Live inputs hold the facts their status needs: the dispatched turn and its terminal kind, the steer target's terminal kind and cause, the promotion frame and the settle sequence. The 64 most recently settled inputs stay by settle sequence. A new input's order position follows the live inputs of its lane. | Input status is computed on the reactor's snapshot without index reads. The values are facts of later frames and replay recomputes them. |
+| SJ-D21 | The writer creates the `lock` file when it is absent. | The lock is not authority; a journal copied without it still opens. |
+| SJ-D22 | The service keeps at most 256 registrations from project pages to serve context identity, audit reads and sensor inspection for projects outside the recent set. Cancel answers from the live state and delta: an operation outside them is not running and gets `unknown_operation`; observation of such an operation reads it through `ReadResponse`. | The reactor never reads the index (AE-01), and cancel never waits for the journal (J1-0-07). The cache holds writer replies only; the journal stays the source. |
+| SJ-D23 | `Prepare` also returns `omitted`: completed turns beyond its 8 MiB candidate text. The composer adds them to the omitted range; the context line then reads "more than N bytes". | The kind 21 composition must account for every completed prior turn. |
+| SJ-D24 | Payload recovery runs `PayloadFacts` for the files present in the payload directories, from its own worker through a shared writer client, and waits on that worker for each reply. A call whose files are all gone is not listed. | Recovery work is bounded by retained files, not by history. The worker never holds a snapshot. |
+| SJ-D25 | The inspection witness detects new, removed or renamed control files; damage inside an existing file is detected by frame, page and file digests when read. | A multi-file journal is read through locators; per-file content stamps would cover only files the scan opened. |
+| SJ-D26 | The protocol adds `CONVERSATION_WAIT_STEP_JOURNAL_PAUSED = 5` for a paused turn and inspection reason 17 `checkpoint_rebuild_pending` (state `Recovering`). | The person sees the pause and the rebuild; protocol stays 0.1 under the schema rules. |
+| SJ-D27 | The run list may name at most 64 runs: a roll that would list a 65th holds normal records with `journal_quota` until a merge completes. A complete merge output becomes visible at the next roll. | As designed; recorded because the merge and roll share the writer gate. |
 
 ## Owner decisions (2026-10-19)
 

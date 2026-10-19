@@ -112,7 +112,9 @@ pub(super) fn runtime(case: &mut Case) -> Result<()> {
         case.root.join("home/.asura/db").is_dir(),
         "automatic database missing",
     )?;
-    let journal = case.root.join("home/.asura/state/control/slot-0.log");
+    let journal = case
+        .root
+        .join("home/.asura/state/control/seg-0000000000000001.log");
     let original = fs::read(&journal)?;
     require(
         !original.is_empty(),
@@ -178,7 +180,7 @@ fn journal(case: &mut Case, bytes: &[u8], reason: &str, revision: Option<u64>) -
     fs::DirBuilder::new()
         .mode(0o700)
         .create(root.join("control"))?;
-    let path = root.join("control/slot-0.log");
+    let path = root.join("control/seg-0000000000000001.log");
     fs::write(&path, bytes)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     let mut prior_epoch = serde_json::Value::Null;

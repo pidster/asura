@@ -1034,10 +1034,9 @@ exec_cmd call over today: kind 23 (a frame of at most 4,250 bytes since
 2026-10-18). The kind 14 `ToolCall` record that replaced kind 22 holds the
 argument text once; its growth is bounded in
 [tool call records](tool-call-records.md#size-limits). This counts
-against the current single 8 MiB journal file. Until the proposed
-[segmented journal](segmented-journal.md) is implemented,
-heavy exec_cmd use reaches journal capacity sooner, and capacity exhaustion keeps
-its existing explicit failure.
+against the journal quota of the [segmented journal](segmented-journal.md)
+(implemented 2026-10-19); kind 23 and the pending call's kind 15 are closure
+records there (SJ-D18).
 
 ### J1 ownership
 
@@ -1622,7 +1621,7 @@ sequenceDiagram
 | Process or scratch cleanup passes its L3 bound | Today's repair path, `authority_repair_required` | Unchanged |
 | Install fault | Staging kept; recovery installs after the digest check | None |
 | Journal append slow for kind 14, 23 or 15 | The append and its observation wait; no fence and no turn failure (J1-0). New writer requests beyond 8 slots get `busy` | None until it commits |
-| Journal capacity reached | Existing explicit capacity failure; J1 records add about 5 KiB per call until the proposed [segmented journal](segmented-journal.md) | Unchanged |
+| Journal quota reached | The turn pauses before the next `run` kind 14; a running call's kind 23 and kind 15 still commit ([segmented journal](segmented-journal.md#holding-and-resuming)) | None written while held |
 | Journal append I/O error for kind 14, 23 or 15 | Journal fenced; today's storage-unavailable path; turn fails | Unchanged |
 | Crash or restart at any point | No rerun; [derived recovery](#replay-order-and-reservation) | None written at recovery |
 | Page read stalls | `busy` after the 2 s step; worker held until it returns | None |

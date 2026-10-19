@@ -10,7 +10,10 @@ pub use pages::{
     Origin, PAGE_LIMIT, PAGE_QUEUE, PAGE_STEP, Page, PagePool, PageRequest, PageState, Ticket,
     read_page,
 };
-pub use recovery::{Known, RecoveryError, RecoveryReport, known_calls, recover, recover_known};
+pub use recovery::{
+    FACT_BATCH, Known, RecoveryError, RecoveryReport, known_calls, recover, recover_known,
+    recover_with_facts,
+};
 pub use store::{
     Capture, DEFAULT_QUOTA, Ledger, Location, MAX_EXPIRY_PER_ATTEMPT, MAX_QUOTA, MIB, MIN_QUOTA,
     PayloadId, PayloadState, PayloadStore, RECOVERY_RESERVE, RESERVATION_STEP, Short,

@@ -6,10 +6,13 @@ use asura_storage::sensors::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},
 };
-const MAX_PROJECTS: usize = 64;
+/// Resident-set size of the project-state cache. Registrations have no total.
+pub(crate) const MAX_RESIDENT: usize = 64;
+/// Projects whose activity waits for a resident slot.
+pub(crate) const MAX_DEFERRED: usize = 64;
 const IDLE: Duration = Duration::from_secs(300);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
@@ -31,6 +34,31 @@ pub(crate) struct StatusSnapshot {
 pub(crate) struct Capture {
     pub observation: Observation,
     pub durable: bool,
+}
+/// Coalesced journal activity for a project that is not resident yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Activity {
+    pub operation: Id,
+    pub generation: u64,
+    pub sequence: u64,
+    pub settled: bool,
+}
+/// Persistence flags reported beside a committed projection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InspectStatus {
+    pub pending_persistence: bool,
+    pub intake_unavailable: bool,
+    pub clock_uncertain: bool,
+}
+impl InspectStatus {
+    /// Flags for a state loaded for inspection only: nothing is pending in memory.
+    pub fn loaded(state: &ProjectState, wall_ms: u64) -> Self {
+        Self {
+            pending_persistence: false,
+            intake_unavailable: false,
+            clock_uncertain: wall_ms < state.last_received_ms,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Write {
@@ -68,10 +96,28 @@ impl Project {
         self.clock_uncertain = false;
         true
     }
+    /// Settled states hold nothing that only memory knows and no work that a timer
+    /// or writer reply still has to finish, so they may leave the resident set.
+    fn settled(&self) -> bool {
+        self.idle_emitted
+            && !self.dirty
+            && self.writing.is_none()
+            && !self.uncertain
+            && self.active == 0
+            && self.debounce.is_none()
+            && self.pending.is_empty()
+            && !self
+                .working
+                .proposals
+                .iter()
+                .any(|proposal| proposal.state == ProposalState::Held)
+    }
 }
 pub(crate) struct Owner {
     epoch: Id,
     projects: BTreeMap<Id, Project>,
+    deferred: VecDeque<(Id, Activity)>,
+    deferred_dropped: u64,
     status: StatusSnapshot,
     closing: bool,
 }
@@ -83,6 +129,8 @@ impl Owner {
         Ok(Self {
             epoch,
             projects: BTreeMap::new(),
+            deferred: VecDeque::new(),
+            deferred_dropped: 0,
             status,
             closing: false,
         })
@@ -100,7 +148,7 @@ impl Owner {
         if self.projects.contains_key(&state.project) {
             return Err(Error::Busy);
         }
-        if self.projects.len() >= MAX_PROJECTS {
+        if self.projects.len() >= MAX_RESIDENT {
             return Err(Error::Limit);
         }
         let original = state.clone();
@@ -138,6 +186,57 @@ impl Owner {
             },
         );
         Ok(())
+    }
+    pub fn resident(&self, project: Id) -> bool {
+        self.projects.contains_key(&project)
+    }
+    /// The settled state with the oldest activity, then the lowest project ID.
+    /// Resident project states.
+    pub fn len(&self) -> usize {
+        self.projects.len()
+    }
+    pub fn evictable(&self) -> Option<Id> {
+        self.projects
+            .iter()
+            .filter(|(_, project)| project.settled())
+            .min_by_key(|(id, project)| (project.last_activity, project.last_activity_ms, **id))
+            .map(|(id, _)| *id)
+    }
+    /// Remove a settled state from memory. Its committed record is already durable,
+    /// so eviction writes nothing.
+    pub fn evict(&mut self, project: Id) -> Result<(), Error> {
+        let state = self.projects.get(&project).ok_or(Error::Unavailable)?;
+        if !state.settled() {
+            return Err(Error::Busy);
+        }
+        self.projects.remove(&project);
+        Ok(())
+    }
+    /// Keep the newest activity of a project that cannot be admitted yet. The queue
+    /// holds at most MAX_DEFERRED projects; when full, the oldest entry is dropped
+    /// and counted. A later activity for that project records a current checkpoint.
+    pub fn defer(&mut self, project: Id, activity: Activity) {
+        if let Some((_, pending)) = self.deferred.iter_mut().find(|(id, _)| *id == project) {
+            if activity.sequence >= pending.sequence {
+                *pending = activity;
+            }
+            return;
+        }
+        if self.deferred.len() >= MAX_DEFERRED {
+            self.deferred.pop_front();
+            self.deferred_dropped = self.deferred_dropped.saturating_add(1);
+        }
+        self.deferred.push_back((project, activity));
+    }
+    /// The oldest pending activity, in the order its project entered the queue.
+    pub fn take_deferred(&mut self) -> Option<(Id, Activity)> {
+        self.deferred.pop_front()
+    }
+    pub fn deferred_len(&self) -> usize {
+        self.deferred.len()
+    }
+    pub fn deferred_dropped(&self) -> u64 {
+        self.deferred_dropped
     }
     /// Seed foreground state from canonical replay before enabling idle observation.
     pub fn active_foreground(&mut self, project: Id, count: u32) -> Result<(), Error> {
@@ -512,7 +611,31 @@ impl Owner {
         let Some(project) = self.projects.get(&project_id) else {
             return inspection_error("sensor_loading");
         };
-        let state = &project.committed;
+        Self::inspect_state(
+            &project.committed,
+            query,
+            InspectStatus {
+                pending_persistence: project.dirty || project.writing.is_some(),
+                intake_unavailable: project.uncertain,
+                clock_uncertain: project.clock_uncertain,
+            },
+        )
+    }
+    /// The same bounded projection for a committed state, resident or loaded only
+    /// for this inspection. It never makes a project resident.
+    pub fn inspect_state(
+        state: &ProjectState,
+        query: &pb::SensorsInspect,
+        status: InspectStatus,
+    ) -> pb::SensorsReply {
+        let project_id: Id = query
+            .project_id
+            .as_deref()
+            .and_then(|v| v.try_into().ok())
+            .unwrap_or([0; 16]);
+        if project_id != state.project {
+            return inspection_error("sensor_unavailable");
+        }
         if query
             .revision
             .is_some_and(|revision| revision != state.revision)
@@ -534,9 +657,9 @@ impl Owner {
             total_observations: Some(state.observations.len() as u32),
             offset: Some(offset as u32),
             next_offset: (end < state.observations.len()).then_some(end as u32),
-            pending_persistence: Some(project.dirty || project.writing.is_some()),
-            intake_unavailable: Some(project.uncertain),
-            clock_uncertain: Some(project.clock_uncertain),
+            pending_persistence: Some(status.pending_persistence),
+            intake_unavailable: Some(status.intake_unavailable),
+            clock_uncertain: Some(status.clock_uncertain),
             observations: state.observations[offset..end]
                 .iter()
                 .map(observation_summary)
@@ -1103,6 +1226,250 @@ mod tests {
                 .proposals
                 .iter()
                 .any(|p| p.purpose == Purpose::Reflection)
+        );
+    }
+    fn empty_owner() -> Owner {
+        Owner::new(
+            [2; 16],
+            StatusSnapshot {
+                lifecycle: 1,
+                installation: 1,
+                reason: 0,
+            },
+        )
+        .unwrap()
+    }
+    fn commit_all(owner: &mut Owner) {
+        while let Some(write) = owner.take_write() {
+            owner
+                .persisted(write.state.project, write.state.write_id, Ok(()))
+                .unwrap();
+        }
+    }
+    /// Fire idle for every resident state, persist it, then expire the held
+    /// reflection and persist that, leaving each state settled.
+    fn settle_all(owner: &mut Owner, at: Instant, wall: u64) {
+        owner.poll(at + IDLE, wall + 300_000);
+        commit_all(owner);
+        owner.poll(at + IDLE * 2, wall + 600_000);
+        commit_all(owner);
+    }
+    fn activity_record(sequence: u64) -> Activity {
+        Activity {
+            operation: [3; 16],
+            generation: 1,
+            sequence,
+            settled: true,
+        }
+    }
+    #[test]
+    fn eviction_takes_oldest_settled_activity_then_lowest_project() {
+        let now = Instant::now();
+        let mut owner = empty_owner();
+        owner
+            .restore(ProjectState::empty([5; 16]), now, 1000)
+            .unwrap();
+        let later = now + Duration::from_secs(1);
+        owner
+            .restore(ProjectState::empty([4; 16]), later, 2000)
+            .unwrap();
+        owner
+            .restore(ProjectState::empty([3; 16]), later, 2000)
+            .unwrap();
+        assert_eq!(owner.evictable(), None);
+        settle_all(&mut owner, later, 2000);
+        assert_eq!(owner.evictable(), Some([5; 16]));
+        owner.evict([5; 16]).unwrap();
+        assert!(!owner.resident([5; 16]));
+        assert_eq!(owner.evictable(), Some([3; 16]));
+        owner.evict([3; 16]).unwrap();
+        assert_eq!(owner.evictable(), Some([4; 16]));
+        owner.evict([4; 16]).unwrap();
+        assert_eq!(owner.evictable(), None);
+        assert_eq!(owner.evict([4; 16]), Err(Error::Unavailable));
+        assert!(owner.take_write().is_none());
+    }
+    #[test]
+    fn eviction_refuses_every_unsettled_state() {
+        let now = Instant::now();
+        let mut owner = owner(now);
+        // Idle observation has not fired.
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        // Idle fired; the held reflection awaits revalidation.
+        owner.poll(now + IDLE, 301_000);
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        commit(&mut owner);
+        assert_eq!(
+            owner.snapshot([1; 16]).unwrap().proposals[0].state,
+            ProposalState::Held
+        );
+        assert_eq!(owner.evictable(), None);
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        // Expiry is a pending write until persisted.
+        owner.poll(now + IDLE * 2, 601_000);
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        commit(&mut owner);
+        assert_eq!(owner.evictable(), Some([1; 16]));
+        // Active foreground work.
+        owner.active_foreground([1; 16], 1).unwrap();
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        owner.active_foreground([1; 16], 0).unwrap();
+        // Debounce and pending captures.
+        let at = now + IDLE * 2;
+        owner.projects.get_mut(&[1; 16]).unwrap().debounce = Some((at, at));
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        owner.projects.get_mut(&[1; 16]).unwrap().debounce = None;
+        owner
+            .projects
+            .get_mut(&[1; 16])
+            .unwrap()
+            .pending
+            .push([7; 16]);
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        owner.projects.get_mut(&[1; 16]).unwrap().pending.clear();
+        assert_eq!(owner.evictable(), Some([1; 16]));
+        // Dirty, then in flight, then uncertain.
+        owner
+            .capture_status([1; 16], [3; 16], 1, 1, at, 601_000)
+            .unwrap();
+        assert_eq!(owner.evictable(), None);
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        let write = owner.take_write().unwrap();
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        assert_eq!(
+            owner.persisted([1; 16], write.state.write_id, Err(Error::Unconfirmed)),
+            Err(Error::Unconfirmed)
+        );
+        assert_eq!(owner.evict([1; 16]), Err(Error::Busy));
+        assert!(owner.reconcile(write.state.clone()).unwrap());
+        assert_eq!(owner.evictable(), Some([1; 16]));
+        owner.evict([1; 16]).unwrap();
+        assert!(!owner.resident([1; 16]));
+    }
+    #[test]
+    fn resident_set_is_bounded_and_eviction_frees_a_slot() {
+        let now = Instant::now();
+        let mut owner = empty_owner();
+        for index in 1..=MAX_RESIDENT as u8 {
+            owner
+                .restore(ProjectState::empty([index; 16]), now, 1000)
+                .unwrap();
+        }
+        let extra = [MAX_RESIDENT as u8 + 1; 16];
+        assert_eq!(
+            owner.restore(ProjectState::empty(extra), now, 1000),
+            Err(Error::Limit)
+        );
+        assert!(!owner.resident(extra));
+        settle_all(&mut owner, now, 1000);
+        let leaving = owner.evictable().unwrap();
+        assert_eq!(leaving, [1; 16]);
+        let durable = owner.snapshot(leaving).unwrap().clone();
+        owner.evict(leaving).unwrap();
+        owner
+            .restore(ProjectState::empty(extra), now, 601_000)
+            .unwrap();
+        assert!(owner.resident(extra));
+        assert!(!owner.resident(leaving));
+        assert_eq!(
+            owner.restore(durable.clone(), now, 601_000),
+            Err(Error::Limit)
+        );
+        // The evicted state reloads unchanged once a slot is free again.
+        owner.evict(owner.evictable().unwrap()).unwrap();
+        owner.restore(durable.clone(), now, 601_000).unwrap();
+        assert_eq!(owner.snapshot(leaving), Some(&durable));
+    }
+    #[test]
+    fn deferred_activity_is_bounded_newest_wins_and_oldest_drops() {
+        let mut owner = empty_owner();
+        for index in 1..=MAX_DEFERRED as u8 {
+            owner.defer([index; 16], activity_record(10));
+        }
+        assert_eq!(owner.deferred_len(), MAX_DEFERRED);
+        owner.defer([1; 16], activity_record(12));
+        owner.defer([1; 16], activity_record(11));
+        assert_eq!(owner.deferred_len(), MAX_DEFERRED);
+        assert_eq!(owner.deferred_dropped(), 0);
+        let newcomer = [MAX_DEFERRED as u8 + 1; 16];
+        owner.defer(newcomer, activity_record(1));
+        assert_eq!(owner.deferred_len(), MAX_DEFERRED);
+        assert_eq!(owner.deferred_dropped(), 1);
+        for index in 2..=MAX_DEFERRED as u8 {
+            assert_eq!(
+                owner.take_deferred(),
+                Some(([index; 16], activity_record(10)))
+            );
+        }
+        assert_eq!(owner.take_deferred(), Some((newcomer, activity_record(1))));
+        assert_eq!(owner.take_deferred(), None);
+        assert_eq!(owner.deferred_len(), 0);
+        // A dropped project re-enters with its newest activity.
+        owner.defer([1; 16], activity_record(13));
+        owner.defer([2; 16], activity_record(5));
+        owner.defer([1; 16], activity_record(14));
+        assert_eq!(owner.take_deferred(), Some(([1; 16], activity_record(14))));
+        assert_eq!(owner.take_deferred(), Some(([2; 16], activity_record(5))));
+        assert_eq!(owner.deferred_dropped(), 1);
+    }
+    #[test]
+    fn deferred_newest_activity_replaces_older_in_place() {
+        let mut owner = empty_owner();
+        owner.defer([1; 16], activity_record(3));
+        owner.defer([2; 16], activity_record(4));
+        owner.defer([1; 16], activity_record(9));
+        assert_eq!(owner.deferred_len(), 2);
+        assert_eq!(owner.take_deferred(), Some(([1; 16], activity_record(9))));
+        assert_eq!(owner.take_deferred(), Some(([2; 16], activity_record(4))));
+    }
+    #[test]
+    fn non_resident_inspection_matches_resident_inspection() {
+        let now = Instant::now();
+        let mut owner = owner(now);
+        for sequence in 1..=3 {
+            owner
+                .ingest(activity(sequence, 1000, false), now, 1000)
+                .unwrap();
+        }
+        owner.poll(now + Duration::from_millis(250), 1250);
+        commit(&mut owner);
+        let state = owner.snapshot([1; 16]).unwrap().clone();
+        for wall in [1250, 900] {
+            let mut resident = empty_owner();
+            resident.restore(state.clone(), now, wall).unwrap();
+            for request in [
+                query(0, None),
+                query(1, Some(state.revision)),
+                query(1, Some(999)),
+                query(4, Some(state.revision)),
+            ] {
+                let loaded =
+                    Owner::inspect_state(&state, &request, InspectStatus::loaded(&state, wall));
+                let mut expected = resident.inspect(&request);
+                if wall < state.last_received_ms && expected.error.is_none() {
+                    // Restoring under rollback queues a rewrite of the held reason in
+                    // the resident owner; a state loaded only for inspection has
+                    // nothing pending in memory. Every other field is identical.
+                    assert_eq!(expected.pending_persistence, Some(true));
+                    expected.pending_persistence = Some(false);
+                }
+                assert_eq!(loaded, expected);
+            }
+        }
+        let detached = empty_owner();
+        let reply =
+            Owner::inspect_state(&state, &query(0, None), InspectStatus::loaded(&state, 1250));
+        assert_eq!(reply.observations.len(), 1);
+        assert_eq!(reply.total_observations, Some(3));
+        assert_eq!(reply.clock_uncertain, Some(false));
+        assert!(!detached.resident([1; 16]));
+        let mut other = query(0, None);
+        other.project_id = Some(vec![9; 16]);
+        assert_eq!(
+            Owner::inspect_state(&state, &other, InspectStatus::loaded(&state, 1250))
+                .error
+                .as_deref(),
+            Some("sensor_unavailable")
         );
     }
 }

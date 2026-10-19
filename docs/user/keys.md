@@ -127,6 +127,9 @@ Press F6 to open the response browser.
 | Enter | Use the selected project or model |
 | Escape | Close the list without a change; stops a model search |
 
+The project list shows at most 64 projects. On its last or first row, Up,
+Down, Home and End read the next or the previous projects.
+
 ## Panel and dialog keys
 
 Result panels show `/help`, `/config`, `/models`, `/tools` and `/audit` output.

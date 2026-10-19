@@ -1,10 +1,57 @@
 pub use asura_platform::secrets::{LossReason, LossSpan, NumberOrigin, RefusalCode, SecretKind};
-use std::ops::Range;
 
 pub type Id = [u8; 16];
 pub type Hash = [u8; 32];
-pub const MAX_PROJECTS: usize = 64;
-pub const MAX_CONVERSATIONS: usize = 256;
+/// Projects kept in the live state by newest activity, plus pinned ones
+/// (segmented journal). A memory bound, not a registration limit.
+pub const RECENT_PROJECTS: usize = 64;
+/// Conversations kept in the live state by newest activity, plus pinned ones.
+pub const RECENT_CONVERSATIONS: usize = 256;
+/// Settled inputs kept in the live state for queue projection.
+pub const RECENT_SETTLED_INPUTS: usize = 64;
+/// One response's piece list while its operation is active (SJ-D9).
+pub const MAX_RESPONSE_PIECES: usize = 65_536;
+
+/// The address of one journal frame: its sequence, the first sequence of the
+/// segment file that holds it, its byte offset in that file and its length.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Locator {
+    pub sequence: u64,
+    pub segment: u64,
+    pub offset: u32,
+    pub length: u32,
+}
+impl Locator {
+    pub const NONE: Self = Self {
+        sequence: 0,
+        segment: 0,
+        offset: 0,
+        length: 0,
+    };
+    pub fn is_none(&self) -> bool {
+        self.sequence == 0
+    }
+    /// The frame's byte range within its segment file.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.offset as usize..self.offset as usize + self.length as usize
+    }
+    pub fn encode(&self) -> [u8; 24] {
+        let mut out = [0; 24];
+        out[..8].copy_from_slice(&self.sequence.to_be_bytes());
+        out[8..16].copy_from_slice(&self.segment.to_be_bytes());
+        out[16..20].copy_from_slice(&self.offset.to_be_bytes());
+        out[20..].copy_from_slice(&self.length.to_be_bytes());
+        out
+    }
+    pub fn decode(bytes: &[u8]) -> Self {
+        Self {
+            sequence: u64::from_be_bytes(bytes[..8].try_into().expect("24-byte locator")),
+            segment: u64::from_be_bytes(bytes[8..16].try_into().expect("24-byte locator")),
+            offset: u32::from_be_bytes(bytes[16..20].try_into().expect("24-byte locator")),
+            length: u32::from_be_bytes(bytes[20..24].try_into().expect("24-byte locator")),
+        }
+    }
+}
 pub const MAX_PROMPT: usize = 32 * 1024;
 /// Response text in one kind 24 segment or one kind 8 tail: a per-frame bound,
 /// not a response total (response-text-transfer.md).
@@ -171,6 +218,17 @@ pub enum TerminalKind {
     Cancelled = 3,
     Interrupted = 4,
 }
+impl TerminalKind {
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Complete,
+            2 => Self::Failed,
+            3 => Self::Cancelled,
+            4 => Self::Interrupted,
+            _ => return None,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Cause {
@@ -185,6 +243,24 @@ pub enum Cause {
     AuthorityFailure = 8,
     InputLimit = 9,
     Steering = 10,
+}
+impl Cause {
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::None,
+            1 => Self::UserCancel,
+            2 => Self::Deadline,
+            3 => Self::OutputLimit,
+            4 => Self::ServiceShutdown,
+            5 => Self::ProviderFailure,
+            6 => Self::ProtocolFailure,
+            7 => Self::Restart,
+            8 => Self::AuthorityFailure,
+            9 => Self::InputLimit,
+            10 => Self::Steering,
+            _ => return None,
+        })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnTerminal {
@@ -262,6 +338,10 @@ impl Record {
 pub struct RequestResult {
     pub digest: Hash,
     pub result: Outcome,
+    /// Record kind of the frame that holds the result.
+    pub kind: u16,
+    /// The frame that holds the result.
+    pub frame: Locator,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -293,13 +373,48 @@ pub enum Outcome {
         operation: Id,
     },
 }
+/// One registered project in the live state (recent or pinned).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectEntry {
+    pub registration: ProjectRegistered,
+    /// The kind 4 frame.
+    pub registered: Locator,
+    pub name: Option<ProjectName>,
+    pub latest: Option<ProjectLatest>,
+    /// Sequence of the newest committed record that names the project.
+    pub activity: u64,
+}
+/// The project's newest accepted turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectLatest {
+    pub conversation: Id,
+    pub operation: Id,
+    pub generation: u64,
+    pub accepted: u64,
+    /// Sequence of its kind 8, once terminal.
+    pub terminal: Option<u64>,
+}
+/// The newest turn of a conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LatestTurn {
+    pub operation: Id,
+    pub terminal: Option<TerminalKind>,
+    pub accepted: Locator,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conversation {
     pub project: Id,
     pub generation: u64,
+    /// The frame that created the conversation (kind 18 or 21).
+    pub created: Locator,
+    pub latest: Option<LatestTurn>,
+    /// Completed turns so far (SJ-D12).
+    pub completed: u64,
+    /// Sequence of the newest committed record that names the conversation.
+    pub activity: u64,
 }
 /// Bodies are deliberately not retained in replay indexes. Decode the validated
-/// frame range from the same immutable journal bytes when a response is needed.
+/// frame through its locator when a response is needed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Operation {
     pub conversation: Id,
@@ -307,7 +422,7 @@ pub struct Operation {
     pub task: Id,
     pub owner_generation: u64,
     pub input_digest: Hash,
-    pub accepted_frame: Range<usize>,
+    pub accepted_frame: Locator,
     pub helper: Option<Id>,
     pub cancel: Option<Cause>,
     pub terminal: Option<Terminal>,
@@ -321,7 +436,7 @@ pub struct Operation {
 pub struct ResponsePiece {
     pub start: u64,
     pub kept: u64,
-    pub frame: Range<usize>,
+    pub frame: Locator,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Response {
@@ -331,7 +446,7 @@ pub struct Response {
 impl Response {
     /// Keep `offset` bytes, then append `appended` bytes held in `frame`.
     /// Returns `None` when `offset` exceeds the length.
-    pub fn apply(&mut self, offset: u64, appended: u64, frame: Range<usize>) -> Option<()> {
+    pub fn apply(&mut self, offset: u64, appended: u64, frame: Locator) -> Option<()> {
         if offset > self.len {
             return None;
         }
@@ -356,7 +471,9 @@ pub struct Terminal {
     pub cause: Cause,
     pub usage_known: bool,
     pub output_tokens: u32,
-    pub frame: Range<usize>,
+    pub frame: Locator,
+    /// Completed turns of the conversation through this one (SJ-D12).
+    pub completed: u64,
 }
 
 pub const MAX_INPUTS: usize = 16;
@@ -422,13 +539,23 @@ pub struct QueuedInput {
     /// Expected generation, or the promotion target generation for Steer.
     pub target_generation: u64,
     pub kind: InputKind,
-    pub frame: Range<usize>,
+    pub frame: Locator,
     pub sequence: u64,
     pub owner_generation: u64,
     pub held: bool,
     pub dropped: bool,
     pub resumed: bool,
     pub order_position: u64,
+    /// The kind 16 promotion frame, for a Steer input.
+    pub promoted: Option<Locator>,
+    /// The turn its dispatch request started.
+    pub dispatched: Option<(Id, u64)>,
+    /// The terminal kind of that turn.
+    pub dispatched_terminal: Option<TerminalKind>,
+    /// The terminal kind and cause of a Steer input's target operation.
+    pub target_terminal: Option<(TerminalKind, Cause)>,
+    /// Sequence at which the input's status became final.
+    pub settled: Option<u64>,
 }
 
 /// The four registered model-facing tool names (TCR-D24). Replay looks a
@@ -876,7 +1003,7 @@ pub struct ExecCmdSettlement {
     pub sequence: u64,
     /// Stored bytes and digest per stream (stdout, stderr).
     pub streams: [(u64, Option<Hash>); 2],
-    pub frame: Range<usize>,
+    pub frame: Locator,
 }
 
 /// Replay projection of one kind 14 call and its later records. Bounded
@@ -897,8 +1024,8 @@ pub struct ToolRecord {
     /// A display prefix of at most 192 bytes of the stored argument text.
     pub arguments: String,
     pub result_status: Option<u8>,
-    pub intent_frame: Range<usize>,
-    pub result_frame: Option<Range<usize>>,
+    pub intent_frame: Locator,
+    pub result_frame: Option<Locator>,
     pub result_bytes: usize,
     pub preview: Option<String>,
     pub truncated: Option<bool>,

@@ -133,6 +133,7 @@ pub(crate) fn reason_name(reason: i32) -> &'static str {
         14 => "authority_changed",
         15 => "inspection_io",
         16 => "graph_verified",
+        17 => "checkpoint_rebuild_pending",
         _ => unreachable!("the control owner validated inspection reason"),
     }
 }
@@ -460,7 +461,7 @@ pub fn entry_with_logs(
             offset,
             revision,
         }) => sensors_cli::run(resolve, project, offset, revision),
-        Ok(Command::ProjectList) => setup(crate::conversation::Command::List, resolve),
+        Ok(Command::ProjectList) => project_list(resolve),
         Ok(Command::Start) => lifecycle(true, log.as_ref(), resolve),
         Ok(Command::Status) => status(resolve),
         Ok(Command::InstallationStatus { json }) => installation_status(resolve, json),
@@ -511,6 +512,56 @@ fn setup(command: crate::conversation::Command, resolve: RuntimeResolver) -> i32
             3
         }
     }
+}
+
+/// `asura project list`: prints every page as it arrives, with no page total
+/// (CF06b project paging). Each read is one request with no time bound;
+/// Ctrl-C or a lost connection ends the wait.
+fn project_list(resolve: RuntimeResolver) -> i32 {
+    let cancel = ctrl_c();
+    let result = (|| {
+        let runtime = resolve(false).map_err(|e| e.to_string())?;
+        let mut client =
+            Client::attach(&runtime, BUILD, &|| cancel()).map_err(|e| e.to_string())?;
+        client.set_cancel(cancel.clone());
+        let mut out = std::io::stdout().lock();
+        print_project_pages(
+            |read, limit| client.projects(read, limit).map_err(|e| e.to_string()),
+            &mut out,
+        )
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            tracing::error!("{error}");
+            3
+        }
+    }
+}
+
+/// Writes each page's lines before the next read starts.
+fn print_project_pages(
+    fetch: impl FnMut(
+        crate::conversation::ProjectPage,
+        u32,
+    ) -> Result<asura_control::pb::ProjectsReply, String>,
+    out: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let count = crate::conversation::each_page(
+        fetch,
+        || Ok(()),
+        |rows| {
+            for row in rows {
+                writeln!(out, "{}", crate::conversation::project_list_line(row))
+                    .map_err(|e| e.to_string())?;
+            }
+            out.flush().map_err(|e| e.to_string())
+        },
+    )?;
+    if count == 0 {
+        writeln!(out, "No projects. Use /project add PATH").map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// The person's Ctrl-C (or a termination signal) as a latched client cancel.

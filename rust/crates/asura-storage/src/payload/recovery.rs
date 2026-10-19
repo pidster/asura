@@ -33,6 +33,8 @@ pub struct RecoveryReport {
 #[derive(Debug)]
 pub enum RecoveryError {
     Cancelled,
+    /// The journal could not answer a facts request.
+    Journal,
     Payload(PayloadError),
 }
 impl From<PayloadError> for RecoveryError {
@@ -95,7 +97,57 @@ pub struct Known {
     settled: Option<Settled>,
 }
 
-/// The exec_cmd calls a replay names, for [`recover_known`].
+impl From<&crate::authority::writer::PayloadFact> for Known {
+    fn from(fact: &crate::authority::writer::PayloadFact) -> Self {
+        Self {
+            call: fact.call,
+            operation: fact.operation,
+            payloads: fact.payloads,
+            intent_sequence: fact.intent_sequence,
+            settled: fact.settled,
+        }
+    }
+}
+/// Payload IDs asked of the journal in one `PayloadFacts` request.
+pub const FACT_BATCH: usize = 128;
+/// Recovery from the payload directories and the journal's `X` facts: each
+/// file on disk is looked up in batches of 128; a file no `run` exec_cmd
+/// kind 14 names is an orphan (segmented journal, `PayloadFacts`).
+pub fn recover_with_facts(
+    store: &PayloadStore,
+    facts: &mut dyn FnMut(
+        Vec<PayloadId>,
+    ) -> Result<Vec<crate::authority::writer::PayloadFact>, RecoveryError>,
+    configured_quota: u64,
+    cancel: &AtomicBool,
+) -> Result<RecoveryReport, RecoveryError> {
+    let staging = list_all(store, PayloadDirectory::Staging, cancel)?;
+    let objects = list_all(store, PayloadDirectory::Objects, cancel)?;
+    let ids: Vec<PayloadId> = staging
+        .keys()
+        .chain(objects.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut known: BTreeMap<Id, Known> = BTreeMap::new();
+    for batch in ids.chunks(FACT_BATCH) {
+        if cancel.load(Ordering::Acquire) {
+            return Err(RecoveryError::Cancelled);
+        }
+        for fact in facts(batch.to_vec())? {
+            known.entry(fact.call).or_insert_with(|| Known::from(&fact));
+        }
+    }
+    recover_known(
+        store,
+        known.into_values().collect(),
+        configured_quota,
+        cancel,
+    )
+}
+/// The exec_cmd calls of the operations a replay holds in memory (the
+/// active operation and the delta), for [`recover_known`] in tests.
 pub fn known_calls(replay: &Replay) -> Vec<Known> {
     let mut known = Vec::new();
     for (operation, op) in &replay.operations {

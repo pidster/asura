@@ -292,10 +292,11 @@ pub(super) fn valid(body: &Body) -> bool {
                             _ => false,
                         }
                 });
-            // Live post-admission step: PENDING only, sending input or output.
+            // Live post-admission step: PENDING only, sending input, output,
+            // or paused at the journal quota (segmented journal, OD-SJ-2).
             let step = v
                 .waiting_step
-                .is_none_or(|step| v.kind == Some(1) && (3..=4).contains(&step));
+                .is_none_or(|step| v.kind == Some(1) && (3..=5).contains(&step));
             // One response window: keep text_offset bytes, append text, giving
             // text_bytes (response-text-transfer.md). No response total exists.
             let window = matches!(
@@ -410,7 +411,18 @@ pub(super) fn valid(body: &Body) -> bool {
             }
         }
         Body::ProjectList(v) => {
-            (v.after_project_id.is_none() || id(&v.after_project_id))
+            [
+                &v.after_project_id,
+                &v.before_project_id,
+                &v.only_project_id,
+            ]
+            .iter()
+            .filter(|cursor| cursor.is_some())
+            .count()
+                <= 1
+                && (v.after_project_id.is_none() || id(&v.after_project_id))
+                && (v.before_project_id.is_none() || id(&v.before_project_id))
+                && (v.only_project_id.is_none() || id(&v.only_project_id))
                 && v.limit.is_some_and(|n| (1..=8).contains(&n))
         }
         Body::ProjectsReply(v) => {
@@ -785,6 +797,43 @@ mod tests {
         reply.entries[0].hold_reason = Some("bad reason".into());
         assert!(!valid(&Body::ConversationQueueReply(reply)));
     }
+    /// SJ-37: a project page names at most one cursor or exact ID.
+    #[test]
+    fn project_list_accepts_one_of_after_before_or_only() {
+        let base = pb::ProjectList {
+            limit: Some(8),
+            ..Default::default()
+        };
+        assert!(valid(&Body::ProjectList(base.clone())));
+        for (after, before, only) in [
+            (Some(vec![1; 16]), None, None),
+            (None, Some(vec![1; 16]), None),
+            (None, None, Some(vec![1; 16])),
+        ] {
+            let page = pb::ProjectList {
+                after_project_id: after,
+                before_project_id: before,
+                only_project_id: only,
+                ..base.clone()
+            };
+            assert!(valid(&Body::ProjectList(page)));
+        }
+        for (after, before, only) in [
+            (Some(vec![1; 16]), Some(vec![2; 16]), None),
+            (Some(vec![1; 16]), None, Some(vec![2; 16])),
+            (None, Some(vec![1; 16]), Some(vec![2; 16])),
+            (None, Some(vec![0; 16]), None),
+            (None, None, Some(vec![1; 15])),
+        ] {
+            let page = pb::ProjectList {
+                after_project_id: after,
+                before_project_id: before,
+                only_project_id: only,
+                ..base.clone()
+            };
+            assert!(!valid(&Body::ProjectList(page)));
+        }
+    }
     /// WS-02: a waiting step is live display state with exact placement.
     #[test]
     fn waiting_steps_are_bounded_to_pending_events_and_queued_entries() {
@@ -830,11 +879,11 @@ mod tests {
             reason: Some(0),
             ..Default::default()
         };
-        for step in [3, 4] {
+        for step in [3, 4, 5] {
             event.waiting_step = Some(step);
             assert!(valid(&Body::ConversationEvent(event.clone())));
         }
-        for step in [0, 1, 2, 5] {
+        for step in [0, 1, 2, 6] {
             event.waiting_step = Some(step);
             assert!(!valid(&Body::ConversationEvent(event.clone())));
         }

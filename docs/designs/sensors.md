@@ -598,7 +598,7 @@ replaces this scan; see [resident project states](#resident-project-states).
 
 ### Resident project states
 
-Proposed (2026-10-19). The owner removed the 64-project registration total. The
+Implemented (2026-10-19). The owner removed the 64-project registration total. The
 sensor owner keeps its 64-state memory bound as a cache. The design below
 implements Option A of
 [OD-SJ-5](segmented-journal.md#od-sj-5-which-projects-keep-sensor-state-in-memory),
@@ -626,6 +626,9 @@ selected by the owner on 2026-10-19.
   time, so more than 64 unsettled states needs 64 projects with active writes.
 - **Inspection.** `SensorsInspect` for a non-resident project loads its state
   through the writer and returns it; it does not make the project resident.
+  Such a loaded state reports no pending persistence, because nothing of it is
+  held in memory; the resident path still reports clock-uncertain re-marks as
+  pending.
 - **Closures.** Loading, eviction and the pending queue have no time bound.
   Each wait ends on the writer reply, shutdown or a held state.
 

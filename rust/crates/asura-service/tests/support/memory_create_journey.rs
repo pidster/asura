@@ -1,7 +1,7 @@
 //! HM3-E1: native creation is proved by exact journal, note, edge and receipt evidence.
 use super::*;
 use asura_storage::{authority::conversation as journal, memory};
-use std::{io::Read, sync::atomic::AtomicBool};
+use std::sync::atomic::AtomicBool;
 
 /// One native create as the durable evidence states it: the derived call
 /// identity (recomputed by replay, never stored), the put command the store
@@ -31,13 +31,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 fn replay(fixture: &Fixture) -> Result<(Vec<u8>, journal::Replay)> {
-    let mut bytes = Vec::new();
-    fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
-        .take(asura_storage::authority::MAX_JOURNAL as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > asura_storage::authority::MAX_JOURNAL {
-        return Err("HM3 fixture journal exceeds bound".into());
-    }
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let state = journal::replay(&bytes, &AtomicBool::new(false))
         .map_err(|e| format!("HM3 replay: {e:?}"))?;
     Ok((bytes, state))
@@ -49,9 +43,12 @@ fn binding(state: &journal::Replay) -> Result<memory::Binding> {
         init_operation_id: memory::Id::new(state.initialization.request)?,
     })
 }
-fn decode(bytes: &[u8], range: std::ops::Range<usize>) -> Result<journal::Record> {
+fn decode(
+    bytes: &[u8],
+    range: asura_storage::authority::conversation::Locator,
+) -> Result<journal::Record> {
     // Canonical replay above validates the format-1 envelope before this extraction.
-    let frame = &bytes[range];
+    let frame = &bytes[range.range()];
     journal::decode_record(
         u16::from_be_bytes([frame[10], frame[11]]),
         &frame[144..frame.len() - 40],
@@ -70,11 +67,11 @@ fn records(
         .ok_or("HM3 missing operation")?
         .tools
     {
-        let result = tool.result_frame.clone().ok_or("HM3 unresolved tool")?;
+        let result = tool.result_frame.ok_or("HM3 unresolved tool")?;
         let journal::Record::ToolResult(result) = decode(&bytes, result)? else {
             return Err("HM3 unexpected result frame".into());
         };
-        out.push((decode(&bytes, tool.intent_frame.clone())?, result));
+        out.push((decode(&bytes, tool.intent_frame)?, result));
     }
     Ok(out)
 }

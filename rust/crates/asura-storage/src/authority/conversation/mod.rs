@@ -4,8 +4,9 @@ mod codec;
 mod state;
 mod types;
 
+pub(crate) use codec::{Reader, Writer};
 pub use codec::{
     capitalize_project_name, decode_record, encode_frame, exec_cmd_job_id, request_digest,
 };
-pub use state::{Replay, replay};
+pub use state::*;
 pub use types::*;

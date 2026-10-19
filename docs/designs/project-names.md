@@ -259,8 +259,9 @@ The command has no filesystem effect and no model or tool execution. It does not
 grant access to project content. Log project ID and result code, not the new name,
 unless the audit contract explicitly authorizes content logging.
 
-Existing limits remain: 40 KiB project-list reply, 64 KiB journal frame and the
-8 MiB journal until the [segmented journal](segmented-journal.md) replaces it.
+Existing limits remain: 40 KiB project-list reply and 64 KiB journal frame; the
+[segmented journal](segmented-journal.md) bounds each segment file and the
+journal quota bounds the total.
 The 64-project total is removed (owner, 2026-10-19); the list pages without a
 total ([CF06b](command-flows.md#cf06b-project-list-and-local-selection)). The 128-byte name and one-writer command keep one rename
 within those bounds. A full journal rejects the mutation without altering the

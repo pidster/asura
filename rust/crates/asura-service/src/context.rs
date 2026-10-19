@@ -117,14 +117,23 @@ fn turn_len(turn: &Candidate, fidelity: Fidelity) -> u64 {
     }
 }
 /// The labelled, service-written context block placed before the person's text.
-fn context_block(omitted: &[&Candidate]) -> String {
-    if omitted.is_empty() {
+/// `unlisted` counts older completed turns that `Prepare` did not return
+/// (past its 8 MiB candidate bound); their size is not known here.
+fn context_block(omitted: &[&Candidate], unlisted: u32) -> String {
+    if omitted.is_empty() && unlisted == 0 {
         return String::new();
     }
     let bytes: usize = omitted
         .iter()
         .map(|t| t.prompt.len() + t.answer.len())
         .sum();
+    if unlisted > 0 {
+        return format!(
+            "<asura-context>\nEarlier turns omitted for space: {} turns, more than {} bytes.\n</asura-context>\n\n",
+            omitted.len() as u64 + u64::from(unlisted),
+            bytes
+        );
+    }
     format!(
         "<asura-context>\nEarlier turns omitted for space: {} turns, {} bytes.\n</asura-context>\n\n",
         omitted.len(),
@@ -133,10 +142,22 @@ fn context_block(omitted: &[&Candidate]) -> String {
 }
 
 /// Compose one turn-start request. `history` may arrive in any order.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compose(
     instructions: &str,
     prompt: &str,
     history: &[Candidate],
+    budget: Budget,
+) -> Result<Composed, Error> {
+    compose_with(instructions, prompt, history, 0, budget)
+}
+/// [`compose`] when `unlisted` older completed turns were not returned as
+/// candidates; they join the omitted range (segmented journal, SJ-D10).
+pub(crate) fn compose_with(
+    instructions: &str,
+    prompt: &str,
+    history: &[Candidate],
+    unlisted: u32,
     budget: Budget,
 ) -> Result<Composed, Error> {
     let limit = budget.bytes().ok_or(Error::ContextLimit {
@@ -149,7 +170,7 @@ pub(crate) fn compose(
     let mandatory = field_len(instructions.len() as u64) + field_len(prompt.len() as u64);
     // Reserve room for the largest possible context block, so the omitted line never
     // displaces a decision already made.
-    let block_room = context_block_room(history);
+    let block_room = context_block_room(history, unlisted);
     if mandatory + block_room > limit {
         return Err(Error::ContextLimit {
             mandatory_bytes: mandatory,
@@ -204,7 +225,7 @@ pub(crate) fn compose(
         // Everything older than the shown turns, including any beyond the
         // shown-turn bound, joins one omitted range.
         let omitted = &ordered[fidelity.len()..];
-        let block = context_block(omitted);
+        let block = context_block(omitted, unlisted);
         let input = build(instructions, &block, prompt, shown, &fidelity);
         let bytes = model::encode_input(&input).map_err(|_| Error::Invalid)?;
         if bytes.len() as u64 <= limit {
@@ -223,7 +244,7 @@ pub(crate) fn compose(
             return Ok(Composed {
                 input: bytes,
                 shown: shown_ids.into_iter().map(|(_, id)| id).collect(),
-                omitted: omitted.len() as u32,
+                omitted: omitted.len() as u32 + unlisted,
                 manifest_digest,
             });
         }
@@ -240,13 +261,13 @@ pub(crate) fn compose(
     })
 }
 /// Room for the context block when every candidate is omitted.
-fn context_block_room(history: &[Candidate]) -> u64 {
-    if history.is_empty() {
+fn context_block_room(history: &[Candidate], unlisted: u32) -> u64 {
+    if history.is_empty() && unlisted == 0 {
         return 0;
     }
     let all: Vec<&Candidate> = history.iter().collect();
     // The block joins the prompt field; its length can add one varint byte there.
-    context_block(&all).len() as u64 + 2
+    context_block(&all, unlisted).len() as u64 + 2
 }
 fn build(
     instructions: &str,

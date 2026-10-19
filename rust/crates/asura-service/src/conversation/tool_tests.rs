@@ -38,6 +38,8 @@ impl Fixture {
             composition: journal::Composition::default(),
         };
         let active = Active {
+            journal_held: None,
+            unlisted: 0,
             foreground_user: true,
             queue_input: None,
             person_held: false,
@@ -83,10 +85,10 @@ impl Fixture {
                 audit_health: audit_tools::unavailable(),
                 audit_emitter: None,
                 sensor_owner: None,
-                sensor_scan_revision: None,
-                sensor_scan_cursor: None,
-                sensor_scan_pending: false,
-                sensor_latest: BTreeMap::new(),
+                sensor_seeded: false,
+                journal_quota: None,
+                journal_status: None,
+                known_projects: VecDeque::new(),
                 sensor_epoch: [0; 16],
                 sensor_reconcile: None,
                 sensor_retried: BTreeSet::new(),
@@ -158,6 +160,7 @@ impl Fixture {
                 project_name_changed: None,
                 stale_project_name_revision: false,
                 response_bytes: None,
+                ..Default::default()
             }),
             Instant::now(),
         );
@@ -374,6 +377,7 @@ fn registry_refresh_waits_for_sensor_writer_then_runs_before_background_work() {
         body: Some(Body::ProjectList(pb::ProjectList {
             after_project_id: None,
             limit: Some(16),
+            ..Default::default()
         })),
     };
     assert!(owner.request(request.clone(), now).is_none());
@@ -405,6 +409,7 @@ fn retained_foreground_requests_wait_without_a_timer_and_drain_on_shutdown() {
         body: Some(Body::ProjectList(pb::ProjectList {
             after_project_id: None,
             limit: Some(16),
+            ..Default::default()
         })),
     };
     let (ticket, _controller) =
@@ -1079,6 +1084,7 @@ pub(super) fn memory_reply() -> writer::Reply {
         project_name_changed: None,
         stale_project_name_revision: false,
         response_bytes: None,
+        ..Default::default()
     }
 }
 #[test]
@@ -1216,7 +1222,7 @@ fn install_recorded_memory_cancel(fixture: &mut Fixture) {
             task: active.turn.task,
             owner_generation: 1,
             input_digest: active.turn.input_digest,
-            accepted_frame: 0..1,
+            accepted_frame: journal::Locator::NONE,
             helper: None,
             cancel: active.cancel,
             terminal: None,
@@ -1310,7 +1316,7 @@ fn tool_record(name: &str, decision: journal::ToolDecision) -> journal::ToolReco
         arguments_bytes: 19,
         arguments: r#"{"command":"tools"}"#.into(),
         result_status: None,
-        intent_frame: 0..1,
+        intent_frame: journal::Locator::NONE,
         result_frame: None,
         result_bytes: 0,
         preview: None,
@@ -1555,6 +1561,7 @@ fn j1t_05_late_tool_result_never_fails_the_turn() {
             project_name_changed: None,
             stale_project_name_revision: false,
             response_bytes: None,
+            ..Default::default()
         }),
         now + Duration::from_secs(120),
     );
@@ -1719,8 +1726,7 @@ impl Journaled {
     }
     /// Every record of the journal, in order.
     fn records(&self) -> Vec<journal::Record> {
-        let bytes =
-            std::fs::read(self.fixture.path.join(".asura/state/control/slot-0.log")).unwrap();
+        let bytes = asura_storage::authority::fixture::journal_bytes(&self.fixture.path).unwrap();
         let mut out = Vec::new();
         let mut offset = 0;
         while offset < bytes.len() {

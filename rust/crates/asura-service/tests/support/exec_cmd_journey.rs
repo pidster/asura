@@ -9,10 +9,7 @@ fn recorded(
     fixture: &Fixture,
     operation: [u8; 16],
 ) -> Result<(journal::ToolCall, journal::ToolResult)> {
-    let mut bytes = Vec::new();
-    fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
-        .take(asura_storage::authority::MAX_JOURNAL as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
         .map_err(|error| format!("exec_cmd replay: {error:?}"))?;
     let operation = replay
@@ -26,21 +23,22 @@ fn recorded(
     );
     let tool = &operation.tools[0];
     assert_eq!(tool.tool_operation, Some(journal::ToolOperation::ExecCmd));
-    let decode = |range: std::ops::Range<usize>| -> Result<journal::Record> {
-        let frame = &bytes[range];
-        Ok(journal::decode_record(
-            u16::from_be_bytes([frame[10], frame[11]]),
-            &frame[144..frame.len() - 40],
-        )
-        .map_err(|error| format!("exec_cmd record: {error:?}"))?)
-    };
+    let decode =
+        |range: asura_storage::authority::conversation::Locator| -> Result<journal::Record> {
+            let frame = &bytes[range.range()];
+            Ok(journal::decode_record(
+                u16::from_be_bytes([frame[10], frame[11]]),
+                &frame[144..frame.len() - 40],
+            )
+            .map_err(|error| format!("exec_cmd record: {error:?}"))?)
+        };
     // Every exec_cmd call records one kind 14 ToolCall (tool-call-records.md).
-    let journal::Record::ToolCall(intent) = decode(tool.intent_frame.clone())? else {
+    let journal::Record::ToolCall(intent) = decode(tool.intent_frame)? else {
         return Err("exec_cmd intent variant".into());
     };
     let intent = *intent;
     let journal::Record::ToolResult(result) =
-        decode(tool.result_frame.clone().ok_or("exec_cmd result absent")?)?
+        decode(tool.result_frame.ok_or("exec_cmd result absent")?)?
     else {
         return Err("exec_cmd result variant".into());
     };

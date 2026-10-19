@@ -49,6 +49,33 @@ impl From<asura_platform::Error> for Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Which page of the project registry one `ProjectList` request reads.
+/// The list has no page total; each page holds at most 8 entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectPage {
+    /// Ascending ID order from the lowest ID.
+    First,
+    /// Ascending ID order, IDs above the cursor.
+    After([u8; 16]),
+    /// Descending ID order, IDs below the cursor.
+    Before([u8; 16]),
+    /// That one project, or an empty list when it is not registered.
+    Only([u8; 16]),
+}
+fn project_list(page: ProjectPage, limit: u32) -> pb::ProjectList {
+    let mut list = pb::ProjectList {
+        limit: Some(limit),
+        ..Default::default()
+    };
+    match page {
+        ProjectPage::First => {}
+        ProjectPage::After(id) => list.after_project_id = Some(id.to_vec()),
+        ProjectPage::Before(id) => list.before_project_id = Some(id.to_vec()),
+        ProjectPage::Only(id) => list.only_project_id = Some(id.to_vec()),
+    }
+    list
+}
+
 fn rename_reply_matches(project_id: &Option<Vec<u8>>, reply: &pb::ProjectRenameReply) -> bool {
     let matching_projects = || {
         reply
@@ -597,11 +624,11 @@ impl Client {
             _ => Err(Error::Protocol),
         }
     }
-    pub fn projects(&mut self, after: Option<[u8; 16]>) -> Result<pb::ProjectsReply> {
-        match self.request(pb::envelope::Body::ProjectList(pb::ProjectList {
-            after_project_id: after.map(|id| id.to_vec()),
-            limit: Some(8),
-        }))? {
+    /// Reads one page of the project registry (CF06b project paging). The
+    /// read has no time bound: the reply, this attachment's cancel or a lost
+    /// connection ends it. The caller validates order and cursor.
+    pub fn projects(&mut self, page: ProjectPage, limit: u32) -> Result<pb::ProjectsReply> {
+        match self.request(pb::envelope::Body::ProjectList(project_list(page, limit)))? {
             pb::envelope::Body::ProjectsReply(reply) => Ok(reply),
             _ => Err(Error::Protocol),
         }
@@ -1198,6 +1225,31 @@ mod tests {
         }
         cancelled.set(true);
         assert!(matches!(slice(&check), Err(Error::Cancelled)));
+    }
+    /// CF06b: each page request names at most one of after, before or only,
+    /// and the control contract accepts every form.
+    #[test]
+    fn project_pages_name_one_cursor() {
+        let id = [3; 16];
+        for (page, after, before, only) in [
+            (ProjectPage::First, None, None, None),
+            (ProjectPage::After(id), Some(id.to_vec()), None, None),
+            (ProjectPage::Before(id), None, Some(id.to_vec()), None),
+            (ProjectPage::Only(id), None, None, Some(id.to_vec())),
+        ] {
+            let list = project_list(page, 8);
+            assert_eq!(list.after_project_id, after);
+            assert_eq!(list.before_project_id, before);
+            assert_eq!(list.only_project_id, only);
+            assert_eq!(list.limit, Some(8));
+            let envelope = pb::Envelope {
+                service_epoch: Some(vec![7; 16]),
+                attachment_id: Some(vec![9; 16]),
+                request_counter: Some(1),
+                body: Some(pb::envelope::Body::ProjectList(list)),
+            };
+            assert!(validate_semantics(&envelope, Direction::ClientToServer).is_ok());
+        }
     }
     #[test]
     fn errors_do_not_disclose_paths() {

@@ -373,17 +373,18 @@ Maximum frame remains 64 KiB including overhead; encode and check the entire
 frame before append. The earlier totals of 64 registered projects and 256
 conversations are removed (owner, 2026-10-19): registrations and conversations
 have no lifetime total. The [segmented journal](segmented-journal.md#checkpoint-content)
-bounds how many stay in memory and serves the rest from its index. Journal
-bounds remain 8 MiB and 32,768 frames until that design is implemented. At most
-one operation is nonterminal.
+bounds how many stay in memory and serves the rest from its index. Since that
+design was implemented (2026-10-19), 8 MiB and 32,768 frames bound each segment
+file; the journal total comes from `journal.quotaBytes` and free disk space. At
+most one operation is nonterminal.
 
 Required follow-up design (owner, 2026-10-15): the single 8 MiB file must not
 remain the journal's limit. The owner chose to keep a separate file journal,
 not SurrealDB, and to move to known-size segment files with checkpoint
 snapshots and compaction. Total size comes from a configurable quota and
-available disk space. The proposed [segmented journal](segmented-journal.md)
-defines it. Until it is implemented, the limits above apply. No overwrite or
-deletion makes space at a limit.
+available disk space. The [segmented journal](segmented-journal.md) defines and
+implements it (2026-10-19). No overwrite or deletion makes space at a limit; at
+the quota new work is held and a running turn pauses.
 
 Terminal cause values are closed: 0 none, 1 user cancel, 2 deadline, 3 output limit,
 4 service shutdown, 5 provider failure, 6 protocol failure, 7 restart, 8 authority
@@ -801,7 +802,7 @@ No model permit may be enabled before the writer and recovery checks below pass.
 | CA05 completion | Usage limits, provisional/complete distinction, terminal cursor | Kill before/after terminal flush; preserve complete response only after commit | Reconnect displays original complete or interrupted result |
 | CA06 restart | Started versus never-started charge and no re-execution | Real child/service death with durable or incomplete frames | Restart reports Interrupted without another model call |
 | CA07 journal failure | Reserved closure capacity, short writes, zero write and stalled write | Real scratch disk/flush failures, identity swaps, stalled worker and owner retention | Inspect/Stop and TUI input remain responsive, unknown outcomes explicit |
-| CA08 bounds | No project or conversation total (SJ-35, SJ-36), 8 MiB/32768 frame limits until the segmented journal, eight-slot queue | Saturation and 16 MiB replay allocation measurement | Capacity exhaustion preserves draft and existing outcomes |
+| CA08 bounds | No project or conversation total (SJ-35, SJ-36), 8 MiB/32768 frame bounds per segment file, journal quota, eight-slot queue | Saturation and 16 MiB replay allocation measurement | Capacity exhaustion preserves draft and existing outcomes |
 | CA09 live model | Model selection and result validation | Real helper transport and cancellation, no tools | Supported macOS model completes a scoped turn with durable history |
 
 Target TUI/control response under a stalled storage/helper dependency is 100 ms

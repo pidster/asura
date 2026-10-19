@@ -632,6 +632,10 @@ where
                 {
                     let _ = worker.emitter().try_emit(event);
                 }
+                // A persisted `journal.quotaBytes` applies at once (SJ-14).
+                if let Some(quota) = job.take_journal_quota() {
+                    conversations.set_journal_quota(quota);
+                }
                 if job.settled() {
                     config_job = None;
                 }
@@ -1132,6 +1136,9 @@ where
                 && let Some(worker) = &audit
             {
                 let _ = worker.emitter().try_emit(event);
+            }
+            if let Some(quota) = job.take_journal_quota() {
+                conversations.set_journal_quota(quota);
             }
             if job.settled() {
                 config_job = None;

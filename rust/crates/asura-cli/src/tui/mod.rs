@@ -11,6 +11,7 @@ mod history;
 mod models;
 mod observation;
 mod project_admin;
+mod project_pages;
 mod queue;
 mod queue_watch;
 mod terminal;
@@ -54,6 +55,7 @@ pub(crate) fn run(
     let mut audit_worker = audit::Worker::default();
     let mut queue_worker = queue::Worker::default();
     let mut project_admin_worker = project_admin::Worker::default();
+    let mut project_page_worker = project_pages::Worker::default();
     let mut context_worker = context::Worker::default();
     let mut queue_observer = queue_watch::Worker::default();
     conversation_worker.set_notice(router.notice(Source::Conversation));
@@ -62,6 +64,7 @@ pub(crate) fn run(
     audit_worker.set_notice(router.notice(Source::Audit));
     queue_worker.set_notice(router.notice(Source::Queue));
     project_admin_worker.set_notice(router.notice(Source::Conversation));
+    project_page_worker.set_notice(router.notice(Source::Conversation));
     context_worker.set_notice(router.notice(Source::Context));
     queue_observer.set_notice(router.notice(Source::QueueWatch));
     let result = (|| {
@@ -128,6 +131,9 @@ pub(crate) fn run(
             if app.take_project_admin_cancel() {
                 project_admin_worker.cancel();
             }
+            if app.take_project_page_cancel() {
+                project_page_worker.cancel();
+            }
             let queue_cancelled = app.take_queue_cancel();
             if queue_cancelled {
                 queue_worker.cancel();
@@ -173,6 +179,12 @@ pub(crate) fn run(
                 app.project_admin_finished(update);
                 dirty = true;
             }
+            if has(Source::Conversation)
+                && let Some(update) = project_page_worker.poll()
+            {
+                app.project_page_finished(update);
+                dirty = true;
+            }
             if (has(Source::Queue) || queue_cancelled)
                 && let Some(update) = queue_worker.poll()
             {
@@ -215,7 +227,9 @@ pub(crate) fn run(
                 (Source::Audit, audit_worker.running()),
                 (
                     Source::Conversation,
-                    conversation_worker.running() || project_admin_worker.running(),
+                    conversation_worker.running()
+                        || project_admin_worker.running()
+                        || project_page_worker.running(),
                 ),
                 (Source::Queue, queue_worker.running()),
                 (Source::Context, context_worker.running()),
@@ -278,6 +292,17 @@ pub(crate) fn run(
                         outcome: project_admin::Outcome::Definite(error),
                         service_epoch: None,
                         settled: true,
+                    });
+                }
+                dirty = true;
+            }
+            if !project_page_worker.running()
+                && let Some(request) = app.take_project_page_request()
+            {
+                if let Err(error) = project_page_worker.submit(resolve, request.clone()) {
+                    app.project_page_finished(project_pages::Update {
+                        request,
+                        result: Err(error),
                     });
                 }
                 dirty = true;
@@ -356,6 +381,7 @@ pub(crate) fn run(
     conversation_worker.disconnect();
     queue_worker.disconnect();
     project_admin_worker.cancel();
+    project_page_worker.cancel();
     config_worker.cancel();
     models_worker.cancel();
     audit_worker.cancel();

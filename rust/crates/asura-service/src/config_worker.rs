@@ -4,6 +4,7 @@
 //! the person's cancel or a lost connection.
 use asura_control::pb;
 use asura_platform::RuntimeDirectory;
+use asura_storage::config::Reply;
 use std::{
     io,
     sync::{
@@ -15,12 +16,13 @@ use std::{
 };
 
 pub(crate) struct Worker {
-    task: Option<JoinHandle<Result<String, &'static str>>>,
+    task: Option<JoinHandle<Result<Reply, &'static str>>>,
     cancel: Arc<AtomicBool>,
     request: pb::Envelope,
     replied: bool,
     mutation: bool,
     audit_event: Option<asura_storage::audit::Event>,
+    journal_quota: Option<u64>,
     completion: crate::completion::Completion,
 }
 impl Worker {
@@ -50,6 +52,7 @@ impl Worker {
             replied: false,
             mutation,
             audit_event: None,
+            journal_quota: None,
             completion,
         })
     }
@@ -73,6 +76,12 @@ impl Worker {
     }
     pub(crate) fn take_audit_event(&mut self) -> Option<asura_storage::audit::Event> {
         self.audit_event.take()
+    }
+    /// The new effective `journal.quotaBytes` after a persisted set of
+    /// `journal` or `journal.quotaBytes`. The set applies at once, so the
+    /// caller forwards it to the journal writer. Taken once.
+    pub(crate) fn take_journal_quota(&mut self) -> Option<u64> {
+        self.journal_quota.take()
     }
     pub(crate) fn poll(&mut self) -> Option<pb::Envelope> {
         let done = self.task.as_ref().is_some_and(JoinHandle::is_finished);
@@ -115,10 +124,14 @@ impl Worker {
                 Some("audit.maxFileBytes") => Some(Setting::AuditMaxFileBytes),
                 Some("providers.mlx.models") => Some(Setting::ProvidersMlxModels),
                 Some("retention.quotaBytes") => Some(Setting::RetentionQuotaBytes),
+                Some("journal" | "journal.quotaBytes") => Some(Setting::JournalQuotaBytes),
                 _ => None,
             };
             if let (Some(setting), Some(outcome)) = (setting, outcome) {
                 self.audit_event = Some(Event::ConfigChanged { setting, outcome });
+            }
+            if let Ok(reply) = result {
+                self.journal_quota = reply.journal_quota;
             }
         }
         if self.replied {
@@ -127,7 +140,7 @@ impl Worker {
         let result = result?;
         self.replied = true;
         let (value_yaml, error) = match result {
-            Ok(value) => (Some(value), None),
+            Ok(reply) => (Some(reply.value_yaml), None),
             Err(error) => (None, Some(error.into())),
         };
         let mut reply = self.request.clone();
@@ -146,10 +159,24 @@ mod tests {
     use std::time::Duration;
 
     fn blocked(mutation: bool) -> (Worker, mpsc::SyncSender<()>) {
+        blocked_with(
+            mutation,
+            "audit.enabled",
+            Ok(Reply {
+                value_yaml: "true\n".into(),
+                journal_quota: None,
+            }),
+        )
+    }
+    fn blocked_with(
+        mutation: bool,
+        key: &str,
+        result: Result<Reply, &'static str>,
+    ) -> (Worker, mpsc::SyncSender<()>) {
         let (send, receive) = mpsc::sync_channel(1);
         let task = thread::spawn(move || {
             receive.recv().unwrap();
-            Ok("true\n".into())
+            result
         });
         let request = pb::Envelope {
             service_epoch: Some(vec![1; 16]),
@@ -157,12 +184,12 @@ mod tests {
             request_counter: Some(7),
             body: Some(if mutation {
                 pb::envelope::Body::ConfigSet(pb::ConfigSet {
-                    key: Some("audit.enabled".into()),
+                    key: Some(key.into()),
                     value_yaml: Some("true".into()),
                 })
             } else {
                 pb::envelope::Body::ConfigGet(pb::ConfigGet {
-                    key: Some("audit.enabled".into()),
+                    key: Some(key.into()),
                 })
             }),
         };
@@ -174,10 +201,75 @@ mod tests {
                 replied: false,
                 mutation,
                 audit_event: None,
+                journal_quota: None,
                 completion: Default::default(),
             },
             send,
         )
+    }
+    fn settle(worker: &mut Worker, release: mpsc::SyncSender<()>) -> pb::ConfigReply {
+        release.send(()).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        let reply = loop {
+            if let Some(reply) = worker.poll() {
+                break reply;
+            }
+            assert!(Instant::now() < end);
+            thread::yield_now();
+        };
+        let Some(pb::envelope::Body::ConfigReply(reply)) = reply.body else {
+            panic!()
+        };
+        reply
+    }
+    /// SJ-14: a persisted set of `journal.quotaBytes` or the `journal`
+    /// mapping carries the new quota to the caller once, with the audit
+    /// setting; gets, failures and other keys carry none.
+    #[test]
+    fn persisted_journal_set_reports_the_new_quota_once() {
+        use asura_storage::audit::{ConfigOutcome, Event, Setting};
+        for key in ["journal.quotaBytes", "journal"] {
+            let (mut worker, release) = blocked_with(
+                true,
+                key,
+                Ok(Reply {
+                    value_yaml: "67108864\n".into(),
+                    journal_quota: Some(67_108_864),
+                }),
+            );
+            assert_eq!(worker.take_journal_quota(), None);
+            let reply = settle(&mut worker, release);
+            assert_eq!(reply.value_yaml.as_deref(), Some("67108864\n"));
+            assert_eq!(worker.take_journal_quota(), Some(67_108_864));
+            assert_eq!(worker.take_journal_quota(), None);
+            assert_eq!(
+                worker.take_audit_event(),
+                Some(Event::ConfigChanged {
+                    setting: Setting::JournalQuotaBytes,
+                    outcome: ConfigOutcome::Persisted,
+                })
+            );
+        }
+        for error in ["config_invalid_value", "config_outcome_unconfirmed"] {
+            let (mut worker, release) = blocked_with(true, "journal.quotaBytes", Err(error));
+            let reply = settle(&mut worker, release);
+            assert_eq!(reply.error.as_deref(), Some(error));
+            assert_eq!(worker.take_journal_quota(), None);
+        }
+        let (mut worker, release) = blocked_with(
+            false,
+            "journal.quotaBytes",
+            Ok(Reply {
+                value_yaml: "4294967296\n".into(),
+                journal_quota: None,
+            }),
+        );
+        settle(&mut worker, release);
+        assert_eq!(worker.take_journal_quota(), None);
+        assert_eq!(worker.take_audit_event(), None);
+        let (mut worker, release) = blocked(true);
+        settle(&mut worker, release);
+        assert_eq!(worker.take_journal_quota(), None);
     }
     #[test]
     fn held_job_has_no_deadline_and_replies_on_completion() {
@@ -260,7 +352,10 @@ mod reactor_tests {
                     let task = thread::spawn(move || {
                         let _completion = signal.guard();
                         receive.recv().unwrap();
-                        Ok("true\n".into())
+                        Ok(Reply {
+                            value_yaml: "true\n".into(),
+                            journal_quota: None,
+                        })
                     });
                     admitted_tx.send(()).unwrap();
                     Ok(Worker {
@@ -270,6 +365,7 @@ mod reactor_tests {
                         replied: false,
                         mutation: true,
                         audit_event: None,
+                        journal_quota: None,
                         completion,
                     })
                 },

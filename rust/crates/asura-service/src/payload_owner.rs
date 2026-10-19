@@ -5,12 +5,41 @@ use crate::capture_worker::{self, Message};
 use asura_platform::RuntimeDirectory;
 use asura_platform::events::WakeSender;
 use asura_storage::authority::conversation::{ExecCmdBusyReason, Replay};
-use asura_storage::payload::{PagePool, PayloadStore, RecoveryReport, known_calls, recover_known};
+use asura_storage::authority::writer::{self, WriterClient};
+use asura_storage::payload::{
+    PagePool, PayloadStore, RecoveryError, RecoveryReport, recover_with_facts,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// One `PayloadFacts` request from the recovery worker. A full writer
+/// queue is retried with pacing; the reply or the writer's close ends the
+/// wait (no time bound).
+fn journal_facts(
+    client: &WriterClient,
+    payloads: Vec<[u8; 16]>,
+    cancel: &AtomicBool,
+) -> Result<Vec<writer::PayloadFact>, RecoveryError> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(RecoveryError::Cancelled);
+        }
+        match client.try_submit(writer::Command::PayloadFacts {
+            payloads: payloads.clone(),
+        }) {
+            Ok(ticket) => {
+                return ticket
+                    .wait()
+                    .map(|reply| reply.payload_facts)
+                    .map_err(|_| RecoveryError::Journal);
+            }
+            Err(writer::Error::Busy) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return Err(RecoveryError::Journal),
+        }
+    }
+}
 /// Capture workers kept after their call: installing or abandoned.
 pub(crate) const PENDING_INSTALLS: usize = 4;
 /// Shutdown cleanup bound for pending installs and live captures.
@@ -54,17 +83,17 @@ impl Payloads {
         &mut self,
         runtime: &RuntimeDirectory,
         replay: Option<&Arc<Replay>>,
+        client: Option<WriterClient>,
         wake: Option<&WakeSender>,
     ) {
         if !matches!(self.state, State::Idle) || self.shutdown.is_some() {
             return;
         }
-        let Some(replay) = replay else {
+        let (Some(_), Some(client)) = (replay, client) else {
             return;
         };
-        // Extract the facts here: the worker must not retain a replay
-        // snapshot, which would make the journal writer answer `busy`.
-        let known = known_calls(replay);
+        // The worker asks the journal for the facts of the payloads on disk
+        // in batches of 128 (`PayloadFacts`); it never holds a snapshot.
         let runtime = runtime.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let result: Arc<Mutex<Option<Recovered>>> = Arc::new(Mutex::new(None));
@@ -77,7 +106,9 @@ impl Payloads {
                     let quota = asura_storage::config::retention_quota(runtime.clone(), &token)
                         .map_err(|_| "payload_config_unavailable")?;
                     let store = PayloadStore::open(&runtime).map_err(|_| "payload_unavailable")?;
-                    let report = recover_known(&store, known, quota, &token)
+                    let mut facts =
+                        |payloads: Vec<[u8; 16]>| journal_facts(&client, payloads, &token);
+                    let report = recover_with_facts(&store, &mut facts, quota, &token)
                         .map_err(|_| "payload_unavailable")?;
                     Ok((Arc::new(store), report))
                 })();

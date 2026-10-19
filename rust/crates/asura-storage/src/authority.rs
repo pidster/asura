@@ -1,14 +1,18 @@
+pub mod checkpoint;
 pub mod conversation;
 #[cfg(feature = "test-support")]
 pub mod fixture;
+pub mod index;
+pub mod journal;
 pub mod writer;
 
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const MAX_JOURNAL: usize = 8 * 1024 * 1024;
+/// One segment file: at most 8 MiB and 32,768 frames (segmented journal).
+pub const SEGMENT_BYTES: usize = 8 * 1024 * 1024;
+pub const SEGMENT_FRAMES: usize = 32_768;
 pub const MAX_FRAME: usize = 64 * 1024;
-pub const MAX_FRAMES: usize = 32_768;
 const HEADER: usize = 144;
 const TRAILER: usize = 40;
 
@@ -41,7 +45,7 @@ impl std::fmt::Display for ReplayError {
 }
 impl std::error::Error for ReplayError {}
 /// Replay has no time bound (J1-0); only the cancel flag stops it.
-fn active(cancelled: &AtomicBool) -> Result<(), ReplayError> {
+pub(crate) fn active(cancelled: &AtomicBool) -> Result<(), ReplayError> {
     if cancelled.load(Ordering::Acquire) {
         Err(ReplayError::Cancelled)
     } else {
@@ -60,23 +64,9 @@ fn id_at(bytes: &[u8], offset: usize) -> [u8; 16] {
         .try_into()
         .expect("validated fixed-width field")
 }
-/// Replays complete format-1 frames. Any error discards the entire public result.
-/// The input plus the bounded operation-ID set stay below the 16 MiB replay budget.
-pub fn replay(bytes: &[u8], cancelled: &AtomicBool) -> Result<Replay, ReplayError> {
-    active(cancelled)?;
-    if bytes.len() > MAX_JOURNAL {
-        return Err(ReplayError::Limit);
-    }
-    if bytes.is_empty() {
-        return Err(ReplayError::Empty);
-    }
-    // Every journal starts with kind 10. Kind 3 owner generations and all
-    // later records replay through the conversation authority.
-    if envelope(bytes)?.kind != 10 {
-        return Err(ReplayError::UnsupportedFormat);
-    }
-    let state = conversation::replay(bytes, cancelled)?;
-    Ok(Replay {
+/// The inspection summary of a replayed state.
+pub fn summary(state: &conversation::Replay) -> Replay {
+    Replay {
         installation_id: state.installation_id,
         revision: state.revision,
         owner_generation: state.owner_generation,
@@ -86,18 +76,57 @@ pub fn replay(bytes: &[u8], cancelled: &AtomicBool) -> Result<Replay, ReplayErro
         } else {
             ReplayState::PendingInit
         },
-    })
+    }
+}
+/// Replays one contiguous journal held in memory (segment file 1). Any error
+/// discards the entire public result.
+pub fn replay(bytes: &[u8], cancelled: &AtomicBool) -> Result<Replay, ReplayError> {
+    active(cancelled)?;
+    if bytes.is_empty() {
+        return Err(ReplayError::Empty);
+    }
+    // Every journal starts with kind 10.
+    if envelope(bytes)?.kind != 10 {
+        return Err(ReplayError::UnsupportedFormat);
+    }
+    let state = conversation::replay(bytes, cancelled)?;
+    Ok(summary(&state))
 }
 
 /// One strict format-1 envelope for conversation records.
-struct Envelope<'a> {
-    context: conversation::FrameContext,
-    kind: u16,
-    payload: &'a [u8],
-    digest: [u8; 32],
-    length: usize,
+pub(crate) struct Envelope<'a> {
+    pub(crate) context: conversation::FrameContext,
+    pub(crate) kind: u16,
+    pub(crate) payload: &'a [u8],
+    pub(crate) digest: [u8; 32],
+    pub(crate) length: usize,
 }
-fn envelope(bytes: &[u8]) -> Result<Envelope<'_>, ReplayError> {
+/// Decodes one frame read through a locator: the envelope must fill exactly
+/// the located bytes and carry the located sequence.
+pub(crate) fn verified_frame(
+    bytes: &[u8],
+    locator: &conversation::Locator,
+) -> Result<(conversation::FrameContext, conversation::Record, [u8; 32]), ReplayError> {
+    let envelope = envelope(bytes).map_err(|e| match e {
+        ReplayError::UnsupportedFormat => e,
+        _ => ReplayError::Corrupt,
+    })?;
+    if envelope.length != bytes.len()
+        || envelope.length != locator.length as usize
+        || envelope.context.sequence != locator.sequence
+    {
+        return Err(ReplayError::Corrupt);
+    }
+    let record = conversation::decode_record(envelope.kind, envelope.payload)?;
+    Ok((envelope.context, record, envelope.digest))
+}
+pub(crate) fn verified_record(
+    bytes: &[u8],
+    locator: &conversation::Locator,
+) -> Result<conversation::Record, ReplayError> {
+    verified_frame(bytes, locator).map(|(_, record, _)| record)
+}
+pub(crate) fn envelope(bytes: &[u8]) -> Result<Envelope<'_>, ReplayError> {
     if bytes.len() < HEADER {
         return Err(ReplayError::IncompleteTail);
     }

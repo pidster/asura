@@ -39,6 +39,18 @@ pub(super) struct Worker {
     notice: super::events::Notice,
     job: Option<Job>,
 }
+/// A definite service rejection keeps the text; a journal hold reason shows
+/// its notice. Any other failure leaves the outcome unconfirmed.
+fn failure_text(error: asura_client::Error) -> String {
+    match &error {
+        asura_client::Error::Remote(_, reason) => match crate::conversation::journal_notice(reason)
+        {
+            Some(notice) => format!("{notice} Draft retained."),
+            None => format!("{error}; draft retained"),
+        },
+        _ => format!("{error}; queue outcome unconfirmed; retry the same request ID"),
+    }
+}
 impl Worker {
     pub fn set_notice(&mut self, notice: super::events::Notice) {
         self.notice = notice;
@@ -99,13 +111,7 @@ impl Worker {
                             client.decide_conversation_input(request, &stop)
                         }
                     };
-                    result.map_err(|e| {
-                        if matches!(e, asura_client::Error::Remote(..)) {
-                            format!("{e}; draft retained")
-                        } else {
-                            format!("{e}; queue outcome unconfirmed; retry the same request ID")
-                        }
-                    })
+                    result.map_err(failure_text)
                 };
                 let _ = sender.try_send(run());
             })
@@ -176,6 +182,26 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// SJ-15 (client): journal hold reasons show their notices and keep the
+    /// text as a definite rejection, never as an unconfirmed outcome.
+    #[test]
+    fn journal_hold_reasons_are_definite_rejections_with_notices() {
+        let quota = failure_text(asura_client::Error::Remote(3, "journal_quota".into()));
+        assert_eq!(
+            quota,
+            "Journal space is full. Raise journal.quotaBytes or free disk space. Draft retained."
+        );
+        let disk = failure_text(asura_client::Error::Remote(3, "journal_disk_space".into()));
+        assert_eq!(disk, "Disk space is low for the journal. Draft retained.");
+        for text in [&quota, &disk] {
+            assert!(!text.contains("unconfirmed"));
+        }
+        assert_eq!(
+            failure_text(asura_client::Error::Remote(3, "conversation_busy".into())),
+            "conversation_busy; draft retained"
+        );
+        assert!(failure_text(asura_client::Error::Unavailable).contains("unconfirmed"));
+    }
     use std::time::{Duration, Instant};
     fn held_worker(cancelled: bool) -> (Worker, mpsc::SyncSender<()>) {
         let (sender, receiver) = mpsc::sync_channel(1);

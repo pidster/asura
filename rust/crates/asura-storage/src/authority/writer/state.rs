@@ -1,14 +1,19 @@
-use super::super::{HEADER, TRAILER};
 use super::*;
-use asura_platform::{AuthoritySource, random_id};
+use crate::authority::ReplayError;
+use crate::authority::index::{Entry, Key, Tag};
+use crate::authority::journal::{Failure, HoldReason, Journal, JournalStatus, Opened, Store};
+use asura_platform::{AuthoritySource, JournalDirectory, random_id};
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "embedded-memory")]
 use std::time::Duration;
 
+/// `Prepare` returns history until the next turn would pass this much prompt
+/// and response text (SJ-D10).
+pub const PREPARE_TEXT: usize = 8 * 1024 * 1024;
+
 pub(super) struct State {
     runtime: RuntimeDirectory,
-    file: Option<JournalFile>,
-    bytes: Vec<u8>,
+    journal: Option<Journal<JournalDirectory>>,
     replay: Option<Arc<Replay>>,
     fenced: bool,
     opened: bool,
@@ -16,6 +21,8 @@ pub(super) struct State {
     /// The writer's close flag. Shutdown cancels replay and configuration reads;
     /// no journal step has a time bound (J1-0).
     cancel: Arc<AtomicBool>,
+    /// Journal usage and hold state shared with the handle.
+    status: Arc<std::sync::Mutex<JournalStatus>>,
     #[cfg(feature = "embedded-memory")]
     graph: Option<Graph>,
 }
@@ -44,13 +51,39 @@ fn project_error(error: asura_platform::Error) -> Error {
         _ => Error::StaleProject,
     }
 }
+fn failure(error: Failure) -> Error {
+    match error {
+        Failure::Invalid => Error::Invalid,
+        Failure::Held(HoldReason::Quota) => Error::JournalQuota,
+        Failure::Held(HoldReason::Disk) => Error::JournalDiskSpace,
+        Failure::Exhausted => Error::Limit,
+        Failure::Unconfirmed => Error::OutcomeUnconfirmed,
+        Failure::Cancelled => Error::Cancelled,
+        Failure::OwnerBusy => Error::Busy,
+        _ => Error::RepairRequired,
+    }
+}
+fn lookup(error: ReplayError) -> Error {
+    match error {
+        ReplayError::Cancelled => Error::Cancelled,
+        _ => Error::RepairRequired,
+    }
+}
+/// The index key range of one `(tag, id)` prefix.
+fn prefix(tag: Tag, id: Id) -> (Key, Key) {
+    (Key::new(tag, id, 0), Key::new(tag, id, u64::MAX))
+}
 impl State {
-    pub(super) fn new(runtime: RuntimeDirectory, cancel: Arc<AtomicBool>) -> Self {
+    pub(super) fn new(
+        runtime: RuntimeDirectory,
+        cancel: Arc<AtomicBool>,
+        status: Arc<std::sync::Mutex<JournalStatus>>,
+    ) -> Self {
         Self {
             runtime,
             cancel,
-            file: None,
-            bytes: Vec::new(),
+            status,
+            journal: None,
             replay: None,
             fenced: false,
             opened: false,
@@ -61,26 +94,9 @@ impl State {
     }
     fn reply(&self) -> Reply {
         Reply {
-            #[cfg(feature = "embedded-memory")]
-            memory_result: None,
-            #[cfg(feature = "embedded-memory")]
-            memory_create_result: None,
-            sensor_state: None,
             replay: self.replay.clone(),
-            record: None,
-            history: None,
-            prepared: None,
-            projects: Vec::new(),
-            inputs: Vec::new(),
-            queued: None,
             order_revision: self.replay.as_ref().map(|s| s.order_revision),
-            stale_order: false,
-            accepted_input_id: None,
-            project_name: None,
-            project_name_revision: None,
-            project_name_changed: None,
-            stale_project_name_revision: false,
-            response_bytes: None,
+            ..Default::default()
         }
     }
     fn config(&self) -> Result<crate::config::ConversationSnapshot> {
@@ -95,25 +111,88 @@ impl State {
             Error::RepairRequired
         }
     }
-    fn record(&self, range: Range<usize>) -> Result<Record> {
-        let bytes = self.bytes.get(range).ok_or(Error::Invalid)?;
-        if bytes.len() < HEADER + TRAILER {
-            return Err(Error::Invalid);
+    fn journal(&mut self) -> Result<&mut Journal<JournalDirectory>> {
+        self.journal.as_mut().ok_or(Error::NotInitialized)
+    }
+    fn state(&self) -> Result<&Arc<Replay>> {
+        self.replay.as_ref().ok_or(Error::NotInitialized)
+    }
+    /// Runs index reads against the current state.
+    fn read<R>(
+        &mut self,
+        f: impl FnOnce(&Replay, &mut Store<'_, JournalDirectory>) -> std::result::Result<R, ReplayError>,
+    ) -> Result<R> {
+        let (state, mut store) = self.journal()?.store();
+        let result = f(&state, &mut store);
+        // A damaged frame, page or run fences admission (SJ-F11, SJ-F12);
+        // evidence is preserved and nothing more is written.
+        if matches!(result, Err(ReplayError::Corrupt)) {
+            self.fenced = true;
         }
-        let kind = u16::from_be_bytes([bytes[10], bytes[11]]);
-        decode_record(kind, &bytes[HEADER..bytes.len() - TRAILER])
-            .map_err(|_| Error::RepairRequired)
+        result.map_err(lookup)
+    }
+    fn record(&mut self, locator: Locator) -> Result<Record> {
+        self.read(|_, store| store.frame(&locator))
+    }
+    /// Publishes the shared status and reports whether it changed the hold.
+    pub(super) fn publish_status(&self) -> bool {
+        let Some(journal) = &self.journal else {
+            return false;
+        };
+        let status = journal.status();
+        let mut shared = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = shared.held != status.held;
+        *shared = status;
+        changed
+    }
+    /// Idle work between commands: one merge step. Returns true while work remains.
+    pub(super) fn idle(&mut self) -> bool {
+        if self.fenced {
+            return false;
+        }
+        let Some(journal) = self.journal.as_mut() else {
+            return false;
+        };
+        match journal.merge_step() {
+            Ok(more) => more,
+            Err(Failure::Held(_)) => false,
+            Err(_) => {
+                self.fenced = journal.fenced();
+                false
+            }
+        }
+    }
+    pub(super) fn merge_pending(&self) -> bool {
+        self.journal.as_ref().is_some_and(|j| j.merge_pending())
+    }
+    pub(super) fn held(&self) -> bool {
+        self.journal.as_ref().is_some_and(|j| j.held().is_some())
+    }
+    /// Paced free-space recheck while held. Returns true when the hold ended.
+    pub(super) fn recheck(&mut self) -> bool {
+        let Some(journal) = self.journal.as_mut() else {
+            return false;
+        };
+        let was = journal.held().is_some();
+        let free = journal.recheck();
+        was && free
+    }
+    pub(super) fn shutdown(&mut self) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.abandon_merge();
+        }
     }
     /// Bytes `lo..hi` of a journaled response, rebuilt from its pieces. A piece
     /// cut inside a UTF-8 character is damage.
-    fn response_bytes(&self, response: &Response, lo: u64, hi: u64) -> Result<Vec<u8>> {
+    fn response_bytes(&mut self, operation: Id, lo: u64, hi: u64) -> Result<Vec<u8>> {
+        let pieces = self.pieces(operation, lo, hi)?;
         let mut out = Vec::with_capacity(hi.saturating_sub(lo) as usize);
-        for piece in &response.pieces {
+        for piece in pieces {
             let end = piece.start + piece.kept;
             if end <= lo || piece.start >= hi {
                 continue;
             }
-            let text = match self.record(piece.frame.clone())? {
+            let text = match self.record(piece.frame)? {
                 Record::ResponseText(segment) => segment.text,
                 Record::TurnTerminal(terminal) => terminal.text,
                 _ => return Err(Error::RepairRequired),
@@ -128,24 +207,95 @@ impl State {
         }
         Ok(out)
     }
+    /// The response pieces of an operation that overlap `lo..hi`, from the
+    /// live state or delta, otherwise from `P` entries in the runs.
+    fn pieces(&mut self, operation: Id, lo: u64, hi: u64) -> Result<Vec<ResponsePiece>> {
+        if let Some(op) = self.state()?.operations.get(&operation) {
+            return Ok(op
+                .response
+                .pieces
+                .iter()
+                .filter(|p| p.start + p.kept > lo && p.start < hi)
+                .cloned()
+                .collect());
+        }
+        self.read(|state, store| {
+            let (lo_key, hi_key) = prefix(Tag::Piece, operation);
+            // The last piece that starts at or before `lo`.
+            let mut out = Vec::new();
+            let mut from = state
+                .range(
+                    &lo_key,
+                    &Key::new(Tag::Piece, operation, lo.saturating_add(1)),
+                    true,
+                    1,
+                    store,
+                )?
+                .first()
+                .map_or(lo_key, |(k, _)| *k);
+            loop {
+                let batch = state.range(&from, &hi_key, false, 64, store)?;
+                let full = batch.len() == 64;
+                for (key, value) in &batch {
+                    if key.disc >= hi {
+                        return Ok(out);
+                    }
+                    let Entry::Piece { kept, frame } = Entry::decode(Tag::Piece, value)? else {
+                        return Err(ReplayError::Corrupt);
+                    };
+                    out.push(ResponsePiece {
+                        start: key.disc,
+                        kept,
+                        frame,
+                    });
+                }
+                match batch.last() {
+                    Some((key, _)) if full => {
+                        from = Key::new(
+                            Tag::Piece,
+                            operation,
+                            key.disc.checked_add(1).ok_or(ReplayError::Corrupt)?,
+                        )
+                    }
+                    _ => return Ok(out),
+                }
+            }
+        })
+    }
+    /// The response length and terminal frame of a terminal operation.
+    fn terminal_facts(&mut self, operation: Id) -> Result<(u64, Locator)> {
+        if let Some(op) = self.state()?.operations.get(&operation) {
+            let terminal = op.terminal.as_ref().ok_or(Error::Invalid)?;
+            return Ok((op.response.len, terminal.frame));
+        }
+        let facts = self
+            .read(|state, store| state.operation_facts(operation, store))?
+            .ok_or(Error::Invalid)?;
+        Ok((facts.response_len, facts.terminal_frame))
+    }
     /// The whole journaled response.
-    pub(super) fn response_text(&self, response: &Response) -> Result<String> {
-        String::from_utf8(self.response_bytes(response, 0, response.len)?)
+    pub(super) fn response_text(&mut self, operation: Id, length: u64) -> Result<String> {
+        String::from_utf8(self.response_bytes(operation, 0, length)?)
             .map_err(|_| Error::RepairRequired)
     }
     /// At most `MAX_TEXT` bytes from the largest character boundary not after
     /// `offset`. Returns the window start and text.
-    fn response_window(&self, response: &Response, offset: u64) -> Result<(u64, String)> {
-        let requested = offset.min(response.len);
+    fn response_window(
+        &mut self,
+        operation: Id,
+        length: u64,
+        offset: u64,
+    ) -> Result<(u64, String)> {
+        let requested = offset.min(length);
         let lo = requested.saturating_sub(3);
-        let fetched_end = response.len.min(requested + MAX_TEXT as u64 + 1);
-        let bytes = self.response_bytes(response, lo, fetched_end)?;
+        let fetched_end = length.min(requested + MAX_TEXT as u64 + 1);
+        let bytes = self.response_bytes(operation, lo, fetched_end)?;
         let continuation = |index: usize| bytes.get(index).is_some_and(|b| b & 0xC0 == 0x80);
         let mut start = (requested - lo) as usize;
         while start > 0 && continuation(start) {
             start -= 1;
         }
-        let window_end = response.len.min(lo + start as u64 + MAX_TEXT as u64);
+        let window_end = length.min(lo + start as u64 + MAX_TEXT as u64);
         let mut end = (window_end - lo) as usize;
         while end > start && continuation(end) {
             end -= 1;
@@ -153,6 +303,61 @@ impl State {
         let text =
             String::from_utf8(bytes[start..end].to_vec()).map_err(|_| Error::RepairRequired)?;
         Ok((lo + start as u64, text))
+    }
+    /// The tool calls of an operation, from the live state or rebuilt from
+    /// their frames through `C` entries.
+    fn tools(&mut self, operation: Id) -> Result<Vec<ToolRecord>> {
+        if let Some(op) = self.state()?.operations.get(&operation) {
+            return Ok(op.tools.clone());
+        }
+        let facts = self
+            .read(|state, store| state.operation_facts(operation, store))?
+            .ok_or(Error::Invalid)?;
+        self.read(|state, store| {
+            let project = match state.find_conversation(facts.conversation, store)? {
+                Some(c) => c.project,
+                None => return Err(ReplayError::Corrupt),
+            };
+            let binding = [
+                state.installation_id,
+                state.initialization.graph,
+                state.initialization.request,
+            ];
+            let (lo, hi) = prefix(Tag::Call, operation);
+            let calls = state.range(&lo, &hi, false, MAX_TOOL_CALL_ORDINAL as usize, store)?;
+            let mut tools = Vec::with_capacity(calls.len());
+            for (_, value) in calls {
+                let Entry::Call {
+                    intent,
+                    settled,
+                    result,
+                    ..
+                } = Entry::decode(Tag::Call, &value)?
+                else {
+                    return Err(ReplayError::Corrupt);
+                };
+                let mut read =
+                    |at: Locator| -> std::result::Result<Option<(Locator, Record)>, ReplayError> {
+                        if at.is_none() {
+                            Ok(None)
+                        } else {
+                            Ok(Some((at, store.frame(&at)?)))
+                        }
+                    };
+                let intent = read(intent)?.ok_or(ReplayError::Corrupt)?;
+                let settled = read(settled)?;
+                let result = read(result)?;
+                tools.push(tool_from_frames(
+                    state.installation_id,
+                    binding,
+                    project,
+                    intent,
+                    settled,
+                    result,
+                )?);
+            }
+            Ok(tools)
+        })
     }
     /// Appends one record. The write and sync have no time bound (J1-0); only
     /// an actual I/O or validation error fences the writer.
@@ -164,60 +369,21 @@ impl State {
         let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
         // One prior snapshot may remain held by the reactor. Reject before allocating
         // another replay if a caller retains more generations than that contract.
-        if !self.retired.is_empty() && Arc::strong_count(state) > 1 {
+        if !self.retired.is_empty() && Arc::strong_count(state) > 2 {
             return Err(Error::Busy);
         }
-        let old_snapshot = if Arc::strong_count(state) > 1 {
-            Some(Arc::downgrade(state))
-        } else {
-            None
-        };
-        let context = FrameContext {
-            installation_id: state.installation_id,
-            transition_id: random_id(),
-            sequence: state.sequence.checked_add(1).ok_or(Error::Limit)?,
-            prior_digest: state.last_digest,
-            expected_revision: state.revision,
-            owner_generation: state
-                .owner_generation
-                .checked_add(u64::from(matches!(record, Record::OwnerGeneration)))
-                .ok_or(Error::Limit)?,
-        };
-        let frame = encode_frame(&context, &record).map_err(|_| Error::Invalid)?;
-        let old = self.bytes.len();
-        if old
-            .checked_add(frame.len())
-            .is_none_or(|n| n > super::super::MAX_JOURNAL)
-        {
-            return Err(Error::Limit);
-        }
-        self.bytes
-            .try_reserve_exact(frame.len())
-            .map_err(|_| Error::Limit)?;
-        self.bytes.extend_from_slice(&frame);
-        let proposed = replay(&self.bytes, &AtomicBool::new(false));
-        let proposed = match proposed {
-            Ok(state) => state,
-            Err(_) => {
-                self.bytes.truncate(old);
-                return Err(Error::Invalid);
-            }
-        };
-        if self
-            .file
-            .as_mut()
-            .ok_or(Error::NotInitialized)?
-            .append(old, &frame)
-            .is_err()
-        {
+        let old_snapshot = (Arc::strong_count(state) > 2).then(|| Arc::downgrade(state));
+        self.replay = None;
+        let journal = self.journal.as_mut().ok_or(Error::NotInitialized)?;
+        let result = journal.append(record, random_id());
+        self.replay = Some(journal.state().clone());
+        if journal.fenced() {
             self.fenced = true;
-            self.bytes.truncate(old);
-            return Err(Error::OutcomeUnconfirmed);
         }
+        result.map_err(failure)?;
         if let Some(old) = old_snapshot {
             self.retired.push(old);
         }
-        self.replay = Some(Arc::new(proposed));
         Ok(())
     }
     fn open(&mut self) -> Result<()> {
@@ -239,28 +405,34 @@ impl State {
             AuthoritySource::Journal(reader) if !reader.has_unknown_root_content() => {}
             _ => return Err(Error::RepairRequired),
         }
-        let file =
-            JournalFile::open(self.runtime.clone(), false).map_err(|_| Error::RepairRequired)?;
-        let bytes = file
-            .read_all(&self.cancel)
-            .map_err(|_| self.replay_failed())?;
-        let state = replay(&bytes, &self.cancel).map_err(|_| self.replay_failed())?;
-        self.file = Some(file);
-        self.bytes = bytes;
-        self.replay = Some(Arc::new(state));
+        let directory = JournalDirectory::open(self.runtime.clone(), false, self.cancel.clone())
+            .map_err(|e| match e {
+                asura_platform::JournalError::OwnerBusy => Error::Busy,
+                _ => Error::RepairRequired,
+            })?;
+        let mut journal = match Journal::open(directory, true, &self.cancel) {
+            Ok(Opened::Journal(journal)) => *journal,
+            Ok(Opened::Empty(_)) => return Err(Error::RepairRequired),
+            Err(Failure::Cancelled) => return Err(Error::Cancelled),
+            Err(Failure::OwnerBusy) => return Err(Error::Busy),
+            Err(_) => return Err(self.replay_failed()),
+        };
+        if let Ok(quota) = crate::config::journal_quota(self.runtime.clone(), &self.cancel) {
+            journal.set_quota(quota);
+        }
+        self.replay = Some(journal.state().clone());
+        self.journal = Some(journal);
         self.append(Record::OwnerGeneration)?;
-        if let Some(id) = self
+        let interrupted = self
             .replay
             .as_ref()
-            .and_then(|r| r.active_operation)
-            .filter(|id| {
-                !self.replay.as_ref().expect("replay").operations[id]
-                    .tools
+            .and_then(|r| r.active())
+            .filter(|(_, op)| {
+                !op.tools
                     .iter()
                     .any(|t| t.create.is_some() && t.result_frame.is_none())
-            })
-        {
-            let op = &self.replay.as_ref().expect("replay").operations[&id];
+            });
+        if let Some((id, op)) = interrupted {
             let generation = op.generation;
             let started = op.helper.is_some();
             // The interrupted operation keeps its journaled response prefix.
@@ -282,6 +454,226 @@ impl State {
         }
         self.opened = true;
         Ok(())
+    }
+    /// Initialization has no time bound (owner, 2026-10-15): it waits for the
+    /// engine; shutdown and real errors stop it.
+    fn initialize(&mut self, request: Id) -> Result<()> {
+        if !cfg!(feature = "embedded-memory") {
+            return Err(Error::Unavailable);
+        }
+        self.open()?;
+        let digest = request_digest(Request::Initialize { mode: 1 }).map_err(|_| Error::Invalid)?;
+        if let Some(state) = self.replay.clone() {
+            if state.initialization.digest != digest {
+                return Err(Error::Conflict);
+            }
+            if state.initialization.request != request {
+                if self.read(|s, store| s.outcome(request, store))?.is_some() {
+                    return Err(Error::Conflict);
+                }
+                return Err(if state.binding.is_some() {
+                    Error::AlreadyInitialized
+                } else {
+                    Error::Busy
+                });
+            }
+            if state.binding.is_some() {
+                return Ok(());
+            }
+        } else {
+            let scan = self
+                .runtime
+                .authority_source(&self.cancel)
+                .map_err(|_| self.replay_failed())?;
+            if !matches!(scan.source, AuthoritySource::RuntimeOnly) {
+                return Err(Error::RepairRequired);
+            }
+            let configuration_digest = self.config()?.digest;
+            let pending = PendingInit {
+                request,
+                digest,
+                mode: 1,
+                configuration_revision: 1,
+                configuration_digest,
+                graph: random_id(),
+            };
+            let context = FrameContext {
+                installation_id: random_id(),
+                transition_id: random_id(),
+                sequence: 1,
+                prior_digest: [0; 32],
+                expected_revision: 0,
+                owner_generation: 1,
+            };
+            let directory = JournalDirectory::open(self.runtime.clone(), true, self.cancel.clone())
+                .map_err(|e| match e {
+                    asura_platform::JournalError::OwnerBusy => Error::Busy,
+                    _ => Error::RepairRequired,
+                })?;
+            let mut journal = match Journal::initialize(directory, &context, pending) {
+                Ok(journal) => journal,
+                Err(Failure::Unconfirmed) => {
+                    self.fenced = true;
+                    return Err(Error::OutcomeUnconfirmed);
+                }
+                Err(error) => return Err(failure(error)),
+            };
+            if let Ok(quota) = crate::config::journal_quota(self.runtime.clone(), &self.cancel) {
+                journal.set_quota(quota);
+            }
+            self.replay = Some(journal.state().clone());
+            self.journal = Some(journal);
+        }
+        self.connect_graph(true)?;
+        let state = self.replay.as_ref().expect("pending");
+        self.append(Record::ActiveBinding(ActiveBinding {
+            request,
+            generation: 1,
+            graph: state.initialization.graph,
+            configuration_digest: state.initialization.configuration_digest,
+        }))
+    }
+    /// Any registered project, from the live state or the index.
+    fn find_project(&mut self, id: Id) -> Result<ProjectEntry> {
+        self.read(|state, store| state.find_project(id, store))?
+            .ok_or(Error::Invalid)
+    }
+    fn project(&mut self, id: Id) -> Result<ProjectIdentity> {
+        let project = self.find_project(id)?;
+        self.held_identity(&project.registration)
+    }
+    fn held_identity(&self, project: &ProjectRegistered) -> Result<ProjectIdentity> {
+        let held = ProjectIdentity::open(&project.location, &self.runtime.state_boundary())
+            .map_err(project_error)?;
+        if held.device != project.device || held.inode != project.inode {
+            return Err(Error::StaleProject);
+        }
+        Ok(held)
+    }
+    /// The listing of one project: registration, effective name and stale check.
+    fn listing(&mut self, entry: ProjectEntry) -> ProjectListing {
+        let (name, name_revision) = match &entry.name {
+            Some(name) => (name.name.clone(), name.revision),
+            None => (
+                default_project_name(entry.registration.project, &entry.registration.location),
+                0,
+            ),
+        };
+        let error = self.held_identity(&entry.registration).err();
+        ProjectListing {
+            registration: entry.registration,
+            name,
+            name_revision,
+            error,
+        }
+    }
+    fn input_view(&mut self, input: Id, full: bool) -> Result<InputView> {
+        let state = self.state()?.clone();
+        let entry = state.inputs.get(&input).ok_or(Error::Invalid)?;
+        let Record::InputQueued(mut value) = self.record(entry.frame)? else {
+            return Err(Error::RepairRequired);
+        };
+        // The record retains the enqueue digest and prompt. Scheduling fields
+        // change only through a durable promotion record.
+        if !full && value.prompt.len() > 256 {
+            let mut end = 256;
+            while !value.prompt.is_char_boundary(end) {
+                end -= 1;
+            }
+            value.prompt.truncate(end);
+        }
+        Ok(InputView {
+            input: value,
+            kind: entry.kind,
+            target_operation: (entry.kind == InputKind::Steer).then_some(entry.target_operation),
+            target_generation: entry.target_generation,
+            order_position: u32::try_from(entry.order_position).map_err(|_| Error::Limit)?,
+            status: state.input_status(input).ok_or(Error::RepairRequired)?,
+            operation: state.input_operation(input),
+            sequence: entry.sequence,
+        })
+    }
+    fn queue_reply(&mut self, input: Id) -> Result<Reply> {
+        let mut reply = self.reply();
+        reply.inputs.push(self.input_view(input, false)?);
+        Ok(reply)
+    }
+    fn project_queue_reply(&mut self, project: Id, accepted: Option<Id>) -> Result<Reply> {
+        let state = self.state()?.clone();
+        let mut reply = self.reply();
+        reply.accepted_input_id = accepted;
+        let mut entries: Vec<_> = state
+            .inputs
+            .values()
+            .filter(|q| {
+                q.project == project
+                    && matches!(
+                        state.input_status(q.request),
+                        Some(InputStatus::Queued | InputStatus::Held | InputStatus::Running)
+                    )
+            })
+            .collect();
+        if let Some(id) = accepted
+            && let Some(accepted_entry) = state.inputs.get(&id)
+        {
+            if accepted_entry.project != project {
+                return Err(Error::Invalid);
+            }
+            if !entries.iter().any(|q| q.request == id) {
+                entries.push(accepted_entry);
+            }
+        }
+        entries.sort_by_key(|q| (q.conversation, q.order_position));
+        if entries.len() > MAX_INPUTS {
+            if let Some(id) = accepted
+                && let Some(position) = entries.iter().position(|q| q.request == id)
+                && position >= MAX_INPUTS
+            {
+                entries.remove(MAX_INPUTS - 1);
+            }
+            entries.truncate(MAX_INPUTS);
+        }
+        let ids: Vec<Id> = entries.iter().map(|q| q.request).collect();
+        for id in ids {
+            reply.inputs.push(self.input_view(id, false)?);
+        }
+        Ok(reply)
+    }
+    /// The project of an input, from the live state or its kind 18 frame.
+    fn input_project(&mut self, input: Id) -> Result<Id> {
+        if let Some(q) = self.state()?.inputs.get(&input) {
+            return Ok(q.project);
+        }
+        let entry =
+            self.read(|state, store| state.entry(&Key::new(Tag::Input, input, 0), store))?;
+        let Some(Entry::Input { queued, .. }) = entry else {
+            return Err(Error::Invalid);
+        };
+        match self.record(queued)? {
+            Record::InputQueued(value) => Ok(value.project),
+            _ => Err(Error::RepairRequired),
+        }
+    }
+    fn steering_prompt(&mut self, target: Id, instruction: &str) -> Result<String> {
+        let accepted = match self.state()?.operations.get(&target) {
+            Some(op) => op.accepted_frame,
+            None => {
+                self.read(|state, store| state.operation_facts(target, store))?
+                    .ok_or(Error::Invalid)?
+                    .accepted
+            }
+        };
+        let Record::TurnAccepted(prior) = self.record(accepted)? else {
+            return Err(Error::RepairRequired);
+        };
+        let prompt = format!(
+            "Original request:\n{}\n\nSteering instruction:\n{}",
+            prior.prompt, instruction
+        );
+        if prompt.len() > MAX_PROMPT {
+            return Err(Error::Limit);
+        }
+        Ok(prompt)
     }
     #[cfg(feature = "embedded-memory")]
     fn connect_graph(&mut self, initialize: bool) -> Result<()> {
@@ -358,184 +750,11 @@ impl State {
         Err(Error::Unavailable)
     }
     /// Initialization has no time bound (owner, 2026-10-15): it waits for the
-    /// engine; shutdown and real errors stop it.
-    fn initialize(&mut self, request: Id) -> Result<()> {
-        if !cfg!(feature = "embedded-memory") {
-            return Err(Error::Unavailable);
-        }
-        self.open()?;
-        let digest = request_digest(Request::Initialize { mode: 1 }).map_err(|_| Error::Invalid)?;
-        if let Some(state) = &self.replay {
-            if state.initialization.digest != digest {
-                return Err(Error::Conflict);
-            }
-            if state.initialization.request != request {
-                if state.requests.contains_key(&request) {
-                    return Err(Error::Conflict);
-                }
-                return Err(if state.binding.is_some() {
-                    Error::AlreadyInitialized
-                } else {
-                    Error::Busy
-                });
-            }
-            if state.binding.is_some() {
-                return Ok(());
-            }
-        } else {
-            let scan = self
-                .runtime
-                .authority_source(&self.cancel)
-                .map_err(|_| self.replay_failed())?;
-            if !matches!(scan.source, AuthoritySource::RuntimeOnly) {
-                return Err(Error::RepairRequired);
-            }
-            let configuration_digest = self.config()?.digest;
-            let pending = Record::PendingInit(PendingInit {
-                request,
-                digest,
-                mode: 1,
-                configuration_revision: 1,
-                configuration_digest,
-                graph: random_id(),
-            });
-            let context = FrameContext {
-                installation_id: random_id(),
-                transition_id: random_id(),
-                sequence: 1,
-                prior_digest: [0; 32],
-                expected_revision: 0,
-                owner_generation: 1,
-            };
-            let frame = encode_frame(&context, &pending).map_err(|_| Error::Invalid)?;
-            let state = replay(&frame, &AtomicBool::new(false)).map_err(|_| Error::Invalid)?;
-            let mut file =
-                JournalFile::open(self.runtime.clone(), true).map_err(|_| Error::RepairRequired)?;
-            if file.append(0, &frame).is_err() {
-                self.fenced = true;
-                self.file = Some(file);
-                return Err(Error::OutcomeUnconfirmed);
-            }
-            self.file = Some(file);
-            self.bytes = frame;
-            self.replay = Some(Arc::new(state));
-        }
-        self.connect_graph(true)?;
-        let state = self.replay.as_ref().expect("pending");
-        self.append(Record::ActiveBinding(ActiveBinding {
-            request,
-            generation: 1,
-            graph: state.initialization.graph,
-            configuration_digest: state.initialization.configuration_digest,
-        }))
-    }
-    fn project(&self, id: Id) -> Result<ProjectIdentity> {
-        let project = self
-            .replay
-            .as_ref()
-            .ok_or(Error::NotInitialized)?
-            .projects
-            .get(&id)
-            .ok_or(Error::Invalid)?;
-        let held = ProjectIdentity::open(&project.location, &self.runtime.state_boundary())
-            .map_err(project_error)?;
-        if held.device != project.device || held.inode != project.inode {
-            return Err(Error::StaleProject);
-        }
-        Ok(held)
-    }
-    fn input_view(&self, input: Id, full: bool) -> Result<InputView> {
-        let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-        let entry = state.inputs.get(&input).ok_or(Error::Invalid)?;
-        let Record::InputQueued(mut value) = self.record(entry.frame.clone())? else {
-            return Err(Error::RepairRequired);
-        };
-        // The record retains the enqueue digest and prompt. Scheduling fields
-        // change only through a durable promotion record.
-        if !full && value.prompt.len() > 256 {
-            let mut end = 256;
-            while !value.prompt.is_char_boundary(end) {
-                end -= 1;
-            }
-            value.prompt.truncate(end);
-        }
-        Ok(InputView {
-            input: value,
-            kind: entry.kind,
-            target_operation: (entry.kind == InputKind::Steer).then_some(entry.target_operation),
-            target_generation: entry.target_generation,
-            order_position: u32::try_from(entry.order_position).map_err(|_| Error::Limit)?,
-            status: state.input_status(input).ok_or(Error::RepairRequired)?,
-            operation: state.input_operation(input),
-            sequence: entry.sequence,
-        })
-    }
-    fn queue_reply(&self, input: Id) -> Result<Reply> {
-        let mut reply = self.reply();
-        reply.inputs.push(self.input_view(input, false)?);
-        Ok(reply)
-    }
-    fn project_queue_reply(&self, project: Id, accepted: Option<Id>) -> Result<Reply> {
-        let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-        let mut reply = self.reply();
-        reply.accepted_input_id = accepted;
-        let mut entries: Vec<_> = state
-            .inputs
-            .values()
-            .filter(|q| {
-                q.project == project
-                    && matches!(
-                        state.input_status(q.request),
-                        Some(InputStatus::Queued | InputStatus::Held | InputStatus::Running)
-                    )
-            })
-            .collect();
-        if let Some(id) = accepted {
-            let accepted_entry = state.inputs.get(&id).ok_or(Error::Invalid)?;
-            if accepted_entry.project != project {
-                return Err(Error::Invalid);
-            }
-            if !entries.iter().any(|q| q.request == id) {
-                entries.push(accepted_entry);
-            }
-        }
-        entries.sort_by_key(|q| (q.conversation, q.order_position));
-        if entries.len() > MAX_INPUTS {
-            if let Some(id) = accepted
-                && let Some(position) = entries.iter().position(|q| q.request == id)
-                && position >= MAX_INPUTS
-            {
-                entries.remove(MAX_INPUTS - 1);
-            }
-            entries.truncate(MAX_INPUTS);
-        }
-        for q in entries {
-            reply.inputs.push(self.input_view(q.request, false)?);
-        }
-        Ok(reply)
-    }
-    fn steering_prompt(&self, target: Id, instruction: &str) -> Result<String> {
-        let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-        let op = state.operations.get(&target).ok_or(Error::Invalid)?;
-        let Record::TurnAccepted(prior) = self.record(op.accepted_frame.clone())? else {
-            return Err(Error::RepairRequired);
-        };
-        let prompt = format!(
-            "Original request:\n{}\n\nSteering instruction:\n{}",
-            prior.prompt, instruction
-        );
-        if prompt.len() > MAX_PROMPT {
-            return Err(Error::Limit);
-        }
-        Ok(prompt)
-    }
     #[cfg(feature = "embedded-memory")]
     fn memory_read(&mut self, project: Id, query: crate::memory::ReadNotes) -> Result<Reply> {
         query.validate().map_err(|_| Error::Invalid)?;
+        self.find_project(project)?;
         let replay = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-        if !replay.projects.contains_key(&project) {
-            return Err(Error::Invalid);
-        }
         if replay.project_memory_blocked(project) {
             return Err(Error::Busy);
         }
@@ -630,10 +849,7 @@ impl State {
         project: Id,
         write: Option<(u64, crate::sensors::ProjectState)>,
     ) -> Result<Reply> {
-        let replay = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-        if !replay.projects.contains_key(&project) {
-            return Err(Error::Invalid);
-        }
+        self.find_project(project)?;
         self.connect_graph(false)?;
         #[cfg(feature = "embedded-memory")]
         {
@@ -666,16 +882,86 @@ impl State {
             Err(Error::Unavailable)
         }
     }
+    /// One page of registered projects in ID order: ascending after a
+    /// cursor, or descending below `before`. The page count has no bound.
+    fn projects(&mut self, after: Option<Id>, before: Option<Id>, limit: usize) -> Result<Reply> {
+        let (lo, hi, descending) = match (after, before) {
+            (Some(after), None) => (
+                Key::new(Tag::Project, after, 1),
+                Key::last(Tag::Project),
+                false,
+            ),
+            (None, Some(before)) => (
+                Key::first(Tag::Project),
+                Key::new(Tag::Project, before, 0),
+                true,
+            ),
+            (None, None) => (Key::first(Tag::Project), Key::last(Tag::Project), false),
+            _ => return Err(Error::Invalid),
+        };
+        let found =
+            self.read(|state, store| state.range(&lo, &hi, descending, limit + 1, store))?;
+        let more = found.len() > limit;
+        let mut reply = self.reply();
+        for (key, _) in found.into_iter().take(limit) {
+            let entry = self.find_project(key.id)?;
+            let listing = self.listing(entry);
+            reply.projects.push(listing);
+        }
+        reply.more = more;
+        Ok(reply)
+    }
+    /// Completed prior turns, newest first, until the next turn would pass
+    /// 8 MiB of prompt and response text; the rest are reported as omitted.
+    fn history(&mut self, conversation: Id) -> Result<(Vec<(TurnAccepted, TurnTerminal)>, u32)> {
+        let completed = self
+            .read(|state, store| state.find_conversation(conversation, store))?
+            .ok_or(Error::Invalid)?
+            .completed;
+        let mut history = Vec::new();
+        let mut text = 0usize;
+        let (lo, mut hi) = prefix(Tag::Turn, conversation);
+        'pages: loop {
+            let page = self.read(|state, store| state.range(&lo, &hi, true, 8, store))?;
+            if page.is_empty() {
+                break;
+            }
+            for (key, value) in &page {
+                hi = *key;
+                let Entry::Turn {
+                    operation,
+                    terminal,
+                    accepted,
+                    ..
+                } = Entry::decode(Tag::Turn, value).map_err(lookup)?
+                else {
+                    return Err(Error::RepairRequired);
+                };
+                if terminal != TerminalKind::Complete {
+                    continue;
+                }
+                let Record::TurnAccepted(prior) = self.record(accepted)? else {
+                    return Err(Error::RepairRequired);
+                };
+                let (length, terminal_frame) = self.terminal_facts(operation)?;
+                if text + prior.prompt.len() + length as usize > PREPARE_TEXT {
+                    break 'pages;
+                }
+                let Record::TurnTerminal(mut terminal) = self.record(terminal_frame)? else {
+                    return Err(Error::RepairRequired);
+                };
+                // The whole response: kind 24 segments and the tail.
+                terminal.text = self.response_text(operation, length)?;
+                terminal.text_offset = 0;
+                text += prior.prompt.len() + terminal.text.len();
+                history.push((*prior, terminal));
+            }
+        }
+        let omitted = completed.saturating_sub(history.len() as u64);
+        Ok((history, u32::try_from(omitted).map_err(|_| Error::Limit)?))
+    }
     pub(super) fn execute(&mut self, command: Command) -> Result<Reply> {
         if self.fenced {
-            return Err(Error::RepairRequired);
-        }
-        if self
-            .file
-            .as_ref()
-            .is_some_and(|file| file.validate().is_err())
-        {
-            self.fenced = true;
             return Err(Error::RepairRequired);
         }
         match command {
@@ -721,11 +1007,62 @@ impl State {
             } => return self.sensor(state.project, Some((expected_revision, state))),
 
             Command::Open => self.open()?,
-            Command::Inputs { project, input } => {
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                if !state.projects.contains_key(&project) {
+            Command::SetQuota { bytes } => {
+                if let Some(journal) = self.journal.as_mut() {
+                    journal.set_quota(bytes);
+                    journal.recheck();
+                }
+            }
+            Command::JournalStatus => {
+                if let Some(journal) = self.journal.as_mut() {
+                    journal.recheck();
+                }
+                let mut reply = self.reply();
+                reply.status = self.journal.as_ref().map(|j| j.status());
+                return Ok(reply);
+            }
+            Command::Lookup { operation } => {
+                let state = self.state()?.clone();
+                let view = match state.operations.get(&operation) {
+                    Some(op) => OperationView {
+                        conversation: op.conversation,
+                        generation: op.generation,
+                        terminal: op.terminal.as_ref().map(|t| (t.kind, t.cause)),
+                        cancel: op.cancel,
+                    },
+                    None => {
+                        let facts = self
+                            .read(|state, store| state.operation_facts(operation, store))?
+                            .ok_or(Error::Invalid)?;
+                        OperationView {
+                            conversation: facts.conversation,
+                            generation: facts.generation,
+                            terminal: Some((facts.terminal, facts.cause)),
+                            cancel: None,
+                        }
+                    }
+                };
+                let mut reply = self.reply();
+                reply.operation = Some(view);
+                return Ok(reply);
+            }
+            Command::PayloadFacts { payloads } => {
+                if payloads.len() > 128 {
                     return Err(Error::Invalid);
                 }
+                let mut facts = Vec::new();
+                for payload in payloads {
+                    if let Some(fact) = self.payload_fact(payload)? {
+                        facts.push(fact);
+                    }
+                }
+                let mut reply = self.reply();
+                reply.payload_facts = facts;
+                return Ok(reply);
+            }
+            Command::Inputs { project, input } => {
+                self.find_project(project)?;
+                let state = self.state()?.clone();
                 let mut reply = self.reply();
                 if let Some(id) = input {
                     let view = self.input_view(id, true)?;
@@ -752,8 +1089,9 @@ impl State {
                         )
                     });
                     entries.truncate(MAX_INPUTS);
-                    for entry in entries {
-                        reply.inputs.push(self.input_view(entry.request, false)?);
+                    let ids: Vec<Id> = entries.iter().map(|q| q.request).collect();
+                    for id in ids {
+                        reply.inputs.push(self.input_view(id, false)?);
                     }
                 }
                 return Ok(reply);
@@ -774,8 +1112,7 @@ impl State {
                     prompt: &prompt,
                 })
                 .map_err(|_| Error::Invalid)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                if let Some(prior) = state.requests.get(&request) {
+                if let Some(prior) = self.read(|state, store| state.outcome(request, store))? {
                     return if prior.digest == digest {
                         if let Outcome::QueueInput {
                             input,
@@ -783,12 +1120,7 @@ impl State {
                             order_revision,
                         } = prior.result
                         {
-                            let project = self
-                                .replay
-                                .as_ref()
-                                .and_then(|s| s.inputs.get(&input))
-                                .ok_or(Error::Invalid)?
-                                .project;
+                            let project = self.input_project(input)?;
                             let mut reply = self.project_queue_reply(project, Some(input))?;
                             reply.order_revision = Some(order_revision);
                             Ok(reply)
@@ -799,19 +1131,22 @@ impl State {
                         Err(Error::Conflict)
                     };
                 }
-                if !state.projects.contains_key(&project) {
-                    return Err(Error::Invalid);
-                }
-                if let Some(id) = conversation
-                    && !state.conversations.get(&id).is_some_and(|c| {
+                self.find_project(project)?;
+                if let Some(id) = conversation {
+                    let found = self.read(|state, store| state.find_conversation(id, store))?;
+                    if !found.is_some_and(|c| {
                         c.project == project && expected_generation <= c.generation
-                    })
-                {
-                    return Err(Error::Conflict);
+                    }) {
+                        return Err(Error::Conflict);
+                    }
                 }
                 let held = self.project(project)?;
                 held.validate().map_err(|_| Error::StaleProject)?;
-                let revision = state.order_revision.checked_add(1).ok_or(Error::Limit)?;
+                let revision = self
+                    .state()?
+                    .order_revision
+                    .checked_add(1)
+                    .ok_or(Error::Limit)?;
                 self.append(Record::InputQueued(InputQueued {
                     request,
                     digest,
@@ -825,12 +1160,7 @@ impl State {
                     order_revision: revision,
                 }))?;
                 held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
-                let input = match self
-                    .replay
-                    .as_ref()
-                    .and_then(|s| s.requests.get(&request))
-                    .map(|r| &r.result)
-                {
+                let input = match self.state()?.requests.get(&request).map(|r| &r.result) {
                     Some(Outcome::QueueInput { input, .. }) => *input,
                     _ => return Err(Error::RepairRequired),
                 };
@@ -848,20 +1178,14 @@ impl State {
                     expected_order_revision,
                 })
                 .map_err(|_| Error::Invalid)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                if let Some(prior) = state.requests.get(&request) {
+                if let Some(prior) = self.read(|state, store| state.outcome(request, store))? {
                     return if prior.digest == digest {
                         if let Outcome::ReorderInput {
                             input,
                             order_revision,
                         } = prior.result
                         {
-                            let project = self
-                                .replay
-                                .as_ref()
-                                .and_then(|s| s.inputs.get(&input))
-                                .ok_or(Error::Invalid)?
-                                .project;
+                            let project = self.input_project(input)?;
                             let mut reply = self.project_queue_reply(project, None)?;
                             reply.order_revision = Some(order_revision);
                             Ok(reply)
@@ -872,6 +1196,7 @@ impl State {
                         Err(Error::Conflict)
                     };
                 }
+                let state = self.state()?.clone();
                 if expected_order_revision != state.order_revision {
                     let project = state.inputs.get(&input).ok_or(Error::Invalid)?.project;
                     let mut reply = self.project_queue_reply(project, None)?;
@@ -918,8 +1243,7 @@ impl State {
             } => {
                 let digest = request_digest(Request::InputDecision { input, action })
                     .map_err(|_| Error::Invalid)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                if let Some(prior) = state.requests.get(&request) {
+                if let Some(prior) = self.read(|state, store| state.outcome(request, store))? {
                     return if prior.digest == digest
                         && prior.result == Outcome::InputDecision(input)
                     {
@@ -928,7 +1252,7 @@ impl State {
                         Err(Error::Conflict)
                     };
                 }
-                let status = state.input_status(input).ok_or(Error::Invalid)?;
+                let status = self.state()?.input_status(input).ok_or(Error::Invalid)?;
                 if !(if action == InputAction::Hold {
                     status == InputStatus::Queued
                 } else {
@@ -956,8 +1280,7 @@ impl State {
                     target_generation,
                 })
                 .map_err(|_| Error::Invalid)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                if let Some(prior) = state.requests.get(&request) {
+                if let Some(prior) = self.read(|state, store| state.outcome(request, store))? {
                     return if prior.digest == digest
                         && prior.result == Outcome::InputDecision(input)
                     {
@@ -966,13 +1289,14 @@ impl State {
                         Err(Error::Conflict)
                     };
                 }
+                let state = self.state()?.clone();
                 if !state.can_promote_input(input, target_operation, target_generation) {
                     return Err(Error::Conflict);
                 }
                 let queued = state.inputs.get(&input).ok_or(Error::Invalid)?;
                 let project = queued.project;
                 // Every queued input is a kind 18 record.
-                let Record::InputQueued(original) = self.record(queued.frame.clone())? else {
+                let Record::InputQueued(original) = self.record(queued.frame)? else {
                     return Err(Error::RepairRequired);
                 };
                 self.steering_prompt(target_operation, &original.prompt)?;
@@ -989,7 +1313,7 @@ impl State {
                 return self.queue_reply(input);
             }
             Command::PrepareInput { input } => {
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
+                let state = self.state()?.clone();
                 if state.ready_input() != Some(input) {
                     return Err(Error::Conflict);
                 }
@@ -1023,50 +1347,83 @@ impl State {
             }
 
             Command::Initialize { request } => self.initialize(request)?,
-            Command::Projects { after, limit } => {
+            Command::Projects {
+                after,
+                before,
+                limit,
+            } => {
                 if !(1..=8).contains(&limit) {
                     return Err(Error::Invalid);
                 }
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
+                self.state()?;
+                return self.projects(after, before, limit);
+            }
+            Command::Project { project } => {
+                self.state()?;
+                let entry = self.read(|state, store| state.find_project(project, store))?;
                 let mut reply = self.reply();
-                for (id, p) in state
-                    .projects
-                    .iter()
-                    .filter(|(id, _)| after.is_none_or(|after| **id > after))
-                    .take(limit)
-                {
-                    reply.projects.push((p.clone(), self.project(*id).err()));
+                if let Some(entry) = entry {
+                    let listing = self.listing(entry);
+                    reply.projects.push(listing);
                 }
                 return Ok(reply);
             }
-            Command::ReadRecord { range } => {
-                let valid = self.replay.as_ref().is_some_and(|r| {
-                    r.inputs.values().any(|q| q.frame == range)
-                        || r.operations.values().any(|op| {
-                            op.accepted_frame == range
-                                || op.terminal.as_ref().is_some_and(|t| t.frame == range)
-                        })
-                });
-                if !valid {
+            Command::Conversations {
+                project,
+                before,
+                limit,
+            } => {
+                if !(1..=8).contains(&limit) {
+                    return Err(Error::Invalid);
+                }
+                self.find_project(project)?;
+                let hi = Key::new(
+                    Tag::ProjectConversation,
+                    project,
+                    before.unwrap_or(u64::MAX),
+                );
+                let lo = Key::new(Tag::ProjectConversation, project, 0);
+                let found =
+                    self.read(|state, store| state.range(&lo, &hi, true, limit + 1, store))?;
+                let mut reply = self.reply();
+                reply.more = found.len() > limit;
+                for (key, value) in found.into_iter().take(limit) {
+                    let Entry::ProjectConversation { conversation } =
+                        Entry::decode(Tag::ProjectConversation, &value).map_err(lookup)?
+                    else {
+                        return Err(Error::RepairRequired);
+                    };
+                    reply.conversations.push((conversation, key.disc));
+                }
+                return Ok(reply);
+            }
+            Command::ReadRecord { locator } => {
+                // A caller's locator that names no frame is not damage.
+                let (_, mut store) = self.journal()?.store();
+                let record = store.frame(&locator).map_err(|_| Error::Invalid)?;
+                if !matches!(
+                    record,
+                    Record::InputQueued(_) | Record::TurnAccepted(_) | Record::TurnTerminal(_)
+                ) {
                     return Err(Error::Invalid);
                 }
                 let mut reply = self.reply();
-                reply.record = Some(self.record(range)?);
+                reply.record = Some(record);
                 return Ok(reply);
             }
             Command::ReadResponse { operation, offset } => {
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                let op = state.operations.get(&operation).ok_or(Error::Invalid)?;
-                let terminal = op.terminal.as_ref().ok_or(Error::Invalid)?;
-                let Record::TurnTerminal(mut record) = self.record(terminal.frame.clone())? else {
+                let (length, terminal_frame) = self.terminal_facts(operation)?;
+                let Record::TurnTerminal(mut record) = self.record(terminal_frame)? else {
                     return Err(Error::RepairRequired);
                 };
-                let (start, text) = self.response_window(&op.response, offset)?;
+                let (start, text) = self.response_window(operation, length, offset)?;
                 record.text_offset = start;
                 record.text = text;
+                let tools = self.tools(operation)?;
                 let mut reply = self.reply();
-                reply.response_bytes = Some(op.response.len);
+                reply.response_bytes = Some(length);
                 reply.record = Some(Record::TurnTerminal(record));
+                reply.tools = Some(tools);
                 return Ok(reply);
             }
             Command::History {
@@ -1083,73 +1440,61 @@ impl State {
                 }
                 self.connect_graph(false)?;
                 let held = self.project(project)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                let selected = if let Some(conversation) = conversation {
-                    if !state
-                        .conversations
-                        .get(&conversation)
-                        .is_some_and(|c| c.project == project)
-                    {
-                        return Err(Error::Invalid);
+                let selected = match conversation {
+                    Some(conversation) => {
+                        let found =
+                            self.read(|state, store| state.find_conversation(conversation, store))?;
+                        if !found.is_some_and(|c| c.project == project) {
+                            return Err(Error::Invalid);
+                        }
+                        Some(conversation)
                     }
-                    Some(conversation)
-                } else {
-                    state.latest_conversation(project)
+                    None => self.find_project(project)?.latest.map(|l| l.conversation),
                 };
-                if let Some(before) = before_accepted_frame
-                    && !state.operations.values().any(|op| {
-                        Some(op.conversation) == selected && op.accepted_frame.start == before
-                    })
-                {
-                    return Err(Error::Invalid);
-                }
-                let mut entries: Vec<_> = selected
-                    .map(|conversation| {
-                        state.accepted_page(conversation, before_accepted_frame, limit + 1)
-                    })
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(operation, op)| HistoryEntry {
-                        operation,
-                        generation: op.generation,
-                        accepted_frame: op.accepted_frame.start,
-                        terminal: op.terminal.as_ref().map(|terminal| terminal.kind),
-                    })
-                    .collect();
-                let has_more = entries.len() > limit;
-                entries.truncate(limit);
+                let page = match selected {
+                    Some(conversation) => {
+                        self.history_page(project, conversation, before_accepted_frame, limit)?
+                    }
+                    None => (Vec::new(), false, None),
+                };
                 held.validate().map_err(|_| Error::StaleProject)?;
                 let mut reply = self.reply();
                 reply.history = Some(HistoryPage {
                     project,
                     conversation: selected,
-                    generation: selected.map(|id| state.conversations[&id].generation),
-                    revision: state.revision,
-                    has_more,
-                    entries,
+                    generation: page.2,
+                    revision: self.state()?.revision,
+                    has_more: page.1,
+                    entries: page.0,
                 });
                 return Ok(reply);
             }
             Command::ReadPrompt { project, operation } => {
                 self.connect_graph(false)?;
                 let held = self.project(project)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                let op = state.operations.get(&operation).ok_or(Error::Invalid)?;
-                if !state
-                    .conversations
-                    .get(&op.conversation)
-                    .is_some_and(|c| c.project == project)
-                {
+                let (conversation, generation, accepted) =
+                    match self.state()?.operations.get(&operation) {
+                        Some(op) => (op.conversation, op.generation, op.accepted_frame),
+                        None => {
+                            let facts = self
+                                .read(|state, store| state.operation_facts(operation, store))?
+                                .ok_or(Error::Invalid)?;
+                            (facts.conversation, facts.generation, facts.accepted)
+                        }
+                    };
+                let found =
+                    self.read(|state, store| state.find_conversation(conversation, store))?;
+                if !found.is_some_and(|c| c.project == project) {
                     return Err(Error::Invalid);
                 }
-                let record = self.record(op.accepted_frame.clone())?;
-                let Record::TurnAccepted(ref accepted) = record else {
+                let record = self.record(accepted)?;
+                let Record::TurnAccepted(ref value) = record else {
                     return Err(Error::RepairRequired);
                 };
-                if accepted.project != project
-                    || accepted.operation != operation
-                    || accepted.conversation != op.conversation
-                    || accepted.generation != op.generation
+                if value.project != project
+                    || value.operation != operation
+                    || value.conversation != conversation
+                    || value.generation != generation
                 {
                     return Err(Error::RepairRequired);
                 }
@@ -1164,37 +1509,45 @@ impl State {
                     location: &location,
                 })
                 .map_err(|_| Error::Invalid)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                if let Some(existing) = state.requests.get(&request) {
+                if let Some(existing) = self.read(|state, store| state.outcome(request, store))? {
                     return if existing.digest == digest {
-                        if let Outcome::Project(id) = existing.result {
-                            self.project(id)?
-                                .validate()
-                                .map_err(|_| Error::StaleProject)?;
-                        } else {
+                        let Outcome::Project(id) = existing.result else {
                             return Err(Error::Conflict);
-                        }
-                        Ok(self.reply())
+                        };
+                        self.project(id)?
+                            .validate()
+                            .map_err(|_| Error::StaleProject)?;
+                        let entry = self.find_project(id)?;
+                        let mut reply = self.reply();
+                        reply.project = Some(self.listing(entry));
+                        Ok(reply)
                     } else {
                         Err(Error::Conflict)
                     };
                 }
                 let held = ProjectIdentity::open(&location, &self.runtime.state_boundary())
                     .map_err(project_error)?;
-                let record = if let Some(existing) = state
-                    .projects
-                    .values()
-                    .find(|p| p.device == held.device && p.inode == held.inode)
-                {
-                    self.project(existing.project)?
+                let identity = Key::new(
+                    Tag::Identity,
+                    crate::authority::index::identity_id(held.device, held.inode),
+                    0,
+                );
+                let existing = match self.read(|state, store| state.entry(&identity, store))? {
+                    Some(Entry::Identity { project }) => Some(self.find_project(project)?),
+                    Some(_) => return Err(Error::RepairRequired),
+                    None => None,
+                };
+                let project_id = existing.as_ref().map(|e| e.registration.project);
+                let record = if let Some(existing) = existing {
+                    self.project(existing.registration.project)?
                         .validate()
                         .map_err(|_| Error::StaleProject)?;
                     Record::ProjectRequestAlias(ProjectRequestAlias {
                         request,
                         digest,
                         location,
-                        project: existing.project,
-                        registry_revision: existing.registry_revision,
+                        project: existing.registration.project,
+                        registry_revision: existing.registration.registry_revision,
                     })
                 } else {
                     Record::ProjectRegistered(ProjectRegistered {
@@ -1208,9 +1561,17 @@ impl State {
                         visibility: 1,
                     })
                 };
+                let id = match &record {
+                    Record::ProjectRegistered(p) => p.project,
+                    _ => project_id.expect("alias names a project"),
+                };
                 held.validate().map_err(|_| Error::StaleProject)?;
                 self.append(record)?;
                 held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
+                let entry = self.find_project(id)?;
+                let mut reply = self.reply();
+                reply.project = Some(self.listing(entry));
+                return Ok(reply);
             }
             Command::RenameProject {
                 request,
@@ -1224,8 +1585,7 @@ impl State {
                     name: &name,
                 })
                 .map_err(|_| Error::Invalid)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
-                if let Some(existing) = state.requests.get(&request) {
+                if let Some(existing) = self.read(|state, store| state.outcome(request, store))? {
                     if existing.digest != digest {
                         return Err(Error::Conflict);
                     }
@@ -1245,17 +1605,22 @@ impl State {
                     reply.project_name = Some(original_name.clone());
                     reply.project_name_revision = Some(*original_revision);
                     reply.project_name_changed = Some(*changed);
+                    let entry = self.find_project(project)?;
+                    reply.project = Some(self.listing(entry));
                     return Ok(reply);
                 }
-                let held = self.project(project)?;
+                let entry = self.find_project(project)?;
+                let held = self.held_identity(&entry.registration)?;
+                let listing = self.listing(entry);
                 let (current_name, current_revision) =
-                    state.project_name(project).ok_or(Error::Invalid)?;
+                    (listing.name.clone(), listing.name_revision);
                 if expected_name_revision != current_revision {
                     let mut reply = self.reply();
                     reply.project_name = Some(current_name);
                     reply.project_name_revision = Some(current_revision);
                     reply.project_name_changed = Some(false);
                     reply.stale_project_name_revision = true;
+                    reply.project = Some(listing);
                     return Ok(reply);
                 }
                 let capitalized = capitalize_project_name(&name).map_err(|_| Error::Invalid)?;
@@ -1275,6 +1640,8 @@ impl State {
                 reply.project_name_changed = Some(current_name != capitalized);
                 reply.project_name = Some(capitalized);
                 reply.project_name_revision = Some(name_revision);
+                let entry = self.find_project(project)?;
+                reply.project = Some(self.listing(entry));
                 return Ok(reply);
             }
             Command::Prepare {
@@ -1292,64 +1659,30 @@ impl State {
                     prompt: &prompt,
                 })
                 .map_err(|_| Error::Invalid)?;
-                let state = self.replay.as_ref().ok_or(Error::NotInitialized)?;
                 let config = self.config()?;
-                let model = config.model;
-                let asset_root = config.asset_root;
-                let ollama_endpoint = config.ollama_endpoint;
-                let model_capabilities = config.model_capabilities;
-                let configuration_digest = config.digest;
                 let mut history = Vec::new();
+                let mut omitted = 0;
                 if let Some(id) = conversation {
-                    let conversation = state.conversations.get(&id).ok_or(Error::Invalid)?;
-                    if conversation.project != project
-                        || conversation.generation != expected_generation
-                    {
+                    let found = self
+                        .read(|state, store| state.find_conversation(id, store))?
+                        .ok_or(Error::Invalid)?;
+                    if found.project != project || found.generation != expected_generation {
                         return Err(Error::Conflict);
                     }
-                    let mut prior: Vec<_> = state
-                        .operations
-                        .values()
-                        .filter(|op| {
-                            op.conversation == id
-                                && op
-                                    .terminal
-                                    .as_ref()
-                                    .is_some_and(|t| t.kind == TerminalKind::Complete)
-                        })
-                        .collect();
-                    // Candidates for the context composer, newest first. The window is
-                    // known only after Hello, so no turn-count or byte rule applies
-                    // here; the journal's fixed capacity bounds the total text.
-                    prior.sort_by_key(|op| std::cmp::Reverse(op.generation));
-                    for op in prior {
-                        let Record::TurnAccepted(accepted) =
-                            self.record(op.accepted_frame.clone())?
-                        else {
-                            return Err(Error::RepairRequired);
-                        };
-                        let Record::TurnTerminal(mut terminal) =
-                            self.record(op.terminal.as_ref().expect("complete").frame.clone())?
-                        else {
-                            return Err(Error::RepairRequired);
-                        };
-                        // The whole response: kind 24 segments and the tail.
-                        terminal.text = self.response_text(&op.response)?;
-                        terminal.text_offset = 0;
-                        history.push((*accepted, terminal));
-                    }
+                    (history, omitted) = self.history(id)?;
                 } else if expected_generation != 0 {
                     return Err(Error::Conflict);
                 }
                 held.validate().map_err(|_| Error::StaleProject)?;
                 let mut reply = self.reply();
                 reply.prepared = Some(Prepared {
-                    model,
-                    asset_root,
-                    ollama_endpoint,
-                    model_capabilities,
-                    configuration_digest,
+                    model: config.model,
+                    asset_root: config.asset_root,
+                    ollama_endpoint: config.ollama_endpoint,
+                    model_capabilities: config.model_capabilities,
+                    configuration_digest: config.digest,
                     history,
+                    omitted,
                 });
                 return Ok(reply);
             }
@@ -1358,8 +1691,7 @@ impl State {
                 record,
                 admission,
             } => {
-                if self.replay.as_ref().ok_or(Error::NotInitialized)?.revision != expected_revision
-                {
+                if self.state()?.revision != expected_revision {
                     return Err(Error::Conflict);
                 }
                 let held = if let Record::TurnAccepted(turn) = &record {
@@ -1382,5 +1714,148 @@ impl State {
             }
         }
         Ok(self.reply())
+    }
+    /// One newest-first page of a conversation's turns below an accepted
+    /// sequence (SJ-D14), with the conversation generation.
+    fn history_page(
+        &mut self,
+        project: Id,
+        conversation: Id,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<(Vec<HistoryEntry>, bool, Option<u64>)> {
+        let found = self
+            .read(|state, store| state.find_conversation(conversation, store))?
+            .ok_or(Error::Invalid)?;
+        let state = self.state()?.clone();
+        let mut entries = Vec::new();
+        // The newest turn may be active (no `T` entry yet).
+        let active = state
+            .active()
+            .filter(|(_, op)| op.conversation == conversation)
+            .map(|(id, op)| HistoryEntry {
+                operation: id,
+                generation: op.generation,
+                accepted_frame: op.accepted_frame.sequence,
+                terminal: None,
+            });
+        let below_generation = match before {
+            None => {
+                entries.extend(active);
+                found.generation.saturating_add(1)
+            }
+            Some(sequence) => {
+                let anchor = self.read(|state, store| {
+                    state.entry(&Key::new(Tag::Activity, project, sequence), store)
+                })?;
+                match anchor {
+                    Some(Entry::Activity {
+                        conversation: c,
+                        generation,
+                        ..
+                    }) if c == conversation => generation,
+                    _ => return Err(Error::Invalid),
+                }
+            }
+        };
+        let lo = Key::new(Tag::Turn, conversation, 0);
+        let hi = Key::new(Tag::Turn, conversation, below_generation);
+        let want = limit + 1 - entries.len().min(limit);
+        let turns = self.read(|state, store| state.range(&lo, &hi, true, want, store))?;
+        for (key, value) in turns {
+            let Entry::Turn {
+                operation,
+                terminal,
+                accepted,
+                ..
+            } = Entry::decode(Tag::Turn, &value).map_err(lookup)?
+            else {
+                return Err(Error::RepairRequired);
+            };
+            if entries
+                .iter()
+                .any(|e: &HistoryEntry| e.operation == operation)
+            {
+                continue;
+            }
+            entries.push(HistoryEntry {
+                operation,
+                generation: key.disc,
+                accepted_frame: accepted.sequence,
+                terminal: Some(terminal),
+            });
+        }
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        Ok((entries, has_more, Some(found.generation)))
+    }
+    /// The journal facts of one retained exec_cmd payload.
+    fn payload_fact(&mut self, payload: Id) -> Result<Option<PayloadFact>> {
+        let state = self.state()?.clone();
+        // The active and delta operations hold their calls in memory.
+        for (operation, op) in &state.operations {
+            for tool in &op.tools {
+                if let Some(exec) = tool.exec_cmd.as_deref()
+                    && (exec.stdout_payload == payload || exec.stderr_payload == payload)
+                {
+                    return Ok(Some(PayloadFact {
+                        payload,
+                        call: exec.job,
+                        operation: *operation,
+                        payloads: [exec.stdout_payload, exec.stderr_payload],
+                        intent_sequence: exec.intent_sequence,
+                        settled: exec
+                            .settled
+                            .as_ref()
+                            .map(|s| (s.state, s.sequence, s.streams)),
+                        active: state.active_operation == Some(*operation),
+                    }));
+                }
+            }
+        }
+        let entry =
+            self.read(|state, store| state.entry(&Key::new(Tag::Payload, payload, 0), store))?;
+        let Some(Entry::Payload {
+            operation,
+            generation,
+            ordinal,
+            intent,
+            settled,
+            ..
+        }) = entry
+        else {
+            return Ok(None);
+        };
+        let call = match self.record(intent)? {
+            Record::ToolCall(call) => call,
+            _ => return Err(Error::RepairRequired),
+        };
+        if call.operation != operation || call.generation != generation || call.ordinal != ordinal {
+            return Err(Error::RepairRequired);
+        }
+        let exec = exec_cmd_call(state.installation_id, &call, intent.sequence);
+        if exec.stdout_payload != payload && exec.stderr_payload != payload {
+            return Err(Error::RepairRequired);
+        }
+        let settled = if settled.is_none() {
+            None
+        } else {
+            match self.record(settled)? {
+                Record::CaptureSettled(p) => {
+                    let s = settlement(&p, settled);
+                    Some((s.state, s.sequence, s.streams))
+                }
+                _ => return Err(Error::RepairRequired),
+            }
+        };
+        Ok(Some(PayloadFact {
+            payload,
+            call: exec.job,
+            operation,
+            payloads: [exec.stdout_payload, exec.stderr_payload],
+            intent_sequence: exec.intent_sequence,
+            settled,
+            active: false,
+        }))
     }
 }

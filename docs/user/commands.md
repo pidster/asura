@@ -43,9 +43,23 @@ on the top bar. An unknown command shows "Unknown command; use /help."
 | Command | Action |
 | --- | --- |
 | `/project add PATH` | Add a folder as a project and select it |
-| `/project list` | List projects with their IDs, names and folders |
-| `/project select ID` | Select a project |
+| `/project list` | List the first 64 projects with their IDs, names and folders |
+| `/project list after ID` | List the next 64 projects after the project with this ID |
+| `/project select ID` | Select a project, also one that the list does not show |
 | `/project rename NAME` | Rename the selected project |
+
+There is no limit on the number of projects. Asura reads the list in pages of
+8 projects and shows at most 64 at a time. When more projects follow, the last
+line is `More: /project list after ID`. Type that command to see the next 64.
+In the project list on the status bar, Asura reads the next or the previous
+page when you move past the last or the first row.
+
+`/project select ID` first asks the service for that project when the list
+does not show it. If the project is not found, Asura keeps your text and
+shows "Project not found". Escape stops the wait.
+
+In a terminal, `asura project list` prints every project, one page at a time,
+as each page arrives. Press Ctrl-C to stop it.
 
 ## Model and configuration commands
 
@@ -66,3 +80,20 @@ on the top bar. An unknown command shows "Unknown command; use /help."
 `/help`, `/quit`, `/exit`, `/init`, `/new`, `/cancel`, `/retry`, `/models` and
 `/tools` take no arguments. Results open in a panel above the input box; Escape
 closes it.
+
+## Journal space
+
+The service records conversations and projects in its journal. The journal has
+a size limit, the `journal.quotaBytes` setting, and it keeps some free disk
+space. See [Configuration](guide.md#configuration). When the journal is full,
+the service refuses new messages, new projects and renames, and Asura keeps
+your text:
+
+| Message | Meaning |
+| --- | --- |
+| Journal space is full. Raise journal.quotaBytes or free disk space. | The journal reached `journal.quotaBytes`. Use `/config set journal.quotaBytes VALUE` with a larger value, or remove files. |
+| Disk space is low for the journal. | The disk has too little free space. Remove files from the disk. |
+
+An answer that is running when the journal fills pauses. Its activity row
+shows `Paused: journal space is full.` The answer continues when space is
+available again. Escape or `/cancel` stops it.

@@ -137,3 +137,66 @@ fn installation_commands_and_failure_nullability() {
     }
     assert_eq!(value["error_code"], "service_absent");
 }
+/// CF06b / SJ-37 (command level): `asura project list` prints all 200
+/// projects, each page written before the next read, with no page total.
+#[test]
+fn project_list_prints_every_page_as_it_arrives() {
+    use crate::conversation::tests::{numbered, serve};
+    let mut out = Vec::new();
+    let mut reads = 0;
+    print_project_pages(
+        |read, limit| {
+            reads += 1;
+            Ok(serve(200, read, limit))
+        },
+        &mut out,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(reads, 25);
+    assert_eq!(lines.len(), 200);
+    for (index, line) in lines.iter().enumerate() {
+        assert_eq!(
+            *line,
+            crate::conversation::project_list_line(&numbered(index as u16 + 1))
+        );
+    }
+    // A page is written before the following read starts.
+    struct Sink<'a>(&'a std::cell::RefCell<Vec<u8>>);
+    impl std::io::Write for Sink<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let written = std::cell::RefCell::new(Vec::new());
+    let mut lines_before_read = Vec::new();
+    print_project_pages(
+        |read, limit| {
+            lines_before_read.push(written.borrow().iter().filter(|b| **b == b'\n').count());
+            Ok(serve(20, read, limit))
+        },
+        &mut Sink(&written),
+    )
+    .unwrap();
+    assert_eq!(lines_before_read, vec![0, 8, 16]);
+    let mut empty = Vec::new();
+    print_project_pages(|read, limit| Ok(serve(0, read, limit)), &mut empty).unwrap();
+    assert_eq!(empty, b"No projects. Use /project add PATH\n");
+    let mut failed = Vec::new();
+    assert_eq!(
+        print_project_pages(
+            |_, _| Ok(asura_control::pb::ProjectsReply {
+                error: Some("journal_disk_space".into()),
+                ..Default::default()
+            }),
+            &mut failed
+        )
+        .unwrap_err(),
+        crate::conversation::JOURNAL_DISK_NOTICE
+    );
+}

@@ -3,24 +3,24 @@ use crate::authority::{HEADER, MAX_FRAME, ReplayError, TRAILER};
 use sha2::{Digest, Sha256};
 
 type Result<T> = std::result::Result<T, ReplayError>;
-struct Writer(Vec<u8>);
+pub(crate) struct Writer(pub(crate) Vec<u8>);
 impl Writer {
-    fn bytes(&mut self, b: &[u8]) {
+    pub(crate) fn bytes(&mut self, b: &[u8]) {
         self.0.extend_from_slice(b);
     }
-    fn byte(&mut self, n: u8) {
+    pub(crate) fn byte(&mut self, n: u8) {
         self.0.push(n);
     }
-    fn u64(&mut self, n: u64) {
+    pub(crate) fn u64(&mut self, n: u64) {
         self.bytes(&n.to_be_bytes());
     }
-    fn u32(&mut self, n: u32) {
+    pub(crate) fn u32(&mut self, n: u32) {
         self.bytes(&n.to_be_bytes());
     }
-    fn u16(&mut self, n: u16) {
+    pub(crate) fn u16(&mut self, n: u16) {
         self.bytes(&n.to_be_bytes());
     }
-    fn string(&mut self, s: &str, limit: usize) -> Result<()> {
+    pub(crate) fn string(&mut self, s: &str, limit: usize) -> Result<()> {
         if s.len() > limit {
             return Err(ReplayError::Limit);
         }
@@ -28,19 +28,19 @@ impl Writer {
         self.bytes(s.as_bytes());
         Ok(())
     }
-    fn optional(&mut self, id: Option<Id>) {
+    pub(crate) fn optional(&mut self, id: Option<Id>) {
         self.byte(u8::from(id.is_some()));
         if let Some(id) = id {
             self.bytes(&id);
         }
     }
 }
-struct Reader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
+pub(crate) struct Reader<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) offset: usize,
 }
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.offset.checked_add(n).ok_or(ReplayError::Corrupt)?;
         let bytes = self
             .bytes
@@ -49,23 +49,23 @@ impl<'a> Reader<'a> {
         self.offset = end;
         Ok(bytes)
     }
-    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
         Ok(self.take(N)?.try_into().unwrap())
     }
-    fn byte(&mut self) -> Result<u8> {
+    pub(crate) fn byte(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
-    fn u64(&mut self) -> Result<u64> {
+    pub(crate) fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_be_bytes(self.array()?))
     }
-    fn u32(&mut self) -> Result<u32> {
+    pub(crate) fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.array()?))
     }
-    fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_be_bytes(self.array()?))
     }
     /// A J1 string: a length over `limit` is `Corrupt`, like any other field.
-    fn bounded_string(&mut self, limit: usize) -> Result<String> {
+    pub(crate) fn bounded_string(&mut self, limit: usize) -> Result<String> {
         let n = self.u32()? as usize;
         if n > limit {
             return Err(ReplayError::Corrupt);
@@ -74,21 +74,21 @@ impl<'a> Reader<'a> {
             .map_err(|_| ReplayError::Corrupt)?
             .to_owned())
     }
-    fn flag(&mut self) -> Result<bool> {
+    pub(crate) fn flag(&mut self) -> Result<bool> {
         match self.byte()? {
             0 => Ok(false),
             1 => Ok(true),
             _ => Err(ReplayError::Corrupt),
         }
     }
-    fn optional(&mut self) -> Result<Option<Id>> {
+    pub(crate) fn optional(&mut self) -> Result<Option<Id>> {
         if self.flag()? {
             Ok(Some(self.array()?))
         } else {
             Ok(None)
         }
     }
-    fn string(&mut self, limit: usize) -> Result<String> {
+    pub(crate) fn string(&mut self, limit: usize) -> Result<String> {
         let n = self.u32()? as usize;
         if n > limit {
             return Err(ReplayError::Limit);
@@ -97,21 +97,11 @@ impl<'a> Reader<'a> {
             .map_err(|_| ReplayError::Corrupt)?
             .to_owned())
     }
-    fn cause(&mut self) -> Result<Cause> {
-        match self.byte()? {
-            0 => Ok(Cause::None),
-            1 => Ok(Cause::UserCancel),
-            2 => Ok(Cause::Deadline),
-            3 => Ok(Cause::OutputLimit),
-            4 => Ok(Cause::ServiceShutdown),
-            5 => Ok(Cause::ProviderFailure),
-            6 => Ok(Cause::ProtocolFailure),
-            7 => Ok(Cause::Restart),
-            8 => Ok(Cause::AuthorityFailure),
-            9 => Ok(Cause::InputLimit),
-            10 => Ok(Cause::Steering),
-            _ => Err(ReplayError::Corrupt),
-        }
+    pub(crate) fn cause(&mut self) -> Result<Cause> {
+        Cause::from_code(self.byte()?).ok_or(ReplayError::Corrupt)
+    }
+    pub(crate) fn finish(&self) -> Result<()> {
+        require(self.offset == self.bytes.len())
     }
 }
 
@@ -1437,13 +1427,7 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
         8 => Record::TurnTerminal(TurnTerminal {
             operation: r.array()?,
             generation: r.u64()?,
-            kind: match r.byte()? {
-                1 => TerminalKind::Complete,
-                2 => TerminalKind::Failed,
-                3 => TerminalKind::Cancelled,
-                4 => TerminalKind::Interrupted,
-                _ => return Err(ReplayError::Corrupt),
-            },
+            kind: TerminalKind::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
             cause: r.cause()?,
             final_cursor: r.u64()?,
             usage_known: r.flag()?,

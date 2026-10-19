@@ -7,7 +7,6 @@ use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const MAX_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorityError {
     Unsafe,
@@ -47,7 +46,7 @@ impl Drop for DirectoryStream {
         }
     }
 }
-fn census(fd: RawFd, cancel: &AtomicBool) -> Result<Vec<CString>, AuthorityError> {
+fn census(fd: RawFd, cancel: &AtomicBool, limit: usize) -> Result<Vec<CString>, AuthorityError> {
     let fresh = open_at(fd, c".", libc::O_RDONLY | libc::O_DIRECTORY, 0).map_err(map)?;
     let raw = fresh.into_raw_fd();
     // SAFETY: fdopendir takes the fresh descriptor on success; failure closes it below.
@@ -80,7 +79,7 @@ fn census(fd: RawFd, cancel: &AtomicBool) -> Result<Vec<CString>, AuthorityError
         if [c".", c".."].contains(&name) {
             continue;
         }
-        if names.len() == 64 {
+        if names.len() == limit {
             return Err(AuthorityError::Limit);
         }
         names.push(name.to_owned());
@@ -191,7 +190,6 @@ pub enum AuthoritySource {
 }
 pub struct AuthorityReader {
     inspection: Arc<Inspection>,
-    journal: usize,
     unknown: bool,
 }
 impl AuthorityReader {
@@ -201,54 +199,24 @@ impl AuthorityReader {
     pub fn validate(&self) -> Result<(), AuthorityError> {
         self.inspection.validate()
     }
-    pub fn read_all(&mut self, cancelled: &AtomicBool) -> Result<Vec<u8>, AuthorityError> {
-        active(cancelled)?;
+    /// A read-only view of the journal control directory for replay. It
+    /// never writes and takes no lock; the inspection witness detects any
+    /// change made while it reads.
+    pub fn directory(
+        &self,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<crate::JournalDirectory, AuthorityError> {
+        active(&cancelled)?;
         self.validate()?;
-        let node = &self.inspection.nodes[self.journal];
-        let size = u64::try_from(node.before.st_size).map_err(|_| AuthorityError::Unsafe)?;
-        if size > MAX_BYTES {
-            return Err(AuthorityError::Limit);
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(size as usize)
-            .map_err(|_| AuthorityError::Limit)?;
-        let mut offset = 0;
-        let mut chunk = [0u8; 64 * 1024];
-        while offset < size {
-            crate::journal_io::gate::read_point(&self.inspection.runtime, cancelled, false)
-                .map_err(|_| AuthorityError::Cancelled)?;
-            active(cancelled)?;
-            let wanted = (size - offset).min(chunk.len() as u64) as usize;
-            // SAFETY: pread reads at most wanted bytes into a valid buffer; no shared cursor change.
-            let count = unsafe {
-                libc::pread(
-                    node.fd.as_raw_fd(),
-                    chunk.as_mut_ptr().cast(),
-                    wanted,
-                    offset as libc::off_t,
-                )
-            };
-            if count < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(if error.kind() == io::ErrorKind::PermissionDenied {
-                    AuthorityError::Unsafe
-                } else {
-                    AuthorityError::Io
-                });
-            }
-            if count == 0 {
-                return Err(AuthorityError::Changed);
-            }
-            bytes.extend_from_slice(&chunk[..count as usize]);
-            offset += count as u64;
-        }
-        active(cancelled)?;
-        self.validate()?;
-        Ok(bytes)
+        crate::JournalDirectory::open_read_only(self.inspection.runtime.clone(), cancelled).map_err(
+            |error| match error {
+                crate::JournalError::Cancelled => AuthorityError::Cancelled,
+                crate::JournalError::Unsafe => AuthorityError::Unsafe,
+                crate::JournalError::Absent => AuthorityError::Changed,
+                crate::JournalError::Limit => AuthorityError::Limit,
+                _ => AuthorityError::Io,
+            },
+        )
     }
 }
 impl RuntimeDirectory {
@@ -272,7 +240,7 @@ impl RuntimeDirectory {
                 content: true,
             }],
         };
-        let names = census(inspection.nodes[0].fd.as_raw_fd(), cancelled)?;
+        let names = census(inspection.nodes[0].fd.as_raw_fd(), cancelled, 64)?;
         let mut evidence = false;
         let mut unknown = false;
         let mut state = None;
@@ -327,33 +295,32 @@ impl RuntimeDirectory {
             } else {
                 let control =
                     inspection.open(state, c"control", libc::S_IFDIR, Some(0o700), true)?;
-                let entries = census(inspection.nodes[control].fd.as_raw_fd(), cancelled)?;
-                if entries
-                    .iter()
-                    .any(|entry| entry.as_c_str() != c"slot-0.log")
-                {
-                    AuthoritySource::UnsupportedLayout
-                } else if entries.is_empty() {
-                    AuthoritySource::Remnants
-                } else {
-                    let journal = inspection.open(
-                        control,
-                        c"slot-0.log",
-                        libc::S_IFREG,
-                        Some(0o600),
-                        true,
-                    )?;
-                    inspection.validate()?;
-                    active(cancelled)?;
-                    let inspection = Arc::new(inspection);
-                    return Ok(AuthorityScan {
-                        witness: AuthorityWitness(Arc::clone(&inspection)),
-                        source: AuthoritySource::Journal(AuthorityReader {
-                            inspection,
-                            journal,
-                            unknown,
-                        }),
-                    });
+                // The journal names are checked by the read-only census;
+                // only the first entry decides between remnants and a journal.
+                let first = census(
+                    inspection.nodes[control].fd.as_raw_fd(),
+                    cancelled,
+                    crate::journal_io::MAX_CENSUS,
+                )
+                .map(|names| names.into_iter().next());
+                match first {
+                    Ok(None) => AuthoritySource::Remnants,
+                    Ok(Some(name)) if crate::JournalName::parse(name.to_bytes()).is_none() => {
+                        AuthoritySource::UnsupportedLayout
+                    }
+                    Ok(Some(_)) => {
+                        inspection.validate()?;
+                        active(cancelled)?;
+                        let inspection = Arc::new(inspection);
+                        return Ok(AuthorityScan {
+                            witness: AuthorityWitness(Arc::clone(&inspection)),
+                            source: AuthoritySource::Journal(AuthorityReader {
+                                inspection,
+                                unknown,
+                            }),
+                        });
+                    }
+                    Err(error) => return Err(error),
                 }
             }
         } else if evidence {

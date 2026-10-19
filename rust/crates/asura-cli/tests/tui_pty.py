@@ -976,7 +976,7 @@ def repeated_initialization(fixture):
                 assert current["installation_id"] == installation_id, current
             else:
                 installation_id = current["installation_id"]
-            journal = fixture.root / "home/.asura/state/control/slot-0.log"
+            journal = fixture.root / "home/.asura/state/control/seg-0000000000000001.log"
             before = journal.read_bytes()
             command(trial, "/init", "Installation already initialized.")
             assert journal.read_bytes() == before, "repeated init changed journal"
@@ -2560,6 +2560,198 @@ def state_isolation(source):
     print("PASS existing overlapping registration is listed unavailable and refused on selection")
 
 
+def segmented_journal(fixture):
+    """Segmented journal end to end (SJ-01, SJ-15, SJ-35, SJ-37): the old
+    single-file layout is unsupported; 200 projects page in the CLI and the
+    TUI; a project beyond the 64-entry window is selected by ID; a project
+    is added beyond 64; at the disk floor new input is refused with the
+    journal notice and the draft is kept."""
+    # SJ-01: a single-file journal home reports unsupported_layout.
+    old = Fixture(fixture.binary)
+    try:
+        control = old.root / "home/.asura/state/control"
+        control.mkdir(parents=True, mode=0o700)
+        for directory in [old.root / "home/.asura", old.root / "home/.asura/state", control]:
+            directory.chmod(0o700)
+        journal = control / "slot-0.log"
+        journal.write_bytes(b"ASURAJ01 old single-file journal")
+        journal.chmod(0o600)
+        code, raw, err = old.command("service", "start")
+        assert code == 0, (raw, err)
+        old.started = True
+        code, raw, _ = old.command("installation", "status", "--json")
+        status = json.loads(raw)
+        assert status.get("reason") == "unsupported_layout", raw
+        assert journal.read_bytes() == b"ASURAJ01 old single-file journal"
+        old.command("service", "stop")
+    finally:
+        old.cleanup()
+    print("PASS SJ-01 single-file journal home reports unsupported_layout and is preserved")
+
+    result = fixture.command("--seed-projects", "200")
+    assert result[0] == 0, result
+    code, raw, err = fixture.command("service", "start")
+    assert code == 0, (raw, err)
+    fixture.started = True
+    # SJ-37: the CLI prints every page.
+    code, listed, err = fixture.command("project", "list")
+    assert code == 0, (listed, err)
+    lines = [line for line in listed.decode().splitlines() if re.match(r"^[0-9a-f]{32}  ", line)]
+    assert len(lines) == 200, len(lines)
+    ids = [line[:32] for line in lines]
+    assert ids == sorted(ids), "ID order"
+    # SJ-35: a project beyond the old 64 total is added.
+    extra = fixture.root / "projects/extra"
+    extra.mkdir(mode=0o700)
+    code, added, err = fixture.command("project", "add", str(extra))
+    assert code == 0, (added, err)
+    code, listed, _ = fixture.command("project", "list")
+    assert code == 0 and str(extra).encode() in listed, listed
+    ids = [line[:32] for line in listed.decode().splitlines() if re.match(r"^[0-9a-f]{32}  ", line)]
+    assert len(ids) == 201 and ids == sorted(ids)
+    print("PASS SJ-35/SJ-37 CLI: 201 projects listed in ID order; project add succeeds beyond 64")
+
+    trial = fixture.launch(cwd=fixture.root / "projects/p000")
+    try:
+        # Tall enough for 64 rows and the More line.
+        trial.resize(160, 90)
+        offset = len(trial.output)
+        trial.send(b"/project list\r")
+        trial.until(b"More: /project list after ", offset, plain=True, limit=15)
+        screen = trial.screen.text()
+        cursor = re.search(r"More: /project list after ([0-9a-f]{32})", screen)
+        assert cursor, screen
+        assert cursor[1] == ids[63], (cursor[1], ids[63])
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        offset = len(trial.output)
+        trial.send(f"/project list after {cursor[1]}\r".encode())
+        trial.until(ids[64].encode(), offset, plain=True, limit=15)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        # Entry 150 is outside the window: selected by an exact read.
+        target = ids[149]
+        name = next(line.split("  ")[1] for line in listed.decode().splitlines() if line.startswith(target))
+        offset = len(trial.output)
+        trial.send(f"/project select {target}\r".encode())
+        trial.until(f" {name} \u00b7 ".encode(), offset, plain=True, limit=15)
+        print("PASS SJ-37 TUI: More hint, /project list after ID, and selection of entry 150 by ID")
+        # The status-bar picker reads the next page at its last row.
+        offset = len(trial.output)
+        trial.send(b"\x1b[B")  # Plain Down on the input row enters status focus.
+        trial.until(b"Enter open", offset, plain=True, limit=10)
+        offset = len(trial.output)
+        trial.send(b"\r")
+        trial.until("\u2191\u2193 select".encode(), offset, plain=True, limit=10)
+        trial.send(b"\x1b[H")
+        trial.idle(0.2)
+        names = {line[:32]: line.split("  ")[1] for line in listed.decode().splitlines()
+                 if re.match(r"^[0-9a-f]{32}  ", line)}
+        # The window holds entries 64..127 after `/project list after`; the
+        # next page starts at entry 128.
+        beyond = [names[i] for i in ids[128:136]]
+        for _ in range(72):
+            trial.send(b"\x1b[B")
+            trial.idle(0.02)
+        end = time.monotonic() + 10
+        while not any(f" {name} " in trial.screen.text() for name in beyond):
+            assert time.monotonic() < end, trial.screen.text()
+            trial.read(0.05)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        print("PASS SJ-37 TUI picker: moving past row 64 reads the next page")
+        # SJ-15: at the disk floor new input is refused with the notice and
+        # the draft stays. A journal.quotaBytes set rechecks at once.
+        (fixture.root / "home/journal-free-bytes").write_text(str(40 << 20))
+        offset = len(trial.output)
+        trial.send(b"/config set journal.quotaBytes 8589934592\r")
+        trial.until(b"Saved journal.quotaBytes", offset, plain=True, limit=15)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        offset = len(trial.output)
+        trial.send(b"keep this draft\r")
+        trial.until(b"Disk space is low for the journal.", offset, plain=True, limit=15)
+        assert "keep this draft" in trial.screen.text(), trial.screen.text()
+        assert "Rejected local" in trial.screen.text(), trial.screen.text()
+        (fixture.root / "home/journal-free-bytes").write_text(str(1 << 40))
+        print("PASS SJ-15 TUI: journal_disk_space notice, draft kept")
+        # The retained local input asks before it is discarded on exit.
+        trial.send(b"\x01\x0b/quit\r")
+        trial.idle(0.2)
+        trial.send(b"\x1b[D")
+        trial.idle(0.1)
+        trial.send(b"\r")
+        trial.finish()
+    finally:
+        trial.close()
+    # The CLI started this backend; stop it explicitly.
+    code, raw, err = fixture.command("service", "stop")
+    assert code == 0, (raw, err)
+    fixture.wait_absent(stable=0.2)
+
+
+def segmented_restore(source):
+    """SJ-38 and SJ-08 end to end: a project outside the recent set restores
+    its latest conversation through the index; with every checkpoint and
+    run removed the TUI shows checkpoint_rebuild_pending while the writer
+    is held, then the rebuilt installation and the same conversation."""
+    fixture = Fixture(source)
+    try:
+        result = fixture.command("--seed-long-journal")
+        assert result[0] == 0, result
+        control = fixture.root / "home/.asura/state/control"
+        segments = sorted(p.name for p in control.iterdir() if p.name.startswith("seg-"))
+        assert len(segments) >= 3, segments
+        trial = fixture.launch(cwd=fixture.root / "old")
+        trial.resize(220, 40)
+        try:
+            try:
+                trial.until(b"OLD-ANSWER", plain=True, limit=15)
+            except AssertionError:
+                print(trial.screen.text())
+                print(fixture.command("project", "list")[1].decode()[:3000])
+                raise
+            trial.send(b"\x01\x0b/quit\r")
+            trial.finish()
+        finally:
+            trial.close()
+        fixture.wait_absent(stable=0.2)
+        print(f"PASS SJ-38 relaunch in a project outside the recent set restores its conversation ({len(segments)} segment files)")
+        for path in control.iterdir():
+            if path.name.startswith(("ckpt-", "run-")):
+                path.unlink()
+        hold = fixture.root / "home/journal-hold-writer-reads"
+        hold.write_bytes(b"")
+        fixture.started = True
+        fixture.uncertain_start = True
+        trial = Trial(fixture.binary, cwd=fixture.root / "old")
+        fixture.active_trials.append(trial)
+        try:
+            trial.resize(220, 40)
+            end = time.monotonic() + 20
+            # The loading state while the held writer rebuilds.
+            while "Installation recovering" not in trial.screen.text():
+                assert time.monotonic() < end, trial.screen.text()
+                trial.read(0.05)
+            trial.idle(1.0)
+            assert "Installation recovering" in trial.screen.text(), trial.screen.text()
+            fixture.uncertain_start = False
+            hold.unlink()
+            trial.until(b"Installation graph_ready", plain=True, limit=30)
+            trial.until(b"OLD-ANSWER", plain=True, limit=15)
+            assert any(p.name.startswith("ckpt-") for p in control.iterdir())
+            trial.send(b"\x01\x0b/quit\r")
+            trial.finish()
+        finally:
+            trial.close()
+        fixture.wait_absent(stable=0.2)
+        print("PASS SJ-08 TUI shows the loading state while the writer rebuilds, then the rebuilt installation and conversation")
+    finally:
+        fixture.cleanup()
+
+
 def help_driver(trial):
     """Screen helpers for the help journeys; each waits for a complete frame."""
     def screen():
@@ -2836,7 +3028,9 @@ def main():
     steps = len(sys.argv) == 3 and sys.argv[2] == "--waiting-steps"
     steer = len(sys.argv) == 3 and sys.argv[2] == "--queue-steer"
     records = len(sys.argv) == 3 and sys.argv[2] == "--tool-call-records"
-    assert len(sys.argv) == 2 or records or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
+    segmented = len(sys.argv) == 3 and sys.argv[2] == "--segmented-journal"
+    restore = len(sys.argv) == 3 and sys.argv[2] == "--segmented-restore"
+    assert len(sys.argv) == 2 or segmented or restore or records or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
@@ -2886,6 +3080,14 @@ def main():
         if records:
             tool_call_records(fixture, source)
             return
+        if segmented:
+            DEADLINE = time.monotonic() + 70
+            segmented_journal(fixture)
+            return
+        if restore:
+            DEADLINE = time.monotonic() + 70
+            segmented_restore(source)
+            return
         if steps:
             DEADLINE = time.monotonic() + 70
             waiting_steps(fixture, source)
@@ -2930,7 +3132,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture and not records and not waits_client and not steps and not steer:
+            if not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture and not records and not segmented and not restore and not waits_client and not steps and not steer:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)

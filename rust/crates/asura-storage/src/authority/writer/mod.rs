@@ -1,7 +1,7 @@
 //! Serialized, pollable journal ownership. All filesystem work stays on its worker.
 use super::conversation::*;
-use asura_platform::{JournalFile, ProjectIdentity, RuntimeDirectory};
-use std::ops::Range;
+pub use super::journal::{HoldReason, JournalStatus};
+use asura_platform::{ProjectIdentity, RuntimeDirectory};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -13,9 +13,10 @@ mod state;
 pub mod test_support;
 /// Journal owner allocation ceiling; embedded engine resources are separate.
 pub const MAX_JOURNAL_OWNER_MEMORY: usize = 64 * 1024 * 1024;
-// Retired/current/proposed replay + journal + queue + frame + history + project page.
+// Retired/current/proposed replay + Prepare history + queue + frame, checkpoint
+// and segment buffers + merge pages + project and lookup pages (segmented journal).
 const _: () = assert!(
-    3 * 16 * 1024 * 1024 + 8 * 1024 * 1024 + 8 * 65536 + 65536 + 65536 + 40960
+    3 * 16 * 1024 * 1024 + 8 * 1024 * 1024 + 8 * 65536 + 192 * 1024 + 36 * 1024 + 64 * 1024
         < MAX_JOURNAL_OWNER_MEMORY
 );
 
@@ -35,6 +36,10 @@ pub enum Error {
     OverlapsAsuraState,
     ModelUnavailable,
     Limit,
+    /// Normal records are held at the configured journal quota.
+    JournalQuota,
+    /// Normal records are held at the disk floor.
+    JournalDiskSpace,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
@@ -105,9 +110,35 @@ pub enum Command {
     Initialize {
         request: Id,
     },
+    /// One page of projects: ascending after `after`, or descending below `before`.
     Projects {
         after: Option<Id>,
+        before: Option<Id>,
         limit: usize,
+    },
+    /// One exact project, or none.
+    Project {
+        project: Id,
+    },
+    /// One newest-first page of a project's conversations.
+    Conversations {
+        project: Id,
+        before: Option<u64>,
+        limit: usize,
+    },
+    /// The `O` facts of any operation.
+    Lookup {
+        operation: Id,
+    },
+    /// Journal facts of at most 128 retained payloads.
+    PayloadFacts {
+        payloads: Vec<Id>,
+    },
+    /// Usage, quota and hold state; also rechecks free space.
+    JournalStatus,
+    /// A successful `journal.quotaBytes` set applies at once.
+    SetQuota {
+        bytes: u64,
     },
     Register {
         request: Id,
@@ -131,7 +162,7 @@ pub enum Command {
         admission: Option<AdmissionFence>,
     },
     ReadRecord {
-        range: Range<usize>,
+        locator: Locator,
     },
     /// One window of a terminal operation's response: the kind 8 record with
     /// `text` replaced by at most `MAX_TEXT` bytes starting at the largest
@@ -143,7 +174,8 @@ pub enum Command {
     History {
         project: Id,
         conversation: Option<Id>,
-        before_accepted_frame: Option<usize>,
+        /// The accepted frame sequence of the oldest entry already shown.
+        before_accepted_frame: Option<u64>,
         limit: usize,
     },
     ReadPrompt {
@@ -163,10 +195,45 @@ pub struct Prepared {
     pub ollama_endpoint: Option<String>,
     pub model_capabilities: Option<u32>,
     pub configuration_digest: Hash,
-    /// Every completed prior turn of the conversation, newest first.
+    /// Completed prior turns of the conversation, newest first, until 8 MiB
+    /// of text (SJ-D10).
     pub history: Vec<(TurnAccepted, TurnTerminal)>,
+    /// Older completed turns not returned.
+    pub omitted: u32,
 }
-#[derive(Debug)]
+/// One project as a page lists it.
+#[derive(Clone, Debug)]
+pub struct ProjectListing {
+    pub registration: ProjectRegistered,
+    pub name: String,
+    pub name_revision: u64,
+    /// The open failure; `None` means current.
+    pub error: Option<Error>,
+}
+/// The facts of one operation for observation and cancel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperationView {
+    pub conversation: Id,
+    pub generation: u64,
+    pub terminal: Option<(TerminalKind, Cause)>,
+    pub cancel: Option<Cause>,
+}
+/// Kind 23 facts as payload recovery uses them: state, sequence, and stored
+/// bytes and digest per stream.
+pub type Settlement = (CaptureState, u64, [(u64, Option<Hash>); 2]);
+/// Journal facts of one retained exec_cmd payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayloadFact {
+    pub payload: Id,
+    pub call: Id,
+    pub operation: Id,
+    pub payloads: [Id; 2],
+    pub intent_sequence: u64,
+    pub settled: Option<Settlement>,
+    /// The call belongs to the active operation.
+    pub active: bool,
+}
+#[derive(Debug, Default)]
 pub struct Reply {
     #[cfg(feature = "embedded-memory")]
     pub memory_create_result: Option<crate::memory::Result<crate::memory::MemoryCreateResult>>,
@@ -177,8 +244,19 @@ pub struct Reply {
     pub record: Option<Record>,
     pub history: Option<HistoryPage>,
     pub prepared: Option<Prepared>,
-    /// Each registration with its open failure; `None` means current.
-    pub projects: Vec<(ProjectRegistered, Option<Error>)>,
+    /// One page of projects.
+    pub projects: Vec<ProjectListing>,
+    /// Another page exists in the same order.
+    pub more: bool,
+    /// The registered or renamed project.
+    pub project: Option<ProjectListing>,
+    /// One page of a project's conversations with their creation sequence.
+    pub conversations: Vec<(Id, u64)>,
+    pub operation: Option<OperationView>,
+    /// The operation's tool calls, for `ReadResponse`.
+    pub tools: Option<Vec<ToolRecord>>,
+    pub payload_facts: Vec<PayloadFact>,
+    pub status: Option<JournalStatus>,
     pub inputs: Vec<InputView>,
     pub queued: Option<QueuedPreparation>,
     pub order_revision: Option<u64>,
@@ -204,7 +282,8 @@ pub struct HistoryPage {
 pub struct HistoryEntry {
     pub operation: Id,
     pub generation: u64,
-    pub accepted_frame: usize,
+    /// The accepted frame's sequence (SJ-D14).
+    pub accepted_frame: u64,
     pub terminal: Option<TerminalKind>,
 }
 #[derive(Debug)]
@@ -261,6 +340,21 @@ pub struct Ticket {
     settled: Arc<AtomicBool>,
 }
 impl Ticket {
+    /// Blocks until the reply or the worker's disconnection. Only a
+    /// retained worker thread calls this, never the reactor; the writer's
+    /// close disconnects it.
+    pub fn wait(mut self) -> Result<Reply> {
+        let result = match self.receiver.recv() {
+            Ok(result) => result,
+            Err(_) => Err(if self.mutation {
+                Error::OutcomeUnconfirmed
+            } else {
+                Error::Unavailable
+            }),
+        };
+        self.done = true;
+        result
+    }
     /// True only when the accepted job finished or was dropped without execution.
     /// A closed result receiver alone cannot establish this.
     pub fn is_settled(&self) -> bool {
@@ -292,12 +386,20 @@ impl Drop for Claim {
         CLAIM.store(false, Ordering::Release);
     }
 }
-pub struct WriterHandle {
+/// A submitter of journal requests that a retained worker thread (payload
+/// recovery) may hold; it shares the 8-slot queue and its admission rules.
+#[derive(Clone)]
+pub struct WriterClient {
     sender: SyncSender<Option<Job>>,
     count: Arc<AtomicUsize>,
     closing: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
     wake: Option<asura_platform::events::WakeSender>,
+}
+pub struct WriterHandle {
+    client: WriterClient,
+    handle: Option<JoinHandle<()>>,
+    status: Arc<std::sync::Mutex<JournalStatus>>,
+    wake_slot: Arc<std::sync::Mutex<Option<asura_platform::events::WakeSender>>>,
 }
 impl WriterHandle {
     pub fn start(runtime: RuntimeDirectory) -> Result<Self> {
@@ -309,25 +411,54 @@ impl WriterHandle {
         let count = Arc::new(AtomicUsize::new(0));
         let closing = Arc::new(AtomicBool::new(false));
         let stop = closing.clone();
+        let status = Arc::new(std::sync::Mutex::new(JournalStatus::default()));
+        let wake_slot: Arc<std::sync::Mutex<Option<asura_platform::events::WakeSender>>> =
+            Arc::default();
+        let (shared, slot) = (status.clone(), wake_slot.clone());
         let handle = thread::Builder::new()
             .name("asura-journal".into())
             .spawn(move || {
                 let _claim = claim;
-                let mut state = state::State::new(runtime, stop.clone());
-                run_jobs(&receiver, &stop, |command| state.execute(command));
+                let mut state = state::State::new(runtime, stop.clone(), shared);
+                let notify = || {
+                    if let Some(wake) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        let _ = wake.notify();
+                    }
+                };
+                run_worker(&receiver, &stop, &mut state, notify);
             })
             .map_err(|_| Error::Unavailable)?;
         Ok(Self {
-            sender,
-            count,
-            closing,
+            client: WriterClient {
+                sender,
+                count,
+                closing,
+                wake: None,
+            },
             handle: Some(handle),
-            wake: None,
+            status,
+            wake_slot,
         })
     }
     pub fn set_wake(&mut self, wake: asura_platform::events::WakeSender) {
-        self.wake = Some(wake);
+        *self.wake_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake.clone());
+        self.client.wake = Some(wake);
     }
+    /// A submitter for a retained worker thread.
+    pub fn client(&self) -> WriterClient {
+        self.client.clone()
+    }
+    /// Admits one request to the 8-slot queue or returns `Busy`.
+    pub fn try_submit(&self, command: Command) -> Result<Ticket> {
+        self.client.try_submit(command)
+    }
+    /// Journal usage and the hold state, as the worker last published them.
+    /// Reading it never waits for the worker.
+    pub fn status(&self) -> JournalStatus {
+        *self.status.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+impl WriterClient {
     /// Admits one request to the 8-slot queue or returns `Busy`. The writer's work
     /// has no time bound; a caller's own deadline applies only to its own wait.
     pub fn try_submit(&self, command: Command) -> Result<Ticket> {
@@ -473,6 +604,11 @@ impl WriterHandle {
                 ..
             }
         );
+        if let Command::PayloadFacts { payloads } = &command
+            && payloads.len() > 128
+        {
+            return Err(Error::Invalid);
+        }
         let limit = if control { 8 } else { 6 };
         self.count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -519,9 +655,11 @@ impl WriterHandle {
             settled,
         })
     }
+}
+impl WriterHandle {
     pub fn close(&self) {
-        if !self.closing.swap(true, Ordering::AcqRel) {
-            let _ = self.sender.try_send(None);
+        if !self.client.closing.swap(true, Ordering::AcqRel) {
+            let _ = self.client.sender.try_send(None);
         }
     }
     pub fn settled(&mut self) -> bool {
@@ -531,7 +669,77 @@ impl WriterHandle {
         self.handle.is_none()
     }
 }
+/// Longest gap between free-space rechecks while held (owner, 2026-10-19).
+const RECHECK_CAP_SECS: u64 = 60;
+/// The next recheck gaps: each the sum of the two before, at most
+/// `RECHECK_CAP_SECS`.
+fn next_pacing((a, b): (u64, u64)) -> (u64, u64) {
+    (b, a.saturating_add(b).min(RECHECK_CAP_SECS))
+}
+/// The journal worker loop: queued commands in order; between commands, run
+/// compaction steps, and while normal records are held, recheck free space
+/// after 1, 1, 2, 3, 5, 8 seconds and so on, at most 60 seconds apart. The
+/// recheck is pacing: it never ends or refuses work. Close ends the loop.
+fn run_worker(
+    receiver: &Receiver<Option<Job>>,
+    stop: &AtomicBool,
+    state: &mut state::State,
+    notify: impl Fn(),
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+    let mut pacing = (1u64, 1u64);
+    state.publish_status();
+    while !stop.load(Ordering::Acquire) {
+        let job = match receiver.try_recv() {
+            Ok(job) => Some(job),
+            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {
+                if state.merge_pending() && state.idle() {
+                    if state.publish_status() {
+                        notify();
+                    }
+                    continue;
+                }
+                if state.held() {
+                    match receiver.recv_timeout(Duration::from_secs(pacing.0)) {
+                        Ok(job) => Some(job),
+                        Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            pacing = next_pacing(pacing);
+                            state.recheck();
+                            if state.publish_status() {
+                                notify();
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    match receiver.recv() {
+                        Ok(job) => Some(job),
+                        Err(_) => break,
+                    }
+                }
+            }
+        };
+        let Some(Some(job)) = job else {
+            break;
+        };
+        let result = state.execute(job.command);
+        let changed = state.publish_status();
+        if !state.held() {
+            pacing = (1, 1);
+        }
+        let _ = job.reply.try_send(result);
+        drop(job.settlement);
+        if changed {
+            notify();
+        }
+    }
+    state.shutdown();
+}
 /// Runs queued jobs in order until close. No job is dropped for age (J1-0).
+#[cfg(test)]
 fn run_jobs(
     receiver: &Receiver<Option<Job>>,
     stop: &AtomicBool,
@@ -560,42 +768,36 @@ impl Drop for WriterHandle {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    /// SJ-14: the held recheck gaps grow as 1, 1, 2, 3, 5 ... and stop at 60 s.
+    #[test]
+    fn held_recheck_pacing_is_capped() {
+        let mut pacing = (1, 1);
+        let mut gaps = Vec::new();
+        for _ in 0..14 {
+            gaps.push(pacing.0);
+            pacing = next_pacing(pacing);
+        }
+        assert_eq!(gaps, [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 60, 60, 60, 60]);
+    }
     fn queued_writer() -> (WriterHandle, Receiver<Option<Job>>) {
         let (sender, receiver) = mpsc::sync_channel(8);
         (
             WriterHandle {
-                sender,
-                count: Arc::new(AtomicUsize::new(0)),
-                closing: Arc::new(AtomicBool::new(false)),
+                client: WriterClient {
+                    sender,
+                    count: Arc::new(AtomicUsize::new(0)),
+                    closing: Arc::new(AtomicBool::new(false)),
+                    wake: None,
+                },
                 handle: None,
-                wake: None,
+                status: Arc::default(),
+                wake_slot: Arc::default(),
             },
             receiver,
         )
     }
     fn empty_reply() -> Reply {
-        Reply {
-            #[cfg(feature = "embedded-memory")]
-            memory_result: None,
-            #[cfg(feature = "embedded-memory")]
-            memory_create_result: None,
-            sensor_state: None,
-            replay: None,
-            record: None,
-            history: None,
-            prepared: None,
-            projects: Vec::new(),
-            inputs: Vec::new(),
-            queued: None,
-            order_revision: None,
-            stale_order: false,
-            accepted_input_id: None,
-            project_name: None,
-            project_name_revision: None,
-            project_name_changed: None,
-            stale_project_name_revision: false,
-            response_bytes: None,
-        }
+        Reply::default()
     }
     fn control() -> Command {
         Command::Append {
@@ -615,12 +817,12 @@ mod tests {
             .map(|_| writer.try_submit(control()).unwrap())
             .collect();
         assert!(matches!(writer.try_submit(control()), Err(Error::Busy)));
-        assert_eq!(writer.count.load(Ordering::Acquire), 8);
+        assert_eq!(writer.client.count.load(Ordering::Acquire), 8);
         drop((ordinary, controls));
         // Queued jobs keep their slots until the worker settles them.
-        assert_eq!(writer.count.load(Ordering::Acquire), 8);
+        assert_eq!(writer.client.count.load(Ordering::Acquire), 8);
         drop(receiver);
-        assert_eq!(writer.count.load(Ordering::Acquire), 0);
+        assert_eq!(writer.client.count.load(Ordering::Acquire), 0);
     }
     #[test]
     fn j1_0_02_ticket_without_reply_never_reports_uncertainty_and_late_reply_applies() {
@@ -651,6 +853,7 @@ mod tests {
             control(),
             Command::Projects {
                 after: None,
+                before: None,
                 limit: 1,
             },
         ]

@@ -123,7 +123,7 @@ impl Fixture {
         Ok(())
     }
     fn journal(&self) -> Result<(Vec<u8>, journal::Replay)> {
-        let bytes = std::fs::read(self.home.join(".asura/state/control/slot-0.log"))?;
+        let bytes = asura_storage::authority::fixture::journal_bytes(&self.home)?;
         let replay = journal::replay(&bytes, &AtomicBool::new(false))
             .map_err(|e| format!("replay: {e:?}"))?;
         Ok((bytes, replay))
@@ -407,8 +407,16 @@ fn finish(
         thread::sleep(Duration::from_millis(50));
     }
 }
+/// A byte range of the concatenated segment files.
+struct Range(std::ops::Range<usize>);
+impl Range {
+    fn range(&self) -> std::ops::Range<usize> {
+        self.0.clone()
+    }
+}
 fn decode(bytes: &[u8], range: std::ops::Range<usize>) -> Result<journal::Record> {
-    let frame = &bytes[range];
+    let range = Range(range);
+    let frame = &bytes[range.range()];
     Ok(journal::decode_record(
         u16::from_be_bytes([frame[10], frame[11]]),
         &frame[144..frame.len() - 40],
@@ -430,11 +438,11 @@ fn calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Recorded>> {
         .ok_or("operation absent")?;
     let mut out = Vec::new();
     for tool in &op.tools {
-        let journal::Record::ToolCall(call) = decode(&bytes, tool.intent_frame.clone())? else {
+        let journal::Record::ToolCall(call) = decode(&bytes, tool.intent_frame.range())? else {
             return Err("kind 14 expected".into());
         };
         let result = match &tool.result_frame {
-            Some(frame) => match decode(&bytes, frame.clone())? {
+            Some(frame) => match decode(&bytes, frame.range())? {
                 journal::Record::ToolResult(result) => Some(result),
                 _ => return Err("kind 15 expected".into()),
             },
@@ -442,7 +450,7 @@ fn calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Recorded>> {
         };
         out.push(Recorded {
             call: *call,
-            frame: tool.intent_frame.len(),
+            frame: tool.intent_frame.length as usize,
             result,
             tool: tool.clone(),
         });
@@ -519,7 +527,8 @@ fn setup(label: &str) -> Result<(Fixture, Model, [u8; 16], PathBuf)> {
 fn arguments(call: &journal::ToolCall) -> Value {
     serde_json::from_str(&call.arguments).unwrap_or_default()
 }
-const JOURNAL_BYTES: f64 = asura_storage::authority::MAX_JOURNAL as f64;
+/// Share of one segment file (segmented journal).
+const JOURNAL_BYTES: f64 = asura_storage::authority::SEGMENT_BYTES as f64;
 
 // ------------------------------------------------------------------ cases
 
@@ -672,7 +681,7 @@ fn exec_cmd_secret() -> Result<()> {
             .tool
             .result_frame
             .as_ref()
-            .map_or(0, |f| f.len()),
+            .map_or(0, |f| f.length as usize),
         100.0 * recorded[0].frame as f64 / JOURNAL_BYTES
     );
     let mut fixture = fixture;
@@ -1011,7 +1020,7 @@ fn held_append_and_cancel() -> Result<()> {
     assert_eq!(event.kind, Some(5), "{event:?}");
     let (bytes, replay) = fixture.journal()?;
     let op = &replay.operations[&operation];
-    let start = op.accepted_frame.start;
+    let start = op.accepted_frame.range().start;
     let ours: Vec<u16> = frames(&bytes[start..])?
         .into_iter()
         .filter_map(|(kind, record)| match &record {
@@ -1160,7 +1169,7 @@ fn long_response() -> Result<()> {
     let (bytes, replay) = fixture.journal()?;
     let op = &replay.operations[&operation];
     assert_eq!(op.response.len, full.len() as u64);
-    let segments = frames(&bytes[op.accepted_frame.start..])?
+    let segments = frames(&bytes[op.accepted_frame.range().start..])?
         .into_iter()
         .filter(|(_, record)| {
             matches!(record, journal::Record::ResponseText(p) if p.operation == operation)
@@ -1175,6 +1184,177 @@ fn long_response() -> Result<()> {
     println!(
         "PASS RT-03/RT-05/RT-06 integration: {} bytes in {segments} kind 24 segments; at most {largest} bytes held while appends stalled; {windows} windows",
         full.len()
+    );
+    Ok(())
+}
+
+/// SJ-15, SJ-16 and SJ-14 (integration): a running turn pauses when the
+/// journal holds normal records (here at the disk floor, through the test
+/// free-space override). A `journal.quotaBytes` set makes the writer recheck
+/// at once. While paused the service shows the paused step, journals no more
+/// response text and refuses new work with the hold reason; when space
+/// returns the turn resumes and the response is journaled whole. A cancel
+/// during a pause ends the turn with its journaled prefix (closure records
+/// always fit).
+fn journal_pause() -> Result<()> {
+    let (fixture, model, project, _) = setup("pause")?;
+    let full: String = "p".repeat(4_000_000);
+    let free = fixture.home.join("journal-free-bytes");
+    let pause = |operation: [u8; 16]| -> Result<u64> {
+        wait_for(Duration::from_secs(60), "first revision", || {
+            fixture
+                .attach()
+                .and_then(|mut c| Ok(c.observe_conversation(operation, 0, 0)?))
+                .is_ok_and(|e| e.text_bytes.unwrap_or(0) > 0)
+        })?;
+        // 40 MiB free: below the floor plus the roll reserve and closures.
+        std::fs::write(&free, (40u64 << 20).to_string())?;
+        fixture
+            .attach()?
+            .config("journal.quotaBytes", Some("8589934592"), &|| false)?;
+        // A caught-up observer gets heartbeats that carry the waiting step.
+        let mut assembly = asura_client::ResponseAssembly::default();
+        wait_for(Duration::from_secs(60), "paused step", || {
+            let Ok(event) = fixture.attach().and_then(|mut c| {
+                Ok(c.observe_conversation(operation, assembly.cursor(), assembly.held())?)
+            }) else {
+                return false;
+            };
+            let paused = event.waiting_step == Some(pb::ConversationWaitStep::JournalPaused as i32);
+            let _ = assembly.apply(&event);
+            paused
+        })?;
+        let (_, replay) = fixture.journal()?;
+        Ok(replay.operations[&operation].response.len)
+    };
+    model.script(&[Step::Text(full.clone())]);
+    let operation = submit(&fixture, project, "SJ-16 resume")?;
+    let journaled = pause(operation)?;
+    thread::sleep(Duration::from_secs(2));
+    let (_, replay) = fixture.journal()?;
+    assert_eq!(
+        replay.operations[&operation].response.len, journaled,
+        "no response text is journaled while paused"
+    );
+    drop(replay);
+    // New work is refused with the hold reason; nothing is written.
+    let refused = fixture.attach()?.queue_conversation_input(
+        queue_submit::queue_request(project, None, 0, "later"),
+        &|| false,
+    );
+    assert!(
+        matches!(&refused, Err(asura_client::Error::Remote(_, m)) if m == "journal_disk_space"),
+        "{refused:?}"
+    );
+    // Space returns: the paced recheck ends the hold and the turn resumes.
+    std::fs::write(&free, (1u64 << 40).to_string())?;
+    let event = finish(&fixture, operation, Duration::from_secs(120))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    let (_, replay) = fixture.journal()?;
+    assert_eq!(
+        replay.operations[&operation].response.len,
+        full.len() as u64
+    );
+    drop(replay);
+    // A cancel during a pause records the journaled prefix.
+    model.script(&[Step::Text(full.clone())]);
+    let operation = submit(&fixture, project, "SJ-16 cancel")?;
+    let journaled = pause(operation)?;
+    let started = Instant::now();
+    fixture
+        .attach()?
+        .cancel_conversation(operation, 1, &|| false)?;
+    assert!(started.elapsed() < Duration::from_millis(100));
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(5), "{event:?}");
+    let (_, replay) = fixture.journal()?;
+    let response = replay.operations[&operation].response.len;
+    assert!(response >= journaled && response < full.len() as u64);
+    drop(replay);
+    std::fs::write(&free, (1u64 << 40).to_string())?;
+    sweep(&fixture.home, &[])?;
+    println!(
+        "PASS SJ-15/SJ-16 pause at the disk floor: paused step shown, {journaled} bytes journaled while held, new work refused journal_disk_space, resumed whole; cancel during a pause kept {response} bytes"
+    );
+    Ok(())
+}
+
+/// SJ-04 and SJ-23 (integration): a roll held at its checkpoint sync does
+/// not fence and keeps Inspect within 100 ms; the service killed there
+/// restarts from the files it left (the roll's tmp file is removed), the
+/// turn is interrupted with its journaled prefix, and a new turn completes.
+fn roll_crash() -> Result<()> {
+    let (mut fixture, model, project, _) = setup("roll")?;
+    // One model request carries at most 4 MiB (L28): two full turns fill
+    // most of the first segment file; the third turn rolls it.
+    let part: String = "r".repeat(3_500_000);
+    for n in 0..2 {
+        model.script(&[Step::Text(part.clone())]);
+        let operation = submit(&fixture, project, &format!("SJ-04 fill {n}"))?;
+        let event = finish(&fixture, operation, Duration::from_secs(120))?;
+        assert_eq!(event.kind, Some(3), "{event:?}");
+    }
+    model.script(&[Step::Text(part)]);
+    let hold = fixture.home.join("journal-hold-checkpoint-sync");
+    std::fs::write(&hold, b"")?;
+    let operation = submit(&fixture, project, "SJ-04")?;
+    let reached = fixture.home.join("journal-hold-checkpoint-sync.reached");
+    let control = fixture.home.join(".asura/state/control");
+    if let Err(error) = wait_for(
+        Duration::from_secs(180),
+        "a roll at its checkpoint sync",
+        || reached.exists(),
+    ) {
+        let names: Vec<_> = std::fs::read_dir(&control)?
+            .filter_map(|e| e.ok())
+            .map(|e| (e.file_name(), e.metadata().map(|m| m.len()).unwrap_or(0)))
+            .collect();
+        let event = fixture.attach()?.observe_conversation(operation, 0, 0)?;
+        return Err(format!(
+            "{error}: {names:?}; {:?} {:?}",
+            event.kind, event.text_bytes
+        )
+        .into());
+    }
+    // SJ-23: control stays responsive while the roll is held.
+    let mut client = fixture.attach()?;
+    let started = Instant::now();
+    client.inspect()?;
+    let inspect = started.elapsed();
+    assert!(
+        inspect < Duration::from_millis(100),
+        "Inspect took {inspect:?}"
+    );
+    drop(client);
+    thread::sleep(Duration::from_secs(2));
+    let tmp = |control: &Path| -> Result<usize> {
+        Ok(std::fs::read_dir(control)?
+            .filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            })
+            .count())
+    };
+    assert_eq!(tmp(&control)?, 1, "the held roll left its checkpoint tmp");
+    // SJ-04: process death inside the roll.
+    fixture.crash()?;
+    std::fs::remove_file(&hold)?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    assert_eq!(tmp(&control)?, 0, "the writer removed the tmp file");
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(6), "interrupted: {event:?}");
+    let (_, replay) = fixture.journal()?;
+    let journaled = replay.operations[&operation].response.len;
+    assert!(journaled > 0);
+    drop(replay);
+    model.script(&[Step::Text("after the restart".into())]);
+    let next = submit(&fixture, project, "SJ-04 after")?;
+    let event = finish(&fixture, next, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    sweep(&fixture.home, &[])?;
+    println!(
+        "PASS SJ-04/SJ-23 roll held at its checkpoint sync: Inspect in {inspect:?}, no fence; killed there, restarted: tmp removed, turn interrupted with {journaled} bytes, next turn completed"
     );
     Ok(())
 }
@@ -1212,7 +1392,7 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 7] = [
+    let cases: [Case; 9] = [
         ("malformed", malformed_then_valid),
         ("secret", exec_cmd_secret),
         ("create", create_note_body),
@@ -1220,6 +1400,8 @@ fn main() {
         ("held", held_append_and_cancel),
         ("restart", restarts),
         ("response", long_response),
+        ("pause", journal_pause),
+        ("roll", roll_crash),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

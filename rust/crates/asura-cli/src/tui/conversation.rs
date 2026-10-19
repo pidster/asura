@@ -38,7 +38,15 @@ pub(super) struct Update {
     pub project: Option<[u8; 16]>,
     pub project_offer: Option<String>,
     pub launch_directory: Option<String>,
+    /// A new project window (CF06b): at most 64 consecutive entries.
     pub projects: Option<Vec<pb::ProjectReply>>,
+    /// Whether reads before the window's first or after its last entry
+    /// may find more projects.
+    pub more_before: bool,
+    pub more_after: bool,
+    /// Rows outside the window this worker read: launch matches and a
+    /// registered project. The selected project's row may come from here.
+    pub known_rows: Vec<pb::ProjectReply>,
     pub restore: Option<RestoreUpdate>,
     pub preserve_project_selection: bool,
     pub other_matches: Vec<[u8; 16]>,
@@ -246,25 +254,29 @@ impl Worker {
                             return Ok(());
                         }
                         Request::DiscoverProject => {
-                            let projects = crate::conversation::project_registry(&mut client, || {
-                                if stopped.load(Ordering::Acquire) { Err("Project discovery cancelled".into()) }
-                                else { Ok(()) }
-                            })?;
+                            // Discovery reads every page (no page total) to find
+                            // the launch match; it keeps the first window and
+                            // the matches only.
                             let launch = crate::conversation::location(".")?;
-                            let (project, other_matches) = crate::conversation::initial_project(&projects, &launch);
-                            let project_offer = projects.is_empty().then(|| launch.clone());
-                            publish(Update{projects: Some(projects), preserve_project_selection: true, project, other_matches, project_offer, launch_directory: Some(launch), success:true,done:true,..Default::default()});
+                            let discovery = crate::conversation::discover(
+                                |read, limit| client.projects(read, limit).map_err(|e| e.to_string()),
+                                || if stopped.load(Ordering::Acquire) { Err("Project discovery cancelled".into()) } else { Ok(()) },
+                                &launch,
+                            )?;
+                            let (project, other_matches) = crate::conversation::initial_project(&discovery.matches, &launch);
+                            let project_offer = discovery.empty.then(|| launch.clone());
+                            publish(Update{projects: Some(discovery.window.rows), more_after: discovery.window.more_after, known_rows: discovery.matches, preserve_project_selection: true, project, other_matches, project_offer, launch_directory: Some(launch), success:true,done:true,..Default::default()});
                             return Ok(());
                         }
                         Request::Setup(crate::conversation::Command::Observe(id)) => (id, 0),
-                        Request::Setup(crate::conversation::Command::List) => {
-                            let projects = crate::conversation::project_registry(&mut client, || {
-                                if stopped.load(Ordering::Acquire) { Err("Project discovery cancelled".into()) }
-                                else { Ok(()) }
-                            })?;
-                            let message = if projects.is_empty() { "No projects. Use /project add PATH".into() }
-                            else { projects.iter().map(crate::conversation::project_list_line).collect::<Vec<_>>().join("\n") };
-                            publish(Update { projects: Some(projects), preserve_project_selection: true, message: Some(message), success: true, done: true, ..Default::default() });
+                        Request::Setup(crate::conversation::Command::List(after)) => {
+                            let window = crate::conversation::fill_window(
+                                |read, limit| client.projects(read, limit).map_err(|e| e.to_string()),
+                                || if stopped.load(Ordering::Acquire) { Err("Project list cancelled".into()) } else { Ok(()) },
+                                after,
+                            )?;
+                            let message = window.message();
+                            publish(Update { projects: Some(window.rows), more_before: window.more_before, more_after: window.more_after, preserve_project_selection: true, message: Some(message), success: true, done: true, ..Default::default() });
                             return Ok(());
                         }
                         Request::Setup(command) => {
@@ -276,15 +288,33 @@ impl Worker {
                             };
                             let stop_waiting = || cancellation.load(Ordering::Acquire) || stopped.load(Ordering::Acquire);
                             let (mut message, project) = crate::conversation::execute(&mut client, command, &stop_waiting)?;
-                            let projects = if project.is_some() {
-                                match crate::conversation::project_registry(&mut client, || {
-                                    if stopped.load(Ordering::Acquire) { Err("Registry refresh stopped".into()) } else { Ok(()) }
-                                }) {
-                                    Ok(projects) => Some(projects),
-                                    Err(error) => { message.push_str(&format!("\nRegistration succeeded; registry refresh failed: {error}. Use /project list.")); None }
+                            let mut update = Update { message: None, project, success: true, done: true, ..Default::default() };
+                            if let Some(id) = project {
+                                // Refresh the window; read the registered row
+                                // exactly when it falls outside the window.
+                                let refreshed = crate::conversation::fill_window(
+                                    |read, limit| client.projects(read, limit).map_err(|e| e.to_string()),
+                                    || if stopped.load(Ordering::Acquire) { Err("Registry refresh stopped".into()) } else { Ok(()) },
+                                    None,
+                                )
+                                .and_then(|window| {
+                                    let listed = window.rows.iter().any(|row| row.project_id.as_deref() == Some(id.as_slice()));
+                                    let known = if listed { Vec::new() } else {
+                                        crate::conversation::project_page(&mut client, crate::conversation::ProjectPage::Only(id), 1)?.rows
+                                    };
+                                    Ok((window, known))
+                                });
+                                match refreshed {
+                                    Ok((window, known)) => {
+                                        update.projects = Some(window.rows);
+                                        update.more_after = window.more_after;
+                                        update.known_rows = known;
+                                    }
+                                    Err(error) => message.push_str(&format!("\nRegistration succeeded; registry refresh failed: {error}. Use /project list.")),
                                 }
-                            } else { None };
-                            publish(Update { projects, message: Some(message), project, success: true, done: true, ..Default::default() });
+                            }
+                            update.message = Some(message);
+                            publish(update);
                             return Ok(());
                         }
                     };

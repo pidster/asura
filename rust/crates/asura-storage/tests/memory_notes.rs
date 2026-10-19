@@ -201,7 +201,7 @@ fn bound_authority_reads_only_registered_project_without_journal_mutation() {
         .next()
         .unwrap();
     drop(registered);
-    let journal = root.join(".asura/state/control/slot-0.log");
+    let journal = root.join(".asura/state/control/seg-0000000000000001.log");
     let before = fs::read(&journal).unwrap();
     let reply = receive(
         writer

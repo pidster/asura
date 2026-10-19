@@ -53,6 +53,7 @@ fn response(outcome: MemoryCreateResult) -> writer::Reply {
         project_name_changed: None,
         stale_project_name_revision: false,
         response_bytes: None,
+        ..Default::default()
     }
 }
 struct Writer(writer::WriterHandle);
@@ -246,7 +247,7 @@ fn pending_projection() -> Arc<journal::Replay> {
             task: [6; 16],
             owner_generation: 1,
             input_digest: [7; 32],
-            accepted_frame: 0..1,
+            accepted_frame: journal::Locator::NONE,
             helper: Some([8; 16]),
             cancel: None,
             terminal: None,
@@ -264,7 +265,7 @@ fn pending_projection() -> Arc<journal::Replay> {
                 preview: None,
                 truncated: None,
                 exit_code: None,
-                intent_frame: 0..1,
+                intent_frame: journal::Locator::NONE,
                 create: Some(create),
                 result_frame: None,
                 result_status: None,
@@ -531,7 +532,7 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
     );
     assert!(!operation.terminal.as_ref().unwrap().usage_known);
     assert!(!replay.project_memory_blocked(project));
-    let result_frame = operation.tools[0].result_frame.clone().unwrap();
+    let result_frame = operation.tools[0].result_frame.unwrap();
     fixture.owner.shutdown();
     let end = Instant::now() + Duration::from_secs(10);
     while !fixture.owner.settled() {
@@ -539,9 +540,9 @@ fn actual_startup_reconciles_receipt_then_persists_result_and_interruption_witho
         assert!(Instant::now() < end);
         std::thread::sleep(Duration::from_millis(1));
     }
-    let bytes = std::fs::read(fixture.path.join(".asura/state/control/slot-0.log")).unwrap();
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.path).unwrap();
     journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false)).unwrap();
-    let frame = &bytes[result_frame];
+    let frame = &bytes[result_frame.range()];
     // Format 1 frame boundaries, as in the native journal proof harness.
     match journal::decode_record(15, &frame[144..frame.len() - 40]).unwrap() {
         // TCR-D1: the durable result stores no text; the identity is derived.

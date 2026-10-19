@@ -742,7 +742,7 @@ existing retained workers. No fixed time limit ends composition (CCR26).
 | Boundary | Value |
 | --- | --- |
 | Concurrent compositions | One per active turn; the service runs one active turn today |
-| Candidate set from `Prepare` | The conversation's records, newest first, stopping at `W` bytes of text; the journal's 8 MiB capacity (L30) bounds the total. The proposed [segmented journal](segmented-journal.md#read-commands) replaces that with an 8 MiB candidate-text bound |
+| Candidate set from `Prepare` | The conversation's records, newest first, stopping at `W` bytes of text; `Prepare` stops at 8 MiB of candidate text ([segmented journal](segmented-journal.md#read-commands)) and reports older completed turns as omitted |
 | Page reads per composition | One in flight on the reserved model worker; count follows the planned views, at most `⌈view budget ÷ 8 KiB⌉` |
 | Pure core work | At most 2,048 segments (proposed), `W` bytes of content, two passes and four encode attempts |
 | Excerpt floor | 512 bytes per view (proposed composer policy); below it a view stays a reference |
@@ -788,10 +788,11 @@ decisions, except item 8, which the owner selected.
 
 1. **Candidates.** `Prepare` returns every completed prior turn of the
    conversation, newest first, with its accepted prompt and terminal text. `W` is
-   known only after Hello, so the writer applies no turn-count or byte rule. The
-   journal's fixed 8 MiB capacity (L30) bounds the total text. The proposed
-   [segmented journal](segmented-journal.md#read-commands) keeps this bound by
-   stopping `Prepare` at 8 MiB of history text.
+   known only after Hello, so the writer applies no turn-count rule. The
+   [segmented journal](segmented-journal.md#read-commands) stops `Prepare` at
+   8 MiB of history text and returns the count of older completed turns; the
+   composer adds them to the omitted range, and the context line then reads
+   "more than N bytes" (SJ-D23).
 2. **Composition point.** `prepared` builds the turn without input. The
    composer runs when the helper's Hello reports the model available
    (`ModelEvent::Available`), before `TurnAccepted` is appended. This replaces

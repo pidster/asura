@@ -133,7 +133,7 @@ its classification under the principles above.
 | ID | Limit | Current value | Class | Owner after review |
 | --- | --- | --- | --- | --- |
 | L29 | Frame | 64 KiB | Keep | Journal transport unit |
-| L30 | Journal capacity | 8 MiB, 32,768 frames | Replace (owner, 2026-10-15): the single 8 MiB file must not be the limit | [Segmented journal](segmented-journal.md) (proposed): 8 MiB and 32,768-frame segment files with checkpoint snapshots and index-run compaction; total size from `journal.quotaBytes` and disk space. Current values stay until it is implemented |
+| L30 | Journal capacity | 8 MiB, 32,768 frames | Replace (owner, 2026-10-15): the single 8 MiB file must not be the limit | [Segmented journal](segmented-journal.md) (implemented 2026-10-19): 8 MiB and 32,768-frame segment files with checkpoint snapshots and index-run compaction; total size from `journal.quotaBytes` and disk space |
 | L31 | Tool result text record | 16,384 B | Replace | Reference, digest and summary record |
 | L32 | exec_cmd intent payload | 9217 B | Keep | exec_cmd tool |
 | L33 | exec_cmd intent timeout | 1–60,000 ms | Remove | J1's ExecCmdIntent kind 22 records no timeout (owner, 2026-10-15, J1-Q3); the job intent records none either (owner, 2026-10-14, J2a-1). Older kind 14 records keep theirs. |

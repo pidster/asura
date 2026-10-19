@@ -204,7 +204,9 @@ While the model starts, the queue row shows `Preparing model` or
 `Starting model`. Then Escape or `/cancel` holds the message as `Held (cancelled)`; use
 `/queue resume ID` or `/queue drop ID` for it. After the model starts, the
 activity row shows `Waiting: sending input` or `Waiting: model output`, and
-Escape or `/cancel` stops the answer.
+Escape or `/cancel` stops the answer. If the service journal is full, the
+activity row shows `Paused: journal space is full.` until space is available;
+see [Journal space](commands.md#journal-space).
 
 `/retry` repeats a request whose result is unknown. It uses the original request
 ID, so the service does not do the work twice. It also retries restoring the
@@ -245,12 +247,17 @@ Yes to add the folder and select it, or No to leave things unchanged.
 
 - `/project add PATH` adds a folder and selects it. `/project add .` adds the
   current folder.
-- `/project list` shows each project's 32-digit ID, name and folder.
-- `/project select ID` selects a project by its 32-digit ID.
+- `/project list` shows each project's 32-digit ID, name and folder, for at
+  most 64 projects. If more follow, the last line shows
+  `More: /project list after ID`; type it to see the next 64.
+- `/project select ID` selects a project by its 32-digit ID. The project does
+  not need to be in the list that Asura shows.
 
 You can also select a project from the status bar. Press Down on the last row of
 the input box, or Shift+Down. With the project name selected, press Enter. Choose
-a project with Up and Down and press Enter. Escape closes the list.
+a project with Up and Down and press Enter. Escape closes the list. The list
+holds at most 64 projects. When you move to its last or first row, Asura reads
+the next or the previous projects.
 
 You cannot change projects while a request is active or a message is still
 pending in this client. Changing projects keeps your draft. `[stale]` in the
@@ -346,9 +353,13 @@ Settings are in `~/.asura/config.yaml`. Use these commands:
 | `audit.keepFiles` | 1 to 10000 | `5` |
 | `audit.maxFileBytes` | 1 to 1099511627776 | `10485760` |
 | `providers.ollama.endpoint` | An `http` or `https` URL on `127.0.0.1` or `::1` | `http://127.0.0.1:11434` |
+| `journal.quotaBytes` | 67108864 (64 MiB) to 1099511627776 (1 TiB) | `4294967296` (4 GiB) |
 
 Values use YAML. Quote text that contains spaces or punctuation. A model change
 applies to the next message. Audit changes apply after the service restarts.
+A `journal.quotaBytes` change applies at once. It limits the service journal,
+which holds conversations and projects. It is separate from
+`retention.quotaBytes`. See [Journal space](commands.md#journal-space).
 If Asura cannot confirm a change, use `/config get` before you try again.
 
 ## Audit and tools

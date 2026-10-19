@@ -152,7 +152,7 @@ fn active_projection(owner: &Owner) -> Arc<journal::Replay> {
             task: active.turn.task,
             owner_generation: 1,
             input_digest: active.turn.input_digest,
-            accepted_frame: 0..1,
+            accepted_frame: journal::Locator::NONE,
             helper: None,
             cancel: None,
             terminal: None,

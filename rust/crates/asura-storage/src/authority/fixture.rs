@@ -43,3 +43,20 @@ pub fn initialization_journal(bound: bool) -> Vec<u8> {
     }
     bytes
 }
+
+/// Every segment file of a scratch home's journal, concatenated in order.
+/// Replaying the result as one stream gives locators into these bytes.
+pub fn journal_bytes(home: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let control = home.join(".asura/state/control");
+    let mut names: Vec<_> = std::fs::read_dir(&control)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("seg-") && name.ends_with(".log"))
+        .collect();
+    names.sort();
+    let mut bytes = Vec::new();
+    for name in names {
+        bytes.extend(std::fs::read(control.join(name))?);
+    }
+    Ok(bytes)
+}

@@ -182,6 +182,9 @@ enum InstallationInspectionReason {
   INSTALLATION_INSPECTION_REASON_AUTHORITY_CHANGED = 14;
   INSTALLATION_INSPECTION_REASON_INSPECTION_IO = 15;
   INSTALLATION_INSPECTION_REASON_GRAPH_VERIFIED = 16;
+  // The read-only scan found no usable journal checkpoint for a long tail;
+  // the writer rebuilds it (segmented journal).
+  INSTALLATION_INSPECTION_REASON_CHECKPOINT_REBUILD_PENDING = 17;
 }
 
 message ConversationObserve {
@@ -259,6 +262,8 @@ enum ConversationWaitStep {
   CONVERSATION_WAIT_STEP_STARTING_MODEL = 2;
   CONVERSATION_WAIT_STEP_SENDING_INPUT = 3;
   CONVERSATION_WAIT_STEP_MODEL_OUTPUT = 4;
+  // The journal holds normal records at its quota or disk floor; the turn is paused.
+  CONVERSATION_WAIT_STEP_JOURNAL_PAUSED = 5;
 }
 enum ConversationReason {
   CONVERSATION_REASON_NONE = 0;
@@ -316,7 +321,16 @@ message ProjectRenameReply {
   optional string error = 3;
   optional ProjectReply current_project = 4;
 }
-message ProjectList { optional bytes after_project_id = 1; optional uint32 limit = 2; }
+// Pages registered projects with no page total (segmented journal, 2026-10-19).
+// At most one of after_project_id, before_project_id and only_project_id.
+// `before` pages in descending ID order; `only` reads one exact project or none.
+// next_cursor is the last entry's ID when another page exists in the same order.
+message ProjectList {
+  optional bytes after_project_id = 1;
+  optional uint32 limit = 2;
+  optional bytes before_project_id = 3;
+  optional bytes only_project_id = 4;
+}
 message ProjectsReply { repeated ProjectReply projects = 1; optional bytes next_cursor = 2; optional string error = 3; }
 
 // Durable service-owned input queue. Values evolve within protocol 0.1.

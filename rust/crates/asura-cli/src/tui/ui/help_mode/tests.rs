@@ -410,6 +410,25 @@ fn hu15_enter_opens_the_entry_without_submitting_or_recording() {
     assert_eq!(app.draft(), "zzzzqq");
 }
 
+/// CF06b: `/project list after ID` is a help command row; searching for it
+/// selects and opens it without submitting a project list request.
+#[test]
+fn project_list_after_is_found_and_opened_locally() {
+    let index = help::index().unwrap();
+    assert!(index.find("command:/project list after ID").is_some());
+    let mut app = App::new();
+    type_text(&mut app, "?list after");
+    assert_eq!(
+        selected_id(&app).as_deref(),
+        Some("command:/project list after ID")
+    );
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(app.overlay, Some(Overlay::HelpEntry(..))));
+    let text = text_of(&mut app, 100, 30);
+    assert!(text.contains("/project list after ID"), "{text}");
+    assert_local_only(&app);
+}
+
 #[test]
 fn hu16_focus_moving_keys_are_ignored() {
     let mut app = App::new();

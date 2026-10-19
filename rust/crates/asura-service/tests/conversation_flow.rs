@@ -296,7 +296,9 @@ fn journey(native: bool) -> Result<()> {
     }
     let project = checked_id(registered.project_id)?;
     remote_endpoint_restriction(&fixture, project)?;
-    let listed = fixture.attach()?.projects(None)?;
+    let listed = fixture
+        .attach()?
+        .projects(asura_client::ProjectPage::First, 8)?;
     assert_eq!(listed.projects.len(), 1);
     assert_eq!(
         listed.projects[0].project_id.as_deref(),
@@ -371,7 +373,11 @@ fn journey(native: bool) -> Result<()> {
         Some(2)
     );
     assert_eq!(
-        fixture.attach()?.projects(None)?.projects[0].name_revision,
+        fixture
+            .attach()?
+            .projects(asura_client::ProjectPage::First, 8)?
+            .projects[0]
+            .name_revision,
         Some(2)
     );
     let empty = fixture
@@ -408,7 +414,9 @@ fn journey(native: bool) -> Result<()> {
         Some("installation_already_initialized")
     );
     wait_ready(&fixture, installation.clone())?;
-    let after_restart = fixture.attach()?.projects(None)?;
+    let after_restart = fixture
+        .attach()?
+        .projects(asura_client::ProjectPage::First, 8)?;
     assert_eq!(after_restart.projects.len(), 1);
     assert_eq!(
         after_restart.projects[0].name.as_deref(),
@@ -1093,7 +1101,7 @@ fn write_journal_fixture(fixture: &Fixture, bytes: &[u8]) -> Result<PathBuf> {
     for dir in [&state, &control] {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    let file = control.join("slot-0.log");
+    let file = control.join("seg-0000000000000001.log");
     fs::write(&file, bytes)?;
     fs::set_permissions(&file, fs::Permissions::from_mode(0o600))?;
     Ok(file)
@@ -1175,7 +1183,9 @@ fn preservation_journeys() -> Result<()> {
         fixture.start()?;
         let first = wait_ready(&fixture, None)?;
         fixture.stop()?;
-        let file = fixture.home.join(".asura/state/control/slot-0.log");
+        let file = fixture
+            .home
+            .join(".asura/state/control/seg-0000000000000001.log");
         let before = fs::read(&file)?;
         let original = journal::replay(&before, &AtomicBool::new(false))?;
         fs::rename(
@@ -1568,7 +1578,7 @@ fn native_tools(provider: &str) -> Result<()> {
     fixture
         .stop()
         .map_err(|e| format!("native-tools stop: {e}"))?;
-    let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let replay = journal::replay(&bytes, &AtomicBool::new(false))
         .map_err(|error| format!("tool journal replay: {error:?}"))?;
     let record = &replay.operations[&operation];
@@ -2406,7 +2416,9 @@ fn journal_wait_journey() -> Result<()> {
         return Err("late reply did not update the service queue".into());
     }
     // The owner is neither unavailable nor fenced after the slow append.
-    fixture.attach()?.projects(None)?;
+    fixture
+        .attach()?
+        .projects(asura_client::ProjectPage::First, 8)?;
     println!(
         "PASS held append: no timeout, no fence, responsive Inspect/cancel, late reply applied"
     );
@@ -2431,7 +2443,9 @@ fn journal_wait_journey() -> Result<()> {
             .into());
         }
         let mut client = fixture.attach()?;
-        let refused = within_100ms("refused work", || client.projects(None))?;
+        let refused = within_100ms("refused work", || {
+            client.projects(asura_client::ProjectPage::First, 8)
+        })?;
         let refused = refused?;
         if refused.error.as_deref() != Some("conversation_busy") {
             return Err(format!("work was not refused during replay: {refused:?}").into());
@@ -2466,13 +2480,17 @@ fn journal_wait_journey() -> Result<()> {
     if status.reason != pb::InstallationInspectionReason::InspectionPending {
         return Err(format!("writer replay loading ended early: {:?}", status.reason).into());
     }
-    let refused = fixture.attach()?.projects(None)?;
+    let refused = fixture
+        .attach()?
+        .projects(asura_client::ProjectPage::First, 8)?;
     if refused.error.as_deref() != Some("conversation_busy") {
         return Err(format!("work was not refused during writer replay: {refused:?}").into());
     }
     fs::remove_file(&hold_writer)?;
     wait_ready(&fixture, None)?;
-    fixture.attach()?.projects(None)?;
+    fixture
+        .attach()?
+        .projects(asura_client::ProjectPage::First, 8)?;
     fixture.stop()?;
     println!("PASS held replay: loading state, refused work, shutdown cancels replay");
     Ok(())
@@ -2654,7 +2672,9 @@ fn stop_drain_journey() -> Result<()> {
     // The next owner recovers by replay, as after a crash.
     fixture.start()?;
     wait_ready(&fixture, installation)?;
-    fixture.attach()?.projects(None)?;
+    fixture
+        .attach()?
+        .projects(asura_client::ProjectPage::First, 8)?;
     fixture.stop()?;
     println!("PASS second stop forced exit in {forced_after:?}; next owner recovered");
     Ok(())

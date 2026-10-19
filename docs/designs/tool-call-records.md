@@ -76,8 +76,8 @@ Non-goals:
   owns their records.
 - Changes to authority, grants or tool behavior. A record grants nothing.
 - Recovery of old journals (TCR-O2).
-- Journal capacity. The proposed [segmented journal](segmented-journal.md)
-  replaces the single 8 MiB journal file; this design adds no second store.
+- Journal capacity. The [segmented journal](segmented-journal.md) replaced the
+  single 8 MiB journal file; this design adds no second store.
 
 Dependencies:
 
@@ -388,13 +388,11 @@ frame can hold that worst case.
 Journal growth from large arguments is bounded by known sizes. One call adds
 at most one 64 KiB frame. A turn has at most 200 calls plus one small
 ordinal-201 record, so it adds at most about 12.6 MiB of call records. Typical
-records are a few hundred bytes. A turn of large calls can therefore fill the
-single 8 MiB journal file. The writer then refuses the append with its existing
-`Limit` error (`capacity_exhausted`). The conversation owner cancels the helper
-and reports the journal unavailable; restart records the turn `Interrupted`.
-That is a known-size exhaustion closure, not a hang. The
-[segmented journal](segmented-journal.md) owns the journal capacity; it lets a
-turn's call records span segment files (case SJ-28). This design adds no second store.
+records are a few hundred bytes. The [segmented journal](segmented-journal.md)
+owns the journal capacity: a turn's call records span segment files (case
+SJ-28). At the journal quota a `run` kind 14 whose result reservation does not
+fit is held before execution and the turn pauses (SJ-D19); a kind 14
+`cancelled` is a closure record (SJ-D18). This design adds no second store.
 
 ## Record: kind 14 `ToolCall`
 

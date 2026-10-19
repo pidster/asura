@@ -17,7 +17,7 @@ fn wait<T>(mut pending: memory::Pending<T>) -> Result<T> {
     }
 }
 fn seed(fixture: &Fixture, project: [u8; 16], foreign: [u8; 16], fact: &str) -> Result<()> {
-    let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
         .map_err(|e| format!("seed replay:{e:?}"))?;
     let binding = memory::Binding {
@@ -240,7 +240,7 @@ pub(super) fn run(provider: &str) -> Result<()> {
         saved.push((operation, event));
     }
     fixture.stop()?;
-    let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
         .map_err(|e| format!("memory replay:{e:?}"))?;
     for (operation, event) in &saved {
@@ -270,16 +270,16 @@ fn diagnose(fixture: &Fixture, operation: [u8; 16], event: &pb::ConversationEven
             .take(2048)
             .collect::<String>()
     );
-    let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
         .map_err(|e| format!("diagnostic replay:{e:?}"))?;
     for tool in replay.operations[&operation].tools.iter().take(8) {
         // Fixed journal-format-1 header/trailer; replay above has validated these exact frames.
-        for range in [Some(tool.intent_frame.clone()), tool.result_frame.clone()]
+        for range in [Some(tool.intent_frame), tool.result_frame]
             .into_iter()
             .flatten()
         {
-            let frame = &bytes[range];
+            let frame = &bytes[range.range()];
             let kind = u16::from_be_bytes([frame[10], frame[11]]);
             match journal::decode_record(kind, &frame[144..frame.len() - 40])
                 .map_err(|e| format!("diagnostic record:{e:?}"))?
@@ -307,14 +307,7 @@ fn committed_tools(
     fixture: &Fixture,
     operation: [u8; 16],
 ) -> Result<Vec<(journal::ToolCall, journal::ToolResult)>> {
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
-        .take(asura_storage::authority::MAX_JOURNAL as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > asura_storage::authority::MAX_JOURNAL {
-        return Err("fixture journal exceeds bound".into());
-    }
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
         .map_err(|e| format!("evidence replay:{e:?}"))?;
     let mut records = Vec::new();
@@ -326,20 +319,21 @@ fn committed_tools(
         .iter()
         .take(8)
     {
-        let Some(result_range) = tool.result_frame.clone() else {
+        let Some(result_range) = tool.result_frame else {
             continue;
         };
-        let decode = |range: std::ops::Range<usize>| -> Result<journal::Record> {
-            // Fixed journal-format-1 envelope, validated by canonical replay above.
-            let frame = &bytes[range];
-            journal::decode_record(
-                u16::from_be_bytes([frame[10], frame[11]]),
-                &frame[144..frame.len() - 40],
-            )
-            .map_err(|e| format!("evidence decode:{e:?}").into())
-        };
+        let decode =
+            |range: asura_storage::authority::conversation::Locator| -> Result<journal::Record> {
+                // Fixed journal-format-1 envelope, validated by canonical replay above.
+                let frame = &bytes[range.range()];
+                journal::decode_record(
+                    u16::from_be_bytes([frame[10], frame[11]]),
+                    &frame[144..frame.len() - 40],
+                )
+                .map_err(|e| format!("evidence decode:{e:?}").into())
+            };
         if let (journal::Record::ToolCall(intent), journal::Record::ToolResult(result)) =
-            (decode(tool.intent_frame.clone())?, decode(result_range)?)
+            (decode(tool.intent_frame)?, decode(result_range)?)
         {
             records.push((*intent, result));
         }

@@ -283,7 +283,8 @@ short responses only.
 - **Selected: client-held count instead of per-client service state.** A slow
   client cannot grow service memory.
 
-Open: the journal capacity remains the effective bound on response size until
-the proposed [segmented journal](segmented-journal.md) replaces the single 8 MiB
-file (L30). That design bounds one response by the journal quota and by 65,536
-pieces (about 3.75 GiB of full pieces).
+The [segmented journal](segmented-journal.md) replaced the single 8 MiB file
+(L30) on 2026-10-19. One response is bounded by the journal quota and by 65,536
+pieces (about 3.75 GiB of full pieces). At the quota the turn pauses
+(OD-SJ-2): its unjournaled text waits and output credit is withheld until
+space returns; a cancel keeps the journaled prefix and one tail.

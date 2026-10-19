@@ -1,7 +1,7 @@
 use asura_storage::authority::conversation::{
     ActiveBinding, FrameContext, PendingInit, Record, Request, encode_frame, request_digest,
 };
-use asura_storage::authority::{MAX_FRAME, MAX_JOURNAL, ReplayError, ReplayState, replay};
+use asura_storage::authority::{MAX_FRAME, ReplayError, ReplayState, replay};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -209,7 +209,6 @@ fn removed_and_unknown_first_kinds_and_lengths_limits_and_cancellation() {
     bytes = PENDING.to_vec();
     bytes[12..16].copy_from_slice(&((MAX_FRAME + 1) as u32).to_be_bytes());
     assert_eq!(inspect(&bytes), Err(ReplayError::Limit));
-    assert_eq!(inspect(&vec![0; MAX_JOURNAL + 1]), Err(ReplayError::Limit));
     assert_eq!(
         replay(&PENDING, &AtomicBool::new(true)),
         Err(ReplayError::Cancelled)

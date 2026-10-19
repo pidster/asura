@@ -75,7 +75,7 @@ fn run_for(long: bool) -> Result<()> {
                 && tool.status == Some(1))
     );
     fixture.stop()?;
-    let bytes = fs::read(fixture.home.join(".asura/state/control/slot-0.log"))?;
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
         .map_err(|error| format!("inventory replay: {error:?}"))?;
     let tools = &replay
@@ -95,8 +95,8 @@ fn run_for(long: bool) -> Result<()> {
     assert_eq!(inventory[0].result_status, Some(1));
     let frame = &bytes[inventory[0]
         .result_frame
-        .clone()
-        .ok_or("missing inventory result")?];
+        .ok_or("missing inventory result")?
+        .range()];
     let result = journal::decode_record(
         u16::from_be_bytes([frame[10], frame[11]]),
         &frame[144..frame.len() - 40],

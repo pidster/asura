@@ -436,6 +436,8 @@ fn terminal_regressions() -> Result<()> {
         Some("--tool-call-records"),
         Some("--waiting-steps"),
         Some("--queue-steer"),
+        Some("--segmented-journal"),
+        Some("--segmented-restore"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);
@@ -676,6 +678,251 @@ fn overlapping_project_fixture() -> Result<()> {
     result
 }
 
+/// SJ-35 and SJ-37 (end to end): registers `count` projects in private
+/// folders through the real writer, with no service running.
+fn many_projects_fixture(count: usize) -> Result<()> {
+    use asura_storage::authority::writer as w;
+    fn execute(writer: &w::WriterHandle, command: w::Command) -> Result<w::Reply> {
+        let mut ticket = writer
+            .try_submit(command)
+            .map_err(|e| format!("fixture submit:{e:?}"))?;
+        let end = Instant::now() + Duration::from_secs(12);
+        loop {
+            if let Some(result) = ticket.poll() {
+                return result.map_err(|e| format!("fixture writer:{e:?}").into());
+            }
+            require(Instant::now() < end, "fixture writer deadline")?;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let root = std::env::current_exe()?
+        .parent()
+        .ok_or("fixture parent")?
+        .to_owned();
+    let mut writer =
+        w::WriterHandle::start(resolver(true)?).map_err(|e| format!("fixture start:{e:?}"))?;
+    let result = (|| {
+        execute(&writer, w::Command::Initialize { request: [1; 16] })?;
+        let base = root.join("projects");
+        fs::DirBuilder::new().mode(0o700).create(&base)?;
+        for n in 0..count {
+            let project = base.join(format!("p{n:03}"));
+            fs::DirBuilder::new().mode(0o700).create(&project)?;
+            execute(
+                &writer,
+                w::Command::Register {
+                    request: asura_platform::random_id(),
+                    location: project.to_str().ok_or("project UTF8")?.into(),
+                },
+            )?;
+        }
+        Ok(())
+    })();
+    writer.close();
+    let end = Instant::now() + Duration::from_secs(10);
+    while !writer.settled() {
+        require(Instant::now() < end, "fixture writer close")?;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    result
+}
+
+/// SJ-08 and SJ-38 (end to end): an old project with one completed turn,
+/// 70 newer projects with a turn each (the old one leaves the recent set),
+/// and enough response text for several segment files. `strip` removes
+/// every checkpoint and index run afterwards, so the next writer rebuilds.
+fn long_journal_fixture(strip: bool) -> Result<()> {
+    use asura_storage::authority::{conversation as j, writer as w};
+    thread_local!(static REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) });
+    fn execute(writer: &w::WriterHandle, command: w::Command) -> Result<w::Reply> {
+        let mut ticket = writer
+            .try_submit(command)
+            .map_err(|e| format!("fixture submit:{e:?}"))?;
+        let end = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(result) = ticket.poll() {
+                return result.map_err(|e| format!("fixture writer:{e:?}").into());
+            }
+            require(Instant::now() < end, "fixture writer deadline")?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn append(
+        writer: &w::WriterHandle,
+        record: j::Record,
+        admission: Option<w::AdmissionFence>,
+    ) -> Result<()> {
+        // The writer's reply carries the next revision; one round trip.
+        let mut revision = REVISION.with(|r| r.get());
+        if revision == 0 {
+            revision = execute(writer, w::Command::Open)?
+                .replay
+                .ok_or("replay")?
+                .revision;
+        }
+        let next = execute(
+            writer,
+            w::Command::Append {
+                expected_revision: revision,
+                record,
+                admission,
+            },
+        )?
+        .replay
+        .ok_or("replay")?
+        .revision;
+        REVISION.with(|r| r.set(next));
+        Ok(())
+    }
+    fn turn(
+        writer: &w::WriterHandle,
+        project: j::Id,
+        prompt: &str,
+        answer: &[String],
+    ) -> Result<()> {
+        let digest = execute(
+            writer,
+            w::Command::Prepare {
+                project,
+                conversation: None,
+                expected_generation: 0,
+                prompt: prompt.into(),
+            },
+        )?
+        .prepared
+        .ok_or("prepared")?
+        .configuration_digest;
+        let operation = asura_platform::random_id();
+        append(
+            writer,
+            j::Record::TurnAccepted(Box::new(j::TurnAccepted {
+                request: asura_platform::random_id(),
+                digest: j::request_digest(j::Request::Submit {
+                    project,
+                    conversation: None,
+                    expected_generation: 0,
+                    prompt,
+                })
+                .map_err(|e| format!("digest:{e:?}"))?,
+                project,
+                original_conversation: None,
+                expected_generation: 0,
+                conversation: asura_platform::random_id(),
+                generation: 1,
+                task: asura_platform::random_id(),
+                operation,
+                model: "system".into(),
+                configuration_digest: digest,
+                instructions_digest: [1; 32],
+                input_digest: [2; 32],
+                prior_operations: Vec::new(),
+                prompt: prompt.into(),
+                event_cursor: 1,
+                composition: j::Composition::default(),
+            })),
+            Some(w::AdmissionFence {
+                project,
+                configuration_digest: digest,
+            }),
+        )?;
+        append(
+            writer,
+            j::Record::StartAuthorized(j::StartAuthorized {
+                operation,
+                generation: 1,
+                helper: asura_platform::random_id(),
+                input_digest: [2; 32],
+            }),
+            None,
+        )?;
+        let mut offset = 0u64;
+        for piece in &answer[..answer.len() - 1] {
+            append(
+                writer,
+                j::Record::ResponseText(j::ResponseText {
+                    operation,
+                    generation: 1,
+                    offset,
+                    text: piece.clone(),
+                }),
+                None,
+            )?;
+            offset += piece.len() as u64;
+        }
+        append(
+            writer,
+            j::Record::TurnTerminal(j::TurnTerminal {
+                operation,
+                generation: 1,
+                kind: j::TerminalKind::Complete,
+                cause: j::Cause::None,
+                final_cursor: u64::MAX,
+                usage_known: true,
+                output_tokens: 1,
+                text_offset: offset,
+                text: answer[answer.len() - 1].clone(),
+            }),
+            None,
+        )
+    }
+    let root = std::env::current_exe()?
+        .parent()
+        .ok_or("fixture parent")?
+        .to_owned();
+    let mut writer =
+        w::WriterHandle::start(resolver(true)?).map_err(|e| format!("fixture start:{e:?}"))?;
+    let result: Result<()> = (|| {
+        execute(&writer, w::Command::Initialize { request: [1; 16] })?;
+        let register = |name: &str| -> Result<j::Id> {
+            let path = root.join(name);
+            fs::DirBuilder::new().mode(0o700).create(&path)?;
+            let reply = execute(
+                &writer,
+                w::Command::Register {
+                    request: asura_platform::random_id(),
+                    location: path.to_str().ok_or("UTF8")?.into(),
+                },
+            )?;
+            let revision = reply.replay.as_ref().ok_or("replay")?.revision;
+            REVISION.with(|r| r.set(revision));
+            Ok(reply.project.ok_or("project")?.registration.project)
+        };
+        let old = register("old")?;
+        turn(&writer, old, "OLD-PROMPT", &["OLD-ANSWER".into()])?;
+        let filler: Vec<String> = (0..100)
+            .map(|_| "f".repeat(60 * 1024))
+            .chain(["end".into()])
+            .collect();
+        for n in 0..70 {
+            let project = register(&format!("newer{n:02}"))?;
+            let answer = if n < 3 {
+                filler.clone()
+            } else {
+                vec!["ok".into()]
+            };
+            turn(&writer, project, "newer", &answer)?;
+        }
+        Ok(())
+    })();
+    writer.close();
+    let end = Instant::now() + Duration::from_secs(10);
+    while !writer.settled() {
+        require(Instant::now() < end, "fixture writer close")?;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    result?;
+    if strip {
+        let control = root.join("home/.asura/state/control");
+        for entry in fs::read_dir(&control)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.starts_with("ckpt-") || name.starts_with("run-") {
+                fs::remove_file(control.join(name))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn queue_history_fixture(verify: bool) -> Result<()> {
     use asura_storage::authority::{conversation as j, writer as w};
     fn execute(writer: &w::WriterHandle, command: w::Command) -> Result<w::Reply> {
@@ -734,7 +981,7 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
                 let record = execute(
                     &writer,
                     w::Command::ReadRecord {
-                        range: operation.accepted_frame.clone(),
+                        locator: operation.accepted_frame,
                     },
                 )?
                 .record
@@ -1142,6 +1389,25 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("--verify-queue-steer") {
         if let Err(error) = queue_steer_verify() {
             eprintln!("queue steer fixture: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--seed-projects") {
+        let count = std::env::args()
+            .nth(2)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(200);
+        if let Err(error) = many_projects_fixture(count) {
+            eprintln!("many projects fixture: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--seed-long-journal") {
+        let strip = std::env::args().nth(2).as_deref() == Some("--strip");
+        if let Err(error) = long_journal_fixture(strip) {
+            eprintln!("long journal fixture: {error}");
             std::process::exit(1);
         }
         return;

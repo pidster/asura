@@ -177,7 +177,7 @@ fn installation_pair(state: Option<i32>, reason: Option<i32>) -> bool {
         (S::Uninitialized, R::RuntimeOnly)
             | (
                 S::Recovering,
-                R::InspectionPending | R::InitializationPending
+                R::InspectionPending | R::InitializationPending | R::CheckpointRebuildPending
             )
             | (S::GraphUnavailable, R::GraphVerificationUnavailable)
             | (S::GraphReady, R::GraphVerified)

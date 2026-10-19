@@ -160,7 +160,7 @@ fn roundtrip_requests_terminal_offsets_and_unknown_complete_usage() {
     // No turn reservation exists: unknown usage records zero output.
     assert!(!t.usage_known);
     assert_eq!(t.output_tokens, 0);
-    let frame = &j.bytes[t.frame.clone()];
+    let frame = &j.bytes[t.frame.range()];
     let Record::TurnTerminal(decoded) = decode_record(8, &frame[144..frame.len() - 40]).unwrap()
     else {
         panic!("terminal")
@@ -442,7 +442,7 @@ fn file_fixture_reopen_preserves_the_same_authority_result() {
     std::fs::remove_file(path).unwrap();
     let s = inspect(&loaded).unwrap();
     assert_eq!(s.active_operation, Some(id(10)));
-    assert_eq!(s.end_offset, loaded.len());
+    assert_eq!(s.last_frame.range().end, loaded.len());
     assert_eq!(s.last_digest, j.digest);
 }
 #[test]
@@ -474,40 +474,57 @@ fn alias_preserves_original_digest_and_does_not_create_another_project() {
     j.append(Record::ProjectRequestAlias(wrong));
     assert!(inspect(&j.bytes).is_err());
 }
+/// SJ-35 unit: no registration total. The recent set keeps 64 projects by
+/// activity plus pins; every project is found through the index (`J`, `D`).
 #[test]
-fn project_capacity_does_not_discard_existing_entries() {
+fn sj35_project_registrations_have_no_total_and_residency_is_bounded() {
     let mut j = Journal::base();
-    for n in 1..=MAX_PROJECTS {
+    let register = |j: &mut Journal, n: u64, inode: u64| {
         let location = format!("/project/{n}");
         j.append(Record::ProjectRegistered(ProjectRegistered {
-            request: id(100 + 2 * n as u64),
+            request: id(100_000 + 2 * n),
             digest: request_digest(Request::Register {
                 location: &location,
             })
             .unwrap(),
-            project: id(101 + 2 * n as u64),
+            project: id(100_001 + 2 * n),
             location,
             device: 1,
-            inode: 2 + n as u64,
+            inode,
             registry_revision: 1,
             visibility: 1,
         }));
-        if n == MAX_PROJECTS - 1 {
-            assert_eq!(inspect(&j.bytes).unwrap().projects.len(), MAX_PROJECTS);
+    };
+    for n in 1..=1000 {
+        register(&mut j, n, 2 + n);
+        if n == 65 {
+            let s = inspect(&j.bytes).unwrap();
+            // The base project plus 65 new ones: the oldest by activity left memory.
+            assert_eq!(s.projects.len(), RECENT_PROJECTS);
+            assert!(!s.projects.contains_key(&id(6)));
         }
     }
-    assert_eq!(inspect(&j.bytes).unwrap_err(), ReplayError::Limit);
-}
-#[test]
-fn accepted_turn_reserves_closure_frames_before_the_frame_limit() {
-    let mut j = Journal::base();
-    while j.sequence < authority::MAX_FRAMES as u64 - 4 {
-        j.append(Record::OwnerGeneration);
+    let s = inspect(&j.bytes).unwrap();
+    assert_eq!(s.projects.len(), RECENT_PROJECTS);
+    // The newest 64 by activity, then ID.
+    assert!(s.projects.contains_key(&id(100_001 + 2000)));
+    assert!(!s.projects.contains_key(&id(100_001 + 2 * 936)));
+    let mut index = MemoryIndex {
+        segments: std::collections::BTreeMap::from([(1, j.bytes.as_slice())]),
+    };
+    for n in [1u64, 500, 1000] {
+        let entry = s
+            .find_project(id(100_001 + 2 * n), &mut index)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.registration.location, format!("/project/{n}"));
     }
-    j.append(Record::TurnAccepted(Box::new(turn())));
-    assert_eq!(inspect(&j.bytes).unwrap_err(), ReplayError::Limit);
+    // The base project is found through the index after eviction.
+    assert!(s.find_project(id(6), &mut index).unwrap().is_some());
+    // A second registration of an existing device and inode is rejected (`D`).
+    register(&mut j, 1001, 2 + 7);
+    assert!(inspect(&j.bytes).is_err());
 }
-
 fn seal(frame: &mut [u8]) {
     use sha2::{Digest, Sha256};
     let end = frame.len() - 40;
@@ -785,7 +802,7 @@ fn input_queue_is_durable_offset_backed_and_fifo_dispatch_is_atomic() {
     let state = inspect(&j.bytes).unwrap();
     assert_eq!(state.input_status(first.input), Some(InputStatus::Queued));
     assert_eq!(state.ready_input(), None);
-    let range = state.inputs[&first.input].frame.clone();
+    let range = state.inputs[&first.input].frame.range();
     let frame = &j.bytes[range];
     assert_eq!(
         decode_record(18, &frame[144..frame.len() - 40]).unwrap(),
@@ -1152,12 +1169,12 @@ fn status_tool_result_replays_and_rejects_file_paging_or_oversized_payload() {
     assert!(inspect(&valid.bytes).unwrap().active_operation.is_none());
     valid.append(Record::OwnerGeneration);
     let restarted = inspect(&valid.bytes).unwrap();
-    let frame = restarted.operations[&id(10)].tools[0]
-        .result_frame
-        .clone()
-        .unwrap();
+    let frame = restarted.operations[&id(10)].tools[0].result_frame.unwrap();
     assert_eq!(
-        decode_record(15, &valid.bytes[frame.start + 144..frame.end - 40]),
+        decode_record(
+            15,
+            &valid.bytes[frame.range().start + 144..frame.range().end - 40]
+        ),
         Ok(Record::ToolResult(result.clone()))
     );
     let mut interrupted = Journal::started();
@@ -2340,7 +2357,8 @@ fn tcr_u13_replay_recomputes_derived_identities() {
     );
     let Record::ToolCall(stored) = decode_record(
         14,
-        &journal.bytes[tools[0].intent_frame.start + 144..tools[0].intent_frame.end - 40],
+        &journal.bytes
+            [tools[0].intent_frame.range().start + 144..tools[0].intent_frame.range().end - 40],
     )
     .unwrap() else {
         panic!("kind 14");

@@ -313,7 +313,7 @@ fn authority_fixture(root: &Scratch, bytes: &[u8]) -> RuntimeDirectory {
         .mode(0o700)
         .create(&directory)
         .unwrap();
-    let journal = directory.join("slot-0.log");
+    let journal = directory.join("seg-0000000000000001.log");
     fs::write(&journal, bytes).unwrap();
     fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
     runtime
@@ -373,6 +373,17 @@ fn authority_runtime_logs_remnants_and_unsupported_layout() {
         fs::read(directory.join("slot-1.log")).unwrap(),
         b"do not select"
     );
+    // SJ-01: the single-file journal has no reader.
+    fs::remove_file(directory.join("slot-1.log")).unwrap();
+    fs::write(directory.join("slot-0.log"), b"old journal").unwrap();
+    assert!(matches!(
+        authority_scan(&runtime).unwrap().source,
+        AuthoritySource::UnsupportedLayout
+    ));
+    assert_eq!(
+        fs::read(directory.join("slot-0.log")).unwrap(),
+        b"old journal"
+    );
 }
 #[test]
 fn finder_metadata_preserves_fresh_and_initialized_authority() {
@@ -389,15 +400,19 @@ fn finder_metadata_preserves_fresh_and_initialized_authority() {
         let scan = authority_scan(&runtime).unwrap();
         match scan.source {
             AuthoritySource::RuntimeOnly => assert!(!initialized),
-            AuthoritySource::Journal(mut reader) => {
+            AuthoritySource::Journal(reader) => {
                 assert!(initialized);
                 assert!(!reader.has_unknown_root_content());
-                assert_eq!(
-                    reader
-                        .read_all(&std::sync::atomic::AtomicBool::new(false))
-                        .unwrap(),
-                    b"journal bytes"
-                );
+                let mut directory = reader
+                    .directory(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                        false,
+                    )))
+                    .unwrap();
+                let name = crate::JournalName::Segment(1);
+                assert_eq!(directory.census().unwrap().len(), 1);
+                let mut bytes = vec![0; 13];
+                directory.read_at(name, 0, &mut bytes).unwrap();
+                assert_eq!(bytes, b"journal bytes");
             }
             _ => panic!("Finder metadata changed authority classification"),
         }
@@ -475,18 +490,22 @@ fn authority_reads_exact_bytes_and_preserves_known_model_areas() {
         .create(root.0.join(".asura/data"))
         .unwrap();
     let scan = authority_scan(&runtime).unwrap();
-    let AuthoritySource::Journal(mut reader) = scan.source else {
+    let AuthoritySource::Journal(reader) = scan.source else {
         panic!("journal missing");
     };
     assert!(!reader.has_unknown_root_content());
-    assert_eq!(
-        reader
-            .read_all(&std::sync::atomic::AtomicBool::new(false))
-            .unwrap(),
-        bytes
-    );
+    let mut directory = reader
+        .directory(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )))
+        .unwrap();
+    let mut read = vec![0; bytes.len()];
+    directory
+        .read_at(crate::JournalName::Segment(1), 0, &mut read)
+        .unwrap();
+    assert_eq!(read, bytes);
     scan.witness.validate().unwrap();
-    let path = root.0.join(".asura/state/control/slot-0.log");
+    let path = root.0.join(".asura/state/control/seg-0000000000000001.log");
     assert_eq!(fs::read(path).unwrap(), bytes);
     let unknown = root.0.join(".asura/unknown");
     fs::write(&unknown, b"preserve").unwrap();
@@ -519,9 +538,13 @@ fn queued_authority_witnesses_reject_namespace_and_file_changes() {
     let AuthoritySource::Journal(reader) = scan.source else {
         panic!("journal missing");
     };
-    let path = root.0.join(".asura/state/control/slot-0.log");
-    fs::write(&path, b"longer changed journal bytes").unwrap();
+    let path = root.0.join(".asura/state/control/seg-0000000000000001.log");
+    // A new journal file changes the held control directory; content is
+    // checked by frame digests on read, not by the witness.
+    let added = root.0.join(".asura/state/control/seg-0000000000000002.log");
+    fs::write(&added, b"").unwrap();
     assert_eq!(reader.validate(), Err(AuthorityError::Changed));
+    fs::remove_file(&added).unwrap();
     assert_eq!(scan.witness.validate(), Err(AuthorityError::Changed));
     let scan = authority_scan(&runtime).unwrap();
     fs::rename(&path, root.0.join("old-journal")).unwrap();
@@ -534,7 +557,7 @@ fn authority_unsafe_links_modes_and_nonregular_files_are_rejected() {
     for variant in 0..4 {
         let root = Scratch::new();
         let runtime = authority_fixture(&root, b"preserve");
-        let path = root.0.join(".asura/state/control/slot-0.log");
+        let path = root.0.join(".asura/state/control/seg-0000000000000001.log");
         match variant {
             0 => fs::hard_link(&path, root.0.join("linked-journal")).unwrap(),
             1 => fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap(),
@@ -549,8 +572,19 @@ fn authority_unsafe_links_modes_and_nonregular_files_are_rejected() {
                 assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
             }
         }
-        assert!(
-            matches!(authority_scan(&runtime), Err(AuthorityError::Unsafe)),
+        // The read-only census checks every journal file (SJ-F18).
+        let scan = authority_scan(&runtime).unwrap();
+        let AuthoritySource::Journal(reader) = scan.source else {
+            panic!("journal missing");
+        };
+        let mut directory = reader
+            .directory(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )))
+            .unwrap();
+        assert_eq!(
+            directory.census(),
+            Err(crate::JournalError::Unsafe),
             "variant {variant}"
         );
     }
@@ -559,21 +593,6 @@ fn authority_unsafe_links_modes_and_nonregular_files_are_rejected() {
 fn authority_size_census_limit_and_cancellation_are_bounded() {
     let root = Scratch::new();
     let runtime = authority_fixture(&root, b"");
-    let path = root.0.join(".asura/state/control/slot-0.log");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(8 * 1024 * 1024 + 1)
-        .unwrap();
-    let scan = authority_scan(&runtime).unwrap();
-    let AuthoritySource::Journal(mut reader) = scan.source else {
-        panic!("journal missing");
-    };
-    assert_eq!(
-        reader.read_all(&std::sync::atomic::AtomicBool::new(false)),
-        Err(AuthorityError::Limit)
-    );
     assert!(matches!(
         runtime.authority_source(&std::sync::atomic::AtomicBool::new(true)),
         Err(AuthorityError::Cancelled)

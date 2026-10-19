@@ -32,6 +32,11 @@ impl Activity {
             "Observation unavailable".into()
         } else {
             match (self.kind, self.waiting_step.and_then(wait_label)) {
+                // Segmented journal OD-SJ-2: the turn pauses at the journal
+                // quota or disk floor, before or during output.
+                (0..=2, _) if self.waiting_step == Some(JOURNAL_PAUSED) => {
+                    format!("{PAUSED_TEXT} · Esc stops")
+                }
                 (0 | 1, Some(step)) => format!("Waiting: {step} · Esc stops"),
                 (0 | 1, None) => "Waiting".into(),
                 (2, _) => "Generating".into(),
@@ -159,6 +164,10 @@ fn fault_label(code: u32) -> Option<&'static str> {
         _ => return None,
     })
 }
+/// `CONVERSATION_WAIT_STEP_JOURNAL_PAUSED`: the journal is held at its quota
+/// or disk floor and the turn is paused until it resumes or is cancelled.
+const JOURNAL_PAUSED: i32 = 5;
+pub(super) const PAUSED_TEXT: &str = "Paused: journal space is full.";
 /// Waiting step labels for an accepted turn (lowercase, after `Waiting:`).
 fn wait_label(step: i32) -> Option<&'static str> {
     match step {
@@ -281,6 +290,9 @@ impl App {
             // other value a heartbeat can replace.
             if entry.kind <= 1 && event.kind == Some(1) {
                 entry.waiting_step = event.waiting_step;
+            } else if entry.kind == 2 && event.kind == Some(1) {
+                // A generating turn can only pause for the journal, or resume.
+                entry.waiting_step = event.waiting_step.filter(|step| *step == JOURNAL_PAUSED);
             }
             return None;
         }
@@ -753,6 +765,48 @@ mod tests {
         assert!(app.activity[0].display().contains("Generating"));
         assert!(!app.activity[0].display().contains("model output"));
         assert_eq!(app.transcript[0].1, "partial");
+    }
+    /// SJ-16 (TUI): wait step 5 shows the journal pause while present, then
+    /// the normal running or terminal display.
+    #[test]
+    fn journal_pause_step_shows_paused_then_running_or_cancelled() {
+        let mut app = App::new();
+        app.append_response("Big answer".into(), Some(vec![1; 16]));
+        app.active_operation = Some(vec![1; 16]);
+        app.conversation_busy = true;
+        let mut pending = event(1, 2, 1, 1);
+        pending.tools.clear();
+        pending.waiting_step = Some(5);
+        apply(&mut app, pending.clone());
+        assert!(
+            draw(&mut app, 100, 25, "journal-paused")
+                .contains("Activity · Paused: journal space is full. · Esc stops")
+        );
+        // Output resumes: the next text event clears the pause.
+        let mut text = event(1, 3, 2, 1);
+        text.tools.clear();
+        text.text = Some("partial".into());
+        apply(&mut app, text);
+        assert!(app.activity[0].display().contains("Generating"));
+        // A pause during output: an equal-cursor heartbeat sets it, and a
+        // heartbeat without the step resumes the generating display.
+        pending.cursor = Some(3);
+        pending.waiting_step = Some(5);
+        apply(&mut app, pending.clone());
+        assert!(app.activity[0].display().contains(PAUSED_TEXT));
+        pending.waiting_step = None;
+        apply(&mut app, pending.clone());
+        assert!(app.activity[0].display().contains("Generating"));
+        pending.waiting_step = Some(5);
+        apply(&mut app, pending);
+        // Cancel during the pause: the terminal event shows Cancelled.
+        let mut cancelled = event(1, 4, 5, 1);
+        cancelled.tools.clear();
+        cancelled.text = Some("partial".into());
+        apply(&mut app, cancelled);
+        let display = app.activity[0].display();
+        assert!(display.contains("Cancelled"), "{display}");
+        assert!(!display.contains("Paused"));
     }
     #[test]
     fn stale_operation_cursor_generation_and_observation_failure_are_safe() {

@@ -26,11 +26,12 @@ the working directory or an environment override. Tests use scratch runtime root
 | `providers.ollama.endpoint` | ASCII URL, at most 2048 bytes; numeric-loopback host over HTTP or HTTPS. Set rejects other hosts with `config_remote_endpoint_restricted` under the [loopback restriction](model-provider-integration.md#loopback-endpoint-restriction--selected-2026-10-13) | `http://127.0.0.1:11434` at inference admission |
 
 The owner accepted `journal.quotaBytes`, its range and its 4 GiB default on
-2026-10-19. The configuration owner adds the key in the same change that
-implements the [segmented journal](segmented-journal.md#configuration); until
-then it is not accepted on the wire and the single-file journal bounds apply.
+2026-10-19; it is implemented with the [segmented journal](segmented-journal.md#configuration).
 Like `retention`, `journal` is written only when set away from its default.
-Validation case SJ-14 covers its bounds and immediate effect.
+`set journal` takes the whole mapping and requires its one field. A persisted
+set reaches the journal writer at once: the service forwards the new effective
+value and the writer rechecks its held state. Validation case SJ-14 covers its
+bounds and immediate effect.
 
 `/config` without arguments returns the complete effective configuration as YAML,
 including audit defaults and omitting an unset model. It uses the same bounded

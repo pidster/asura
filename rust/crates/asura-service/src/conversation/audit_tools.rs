@@ -164,6 +164,7 @@ pub(super) fn reason(code: &str) -> asura_storage::audit::DecisionReason {
 pub(super) fn rejected(
     request: &pb::Envelope,
     state: Option<&asura_storage::authority::conversation::Replay>,
+    known: bool,
     code: &str,
 ) -> Option<Event> {
     // Conversation input enters through the queue; a rejected submission is
@@ -173,7 +174,8 @@ pub(super) fn rejected(
     };
     let project: [u8; 16] = query.project_id.as_deref()?.try_into().ok()?;
     let state = state?;
-    if !state.projects.contains_key(&project) {
+    // Resident, or learned from a project page (no registration total).
+    if !known && !state.projects.contains_key(&project) {
         return None;
     }
     let conversation = query

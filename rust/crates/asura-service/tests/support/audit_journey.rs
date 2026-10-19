@@ -331,11 +331,7 @@ pub(super) fn run(provider: Option<&str>) -> Result<()> {
     Ok(())
 }
 fn verify_tool(fixture: &Fixture, operation: [u8; 16], project: [u8; 16]) -> Result<()> {
-    use std::io::Read;
-    let mut bytes = vec![];
-    fs::File::open(fixture.home.join(".asura/state/control/slot-0.log"))?
-        .take(asura_storage::authority::MAX_JOURNAL as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let replay = j::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
         .map_err(|e| format!("audit proof replay:{e:?}"))?;
     let tools = &replay
@@ -350,15 +346,15 @@ fn verify_tool(fixture: &Fixture, operation: [u8; 16], project: [u8; 16]) -> Res
     assert_eq!(selected.len(), 1);
     let tool = selected[0];
     assert_eq!(tool.result_status, Some(1));
-    let decode = |range: std::ops::Range<usize>| -> Result<j::Record> {
-        let frame = &bytes[range];
+    let decode = |range: asura_storage::authority::conversation::Locator| -> Result<j::Record> {
+        let frame = &bytes[range.range()];
         Ok(j::decode_record(
             u16::from_be_bytes([frame[10], frame[11]]),
             &frame[144..frame.len() - 40],
         )
         .map_err(|e| format!("audit record:{e:?}"))?)
     };
-    let j::Record::ToolCall(intent) = decode(tool.intent_frame.clone())? else {
+    let j::Record::ToolCall(intent) = decode(tool.intent_frame)? else {
         return Err("audit intent variant".into());
     };
     // The kind 14 arguments select no log path; the limit defaults to 16.
@@ -372,8 +368,7 @@ fn verify_tool(fixture: &Fixture, operation: [u8; 16], project: [u8; 16]) -> Res
             .as_object()
             .is_some_and(|members| members.keys().all(|k| k == "command" || k == "limit"))
     );
-    let j::Record::ToolResult(result) = decode(tool.result_frame.clone().ok_or("audit result")?)?
-    else {
+    let j::Record::ToolResult(result) = decode(tool.result_frame.ok_or("audit result")?)? else {
         return Err("audit result variant".into());
     };
     assert!(

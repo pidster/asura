@@ -164,6 +164,8 @@ pub enum Setting {
     ProvidersMlxModels,
     #[serde(rename = "retention.quotaBytes")]
     RetentionQuotaBytes,
+    #[serde(rename = "journal.quotaBytes")]
+    JournalQuotaBytes,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -426,4 +428,21 @@ mod optional_id {
 
 fn present_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     u64::deserialize(d).map(Some)
+}
+
+#[cfg(test)]
+mod setting_tests {
+    use super::*;
+    #[test]
+    fn journal_quota_setting_uses_its_config_key_name() {
+        assert_eq!(
+            serde_json::to_string(&Setting::JournalQuotaBytes).unwrap(),
+            "\"journal.quotaBytes\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Setting>("\"journal.quotaBytes\"").unwrap(),
+            Setting::JournalQuotaBytes
+        );
+        assert_ne!(Setting::JournalQuotaBytes, Setting::RetentionQuotaBytes);
+    }
 }
