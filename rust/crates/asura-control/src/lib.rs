@@ -3,6 +3,7 @@ use prost::Message;
 use std::fmt;
 mod audit_query;
 mod sensor_query;
+pub mod thinking;
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/asura.control.v1.rs"));
@@ -322,6 +323,7 @@ pub fn validate_semantics(
         Body::ObserveService(_) => true,
         Body::ServiceObservation(v) => {
             v.uptime_ms.is_some()
+                && v.thinking_level.is_none_or(|n| (0..=4).contains(&n))
                 && v.stored_memory.as_ref().is_some_and(|memory| {
                     let available = v
                         .status

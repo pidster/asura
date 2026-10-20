@@ -274,8 +274,9 @@ graph. The earlier diagnostic initialization kinds 1 and 2 are removed, and repl
 rejects a stream that starts with any other kind. Kind 3 keeps its OwnerGeneration
 meaning; kinds 4 through 9 add the conversation transitions below. Later amendments
 add kinds 13–23 for queue decisions, tools, promotion, Memory create, the managed
-queue, project rename, composed turns and exec_cmd, and kind 24 for response text
-segments ([response text transfer](response-text-transfer.md#journal-records)).
+queue, project rename, composed turns and exec_cmd, kind 24 for response text
+segments ([response text transfer](response-text-transfer.md#journal-records)) and
+kind 25 for thinking text ([thinking level](thinking-level.md#journal-format-1)).
 Kinds 1, 2, 5, 12, 17 and 22 are unassigned. Never reinterpret an existing kind based on payload length.
 
 Tool record kinds after the [tool call records](tool-call-records.md) change
@@ -358,10 +359,11 @@ include the complete state/result/event obligation described below.
 | 3 OwnerGeneration | no payload | Previous owner generation plus 1; durable before any new dispatch |
 | 4 ProjectRegistered | request ID, request digest, project ID, location string, device u64, inode u64, registry revision u64, visibility u8 | First project revision 1, visibility 1 closed; records original result and pinned association |
 | 9 ProjectRequestAlias | request ID, request digest, original location string, existing project ID, registry revision u64 | Existing same-object association; records idempotent result for a new request without another project |
-| 21 TurnAccepted | request ID, request digest, project ID, original conversation ID optional, expected generation u64, conversation ID, generation u64, task ID, model-operation ID, model string, configuration digest, instructions digest, input digest, prior-operation ID list, prompt string, event cursor u64, then the required composition (see [graph memory evolution](graph-memory-evolution.md)) | Registry and expected generation verified; atomically creates conversation when needed, accepts task/operation and records acceptance cursor 1. It reserves no output tokens (owner, 2026-10-18). Kind 5, the earlier form without composition, is removed |
+| 21 TurnAccepted | request ID, request digest, project ID, original conversation ID optional, expected generation u64, conversation ID, generation u64, task ID, model-operation ID, model string, configuration digest, instructions digest, input digest, prior-operation ID list, prompt string, event cursor u64, then the required composition (see [graph memory evolution](graph-memory-evolution.md)), then thinking level u8 and thinking request u8 ([thinking level](thinking-level.md#journal-format-1)) | Registry and expected generation verified; atomically creates conversation when needed, accepts task/operation and records acceptance cursor 1. It reserves no output tokens (owner, 2026-10-18). Kind 5, the earlier form without composition, is removed |
 | 6 StartAuthorized | model-operation ID, conversation generation u64, helper-instance ID, input digest | Accepted operation, no cancel/terminal and same owner generation; one dispatch permit only |
 | 7 CancelRequested | model-operation ID, conversation generation u64, cause u8 | Cause 1 user, 2 deadline, 3 output limit, 4 service shutdown; one intent per operation, existing intent wins |
 | 24 ResponseText | model-operation ID, conversation generation u64, offset u64, text string | Accepted, started, nonterminal operation of the current owner generation; keeps `offset` bytes of the journaled response (at most its length) and appends text of at most 61,440 bytes; must change the text ([response text transfer](response-text-transfer.md#journal-records)) |
+| 25 ThinkingText | model-operation ID, conversation generation u64, offset u64, text string | As kind 24, applied to the operation's thinking text instead of its response; kind 8 carries no thinking tail ([thinking level](thinking-level.md#journal-format-1)) |
 | 8 TurnTerminal | model-operation ID, conversation generation u64, terminal kind u8, cause u8, final cursor u64, usage-known u8, output-tokens u32, text offset u64, text string | Kind 1 complete, 2 failed, 3 cancelled, 4 interrupted; only once, helper settled where applicable; keeps `text offset` bytes of the journaled response and appends the text tail; terminal task/operation, accounting and final event commit atomically |
 
 Location is at most 4096 UTF-8 bytes. Model identity is at most 1024 bytes. Prompt

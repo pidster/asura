@@ -846,6 +846,11 @@ uses concrete error types, never their descriptions or raw generated content.
 
 ### Optional MLX reasoning activation
 
+Superseded 2026-10-19 by [thinking level](thinking-level.md#decisions-and-alternatives)
+(D4). Hello field 19 is removed and reserved. The model thinking level now
+selects the reasoning option; `default` sends none. The text below records the
+earlier behavior.
+
 For a declared reasoning-capable MLX model with a native `templateFlag` strategy,
 this conversation slice explicitly disables optional reasoning. Support remains
 recorded as supported. The pinned MLX bridge accepts only

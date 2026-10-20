@@ -2,8 +2,9 @@
 //! Swift helper, a scripted loopback Ollama endpoint, the real conversation
 //! owner, journal, payload and memory stores, in private scratch homes. Each
 //! case ends with a raw-byte sweep for the secrets it used.
-//! Cases: TCR-I01..I07, TCR-I09, TCR-E01..E03 (service part), TCR-P2 and
-//! the response text transfer cases RT-03, RT-05 and RT-06 (integration).
+//! Cases: TCR-I01..I07, TCR-I09, TCR-E01..E03 (service part), TCR-P2,
+//! the response text transfer cases RT-03, RT-05 and RT-06 (integration) and
+//! the thinking level cases TL-01..TL-07, TL-09, TL-10, TL-12, TL-13.
 #[path = "support/queue_submit.rs"]
 mod queue_submit;
 use asura_client::Client;
@@ -195,6 +196,9 @@ enum Step {
     Call(String, Value),
     /// The final answer.
     Final,
+    /// Thinking text streamed in `message.thinking` records of at most 40,000
+    /// bytes, then this answer (thinking-level.md).
+    Thinking(String, String),
     /// The final answer with this text, streamed in NDJSON records of at most
     /// 40,000 bytes of content.
     Text(String),
@@ -213,6 +217,8 @@ struct Model {
     endpoint: String,
     stop: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<Value>>>,
+    /// The `/api/show` reply; tests change it to model thinking support.
+    show: Arc<Mutex<Value>>,
     script: Arc<Mutex<std::collections::VecDeque<Step>>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -224,7 +230,10 @@ impl Model {
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        let (token, log, steps) = (stop.clone(), requests.clone(), script.clone());
+        let show = Arc::new(Mutex::new(json!({"capabilities": ["completion", "tools"],
+            "model_info": {"fixture.context_length": 32768}})));
+        let (token, log, steps, shown) =
+            (stop.clone(), requests.clone(), script.clone(), show.clone());
         let thread = thread::spawn(move || {
             while !token.load(Ordering::Acquire) {
                 let (mut socket, _) = match listener.accept() {
@@ -237,10 +246,12 @@ impl Model {
                 };
                 let _ = socket.set_nonblocking(false);
                 let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
-                let (log, steps, token) = (log.clone(), steps.clone(), token.clone());
+                let (log, steps, token, shown) =
+                    (log.clone(), steps.clone(), token.clone(), shown.clone());
                 // Held replies must not block the next request.
                 thread::spawn(move || {
-                    let _ = serve(&mut socket, &log, &steps, &token);
+                    let show = shown.lock().unwrap().clone();
+                    let _ = serve(&mut socket, &log, &steps, &token, &show);
                 });
             }
         });
@@ -248,6 +259,7 @@ impl Model {
             endpoint,
             stop,
             requests,
+            show,
             script,
             thread: Some(thread),
         })
@@ -292,6 +304,7 @@ fn serve(
     log: &Mutex<Vec<Value>>,
     steps: &Mutex<std::collections::VecDeque<Step>>,
     stop: &AtomicBool,
+    show: &Value,
 ) -> std::io::Result<()> {
     let mut request = Vec::new();
     let (header_end, length) = loop {
@@ -327,10 +340,7 @@ fn serve(
         )
     };
     if request.starts_with(b"POST /api/show ") {
-        respond(
-            socket,
-            json!({"capabilities": ["completion", "tools"], "model_info": {"fixture.context_length": 32768}}),
-        )
+        respond(socket, show.clone())
     } else if request.starts_with(b"POST /api/chat ") {
         let chat: Value = serde_json::from_slice(body).unwrap_or_default();
         log.lock().unwrap().push(chat);
@@ -353,6 +363,24 @@ fn serve(
         socket.write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
         )?;
+        if let Step::Thinking(thinking, answer) = &step {
+            let mut start = 0;
+            while start < thinking.len() {
+                let mut end = (start + 40_000).min(thinking.len());
+                while !thinking.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let line = json!({"message": {"role": "assistant", "content": "",
+                    "thinking": &thinking[start..end]}, "done": false});
+                socket.write_all(format!("{line}\n").as_bytes())?;
+                start = end;
+            }
+            let line = json!({"message": {"role": "assistant", "content": answer}, "done": false});
+            socket.write_all(format!("{line}\n").as_bytes())?;
+            let done = json!({"message": {"role": "assistant", "content": ""},
+                "done": true, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3});
+            return socket.write_all(format!("{done}\n").as_bytes());
+        }
         if let Step::Text(text) = &step {
             let mut start = 0;
             while start < text.len() {
@@ -1139,8 +1167,12 @@ fn long_response() -> Result<()> {
         let mut assembly = asura_client::ResponseAssembly::default();
         let mut windows = 0;
         loop {
-            let event =
-                client.observe_conversation(operation, assembly.cursor(), assembly.held())?;
+            let event = client.observe_with_thinking(
+                operation,
+                assembly.cursor(),
+                assembly.held(),
+                assembly.held_thinking(),
+            )?;
             let envelope = pb::Envelope {
                 body: Some(pb::envelope::Body::ConversationEvent(event.clone())),
                 ..Default::default()
@@ -1216,7 +1248,12 @@ fn journal_pause() -> Result<()> {
         let mut assembly = asura_client::ResponseAssembly::default();
         wait_for(Duration::from_secs(60), "paused step", || {
             let Ok(event) = fixture.attach().and_then(|mut c| {
-                Ok(c.observe_conversation(operation, assembly.cursor(), assembly.held())?)
+                Ok(c.observe_with_thinking(
+                    operation,
+                    assembly.cursor(),
+                    assembly.held(),
+                    assembly.held_thinking(),
+                )?)
             }) else {
                 return false;
             };
@@ -1359,6 +1396,176 @@ fn roll_crash() -> Result<()> {
     Ok(())
 }
 
+/// TL-01..TL-07, TL-09, TL-10, TL-12 and TL-13 through the real service,
+/// the real Swift helper and a scripted loopback Ollama endpoint: the level
+/// set by config reaches `/api/chat` in the form the model's `/api/show`
+/// accepts, nothing is sent for model default or a model that cannot think,
+/// 200,000 bytes of streamed thinking are journaled in kind 25 segments with
+/// the level on kind 21, a client assembles them from windows that share one
+/// budget with the answer before and after a restart, and the next turn's
+/// request carries no thinking.
+fn thinking() -> Result<()> {
+    let (mut fixture, model, project, _) = setup("thinking")?;
+    let graded = json!({"capabilities": ["completion", "tools", "thinking"],
+        "model_info": {"fixture.context_length": 32768},
+        "thinking": {"values": [false, true, "low", "medium", "high"], "default": true}});
+    let toggle = json!({"capabilities": ["completion", "tools", "thinking"],
+        "model_info": {"fixture.context_length": 32768},
+        "thinking": {"values": [false, true], "default": true}});
+    let set = |level: &str| -> Result<()> {
+        let reply = fixture
+            .attach()?
+            .config("thinking", Some(level), &|| false)?;
+        assert!(reply.error.is_none(), "thinking {level}: {:?}", reply.error);
+        Ok(())
+    };
+    let think = |model: &Model| -> Option<Value> {
+        let requests = model.requests.lock().unwrap();
+        requests
+            .last()
+            .and_then(|request| request.get("think").cloned())
+    };
+    // TL-01: model default sends nothing, even to a thinking model.
+    *model.show.lock().unwrap() = graded.clone();
+    model.script(&[Step::Text("plain".into())]);
+    let plain = submit(&fixture, project, "TL-01")?;
+    assert_eq!(
+        finish(&fixture, plain, Duration::from_secs(60))?.kind,
+        Some(3)
+    );
+    assert_eq!(think(&model), None);
+    // TL-05, TL-09, TL-12: high to a graded model, 200,000 bytes of thinking.
+    set("high")?;
+    let thought: String = "thinking é😀 ".repeat(200_000 / 15);
+    model.script(&[Step::Thinking(thought.clone(), "Answer one.".into())]);
+    let first = submit(&fixture, project, "TL-09")?;
+    let event = finish(&fixture, first, Duration::from_secs(120))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    assert_eq!(think(&model), Some(json!("high")));
+    let read = |fixture: &Fixture| -> Result<(String, String, pb::ConversationEvent)> {
+        let mut client = fixture.attach()?;
+        let mut assembly = asura_client::ResponseAssembly::default();
+        loop {
+            let event = client.observe_with_thinking(
+                first,
+                assembly.cursor(),
+                assembly.held(),
+                assembly.held_thinking(),
+            )?;
+            let envelope = pb::Envelope {
+                body: Some(pb::envelope::Body::ConversationEvent(event.clone())),
+                ..Default::default()
+            };
+            let frame = asura_control::encode_frame(&envelope)
+                .map_err(|e| format!("event frame: {e:?}"))?;
+            assert!(frame.len() <= asura_control::MAX_FRAME_BYTES + asura_control::HEADER_BYTES);
+            assert!(
+                event.text.as_ref().map_or(0, String::len)
+                    + event.thinking_text.as_ref().map_or(0, String::len)
+                    <= 61_440
+            );
+            assembly.apply(&event)?;
+            if assembly.done() {
+                return Ok((
+                    assembly.thinking().to_owned(),
+                    assembly.text().to_owned(),
+                    event,
+                ));
+            }
+        }
+    };
+    let (thinking, text, event) = read(&fixture)?;
+    assert!(
+        thinking == thought,
+        "thinking {} of {}",
+        thinking.len(),
+        thought.len()
+    );
+    assert_eq!(text, "Answer one.");
+    assert_eq!(
+        (event.thinking_level, event.thinking_request),
+        (Some(4), Some(5))
+    );
+    let (bytes, replay) = fixture.journal()?;
+    let op = &replay.operations[&first];
+    assert_eq!(op.thinking.len, thought.len() as u64);
+    let conversation = op.conversation;
+    let records = frames(&bytes[op.accepted_frame.range().start..])?;
+    let segments = records
+        .iter()
+        .filter(|(_, r)| matches!(r, journal::Record::ThinkingText(p) if p.operation == first))
+        .count();
+    assert!(segments >= 3, "{segments} kind 25 segments");
+    assert!(records.iter().any(|(_, r)| matches!(r,
+        journal::Record::TurnAccepted(t) if t.operation == first
+            && t.thinking_level == 4 && t.thinking_request == 5)));
+    // TL-04 and TL-10: low to an on/off model sends `true`; the next turn of
+    // the conversation carries the answer but no thinking.
+    *model.show.lock().unwrap() = toggle;
+    set("low")?;
+    model.script(&[Step::Text("Answer two.".into())]);
+    let accepted = queue_submit::submit_queued(
+        &|| fixture.attach(),
+        project,
+        Some(conversation.to_vec()),
+        1,
+        "TL-10",
+    )?;
+    let second = id(accepted.operation_id)?;
+    assert_eq!(
+        finish(&fixture, second, Duration::from_secs(60))?.kind,
+        Some(3)
+    );
+    assert_eq!(think(&model), Some(json!(true)));
+    {
+        let requests = model.requests.lock().unwrap();
+        let body = requests.last().unwrap().to_string();
+        assert!(body.contains("Answer one."), "history lost the answer");
+        assert!(!body.contains("thinking é😀"), "thinking reached the model");
+        assert!(
+            requests.last().unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m.get("thinking").is_none())
+        );
+    }
+    // TL-06 and TL-07: off sends `false`; a model without the capability
+    // gets nothing for any level.
+    set("off")?;
+    model.script(&[Step::Text("Answer three.".into())]);
+    let third = submit(&fixture, project, "TL-06")?;
+    assert_eq!(
+        finish(&fixture, third, Duration::from_secs(60))?.kind,
+        Some(3)
+    );
+    assert_eq!(think(&model), Some(json!(false)));
+    *model.show.lock().unwrap() = json!({"capabilities": ["completion", "tools"],
+        "model_info": {"fixture.context_length": 32768},
+        "thinking": {"values": [false], "default": false}});
+    set("high")?;
+    model.script(&[Step::Text("Answer four.".into())]);
+    let fourth = submit(&fixture, project, "TL-07")?;
+    let event = finish(&fixture, fourth, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3));
+    assert_eq!(think(&model), None);
+    assert_eq!(
+        (event.thinking_level, event.thinking_request),
+        (Some(4), Some(0))
+    );
+    // TL-13: after a restart the journal is the source of the thinking text.
+    fixture.stop()?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    let (thinking, text, _) = read(&fixture)?;
+    assert!(thinking == thought && text == "Answer one.");
+    println!(
+        "PASS TL-01..07/09/10/12/13 integration: {} thinking bytes in {segments} kind 25 segments; think forms none, \"high\", true, false, none",
+        thought.len()
+    );
+    Ok(())
+}
+
 fn child(home: &Path) -> Result<()> {
     asura_platform::journal_gate::install_file_gate(home);
     tracing_subscriber::fmt()
@@ -1392,7 +1599,7 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 9] = [
+    let cases: [Case; 10] = [
         ("malformed", malformed_then_valid),
         ("secret", exec_cmd_secret),
         ("create", create_note_body),
@@ -1402,6 +1609,7 @@ fn main() {
         ("response", long_response),
         ("pause", journal_pause),
         ("roll", roll_crash),
+        ("thinking", thinking),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

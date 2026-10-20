@@ -1182,6 +1182,12 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.u32(c.output_reservation);
             w.u32(c.overhead_tokens);
             w.u32(c.bytes_per_token_milli);
+            require(
+                p.thinking_level <= MAX_THINKING_LEVEL
+                    && p.thinking_request <= MAX_THINKING_REQUEST,
+            )?;
+            w.byte(p.thinking_level);
+            w.byte(p.thinking_request);
         }
         Record::StartAuthorized(p) => {
             w.bytes(&p.operation);
@@ -1220,7 +1226,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.string(&p.text, MAX_TEXT)?;
         }
         Record::CaptureSettled(p) => write_capture_settled(&mut w, p)?,
-        Record::ResponseText(p) => {
+        Record::ResponseText(p) | Record::ThinkingText(p) => {
             require(!p.text.is_empty() || p.offset > 0)?;
             w.bytes(&p.operation);
             w.u64(p.generation);
@@ -1393,6 +1399,11 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 overhead_tokens: r.u32()?,
                 bytes_per_token_milli: r.u32()?,
             };
+            let thinking_level = r.byte()?;
+            let thinking_request = r.byte()?;
+            require(
+                thinking_level <= MAX_THINKING_LEVEL && thinking_request <= MAX_THINKING_REQUEST,
+            )?;
             Record::TurnAccepted(Box::new(TurnAccepted {
                 request,
                 digest,
@@ -1411,6 +1422,8 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
                 prompt,
                 event_cursor,
                 composition,
+                thinking_level,
+                thinking_request,
             }))
         }
         6 => Record::StartAuthorized(StartAuthorized {
@@ -1444,6 +1457,16 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             };
             require(!value.text.is_empty() || value.offset > 0)?;
             Record::ResponseText(value)
+        }
+        25 => {
+            let value = ResponseText {
+                operation: r.array()?,
+                generation: r.u64()?,
+                offset: r.u64()?,
+                text: r.string(MAX_TEXT)?,
+            };
+            require(!value.text.is_empty() || value.offset > 0)?;
+            Record::ThinkingText(value)
         }
         14 => {
             require(payload.len() <= MAX_TOOL_CALL_PAYLOAD)?;

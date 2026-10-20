@@ -25,6 +25,8 @@ pub enum Tag {
     Identity = b'D',
     /// Generated ID: installation, graph, task, operation, input or dispatch request.
     Generated = b'G',
+    /// Thinking piece: operation, start offset (thinking-level.md).
+    Thinking = b'H',
     /// Settled input.
     Input = b'I',
     /// Project registration.
@@ -49,11 +51,12 @@ pub enum Tag {
     Payload = b'X',
 }
 impl Tag {
-    pub const ALL: [Tag; 15] = [
+    pub const ALL: [Tag; 16] = [
         Tag::Activity,
         Tag::Call,
         Tag::Identity,
         Tag::Generated,
+        Tag::Thinking,
         Tag::Input,
         Tag::Project,
         Tag::ProjectConversation,
@@ -162,6 +165,11 @@ pub enum Entry {
     },
     Operation(OperationFacts),
     Piece {
+        kept: u64,
+        frame: Locator,
+    },
+    /// A thinking piece: the `Piece` layout over kind 25 frames.
+    Thinking {
         kept: u64,
         frame: Locator,
     },
@@ -307,6 +315,7 @@ impl Entry {
             Self::Generated { .. } => Tag::Generated,
             Self::Operation(_) => Tag::Operation,
             Self::Piece { .. } => Tag::Piece,
+            Self::Thinking { .. } => Tag::Thinking,
             Self::Call { .. } => Tag::Call,
             Self::Turn { .. } => Tag::Turn,
             Self::Input { .. } => Tag::Input,
@@ -346,7 +355,7 @@ impl Entry {
                 out.locator(&o.accepted);
                 out.locator(&o.terminal_frame);
             }
-            Self::Piece { kept, frame } => {
+            Self::Piece { kept, frame } | Self::Thinking { kept, frame } => {
                 out.u64(*kept);
                 out.locator(frame);
             }
@@ -470,6 +479,10 @@ impl Entry {
                 kept: r.u64(),
                 frame: r.locator(),
             },
+            Tag::Thinking => Self::Thinking {
+                kept: r.u64(),
+                frame: r.locator(),
+            },
             Tag::Call => Self::Call {
                 decision: r.byte(),
                 intent: r.locator(),
@@ -587,6 +600,10 @@ mod tests {
             Entry::Piece {
                 kept: 61_440,
                 frame: locator(8),
+            },
+            Entry::Thinking {
+                kept: 61_440,
+                frame: locator(18),
             },
             Entry::Call {
                 decision: 1,

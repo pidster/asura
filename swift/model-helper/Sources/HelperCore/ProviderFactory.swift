@@ -45,7 +45,7 @@ public enum ProviderFactory {
                     instrumented.usageObserver = usage
                     instrumented.unregisteredToolHandler = handler
                     return instrumented
-                })
+                }, thinkingControls: model.thinkingControls)
         default: throw Failure.unsupportedProvider
         }
     }

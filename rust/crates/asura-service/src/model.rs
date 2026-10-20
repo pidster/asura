@@ -115,7 +115,8 @@ pub enum Capability {
 pub(crate) struct CapabilityProfile {
     pub supported: Option<u32>,
     pub source: Option<u32>,
-    pub reasoning_disabled: bool,
+    /// Thinking forms the model accepts (Hello field 23, thinking-level.md).
+    pub thinking_controls: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Activation {
@@ -125,7 +126,17 @@ pub(crate) enum Activation {
     Unknown,
 }
 impl CapabilityProfile {
-    pub fn activation(self, bit: u32, tools_enabled: bool) -> Activation {
+    /// Whether the model reports reasoning support with a known source.
+    pub fn reasoning(self) -> Option<bool> {
+        self.supported.map(|mask| mask & 4 != 0)
+    }
+    /// `thinking` is the form sent for the turn; off disables reasoning.
+    pub fn activation(
+        self,
+        bit: u32,
+        tools_enabled: bool,
+        thinking: asura_control::thinking::Request,
+    ) -> Activation {
         if bit == 1 {
             return if tools_enabled {
                 Activation::Enabled
@@ -133,7 +144,7 @@ impl CapabilityProfile {
                 Activation::Disabled
             };
         }
-        if self.reasoning_disabled && bit == 4 {
+        if thinking == asura_control::thinking::Request::Off && bit == 4 {
             return Activation::Disabled;
         }
         if bit != 4 {

@@ -183,7 +183,16 @@ pub struct TurnAccepted {
     pub event_cursor: u64,
     /// The context composer's record; every accepted turn carries one (kind 21).
     pub composition: Composition,
+    /// The thinking level the turn used: 0 default, 1 off, 2 low, 3 medium,
+    /// 4 high (thinking-level.md).
+    pub thinking_level: u8,
+    /// The form sent: 0 none, 1 off, 2 on, 3 low, 4 medium, 5 high.
+    pub thinking_request: u8,
 }
+/// Largest kind 21 thinking level code.
+pub const MAX_THINKING_LEVEL: u8 = 4;
+/// Largest kind 21 thinking request code.
+pub const MAX_THINKING_REQUEST: u8 = 5;
 /// Shown prior turns of a composed turn; `prior_operations` lists them.
 pub const MAX_COMPOSED_PRIOR: usize = 1024;
 /// The context composer's record of one turn-start composition (N1).
@@ -308,6 +317,9 @@ pub enum Record {
     CaptureSettled(Box<CaptureSettled>),
     /// Kind 24: one response text segment.
     ResponseText(ResponseText),
+    /// Kind 25: one thinking text segment, the same layout applied to the
+    /// operation's thinking text (thinking-level.md).
+    ThinkingText(ResponseText),
 }
 impl Record {
     pub fn kind(&self) -> u16 {
@@ -330,6 +342,7 @@ impl Record {
             Self::InputPromoted(_) => 16,
             Self::CaptureSettled(_) => 23,
             Self::ResponseText(_) => 24,
+            Self::ThinkingText(_) => 25,
         }
     }
 }
@@ -429,6 +442,8 @@ pub struct Operation {
     pub tools: Vec<ToolRecord>,
     /// The journaled response: kind 24 segments, then the kind 8 tail.
     pub response: Response,
+    /// The journaled thinking text: kind 25 segments (thinking-level.md).
+    pub thinking: Response,
 }
 /// `kept` bytes of the text in the kind 24 or kind 8 frame at `frame`, at
 /// byte `start` of the response. Replay clones no text.

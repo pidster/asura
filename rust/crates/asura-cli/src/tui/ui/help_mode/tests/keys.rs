@@ -25,8 +25,10 @@ enum Setup {
     QueueRejected,
     StatusProject,
     StatusModel,
+    StatusThinking,
     ProjectList,
     ModelList,
+    ThinkingList,
     /// Help mode with a query, the selection on the third result.
     HelpQuery,
     /// Help mode with the cursor at byte 0.
@@ -152,6 +154,7 @@ const FIXTURE: &[Chord] = &[
     chord(BROWSER, "End", KeyCode::End, N, Browser),
     chord(BROWSER, "Enter", KeyCode::Enter, N, Browser),
     chord(BROWSER, "Space", KeyCode::Char(' '), N, Browser),
+    chord(BROWSER, "t", KeyCode::Char('t'), N, Browser),
     chord(BROWSER, "Page Up", KeyCode::PageUp, N, Browser),
     chord(BROWSER, "Page Down", KeyCode::PageDown, N, Browser),
     chord(BROWSER, "Escape", KeyCode::Esc, N, Browser),
@@ -161,6 +164,9 @@ const FIXTURE: &[Chord] = &[
     chord(STATUS, "Tab", KeyCode::Tab, N, StatusProject),
     chord(STATUS, "Enter", KeyCode::Enter, N, StatusProject),
     chord(STATUS, "Enter", KeyCode::Enter, N, StatusModel),
+    chord(STATUS, "Enter", KeyCode::Enter, N, StatusThinking),
+    chord(STATUS, "Left", KeyCode::Left, N, StatusThinking),
+    chord(STATUS, "Right", KeyCode::Right, N, StatusThinking),
     chord(STATUS, "Up", KeyCode::Up, N, StatusProject),
     chord(STATUS, "Shift+Up", KeyCode::Up, SHIFT, StatusProject),
     chord(STATUS, "Escape", KeyCode::Esc, N, StatusProject),
@@ -176,6 +182,12 @@ const FIXTURE: &[Chord] = &[
     chord(LISTS, "End", KeyCode::End, N, ModelList),
     chord(LISTS, "Enter", KeyCode::Enter, N, ModelList),
     chord(LISTS, "Escape", KeyCode::Esc, N, ModelList),
+    chord(LISTS, "Up", KeyCode::Up, N, ThinkingList),
+    chord(LISTS, "Down", KeyCode::Down, N, ThinkingList),
+    chord(LISTS, "Home", KeyCode::Home, N, ThinkingList),
+    chord(LISTS, "End", KeyCode::End, N, ThinkingList),
+    chord(LISTS, "Enter", KeyCode::Enter, N, ThinkingList),
+    chord(LISTS, "Escape", KeyCode::Esc, N, ThinkingList),
     chord(HELP, "Up", KeyCode::Up, N, HelpQuery),
     chord(HELP, "Down", KeyCode::Down, N, HelpQuery),
     chord(HELP, "Page Up", KeyCode::PageUp, N, HelpQuery),
@@ -272,6 +284,7 @@ fn picker_name(app: &App) -> String {
         None => String::new(),
         Some(Picker::Projects { selected, rows }) => format!("projects {selected}/{}", rows.len()),
         Some(Picker::Models { selected, .. }) => format!("models {selected}"),
+        Some(Picker::Thinking { selected }) => format!("thinking {selected}"),
     }
 }
 /// Everything a router decision can change, for the "key was handled" check.
@@ -291,7 +304,7 @@ fn snapshot(app: &App) -> String {
         app.response_scroll,
         app.activity
             .iter()
-            .map(|a| a.expanded())
+            .map(|a| (a.expanded(), a.thinking_open()))
             .collect::<Vec<_>>(),
         picker_name(app),
         app.queue_focused_id,
@@ -337,7 +350,8 @@ fn typed(text: &str) -> App {
 fn app_for(setup: Setup) -> App {
     let mut app = match setup {
         Empty => App::new(),
-        Draft | WithLog | WithQueue | StatusProject | StatusModel | ProjectList | ModelList => {
+        Draft | WithLog | WithQueue | StatusProject | StatusModel | StatusThinking
+        | ProjectList | ModelList | ThinkingList => {
             let mut app = typed("alpha beta gamma");
             for _ in 0..5 {
                 press(&mut app, KeyCode::Left);
@@ -385,6 +399,10 @@ fn app_for(setup: Setup) -> App {
         Browser => {
             with_log(&mut app);
             app.transcript[3].1 = (0..80).map(|n| format!("line {n}\n\n")).collect();
+            app.activity[3].set_thinking(&asura_control::pb::ConversationEvent {
+                thinking_text: Some("considering".into()),
+                ..Default::default()
+            });
             app.rendered_responses[3] = markdown::render(&app.transcript[3].1);
             frame(&mut app, 80, 20);
             press(&mut app, KeyCode::F(6));
@@ -423,7 +441,7 @@ fn app_for(setup: Setup) -> App {
             press_with(&mut app, KeyCode::Up, CTRL);
             assert!(matches!(app.focus, Focus::Queue(_)));
         }
-        StatusProject | StatusModel | ProjectList | ModelList => {
+        StatusProject | StatusModel | StatusThinking | ProjectList | ModelList | ThinkingList => {
             app.projects = Some(projects(3));
             app.selected_project = Some([2; 16]);
             press_with(&mut app, KeyCode::Down, SHIFT);
@@ -439,6 +457,14 @@ fn app_for(setup: Setup) -> App {
                         app.picker,
                         Some(Picker::Projects { selected: 1, .. })
                     ));
+                }
+                StatusThinking => {
+                    press(&mut app, KeyCode::Left);
+                    assert_eq!(app.focus, Focus::Thinking);
+                }
+                ThinkingList => {
+                    app.focus = Focus::Thinking;
+                    app.picker = Some(Picker::Thinking { selected: 2 });
                 }
                 ModelList => {
                     app.focus = Focus::Model;

@@ -144,19 +144,25 @@ fn restore(
 // Each transport call remains bounded by Client. Turn age does not terminate
 // subscription; the existing owner keeps the worker slot until it settles.
 /// Each event carries one window; the worker assembles the whole response
-/// and publishes it (response-text-transfer.md). `observe` takes the cursor,
-/// the held byte count, the generation and a cancel request.
+/// and its thinking text and publishes them (response-text-transfer.md,
+/// thinking-level.md). `observe` takes the cursor, the held response and
+/// thinking byte counts, the generation and a cancel request.
 fn observe_until_terminal(
     stopped: &AtomicBool,
     cancellation: &AtomicBool,
     mut generation: u64,
-    mut observe: impl FnMut(u64, u64, u64, bool) -> Result<Option<pb::ConversationEvent>, String>,
+    mut observe: impl FnMut(u64, (u64, u64), u64, bool) -> Result<Option<pb::ConversationEvent>, String>,
     mut publish: impl FnMut(Update),
 ) -> Result<(), String> {
     let mut assembly = asura_client::ResponseAssembly::default();
     while !stopped.load(Ordering::Acquire) {
         let cancel = generation > 0 && cancellation.swap(false, Ordering::AcqRel);
-        if let Some(event) = observe(assembly.cursor(), assembly.held(), generation, cancel)? {
+        if let Some(event) = observe(
+            assembly.cursor(),
+            (assembly.held(), assembly.held_thinking()),
+            generation,
+            cancel,
+        )? {
             generation = event.generation.unwrap_or(generation);
             assembly
                 .apply(&event)
@@ -328,7 +334,7 @@ impl Worker {
                                 client.cancel_conversation(operation, generation, &|| stopped.load(Ordering::Acquire)).map_err(|e| format!("Cancel outcome unconfirmed: {e}"))?;
                                 publish(Update { cancel_accepted: true, success: true, ..Default::default() });
                             }
-                            match client.observe_conversation(operation, cursor, held) {
+                            match client.observe_with_thinking(operation, cursor, held.0, held.1) {
                                 Ok(event) => Ok(Some(event)),
                                 Err(_) => {
                                     client = attach().map_err(|e| format!("Disconnected: {e}. Use /observe {}", crate::conversation::hex(&operation)))?;
@@ -496,7 +502,7 @@ mod tests {
             &stopped,
             &cancellation,
             0,
-            |cursor, held, _, _| {
+            |cursor, (held, _), _, _| {
                 requests.push((cursor, held));
                 let start = held as usize;
                 let mut end = (start + 61_440).min(full.len());
@@ -526,6 +532,54 @@ mod tests {
             last.event.as_ref().unwrap().text.as_deref(),
             Some(full.as_str())
         );
+    }
+
+    /// TL-09 and TL-12 (TUI worker): thinking windows arrive before the
+    /// response in one shared budget; the worker asks by both held counts and
+    /// publishes the whole thinking text with the terminal.
+    #[test]
+    fn tl09_worker_assembles_thinking_before_the_response() {
+        let thinking: String = "t\u{e9}".repeat(100_000 / 3);
+        let answer = "Answer.";
+        let stopped = AtomicBool::new(false);
+        let cancellation = AtomicBool::new(false);
+        let mut updates = Vec::new();
+        let mut requests = Vec::new();
+        observe_until_terminal(
+            &stopped,
+            &cancellation,
+            0,
+            |_, (held, held_thinking), _, _| {
+                requests.push((held, held_thinking));
+                let start = held_thinking as usize;
+                let mut end = (start + 61_440).min(thinking.len());
+                while !thinking.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let room = 61_440 - (end - start);
+                let text = &answer[held as usize..answer.len().min(held as usize + room)];
+                Ok(Some(pb::ConversationEvent {
+                    generation: Some(1),
+                    cursor: Some(u64::MAX),
+                    kind: Some(3),
+                    text: Some(text.into()),
+                    text_offset: Some(held),
+                    text_bytes: Some(answer.len() as u64),
+                    thinking_text: Some(thinking[start..end].into()),
+                    thinking_offset: Some(held_thinking),
+                    thinking_bytes: Some(thinking.len() as u64),
+                    ..Default::default()
+                }))
+            },
+            |update| updates.push(update),
+        )
+        .unwrap();
+        assert_eq!(requests[0], (0, 0));
+        assert!(requests[1].1 > 61_000 && requests[1].0 == 0);
+        assert_eq!(updates.len(), 1);
+        let event = updates[0].event.as_ref().unwrap();
+        assert_eq!(event.thinking_text.as_deref(), Some(thinking.as_str()));
+        assert_eq!(event.text.as_deref(), Some(answer));
     }
 
     #[test]

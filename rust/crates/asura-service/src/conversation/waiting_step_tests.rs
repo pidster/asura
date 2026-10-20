@@ -123,25 +123,46 @@ fn ws02_pending_event_carries_the_step_and_text_removes_it() {
             after_cursor: Some(2),
             wait_ms: Some(0),
             text_offset: None,
+            thinking_offset: None,
         }))
     };
-    let pending = event(fixture.owner.observe(observe(), OPERATION, 2, 0).unwrap());
+    let pending = event(
+        fixture
+            .owner
+            .observe(observe(), OPERATION, 2, 0, 0)
+            .unwrap(),
+    );
     assert_eq!(pending.kind, Some(1));
     assert_eq!(pending.waiting_step, Some(Step::ModelOutput as i32));
     fixture.owner.active.as_mut().unwrap().model =
         ModelOwner::step_test_fixture(Some(HelperStep::Input));
-    let sending = event(fixture.owner.observe(observe(), OPERATION, 2, 0).unwrap());
+    let sending = event(
+        fixture
+            .owner
+            .observe(observe(), OPERATION, 2, 0, 0)
+            .unwrap(),
+    );
     assert_eq!(sending.waiting_step, Some(Step::SendingInput as i32));
     fixture.owner.active.as_mut().unwrap().model =
         ModelOwner::step_test_fixture(Some(HelperStep::Running));
     let active = fixture.owner.active.as_mut().unwrap();
     active.response.revise(0, "partial", 3).unwrap();
     active.cursor = 3;
-    let snapshot = event(fixture.owner.observe(observe(), OPERATION, 2, 0).unwrap());
+    let snapshot = event(
+        fixture
+            .owner
+            .observe(observe(), OPERATION, 2, 0, 0)
+            .unwrap(),
+    );
     assert_eq!(snapshot.kind, Some(2));
     assert_eq!(snapshot.waiting_step, None);
     // An equal-cursor heartbeat after text names no step.
-    let heartbeat = event(fixture.owner.observe(observe(), OPERATION, 3, 7).unwrap());
+    let heartbeat = event(
+        fixture
+            .owner
+            .observe(observe(), OPERATION, 3, 7, 0)
+            .unwrap(),
+    );
     assert_eq!(heartbeat.kind, Some(1));
     assert_eq!(heartbeat.waiting_step, None);
 }

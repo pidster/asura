@@ -32,13 +32,47 @@ import Testing
 }
 
 
-@Test func optionalMLXReasoningCanBeDisabledWithoutChangingSupport() throws {
-    #expect(MLXProvider.disablesReasoning(mask: 5, strategy: .templateFlag(key: "enable_thinking", defaultOn: true)))
-    #expect(!MLXProvider.disablesReasoning(mask: 5, strategy: .alwaysOn))
-    #expect(!MLXProvider.disablesReasoning(mask: 5, strategy: nil))
-    #expect(!MLXProvider.disablesReasoning(mask: 1, strategy: .templateFlag(key: "enable_thinking", defaultOn: true)))
-    let profile = try CapabilityProfile(mask: 5, provenance: .configuration, reasoningDisabled: true)
+@Test func mlxThinkingControlsFollowTheReasoningStrategy() throws {
+    let toggle: ThinkingControls = [.off, .on]
+    #expect(MLXProvider.thinkingControls(mask: 5, strategy: .templateFlag(key: "enable_thinking", defaultOn: true)) == toggle)
+    #expect(MLXProvider.thinkingControls(mask: 5, strategy: .alwaysOn) == [.on])
+    #expect(MLXProvider.thinkingControls(mask: 5, strategy: ReasoningPromptStrategy.none) == [])
+    #expect(MLXProvider.thinkingControls(mask: 5, strategy: nil) == [])
+    // Undeclared reasoning has no controls, whatever the template says.
+    #expect(MLXProvider.thinkingControls(mask: 1, strategy: .templateFlag(key: "enable_thinking", defaultOn: true)) == [])
+    #expect(MLXProvider.thinkingControls(mask: nil, strategy: .alwaysOn) == [])
+    // Off disables reasoning activation; support is unchanged.
+    let profile = try CapabilityProfile(mask: 5, provenance: .configuration)
     #expect(profile.support(.reasoning) == .supported)
-    #expect(profile.activation(.reasoning, toolsEnabled: true) == .disabled)
-    #expect(throws: HelperError.self) { try CapabilityProfile(mask: 1, provenance: .configuration, reasoningDisabled: true) }
+    #expect(profile.activation(.reasoning, toolsEnabled: true, thinking: .off) == .disabled)
+    #expect(profile.activation(.reasoning, toolsEnabled: true, thinking: .on) == .providerControlled)
+}
+
+/// TL-04 to TL-06 and TL-15 (helper): accepted forms and the SDK option
+/// each request becomes.
+@Test func thinkingRequestsMapToReportedFormsAndSdkLevels() {
+    let toggle: ThinkingControls = [.off, .on]
+    #expect(toggle.accepts(.none) && toggle.accepts(.off) && toggle.accepts(.on))
+    #expect(!toggle.accepts(.low) && !toggle.accepts(.high))
+    #expect(!ThinkingControls.all.accepts(.UNRECOGNIZED(9)))
+    #expect(ThinkingControls.reasoningLevel(.none) == nil)
+    #expect(ThinkingControls.reasoningLevel(.off) == .custom("no_think"))
+    #expect(ThinkingControls.reasoningLevel(.on) == .custom("think"))
+    #expect(ThinkingControls.reasoningLevel(.low) == .light)
+    #expect(ThinkingControls.reasoningLevel(.medium) == .moderate)
+    #expect(ThinkingControls.reasoningLevel(.high) == .deep)
+}
+
+/// TL-09: thinking text comes from reasoning entries only, one blank line
+/// between entries.
+@Test func thinkingTextJoinsReasoningEntriesOnly() {
+    let entries: [Transcript.Entry] = [
+        .prompt(.init(segments: [.text(.init(content: "question"))])),
+        .reasoning(.init(segments: [.text(.init(content: "first ")), .text(.init(content: "idea"))])),
+        .response(.init(segments: [.text(.init(content: "answer"))])),
+        .reasoning(.init(segments: [.text(.init(content: "second"))])),
+        .reasoning(.init(segments: []))
+    ]
+    #expect(thinkingText(entries) == "first idea\n\nsecond")
+    #expect(thinkingText([Transcript.Entry]()) == "")
 }

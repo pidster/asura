@@ -21,10 +21,16 @@ enum MLXProvider {
         return try AssetLocation.capacity(count)
     }
 
-    static func disablesReasoning(mask: UInt32?, strategy: ReasoningPromptStrategy?) -> Bool {
-        guard mask.map({ $0 & 4 != 0 }) == true else { return false }
-        if case .templateFlag? = strategy { return true }
-        return false
+    /// Thinking forms of a declared reasoning model (thinking-level.md):
+    /// a template flag toggles; always-on takes only on; no strategy has no
+    /// control. The pinned bridge maps every level other than `no_think` to on.
+    static func thinkingControls(mask: UInt32?, strategy: ReasoningPromptStrategy?) -> ThinkingControls {
+        guard mask.map({ $0 & 4 != 0 }) == true else { return [] }
+        switch strategy {
+        case .templateFlag?: return [.off, .on]
+        case .alwaysOn?: return [.on]
+        case .none?, nil: return []
+        }
     }
 
     static func make(root: String?, name: String, capabilities: UInt32?) async throws -> any ModelBackend {
@@ -39,8 +45,7 @@ enum MLXProvider {
         try Task.checkCancellation()
         let container = try await loadModelContainer(from: directory, using: #huggingFaceTokenizerLoader())
         let configuration = await container.configuration
-        let profile = try CapabilityProfile(mask: capabilities, provenance: capabilities == nil ? .undeclared : .configuration,
-            reasoningDisabled: disablesReasoning(mask: capabilities, strategy: configuration.reasoningConfig?.promptStrategy))
+        let profile = try CapabilityProfile(mask: capabilities, provenance: capabilities == nil ? .undeclared : .configuration)
         let supportsTools = profile.support(.toolCalling) == .supported
         guard !supportsTools || configuration.toolCallFormat != nil else { throw HelperError.unavailable }
         let model = MLXLanguageModel(configuration: configuration,
@@ -48,6 +53,7 @@ enum MLXProvider {
             weightsLocation: { _ in directory }, load: { _, _ in container })
         return FoundationBackend(model: model, contextTokens: capacity, contextSource: .mlx,
             modelName: "mlx:\(name)", supportsTools: supportsTools, capabilityProfile: profile,
-            responseTokensFromWindow: true)
+            responseTokensFromWindow: true,
+            thinkingControls: thinkingControls(mask: capabilities, strategy: configuration.reasoningConfig?.promptStrategy))
     }
 }

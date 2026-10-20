@@ -4,6 +4,7 @@ mod composer;
 mod help_mode;
 mod markdown;
 mod paging;
+mod thinking;
 use super::editor::{CommandHeader, Editor, MAX_DRAFT_BYTES};
 use composer::{Focus, Picker, selection_style};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -22,6 +23,8 @@ pub struct ServiceDetails {
     pub owned: bool,
     pub uptime_ms: u64,
     pub stored_memory: asura_control::pb::StoredMemoryStatus,
+    /// The configured thinking level code (thinking-level.md).
+    pub thinking_level: Option<i32>,
 }
 #[derive(Clone)]
 pub struct View {
@@ -98,9 +101,9 @@ const INPUT_GLOW: Color = Color::Rgb(0xCF, 0xF1, 0xFF);
 const INPUT_TEXT: Color = Color::Rgb(0xE6, 0xED, 0xF0);
 const COMMAND_AMBER: Color = Color::Rgb(0xE8, 0xB5, 0x77);
 const GAUGE_AMBER: Color = Color::Rgb(0xF2, 0xB9, 0x50);
-const LOCAL_COMMANDS: [&str; 14] = [
+const LOCAL_COMMANDS: [&str; 15] = [
     "/help", "/quit", "/exit", "/config", "/init", "/project", "/cancel", "/observe", "/retry",
-    "/queue", "/models", "/tools", "/audit", "/new",
+    "/queue", "/models", "/tools", "/audit", "/new", "/think",
 ];
 
 enum Overlay {
@@ -227,6 +230,12 @@ pub struct App {
     history_page: usize,
     help: Option<HelpMode>,
     last_area: super::help::Area,
+    /// The configured thinking level: the latest saved or observed value.
+    thinking_level: Option<asura_control::thinking::Level>,
+    /// A pending thinking save: the level and whether the picker sent it.
+    thinking_save: Option<(asura_control::thinking::Level, bool)>,
+    /// The configured model's reported (reasoning, controls).
+    thinking_support: Option<(bool, u32)>,
 }
 impl App {
     pub fn new() -> Self {
@@ -327,6 +336,9 @@ impl App {
             history_page: 1,
             help: None,
             last_area: super::help::Area::Box,
+            thinking_level: None,
+            thinking_save: None,
+            thinking_support: None,
         }
     }
     pub(super) fn take_queue_request(
@@ -939,6 +951,9 @@ impl App {
         self.config_request.take()
     }
     pub(super) fn config_finished(&mut self, outcome: super::config::Outcome) {
+        if self.thinking_saved(&outcome) {
+            return;
+        }
         if let Some(selector) = self.picker_model_save.take() {
             self.config_draft = None;
             match outcome {
@@ -946,6 +961,7 @@ impl App {
                     self.view.configured_model = Some(selector);
                     self.observed_model = None;
                     self.model_context = None;
+                    self.thinking_support = None;
                     if self.picker.take().is_some() {
                         self.focus = Focus::Model;
                     }
@@ -1156,6 +1172,10 @@ impl App {
                 if context.basis == Some(1) {
                     self.model_context = Some(context.clone());
                 }
+                self.observe_thinking_support(context);
+            }
+            if let Some(entry) = self.activity.get_mut(response_index) {
+                entry.set_thinking(&event);
             }
             self.active_operation = event.operation_id.clone();
             self.conversation_generation = event.generation.unwrap_or(self.conversation_generation);
@@ -1242,6 +1262,10 @@ impl App {
                     if context.basis == Some(1) {
                         self.model_context = Some(context.clone());
                     }
+                    self.observe_thinking_support(context);
+                }
+                if let Some(entry) = self.activity.get_mut(index) {
+                    entry.set_thinking(&turn.event);
                 }
                 if turn.event.kind != Some(1)
                     && let Some((_, response)) = self.transcript.get_mut(index)
@@ -1317,6 +1341,13 @@ impl App {
         if view.configured_model != self.view.configured_model {
             self.observed_model = None;
             self.model_context = None;
+            self.thinking_support = None;
+        }
+        if let Some(level) =
+            thinking::from_code(view.service.as_ref().and_then(|s| s.thinking_level))
+            && self.thinking_save.is_none()
+        {
+            self.thinking_level = Some(level);
         }
         if view.epoch.is_some() && view.epoch != self.view.epoch {
             for activity in &mut self.activity {
@@ -2191,6 +2222,9 @@ impl App {
             }
             return false;
         }
+        if name == "/think" {
+            return self.think_command(&draft);
+        }
         if name == "/models" {
             if draft.split_whitespace().count() != 1 {
                 self.notice = "Use /models without arguments; draft retained".into();
@@ -2493,16 +2527,29 @@ impl App {
             .or(self.view.configured_model.as_deref())
             .unwrap_or("?");
         let git = self.context.report();
+        // The thinking item leads the right group (thinking-level.md); below
+        // 40 columns there is no room for it.
+        let (think, think_dim) = thinking::label(self.thinking_level(), self.thinking_support);
+        let think = if area.width >= 40 {
+            shorten(&think, 20)
+        } else {
+            String::new()
+        };
+        let think_width = if think.is_empty() {
+            0
+        } else {
+            unicode_display_width::width(&think) as u16 + 3
+        };
         let (project, tail, model) = status_groups(
             self.editor.character_count(),
-            area.width,
+            area.width - think_width,
             &project_name,
             model_name,
             self.context_directory(),
             git.as_ref(),
             self.model_context.as_ref(),
         );
-        let right_width = unicode_display_width::width(&model) as u16;
+        let right_width = unicode_display_width::width(&model) as u16 + think_width;
         frame.render_widget(
             Paragraph::new(Line::from(
                 std::iter::once(Span::styled(
@@ -2526,20 +2573,33 @@ impl App {
         let percent = measured_percent(self.model_context.as_ref());
         let gauge_end = model.find(" · ").unwrap_or(model.len());
         let (gauge, rest) = model.split_at(gauge_end);
+        let think_style = if think_dim {
+            muted.add_modifier(Modifier::DIM)
+        } else {
+            muted
+        };
+        let mut right = Vec::new();
+        if !think.is_empty() {
+            right.push(Span::styled(
+                think,
+                self.focus_style(Focus::Thinking, think_style),
+            ));
+            right.push(Span::styled(" · ", muted));
+        }
+        right.extend([
+            // Focus styling wins over the gauge colour on the selected item.
+            Span::styled(
+                gauge.to_owned(),
+                if self.focus == Focus::Model {
+                    self.focus_style(Focus::Model, muted)
+                } else {
+                    gauge_style(percent, muted)
+                },
+            ),
+            Span::styled(rest.to_owned(), self.focus_style(Focus::Model, muted)),
+        ]);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                // Focus styling wins over the gauge colour on the selected item.
-                Span::styled(
-                    gauge.to_owned(),
-                    if self.focus == Focus::Model {
-                        Style::default()
-                    } else {
-                        gauge_style(percent, muted)
-                    },
-                ),
-                Span::raw(rest.to_owned()),
-            ]))
-            .style(self.focus_style(Focus::Model, muted)),
+            Paragraph::new(Line::from(right)).style(muted),
             Rect::new(
                 status_area.right() - right_width,
                 status_area.y,
@@ -3191,6 +3251,18 @@ fn render_history(
                 (strips > 0).then(|| Text::raw("▀".repeat(area.width as usize))),
                 0,
                 Style::default().fg(band.bg.unwrap_or(Color::Reset)),
+                None,
+            ),
+            // The folded thinking block (thinking-level.md).
+            (
+                history
+                    .activity
+                    .get(index)
+                    .and_then(|entry| thinking::block(entry.thinking(), entry.thinking_open()))
+                    .map(Text::raw),
+                1,
+                text.fg(Color::Rgb(139, 161, 177))
+                    .add_modifier(Modifier::ITALIC),
                 None,
             ),
             (
@@ -4397,6 +4469,7 @@ mod tests {
         app.view.reason = "graph_verified";
         app.view.service = Some(ServiceDetails {
             owned: true,
+            thinking_level: None,
             uptime_ms: 3_661_000,
             stored_memory: asura_control::pb::StoredMemoryStatus {
                 available: Some(true),
@@ -4537,6 +4610,8 @@ mod tests {
             basis: Some(1),
             reported_max_tokens: Some(4096),
             capacity_source: Some(1),
+            reasoning: None,
+            thinking_controls: None,
         };
         let (_, _, model) = status_groups(
             0,
@@ -5134,6 +5209,11 @@ mod tests {
                 text: Some(format!("Partial{}", "é".repeat(100_000))),
                 text_offset: Some(0),
                 text_bytes: Some(200_007),
+                thinking_text: None,
+                thinking_offset: None,
+                thinking_bytes: None,
+                thinking_level: None,
+                thinking_request: None,
                 reason: Some(11),
                 usage_tokens: None,
                 usage_known: Some(false),

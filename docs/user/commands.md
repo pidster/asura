@@ -66,6 +66,7 @@ as each page arrives. Press Ctrl-C to stop it.
 | Command | Action |
 | --- | --- |
 | `/models` | List models; `*` marks the configured model |
+| `/think LEVEL` | Set the model thinking level for the next messages: `off`, `low`, `medium`, `high` or `default` |
 | `/config` | Show all settings, including defaults |
 | `/config get NAME` | Show one setting |
 | `/config set NAME VALUE` | Change one setting; dotted names select nested settings |

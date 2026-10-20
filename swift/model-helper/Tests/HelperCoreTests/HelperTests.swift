@@ -988,3 +988,153 @@ private func runRevisions(_ backend: RevisionBackend) async throws
     terminal.totalBytes = UInt64.max
     #expect(throws: HelperError.self) { try Wire.validate(scoped(.terminal(terminal)), from: .helper) }
 }
+
+// ---------------------------------------------------------- thinking text
+// thinking-level.md: Hello controls, the Begin request, and revisions whose
+// first `thinking_bytes` revise the thinking text.
+
+/// A reasoning backend with on/off controls. It records the request it was
+/// given and emits each `(thinking, text)` pair as one snapshot.
+private actor ThinkingBackend: ModelBackend {
+    let snapshots: [(String, String)]
+    var received: [ThinkingRequest] = []
+    init(_ snapshots: [(String, String)]) { self.snapshots = snapshots }
+    func status() async -> BackendStatus {
+        BackendStatus(contextTokens: 4096, reportedContextTokens: 4096, contextSource: .system,
+            capabilityProfile: try? CapabilityProfile(mask: 4, provenance: .runtime),
+            thinkingControls: [.off, .on])
+    }
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        Issue.record("the thinking-aware entry must be used")
+    }
+    func generate(_ input: ModelInput, thinking: ThinkingRequest,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        received.append(thinking)
+        for (thought, text) in snapshots {
+            try await snapshot(Snapshot(text: text, thinking: thought.isEmpty ? nil : thought))
+        }
+    }
+}
+
+/// Runs one generation with `request` in Begin. Returns the Hello controls,
+/// the applied thinking and response, every SnapshotEnd and the terminal; a
+/// nil terminal means the helper closed the channel.
+private func runThinking(_ backend: ThinkingBackend, request: ThinkingRequest) async throws
+    -> (UInt32, String, String, [Asura_Model_V1_SnapshotEnd], Asura_Model_V1_Terminal?) {
+    let (helper, service) = try pair()
+    defer { helper.close(); service.close() }
+    let identity = Data(repeating: 1, count: 32)
+    let session = HelperSession(transport: helper, backend: backend, buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    defer { running.cancel() }
+    var replies = service.frames.makeAsyncIterator()
+    try await service.send(hello(identity))
+    let available = try Wire.decode(#require(try await replies.next())).hello
+    var input = ModelInput(); input.instructions = ""; input.prompt = "fixture"
+    let bytes = try input.serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = "system"; begin.inputBytes = UInt64(bytes.count)
+    if request != .none { begin.thinking = request }
+    try await service.send(scoped(.begin(begin)))
+    guard let credit = try await replies.next() else {
+        return (available.thinkingControls, "", "", [], nil)
+    }
+    _ = credit
+    var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+    chunk.ordinal = 0; chunk.revision = 0; chunk.data = bytes
+    try await service.send(scoped(.chunk(chunk)), control: false)
+    var end = Asura_Model_V1_InputEnd(); end.count = 1; end.totalBytes = UInt64(bytes.count)
+    try await service.send(scoped(.inputEnd(end)), control: false); _ = try await replies.next()
+    try await service.send(scoped(.start(.init())))
+    try await service.send(outputCredit(2))
+    var delta = Data(); var response = Data(); var thinking = Data()
+    var ends: [Asura_Model_V1_SnapshotEnd] = []
+    while let raw = try await replies.next() {
+        let frame = try Wire.decode(raw)
+        switch frame.body {
+        case .chunk(let value): delta.append(value.data)
+        case .snapshotEnd(let value):
+            #expect(UInt64(delta.count) == value.totalBytes && delta.count <= Limits.revisionBytes)
+            if value.hasThinkingBytes {
+                let count = Int(value.thinkingBytes)
+                #expect(value.thinkingOffset <= UInt64(thinking.count))
+                thinking.removeSubrange(Int(value.thinkingOffset)..<thinking.count)
+                thinking.append(delta.prefix(count))
+                delta.removeFirst(count)
+            }
+            ends.append(value)
+            #expect(value.offset <= UInt64(response.count))
+            response.removeSubrange(Int(value.offset)..<response.count)
+            response.append(delta); delta.removeAll()
+            do { try await service.send(outputCredit(value.revision + 2)) } catch HelperError.closed {}
+        case .terminal(let value):
+            await running.value
+            return (available.thinkingControls, String(decoding: thinking, as: UTF8.self),
+                String(decoding: response, as: UTF8.self), ends, value)
+        default: Issue.record("unexpected thinking frame")
+        }
+    }
+    return (available.thinkingControls, "", "", ends, nil)
+}
+
+/// TL-04, TL-09 and TL-12 (helper side): Hello reports the controls, the
+/// backend receives the Begin request, and 100,000 bytes of multibyte
+/// thinking travel ahead of the answer in revisions of at most 61,440 bytes
+/// that cut on character boundaries; a rewrite keeps the shared prefix.
+@Test func tl09ThinkingTravelsAheadOfTheAnswerInBoundedRevisions() async throws {
+    let thought = String(repeating: "t😀é", count: 100_000 / 7)
+    let rewritten = String(thought.dropLast(3)) + "!"
+    let backend = ThinkingBackend([(thought, ""), (rewritten, "Ans"), (rewritten, "Answer.")])
+    let (controls, thinking, response, ends, terminal) = try await runThinking(backend, request: .on)
+    #expect(controls == ThinkingControls([.off, .on]).rawValue)
+    #expect(await backend.received == [.on])
+    #expect(thinking == rewritten)
+    #expect(response == "Answer.")
+    #expect(terminal?.outcome == .complete)
+    #expect(ends.count >= 2)
+    #expect(ends.allSatisfy { $0.totalBytes <= UInt64(Limits.revisionBytes) })
+    #expect(ends.first?.thinkingOffset == 0)
+    for end in ends { try Wire.validate(scoped(.snapshotEnd(end)), from: .helper) }
+}
+
+/// TL-15 (helper side): a Begin request outside the reported controls closes
+/// the channel without calling the model; no request means none.
+@Test func tl15BeginOutsideTheControlsNeverCallsTheModel() async throws {
+    let refused = ThinkingBackend([("", "x")])
+    let (_, _, _, _, terminal) = try await runThinking(refused, request: .low)
+    #expect(terminal == nil)
+    #expect(await refused.received.isEmpty)
+    let plain = ThinkingBackend([("", "plain")])
+    let (_, thinking, response, ends, done) = try await runThinking(plain, request: .none)
+    #expect(await plain.received == [ThinkingRequest.none])
+    #expect(thinking.isEmpty && response == "plain" && done?.outcome == .complete)
+    #expect(ends.allSatisfy { !$0.hasThinkingBytes })
+}
+
+/// TL-12 (helper side): the revision planner gives thinking the budget first
+/// and leaves an unchanged or budgetless response at its committed length.
+@Test func revisionPlannerSharesOneBudget() {
+    let full = Data(repeating: 0x74, count: Limits.revisionBytes + 10)
+    let first = HelperSession.revision(committed: Data(), target: Data("abc".utf8),
+        committedThinking: Data(), targetThinking: full, first: true)
+    #expect(first?.thinking?.count == Limits.revisionBytes)
+    #expect(first?.bytes.count == Limits.revisionBytes && first?.offset == 0)
+    let rest = HelperSession.revision(committed: Data(), target: Data("abc".utf8),
+        committedThinking: full.prefix(Limits.revisionBytes), targetThinking: full, first: false)
+    #expect(rest?.thinking?.offset == Limits.revisionBytes && rest?.thinking?.count == 10)
+    #expect(rest?.bytes == Data(repeating: 0x74, count: 10) + Data("abc".utf8))
+    #expect(HelperSession.revision(committed: Data("abc".utf8), target: Data("abc".utf8),
+        committedThinking: full, targetThinking: full, first: false) == nil)
+    // A cut needs no budget.
+    let cut = HelperSession.revision(committed: Data("abcdef".utf8), target: Data("abX".utf8),
+        committedThinking: Data(), targetThinking: full, first: false)
+    #expect(cut?.thinking?.count == Limits.revisionBytes && cut?.offset == 2)
+    // Wire: thinking fields come together and fit in the transfer.
+    var end = Asura_Model_V1_SnapshotEnd()
+    end.revision = 2; end.count = 1; end.totalBytes = 10; end.offset = 0
+    end.thinkingOffset = 0; end.thinkingBytes = 10
+    #expect((try? Wire.validate(scoped(.snapshotEnd(end)), from: .helper)) != nil)
+    end.thinkingBytes = 11
+    #expect(throws: HelperError.self) { try Wire.validate(scoped(.snapshotEnd(end)), from: .helper) }
+    end.clearThinkingBytes()
+    #expect(throws: HelperError.self) { try Wire.validate(scoped(.snapshotEnd(end)), from: .helper) }
+}

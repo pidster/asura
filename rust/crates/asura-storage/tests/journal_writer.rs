@@ -562,6 +562,8 @@ fn initialization_registration_admission_and_restart_with_budget() {
         prompt: "hello".into(),
         event_cursor: 1,
         composition: Composition::default(),
+        thinking_level: 0,
+        thinking_request: 0,
     };
     let accepted = wait(
         &mut writer
@@ -948,6 +950,8 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
         prompt: "remember".into(),
         event_cursor: 1,
         composition: Composition::default(),
+        thinking_level: 0,
+        thinking_request: 0,
     };
     let mut state = wait(
         &mut writer
@@ -1626,6 +1630,8 @@ fn j1_turn(project: Id, configuration_digest: Hash) -> TurnAccepted {
         prompt: "hello".into(),
         event_cursor: 1,
         composition: Composition::default(),
+        thinking_level: 0,
+        thinking_request: 0,
     }
 }
 fn j1_start() -> Record {
@@ -1984,6 +1990,7 @@ fn rt_read(writer: &mut WriterHandle, offset: u64) -> (u64, String, u64) {
             .try_submit(Command::ReadResponse {
                 operation: [35; 16],
                 offset,
+                thinking_offset: 0,
             })
             .unwrap(),
     )

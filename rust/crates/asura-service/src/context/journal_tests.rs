@@ -132,6 +132,8 @@ fn forty_turns_compose_within_the_window_and_reconstruct_after_replay() {
             prompt: prompt.clone(),
             event_cursor: 1,
             composition: composed.composition(budget),
+            thinking_level: 0,
+            thinking_request: 0,
         };
         for record in [
             journal::Record::TurnAccepted(Box::new(turn.clone())),

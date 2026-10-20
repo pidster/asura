@@ -8,6 +8,8 @@ pub(super) enum Focus {
     Editor,
     Project,
     Model,
+    /// The thinking level item (thinking-level.md).
+    Thinking,
     Queue(usize),
 }
 pub(super) enum Picker {
@@ -19,6 +21,8 @@ pub(super) enum Picker {
         selected: usize,
         result: Option<super::super::models::Outcome>,
     },
+    /// The five thinking levels (thinking-level.md).
+    Thinking { selected: usize },
 }
 impl App {
     pub(super) fn close_picker(&mut self) {
@@ -258,7 +262,7 @@ impl App {
             if !key.modifiers.is_empty() {
                 return true;
             }
-            if self.picker_model_save.is_some() {
+            if self.picker_model_save.is_some() || self.thinking_save.is_some() {
                 return true;
             }
             let picker = self.picker.take().unwrap();
@@ -324,6 +328,13 @@ impl App {
                     }
                     self.picker = Some(Picker::Models { selected, result });
                 }
+                Picker::Thinking { mut selected } => {
+                    navigate(&mut selected, super::thinking::ROWS.len(), key.code);
+                    self.picker = Some(Picker::Thinking { selected });
+                    if key.code == KeyCode::Enter {
+                        self.save_thinking(super::thinking::ROWS[selected].1, None);
+                    }
+                }
             }
             return true;
         }
@@ -351,8 +362,8 @@ impl App {
                     }
                 }
                 Focus::Editor => self.focus = Focus::Project,
-                Focus::Project | Focus::Model if up => self.focus = Focus::Editor,
-                Focus::Project | Focus::Model => {}
+                Focus::Project | Focus::Model | Focus::Thinking if up => self.focus = Focus::Editor,
+                Focus::Project | Focus::Model | Focus::Thinking => {}
                 Focus::Queue(_) if up => {
                     self.enter_log();
                 }
@@ -381,15 +392,26 @@ impl App {
                 }
                 _ => false,
             },
-            Focus::Project | Focus::Model => {
+            Focus::Project | Focus::Model | Focus::Thinking => {
                 match key.code {
                     KeyCode::Up | KeyCode::Esc => self.focus = Focus::Editor,
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        self.focus = if self.focus == Focus::Project {
-                            Focus::Model
-                        } else {
-                            Focus::Project
+                    // Project, model and thinking level, in a ring.
+                    KeyCode::Right | KeyCode::Tab => {
+                        self.focus = match self.focus {
+                            Focus::Project => Focus::Model,
+                            Focus::Model => Focus::Thinking,
+                            _ => Focus::Project,
                         }
+                    }
+                    KeyCode::Left => {
+                        self.focus = match self.focus {
+                            Focus::Project => Focus::Thinking,
+                            Focus::Thinking => Focus::Model,
+                            _ => Focus::Project,
+                        }
+                    }
+                    KeyCode::Enter if self.focus == Focus::Thinking => {
+                        self.open_thinking_picker();
                     }
                     KeyCode::Enter if self.focus == Focus::Project => {
                         let selected = self
@@ -539,7 +561,8 @@ impl App {
             return hint;
         }
         if self.response_selection.is_some() {
-            return "↑↓ responses · Enter activity · PgUp/PgDn scroll · Esc input".into();
+            return "↑↓ responses · Enter activity · t thinking · PgUp/PgDn scroll · Esc input"
+                .into();
         }
         if self.history_focus {
             let below = if self.queue_focus_ids().is_empty() {
@@ -551,6 +574,9 @@ impl App {
         }
         if self.picker_model_save.is_some() {
             return "Saving model selection · draft preserved".into();
+        }
+        if self.thinking_save.is_some_and(|(_, picker)| picker) {
+            return "Saving thinking level · draft preserved".into();
         }
         if self.picker.is_some() {
             return "↑↓ select · Enter apply · Esc close".into();
@@ -577,7 +603,7 @@ impl App {
                     "↵ send"
                 }
             ),
-            Focus::Project | Focus::Model => {
+            Focus::Project | Focus::Model | Focus::Thinking => {
                 "←→ / Tab select item · Enter open · ↑ / Esc input".into()
             }
             Focus::Queue(_) if self.queue_busy => "Queue request pending · Esc input".into(),
@@ -605,6 +631,7 @@ impl App {
                 .map_or(1, |r| {
                     r.models.len().max(1) + usize::from(!r.issues.is_empty())
                 }),
+            Picker::Thinking { .. } => super::thinking::ROWS.len(),
         };
         (rows as u16 + 2).min(8).min(height.saturating_sub(7))
     }
@@ -673,6 +700,7 @@ impl App {
                 },
                 *selected,
             ),
+            Picker::Thinking { selected } => (self.thinking_rows(), *selected),
         };
         let rows = if rows.is_empty() {
             vec!["No entries available".into()]

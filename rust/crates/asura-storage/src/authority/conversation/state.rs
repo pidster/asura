@@ -133,7 +133,7 @@ pub(crate) fn op_charge(op: &Operation) -> usize {
         .iter()
         .map(|tool| 1536 + tool.name.len())
         .sum::<usize>()
-        + op.response.pieces.len() * PIECE_CHARGE
+        + (op.response.pieces.len() + op.thinking.pieces.len()) * PIECE_CHARGE
 }
 fn decision_of(record: &Record) -> u16 {
     record.kind()
@@ -318,6 +318,18 @@ impl Replay {
                         ));
                     }
                 }
+                Tag::Thinking => {
+                    for piece in &op.thinking.pieces {
+                        out.push((
+                            Key::new(Tag::Thinking, *id, piece.start),
+                            Entry::Thinking {
+                                kept: piece.kept,
+                                frame: piece.frame,
+                            }
+                            .encode(),
+                        ));
+                    }
+                }
                 Tag::Call => {
                     for (index, tool) in op.tools.iter().enumerate() {
                         out.push((
@@ -403,7 +415,7 @@ impl Replay {
                     )
                 })
                 .collect(),
-            Tag::Operation | Tag::Piece | Tag::Call | Tag::Turn | Tag::Payload => {
+            Tag::Operation | Tag::Piece | Tag::Thinking | Tag::Call | Tag::Turn | Tag::Payload => {
                 self.operation_entries(tag)
             }
             _ => self
@@ -427,7 +439,7 @@ impl Replay {
     pub fn delta_entry_count(&self) -> u64 {
         let mut count = self.requests.len() + self.delta.generated.len() + self.delta.entries.len();
         for op in self.operations.values().filter(|op| op.terminal.is_some()) {
-            count += 2 + op.response.pieces.len() + op.tools.len();
+            count += 2 + op.response.pieces.len() + op.thinking.pieces.len() + op.tools.len();
             count += 2 * op.tools.iter().filter(|t| t.exec_cmd.is_some()).count();
         }
         count as u64
@@ -439,7 +451,7 @@ impl Replay {
                 .into_iter()
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v),
-            Tag::Operation | Tag::Piece | Tag::Call => {
+            Tag::Operation | Tag::Piece | Tag::Thinking | Tag::Call => {
                 let op = self
                     .operations
                     .get(&key.id)
@@ -1325,6 +1337,21 @@ impl Replay {
                 }
                 self.active_activity(sequence);
             }
+            Record::ThinkingText(p) => {
+                // Kind 25: the kind 24 rules applied to the operation's
+                // thinking text (thinking-level.md).
+                let piece_limit = self.piece_limit;
+                let op = self.operation_mut(p.operation, p.generation)?;
+                require(op.helper.is_some())?;
+                require(p.offset < op.thinking.len || !p.text.is_empty())?;
+                op.thinking
+                    .apply(p.offset, p.text.len() as u64, frame)
+                    .ok_or(ReplayError::Corrupt)?;
+                if op.thinking.pieces.len() > piece_limit {
+                    return Err(ReplayError::Limit);
+                }
+                self.active_activity(sequence);
+            }
         }
         Ok(())
     }
@@ -1572,6 +1599,7 @@ impl Replay {
                 terminal: None,
                 tools: Vec::new(),
                 response: Response::default(),
+                thinking: Response::default(),
             },
         );
         self.active_operation = Some(p.operation);

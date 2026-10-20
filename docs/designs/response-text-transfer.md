@@ -7,6 +7,9 @@ It removes the three per-operation output totals. The
 [conversation admission](conversation-admission.md#transition-payloads) and
 [response activity](response-activity.md) link here for the response text
 contract. Wire protocol 0.1 and journal format 1 do not change.
+[Thinking level](thinking-level.md#model-channel-modelproto) extends each
+revision with an optional thinking part and each event with a thinking window
+that shares the 61,440-byte window budget.
 
 ## Owner decision and scope
 

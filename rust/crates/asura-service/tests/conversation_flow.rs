@@ -204,8 +204,12 @@ fn observe(fixture: &Fixture, operation: [u8; 16]) -> Result<pb::ConversationEve
     let mut assembly = asura_client::ResponseAssembly::default();
     let mut client = fixture.attach()?;
     while Instant::now() < end {
-        let event = match client.observe_conversation(operation, assembly.cursor(), assembly.held())
-        {
+        let event = match client.observe_with_thinking(
+            operation,
+            assembly.cursor(),
+            assembly.held(),
+            assembly.held_thinking(),
+        ) {
             Ok(event) => event,
             Err(asura_client::Error::Remote(_, message)) if message == "conversation_busy" => {
                 thread::sleep(Duration::from_millis(10));
@@ -616,6 +620,13 @@ fn journey(native: bool) -> Result<()> {
         );
         let mut expected_recovered = event.clone();
         expected_recovered.model_context = None;
+        // Turn statistics are live-only measurements; restart leaves them
+        // absent and replay must not invent them (response-activity.md).
+        assert!(
+            recovered.statistics.is_none(),
+            "restart must not invent statistics"
+        );
+        expected_recovered.statistics = None;
         assert_eq!(recovered, expected_recovered);
         let cancelled = submit(
             &fixture,
@@ -1984,6 +1995,127 @@ fn native_ollama() -> Result<()> {
     result.map_err(|error| format!("native-ollama {stage}: {error}").into())
 }
 
+/// TL-04, TL-09, TL-10 and TL-13 with a live local thinking model
+/// (thinking-level.md). `ASURA_TEST_OLLAMA_THINKING_MODEL` selects it
+/// (default `qwen3:1.7b`). The journey sets `thinking: high`, checks the
+/// level and the form recorded on the turn, that thinking text was streamed,
+/// journaled and shown apart from the answer, and that the model's support
+/// reached the event; then a second turn with `thinking: off` records the
+/// off form and journals no thinking text. The daemon is never started and
+/// no model is pulled.
+fn native_ollama_thinking() -> Result<()> {
+    use asura_storage::authority::conversation as journal;
+    let mut stage = "model selection";
+    let result = (|| -> Result<()> {
+        let name = std::env::var("ASURA_TEST_OLLAMA_THINKING_MODEL")
+            .unwrap_or_else(|_| "qwen3:1.7b".into());
+        assert!(!name.is_empty() && !name.chars().any(char::is_whitespace));
+        let mut fixture = Fixture::new()?;
+        stage = "service startup";
+        fixture.start()?;
+        stage = "installation ready";
+        wait_ready(&fixture, None)?;
+        let directory = fixture.home.join("thinking-project");
+        fs::create_dir(&directory)?;
+        stage = "project registration";
+        let project = checked_id(
+            fixture
+                .attach()?
+                .register_project(
+                    pb::ProjectRegister {
+                        request_id: Some(asura_platform::random_id().to_vec()),
+                        location: Some(directory.to_str().ok_or("invalid fixture path")?.into()),
+                    },
+                    &|| false,
+                )?
+                .project_id,
+        )?;
+        stage = "provider configuration";
+        for (key, value) in [
+            (
+                "providers.ollama.endpoint",
+                "http://127.0.0.1:11434".to_owned(),
+            ),
+            ("model", format!("ollama:{name}")),
+            ("thinking", "high".to_owned()),
+        ] {
+            let reply = fixture.attach()?.config(key, Some(&value), &|| false)?;
+            assert!(reply.error.is_none(), "configuration failed: {reply:?}");
+        }
+        stage = "thinking submit";
+        let accepted = provider_submit(
+            &fixture,
+            project,
+            None,
+            0,
+            "What is 17 + 25? Think it through, then answer with the number.",
+        )?;
+        let operation = checked_id(accepted.operation_id)?;
+        stage = "thinking completion";
+        let terminal = observe(&fixture, operation)?;
+        assert_eq!(terminal.kind, Some(3), "thinking turn failed: {terminal:?}");
+        let thinking = terminal.thinking_text.clone().unwrap_or_default();
+        let answer = terminal.text.clone().unwrap_or_default();
+        assert!(
+            !thinking.trim().is_empty(),
+            "no thinking text: {terminal:?}"
+        );
+        assert!(!answer.trim().is_empty(), "no answer");
+        // Ollama splits thinking from content; the answer holds no thinking.
+        assert!(!answer.contains(thinking.trim()));
+        // On/off controls: high is sent as `true`, recorded as request on.
+        assert_eq!(terminal.thinking_level, Some(4));
+        assert_eq!(terminal.thinking_request, Some(2));
+        stage = "journal";
+        let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
+        let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
+            .map_err(|e| format!("replay: {e:?}"))?;
+        let op = &replay.operations[&operation];
+        assert_eq!(op.thinking.len, thinking.len() as u64);
+        let conversation = op.conversation;
+        stage = "thinking off submit";
+        let reply = fixture
+            .attach()?
+            .config("thinking", Some("off"), &|| false)?;
+        assert!(reply.error.is_none());
+        let accepted = provider_submit(
+            &fixture,
+            project,
+            Some(conversation.to_vec()),
+            1,
+            "And 3 + 4? Answer with the number only.",
+        )?;
+        let second = checked_id(accepted.operation_id)?;
+        let terminal = observe(&fixture, second)?;
+        assert_eq!(terminal.kind, Some(3), "off turn failed: {terminal:?}");
+        assert_eq!(
+            (terminal.thinking_level, terminal.thinking_request),
+            (Some(1), Some(1))
+        );
+        assert!(
+            terminal
+                .thinking_text
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        stage = "service restart";
+        fixture.stop()?;
+        fixture.start()?;
+        wait_ready(&fixture, None)?;
+        let restored = observe(&fixture, operation)?;
+        assert_eq!(restored.thinking_text.as_deref(), Some(thinking.as_str()));
+        fixture.stop()?;
+        println!(
+            "PASS native Ollama thinking ({name}): {} thinking bytes journaled and shown apart from a {}-byte answer; high sent as on; off recorded and no thinking",
+            thinking.len(),
+            answer.len()
+        );
+        Ok(())
+    })();
+    result.map_err(|error| format!("native-ollama-thinking {stage}: {error}").into())
+}
+
 // Read-only helper inventory integration: synthetic metadata/catalog, no inference.
 fn inventory_journey() -> Result<()> {
     use std::{
@@ -2250,6 +2382,8 @@ fn main() {
         sensors_journey::run()
     } else if args.iter().any(|a| a == "--models") {
         inventory_journey()
+    } else if args.iter().any(|a| a == "--native-ollama-thinking") {
+        native_ollama_thinking()
     } else if args.iter().any(|a| a == "--native-ollama") {
         native_ollama()
     } else if args.iter().any(|a| a == "--native-mlx") {

@@ -240,15 +240,16 @@ pub fn validate_semantics(
                 }
                 _ => false,
             };
-            let reasoning = v.reasoning_disabled.is_none_or(|disabled| {
+            // Thinking controls (thinking-level.md): helper-only on an
+            // available Hello; nonzero needs a known source with reasoning.
+            let reasoning = v.thinking_controls.is_none_or(|controls| {
                 !service
                     && v.inventory_only != Some(true)
                     && v.availability == Some(1)
-                    && (!disabled
-                        || (v.supported_capabilities.is_some_and(|mask| mask & 4 != 0)
-                            && v.selected_model
-                                .as_deref()
-                                .is_some_and(|name| name.starts_with("mlx:"))))
+                    && controls <= crate::thinking::ALL
+                    && (controls == 0
+                        || (matches!(v.capability_source, Some(1..=3))
+                            && v.supported_capabilities.is_some_and(|mask| mask & 4 != 0)))
             });
             let shape = reasoning
                 && profile
@@ -364,7 +365,10 @@ pub fn validate_semantics(
         }
         Body::Begin(v) => {
             // No output cap crosses the wire (owner, 2026-10-19).
-            v.model.as_deref().is_some_and(selector) && positive(v.input_bytes, MAX_INPUT_BYTES)
+            v.model.as_deref().is_some_and(selector)
+                && positive(v.input_bytes, MAX_INPUT_BYTES)
+                // Absent means send nothing (thinking-level.md).
+                && v.thinking.is_none_or(|n| (1..=5).contains(&n))
         }
         Body::Chunk(v) => {
             transfer(v.transfer_id, v.direction)
@@ -393,6 +397,13 @@ pub fn validate_semantics(
             positive(v.revision, u64::MAX - 1)
                 && count_bytes(v.count, v.total_bytes, MAX_REVISION_BYTES)
                 && v.offset.is_some()
+                // A thinking part (thinking-level.md): both fields or neither,
+                // within the transfer's bytes.
+                && match (v.thinking_offset, v.thinking_bytes) {
+                    (None, None) => true,
+                    (Some(_), Some(bytes)) => v.total_bytes.is_some_and(|total| bytes <= total),
+                    _ => false,
+                }
         }
         // Unparsed proposals: the service is the only argument parser. Exactly
         // one of name / name_bytes and of arguments / arguments_bytes; a size

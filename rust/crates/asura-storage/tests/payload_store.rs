@@ -615,6 +615,8 @@ impl Journal {
             prompt: "hello".into(),
             event_cursor: 1,
             composition: Composition::default(),
+            thinking_level: 0,
+            thinking_request: 0,
         })));
         j.append(Record::StartAuthorized(StartAuthorized {
             operation: id(10),

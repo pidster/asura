@@ -119,8 +119,12 @@ public enum Wire {
             try check(!v.hasModelName || (!service && !v.modelName.isEmpty && v.modelName.utf8.count <= 256 && !v.modelName.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })))
             try check(v.hasBuildID && v.buildID.count == 32 && v.hasSchemaDigest && v.schemaDigest.count == 32
                 && v.hasMaxFrameBytes && v.maxFrameBytes == 65_536 && v.hasAvailability && v.hasReason)
-            try check(!v.hasReasoningDisabled || (!service && !v.inventoryOnly && v.availability == .available
-                && (!v.reasoningDisabled || (v.hasSupportedCapabilities && v.supportedCapabilities & 4 != 0 && v.selectedModel.hasPrefix("mlx:")))))
+            // Thinking controls (thinking-level.md): helper-only on an available
+            // Hello; nonzero needs a known source with reasoning support.
+            try check(!v.hasThinkingControls || (!service && !v.inventoryOnly && v.availability == .available
+                && v.thinkingControls <= ThinkingControls.all.rawValue
+                && (v.thinkingControls == 0 || (v.hasCapabilitySource && (1...3).contains(v.capabilitySource)
+                    && v.hasSupportedCapabilities && v.supportedCapabilities & 4 != 0))))
             if v.hasCapabilitySource || v.hasSupportedCapabilities {
                 try check(!service && !v.inventoryOnly && v.availability == .available)
                 if v.capabilitySource == 4 { try check(!v.hasSupportedCapabilities) }
@@ -178,7 +182,8 @@ public enum Wire {
                     && v.reason == .modelUnavailable)
             }
         case .begin(let v):
-            try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...Limits.input).contains(v.inputBytes))
+            try check(service && v.hasModel && selector(v.model) && v.hasInputBytes && (1...Limits.input).contains(v.inputBytes)
+                && (!v.hasThinking || (1...5).contains(v.thinking.rawValue)))
         case .chunk(let v):
             try check(v.hasTransferID && v.hasDirection && transfer(v.transferID, v.direction)
                 && v.direction == (service ? .input : .output) && v.hasData && !v.data.isEmpty && v.data.count <= Limits.chunk
@@ -199,7 +204,10 @@ public enum Wire {
         case .snapshotEnd(let v):
             try check(!service && v.hasRevision && v.revision >= 1 && v.revision < UInt64.max
                 && v.hasCount && v.hasTotalBytes && v.hasOffset
-                && counts(v.count, v.totalBytes, UInt64(Limits.revisionBytes)))
+                && counts(v.count, v.totalBytes, UInt64(Limits.revisionBytes))
+                // A thinking part: both fields or neither, within the transfer.
+                && v.hasThinkingOffset == v.hasThinkingBytes
+                && (!v.hasThinkingBytes || v.thinkingBytes <= v.totalBytes))
         case .toolCall(let v):
             // Exactly one of name / name_bytes and of arguments / arguments_bytes.
             try check(!service && v.hasOrdinal && (1...Limits.toolProposals).contains(v.ordinal)

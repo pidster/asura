@@ -138,6 +138,10 @@ Proposed sources this design must stay consistent with, not decisions:
   line 85; proposed).
 
 
+Thinking text is never model input (owner, 2026-10-19). Candidates carry the
+prompt and the journaled answer only; the composer has no access to kind 25
+thinking text ([thinking level](thinking-level.md)).
+
 ## Owner decisions
 
 Required behavior (owner, 2026-10-14). Each row states the decision and the

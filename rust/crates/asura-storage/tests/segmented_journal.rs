@@ -144,6 +144,16 @@ impl Session {
     }
     /// Accept and start a turn; returns (conversation, operation, generation).
     fn start_turn(&mut self, project: Id, conversation: Option<Id>) -> (Id, Id, u64) {
+        self.start_turn_thinking(project, conversation, 0, 0)
+    }
+    /// [`Self::start_turn`] with kind 21 thinking level and request codes.
+    fn start_turn_thinking(
+        &mut self,
+        project: Id,
+        conversation: Option<Id>,
+        thinking_level: u8,
+        thinking_request: u8,
+    ) -> (Id, Id, u64) {
         let digest = self.configuration(project);
         let current = state(&self.writer);
         let (expected, completed) = match conversation {
@@ -192,6 +202,8 @@ impl Session {
                 omitted_turns: completed as u32,
                 ..Composition::default()
             },
+            thinking_level,
+            thinking_request,
         };
         run(
             &self.writer,
@@ -230,7 +242,15 @@ impl Session {
         .unwrap();
     }
     fn read(&self, operation: Id, offset: u64) -> (u64, String, u64) {
-        let reply = run(&self.writer, Command::ReadResponse { operation, offset }).unwrap();
+        let reply = run(
+            &self.writer,
+            Command::ReadResponse {
+                operation,
+                offset,
+                thinking_offset: 0,
+            },
+        )
+        .unwrap();
         let Some(Record::TurnTerminal(terminal)) = reply.record else {
             panic!("terminal");
         };
@@ -363,6 +383,117 @@ fn sj27_twenty_mib_response_spans_segment_files_and_reads_back_whole() {
     close(&mut writer);
 }
 
+/// TL-12 and TL-13 (thinking-level.md): about 10 MiB of thinking text in
+/// kind 25 segments spans segment files, settles into `H` index pieces and
+/// reads back whole in windows that share 61,440 bytes with the response,
+/// before and after a restart and after a rebuild from frames. Kind 21
+/// returns the level and request; history and derived files hold no
+/// thinking text.
+#[test]
+fn tl12_tl13_thinking_spans_segment_files_and_reads_back_whole() {
+    let _guard = WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut session = Session::start(&scratch);
+    let project = session.register(&scratch, 1);
+    let (conversation, operation, generation) = session.start_turn_thinking(project, None, 4, 2);
+    let mut thinking = String::new();
+    let mut n = 0;
+    while thinking.len() < 10 * 1024 * 1024 {
+        let text = piece(n);
+        session
+            .append(Record::ThinkingText(ResponseText {
+                operation,
+                generation,
+                offset: thinking.len() as u64,
+                text: text.clone(),
+            }))
+            .unwrap();
+        thinking.push_str(&text);
+        n += 1;
+    }
+    // A cut rewrites the last characters of the journaled thinking.
+    let mut cut = thinking.len() - 7;
+    while !thinking.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    thinking.truncate(cut);
+    thinking.push_str("done.");
+    session
+        .append(Record::ThinkingText(ResponseText {
+            operation,
+            generation,
+            offset: cut as u64,
+            text: "done.".into(),
+        }))
+        .unwrap();
+    session.finish(operation, generation, 0, "answer");
+    assert!(segment_files(&scratch).len() >= 2, "{:?}", scratch.names());
+    let read_both = |session: &Session| {
+        let (mut text, mut held) = (String::new(), String::new());
+        loop {
+            let reply = run(
+                &session.writer,
+                Command::ReadResponse {
+                    operation,
+                    offset: text.len() as u64,
+                    thinking_offset: held.len() as u64,
+                },
+            )
+            .unwrap();
+            let window = reply.thinking.unwrap();
+            assert_eq!((window.level, window.request), (4, 2));
+            let Some(Record::TurnTerminal(terminal)) = reply.record else {
+                panic!("terminal");
+            };
+            assert!(window.text.len() + terminal.text.len() <= MAX_TEXT);
+            held.truncate(window.offset as usize);
+            held.push_str(&window.text);
+            text.truncate(terminal.text_offset as usize);
+            text.push_str(&terminal.text);
+            if held.len() as u64 == window.bytes
+                && text.len() as u64 == reply.response_bytes.unwrap()
+            {
+                return (held, text);
+            }
+        }
+    };
+    assert_eq!(read_both(&session), (thinking.clone(), "answer".into()));
+    // TL-10: history carries the answer only.
+    let prepared = run(
+        &session.writer,
+        Command::Prepare {
+            project,
+            conversation: Some(conversation),
+            expected_generation: generation,
+            prompt: "next".into(),
+        },
+    )
+    .unwrap()
+    .prepared
+    .unwrap();
+    assert_eq!(prepared.history.len(), 1);
+    assert_eq!(prepared.history[0].1.text, "answer");
+    assert_eq!(prepared.history[0].0.thinking_level, 4);
+    let marker = piece(7);
+    for (name, bytes) in derived_files(&scratch) {
+        assert!(
+            !bytes.windows(64).any(|w| w == &marker.as_bytes()[..64]),
+            "{name}"
+        );
+    }
+    close(&mut session.writer);
+    let session = Session::start(&scratch);
+    assert_eq!(read_both(&session), (thinking.clone(), "answer".into()));
+    close(&mut { session }.writer);
+    for (name, _) in derived_files(&scratch) {
+        fs::remove_file(scratch.control().join(name)).unwrap();
+    }
+    let session = Session::start(&scratch);
+    assert_eq!(read_both(&session), (thinking, "answer".into()));
+    let mut writer = session.writer;
+    close(&mut writer);
+}
+
 /// SJ-10, SJ-28: 200 tool-call records of about 64 KiB commit across
 /// segment files; their records read back through `C` entries after the
 /// operation leaves memory; history pages across runs.
@@ -425,6 +556,7 @@ fn sj28_two_hundred_large_tool_calls_span_segment_files() {
         Command::ReadResponse {
             operation,
             offset: 0,
+            thinking_offset: 0,
         },
     )
     .unwrap();
@@ -1174,6 +1306,7 @@ fn sj18_to_sj21_sj26_damage_on_real_files_is_detected_and_preserved() {
             Command::ReadResponse {
                 operation: *operation,
                 offset: 0,
+                thinking_offset: 0,
             },
         ) {
             assert_eq!(error, Error::RepairRequired);
@@ -1186,6 +1319,7 @@ fn sj18_to_sj21_sj26_damage_on_real_files_is_detected_and_preserved() {
                 Command::ReadResponse {
                     operation: *operation,
                     offset: k * MAX_TEXT as u64,
+                    thinking_offset: 0,
                 },
             )
             .map(|_| ())
@@ -1241,6 +1375,7 @@ fn sj18_to_sj21_sj26_damage_on_real_files_is_detected_and_preserved() {
             Command::ReadResponse {
                 operation: operations[0],
                 offset: 0,
+                thinking_offset: 0,
             },
         );
         assert!(matches!(result, Err(Error::RepairRequired)), "{result:?}");
@@ -1305,6 +1440,7 @@ fn sj11_sj24_merges_interleave_with_commands_on_real_files() {
             Command::ReadResponse {
                 operation: *operation,
                 offset: 0,
+                thinking_offset: 0,
             },
         )
         .unwrap();

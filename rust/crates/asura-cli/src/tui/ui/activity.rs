@@ -15,8 +15,24 @@ pub(super) struct Activity {
     waiting_step: Option<i32>,
     expanded: bool,
     unavailable: bool,
+    /// The turn's assembled thinking text and whether its block is open
+    /// (thinking-level.md). Blocks start folded.
+    thinking: String,
+    thinking_open: bool,
 }
 impl Activity {
+    pub(super) fn thinking(&self) -> &str {
+        &self.thinking
+    }
+    pub(super) fn thinking_open(&self) -> bool {
+        self.thinking_open
+    }
+    /// The thinking text of a whole event, as the worker assembled it.
+    pub(super) fn set_thinking(&mut self, event: &pb::ConversationEvent) {
+        if let Some(text) = &event.thinking_text {
+            self.thinking = text.clone();
+        }
+    }
     #[cfg(test)]
     pub(super) fn expanded(&self) -> bool {
         self.expanded
@@ -363,6 +379,17 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(entry) = self.activity.get_mut(selected) {
                     entry.expanded = !entry.expanded;
+                }
+                self.response_scroll = 0;
+            }
+            // Open or fold the thinking block (thinking-level.md).
+            KeyCode::Char('t') => {
+                if let Some(entry) = self
+                    .activity
+                    .get_mut(selected)
+                    .filter(|entry| !entry.thinking.is_empty())
+                {
+                    entry.thinking_open = !entry.thinking_open;
                 }
                 self.response_scroll = 0;
             }

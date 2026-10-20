@@ -36,6 +36,19 @@ struct Config {
     retention: Retention,
     #[serde(default, skip_serializing_if = "Journal::is_default")]
     journal: Journal,
+    /// The model thinking level (thinking-level.md); absent is `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
+}
+/// Thinking level spellings in code order: 0 default, 1 off, 2 low,
+/// 3 medium, 4 high (thinking-level.md).
+pub const THINKING_LEVELS: [&str; 5] = ["default", "off", "low", "medium", "high"];
+/// The code of a thinking level spelling.
+pub fn thinking_code(name: &str) -> Option<u8> {
+    THINKING_LEVELS
+        .iter()
+        .position(|level| *level == name)
+        .map(|code| code as u8)
 }
 /// Retained exec_cmd output (J1 quota ledger).
 #[derive(Serialize, Deserialize)]
@@ -282,6 +295,10 @@ impl Config {
             || !(crate::payload::MIN_QUOTA..=crate::payload::MAX_QUOTA)
                 .contains(&self.retention.quota_bytes)
             || !(JOURNAL_MIN_QUOTA..=JOURNAL_MAX_QUOTA).contains(&self.journal.quota_bytes)
+            || self
+                .thinking
+                .as_deref()
+                .is_some_and(|level| thinking_code(level).is_none())
         {
             return Err("config_invalid_value");
         }
@@ -304,6 +321,13 @@ impl Config {
             capabilities.mask()?;
         }
         Ok(())
+    }
+    /// The effective thinking level code.
+    fn thinking(&self) -> u8 {
+        self.thinking
+            .as_deref()
+            .and_then(thinking_code)
+            .unwrap_or(0)
     }
     fn model_capabilities(&self) -> Option<u32> {
         let asset = self.model.as_deref()?.strip_prefix("mlx:")?;
@@ -332,6 +356,7 @@ impl Config {
             "retention.quotaBytes" => yaml(&self.retention.quota_bytes),
             "journal" => yaml(&self.journal),
             "journal.quotaBytes" => yaml(&self.journal.quota_bytes),
+            "thinking" => yaml(&THINKING_LEVELS[usize::from(self.thinking())]),
             _ => Err("config_unknown_key"),
         }
     }
@@ -401,6 +426,17 @@ impl Config {
             }
             "journal.quotaBytes" => {
                 self.journal.quota_bytes = value.as_u64().ok_or("config_invalid_value")?
+            }
+            "thinking" => {
+                let Value::String(level) = value else {
+                    return Err("config_invalid_value");
+                };
+                // `default` removes the key: absent is the default.
+                self.thinking = match thinking_code(&level) {
+                    Some(0) => None,
+                    Some(_) => Some(level),
+                    None => return Err("config_invalid_value"),
+                };
             }
             _ => return Err("config_unknown_key"),
         }
@@ -542,6 +578,7 @@ pub fn execute(
                 | "retention.quotaBytes"
                 | "journal"
                 | "journal.quotaBytes"
+                | "thinking"
         )
     {
         return Err("config_unknown_key");
@@ -614,6 +651,8 @@ pub struct ConversationSnapshot {
     pub asset_root: String,
     pub ollama_endpoint: Option<String>,
     pub model_capabilities: Option<u32>,
+    /// The thinking level code, 0 default through 4 high (thinking-level.md).
+    pub thinking: u8,
     pub digest: [u8; 32],
 }
 
@@ -636,6 +675,7 @@ pub fn conversation_snapshot(
     Ok(ConversationSnapshot {
         asset_root,
         model_capabilities,
+        thinking: config.thinking(),
         model: config.model.unwrap_or_else(|| "system".into()),
         ollama_endpoint: config.providers.ollama.endpoint,
         digest,
@@ -830,6 +870,45 @@ mod tests {
         ] {
             assert!(Config::read(document.as_bytes()).is_err(), "{document}");
         }
+    }
+    /// TL-02, TL-03 and TL-14 (thinking-level.md): the `thinking` key is
+    /// absent by default, takes the five spellings, `default` removes it and
+    /// other values reject without change.
+    #[test]
+    fn thinking_level_key_defaults_sets_removes_and_rejects() {
+        let mut config = Config::default();
+        assert_eq!(config.get("thinking").unwrap(), "default\n");
+        assert_eq!(config.thinking(), 0);
+        for (name, code) in [("off", 1), ("low", 2), ("medium", 3), ("high", 4)] {
+            config.set("thinking", name).unwrap();
+            assert_eq!(config.get("thinking").unwrap(), format!("{name}\n"));
+            assert_eq!(config.thinking(), code);
+            assert!(
+                yaml(&config)
+                    .unwrap()
+                    .contains(&format!("thinking: {name}"))
+            );
+        }
+        config.set("thinking", "default").unwrap();
+        assert_eq!(config.thinking(), 0);
+        assert!(!yaml(&config).unwrap().contains("thinking"));
+        config.set("thinking", "high").unwrap();
+        for invalid in [
+            "max",
+            "High",
+            "true",
+            "4",
+            "null",
+            "[high]",
+            "!tag high",
+            "''",
+        ] {
+            assert!(config.set("thinking", invalid).is_err(), "{invalid}");
+            assert_eq!(config.thinking(), 4);
+        }
+        assert!(Config::read(b"thinking: maximum").is_err());
+        assert_eq!(Config::read(b"thinking: low").unwrap().thinking(), 2);
+        assert_eq!(Config::read(b"thinking: default").unwrap().thinking(), 0);
     }
     #[test]
     fn defaults_types_and_independent_keys() {

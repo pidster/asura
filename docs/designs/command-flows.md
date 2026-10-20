@@ -379,6 +379,10 @@ ownership until settled. No automatic set retry occurs. A cancelled client wait
 does not prove that the write stopped. `/config` reports effective persisted values, not model
 or audit-consumer activation. Unsupported keys and an unset model are errors.
 
+`/think LEVEL` and the status-bar thinking list write the `thinking` key through
+this flow. Their command flowchart is in
+[thinking level](thinking-level.md#think-command).
+
 ## CF08: Conversation submit and observation
 
 Implemented outbox, admission and observation pipeline with service-owned

@@ -17,7 +17,9 @@ schemas and runtime mechanisms remain with their governing designs.
 | Control client | CLI, TUI or GUI that sends commands and presents task events |
 | Composer | Chat editor together with its adjacent destination, information, status and control areas; distinct from the context composer |
 | Context composer | Service component that chooses, for each model request, the instructions, history, notices and model view of tool output sent to the model, sized from the model's capacity, and records a composition manifest; see the [context composer design](designs/context-composer.md). It is not the TUI input box |
-| Status bar | Compact row below the input showing project/Git context, draft count, running activity and model/context status |
+| Status bar | Compact row below the input showing project/Git context, draft count, running activity, thinking level and model/context status |
+| Thinking level | The person's model reasoning setting: model default, off, low, medium or high; see [thinking level](designs/thinking-level.md) |
+| Thinking text | A model's reasoning output for a turn; journaled and shown folded, never sent back to the model |
 | Message tray | Bounded area above the input showing submitted messages and their observed states, with access to full text |
 | Task | A unit of user-requested work with goals, limits and completion criteria |
 | Plan | A versioned graph of intended work, dependencies and completion criteria |

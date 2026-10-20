@@ -157,6 +157,16 @@ fn project(listing: &writer::ProjectListing) -> pb::ProjectReply {
         name_revision: Some(listing.name_revision),
     }
 }
+/// The helper's next revision credit waits while either the response or the
+/// thinking backlog is large (thinking-level.md).
+fn output_paused(active: &Active) -> bool {
+    active.response.paused() || active.thinking.paused()
+}
+/// Both the response and the thinking text are held whole by a client at
+/// cursor `after` holding `held` and `held_thinking` bytes.
+fn caught_up(active: &Active, after: u64, held: u64, held_thinking: u64) -> bool {
+    active.response.caught_up(after, held) && active.thinking.caught_up(after, held_thinking)
+}
 /// What the active turn waits on, for display only (owner, 2026-10-16).
 /// Derived from messages the owner already sees; it ends nothing.
 fn wait_step(active: &Active) -> Option<pb::ConversationWaitStep> {
@@ -209,6 +219,12 @@ fn terminal_event(turn: &journal::TurnTerminal, text_bytes: u64) -> pb::Conversa
         text: Some(turn.text.clone()),
         text_offset: Some(turn.text_offset),
         text_bytes: Some(text_bytes),
+        // A journal read fills the thinking window and the kind 21 level.
+        thinking_text: None,
+        thinking_offset: None,
+        thinking_bytes: None,
+        thinking_level: None,
+        thinking_request: None,
         usage_known: Some(turn.usage_known),
         usage_tokens: turn.usage_known.then_some(u64::from(turn.output_tokens)),
         tools: Vec::new(),
@@ -440,6 +456,8 @@ struct Active {
     helper: journal::Id,
     /// The response, its journaled prefix and recent cuts.
     response: response::Response,
+    /// The thinking text, journaled as kind 25 (thinking-level.md).
+    thinking: response::Response,
     cursor: u64,
     cancel: Option<journal::Cause>,
     cancel_replies: Vec<pb::Envelope>,
@@ -517,6 +535,8 @@ enum Job {
     ToolResult,
     /// One kind 24 response segment (response-text-transfer.md).
     ResponseText,
+    /// One kind 25 thinking segment (thinking-level.md).
+    ThinkingText,
     RecoverCreateResult,
     RecoverCreateFinish,
     Read(pb::Envelope),
@@ -1433,9 +1453,12 @@ impl Owner {
                     active.turn.operation == id(&value.operation_id)
                         && active.accepted
                         && active.cursor <= after
-                        && active
-                            .response
-                            .caught_up(after, value.text_offset.unwrap_or(0))
+                        && caught_up(
+                            active,
+                            after,
+                            value.text_offset.unwrap_or(0),
+                            value.thinking_offset.unwrap_or(0),
+                        )
                 }) || self.terminal_read_wait(id(&value.operation_id)).is_some()
             }
             Some(Body::ConversationQueueList(value))
@@ -1475,6 +1498,7 @@ impl Owner {
                     id(&value.operation_id),
                     value.after_cursor.unwrap(),
                     value.text_offset.unwrap_or(0),
+                    value.thinking_offset.unwrap_or(0),
                 );
             }
             Body::ResolveInitialization(value) => {
@@ -1699,24 +1723,35 @@ impl Owner {
             }),
         )
     }
-    /// `held` is the count of response bytes the client holds; the reply
-    /// carries one window (response-text-transfer.md).
+    /// `held` and `held_thinking` count the response and thinking bytes
+    /// the client holds; the reply carries the thinking window first and the
+    /// response window in the rest of one budget (response-text-transfer.md,
+    /// thinking-level.md).
     fn observe(
         &mut self,
         request: pb::Envelope,
         operation: journal::Id,
         after: u64,
         held: u64,
+        held_thinking: u64,
     ) -> Option<pb::Envelope> {
         if let Some(active) = &self.active
             && active.accepted
             && active.turn.operation == operation
         {
-            let (start, window) = active.response.window(after, held);
+            let (thinking_start, thinking) = active.thinking.window(after, held_thinking);
+            let thinking_changed = !(thinking.is_empty() && thinking_start == held_thinking);
+            let (start, window) = active.response.window_within(
+                after,
+                held,
+                asura_control::MAX_RESPONSE_WINDOW_BYTES - thinking.len(),
+            );
             // A caught-up client gets a pending heartbeat; a window also
             // tells a client to truncate a cut response.
-            let snapshot =
-                active.cursor > 1 && after < u64::MAX && !(window.is_empty() && start == held);
+            let snapshot = active.cursor > 1
+                && after < u64::MAX
+                && (thinking_changed || !(window.is_empty() && start == held));
+            let thinking_window = snapshot && (thinking_changed || !active.thinking.is_empty());
             return Some(reply(
                 request,
                 Body::ConversationEvent(pb::ConversationEvent {
@@ -1731,6 +1766,11 @@ impl Owner {
                     text: snapshot.then(|| window.to_owned()),
                     text_offset: snapshot.then_some(start),
                     text_bytes: snapshot.then_some(active.response.len() as u64),
+                    thinking_text: thinking_window.then(|| thinking.to_owned()),
+                    thinking_offset: thinking_window.then_some(thinking_start),
+                    thinking_bytes: thinking_window.then_some(active.thinking.len() as u64),
+                    thinking_level: Some(i32::from(active.turn.thinking_level)),
+                    thinking_request: Some(i32::from(active.turn.thinking_request)),
                     reason: Some(0),
                     usage_tokens: None,
                     usage_known: None,
@@ -1765,6 +1805,7 @@ impl Owner {
             writer::Command::ReadResponse {
                 operation,
                 offset: if after == u64::MAX { held } else { 0 },
+                thinking_offset: if after == u64::MAX { held_thinking } else { 0 },
             },
             Job::Read(request.clone()),
         ) {
@@ -1876,6 +1917,10 @@ impl Owner {
             event_cursor: 1,
             // Replaced by the composer's record before acceptance.
             composition: journal::Composition::default(),
+            // The configured level; the request is set when the helper
+            // reports its controls, before acceptance (thinking-level.md).
+            thinking_level: prepared.thinking,
+            thinking_request: 0,
         };
         let mut model = ModelOwner::new(
             self.runtime.clone(),
@@ -1912,6 +1957,7 @@ impl Owner {
             activation: [crate::model::Activation::Unknown; 4],
             helper: asura_platform::random_id(),
             response: Default::default(),
+            thinking: Default::default(),
             cursor: 1,
             cancel: None,
             cancel_replies: Vec::new(),
@@ -2035,15 +2081,17 @@ impl Owner {
                     | Job::QueueList(request) => self.out.push_back(error(request, message)),
                     // The journal holds normal records at its quota or disk
                     // floor: the turn pauses, nothing is lost (OD-SJ-2).
-                    Job::ResponseText | Job::ToolIntent
+                    Job::ResponseText | Job::ThinkingText | Job::ToolIntent
                         if matches!(
                             cause,
                             writer::Error::JournalQuota | writer::Error::JournalDiskSpace
                         ) =>
                     {
                         if let Some(active) = &mut self.active {
-                            if matches!(job, Job::ResponseText) {
-                                active.response.refused();
+                            match job {
+                                Job::ResponseText => active.response.refused(),
+                                Job::ThinkingText => active.thinking.refused(),
+                                _ => {}
                             }
                             active.journal_held = Some(message);
                             active.model.set_output_paused(true);
@@ -2070,12 +2118,17 @@ impl Owner {
                     // A single response reached its piece bound: keep the
                     // prefix plus one tail and cancel with output_limit
                     // (response-text-transfer.md, RT-07; SJ-D9).
-                    Job::ResponseText
+                    Job::ResponseText | Job::ThinkingText
                         if matches!(cause, writer::Error::Limit | writer::Error::Invalid) =>
                     {
                         if let Some(active) = &mut self.active {
                             active.cursor += 1;
-                            active.response.exhaust(active.cursor);
+                            if matches!(job, Job::ThinkingText) {
+                                // No kind 8 tail carries thinking (thinking-level.md).
+                                active.thinking.exhaust_to_journaled(active.cursor);
+                            } else {
+                                active.response.exhaust(active.cursor);
+                            }
                             active.model.set_output_paused(false);
                             active.cancel.get_or_insert(journal::Cause::OutputLimit);
                             active.revoke_create();
@@ -2322,6 +2375,8 @@ impl Owner {
                     active.turn.generation,
                     std::mem::take(&mut active.input),
                     active.tools_enabled,
+                    asura_control::thinking::Request::from_code(active.turn.thinking_request)
+                        .unwrap_or_default(),
                 ) {
                     Self::failed(active, message, now);
                 }
@@ -2342,7 +2397,12 @@ impl Owner {
             Job::ResponseText => {
                 let active = self.active.as_mut().expect("active response");
                 active.response.committed();
-                active.model.set_output_paused(active.response.paused());
+                active.model.set_output_paused(output_paused(active));
+            }
+            Job::ThinkingText => {
+                let active = self.active.as_mut().expect("active thinking");
+                active.thinking.committed();
+                active.model.set_output_paused(output_paused(active));
             }
             Job::Cancel => {
                 let active = self.active.as_mut().expect("active cancel");
@@ -2703,6 +2763,15 @@ impl Owner {
                     Some(journal::Record::TurnTerminal(terminal)) => {
                         let mut event =
                             terminal_event(&terminal, value.response_bytes.unwrap_or(0));
+                        if let Some(thinking) = value.thinking {
+                            event.thinking_level = Some(i32::from(thinking.level));
+                            event.thinking_request = Some(i32::from(thinking.request));
+                            if thinking.bytes > 0 || thinking.offset > 0 {
+                                event.thinking_text = Some(thinking.text);
+                                event.thinking_offset = Some(thinking.offset);
+                                event.thinking_bytes = Some(thinking.bytes);
+                            }
+                        }
                         event.model_context = self
                             .model_context
                             .iter()
@@ -3173,10 +3242,11 @@ impl Owner {
                         continue;
                     }
                     let held = value.text_offset.unwrap_or(0);
+                    let held_thinking = value.thinking_offset.unwrap_or(0);
                     let unchanged = self.active.as_ref().is_some_and(|active| {
                         active.turn.operation == operation
                             && active.cursor <= after
-                            && active.response.caught_up(after, held)
+                            && caught_up(active, after, held, held_thinking)
                     });
                     if unchanged && now < deadline {
                         self.observations.push((request, deadline));
@@ -3275,8 +3345,25 @@ impl Owner {
                     ));
                     active.tools_enabled &= tools_available;
                     active.capabilities = capabilities;
-                    active.activation =
-                        [1, 2, 4, 8].map(|bit| capabilities.activation(bit, active.tools_enabled));
+                    // The one mapping (thinking-level.md); kind 21 records it.
+                    let thinking = asura_control::thinking::request(
+                        asura_control::thinking::Level::from_code(active.turn.thinking_level)
+                            .unwrap_or_default(),
+                        capabilities.thinking_controls,
+                    );
+                    active.turn.thinking_request = thinking as u8;
+                    if let Some((_, context)) = self
+                        .model_context
+                        .iter_mut()
+                        .find(|(id, _)| *id == active.turn.operation)
+                    {
+                        context.reasoning = capabilities.reasoning();
+                        context.thinking_controls = capabilities
+                            .reasoning()
+                            .map(|_| capabilities.thinking_controls);
+                    }
+                    active.activation = [1, 2, 4, 8]
+                        .map(|bit| capabilities.activation(bit, active.tools_enabled, thinking));
                     tracing::debug!(supported = ?active.capabilities.supported,
                         source = ?active.capabilities.source, activation = ?active.activation,
                         "model capabilities negotiated");
@@ -3353,10 +3440,18 @@ impl Owner {
                     revision,
                     offset,
                     text,
+                    thinking,
                 } => {
                     if active.cancel.is_none() {
                         active.cursor = active.cursor.max(revision) + 1;
-                        if let Err(message) = active.response.revise(offset, &text, active.cursor) {
+                        let revised = match thinking {
+                            Some((offset, text)) => {
+                                active.thinking.revise(offset, &text, active.cursor)
+                            }
+                            None => Ok(()),
+                        }
+                        .and_then(|()| active.response.revise(offset, &text, active.cursor));
+                        if let Err(message) = revised {
                             Self::failed(active, message, now);
                         }
                     }
@@ -3506,7 +3601,7 @@ impl Owner {
         };
         // The next revision's credit only while fewer than 122,880 bytes wait
         // for the journal, decided after this pass's revisions applied.
-        active.model.set_output_paused(active.response.paused());
+        active.model.set_output_paused(output_paused(active));
         if self.closing {
             active.revoke_create();
             active.cancel.get_or_insert(journal::Cause::ServiceShutdown);
@@ -3641,14 +3736,20 @@ impl Owner {
                 .is_some_and(|w| w.status().held.is_some());
             if !held {
                 active.journal_held = None;
-                active.model.set_output_paused(active.response.paused());
+                active.model.set_output_paused(output_paused(active));
                 tracing::info!("journal_turn_resumed");
             } else if active.cancel.is_none() && active.terminal.is_none() {
                 return;
-            } else if !active.response.is_exhausted() {
-                // Cancelled while paused: keep the journaled prefix and one tail.
+            } else if !active.response.is_exhausted() || !active.thinking.is_exhausted() {
+                // Cancelled while paused: keep the journaled prefix and one
+                // response tail; thinking keeps its journaled prefix.
                 active.cursor += 1;
-                active.response.exhaust(active.cursor);
+                if !active.response.is_exhausted() {
+                    active.response.exhaust(active.cursor);
+                }
+                if !active.thinking.is_exhausted() {
+                    active.thinking.exhaust_to_journaled(active.cursor);
+                }
             }
         }
         // Journal the response while its tail exceeds one kind 8 frame. The
@@ -3663,6 +3764,26 @@ impl Owner {
                 text,
             });
             if let Err(e) = self.append(record, Job::ResponseText, None) {
+                self.unavailable = Some(storage_error(e));
+            }
+            return;
+        }
+        // Thinking: a segment while its backlog exceeds one frame, and every
+        // remaining byte once the turn has its terminal (thinking-level.md).
+        if active.start_committed
+            && let Some((offset, text)) = if active.terminal.is_some() {
+                active.thinking.flush_segment()
+            } else {
+                active.thinking.next_segment()
+            }
+        {
+            let record = journal::Record::ThinkingText(journal::ResponseText {
+                operation,
+                generation,
+                offset,
+                text,
+            });
+            if let Err(e) = self.append(record, Job::ThinkingText, None) {
                 self.unavailable = Some(storage_error(e));
             }
             return;
@@ -3895,8 +4016,10 @@ impl Owner {
                 .and_then(|tool| tool.memory_ticket.as_ref())
                 .is_none_or(writer::Ticket::is_settled)
         {
-            // The tail follows the journaled prefix; segments commit first.
+            // The tail follows the journaled prefix; segments commit first,
+            // thinking included (thinking-level.md).
             if let Some(mut terminal) = active.terminal.clone()
+                && (!active.start_committed || active.thinking.flushed())
                 && let Some((text_offset, text)) = active.response.tail()
             {
                 terminal.text_offset = text_offset;
@@ -4278,6 +4401,7 @@ mod observation_tests {
             [6; 16],
             journal::Operation {
                 response: Default::default(),
+                thinking: Default::default(),
                 conversation: [7; 16],
                 generation: 4,
                 task: [8; 16],
@@ -4304,6 +4428,7 @@ mod observation_tests {
             request_counter: Some(1),
             body: Some(Body::ConversationObserve(pb::ConversationObserve {
                 text_offset: None,
+                thinking_offset: None,
                 operation_id: Some(vec![6; 16]),
                 after_cursor: Some(19),
                 wait_ms: Some(1000),

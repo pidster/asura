@@ -113,6 +113,8 @@ fn turn() -> TurnAccepted {
         prompt: "hello".into(),
         event_cursor: 1,
         composition: Composition::default(),
+        thinking_level: 0,
+        thinking_request: 0,
     }
 }
 fn start() -> Record {
@@ -2619,4 +2621,99 @@ fn rt08_restart_keeps_the_journaled_prefix() {
     j.append(tail(TerminalKind::Interrupted, Cause::Restart, 7, ""));
     let op = &inspect(&j.bytes).unwrap().operations[&id(10)];
     assert_eq!(op.response.len, 7);
+}
+
+// ---------------------------------------------------------- thinking text
+// thinking-level.md: kind 25 segments and the kind 21 level and request.
+
+fn thought(offset: u64, text: &str) -> Record {
+    Record::ThinkingText(ResponseText {
+        operation: id(10),
+        generation: 1,
+        offset,
+        text: text.into(),
+    })
+}
+
+/// TL-09 and TL-12 in replay: kind 25 segments build the operation's
+/// thinking pieces beside the response; a cut keeps the shorter prefix; a
+/// restart terminal keeps the journaled thinking.
+#[test]
+fn tl09_tl12_thinking_replays_beside_the_response() {
+    let mut j = Journal::started();
+    let full = MAX_TEXT as u64;
+    for n in 0..3 {
+        j.append(thought(n * full, &"t".repeat(MAX_TEXT)));
+    }
+    j.append(thought(3 * full - 5, "cut"));
+    j.append(segment(0, "answer"));
+    j.append(tail(TerminalKind::Complete, Cause::None, 6, ""));
+    let op = &inspect(&j.bytes).unwrap().operations[&id(10)];
+    assert_eq!(op.thinking.len, 3 * full - 2);
+    assert_eq!(op.thinking.pieces.len(), 4);
+    assert_eq!(op.response.len, 6);
+    assert_eq!(op.response.pieces.len(), 1);
+    let mut j = Journal::started();
+    j.append(thought(0, "partial"));
+    j.append(Record::OwnerGeneration);
+    j.append(tail(TerminalKind::Interrupted, Cause::Restart, 0, ""));
+    let op = &inspect(&j.bytes).unwrap().operations[&id(10)];
+    assert_eq!(op.thinking.len, 7);
+    assert_eq!(op.response.len, 0);
+}
+
+/// TL-15 in replay: kind 25 follows the kind 24 rules; kind 21 rejects an
+/// unknown level or request code.
+#[test]
+fn tl15_invalid_thinking_records_reject() {
+    for records in [
+        // Offset above the journaled thinking length.
+        vec![thought(1, "x")],
+        // A no-op segment.
+        vec![thought(0, "x"), thought(1, "")],
+        // Response length does not count toward thinking.
+        vec![segment(0, "abc"), thought(2, "x")],
+    ] {
+        let mut j = Journal::started();
+        for record in records {
+            j.append(record);
+        }
+        assert!(inspect(&j.bytes).is_err());
+    }
+    // Before StartAuthorized.
+    let mut j = Journal::accepted();
+    j.append(thought(0, "x"));
+    assert!(inspect(&j.bytes).is_err());
+    // After the terminal.
+    let mut j = Journal::started();
+    j.append(tail(TerminalKind::Complete, Cause::None, 0, "done"));
+    j.append(thought(0, "x"));
+    assert!(inspect(&j.bytes).is_err());
+    // An oversized segment does not encode.
+    let context = FrameContext {
+        installation_id: id(1),
+        transition_id: id(2),
+        sequence: 1,
+        prior_digest: [0; 32],
+        expected_revision: 0,
+        owner_generation: 1,
+    };
+    assert!(encode_frame(&context, &thought(0, &"x".repeat(MAX_TEXT + 1))).is_err());
+    // Kind 21 level and request codes round trip and reject out of range.
+    for (level, request, valid) in [(4, 5, true), (0, 0, true), (5, 0, false), (0, 6, false)] {
+        let record = Record::TurnAccepted(Box::new(TurnAccepted {
+            thinking_level: level,
+            thinking_request: request,
+            ..turn()
+        }));
+        match encode_frame(&context, &record) {
+            Ok(frame) => {
+                assert!(valid);
+                // The format-1 frame: 144-byte header, payload, 40-byte trailer.
+                let payload = &frame[144..frame.len() - 40];
+                assert_eq!(decode_record(21, payload).unwrap(), record);
+            }
+            Err(_) => assert!(!valid),
+        }
+    }
 }

@@ -36,6 +36,16 @@ public typealias ToolHandler = @Sendable (ToolProposal) async throws -> ToolResu
 public protocol ToolModelBackend: ModelBackend {
     func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws
+    /// As `generateWithTools`, with the thinking form the service sent
+    /// (thinking-level.md). Backends without thinking controls ignore it.
+    func generateWithTools(_ input: ModelInput, thinking: ThinkingRequest, handler: @escaping ToolHandler,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws
+}
+extension ToolModelBackend {
+    public func generateWithTools(_ input: ModelInput, thinking: ThinkingRequest, handler: @escaping ToolHandler,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await generateWithTools(input, handler: handler, snapshot: snapshot)
+    }
 }
 
 public func makeProjectTools(_ handler: @escaping ToolHandler, budget: ToolRoundBudget? = nil) -> [any Tool] {

@@ -71,6 +71,8 @@ fn seed(fixture: &Fixture, projects: &[[u8; 16]]) -> Result<()> {
                 prompt: prompt.into(),
                 event_cursor: 1,
                 composition: j::Composition::default(),
+                thinking_level: 0,
+                thinking_request: 0,
             };
             revision = execute(
                 &writer,

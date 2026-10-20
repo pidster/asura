@@ -819,6 +819,8 @@ fn long_journal_fixture(strip: bool) -> Result<()> {
                 prompt: prompt.into(),
                 event_cursor: 1,
                 composition: j::Composition::default(),
+                thinking_level: 0,
+                thinking_request: 0,
             })),
             Some(w::AdmissionFence {
                 project,
@@ -1077,6 +1079,8 @@ fn queue_history_fixture(verify: bool) -> Result<()> {
                     omitted_turns: u32::from(generation - 1),
                     ..j::Composition::default()
                 },
+                thinking_level: 0,
+                thinking_request: 0,
             };
             append(
                 &writer,
@@ -1288,6 +1292,8 @@ fn queue_reorder_fixture(verify: bool) -> Result<()> {
                 prompt: prompt.into(),
                 event_cursor: 1,
                 composition: j::Composition::default(),
+                thinking_level: 0,
+                thinking_request: 0,
             })),
             Some(w::AdmissionFence {
                 project,

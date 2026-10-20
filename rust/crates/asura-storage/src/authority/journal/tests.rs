@@ -116,6 +116,8 @@ impl Harness {
                 omitted_turns: completed as u32,
                 ..Composition::default()
             },
+            thinking_level: 0,
+            thinking_request: 0,
         })))
         .unwrap();
         let helper = self.fresh();
@@ -669,6 +671,8 @@ fn sj13_generated_id_in_a_run_is_rejected() {
         prompt: "p".into(),
         event_cursor: 1,
         composition: Composition::default(),
+        thinking_level: 0,
+        thinking_request: 0,
     }));
     assert_eq!(h.append(reused), Err(Failure::Invalid));
 }

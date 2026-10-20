@@ -177,6 +177,16 @@ defaults; lifecycle and terminal-restoration journeys also passed. The normal
 debug binary was rebuilt. This does not activate model or audit consumers.
 
 ## Audit setting consumption and event journal
+## Thinking level key
+
+Status: selected design, implemented 2026-10-19. The
+[thinking level design](thinking-level.md#configuration-key) is canonical.
+`thinking` is a top-level string: `default`, `off`, `low`, `medium` or `high`.
+Absent means `default`; setting `default` removes the key. Other values reject
+with `config_invalid_value` and leave the file unchanged. Get returns the
+effective value. The admission snapshot and the service observer carry it.
+`/think` in the TUI writes the same key through the same worker.
+
 
 **Status: recording base selected on 2026-09-27; recent-inspection extension
 accepted for scoped implementation on 2026-09-28. Integration and validation

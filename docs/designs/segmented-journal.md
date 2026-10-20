@@ -536,6 +536,7 @@ stateDiagram-v2
 | `G` generated ID | Installation, graph, task, operation, input or dispatch-request ID, 0 (SJ-D16) | Entity kind u8, locator of the creating frame | Roll after commit |
 | `O` operation | Operation ID, 0 | Conversation, generation, terminal kind, cause, response length, piece count, call count, accepted and terminal locators | Roll after terminal |
 | `P` response piece | Operation ID, start offset | Kept length, locator of the kind 24 or kind 8 frame | With `O` |
+| `H` thinking piece | Operation ID, start offset | Kept length, locator of the kind 25 frame | With `O`; the thinking length is the end of the last `H` piece ([thinking level](thinking-level.md#journal-format-1)) |
 | `C` tool call | Operation ID, ordinal | Decision, kind 14, kind 15 and kind 23 locators (zero when absent) | With `O` |
 | `T` turn | Conversation ID, generation | Operation ID, terminal kind, accepted locator, completed turns through this generation (SJ-D12) | With `O` |
 | `I` input | Input ID, 0 | Status, kind 18 locator, promotion locator, dispatched operation | Roll after the input settles |
@@ -756,7 +757,7 @@ runs. Typical journals have fewer than 10 runs.
 | Command | Change |
 | --- | --- |
 | `ReadRecord { range }` | Becomes `ReadRecord { locator }`. The locator must be one that the live state, delta or an index entry names. |
-| `ReadResponse { operation, offset }` | `O` gives the length and piece count. The worker finds the last `P` entry with start at most `offset` and reads frames until the 61,440-byte window is full. Pieces in different segment files are read in order. |
+| `ReadResponse { operation, offset, thinking_offset }` | `O` gives the length and piece count. The worker finds the last `P` entry with start at most `offset` and reads frames until the 61,440-byte window is full. Pieces in different segment files are read in order. |
 | `History { conversation, before, limit ≤ 8 }` | `before` is the accepted frame sequence of the oldest entry shown (SJ-D14); the `A` entry for it gives the generation. Searches `T` entries in each run and the delta below that generation, adds the active turn on the first page, merges them newest first and returns `limit + 1` to set `has_more`. |
 | `Prepare` | Returns completed prior turns newest first, from `T`, `O` and `P`, until the next turn would pass 8 MiB of prompt and response text. Older turns are reported as `omitted` (SJ-D23). The [context composer](context-composer.md#cc1-implementation-details) already omits turns that do not fit `W`. |
 | `ReadPrompt { operation }` | `O` gives the accepted locator. |

@@ -197,12 +197,15 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
                 );
                 option_locator(&mut w, tool.result_frame.as_ref());
             }
-            w.u64(op.response.len);
-            w.u32(op.response.pieces.len() as u32);
-            for piece in &op.response.pieces {
-                w.u64(piece.start);
-                w.u64(piece.kept);
-                locator(&mut w, &piece.frame);
+            // The response, then the thinking text (thinking-level.md).
+            for text in [&op.response, &op.thinking] {
+                w.u64(text.len);
+                w.u32(text.pieces.len() as u32);
+                for piece in &text.pieces {
+                    w.u64(piece.start);
+                    w.u64(piece.kept);
+                    locator(&mut w, &piece.frame);
+                }
             }
         }
     }
@@ -433,17 +436,21 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
                 read_option_locator(&mut r)?,
             ));
         }
-        let length = r.u64()?;
-        let count = r.u32()? as usize;
-        require(count <= MAX_RESPONSE_PIECES)?;
-        let mut pieces = Vec::with_capacity(count);
-        for _ in 0..count {
-            pieces.push(ResponsePiece {
-                start: r.u64()?,
-                kept: r.u64()?,
-                frame: read_locator(&mut r)?,
-            });
+        let mut texts = [Response::default(), Response::default()];
+        for text in &mut texts {
+            text.len = r.u64()?;
+            let count = r.u32()? as usize;
+            require(count <= MAX_RESPONSE_PIECES)?;
+            text.pieces.reserve_exact(count);
+            for _ in 0..count {
+                text.pieces.push(ResponsePiece {
+                    start: r.u64()?,
+                    kept: r.u64()?,
+                    frame: read_locator(&mut r)?,
+                });
+            }
         }
+        let [response, thinking] = texts;
         let project = state
             .conversations
             .get(&conversation)
@@ -478,10 +485,8 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
                 cancel,
                 terminal: None,
                 tools,
-                response: Response {
-                    len: length,
-                    pieces,
-                },
+                response,
+                thinking,
             },
         );
         state.active_operation = Some(id);

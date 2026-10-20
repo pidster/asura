@@ -11,7 +11,7 @@ fn envelope(body: Body) -> pb::Envelope {
 fn hello(service: bool) -> pb::Envelope {
     envelope(Body::Hello(pb::Hello {
         local_tool_destination: None,
-        reasoning_disabled: None,
+        thinking_controls: None,
         supported_capabilities: None,
         capability_source: None,
         model_capabilities: None,
@@ -53,6 +53,7 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
                 model: Some("system".into()),
                 input_bytes: Some(10),
                 enable_project_tools: None,
+                thinking: None,
             })),
             ServiceToHelper,
         ),
@@ -113,6 +114,8 @@ fn fixtures() -> Vec<(pb::Envelope, Direction)> {
                 count: Some(1),
                 total_bytes: Some(10),
                 offset: Some(0),
+                thinking_offset: None,
+                thinking_bytes: None,
             })),
             HelperToService,
         ),
@@ -506,31 +509,49 @@ fn export_cross_language_fixtures() {
         true,
         local.encode_to_vec(),
     );
+    // Thinking controls (thinking-level.md): helper-only, need reasoning.
     let mut reasoning = local.clone();
     if let Some(Body::Hello(value)) = &mut reasoning.body {
-        value.selected_model = Some("mlx:fixture".into());
-        value.reasoning_disabled = Some(true);
-        value.context_source = Some(3);
+        value.thinking_controls = Some(3);
     }
     write(
-        "mlx_reasoning_disabled.pb",
+        "thinking_controls.pb",
         "helper",
         true,
         reasoning.encode_to_vec(),
     );
     write(
-        "mlx_reasoning_wrong_direction.pb",
+        "thinking_controls_wrong_direction.pb",
         "service",
         false,
         reasoning.encode_to_vec(),
     );
     if let Some(Body::Hello(value)) = &mut reasoning.body {
+        value.thinking_controls = Some(32);
+    }
+    write(
+        "thinking_controls_unknown_bit.pb",
+        "helper",
+        false,
+        reasoning.encode_to_vec(),
+    );
+    if let Some(Body::Hello(value)) = &mut reasoning.body {
+        value.thinking_controls = Some(3);
         value.supported_capabilities = Some(1);
     }
     write(
-        "mlx_reasoning_unsupported.pb",
+        "thinking_controls_without_reasoning.pb",
         "helper",
         false,
+        reasoning.encode_to_vec(),
+    );
+    if let Some(Body::Hello(value)) = &mut reasoning.body {
+        value.thinking_controls = Some(0);
+    }
+    write(
+        "thinking_controls_zero_without_reasoning.pb",
+        "helper",
+        true,
         reasoning.encode_to_vec(),
     );
     write(
@@ -709,8 +730,73 @@ fn export_cross_language_fixtures() {
             count: Some(count),
             total_bytes: Some(total),
             offset,
+            thinking_offset: None,
+            thinking_bytes: None,
         }));
         write(name, "helper", accepted, message.encode_to_vec());
+    }
+    // A thinking part: both fields or neither, within the transfer
+    // (thinking-level.md).
+    for (name, total, thinking_offset, thinking_bytes, accepted) in [
+        (
+            "helper_snapshot_end_thinking.pb",
+            10,
+            Some(0),
+            Some(4),
+            true,
+        ),
+        (
+            "helper_snapshot_end_thinking_whole.pb",
+            10,
+            Some(7),
+            Some(10),
+            true,
+        ),
+        (
+            "helper_snapshot_end_thinking_over.pb",
+            10,
+            Some(0),
+            Some(11),
+            false,
+        ),
+        (
+            "helper_snapshot_end_thinking_no_offset.pb",
+            10,
+            None,
+            Some(4),
+            false,
+        ),
+        (
+            "helper_snapshot_end_thinking_no_bytes.pb",
+            10,
+            Some(0),
+            None,
+            false,
+        ),
+    ] {
+        let message = envelope(Body::SnapshotEnd(pb::SnapshotEnd {
+            revision: Some(2),
+            count: Some(1),
+            total_bytes: Some(total),
+            offset: Some(0),
+            thinking_offset,
+            thinking_bytes,
+        }));
+        write(name, "helper", accepted, message.encode_to_vec());
+    }
+    for (name, thinking, accepted) in [
+        ("service_begin_thinking_on.pb", Some(2), true),
+        ("service_begin_thinking_high.pb", Some(5), true),
+        ("service_begin_thinking_none.pb", Some(0), false),
+        ("service_begin_thinking_unknown.pb", Some(6), false),
+    ] {
+        let message = envelope(Body::Begin(pb::Begin {
+            model: Some("system".into()),
+            input_bytes: Some(10),
+            enable_project_tools: None,
+            thinking,
+        }));
+        write(name, "service", accepted, message.encode_to_vec());
     }
     let message = envelope(Body::Chunk(pb::Chunk {
         transfer_id: Some(5_001),
@@ -1327,6 +1413,7 @@ fn begin_carries_no_deadline_and_removed_field_is_rejected() {
         model: Some("system".into()),
         input_bytes: Some(1),
         enable_project_tools: None,
+        thinking: None,
     };
     let message = envelope(Body::Begin(begin.clone()));
     assert!(encode_frame(&message, Direction::ServiceToHelper).is_ok());

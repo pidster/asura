@@ -542,6 +542,7 @@ fn stored_memory_status_is_bounded_truthful_and_paired_with_service_uptime() {
             reason: Some(16),
         }),
         configured_model: None,
+        thinking_level: Some(4),
         uptime_ms: Some(100),
         stored_memory: Some(pb::StoredMemoryStatus {
             available: Some(true),

@@ -10,6 +10,9 @@ public actor HelperSession {
     private var supportsTools = false
     private var capabilities: CapabilityProfile?
     private var activation: [ModelCapability: CapabilityActivation] = [:]
+    /// Hello field 23 and the form Begin carried (thinking-level.md).
+    private var thinkingControls: ThinkingControls = []
+    private var thinking: ThinkingRequest = .none
     private let buildID: Data
     private let schemaDigest: Data
     private var phase = Phase.hello
@@ -38,14 +41,17 @@ public actor HelperSession {
     private var activeInferenceOrdinal: UInt32?
     /// The response text as the service holds it after the last SnapshotEnd.
     private var committed = Data()
-    /// The newest SDK text not yet committed; `targetVersion` changes with it.
+    /// The newest SDK text not yet committed.
     private var target: Data?
-    private var targetVersion: UInt64 = 0
-    /// One revision in flight: at most `Limits.revisionBytes` after `transmitOffset`.
+    /// The thinking text as the service holds it, and the newest not yet
+    /// committed (thinking-level.md).
+    private var committedThinking = Data()
+    private var targetThinking: Data?
+    /// One revision in flight, at most `Limits.revisionBytes`: the thinking
+    /// part first, then the response part from `transmitOffset`.
     private var transmitting: Data?
     private var transmitOffset = 0
-    private var transmitEnd = 0
-    private var transmitVersion: UInt64 = 0
+    private var transmitThinking: (offset: Int, count: Int)?
     private var transfer: UInt64 = 2
     private var revision: UInt64 = 0
     private var transferChunks: UInt64 = 0
@@ -167,6 +173,7 @@ public actor HelperSession {
             let status = await backend?.status() ?? BackendStatus(contextTokens: nil)
             supportsTools = status.supportsTools
             capabilities = status.capabilityProfile
+            thinkingControls = status.thinkingControls
             // Timer may have closed discovery while the SDK availability observation was pending.
             guard phase == .hello else { throw HelperError.closed }
             var response = Asura_Model_V1_Hello()
@@ -185,8 +192,12 @@ public actor HelperSession {
                 contextTokens = context
                 if let profile = status.capabilityProfile {
                     response.capabilitySource = profile.provenance.rawValue
-                    if profile.reasoningDisabled { response.reasoningDisabled = true }
                     if let mask = profile.mask { response.supportedCapabilities = mask }
+                    // Controls need a known source with reasoning support.
+                    if !status.thinkingControls.isEmpty, profile.provenance != .undeclared,
+                        profile.support(.reasoning) == .supported {
+                        response.thinkingControls = status.thinkingControls.rawValue
+                    }
                 }
                 if let name = ProviderMetadata.displayName(status.modelName) { response.modelName = name }
             } else {
@@ -207,12 +218,19 @@ public actor HelperSession {
                 begin.hasInputBytes, begin.inputBytes > 0, begin.inputBytes <= Limits.input,
                 // A sanity bound on allocation, not a content limit.
                 begin.inputBytes <= UInt64(contextTokens) * 8 else { throw HelperError.protocolFault }
+            // Only a form reported in Hello (thinking-level.md); absent is none.
+            if begin.hasThinking {
+                guard begin.thinking != .none, thinkingControls.accepts(begin.thinking) else {
+                    throw HelperError.protocolFault
+                }
+                thinking = begin.thinking
+            }
             operation = message.operationID; generation = message.generation
             expectedInput = begin.inputBytes
             projectToolsEnabled = begin.hasEnableProjectTools && begin.enableProjectTools
             if let capabilities {
                 activation = Dictionary(uniqueKeysWithValues: ModelCapability.allCases.map {
-                    ($0, capabilities.activation($0, toolsEnabled: projectToolsEnabled))
+                    ($0, capabilities.activation($0, toolsEnabled: projectToolsEnabled, thinking: thinking))
                 })
             }
             if projectToolsEnabled && (!supportsTools || !(backend is any ToolModelBackend)) { throw HelperError.unavailable }
@@ -259,14 +277,15 @@ public actor HelperSession {
             guard let backend = self.backend else { throw HelperError.unavailable }
             let owner = self
             let enableTools = projectToolsEnabled
+            let thinking = self.thinking
             modelTask = Task {
                 do {
                     if enableTools, let toolBackend = backend as? any ToolModelBackend {
-                        try await toolBackend.generateWithTools(input,
+                        try await toolBackend.generateWithTools(input, thinking: thinking,
                             handler: { proposal in try await owner.requestTool(proposal) },
                             snapshot: { value in try await owner.snapshot(value) })
                     } else {
-                        try await backend.generate(input) { value in
+                        try await backend.generate(input, thinking: thinking) { value in
                             try await owner.snapshot(value)
                         }
                     }
@@ -381,7 +400,8 @@ public actor HelperSession {
             return
         }
         // No response size, revision or transmitted-byte total (owner, 2026-10-18).
-        target = Data(value.text.utf8); targetVersion &+= 1; usage = value.usageTokens
+        target = Data(value.text.utf8); usage = value.usageTokens
+        if let thought = value.thinking { targetThinking = Data(thought.utf8) }
         try await pump()
     }
     private func backendCancelled(taskCancelled: Bool) async {
@@ -401,7 +421,7 @@ public actor HelperSession {
     private func completed() async {
         guard phase == .running else { return }
         backendFinished = true
-        if revision == 0 && target == nil { target = Data(); targetVersion &+= 1 }
+        if revision == 0 && target == nil { target = Data() }
         do { try await pump() } catch { await fail(.outputLimit, cancelled: false) }
     }
 
@@ -411,25 +431,25 @@ public actor HelperSession {
         defer { pumping = false }
         while phase == .running {
             if transmitting == nil {
-                guard let next = target else {
+                if target == nil && targetThinking == nil {
                     if backendFinished {
                         try await terminal(pendingFailure == nil ? .complete : .failed,
                             reason: pendingFailure ?? .none)
                     }
                     return
                 }
-                let prefix = Self.sharedPrefix(committed, next)
-                // An unchanged text needs no revision; the first is always sent.
-                if revision > 0 && prefix == committed.count && prefix == next.count {
-                    target = nil
+                guard let part = Self.revision(committed: committed, target: target,
+                    committedThinking: committedThinking, targetThinking: targetThinking,
+                    first: revision == 0) else {
+                    // Both texts are committed: nothing to send.
+                    target = nil; targetThinking = nil
                     continue
                 }
-                var end = min(next.count, prefix + Limits.revisionBytes)
-                while end < next.count && end > prefix && next[end] & 0xC0 == 0x80 { end -= 1 }
                 guard revision < UInt64.max - 1 else { throw HelperError.protocolFault }
                 revision += 1; transferChunks = 0
-                transmitting = next.subdata(in: prefix..<end)
-                transmitOffset = prefix; transmitEnd = end; transmitVersion = targetVersion
+                transmitting = part.bytes
+                transmitOffset = part.offset
+                transmitThinking = part.thinking
             }
             guard let bytes = transmitting, var ledger = ledgers[transfer] else { throw HelperError.protocolFault }
             while ledger.sent < UInt64(bytes.count) {
@@ -449,19 +469,66 @@ public actor HelperSession {
             var end = Asura_Model_V1_SnapshotEnd()
             end.revision = revision; end.count = transferChunks; end.totalBytes = UInt64(bytes.count)
             end.offset = UInt64(transmitOffset)
+            var responseBytes = bytes
+            if let part = transmitThinking {
+                end.thinkingOffset = UInt64(part.offset); end.thinkingBytes = UInt64(part.count)
+                committedThinking.removeSubrange(part.offset..<committedThinking.count)
+                committedThinking.append(bytes.prefix(part.count))
+                responseBytes = bytes.subdata(in: part.count..<bytes.count)
+            }
             let old = transfer
             transfer += 1
             ledgers = [old: ledger, transfer: Ledger()]
             committed.removeSubrange(transmitOffset..<committed.count)
-            committed.append(bytes)
-            // The whole target is committed unless a newer snapshot replaced it.
-            if transmitVersion == targetVersion, let current = target, transmitEnd == current.count {
-                target = nil
-            }
-            transmitting = nil
+            committed.append(responseBytes)
+            // A target is done when the service holds it, unless a newer
+            // snapshot replaced it.
+            if target == committed { target = nil }
+            if targetThinking == committedThinking { targetThinking = nil }
+            transmitting = nil; transmitThinking = nil
             // Keep SnapshotEnd ordered after the data it terminates.
             try await transport.send(envelope(.snapshotEnd(end)), control: false)
         }
+    }
+
+    /// One revision from the committed and target texts (thinking-level.md):
+    /// the thinking change first, then the response change in the remaining
+    /// budget of `Limits.revisionBytes`. A part without a change, or without
+    /// budget, keeps its committed length. Returns nil when nothing changes,
+    /// except that the first revision is always sent.
+    static func revision(committed: Data, target: Data?, committedThinking: Data, targetThinking: Data?,
+        first: Bool) -> (bytes: Data, offset: Int, thinking: (offset: Int, count: Int)?)? {
+        func boundary(_ data: Data, _ prefix: Int, _ budget: Int) -> Int {
+            var end = min(data.count, prefix + budget)
+            while end < data.count && end > prefix && data[end] & 0xC0 == 0x80 { end -= 1 }
+            return end
+        }
+        var budget = Limits.revisionBytes
+        var bytes = Data()
+        var thinking: (offset: Int, count: Int)?
+        if let next = targetThinking {
+            let prefix = sharedPrefix(committedThinking, next)
+            if !(prefix == committedThinking.count && prefix == next.count) {
+                let end = boundary(next, prefix, budget)
+                bytes.append(next.subdata(in: prefix..<end))
+                thinking = (prefix, end - prefix)
+                budget -= end - prefix
+            }
+        }
+        var offset = committed.count
+        if let next = target {
+            let prefix = sharedPrefix(committed, next)
+            if !(prefix == committed.count && prefix == next.count) {
+                let end = boundary(next, prefix, budget)
+                // A cut needs no budget; an append waits for budget.
+                if end > prefix || prefix < committed.count {
+                    bytes.append(next.subdata(in: prefix..<end))
+                    offset = prefix
+                }
+            }
+        }
+        if !first && thinking == nil && offset == committed.count && bytes.isEmpty { return nil }
+        return (bytes, offset, thinking)
     }
 
     /// Length of the common prefix, backed off to a UTF-8 character boundary
@@ -488,7 +555,7 @@ public actor HelperSession {
             activeInferenceOrdinal = nil; settledInferenceOrdinal = ordinal
             try await transport.send(envelope(.inferenceUsage(RequestUsage(ordinal: ordinal).wire)))
         }
-        target = nil; transmitting = nil; inputData.removeAll(); decodedInput = nil
+        target = nil; targetThinking = nil; transmitting = nil; inputData.removeAll(); decodedInput = nil
         var end = Asura_Model_V1_Terminal()
         end.outcome = outcome; end.lastRevision = revision
         end.count = totalChunks; end.totalBytes = totalBytes; end.reason = reason

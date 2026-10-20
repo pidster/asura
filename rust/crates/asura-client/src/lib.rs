@@ -141,6 +141,8 @@ pub struct ServiceUpdate {
     pub revision: u64,
     pub pending: bool,
     pub configured_model: Option<String>,
+    /// The configured thinking level code (thinking-level.md).
+    pub thinking_level: Option<i32>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -417,6 +419,7 @@ impl Client {
                     revision: value.revision.ok_or(Error::Protocol)?,
                     pending: value.pending.ok_or(Error::Protocol)?,
                     configured_model: value.configured_model,
+                    thinking_level: value.thinking_level,
                 })
             }
             _ => Err(Error::Protocol),
@@ -778,11 +781,23 @@ impl Client {
         }
     }
     /// One observation; `text_offset` is the count of response bytes held.
+    /// The caller holds no thinking text.
     pub fn observe_conversation(
         &mut self,
         operation: [u8; 16],
         after_cursor: u64,
         text_offset: u64,
+    ) -> Result<pb::ConversationEvent> {
+        self.observe_with_thinking(operation, after_cursor, text_offset, 0)
+    }
+    /// One observation; `text_offset` and `thinking_offset` count the
+    /// response and thinking bytes held (thinking-level.md).
+    pub fn observe_with_thinking(
+        &mut self,
+        operation: [u8; 16],
+        after_cursor: u64,
+        text_offset: u64,
+        thinking_offset: u64,
     ) -> Result<pb::ConversationEvent> {
         match self.request(pb::envelope::Body::ConversationObserve(
             pb::ConversationObserve {
@@ -790,6 +805,7 @@ impl Client {
                 after_cursor: Some(after_cursor),
                 wait_ms: Some(1000),
                 text_offset: Some(text_offset),
+                thinking_offset: Some(thinking_offset),
             },
         ))? {
             pb::envelope::Body::ConversationEvent(reply)
@@ -810,7 +826,12 @@ impl Client {
         assembly: &mut ResponseAssembly,
     ) -> Result<pb::ConversationEvent> {
         loop {
-            let event = self.observe_conversation(operation, assembly.cursor(), assembly.held())?;
+            let event = self.observe_with_thinking(
+                operation,
+                assembly.cursor(),
+                assembly.held(),
+                assembly.held_thinking(),
+            )?;
             assembly.apply(&event)?;
             if assembly.complete() {
                 return Ok(assembly.whole(event));

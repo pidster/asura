@@ -107,6 +107,7 @@ Press F6 to open the response browser.
 | Up or Down | Choose an earlier or later response |
 | Home or End | Choose the first or last response |
 | Enter or Space | Expand or collapse the response's tool activity |
+| t | Open or fold the response's thinking |
 | Page Up or Page Down | Scroll the response |
 | Escape or F6 | Return to the input box |
 
@@ -114,8 +115,8 @@ Press F6 to open the response browser.
 
 | Key | Action |
 | --- | --- |
-| Left, Right or Tab | Select the project or the model |
-| Enter | Open the project list or the model list |
+| Left, Right or Tab | Select the project, the model or the thinking level |
+| Enter | Open the project list, the model list or the thinking list |
 | Up, Shift+Up or Escape | Return to the input box |
 
 ## Project and model list keys
@@ -124,7 +125,7 @@ Press F6 to open the response browser.
 | --- | --- |
 | Up or Down | Select a row |
 | Home or End | Select the first or last row |
-| Enter | Use the selected project or model |
+| Enter | Use the selected project, model or thinking level |
 | Escape | Close the list without a change; stops a model search |
 
 The project list shows at most 64 projects. On its last or first row, Up,

@@ -170,6 +170,9 @@ pub enum Command {
     ReadResponse {
         operation: Id,
         offset: u64,
+        /// Thinking bytes the reader holds; the thinking window comes first
+        /// and shares the window budget (thinking-level.md).
+        thinking_offset: u64,
     },
     History {
         project: Id,
@@ -194,6 +197,8 @@ pub struct Prepared {
     pub asset_root: String,
     pub ollama_endpoint: Option<String>,
     pub model_capabilities: Option<u32>,
+    /// The configured thinking level code (thinking-level.md).
+    pub thinking: u8,
     pub configuration_digest: Hash,
     /// Completed prior turns of the conversation, newest first, until 8 MiB
     /// of text (SJ-D10).
@@ -268,6 +273,22 @@ pub struct Reply {
     pub stale_project_name_revision: bool,
     /// The whole response length for `ReadResponse`.
     pub response_bytes: Option<u64>,
+    /// The turn's thinking level, request and one thinking window, for
+    /// `ReadResponse`.
+    pub thinking: Option<ThinkingWindow>,
+}
+/// One window of a terminal operation's thinking text (thinking-level.md).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThinkingWindow {
+    /// Kind 21 thinking level code.
+    pub level: u8,
+    /// Kind 21 thinking request code.
+    pub request: u8,
+    /// Start of `text` in the thinking text.
+    pub offset: u64,
+    pub text: String,
+    /// The whole thinking length.
+    pub bytes: u64,
 }
 #[derive(Clone, Debug)]
 pub struct HistoryPage {

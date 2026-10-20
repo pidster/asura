@@ -11,6 +11,8 @@ use std::{
 };
 struct ReadValue {
     model: Option<String>,
+    /// The configured thinking level code (thinking-level.md).
+    thinking: Option<u8>,
     size: Result<u64, asura_storage::stored_memory::SizeError>,
     sampled: Instant,
 }
@@ -32,6 +34,7 @@ pub(crate) struct Observer {
     size_reason: u32,
     revision: u64,
     model: Option<String>,
+    thinking: Option<u8>,
     read: Option<Read>,
     refresh: bool,
     closing: bool,
@@ -49,6 +52,7 @@ impl Observer {
             size_reason: 2,
             revision: 1,
             model: None,
+            thinking: None,
             read: None,
             refresh: true,
             closing: false,
@@ -78,6 +82,7 @@ impl Observer {
             pending: Some(pending),
             status: Some(self.status),
             configured_model: self.model.clone(),
+            thinking_level: self.thinking.map(i32::from),
             uptime_ms: Some(millis(
                 Instant::now().saturating_duration_since(self.started),
             )),
@@ -102,7 +107,7 @@ impl Observer {
         if self.status.installation != status.installation || self.status.reason != status.reason {
             self.refresh = true;
         }
-        let previous_model = self.model.clone();
+        let previous_model = (self.model.clone(), self.thinking);
         let previous_size = (self.size, self.size_reason);
         if let Some(read) = self.read.as_mut() {
             if !read.handle.is_finished() && !read.cancel.load(Ordering::Acquire) {
@@ -117,6 +122,7 @@ impl Observer {
                     match result {
                         Ok(value) => {
                             self.model = value.model;
+                            self.thinking = value.thinking;
                             match value.size {
                                 Ok(bytes) => {
                                     self.size = Some((
@@ -150,13 +156,14 @@ impl Observer {
                 .name("asura-status-config".into())
                 .spawn(move || {
                     let _done = signal.guard();
-                    let model =
-                        asura_storage::config::conversation_snapshot(runtime.clone(), &token)
-                            .ok()
-                            .map(|snapshot| snapshot.model);
+                    let snapshot =
+                        asura_storage::config::conversation_snapshot(runtime.clone(), &token).ok();
+                    let thinking = snapshot.as_ref().map(|snapshot| snapshot.thinking);
+                    let model = snapshot.map(|snapshot| snapshot.model);
                     let size = asura_storage::stored_memory::stored_bytes(runtime, &token);
                     ReadValue {
                         model,
+                        thinking,
                         size,
                         sampled: Instant::now(),
                     }
@@ -172,7 +179,7 @@ impl Observer {
             }
         }
         if self.status != status
-            || previous_model != self.model
+            || previous_model != (self.model.clone(), self.thinking)
             || previous_size != (self.size, self.size_reason)
         {
             self.status = status;
@@ -360,6 +367,7 @@ mod tests {
             assert!(token.load(Ordering::Acquire));
             ReadValue {
                 model: Some("late".into()),
+                thinking: Some(4),
                 size: Ok(999),
                 sampled: Instant::now(),
             }

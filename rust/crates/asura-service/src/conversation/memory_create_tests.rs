@@ -242,6 +242,7 @@ fn pending_projection() -> Arc<journal::Replay> {
         create.operation,
         journal::Operation {
             response: Default::default(),
+            thinking: Default::default(),
             conversation: [5; 16],
             generation: 1,
             task: [6; 16],

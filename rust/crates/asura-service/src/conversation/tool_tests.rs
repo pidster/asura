@@ -36,6 +36,8 @@ impl Fixture {
             prompt: "observe status".into(),
             event_cursor: 1,
             composition: journal::Composition::default(),
+            thinking_level: 0,
+            thinking_request: 0,
         };
         let active = Active {
             journal_held: None,
@@ -55,7 +57,7 @@ impl Fixture {
             capabilities: crate::model::CapabilityProfile {
                 supported: Some(1),
                 source: Some(1),
-                reasoning_disabled: false,
+                thinking_controls: 0,
             },
             activation: [
                 crate::model::Activation::Enabled,
@@ -65,6 +67,7 @@ impl Fixture {
             ],
             helper: [10; 16],
             response: Default::default(),
+            thinking: Default::default(),
             cursor: 2,
             cancel: None,
             cancel_replies: vec![],
@@ -1217,6 +1220,7 @@ fn install_recorded_memory_cancel(fixture: &mut Fixture) {
         active.turn.operation,
         journal::Operation {
             response: Default::default(),
+            thinking: Default::default(),
             conversation: active.turn.conversation,
             generation: active.turn.generation,
             task: active.turn.task,
@@ -1344,7 +1348,7 @@ fn committed_tool_activity_is_observable_before_model_text() {
     assert!(fixture.active().response.is_empty());
     let reply = fixture
         .owner
-        .observe(pb::Envelope::default(), operation, before, 0)
+        .observe(pb::Envelope::default(), operation, before, 0, 0)
         .unwrap();
     let Some(Body::ConversationEvent(event)) = reply.body else {
         panic!("activity event");
@@ -1367,7 +1371,7 @@ fn committed_tool_activity_is_observable_before_model_text() {
         .result_status = Some(1);
     let reply = fixture
         .owner
-        .observe(pb::Envelope::default(), operation, before, 0)
+        .observe(pb::Envelope::default(), operation, before, 0, 0)
         .unwrap();
     let Some(Body::ConversationEvent(event)) = reply.body else {
         panic!("completed tool event");
@@ -1402,7 +1406,7 @@ fn rejected_call_projection_uses_codes_and_never_guesses_text() {
         .extend([rejected, oversized]);
     let reply = fixture
         .owner
-        .observe(pb::Envelope::default(), operation, 0, 0)
+        .observe(pb::Envelope::default(), operation, 0, 0, 0)
         .unwrap();
     let Some(Body::ConversationEvent(event)) = reply.body else {
         panic!("activity event");
@@ -1713,6 +1717,7 @@ impl Journaled {
             Job::ToolResult => "tool_result",
             Job::Finish => "finish",
             Job::ResponseText => "response_text",
+            Job::ThinkingText => "thinking_text",
             _ => "other",
         };
         assert!(reply.is_ok(), "{tag}: {:?}", reply.as_ref().err());
@@ -1899,7 +1904,7 @@ fn tcr_i11_two_hundred_calls_run_and_the_next_is_limit() {
     let operation = journaled.owner.active.as_ref().unwrap().turn.operation;
     let reply = journaled
         .owner
-        .observe(pb::Envelope::default(), operation, 0, 0)
+        .observe(pb::Envelope::default(), operation, 0, 0, 0)
         .unwrap();
     let Some(Body::ConversationEvent(event)) = reply.body else {
         panic!("activity event");
@@ -2110,4 +2115,135 @@ fn rt07_refused_segment_cancels_with_output_limit_and_keeps_one_tail() {
     // A client that held all 200,000 bytes is told to truncate.
     let (start, text) = active.response.window(cursor, 200_000);
     assert_eq!((start, text), (61_440, ""));
+}
+
+// ---------------------------------------------------------- thinking text
+// thinking-level.md: kind 25 segments beside the response, the output pause
+// and the terminal flush, through the real owner and a real private journal.
+
+/// TL-09, TL-12 (owner, real journal): a large thinking backlog journals kind
+/// 25 segments and withholds the helper's credit; observation sends the
+/// thinking window first within one shared budget; at the terminal every
+/// remaining thinking byte commits before kind 8.
+#[test]
+fn tl09_tl12_thinking_segments_pause_windows_and_flush_before_terminal() {
+    const SEGMENT: usize = 61_440;
+    let mut journaled = Journaled::new();
+    let operation = journaled.active().turn.operation;
+    let active = journaled.active();
+    active.model.response_test_revision(1);
+    active.cursor += 1;
+    let thinking = "t\u{e9}".repeat(150_000 / 3);
+    active.thinking.revise(0, &thinking, active.cursor).unwrap();
+    active.response.revise(0, "Answer.", active.cursor).unwrap();
+    // A late client gets the thinking window first and the response in the
+    // rest of the budget.
+    let event = match journaled
+        .owner
+        .observe(pb::Envelope::default(), operation, 0, 0, 0)
+        .unwrap()
+        .body
+    {
+        Some(Body::ConversationEvent(event)) => event,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(event.thinking_offset, Some(0));
+    assert_eq!(event.thinking_bytes, Some(thinking.len() as u64));
+    let window = event.thinking_text.unwrap();
+    assert!(window.len() + event.text.as_ref().unwrap().len() <= SEGMENT);
+    assert!(thinking.starts_with(&window) && window.len() > SEGMENT - 2);
+    assert_eq!(event.text.as_deref(), Some(""));
+    // A client holding all thinking gets the whole response.
+    let event = match journaled
+        .owner
+        .observe(
+            pb::Envelope::default(),
+            operation,
+            0,
+            0,
+            thinking.len() as u64,
+        )
+        .unwrap()
+        .body
+    {
+        Some(Body::ConversationEvent(event)) => event,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(event.thinking_text.as_deref(), Some(""));
+    assert_eq!(event.text.as_deref(), Some("Answer."));
+    let mut released = Vec::new();
+    let mut segments = 0;
+    loop {
+        journaled.owner.drive(Instant::now());
+        if journaled.owner.pending.is_none() {
+            break;
+        }
+        let active = journaled.active();
+        let backlog = active.thinking.backlog();
+        let credits = active.model.response_test_credits();
+        assert!(
+            backlog < 2 * SEGMENT || credits.is_empty(),
+            "credit at {backlog}"
+        );
+        released.extend(credits);
+        assert_eq!(journaled.settle(), "thinking_text");
+        segments += 1;
+        released.extend(journaled.active().model.response_test_credits());
+    }
+    // 150,000 bytes: two segments while streaming; the rest waits for the
+    // terminal flush.
+    assert_eq!(segments, 2);
+    assert_eq!(released, vec![3]);
+    let active = journaled.active();
+    assert!(active.thinking.backlog() > 0 && !active.thinking.flushed());
+    Owner::helper_terminal(active, 1, 0, None);
+    active.model = ModelOwner::settled_test_fixture();
+    journaled.owner.drive(Instant::now());
+    assert_eq!(journaled.settle(), "thinking_text");
+    journaled.owner.drive(Instant::now());
+    assert_eq!(journaled.settle(), "finish");
+    let mut rebuilt = String::new();
+    let mut response = String::new();
+    let mut order = Vec::new();
+    for record in journaled.records() {
+        match record {
+            journal::Record::ThinkingText(segment) => {
+                order.push(25);
+                rebuilt.truncate(segment.offset as usize);
+                rebuilt.push_str(&segment.text);
+            }
+            journal::Record::TurnTerminal(terminal) => {
+                order.push(8);
+                assert_eq!(terminal.kind, journal::TerminalKind::Complete);
+                response.truncate(terminal.text_offset as usize);
+                response.push_str(&terminal.text);
+            }
+            journal::Record::ResponseText(_) => order.push(24),
+            _ => {}
+        }
+    }
+    assert_eq!(order, vec![25, 25, 25, 8]);
+    assert_eq!(rebuilt, thinking);
+    assert_eq!(response, "Answer.");
+}
+
+/// TL-15 (owner): a kind 25 segment refused for journal capacity keeps only
+/// the journaled thinking and cancels with `output_limit`.
+#[test]
+fn tl15_refused_thinking_segment_cancels_and_keeps_the_journaled_prefix() {
+    let mut fixture = Fixture::new();
+    let active = fixture.active();
+    active.cursor += 1;
+    active
+        .thinking
+        .revise(0, &"x".repeat(200_000), active.cursor)
+        .unwrap();
+    assert!(active.thinking.next_segment().is_some());
+    fixture
+        .owner
+        .job_done(Job::ThinkingText, Err(writer::Error::Limit), Instant::now());
+    let active = fixture.active();
+    assert_eq!(active.cancel, Some(journal::Cause::OutputLimit));
+    assert_eq!(active.thinking.len(), 0);
+    assert!(active.thinking.flushed());
 }

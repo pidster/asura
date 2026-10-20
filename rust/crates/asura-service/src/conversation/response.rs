@@ -1,5 +1,7 @@
 //! The active response (response-text-transfer.md): its text, the prefix the
 //! journal holds, recent cuts for observation windows and the output pause.
+//! The active thinking text (thinking-level.md) uses the same state; it has
+//! no kind 8 tail, so the terminal flush writes all of it as kind 25.
 //! Pure state; the conversation owner submits journal commands and credit.
 use asura_control::MAX_RESPONSE_WINDOW_BYTES;
 use asura_storage::authority::conversation::MAX_TEXT;
@@ -92,6 +94,32 @@ impl Response {
         self.pending_floor = usize::MAX;
         Some((start as u64, self.text[start..end].to_owned()))
     }
+    /// The next kind 25 segment at the terminal flush: any unjournaled
+    /// bytes, at most one segment.
+    pub(super) fn flush_segment(&mut self) -> Option<(u64, String)> {
+        if self.exhausted || self.pending.is_some() || self.backlog() == 0 {
+            return None;
+        }
+        let start = self.stable;
+        let end = floor(&self.text, start + SEGMENT_BYTES);
+        self.pending = Some((start, end));
+        self.pending_floor = usize::MAX;
+        Some((start as u64, self.text[start..end].to_owned()))
+    }
+    /// Nothing remains to journal.
+    pub(super) fn flushed(&self) -> bool {
+        self.pending.is_none() && (self.exhausted || self.backlog() == 0)
+    }
+    /// The journal refused a thinking segment for capacity: keep only what
+    /// it holds, since no kind 8 tail carries thinking.
+    pub(super) fn exhaust_to_journaled(&mut self, cursor: u64) {
+        self.pending = None;
+        self.exhausted = true;
+        if self.stable < self.text.len() {
+            self.cut(cursor, self.stable);
+            self.text.truncate(self.stable);
+        }
+    }
     /// The pending segment committed.
     pub(super) fn committed(&mut self) {
         if let Some((_, end)) = self.pending.take() {
@@ -127,6 +155,11 @@ impl Response {
     /// start (the held count, or the lowest cut since `after`) and at most
     /// one window of text.
     pub(super) fn window(&self, after: u64, held: u64) -> (u64, &str) {
+        self.window_within(after, held, MAX_RESPONSE_WINDOW_BYTES)
+    }
+    /// [`Self::window`] with at most `budget` bytes of text: thinking and
+    /// response windows share one event budget (thinking-level.md).
+    pub(super) fn window_within(&self, after: u64, held: u64, budget: usize) -> (u64, &str) {
         let mut start = usize::try_from(held).unwrap_or(usize::MAX);
         if after < self.forgotten {
             start = 0;
@@ -137,7 +170,7 @@ impl Response {
             }
         }
         let start = floor(&self.text, start);
-        let end = floor(&self.text, start + MAX_RESPONSE_WINDOW_BYTES);
+        let end = floor(&self.text, start + budget.min(MAX_RESPONSE_WINDOW_BYTES));
         (start as u64, &self.text[start..end])
     }
     /// The client at `after` holding `held` bytes has the whole response.
@@ -236,6 +269,42 @@ mod tests {
         assert_eq!(response.backlog(), 1);
         assert!(!response.paused());
         assert_eq!(response.tail().unwrap(), (100, "z".into()));
+    }
+
+    /// TL-12: thinking flushes every unjournaled byte at the terminal in
+    /// segments of at most 61,440 bytes; a capacity refusal keeps only the
+    /// journaled prefix; windows honor a smaller shared budget on character
+    /// boundaries.
+    #[test]
+    fn tl12_thinking_flush_exhaust_and_budgeted_windows() {
+        let mut thinking = Response::default();
+        thinking
+            .revise(0, &"é".repeat(SEGMENT_BYTES / 2 + 10), 2)
+            .unwrap();
+        let (offset, text) = thinking.flush_segment().unwrap();
+        assert_eq!((offset, text.len()), (0, SEGMENT_BYTES));
+        assert!(thinking.flush_segment().is_none() && !thinking.flushed());
+        thinking.committed();
+        // A small backlog waits for the terminal flush.
+        assert!(thinking.next_segment().is_none());
+        let (offset, text) = thinking.flush_segment().unwrap();
+        assert_eq!((offset, text.len()), (SEGMENT_BYTES as u64, 20));
+        thinking.committed();
+        assert!(thinking.flushed() && thinking.flush_segment().is_none());
+        // A budget cuts on a character boundary.
+        assert_eq!(thinking.window_within(0, 0, 5).1, "éé");
+        assert_eq!(thinking.window_within(0, 0, 0), (0, ""));
+        // Exhaustion keeps the journaled prefix and tells observers.
+        let mut thinking = Response::default();
+        thinking.revise(0, "abcdef", 2).unwrap();
+        let _ = thinking.flush_segment();
+        thinking.committed();
+        thinking.revise(6, "ghi", 3).unwrap();
+        assert!(thinking.flush_segment().is_some());
+        thinking.exhaust_to_journaled(4);
+        assert_eq!(thinking.len(), 6);
+        assert!(thinking.flushed() && thinking.flush_segment().is_none());
+        assert_eq!(thinking.window(3, 9), (6, ""));
     }
 
     /// RT-07: a refused segment keeps the journaled prefix plus one tail and

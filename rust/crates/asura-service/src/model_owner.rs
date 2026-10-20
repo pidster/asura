@@ -49,11 +49,13 @@ pub(crate) enum ModelEvent {
     },
     Ready,
     /// One validated revision: keep `offset` bytes, append `text`
-    /// (response-text-transfer.md).
+    /// (response-text-transfer.md). `thinking` revises the thinking text the
+    /// same way (thinking-level.md).
     Revision {
         revision: u64,
         offset: u64,
         text: String,
+        thinking: Option<(u64, String)>,
     },
     Terminal {
         outcome: i32,
@@ -140,6 +142,8 @@ pub(crate) struct ModelOwner {
     measured_context: bool,
     usage_reports: u32,
     effective_context: Option<u32>,
+    /// Hello field 23; Begin sends only a request within it.
+    thinking_controls: u32,
     completion: crate::completion::Completion,
     cleanup_completion: crate::completion::Completion,
     wake: Option<asura_platform::events::WakeSender>,
@@ -284,6 +288,7 @@ impl ModelOwner {
             measured_context: false,
             usage_reports: 0,
             effective_context: None,
+            thinking_controls: 0,
             completion,
             cleanup_completion: Default::default(),
             wake: None,
@@ -295,9 +300,14 @@ impl ModelOwner {
         generation: u64,
         input: Vec<u8>,
         enable_tools: bool,
+        thinking: asura_control::thinking::Request,
     ) -> Result<(), &'static str> {
         if self.phase != Phase::Available || generation == 0 || operation == [0; 16] {
             return Err("model_not_ready");
+        }
+        // Only a form the helper reported (thinking-level.md).
+        if thinking.control() & !self.thinking_controls != 0 {
+            return Err("model_input_invalid");
         }
         model::decode_input(&input).map_err(|_| "model_input_invalid")?;
         // A protocol sanity bound on allocation, not a content limit.
@@ -316,6 +326,8 @@ impl ModelOwner {
             // No output cap: the model writes until it stops or its window is
             // full (owner, 2026-10-19; turn-usage-helper.md, request admission).
             enable_project_tools: enable_tools.then_some(true),
+            thinking: (thinking != asura_control::thinking::Request::None)
+                .then_some(thinking as i32),
         }))?;
         self.input = Some(input);
         self.input_sent = 0;
@@ -452,7 +464,7 @@ impl ModelOwner {
                         self.phase = Phase::Hello;
                         let hello = Body::Hello(pb::Hello {
                             local_tool_destination: None,
-                            reasoning_disabled: None,
+                            thinking_controls: None,
                             supported_capabilities: None,
                             capability_source: None,
                             model_capabilities: self.selection.model_capabilities,
@@ -703,6 +715,7 @@ impl ModelOwner {
             // The canonical codec validates the source against the selector,
             // including case-insensitive provider prefixes. Identity stays exact.
             self.effective_context = hello.context_tokens;
+            self.thinking_controls = hello.thinking_controls.unwrap_or(0);
             // Tool support comes from the capability mask alone (owner, 2026-10-17).
             self.tools_available = hello
                 .supported_capabilities
@@ -723,7 +736,7 @@ impl ModelOwner {
                 capabilities: crate::model::CapabilityProfile {
                     supported: hello.supported_capabilities,
                     source: hello.capability_source,
-                    reasoning_disabled: hello.reasoning_disabled == Some(true),
+                    thinking_controls: hello.thinking_controls.unwrap_or(0),
                 },
             });
             return Ok(());
@@ -842,10 +855,27 @@ impl ModelOwner {
                 }
                 self.revision += 1;
                 self.chunks = 0;
-                // The kept prefix ends on a character boundary, so the
-                // appended bytes are UTF-8 by themselves.
-                let text = String::from_utf8(std::mem::take(&mut self.snapshot))
-                    .map_err(|_| "model_protocol_fault")?;
+                // The first `thinking_bytes` bytes revise the thinking text
+                // (thinking-level.md). Each kept prefix ends on a character
+                // boundary, so each appended part is UTF-8 by itself.
+                let mut bytes = std::mem::take(&mut self.snapshot);
+                let thinking = match (end.thinking_offset, end.thinking_bytes) {
+                    (Some(offset), Some(count)) => {
+                        let count = usize::try_from(count)
+                            .ok()
+                            .filter(|count| *count <= bytes.len())
+                            .ok_or("model_protocol_fault")?;
+                        let rest = bytes.split_off(count);
+                        let thinking = std::mem::replace(&mut bytes, rest);
+                        Some((
+                            offset,
+                            String::from_utf8(thinking).map_err(|_| "model_protocol_fault")?,
+                        ))
+                    }
+                    (None, None) => None,
+                    _ => return Err("model_protocol_fault"),
+                };
+                let text = String::from_utf8(bytes).map_err(|_| "model_protocol_fault")?;
                 if self.phase == Phase::Running {
                     // The conversation owner releases the next credit after
                     // it applies this revision (`set_output_paused`).
@@ -853,6 +883,7 @@ impl ModelOwner {
                         revision: self.revision,
                         offset: end.offset.ok_or("model_protocol_fault")?,
                         text,
+                        thinking,
                     });
                 }
             }
@@ -1092,6 +1123,7 @@ mod tests {
             measured_context: false,
             usage_reports: 0,
             effective_context: (phase != Phase::Hello).then_some(4096),
+            thinking_controls: 0,
             completion: Default::default(),
             cleanup_completion: Default::default(),
             wake: None,
@@ -1122,6 +1154,8 @@ mod tests {
             count: Some(count),
             total_bytes: Some(text.len() as u64),
             offset: Some(offset),
+            thinking_offset: None,
+            thinking_bytes: None,
         })
     }
     /// Credits queued for output transfers, in order; drains the queue.
@@ -1178,7 +1212,7 @@ mod tests {
         assert_eq!(events.len(), 1_100);
         assert!(matches!(
             events.last(),
-            Some(ModelEvent::Revision { revision: 1_100, offset: 0, text }) if text.len() == 61_440
+            Some(ModelEvent::Revision { revision: 1_100, offset: 0, text, thinking: None }) if text.len() == 61_440
         ));
         owner
             .receive(
@@ -1195,6 +1229,92 @@ mod tests {
             )
             .unwrap();
         assert!(owner.terminal_seen);
+    }
+    /// TL-09 and TL-15: a revision's first `thinking_bytes` bytes revise the
+    /// thinking text; a thinking part beyond the transfer, a lone thinking
+    /// field or a part cut inside a character is a protocol fault.
+    #[test]
+    fn tl09_tl15_revisions_split_thinking_and_response_parts() {
+        let thinking_end = |total: u64, offset: Option<u64>, bytes: Option<u64>| {
+            Body::SnapshotEnd(pb::SnapshotEnd {
+                revision: Some(1),
+                count: Some(1),
+                total_bytes: Some(total),
+                offset: Some(0),
+                thinking_offset: offset,
+                thinking_bytes: bytes,
+            })
+        };
+        let mut model = owner(Phase::Running);
+        let mut events = Vec::new();
+        model
+            .receive(message(chunk("hmm…ok", 1, 0)), &mut events)
+            .unwrap();
+        model
+            .receive(message(thinking_end(8, Some(0), Some(6))), &mut events)
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::Revision { revision: 1, offset: 0, text, thinking: Some((0, thought)) }]
+                if text == "ok" && thought == "hmm…"
+        ));
+        // A part ending inside `…` is not UTF-8 by itself.
+        let mut model = owner(Phase::Running);
+        model
+            .receive(message(chunk("hmm…ok", 1, 0)), &mut events)
+            .unwrap();
+        assert!(
+            model
+                .receive(message(thinking_end(8, Some(0), Some(4))), &mut events)
+                .is_err()
+        );
+        // The helper wire rejects a part beyond the transfer and a lone field.
+        for (offset, bytes) in [(Some(0), Some(9)), (Some(0), None), (None, Some(2))] {
+            let frame = model::encode_frame(
+                &message(thinking_end(8, offset, bytes)),
+                Direction::HelperToService,
+            );
+            assert!(frame.is_err());
+        }
+    }
+    /// TL-15: Begin carries only a thinking request within the controls the
+    /// helper reported; none is sent as an absent field.
+    #[test]
+    fn tl15_begin_sends_only_a_reported_thinking_form() {
+        use asura_control::thinking::{self, Request};
+        let input = model::encode_input(&pb::ModelInput {
+            instructions: Some("i".into()),
+            history: Vec::new(),
+            prompt: Some("p".into()),
+        })
+        .unwrap();
+        let begin = |controls: u32, request: Request| {
+            let mut model = owner(Phase::Available);
+            model.thinking_controls = controls;
+            let result = model.begin([4; 16], 1, input.clone(), false, request);
+            let sent = model.outgoing.front().map(|frame| {
+                let mut codec = ModelCodec::new();
+                codec.push(frame).unwrap();
+                match codec
+                    .next_frame(Direction::ServiceToHelper)
+                    .unwrap()
+                    .unwrap()
+                    .body
+                {
+                    Some(Body::Begin(begin)) => begin.thinking,
+                    _ => panic!("begin"),
+                }
+            });
+            (result.is_ok(), sent.flatten())
+        };
+        assert_eq!(begin(0, Request::None), (true, None));
+        assert_eq!(
+            begin(thinking::OFF | thinking::ON, Request::On),
+            (true, Some(2))
+        );
+        assert_eq!(begin(thinking::ALL, Request::High), (true, Some(5)));
+        assert_eq!(begin(thinking::ON, Request::Off), (false, None));
+        assert_eq!(begin(0, Request::Low), (false, None));
     }
     /// RT-05: while paused, the next transfer gets no credit and data for it
     /// is a fault; releasing the pause grants exactly that credit.
@@ -1233,7 +1353,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             events.last(),
-            Some(ModelEvent::Revision { revision: 2, offset: 3, text }) if text == "d"
+            Some(ModelEvent::Revision { revision: 2, offset: 3, text, thinking: None }) if text == "d"
         ));
     }
     /// B3: tool availability comes from `supported_capabilities` bit 0 alone.
@@ -1310,7 +1430,15 @@ mod tests {
                     prompt: Some("hello".into()),
                 })
                 .unwrap();
-                owner.begin([4; 16], 1, input, admitted).unwrap();
+                owner
+                    .begin(
+                        [4; 16],
+                        1,
+                        input,
+                        admitted,
+                        asura_control::thinking::Request::None,
+                    )
+                    .unwrap();
                 assert_eq!(owner.tools_enabled, admitted && available);
                 assert_eq!(owner.phase, Phase::Input);
             }
@@ -1322,7 +1450,17 @@ mod tests {
         for phase in [Phase::Preparing, Phase::Hello, Phase::Draining] {
             let mut owner = owner(phase);
             owner.tools_available = false;
-            assert!(owner.begin([4; 16], 1, vec![], true).is_err());
+            assert!(
+                owner
+                    .begin(
+                        [4; 16],
+                        1,
+                        vec![],
+                        true,
+                        asura_control::thinking::Request::None
+                    )
+                    .is_err()
+            );
             assert!(owner.outgoing.is_empty());
         }
     }
@@ -1401,7 +1539,15 @@ mod tests {
             prompt: Some("hello".into()),
         })
         .unwrap();
-        owner.begin([4; 16], 1, input, false).unwrap();
+        owner
+            .begin(
+                [4; 16],
+                1,
+                input,
+                false,
+                asura_control::thinking::Request::None,
+            )
+            .unwrap();
         assert_eq!(owner.helper_step(), Some(HelperStep::Input));
         let mut owner = owner_with_ready();
         assert_eq!(owner.helper_step(), None);
@@ -1424,7 +1570,15 @@ mod tests {
             prompt: Some("hello".into()),
         })
         .unwrap();
-        owner.begin([4; 16], 1, input, false).unwrap();
+        owner
+            .begin(
+                [4; 16],
+                1,
+                input,
+                false,
+                asura_control::thinking::Request::None,
+            )
+            .unwrap();
         let frame = owner.outgoing.front().unwrap().clone();
         let mut codec = ModelCodec::new();
         codec.push(&frame).unwrap();
@@ -1443,6 +1597,7 @@ mod tests {
                 model: begin.model.clone(),
                 input_bytes: Some(begin.input_bytes.unwrap()),
                 enable_project_tools: None,
+                thinking: None,
             }
         );
         assert!(begin.model.is_some());
@@ -1569,7 +1724,15 @@ mod tests {
             prompt: Some("hello".into()),
         })
         .unwrap();
-        owner.begin([4; 16], 1, input, false).unwrap();
+        owner
+            .begin(
+                [4; 16],
+                1,
+                input,
+                false,
+                asura_control::thinking::Request::None,
+            )
+            .unwrap();
         assert!(owner.start().is_err());
         let mut events = Vec::new();
         let credit = message(Body::Credit(pb::Credit {
@@ -1601,7 +1764,15 @@ mod tests {
         })
         .unwrap();
         let total = input.len() as u64;
-        owner.begin([4; 16], 1, input, false).unwrap();
+        owner
+            .begin(
+                [4; 16],
+                1,
+                input,
+                false,
+                asura_control::thinking::Request::None,
+            )
+            .unwrap();
         let credit = |accepted: u64, granted: u64| {
             message(Body::Credit(pb::Credit {
                 transfer_id: Some(1),
@@ -1639,7 +1810,17 @@ mod tests {
             prompt: Some("hello".into()),
         })
         .unwrap();
-        assert!(owner.begin([4; 16], 1, input, false).is_err());
+        assert!(
+            owner
+                .begin(
+                    [4; 16],
+                    1,
+                    input,
+                    false,
+                    asura_control::thinking::Request::None
+                )
+                .is_err()
+        );
     }
     #[test]
     fn cancel_during_transfer_stops_sending() {
@@ -1651,7 +1832,15 @@ mod tests {
             prompt: Some("hello".into()),
         })
         .unwrap();
-        owner.begin([4; 16], 1, input, false).unwrap();
+        owner
+            .begin(
+                [4; 16],
+                1,
+                input,
+                false,
+                asura_control::thinking::Request::None,
+            )
+            .unwrap();
         let mut events = Vec::new();
         owner
             .receive(
@@ -1728,7 +1917,7 @@ mod tests {
             body: Some(Body::Hello(pb::Hello {
                 local_tool_destination: None,
                 tool_schema_bytes: None,
-                reasoning_disabled: None,
+                thinking_controls: None,
                 supported_capabilities: None,
                 capability_source: None,
                 model_capabilities: None,
@@ -1749,7 +1938,17 @@ mod tests {
         owner.receive(hello, &mut events).unwrap();
         assert!(matches!(events.as_slice(), [ModelEvent::Inventory { .. }]));
         assert_eq!(owner.phase, Phase::Draining);
-        assert!(owner.begin([7; 16], 1, vec![], false).is_err());
+        assert!(
+            owner
+                .begin(
+                    [7; 16],
+                    1,
+                    vec![],
+                    false,
+                    asura_control::thinking::Request::None
+                )
+                .is_err()
+        );
         assert!(owner.outgoing.is_empty());
     }
     #[test]
@@ -1762,7 +1961,7 @@ mod tests {
             body: Some(Body::Hello(pb::Hello {
                 local_tool_destination: None,
                 tool_schema_bytes: None,
-                reasoning_disabled: None,
+                thinking_controls: None,
                 supported_capabilities: None,
                 capability_source: None,
                 model_capabilities: None,

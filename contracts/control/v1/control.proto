@@ -63,7 +63,12 @@ message ServiceObservation {
   optional string configured_model = 4;
   optional uint64 uptime_ms = 5;
   optional StoredMemoryStatus stored_memory = 6;
+  // The configured thinking level (thinking-level.md).
+  optional ThinkingLevel thinking_level = 7;
 }
+// The person's thinking level and the form sent for a turn (thinking-level.md).
+enum ThinkingLevel { THINKING_LEVEL_DEFAULT = 0; THINKING_LEVEL_OFF = 1; THINKING_LEVEL_LOW = 2; THINKING_LEVEL_MEDIUM = 3; THINKING_LEVEL_HIGH = 4; }
+enum ThinkingRequest { THINKING_REQUEST_NONE = 0; THINKING_REQUEST_OFF = 1; THINKING_REQUEST_ON = 2; THINKING_REQUEST_LOW = 3; THINKING_REQUEST_MEDIUM = 4; THINKING_REQUEST_HIGH = 5; }
 message StoredMemoryStatus {
   optional bool available = 1;
   optional uint64 size_bytes = 2;
@@ -193,6 +198,8 @@ message ConversationObserve {
   optional uint32 wait_ms = 3;
   // Response bytes the client holds (response-text-transfer.md).
   optional uint64 text_offset = 4;
+  // Thinking bytes the client holds (thinking-level.md).
+  optional uint64 thinking_offset = 5;
 }
 message ConversationHistory {
   optional bytes project_id = 1;
@@ -243,6 +250,14 @@ message ConversationEvent {
   // 61,440 bytes); the response then has text_bytes bytes.
   optional uint64 text_offset = 13;
   optional uint64 text_bytes = 14;
+  // One thinking window, before the response window; the two texts share
+  // the 61,440-byte budget (thinking-level.md).
+  optional string thinking_text = 15;
+  optional uint64 thinking_offset = 16;
+  optional uint64 thinking_bytes = 17;
+  // The level and the form the turn recorded at acceptance.
+  optional ThinkingLevel thinking_level = 18;
+  optional ThinkingRequest thinking_request = 19;
 }
 message ConversationCancel { optional bytes operation_id = 1; optional uint64 generation = 2; }
 message ConversationCancelAccepted { optional bytes operation_id = 1; optional bool terminal = 2; }
@@ -412,7 +427,7 @@ enum ToolProgressState { TOOL_PROGRESS_STATE_UNSPECIFIED = 0; TOOL_PROGRESS_STAT
 // basis 1 means the measured input at generation start, not current occupancy.
 // capacity_tokens is the selected effective request window. Input counts are optional.
 // capacity_source: 1 system runtime, 2 CoreAI bundle, 3 MLX config, 4 Ollama show.
-message ModelContext { optional string model_name = 1; optional uint32 input_tokens = 2; optional uint32 capacity_tokens = 3; optional uint32 basis = 4; optional uint32 reported_max_tokens = 5; optional uint32 capacity_source = 6; }
+message ModelContext { optional string model_name = 1; optional uint32 input_tokens = 2; optional uint32 capacity_tokens = 3; optional uint32 basis = 4; optional uint32 reported_max_tokens = 5; optional uint32 capacity_source = 6; optional bool reasoning = 7; optional uint32 thinking_controls = 8; }
 
 // Inventory states: 1 available, 2 installed, 3 listed, 4 unavailable, 5 unchecked.
 message ModelsList {}

@@ -65,9 +65,11 @@ See [Write and edit text](#write-and-edit-text).
 ### Status bar
 
 The status bar shows the selected project, its folder and Git state, the draft's
-character count, the input gauge and the model. Narrow terminals omit the folder
-and Git state. You can select the project or the model here and open a list to
-change it. See [Projects](#projects) and [Models](#models).
+character count, the thinking level, the input gauge and the model. Narrow
+terminals omit the folder and Git state; below 40 columns they also omit the
+thinking level. You can select the project, the model or the thinking level here
+and open a list to change it. See [Projects](#projects), [Models](#models) and
+[Thinking level](#thinking-level).
 
 The input gauge shows how much of the model's input context the last request
 used. It is muted below 50%, bright from 50% and amber from 80%.
@@ -228,6 +230,10 @@ expands or collapses its tool activity. Page Up and Page Down scroll it. Escape
 or F6 returns to the input box. This view keeps the last eight responses of the
 current session.
 
+When the model thought before it answered, a folded `▸ Thinking` line shows
+above the answer with its length. In the response browser, press t to open or
+fold it. The model never sees its earlier thinking.
+
 ## Projects
 
 A project is a folder that Asura works in. Each conversation belongs to one
@@ -327,6 +333,20 @@ You can also type `/config set model SELECTOR`. The selectors are:
 
 Asura does not download missing model files. Ollama must run on this computer;
 by default Asura uses `http://127.0.0.1:11434`.
+
+### Thinking level
+
+Some models can think before they answer. The thinking level sets how much:
+`default` lets the model choose, and `off`, `low`, `medium` and `high` ask for a
+level. Type `/think high`, or select the thinking level on the status bar and
+press Enter. The level applies to the next messages and stays after a restart;
+a running answer keeps its level. `/config set thinking LEVEL` does the same.
+
+Asura sends each level in the form the model takes. A model with only on and
+off gets on for low, medium and high, and the status bar shows `(on)`. A level
+the model cannot take shows `(n/a)` and nothing is sent. A model that cannot
+think shows `no thinking`. The status bar learns this from the model's first
+answer.
 
 ### Model tools
 

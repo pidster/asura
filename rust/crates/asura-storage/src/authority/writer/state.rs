@@ -73,6 +73,26 @@ fn lookup(error: ReplayError) -> Error {
 fn prefix(tag: Tag, id: Id) -> (Key, Key) {
     (Key::new(tag, id, 0), Key::new(tag, id, u64::MAX))
 }
+/// The text of an operation a window reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stream {
+    Response,
+    Thinking,
+}
+impl Stream {
+    fn of(self, op: &Operation) -> &Response {
+        match self {
+            Stream::Response => &op.response,
+            Stream::Thinking => &op.thinking,
+        }
+    }
+    fn tag(self) -> Tag {
+        match self {
+            Stream::Response => Tag::Piece,
+            Stream::Thinking => Tag::Thinking,
+        }
+    }
+}
 impl State {
     pub(super) fn new(
         runtime: RuntimeDirectory,
@@ -182,19 +202,20 @@ impl State {
             journal.abandon_merge();
         }
     }
-    /// Bytes `lo..hi` of a journaled response, rebuilt from its pieces. A piece
-    /// cut inside a UTF-8 character is damage.
-    fn response_bytes(&mut self, operation: Id, lo: u64, hi: u64) -> Result<Vec<u8>> {
-        let pieces = self.pieces(operation, lo, hi)?;
+    /// Bytes `lo..hi` of a journaled response or thinking text, rebuilt
+    /// from its pieces. A piece cut inside a UTF-8 character is damage.
+    fn text_bytes(&mut self, stream: Stream, operation: Id, lo: u64, hi: u64) -> Result<Vec<u8>> {
+        let pieces = self.pieces(stream, operation, lo, hi)?;
         let mut out = Vec::with_capacity(hi.saturating_sub(lo) as usize);
         for piece in pieces {
             let end = piece.start + piece.kept;
             if end <= lo || piece.start >= hi {
                 continue;
             }
-            let text = match self.record(piece.frame)? {
-                Record::ResponseText(segment) => segment.text,
-                Record::TurnTerminal(terminal) => terminal.text,
+            let text = match (stream, self.record(piece.frame)?) {
+                (Stream::Response, Record::ResponseText(segment)) => segment.text,
+                (Stream::Response, Record::TurnTerminal(terminal)) => terminal.text,
+                (Stream::Thinking, Record::ThinkingText(segment)) => segment.text,
                 _ => return Err(Error::RepairRequired),
             };
             let kept = usize::try_from(piece.kept).map_err(|_| Error::RepairRequired)?;
@@ -207,26 +228,33 @@ impl State {
         }
         Ok(out)
     }
-    /// The response pieces of an operation that overlap `lo..hi`, from the
-    /// live state or delta, otherwise from `P` entries in the runs.
-    fn pieces(&mut self, operation: Id, lo: u64, hi: u64) -> Result<Vec<ResponsePiece>> {
+    /// The pieces of an operation's text that overlap `lo..hi`, from the
+    /// live state or delta, otherwise from `P` or `H` entries in the runs.
+    fn pieces(
+        &mut self,
+        stream: Stream,
+        operation: Id,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Vec<ResponsePiece>> {
         if let Some(op) = self.state()?.operations.get(&operation) {
-            return Ok(op
-                .response
+            return Ok(stream
+                .of(op)
                 .pieces
                 .iter()
                 .filter(|p| p.start + p.kept > lo && p.start < hi)
                 .cloned()
                 .collect());
         }
+        let tag = stream.tag();
         self.read(|state, store| {
-            let (lo_key, hi_key) = prefix(Tag::Piece, operation);
+            let (lo_key, hi_key) = prefix(tag, operation);
             // The last piece that starts at or before `lo`.
             let mut out = Vec::new();
             let mut from = state
                 .range(
                     &lo_key,
-                    &Key::new(Tag::Piece, operation, lo.saturating_add(1)),
+                    &Key::new(tag, operation, lo.saturating_add(1)),
                     true,
                     1,
                     store,
@@ -240,7 +268,9 @@ impl State {
                     if key.disc >= hi {
                         return Ok(out);
                     }
-                    let Entry::Piece { kept, frame } = Entry::decode(Tag::Piece, value)? else {
+                    let (Entry::Piece { kept, frame } | Entry::Thinking { kept, frame }) =
+                        Entry::decode(tag, value)?
+                    else {
                         return Err(ReplayError::Corrupt);
                     };
                     out.push(ResponsePiece {
@@ -252,7 +282,7 @@ impl State {
                 match batch.last() {
                     Some((key, _)) if full => {
                         from = Key::new(
-                            Tag::Piece,
+                            tag,
                             operation,
                             key.disc.checked_add(1).ok_or(ReplayError::Corrupt)?,
                         )
@@ -262,40 +292,63 @@ impl State {
             }
         })
     }
-    /// The response length and terminal frame of a terminal operation.
-    fn terminal_facts(&mut self, operation: Id) -> Result<(u64, Locator)> {
+    /// The response length, terminal frame and accepted frame of a terminal
+    /// operation.
+    fn terminal_facts(&mut self, operation: Id) -> Result<(u64, Locator, Locator)> {
         if let Some(op) = self.state()?.operations.get(&operation) {
             let terminal = op.terminal.as_ref().ok_or(Error::Invalid)?;
-            return Ok((op.response.len, terminal.frame));
+            return Ok((op.response.len, terminal.frame, op.accepted_frame));
         }
         let facts = self
             .read(|state, store| state.operation_facts(operation, store))?
             .ok_or(Error::Invalid)?;
-        Ok((facts.response_len, facts.terminal_frame))
+        Ok((facts.response_len, facts.terminal_frame, facts.accepted))
+    }
+    /// The journaled thinking length: the live value, or the end of the
+    /// last `H` piece of a settled operation (a derived value).
+    fn thinking_len(&mut self, operation: Id) -> Result<u64> {
+        if let Some(op) = self.state()?.operations.get(&operation) {
+            return Ok(op.thinking.len);
+        }
+        self.read(|state, store| {
+            let (lo, hi) = prefix(Tag::Thinking, operation);
+            Ok(match state.range(&lo, &hi, true, 1, store)?.first() {
+                Some((key, value)) => {
+                    let Entry::Thinking { kept, .. } = Entry::decode(Tag::Thinking, value)? else {
+                        return Err(ReplayError::Corrupt);
+                    };
+                    key.disc.checked_add(kept).ok_or(ReplayError::Corrupt)?
+                }
+                None => 0,
+            })
+        })
     }
     /// The whole journaled response.
     pub(super) fn response_text(&mut self, operation: Id, length: u64) -> Result<String> {
-        String::from_utf8(self.response_bytes(operation, 0, length)?)
+        String::from_utf8(self.text_bytes(Stream::Response, operation, 0, length)?)
             .map_err(|_| Error::RepairRequired)
     }
-    /// At most `MAX_TEXT` bytes from the largest character boundary not after
-    /// `offset`. Returns the window start and text.
-    fn response_window(
+    /// At most `budget` bytes (at most `MAX_TEXT`) from the largest character
+    /// boundary not after `offset`. Returns the window start and text.
+    fn text_window(
         &mut self,
+        stream: Stream,
         operation: Id,
         length: u64,
         offset: u64,
+        budget: usize,
     ) -> Result<(u64, String)> {
+        let budget = budget.min(MAX_TEXT) as u64;
         let requested = offset.min(length);
         let lo = requested.saturating_sub(3);
-        let fetched_end = length.min(requested + MAX_TEXT as u64 + 1);
-        let bytes = self.response_bytes(operation, lo, fetched_end)?;
+        let fetched_end = length.min(requested + budget + 1);
+        let bytes = self.text_bytes(stream, operation, lo, fetched_end)?;
         let continuation = |index: usize| bytes.get(index).is_some_and(|b| b & 0xC0 == 0x80);
         let mut start = (requested - lo) as usize;
         while start > 0 && continuation(start) {
             start -= 1;
         }
-        let window_end = length.min(lo + start as u64 + MAX_TEXT as u64);
+        let window_end = length.min(lo + start as u64 + budget);
         let mut end = (window_end - lo) as usize;
         while end > start && continuation(end) {
             end -= 1;
@@ -943,7 +996,7 @@ impl State {
                 let Record::TurnAccepted(prior) = self.record(accepted)? else {
                     return Err(Error::RepairRequired);
                 };
-                let (length, terminal_frame) = self.terminal_facts(operation)?;
+                let (length, terminal_frame, _) = self.terminal_facts(operation)?;
                 if text + prior.prompt.len() + length as usize > PREPARE_TEXT {
                     break 'pages;
                 }
@@ -1411,12 +1464,31 @@ impl State {
                 reply.record = Some(record);
                 return Ok(reply);
             }
-            Command::ReadResponse { operation, offset } => {
-                let (length, terminal_frame) = self.terminal_facts(operation)?;
+            Command::ReadResponse {
+                operation,
+                offset,
+                thinking_offset,
+            } => {
+                let (length, terminal_frame, accepted_frame) = self.terminal_facts(operation)?;
                 let Record::TurnTerminal(mut record) = self.record(terminal_frame)? else {
                     return Err(Error::RepairRequired);
                 };
-                let (start, text) = self.response_window(operation, length, offset)?;
+                let Record::TurnAccepted(accepted) = self.record(accepted_frame)? else {
+                    return Err(Error::RepairRequired);
+                };
+                // The thinking window first; the response gets the rest of
+                // the shared budget (thinking-level.md).
+                let thinking_bytes = self.thinking_len(operation)?;
+                let (thinking_start, thinking_text) = self.text_window(
+                    Stream::Thinking,
+                    operation,
+                    thinking_bytes,
+                    thinking_offset,
+                    MAX_TEXT,
+                )?;
+                let budget = MAX_TEXT - thinking_text.len();
+                let (start, text) =
+                    self.text_window(Stream::Response, operation, length, offset, budget)?;
                 record.text_offset = start;
                 record.text = text;
                 let tools = self.tools(operation)?;
@@ -1424,6 +1496,13 @@ impl State {
                 reply.response_bytes = Some(length);
                 reply.record = Some(Record::TurnTerminal(record));
                 reply.tools = Some(tools);
+                reply.thinking = Some(ThinkingWindow {
+                    level: accepted.thinking_level,
+                    request: accepted.thinking_request,
+                    offset: thinking_start,
+                    text: thinking_text,
+                    bytes: thinking_bytes,
+                });
                 return Ok(reply);
             }
             Command::History {
@@ -1680,6 +1759,7 @@ impl State {
                     asset_root: config.asset_root,
                     ollama_endpoint: config.ollama_endpoint,
                     model_capabilities: config.model_capabilities,
+                    thinking: config.thinking,
                     configuration_digest: config.digest,
                     history,
                     omitted,

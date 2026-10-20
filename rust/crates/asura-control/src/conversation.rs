@@ -250,6 +250,11 @@ pub(super) fn valid(body: &Body) -> bool {
                         }
                         _ => false,
                     }
+                    // Thinking controls need reasoning (thinking-level.md).
+                    && m.thinking_controls.is_none_or(|controls| {
+                        controls <= crate::thinking::ALL
+                            && (controls == 0 || m.reasoning == Some(true))
+                    })
                 })
                 && v.statistics.as_ref().is_none_or(|s| {
                     // No request count or token total per turn (owner,
@@ -299,18 +304,30 @@ pub(super) fn valid(body: &Body) -> bool {
                 .is_none_or(|step| v.kind == Some(1) && (3..=5).contains(&step));
             // One response window: keep text_offset bytes, append text, giving
             // text_bytes (response-text-transfer.md). No response total exists.
+            // The thinking window comes first; both texts share one budget
+            // (thinking-level.md).
+            let thinking_len = v.thinking_text.as_ref().map_or(0, String::len);
             let window = matches!(
                 (&v.text, v.text_offset, v.text_bytes),
                 (Some(text), Some(offset), Some(total))
-                    if text.len() <= MAX_RESPONSE_WINDOW_BYTES
+                    if text.len() + thinking_len <= MAX_RESPONSE_WINDOW_BYTES
                         && offset.checked_add(text.len() as u64).is_some_and(|end| end <= total)
             );
+            let thinking = match (&v.thinking_text, v.thinking_offset, v.thinking_bytes) {
+                (None, None, None) => true,
+                (Some(text), Some(offset), Some(total)) => offset
+                    .checked_add(text.len() as u64)
+                    .is_some_and(|end| end <= total),
+                _ => false,
+            };
             base && step
+                && thinking
                 && match v.kind {
                     Some(1) => {
                         v.text.is_none()
                             && v.text_offset.is_none()
                             && v.text_bytes.is_none()
+                            && v.thinking_text.is_none()
                             && v.usage_known.is_none()
                             && v.usage_tokens.is_none()
                             && v.reason == Some(0)
@@ -601,6 +618,11 @@ mod tests {
             tools: Vec::new(),
             text_offset: Some(0),
             text_bytes: Some(8),
+            thinking_text: None,
+            thinking_offset: None,
+            thinking_bytes: None,
+            thinking_level: None,
+            thinking_request: None,
         };
         assert!(valid(&Body::ConversationEvent(event.clone())));
         for changed in [
@@ -751,6 +773,8 @@ mod tests {
                 basis: Some(1),
                 reported_max_tokens: Some(4096),
                 capacity_source: Some(1),
+                reasoning: Some(true),
+                thinking_controls: Some(3),
             }),
             ..Default::default()
         };
@@ -930,9 +954,16 @@ mod tests {
             cursor: Some(u64::MAX),
             kind: Some(3),
             reason: Some(0),
-            text: Some("a".repeat(MAX_RESPONSE_WINDOW_BYTES)),
+            // TL-12: the window split between thinking and response, so both
+            // strings carry three-byte lengths, with the largest offsets.
+            text: Some("a".repeat(MAX_RESPONSE_WINDOW_BYTES / 2)),
             text_offset: Some(u64::MAX - MAX_RESPONSE_WINDOW_BYTES as u64),
             text_bytes: Some(u64::MAX),
+            thinking_text: Some("t".repeat(MAX_RESPONSE_WINDOW_BYTES / 2)),
+            thinking_offset: Some(u64::MAX - MAX_RESPONSE_WINDOW_BYTES as u64),
+            thinking_bytes: Some(u64::MAX),
+            thinking_level: Some(4),
+            thinking_request: Some(5),
             usage_known: Some(false),
             // The most recent window, ending at the over-limit ordinal (TCR-D31).
             tools: (crate::model::MAX_TOOL_ORDINAL + 1 - MAX_TOOL_PROGRESS_ENTRIES as u32
@@ -1074,7 +1105,100 @@ mod tests {
             after_cursor: Some(u64::MAX),
             wait_ms: Some(0),
             text_offset: Some(9 * 1024 * 1024),
+            thinking_offset: Some(70_000),
         };
         assert!(valid(&Body::ConversationObserve(observe)));
+    }
+    /// TL-12 (wire): the thinking window comes first and shares the
+    /// 61,440-byte budget with the response window; its three fields come
+    /// together; a pending event carries none.
+    #[test]
+    fn thinking_windows_share_the_event_budget() {
+        let event = pb::ConversationEvent {
+            operation_id: Some(vec![1; 16]),
+            generation: Some(1),
+            cursor: Some(5),
+            kind: Some(2),
+            reason: Some(0),
+            text: Some("b".repeat(1_000)),
+            text_offset: Some(0),
+            text_bytes: Some(1_000),
+            thinking_text: Some("t".repeat(MAX_RESPONSE_WINDOW_BYTES - 1_000)),
+            thinking_offset: Some(200_000),
+            thinking_bytes: Some(300_000),
+            thinking_level: Some(4),
+            thinking_request: Some(2),
+            ..Default::default()
+        };
+        assert!(valid(&Body::ConversationEvent(event.clone())));
+        // A whole budget of thinking leaves an empty response window.
+        assert!(valid(&Body::ConversationEvent(pb::ConversationEvent {
+            text: Some(String::new()),
+            text_offset: Some(1_000),
+            thinking_text: Some("t".repeat(MAX_RESPONSE_WINDOW_BYTES)),
+            ..event.clone()
+        })));
+        for changed in [
+            pb::ConversationEvent {
+                text: Some("b".repeat(1_001)),
+                text_bytes: Some(1_001),
+                ..event.clone()
+            },
+            pb::ConversationEvent {
+                thinking_offset: None,
+                ..event.clone()
+            },
+            pb::ConversationEvent {
+                thinking_bytes: None,
+                ..event.clone()
+            },
+            pb::ConversationEvent {
+                thinking_bytes: Some(200_001),
+                ..event.clone()
+            },
+            pb::ConversationEvent {
+                kind: Some(1),
+                text: None,
+                text_offset: None,
+                text_bytes: None,
+                ..event.clone()
+            },
+        ] {
+            assert!(!valid(&Body::ConversationEvent(changed)));
+        }
+        // Thinking controls need reasoning.
+        let context = |reasoning, controls| pb::ConversationEvent {
+            kind: Some(1),
+            cursor: Some(1),
+            text: None,
+            text_offset: None,
+            text_bytes: None,
+            thinking_text: None,
+            thinking_offset: None,
+            thinking_bytes: None,
+            model_context: Some(pb::ModelContext {
+                model_name: Some("ollama:qwen3".into()),
+                reasoning,
+                thinking_controls: controls,
+                ..Default::default()
+            }),
+            ..event.clone()
+        };
+        assert!(valid(&Body::ConversationEvent(context(
+            Some(false),
+            Some(0)
+        ))));
+        assert!(valid(&Body::ConversationEvent(context(
+            Some(true),
+            Some(31)
+        ))));
+        assert!(!valid(&Body::ConversationEvent(context(
+            Some(false),
+            Some(3)
+        ))));
+        assert!(!valid(&Body::ConversationEvent(context(
+            Some(true),
+            Some(32)
+        ))));
     }
 }

@@ -60,6 +60,8 @@ fn turn(writer: &writer::WriterHandle, project: journal::Id, digest: journal::Ha
             prompt: "p".into(),
             event_cursor: 1,
             composition: journal::Composition::default(),
+            thinking_level: 0,
+            thinking_request: 0,
         })),
         Some(writer::AdmissionFence {
             project,

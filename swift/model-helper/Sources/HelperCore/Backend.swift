@@ -92,25 +92,29 @@ public struct BackendStatus: Sendable {
     public let supportsTools: Bool
     public let localToolDestination: Bool
     public let capabilityProfile: CapabilityProfile?
+    /// Thinking forms the model accepts (Hello field 23, thinking-level.md).
+    public let thinkingControls: ThinkingControls
     public init(contextTokens: UInt32?, reportedContextTokens: UInt32? = nil,
         contextSource: ContextCapacitySource? = nil, modelName: String? = nil,
         supportsTools: Bool = false, localToolDestination: Bool = false,
-        capabilityProfile: CapabilityProfile? = nil) {
+        capabilityProfile: CapabilityProfile? = nil, thinkingControls: ThinkingControls = []) {
         self.contextTokens = contextTokens; self.reportedContextTokens = reportedContextTokens
         self.contextSource = contextSource; self.modelName = modelName
         self.supportsTools = supportsTools; self.localToolDestination = localToolDestination
-        self.capabilityProfile = capabilityProfile
+        self.capabilityProfile = capabilityProfile; self.thinkingControls = thinkingControls
     }
 }
 public struct Snapshot: Sendable {
     public let text: String
+    /// The whole thinking text so far; nil leaves it unchanged (thinking-level.md).
+    public let thinking: String?
     public let usageTokens: UInt64?
     public let inputContext: (tokens: UInt32, capacity: UInt32)?
     public let inferenceStartedOrdinal: UInt32?
     public let inferenceUsage: RequestUsage?
-    public init(text: String, usageTokens: UInt64? = nil, inputContext: (tokens: UInt32, capacity: UInt32)? = nil,
+    public init(text: String, thinking: String? = nil, usageTokens: UInt64? = nil, inputContext: (tokens: UInt32, capacity: UInt32)? = nil,
         inferenceStartedOrdinal: UInt32? = nil, inferenceUsage: RequestUsage? = nil) {
-        self.text = text; self.usageTokens = usageTokens; self.inputContext = inputContext
+        self.text = text; self.thinking = thinking; self.usageTokens = usageTokens; self.inputContext = inputContext
         self.inferenceStartedOrdinal = inferenceStartedOrdinal; self.inferenceUsage = inferenceUsage
     }
 }
@@ -121,6 +125,16 @@ public struct BackendFailure: Error, Sendable {
 public protocol ModelBackend: Sendable {
     func status() async -> BackendStatus
     func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws
+    /// As `generate`, with the thinking form the service sent
+    /// (thinking-level.md). Backends without thinking controls ignore it.
+    func generate(_ input: ModelInput, thinking: ThinkingRequest,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws
+}
+extension ModelBackend {
+    public func generate(_ input: ModelInput, thinking: ThinkingRequest,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await generate(input, snapshot: snapshot)
+    }
 }
 
 /// System inference adapter. Tool callbacks proxy to the service; no host IO.
@@ -135,7 +149,13 @@ public struct SystemBackend: ToolModelBackend {
         return BackendStatus(contextTokens: capacity, reportedContextTokens: capacity,
             contextSource: .system, modelName: model.variant.displayName,
             supportsTools: model.capabilities.contains(.toolCalling),
-            capabilityProfile: CapabilityProfile(native: model.capabilities, provenance: .framework))
+            capabilityProfile: CapabilityProfile(native: model.capabilities, provenance: .framework),
+            thinkingControls: Self.thinkingControls(model.capabilities))
+    }
+    /// The framework's own levels when the system model reasons; its off
+    /// form is unverified, so off is not offered (thinking-level.md).
+    static func thinkingControls(_ capabilities: LanguageModelCapabilities) -> ThinkingControls {
+        capabilities.contains(.reasoning) ? [.low, .medium, .high] : []
     }
 
     public static func history(_ input: ModelInput) -> [Transcript.Entry] {
@@ -164,14 +184,22 @@ public struct SystemBackend: ToolModelBackend {
                 let transcript = try await model.tokenCount(for: entries)
                 let schemas = try await model.tokenCount(for: tools)
                 return transcript + schemas
-            })
+            }, thinkingControls: Self.thinkingControls(model.capabilities))
     }
     public func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await engine().generate(input, snapshot: snapshot)
     }
+    public func generate(_ input: ModelInput, thinking: ThinkingRequest,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await engine().generate(input, thinking: thinking, snapshot: snapshot)
+    }
     public func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         try await engine().generateWithTools(input, handler: handler, snapshot: snapshot)
+    }
+    public func generateWithTools(_ input: ModelInput, thinking: ThinkingRequest, handler: @escaping ToolHandler,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await engine().generateWithTools(input, thinking: thinking, handler: handler, snapshot: snapshot)
     }
 }
 
@@ -198,11 +226,14 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
     /// True for adapters that replace a nil response limit with their own small
     /// default (CoreAI, MLX); they receive the context window instead.
     private let responseTokensFromWindow: Bool
+    /// Thinking forms the model accepts; only reasoning models report any.
+    private let thinkingControls: ThinkingControls
     public init(model: Model, contextTokens: UInt32?,
         reportedContextTokens: UInt32? = nil, contextSource: ContextCapacitySource? = nil,
         modelName: String, supportsTools: Bool,
         reportsUsage: Bool = false, localToolDestination: Bool = false, capabilityProfile: CapabilityProfile? = nil, tokenCounter: NativeTokenCounter? = nil,
-        instrumentationFactory: InstrumentationFactory? = nil, responseTokensFromWindow: Bool = false) {
+        instrumentationFactory: InstrumentationFactory? = nil, responseTokensFromWindow: Bool = false,
+        thinkingControls: ThinkingControls = []) {
         self.model = model; self.contextTokens = contextTokens
         self.reportedContextTokens = reportedContextTokens ?? contextTokens
         self.contextSource = contextSource; self.modelName = modelName
@@ -213,23 +244,36 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
         self.reportsUsage = reportsUsage; self.tokenCounter = tokenCounter
         self.instrumentationFactory = instrumentationFactory
         self.responseTokensFromWindow = responseTokensFromWindow
+        // Controls need declared reasoning support.
+        self.thinkingControls = profile.support(.reasoning) == .supported ? thinkingControls : []
     }
     public func status() async -> BackendStatus {
         BackendStatus(contextTokens: contextTokens, reportedContextTokens: reportedContextTokens,
             contextSource: contextSource, modelName: modelName, supportsTools: supportsTools,
-            localToolDestination: localToolDestination, capabilityProfile: capabilityProfile)
+            localToolDestination: localToolDestination, capabilityProfile: capabilityProfile,
+            thinkingControls: thinkingControls)
     }
     public func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
-        try await generateSession(input, handler: nil, snapshot: snapshot)
+        try await generateSession(input, thinking: .none, handler: nil, snapshot: snapshot)
+    }
+    public func generate(_ input: ModelInput, thinking: ThinkingRequest,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await generateSession(input, thinking: thinking, handler: nil, snapshot: snapshot)
     }
     public func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await generateWithTools(input, thinking: .none, handler: handler, snapshot: snapshot)
+    }
+    public func generateWithTools(_ input: ModelInput, thinking: ThinkingRequest, handler: @escaping ToolHandler,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
         guard supportsTools else { throw BackendFailure(.modelUnavailable) }
         try capabilityProfile.require([.toolCalling])
-        try await generateSession(input, handler: handler, snapshot: snapshot)
+        try await generateSession(input, thinking: thinking, handler: handler, snapshot: snapshot)
     }
-    private func generateSession(_ input: ModelInput, handler: ToolHandler?,
+    private func generateSession(_ input: ModelInput, thinking: ThinkingRequest, handler: ToolHandler?,
         snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        // The service sends only a reported form; anything else is a fault.
+        guard thinkingControls.accepts(thinking) else { throw BackendFailure(.protocolFault) }
         try Task.checkCancellation()
         let entries = SystemBackend.history(input)
         let current = Transcript.Entry.prompt(.init(segments: [.text(.init(content: input.prompt))]))
@@ -266,14 +310,17 @@ public struct FoundationBackend<Model: LanguageModel>: ToolModelBackend {
                 transcript: Transcript(entries: entries))
             // The SDK session owns inference; retain it through every async stream exit.
             defer { withExtendedLifetime(session) {} }
-            let contextOptions = ContextOptions(reasoningLevel: capabilityProfile.reasoningDisabled ? .custom("no_think") : nil)
+            // The thinking form the service sent; none leaves the model's default.
+            let contextOptions = ContextOptions(reasoningLevel: ThinkingControls.reasoningLevel(thinking))
             let stream = session.streamResponse(to: input.prompt, options: GenerationOptions(maximumResponseTokens: responseTokens), contextOptions: contextOptions)
             for try await value in stream {
                 try Task.checkCancellation()
                 // A count above the counter validity bound stays unknown.
                 let total = reportsUsage ? UInt64(exactly: value.usage.output.totalTokenCount)
                     .flatMap { $0 <= Limits.countedTokens ? $0 : nil } : nil
-                try await snapshot(Snapshot(text: value.content, usageTokens: handler == nil ? total : nil))
+                let thought = thinkingText(value.transcriptEntries)
+                try await snapshot(Snapshot(text: value.content, thinking: thought.isEmpty ? nil : thought,
+                    usageTokens: handler == nil ? total : nil))
             }
             if let failure = await boundedModel.budget.recordedFailure() { throw failure }
         } catch {

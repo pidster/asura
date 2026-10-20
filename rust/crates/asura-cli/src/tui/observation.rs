@@ -125,6 +125,7 @@ impl Worker {
                             owned: owned_epoch == Some(update.snapshot.service_epoch),
                             uptime_ms: update.uptime_ms,
                             stored_memory: update.stored_memory,
+                            thinking_level: update.thinking_level,
                         };
                         Ok((update.snapshot, update.configured_model, Some(details)))
                     }

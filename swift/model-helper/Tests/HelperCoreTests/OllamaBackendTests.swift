@@ -285,3 +285,57 @@ func ollamaFinalMeasurementMapsLengthToContextLimitAndRejectsUnverifiedReasons(_
     #expect(await measurements.values.count == (reason == "length" ? 1 : 0))
     if reason == "length" { #expect(await measurements.values.first?.0 == 700) }
 }
+
+/// TL-04 to TL-07 (Ollama): controls come from `/api/show` (verified shape,
+/// Ollama 0.40.5); a thinking model without `thinking.values` takes booleans;
+/// a model without the capability gets nothing.
+@Test func ollamaThinkingControlsComeFromShowMetadata() throws {
+    let settings = try OllamaLanguageModel.Settings(name: "example")
+    func controls(_ json: String) throws -> (Bool, ThinkingControls) {
+        let model = try OllamaLanguageModel.checked(settings, data: Data(json.utf8))
+        return (model.capabilities.contains(.reasoning), model.thinkingControls)
+    }
+    let qwen = try controls(#"{"capabilities":["completion","tools","thinking"],"model_info":{"a.context_length":4096},"thinking":{"values":[false,true],"default":true}}"#)
+    #expect(qwen.0 && qwen.1 == [.off, .on])
+    let granite = try controls(#"{"capabilities":["completion","thinking"],"model_info":{"a.context_length":4096}}"#)
+    #expect(granite.0 && granite.1 == [.off, .on])
+    let graded = try controls(#"{"capabilities":["completion","thinking"],"model_info":{"a.context_length":4096},"thinking":{"values":["low","medium","high","max"]}}"#)
+    #expect(graded.1 == [.low, .medium, .high])
+    let llama = try controls(#"{"capabilities":["completion","tools"],"model_info":{"a.context_length":4096},"thinking":{"values":[false],"default":false}}"#)
+    #expect(!llama.0 && llama.1 == [])
+}
+
+/// TL-01, TL-04 to TL-06 and TL-10 (Ollama): the request carries `think`
+/// only for a level, in the provider's form; reasoning entries never return
+/// to the model.
+@Test func ollamaRequestSendsThinkOnlyForALevelAndDropsReasoningHistory() throws {
+    #expect(OllamaLanguageModel.think(nil) == nil)
+    #expect(OllamaLanguageModel.think(.custom("no_think")) == .bool(false))
+    #expect(OllamaLanguageModel.think(.custom("think")) == .bool(true))
+    #expect(OllamaLanguageModel.think(.light) == .string("low"))
+    #expect(OllamaLanguageModel.think(.moderate) == .string("medium"))
+    #expect(OllamaLanguageModel.think(.deep) == .string("high"))
+    func body(_ think: OllamaLanguageModel.JSON?) throws -> [String: Any] {
+        let data = try JSONEncoder().encode(OllamaLanguageModel.Request(model: "m", messages: [], tools: nil,
+            think: think, options: .init(num_ctx: 4096)))
+        return try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    }
+    #expect(try body(nil)["think"] == nil)
+    #expect(try body(.bool(false))["think"] as? Bool == false)
+    #expect(try body(.string("high"))["think"] as? String == "high")
+    let transcript = Transcript(entries: [
+        .prompt(.init(segments: [.text(.init(content: "hello"))])),
+        .reasoning(.init(segments: [.text(.init(content: "secret plan"))])),
+        .response(.init(segments: [.text(.init(content: "answer"))]))
+    ])
+    let messages = try OllamaLanguageModel.messages(transcript)
+    #expect(messages.map(\.role) == ["user", "assistant"])
+    #expect(messages.allSatisfy { $0.thinking == nil && !$0.content.contains("secret") })
+    // Streamed thinking decodes beside the content.
+    var state = OllamaLanguageModel.StreamState(contextTokens: 4096)
+    var chunk: OllamaLanguageModel.Chunk?
+    for byte in (#"{"message":{"role":"assistant","content":"","thinking":"hmm"},"done":false}"# + "\n").utf8 {
+        if let value = try state.consume(byte) { chunk = value }
+    }
+    #expect(chunk?.message?.thinking == "hmm")
+}

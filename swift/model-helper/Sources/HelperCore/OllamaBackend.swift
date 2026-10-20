@@ -29,6 +29,9 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
     public let reportedContextTokens: UInt32
     public var localToolModel: String? = nil
     public var supportsReasoning = false
+    /// Thinking forms from `/api/show` (thinking-level.md); empty without
+    /// the `thinking` capability.
+    public var thinkingControls: ThinkingControls = []
     var inputObserver: OllamaInputObserver? = nil
     var usageObserver: InferenceUsageObserver? = nil
     /// Session tool handler for a call whose name is not registered: the SDK
@@ -108,8 +111,42 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
         return (value.remote_host ?? "").isEmpty && (value.remote_model ?? "").isEmpty
     }
 
+    /// Thinking forms of a model with the `thinking` capability: `false` is
+    /// off, `true` is on and `"low"`, `"medium"`, `"high"` are those levels;
+    /// other strings are ignored. Without `thinking.values` a thinking model
+    /// takes `true` and `false` (verified, Ollama 0.40.5; thinking-level.md).
+    static func thinkingControls(capable: Bool, values: [JSON]?) -> ThinkingControls {
+        guard capable else { return [] }
+        guard let values else { return [.off, .on] }
+        var controls: ThinkingControls = []
+        for value in values {
+            switch value {
+            case .bool(false): controls.insert(.off)
+            case .bool(true): controls.insert(.on)
+            case .string("low"): controls.insert(.low)
+            case .string("medium"): controls.insert(.medium)
+            case .string("high"): controls.insert(.high)
+            default: break
+            }
+        }
+        return controls
+    }
+
+    /// The `think` value for the SDK option the session passed.
+    static func think(_ level: ContextOptions.ReasoningLevel?) -> JSON? {
+        switch level {
+        case nil: return nil
+        case .custom(let value)?: return .bool(value != "no_think")
+        case .light?: return .string("low")
+        case .moderate?: return .string("medium")
+        case .deep?: return .string("high")
+        @unknown default: return nil
+        }
+    }
+
     static func checked(_ settings: Settings, data: Data) throws -> Self {
-        struct Shown: Decodable { let capabilities: [String]; let model_info: [String: JSON]? }
+        struct Thinking: Decodable { let values: [JSON]? }
+        struct Shown: Decodable { let capabilities: [String]; let model_info: [String: JSON]?; let thinking: Thinking? }
         guard data.count <= 65_536 else { throw Failure.limit }
         let shown = try JSONDecoder().decode(Shown.self, from: data)
         guard shown.capabilities.contains("completion") else { throw Failure.unsupported }
@@ -120,9 +157,11 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
             return UInt32(number)
         }
         guard let capacity = capacities.min() else { throw Failure.unavailable }
+        let thinking = shown.capabilities.contains("thinking")
         return Self(settings: settings, supportsTools: shown.capabilities.contains("tools"),
             contextTokens: min(capacity, 8192), reportedContextTokens: capacity,
-            supportsReasoning: shown.capabilities.contains("thinking"))
+            supportsReasoning: thinking,
+            thinkingControls: thinkingControls(capable: thinking, values: shown.thinking?.values))
     }
 
     private final class RedirectGuard: NSObject, URLSessionTaskDelegate, Sendable {
@@ -173,6 +212,8 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
     struct Message: Codable, Sendable, Equatable {
         var role: String
         var content: String
+        /// Streamed reasoning text; never sent back (thinking-level.md).
+        var thinking: String? = nil
         var tool_calls: [Call]?
         var tool_name: String?
         struct Call: Codable, Sendable, Equatable {
@@ -189,6 +230,8 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
         var model: String
         var messages: [Message]
         var tools: [ToolSpec]?
+        /// Omitted for model default; a bool or a level string otherwise.
+        var think: JSON? = nil
         var stream = true
         var truncate = false
         var shift = false
@@ -216,8 +259,10 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 }
             }.joined()
         }
-        return try transcript.map { entry in
+        return try transcript.compactMap { entry in
             switch entry {
+            // Thinking is never sent back to the model (thinking-level.md).
+            case .reasoning: return nil
             case .instructions(let v): return Message(role: "system", content: try text(v.segments))
             case .prompt(let v): return Message(role: "user", content: try text(v.segments))
             case .response(let v): return Message(role: "assistant", content: try text(v.segments))
@@ -331,9 +376,11 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
             let hasTools = !request.enabledToolDefinitions.isEmpty
             let registered = Set(request.enabledToolDefinitions.map(\.name))
             guard !hasTools || model.localToolModel != nil else { throw Failure.unsupported }
+            // Only a thinking model receives `think`; others reject it.
+            let think = model.supportsReasoning ? OllamaLanguageModel.think(request.contextOptions.reasoningLevel) : nil
             let body = try JSONEncoder().encode(Request(model: model.localToolModel ?? settings.name,
                 messages: try messages(request.transcript), tools: tools.isEmpty ? nil : tools,
-                options: .init(num_ctx: model.contextTokens)))
+                think: think, options: .init(num_ctx: model.contextTokens)))
             guard body.count <= 262_144 else { throw Failure.limit }
             let session = session()
             defer { session.invalidateAndCancel() }
@@ -350,6 +397,9 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 func emit(_ chunk: Chunk) async throws {
                     try Task.checkCancellation()
                     if let message = chunk.message {
+                        if let thinking = message.thinking, !thinking.isEmpty, model.supportsReasoning {
+                            await channel.send(.reasoning(action: .appendText(thinking, tokenCount: 0)))
+                        }
                         if !message.content.isEmpty {
                             await channel.send(.response(action: .appendText(message.content, tokenCount: 0)))
                         }

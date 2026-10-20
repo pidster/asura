@@ -78,6 +78,7 @@ own authorization and validation scope; it does not establish product readiness.
 | [Event routing and readiness](event-routing.md) | Bounded priority inboxes, service readiness and recorded integration evidence. |
 | [Response activity and navigation](response-activity.md) | Implemented live tool activity and expandable response history, with recorded qualification on 2026-09-30. |
 | [Response text transfer](response-text-transfer.md) | Selected and implemented 2026-10-18: response revisions, kind 24 journal segments and observation windows replace whole-text snapshots and remove the three per-operation output totals. |
+| [Thinking level](thinking-level.md) | Selected and implemented 2026-10-19: the persisted `thinking` level, per-model thinking controls, `/think` and the status-bar item, thinking text in kind 25 segments and a folded log block, never sent back to the model. |
 | [Consolidated parameterised tools](consolidated-tools.md) | Implemented typed grouped commands over canonical operation owners; validation recorded 2026-09-28; revised 2026-10-18: the helper forwards name and argument text and the service is the only parser. |
 | [Tool call records](tool-call-records.md) | Implemented and verified 2026-10-18, uncommitted (owner-reviewed 2026-10-17, refinements TCR-D1–D30): one kind 14 record per model tool call, including malformed calls, holding the redacted tool name and argument JSON (only copy, up to 64,000 bytes), operation, decision and fault; service is the only parser; replaces kinds 17 and 22; derived values recomputed on replay. |
 
