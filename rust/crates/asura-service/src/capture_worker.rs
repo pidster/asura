@@ -463,17 +463,18 @@ enum Wake {
     Timer,
 }
 /// The paused-capture retry backoff (owner, 2026-10-15): delays of 1, 1, 2,
-/// 3, 5, 8 s and so on, each the sum of the two before, with no cap. It is
-/// pacing only: it never ends or refuses work.
+/// 3, 5, 8 s and so on, each the sum of the two before, at most 60 s apart
+/// (owner, 2026-10-19). It is pacing only: it never ends or refuses work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Backoff(u64, u64);
 impl Backoff {
     const START: Self = Self(1, 1);
+    const CAP_SECS: u64 = 60;
     fn delay(self) -> Duration {
         Duration::from_secs(self.0)
     }
     fn next(self) -> Self {
-        Self(self.1, self.0.saturating_add(self.1))
+        Self(self.1, self.0.saturating_add(self.1).min(Self::CAP_SECS))
     }
 }
 /// Waits for the next retry: abandonment, a cancel trigger, a space event

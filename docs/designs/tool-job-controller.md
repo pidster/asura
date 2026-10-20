@@ -1002,7 +1002,7 @@ What later packets keep or replace:
 | J1-Q2 | When quota or disk space runs short, capture pauses: the service stops reading the pipes, and new calls return `busy`. An interim quota-pressure expiry deletes settled, unheld output, oldest last use first, as one class until J6. No output expires by age. The 64 MiB per-call stop is removed (J1d). | [Quota ledger](#quota-ledger) |
 | J1-Q3 | The exec_cmd 1–60 s timeout is removed in J1. A command ends on completion or turn cancel. `timeout_seconds` was accepted and ignored; it is removed from the wire and helper ahead of J3 (owner, 2026-10-17). | [Timeout and setup removal](#j1-timeout-and-setup-budget-removal) |
 | J1-Q4 | The 2 s setup budget (L2) is removed in J1. Setup ends on spawn, cancel or a setup fault. | [Timeout and setup removal](#j1-timeout-and-setup-budget-removal) |
-| J1 retry | A paused capture retries with backoff starting at 1 s, with Fibonacci-increasing delays: 1, 1, 2, 3, 5, 8 s and so on, with no cap. It also retries at once, and restarts the sequence, on an event that may free space: a call settles, output expires, or the person acts. The retry never ends or refuses work. | [Quota ledger](#quota-ledger) |
+| J1 retry | A paused capture retries with backoff starting at 1 s, with Fibonacci-increasing delays: 1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart (owner, 2026-10-19; the 2026-10-15 rule had no cap). It also retries at once, and restarts the sequence, on an event that may free space: a call settles, output expires, or the person acts. The retry never ends or refuses work. | [Quota ledger](#quota-ledger) |
 | J1-0 | Journal waits have no time bound: append, append observation, startup replay and the queue worker. An append waits for its write and sync; only an actual I/O error fences the journal. The service waits for the writer's real reply; a cancelled turn stops waiting and the late reply is applied. Queued jobs run in order. Beyond the 8-slot queue, requests get `busy`. Replay answers Inspect with a loading state. | [Prerequisite](#j1-prerequisite-journal-step-j1-0) |
 | Discard | Output after a cancel trigger that the full sink cannot take is dropped, counted and recorded as `discarded_after_cancel`. | [Output sink](#platform-output-sink-and-redacted-tail) |
 
@@ -1370,7 +1370,7 @@ never across I/O.
   chunks. The queue fills, the reactor stops reading the pipes, and the
   producer blocks in the kernel. The worker retries growth or the failed write
   after delays of 1, 1, 2, 3, 5, 8 s and so on, each the sum of the two before,
-  with no cap. It retries at once and restarts the sequence when an event may
+  at most 60 s apart (owner, 2026-10-19). It retries at once and restarts the sequence when an event may
   free space: a call settles, output expires or is deleted, a pending install
   ends, or the person acts. The retry never ends or refuses work. While any capture is paused, admission returns `busy` with reason
   `capture_paused`.
@@ -1659,7 +1659,7 @@ Only known-size limits apply.
 | Quota | 1 GiB default, 64 MiB minimum, effective value bounded by disk at start | `busy`, `quota`; pause |
 | Reservation | 1 MiB initial, 1 MiB steps | Pause |
 | Recovery reserve | 16 MiB of free disk space | Pause, reason `enospc` |
-| Pause retry | Delays 1, 1, 2, 3, 5, 8 s …, no cap (owner); reset on a space event | Never ends or refuses work |
+| Pause retry | Delays 1, 1, 2, 3, 5, 8 s …, at most 60 s (owner, 2026-10-19); reset on a space event | Never ends or refuses work |
 | Expiry deletions | Calls chosen until the step is covered; at most 128 per attempt (proposed) | Pause if still short |
 | Page | 8 KiB source bytes | Shorter page |
 | Page-read pool | 2 workers, 1 model-reserved, 8 queued | `busy` |
@@ -1682,7 +1682,7 @@ Each integration and end-to-end case ends with the
 | J1T-06 | Setup budget removed (J1-Q4) | Setup checks cancel only | A gated setup held over 2 s still spawns; cancel ends it | — |
 | J1T-07 | No 64 MiB stop (J1-Q2) | No `OutputLimit` producer | 80 MiB of output is retained whole under a 1 GiB quota | — |
 | J1T-08 | Quota race (RG-04) | Admission and growth race on the ledger; no over-reservation; victims held by reads skipped | Two calls in sequence fill a small quota; interim expiry order | Visible `busy` result |
-| J1T-09 | `ENOSPC` and retry | `NoSpace` maps to pause; delay sequence 1, 1, 2, 3, 5, 8, 13 s with no cap; a space event retries at once and restarts the sequence | A constrained APFS disk image fills while running; capture pauses; freeing space outside Asura resumes it at the next delay; an expiry or settlement event resumes it at once; cancel while paused records `enospc` | — |
+| J1T-09 | `ENOSPC` and retry | `NoSpace` maps to pause; delay sequence 1, 1, 2, 3, 5, 8, 13 s, at most 60 s; a space event retries at once and restarts the sequence | A constrained APFS disk image fills while running; capture pauses; freeing space outside Asura resumes it at the next delay; an expiry or settlement event resumes it at once; cancel while paused records `enospc` | — |
 | J1T-10 | Page snapping and states | Offsets inside 2-, 3- and 4-byte scalars; end trim; invalid UTF-8; offset at and past the total; each state | `live` page under the watermark during a flood; offsets stable across install | — (J3, J4) |
 | J1T-11 | Page pool | Reserved model worker; 9th queued request `busy` | A blocked read returns `busy` after 2 s; the worker stays held | — |
 | J1T-12 | Split secrets (SDI-01) | — | A writer prints a secret in pieces; `live` pages never show a piece | — |

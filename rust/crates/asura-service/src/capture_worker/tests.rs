@@ -98,9 +98,9 @@ fn waiting_bytes_merge_per_stream_up_to_one_chunk() {
     drop(rx);
 }
 
-/// J1T-09 unit: the retry delays are 1, 1, 2, 3, 5, 8, 13 s with no cap.
+/// J1T-09 unit: the retry delays are 1, 1, 2, 3, 5, 8, 13 s, at most 60 s.
 #[test]
-fn j1t_09_backoff_is_fibonacci_without_a_cap() {
+fn j1t_09_backoff_is_fibonacci_capped_at_a_minute() {
     let mut backoff = Backoff::START;
     let mut seen = Vec::new();
     for _ in 0..8 {
@@ -108,14 +108,21 @@ fn j1t_09_backoff_is_fibonacci_without_a_cap() {
         backoff = backoff.next();
     }
     assert_eq!(seen, [1, 1, 2, 3, 5, 8, 13, 21]);
+    let mut capped = Backoff::START;
+    let mut gaps = Vec::new();
+    for _ in 0..12 {
+        gaps.push(capped.delay().as_secs());
+        capped = capped.next();
+    }
+    assert_eq!(gaps, [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 60, 60]);
     let mut far = Backoff::START;
     for _ in 0..200 {
         far = far.next();
     }
     assert_eq!(
         far.delay().as_secs(),
-        u64::MAX,
-        "saturates; never ends work"
+        60,
+        "stays at the cap; never ends work"
     );
 }
 
