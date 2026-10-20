@@ -352,9 +352,10 @@ SDK's `contextSizeExceeded` error to the `context_limit` turn failure, both
 before generation and when a later request in the turn overflows. Before this
 change, an overflow raised inside the bounded executor was reported as an
 internal error; the executor now records it as `context_limit` (Swift test
-`contextWindowFullMidTurnFailsWithContextLimit`). The Ollama server truncates its prompt to the requested context size
-instead of failing (provider documentation claim, not verified live here); the
-turn then continues until another closure applies, at most the 201st proposal.
+`contextWindowFullMidTurnFailsWithContextLimit`). With `truncate: false`, Ollama refuses a prompt above
+`num_ctx` with HTTP 400 instead of truncating it (verified live, Ollama 0.40.5,
+2026-10-20); the adapter reports a provider failure
+([full-window requests](model-provider-integration.md#full-window-ollama-requests--owner-2026-10-20)).
 
 ## Current loops
 

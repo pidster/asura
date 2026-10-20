@@ -10,8 +10,9 @@ remain unknown when the adapter cannot measure them; see the
 Required behavior: no consumer assumes a model's context window size. The helper
 reports an **effective request capacity** from the selected provider. It also
 reports the provider's **reported maximum** and the source of that value. These
-are different facts. The effective capacity may be lower because Asura selected
-a smaller request window. Input tokens are a third, operation-specific value.
+are different facts. The effective capacity may be lower when Asura selects
+a smaller request window; no current provider does
+([full-window requests](model-provider-integration.md#full-window-ollama-requests--owner-2026-10-20)). Input tokens are a third, operation-specific value.
 Unknown values remain absent. A missing usable capacity makes the selected model
 unavailable; it does not become an implicit default.
 
@@ -20,7 +21,7 @@ unavailable; it does not become an implicit default.
 | System | Loaded `SystemLanguageModel.contextSize` | Same value |
 | CoreAI | Validated loaded bundle `maxContextLength` | Same value |
 | MLX | Validated local model configuration `max_position_embeddings` | Same value |
-| Ollama | Bounded `/api/show` `model_info` context length; smallest valid value when keys disagree | Smaller of reported maximum and the existing explicit 8,192 request limit; sent as `num_ctx` |
+| Ollama | Bounded `/api/show` `model_info` context length; smallest valid value when keys disagree | Same value (owner, 2026-10-20; the 8,192 clamp is removed); sent as `num_ctx` |
 
 The Swift provider adapter owns discovery inside the supervised helper. The Rust
 model owner validates and forwards its result. The conversation owner caches

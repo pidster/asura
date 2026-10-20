@@ -745,8 +745,13 @@ impl ModelOwner {
             .map_err(|_| "model_protocol_identity_mismatch")?;
         match envelope.body.ok_or("model_protocol_fault")? {
             Body::Credit(credit) if self.phase == Phase::Input => {
-                let input = self.input.as_ref().ok_or("model_protocol_fault")?;
-                let total = input.len() as u64;
+                // The helper advances its window for every accepted chunk, so
+                // credits for chunks already sent can follow InputEnd. They
+                // only update the ledger (context-composer.md, CC-U16).
+                let total = self
+                    .input
+                    .as_ref()
+                    .map_or(self.input_sent, |input| input.len() as u64);
                 let (Some(accepted), Some(granted)) = (credit.accepted_bytes, credit.granted_bytes)
                 else {
                     return Err("model_protocol_fault");
@@ -767,7 +772,7 @@ impl ModelOwner {
                 loop {
                     let start = self.input_sent;
                     let end = (start + chunk).min(total);
-                    if start >= total || end > granted {
+                    if self.input.is_none() || start >= total || end > granted {
                         break;
                     }
                     let data =
@@ -781,7 +786,7 @@ impl ModelOwner {
                     }))?;
                     self.input_sent = end;
                 }
-                if self.input_sent == total {
+                if self.input.is_some() && self.input_sent == total {
                     self.queue(Body::InputEnd(pb::InputEnd {
                         count: Some(total.div_ceil(chunk)),
                         total_bytes: Some(total),
@@ -1799,6 +1804,18 @@ mod tests {
             assert!(owner.input_sent <= granted);
         }
         assert_eq!(owner.input_sent, total);
+        // The helper credits every accepted chunk, so credits for chunks
+        // already sent follow InputEnd; they queue nothing and are not faults.
+        owner.outgoing.clear();
+        while accepted + 16_384 <= total {
+            accepted += 16_384;
+            owner
+                .receive(credit(accepted, accepted + 65_536), &mut events)
+                .unwrap();
+        }
+        assert!(owner.outgoing.is_empty(), "nothing is sent after InputEnd");
+        // Acceptance of unsent bytes is still a fault after InputEnd.
+        assert!(owner.clone_ledger_check(credit(total + 1, total + 65_537)));
         owner
             .receive(message(Body::Ready(pb::Ready {})), &mut events)
             .unwrap();

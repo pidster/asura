@@ -4,7 +4,8 @@
 //! case ends with a raw-byte sweep for the secrets it used.
 //! Cases: TCR-I01..I07, TCR-I09, TCR-E01..E03 (service part), TCR-P2,
 //! the response text transfer cases RT-03, RT-05 and RT-06 (integration) and
-//! the thinking level cases TL-01..TL-07, TL-09, TL-10, TL-12, TL-13.
+//! the thinking level cases TL-01..TL-07, TL-09, TL-10, TL-12, TL-13 and the
+//! full-window case FW-I3 (model-provider-integration.md).
 #[path = "support/queue_submit.rs"]
 mod queue_submit;
 use asura_client::Client;
@@ -196,6 +197,9 @@ enum Step {
     Call(String, Value),
     /// The final answer.
     Final,
+    /// An HTTP 400 reply with this JSON body, as the daemon refuses a prompt
+    /// above `num_ctx` (verified, Ollama 0.40.5).
+    Refused(String),
     /// Thinking text streamed in `message.thinking` records of at most 40,000
     /// bytes, then this answer (thinking-level.md).
     Thinking(String, String),
@@ -359,6 +363,14 @@ fn serve(
                 thread::sleep(Duration::from_millis(5));
             }
             step = *then;
+        }
+        if let Step::Refused(body) = &step {
+            return write!(
+                socket,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
         }
         socket.write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
@@ -1566,6 +1578,88 @@ fn thinking() -> Result<()> {
     Ok(())
 }
 
+/// FW-I3 (owner, 2026-10-20): a model reporting 262,144 tokens gets that
+/// whole window. Every request sends it as `num_ctx`, the request body grows
+/// past the removed 262,144-byte bound within one turn and the turn completes;
+/// the capacity event carries the window twice. The daemon's over-window
+/// refusal (HTTP 400) then fails one turn as a provider failure, and the next
+/// turn completes.
+fn full_window() -> Result<()> {
+    const WINDOW: u64 = 262_144;
+    let (fixture, model, project, directory) = setup("window")?;
+    *model.show.lock().unwrap() = json!({"capabilities": ["completion", "tools"],
+        "model_info": {"fixture.context_length": WINDOW}});
+    let text: String = (0..1000).map(|i| format!("line {i:05} body\n")).collect();
+    assert_eq!(text.len(), 16_000);
+    std::fs::write(directory.join("big.txt"), &text)?;
+    let mut steps: Vec<Step> = (0..20)
+        .map(|_| {
+            call(
+                "project",
+                json!({"command": "read_file", "path": "big.txt", "limit": 16384}),
+            )
+        })
+        .collect();
+    steps.push(Step::Final);
+    model.script(&steps);
+    let operation = submit(&fixture, project, "FW-I3")?;
+    let event = finish(&fixture, operation, Duration::from_secs(120))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    let context = event.model_context.as_ref().ok_or("model context")?;
+    assert_eq!(
+        (context.capacity_tokens, context.reported_max_tokens),
+        (Some(WINDOW as u32), Some(WINDOW as u32))
+    );
+    let (sizes, windows): (Vec<usize>, Vec<Option<u64>>) = model
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| (r.to_string().len(), r["options"]["num_ctx"].as_u64()))
+        .unzip();
+    assert_eq!(sizes.len(), 21);
+    assert!(windows.iter().all(|w| *w == Some(WINDOW)), "{windows:?}");
+    let last = *sizes.last().unwrap();
+    assert!(last > 262_144, "last request body {last} bytes");
+    let messages = model.tool_messages();
+    assert_eq!(messages.len(), 20);
+    assert!(messages.iter().all(|m| m.contains("line 00999 body")));
+    println!("PASS FW-I3 full window: num_ctx {WINDOW} on 21 requests, last body {last} bytes");
+    model.script(&[Step::Refused(
+        json!({"error": "request (300000 tokens) exceeds the available context size (262144 tokens), try increasing it"})
+            .to_string(),
+    )]);
+    let refused = submit(&fixture, project, "FW-I3 refused")?;
+    let event = finish(&fixture, refused, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(4), "{event:?}");
+    assert_eq!(model.chat_requests(), 1, "no retry");
+    model.script(&[Step::Final]);
+    let next = submit(&fixture, project, "FW-I3 next")?;
+    assert_eq!(
+        finish(&fixture, next, Duration::from_secs(60))?.kind,
+        Some(3)
+    );
+    println!(
+        "PASS FW-I3 over-window refusal: HTTP 400 failed the turn after one request; the next turn completed"
+    );
+    // An input of several 16 KiB chunks that fits the first credit window:
+    // the helper's credits for chunks already sent follow InputEnd and must
+    // not fault the transfer (model owner, CC-U16).
+    let prompt = "y ".repeat(15_000);
+    model.script(&[Step::Final]);
+    let large = submit(&fixture, project, &prompt)?;
+    let event = finish(&fixture, large, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    let sent = model.requests.lock().unwrap()[0]["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .and_then(|m| m["content"].as_str())
+        .map_or(0, str::len);
+    assert!(sent >= 30_000, "prompt reached the model with {sent} bytes");
+    println!("PASS FW-I3 multi-chunk input: a 30,000-byte prompt reached the model whole");
+    Ok(())
+}
+
 fn child(home: &Path) -> Result<()> {
     asura_platform::journal_gate::install_file_gate(home);
     tracing_subscriber::fmt()
@@ -1599,7 +1693,7 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 10] = [
+    let cases: [Case; 11] = [
         ("malformed", malformed_then_valid),
         ("secret", exec_cmd_secret),
         ("create", create_note_body),
@@ -1610,6 +1704,7 @@ fn main() {
         ("pause", journal_pause),
         ("roll", roll_crash),
         ("thinking", thinking),
+        ("window", full_window),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

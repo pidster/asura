@@ -32,7 +32,8 @@ Non-goals: the journal capacity (8 MiB, 32,768 frames; L30 in
 [tool output views](tool-output-views.md#journal-and-records)) and the
 [segmented journal](segmented-journal.md) that replaces it; the per-request output-token cap (2,048, since
 removed by the owner on 2026-10-19; see [request admission](turn-usage-helper.md#request-admission)); the
-Ollama per-request stream parser bound (4 MiB, L28); control and model frame
+Ollama per-request stream parser total (4 MiB, L28; removed on 2026-10-20 by
+[full-window requests](model-provider-integration.md#full-window-ollama-requests--owner-2026-10-20)); control and model frame
 sizes; tool call limits; Markdown presentation limits.
 
 ## Required behavior

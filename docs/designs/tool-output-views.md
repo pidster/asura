@@ -52,6 +52,9 @@ Required behavior (owner, 2026-10-13):
 6. **Ollama context from configuration.** The helper's hard-coded
    `min(capacity, 8192)` context clamp is removed. Context comes from the
    model's capacity record under [model-sized limits](loop-closure.md#model-sized-limits).
+   Owner, 2026-10-20: the request window (`num_ctx`) is the model's full
+   reported maximum. The adapter byte totals that were sized for the clamp
+   are removed with it ([full-window requests](model-provider-integration.md#full-window-ollama-requests--owner-2026-10-20)).
 
 A fixed numeric limit remains valid only as a
 [known-size exhaustion closure](loop-closure.md#model-sized-limits): a quantity
@@ -126,9 +129,9 @@ its classification under the principles above.
 | L23 | Memory-create headroom | None (removed with L22, owner, 2026-10-18; was 256 B) | Removed | — |
 | L24 | Request caps | None (removed, owner, 2026-10-19; was 1024 first, then 512, or the caller's cap with a 2048 ceiling). The model writes until it stops or its window is full | Removed | — |
 | L25 | Inference requests per turn | None (removed, owner, 2026-10-18; was 64) | Removed | — |
-| L26 | Ollama context clamp | min(capacity, 8192) | Model-sized | Capacity record (rule 6) |
+| L26 | Ollama context clamp | None (removed, owner, 2026-10-20; was min(capacity, 8192)). `num_ctx` is the model's full reported maximum | Removed | Provider design (rule 6) |
 | L27 | Model input, history, prompt | 64 KiB; 32 entries; 32 KiB | Remove | Composer; transfer chunking stays fixed |
-| L28 | Ollama parser bounds | 16 KiB arguments; 128 B name; 64 KiB line; 4 MiB stream | Keep | Helper parser |
+| L28 | Ollama parser bounds | 16 KiB arguments; 128 B name; 64 KiB line. The 4 MiB stream total and the 256 KiB request body bound are removed with L26 (2026-10-20): with a full window each stopped a request that fits | Keep | Helper parser |
 
 ### Journal and records
 
@@ -168,7 +171,7 @@ its classification under the principles above.
 | exec_cmd job scope (L8) | One service-wide job (`exec-cmd-tool.md`) | One job per active turn (`conversation.rs:487`); the owner holds one active turn (`conversation.rs:584`), so both statements hold |
 | Truncation fields (L18) | `stdout_truncated` and `stderr_truncated` | One `truncated` field (`exec_cmd.rs:51`) |
 | Audit reply bytes (L47) | 16,384 | Stops at 15,000 (`audit_tools.rs:60`) |
-| Ollama context (L26) | No design | `min(capacity, 8192)` (`OllamaBackend.swift:130`) |
+| Ollama context (L26) | Resolved 2026-10-20: the [provider design](model-provider-integration.md#full-window-ollama-requests--owner-2026-10-20) selects the full reported maximum | The clamp is removed; `num_ctx` equals the reported maximum |
 
 The job designs also disagreed among themselves. Rules 1–3 resolve the three
 preview sizes (job head and tail, rendered stream, `!` notice tail) and the three
@@ -201,7 +204,7 @@ Each owner design must adopt these principles before implementing its part.
 | [Loop closure](loop-closure.md) | Record the trace-classifier direction for the tool-loop backstop |
 | [Person command mode](person-command-mode.md) | Drop its fixed notice and record sizes; use the two views |
 | [Execution threat model](execution-threat-model.md) | Update statements about journaled output size once records hold references |
-| Model provider and helper | Remove the Ollama clamp once the capacity record exists |
+| Model provider and helper | Removed the Ollama clamp (owner, 2026-10-20) and the byte totals sized for it ([full-window requests](model-provider-integration.md#full-window-ollama-requests--owner-2026-10-20)) |
 
 ## Validation
 

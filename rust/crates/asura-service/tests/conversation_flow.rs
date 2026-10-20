@@ -1974,21 +1974,60 @@ fn native_ollama() -> Result<()> {
             assert!(context.input_tokens <= context.capacity_tokens);
             assert_eq!(context.basis, Some(1));
         }
-        let oversized = "x ".repeat(15_000);
-        stage = "overflow submit";
-        let overflow = provider_submit(&fixture, project, None, 0, &oversized)?;
-        stage = "overflow rejection";
-        let rejected = observe(&fixture, checked_id(overflow.operation_id)?)?;
-        assert_eq!(
-            rejected.kind,
-            Some(4),
-            "Ollama silently truncated oversized prompt: {rejected:?}"
+        // FW-E1 (owner, 2026-10-20): the request window is the model's full
+        // reported maximum, so a prompt above the removed 8,192-token clamp
+        // completes. An over-window refusal is not reachable here: a prompt is
+        // at most 32 KiB and the composer keeps input inside the window
+        // (model-provider-integration.md, full-window validation).
+        stage = "full window";
+        let window = terminal
+            .model_context
+            .as_ref()
+            .and_then(|context| context.capacity_tokens)
+            .ok_or("Ollama capacity missing")?;
+        let reported = terminal
+            .model_context
+            .as_ref()
+            .and_then(|context| context.reported_max_tokens);
+        assert_eq!(Some(window), reported, "window is not the reported maximum");
+        assert!(
+            window > 8192,
+            "select a model whose maximum exceeds 8,192 tokens; {name} reports {window}"
         );
-        assert!(rejected.tools.is_empty());
+        let large = format!(
+            "Ignore the filler text below. Reply with exactly one word: done.\n{}\nReply with exactly one word: done.",
+            "x ".repeat(14_900)
+        );
+        stage = "large prompt submit";
+        let accepted = provider_submit(&fixture, project, None, 0, &large)?;
+        stage = "large prompt completion";
+        let completed = observe(&fixture, checked_id(accepted.operation_id)?)?;
+        if completed.kind != Some(3) {
+            fixture.print_model_diagnostics();
+            let _ = fs::copy(
+                fixture.home.join("service.log"),
+                "/private/tmp/asura-native-ollama-full-window.log",
+            );
+        }
+        assert_eq!(
+            completed.kind,
+            Some(3),
+            "prompt above 8,192 tokens failed: {completed:?}"
+        );
+        assert!(completed.tools.is_empty());
+        let measured = completed
+            .model_context
+            .as_ref()
+            .and_then(|context| context.input_tokens)
+            .ok_or("large prompt measurement missing")?;
+        assert!(
+            measured > 8192 && measured <= window,
+            "measured input {measured} of window {window}"
+        );
         stage = "service shutdown";
         fixture.stop()?;
         println!(
-            "PASS native Ollama synthetic completion, no project disclosure and explicit context overflow rejection"
+            "PASS native Ollama ({name}) synthetic completion, no project disclosure, full window {window} tokens and a {measured}-token prompt above 8,192 completed"
         );
         Ok(())
     })();

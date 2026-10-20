@@ -4,16 +4,21 @@ import Testing
 @testable import HelperCore
 
 /// A loopback Ollama fixture: answers /api/show for discovery and serves one
-/// scripted /api/chat line per request. Test-only; bounded by the test.
+/// scripted /api/chat line per request. A chat entry that starts with
+/// `!400 ` is sent with that HTTP status and the rest as its body. Every chat
+/// request body is kept. Test-only; bounded by the test.
 final class OllamaFixtureServer: @unchecked Sendable {
     let port: UInt16
     private let socket: Int32
     private let lock = NSLock()
     private var chats: [String]
+    private let show: String
     private(set) var chatRequests = 0
+    private var bodies: [Data] = []
     private var thread: Thread?
-    init(chats: [String]) throws {
-        self.chats = chats
+    init(chats: [String],
+         show: String = #"{"capabilities":["completion","tools"],"model_info":{"fixture.context_length":16384}}"#) throws {
+        self.chats = chats; self.show = show
         let listener = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard listener >= 0 else { throw HelperError.unavailable }
         var address = sockaddr_in()
@@ -37,6 +42,7 @@ final class OllamaFixtureServer: @unchecked Sendable {
         thread.start()
     }
     var chatCount: Int { lock.withLock { chatRequests } }
+    var chatBodies: [Data] { lock.withLock { bodies } }
     func close() { Darwin.shutdown(socket, SHUT_RDWR); Darwin.close(socket) }
     private func serve() {
         while true {
@@ -46,6 +52,7 @@ final class OllamaFixtureServer: @unchecked Sendable {
             Darwin.close(client)
         }
     }
+    private func head(_ data: Data) -> String { String(decoding: data.prefix(64), as: UTF8.self) }
     private func handle(_ client: Int32) {
         var request = Data()
         var buffer = [UInt8](repeating: 0, count: 65_536)
@@ -60,13 +67,18 @@ final class OllamaFixtureServer: @unchecked Sendable {
                 guard parts.count == 2, parts[0].lowercased() == "content-length" else { return nil }
                 return Int(parts[1].trimmingCharacters(in: .whitespaces))
             }.first ?? 0
-            if request.count >= end.upperBound + length { break }
+            if request.count >= end.upperBound + length {
+                let start = end.upperBound
+                lock.withLock { if head(request).hasPrefix("POST /api/chat ") { bodies.append(request.subdata(in: start..<(start + length))) } }
+                break
+            }
         }
-        let text = String(decoding: request, as: UTF8.self)
-        let body: String
+        let text = head(request)
+        var body: String
         let type: String
+        var status = "200 OK"
         if text.hasPrefix("POST /api/show ") {
-            body = #"{"capabilities":["completion","tools"],"model_info":{"fixture.context_length":16384}}"#
+            body = show
             type = "application/json"
         } else if text.hasPrefix("POST /api/chat ") {
             body = lock.withLock {
@@ -74,11 +86,20 @@ final class OllamaFixtureServer: @unchecked Sendable {
                 return chats.isEmpty
                     ? #"{"message":{"role":"assistant","content":"done"},"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":1}"#
                     : chats.removeFirst()
-            } + "\n"
+            }
+            if body.hasPrefix("!400 ") { status = "400 Bad Request"; body.removeFirst(5) }
+            body += "\n"
             type = "application/x-ndjson"
         } else { return }
-        let response = "HTTP/1.1 200 OK\r\nContent-Type: \(type)\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
-        _ = response.withCString { write(client, $0, strlen($0)) }
+        let response = Data("HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)".utf8)
+        response.withUnsafeBytes { raw in
+            var offset = 0
+            while offset < raw.count {
+                let count = write(client, raw.baseAddress! + offset, raw.count - offset)
+                guard count > 0 else { return }
+                offset += count
+            }
+        }
     }
 }
 

@@ -37,7 +37,7 @@ Objectives:
 Non-goals: model-generated summaries, semantic retrieval, memory search ranking,
 cross-project evidence, remote-provider egress policy, provider prompt-cache
 tuning, the tool-loop backstop (L20, L25), capacity probing and the Ollama
-context clamp (L26, owned by the provider design). Each has, or
+context clamp (L26, owned by the provider design and removed on 2026-10-20). Each has, or
 needs, its own design. This design names where each would attach.
 
 ## Current behavior
@@ -69,7 +69,7 @@ to the working tree at that date.
 | The helper maps instructions, history and prompt into an SDK transcript in that order. | `Backend.swift:150-162`, `Backend.swift:234-235` |
 | When a token counter exists (system model), the helper counts the whole input and fails with `contextLimit` when the count leaves no room for one output token (owner, 2026-10-19; previously capacity minus the output cap). | `Backend.swift:251-258` |
 | Within a turn, one SDK `LanguageModelSession` owns the transcript. Tool calls and results are appended by the SDK across its requests; the service cannot change that transcript. A turn has no request count limit (owner, 2026-10-18). | `Backend.swift:260`; `BoundedToolModel.swift:5-7`, `BoundedToolModel.swift:21` |
-| The Ollama backend clamps the effective context to `min(capacity, 8192)` (L26). | `OllamaBackend.swift:130` |
+| Removed (owner, 2026-10-20): the Ollama backend clamped the effective context to `min(capacity, 8192)` (L26). The window is now the model's full reported maximum ([full-window requests](model-provider-integration.md#full-window-ollama-requests--owner-2026-10-20)). | `OllamaBackend.swift` `checked` |
 
 ### Tool results within a turn
 
@@ -377,8 +377,8 @@ Reasons for the rule:
    decision is needed.
 2. It scales with the model. A fixed reserve would take most of a small window
    or waste a large one. The system model (4,096 tokens) reserves 1,024 tokens,
-   which gives input more room than the old 2,048. The Ollama window clamp
-   (8,192) reserves 2,048, as before.
+   which gives input more room than the old 2,048. An Ollama model at its
+   full window (owner, 2026-10-20), such as 131,072 tokens, reserves 32,768.
 3. Input keeps at least three quarters of the window, so history stays useful.
 4. A larger answer is still possible. The reserve only limits how much the
    composer adds; it limits nothing the model writes.
@@ -505,6 +505,12 @@ Required behavior: D7. Selected mechanism, within protocol `0.1`:
 - The helper grants input credit as a sliding window, as output credit already
   works: `granted − accepted ≤ 65,536`. It advances the grant after it has
   appended each accepted chunk. The service sends while `sent < granted`.
+  Credits for chunks already sent can arrive after the service's `InputEnd`.
+  The service checks them against the ledger, sends nothing more and does not
+  treat them as a fault. A credit that accepts unsent bytes is still a fault.
+  (Correction, 2026-10-20: the owner faulted on the first such credit, so every
+  input above one 16 KiB chunk failed; the [full-window
+  journey](model-provider-integration.md#full-window-validation) exposed it.)
 - `Begin.input_bytes` carries the total size. Both peers replace the 65,536 bound
   with a protocol sanity bound of the effective capacity times 8 bytes per token,
   the same cap as `k`. The helper rejects a larger `Begin` before allocating.
@@ -801,8 +807,8 @@ requests `reconstruction_unavailable`.
 
 Other items stay with their owners: loop closure decision 6 (stage B), the
 capacity record's defaults, probe and configuration schema (provider design),
-and the removal of the Ollama clamp L26 (provider design). Until that clamp is
-removed, an Ollama model's window in CC1 is at most 8,192 tokens.
+and the removal of the Ollama clamp L26 (provider design). The clamp was removed
+on 2026-10-20: an Ollama model's window in CC1 is its full reported maximum.
 
 ## Dependencies and delivery
 
@@ -957,7 +963,7 @@ Ollama.
 | CC-U13 | CC1 | Model with no measurements | Compose | `k = 1`; manifest records fallback source |
 | CC-U14 | CC1 | Model with 2, then 3, then 20 measured pairs | Compose after each | Fallback until 3 pairs; then smallest ratio of the last 16 times 0.8, capped at 8 |
 | CC-U15 | CC1 | Calibrated model | Helper `contextLimit` reported | Pairs cleared; next composition uses `k = 1` |
-| CC-U16 | CC1 | Credit ledger states | Grant, send, accept, cancel | Never sends beyond the grant; window at most 65,536; cancel stops sending |
+| CC-U16 | CC1 | Credit ledger states | Grant, send, accept, cancel; credits after `InputEnd` | Never sends beyond the grant; window at most 65,536; cancel stops sending; a credit after `InputEnd` sends nothing and is not a fault |
 | CC-U17 | CC2 | D8 rule table | Failure, success, running, interrupted outcomes | Allocation order matches the table |
 | CC-U18 | CC1 | `Begin` sizes at, above and far above the sanity bound | Helper validation | Accepts at the bound; rejects above it before allocation |
 | CC-U19 | CC1 | Windows 4,096, 8,192 and 128,000 | Compute `R` and compose | `R` is 1,024, 2,048 and 32,000; the recorded budget inputs carry that `R`; no constant output reservation remains (owner, 2026-10-19) |
@@ -1029,14 +1035,14 @@ CC1 implementation evidence, 2026-10-15, macOS 27 development host:
 | Case | Evidence | Result |
 | --- | --- | --- |
 | CC-U1, U2, U3, U7, U8, U10, U13, U14, U15 | `asura-service` `context::tests` | Pass |
-| CC-U16, CC-U18 | `model_owner` sliding-credit and cancel tests; Swift `windowSizedInputUsesSlidingCredit`, `beginAboveCapacityBoundIsRefusedBeforeAllocation`; `asura-control` transfer bound test | Pass |
+| CC-U16, CC-U18 | `model_owner` sliding-credit and cancel tests; Swift `windowSizedInputUsesSlidingCredit`, `beginAboveCapacityBoundIsRefusedBeforeAllocation`; `asura-control` transfer bound test. Since 2026-10-20 the sliding-credit test also sends the helper's credits after `InputEnd`, and `tool_call_flow window` sends a 30,000-byte prompt through the real service and helper | Pass |
 | CC-I1, CC-I7 | `context::journal_tests`: 40 turns through the real writer, restart, exact recomposition of every turn from the recorded budget inputs | Pass |
 | CC-I13 | Swift `toolSchemaBytesCoverDeclaredTools`; the service uses the helper's reported value | Pass (helper side) |
 | Kind 21 record | `authority_conversation` round trip and replay accounting | Pass |
 | CC-E1 | `tui_pty.py --long-conversation`: 40 real turns with the system model, no `context_limit` or `capacity_exhausted` | Pass |
 | Native journey | `tui_pty.py --conversation` with the rebuilt helper package | Pass |
 | CC-I2, CC-I5, CC-I6, CC-I9, CC-I11, CC-E5 | Not run as dedicated cases | Unverified |
-| CC-I10, CC-I12, CC-E2, CC-E6 | Need a window above 64 KiB or measured Ollama turns. The system model reports 4,096 tokens and the helper clamps Ollama to 8,192 (L26) until the provider design removes the clamp. | Unverified |
+| CC-I10, CC-I12, CC-E2, CC-E6 | Need a window above 64 KiB or measured Ollama turns. The system model reports 4,096 tokens. Since 2026-10-20 an Ollama model has its full window (131,072 for `granite4.1:8b`), so these cases can now run; they have not been run as dedicated cases. | Unverified |
 
 The `--long-conversation` journey needs the native model and takes several
 minutes, so it is not in the lifecycle Cargo gate.

@@ -34,7 +34,7 @@ import Testing
     let text = try OllamaLanguageModel.checked(settings, data: Data(#"{"capabilities":["completion"],"model_info":{"test.context_length":32768}}"#.utf8))
     #expect(!text.supportsTools)
     #expect(text.reportedContextTokens == 32768)
-    #expect(text.contextTokens == 8192)
+    #expect(text.contextTokens == 32768)
     let tools = try OllamaLanguageModel.checked(settings, data: Data(#"{"capabilities":["completion","tools"],"model_info":{"test.context_length":8192}}"#.utf8))
     #expect(tools.supportsTools)
     #expect(!tools.capabilities.contains(.guidedGeneration))
@@ -87,10 +87,7 @@ private func consume(_ text: String, state: inout OllamaLanguageModel.StreamStat
     }
 }
 
-@Test func ollamaStreamBoundsAggregateAndTextAndNativeCalls() throws {
-    var aggregate = OllamaLanguageModel.StreamState(contextTokens: 4096)
-    aggregate.total = 4 * 1024 * 1024
-    #expect(throws: OllamaLanguageModel.Failure.limit) { try aggregate.consume(10) }
+@Test func ollamaStreamBoundsTextAndNativeCalls() throws {
     // No response text total (owner, 2026-10-18): 100,000 bytes of content
     // in one request stay within the per-request stream bound.
     var text = OllamaLanguageModel.StreamState(contextTokens: 4096)
@@ -338,4 +335,116 @@ func ollamaFinalMeasurementMapsLengthToContextLimitAndRejectsUnverifiedReasons(_
         if let value = try state.consume(byte) { chunk = value }
     }
     #expect(chunk?.message?.thinking == "hmm")
+}
+
+
+/// FW-U1 and FW-U2 (owner, 2026-10-20): the request window is the model's
+/// full reported maximum, the smallest valid key, and is sent as num_ctx.
+@Test func ollamaRequestWindowIsTheReportedMaximum() throws {
+    let settings = try OllamaLanguageModel.Settings(name: "example")
+    for json in [#"{"capabilities":["completion"],"model_info":{"granite.context_length":131072}}"#,
+                 #"{"capabilities":["completion"],"model_info":{"a.context_length":262144,"b.context_length":131072}}"#] {
+        let model = try OllamaLanguageModel.checked(settings, data: Data(json.utf8))
+        #expect(model.contextTokens == 131_072)
+        #expect(model.reportedContextTokens == 131_072)
+    }
+    let data = try JSONEncoder().encode(OllamaLanguageModel.Request(model: "example", messages: [],
+        options: .init(num_ctx: 131_072)))
+    let value = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect((value["options"] as! [String: Any])["num_ctx"] as? Int == 131_072)
+    #expect(value["truncate"] as? Bool == false && value["shift"] as? Bool == false)
+}
+
+/// FW-U3 (2026-10-20): the stream has no byte total. More than 4 MiB of
+/// records within the window is accepted; one record above 64 KiB is not.
+@Test func ollamaStreamHasNoByteTotalWithinTheWindow() throws {
+    var state = OllamaLanguageModel.StreamState(contextTokens: 131_072)
+    let record = #"{"message":{"role":"assistant","content":""# + String(repeating: "x", count: 60_000) + #""},"done":false}"# + "\n"
+    for _ in 0..<80 { try consume(record, state: &state) }
+    try consume(#"{"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":80}"# + "\n", state: &state)
+    #expect(state.done)
+    var long = OllamaLanguageModel.StreamState(contextTokens: 131_072)
+    try consume(String(repeating: "x", count: 65_536), state: &long)
+    #expect(throws: OllamaLanguageModel.Failure.limit) { try long.consume(120) }
+}
+
+/// Runs one Ollama turn through a real helper session against `server`,
+/// streaming `input` under the sliding input credit.
+private func ollamaTurn(_ server: OllamaFixtureServer, input: ModelInput)
+    async throws -> (Asura_Model_V1_Hello, Asura_Model_V1_Terminal) {
+    var fds: [Int32] = [-1, -1]
+    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+    let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
+    let identity = Data(repeating: 1, count: 32)
+    let session = HelperSession(transport: helper, factory: { selected, root, endpoint, capabilities in
+        try await ProviderFactory.make(selected, assetRoot: root, endpoint: endpoint, capabilities: capabilities)
+    }, buildID: identity, schemaDigest: identity)
+    let running = Task { await session.run() }
+    let channel = ToolSessionChannel(helper: helper, service: service, running: running)
+    defer { channel.close() }
+    var hello = Asura_Model_V1_Hello()
+    hello.buildID = identity; hello.schemaDigest = identity; hello.maxFrameBytes = 65_536
+    hello.availability = .unknown; hello.reason = .none; hello.selectedModel = "ollama:fixture"
+    hello.endpoint = "http://127.0.0.1:\(server.port)"
+    var helloEnvelope = Envelope(); helloEnvelope.body = .hello(hello)
+    try await service.send(helloEnvelope)
+    let greeting = try await channel.next().hello
+    let data = try input.serializedData()
+    var begin = Asura_Model_V1_Begin(); begin.model = "ollama:fixture"; begin.inputBytes = UInt64(data.count)
+    try await channel.send(.begin(begin)); _ = try await channel.next()
+    var offset = 0
+    var ordinal: UInt64 = 0
+    while offset < data.count {
+        let end = min(offset + Limits.chunk, data.count)
+        var chunk = Asura_Model_V1_Chunk(); chunk.transferID = 1; chunk.direction = .input
+        chunk.ordinal = ordinal; chunk.revision = 0; chunk.data = data.subdata(in: offset..<end)
+        try await service.send(channel.scoped(.chunk(chunk)), control: false)
+        offset = end; ordinal += 1
+        if offset < data.count { _ = try await channel.next() }
+    }
+    var end = Asura_Model_V1_InputEnd(); end.count = ordinal; end.totalBytes = UInt64(data.count)
+    try await service.send(channel.scoped(.inputEnd(end)), control: false); _ = try await channel.next()
+    var credit = Asura_Model_V1_Credit(); credit.transferID = 2; credit.direction = .output
+    credit.acceptedBytes = 0; credit.grantedBytes = 65_536
+    try await channel.send(.start(.init()))
+    try await channel.send(.credit(credit))
+    return (greeting, try await channel.terminal())
+}
+
+private let fullWindowShow = #"{"capabilities":["completion"],"model_info":{"granite.context_length":131072}}"#
+
+/// FW-I1 (owner, 2026-10-20): a helper discovering a 131,072-token model
+/// reports that window twice and sends a body above the removed 262,144-byte
+/// bound with num_ctx 131,072; the turn completes.
+@Test func ollamaFullWindowBodyAboveFormerBoundIsSent() async throws {
+    let server = try OllamaFixtureServer(chats: [], show: fullWindowShow)
+    server.start()
+    defer { server.close() }
+    var input = ModelInput(); input.instructions = String(repeating: "x", count: 300_000); input.prompt = "window"
+    let (hello, terminal) = try await ollamaTurn(server, input: input)
+    #expect(hello.availability == .available)
+    #expect(hello.contextTokens == 131_072 && hello.reportedContextTokens == 131_072)
+    #expect(terminal.outcome == .complete)
+    let body = try #require(server.chatBodies.last)
+    #expect(body.count > 262_144)
+    let value = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+    #expect((value["options"] as! [String: Any])["num_ctx"] as? Int == 131_072)
+    #expect(value["truncate"] as? Bool == false)
+}
+
+/// FW-I2 (2026-10-20): the daemon's over-window refusal (HTTP 400, the
+/// verified Ollama 0.40.5 text) and an error record in the stream each fail
+/// the turn as a provider failure after one request, with no retry.
+@Test(arguments: [
+    #"!400 {"error":"request (140000 tokens) exceeds the available context size (131072 tokens), try increasing it"}"#,
+    #"{"error":"model failed to load, this may be due to resource limitations"}"#
+])
+func ollamaWindowErrorsFailTheTurnAsProviderFailure(_ reply: String) async throws {
+    let server = try OllamaFixtureServer(chats: [reply], show: fullWindowShow)
+    server.start()
+    defer { server.close() }
+    var input = ModelInput(); input.instructions = ""; input.prompt = "window"
+    let (_, terminal) = try await ollamaTurn(server, input: input)
+    #expect(terminal.outcome == .failed && terminal.reason == .internalError)
+    #expect(server.chatCount == 1)
 }

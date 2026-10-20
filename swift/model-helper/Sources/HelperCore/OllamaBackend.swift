@@ -158,8 +158,10 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
         }
         guard let capacity = capacities.min() else { throw Failure.unavailable }
         let thinking = shown.capabilities.contains("thinking")
+        // The request window is the model's full reported maximum (owner,
+        // 2026-10-20; model-provider-integration.md, full-window requests).
         return Self(settings: settings, supportsTools: shown.capabilities.contains("tools"),
-            contextTokens: min(capacity, 8192), reportedContextTokens: capacity,
+            contextTokens: capacity, reportedContextTokens: capacity,
             supportsReasoning: thinking,
             thinkingControls: thinkingControls(capable: thinking, values: shown.thinking?.values))
     }
@@ -279,16 +281,16 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
     }
 
     /// Record accumulation is bounded before JSON decoding, including missing-newline responses.
+    /// The stream has no byte total (2026-10-20): one record bounds memory and
+    /// the window bounds output, so a full-window answer is never cut.
     struct StreamState {
         /// The request window: output cannot exceed it, so a larger count is invalid.
         var contextTokens = 0
         var line = Data()
-        var total = 0
         var calls = 0
         var done = false
         mutating func consume(_ byte: UInt8) throws -> Chunk? {
-            guard !done, total < 4 * 1024 * 1024 else { throw Failure.limit }
-            total += 1
+            guard !done else { throw Failure.limit }
             if byte != 10 {
                 guard line.count < 65_536 else { throw Failure.limit }
                 line.append(byte); return nil
@@ -310,7 +312,7 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
                 // Arguments are forwarded unread; the service applies the
                 // 64,000-byte limit and every argument rule (TCR-D17).
                 // No response text total (owner, 2026-10-18) and no token cap
-                // (owner, 2026-10-19); the stream bound above and the window bound one request.
+                // (owner, 2026-10-19); the record bound above and the window bound one request.
                 guard calls <= Int(Limits.toolProposals) else { throw Failure.limit }
                 for call in message.tool_calls ?? [] {
                     guard !call.function.name.isEmpty else { throw Failure.invalidResponse }
@@ -381,7 +383,9 @@ public struct OllamaLanguageModel: LanguageModel, Sendable {
             let body = try JSONEncoder().encode(Request(model: model.localToolModel ?? settings.name,
                 messages: try messages(request.transcript), tools: tools.isEmpty ? nil : tools,
                 think: think, options: .init(num_ctx: model.contextTokens)))
-            guard body.count <= 262_144 else { throw Failure.limit }
+            // No byte bound of its own (2026-10-20): each part of the body is
+            // bounded where it enters, and the daemon refuses a prompt above
+            // num_ctx (truncate: false) with an HTTP error, a provider failure.
             let session = session()
             defer { session.invalidateAndCancel() }
             try Task.checkCancellation()

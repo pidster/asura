@@ -152,13 +152,13 @@ termination/reap. Adapter retries are disabled; cancellation invalidates its ses
 | Model name | 1 to 1,024 UTF-8 bytes, no whitespace/control |
 | Discovery request | 64 KiB response; no time limit (owner, 2026-10-16) |
 | Generation request | No time limit: no whole-turn expiry, network inactivity bound or resource bound (owner, 2026-10-16) |
-| Encoded request | 256 KiB including transcript and tool schemas |
+| Encoded request | No byte bound of its own (2026-10-20). Each part is bounded where it enters, and the daemon checks the window ([full-window requests](#full-window-ollama-requests--owner-2026-10-20)); the former 256 KiB check is removed |
 | NDJSON record | 64 KiB before decoding |
-| NDJSON stream | 4 MiB per HTTP request, a parser bound (L28 in [tool output views](tool-output-views.md#result-delivery-to-the-model)); no per-operation output total (owner, 2026-10-18) |
+| NDJSON stream | No byte total (2026-10-20). The 64 KiB record bound holds memory; `eval_count` at most `num_ctx` bounds output ([full-window requests](#full-window-ollama-requests--owner-2026-10-20)); the former 4 MiB total (L28 in [tool output views](tool-output-views.md#result-delivery-to-the-model)) is removed |
 | Response text | No byte or token total; the model's context window bounds each request, and revisions of at most 61,440 bytes carry it ([response text transfer](response-text-transfer.md)) |
 | Tool calls | 201 per provider stream: the turn's 200 recorded calls plus the over-limit ordinal 201 ([tool call records](tool-call-records.md); owner, 2026-10-18) |
 | Tool arguments | 16 KiB per call |
-| Ollama context request | At most 8,192 tokens, selected after `/api/show` discovery; reported maximum and effective request capacity are separate observations |
+| Ollama context request | The model's full reported maximum (owner, 2026-10-20): the smallest valid `.context_length` from `/api/show`, sent as `num_ctx`. Effective request capacity equals the reported maximum |
 | Output request | No Asura cap: `num_predict: -1`; the request's `num_ctx` window bounds output, and a full window (`done_reason: "length"`) ends it with `context_limit` ([request admission](turn-usage-helper.md#request-admission); owner, 2026-10-19) |
 
 Read network bytes incrementally and reject before growing the record buffer beyond
@@ -176,7 +176,7 @@ responsiveness; MP2 requires real fault injection before activation.
 | --- | --- | --- |
 | MP1-A | Endpoint/name rejection and no fallback inventory | MP2 sends exact admitted endpoint/model through private channel |
 | MP1-B | Preserve roles, native tool arguments and capability absence | Isolated loopback server records real request and native callback/result cycle |
-| MP1-C | Frame/total/text/call bounds, malformed JSON and missing done | Real oversized/truncated/stalled server response fails without blocked control |
+| MP1-C | Record/text/call bounds, malformed JSON and missing done (the stream total was removed on 2026-10-20) | Real oversized/truncated/stalled server response fails without blocked control |
 | MP1-D | Usage bounds and unsupported content/schema | Provider usage or unknown usage preserved through service settlement |
 | MP1-E | Discovery requires completion and reflects tools declaration | Capability change between discovery/use fails explicitly, no silent tools loss |
 | MP2-A | Generation fencing and grant checks | Cancel during connect/stream/tool wait, disconnect/restart, no duplicate execution |
@@ -305,9 +305,13 @@ its native path. The recorded checks below are the current runtime evidence.
 ### MP2 Ollama limits
 
 Discovery must return a positive integer model-info key ending in `.context_length`.
-Conflicting values use the smallest reported maximum. The request context is the smaller
-of that maximum and 8,192 tokens; Hello reports both values and the discovery source.
-Missing capacity fails unavailable. Every request sends `num_predict: -1`
+Conflicting values use the smallest reported maximum. The request context is that
+maximum (owner, 2026-10-20); the former `min(capacity, 8192)` clamp (L26) is removed.
+Hello reports both values, which are now equal, and the discovery source.
+Missing capacity fails unavailable. The
+[full-window requests](#full-window-ollama-requests--owner-2026-10-20) section
+defines the body and stream bounds and the failure handling for a large window.
+Every request sends `num_predict: -1`
 (owner, 2026-10-19). Ollama documents −1 as “infinite generation”; sending it
 explicitly prevents a Modelfile `PARAMETER num_predict` from adding a cap. With
 `shift: false` and `truncate: false`, a stream that fills `num_ctx` ends with
@@ -315,6 +319,185 @@ explicitly prevents a Modelfile `PARAMETER num_predict` from adding a cap. With
 output-limit. An `eval_count` above `num_ctx` is an invalid response. Discovery keeps its resource bounds;
 the [endpoint configuration contract](#mp2-endpoint-configuration-handoff) governs
 local HTTP and remote HTTPS selection.
+
+
+### Full-window Ollama requests — owner, 2026-10-20
+
+Status: selected design, implemented 2026-10-20. The
+[recorded checks](#full-window-recorded-checks) list what ran and what is unverified.
+
+Required behavior (owner, 2026-10-20): the Ollama request window (`num_ctx`) is
+the model's full reported maximum. The helper sets the effective request capacity
+to the smallest valid `.context_length` from `/api/show` and sends it as
+`num_ctx`. The `min(capacity, 8192)` clamp (L26 in
+[tool output views](tool-output-views.md#limit-review)) is removed. The
+conversation owner, the composer and the person see one window: effective
+capacity equals the reported maximum.
+
+Two adapter byte totals were sized for the 8,192-token window. With a full
+window, each would stop a request that fits the model. Under the owner rules
+“bound single items and memory, never turn totals” and
+[model-sized limits](loop-closure.md#model-sized-limits), both are removed:
+
+| Former bound | Why it became a hidden total | Replacement |
+| --- | --- | --- |
+| Encoded `/api/chat` body, 262,144 bytes | The composer may place up to `(E − R − S) × k` input bytes, with `R = E ÷ 4` and `k` at most 8 bytes per token. For a 131,072-token window that is about 786 KiB, so the check capped a conversation near 64K tokens | No separate bound. Each part is bounded where it enters (table below), and the daemon checks the window |
+| NDJSON stream, 4 MiB per request (L28) | Ollama sends about 100–150 bytes of JSON per streamed token, so 4 MiB stopped an answer near 30,000 tokens. That contradicts the 2026-10-19 rule that a request writes until the model stops or the window is full | No byte total. One record stays at most 64 KiB, and `eval_count` above `num_ctx` stays invalid |
+
+#### Body bound rule
+
+Selected rule: the encoded chat body has no byte bound of its own. The body is
+the JSON encoding of the turn's transcript, which the helper already holds. Each
+part of that transcript has a known-size bound where it enters:
+
+| Body part | Bound and owner |
+| --- | --- |
+| Instructions, history and prompt | The service's `ModelInput` is at most `8 × E` bytes: helper `Begin` admission (`Session.swift`) matches the composer's largest learned ratio, 8 bytes per token (`context.rs`). The 1 GiB transfer bound and 2,048 history entries also apply |
+| One person prompt | 32 KiB (journal `MAX_PROMPT`), a single item |
+| Tool definitions | The helper's fixed definitions; their reported size is at most 1 MiB |
+| Tool proposals in the turn | At most 201. Each arrives in one NDJSON record of at most 64 KiB |
+| Tool results in the turn | At most 200. Each is at most 16,384 bytes of text (`Wire.swift`) plus a short continuation note |
+| Earlier answers in the turn | Each request's output is at most `num_ctx` tokens |
+| Model name | 1 to 1,024 bytes |
+
+JSON encoding adds at most six bytes per text byte (a control byte becomes
+`\u00XX`) plus fixed framing per message. Memory for the body therefore follows
+the transcript's own bounds. The window itself is checked by the daemon: the
+adapter sends `truncate: false`, and Ollama refuses a prompt above `num_ctx`.
+
+Rejected alternatives:
+
+1. A bound derived from the window, such as `E` times a bytes-per-token figure.
+   A token has no fixed byte size, so any figure either cuts a request that fits
+   the window or bounds nothing the parts do not already bound.
+2. A bound summed from the part bounds. Earlier answers in the turn are bounded
+   only in tokens, so the sum has no byte value without the same assumption.
+   The other parts are already refused at their own bounds, so such a check could
+   never fire for valid parts.
+
+#### Stream bound rule
+
+Selected rule: the response stream has no byte total. The parser holds one record
+of at most 64 KiB before decoding, which bounds its memory. The window bounds
+output: `eval_count` above `num_ctx` is an invalid response, and
+`done_reason: "length"` ends the request with `context_limit`. Tool proposals keep
+their 201 bound. A stream ends on its done record, an HTTP or transport error,
+cancellation, helper exit or service shutdown. It has no time limit.
+
+#### Failure handling
+
+A large window makes Ollama allocate a large KV cache when it loads the model.
+Measured on 2026-10-20 (Ollama 0.40.5, 48 GiB host): `granite4.1:8b` used
+9.8 GB at 28,672 tokens and 27.3 GB at 131,072 tokens; the 131,072-token load
+took 5.0 seconds. The adapter handles each outcome as an existing provider failure:
+
+| Case | Daemon result | Adapter result |
+| --- | --- | --- |
+| Model load fails, for example for lack of memory | Non-200 status | `Failure.unavailable`; the turn fails with `internal_error` |
+| Prompt above the window | HTTP 400 `request (N tokens) exceeds the available context size (M tokens)` (verified live, 2026-10-20) | Same provider failure |
+| Error during the stream | Record with `error` | Same provider failure |
+| Slow load or slow first token | Reply pending | The request waits until reply, error, cancel, helper exit or shutdown |
+| Window filled by output | `done_reason: "length"` | `context_limit` |
+
+The adapter never retries with a smaller `num_ctx` and never truncates. A daemon
+that cannot provide the window refuses the request, so a smaller window is never
+used silently. No timeout or deadline is added (owner, 2026-10-16 and the
+[loop-closure](loop-closure.md) rules); the person's cancel ends a slow load.
+The failed turn keeps the existing turn-failure and queue rules. The service
+stays available.
+
+#### Asynchronous execution
+
+| Rule | Application |
+| --- | --- |
+| AE-01, AE-02 | Unchanged: discovery and chat run as cancellable `URLSession` tasks inside the supervised helper; nothing blocks the service reactor |
+| AE-03 | Memory: one body, at most six times the transcript text plus framing; one stream record of at most 64 KiB; one request per helper. The daemon's KV cache is outside Asura's process and grows with `num_ctx` |
+| AE-04 | Closures listed above; no time bound; cancellation invalidates the session |
+| AE-05 | No adapter retry. A failed turn follows the existing failure and queue rules |
+| AE-06 | Unchanged helper lifecycle |
+| AE-07 | Tests below; stalled-load responsiveness is covered by the existing HW-04 checks |
+
+#### Full-window request sequence
+
+Selected design. Solid arrows are requests; dashed arrows are replies. `E` is
+the reported maximum.
+
+```mermaid
+sequenceDiagram
+    participant Owner as Service model owner
+    participant Helper as Helper Ollama adapter
+    participant Daemon as Ollama daemon
+    Owner->>Helper: Hello with Ollama selector
+    Helper->>Daemon: POST /api/show
+    Daemon-->>Helper: model_info context_length E
+    Helper-->>Owner: Hello, capacity E, reported E
+    Owner->>Helper: Begin, input at most 8 × E bytes
+    Helper->>Helper: Encode body, no separate byte bound
+    Helper->>Daemon: POST /api/chat, num_ctx E, truncate false
+    alt Load fails or HTTP status is not 200
+        Daemon-->>Helper: Error status
+        Helper-->>Owner: Terminal failed, internal_error
+    else Prompt above E
+        Daemon-->>Helper: HTTP 400, exceeds context size
+        Helper-->>Owner: Terminal failed, internal_error
+    else Streamed records
+        Daemon-->>Helper: Records of at most 64 KiB each
+        alt done_reason stop
+            Helper-->>Owner: Terminal complete
+        else done_reason length
+            Helper-->>Owner: Terminal failed, context_limit
+        else Error record or eval_count above E
+            Helper-->>Owner: Terminal failed
+        end
+    else Person cancels
+        Owner->>Helper: Cancel
+        Helper->>Daemon: Invalidate session
+        Helper-->>Owner: Terminal cancelled
+    end
+```
+
+#### Full-window validation
+
+| ID | Layer | Initial state and trigger | Required result | Test |
+| --- | --- | --- | --- | --- |
+| FW-U1 | Unit | `/api/show` reports 131,072; or two keys, 131,072 and 262,144 | Effective capacity equals the reported maximum, 131,072 in both cases | Swift `ollamaRequestWindowIsTheReportedMaximum` |
+| FW-U2 | Unit | A request at window 131,072 | The encoded body has `num_ctx` 131,072, `truncate` and `shift` false | Same test |
+| FW-U3 | Unit | A stream of more than 4 MiB of records within the window | Accepted; a record above 64 KiB is still refused | Swift `ollamaStreamHasNoByteTotalWithinTheWindow` |
+| FW-I1 | Integration | Real helper session and a loopback daemon fixture reporting 131,072; a 300,000-byte input | Hello reports 131,072 for both values; the daemon receives a body above 262,144 bytes with `num_ctx` 131,072; the turn completes | Swift `ollamaFullWindowBodyAboveFormerBoundIsSent` |
+| FW-I2 | Integration | The fixture answers HTTP 400 with the over-window error, or streams an error record | The turn fails as a provider failure with one chat request and no retry | Swift `ollamaWindowErrorsFailTheTurnAsProviderFailure` |
+| FW-I3 | Integration | Real service, helper and loopback daemon reporting 262,144; the model calls `read_file` 20 times on a 16,000-byte file; then the daemon answers HTTP 400 | Every request sends `num_ctx` 262,144; the last body exceeds 262,144 bytes; capacity and reported maximum are 262,144; the turn completes. The HTTP 400 turn fails and the next turn completes | `tool_call_flow window` |
+| FW-I4 | Integration | Same fixture; a 30,000-byte prompt, two 16 KiB input chunks inside the first credit window | The helper's credit for the first chunk arrives after the service's `InputEnd` and is not a fault; the prompt reaches the daemon whole and the turn completes ([CC-U16 correction](context-composer.md)) | `tool_call_flow window`; `model_owner` sliding-credit unit test |
+| FW-E1 | End-to-end | Native daemon and `granite4.1:8b` (131,072 tokens) | Capacity equals the reported maximum and exceeds 8,192; a 30,000-byte prompt of about 15,000 tokens completes with measured input above 8,192 | `conversation_flow --native-ollama` |
+| FW-E2 | End-to-end | Native daemon | Tool, long-answer and thinking journeys pass at full windows | `--native-ollama-tools`, `--native-long-ollama`, `--native-ollama-thinking` |
+
+Proof gaps: the journey cannot reach the daemon's over-window refusal. A prompt is
+at most 32 KiB, and the composer keeps input within `E − R − S` estimated tokens.
+A live probe and FW-I2 and FW-I3 cover that refusal instead. A load failure from
+lack of memory is not induced live, because that needs an exhausted host; FW-I2
+covers the non-200 mapping. A live answer that fills a 131,072-token window is
+not exercised.
+
+#### Full-window recorded checks
+
+Recorded on 2026-10-20 on macOS with Ollama 0.40.5 (48 GiB host):
+
+| Check | Result |
+| --- | --- |
+| Live probe: `qwen3:1.7b`, `num_ctx` 600, `truncate: false`, a 3,019-token prompt | HTTP 400 `request (3019 tokens) exceeds the available context size (768 tokens)`; nothing truncated |
+| Live probe: `granite4.1:8b` at `num_ctx` 131,072 | Loaded in 5.0 s; 27.3 GB resident against 9.8 GB at 28,672 tokens; about 133 bytes of NDJSON per streamed token |
+| FW-U1–FW-U3, FW-I1, FW-I2 | Pass in `swift test` (116 tests) |
+| FW-I3, FW-I4 | Pass: `num_ctx` 262,144 on 21 requests, last body 349,470 bytes; HTTP 400 failed one turn after one request; a 30,000-byte prompt reached the daemon whole. FW-I4 failed with `model_protocol_fault` before the owner correction |
+| FW-E1 `--native-ollama`, `granite4.1:8b` | Pass: window 131,072 tokens reported and sent; a 15,887-token measured prompt completed |
+| FW-E2 | Pass: `--native-ollama-tools` (`granite4.1:8b`), `--native-long-ollama` (946 words, 1,430 output tokens), `--native-ollama-thinking` (`qwen3:1.7b` at its full 40,960 tokens, 6.05 GB resident) |
+
+The FW-E1 journey first failed with `model_protocol_fault` in the input phase.
+The service model owner faulted on the helper's credit for an input chunk that
+it had already sent. Every input above one 16 KiB chunk was affected. The
+former overflow case, a 30,000-byte prompt, would also have failed this way once
+the sliding input credit was in place, so a pass of that case since then did not
+prove a daemon overflow. The
+[composer design](context-composer.md) records the correction; FW-I4 and the
+extended unit test cover it.
 
 
 ### Dependency graph review
@@ -460,9 +643,13 @@ The opt-in `conversation_flow --native-ollama` journey uses an already running
 numeric-loopback Ollama daemon. `ASURA_TEST_OLLAMA_MODEL` selects its installed model;
 the fixture defaults to `granite4.1:8b`. It writes only scratch Asura configuration,
 never starts/stops or modifies the daemon, and submits synthetic text only. It
-asserts native completion without project tools, then submits a bounded 30,000-byte
-synthetic prompt whose repeated tokens exceed the 8,192-token request window.
-Overflow must fail explicitly; a successful shortened response fails qualification.
+asserts native completion without project tools. It then checks the full window
+(FW-E1, owner 2026-10-20): the effective capacity equals the reported maximum and
+exceeds 8,192 tokens. A bounded 30,000-byte synthetic prompt, about 15,000 tokens,
+must then complete with measured input above 8,192 tokens. Before 2026-10-20 the
+same prompt had to overflow the clamped 8,192-token window. An over-window
+refusal is no longer reachable through the journey; see the
+[full-window proof gaps](#full-window-validation).
 
 
 ### Development hashing performance
@@ -501,7 +688,9 @@ The native Ollama fixture passed synthetic inference and explicit context-overfl
 rejection against the existing Ollama 0.34.4 daemon with `granite4.1:8b`. It exposed
 no project tools or project data. This qualifies that daemon/model combination's
 observed text and overflow path, not authenticated remote transport or native
-remote tool disclosure.
+remote tool disclosure. That overflow ran against the 8,192-token clamp, which
+was removed on 2026-10-20; the [full-window checks](#full-window-recorded-checks)
+supersede it.
 
 Root reports the native MLX fixture passed with
 `LFM2.5-1.2B-Instruct-MLX-4bit`. The fixture verified missing-asset rejection,
