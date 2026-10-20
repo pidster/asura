@@ -19,6 +19,11 @@ The approval covers:
 - the [probe results](#validation) of 2026-10-14 and the cases still unrun;
 - the person-typed commands section, with decisions PX1–PX6.
 
+On 2026-10-19 the owner added unsandboxed `!!` person commands. The decision
+and its accepted exposure are recorded in
+[unsandboxed person commands](#unsandboxed-person-commands) as EXD-1. It
+overrides PX3's denial for `!!` commands only.
+
 The approval does not select a mechanism that a decision leaves to a
 [follow-up design](#required-follow-up-designs), and it does not claim that any
 required outcome is implemented. It completes the review (T1) that gated
@@ -42,6 +47,8 @@ In scope:
   the OpenAI API specification.
 - **Proposed:** person-typed `!` commands; see
   [Person-typed commands](#person-typed-commands).
+- **Proposed:** person-typed `!!` commands with no sandbox (owner,
+  2026-10-19); see [unsandboxed person commands](#unsandboxed-person-commands).
 
 Out of scope: remote Asura hosts, sensors acting autonomously, plan and task
 execution, and network access from model tools. Each needs its own review.
@@ -52,7 +59,7 @@ execution, and network access from model tools. Each needs its own review.
 | --- | --- |
 | Project source and repository metadata | Only effects the person's request implies; no persistence that runs outside Asura's confinement |
 | Files outside the project | No read or write by tools |
-| Secrets in the project or environment | No egress off the device; no stored copy in Asura records (EX4) |
+| Secrets in the project or environment | No egress off the device; no stored copy in Asura records (EX4); a queued person command's values only in its Keychain item until it settles or is dropped (EXD-2) |
 | Model context and stored memory | Untrusted content never gains instruction priority |
 | Conversation content | Leaves the device only to a destination the person chose |
 | Host processes | No tool process outlives its bound or escapes confinement |
@@ -196,11 +203,27 @@ Each entry gives the decision, the required outcome and where it is applied.
      The log keeps only the variable name. The rewrite follows shell quoting.
      If the command cannot be rewritten safely, Asura refuses it with a reason.
      No variable is reused across commands.
+   - **Amended for person commands (owner, 2026-10-20).** "! and !! will use
+     the exec_cmd tool function, with sandbox and content filter into the
+     journal/secret store." A person command is never refused for a secret.
+     The secret goes to the secret store and never to the journal, and the
+     command runs. A form the rewrite cannot handle runs through the
+     [whole-command variable](secret-detection.md#whole-command-variable)
+     (SO5).
+   - **Extended to model commands (owner, 2026-10-20).** The same rule covers
+     the model's exec_cmd commands: no refusal for a secret the rewrite cannot
+     move. Slice SL7 changes the implemented SL3 behavior. Three refusals
+     stay because they are not a command-line secret:
+     `placeholder_not_available`, `secret_in_cwd` and
+     `secret_detection_unavailable`.
+   - **Durable store (owner, 2026-10-20, EXD-2).** Person command values wait
+     in the macOS Keychain, so held commands resume after a restart. See
+     [secret store at rest](#secret-store-at-rest).
 
    Applied in the job controller (J1 capture path) and person command mode
    (PX6, PT5, PC3). Follow-up design:
    [secret detection and redaction](secret-detection.md), selected on
-   2026-10-15 with owner decisions SD1–SD9; see also
+   2026-10-15 with owner decisions SD1–SD9 and amended by SO5 on 2026-10-20; see also
    [reference: Wisp secret handling](#reference-wisp-secret-handling).
 5. **EX5 — find and stop first (owner, 2026-10-14).** Asura must reliably
    detect and terminate escapees before J2: `setsid` and new-session escapes,
@@ -301,7 +324,7 @@ layer. They did not drive a model or the TUI.
 | EX-V5 | Double-fork, `setsid` and pipe-holding escapes; confirm confinement and cleanup | Run 2026-10-14. Same-group escapes were killed. The `setsid` escapee survived, stayed confined, wrote the project after settlement and left `cleanup_confirmed` true. The pipe-holding case is from code reading. The EX5 design must turn this into a passing case. |
 | EX-V6 | Endpoint request content captured; confirm only granted data classes leave | Not run. It needs a local HTTPS capture server with a test certificate. Under EX13 it becomes the grant check: file pages and tool results absent by default. |
 | EX-V7 | Provider switch from local to remote mid-conversation; record which history leaves | Not run. It needs a remote endpoint admitted, which waits for EX13 and EX14 (EX7). |
-| EX-V8 | A fixture secret in command output and in a command, for model and person origin | Required, not run. Retained streams, journal, model view and viewer hold placeholders only. The command runs with the real value through one variable, and the log holds only the variable name. A command that cannot be rewritten safely is refused with a reason. Detailed cases are in the [secret detection validation](secret-detection.md#validation). |
+| EX-V8 | A fixture secret in command output and in a command, for model and person origin | Required, not run. Retained streams, journal, model view and viewer hold placeholders only. The command runs with the real value through one variable, and the log holds only the variable name. A command that cannot be rewritten safely runs through the whole-command variable, from either origin (EX4 amendment, 2026-10-20). Detailed cases are in the [secret detection validation](secret-detection.md#validation). |
 | EX-V9 | `setsid`, double-fork and pipe-holding escapees under a job | Required, not run. Each escapee is detected and terminated, settlement completes, and cleanup is never reported confirmed while one lives. Detailed cases belong to the EX5 design. |
 | EX-V10 | The EX11 setting turned off globally and for one project | Required, not run. New execution is refused and live model jobs in scope are cancelled with a revocation reason. |
 | EX-V11 | Model exec_cmd runs `git status` and `git init` with the developer folder readable | Required, not run. Git runs; reads outside the roots stay denied. |
@@ -335,6 +358,12 @@ Each must be designed before its code. None is selected by this document.
    results class before remote providers return.
 3. **Network proxy.** EX2 records that a controlled, monitored proxy will
    probably be needed later. No design is started.
+4. **Secret rewrite refusal for `!!`.** Resolved by the owner on 2026-10-20
+   ([PCO1 resolution](person-command-mode.md#pco1-resolution)): person
+   commands are not refused for a secret; see the EX4 amendment.
+5. **Durability of the secret store.** Resolved by the owner on 2026-10-20
+   (EXD-2): durable, in the macOS Keychain. The owner decided the Keychain
+   questions KQ1–KQ3 the same day ([secret store](secret-store.md#owner-decisions)).
 
 ## Person-typed commands
 
@@ -364,8 +393,9 @@ with the model's exec_cmd tool, a person command:
   at capture (EX4);
 - queues behind model turns, and its outcome reaches the model as a notice.
 
-The sandbox keeps write confinement. Shell configuration, `~/.ssh` and other
-dotfiles stay read-only. The person typing a command is the approval; there is
+The sandbox keeps write confinement for a `!` command. Shell configuration,
+`~/.ssh` and other dotfiles stay read-only. A `!!` command has no sandbox; see
+[unsandboxed person commands](#unsandboxed-person-commands). The person typing a command is the approval; there is
 no classifier or prompt. A person command can never do more than the same
 command typed in the person's own terminal, which is unsandboxed.
 
@@ -471,7 +501,7 @@ are caught).
 | PX-V4 | A client PATH with `.`, an empty entry and a relative entry; a planted `ls` in the project does not run for `!ls` |
 | PX-V5 | No client message other than the typed submit creates a person command; the model channel cannot |
 | PX-V6 | For `!cat` of a fixture secret, retained streams, journal records, audit events, the viewer and the model view hold a placeholder, not the secret; the notice entry carries the untrusted-data label; any output the model receives comes from the composer's view or a page it requested |
-| PX-V12 | `!curl -H "Authorization: Bearer <fixture token>" …` runs with the token through one per-execution variable; the journal and viewer show only the variable name; a command that cannot be rewritten safely is refused with a reason |
+| PX-V12 | `!curl -H "Authorization: Bearer <fixture token>" …` runs with the token through one per-execution variable; the journal and viewer show only the variable name; a single-quoted variant also runs, through the whole-command variable, and no record holds the token (owner, 2026-10-20) |
 | PX-V7 | The TUI exits while a command runs: the command continues and a second TUI cancels it; with a TUI-launched backend, exit stops it and no process remains in the owned group |
 | PX-V8 | Audit records for person commands contain no command, PATH or output bytes |
 
@@ -554,11 +584,149 @@ are caught).
    and person commands: secrets are detected at capture with Wisp's ported
    rules (SD1; no classifier) and replaced with placeholders before storage. Secrets only;
    personal data is not filtered. A secret in a command becomes a
-   per-execution variable such as `$ASURA_SECRET_1`; a command that cannot be
-   rewritten safely is refused. The EX4 decision supersedes the earlier
+   per-execution variable such as `$ASURA_SECRET_1`. Since 2026-10-20 (EX4
+   amendment) a command, from the person or the model, that cannot be
+   rewritten safely runs through the whole-command variable instead of being
+   refused. A queued person command's values wait in the Keychain (EXD-2). The EX4 decision supersedes the earlier
    acceptance of the risk and the rejection of token redaction. A person-chosen
    private variant may still follow as a later feature. Mechanism:
    [secret detection](secret-detection.md).
+
+### Unsandboxed person commands
+
+Status: owner decision of 2026-10-19 (EXD-1), recorded here with its accepted
+exposure. The mechanism is in
+[person command mode](person-command-mode.md#outside-mode-in-the-composer)
+PCR20–PCR27 and PC13. Nothing is implemented.
+
+#### What changes for `!!`
+
+The person types `!!` and a command. Asura runs it "like my terminal" (owner,
+2026-10-19), following Wisp's ADR 0064 amendment:
+
+- `/bin/sh -c COMMAND` with no Seatbelt profile, under the existing guardian;
+- the TUI's whole launch environment, unchanged;
+- stdin `/dev/null`, no TTY, its own process group, the person stop and kill
+  path, and no timeout;
+- no confirmation: typing `!!` is the approval;
+- a warning line before it runs: `running OUTSIDE the sandbox, as you typed
+  it: it may write anywhere you can`;
+- the exec_cmd tool function's spawn path, with no sandbox profile (owner,
+  2026-10-20);
+- a person switch, `personCommands.allowOutsideSandbox`, default `true`;
+- audit, kind PCQ and the job intent mark it `outside_sandbox` true;
+- the model notice adds `, outside the sandbox,`.
+
+A `!` command keeps every approved rule, including the sandbox and PX3.
+A `!!` command keeps queueing, retained output, secret filtering at capture and
+command rewrite (EX4), journaled records without output, and audit without
+command text. The model cannot request or create a `!!` command.
+
+#### Unsandboxed command trust view
+
+Selected view (owner decision EXD-1). Solid arrows carry data or requests.
+Dashed arrows carry effects. No arrow is denied: the command has the person's
+full authority. Labels name the threats below.
+
+```mermaid
+flowchart TD
+    Person["Person types !! and a command"] --> TUI["TUI outside mode: red box, !! marker, warning"]
+    TUI -->|"command, cwd, launch environment (PT12)"| Svc["Service: switch check, queue, person grant"]
+    Svc -->|"kind PCQ and job records, no environment"| Journal[("Journal")]
+    Svc -->|"spawn, no sandbox-exec"| Cmd["/bin/sh -c command and children"]
+    Cmd -->|"output, secrets replaced at capture (EX4)"| Retained[("Retained job streams")]
+    ModelWrites["Earlier model exec_cmd writes"] -.->|"PT2: hooks, build scripts"| Proj[("Project")]
+    Proj -->|"executed by the command"| Cmd
+    Cmd -.->|"read and write anything the account can"| Host[("Home, dotfiles, caches, other projects")]
+    Cmd -.->|"PT9: read, write, connect"| State[("~/.asura: journals, config, control socket")]
+    Cmd -.->|"PT3: egress"| Net(("Network"))
+    Svc -->|"notice with outside phrase"| Next["Next model turn"]
+```
+
+#### PX decisions for `!!`
+
+| Decision | Effect for `!!` |
+| --- | --- |
+| PX1 | Applies, and matters more. The PCR18 warning for changed build and test paths and the digest re-check of approved implicit-execution files run before a `!!` command as before a `!` command. Planted code now runs with the person's full authority. |
+| PX2 | Moot. The cache-list write roots belong to the person profile; a `!!` command writes anywhere. |
+| PX3 | Does not hold. Without a sandbox, Asura cannot deny reads, writes or connections under `~/.asura`, or the control socket. Project registration checks still apply, because they do not depend on the sandbox. Accepted under EXD-1. |
+| PX4 | Applies unchanged. The `!!` notice and `job read` access follow the same egress rule. |
+| PX5 | Applies unchanged. Outside mode shows the split commands and hidden characters as command mode does. |
+| PX6 | Applies unchanged. Output is filtered at capture in Asura's capture path, which a `!!` job uses. The command rewrite applies, with the whole-command variable instead of a refusal (EX4 amendment, owner 2026-10-20). The launch environment lives only in the command's Keychain item (EXD-2). |
+
+#### Threats for `!!`
+
+| ID | Threat | Mitigation | Accepted exposure |
+| --- | --- | --- | --- |
+| PT9 | A `!!` command, or code it runs, changes Asura's state: journals, `config.yaml`, retained output, the control socket. It can turn `personCommands.allowOutsideSandbox` back on, corrupt or append journal files, kill the service, or submit control requests as the person. | None that prevents it. The journal's existing corruption checks detect damaged frames when next read. The switch is read at submit and setup, so a changed file takes effect only through the normal configuration path. | Accepted by the owner, 2026-10-19 (EXD-1), as Wisp accepts the same exposure of `~/.wisp`. The person typed the line; it has the authority of a command typed in their own terminal. |
+| PT10 | The person runs `!!` when they meant `!` | Outside mode needs a deliberate second `!` at position 0. The box is red, the marker is `!!`, the hint row says `run OUTSIDE the sandbox`, and the log shows the warning before the command can run. Backspace steps back to `!`. | A person who ignores these signals runs the command unconfined, as in their terminal. |
+| PT11 | Model output persuades the person to type `!!` (PT1 for `!!`) | The PT1 controls apply: no copy path from model output into any command mode; recall holds only person text; a message that starts with `!!` is sent as a message and never runs. | As PT1. |
+| PT12 | The launch environment holds tokens and reaches the service | The service writes it only to the command's Keychain item (EXD-2), never to the journal, audit, logs or payloads. The item is deleted at settlement or Drop. Output that prints an environment value is filtered at capture. | The environment is at rest in the Keychain while the command waits. A token the scanner misses can be stored in output, as PT5 states. |
+| PT13 | An escapee from a `!!` job (EX5) runs on after settlement | The EX5 escapee detection design must cover the outside profile too. | Until then, a `setsid` escapee from `!!` is unconfined, not merely unstopped. |
+
+PT3 (egress) and PT2 (planted content) apply with the sandbox removed. PT4
+(cache persistence), PT6 (state denial) and PT7 (PATH sanitizing) do not
+protect `!!`: there are no write roots, no denial, and the environment passes
+unchanged. PT8 applies unchanged.
+
+#### Owner decision EXD-1
+
+**EXD-1 — Unsandboxed `!!` person commands (owner, 2026-10-19).** The person
+can run a typed command with no sandbox by starting it with `!!`. It works like
+the person's terminal, following Wisp's ADR 0064 amendment. The owner accepts
+that such a command can read, write and connect to anything the person's
+account can, including `~/.asura` and the control socket. Asura applies no
+mitigation inside the command, because any Seatbelt profile, even
+`(allow default)` with one deny, is a sandbox that breaks the work `!!` exists
+for, such as Homebrew's own nested `sandbox-exec`. A check of `~/.asura` before
+and after the run would detect a change, not prevent it, and is not built.
+The protections that stay are outside the command: only the person's typed
+`!!` creates one; the switch turns it off; the TUI marks it before it runs;
+audit marks it; secrets in output are filtered at capture; and the model is
+told the person ran it outside the sandbox. This overrides PCR7's sandbox rule,
+"There is no unsandboxed fallback" and PX3 for `!!` only.
+
+#### Unsandboxed command validation
+
+| ID | Case |
+| --- | --- |
+| PX-V13 | In a scratch Asura home and scratch HOME: `!!` writes a file outside every person-profile root, writes the scratch `config.yaml` and connects to the scratch control socket; each succeeds. The same three from `!` fail. No case touches the account's `~/.asura`. |
+| PX-V14 | With the switch `false`, a `!!` submit is refused with the hint to use `!`, and nothing runs or is queued. A queued `!!` command reaching setup after the switch turns off is not started. |
+| PX-V15 | For `!!cat` of a fixture secret and a fixture token in the launch environment, retained streams, journal records, audit events, viewer and model view hold placeholders; no record holds any launch environment value. |
+| PX-V16 | Audit events for a `!!` job carry `outside_sandbox: true` and no command, cwd, environment or output bytes. |
+| PX-V17 | No client message other than the typed submit with `outside_sandbox` creates a `!!` command; a message starting with `!!` never runs; the model channel cannot create one. |
+
+### Secret store at rest
+
+Status: owner decision of 2026-10-20 (EXD-2). The mechanism is the
+[secret store design](secret-store.md). Nothing is implemented.
+
+Before this decision, no secret value was at rest anywhere Asura controls.
+Now a queued person command's secret values, its whole-command value and a
+`!!` command's launch environment are at rest in one macOS Keychain item from
+submit until settlement or Drop. Model call values stay in memory.
+
+| ID | Threat | Mitigation | Accepted exposure |
+| --- | --- | --- | --- |
+| SS-T1 | A same-user process reads the item | Default ACL trusts only the creating binary; other readers get a prompt or, with user interaction off, a refusal. | Same-UID is one principal under D1; a process that can prompt the person may still persuade them. Accepted. |
+| SS-T2 | The keychain file is copied or backed up | The file is encrypted under the login password. Items never sync. | An attacker with the file and the login password reads the values. Accepted. |
+| SS-T3 | An item outlives its command | Delete after settlement or Drop; startup sweep of unreferenced items; one item per input. | A failed delete keeps the item until the next sweep. |
+| SS-T4 | An item is replayed into another command | Service and account attributes name the installation and input; the payload binding digest covers project, conversation, input and request digest. | None found. |
+| SS-T5 | A Keychain prompt blocks the service | User interaction is disabled for the service process; a would-be prompt fails. | None found. |
+| SS-T6 | A `!!` command reads the item | It runs as the person with no sandbox (EXD-1). | Accepted under EXD-1. |
+
+**EXD-2 — Durable secret store in the Keychain (owner, 2026-10-20).** The
+secret store is durable, in the macOS Keychain, so queued commands with
+secrets and queued `!!` commands, with their launch environment, resume after
+a restart. The owner accepts secret values at rest in the Keychain under the
+mitigations above. EX4's rule that no Asura record holds a secret stands: the
+Keychain item is not an Asura record, and the journal holds names and
+display text only. This supersedes SO2's loss rule.
+
+| ID | Case |
+| --- | --- |
+| PX-V18 | With a scratch keychain: a queued `!` command with a secret and a queued `!!` command survive a restart and run with their values; raw-byte sweeps of journal, payloads, audit and logs find no value; no item remains after settlement |
+| PX-V19 | An item read under another input or installation is rejected; an orphan item is deleted at startup; a locked keychain refuses the submit without a journal record or disk fallback |
 
 ## Design verification
 
@@ -578,5 +746,16 @@ non-loopback endpoints are shown as refused, and the `~/.asura` denial is shown.
 The person command trust view was updated for capture filtering, kind PCQ and
 the PX3 denial. Both diagrams were re-rendered with Mermaid CLI 12.0.0 and
 inspected. No code or test was run for this revision.
+
+Recorded on 2026-10-19: the owner decided EXD-1. The unsandboxed command
+section was added from Wisp's ADR 0049 (as amended) and ADR 0064 and its
+`CommandRunner.swift`, read as design input only. The new trust view was
+rendered with the local Mermaid CLI and inspected. No code or test was run.
+
+Recorded on 2026-10-20: the owner amended EX4 for person commands (no refusal
+for a secret; secrets to the secret store) and stated that `!` and `!!` use the
+exec_cmd tool function. PCO1 is resolved. The owner then answered PQ1 (person profile kept)
+and PQ2 (durable Keychain store, EXD-2) and extended the no-refusal rule to
+model commands. No diagram in this document changed. No code or test was run.
 
 Return to the [design index](README.md).

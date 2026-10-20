@@ -18,7 +18,11 @@ implementation details, including record kind 23 and the exec_cmd facts of
 kind 14 (which replaced kind 22 on 2026-10-18), are in the job controller's
 [J1 and SL3 implementation details](tool-job-controller.md#j1-and-sl3-implementation-details)
 and [J1 implementation](tool-job-controller.md#j1-implementation). No owner
-decision remains open. SL5 waits only for the person command packets. The SD8
+decision remains open. SO5 and SO6 (owner, 2026-10-20) remove the refusal for
+a secret the rewrite cannot move, for model and person commands, and make the
+secret store durable in the macOS Keychain ([secret store](secret-store.md)).
+Slice SL7 changes the implemented SL3 model behavior and can land before J2.
+SL5 waits for the person command packets. The SD8
 fixtures can be committed after the licence commit lands; see
 [fixtures and licensing](#fixtures-and-licensing).
 
@@ -100,9 +104,11 @@ design applies each one.
 | Licence | Asura is MIT. The integrator commits the `LICENSE` file and Cargo licence fields before this design's commit. | [Fixtures and licensing](#fixtures-and-licensing) |
 | Dependencies | Approve `regex` 1.13.1, `aho-corasick` 1.1.5 and `zeroize` 1.9.0 as direct dependencies of `asura-platform`, at their locked versions with minimal features. The lockfile diff is reviewed at implementation. | [Dependencies](#dependencies) |
 | SO1 | Rewrite a secret inside an unquoted word in place with double quotes: `--password="$ASURA_SECRET_1"`, `-p"$ASURA_SECRET_1"`, `user:"$ASURA_SECRET_1"`, `export TOKEN="$ASURA_SECRET_1"`. This extends SD7; single-quoted secrets, `sh -c` bodies, heredocs and unparsable input stay refused. | [Command rewrite](#command-rewrite) |
-| SO2 | After a restart, a queued command whose secret values are lost stays `Held`. Resume is refused with `secrets_lost`; the person enters it again. | [Queued person commands](#queued-person-commands) |
+| SO2 | After a restart, a queued command whose secret values are lost stays `Held`. Resume is refused with `secrets_lost`; the person enters it again. Superseded by SO6 (owner, 2026-10-20): values survive a restart in the Keychain; `secrets_lost` remains only for a missing or mismatched item. | [Queued person commands](#queued-person-commands) |
 | SO3 | Keep SD5 for J1. SDM-05 measures withheld output; revisit if the loss is too high. | [Streaming scanner](#streaming-scanner), [measurement](#measurement) |
 | SO4 | Person chat messages and model replies are a later follow-up design. | [Follow-up designs](#follow-up-designs) |
+| SO5 | Owner, 2026-10-20: "! and !! will use the exec_cmd tool function, with sandbox and content filter into the journal/secret store", then extended the same day to the model's exec_cmd commands. A command with a detected secret is never refused because the rewrite cannot move the secret. Forms SD7 and SO1 accept are rewritten as before; every other form runs through the [whole-command variable](#whole-command-variable). The secret goes to the secret store, never to the journal. | [Whole-command variable](#whole-command-variable) |
+| SO6 | Owner, 2026-10-20: the secret store is durable, in the macOS Keychain, so a queued command with secrets and a queued `!!` command resume after a restart. Model calls never resume, so their values stay in memory. | [Secret store](secret-store.md) |
 | Scan time | No time bound on secret scanning. Matching is linear in the input, so a slow scan backpressures the producer through the transfer queue; it is never a capture fault and never cancels a job. Throughput measurements are acceptance criteria, not closures. | [Asynchronous execution](#asynchronous-execution) |
 | Preamble | Accepted. Secret variables become unexported shell variables; child processes inherit only what the command passes explicitly. | [Environment path](#environment-path) |
 | Guardian erasure | SDI-09 option (a), after the SL2 finding. The guardian copies the accepted values into `Zeroizing` buffers, then overwrites its own environment strings in place before any other setup step, so `KERN_PROCARGS2` and `ps -E` no longer show them. | [Environment path](#environment-path), [SL2 implementation](#sl2-implementation) |
@@ -115,7 +121,8 @@ Effect on earlier decisions:
 - **PX6** is superseded by EX4: redaction applies to person commands as it
   does to model tools. This design is the one rule for both.
 - **SD7** is extended by SO1: a secret inside an unquoted word is rewritten in
-  place. The refusals SD7 lists still apply.
+  place. SO5 replaces each SD7 refusal with the whole-command variable, for
+  model and person commands.
 - **PCR19 and PC3** gain their mechanism: the secret variable names, count and
   size bounds below.
 - **R5 and RG-11**: offsets, pages and digests describe the redacted stored
@@ -151,8 +158,8 @@ Required behavior. Each item traces to EX4 and the SD decisions.
 | SR3 | Bytes the scanner cannot check are not stored. A loss marker replaces them and states their size and reason. The job continues (SD2, SD5). |
 | SR4 | Raw bytes are never written to disk. Carry, numbers and literals live in memory and are dropped at settlement (SD4). |
 | SR5 | Digests, byte offsets and pages describe the redacted stored bytes. The descriptor records that redaction ran and the rule-set revision. No digest of raw output or of a secret value is computed or stored (SD9). |
-| SR6 | A command with a detected secret is rewritten before any record holds it. Each value becomes a secret variable for that one execution. Only the forms in SD7 and SO1 are rewritten; any other command with a detected secret is refused with a reason that never contains the value. |
-| SR7 | A secret variable value never appears in a journal record, audit event, log, argument vector or client reply. It is held in zeroizing memory and dropped after spawn, except where the literal matcher needs it until settlement. |
+| SR6 | A command with a detected secret is rewritten before any record holds it. Each value becomes a secret variable for that one execution. Only the forms in SD7 and SO1 are rewritten. Any other command, from the model or the person, runs through the whole-command variable (SO5); it is never refused because the rewrite cannot move a secret. |
+| SR7 | A secret variable value never appears in a journal record, audit event, log, argument vector or client reply. It is held in zeroizing memory and dropped after spawn, except where the literal matcher needs it until settlement. A queued person command's values also wait in its Keychain item until settlement or Drop (SO6, [secret store](secret-store.md)). |
 | SR8 | Detection is labelled best effort wherever Asura describes it to the person. |
 | SR9 | Detection never runs on the reactor. A slow detector applies backpressure to the job's pipes; it never stalls controls (AE-01, AE-03). |
 
@@ -170,8 +177,8 @@ owner, and the platform spawn path.
 | Per-job redaction state | Created by the job controller (`asura-service`) at admission; moved to the job slot's capture worker; dropped at settlement | The controller owns job lifetime and slots (TJ-O1). |
 | Scanning of output chunks | The job slot's capture worker, before the payload adapter hashes and stages bytes | R4 assigns one capture worker per slot. The scan is the worker's first stage. |
 | Hashing, staging, descriptors and pages | Existing payload adapter (`asura-storage`), unchanged except that it accepts only redacted chunks | The adapter's append API takes a `secrets::Redacted` value that only the scanner constructs, so the type system rejects raw bytes. |
-| Model command rewrite and refusal | Conversation owner, in tool validation before the intent append | The intent is the first record of a command. |
-| Person command rewrite and refusal | Conversation owner, in submit validation before the kind PCQ append | Kind PCQ is the first record of a person command. |
+| Model command rewrite and whole-command variable | Conversation owner, in tool validation before the intent append | The intent is the first record of a command. |
+| Person command rewrite and whole-command variable | Conversation owner, in submit validation; the [secret store](secret-store.md) item is written before the kind PCQ append | Kind PCQ is the first record of a person command. |
 | Secret variables through spawn | Platform exec_cmd owner and guardian | They own the environment and argument vector. |
 
 Rejected owners:
@@ -642,7 +649,10 @@ Context rules for step 5:
 
 ### SD-F1: span classification
 
-Selected design. Each path ends in rewrite or refusal. Arrows name the tested
+Selected design. Each path ends in rewrite or refusal. For a person command
+each refusal ending except detection unavailable leads to the
+[whole-command variable](#whole-command-variable) instead (SO5), except the
+endings the next section keeps. Arrows name the tested
 condition.
 
 ```mermaid
@@ -680,22 +690,61 @@ flowchart TD
 
 ### Refusal
 
-A refusal carries a reason code, the rule kind and the 1-based word index. It
-never carries the value, a masked preview, a byte offset or a digest. Example
-text: "Command refused: a `cli-password` secret in word 4: it is single-quoted.
-Use double quotes so Asura can pass it as a variable." The word index counts
-the tokenizer's words, so a substitution body counts as words. It names the
-first word that holds a span byte, and is absent for a heredoc body.
+The rewrite planner reports a reason code, the rule kind and the 1-based word
+index when it cannot rewrite. It never reports the value, a masked preview, a
+byte offset or a digest. The word index counts the tokenizer's words, so a
+substitution body counts as words. It names the first word that holds a span
+byte, and is absent for a heredoc body. Since SO5 most reasons select the
+whole-command variable and are recorded as its reason; only the three below
+refuse. Example refusal text: "Command refused: the working directory holds a
+`cli-password` secret."
 
-- **Model origin.** The conversation owner records the intent in
-  display-redacted form: every span replaced by its placeholder, with a refused
-  flag. It records a refused result with the reason. Nothing is spawned. The
-  model sees the reason.
-- **Person origin.** The submit returns `secret_unsafe` with the reason before
-  kind PCQ, as other validation failures do (PCM-S1 `Rejected`). Nothing is
-  journaled. The TUI keeps the draft and mode and shows the reason.
-- **Detection unavailable.** If the rule set failed its startup self-check,
-  every command is refused with `secret_detection_unavailable`.
+Owner decision SO5 (2026-10-20) removes the refusal for a secret the rewrite
+cannot move, from either origin. Three refusals stay, because they are not a
+secret in the command line:
+
+- `placeholder_not_available`: the command names a reserved `$ASURA_SECRET_<n>`
+  placeholder; running it would expand an unset variable.
+- `secret_in_cwd`: the working directory holds a secret. The service opens the
+  directory itself, so the path cannot travel in a variable.
+- `secret_detection_unavailable`: the rule set failed its startup self-check,
+  a build defect; every command is refused.
+
+For these, model origin records the display-redacted intent with the refused
+decision, and person origin returns the reason before kind PCQ. Nothing is
+spawned. The reason never contains a value.
+
+### Whole-command variable
+
+Selected by owner decision SO5 (2026-10-20); the mechanism is proposed. It
+applies to a command from either origin whose rewrite returns any other
+refusal code, including `too_many_secrets` and `rewritten_command_too_long`.
+
+1. The conversation owner holds the whole raw command as the value of one
+   variable, `ASURA_SECRET_COMMAND`. No numbered variable is passed with it.
+   Person origin writes it to the durable [secret store](secret-store.md)
+   before kind PCQ. Model origin holds it in memory, because a model call never
+   runs again after a restart (SO6).
+2. The executable command is the fixed text `eval "$ASURA_SECRET_COMMAND"`.
+   The guardian preamble first moves the variable to an unexported shell
+   variable, then `eval` runs the raw text in the same shell. The shell parses
+   the raw text once, as `/bin/sh -c` would. Neither the argument vector nor
+   any record holds the raw text.
+3. The record holds a display-redacted command: every detected value replaced
+   by its numbered placeholder, under the ordinary numbering, with a
+   whole-command flag. Model origin uses kind 14 fields 14 and 20–23
+   ([SL7](#sl7-model-whole-command-variable)); person origin uses kind PCQ.
+   The log, the job viewer, notices and model results show the display text
+   and say that it is a filtered copy.
+4. The capture worker receives each detected value as a literal, so an echo of
+   one is replaced by its placeholder (SD3).
+5. The guardian accepts `ASURA_SECRET_COMMAND` only alone: with it, no
+   `ASURA_SECRET_<n>` is allowed. Its value is 1–8192 bytes, within the
+   existing 8192-byte value total.
+
+The rewrite remains the first choice, because it keeps the exact executable
+text in the record. The whole-command variable runs only when the rewrite
+cannot.
 
 A false positive in a command is rewritten, not refused, when its form is
 safe. The command still runs with the same bytes, and the log shows a
@@ -733,20 +782,27 @@ sequenceDiagram
     participant Own as Conversation owner
     participant Rw as secrets rewrite
     participant J as Journal
+    participant KS as Secret store
     participant Ctl as Job controller
     participant Set as Slot setup worker
     participant G as Guardian
-    participant Sh as /bin/sh in sandbox
+    participant Sh as /bin/sh, sandboxed except for !!
     participant Cap as Capture worker
     Src->>Own: raw command
     Own->>Rw: rewrite(command)
-    alt refused
+    alt kept refusal: placeholder, cwd or detection unavailable
         Rw-->>Own: reason, kind, word index
-        Own->>J: model origin only: display-redacted refused intent and result
+        Own->>J: model origin: display-redacted refused call record
         Own-->>Src: refusal reason, no value
+    else rewrite cannot move a secret (SO5)
+        Rw-->>Own: reason, spans
+        Own->>KS: values: whole raw command as ASURA_SECRET_COMMAND (person: Keychain item first)
+        Own->>J: record: eval "$ASURA_SECRET_COMMAND", reason, display-only text
+        Own->>Ctl: admit job, values
     else rewritten
         Rw-->>Own: rewritten command, names, values
-        Own->>J: intent or kind PCQ with rewritten command and names
+        Own->>KS: values (person: Keychain item first)
+        Own->>J: call record or kind PCQ with rewritten command and names
         Own->>Ctl: admit job, values
         Ctl->>Cap: literals and first free number
         Ctl->>Set: ExecCmdRequest with rewritten command, values
@@ -875,7 +931,7 @@ controller's own mapping applies to the job.
 | AE-02 | The scanner makes no blocking call. `arc4random_buf` for the per-job key runs once at admission; it does not block and has no failure result. Environment construction runs on the existing setup worker and guardian. Hashing and staging keep their existing isolation. |
 | AE-03 | Limits are in the table below. A slow scan fills the 512 KiB transfer queue; the reactor then stops reading that job's pipes, so the job's writes block in the kernel. Other jobs and controls are unaffected. |
 | AE-04 | Scanning has no time bound (owner, 2026-10-15). `regex::bytes` and Aho–Corasick match in time linear in the input, so a chunk's scan time is proportional to its size; SDM-02 measures it. A slow scan fills the transfer queue and backpressures the producer; it is never a capture fault and never cancels the job. The capture worker checks cancellation between chunks. Turn and job cancellation do not stop capture; the scanner flushes at pipe EOF and at settlement as designed. Capture stop for a storage fault drops the carry. |
-| AE-05 | No raw byte is persisted, so recovery never has raw state to reconcile. Replay never needs a value, because a restarted job never runs again. A queued person command that lost its values stays `Held` and cannot resume (SO2). |
+| AE-05 | No raw byte is persisted, so recovery never has raw state to reconcile. Replay never needs a value, because a restarted job never runs again. A queued person command keeps its values in its Keychain item and resumes after a restart (SO6); recovery reconciles items against the journal ([secret store](secret-store.md)). |
 | AE-06 | Shutdown follows the job controller and its shutdown cleanup bound, which belongs to the job, not to the scan. The scanner flushes as the streams end. A job that does not settle within that bound becomes `interrupted`, and its staging holds redacted bytes only. |
 | AE-07 | SDI-04, SDI-05 and SDE-04 require real processes, a gated and a deliberately slowed scanner, a full queue and typing within 100 ms. |
 
@@ -893,7 +949,7 @@ known-size limit. Performance figures are acceptance criteria only.
 | Carry per stream | 64 KiB (SD5); beyond it, a loss marker |
 | Private-key block | Inside the stream's 64 KiB carry (SD5) |
 | Transfer queue | 512 KiB per job in chunks of at most 64 KiB (R4); a full queue stops pipe reads |
-| Secret variables per command | 16 distinct values; more refuses with `too_many_secrets` |
+| Secret variables per command | 16 distinct values; more uses the whole-command variable (SO5) |
 | Command secret bytes | At most 8192 in total, bounded by the command limit |
 | Propagated literals | 256 values of 8–4096 bytes, 64 KiB in total per job (proposed); beyond it, values are still replaced but not propagated |
 | Numbered values | 16,384 per job (proposed); beyond it, `$ASURA_SECRET_0` |
@@ -918,33 +974,31 @@ mechanism for each case:
 | Slow scanning, queue full | Backpressure: pipe reads pause and the producer's writes block; nothing is lost and the job is not cancelled. There is no scan time bound. |
 | Number limit reached | `$ASURA_SECRET_0` for new values |
 | Binary or invalid UTF-8 output | Scanned as bytes; stored unchanged apart from replacements (SD6) |
-| Command cannot be rewritten safely | Refused with a reason; nothing runs |
+| Command cannot be rewritten safely | Runs through the whole-command variable (SO5), from either origin |
 | Guardian rejects the secret environment | Setup failure notice; outcome not started, `spawn_failed`; values dropped |
 | Capture stops for a storage fault | Carry dropped unwritten; retained prefix labelled, as today |
 | Service restart or crash | Carry, numbers, key and literals are lost with the process. Staging holds redacted bytes only and becomes an unverified prefix (R2). The job never runs again. |
-| Restart with a queued person command that has secret variables | `Held`; Resume refused with `secrets_lost`; the person enters the command again (SO2) |
+| Restart with a queued person command that has secret variables, a whole-command variable or a `!!` launch environment | `Held` (MQ07R); Resume reads its Keychain item and runs it. A missing or mismatched item gives `secrets_lost`; a locked Keychain gives `secret_store_locked` ([secret store](secret-store.md#failure-handling)) |
 | Allocation failure | Process abort under Rust's default; restart as above |
 
 ### Queued person commands
 
 A person command is rewritten at submit, before kind PCQ. Its values must wait
-in memory until dispatch, which can follow other queued work.
+until dispatch, which can follow other queued work and a restart. The
+[secret store design](secret-store.md) is canonical for where they wait (SO6):
 
-Mechanism for SL5; the restart rule is owner decision SO2:
-
-- The conversation owner keeps a secret store keyed by input ID. Each entry
-  holds the zeroizing values and a keyed digest of them for duplicate checks.
-  The store holds at most 16 entries, the unresolved-input limit.
-- The request digest of kind PCQ covers the rewritten command, never the raw
-  one. An exact retry in the same service run compares the keyed digest of its
-  values; different values under the same request ID conflict.
-- Dispatch moves the values into the job admission and deletes the entry.
-  Drop deletes the entry. Settlement drops the values.
-- After a restart, a kind PCQ entry whose secret variable list is not empty has
-  no values. Restart already makes it `Held` (MQ07R). Resume is refused with
-  `secrets_lost` (SO2), and the TUI says "This command's secrets were cleared
-  when the service restarted. Drop it and enter it again." The person can
-  still Drop it.
+- The values, any whole-command variable (SO5), and for a `!!` command the TUI
+  launch environment ([outside environment](person-command-mode.md#outside-profile-environment))
+  are written to one Keychain item before kind PCQ.
+- The request digest of kind PCQ covers the rewritten or display-only command,
+  never the raw one. An exact retry compares a keyed digest of the values
+  stored in the item; different values under the same request ID conflict.
+- Dispatch reads the item and moves the values into the job admission.
+  Settlement, Drop and a rejected append delete the item.
+- After a restart the command is `Held` (MQ07R). Resume reads the item. Only a
+  missing or mismatched item gives `secrets_lost`; the TUI says "This
+  command's secrets are no longer in the Keychain. Drop it and enter it
+  again."
 
 ## Security
 
@@ -959,6 +1013,8 @@ Trust boundaries:
   and session-local recall. Recall is never persisted
   ([editor navigation](composer-editor-navigation.md)) and process exit
   discards it.
+- The Keychain item of a queued person command is inside the raw-data
+  boundary, protected by the Keychain (SO6).
 - Disk, journal, audit, payloads and the model view are outside the raw-data
   boundary. Only redacted bytes and names cross it.
 
@@ -1023,6 +1079,7 @@ on any fixture secret's raw bytes.
 | SDU-13 | Guardian secret environment validation: bad name, number 0 and 17, duplicate, NUL, over 8192 bytes | Each rejects with the setup failure notice |
 | SDU-14 | Descriptor and intent codecs with redaction fields | Exact round trip; bounds; no value or value digest field |
 | SDU-15 | Fixture loader strips U+200B and keeps secret and none lines only | Counts per file match [fixtures](#fixtures-and-licensing) |
+| SDU-16 | Model and person submits for each SDU-12 form except the three kept refusals, 17 values and a rewrite over 8,192 bytes (SO5) | No refusal; executable command `eval "$ASURA_SECRET_COMMAND"`; display-only text with ordinary placeholder numbers; no record, reply or argument vector holds a value; `placeholder_not_available`, `secret_in_cwd` and `secret_detection_unavailable` still refuse |
 
 ### Integration
 
@@ -1037,7 +1094,7 @@ on any fixture secret's raw bytes.
 | SDI-07 | `printenv`, `env` and the shell's `set` after a rewritten command | `printenv` and `env` show no secret variable; `set` output shows the placeholder, not the value |
 | SDI-08 | Echo of a command secret on stdout and stderr | Both map to the variable's number |
 | SDI-09 | A second sandboxed model job runs `ps -E` and a `KERN_PROCARGS2` read against the first job's `sh` | Record the result. A readable value is a threat model finding, not a pass. |
-| SDI-10 | Restart while a job prints secrets; restart with a queued person command holding secrets | Unverified prefix holds redacted bytes only; the queued command is `Held` and Resume returns `secrets_lost` (SO2) |
+| SDI-10 | Restart while a job prints secrets; restart with a queued person command holding secrets | Unverified prefix holds redacted bytes only; the queued command is `Held`, and Resume runs it with its values from the scratch Keychain item (SO6) |
 | SDI-11 | Concurrent jobs at the slot limit, each printing secrets | Numbers are independent per job; memory per job within SDM-04 |
 
 ### End to end
@@ -1046,7 +1103,7 @@ on any fixture secret's raw bytes.
 | --- | --- | --- |
 | SDE-01 | Native model runs `cat` of a fixture `.env` through the exec_cmd tool (J1), then pages with `job read` (J3) | Model result and pages show placeholders; the TUI tool activity shows placeholders; raw-byte sweep clean |
 | SDE-02 | Native model issues a command with a secret | The TUI shows the rewritten command; the command succeeds |
-| SDE-03 | Person types `!curl -H "Authorization: Bearer <token>" …` (P4) | The log header shows the placeholder; the job runs; the viewer shows placeholders; a single-quoted variant is refused and the draft is kept |
+| SDE-03 | Person types `!curl -H "Authorization: Bearer <token>" …` (P4), then a single-quoted variant, then the same as `!!` | The log header shows the placeholder; each job runs with the real value; the viewer shows placeholders; the single-quoted variant runs through the whole-command variable, and its journal record holds `eval "$ASURA_SECRET_COMMAND"` and the display-only text, never the token (SO5) |
 | SDE-04 | Flood with secrets while the person types and opens the viewer | Typing and viewer controls respond within 100 ms (AE-07) |
 | SDE-05 | Job viewer over a capture with a loss marker | The marker and the withheld count are visible |
 
@@ -1137,7 +1194,10 @@ flowchart TD
     SL3 --> J1["J1 complete"]
     J1 --> J2["J2: controller core"]
     J2 --> SL4["SL4 with J3 and J4: job read and viewer counts, end-to-end cases"]
-    J2 --> SL5["SL5 with person packets P2-P4: submit rewrite, secret store, restart rule"]
+    SL3 --> SL7["SL7: whole-command variable for model exec_cmd (SO5)"]
+    SL7 --> SL5
+    SS1["SS1: Keychain secret store (SO6)"] --> SL5
+    J2 --> SL5["SL5 with person packets P2-P4: submit rewrite, Keychain items, resume"]
     TA["Tool adoption design"] --> SL6["SL6: typed tool results filtered"]
 ```
 
@@ -1147,11 +1207,36 @@ flowchart TD
 | SL2 | `ExecCmdRequest` secret variables, environment construction, guardian validation and preamble, zeroization | SDU-13; SDI-06, SDI-07, SDI-09 |
 | SL3 | Inside J1: scanner on each capture worker before hashing; redaction fields in descriptors; loss markers; the model result tail from the redacted stream; model exec_cmd command rewrite and refusal before the intent | SDU-14; SDI-01–SDI-05, SDI-08, SDI-11; SDE-01 (exec_cmd result part), SDE-02, SDE-04; SDM-04 |
 | SL4 | With J3 and J4: counts in job results, notices, pages and the viewer | SDE-01 (`job read` part), SDE-05 |
-| SL5 | With person packets: submit rewrite, `secret_unsafe` reply, secret store, kind PCQ variable list, the SO2 restart rule | SDI-10; SDE-03 |
+| SL5 | With person packets: submit rewrite, the whole-command variable for person origin, Keychain items with the `!!` launch environment through SS1, kind PCQ variable list and display-only text, resume after restart (SO6) | SDI-10; SDU-16 person part; SDE-03 |
+| SL7 | Before J2, independent of it: the [model whole-command variable](#sl7-model-whole-command-variable). Changes implemented SL3 behavior | SDU-16 model part, SDU-17; SDI-12; SDE-06 |
 | SL6 | With the tool adoption design: whole-buffer scanning of typed tool results before their records | Defined by that design |
 
 This design unblocks J1: J1's "secret filter" item is SL3, which needs SL1, SL2
-and the licence commit for its fixtures. No owner decision remains open.
+and the licence commit for its fixtures. SS1 is defined in the
+[secret store design](secret-store.md#delivery).
+
+### SL7: model whole-command variable
+
+Proposed packet for owner decision SO5 (2026-10-20). It changes implemented
+J1 and SL3 behavior: today the conversation owner refuses a model exec_cmd
+command whose secret the rewrite cannot move. SL7 depends only on SL1–SL3, so
+it can land before J2. It needs no Keychain: model values stay in memory.
+
+| Area | Change | Owner and files |
+| --- | --- | --- |
+| Rewrite result | `rewrite_command` returns `WholeCommand { reason, kind, word, display }` for every refusal code except `placeholder_not_available`, `secret_detection_unavailable` and `secret_in_cwd`. The display text uses the ordinary numbering. | `asura-platform/src/secrets/rewrite.rs` |
+| Guardian | Accepts `ASURA_SECRET_COMMAND` as the only secret variable when present, 1–8192 bytes, erased like the others; the preamble covers it. Any numbered variable beside it is refused. | `asura-platform/src/exec_cmd` guardian and request validation |
+| Call admission | A `WholeCommand` result admits the call with decision `run`; the spawn command is `eval "$ASURA_SECRET_COMMAND"`. | `asura-service/src/conversation/exec_cmd_call.rs` |
+| Kind 14 | Stores the display text in field 14's `command`, sets exec_cmd flag bit 1 (whole-command), and keeps the reason in fields 21–23 as the fallback reason. See the [tool call record amendment](tool-call-records.md#sl7-amendment-owner-2026-10-20). | `asura-storage` kind 14 codec and replay |
+| Views | The TUI activity row and the model's result say `command filtered: run from a secret variable` beside the display text. | Service result rendering, TUI activity |
+
+Tests:
+
+| ID | Layer | Case and required result |
+| --- | --- | --- |
+| SDU-17 | Unit | Guardian and request validation: `ASURA_SECRET_COMMAND` alone accepted; with any numbered variable, empty, or 8193 bytes refused |
+| SDI-12 | Integration | Real service, guardian and sandbox: a model call with a single-quoted fixture token runs and prints through `eval`; kind 14 has decision `run`, bit 1 and no value; a raw-byte sweep of journal, payloads, audit and `ps` argument vectors finds no value |
+| SDE-06 | End to end | A deterministic model fixture issues `printf %s '<fixture token>' \| shasum -a 256`; the printed digest matches the fixture token's digest, proving the real value ran; the TUI shows the filtered command; no record holds the token |
 
 ## Follow-up designs
 

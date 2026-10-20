@@ -435,6 +435,29 @@ state this maximum and test it (TCR-U03).
 Fields 20–23 are the exec_cmd facts that the stored text cannot show. They are
 fixed-size, so a separate detail block or tag is not needed.
 
+### SL7 amendment (owner, 2026-10-20)
+
+Proposed, not implemented; delivered by
+[slice SL7](secret-detection.md#sl7-model-whole-command-variable). Owner
+decision SO5 removes the exec_cmd refusal for a secret the rewrite cannot move.
+Such a call is admitted with decision `run` and runs through the
+[whole-command variable](secret-detection.md#whole-command-variable):
+
+- Field 14's `command` holds the display-redacted command, cut at 8,192 bytes
+  with field 20 bit 0 set, as a refused call does today.
+- Field 20 bit 1 marks the whole-command variable. It is valid only with
+  operation exec_cmd and decision `run`.
+- Fields 21–23 hold the rewrite's reason, kind and word with decision `run`
+  when bit 1 is set. With `refused` they keep their meaning.
+- Decision `refused` for exec_cmd remains only for `placeholder_not_available`,
+  `secret_in_cwd` and `secret_detection_unavailable`.
+- Replay recomputes the executable command as the fixed text
+  `eval "$ASURA_SECRET_COMMAND"` when bit 1 is set, and the secret variable
+  count as 1. Without bit 1 the existing rules apply.
+- Unit cases: the codec rejects bit 1 with any other decision or operation;
+  replay derives the fixed command. SL7's SDU-16, SDU-17, SDI-12 and SDE-06
+  cover the behavior.
+
 ### Values recomputed on replay
 
 These values are not stored (TCR-O5). Replay recomputes them from stored

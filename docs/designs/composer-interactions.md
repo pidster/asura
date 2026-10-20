@@ -90,6 +90,7 @@ designs own each mode's behavior; this section owns their presentation.
 | Slash commands | The box and marker keep their normal colours while the draft starts with `/` |
 | Active command | When the first word exactly names a TUI command, that word uses command amber `#E8B577`, bold. Other words and unknown names keep the typed-text style. |
 | `!` command mode | Box and strips in command amber `#E8B577`; marker `!` and text in bold black `#000000`. A sent command's log line is a stripe in `#745A3C` with light text. |
+| `!!` outside mode | Proposed with [person command mode](person-command-mode.md#outside-mode-in-the-composer) PCR26 (owner, 2026-10-19): box and strips in outside red `#D27068`; marker `!!` and text in bold black `#000000`; hidden marks in bold black. A sent command's log line is a stripe in `#693834` with light text, followed by a warning line in `#FF6B6B`, bold. Values from Wisp's palette. |
 | `?` help mode | Box and strips in help indigo `#252D4E`; marker `?` in glow `#CFF1FF`, bold; text in the typed-text style |
 | Context gauge | `N% input` stays muted below 50%, uses glow `#CFF1FF` from 50% and amber `#F2B950` from 80%. The model name stays muted. |
 

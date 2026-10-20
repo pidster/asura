@@ -970,7 +970,7 @@ It does not add the job controller, job handles or job tools.
 
 | Area | J1 delivers | Model-visible |
 | --- | --- | --- |
-| Command rewrite | SL3: the conversation owner rewrites the exec_cmd command at `ToolCall`, before any record. Unsafe forms are refused. | Yes: refusal results; the command runs through secret variables |
+| Command rewrite | SL3: the conversation owner rewrites the exec_cmd command at `ToolCall`, before any record. Unsafe forms are refused; SL7 (owner, 2026-10-20) runs them through the whole-command variable instead. | Yes: refusal results; the command runs through secret variables |
 | Capture | Scan, then stage, then hash each stream on a capture worker, with backpressure and the 512 KiB transfer queue | No |
 | Model result | Kind 15 keeps today's shape. Its tails come from the redacted stream, and its header gains the capture state. | Yes: placeholders in tails; `capture=` field |
 | Durable records | Kind 14 `ToolCall` (replaced kind 22 on 2026-10-18) and kind 23 (CaptureSettled); kind 15 unchanged | No |

@@ -24,6 +24,7 @@ the working directory or an environment override. Tests use scratch runtime root
 | `journal.quotaBytes` | Integer, 67108864 (64 MiB) through 1099511627776 (1 TiB). Values outside the range are `config_invalid_value`. A successful set applies at once; the effective quota is the smaller of this value and journal bytes plus free disk space minus the 16 MiB disk floor ([segmented journal](segmented-journal.md#quota-and-disk-space)). Separate from `retention.quotaBytes` (owner, 2026-10-19) | `4294967296` (4 GiB, owner, 2026-10-19) |
 | `providers.mlx.models` | Up to 64 exact asset keys, each with a bounded capability list; see below | Empty mapping |
 | `providers.ollama.endpoint` | ASCII URL, at most 2048 bytes; numeric-loopback host over HTTP or HTTPS. Set rejects other hosts with `config_remote_endpoint_restricted` under the [loopback restriction](model-provider-integration.md#loopback-endpoint-restriction--selected-2026-10-13) | `http://127.0.0.1:11434` at inference admission |
+| `personCommands.allowOutsideSandbox` | Boolean. Proposed with [person command mode](person-command-mode.md#required-behavior) PCR23 (owner, 2026-10-19), not implemented. `false` refuses `!!` person commands; `!` commands are unaffected. A successful set applies to the next `!!` submit and to setup of a queued one; a running command continues. Written only when set away from its default; `set personCommands` takes the whole mapping | `true` |
 
 The owner accepted `journal.quotaBytes`, its range and its 4 GiB default on
 2026-10-19; it is implemented with the [segmented journal](segmented-journal.md#configuration).
@@ -176,7 +177,6 @@ The isolated TUI journey displayed the saved model and audit values, including
 defaults; lifecycle and terminal-restoration journeys also passed. The normal
 debug binary was rebuilt. This does not activate model or audit consumers.
 
-## Audit setting consumption and event journal
 ## Thinking level key
 
 Status: selected design, implemented 2026-10-19. The
@@ -187,6 +187,7 @@ with `config_invalid_value` and leave the file unchanged. Get returns the
 effective value. The admission snapshot and the service observer carry it.
 `/think` in the TUI writes the same key through the same worker.
 
+## Audit setting consumption and event journal
 
 **Status: recording base selected on 2026-09-27; recent-inspection extension
 accepted for scoped implementation on 2026-09-28. Integration and validation
