@@ -80,7 +80,7 @@ selected here.
 | ID | Decision | Effect on this design |
 | --- | --- | --- |
 | EX4 | Owner, 2026-10-15. All tools use jobs; there are no legacy tools. Secrets are detected with Wisp's ported rules (SD1 corrects "rules plus a classifier"; no classifier) and replaced with placeholders at capture, before storage; secrets only. A secret in a command becomes a per-execution variable such as `$ASURA_SECRET_1`; the log keeps only its name; an unsafe rewrite is refused. | Supersedes R3's "legacy tools keep kind 15". The J1 capture path filters secrets under the [secret detection design](secret-detection.md). Retained streams, pages, journal records and both views hold placeholders. Job intent records the rewritten command. How other tools adopt jobs is a follow-up design. |
-| EX5 | Owner, 2026-10-14. Detect and terminate escapees reliably before J2: `setsid` and new-session escapes, pipe-holding escapees that block settlement, and false `cleanup_confirmed`. | J2 prerequisite. Without it a pipe-holding escapee could hold a slot indefinitely, since jobs have no lifetime (J2a-1). |
+| EX5 | Owner, 2026-10-14. Detect and terminate escapees reliably before J2: `setsid` and new-session escapes, pipe-holding escapees that block settlement, and false `cleanup_confirmed`. Selected: [escapee control](escapee-control.md), 2026-10-20. | J2 prerequisite. The guardian's settlement gate now confirms cleanup only when no attributed descendant remains; J2 consumes the gate and the escapee facts (see [what J2 consumes](escapee-control.md#what-j2-consumes)). Without it a pipe-holding escapee could hold a slot indefinitely, since jobs have no lifetime (J2a-1). |
 | EX10 | Owner, 2026-10-14. Run SH-E1-style exec_cmd qualification for each local tool-capable provider (CoreAI, MLX, Ollama models) before J2. | J2 prerequisite. |
 | EX11 | Owner, 2026-10-14. A person execution setting: global default plus a per-project override, default on. A change is a revocation trigger: turning it off refuses new execution and cancels live model jobs in scope. | Added to [revocation triggers](#security-and-authority) and TJ-14. The setting needs its own design. |
 | EX12 | Owner, 2026-10-14. The client shows a visible notice whenever a job outlives its turn. | Added to [turn end](#turn-end-steering-cancellation-and-completion). Proposed placement: J4. |
@@ -828,7 +828,9 @@ turn. The original grant snapshot, sandbox, environment, scratch, network denial
 and descendant limits apply unchanged. The unbounded lifetime widens none of them.
 A `setsid` escapee currently survives cleanup and can write the project after
 settlement (threat model EX5, probe of 2026-10-14); J2 waits for its detection
-and termination.
+and termination under the [escapee control design](escapee-control.md), which
+gates cleanup confirmation on a zero-descendant scan so the escapee is killed
+before `cleanup_confirmed`.
 Every profile denies `~/.asura` except the call's scratch (SI3, implemented).
 Person jobs use the [person profile and grant](person-command-mode.md#authority-and-grant)
 instead; they have network access by owner decision (PCR7). The full threat
@@ -929,7 +931,7 @@ and end-to-end tests before the next starts.
 flowchart TD
     RP[Retention packet changes: G1, R1, R2, R4, R5] --> J1[J1: staging capture, secret filter, descriptors, text pages, quota]
     SD[EX4: secret detection slices SL1, SL2, implemented] --> J1
-    ESC[EX5: escapee detection and termination] --> J2[J2: controller core with model and person origin]
+    ESC[EX5: escapee detection and termination, escapee-control.md] --> J2[J2: controller core with model and person origin]
     QUAL[EX10: exec_cmd qualification per local provider] --> J2
     J1 --> J2
     J2 --> J3[J3: model job tool and exec_cmd adoption]

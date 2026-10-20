@@ -190,10 +190,16 @@ its guardian/setup ownership is unsettled.
 **Selected engineering boundary:** process groups are not complete descendant
 containment. A command can deliberately change session/group or double-fork and
 close inherited pipes. The inspected platform has no verified Seatbelt operation
-that prevents every such escape. This first runner supports cooperative build/test
-commands and guarantees its owned-group cleanup only. If an escape is observed,
-report cleanup_unconfirmed. An undetected escaped descendant is a documented limit;
-never claim all descendants are absent. The guardian protects against service death,
+that prevents every such escape (confirmed on macOS 27: `process-setsid` and
+`process-setpgid` are not Seatbelt operations). This first runner supports
+cooperative build/test commands and guarantees its owned-group cleanup only. If
+an escape is observed, report cleanup_unconfirmed. An undetected escaped
+descendant is a documented limit; never claim all descendants are absent. For
+sandboxed jobs, the [escapee control design](escapee-control.md) (EX5,
+2026-10-20) supersedes this limit before J2: it attributes a job's descendants
+with a per-job `sandbox_check` marker, terminates them freeze-then-kill, and
+gates cleanup confirmation on a zero-descendant scan. The `!!` profile keeps a
+reduced residual under EXD-1. The guardian protects against service death,
 not a malicious same-user actor killing the guardian. Do not invent unsupported
 sandbox operations to hide this limit or add a repeated approval gate.
 

@@ -150,6 +150,11 @@ where marked as code reading:
    The job cannot settle, and the service enters repair. Without a fixed job
    lifetime (J2a-1), such a job could hold a slot indefinitely.
 
+Findings 1–5 are closed for sandboxed jobs, and best-effort for `!!`, by the
+[escapee control design](escapee-control.md), whose macOS 27 probes of
+2026-10-20 reproduced finding 4 (EC-V-OLD) and finding 5 (EC-V-EOF) and verified
+the selected mechanisms read-only.
+
 ## Proposed capabilities
 
 | ID | Threat | Required outcome before implementation |
@@ -230,7 +235,14 @@ Each entry gives the decision, the required outcome and where it is applied.
    detect and terminate escapees before J2: `setsid` and new-session escapes,
    pipe-holding escapees that block settlement, and false
    `cleanup_confirmed`. There is no interim change. Applied as a J2
-   prerequisite. Follow-up design: escapee detection and termination.
+   prerequisite. Follow-up design:
+   [escapee detection and termination](escapee-control.md), 2026-10-20. It
+   selects a per-job `sandbox_check` marker to attribute a sandboxed job's
+   descendants however they `setsid` or double-fork, freeze-then-kill
+   termination, pipe-holder detection for settlement, and a settlement gate that
+   confirms cleanup only when no attributed descendant remains. It covers the
+   `!!` profile best-effort (owned group plus an `ASURA_JOB` environment marker)
+   and states the residual accepted under EXD-1. Owns the EX-V9 case (EC-E3).
 6. **EX6 — person deletion and a review mark (owner, 2026-10-14).** The person
    can delete a note: the note is tombstoned, and the journal stays
    append-only. A model-written note carries a visible "model-written,
@@ -326,7 +338,7 @@ layer. They did not drive a model or the TUI.
 | EX-V6 | Endpoint request content captured; confirm only granted data classes leave | Not run. It needs a local HTTPS capture server with a test certificate. Under EX13 it becomes the grant check: file pages and tool results absent by default. |
 | EX-V7 | Provider switch from local to remote mid-conversation; record which history leaves | Not run. It needs a remote endpoint admitted, which waits for EX13 and EX14 (EX7). |
 | EX-V8 | A fixture secret in command output and in a command, for model and person origin | Required, not run. Retained streams, journal, model view and viewer hold placeholders only. The command runs with the real value through one variable, and the log holds only the variable name. A command that cannot be rewritten safely runs through the whole-command variable, from either origin (EX4 amendment, 2026-10-20). Detailed cases are in the [secret detection validation](secret-detection.md#validation). |
-| EX-V9 | `setsid`, double-fork and pipe-holding escapees under a job | Required, not run. Each escapee is detected and terminated, settlement completes, and cleanup is never reported confirmed while one lives. Detailed cases belong to the EX5 design. |
+| EX-V9 | `setsid`, double-fork and pipe-holding escapees under a job | Required, not run. Each escapee is detected and terminated, settlement completes, and cleanup is never reported confirmed while one lives. Owned by the [escapee control design](escapee-control.md) as case EC-E3; its [macOS 27 probes](escapee-control.md#probe-evidence-macos-27) of 2026-10-20 verified the underlying mechanisms read-only. |
 | EX-V10 | The EX11 setting turned off globally and for one project | Required, not run. New execution is refused and live model jobs in scope are cancelled with a revocation reason. |
 | EX-V11 | Model exec_cmd runs `git status` and `git init` with the developer folder readable | Required, not run. Git runs; reads outside the roots stay denied. |
 
@@ -337,7 +349,7 @@ Each must be designed before its code. None is selected by this document.
 | Design | Source | Gates |
 | --- | --- | --- |
 | Secret detection and redaction: rules, placeholders, command variables, capture integration. Selected 2026-10-15: [secret detection](secret-detection.md) | EX4, PX6, SD1–SD9 | Job packet J1; person command mode |
-| Escapee detection and termination | EX5 | Job packet J2 |
+| Escapee detection and termination: per-job sandbox marker, freeze-then-kill, settlement gate, `!!` best-effort. Selected 2026-10-20: [escapee control](escapee-control.md) | EX5, PT13 | Job packet J2 |
 | exec_cmd qualification per local provider (SH-E1 style) | EX10 | Job packet J2 |
 | Execution setting: global default and per-project override | EX11 | Revocation trigger TJ-14 |
 | Job-outlived-turn notice | EX12 | Client job packet J4 (proposed placement) |
@@ -435,7 +447,7 @@ flowchart TD
 | EX2 | Changed. Network is allowed by owner decision. See PT3. |
 | EX3 | Changed. Home reads are allowed by owner decision. |
 | EX4 | Applies, with the same rule as model tools. The job retains each command's complete output under the retention quota, with secrets replaced at capture; journal records hold references, not text. A secret in the command text becomes a per-execution variable. See PT5. |
-| EX5 | Applies, with no timeout. The owned-group cleanup is unchanged, and the EX5 escape findings apply. The EX5 design must cover the person profile too. See PT8. |
+| EX5 | Applies, with no timeout. The owned-group cleanup is unchanged, and the EX5 escape findings apply. The [escapee control design](escapee-control.md) covers the `!` person profile with the sandbox marker and the `!!` profile best-effort. See PT8. |
 | EX7, EX13 | Apply to the model view. The composer may place output with the notice, and the model may page the streams under PC10. Either sends output to the model's destination. See PT5. |
 | EX6, EX8, EX9, EX10, EX12 | Not affected. The person command has no memory write, no credentials and no model proposer. |
 | EX11 | Does not apply. Each person command is an explicit person action. |
@@ -663,7 +675,7 @@ flowchart TD
 | PT10 | The person runs `!!` when they meant `!` | Outside mode needs a deliberate second `!` at position 0. The box is red, the marker is `!!`, the hint row says `run OUTSIDE the sandbox`, and the log shows the warning before the command can run. Backspace steps back to `!`. | A person who ignores these signals runs the command unconfined, as in their terminal. |
 | PT11 | Model output persuades the person to type `!!` (PT1 for `!!`) | The PT1 controls apply: no copy path from model output into any command mode; recall holds only person text; a message that starts with `!!` is sent as a message and never runs. | As PT1. |
 | PT12 | The launch environment holds tokens and reaches the service | The service writes it only to the command's Keychain item (EXD-2), never to the journal, audit, logs or payloads. The item is deleted at settlement or Drop. Output that prints an environment value is filtered at capture. | The environment is at rest in the Keychain while the command waits. A token the scanner misses can be stored in output, as PT5 states. |
-| PT13 | An escapee from a `!!` job (EX5) runs on after settlement | The EX5 escapee detection design must cover the outside profile too. | Until then, a `setsid` escapee from `!!` is unconfined, not merely unstopped. |
+| PT13 | An escapee from a `!!` job (EX5) runs on after settlement | The [escapee control design](escapee-control.md#attribution-the--unsandboxed-job) covers the outside profile: the guardian attributes `!!` descendants by the owned process group and a per-job `ASURA_JOB` environment marker read with `KERN_PROCARGS2`. Found survivors are left running and counted, as a terminal leaves them (EC-D1, decided under the existing owner rule PC13 "like my terminal", following Wisp, and EXD-1); model and `!` jobs still kill their escapees. The sandbox marker does not apply because `!!` has no Seatbelt profile. | A `setsid` escapee from `!!` that also scrubs its environment carries no marker and cannot be reattributed. Accepted under EXD-1: a `!!` command has the person's full authority, like a detached background process started in their terminal. |
 
 PT3 (egress) and PT2 (planted content) apply with the sandbox removed. PT4
 (cache persistence), PT6 (state denial) and PT7 (PATH sanitizing) do not
