@@ -602,18 +602,34 @@ fn secrets_turn() -> Result<()> {
     );
     assert_eq!(std::fs::read(directory.join("out.txt"))?, second.as_bytes());
     std::fs::remove_file(directory.join("out.txt"))?;
-    // 3. single quotes: refused, display-redacted command.
+    // 3. single quotes (SL7): runs from the whole-command variable; kind 14
+    // holds the display text, bit 1 and the fallback reason.
     let quoted = &calls[2];
-    assert_eq!(quoted.intent.disposition, Disposition::Refused);
+    assert_eq!(quoted.intent.disposition, Disposition::Admitted);
+    assert!(quoted.record.whole_command);
     assert_eq!(
         quoted.intent.refusal.map(|r| r.code),
         Some(journal::RefusalCode::SecretSingleQuoted)
     );
-    assert!(quoted.intent.command.contains("$ASURA_SECRET_"));
-    // A call that does not run is complete at kind 14 (TCR-R5).
-    assert!(quoted.result.is_none());
+    assert_eq!(quoted.intent.command, "echo '$ASURA_SECRET_1'");
     assert_eq!(quoted.record.form, journal::ArgumentForm::Canonical);
-    assert!(quoted.settled.is_none());
+    assert_eq!(
+        quoted.settled.as_ref().map(|s| s.state),
+        Some(CaptureState::Complete)
+    );
+    let echoed = quoted.result.as_ref().ok_or("kind 15")?;
+    assert!(
+        echoed
+            .text
+            .contains("command filtered: run from a secret variable: echo '$ASURA_SECRET_1'"),
+        "{}",
+        echoed.text
+    );
+    assert!(
+        echoed.text.contains("stdout:\n$ASURA_SECRET_1\n"),
+        "{}",
+        echoed.text
+    );
     // What the model saw.
     let messages = model.tool_messages();
     assert_eq!(messages.len(), 3, "{messages:?}");
@@ -621,7 +637,7 @@ fn secrets_turn() -> Result<()> {
     for message in &messages {
         assert!(!message.contains(&first) && !message.contains(&second));
     }
-    assert!(messages[2].contains("single-quoted"));
+    assert!(messages[2].contains("command filtered: run from a secret variable"));
     // The service stays available.
     model.script(&[Step::ExecCmd("printf after".into()), Step::Final]);
     let next = submit(&fixture, project, "Again.")?;
@@ -636,7 +652,113 @@ fn secrets_turn() -> Result<()> {
     std::fs::remove_file(directory.join(".env"))?;
     sweep(&fixture.home, &[&first, &second])?;
     println!(
-        "PASS J1T-24/J1T-14 cat .env placeholders to the model, rewritten command in kind 14 and {ps_checks} ps checks, refusals recorded, raw-byte sweep clean"
+        "PASS J1T-24/J1T-14 cat .env placeholders to the model, rewritten command in kind 14 and {ps_checks} ps checks, single-quoted value run from a secret variable, raw-byte sweep clean"
+    );
+    Ok(())
+}
+
+/// SDI-12 (SL7): real service, helper, guardian and sandbox. A model call
+/// with a single-quoted fixture token runs through `eval` from the
+/// whole-command variable and uses the real value; kind 14 has decision
+/// `run`, field 20 bit 1 and no value; while it runs no process argument
+/// vector holds the value; a raw-byte sweep of the journal, payloads, audit,
+/// logs and config finds no value.
+fn whole_command_turn() -> Result<()> {
+    let (fixture, model, project, directory) = setup("whole")?;
+    let value = token("Wv4");
+    model.script(&[
+        Step::ExecCmd(format!(
+            "printf '%s' '{value}' > whole.txt; sleep 2; printf '%s' '{value}'"
+        )),
+        Step::Final,
+    ]);
+    let operation = submit(&fixture, project, "Run the single-quoted fixture.")?;
+    let end = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < end && !directory.join("whole.txt").exists() {
+        thread::sleep(Duration::from_millis(20));
+    }
+    // While `sleep 2` runs: no argument vector holds the value; the shell's
+    // holds the preamble and the fixed `eval` text.
+    let mut ps_checks = 0;
+    let mut saw_eval = false;
+    for _ in 0..10 {
+        let ps = Command::new("/bin/ps")
+            .args(["-axww", "-o", "args="])
+            .output()?;
+        assert!(!holds(&ps.stdout, &value), "ps showed the value");
+        saw_eval |= holds(&ps.stdout, "eval \"$ASURA_SECRET_COMMAND\"");
+        ps_checks += 1;
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(saw_eval, "the shell ran the fixed eval text");
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    // The activity source marks the call and shows the display text.
+    assert_eq!(event.tools[0].command_filtered, Some(true));
+    assert!(
+        event.tools[0]
+            .arguments
+            .as_deref()
+            .unwrap_or("")
+            .contains("printf '%s' '$ASURA_SECRET_1' > whole.txt")
+    );
+    assert_eq!(
+        std::fs::read(directory.join("whole.txt"))?,
+        value.as_bytes()
+    );
+    std::fs::remove_file(directory.join("whole.txt"))?;
+    let calls = exec_cmd_calls(&fixture, operation)?;
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(call.intent.disposition, Disposition::Admitted);
+    assert!(call.record.whole_command && !call.record.command_cut);
+    assert_eq!(
+        call.intent.refusal.map(|r| r.code),
+        Some(journal::RefusalCode::SecretSingleQuoted)
+    );
+    assert_eq!(
+        call.intent.command,
+        "printf '%s' '$ASURA_SECRET_1' > whole.txt; sleep 2; printf '%s' '$ASURA_SECRET_1'"
+    );
+    assert_eq!(
+        call.intent.variables,
+        vec![journal::SecretKind::GithubToken]
+    );
+    // Replay derives the fixed command and one variable (SL7 amendment).
+    let (_, replay) = fixture.journal()?;
+    let derived = replay.operations[&operation].tools[0]
+        .exec_cmd
+        .as_deref()
+        .ok_or("derived exec_cmd")?;
+    assert_eq!(derived.fixed_command, Some(journal::WHOLE_COMMAND));
+    assert_eq!(derived.secret_variables, 1);
+    let settled = call.settled.as_ref().ok_or("kind 23")?;
+    assert_eq!(settled.state, CaptureState::Complete);
+    let result = call.result.as_ref().ok_or("kind 15")?;
+    assert!(result.text.contains("exit_code=0"), "{}", result.text);
+    assert!(
+        result.text.contains(
+            "command filtered: run from a secret variable: printf '%s' '$ASURA_SECRET_1'"
+        ),
+        "{}",
+        result.text
+    );
+    // The printed value is the command's literal, replaced by its number.
+    assert!(
+        result.text.contains("stdout:\n$ASURA_SECRET_1\n"),
+        "{}",
+        result.text
+    );
+    let messages = model.tool_messages();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("command filtered: run from a secret variable"));
+    assert!(!messages[0].contains(&value));
+    drop(model);
+    let mut fixture = fixture;
+    fixture.stop()?;
+    sweep(&fixture.home, &[&value])?;
+    println!(
+        "PASS SDI-12 single-quoted value ran through eval from ASURA_SECRET_COMMAND, kind 14 run with bit 1 and no value, {ps_checks} ps checks, raw-byte sweep clean"
     );
     Ok(())
 }
@@ -1108,8 +1230,9 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 7] = [
+    let cases: [Case; 8] = [
         ("secrets", secrets_turn),
+        ("whole", whole_command_turn),
         ("setup", setup_budget_removed),
         ("busy", quota_busy),
         ("overload", overload),

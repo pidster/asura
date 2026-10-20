@@ -92,6 +92,7 @@ pub fn run_jobs(
                 call,
                 intent: intent.clone(),
                 secrets: job.secrets,
+                secret_command: None,
                 capture: capture_worker::Start {
                     store: store.clone(),
                     call: job_id,

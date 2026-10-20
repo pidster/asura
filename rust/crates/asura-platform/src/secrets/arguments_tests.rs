@@ -90,7 +90,10 @@ fn tcr_u07_unparsed_escape_hiding_a_secret_is_not_retained() {
 fn tcr_u08_exec_cmd_rewrite_and_refusal() {
     let token = github("Mn4");
     let raw = format!("curl -H \"Authorization: Bearer {token}\" x");
-    let rewrite = rewrite_exec_cmd_call(&raw, ".").expect("rewrite");
+    let rewrite = rewrite_exec_cmd_call(&raw, ".")
+        .expect("rewrite")
+        .rewritten()
+        .expect("rewritten");
     let text = crate::secrets::json::canonical(&Value::Object(vec![
         ("command".into(), Value::String(raw.clone())),
         ("cwd".into(), Value::String(".".into())),
@@ -141,6 +144,73 @@ fn tcr_u08_exec_cmd_rewrite_and_refusal() {
         "{\"command\":\"ls\",\"cwd\":\"dir/$ASURA_SECRET_1\"}"
     );
     assert!(!holds(&out, &token) && !out.command_cut);
+}
+
+/// SL7: a whole-command call stores the rewrite's display text verbatim in
+/// `command`, numbered 1..k by first appearance, and never the value. A
+/// display over 8,192 bytes is cut before a placeholder, never inside one.
+#[test]
+fn sl7_exec_cmd_whole_command_display() {
+    let token = github("Wq7");
+    let raw = format!("echo '{token}' && printf '%s' '{token}'");
+    let plan = rewrite_exec_cmd_call(&raw, ".").expect("plan");
+    let whole = plan.whole_command().expect("whole command");
+    let text = crate::secrets::json::canonical(&Value::Object(vec![
+        ("command".into(), Value::String(raw.clone())),
+        ("cwd".into(), Value::String(".".into())),
+    ]));
+    let out = redact_arguments(
+        rules(),
+        &ArgumentsInput {
+            name: Some("exec_cmd"),
+            arguments: Some(&text),
+            exec_cmd: Some(ExecCmdCommand::WholeCommand {
+                display: &whole.display,
+                variables: &whole.variables,
+            }),
+            exec_cmd_name: true,
+        },
+    );
+    assert_eq!(out.form, ArgumentForm::Canonical);
+    assert_eq!(
+        out.text,
+        "{\"command\":\"echo '$ASURA_SECRET_1' && printf '%s' '$ASURA_SECRET_1'\",\"cwd\":\".\"}"
+    );
+    assert_eq!(out.number_kinds, vec![SecretKind::GithubToken]);
+    assert!(!holds(&out, &token) && !out.command_cut);
+
+    // Over 8,192 bytes: cut before the placeholder that crosses the limit.
+    let long = format!("{}echo '{token}'", "f".repeat(8192 - 8));
+    let whole = rewrite_exec_cmd_call(&long, ".")
+        .unwrap()
+        .whole_command()
+        .unwrap();
+    assert!(whole.display.len() > 8192);
+    let text = crate::secrets::json::canonical(&Value::Object(vec![
+        ("command".into(), Value::String(long.clone())),
+        ("cwd".into(), Value::String(".".into())),
+    ]));
+    let out = redact_arguments(
+        rules(),
+        &ArgumentsInput {
+            name: Some("exec_cmd"),
+            arguments: Some(&text),
+            exec_cmd: Some(ExecCmdCommand::WholeCommand {
+                display: &whole.display,
+                variables: &whole.variables,
+            }),
+            exec_cmd_name: true,
+        },
+    );
+    assert!(out.command_cut);
+    let expected = format!("{}echo '", "f".repeat(8192 - 8));
+    assert_eq!(
+        out.text,
+        format!("{{\"command\":\"{expected}\",\"cwd\":\".\"}}")
+    );
+    // The cut removed the only placeholder, so no number is listed.
+    assert!(out.number_kinds.is_empty() && out.unnumbered == 0);
+    assert!(!holds(&out, &token));
 }
 
 /// TCR-U09: one number per value; verbatim without secrets; the 257th

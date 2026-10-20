@@ -648,6 +648,7 @@ impl Journal {
             rule_set_revision: 1,
             rule_set_digest: [21; 32],
             command_cut: false,
+            whole_command: false,
             refusal: None,
         })))
     }

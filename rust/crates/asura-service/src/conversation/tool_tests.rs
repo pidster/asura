@@ -724,27 +724,57 @@ fn unknown_denied_and_limit_decisions_render_from_codes() {
     );
 }
 
-/// Refused exec_cmd: the SL3 refusal is recorded in fields 21-23 with the
-/// display-redacted command; no record field or result holds the value.
+/// SL7 (owner layer): a single-quoted value is no longer refused. The record
+/// holds the display text and never the value. Bit 1 and the fallback reason
+/// belong only to an admitted `run`, so without a payload store the call is
+/// `busy` without them, and no live secret is kept. A secret in the working
+/// directory is still refused, with fields 21-23 and no value.
 #[test]
-fn refused_exec_cmd_records_refusal_codes_and_no_value() {
+fn whole_command_exec_cmd_is_not_refused_and_kept_refusals_remain() {
     let mut fixture = Fixture::new();
+    install_recorded_memory_cancel(&mut fixture);
     fresh_turn(&mut fixture);
     let token = exec_cmd_token();
     let text = serde_json::json!({ "command": format!("echo '{token}'") }).to_string();
     propose(&mut fixture, wire(1, "exec_cmd", &text));
     let record = pending_record(&mut fixture);
+    assert_eq!(record.decision, journal::ToolDecision::Busy);
+    assert_eq!(
+        record.busy,
+        Some(journal::ExecCmdBusyReason::PayloadUnavailable)
+    );
+    assert!(!record.whole_command && record.refusal.is_none() && !record.command_cut);
+    assert_eq!(record.form, journal::ArgumentForm::Canonical);
+    assert_eq!(record.arguments, "{\"command\":\"echo '$ASURA_SECRET_1'\"}");
+    assert_eq!(
+        record.number_kinds,
+        vec![asura_platform::secrets::SecretKind::GithubToken]
+    );
+    assert!(!format!("{record:?}").contains(&token));
+    let tool = fixture.active().tool.as_ref().unwrap();
+    assert!(tool.call.is_none() && tool.exec_cmd.is_none());
+    fixture.acknowledge(Job::ToolIntent);
+    let results = sent(&mut fixture);
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].text.clone().unwrap().contains(&token));
+
+    // A kept refusal: the working directory holds a secret.
+    let mut fixture = Fixture::new();
+    fresh_turn(&mut fixture);
+    let text = serde_json::json!({ "command": "ls", "cwd": format!("dir/{token}") }).to_string();
+    propose(&mut fixture, wire(1, "exec_cmd", &text));
+    let record = pending_record(&mut fixture);
     assert_eq!(record.decision, journal::ToolDecision::Refused);
+    assert!(!record.whole_command);
     let refusal = record.refusal.expect("refusal fields");
     assert_eq!(
         refusal.code,
-        asura_platform::secrets::RefusalCode::SecretSingleQuoted
+        asura_platform::secrets::RefusalCode::SecretInCwd
     );
     assert_eq!(
         refusal.kind,
         Some(asura_platform::secrets::SecretKind::GithubToken)
     );
-    assert_eq!(record.form, journal::ArgumentForm::Canonical);
     assert!(record.arguments.contains("$ASURA_SECRET_1"));
     assert!(!format!("{record:?}").contains(&token));
     assert!(fixture.active().tool.as_ref().unwrap().exec_cmd.is_none());
@@ -1316,6 +1346,7 @@ fn tool_record(name: &str, decision: journal::ToolDecision) -> journal::ToolReco
         fault: None,
         busy: None,
         refusal: None,
+        whole_command: false,
         form: journal::ArgumentForm::Verbatim,
         arguments_bytes: 19,
         arguments: r#"{"command":"tools"}"#.into(),
@@ -1458,12 +1489,14 @@ fn exec_cmd_wire(ordinal: u32, command: &str) -> mp::ToolCall {
     )
 }
 
-/// J1T-03 (owner layer): a rewrite over 8,192 bytes is a recorded refusal
-/// decided at `ToolCall`; its kind 14 encodes within one frame, so the append
-/// cannot fail on size and make the service unavailable.
+/// J1T-03 (owner layer) as changed by SL7: a rewrite over 8,192 bytes is
+/// not refused; it is planned for the whole-command variable at `ToolCall`.
+/// Its kind 14 encodes within one frame, so the append cannot fail on size
+/// and make the service unavailable. (No payload store here: `busy`.)
 #[test]
-fn j1t_03_overlong_rewrite_is_a_recorded_refusal() {
+fn j1t_03_overlong_rewrite_is_not_refused() {
     let mut fixture = Fixture::new();
+    install_recorded_memory_cancel(&mut fixture);
     fresh_turn(&mut fixture);
     let unit = ["curl -u admin:", "Sup3r", "S3cret", " x;"].concat();
     let long = format!(
@@ -1474,16 +1507,12 @@ fn j1t_03_overlong_rewrite_is_a_recorded_refusal() {
     assert!(long.len() <= 8192);
     propose(&mut fixture, exec_cmd_wire(1, &long));
     let record = pending_record(&mut fixture);
-    assert_eq!(record.decision, journal::ToolDecision::Refused);
-    assert_eq!(
-        record.refusal.map(|r| r.code),
-        Some(journal::RefusalCode::RewrittenCommandTooLong)
-    );
+    assert_eq!(record.decision, journal::ToolDecision::Busy);
+    assert!(record.refusal.is_none());
     assert!(encodes(&record).len() <= 65_050);
     assert!(!record.arguments.contains("Sup3rS3cret"));
+    assert!(record.arguments.contains("admin:$ASURA_SECRET_1 x;"));
     assert!(fixture.owner.unavailable.is_none());
-    fixture.acknowledge(Job::ToolIntent);
-    assert_eq!(sent(&mut fixture)[0].status, Some(3));
 }
 
 /// J1T-04 (owner layer, memory inspection) and busy: with no payload store

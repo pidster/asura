@@ -587,8 +587,12 @@ pub const MAX_RECORDED_CALLS: u32 = 200;
 /// The ordinal after the last recorded call exists only for the over-limit
 /// `limit` record (or `cancelled`, TCR-D30).
 pub const MAX_TOOL_CALL_ORDINAL: u32 = MAX_RECORDED_CALLS + 1;
-/// A refused exec_cmd command is cut at this size (field 20 bit 0).
+/// A refused or whole-command exec_cmd command is cut at this size (field 20
+/// bit 0).
 pub const MAX_REFUSED_COMMAND_BYTES: usize = 8192;
+/// The executable command replay derives for a whole-command call (field 20
+/// bit 1, SL7); its secret variable count is 1.
+pub use asura_platform::secrets::WHOLE_COMMAND;
 
 /// A registered model-facing tool: the replay lookup of kind 14 field 5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -864,9 +868,14 @@ pub struct ToolCall {
     /// from a failed rule-set self-check.
     pub rule_set_revision: u32,
     pub rule_set_digest: Hash,
-    /// Field 20 bit 0: a refused exec_cmd command was cut at 8,192 bytes.
+    /// Field 20 bit 0: a refused or whole-command exec_cmd command was cut
+    /// at 8,192 bytes.
     pub command_cut: bool,
-    /// Fields 21-23: an exec_cmd secret refusal. Never holds a value.
+    /// Field 20 bit 1 (SL7): the `run` exec_cmd command runs through the
+    /// whole-command variable; field 14 holds its display text.
+    pub whole_command: bool,
+    /// Fields 21-23: an exec_cmd secret refusal, or with `whole_command` the
+    /// fallback reason. Never holds a value.
     pub refusal: Option<ExecCmdRefusal>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1005,6 +1014,13 @@ pub struct CaptureSettled {
 /// used as "last use" by the interim expiry (J1-Q2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecCmdCall {
+    /// Derived (SL7): [`WHOLE_COMMAND`] when field 20 bit 1 is set; `None`
+    /// when the stored `command` is the executable text.
+    pub fixed_command: Option<&'static str>,
+    /// Derived: the secret variables passed to the guardian. 1 for the
+    /// whole-command variable, else the distinct numbers in the stored
+    /// command (field 15).
+    pub secret_variables: u16,
     pub job: Id,
     pub stdout_payload: Id,
     pub stderr_payload: Id,
@@ -1034,6 +1050,9 @@ pub struct ToolRecord {
     pub fault: Option<ToolFault>,
     pub busy: Option<ExecCmdBusyReason>,
     pub refusal: Option<ExecCmdRefusal>,
+    /// Field 20 bit 1 (SL7): the command ran from a secret variable; the
+    /// arguments show its display text.
+    pub whole_command: bool,
     pub form: ArgumentForm,
     pub arguments_bytes: u32,
     /// A display prefix of at most 192 bytes of the stored argument text.

@@ -415,6 +415,10 @@ message ToolProgress {
   // Kind 14 fault code 1-15 of a rejected call (tool-call-records.md, TCR-D13).
   // policy_decision carries the kind 14 decision code 1-8.
   optional uint32 fault = 12;
+  // SL7: true when an admitted exec_cmd call ran from the whole-command
+  // variable (kind 14 field 20 bit 1); arguments then show its display text.
+  // Absent otherwise; only with policy_decision 1.
+  optional bool command_filtered = 13;
 }
 // Optional observations; complete means every measured request has full input/output counts.
 message TurnStatistics {

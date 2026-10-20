@@ -212,7 +212,8 @@ Each entry gives the decision, the required outcome and where it is applied.
      (SO5).
    - **Extended to model commands (owner, 2026-10-20).** The same rule covers
      the model's exec_cmd commands: no refusal for a secret the rewrite cannot
-     move. Slice SL7 changes the implemented SL3 behavior. Three refusals
+     move. Slice SL7 changed the implemented SL3 behavior on 2026-10-20
+     ([SL7 implementation](secret-detection.md#sl7-implementation)). Three refusals
      stay because they are not a command-line secret:
      `placeholder_not_available`, `secret_in_cwd` and
      `secret_detection_unavailable`.

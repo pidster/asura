@@ -359,6 +359,7 @@ impl LiveTool {
         record.busy = None;
         record.refusal = None;
         record.command_cut = false;
+        record.whole_command = false;
         if let Some(exec_cmd) = &mut self.exec_cmd {
             exec_cmd.release_admission();
         }
@@ -2929,6 +2930,7 @@ impl Owner {
             rule_set_revision: 0,
             rule_set_digest: [0; 32],
             command_cut: false,
+            whole_command: false,
             refusal: None,
         };
         let mut tool = LiveTool {
@@ -2959,7 +2961,8 @@ impl Owner {
         record.rule_set_revision = rules.revision();
         record.rule_set_digest = rules.digest();
         let parsed = tools::parse_call(name, text);
-        // SL3: the exec_cmd command is rewritten before the record.
+        // SL3, SL7: the exec_cmd command is rewritten, or planned for the
+        // whole-command variable, before the record.
         let rewrite = match &parsed.arguments {
             Ok(tools::Arguments::ExecCmd { command, cwd }) => {
                 Some(secrets::rewrite_exec_cmd_call(command, cwd))
@@ -2972,9 +2975,13 @@ impl Owner {
                 name,
                 arguments: text,
                 exec_cmd: rewrite.as_ref().map(|rewrite| match rewrite {
-                    Ok(rewrite) => ExecCmdCommand::Rewritten {
+                    Ok(secrets::Plan::Rewritten(rewrite)) => ExecCmdCommand::Rewritten {
                         command: &rewrite.command,
                         variables: &rewrite.variables,
+                    },
+                    Ok(secrets::Plan::WholeCommand(whole)) => ExecCmdCommand::WholeCommand {
+                        display: &whole.display,
+                        variables: &whole.variables,
                     },
                     Err(_) => ExecCmdCommand::Refused,
                 }),
@@ -3069,12 +3076,14 @@ impl Owner {
                         record.refusal = Some(exec_cmd_call::refusal(&refusal));
                         record.command_cut = command_cut;
                     }
-                    Ok(rewrite) => {
+                    Ok(plan) => {
                         if let tools::Arguments::ExecCmd { command, .. } = &mut call.arguments {
-                            *command = rewrite.command;
+                            *command = plan.command().to_owned();
                         }
+                        let live = exec_cmd_call::LiveSecrets::from(plan);
                         let run = replay.and_then(|r| {
                             crate::exec_cmd_worker::ExecCmdRun::derive(r.installation_id, &call)
+                                .map(|run| live.filter(run))
                         });
                         let admission = run.as_ref().ok_or(None).and_then(|run| {
                             payloads
@@ -3095,9 +3104,17 @@ impl Owner {
                         });
                         match (run, admission) {
                             (Some(run), Ok((store, victims))) => {
+                                // SL7: field 20 bit 1 and the fallback reason
+                                // only on the admitted `run`.
+                                if let Some(reason) = &live.reason {
+                                    record.whole_command = true;
+                                    record.refusal = Some(exec_cmd_call::refusal(reason));
+                                    record.command_cut = command_cut;
+                                }
                                 tool.exec_cmd = Some(Box::new(exec_cmd_call::ExecCmdLive {
                                     run,
-                                    secrets: rewrite.variables,
+                                    secrets: live.variables,
+                                    secret_command: live.command,
                                     victims,
                                     store: Some(store),
                                     settled: None,
@@ -3847,6 +3864,8 @@ impl Owner {
                                 rules,
                                 &exec_cmd.secrets,
                             );
+                            let (secrets, secret_command) =
+                                exec_cmd_call::request_secrets(exec_cmd);
                             let wake = active.exec_cmd_worker.wake();
                             active
                                 .exec_cmd_worker
@@ -3861,7 +3880,8 @@ impl Owner {
                                     },
                                     call: call.clone(),
                                     intent: exec_cmd.run.clone(),
-                                    secrets: std::mem::take(&mut exec_cmd.secrets),
+                                    secrets,
+                                    secret_command,
                                     capture: crate::capture_worker::Start {
                                         store,
                                         call: exec_cmd.run.job,
@@ -4111,6 +4131,8 @@ impl Owner {
                     }),
                     policy_decision: Some(tool.decision as u32),
                     fault: tool.fault.map(|fault| fault as u32),
+                    // SL7: the arguments show the display text.
+                    command_filtered: tool.whole_command.then_some(true),
                     elapsed_ms: self
                         .active
                         .as_ref()

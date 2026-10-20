@@ -526,6 +526,7 @@ fn sj28_two_hundred_large_tool_calls_span_segment_files() {
                 rule_set_revision: 1,
                 rule_set_digest: [3; 32],
                 command_cut: false,
+                whole_command: false,
                 refusal: None,
             })))
             .unwrap();
@@ -750,6 +751,7 @@ fn sj34_payload_facts_after_rolls() {
                 rule_set_revision: 1,
                 rule_set_digest: [3; 32],
                 command_cut: false,
+                whole_command: false,
                 refusal: None,
             })))
             .unwrap();

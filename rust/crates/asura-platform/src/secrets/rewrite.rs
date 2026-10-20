@@ -1,7 +1,8 @@
 //! Command rewrite planner (SD7 as extended by SO1; flowchart SD-F1). Moves
-//! each detected secret into a per-execution variable, or refuses the whole
-//! command with a reason that never holds the value, a preview, an offset or
-//! a digest. Pure computation over at most one command.
+//! each detected secret into a per-execution variable. A command the rewrite
+//! cannot move runs through the whole-command variable (SO5, slice SL7); only
+//! the three kept refusals refuse it. A reason never holds the value, a
+//! preview, an offset or a digest. Pure computation over at most one command.
 use super::stream::{RawSpan, redact_whole, scan_spans};
 use super::{RuleSet, SecretKind, detection};
 use crate::exec_cmd::split::{Analysis, ByteContext, Quoting, Role, analyze};
@@ -10,16 +11,26 @@ use zeroize::Zeroizing;
 
 /// Distinct secret values per command.
 pub const MAX_SECRET_VARIABLES: usize = 16;
+/// Detected values of a whole-command run that get a number and a capture
+/// literal; later values show the unnumbered placeholder (TCR-D4).
+pub const MAX_WHOLE_COMMAND_NUMBERS: usize = 256;
+/// The whole-command variable's name (SO5).
+pub const SECRET_COMMAND_NAME: &str = "ASURA_SECRET_COMMAND";
+/// The fixed executable command of a whole-command run (SO5). It is the
+/// only command text the argument vector and the records hold for it.
+pub const WHOLE_COMMAND: &str = "eval \"$ASURA_SECRET_COMMAND\"";
+/// What views and the model's result say beside the display text (SL7).
+pub const WHOLE_COMMAND_NOTICE: &str = "command filtered: run from a secret variable";
 
-/// One secret moved out of a command: number 1–16, kind and value. Debug
-/// output never shows the value.
+/// One secret moved out of a command: number 1–16 (1–256 as a whole-command
+/// capture literal), kind and value. Debug output never shows the value.
 pub struct SecretVariable {
-    number: u8,
+    number: u16,
     kind: SecretKind,
     value: Zeroizing<Vec<u8>>,
 }
 impl SecretVariable {
-    pub fn number(&self) -> u8 {
+    pub fn number(&self) -> u16 {
         self.number
     }
     pub fn kind(&self) -> SecretKind {
@@ -34,7 +45,7 @@ impl SecretVariable {
     }
     /// Any number and value, to exercise `ExecCmdRequest` validation.
     #[cfg(test)]
-    pub(crate) fn for_test(number: u8, value: &[u8]) -> Self {
+    pub(crate) fn for_test(number: u16, value: &[u8]) -> Self {
         Self {
             number,
             kind: SecretKind::AssignedSecret,
@@ -59,6 +70,71 @@ pub struct Rewrite {
     pub variables: Vec<SecretVariable>,
 }
 
+/// The whole raw command as the value of `ASURA_SECRET_COMMAND` (SO5).
+/// Zeroed on drop; debug output never shows it.
+pub struct SecretCommand(Zeroizing<Vec<u8>>);
+impl SecretCommand {
+    /// Takes a copy of `command`. Request validation checks its size.
+    pub fn new(command: &[u8]) -> Self {
+        Self(Zeroizing::new(command.to_vec()))
+    }
+    pub fn value(&self) -> &[u8] {
+        &self.0
+    }
+}
+impl std::fmt::Debug for SecretCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretCommand")
+            .field("bytes", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A command the rewrite cannot move (SO5): it runs as [`WHOLE_COMMAND`]
+/// with the raw text in `ASURA_SECRET_COMMAND`. `reason` is the rewrite's
+/// refusal, recorded as the fallback reason. `display` is the raw command
+/// with each detected value replaced by its placeholder under the ordinary
+/// numbering, or `[withheld]` when that text cannot be verified free of
+/// secrets. `variables` are the detected values with those numbers, as
+/// capture literals only; they never reach the environment.
+#[derive(Debug)]
+pub struct WholeCommand {
+    pub reason: Refusal,
+    pub display: String,
+    pub variables: Vec<SecretVariable>,
+    pub command: SecretCommand,
+}
+
+/// How an admitted exec_cmd command runs.
+#[derive(Debug)]
+pub enum Plan {
+    Rewritten(Rewrite),
+    WholeCommand(WholeCommand),
+}
+impl Plan {
+    /// The executable command text: the rewrite, or [`WHOLE_COMMAND`].
+    pub fn command(&self) -> &str {
+        match self {
+            Self::Rewritten(rewrite) => &rewrite.command,
+            Self::WholeCommand(_) => WHOLE_COMMAND,
+        }
+    }
+    /// The rewrite, when the plan is one.
+    pub fn rewritten(self) -> Option<Rewrite> {
+        match self {
+            Self::Rewritten(rewrite) => Some(rewrite),
+            Self::WholeCommand(_) => None,
+        }
+    }
+    /// The whole-command run, when the plan is one.
+    pub fn whole_command(self) -> Option<WholeCommand> {
+        match self {
+            Self::Rewritten(_) => None,
+            Self::WholeCommand(whole) => Some(whole),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalCode {
     PlaceholderNotAvailable,
@@ -79,6 +155,14 @@ pub enum RefusalCode {
     SecretInCwd,
 }
 impl RefusalCode {
+    /// The refusals SO5 keeps: none is a secret in the command line, so the
+    /// whole-command variable cannot help.
+    pub fn kept(self) -> bool {
+        matches!(
+            self,
+            Self::PlaceholderNotAvailable | Self::SecretInCwd | Self::DetectionUnavailable
+        )
+    }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PlaceholderNotAvailable => "placeholder_not_available",
@@ -160,50 +244,126 @@ fn refuse(code: RefusalCode, kind: Option<SecretKind>, word: Option<usize>) -> R
     Refusal { code, kind, word }
 }
 
-/// Rewrites `command` with the process rule set; refuses every command with
-/// `secret_detection_unavailable` if the rule set failed its self-check.
-pub fn rewrite_command(command: &str) -> Result<Rewrite, Refusal> {
-    rewrite_with(detection(), command)
+/// Plans `command` with the process rule set: the rewrite, or the
+/// whole-command variable (SO5). Refuses only with the kept codes;
+/// `secret_detection_unavailable` when the rule set failed its self-check.
+pub fn rewrite_command(command: &str) -> Result<Plan, Refusal> {
+    plan_with(detection(), command)
 }
-pub(crate) fn rewrite_with(
+pub(crate) fn plan_with(
     rules: Result<&'static RuleSet, super::SelfCheckError>,
     command: &str,
-) -> Result<Rewrite, Refusal> {
+) -> Result<Plan, Refusal> {
     match rules {
-        Ok(rules) => rewrite(rules, command),
+        Ok(rules) => plan(rules, command),
         Err(_) => Err(refuse(RefusalCode::DetectionUnavailable, None, None)),
     }
 }
 
 /// The rewritten command limit: the rewrite must fit the exec_cmd command and
-/// intent record limits (J1, G6).
+/// intent record limits (J1, G6). A longer rewrite runs through the
+/// whole-command variable with reason `rewritten_command_too_long`.
 pub const MAX_REWRITTEN_COMMAND_BYTES: usize = 8192;
 
-/// The model exec_cmd call path (J1): rewrites `command`, refuses a rewrite
-/// longer than [`MAX_REWRITTEN_COMMAND_BYTES`] with
-/// `rewritten_command_too_long`, and scans `cwd` in whole-buffer mode; a
-/// detected span refuses with `secret_in_cwd`. The person path reuses it.
-pub fn rewrite_exec_cmd_call(command: &str, cwd: &str) -> Result<Rewrite, Refusal> {
+/// The model exec_cmd call path (J1, SL7). The kept refusals come first, in
+/// order: detection unavailable, a reserved placeholder in the command, then
+/// the whole-buffer scan of `cwd` (a detected span or withheld bytes refuse
+/// with `secret_in_cwd`). Then [`plan`]. The person path reuses it.
+pub fn rewrite_exec_cmd_call(command: &str, cwd: &str) -> Result<Plan, Refusal> {
     rewrite_exec_cmd_call_with(detection(), command, cwd)
 }
 pub(crate) fn rewrite_exec_cmd_call_with(
     rules: Result<&'static RuleSet, super::SelfCheckError>,
     command: &str,
     cwd: &str,
-) -> Result<Rewrite, Refusal> {
-    let rewrite = rewrite_with(rules.clone(), command)?;
+) -> Result<Plan, Refusal> {
     let rules = rules.map_err(|_| refuse(RefusalCode::DetectionUnavailable, None, None))?;
+    if references_placeholder(command.as_bytes()) {
+        return Err(refuse(RefusalCode::PlaceholderNotAvailable, None, None));
+    }
     let (spans, withheld) = scan_spans(rules, cwd.as_bytes());
     if let Some(span) = spans.first() {
         return Err(refuse(RefusalCode::SecretInCwd, Some(span.kind), None));
     }
     if withheld {
-        return Err(refuse(RefusalCode::UnparsedCommand, None, None));
+        return Err(refuse(RefusalCode::SecretInCwd, None, None));
     }
-    if rewrite.command.len() > MAX_REWRITTEN_COMMAND_BYTES {
-        return Err(refuse(RefusalCode::RewrittenCommandTooLong, None, None));
+    plan(rules, command)
+}
+
+/// SO5: the rewrite when it succeeds within [`MAX_REWRITTEN_COMMAND_BYTES`];
+/// otherwise the whole-command variable, with the rewrite's refusal (or
+/// `rewritten_command_too_long`) as its reason. A kept refusal refuses.
+pub fn plan(rules: &'static RuleSet, command: &str) -> Result<Plan, Refusal> {
+    match rewrite(rules, command) {
+        Ok(rewrite) if rewrite.command.len() <= MAX_REWRITTEN_COMMAND_BYTES => {
+            Ok(Plan::Rewritten(rewrite))
+        }
+        Ok(_) => Ok(Plan::WholeCommand(whole_command(
+            rules,
+            command,
+            refuse(RefusalCode::RewrittenCommandTooLong, None, None),
+        ))),
+        Err(refusal) if refusal.code.kept() => Err(refusal),
+        Err(refusal) => Ok(Plan::WholeCommand(whole_command(rules, command, refusal))),
     }
-    Ok(rewrite)
+}
+
+/// The whole-command variable for `command` (SO5): numbers 1..k by first
+/// appearance, equal values sharing one, at most
+/// [`MAX_WHOLE_COMMAND_NUMBERS`]; the display text replaces each detected
+/// span with its placeholder and is rescanned like a rewrite (step 8). A
+/// withheld scan, invalid UTF-8 or a residual match gives `[withheld]`.
+fn whole_command(rules: &'static RuleSet, command: &str, reason: Refusal) -> WholeCommand {
+    let bytes = command.as_bytes();
+    let (spans, withheld) = scan_spans(rules, bytes);
+    let mut numbers: HashMap<&[u8], u16> = HashMap::new();
+    let mut variables: Vec<SecretVariable> = Vec::new();
+    let mut out = Vec::with_capacity(bytes.len() + 16 * spans.len());
+    let mut inserted = Vec::with_capacity(spans.len());
+    let mut cursor = 0;
+    for span in &spans {
+        let range = span.start as usize..span.end as usize;
+        let value = &bytes[range.clone()];
+        let number = match numbers.get(value) {
+            Some(&number) => number,
+            None if numbers.len() < MAX_WHOLE_COMMAND_NUMBERS => {
+                let number = numbers.len() as u16 + 1;
+                numbers.insert(value, number);
+                variables.push(SecretVariable {
+                    number,
+                    kind: span.kind,
+                    value: Zeroizing::new(value.to_vec()),
+                });
+                number
+            }
+            None => 0,
+        };
+        out.extend_from_slice(&bytes[cursor..range.start]);
+        let text = super::placeholder(u32::from(number));
+        inserted.push(out.len() as u64..(out.len() + text.len()) as u64);
+        out.extend_from_slice(text.as_bytes());
+        cursor = range.end;
+    }
+    out.extend_from_slice(&bytes[cursor..]);
+    let display = match String::from_utf8(out) {
+        Ok(display) if !withheld && verify(rules, &display, &inserted).is_ok() => display,
+        Ok(mut display) => {
+            zeroize::Zeroize::zeroize(&mut display);
+            super::WITHHELD_TEXT.to_owned()
+        }
+        Err(error) => {
+            let mut raw = error.into_bytes();
+            zeroize::Zeroize::zeroize(&mut raw);
+            super::WITHHELD_TEXT.to_owned()
+        }
+    };
+    WholeCommand {
+        reason,
+        display,
+        variables,
+        command: SecretCommand::new(bytes),
+    }
 }
 
 /// The command with every detected span replaced by its placeholder, for a
@@ -220,7 +380,8 @@ enum Form {
     Braced,
 }
 
-/// Rewrites one command (design steps 1–9).
+/// Rewrites one command (design steps 1–9; flowchart SD-F1). [`plan`]
+/// turns its refusals into the whole-command variable.
 pub fn rewrite(rules: &'static RuleSet, command: &str) -> Result<Rewrite, Refusal> {
     let bytes = command.as_bytes();
     if references_placeholder(bytes) {
@@ -243,13 +404,13 @@ pub fn rewrite(rules: &'static RuleSet, command: &str) -> Result<Rewrite, Refusa
         plan.push((range.clone(), classify(&analysis, bytes, range, span.kind)?));
     }
     // Numbers 1..k by first appearance; equal values share a number.
-    let mut numbers: HashMap<&[u8], u8> = HashMap::new();
+    let mut numbers: HashMap<&[u8], u16> = HashMap::new();
     let mut variables: Vec<SecretVariable> = Vec::new();
     let mut assigned = Vec::with_capacity(plan.len());
     for ((range, _), span) in plan.iter().zip(&spans) {
         let value = &bytes[range.clone()];
         let next = numbers.len() + 1;
-        let number = *numbers.entry(value).or_insert_with(|| next as u8);
+        let number = *numbers.entry(value).or_insert_with(|| next as u16);
         if usize::from(number) == next {
             if next > MAX_SECRET_VARIABLES {
                 return Err(refuse(RefusalCode::TooManySecrets, None, None));

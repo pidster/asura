@@ -6,8 +6,8 @@ mod protocol;
 mod spawn;
 pub mod split;
 use crate::runtime::{open_at, stat_fd};
-use crate::secrets::SecretVariable;
-use crate::secrets::rewrite::MAX_SECRET_VARIABLES;
+use crate::secrets::rewrite::{MAX_SECRET_VARIABLES, SECRET_COMMAND_NAME, WHOLE_COMMAND};
+use crate::secrets::{SecretCommand, SecretVariable};
 use crate::{PollInterest, ProjectIdentity, RuntimeDirectory, StateBoundary};
 use capture::Capture;
 pub use capture::{DRAIN_BUDGET, OutputSink, READ_BUFFER, Stream, render_tail};
@@ -95,8 +95,11 @@ impl From<ExecCmdError> for ExecCmdFailure {
 pub const MAX_COMMAND_BYTES: usize = 8192;
 /// One exec_cmd execution. `secrets` are the command's secret variables from the
 /// rewrite: numbers 1–16, each distinct, values without NUL and at most
-/// [`MAX_COMMAND_BYTES`] in total. They reach the guardian only through its
-/// environment. No `Debug` is derived, and `SecretVariable`'s omits values.
+/// [`MAX_COMMAND_BYTES`] in total. `secret_command` is the whole-command
+/// variable (SO5, SL7): 1–8192 bytes without NUL, only with no numbered
+/// variable and the command [`WHOLE_COMMAND`]. Both reach the guardian only
+/// through its environment. No `Debug` is derived, and the secret types'
+/// omit values.
 ///
 /// The command has no time bound: it ends on completion or cancel, and setup
 /// checks only cancellation.
@@ -105,6 +108,7 @@ pub struct ExecCmdRequest {
     pub command: String,
     pub cwd: Option<String>,
     pub secrets: Vec<SecretVariable>,
+    pub secret_command: Option<SecretCommand>,
 }
 pub struct PreparedExecCmd {
     request: ExecCmdRequest,
@@ -141,7 +145,20 @@ fn validate(request: &ExecCmdRequest) -> Result<(), ExecCmdError> {
     {
         return Err(ExecCmdError::Invalid);
     }
-    validate_secrets(&request.secrets)
+    validate_secrets(&request.secrets)?;
+    match &request.secret_command {
+        None => Ok(()),
+        Some(command)
+            if request.secrets.is_empty()
+                && request.command == WHOLE_COMMAND
+                && !command.value().is_empty()
+                && command.value().len() <= MAX_COMMAND_BYTES
+                && !command.value().contains(&0) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(ExecCmdError::Invalid),
+    }
 }
 /// The service-side check; the guardian repeats it on its environment.
 fn validate_secrets(secrets: &[SecretVariable]) -> Result<(), ExecCmdError> {
@@ -162,20 +179,23 @@ fn validate_secrets(secrets: &[SecretVariable]) -> Result<(), ExecCmdError> {
     }
     Ok(())
 }
-/// `ASURA_SECRET_<n>=<value>` entries for the guardian's environment, in
-/// zeroizing memory.
-fn secret_environment(secrets: &[SecretVariable]) -> Vec<Zeroizing<Vec<u8>>> {
+/// `ASURA_SECRET_<n>=<value>` entries, or the one `ASURA_SECRET_COMMAND`
+/// entry, for the guardian's environment, in zeroizing memory.
+fn secret_environment(
+    secrets: &[SecretVariable],
+    command: Option<&SecretCommand>,
+) -> Vec<Zeroizing<Vec<u8>>> {
+    let entry = |name: &str, value: &[u8]| {
+        let mut entry = Zeroizing::new(Vec::with_capacity(name.len() + 1 + value.len()));
+        entry.extend_from_slice(name.as_bytes());
+        entry.push(b'=');
+        entry.extend_from_slice(value);
+        entry
+    };
     secrets
         .iter()
-        .map(|secret| {
-            let name = secret.name();
-            let mut entry =
-                Zeroizing::new(Vec::with_capacity(name.len() + 1 + secret.value().len()));
-            entry.extend_from_slice(name.as_bytes());
-            entry.push(b'=');
-            entry.extend_from_slice(secret.value());
-            entry
-        })
+        .map(|secret| entry(&secret.name(), secret.value()))
+        .chain(command.map(|command| entry(SECRET_COMMAND_NAME, command.value())))
         .collect()
 }
 impl PreparedExecCmd {
@@ -262,6 +282,7 @@ impl PreparedExecCmd {
     ) -> Result<ExecCmdJob, ExecCmdFailure> {
         let spawned = self.spawn_inner(executable, cancel, sink);
         self.request.secrets.clear();
+        self.request.secret_command = None;
         match spawned {
             Ok(job) => Ok(job),
             Err(reason) => Err(ExecCmdFailure {
@@ -334,7 +355,8 @@ impl PreparedExecCmd {
         ];
         #[cfg(feature = "test-support")]
         let mappings = &mappings[..mappings.len() - usize::from(self.omit_state_for_test)];
-        let environment = secret_environment(&self.request.secrets);
+        let environment =
+            secret_environment(&self.request.secrets, self.request.secret_command.as_ref());
         #[cfg(feature = "test-support")]
         let environment = match &self.secret_environment_for_test {
             Some(raw) => raw

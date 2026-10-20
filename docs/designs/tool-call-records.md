@@ -331,9 +331,11 @@ Rules for the algorithm:
   is then kept.
 - **exec_cmd.** The `command` value is the SL3 rewrite when the rewrite
   succeeds. It is the display-redacted command, cut at 8,192 bytes, when the
-  rewrite refuses. The record therefore holds the command that ran, with its
-  secrets moved to variables. A refused cwd is redacted like any other string
-  value. The stored arguments are the only copy of the command and cwd.
+  call is refused or runs through the whole-command variable (SL7). The record
+  therefore holds the command that ran, with its secrets moved to variables,
+  or the display text of a whole-command run. A refused cwd is redacted like
+  any other string value. The stored arguments are the only copy of the
+  command and cwd.
 - **Whole-text scan.** The redactor also scans the raw text as one buffer and
   replaces every detected value wherever it occurs in a key or string
   (TCR-D19). A string with withheld bytes is stored as `[withheld]` (TCR-D21).
@@ -422,8 +424,8 @@ then UTF-8, flags as one byte 0 or 1. Any other value is `Corrupt`.
 | 17 | unnumbered | u32 | Occurrences of the unnumbered placeholder in fields 5 and 14: values past the 256th and model-written placeholder tokens (TCR-D4) |
 | 18 | rule-set revision | u32 | The revision used. 0 only with reason `detection_unavailable` |
 | 19 | rule-set digest | 32 bytes | The digest of that revision. Zero only with revision 0 |
-| 20 | exec_cmd flags | u8 | Bit 0: command cut at 8,192 bytes (refused only). Other bits 0. 0 unless operation exec_cmd |
-| 21 | refusal code | u8 | 0 unless exec_cmd `refused`; then 1–14 as kind 22 today |
+| 20 | exec_cmd flags | u8 | Bit 0: command cut at 8,192 bytes (refused or bit 1). Bit 1: whole-command variable, `run` only ([SL7 amendment](#sl7-amendment-owner-2026-10-20)). Other bits 0. 0 unless operation exec_cmd |
+| 21 | refusal code | u8 | 0 unless exec_cmd `refused` (then 1 or 14) or field 20 bit 1 (then a fallback reason, not 1, 12 or 14) |
 | 22 | refusal kind | u8 | 0 or a secret kind 1–33 |
 | 23 | refusal word | u16 | 0, or the 1-based word index 1–4096 |
 
@@ -437,8 +439,9 @@ fixed-size, so a separate detail block or tag is not needed.
 
 ### SL7 amendment (owner, 2026-10-20)
 
-Proposed, not implemented; delivered by
-[slice SL7](secret-detection.md#sl7-model-whole-command-variable). Owner
+Implemented on 2026-10-20 by
+[slice SL7](secret-detection.md#sl7-model-whole-command-variable); evidence is
+in the [SL7 implementation](secret-detection.md#sl7-implementation). Owner
 decision SO5 removes the exec_cmd refusal for a secret the rewrite cannot move.
 Such a call is admitted with decision `run` and runs through the
 [whole-command variable](secret-detection.md#whole-command-variable):
@@ -446,14 +449,27 @@ Such a call is admitted with decision `run` and runs through the
 - Field 14's `command` holds the display-redacted command, cut at 8,192 bytes
   with field 20 bit 0 set, as a refused call does today.
 - Field 20 bit 1 marks the whole-command variable. It is valid only with
-  operation exec_cmd and decision `run`.
+  operation exec_cmd and decision `run`, and the service sets it only when
+  admission ends in `run`. A whole-command call that ends `busy`, `denied` or
+  `cancelled` keeps its display text without bits 0 and 1 or fields 21–23, as
+  a cancelled refused call already did. Bits 2–7 stay 0.
+- A `run` with bit 1 may hold up to 256 numbers in field 15; the 16-number
+  limit applies only to a rewritten `run`.
 - Fields 21–23 hold the rewrite's reason, kind and word with decision `run`
   when bit 1 is set. With `refused` they keep their meaning.
 - Decision `refused` for exec_cmd remains only for `placeholder_not_available`,
-  `secret_in_cwd` and `secret_detection_unavailable`.
+  `secret_in_cwd` and `secret_detection_unavailable`. The codec enforces it:
+  fields 21–23 of a `refused` record hold code 1 or 14 (detection unavailable
+  is recorded without them, as before), and of a bit 1 record any other code
+  except 12.
 - Replay recomputes the executable command as the fixed text
   `eval "$ASURA_SECRET_COMMAND"` when bit 1 is set, and the secret variable
-  count as 1. Without bit 1 the existing rules apply.
+  count as 1. Without bit 1 the existing rules apply. The replay projection
+  `ExecCmdCall` holds them as `fixed_command` and `secret_variables`, and
+  `ToolRecord.whole_command` carries bit 1 to the views.
+- Control `ToolProgress` field 13 `command_filtered` is `true` for a record
+  with bit 1 and absent otherwise; the control codec refuses it with any other
+  decision or the value `false`.
 - Unit cases: the codec rejects bit 1 with any other decision or operation;
   replay derives the fixed command. SL7's SDU-16, SDU-17, SDI-12 and SDE-06
   cover the behavior.
@@ -521,7 +537,7 @@ must not decide a call again.
 | 1 | `run` | Parsed, valid, authorized, within the call limit; exec_cmd admitted | Yes | The outcome, from kind 15 |
 | 2 | `invalid_arguments` | Any parse or validation fault, including oversized text | No | 3 |
 | 3 | `unknown_tool` | Name not registered | No | 3 |
-| 4 | `refused` | exec_cmd secret refusal, or rule set unavailable (any tool) | No | 3 |
+| 4 | `refused` | exec_cmd kept refusal (`placeholder_not_available` or `secret_in_cwd`, SL7), or rule set unavailable (any tool) | No | 3 |
 | 5 | `busy` | exec_cmd busy reasons | No | 4 |
 | 6 | `denied` | The grant lacks the permission, such as `create_note` without a foreground person | No | 2 |
 | 7 | `limit` | Ordinal 201 | No | 7 |
@@ -791,7 +807,8 @@ retained.
 `ToolProgress.arguments` carries a display prefix of at most 192 bytes of the
 stored text, as today, or the service-written `[not retained: <reason>, <n>
 bytes]` for form 4. `ToolProgress.policy_decision` carries the decision code
-1–8. New field 12 `ToolProgress.fault` carries the fault code 1–15. For a call
+1–8. New field 12 `ToolProgress.fault` carries the fault code 1–15. Field 13
+`ToolProgress.command_filtered` is `true` for a whole-command call (SL7). For a call
 that does not run, `state` is 3 (failed), `status` is the rendered status and
 `preview` is the rendered result text. The TUI shows a rejected call with its
 decision and fault, for example `project  invalid_arguments: missing_field`. A

@@ -6,6 +6,7 @@ This verifies process and tty state, not native terminal visual correctness.
 """
 import codecs
 import errno
+import hashlib
 import fcntl
 import json
 import os
@@ -1802,7 +1803,8 @@ def exec_cmd_capture(fixture, source):
     """J1/SL3 end-to-end through the real TUI, service, helper and a scripted
     loopback model: J1T-24 (placeholders in the result and activity),
     J1T-25 fixture part (the TUI shows the rewritten command; it runs),
-    J1T-26 (typing within 100 ms during a secret flood), J1T-21 (typing
+    J1T-26 (typing within 100 ms during a secret flood), SDE-06 (a
+    single-quoted token runs from the whole-command variable), J1T-21 (typing
     during a stalled capture), J1T-22 (restart and inspect the call) and
     J1T-08 (a visible busy result). The stalled-capture step needs a
     test-support build of the fixture binary."""
@@ -1870,8 +1872,8 @@ def exec_cmd_capture(fixture, source):
                                 tool_messages.append(message.get("content", ""))
                         step = script.pop(0) if script else None
                         peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
-                        if step is None:
-                            reply = {"message": {"role": "assistant", "content": "COMPLETE"},
+                        if step is None or isinstance(step, str):
+                            reply = {"message": {"role": "assistant", "content": step or "COMPLETE"},
                                      "done": True, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3}
                         else:
                             reply = {"message": {"role": "assistant", "content": "",
@@ -1924,6 +1926,25 @@ def exec_cmd_capture(fixture, source):
         trial.send(b"\x1b")
         trial.idle(0.1)
         trial.send(b"\x7f" * 3)  # Clear the typed draft.
+        # SDE-06 (SL7): a single-quoted token runs from the whole-command
+        # variable. The printed digest proves the real value ran; the TUI
+        # shows the filtered command; no record holds the token (final sweep).
+        third = "ghp_" + "Kd5" * 12
+        digest = hashlib.sha256(third.encode()).hexdigest()
+        script[:0] = [{"command": f"printf %s '{third}' | shasum -a 256", "cwd": "."}, "DIGEST-DONE"]
+        offset = len(trial.output)
+        trial.send(b"Digest the fixture token.\r")
+        trial.until(b"DIGEST-DONE", offset, plain=True, limit=60, reject="Incomplete response")
+        assert any(digest in m for m in tool_messages), [m[:400] for m in tool_messages[-2:]]
+        assert any("command filtered: run from a secret variable" in m for m in tool_messages)
+        assert all(third not in m for m in tool_messages)
+        trial.send(b"\x1b[17~\r")  # F6 response history; Enter expands the latest activity.
+        trial.until("▾ Activity".encode(), offset, plain=True)
+        trial.until(b"printf %s '$ASURA_SECRET_1' | shasum -a 256", offset, plain=True)
+        trial.until(b"command filtered: run from a secret variable", offset, plain=True)
+        assert third not in trial.screen.text(), "raw secret on screen"
+        trial.send(b"\x1b")
+        trial.idle(0.1)
         # J1T-21: a stalled capture only backpressures; typing stays responsive.
         gate = home / "capture-hold-scan"
         gate.write_bytes(b"")
@@ -1989,8 +2010,10 @@ def exec_cmd_capture(fixture, source):
             if path.is_file() and path.name not in ("asura-fixture", "asura-model"):
                 data = path.read_bytes()
                 assert first.encode() not in data and second.encode() not in data, f"raw secret in {path}"
+                assert third.encode() not in data, f"raw SDE-06 token in {path}"
         assert not errors, errors
-        print(f"PASS J1T-24/25/26/21/22/08 TUI: placeholders shown, rewrite shown and run, "
+        print(f"PASS J1T-24/25/26/21/22/08 SDE-06 TUI: placeholders shown, rewrite shown and run, "
+              "single-quoted token run from a secret variable (digest matched, filtered command shown), "
               f"typing {flood_typing*1000:.0f} ms during a flood and {stall_typing*1000:.0f} ms during a "
               "stalled capture, restart inspection, visible busy, raw-byte sweep clean")
     finally:

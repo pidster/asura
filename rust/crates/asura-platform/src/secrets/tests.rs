@@ -1,6 +1,6 @@
 //! Unit tests SDU-01–SDU-12. Fixture secrets are assembled at run time so no
 //! token-shaped literal is committed.
-use super::rewrite::{Refusal, RefusalCode, display_redacted, rewrite};
+use super::rewrite::{Refusal, RefusalCode, WHOLE_COMMAND, display_redacted, rewrite};
 use super::rules::{Candidate, merge};
 use super::stream::{is_body_line, scan_spans};
 use super::*;
@@ -989,7 +989,7 @@ fn detector_error_and_flush_fail_closed() {
     assert!(format!("{summary:?}").contains("loss_spans"));
 }
 
-fn values_of(r: &rewrite::Rewrite) -> Vec<(u8, String)> {
+fn values_of(r: &rewrite::Rewrite) -> Vec<(u16, String)> {
     r.variables
         .iter()
         .map(|v| (v.number(), String::from_utf8(v.value().to_vec()).unwrap()))
@@ -1069,10 +1069,10 @@ fn sdu_11_rewrite_per_form() {
     for (command, expected, vars) in cases {
         let result = rewrite(rules(), &command).unwrap_or_else(|r| panic!("{command}: {r}"));
         assert_eq!(result.command, expected);
-        let expected_vars: Vec<(u8, String)> = vars
+        let expected_vars: Vec<(u16, String)> = vars
             .into_iter()
             .enumerate()
-            .map(|(i, v)| (i as u8 + 1, v))
+            .map(|(i, v)| (i as u16 + 1, v))
             .collect();
         assert_eq!(values_of(&result), expected_vars, "{command}");
         // The shell value of each word is unchanged once the variables expand.
@@ -1306,7 +1306,7 @@ fn sdu_12_refusal_per_form_never_shows_the_value() {
         refusal.to_string(),
         "Command refused: a `cli-password` secret in word 4: it is single-quoted. Use double quotes so Asura can pass it as a variable."
     );
-    let unavailable = rewrite::rewrite_with(Err(SelfCheckError::Digest), "true").unwrap_err();
+    let unavailable = rewrite::plan_with(Err(SelfCheckError::Digest), "true").unwrap_err();
     assert_eq!(unavailable.code.as_str(), "secret_detection_unavailable");
 }
 
@@ -1384,9 +1384,9 @@ fn named_rule_values_equal_the_capture_groups() {
     assert!(matched > 500, "{matched}");
 }
 
-/// J1T-03 unit (G6): a rewrite of exactly 8,192 bytes is admitted and one of
-/// 8,193 bytes is refused with `rewritten_command_too_long`, whatever the
-/// original length; the refusal holds no value.
+/// J1T-03 unit (G6) as changed by SL7: a rewrite of exactly 8,192 bytes is
+/// admitted; one of 8,193 bytes runs through the whole-command variable with
+/// reason `rewritten_command_too_long`, whatever the original length.
 #[test]
 fn j1t_03_rewritten_command_length_limit() {
     use super::rewrite::{MAX_REWRITTEN_COMMAND_BYTES, rewrite_exec_cmd_call_with};
@@ -1400,18 +1400,27 @@ fn j1t_03_rewritten_command_length_limit() {
     };
     let fits = build(MAX_REWRITTEN_COMMAND_BYTES);
     assert!(fits.len() < MAX_REWRITTEN_COMMAND_BYTES);
-    let rewrite = rewrite_exec_cmd_call_with(Ok(rules()), &fits, ".").unwrap();
+    let rewrite = rewrite_exec_cmd_call_with(Ok(rules()), &fits, ".")
+        .unwrap()
+        .rewritten()
+        .unwrap();
     assert_eq!(rewrite.command.len(), MAX_REWRITTEN_COMMAND_BYTES);
     assert_eq!(rewrite.variables.len(), 1);
     let over = build(MAX_REWRITTEN_COMMAND_BYTES + 1);
     assert!(over.len() <= MAX_REWRITTEN_COMMAND_BYTES);
-    let refusal = rewrite_exec_cmd_call_with(Ok(rules()), &over, ".").unwrap_err();
-    assert_eq!(refusal.code, RefusalCode::RewrittenCommandTooLong);
-    assert_eq!(refusal.code.as_str(), "rewritten_command_too_long");
-    assert!(!refusal.to_string().contains(&value));
+    let plan = rewrite_exec_cmd_call_with(Ok(rules()), &over, ".").unwrap();
+    assert_eq!(plan.command(), WHOLE_COMMAND);
+    let whole = plan.whole_command().unwrap();
+    assert_eq!(whole.reason.code, RefusalCode::RewrittenCommandTooLong);
+    assert_eq!(whole.reason.code.as_str(), "rewritten_command_too_long");
+    assert_eq!(whole.command.value(), over.as_bytes());
+    assert_eq!(whole.variables.len(), 1);
+    assert!(!whole.display.contains(&value));
+    assert!(!format!("{whole:?}").contains(&value));
 }
 /// J1 cwd scan: a detected span in the working directory refuses with
-/// `secret_in_cwd`; a failed self-check refuses first.
+/// `secret_in_cwd`; a failed self-check refuses first. SL7: the kept
+/// refusals come before the whole-command variable.
 #[test]
 fn j1_cwd_secret_and_detection_unavailable_refuse() {
     use super::rewrite::rewrite_exec_cmd_call_with;
@@ -1424,8 +1433,153 @@ fn j1_cwd_secret_and_detection_unavailable_refuse() {
     let unavailable =
         rewrite_exec_cmd_call_with(Err(super::SelfCheckError::Digest), "ls", ".").unwrap_err();
     assert_eq!(unavailable.code, RefusalCode::DetectionUnavailable);
-    // The command refusal comes before the cwd scan.
+    // A command the rewrite cannot move still refuses for a cwd secret.
     let quoted = cat(&["echo '", &gh, "'"]);
     let refusal = rewrite_exec_cmd_call_with(Ok(rules()), &quoted, &gh).unwrap_err();
-    assert_eq!(refusal.code, RefusalCode::SecretSingleQuoted);
+    assert_eq!(refusal.code, RefusalCode::SecretInCwd);
+    let placeholder = cat(&["echo '", &gh, "' $ASURA_SECRET_2"]);
+    let refusal = rewrite_exec_cmd_call_with(Ok(rules()), &placeholder, ".").unwrap_err();
+    assert_eq!(refusal.code, RefusalCode::PlaceholderNotAvailable);
+}
+
+/// SDU-16 (model part; SO5, SL7): every SDU-12 form except the three kept
+/// refusals, 17 values and a rewrite over 8,192 bytes run through the
+/// whole-command variable. The executable command is the fixed `eval` text;
+/// the display text uses ordinary placeholder numbers; neither it, the
+/// reason nor any debug output holds a value. The kept refusals still refuse.
+#[test]
+fn sdu_16_whole_command_variable_for_every_unmovable_form() {
+    use super::rewrite::{plan, rewrite_exec_cmd_call_with};
+    let pw = cat(&["Pat-7731", "-lark"]);
+    let gh = github();
+    let mut forms: Vec<String> = vec![
+        cat(&["echo '", &gh, "'"]),
+        cat(&["echo $'", &gh, "'"]),
+        cat(&["machine h login u password Pw9x\"", "yz12 tail\""]),
+        cat(&["tool --password=", "pa*", "ss9x"]),
+        cat(&["tool --password=\\", &pw]),
+        cat(&["tool {a,b}--password=", &pw]),
+        cat(&["echo $", &gh]),
+        cat(&["tool --password=", &pw, ">out"]),
+        cat(&["echo \"machine h login u password Pw9x`", "yz12 tail\""]),
+        cat(&["echo $(cat --token ", &pw, ")"]),
+        cat(&["echo `tool --token ", &pw, "`"]),
+        cat(&["(tool --token ", &pw, ")"]),
+        cat(&["sh -c \"git push https://u:", "hunter2x", "@host\""]),
+        cat(&["sudo bash -lc \"tool --token ", &pw, "\""]),
+        cat(&["eval tool --token ", &pw]),
+        cat(&["find . -exec sh -c \"tool --token ", &pw, "\" \\;"]),
+        cat(&["cat <<EOF\npassword=", &pw, "\nEOF"]),
+        cat(&["cat <<-'EOF' > f\n\ttoken: ", &gh, "\n\tEOF\necho done"]),
+        cat(&["echo \"unclosed --token ", &pw]),
+        cat(&["tool --token ", &pw, " <<"]),
+    ];
+    let mut many = String::from("tool");
+    for n in 0..17 {
+        many.push_str(&format!(" --token Pw{n:02}xyz9"));
+    }
+    forms.push(many.clone());
+    let value = cat(&["Sup3r", "S3cret"]);
+    let long = cat(&[
+        &cat(&["curl -u admin:", &value, " x;"]).repeat(10),
+        "echo ",
+        &"f".repeat(8192 - 60 - 10 * 26 - 5 + 1),
+    ]);
+    forms.push(long);
+    let secrets = [
+        pw.as_str(),
+        gh.as_str(),
+        "hunter2x",
+        "Pw00xyz9",
+        "Pw16xyz9",
+        &value,
+    ];
+    let mut reasons = Vec::new();
+    for form in &forms {
+        let refusal = rewrite(rules(), form).err();
+        let plan = rewrite_exec_cmd_call_with(Ok(rules()), form, ".")
+            .unwrap_or_else(|r| panic!("{form:?} refused: {r}"));
+        assert_eq!(plan.command(), WHOLE_COMMAND, "{form:?}");
+        let whole = plan.whole_command().unwrap();
+        // The reason is the rewrite's own refusal, or the length limit.
+        let expected = refusal.map_or(RefusalCode::RewrittenCommandTooLong, |r| r.code);
+        assert_eq!(whole.reason.code, expected, "{form:?}");
+        assert!(!whole.reason.code.kept());
+        assert_eq!(whole.command.value(), form.as_bytes());
+        assert!(!whole.variables.is_empty(), "{form:?}");
+        let tokens = placeholder_tokens(&whole.display);
+        assert!(!tokens.malformed && tokens.zero == 0, "{form:?}");
+        let k = whole.variables.len() as u32;
+        assert_eq!(tokens.distinct, (1..=k).collect::<Vec<_>>(), "{form:?}");
+        for (i, variable) in whole.variables.iter().enumerate() {
+            assert_eq!(variable.number() as usize, i + 1);
+        }
+        for secret in secrets {
+            assert!(!whole.display.contains(secret), "{form:?}");
+            assert!(!format!("{whole:?}").contains(secret), "{form:?}");
+            assert!(!whole.reason.to_string().contains(secret), "{form:?}");
+        }
+        reasons.push(whole.reason.code);
+    }
+    // Each SDU-12 refusal code except the kept ones is reached.
+    use RefusalCode::*;
+    for code in [
+        SecretSingleQuoted,
+        SecretAnsiQuoted,
+        SecretMixedQuoting,
+        SecretWithShellSyntax,
+        UnparsedCommand,
+        SecretInSubstitution,
+        SecretInInnerScript,
+        SecretInHeredoc,
+        TooManySecrets,
+        RewrittenCommandTooLong,
+    ] {
+        assert!(reasons.contains(&code), "{code:?} not reached");
+    }
+    // 17 values: numbers 1-17 in first-appearance order, displayed in place.
+    let whole = plan(rules(), &many).unwrap().whole_command().unwrap();
+    assert_eq!(whole.variables.len(), 17);
+    assert!(
+        whole
+            .display
+            .starts_with("tool --token $ASURA_SECRET_1 --token $ASURA_SECRET_2 ")
+    );
+    assert!(whole.display.ends_with(" --token $ASURA_SECRET_17"));
+    // Equal values share a number.
+    let twice = cat(&["echo '", &gh, "' '", &gh, "'"]);
+    let whole = plan(rules(), &twice).unwrap().whole_command().unwrap();
+    assert_eq!(whole.display, "echo '$ASURA_SECRET_1' '$ASURA_SECRET_1'");
+    assert_eq!(whole.variables.len(), 1);
+    assert_eq!(whole.variables[0].value(), gh.as_bytes());
+    // The kept refusals still refuse.
+    let kept = [
+        (
+            rewrite_exec_cmd_call_with(
+                Ok(rules()),
+                &cat(&["echo '", &gh, "' $ASURA_SECRET_1"]),
+                ".",
+            ),
+            PlaceholderNotAvailable,
+        ),
+        (
+            rewrite_exec_cmd_call_with(Ok(rules()), &cat(&["echo '", &gh, "'"]), &gh),
+            SecretInCwd,
+        ),
+        (
+            rewrite_exec_cmd_call_with(
+                Err(SelfCheckError::Digest),
+                &cat(&["echo '", &gh, "'"]),
+                ".",
+            ),
+            DetectionUnavailable,
+        ),
+    ];
+    for (result, code) in kept {
+        assert_eq!(result.unwrap_err().code, code);
+        assert!(code.kept());
+    }
+    // An ordinary command is unchanged and runs as itself.
+    let plain = rewrite_exec_cmd_call_with(Ok(rules()), "ls -la", ".").unwrap();
+    assert_eq!(plain.command(), "ls -la");
 }

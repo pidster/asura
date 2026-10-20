@@ -17,7 +17,7 @@ use asura_platform::{
         ExecCmdCleanup, ExecCmdError, ExecCmdFailure, ExecCmdJob, ExecCmdRequest, ExecCmdResult,
         PreparedExecCmd, StopReason, Tails, render_tail,
     },
-    secrets::SecretVariable,
+    secrets::{SecretCommand, SecretVariable},
 };
 use asura_storage::authority::conversation::{
     self as journal, CaptureReason, CaptureSettled, CaptureState, CaptureStream, ToolResult,
@@ -89,9 +89,11 @@ pub(crate) struct ExecCmdRun {
     pub operation: journal::Id,
     pub generation: u64,
     pub ordinal: u32,
-    /// The SL3 rewrite: the command that runs, its secrets in variables.
+    /// The SL3 rewrite, or the SL7 fixed `eval` text: the command that runs.
     pub command: String,
     pub cwd: String,
+    /// SL7: the line the model's result shows for a whole-command run.
+    pub filtered: Option<String>,
     pub job: journal::Id,
     pub stdout_payload: journal::Id,
     pub stderr_payload: journal::Id,
@@ -116,6 +118,7 @@ impl ExecCmdRun {
             ordinal: call.ordinal,
             command: command.clone(),
             cwd: cwd.clone(),
+            filtered: None,
             job: journal::exec_cmd_job_id(call.operation, call.generation, call.ordinal),
             stdout_payload: payload(asura_storage::payload::ObjectKind::Stdout),
             stderr_payload: payload(asura_storage::payload::ObjectKind::Stderr),
@@ -132,6 +135,8 @@ pub(crate) struct Dispatch {
     pub call: tools::Call,
     pub intent: ExecCmdRun,
     pub secrets: Vec<SecretVariable>,
+    /// SL7: the whole-command variable's value; then `secrets` is empty.
+    pub secret_command: Option<SecretCommand>,
     pub capture: capture_worker::Start,
 }
 
@@ -189,6 +194,7 @@ impl Worker {
             call,
             intent,
             secrets,
+            secret_command,
             capture,
         } = dispatch;
         let Arguments::ExecCmd {
@@ -232,6 +238,7 @@ impl Worker {
             command: intent.command.clone(),
             cwd: Some(intent.cwd.clone()),
             secrets,
+            secret_command,
         };
         let sink = handle.output_sink();
         let work = spawn("asura-exec-cmd-setup", self.wake.as_ref(), move |cancel| {
@@ -684,7 +691,7 @@ fn mapped_result(
         Some(StopReason::Cancelled | StopReason::LeaseEnded) => 6,
         None => 1,
     };
-    let text = result.render_text(tails, capture.as_str());
+    let text = with_filtered(intent, result.render_text(tails, capture.as_str()));
     if text.len() > 16_384 {
         return failed(intent, ExecCmdError::Protocol);
     }
@@ -714,9 +721,56 @@ pub(crate) fn failed(intent: &ExecCmdRun, error: ExecCmdError) -> ToolResult {
         generation: intent.generation,
         ordinal: intent.ordinal,
         status,
-        text: text.into(),
+        text: with_filtered(intent, text.into()),
         next_offset: None,
         truncated: false,
+    }
+}
+/// Display bytes the model's result shows for a whole-command run (SL7).
+/// With two 6,144-byte tails and the status line, a result stays below its
+/// 16,384-byte limit.
+const FILTERED_DISPLAY_BYTES: usize = 2048;
+/// The SL7 line beside the display text: `command filtered: run from a
+/// secret variable: <display>`. The display is cut at 2,048 bytes, never
+/// inside a placeholder, with `…` when cut; control characters become
+/// spaces so the line stays one line. It holds placeholders, never a value.
+pub(crate) fn filtered_line(display: &str) -> String {
+    let mut cut = display.len().min(FILTERED_DISPLAY_BYTES);
+    while !display.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // Never inside `$ASURA_SECRET_<n>`: a cut inside one backs up to its
+    // `$`, the last `$` before the cut.
+    if cut < display.len()
+        && let Some(at) = display[..cut].rfind('$')
+        && let Some(digits) = display[at..].strip_prefix("$ASURA_SECRET_")
+    {
+        let end =
+            at + "$ASURA_SECRET_".len() + digits.bytes().take_while(u8::is_ascii_digit).count();
+        if end > cut {
+            cut = at;
+        }
+    }
+    let mut line = format!("{}: ", asura_platform::secrets::WHOLE_COMMAND_NOTICE);
+    line.extend(
+        display[..cut]
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c }),
+    );
+    if cut < display.len() {
+        line.push('…');
+    }
+    line
+}
+/// Inserts the SL7 line after the result's first (status) line, which
+/// replay reads the exit code from.
+fn with_filtered(intent: &ExecCmdRun, text: String) -> String {
+    let Some(line) = &intent.filtered else {
+        return text;
+    };
+    match text.split_once('\n') {
+        Some((first, rest)) => format!("{first}\n{line}\n{rest}"),
+        None => format!("{text}\n{line}"),
     }
 }
 fn spawn<T: Send + 'static>(

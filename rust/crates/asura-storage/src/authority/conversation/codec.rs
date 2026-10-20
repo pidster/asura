@@ -658,7 +658,8 @@ impl ToolCall {
                     && rules
                     && (!exec
                         || (self.form == ArgumentForm::Canonical
-                            && self.number_kinds.len() <= MAX_EXEC_CMD_VARIABLES))
+                            && (self.whole_command
+                                || self.number_kinds.len() <= MAX_EXEC_CMD_VARIABLES)))
             }
             D::UnknownTool => named && received_text,
             D::Busy => exec && self.form == ArgumentForm::Canonical,
@@ -695,14 +696,21 @@ impl ToolCall {
                     && self.tool_operation.is_none()
                     && matches!(decision, D::Refused | D::Limit | D::Cancelled)
             };
+        // Fields 20-23 (SL7 amendment): bit 1 marks the whole-command
+        // variable, valid only with exec_cmd `run`, and then fields 21-23 hold
+        // the fallback reason, never a kept code. `refused` keeps only the
+        // kept codes; detection unavailable is recorded without fields.
         let refusal = match self.refusal {
-            None => !self.command_cut,
+            None => !self.command_cut && !self.whole_command,
             Some(r) => {
-                decision == D::Refused
-                    && exec
-                    && rules
+                exec && rules
                     && r.code != RefusalCode::DetectionUnavailable
                     && r.word.is_none_or(|w| (1..=MAX_REFUSAL_WORD).contains(&w))
+                    && if self.whole_command {
+                        decision == D::Run && !r.code.kept()
+                    } else {
+                        decision == D::Refused && r.code.kept()
+                    }
             }
         };
         // Placeholders (TCR-D4, TCR-D20): field 15 is the highest number in
@@ -756,7 +764,7 @@ fn tool_call_fields(w: &mut Writer, p: &ToolCall) {
     w.u32(p.unnumbered);
     w.u32(p.rule_set_revision);
     w.bytes(&p.rule_set_digest);
-    w.byte(u8::from(p.command_cut));
+    w.byte(u8::from(p.command_cut) | (u8::from(p.whole_command) << 1));
     w.byte(p.refusal.map_or(0, |r| refusal_code(r.code)));
     w.byte(p.refusal.and_then(|r| r.kind).map_or(0, kind_code));
     w.u16(p.refusal.and_then(|r| r.word).unwrap_or(0));
@@ -791,11 +799,10 @@ fn read_tool_call(r: &mut Reader<'_>) -> Result<ToolCall> {
     let unnumbered = r.u32()?;
     let rule_set_revision = r.u32()?;
     let rule_set_digest = r.array()?;
-    let command_cut = match r.byte()? {
-        0 => false,
-        1 => true,
-        _ => return Err(ReplayError::Corrupt),
-    };
+    let flags = r.byte()?;
+    require(flags & !0b11 == 0)?;
+    let command_cut = flags & 1 != 0;
+    let whole_command = flags & 2 != 0;
     let code = r.byte()?;
     let kind = match r.byte()? {
         0 => None,
@@ -834,6 +841,7 @@ fn read_tool_call(r: &mut Reader<'_>) -> Result<ToolCall> {
         rule_set_revision,
         rule_set_digest,
         command_cut,
+        whole_command,
         refusal,
     };
     value.validate()?;
@@ -1626,13 +1634,27 @@ mod tests {
             rule_set_revision: 1,
             rule_set_digest: [5; 32],
             command_cut: false,
+            whole_command: false,
             refusal: None,
         }
     }
     fn refused14() -> ToolCall {
         ToolCall {
             decision: ToolDecision::Refused,
-            arguments: "{\"command\":\"echo $ASURA_SECRET_1\"}".into(),
+            arguments: "{\"command\":\"ls\",\"cwd\":\"dir/$ASURA_SECRET_1\"}".into(),
+            refusal: Some(ExecCmdRefusal {
+                code: RefusalCode::SecretInCwd,
+                kind: Some(SecretKind::GithubToken),
+                word: None,
+            }),
+            ..run14()
+        }
+    }
+    /// SL7: a `run` exec_cmd through the whole-command variable.
+    fn whole14() -> ToolCall {
+        ToolCall {
+            arguments: "{\"command\":\"echo '$ASURA_SECRET_1'\"}".into(),
+            whole_command: true,
             refusal: Some(ExecCmdRefusal {
                 code: RefusalCode::SecretSingleQuoted,
                 kind: Some(SecretKind::GithubToken),
@@ -1685,6 +1707,37 @@ mod tests {
     fn tokens(count: usize) -> String {
         (1..=count).map(|n| format!("$ASURA_SECRET_{n} ")).collect()
     }
+    /// SL7 amendment: replay derives the fixed `eval` command and one secret
+    /// variable when field 20 bit 1 is set, whatever the stored numbers;
+    /// without it the stored command is the executable text and each number
+    /// is a variable.
+    #[test]
+    fn sl7_replay_derives_whole_command_and_one_variable() {
+        use super::super::state::exec_cmd_call;
+        let whole = exec_cmd_call([9; 16], &whole14(), 7);
+        assert_eq!(whole.fixed_command, Some(WHOLE_COMMAND));
+        assert_eq!(whole.fixed_command, Some("eval \"$ASURA_SECRET_COMMAND\""));
+        assert_eq!(whole.secret_variables, 1);
+        let many = ToolCall {
+            arguments: format!("{{\"command\":\"{}\"}}", tokens(17)),
+            number_kinds: vec![SecretKind::Jwt; 17],
+            ..whole14()
+        };
+        assert_eq!(exec_cmd_call([9; 16], &many, 7).secret_variables, 1);
+        let rewritten = exec_cmd_call([9; 16], &run14(), 7);
+        assert_eq!(
+            (rewritten.fixed_command, rewritten.secret_variables),
+            (None, 1)
+        );
+        let plain = ToolCall {
+            arguments: "{\"command\":\"ls\"}".into(),
+            number_kinds: vec![],
+            ..run14()
+        };
+        assert_eq!(exec_cmd_call([9; 16], &plain, 7).secret_variables, 0);
+        // The derived job and payload identities do not depend on bit 1.
+        assert_eq!(whole.job, exec_cmd_call([9; 16], &run14(), 7).job);
+    }
     /// TCR-U01: every field at each bound round trips through the real
     /// encoder and decoder.
     #[test]
@@ -1692,6 +1745,8 @@ mod tests {
         round14(run14());
         round14(refused14());
         round14(invalid14());
+        let bytes = round14(whole14());
+        assert_eq!(bytes[bytes.len() - 5], 2, "field 20 bit 1");
         // Every recorded ordinal round trips with any decision (owner, 2026-10-18).
         for ordinal in 1..=MAX_RECORDED_CALLS {
             round14(ToolCall { ordinal, ..run14() });
@@ -1807,15 +1862,36 @@ mod tests {
             rule_set_digest: [0; 32],
             ..run14()
         });
-        // Refusal bounds and the cut flag.
+        // Refusal bounds and the cut flag, refused and whole-command.
         round14(ToolCall {
+            command_cut: true,
+            refusal: Some(ExecCmdRefusal {
+                code: RefusalCode::PlaceholderNotAvailable,
+                kind: None,
+                word: Some(4096),
+            }),
+            ..refused14()
+        });
+        let bytes = round14(ToolCall {
             command_cut: true,
             refusal: Some(ExecCmdRefusal {
                 code: RefusalCode::RewrittenCommandTooLong,
                 kind: None,
                 word: Some(4096),
             }),
-            ..refused14()
+            ..whole14()
+        });
+        assert_eq!(bytes[bytes.len() - 5], 3, "field 20 bits 0 and 1");
+        // A whole-command run may hold more than 16 numbers (SO5).
+        round14(ToolCall {
+            arguments: format!("{{\"command\":\"{}\"}}", tokens(17)),
+            number_kinds: vec![SecretKind::Jwt; 17],
+            refusal: Some(ExecCmdRefusal {
+                code: RefusalCode::TooManySecrets,
+                kind: None,
+                word: None,
+            }),
+            ..whole14()
         });
         // Numbers: 256 numbered placeholders and unnumbered tokens.
         let text = format!(
@@ -1993,6 +2069,57 @@ mod tests {
                 command_cut: true,
                 ..run14()
             },
+            // SL7: bit 1 only with exec_cmd `run` and a fallback reason that
+            // is not a kept code; `refused` only with a kept code.
+            ToolCall {
+                decision: ToolDecision::Refused,
+                ..whole14()
+            },
+            ToolCall {
+                decision: ToolDecision::Busy,
+                busy: Some(ExecCmdBusyReason::Quota),
+                ..whole14()
+            },
+            ToolCall {
+                decision: ToolDecision::Denied,
+                ..whole14()
+            },
+            ToolCall {
+                decision: ToolDecision::Cancelled,
+                ..whole14()
+            },
+            ToolCall {
+                refusal: None,
+                ..whole14()
+            },
+            ToolCall {
+                refusal: refused14().refusal,
+                ..whole14()
+            },
+            ToolCall {
+                refusal: Some(ExecCmdRefusal {
+                    code: RefusalCode::PlaceholderNotAvailable,
+                    kind: None,
+                    word: None,
+                }),
+                ..whole14()
+            },
+            ToolCall {
+                name: "project".into(),
+                name_bytes: 7,
+                tool_operation: Some(ToolOperation::ReadFile),
+                form: ArgumentForm::Verbatim,
+                ..whole14()
+            },
+            ToolCall {
+                whole_command: true,
+                refusal: None,
+                ..run14()
+            },
+            ToolCall {
+                refusal: whole14().refusal,
+                ..refused14()
+            },
             // Placeholder counts (TCR-D4, TCR-D20).
             ToolCall {
                 number_kinds: vec![],
@@ -2053,7 +2180,13 @@ mod tests {
         assert_eq!(decode_record(14, &bytes), Err(ReplayError::Corrupt));
         // Bad number kind, flag, refusal and trailing bytes.
         let kinds = 59 + run14().arguments.len() + 2;
-        for (offset, value) in [(kinds, 0), (kinds, 34), (base.len() - 5, 2)] {
+        for (offset, value) in [
+            (kinds, 0),
+            (kinds, 34),
+            (base.len() - 5, 2),
+            (base.len() - 5, 4),
+            (base.len() - 5, 255),
+        ] {
             let mut bytes = base.clone();
             bytes[offset] = value;
             assert_eq!(decode_record(14, &bytes), Err(ReplayError::Corrupt));
@@ -2807,16 +2940,22 @@ mod tests {
             assert_eq!(REFUSALS[index], variant);
             // The stored byte, through the real encoder (kind 14 field 21).
             // Detection unavailable never appears as a kind 14 refusal code.
+            // A kept code is a refusal; every other code is the fallback
+            // reason of a whole-command run (SL7).
             if variant != RefusalCode::DetectionUnavailable {
-                let bytes = round14(ToolCall {
-                    refusal: Some(ExecCmdRefusal {
-                        code: variant,
-                        kind: None,
-                        word: None,
-                    }),
-                    ..refused14()
+                let refusal = Some(ExecCmdRefusal {
+                    code: variant,
+                    kind: None,
+                    word: None,
                 });
+                let (record, wrong) = if variant.kept() {
+                    (refused14(), whole14())
+                } else {
+                    (whole14(), refused14())
+                };
+                let bytes = round14(ToolCall { refusal, ..record });
                 assert_eq!(bytes[bytes.len() - 4], code);
+                invalid14_record(ToolCall { refusal, ..wrong });
             }
         }
         for code in [0, 15, 255] {

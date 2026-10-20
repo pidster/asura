@@ -1027,6 +1027,7 @@ fn memory_create_recovery_retains_intent_and_resolves_without_repeating_write() 
                     rule_set_revision: 1,
                     rule_set_digest: [21; 32],
                     command_cut: false,
+                    whole_command: false,
                     refusal: None,
                 })),
                 admission: None,
@@ -1707,10 +1708,11 @@ fn j1_call(ordinal: u32, decision: ToolDecision) -> ToolCall {
         rule_set_revision: 1,
         rule_set_digest: [39; 32],
         command_cut: !run,
+        whole_command: false,
         refusal: (!run).then_some(ExecCmdRefusal {
-            code: RefusalCode::SecretSingleQuoted,
+            code: RefusalCode::SecretInCwd,
             kind: Some(SecretKind::GithubToken),
-            word: Some(3),
+            word: None,
         }),
     }
 }
@@ -1728,6 +1730,7 @@ fn j1_status(decision: ToolDecision) -> Record {
         arguments: arguments.into(),
         number_kinds: Vec::new(),
         command_cut: false,
+        whole_command: false,
         refusal: None,
         ..j1_call(1, ToolDecision::Run)
     }))
@@ -1788,11 +1791,23 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     };
     // The refused call is complete at its kind 14 (TCR-R5).
     let refused = j1_call(2, ToolDecision::Refused);
+    // SL7: a whole-command run holds its display text and fallback reason.
+    let whole = ToolCall {
+        arguments: "{\"command\":\"printf %s '$ASURA_SECRET_1'\",\"cwd\":\".\"}".into(),
+        whole_command: true,
+        refusal: Some(ExecCmdRefusal {
+            code: RefusalCode::SecretSingleQuoted,
+            kind: Some(SecretKind::GithubToken),
+            word: Some(3),
+        }),
+        ..j1_call(3, ToolDecision::Run)
+    };
     for record in [
         Record::ToolCall(Box::new(call.clone())),
         Record::CaptureSettled(Box::new(settled.clone())),
         Record::ToolResult(result),
         Record::ToolCall(Box::new(refused.clone())),
+        Record::ToolCall(Box::new(whole.clone())),
     ] {
         submit(&mut writer, &mut revision, record).unwrap();
     }
@@ -1800,9 +1815,19 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     // The journal on disk replays with both calls and the derived identities.
     let durable = journal_replay(&scratch);
     let tools = &durable.operations[&[35; 16]].tools;
-    assert_eq!(tools.len(), 2);
+    assert_eq!(tools.len(), 3);
     let derived = tools[0].exec_cmd.as_deref().unwrap();
     assert_eq!(derived.job, exec_cmd_job_id([35; 16], 1, 1));
+    // The stored command is the executable text; one variable per number.
+    assert_eq!((derived.fixed_command, derived.secret_variables), (None, 1));
+    // SL7 amendment: bit 1 derives the fixed command and one variable.
+    let derived_whole = tools[2].exec_cmd.as_deref().unwrap();
+    assert!(tools[2].whole_command && !tools[0].whole_command);
+    assert_eq!(
+        (derived_whole.fixed_command, derived_whole.secret_variables),
+        (Some(WHOLE_COMMAND), 1)
+    );
+    assert_eq!(derived_whole.job, exec_cmd_job_id([35; 16], 1, 3));
     assert_eq!(
         derived.stdout_payload,
         payload_id(installation, [35; 16], 1, 1, ObjectKind::Stdout)
@@ -1824,6 +1849,7 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     let intent_frame = tools[0].intent_frame;
     let settled_frame = settlement.frame;
     let refused_frame = tools[1].intent_frame;
+    let whole_frame = tools[2].intent_frame;
     // A restarted writer reopens the journal and reads each record back.
     let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
     let reopened = wait(&mut writer.try_submit(Command::Open).unwrap())
@@ -1844,6 +1870,7 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
         (intent_frame, 14, Record::ToolCall(Box::new(call))),
         (settled_frame, 23, Record::CaptureSettled(Box::new(settled))),
         (refused_frame, 14, Record::ToolCall(Box::new(refused))),
+        (whole_frame, 14, Record::ToolCall(Box::new(whole))),
     ] {
         assert_eq!(range.segment, 1);
         let frame = &bytes[range.range()];

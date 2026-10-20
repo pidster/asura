@@ -116,6 +116,10 @@ impl Activity {
                         Some(fault) => text.push_str(&format!("\n    · {decision}: {fault}")),
                         None => text.push_str(&format!("\n    · {decision}")),
                     }
+                    // SL7: the arguments above are the filtered display text.
+                    if tool.command_filtered == Some(true) {
+                        text.push_str(" · command filtered: run from a secret variable");
+                    }
                 }
                 if tool.state == Some(3) {
                     text.push_str(&format!(
@@ -650,6 +654,44 @@ mod tests {
         assert!(!display.contains('\u{1b}'));
         assert!(display.len() < 700);
         assert_eq!(grouped_count(u64::MAX), "18,446,744,073,709,551,615");
+    }
+    /// SL7 view: a call that ran from the whole-command variable says
+    /// `command filtered: run from a secret variable` beside its display
+    /// text; an ordinary admitted call does not.
+    #[test]
+    fn whole_command_call_says_filtered_beside_display_text() {
+        let filtered = pb::ToolProgress {
+            ordinal: Some(1),
+            name: Some("exec_cmd".into()),
+            state: Some(2),
+            status: Some(1),
+            arguments: Some(
+                r#"{"command":"printf %s '$ASURA_SECRET_1' | shasum -a 256","cwd":"."}"#.into(),
+            ),
+            policy_decision: Some(1),
+            command_filtered: Some(true),
+            ..Default::default()
+        };
+        let plain = pb::ToolProgress {
+            ordinal: Some(2),
+            command_filtered: None,
+            arguments: Some(r#"{"command":"ls","cwd":"."}"#.into()),
+            ..filtered.clone()
+        };
+        let activity = Activity {
+            tools: vec![filtered, plain],
+            expanded: true,
+            kind: 3,
+            ..Default::default()
+        };
+        let display = activity.display();
+        assert!(
+            display.contains(
+                "printf %s '$ASURA_SECRET_1' | shasum -a 256\",\"cwd\":\".\"}\n    · service admitted · command filtered: run from a secret variable\n"
+            ),
+            "{display}"
+        );
+        assert_eq!(display.matches("command filtered").count(), 1, "{display}");
     }
     /// TCR-D13 / TCR-E01 view: a rejected call shows its decision and fault;
     /// a text that was not retained shows only its size and reason; a name

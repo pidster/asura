@@ -8,6 +8,7 @@ fn intent() -> ExecCmdRun {
         ordinal: 1,
         command: "true".into(),
         cwd: ".".into(),
+        filtered: None,
         job: [2; 16],
         stdout_payload: [3; 16],
         stderr_payload: [4; 16],
@@ -210,4 +211,68 @@ fn settled_setup_failures_never_become_successful_command_results() {
         mapped_result(&intent(), &result, &tails, CaptureState::Complete).status,
         6
     );
+}
+
+/// SL7: a whole-command run's result says it was filtered beside the display
+/// text, after the status line that replay reads the exit code from; the
+/// display is cut at 2,048 bytes before a placeholder and stays one line.
+#[test]
+fn sl7_whole_command_result_says_filtered_beside_display() {
+    assert_eq!(
+        filtered_line("echo '$ASURA_SECRET_1'\nls"),
+        "command filtered: run from a secret variable: echo '$ASURA_SECRET_1' ls"
+    );
+    let long = format!("{}$ASURA_SECRET_12 tail", "x".repeat(2040));
+    let line = filtered_line(&long);
+    assert_eq!(
+        line,
+        format!(
+            "command filtered: run from a secret variable: {}…",
+            "x".repeat(2040)
+        )
+    );
+    let fits = format!("{}$ASURA_SECRET_1 tail", "x".repeat(2048 - 15));
+    assert!(filtered_line(&fits).ends_with("$ASURA_SECRET_1…"));
+    let wide = "é".repeat(1100);
+    assert!(filtered_line(&wide).ends_with('…'));
+    let mut run = intent();
+    run.filtered = Some(filtered_line("echo '$ASURA_SECRET_1'"));
+    let process = ExecCmdResult {
+        failure: None,
+        exit_code: Some(3),
+        signal: None,
+        reason: None,
+        cleanup_confirmed: true,
+    };
+    let tails = Tails {
+        stdout: "$ASURA_SECRET_1\n".into(),
+        stderr: String::new(),
+        truncated: false,
+    };
+    let result = mapped_result(&run, &process, &tails, CaptureState::Complete);
+    let mut lines = result.text.lines();
+    assert!(lines.next().unwrap().contains("exit_code=3"));
+    assert_eq!(
+        lines.next(),
+        Some("command filtered: run from a secret variable: echo '$ASURA_SECRET_1'")
+    );
+    assert!(result.text.contains("\nstdout:\n$ASURA_SECRET_1\n"));
+    let failed = failed(&run, ExecCmdError::Unavailable);
+    assert_eq!(
+        failed.text,
+        "exec_cmd_unavailable\ncommand filtered: run from a secret variable: echo '$ASURA_SECRET_1'"
+    );
+    // The largest tails and display still fit the 16,384-byte result.
+    let big = Tails {
+        stdout: "o".repeat(6144),
+        stderr: "e".repeat(6144),
+        truncated: true,
+    };
+    run.filtered = Some(filtered_line(&"d".repeat(8192)));
+    let result = mapped_result(&run, &process, &big, CaptureState::Complete);
+    assert_eq!(result.status, 1);
+    assert!(result.text.len() <= 16_384);
+    // An ordinary run is unchanged.
+    let plain = mapped_result(&intent(), &process, &tails, CaptureState::Complete);
+    assert!(!plain.text.contains("command filtered"));
 }

@@ -284,6 +284,10 @@ pub(super) fn valid(body: &Body) -> bool {
                         // Kind 14 decision and fault codes (TCR-D13).
                         && tool.policy_decision.is_none_or(|n| (1..=8).contains(&n))
                         && tool.fault.is_none_or(|n| (1..=15).contains(&n))
+                        // SL7: set only, and only true, on an admitted call.
+                        && tool.command_filtered.is_none_or(|filtered| {
+                            filtered && tool.policy_decision == Some(1)
+                        })
                         && tool.result_bytes.is_none_or(|n| n <= 65_536)
                         && tool.ordinal
                             == v.tools[0].ordinal.map(|first| first + index as u32)
@@ -976,7 +980,8 @@ mod tests {
                     status: Some(1),
                     arguments: Some("a".repeat(192)),
                     preview: Some("a".repeat(128)),
-                    policy_decision: Some(8),
+                    policy_decision: Some(1),
+                    command_filtered: Some(true),
                     elapsed_ms: Some(u64::MAX),
                     result_bytes: Some(65536),
                     truncated: Some(true),
@@ -1007,6 +1012,19 @@ mod tests {
             v.tools[0].arguments = Some("a".repeat(193));
         }
         assert!(!valid(invalid.body.as_ref().unwrap()));
+        // SL7: the filtered mark is only `true`, only on an admitted call.
+        for (decision, filtered) in [
+            (Some(1), Some(false)),
+            (Some(4), Some(true)),
+            (None, Some(true)),
+        ] {
+            let mut invalid = message.clone();
+            if let Some(Body::ConversationEvent(v)) = invalid.body.as_mut() {
+                v.tools[0].policy_decision = decision;
+                v.tools[0].command_filtered = filtered;
+            }
+            assert!(!valid(invalid.body.as_ref().unwrap()), "{decision:?}");
+        }
         // TCR-U19: more entries, a gap, a first ordinal of 0 or an ordinal past
         // the over-limit ordinal are rejected; a window starting at 1 passes.
         let tools = |event: &pb::Envelope| match event.body.as_ref() {

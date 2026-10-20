@@ -85,7 +85,10 @@ fn hex(id: Id) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn rewritten(command: &str) -> (String, Vec<SecretVariable>) {
-    let rewrite = rewrite_exec_cmd_call(command, ".").unwrap_or_else(|r| panic!("{r}"));
+    let rewrite = rewrite_exec_cmd_call(command, ".")
+        .unwrap_or_else(|r| panic!("{r}"))
+        .rewritten()
+        .expect("a rewrite");
     (rewrite.command, rewrite.variables)
 }
 /// Fixture secrets assembled at run time, so no token is committed.

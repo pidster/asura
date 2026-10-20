@@ -7,6 +7,7 @@ fn request() -> ExecCmdRequest {
         command: "printf ok".into(),
         cwd: None,
         secrets: Vec::new(),
+        secret_command: None,
     }
 }
 #[test]
@@ -58,12 +59,44 @@ fn secret_variables_reject_numbers_duplicates_nul_and_size() {
         SecretVariable::for_test(1, b""),
     ];
     assert!(validate(&r).is_ok(), "numbers need not be contiguous");
-    let environment = secret_environment(&r.secrets);
+    let environment = secret_environment(&r.secrets, None);
     let entries: Vec<&[u8]> = environment.iter().map(|e| e.as_slice()).collect();
     assert_eq!(
         entries,
         [&b"ASURA_SECRET_3=a b\n$c"[..], &b"ASURA_SECRET_1="[..]]
     );
+}
+/// SDU-17 (request half): `ASURA_SECRET_COMMAND` alone with 1–8192 bytes and
+/// the fixed `eval` command is accepted; beside any numbered variable,
+/// empty, with a NUL, over 8192 bytes or with another command it refuses.
+#[test]
+fn sdu_17_whole_command_variable_request_validation() {
+    use crate::secrets::rewrite::WHOLE_COMMAND;
+    let mut r = request();
+    r.command = WHOLE_COMMAND.into();
+    r.secret_command = Some(SecretCommand::new(b"echo 'x'"));
+    assert!(validate(&r).is_ok());
+    let environment = secret_environment(&r.secrets, r.secret_command.as_ref());
+    let entries: Vec<&[u8]> = environment.iter().map(|e| e.as_slice()).collect();
+    assert_eq!(entries, [&b"ASURA_SECRET_COMMAND=echo 'x'"[..]]);
+    r.secret_command = Some(SecretCommand::new(&[b'v'; 8192]));
+    assert!(validate(&r).is_ok(), "8192 bytes");
+    for (label, value) in [
+        ("8193 bytes", vec![b'v'; 8193]),
+        ("empty", Vec::new()),
+        ("NUL", b"a\0b".to_vec()),
+    ] {
+        r.secret_command = Some(SecretCommand::new(&value));
+        assert_eq!(validate(&r), Err(ExecCmdError::Invalid), "{label}");
+    }
+    r.secret_command = Some(SecretCommand::new(b"echo 'x'"));
+    for n in [1, 16] {
+        r.secrets = vec![SecretVariable::for_test(n, b"value")];
+        assert_eq!(validate(&r), Err(ExecCmdError::Invalid), "numbered {n}");
+    }
+    r.secrets.clear();
+    r.command = "printf ok".into();
+    assert_eq!(validate(&r), Err(ExecCmdError::Invalid), "other command");
 }
 #[test]
 fn notices_reject_identity_reserved_and_invalid_outcomes() {

@@ -2138,6 +2138,12 @@ pub(crate) fn exec_cmd_call(installation: Id, p: &ToolCall, sequence: u64) -> Bo
     let payload =
         |kind| crate::payload::payload_id(installation, p.operation, p.generation, p.ordinal, kind);
     Box::new(ExecCmdCall {
+        fixed_command: p.whole_command.then_some(WHOLE_COMMAND),
+        secret_variables: if p.whole_command {
+            1
+        } else {
+            p.number_kinds.len() as u16
+        },
         job: exec_cmd_job_id(p.operation, p.generation, p.ordinal),
         stdout_payload: payload(crate::payload::ObjectKind::Stdout),
         stderr_payload: payload(crate::payload::ObjectKind::Stderr),
@@ -2172,6 +2178,7 @@ pub(crate) fn tool_record(
         fault: p.fault,
         busy: p.busy,
         refusal: p.refusal,
+        whole_command: p.whole_command,
         form: p.form,
         arguments_bytes: p.arguments_bytes,
         result_status: None,

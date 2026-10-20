@@ -1,6 +1,6 @@
 use super::{ExecCmdError, MAX_COMMAND_BYTES, protocol::Notice, spawn};
 use crate::runtime::{open_at, stat_fd};
-use crate::secrets::rewrite::MAX_SECRET_VARIABLES;
+use crate::secrets::rewrite::{MAX_SECRET_VARIABLES, SECRET_COMMAND_NAME, WHOLE_COMMAND};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -14,17 +14,34 @@ const CF_TEXT_ENCODING: &[u8] = b"__CF_USER_TEXT_ENCODING=";
 /// the `sh -c` script is at most the 8192-byte command plus this.
 const PREAMBLE_LIMIT: usize = 1280;
 
+/// A secret variable's name: `ASURA_SECRET_<n>`, or the whole-command
+/// variable `ASURA_SECRET_COMMAND` (SO5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum SecretName {
+    Numbered(u8),
+    Command,
+}
+impl std::fmt::Display for SecretName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Numbered(n) => write!(f, "ASURA_SECRET_{n}"),
+            Self::Command => f.write_str(SECRET_COMMAND_NAME),
+        }
+    }
+}
 /// One validated secret variable from the guardian's own environment: its
-/// number and the whole `ASURA_SECRET_<n>=<value>` entry, zeroed on drop.
+/// name and the whole `<name>=<value>` entry, zeroed on drop.
 struct SecretEntry {
-    number: u8,
+    name: SecretName,
     entry: Zeroizing<Vec<u8>>,
 }
 
-/// Validate the guardian's environment (SDU-13). Every entry must be
+/// Validate the guardian's environment (SDU-13, SDU-17). Every entry must be
 /// `ASURA_SECRET_<n>=<value>` with a canonical decimal n of 1–16, no number
-/// twice, no NUL, and at most 8192 value bytes in total. Any other entry
-/// refuses the whole set. Returns the entries ordered by number.
+/// twice, no NUL, and at most 8192 value bytes in total; or the single entry
+/// `ASURA_SECRET_COMMAND=<value>` with 1–8192 value bytes and no other
+/// secret variable. Any other entry refuses the whole set. Returns the
+/// entries ordered by number.
 fn secret_environment<'a>(
     entries: impl IntoIterator<Item = &'a [u8]>,
 ) -> Result<Vec<SecretEntry>, ExecCmdError> {
@@ -42,20 +59,32 @@ fn secret_environment<'a>(
             .position(|b| *b == b'=')
             .ok_or(ExecCmdError::Invalid)?;
         let (name, value) = (&entry[..split], &entry[split + 1..]);
-        let digits = name
-            .strip_prefix(SECRET_PREFIX)
-            .ok_or(ExecCmdError::Invalid)?;
-        if digits.is_empty()
-            || digits.len() > 2
-            || digits[0] == b'0'
-            || !digits.iter().all(u8::is_ascii_digit)
-        {
-            return Err(ExecCmdError::Invalid);
-        }
-        let number = digits.iter().fold(0u8, |n, d| n * 10 + (d - b'0'));
-        if usize::from(number) > MAX_SECRET_VARIABLES
-            || accepted.iter().any(|seen| seen.number == number)
-        {
+        let name = if name == SECRET_COMMAND_NAME.as_bytes() {
+            if value.is_empty() {
+                return Err(ExecCmdError::Invalid);
+            }
+            SecretName::Command
+        } else {
+            let digits = name
+                .strip_prefix(SECRET_PREFIX)
+                .ok_or(ExecCmdError::Invalid)?;
+            if digits.is_empty()
+                || digits.len() > 2
+                || digits[0] == b'0'
+                || !digits.iter().all(u8::is_ascii_digit)
+            {
+                return Err(ExecCmdError::Invalid);
+            }
+            let number = digits.iter().fold(0u8, |n, d| n * 10 + (d - b'0'));
+            if usize::from(number) > MAX_SECRET_VARIABLES {
+                return Err(ExecCmdError::Invalid);
+            }
+            SecretName::Numbered(number)
+        };
+        // The whole-command variable is accepted only alone (SO5).
+        if accepted.iter().any(|seen| {
+            seen.name == name || seen.name == SecretName::Command || name == SecretName::Command
+        }) {
             return Err(ExecCmdError::Invalid);
         }
         total += value.len();
@@ -63,11 +92,11 @@ fn secret_environment<'a>(
             return Err(ExecCmdError::Invalid);
         }
         accepted.push(SecretEntry {
-            number,
+            name,
             entry: Zeroizing::new(entry.to_vec()),
         });
     }
-    accepted.sort_by_key(|secret| secret.number);
+    accepted.sort_by_key(|secret| secret.name);
     Ok(accepted)
 }
 
@@ -125,12 +154,13 @@ fn own_secret_environment() -> Result<Vec<SecretEntry>, ExecCmdError> {
 /// is exported; `unset` and reassignment leave an ordinary shell variable with
 /// the same value, which the command expands but children do not inherit.
 /// Assignment does no field splitting or globbing, so the value is exact. The
-/// text holds names only.
-fn preamble(numbers: impl IntoIterator<Item = u8>) -> String {
+/// text holds names only. It covers `ASURA_SECRET_COMMAND` the same way, so
+/// `eval` reads an unexported variable (SO5).
+fn preamble(names: impl IntoIterator<Item = SecretName>) -> String {
     let mut text = String::new();
-    for n in numbers {
+    for name in names {
         text.push_str(&format!(
-            "__asura_t=$ASURA_SECRET_{n}; unset ASURA_SECRET_{n}; ASURA_SECRET_{n}=$__asura_t; "
+            "__asura_t=${name}; unset {name}; {name}=$__asura_t; "
         ));
     }
     if !text.is_empty() {
@@ -319,6 +349,10 @@ fn guardian(jobhex: &str, command: &str) -> Result<(), ExecCmdError> {
     }
     let setup = (|| {
         let secrets = own_secret_environment()?;
+        // The whole-command variable runs only the fixed `eval` text.
+        if secrets.iter().any(|s| s.name == SecretName::Command) && command != WHOLE_COMMAND {
+            return Err(ExecCmdError::Invalid);
+        }
         let project = pinned_path(7)?;
         let cwd = pinned_path(8)?;
         let scratch = pinned_path(9)?;
@@ -337,7 +371,7 @@ fn guardian(jobhex: &str, command: &str) -> Result<(), ExecCmdError> {
         // the script is bounded by the command limit plus PREAMBLE_LIMIT.
         let script = format!(
             "{}{command}",
-            preamble(secrets.iter().map(|secret| secret.number))
+            preamble(secrets.iter().map(|secret| secret.name))
         );
         if script.len() > MAX_COMMAND_BYTES + PREAMBLE_LIMIT {
             return Err(ExecCmdError::Invalid);
@@ -582,8 +616,56 @@ mod tests {
         assert!(quoted.contains("(subpath \"/h/.as\\\"ura\")"));
     }
     fn numbers(entries: &[&[u8]]) -> Result<Vec<u8>, ExecCmdError> {
-        secret_environment(entries.iter().copied())
-            .map(|accepted| accepted.iter().map(|s| s.number).collect())
+        secret_environment(entries.iter().copied()).map(|accepted| {
+            accepted
+                .iter()
+                .map(|s| match s.name {
+                    SecretName::Numbered(n) => n,
+                    SecretName::Command => 0,
+                })
+                .collect()
+        })
+    }
+    /// SDU-17 (guardian half): `ASURA_SECRET_COMMAND` is accepted alone with
+    /// 1–8192 bytes; beside any numbered variable, twice, empty, with a NUL
+    /// or over 8192 bytes it refuses the set.
+    #[test]
+    fn sdu_17_whole_command_variable_only_alone_and_bounded() {
+        let entry = |value: &[u8]| {
+            let mut e = format!("{SECRET_COMMAND_NAME}=").into_bytes();
+            e.extend_from_slice(value);
+            e
+        };
+        let one = entry(b"echo 'x' | tr x y");
+        let max = entry(&[b'v'; 8192]);
+        let over = entry(&[b'v'; 8193]);
+        let empty = entry(b"");
+        let nul = entry(b"a\0b");
+        assert_eq!(numbers(&[&one]), Ok(vec![0]));
+        assert_eq!(
+            numbers(&[&b"__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x0"[..], &max]),
+            Ok(vec![0]),
+            "8192 bytes"
+        );
+        for (label, entries) in [
+            ("8193 bytes", vec![over.as_slice()]),
+            ("empty", vec![empty.as_slice()]),
+            ("NUL", vec![nul.as_slice()]),
+            ("twice", vec![one.as_slice(), one.as_slice()]),
+            ("numbered after", vec![one.as_slice(), b"ASURA_SECRET_1=a"]),
+            (
+                "numbered before",
+                vec![&b"ASURA_SECRET_16=a"[..], one.as_slice()],
+            ),
+            (
+                "numbered empty",
+                vec![&b"ASURA_SECRET_2="[..], one.as_slice()],
+            ),
+            ("lower case", vec![&b"asura_secret_command=a"[..]]),
+            ("suffix", vec![&b"ASURA_SECRET_COMMANDS=a"[..]]),
+        ] {
+            assert_eq!(numbers(&entries), Err(ExecCmdError::Invalid), "{label}");
+        }
     }
     /// SDU-13: each refusal becomes the setup failure notice in `guardian`.
     #[test]
@@ -658,14 +740,21 @@ mod tests {
     }
     #[test]
     fn preamble_holds_names_only_and_is_bounded() {
+        use SecretName::{Command, Numbered};
         assert_eq!(preamble([]), "");
         assert_eq!(
-            preamble([1, 12]),
+            preamble([Command]),
+            "__asura_t=$ASURA_SECRET_COMMAND; unset ASURA_SECRET_COMMAND; \
+             ASURA_SECRET_COMMAND=$__asura_t; unset __asura_t; "
+        );
+        assert!(preamble([Command]).len() <= PREAMBLE_LIMIT);
+        assert_eq!(
+            preamble([Numbered(1), Numbered(12)]),
             "__asura_t=$ASURA_SECRET_1; unset ASURA_SECRET_1; ASURA_SECRET_1=$__asura_t; \
              __asura_t=$ASURA_SECRET_12; unset ASURA_SECRET_12; ASURA_SECRET_12=$__asura_t; \
              unset __asura_t; "
         );
-        let longest = preamble(1..=16);
+        let longest = preamble((1..=16).map(Numbered));
         assert_eq!(longest.len(), 1254);
         assert!(longest.len() <= PREAMBLE_LIMIT);
         assert!(!longest.contains('\n'), "the command keeps its first line");

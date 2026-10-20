@@ -16,8 +16,9 @@ pub use arguments::{
     WITHHELD_TEXT, placeholder_tokens, redact_arguments,
 };
 pub use rewrite::{
-    MAX_REWRITTEN_COMMAND_BYTES, Refusal, RefusalCode, Rewrite, SecretVariable, display_redacted,
-    rewrite_command, rewrite_exec_cmd_call,
+    MAX_REWRITTEN_COMMAND_BYTES, MAX_WHOLE_COMMAND_NUMBERS, Plan, Refusal, RefusalCode, Rewrite,
+    SECRET_COMMAND_NAME, SecretCommand, SecretVariable, WHOLE_COMMAND, WHOLE_COMMAND_NOTICE,
+    WholeCommand, display_redacted, rewrite_command, rewrite_exec_cmd_call,
 };
 pub use rules::{RULE_SET_DIGEST, RULE_SET_REVISION, RuleSet, SelfCheckError};
 pub use stream::{

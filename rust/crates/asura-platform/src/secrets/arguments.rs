@@ -38,6 +38,14 @@ pub enum ExecCmdCommand<'a> {
     /// SL3 refused: the raw value is display-redacted with the shared map,
     /// then cut at 8,192 bytes without splitting a placeholder.
     Refused,
+    /// SL7 whole-command variable: the rewrite's display text replaces the
+    /// value verbatim, cut like a refused command. Its variables seed the
+    /// value set; numbering then follows first appearance (TCR-D22), which
+    /// keeps the display's numbers.
+    WholeCommand {
+        display: &'a str,
+        variables: &'a [SecretVariable],
+    },
 }
 
 pub struct ArgumentsInput<'a> {
@@ -78,7 +86,7 @@ pub struct RedactedArguments {
     pub number_kinds: Vec<SecretKind>,
     /// Number-0 tokens in the stored name and text.
     pub unnumbered: u32,
-    /// A refused exec_cmd command was cut at 8,192 bytes.
+    /// A refused or whole-command exec_cmd command was cut at 8,192 bytes.
     pub command_cut: bool,
 }
 
@@ -376,17 +384,14 @@ impl Emit<'_, '_> {
         let Some((mut text, inserted)) = self.redactor.redact(s, numbers, true) else {
             return WITHHELD_TEXT.into();
         };
-        if text.len() > MAX_REFUSED_COMMAND_BYTES {
-            let mut cut = MAX_REFUSED_COMMAND_BYTES;
-            while !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            if let Some(range) = inserted.iter().find(|r| r.start < cut && cut < r.end) {
-                cut = range.start;
-            }
-            text.truncate(cut);
-            self.command_cut = true;
-        }
+        self.command_cut |= cut_command(&mut text, &inserted);
+        text
+    }
+    /// The whole-command display text, verbatim, cut like a refused command.
+    fn display(&mut self, display: &str) -> String {
+        let mut text = display.to_owned();
+        let placeholders = placeholder_ranges(&text);
+        self.command_cut |= cut_command(&mut text, &placeholders);
         text
     }
     fn value(&mut self, value: &Value, numbers: &mut Numbers, top: bool) -> Value {
@@ -412,6 +417,12 @@ impl Emit<'_, '_> {
                         (true, "command", Value::String(s), Some(ExecCmdCommand::Refused)) => {
                             Value::String(self.command(s, numbers))
                         }
+                        (
+                            true,
+                            "command",
+                            Value::String(_),
+                            Some(ExecCmdCommand::WholeCommand { display, .. }),
+                        ) => Value::String(self.display(display)),
                         _ => self.value(item, numbers, false),
                     };
                     out.push((key_out, item_out));
@@ -421,6 +432,44 @@ impl Emit<'_, '_> {
             other => other.clone(),
         }
     }
+}
+
+/// Cuts a command at 8,192 bytes on a character boundary, never inside a
+/// placeholder. Returns whether it cut.
+fn cut_command(text: &mut String, placeholders: &[Range<usize>]) -> bool {
+    if text.len() <= MAX_REFUSED_COMMAND_BYTES {
+        return false;
+    }
+    let mut cut = MAX_REFUSED_COMMAND_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if let Some(range) = placeholders.iter().find(|r| r.start < cut && cut < r.end) {
+        cut = range.start;
+    }
+    text.truncate(cut);
+    true
+}
+/// Byte ranges of the `$ASURA_SECRET_<n>` and `${ASURA_SECRET_<n>` tokens.
+fn placeholder_ranges(text: &str) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    tokens(text)
+        .into_iter()
+        .map(|token| {
+            let at = token.digits.start - TOKEN.len();
+            let start = if at >= 2 && bytes[at - 1] == b'{' {
+                at - 2
+            } else {
+                at - 1
+            };
+            let end = if bytes.get(token.digits.end) == Some(&b'}') && start + 2 == at {
+                token.digits.end + 1
+            } else {
+                token.digits.end
+            };
+            start..end
+        })
+        .collect()
 }
 
 /// Best-effort JSON unescape of unparsed text: invalid escapes are copied.
@@ -528,12 +577,22 @@ pub fn redact_arguments(rules: &'static RuleSet, input: &ArgumentsInput<'_>) -> 
     let mut numbers = Numbers::new();
     let mut values = Values::default();
     let mut fixed = 0;
-    if let Some(ExecCmdCommand::Rewritten { variables, .. }) = &input.exec_cmd {
-        for variable in variables.iter() {
-            numbers.assign(variable.value(), variable.kind());
-            values.add(&numbers, variable.value(), variable.kind());
+    match &input.exec_cmd {
+        Some(ExecCmdCommand::Rewritten { variables, .. }) => {
+            for variable in variables.iter() {
+                numbers.assign(variable.value(), variable.kind());
+                values.add(&numbers, variable.value(), variable.kind());
+            }
+            fixed = variables.len() as u32;
         }
-        fixed = variables.len() as u32;
+        // A cut or withheld display may omit numbers, so none is fixed.
+        Some(ExecCmdCommand::WholeCommand { variables, .. }) => {
+            for variable in variables.iter() {
+                numbers.assign(variable.value(), variable.kind());
+                values.add(&numbers, variable.value(), variable.kind());
+            }
+        }
+        _ => {}
     }
     let name_withheld = input
         .name
@@ -545,7 +604,10 @@ pub fn redact_arguments(rules: &'static RuleSet, input: &ArgumentsInput<'_>) -> 
     let parsed = text.map(|text| json::parse(text).map(Wiped));
     let mut withheld = Vec::new();
     if let Some(Ok(tree)) = &parsed {
-        let skip = matches!(input.exec_cmd, Some(ExecCmdCommand::Rewritten { .. }));
+        let skip = matches!(
+            input.exec_cmd,
+            Some(ExecCmdCommand::Rewritten { .. } | ExecCmdCommand::WholeCommand { .. })
+        );
         collect(
             &tree.0,
             rules,

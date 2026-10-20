@@ -308,6 +308,9 @@ prefix of at most 64 bytes of the stored redacted name, cut on a UTF-8 boundary
 (TCR-D26; empty when the name was not retained). `policy_decision` is the kind 14 decision code: 1 `run`, 2
 `invalid_arguments`, 3 `unknown_tool`, 4 `refused`, 5 `busy`, 6 `denied`, 7
 `limit`, 8 `cancelled`. New field 12 `fault` carries the fault code 1–15.
+Field 13 `command_filtered` (SL7, 2026-10-20) is `true` when an admitted
+exec_cmd call ran from the whole-command variable; the TUI then adds
+`command filtered: run from a secret variable` to the decision line.
 `arguments` is a display prefix of at most 192 bytes of the stored argument
 text, or a service-written `[not retained: <reason>, <n> bytes]` when the text
 was not retained. For a call that does not run, `state` is 3 (failed), `status`

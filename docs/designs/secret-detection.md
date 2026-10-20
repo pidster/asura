@@ -10,7 +10,8 @@ are engineering choices under the
 Slices SL1 and SL2 are implemented; see
 [SL1 implementation](#sl1-implementation) and
 [SL2 implementation](#sl2-implementation). SL3 is implemented inside tool job
-packet J1; see [SL3 implementation](#sl3-implementation). SL4–SL6 are not implemented.
+packet J1; see [SL3 implementation](#sl3-implementation). SL7 is implemented;
+see [SL7 implementation](#sl7-implementation). SL4–SL6 are not implemented.
 Protocol numbering remains `0.1`; journal format remains `1`.
 
 Readiness: slice SL3 is implemented inside tool job packet J1. Its
@@ -21,8 +22,9 @@ and [J1 implementation](tool-job-controller.md#j1-implementation). No owner
 decision remains open. SO5 and SO6 (owner, 2026-10-20) remove the refusal for
 a secret the rewrite cannot move, for model and person commands, and make the
 secret store durable in the macOS Keychain ([secret store](secret-store.md)).
-Slice SL7 changes the implemented SL3 model behavior and can land before J2.
-SL5 waits for the person command packets. The SD8
+Slice SL7 changed the implemented SL3 model behavior on 2026-10-20: a model
+command whose secret the rewrite cannot move now runs through the
+whole-command variable. SL5 waits for the person command packets. The SD8
 fixtures can be committed after the licence commit lands; see
 [fixtures and licensing](#fixtures-and-licensing).
 
@@ -714,11 +716,20 @@ For these, model origin records the display-redacted intent with the refused
 decision, and person origin returns the reason before kind PCQ. Nothing is
 spawned. The reason never contains a value.
 
+The kept refusals are checked before the rewrite, in this order: the rule set
+self-check, a reserved placeholder in the command, then the working directory
+scan. A working directory scan that withholds bytes also refuses with
+`secret_in_cwd`, without a kind, because Asura cannot show that the directory
+holds no secret. The parser limits a working directory to 1,024 bytes, so
+this case needs a scanner fault.
+
 ### Whole-command variable
 
-Selected by owner decision SO5 (2026-10-20); the mechanism is proposed. It
-applies to a command from either origin whose rewrite returns any other
-refusal code, including `too_many_secrets` and `rewritten_command_too_long`.
+Selected by owner decision SO5 (2026-10-20). Slice SL7 implemented the
+mechanism for model origin ([SL7 implementation](#sl7-implementation)); person
+origin waits for SL5. It applies to a command from either origin whose rewrite
+returns any other refusal code, including `too_many_secrets` and
+`rewritten_command_too_long`.
 
 1. The conversation owner holds the whole raw command as the value of one
    variable, `ASURA_SECRET_COMMAND`. No numbered variable is passed with it.
@@ -740,7 +751,14 @@ refusal code, including `too_many_secrets` and `rewritten_command_too_long`.
    one is replaced by its placeholder (SD3).
 5. The guardian accepts `ASURA_SECRET_COMMAND` only alone: with it, no
    `ASURA_SECRET_<n>` is allowed. Its value is 1–8192 bytes, within the
-   existing 8192-byte value total.
+   existing 8192-byte value total. The guardian and the request validation
+   both refuse it with any command other than `eval "$ASURA_SECRET_COMMAND"`.
+6. The display text replaces each detected span with its placeholder. Numbers
+   follow first appearance, and equal values share one. The first 256 distinct
+   values are numbered and become capture literals; later values show the
+   unnumbered placeholder (TCR-D4). The display text is rescanned like a
+   rewrite (step 8). If that scan withholds bytes or finds a residual match,
+   the display text is `[withheld]`.
 
 The rewrite remains the first choice, because it keeps the exact executable
 text in the record. The whole-command variable runs only when the rewrite
@@ -797,7 +815,7 @@ sequenceDiagram
     else rewrite cannot move a secret (SO5)
         Rw-->>Own: reason, spans
         Own->>KS: values: whole raw command as ASURA_SECRET_COMMAND (person: Keychain item first)
-        Own->>J: record: eval "$ASURA_SECRET_COMMAND", reason, display-only text
+        Own->>J: record: display text, whole-command flag, reason
         Own->>Ctl: admit job, values
     else rewritten
         Rw-->>Own: rewritten command, names, values
@@ -1217,23 +1235,36 @@ and the licence commit for its fixtures. SS1 is defined in the
 
 ### SL7: model whole-command variable
 
-Proposed packet for owner decision SO5 (2026-10-20). It changes implemented
-J1 and SL3 behavior: today the conversation owner refuses a model exec_cmd
-command whose secret the rewrite cannot move. SL7 depends only on SL1–SL3, so
-it can land before J2. It needs no Keychain: model values stay in memory.
+Implemented packet for owner decision SO5 (2026-10-20); see
+[SL7 implementation](#sl7-implementation). It changed implemented J1 and SL3
+behavior: before SL7 the conversation owner refused a model exec_cmd command
+whose secret the rewrite cannot move. SL7 depends only on SL1–SL3, so it
+landed before J2. It needs no Keychain: model values stay in memory.
 
 | Area | Change | Owner and files |
 | --- | --- | --- |
-| Rewrite result | `rewrite_command` returns `WholeCommand { reason, kind, word, display }` for every refusal code except `placeholder_not_available`, `secret_detection_unavailable` and `secret_in_cwd`. The display text uses the ordinary numbering. | `asura-platform/src/secrets/rewrite.rs` |
-| Guardian | Accepts `ASURA_SECRET_COMMAND` as the only secret variable when present, 1–8192 bytes, erased like the others; the preamble covers it. Any numbered variable beside it is refused. | `asura-platform/src/exec_cmd` guardian and request validation |
-| Call admission | A `WholeCommand` result admits the call with decision `run`; the spawn command is `eval "$ASURA_SECRET_COMMAND"`. | `asura-service/src/conversation/exec_cmd_call.rs` |
+| Rewrite result | `rewrite_command` and `rewrite_exec_cmd_call` return a `Plan`: the rewrite, or `WholeCommand { reason, display, variables, command }` for every refusal code except `placeholder_not_available`, `secret_detection_unavailable` and `secret_in_cwd`. `reason` holds the code, kind and word. The display text uses the ordinary numbering. `variables` are the numbered values, used only as capture literals. `command` is the raw text, zeroed on drop. | `asura-platform/src/secrets/rewrite.rs` |
+| Argument redaction | `ExecCmdCommand::WholeCommand` stores the display text verbatim as the `command` value, cut at 8,192 bytes before a placeholder, like a refused command. | `asura-platform/src/secrets/arguments.rs` |
+| Guardian | Accepts `ASURA_SECRET_COMMAND` as the only secret variable when present, 1–8192 bytes, erased like the others; the preamble covers it. Any numbered variable beside it, or any command other than the fixed `eval` text, is refused. | `asura-platform/src/exec_cmd` guardian and request validation (`ExecCmdRequest.secret_command`) |
+| Call admission | A `WholeCommand` result admits the call with decision `run`; the spawn command is `eval "$ASURA_SECRET_COMMAND"`. Bit 1 and the fallback reason are written only when admission ends in `run`; a `busy`, `denied` or `cancelled` call records neither. | `asura-service/src/conversation.rs` (`decide`), `conversation/exec_cmd_call.rs` |
 | Kind 14 | Stores the display text in field 14's `command`, sets exec_cmd flag bit 1 (whole-command), and keeps the reason in fields 21–23 as the fallback reason. See the [tool call record amendment](tool-call-records.md#sl7-amendment-owner-2026-10-20). | `asura-storage` kind 14 codec and replay |
-| Views | The TUI activity row and the model's result say `command filtered: run from a secret variable` beside the display text. | Service result rendering, TUI activity |
+| Views | The TUI activity row and the model's result say `command filtered: run from a secret variable` beside the display text. Control `ToolProgress` field 13 `command_filtered` carries the mark. | Service result rendering (`exec_cmd_worker.rs`), `conversation.rs` (`ToolProgress`), TUI activity |
+
+The model's result places the line `command filtered: run from a secret
+variable: <display>` after its first line, which replay reads the exit code
+from. The line shows at most 2,048 bytes of the display text. The cut never
+splits a placeholder, and `…` marks it. Control characters become spaces. With
+two tails of at most 6,144 bytes each, the result stays below its
+16,384-byte limit.
+
+The TUI shows the mark on the decision line below the arguments:
+`· service admitted · command filtered: run from a secret variable`.
 
 Tests:
 
 | ID | Layer | Case and required result |
 | --- | --- | --- |
+| SDU-16 (model part) | Unit | See [SDU-16](#unit); the model path is `rewrite_exec_cmd_call` |
 | SDU-17 | Unit | Guardian and request validation: `ASURA_SECRET_COMMAND` alone accepted; with any numbered variable, empty, or 8193 bytes refused |
 | SDI-12 | Integration | Real service, guardian and sandbox: a model call with a single-quoted fixture token runs and prints through `eval`; kind 14 has decision `run`, bit 1 and no value; a raw-byte sweep of journal, payloads, audit and `ps` argument vectors finds no value |
 | SDE-06 | End to end | A deterministic model fixture issues `printf %s '<fixture token>' \| shasum -a 256`; the printed digest matches the fixture token's digest, proving the real value ran; the TUI shows the filtered command; no record holds the token |
@@ -1509,6 +1540,57 @@ ends with the raw-byte sweep):
 
 Proof limits: SDE-01's paging part, SDE-03 and SDE-05 belong to later slices;
 SDI-06, SDI-09 and SDI-10 keep their SL2 results or later-slice scope.
+
+## SL7 implementation
+
+Implemented behavior, 2026-10-20. Code:
+
+- `asura-platform/src/secrets/rewrite.rs`: `Plan`, `WholeCommand`,
+  `SecretCommand`, `RefusalCode::kept`, `plan`, and the constants
+  `WHOLE_COMMAND`, `SECRET_COMMAND_NAME` and `WHOLE_COMMAND_NOTICE`.
+  `SecretVariable` numbers widened to `u16` so a whole-command literal can
+  carry numbers up to 256.
+- `asura-platform/src/secrets/arguments.rs`: `ExecCmdCommand::WholeCommand`.
+- `asura-platform/src/exec_cmd.rs` and `exec_cmd/guardian.rs`:
+  `ExecCmdRequest.secret_command`, its validation, the environment entry and
+  the guardian's `SecretName::Command` with its preamble.
+- `asura-service/src/conversation.rs`, `conversation/exec_cmd_call.rs`
+  (`LiveSecrets`, `request_secrets`) and `exec_cmd_worker.rs`
+  (`filtered_line`).
+- `asura-storage` kind 14: field 20 bit 1, its validation and the derived
+  `ExecCmdCall.fixed_command` and `secret_variables`.
+- Control `ToolProgress.command_filtered` (field 13) and the TUI activity row.
+
+Refinements made during implementation, recorded in the sections above:
+the order of the kept refusals and the withheld working directory scan
+([refusal](#refusal)); the 256-value literal limit and the `[withheld]`
+display text ([whole-command variable](#whole-command-variable)); the
+fixed-command check; bit 1 only on an admitted `run`; the model result line.
+The kind 14 codec now also refuses `refused` with a code other than
+`placeholder_not_available` or `secret_in_cwd`
+([tool call record amendment](tool-call-records.md#sl7-amendment-owner-2026-10-20)).
+
+Verified behavior on the macOS 27 development host (real processes, the real
+guardian and sandbox, scratch homes and the scripted loopback model):
+
+| Check | Evidence | Result |
+| --- | --- | --- |
+| SDU-16 (model part) | `secrets::tests::sdu_16_whole_command_variable_for_every_unmovable_form`; `j1t_03_rewritten_command_length_limit`; `j1_cwd_secret_and_detection_unavailable_refuse` | Pass. 22 forms reach every non-kept SDU-12 code, 17 values and a rewrite over 8,192 bytes; each plan runs `eval "$ASURA_SECRET_COMMAND"` with numbers 1..k in the display text and no value in any text or debug output; the three kept refusals still refuse |
+| SDU-17 | `exec_cmd::tests::sdu_17_whole_command_variable_request_validation`; `guardian::tests::sdu_17_whole_command_variable_only_alone_and_bounded`; three real-guardian cases in `exec_cmd_process` | Pass. Alone with 1 or 8,192 bytes accepted; empty, NUL, 8,193 bytes, twice, beside a numbered variable or with another command refused |
+| Argument redaction | `arguments::tests::sl7_exec_cmd_whole_command_display` | Pass. Display stored verbatim and numbered; over 8,192 bytes cut before a placeholder with bit 0 |
+| Kind 14 codec and replay | `codec::tests::tcr_u01_*`, `j1t_01_code_tables_are_fixed`, `sl7_replay_derives_whole_command_and_one_variable`; `journal_writer` J1T-01 | Pass. Bit 1 round trips with `run`; it is `Corrupt` with any other decision, without a reason, with a kept code or off exec_cmd; replay derives the fixed command and one variable, and a real writer reopens it |
+| Owner layer | `tool_tests::whole_command_exec_cmd_is_not_refused_and_kept_refusals_remain`, `j1t_03_overlong_rewrite_is_not_refused`; `exec_cmd_call::tests::refusal_fields_hold_no_value`; `exec_cmd_worker::tests::sl7_whole_command_result_says_filtered_beside_display` | Pass |
+| Platform process | `exec_cmd_process` SL7 step | Pass. `eval` wrote the real value; `printenv` and a child saw no `ASURA_SECRET_COMMAND` |
+| SDI-12 | `capture_flow whole` and `capture_flow secrets` | Pass. The single-quoted value ran through `eval` and wrote the real value; kind 14 has `run`, bit 1 and `secret_single_quoted`; ten `ps -axww` samples held no value and showed the `eval` text; the raw-byte sweep found no value |
+| SDE-06 | `tui_pty.py --exec-cmd-capture` | Pass. The fixture model ran `printf %s '<token>' \| shasum -a 256`; the tool message held the token's SHA-256 digest; the TUI showed the display text and the filtered mark; the sweep found no token |
+
+Proof limits: no native model was asked to send a single-quoted secret. The
+native journeys show only that ordinary calls still work:
+`conversation_flow --native-exec-cmd-tools` passed, and
+`--native-tools` passed three of five runs. One failed run ended at the
+native model's service status call ("missing persisted successful status tool
+result"), and one failure was not captured; neither path uses exec_cmd. Person
+origin (SDU-16 person part, SDE-03) belongs to SL5.
 
 ## Design verification
 

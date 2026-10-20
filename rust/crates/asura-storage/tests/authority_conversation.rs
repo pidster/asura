@@ -1025,6 +1025,7 @@ fn run14(ordinal: u32, op: ToolOperation) -> ToolCall {
         rule_set_revision: 1,
         rule_set_digest: RULE_SET_DIGEST,
         command_cut: false,
+        whole_command: false,
         refusal: None,
     }
 }
@@ -1036,9 +1037,9 @@ fn exec14(ordinal: u32, decision: ToolDecision) -> ToolCall {
         ToolDecision::Busy => call.busy = Some(ExecCmdBusyReason::Quota),
         ToolDecision::Refused => {
             call.refusal = Some(ExecCmdRefusal {
-                code: RefusalCode::SecretSingleQuoted,
+                code: RefusalCode::SecretInCwd,
                 kind: Some(SecretKind::GithubToken),
-                word: Some(2),
+                word: None,
             })
         }
         ToolDecision::InvalidArguments => call.fault = Some(ToolFault::WrongType),

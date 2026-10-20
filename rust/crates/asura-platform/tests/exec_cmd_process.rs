@@ -3,7 +3,7 @@ use asura_platform::exec_cmd::{
     ExecCmdError, ExecCmdRequest, ExecCmdResult, OutputSink, PreparedExecCmd, StopReason, Stream,
     Tails, run_guardian,
 };
-use asura_platform::secrets::{SecretVariable, rewrite_command};
+use asura_platform::secrets::{RefusalCode, SecretVariable, WHOLE_COMMAND, rewrite_command};
 use asura_platform::{ProjectIdentity, RuntimeDirectory};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -145,6 +145,18 @@ fn prepare_with(
     timeout: Duration,
 ) -> JobGuard {
     let _ = timeout;
+    prepare_request(
+        home,
+        ExecCmdRequest {
+            job_id: asura_platform::random_id(),
+            command: command.into(),
+            cwd: None,
+            secrets,
+            secret_command: None,
+        },
+    )
+}
+fn prepare_request(home: &Path, request: ExecCmdRequest) -> JobGuard {
     let runtime = RuntimeDirectory::scratch(home, true).unwrap();
     let project = ProjectIdentity::open(
         home.join("project").to_str().unwrap(),
@@ -152,18 +164,8 @@ fn prepare_with(
     )
     .unwrap();
     let cancel = AtomicBool::new(false);
-    let p = PreparedExecCmd::prepare(
-        runtime,
-        &project,
-        ExecCmdRequest {
-            job_id: asura_platform::random_id(),
-            command: command.into(),
-            cwd: None,
-            secrets,
-        },
-        &cancel,
-    )
-    .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
+    let p = PreparedExecCmd::prepare(runtime, &project, request, &cancel)
+        .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
     let collected = Collected::default();
     JobGuard(
         p.spawn(
@@ -430,6 +432,7 @@ fn guardian_refusals(home: &Path) {
                 command: "printf ran > refused-marker".into(),
                 cwd: None,
                 secrets: Vec::new(),
+                secret_command: None,
             },
             &cancel,
         )
@@ -655,6 +658,23 @@ fn secret_environment_refusals(home: &Path) {
         ("over 8192 bytes", vec![big.clone()]),
         ("over 8192 in total", vec![half.clone(), other_half.clone()]),
         ("NUL", vec![b"ASURA_SECRET_1=va\0lue".to_vec()]),
+        // SDU-17 through a real guardian: the whole-command variable only
+        // alone, non-empty and with the fixed `eval` command.
+        (
+            "whole command beside numbered",
+            vec![
+                b"ASURA_SECRET_COMMAND=printf ran > secret-refused-marker".to_vec(),
+                b"ASURA_SECRET_1=value".to_vec(),
+            ],
+        ),
+        (
+            "whole command with another command",
+            vec![b"ASURA_SECRET_COMMAND=printf ran > secret-refused-marker".to_vec()],
+        ),
+        (
+            "whole command empty",
+            vec![b"ASURA_SECRET_COMMAND=".to_vec()],
+        ),
     ] {
         let runtime = RuntimeDirectory::scratch(home, true).unwrap();
         let project = ProjectIdentity::open(
@@ -671,6 +691,7 @@ fn secret_environment_refusals(home: &Path) {
                 command: "printf ran > secret-refused-marker".into(),
                 cwd: None,
                 secrets: Vec::new(),
+                secret_command: None,
             },
             &cancel,
         )
@@ -727,7 +748,10 @@ fn fixture_token() -> String {
     ["ghp_", &"aB3".repeat(12)].concat()
 }
 fn rewritten(command: &str) -> (String, Vec<SecretVariable>) {
-    let rewrite = rewrite_command(command).unwrap_or_else(|r| panic!("{r}"));
+    let rewrite = rewrite_command(command)
+        .unwrap_or_else(|r| panic!("{r}"))
+        .rewritten()
+        .expect("a rewrite");
     assert!(!rewrite.command.contains(&fixture_token()));
     assert_eq!(rewrite.variables.len(), 1);
     (rewrite.command, rewrite.variables)
@@ -754,6 +778,45 @@ fn secret_variables(home: &Path) {
     assert!(!result.render_text().contains(&token));
     fs::remove_file(home.join("project/out.txt")).unwrap();
     println!("SDI-06: out.txt held the value; captured output held no value");
+
+    // SL7 (SDI-12 platform part): a single-quoted value runs through the
+    // whole-command variable; `eval` runs the raw text with the real value
+    // and no child sees the variable.
+    let raw = format!(
+        "printf '%s' '{token}' > whole.txt; /usr/bin/printenv; \
+         /bin/sh -c 'printf \"child=%s\\n\" \"${{ASURA_SECRET_COMMAND-unset}}\"'"
+    );
+    let whole = rewrite_command(&raw)
+        .unwrap_or_else(|r| panic!("{r}"))
+        .whole_command()
+        .expect("the whole-command variable");
+    assert_eq!(whole.reason.code, RefusalCode::SecretSingleQuoted);
+    assert!(!whole.display.contains(&token));
+    let result = settle(
+        prepare_request(
+            home,
+            ExecCmdRequest {
+                job_id: asura_platform::random_id(),
+                command: WHOLE_COMMAND.into(),
+                cwd: None,
+                secrets: Vec::new(),
+                secret_command: Some(whole.command),
+            },
+        ),
+        Duration::from_secs(5),
+        false,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(
+        fs::read(home.join("project/whole.txt")).unwrap(),
+        token.as_bytes()
+    );
+    assert!(result.stdout.contains("PATH="), "{result:?}");
+    assert!(!result.stdout.contains("ASURA_SECRET"), "{result:?}");
+    assert!(result.stdout.contains("child=unset"), "{result:?}");
+    assert!(!result.render_text().contains(&token));
+    fs::remove_file(home.join("project/whole.txt")).unwrap();
+    println!("SL7: eval ran the raw command with the value; no child saw the variable");
 
     // SDI-07: no child sees the variable; record what `set` prints.
     let (command, secrets) = rewritten(&format!("printf '%s' \"{token}\" >/dev/null"));
