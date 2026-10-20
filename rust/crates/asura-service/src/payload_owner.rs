@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// One `PayloadFacts` request from the recovery worker. A full writer
-/// queue is retried with pacing; the reply or the writer's close ends the
-/// wait (no time bound).
+/// One `PayloadFacts` request from the recovery worker. On a full writer
+/// queue it waits for the queue-room event (J1-0 queue room wait): a job
+/// settles, the writer closes (`Journal`) or recovery is cancelled
+/// (`Cancelled`). No time bound and no polling.
 fn journal_facts(
     client: &WriterClient,
     payloads: Vec<[u8; 16]>,
@@ -35,9 +36,25 @@ fn journal_facts(
                     .map(|reply| reply.payload_facts)
                     .map_err(|_| RecoveryError::Journal);
             }
-            Err(writer::Error::Busy) => std::thread::sleep(Duration::from_millis(10)),
+            Err(writer::Error::Busy) => match client.wait_for_room(cancel) {
+                Ok(()) => {}
+                Err(writer::Error::Cancelled) => return Err(RecoveryError::Cancelled),
+                Err(_) => return Err(RecoveryError::Journal),
+            },
             Err(_) => return Err(RecoveryError::Journal),
         }
+    }
+}
+/// The recovery worker's cancel: sets the flag, then wakes a queue-room
+/// wait so cancellation never depends on an unrelated job settling.
+struct RecoveryCancel {
+    flag: Arc<AtomicBool>,
+    client: WriterClient,
+}
+impl RecoveryCancel {
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.client.wake_room_waiters();
     }
 }
 /// Capture workers kept after their call: installing or abandoned.
@@ -50,7 +67,7 @@ type Recovered = Result<(Arc<PayloadStore>, RecoveryReport), &'static str>;
 enum State {
     Idle,
     Recovering {
-        cancel: Arc<AtomicBool>,
+        cancel: RecoveryCancel,
         result: Arc<Mutex<Option<Recovered>>>,
         _thread: JoinHandle<()>,
     },
@@ -97,7 +114,11 @@ impl Payloads {
         let runtime = runtime.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let result: Arc<Mutex<Option<Recovered>>> = Arc::new(Mutex::new(None));
-        let (token, slot, wake) = (cancel.clone(), result.clone(), wake.cloned());
+        let cancel = RecoveryCancel {
+            flag: cancel,
+            client: client.clone(),
+        };
+        let (token, slot, wake) = (cancel.flag.clone(), result.clone(), wake.cloned());
         let thread = std::thread::Builder::new()
             .name("asura-payload-recovery".into())
             .spawn(move || {
@@ -210,7 +231,7 @@ impl Payloads {
     pub(crate) fn shutdown(&mut self, now: Instant) {
         self.shutdown.get_or_insert(now);
         if let State::Recovering { cancel, .. } = &self.state {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
         }
     }
     /// Settled when the list is empty, or the 2 s shutdown bound has passed:
@@ -226,5 +247,109 @@ impl Payloads {
             return None;
         }
         self.shutdown.map(|started| started + SHUTDOWN_BOUND)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asura_storage::authority::writer::test_support::detached_queue;
+    use std::sync::mpsc;
+    use std::thread;
+
+    type Facts = Result<Vec<writer::PayloadFact>, RecoveryError>;
+    fn fact(payload: [u8; 16]) -> writer::PayloadFact {
+        writer::PayloadFact {
+            payload,
+            call: [2; 16],
+            operation: [3; 16],
+            payloads: [payload, [4; 16]],
+            intent_sequence: 5,
+            settled: None,
+            active: false,
+        }
+    }
+    /// Six ordinary requests fill the queue; returns their tickets.
+    fn fill(client: &WriterClient) -> Vec<writer::Ticket> {
+        let tickets: Vec<_> = (0..6)
+            .map(|_| client.try_submit(writer::Command::Open).unwrap())
+            .collect();
+        assert!(matches!(
+            client.try_submit(writer::Command::Open),
+            Err(writer::Error::Busy)
+        ));
+        tickets
+    }
+    fn spawn_facts(client: WriterClient, cancel: Arc<AtomicBool>) -> mpsc::Receiver<Facts> {
+        let (sender, result) = mpsc::channel();
+        thread::spawn(move || {
+            sender
+                .send(journal_facts(&client, vec![[1; 16]], &cancel))
+                .unwrap();
+        });
+        result
+    }
+    fn still_waiting(result: &mpsc::Receiver<Facts>) -> bool {
+        matches!(
+            result.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        )
+    }
+    /// J1-0-10: a full queue holds the request until a job settles; then it
+    /// is admitted and answered.
+    #[test]
+    fn j1_0_10_full_queue_facts_complete_once_room_appears() {
+        let (client, queue) = detached_queue();
+        let _tickets = fill(&client);
+        let result = spawn_facts(client.clone(), Arc::default());
+        assert!(still_waiting(&result));
+        for _ in 0..6 {
+            assert!(queue.answer_next(|command| {
+                assert!(matches!(command, writer::Command::Open));
+                Ok(writer::Reply::default())
+            }));
+        }
+        assert!(queue.answer_next(|command| {
+            let writer::Command::PayloadFacts { payloads } = command else {
+                panic!("expected PayloadFacts, got {command:?}");
+            };
+            assert_eq!(payloads, vec![[1; 16]]);
+            Ok(writer::Reply {
+                payload_facts: vec![fact([1; 16])],
+                ..Default::default()
+            })
+        }));
+        let facts = result.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(facts.unwrap(), vec![fact([1; 16])]);
+    }
+    /// J1-0-10: shutdown's recovery cancel wakes the wait although no job
+    /// settles.
+    #[test]
+    fn j1_0_10_recovery_cancel_wakes_a_full_queue_wait() {
+        let (client, _queue) = detached_queue();
+        let _tickets = fill(&client);
+        let cancel = RecoveryCancel {
+            flag: Arc::default(),
+            client: client.clone(),
+        };
+        let result = spawn_facts(client, cancel.flag.clone());
+        assert!(still_waiting(&result));
+        cancel.cancel();
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(RecoveryError::Cancelled)
+        ));
+    }
+    /// J1-0-10: the writer's close ends a full-queue wait with `Journal`.
+    #[test]
+    fn j1_0_10_writer_close_ends_a_full_queue_wait() {
+        let (client, queue) = detached_queue();
+        let _tickets = fill(&client);
+        let result = spawn_facts(client, Arc::default());
+        assert!(still_waiting(&result));
+        queue.close();
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(RecoveryError::Journal)
+        ));
     }
 }

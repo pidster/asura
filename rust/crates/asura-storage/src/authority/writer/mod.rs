@@ -340,14 +340,36 @@ struct JobSettlement {
     settled: Arc<AtomicBool>,
     count: Arc<AtomicUsize>,
     wake: Option<asura_platform::events::WakeSender>,
+    room: Arc<Room>,
 }
 impl Drop for JobSettlement {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::AcqRel);
         self.settled.store(true, Ordering::Release);
+        self.room.notify();
         if let Some(wake) = &self.wake {
             let _ = wake.notify();
         }
+    }
+}
+/// Queue slots for ordinary requests; the last two serve control appends.
+const ORDINARY_SLOTS: usize = 6;
+/// The whole writer queue.
+const QUEUE_SLOTS: usize = 8;
+/// The queue-room event (J1-0 queue room wait). A notifier changes the
+/// watched state first (the slot count, the close flag or a waiter's cancel
+/// flag), then takes the lock and wakes every waiter. A waiter checks that
+/// state under the same lock, so a change between its check and its wait
+/// cannot be lost. The lock is never held across other work.
+#[derive(Default)]
+struct Room {
+    lock: std::sync::Mutex<()>,
+    changed: std::sync::Condvar,
+}
+impl Room {
+    fn notify(&self) {
+        drop(self.lock.lock().unwrap_or_else(|e| e.into_inner()));
+        self.changed.notify_all();
     }
 }
 /// One accepted writer request. Observation has no time bound (J1-0): only the
@@ -415,6 +437,7 @@ pub struct WriterClient {
     count: Arc<AtomicUsize>,
     closing: Arc<AtomicBool>,
     wake: Option<asura_platform::events::WakeSender>,
+    room: Arc<Room>,
 }
 pub struct WriterHandle {
     client: WriterClient,
@@ -428,7 +451,7 @@ impl WriterHandle {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::Busy)?;
         let claim = Claim;
-        let (sender, receiver) = mpsc::sync_channel::<Option<Job>>(8);
+        let (sender, receiver) = mpsc::sync_channel::<Option<Job>>(QUEUE_SLOTS);
         let count = Arc::new(AtomicUsize::new(0));
         let closing = Arc::new(AtomicBool::new(false));
         let stop = closing.clone();
@@ -455,6 +478,7 @@ impl WriterHandle {
                 count,
                 closing,
                 wake: None,
+                room: Arc::default(),
             },
             handle: Some(handle),
             status,
@@ -630,7 +654,7 @@ impl WriterClient {
         {
             return Err(Error::Invalid);
         }
-        let limit = if control { 8 } else { 6 };
+        let limit = if control { QUEUE_SLOTS } else { ORDINARY_SLOTS };
         self.count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 if n < limit { Some(n + 1) } else { None }
@@ -653,21 +677,22 @@ impl WriterClient {
         let mutation = mutation || matches!(command, Command::MemoryCreate { .. });
         let (reply, receiver) = mpsc::sync_channel(1);
         let settled = Arc::new(AtomicBool::new(false));
-        if self
-            .sender
-            .try_send(Some(Job {
-                command,
-                reply,
-                settlement: JobSettlement {
-                    settled: settled.clone(),
-                    count: self.count.clone(),
-                    wake: self.wake.clone(),
-                },
-            }))
-            .is_err()
-        {
-            // Failed send drops its job and releases the reservation exactly once.
-            return Err(Error::Busy);
+        match self.sender.try_send(Some(Job {
+            command,
+            reply,
+            settlement: JobSettlement {
+                settled: settled.clone(),
+                count: self.count.clone(),
+                wake: self.wake.clone(),
+                room: self.room.clone(),
+            },
+        })) {
+            // A failed send drops its job and releases the reservation exactly
+            // once. A worker that has gone is unavailable, not busy, so a
+            // room waiter never retries against it.
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => return Err(Error::Busy),
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(Error::Unavailable),
         }
         Ok(Ticket {
             receiver,
@@ -676,11 +701,43 @@ impl WriterClient {
             settled,
         })
     }
+    /// Blocks until an ordinary queue slot is free, the writer closes
+    /// (`Unavailable`) or `cancel` is set (`Cancelled`). It has no time bound
+    /// and never polls: a job settlement, the writer's close and
+    /// `wake_room_waiters` are its only wake events. A free slot is not a
+    /// reservation, so the caller retries `try_submit` and waits again on
+    /// `Busy`. Only a retained worker thread calls this, never the reactor.
+    pub fn wait_for_room(&self, cancel: &AtomicBool) -> Result<()> {
+        let mut guard = self.room.lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(Error::Cancelled);
+            }
+            if self.closing.load(Ordering::Acquire) {
+                return Err(Error::Unavailable);
+            }
+            if self.count.load(Ordering::Acquire) < ORDINARY_SLOTS {
+                return Ok(());
+            }
+            guard = self
+                .room
+                .changed
+                .wait(guard)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    /// Wakes every `wait_for_room` waiter to recheck its cancel flag. A
+    /// canceller sets its flag first, then calls this. It never blocks on
+    /// writer work.
+    pub fn wake_room_waiters(&self) {
+        self.room.notify();
+    }
 }
 impl WriterHandle {
     pub fn close(&self) {
         if !self.client.closing.swap(true, Ordering::AcqRel) {
             let _ = self.client.sender.try_send(None);
+            self.client.room.notify();
         }
     }
     pub fn settled(&mut self) -> bool {
@@ -809,6 +866,7 @@ mod tests {
                     count: Arc::new(AtomicUsize::new(0)),
                     closing: Arc::new(AtomicBool::new(false)),
                     wake: None,
+                    room: Arc::default(),
                 },
                 handle: None,
                 status: Arc::default(),
@@ -843,6 +901,120 @@ mod tests {
         // Queued jobs keep their slots until the worker settles them.
         assert_eq!(writer.client.count.load(Ordering::Acquire), 8);
         drop(receiver);
+        assert_eq!(writer.client.count.load(Ordering::Acquire), 0);
+    }
+    /// Starts a thread that waits for queue room and reports its result.
+    fn room_waiter(
+        client: WriterClient,
+        cancel: Arc<AtomicBool>,
+    ) -> (Receiver<Result<()>>, JoinHandle<()>) {
+        let (sender, result) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            sender.send(client.wait_for_room(&cancel)).unwrap();
+        });
+        (result, thread)
+    }
+    fn fill_ordinary(writer: &WriterHandle) -> Vec<Ticket> {
+        let tickets: Vec<_> = (0..ORDINARY_SLOTS)
+            .map(|_| writer.try_submit(Command::Open).unwrap())
+            .collect();
+        assert!(matches!(writer.try_submit(Command::Open), Err(Error::Busy)));
+        tickets
+    }
+    /// J1-0-09: every waiter on a full queue wakes when one job settles.
+    #[test]
+    fn j1_0_09_room_waiters_wake_when_a_job_settles() {
+        let (writer, receiver) = queued_writer();
+        let _tickets = fill_ordinary(&writer);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiters: Vec<_> = (0..2)
+            .map(|_| room_waiter(writer.client(), cancel.clone()))
+            .collect();
+        for (result, _) in &waiters {
+            assert!(matches!(
+                result.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+        }
+        // The worker takes one job and settles it.
+        drop(receiver.try_recv().unwrap());
+        for (result, thread) in waiters {
+            assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+            thread.join().unwrap();
+        }
+        assert!(writer.try_submit(Command::Open).is_ok());
+    }
+    /// J1-0-09: the writer's close ends the wait with `Unavailable`.
+    #[test]
+    fn j1_0_09_room_waiter_wakes_on_close() {
+        let (writer, _receiver) = queued_writer();
+        let _tickets = fill_ordinary(&writer);
+        let (result, thread) = room_waiter(writer.client(), Arc::default());
+        assert!(matches!(
+            result.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        writer.close();
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(Error::Unavailable)
+        );
+        thread.join().unwrap();
+    }
+    /// J1-0-09: a cancel wakes the waiter although no job settles.
+    #[test]
+    fn j1_0_09_room_waiter_wakes_on_cancel_without_a_settlement() {
+        let (writer, _receiver) = queued_writer();
+        let _tickets = fill_ordinary(&writer);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (result, thread) = room_waiter(writer.client(), cancel.clone());
+        assert!(matches!(
+            result.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        cancel.store(true, Ordering::Release);
+        writer.client().wake_room_waiters();
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(Error::Cancelled)
+        );
+        thread.join().unwrap();
+        assert_eq!(writer.client.count.load(Ordering::Acquire), ORDINARY_SLOTS);
+    }
+    /// J1-0-09: a settlement racing the waiter's check is never lost.
+    #[test]
+    fn j1_0_09_settlement_racing_the_check_is_not_lost() {
+        let (writer, receiver) = queued_writer();
+        for _ in 0..500 {
+            let tickets = fill_ordinary(&writer);
+            let (start, started) = mpsc::channel();
+            let settler = {
+                let job = receiver.try_recv().unwrap();
+                thread::spawn(move || {
+                    started.recv().unwrap();
+                    drop(job);
+                })
+            };
+            let (result, thread) = room_waiter(writer.client(), Arc::default());
+            start.send(()).unwrap();
+            assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+            thread.join().unwrap();
+            settler.join().unwrap();
+            drop(tickets);
+            while receiver.try_recv().is_ok() {}
+            assert_eq!(writer.client.count.load(Ordering::Acquire), 0);
+        }
+    }
+    /// J1-0-09: a submit to a writer whose worker has gone is unavailable,
+    /// not busy, so a room waiter never retries against it.
+    #[test]
+    fn submit_to_a_gone_worker_is_unavailable() {
+        let (writer, receiver) = queued_writer();
+        drop(receiver);
+        assert!(matches!(
+            writer.try_submit(Command::Open),
+            Err(Error::Unavailable)
+        ));
         assert_eq!(writer.client.count.load(Ordering::Acquire), 0);
     }
     #[test]
@@ -933,6 +1105,7 @@ mod tests {
             settled: settled.clone(),
             count: count.clone(),
             wake: None,
+            room: Arc::default(),
         };
         let mut ticket = Ticket {
             receiver,
@@ -976,6 +1149,7 @@ mod tests {
                     settled: settled.clone(),
                     count: count.clone(),
                     wake: Some(wake_sender),
+                    room: Arc::default(),
                 },
             };
             if panic {
@@ -1022,6 +1196,7 @@ mod tests {
                 settled: settled.clone(),
                 count: count.clone(),
                 wake: None,
+                room: Arc::default(),
             },
         };
         let (sender, receiver) = mpsc::sync_channel::<Job>(1);

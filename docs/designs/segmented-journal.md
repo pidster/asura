@@ -763,7 +763,7 @@ runs. Typical journals have fewer than 10 runs.
 | `ReadPrompt { operation }` | `O` gives the accepted locator. |
 | Tool-call replay | `C` entries give the kind 14, 15 and 23 locators for a terminal operation; the active operation's records are in the live state. |
 | New `Lookup { operation }` | Returns the `O` facts of any operation. The service uses it where it reads `replay.operations` for a non-live operation. |
-| New `PayloadFacts { payloads ≤ 128 }` | Returns `X` facts. The payload recovery worker uses it instead of replay-wide facts. |
+| New `PayloadFacts { payloads ≤ 128 }` | Returns `X` facts. The payload recovery worker uses it instead of replay-wide facts. On `busy` it waits for queue room ([J1-0 queue room wait](conversation-admission.md#j1-0-queue-room-wait)). |
 | New `JournalStatus` | Returns usage, effective quota, configured quota, hold state and run count. |
 | `Projects { after or before, limit ≤ 8 }` | Serves `ProjectList`. Merges `J` entries from the delta and every run in project-ID order after `after`, or in descending order below `before`; adds the current name from `N` and the stale check. Each page stays within 40 KiB. The total number of pages has no bound. |
 | New `Project { project }` | Serves `ProjectList` with `only`: one project entry, or not found. Clients use it to validate `/project select ID` for a project outside their window. |

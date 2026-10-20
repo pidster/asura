@@ -1383,7 +1383,9 @@ At service start a retained recovery worker rebuilds the ledger. It lists
 `staging/` and `objects/` in batches of 128 names, compares them with replay,
 and applies the [derived recovery](#replay-order-and-reservation) actions.
 Recovery has no time bound. Until it finishes, exec_cmd admission returns `busy`
-with reason `payload_unavailable`. An unsafe object, such as a symbolic link,
+with reason `payload_unavailable`. When the journal writer's queue is full, the
+worker waits for queue room without polling; shutdown's cancel wakes that wait
+([J1-0 queue room wait](conversation-admission.md#j1-0-queue-room-wait)). An unsafe object, such as a symbolic link,
 another owner or a non-regular file, makes the payload store unavailable; the
 same `busy` reason then applies.
 

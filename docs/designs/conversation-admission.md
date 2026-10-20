@@ -613,7 +613,8 @@ Required behavior (owner, 2026-10-15). No journal wait has a time bound:
 - **Queue worker.** The one-slot queue worker waits for the real reply. Cancel
   stops the wait. A second queue request while one is in flight gets `busy`.
 - **Overload.** Beyond the writer's 8-slot queue, a request gets `busy`. The
-  reactor stays responsive throughout.
+  reactor stays responsive throughout. A retained worker thread may instead
+  wait for queue room ([J1-0 queue room wait](#j1-0-queue-room-wait)).
 
 Tool job packet J1 depends on this step for its kind 14, 23 and 15 records
 ([J1 prerequisite](tool-job-controller.md#j1-prerequisite-journal-step-j1-0)).
@@ -748,6 +749,123 @@ integration check times cancel requests for an unknown operation. A cancel for a
 live turn is admitted without waiting for the writer (unit
 `foreground_tests::j1_0_02_*`). Its durable acknowledgement follows the
 `CancelRequested` record; the TUI shows "Cancelling" until then.
+
+#### J1-0 queue room wait
+
+Selected design (owner TODO, 2026-10-20). It replaces the payload recovery
+worker's 10 ms `busy` retry sleep, which was polling under
+[ADR-0006](../decisions/0006-async-event-pipelines.md).
+
+**Behavior.** `WriterClient::try_submit` stays non-blocking for every caller.
+A retained worker thread that gets `busy` may call
+`WriterClient::wait_for_room(cancel)`. The call returns:
+
+- `Ok` when an ordinary queue slot is free (fewer than 6 reserved slots).
+  A free slot is not a reservation. The caller calls `try_submit` again and
+  waits again on `busy`.
+- `Unavailable` when the writer is closing.
+- `Cancelled` when the caller's cancel flag is set.
+
+The wait has no time bound and never polls. Three events wake it:
+
+1. A job settles. `JobSettlement` releases its slot, then notifies the room.
+2. `WriterHandle::close` sets the close flag, then notifies the room.
+3. A canceller sets its flag, then calls `WriterClient::wake_room_waiters`.
+
+**Ownership.** The journal writer module owns the room event (`Room`: one
+mutex and one condition variable per writer). Each `WriterClient` clone and each
+`JobSettlement` share it. The payload recovery worker is the only caller of
+`wait_for_room`. Its owner, `Payloads`, holds a `RecoveryCancel`. On shutdown
+`RecoveryCancel::cancel` sets the recovery cancel flag and then wakes the room.
+
+**Lost wakeups.** A notifier changes the watched state first: the slot count,
+the close flag or the cancel flag. Then it takes the room lock and wakes every
+waiter. A waiter checks all three conditions under the same lock before it
+waits. A change between the check and the wait is therefore never lost. Several
+waiters may wait at once; each notification wakes all of them, and each rechecks.
+
+**Failure handling.** A writer whose worker thread has gone answers
+`try_submit` with `Unavailable`, not `busy`. A room waiter therefore never
+retries against a dead worker. In payload recovery, `Unavailable` (close) maps
+to `RecoveryError::Journal` and a cancel maps to `RecoveryError::Cancelled`.
+
+**Asynchronous isolation.** Only the retained `asura-payload-recovery` thread
+blocks in `wait_for_room`; the reactor never calls it. A notifier holds the
+room lock only to synchronize with a waiter's check. The journal worker
+notifies after each job and never waits for a waiter. Numeric bounds: one
+room per writer; the 8-slot queue with 6 ordinary slots; one recovery waiter
+today. The design admits any number of waiters because the notification wakes
+all of them.
+
+After `PayloadFacts` is admitted, the ticket wait is unchanged: it ends on the
+reply or the worker's disconnection (J1-0). A cancel during that wait takes
+effect when the reply arrives.
+
+##### Queue room wait states
+
+Selected design. Arrows name the event that moves one waiter.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Submit: Recovery needs PayloadFacts
+    Submit --> Admitted: try_submit returns a ticket
+    Submit --> Check: try_submit returns busy
+    Submit --> Journal: try_submit returns another error
+    Check --> Cancelled: Cancel flag set
+    Check --> Journal: Writer closing (Unavailable)
+    Check --> Submit: Fewer than 6 slots reserved
+    Check --> Waiting: Queue full, room lock held
+    Waiting --> Check: Job settles, writer closes or cancel wakes
+    Admitted --> [*]: Ticket wait ends on reply or disconnect
+    Cancelled --> [*]: Recovery returns Cancelled
+    Journal --> [*]: Recovery returns Journal
+    note right of Waiting: No timer. The lock is released while waiting
+```
+
+##### Queue room wait sequence
+
+Selected design. Arrows are calls or notifications between threads.
+
+```mermaid
+sequenceDiagram
+    participant R as Recovery worker
+    participant C as WriterClient
+    participant Room as Room (mutex and condvar)
+    participant W as Journal worker
+    participant S as Payloads shutdown
+    participant H as WriterHandle owner
+    R->>C: try_submit(PayloadFacts)
+    C-->>R: busy
+    R->>C: wait_for_room(cancel)
+    C->>Room: lock, check cancel, close and slot count
+    Room-->>C: queue full, wait (lock released)
+    alt A job settles
+        W->>W: JobSettlement drop releases its slot
+        W->>Room: lock, unlock, notify all
+        Room-->>C: recheck: slot free
+        C-->>R: Ok, retry try_submit
+    else Shutdown cancels recovery
+        S->>S: RecoveryCancel sets the cancel flag
+        S->>Room: wake_room_waiters: lock, unlock, notify all
+        Room-->>C: recheck: cancel set
+        C-->>R: Cancelled
+    else Writer closes
+        H->>H: WriterHandle close sets the close flag
+        H->>Room: lock, unlock, notify all
+        Room-->>C: recheck: closing
+        C-->>R: Unavailable, RecoveryError::Journal
+    end
+```
+
+| ID | Case | Unit | Integration | End-to-end |
+| --- | --- | --- | --- | --- |
+| J1-0-09 | Room wait wakes on settle, close and cancel, without a lost wakeup | `writer::tests::j1_0_09_*`: two waiters on a full queue both wake when one job settles; close returns `Unavailable`; cancel plus `wake_room_waiters` returns `Cancelled` with no settlement; 500 settlements racing the waiter's check all wake it; a gone worker answers `Unavailable` | — | — |
+| J1-0-10 | Payload recovery facts on a full queue | `payload_owner::tests::j1_0_10_*`: with 6 ordinary slots held, `journal_facts` stays waiting, then completes once the queued jobs settle; `RecoveryCancel::cancel` returns `Cancelled`; the writer's close returns `Journal` | `capture_flow` J1T-22 restarts run recovery through the real writer with an uncontended queue | — |
+
+The unit tests observe "still waiting" with a 200 ms test-side receive and
+detect a hang with a 5 s receive. These are test observation limits, not
+product time bounds. No end-to-end case applies: a full writer queue during
+recovery cannot be produced deterministically through the client.
 
 ### Turn and restart states
 
