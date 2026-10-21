@@ -110,10 +110,13 @@ from `read_authorized`. Its immutable snapshot binds installation, project ident
 turn operation and generation. Unaccepted input, observations, classifiers,
 background reconciliation and remote delegates receive no execution grant.
 
-Only qualified local model providers may propose exec_cmd calls. Apply the existing
+Only local model providers may propose exec_cmd calls. Apply the existing
 supported/enabled native-tool intersection and local destination fence. The verified
-local Ollama fence remains mandatory. CoreAI qualification remains separate; a
-registered exec_cmd entry is not evidence its provider can call it successfully.
+local Ollama fence remains mandatory. A registered exec_cmd entry is not evidence
+that a provider can call it successfully. EX10 (owner, 2026-10-14) keeps exec_cmd
+offered to every local tool-capable model, qualified or not; the
+[per-model qualification](#per-model-exec_cmd-qualification-ex10) records which
+models call it correctly.
 
 Recheck grant, owner generation, cancellation, project registration and retained
 project identity immediately before effect submission. The exec_cmd model cannot
@@ -421,6 +424,9 @@ a unique scratch proof, reports exact exit/output, and demonstrates one durable
 intent/result and one effect despite response retry. Verify denial without execution
 grant and a real cancel/deadline journey. Root stops/reaps every test child and
 reports each provider separately; mocked callbacks do not qualify native inference.
+The command deadline was removed on 2026-10-17. The
+[per-model qualification](#per-model-exec_cmd-qualification-ex10) defines the
+current SH-E1 cases, run count and evidence record for each local model.
 
 ## Model wire packet
 
@@ -628,3 +634,327 @@ mechanisms need design before code.
   environment and result text. Escapee detection and termination (EX5, owner
   2026-10-14) replaces the documented escape limit above. Both are recorded in
   the threat model and the job controller and need follow-up designs.
+
+## Per-model exec_cmd qualification (EX10)
+
+Status: selected procedure, 2026-10-20, under owner decision EX10 (2026-10-14).
+The cases, model identity, failure classes, evidence record and journey changes
+are selected. EXQ-2 to EXQ-5 are settled under existing rules (see
+[decisions](#qualification-decisions)). The verdict threshold (EXQ-1) is
+5 of 5 (owner, 2026-10-21). Results are recorded in
+[qualification results](#qualification-results-2026-10-20).
+
+### Scope and consequence
+
+EX10 requires SH-E1-style qualification of each local tool-capable provider
+(CoreAI, MLX and Ollama) before tool job packet J2. A provider contains many
+models, and one model's result does not qualify another (MP2-L4 in
+[model provider integration](model-provider-integration.md#mp2-provider-validation)).
+The unit of qualification is therefore one model identity, and the provider
+result is the set of its model results.
+
+A model is in scope when the helper offers it native tools:
+
+| Provider | In scope when |
+| --- | --- |
+| Ollama | `/api/show` lists `completion` and `tools`, and the daemon is on a loopback endpoint |
+| MLX | The loaded configuration has a native `toolCallFormat`, and the model declaration lists `toolCalling` |
+| CoreAI | The bundle loads and its native capabilities include tool calling |
+| System | Reference baseline only; it was qualified on 2026-09-28 and is rerun at the same commit to separate model failures from journey defects |
+
+Required behavior (EX10): exec_cmd stays offered to every local tool-capable
+model, whatever its verdict. This design adds no runtime gate, allow-list or
+configuration switch. A verdict is recorded evidence for the person and for J2.
+Remote providers stay out of scope: exec_cmd is denied for remote destinations.
+
+Non-goals: prompt-injection behavior (threat model EX-V4), escapee detection
+(EX5), downloads of models, and changes to the Ollama daemon. A missing local
+model is recorded as a gap, not downloaded.
+
+### Model identity
+
+A verdict applies only to the recorded identity. Each record names:
+
+| Provider | Selector in the journey | Version identity |
+| --- | --- | --- |
+| Ollama | `ollama:NAME:TAG` through `ASURA_TEST_OLLAMA_MODEL` | Daemon version, 12-hex model ID from `ollama list`, reported context window |
+| MLX | `mlx:native-fixture`, copied from `ASURA_TEST_MLX_ASSET` | Source repository and snapshot revision; otherwise the first 16 hex of the SHA-256 of `config.json` |
+| CoreAI | `coreai:native-fixture`, copied from `ASURA_TEST_COREAI_ASSET` | Metadata `name`, first 16 hex of `main.hash`, `max_context_length` |
+| All | — | Asura commit, `asura-model` SHA-256, macOS build |
+
+A new identity needs a new campaign. These changes also void earlier verdicts
+for the affected models: a change to the helper's tool path or provider
+adapter, a change to the exec_cmd schema or tool instructions, or a change to a
+provider dependency pin.
+
+### Cases
+
+Every case runs through the real service, the real helper and the real model in
+an isolated fixture home. The person-facing control surface is the service
+control API that the CLI uses. Mocked callbacks do not qualify a model.
+
+**EQ-1 Proof call.**
+- Initial state: fresh fixture home, model selected, a registered scratch
+  project whose `proof.txt` holds a random 128-bit token.
+- Trigger: a queued prompt asks for exactly one exec_cmd call with the fixed
+  command `printf x >> effect.txt; cat proof.txt; printf stderr-proof >&2` and
+  cwd `.`, then a reply that contains only the token.
+- Required result: the turn completes; the answer contains the token; the turn
+  lists one exec_cmd with status 1; `effect.txt` is exactly `x`. The journal holds
+  one kind 14 call with decision `run`, the exact command and cwd absent or `.`.
+  Its result has status 1, the envelope prefix `exit_code=0 ... cleanup_confirmed=true`,
+  the token on stdout, `stderr-proof` on stderr, no truncation, at most 16,384
+  bytes and no continuation.
+
+**EQ-2 Retry and restart.**
+- Initial state: EQ-1 passed.
+- Trigger: the same queue request is sent again; the service restarts; the request
+  is sent a third time.
+- Required result: each send returns the same accepted input and operation. The
+  observation after restart equals the first one, apart from live elapsed times,
+  which are absent. `effect.txt` stays `x`. The replayed durable result is equal.
+
+**EQ-3 Completion without a time limit.**
+- Initial state: service running, same project.
+- Trigger: a prompt asks for one exec_cmd call of a command that prints
+  `partial-output`, writes its shell PID to `complete.pid`, sleeps 3 seconds and
+  writes `complete.pid.late`.
+- Required result: the turn completes; the recorded command is exact; the result
+  has status 1, `reason=none`, `cleanup_confirmed=true` and `partial-output`. The
+  late marker exists. A read-only `kill -0` probe finds the process group absent.
+
+**EQ-4 Cancel.**
+- Initial state: service running, same project.
+- Trigger: the same command with `cancel.pid` and a 30-second sleep. The journey
+  cancels the turn after `cancel.pid` appears.
+- Required result: the turn ends cancelled (kind 5). The result has status 6,
+  `reason=cancelled`, `cleanup_confirmed=true` and `partial-output`. The late
+  marker is absent. The process group is absent.
+
+**EQ-5 Denial without the execution grant.**
+- Initial state: a call whose grant lacks `execute_authorized`, or whose
+  destination is remote.
+- Trigger: authority validation of an exec_cmd call.
+- Required result: `Denied` before any effect.
+- Evidence: the service unit test
+  `exec_cmd_requires_separate_execution_grant_and_never_remote_disclosure`, run
+  once per campaign at the same commit. The case is independent of the model: no
+  control-surface path creates an accepted project turn without the grant
+  (`tool_grant` in `conversation.rs`), and the loopback restriction blocks remote
+  destinations. A model therefore cannot pass or fail EQ-5.
+
+**EQ-3b and EQ-4b Escape-free variants (diagnostic).**
+- Initial state and trigger: as EQ-3 and EQ-4, with the command
+  `printf partial-output; echo $$ > MARKER; sleep N; echo late > MARKER.late`.
+  The markers are `complete-plain.pid` and `cancel-plain.pid`. The command has no
+  quotes and no backslash escapes.
+- Required result: as EQ-3 and EQ-4, including the exact-bytes rule.
+- Purpose (EXQ-3): a model that fails EQ-3 or EQ-4 but passes EQ-3b and EQ-4b
+  copies commands correctly and fails on escaping or quoting. A model that fails
+  both fails on copying. The variants are reported beside the verdict cases; they
+  do not change the verdict, so results recorded before they existed stay valid.
+
+### Failure classes
+
+| Class | Meaning | Effect on the campaign |
+| --- | --- | --- |
+| Model | No call, another tool, a changed command or cwd, a repeated call, or an answer without the token | Counts against the model |
+| Provider | The model does not load, reports no tool support, fills its context window, or the helper reports a provider failure | Counts against the model; a deterministic provider failure on the first run makes the model `unavailable` without further runs |
+| Service | An invariant fails after the model made the exact call: a second effect, a missing or extra durable record, a wrong status, unconfirmed cleanup, a live process group, or a different replay | A defect. It is not a model verdict; it stops J2 until fixed |
+| Harness | The fixture cannot start, attach or stop | Rerun; not counted |
+
+### Waits and loop closure
+
+The journey has no time bound on model work (owner rule: no default time bounds).
+It waits for each turn until its terminal event. In EQ-4 it waits until the PID
+marker appears or the turn ends; a turn that ends first fails EQ-4 as a model
+failure. Polls are pacing at 25 ms and end nothing. The fixture's own operation
+bounds (service ready, attach, stop) stay; they bound fixture steps, not model
+work. A run that never ends is ended by the operator's cancel or interrupt and
+recorded as such.
+
+### Runs and verdict
+
+Each in-scope model gets 5 independent runs. Each run uses a fresh fixture home.
+Runs are serial; no two inferences run at once. Each run reports every case as
+pass, fail with its class, or not reached. EQ-2 needs EQ-1; EQ-3, EQ-4, EQ-3b
+and EQ-4b run even when EQ-1 fails.
+
+Verdict (owner decision EXQ-1, 2026-10-21):
+
+| Verdict | Condition |
+| --- | --- |
+| Qualified | All 5 runs pass EQ-1 to EQ-4 |
+| Unreliable | At least one run passes EQ-1 to EQ-4, but not all 5 |
+| Failed | No run passes EQ-1 to EQ-4 |
+| Unavailable | A deterministic provider failure prevents the cases |
+| Not run | No local copy of the model exists |
+
+J2 consequence (EXQ-2, settled by EX10): the EX10 prerequisite of J2 is the
+campaign itself. A failed or unreliable model does not hold J2, because EX10 keeps
+exec_cmd offered regardless of the verdict. Only an open service-class defect
+holds J2. The 2026-10-20 campaign found none, so the EX10 prerequisite is met.
+
+### Qualification procedure
+
+Selected procedure. Arrows show the order of steps for one model; branch labels
+are the results that select the next step.
+
+```mermaid
+flowchart TD
+    Start[In-scope local model] --> Ident[Record model identity]
+    Ident --> Run[Fresh fixture home and run N of 5]
+    Run --> Load{Model loads with tool support?}
+    Load -->|No, deterministic| Unavail[Verdict unavailable]
+    Load -->|Yes| EQ1[EQ-1 proof call]
+    EQ1 -->|Pass| EQ2[EQ-2 retry and restart]
+    EQ1 -->|Fail| Mark1[Record class; EQ-2 not reached]
+    EQ2 --> EQ3[EQ-3 completion without time limit]
+    Mark1 --> EQ3
+    EQ3 --> EQ4[EQ-4 cancel after PID marker]
+    EQ4 --> EQb[EQ-3b and EQ-4b escape-free variants, diagnostic]
+    EQb --> Svc{Any service-class failure?}
+    Svc -->|Yes| Defect[Stop campaign; fix defect; J2 blocked]
+    Svc -->|No| More{Fewer than 5 runs?}
+    More -->|Yes| Run
+    More -->|No| Verdict[Verdict from pass counts]
+    Verdict --> Record[Record identity, counts and failure modes]
+```
+
+### Commands
+
+From `rust/`, with the test binary built by
+`cargo test --locked -p asura-service --test conversation_flow --no-run`:
+
+| Provider | Command |
+| --- | --- |
+| System | `conversation_flow --native-exec-cmd-tools` |
+| Ollama | `ASURA_TEST_OLLAMA_MODEL=NAME:TAG conversation_flow --native-ollama-exec-cmd-tools` |
+| MLX | `ASURA_TEST_MLX_ASSET=DIR conversation_flow --native-mlx-exec-cmd-tools` |
+| CoreAI | `ASURA_TEST_COREAI_ASSET=DIR conversation_flow --native-coreai-exec-cmd-tools` |
+| EQ-5 | `cargo test -p asura-service --lib exec_cmd_requires_separate_execution_grant` |
+
+Each run prints one `EQ-n PASS`, `EQ-n FAIL class: reason` or
+`EQ-2 NOT-REACHED` line per case, then `EQ-3b` and `EQ-4b` lines. It exits
+nonzero if any of EQ-1 to EQ-4 fails; the variants do not change the exit
+status. The fixture copies MLX and CoreAI assets into its own home and removes
+them; it never reads or writes `~/.asura`.
+
+### Validation of the journey
+
+The journey change is test code. It is validated by a system-model run at the
+same commit (all cases pass), by a run whose model does not call the tool (the
+cases report the model class and the run ends), and by formatting and Clippy.
+
+### Qualification results, 2026-10-20
+
+Verified behavior for the recorded identities only. Environment: macOS build
+26A428, 48 GiB host, Ollama 0.40.5 on `127.0.0.1:11434`, Asura commit `e68e4f3`
+plus the journey change in this section, `asura-model` SHA-256
+`dbbd51e9…9523`. MLX and CoreAI assets were copied from read-only sources into
+each fixture home; `~/.asura` was not used. Runs were serial. The first Ollama
+campaign ran before two reporting corrections: `model_unavailable` and
+`context_limit` were then labelled harness instead of provider, and an EQ-2
+that was not reached was labelled a failure. The case logic was unchanged.
+
+No run showed a service-class failure. In every run where the model made the
+exact call, the service recorded one durable call and result, made one effect,
+replayed it unchanged after restart, completed or cancelled the command with
+confirmed cleanup, and left no live process group. EQ-5 passed
+(`exec_cmd_requires_separate_execution_grant_and_never_remote_disclosure`, one run).
+
+Counts are runs that passed out of runs made. "All" counts runs that passed
+EQ-1 to EQ-4. The verdict uses the EXQ-1 thresholds.
+
+| Provider | Model | Identity | All | EQ-1 | EQ-2 | EQ-3 | EQ-4 | Verdict | Failure modes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| System | system model | macOS 26A428 | 6/7 | 6/7 | 6/6 | 7/7 | 7/7 | Unreliable (reference) | One answer without the token |
+| Ollama | `granite4.2:8b` | `f586c02fdecd`, 131,072 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | Qualified | — |
+| Ollama | `gemma4:12b` | `6114515d63c1`, 262,144 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | Qualified | — |
+| Ollama | `gemma4:26b` | `001e5dafc3c7`, 262,144 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | Qualified | — |
+| Ollama | `qwen3.8:27b` | `22130167c4c2`, 262,144 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | Qualified | 100–175 s per run |
+| Ollama | `ornith:9b` | `a75697c14589`, 262,144 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | Qualified | — |
+| Ollama | `hf.co/ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M` | `580b55f1a756`, 262,144 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | Qualified | — |
+| Ollama | `granite4.1:8b` | `444af1c4b2fe`, 131,072 | 2/5 | 5/5 | 5/5 | 3/5 | 4/5 | Unreliable | Space dropped in `"$$" >` (2); empty generation (1) |
+| Ollama | `ministral-3:8b` | `1922accd5827`, 262,144 | 2/5 | 5/5 | 5/5 | 5/5 | 2/5 | Unreliable | `\n` sent as a newline (3) |
+| Ollama | `qwen3-coder:latest` | `06c1097efce0`, 262,144 | 1/5 | 5/5 | 5/5 | 1/5 | 2/5 | Unreliable | Parallel second call (`cat complete.pid`) fails the turn (6); empty generation (1) |
+| Ollama | `qwen3:1.7b` | `8f68893c685c`, 40,960 | 0/5 | 5/5 | 5/5 | 0/5 | 0/5 | Failed | Quoting changed (6), `$$` lost (2), 5 calls (1), empty generation (1) |
+| Ollama | `qwen3:4b-q4_K_M` | `2bfd38a7daaf`, 40,960 | 0/5 | 5/5 | 5/5 | 0/5 | 0/5 | Failed | `"$$"` sent as `"$"` (10) |
+| Ollama | `llama3.2:3b` | `a80c4f17acd5`, 131,072 | 0/5 | 3/5 | 3/5 | 0/5 | 0/5 | Failed | No call (8); answer without token (2); `$$` lost (2) |
+| Ollama | `ministral-3:14b` | `4760c35aeb9d`, 262,144 | 0/5 | 4/5 | 4/5 | 0/5 | 0/5 | Failed | No call (11) |
+| MLX | Qwen3.5-4B-MLX-4bit | `mlx-community` `32f3e8ec` | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | Qualified | — |
+| MLX | granite-4.2-3b-q4-mlx | `ibm-granite` `0c6f39b1` | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | Qualified | — |
+| MLX | Qwen3.5-9B-MLX-4bit | `mlx-community` `938d8919` | 4/5 | 4/5 | 4/4 | 5/5 | 5/5 | Unreliable | Answer without token (1) |
+| MLX | LFM2.5-8B-A1B-MLX-4bit | `mlx-community` `146590a4` | 0/5 | 2/5 | 2/2 | 1/5 | 2/5 | Failed | No call (7); command changed (2) |
+| MLX | Qwen3-0.6B (bf16) | `Qwen` `c1899de2` | 0/5 | 4/5 | 4/4 | 0/5 | 0/5 | Failed | `$$` lost (10); answer without token (1) |
+| MLX | Qwen3-1.7B-4bit | `mlx-community` `3b1b1768` | 0/5 | 5/5 | 5/5 | 0/5 | 0/5 | Failed | `$$` lost (4); `\n` sent as a newline (3); empty generation (2); other escape (1) |
+| MLX | Qwen3-4B-4bit | `mlx-community` `4dcb3d10` | 0/5 | 5/5 | 5/5 | 0/5 | 0/5 | Failed | `"$$"` sent as `"$"` (10) |
+| MLX | Qwen3-4B (bf16) | `Qwen` `1cfa9a72` | 0/5 | 5/5 | 5/5 | 0/5 | 0/5 | Failed | `"$$"` sent as `"$"` (10) |
+| MLX | Falcon-H1-Tiny-Tool-Calling-90M-bf16 | `mlx-community` `5347be53` | — | — | — | — | — | Unavailable | Preparation returns `model_unavailable` (5 of 5) |
+| MLX | gemma-4-12B-it-MXFP8 (Osaurus) | `config.json` `1820e760` | — | — | — | — | — | Unavailable | Preparation returns `model_unavailable` (6 of 6) |
+| CoreAI | `qwen3_4b_4bit_dynamic` | `main.hash` `14c5d258`, 40,960 | 0/5 | 0/5 | — | 0/5 | 0/5 | Failed | Empty generation in EQ-1 (5); `"$$"` sent as `"$"` (10); about 20 minutes per run |
+| CoreAI | `muse_glimmer_30b_decode_int4hu_block32_sym` | `main.hash` `e8d27b8f`, 8,192 | 0/5 | 0/5 | — | 0/5 | 5/5 | Failed | Called the `project` tool in EQ-1 (5); empty generation in EQ-3 (5) |
+| CoreAI | `agents_a1_4b_decode_int8hu_block32_sym` | `main.hash` `313bb1e3`, 4,096 | — | — | — | — | — | Unavailable | `context_limit` before generation: the 4,096-token window cannot hold the request (5 of 5) |
+| CoreAI | `nemotron_3_nano_4b_decode_int8hu` | `main.hash` `0516a03c`, 4,096 | — | — | — | — | — | Unavailable | `context_limit` before generation (6 of 6) |
+
+Observations:
+
+1. EQ-1 passes for most models. EQ-3 and EQ-4 fail mostly because the model
+   changes the command bytes. The command `printf '%s\n' "$$"` contains a
+   backslash escape and `$$`. Several models send `\n` as a JSON newline, which
+   changes the bytes but not the shell result. All Qwen3 (not Qwen3.5) builds send
+   `"$$"` as `"$"` on every provider, which changes the result. Under EXQ-3 both
+   remain failures; the [escape-free variants](#variant-check-2026-10-20) show
+   which part fails.
+2. `qwen3-coder` proposes a second tool call while the first is pending. The
+   helper rejects it with `outputLimit` (callback code 103), and the turn fails
+   with `helper_failed`. This is known defect EXQ-D1 (see
+   [decisions](#qualification-decisions)), not a service-invariant failure.
+3. "Empty generation" is the helper diagnostic `generated_content_empty`. The
+   turn fails with `helper_failed`; no tool runs.
+4. The two unavailable MLX models were not diagnosed further. The fixture home,
+   with its service log, is deleted after each run.
+
+Gaps: no local copy exists of the earlier MLX fixture
+`LFM2.5-1.2B-Instruct-MLX-4bit` outside `~/.asura`, so it was not run. The
+Hugging Face cache entries for Agents-A1-4B, Muse-Glimmer-30B and Nemotron-3-Nano
+CoreAI repositories hold no snapshot; the Wisp copies were used instead.
+`deepseek-coder-v2` and `nomic-embed-text` do not declare `tools` and are out of
+scope. Prompt-injection behavior (EX-V4) was not tested.
+
+### Variant check, 2026-10-20
+
+The EQ-3b and EQ-4b variants were added after the campaign. They ran on the
+system model and two Ollama models at the same environment and commit:
+
+| Model | Runs | EQ-1 to EQ-4 (all) | EQ-3 | EQ-4 | EQ-3b | EQ-4b | Reading |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| System model | 2 | 2/2 | 2/2 | 2/2 | 2/2 | 2/2 | Variants pass where the escaped commands pass |
+| `ministral-3:8b` | 3 | 1/3 | 2/3 | 1/3 | 3/3 | 3/3 | Escaping error: `\n` sent as a newline; copying is correct |
+| `qwen3:4b-q4_K_M` | 2 | 0/2 | 0/2 | 0/2 | 2/2 | 2/2 | Escaping and quoting error: `\n` sent as a newline and `"$$"` as `"$"`; unquoted `$$` is copied correctly |
+
+The variants work as designed: they separate escaping errors from copying
+errors. The other models were not rerun with the variants.
+
+### Qualification decisions
+
+| ID | Status and source | Content |
+| --- | --- | --- |
+| EXQ-1 | Owner, 2026-10-21 | All 5 of 5 runs must pass for a model to be qualified; fewer passing runs are unreliable |
+| EXQ-2 | Settled by EX10 (owner, 2026-10-14) | The campaign is the J2 prerequisite. Model verdicts do not hold J2, because EX10 keeps exec_cmd offered. Only an open service-class defect holds J2. None is open, so the EX10 prerequisite of J2 is met |
+| EXQ-3 | Engineering choice under the [iteration rules](../design-process.md#iteration-and-escalation) | Keep the exact-bytes pass rule. Add the escape-free EQ-3b and EQ-4b variants so escaping errors are told apart from copying errors |
+| EXQ-4 | Settled by [model tool execution](model-tool-execution.md) (a concurrent callback fails with an explicit busy error) | The helper's turn failure is known defect EXQ-D1, fixed in a separate packet |
+| EXQ-5 | Settled by EX10 | exec_cmd stays offered to models that fail qualification. Proposed follow-up, not decided: show the person the model's recorded verdict when exec_cmd is offered |
+
+**Known defect EXQ-D1 (not fixed in this change).** Required behavior:
+`model-tool-execution.md` lines 267–268 say "A helper retains at most one
+suspended callback. Concurrent callbacks fail with an explicit busy error".
+Implemented behavior: `swift/model-helper/Sources/HelperCore/Session.swift`
+line 340 throws `BackendFailure(.outputLimit)` when `pendingTool` is not nil.
+The error reaches the Foundation Models session as a tool callback error;
+`Backend.swift` line 41 reports it as `tool_callback 103` (100 +
+`REASON_OUTPUT_LIMIT` 3 in `contracts/model/v1/model.proto`), and the turn fails
+with `helper_failed` (reason 9). Evidence: `qwen3-coder:latest` runs 1, 2, 3 and
+5 of 2026-10-20. The fix belongs in a separate helper packet. It must return the
+designed busy result for the second proposal without ending the turn, and add a
+unit test and a native regression with a parallel-calling model.

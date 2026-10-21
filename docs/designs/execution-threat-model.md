@@ -28,7 +28,8 @@ The approval does not select a mechanism that a decision leaves to a
 [follow-up design](#required-follow-up-designs), and it does not claim that any
 required outcome is implemented. It completes the review (T1) that gated
 [tool job](tool-job-controller.md#delivery-dependencies) packet J2. J2 now
-waits for the EX5 and EX10 prerequisites instead. Remote
+waits for the EX5 prerequisite instead; the EX10 prerequisite was met on
+2026-10-20 ([qualification results](exec-cmd-tool.md#qualification-results-2026-10-20)). Remote
 [model providers](model-provider-integration.md) stay refused until the EX13
 grant and EX14 credentials are built.
 
@@ -126,7 +127,7 @@ to `rust/crates/` or `swift/model-helper/Sources/HelperCore/`. The
 | EX7 | Conversation content leaves the device | Turn preparation refuses a non-loopback endpoint (`conversation.rs:1814-1819`). `/config set` refuses one (`asura-storage/src/config.rs:296-298`) under one rule (`:401-413`). The helper checks again (`OllamaBackend.swift:19`, `:58`). Tools need numeric loopback with helper attestation, except on-device providers (`asura-service/src/model_owner.rs:828-847`, `:835`; `endpoint_permitted` `:851-856`). | The endpoint grammar still accepts HTTPS hosts (`config.rs:398`), so an existing file can hold one; it loads but is refused at use. Before 2026-10-13 an HTTPS endpoint received instructions, prior prompts, prior final answers and the current prompt (`conversation.rs:1826-1838`). Prior final answers can quote project content from earlier local turns (inference from the history composition, not tested). |
 | EX8 | Remote endpoint impersonation or interception | System TLS validation; no redirects, cookies, cache or proxy (`OllamaBackend.swift:134-151`) | No credentials are sent today. Credential storage waits for EX14. |
 | EX9 | Same-UID process squats the loopback model port | Same-UID is one principal under D1 | A squatter receives prompts and tool results; accepted under D1, not mitigated |
-| EX10 | Execution is enabled for a model not qualified for it | Memory, audit and exec_cmd calls are denied for remote destinations (`tools.rs:365-372`); a remote destination must match the grant (`:374-379`) | The [exec_cmd design](exec-cmd-tool.md#implementation-evidence-2026-09-28) qualifies exec_cmd for the system model only. Code offers exec_cmd to every tool-capable provider (`ToolBridge.swift:77-85`, used at `Backend.swift:250`); project tools are allowed for on-device providers and Ollama (`asura-service/src/model.rs:236-245`). |
+| EX10 | Execution is enabled for a model not qualified for it | Memory, audit and exec_cmd calls are denied for remote destinations (`tools.rs:365-372`); a remote destination must match the grant (`:374-379`) | The [exec_cmd design](exec-cmd-tool.md#implementation-evidence-2026-09-28) qualifies exec_cmd for the system model only. Code offers exec_cmd to every tool-capable provider (`ToolBridge.swift:77-85`, used at `Backend.swift:250`); project tools are allowed for on-device providers and Ollama (`asura-service/src/model.rs:236-245`). Per-model SH-E1 qualification procedure and 2026-10-20 results: [exec_cmd per-model qualification](exec-cmd-tool.md#per-model-exec_cmd-qualification-ex10). |
 | EX11 | The person cannot turn execution off | — | `read_authorized` and `execute_authorized` are constant `true` and `remote_destination` is `None` (`conversation.rs:202-212`, `:211`). Only the build constant `ENABLE_PROJECT_TOOLS` (`:20`) disables tools. |
 | EX16 | The model reads or writes Asura's own state: journals, configuration, database and logs under `~/.asura` | Registration and every project open reject overlap with `~/.asura` by directory identity (`asura-platform/src/project_identity.rs:9-98`; `asura-storage/src/authority/writer/state.rs:394`, `:1275`; `conversation.rs:87`). The exec_cmd profile denies `~/.asura` except the call's scratch (`guardian.rs:151-156`). File tools walk each component under the pinned root (`project_identity.rs:176-194`) with `O_NOFOLLOW` (`asura-platform/src/runtime.rs:128-136`). A socket connect from an exec_cmd command returns EPERM (tested 2026-10-14). | Fixed on 2026-10-14 under [Asura state isolation](asura-state-isolation.md) (PX3). Before the fix, at commit `26a10fc`, registration accepted `~/.asura`, a root inside it, or a root containing it such as `~`, and `read_file` reached `.asura/config.yaml`. Copies of the home on other mounts remain a [residual limit](asura-state-isolation.md#residual-limits). |
 
@@ -261,7 +262,10 @@ Each entry gives the decision, the required outcome and where it is applied.
 10. **EX10 — qualify the others (owner, 2026-10-14).** exec_cmd stays offered to
     local tool-capable providers. Each needs SH-E1-style qualification before
     J2: CoreAI, MLX and Ollama models. Applied in the exec_cmd design and as a J2
-    prerequisite.
+    prerequisite. The campaign ran on 2026-10-20 and found no service-class
+    defect, so the J2 prerequisite is met; model verdicts do not hold J2
+    because exec_cmd stays offered (EXQ-2). Procedure, results and decisions
+    EXQ-1 to EXQ-5: [exec_cmd qualification](exec-cmd-tool.md#qualification-results-2026-10-20).
 11. **EX11 — a person-controlled execution setting (owner, 2026-10-14).** A
     global default plus a per-project override; the default is on. A change is
     a revocation trigger: turning execution off refuses new execution and
@@ -350,7 +354,7 @@ Each must be designed before its code. None is selected by this document.
 | --- | --- | --- |
 | Secret detection and redaction: rules, placeholders, command variables, capture integration. Selected 2026-10-15: [secret detection](secret-detection.md) | EX4, PX6, SD1–SD9 | Job packet J1; person command mode |
 | Escapee detection and termination: per-job sandbox marker, freeze-then-kill, settlement gate, `!!` best-effort. Selected 2026-10-20: [escapee control](escapee-control.md) | EX5, PT13 | Job packet J2 |
-| exec_cmd qualification per local provider (SH-E1 style) | EX10 | Job packet J2 |
+| exec_cmd qualification per local provider (SH-E1 style). Selected and run 2026-10-20: [per-model qualification](exec-cmd-tool.md#per-model-exec_cmd-qualification-ex10) | EX10 | Job packet J2 — met 2026-10-20; verdict threshold EXQ-1 is 5 of 5 (owner, 2026-10-21) |
 | Execution setting: global default and per-project override | EX11 | Revocation trigger TJ-14 |
 | Job-outlived-turn notice | EX12 | Client job packet J4 (proposed placement) |
 | Destination grant by data class and project | EX13, EX7 | Remote providers |

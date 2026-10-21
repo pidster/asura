@@ -20,8 +20,10 @@ governing J1 design. J1 also applies the
 [result retention packet](result-retention-graph-packet.md#review-decisions-and-delivery-dependencies)
 changes that the 2026-10-14 decisions record. The full review of findings
 EX1–EX16 (T1) was completed on 2026-10-15. J2 and the packets after it wait
-for EX5 escapee detection and termination and for EX10 exec_cmd qualification of
-each local provider; see [threat model review](#threat-model-review-of-2026-10-15).
+for EX5 escapee detection and termination. The EX10 exec_cmd qualification of
+each local provider was met on 2026-10-20
+([qualification results](exec-cmd-tool.md#qualification-results-2026-10-20)); see
+[threat model review](#threat-model-review-of-2026-10-15).
 Mechanisms marked "proposed" are engineering choices under the
 [iteration rules](../design-process.md#iteration-and-escalation), not owner
 decisions. Protocol numbering remains `0.1`; journal format remains `1`.
@@ -81,7 +83,7 @@ selected here.
 | --- | --- | --- |
 | EX4 | Owner, 2026-10-15. All tools use jobs; there are no legacy tools. Secrets are detected with Wisp's ported rules (SD1 corrects "rules plus a classifier"; no classifier) and replaced with placeholders at capture, before storage; secrets only. A secret in a command becomes a per-execution variable such as `$ASURA_SECRET_1`; the log keeps only its name; an unsafe rewrite is refused. | Supersedes R3's "legacy tools keep kind 15". The J1 capture path filters secrets under the [secret detection design](secret-detection.md). Retained streams, pages, journal records and both views hold placeholders. Job intent records the rewritten command. How other tools adopt jobs is a follow-up design. |
 | EX5 | Owner, 2026-10-14. Detect and terminate escapees reliably before J2: `setsid` and new-session escapes, pipe-holding escapees that block settlement, and false `cleanup_confirmed`. Selected: [escapee control](escapee-control.md), 2026-10-20. | J2 prerequisite. The guardian's settlement gate now confirms cleanup only when no attributed descendant remains; J2 consumes the gate and the escapee facts (see [what J2 consumes](escapee-control.md#what-j2-consumes)). Without it a pipe-holding escapee could hold a slot indefinitely, since jobs have no lifetime (J2a-1). |
-| EX10 | Owner, 2026-10-14. Run SH-E1-style exec_cmd qualification for each local tool-capable provider (CoreAI, MLX, Ollama models) before J2. | J2 prerequisite. |
+| EX10 | Owner, 2026-10-14. Run SH-E1-style exec_cmd qualification for each local tool-capable provider (CoreAI, MLX, Ollama models) before J2. | J2 prerequisite, met 2026-10-20: the campaign is recorded in [exec_cmd qualification results](exec-cmd-tool.md#qualification-results-2026-10-20) with no service-class defect. Model verdicts do not hold J2 because EX10 keeps exec_cmd offered (EXQ-2, [decisions](exec-cmd-tool.md#qualification-decisions)). |
 | EX11 | Owner, 2026-10-14. A person execution setting: global default plus a per-project override, default on. A change is a revocation trigger: turning it off refuses new execution and cancels live model jobs in scope. | Added to [revocation triggers](#security-and-authority) and TJ-14. The setting needs its own design. |
 | EX12 | Owner, 2026-10-14. The client shows a visible notice whenever a job outlives its turn. | Added to [turn end](#turn-end-steering-cancellation-and-completion). Proposed placement: J4. |
 
@@ -932,7 +934,7 @@ flowchart TD
     RP[Retention packet changes: G1, R1, R2, R4, R5] --> J1[J1: staging capture, secret filter, descriptors, text pages, quota]
     SD[EX4: secret detection slices SL1, SL2, implemented] --> J1
     ESC[EX5: escapee detection and termination, escapee-control.md] --> J2[J2: controller core with model and person origin]
-    QUAL[EX10: exec_cmd qualification per local provider] --> J2
+    QUAL[EX10: exec_cmd qualification per local provider, met 2026-10-20] --> J2
     J1 --> J2
     J2 --> J3[J3: model job tool and exec_cmd adoption]
     J2 --> J4[J4: control API, TUI jobs and retention commands]
@@ -1904,7 +1906,8 @@ Proof limits added by the implementation:
 
 No open owner decision blocks J1–J6. J1 is ready for implementation; SL1 and
 SL2 of the [secret detection design](secret-detection.md#delivery) are
-implemented. J2 waits for the EX5 and EX10 prerequisites. These remain for
+implemented. J2 waits for the EX5 prerequisite; the EX10 prerequisite was met
+on 2026-10-20 ([qualification results](exec-cmd-tool.md#qualification-results-2026-10-20)). These remain for
 later designs:
 
 1. **Other tools:** EX4 (owner, 2026-10-15) states that all tools use jobs. The

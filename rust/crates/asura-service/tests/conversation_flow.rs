@@ -200,33 +200,64 @@ fn checked_id(id: Option<Vec<u8>>) -> Result<[u8; 16]> {
 }
 fn observe(fixture: &Fixture, operation: [u8; 16]) -> Result<pb::ConversationEvent> {
     let end = Instant::now() + Duration::from_secs(75);
-    // Windows assemble the whole response (response-text-transfer.md).
-    let mut assembly = asura_client::ResponseAssembly::default();
-    let mut client = fixture.attach()?;
+    let mut observer = Observer::new(operation);
     while Instant::now() < end {
-        let event = match client.observe_with_thinking(
+        if let Some(event) = observer.step(fixture)? {
+            return Ok(event);
+        }
+    }
+    Err("native operation observation deadline".into())
+}
+/// One operation's observation, advanced one paced poll at a time. The caller
+/// chooses the closure: a harness bound, a terminal event or another condition.
+struct Observer {
+    operation: [u8; 16],
+    // Windows assemble the whole response (response-text-transfer.md).
+    assembly: asura_client::ResponseAssembly,
+    client: Option<(Client, Instant)>,
+}
+impl Observer {
+    fn new(operation: [u8; 16]) -> Self {
+        Self {
             operation,
-            assembly.cursor(),
-            assembly.held(),
-            assembly.held_thinking(),
+            assembly: asura_client::ResponseAssembly::default(),
+            client: None,
+        }
+    }
+    /// Polls once and paces; returns the whole event once the turn is terminal.
+    fn step(&mut self, fixture: &Fixture) -> Result<Option<pb::ConversationEvent>> {
+        // An attached client carries the fixture's per-client harness budget,
+        // so a long wait renews the attachment instead of outliving it.
+        if self
+            .client
+            .as_ref()
+            .is_none_or(|(_, attached)| attached.elapsed() >= Duration::from_secs(60))
+        {
+            self.client = Some((fixture.attach()?, Instant::now()));
+        }
+        let (client, _) = self.client.as_mut().ok_or("observer client absent")?;
+        let event = match client.observe_with_thinking(
+            self.operation,
+            self.assembly.cursor(),
+            self.assembly.held(),
+            self.assembly.held_thinking(),
         ) {
             Ok(event) => event,
             Err(asura_client::Error::Remote(_, message)) if message == "conversation_busy" => {
                 thread::sleep(Duration::from_millis(10));
-                continue;
+                return Ok(None);
             }
             Err(error) => return Err(error.into()),
         };
-        assembly.apply(&event)?;
-        if assembly.done() {
-            return Ok(assembly.whole(event));
+        self.assembly.apply(&event)?;
+        if self.assembly.done() {
+            return Ok(Some(self.assembly.whole(event)));
         }
-        if !assembly.complete() {
-            continue;
+        if self.assembly.complete() {
+            thread::sleep(Duration::from_millis(25));
         }
-        thread::sleep(Duration::from_millis(25));
+        Ok(None)
     }
-    Err("native operation observation deadline".into())
 }
 /// Queues one input and waits for its turn; there is no direct submission.
 fn submit(
