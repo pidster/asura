@@ -5,10 +5,10 @@
 //! raw-byte sweep.
 //!
 //! J3 retired the J1 call path (J3-E9): kind 23, the kind 15 tails and the
-//! J1 busy codes. The settled facts are read from the call's kind 28 and the
-//! result from its kind 29. Between J3-D and J34-E a model exec_cmd call is
-//! recorded `denied` and runs nothing (TJ-P3 step 4), so these cases pass
-//! again only once J34-E ports them to the job path.
+//! J1 busy codes. Every model exec_cmd call runs as a job (J34-E port, J1T
+//! cases after J3-D): the settled facts are read from the job's kind 28 and
+//! the result from the call's kind 29, which holds no output text. A job
+//! that outlives its yield window settles after the turn ends.
 #[path = "support/queue_submit.rs"]
 mod queue_submit;
 use asura_client::Client;
@@ -473,6 +473,21 @@ fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
     }
     Ok(out)
 }
+/// The first exec_cmd call of `operation` once its job's kind 28 committed:
+/// a job may settle after its turn ended (J3 yield window).
+fn settled_call(fixture: &Fixture, operation: [u8; 16], limit: Duration) -> Result<Call> {
+    let end = Instant::now() + limit;
+    loop {
+        let mut calls = exec_cmd_calls(fixture, operation)?;
+        if calls.first().is_some_and(|c| c.settled.is_some()) {
+            return Ok(calls.remove(0));
+        }
+        if Instant::now() >= end {
+            return Err("job did not settle".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
 fn hex(id: [u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -572,14 +587,9 @@ fn secrets_turn() -> Result<()> {
     }
     let event = finish(&fixture, operation, Duration::from_secs(60))?;
     assert_eq!(event.kind, Some(3), "{event:?}");
-    // The TUI's activity source: rewritten arguments and redacted previews.
-    assert!(
-        event.tools[0]
-            .preview
-            .as_deref()
-            .unwrap_or("")
-            .contains("$ASURA_SECRET_1")
-    );
+    // The TUI's activity source: rewritten arguments; a job result has no
+    // output preview (PC12), and the activity names the job (J4T-09).
+    assert!(event.tools.iter().all(|t| t.job_id.is_some()));
     assert!(
         event.tools[1]
             .arguments
@@ -637,12 +647,23 @@ fn secrets_turn() -> Result<()> {
     })?;
     let echoed = std::fs::read(object(&fixture, quoted.intent.stdout_payload))?;
     assert_eq!(echoed, b"$ASURA_SECRET_1\n");
-    // What the model saw.
+    // What the model saw: three handle deliveries, no output text.
     let messages = model.tool_messages();
     assert_eq!(messages.len(), 3, "{messages:?}");
     for message in &messages {
         assert!(!message.contains(&first) && !message.contains(&second));
+        assert!(message.starts_with("job: "), "{message}");
+        assert!(
+            !message.contains("GITHUB_TOKEN"),
+            "no output text: {message}"
+        );
     }
+    assert!(
+        messages[2]
+            .contains("command filtered: run from a secret variable: echo '$ASURA_SECRET_1'"),
+        "SL7 line: {}",
+        messages[2]
+    );
     // The service stays available.
     model.script(&[Step::ExecCmd("printf after".into()), Step::Final]);
     let next = submit(&fixture, project, "Again.")?;
@@ -762,7 +783,9 @@ fn whole_command_turn() -> Result<()> {
     Ok(())
 }
 
-/// J1T-05 integration: no 60 s limit; turn cancel stops a command.
+/// J1T-05 integration: no 60 s limit; turn cancel stops a command. J3: the
+/// call returns `running` at its 10 s yield window and the job settles
+/// later with no turn running (J3T-04, TJ-02).
 fn timeout_removed() -> Result<()> {
     let (fixture, model, project, directory) = setup("timeout")?;
     model.script(&[Step::ExecCmd("sleep 65; exit 7".into()), Step::Final]);
@@ -775,10 +798,19 @@ fn timeout_removed() -> Result<()> {
     })?;
     let event = finish(&fixture, operation, Duration::from_secs(120))?;
     assert_eq!(event.kind, Some(3));
-    let calls = exec_cmd_calls(&fixture, operation)?;
-    let result = calls[0].result.as_ref().ok_or("kind 29")?;
+    let returned = started.elapsed();
+    assert!(
+        returned < Duration::from_secs(60),
+        "the turn ended at the yield window: {returned:?}"
+    );
+    // EX12: the job outlived its turn.
+    assert_eq!(event.outlived_jobs, Some(1), "{event:?}");
+    let messages = model.tool_messages();
+    assert!(messages[0].contains("state: running"), "{}", messages[0]);
+    let call = settled_call(&fixture, operation, Duration::from_secs(120))?;
+    let result = call.result.as_ref().ok_or("kind 29")?;
     assert_eq!(result.status, 1);
-    let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
+    let settled = call.settled.as_ref().ok_or("kind 28")?;
     assert_eq!((settled.exit_kind, settled.exit_value), (1, 7));
     assert!(started.elapsed() >= Duration::from_secs(65));
     model.script(&[
@@ -858,7 +890,7 @@ fn no_output_stop() -> Result<()> {
         finish(&fixture, operation, Duration::from_secs(600))?.kind,
         Some(3)
     );
-    let calls = exec_cmd_calls(&fixture, operation)?;
+    let calls = vec![settled_call(&fixture, operation, Duration::from_secs(600))?];
     let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
     assert_eq!(settled.capture_state, JobCaptureState::Complete);
     assert_eq!(settled.stdout.capture.stored_bytes, size);
@@ -902,8 +934,11 @@ fn overload() -> Result<()> {
             finish(&fixture, operation, Duration::from_secs(20))?.kind,
             Some(5)
         );
+        // The cancel ended the yield window: kind 29 status 6 before the
+        // terminal; the job settles at the L3 bound after it (TJ-04).
+        let calls = vec![settled_call(&fixture, operation, Duration::from_secs(20))?];
         let settled_after = cancel_started.elapsed();
-        let calls = exec_cmd_calls(&fixture, operation)?;
+        assert_eq!(calls[0].result.as_ref().map(|r| r.status), Some(6));
         let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
         assert_eq!(settled.capture_state, JobCaptureState::Unconfirmed);
         assert_eq!(settled.capture_reason, CaptureReason::SettlementUnconfirmed);
