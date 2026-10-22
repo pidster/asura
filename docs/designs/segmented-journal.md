@@ -468,6 +468,8 @@ produces. It holds stored facts only:
 - The queue: order revision, last dispatched lane, unresolved inputs (at most
   16), inputs dispatched to the active operation, and the 64 most recently
   settled inputs for queue projection.
+- The unsettled jobs (J2, designed): the kind 26 and kind 27 locators of each
+  job without a kind 28, at most 64.
 - The run list and the segment census.
 
 Activity is any committed record that names the project or conversation:
@@ -478,10 +480,13 @@ index, not the only copy: every project and conversation also has index entries
 (`J`, `N`, `D`, `V`, `K`, `A`, `T`). An entity that leaves a recent set loses
 nothing. With at most 17 pinned entities (one active operation and 16
 unresolved inputs), the sets hold at most 81 projects and 273 conversations.
+J2 also pins the project and conversation of each unsettled job; with at most
+81 pinned entities the sets then hold at most 145 projects and 337
+conversations.
 
 Replay recomputes these derived values after it loads a checkpoint, and never
 stores them: closure reservations, input statuses, registered tool lookups,
-create-note identities, exec_cmd job and payload IDs, request digests from
+create-note identities, job IDs and payload IDs, the job reservation ledger, request digests from
 stored original fields, the per-project latest operation used by sensors, and
 all memory charges. A checkpoint that contains a field outside this list is
 `Corrupt`.
@@ -540,7 +545,8 @@ stateDiagram-v2
 | `C` tool call | Operation ID, ordinal | Decision, kind 14, kind 15 and kind 23 locators (zero when absent) | With `O` |
 | `T` turn | Conversation ID, generation | Operation ID, terminal kind, accepted locator, completed turns through this generation (SJ-D12) | With `O` |
 | `I` input | Input ID, 0 | Status, kind 18 locator, promotion locator, dispatched operation | Roll after the input settles |
-| `X` payload | Payload ID, 0 | Operation ID, generation, ordinal, kind 14 locator, kind 23 locator, last-use sequence | With `O` |
+| `X` payload | Payload ID, 0 | Form 1 (J1 call): operation ID, generation, ordinal, kind 14 locator, kind 23 locator, last-use sequence. Form 2 (job, J2 designed): job ID, kind 26 and kind 28 locators, last-use sequence | Form 1 with `O`; form 2 with `W` |
+| `W` job | Job ID, 0 | Conversation ID, origin, kind 26, kind 27 and kind 28 locators (J2 designed) | Roll after the job's kind 28 |
 | `S` segment | Segment first sequence, 0 | Last sequence, byte length, last frame digest | Roll that seals it |
 | `J` project | Project ID, 0 | Device, inode, visibility, kind 4 locator | Roll after registration |
 | `N` project name | Project ID, name revision | Kind 20 locator | Roll after rename |
@@ -801,10 +807,15 @@ each roll, before each merge and on each resume check.
 The ledger keeps the roll reserve (32 MiB) for closure records. A **normal
 record** is any record except kind 8 `TurnTerminal`, kind 7 `CancelRequested`,
 kind 6 `StartAuthorized` for an already accepted operation, kind 3
-`OwnerGeneration`, the pending `run` call's kind 23 and kind 15, and a kind 14
-with decision `cancelled` (SJ-D18). A normal record fits when its bytes, the
+`OwnerGeneration`, the pending `run` call's kind 23 and kind 15, a kind 14
+with decision `cancelled` (SJ-D18), and the job records kind 27
+`JobCancelRequested` and kind 28 `JobSettled` (designed with
+[J2](tool-job-controller.md#replay-order-and-the-job-reservation-ledger), not
+implemented). A normal record fits when its bytes, the
 roll reserve and the closure reservation after the record (SJ-D19) fit. The existing closure reservation in `reserve()` still holds
 the bytes of those closure frames for the active operation and unresolved inputs.
+J2 adds the job reservation ledger: one kind 27 and one kind 28 frame for each
+unsettled job, independent of the active operation.
 
 ### Quota decision
 
@@ -995,8 +1006,8 @@ exist in every state after the roll that emits them.
 stateDiagram-v2
     [*] --> Recent: Registration or creation committed
     Recent --> Recent: Activity committed, sequence updated
-    Recent --> Pinned: Active operation or unresolved input names it
-    Pinned --> Recent: Operation terminal and inputs settled
+    Recent --> Pinned: Active operation, unresolved input or unsettled job names it
+    Pinned --> Recent: Operation terminal, inputs settled and jobs settled
     Recent --> IndexOnly: 64 projects or 256 conversations have newer activity
     IndexOnly --> Recent: Activity committed, loaded from J or V entries
     IndexOnly --> IndexOnly: Lookup or page read through the index
@@ -1228,7 +1239,7 @@ direction. Each keeps one source of truth: the frames.
 | SJ-D15 | The delta keeps operations that became terminal since the checkpoint whole, charged at 64 bytes per piece; the roll generates their `O`, `P`, `C`, `T` and `X` entries. | Bounds memory as the replay budget states, and keeps one representation of a terminal operation until its run is written. |
 | SJ-D16 | `G` covers installation, graph, task, operation, input and dispatch-request IDs. A dispatch request ID is never accepted as another command's request ID. | Keeps today's rule that an input's dispatch request is used only by its kind 21, without keeping every input in memory. |
 | SJ-D17 | A checkpoint stores the active operation's tool calls as frame locators (kind 14, 23 and 15). Loading rebuilds the display projection, the tool lookup and the derived identities from those frames. | Derived files hold no argument or result text (SJ-32). At most 201 calls are read, through locators, not by a scan. |
-| SJ-D18 | Closure records are kind 8, 7, 6 and 3, plus the pending `run` call's kind 23 and kind 15 and a kind 14 `cancelled`. | The closure reservation already holds the bytes of the pending call's kind 23 and kind 15. A cancel during a pause must record a cancelled call before its terminal (TCR-D8). |
+| SJ-D18 | Closure records are kind 8, 7, 6 and 3, plus the pending `run` call's kind 23 and kind 15 and a kind 14 `cancelled`. J2 (designed) adds kinds 27 and 28, whose capacity the job reservation ledger holds. | The closure reservation already holds the bytes of the pending call's kind 23 and kind 15. A cancel during a pause must record a cancelled call before its terminal (TCR-D8). |
 | SJ-D19 | The quota check of a normal record uses the closure reservation after the record. | A `run` kind 14 reserves its kind 15 and kind 23 (TCR-D16); at the quota it is held before execution, as the pause requires. |
 | SJ-D20 | Live inputs hold the facts their status needs: the dispatched turn and its terminal kind, the steer target's terminal kind and cause, the promotion frame and the settle sequence. The 64 most recently settled inputs stay by settle sequence. A new input's order position follows the live inputs of its lane. | Input status is computed on the reactor's snapshot without index reads. The values are facts of later frames and replay recomputes them. |
 | SJ-D21 | The writer creates the `lock` file when it is absent. | The lock is not authority; a journal copied without it still opens. |

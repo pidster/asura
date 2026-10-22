@@ -159,7 +159,9 @@ guardian through checked platform actions. The guardian owns the command leader,
 its process group and the sole wait/reap responsibility. It remains outside the
 command's confined group and receives one inherited lease read endpoint. The service
 holds its sole writer; EOF requests cleanup even after abrupt service death.
-A hard monotonic job deadline also lives in the guardian, independent of the reactor.
+The hard monotonic job deadline that lived in the guardian was removed (J1-Q3; owner,
+2026-10-17); jobs have no lifetime. From J2 the lease also carries the stop bytes `T` and
+`K` ([guardian contract additions](tool-job-controller.md#guardian-contract-additions)).
 
 Setup and filesystem operations run in one retained platform setup worker, with a
 two-second logical deadline and cancellation checks. Never start a replacement
@@ -286,8 +288,10 @@ settlement, transfer the private scratch cleanup token to a retained cleanup
 worker; that worker alone calls the blocking validated cleanup operation.
 
 The guardian entrypoint is `run_guardian` in this same platform module. Root's CLI
-recognizes only the fixed private marker `--asura-exec-cmd-guardian` followed by job ID,
-absolute monotonic deadline nanoseconds and command as separate argv elements.
+recognizes only the fixed private marker `--asura-exec-cmd-guardian` followed by job ID
+and command as separate argv elements (the deadline argument was removed on 2026-10-17).
+J2 inserts a profile token, `model-1`, between them
+([guardian contract additions](tool-job-controller.md#guardian-contract-additions)).
 The parser never joins/reinterprets argv. Command size remains 8192 bytes; the total
 private argv payload is at most 8704 bytes. No user-supplied executable/profile/env
 is accepted. The validated inherited descriptors, not the marker or argv, authorize
@@ -324,8 +328,8 @@ new version number or RPC service. Encoding is exactly:
 | Bytes | Meaning |
 | --- | --- |
 | 0–3 | ASCII `ASSH` |
-| 4 | Kind:1 spawned,2 settled,3 setup_failed,4 cleanup_unconfirmed,6 escapee_report ([escapee control](escapee-control.md#guardian-status-notice-extensions)) |
-| 5 | Reason:0 none,1 unassigned (former timeout, removed 2026-10-17),2 cancel,3 output_limit,4 lease_ended,5 spawn_failed,6 sandbox_unavailable,7 identity_invalid,8 protocol_fault,9 cleanup_failed,12 escapee_terminated (kind 2),13 escapee_unterminated (kind 4) |
+| 4 | Kind:1 spawned,2 settled,3 setup_failed,4 cleanup_unconfirmed,5 leader_exited (J2),6 escapee_report ([escapee control](escapee-control.md#guardian-status-notice-extensions)) |
+| 5 | Reason:0 none,1 unassigned (former timeout, removed 2026-10-17),2 cancel (lease byte `T`, J2),3 output_limit (unassigned in J2),4 lease_ended,5 spawn_failed,6 sandbox_unavailable,7 identity_invalid,8 protocol_fault,9 cleanup_failed,11 kill (lease byte `K`, J2),12 escapee_terminated (kind 2),13 escapee_unterminated (kind 4) |
 | 6 | Exit kind:0 absent,1 exit_code,2 signal |
 | 7 | Cleanup:0 unconfirmed,1 owned_group_settled |
 | 8–23 | Exact nonzero 16-byte job ID |
@@ -346,8 +350,10 @@ cannot fill the pipe even if the service never reads. An unexpected WouldBlock
 is a protocol fault that triggers retained cleanup; there is no retry queue. The service must
 observe guardian exit and pipe EOF as well as a valid settled notice.
 
-The guardian and service use platform CLOCK_MONOTONIC nanoseconds for the absolute
-command expiry; reject overflow, expired values or more than 60 seconds remaining.
+Superseded (J1-Q3; owner, 2026-10-17): the absolute command expiry below no longer
+exists; the guardian keeps only its 100 ms poll and the wind-down bounds. The text records
+the earlier contract. The guardian and service used platform CLOCK_MONOTONIC nanoseconds for the absolute
+command expiry, rejecting overflow, expired values or more than 60 seconds remaining.
 No wall clock or cross-process serialization of Rust Instant is used. Root fixes
 the deadline before committing the intent, after reserving cleanup inside the
 current turn. A delayed intent acknowledgement never resets or extends it. Guardian rechecks it
@@ -536,7 +542,10 @@ responsiveness, busy admission, cancellation, late settlement and wake ordering.
 
 ## Service wrapper packet
 
-The service `exec_cmd_worker` owns one retained stage: Setup, Running, Cleanup or
+Superseded in part: J1 removed the setup deadline (J1-Q4) and the absolute command
+deadline (J1-Q3), and J2 replaces the Repair stage with `CleanupUnconfirmed` for jobs
+([J2](tool-job-controller.md#cleanupunconfirmed-and-late-settlement)). The text records the
+earlier contract. The service `exec_cmd_worker` owns one retained stage: Setup, Running, Cleanup or
 Repair. Setup runs in one thread with a two-second logical deadline. It resolves
 the current executable, opens the admitted project and rechecks device/inode,
 then calls platform prepare/spawn. The absolute command deadline was fixed before

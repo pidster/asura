@@ -746,7 +746,7 @@ Replay accepts kind 14 under these rules. A broken rule is `Corrupt`.
 | Field 15 equals the highest placeholder number in fields 5 and 14, and every number from 1 to field 15 appears. Field 17 equals the number of unnumbered placeholder tokens in fields 5 and 14 (TCR-D4). For an admitted exec_cmd call, the derived variable count is at most 16. |
 | A `run` exec_cmd record names a nonzero rule set (fields 18–19); kind 23 has no rule-set fields of its own (TCR-D3). |
 | A create_note kind 15 holds empty text (TCR-D1). |
-| A `run` exec_cmd record needs kind 23 before kind 15. Another `run` record needs kind 15 only. A record that does not run is followed by no kind 15 or kind 23. |
+| A `run` exec_cmd record needs kind 23 before kind 15, unless a kind 26 `JobIntent` follows it (a job-mode call, designed with [J2](tool-job-controller.md#replay-order-and-the-job-reservation-ledger)); then no kind 23 follows and kind 15 follows kind 26. Another `run` record needs kind 15 only. A record that does not run is followed by no kind 15 or kind 23. |
 
 The writer's `reserve()` accepts kind 14 only when the journal can still hold
 the record and the frames that must follow it (TCR-D16). After a `run` record
@@ -762,7 +762,8 @@ Crash and restart:
 | Before the kind 14 commit | No record | The turn is interrupted as today. |
 | After kind 14 that does not run | Complete call | None |
 | After kind 14 `run`, before kind 15 | The call is interrupted | Startup writes no tool record. The turn terminal is `Interrupted`. Nothing runs again. |
-| After kind 14 `run` exec_cmd, before kind 23 | As the J1 [derived recovery](tool-job-controller.md#replay-order-and-reservation) table, with payload IDs derived from kind 14 | Unchanged |
+| After kind 14 `run` exec_cmd, before kind 23 | As the J1 [derived recovery](tool-job-controller.md#replay-order-and-reservation) table, with payload IDs derived from the call's job ID | Unchanged |
+| After kind 26 of a job-mode call (J2, designed) | The job is unsettled; the call is interrupted if kind 15 is missing | Startup writes kind 28 `interrupted` ([J2 recovery](tool-job-controller.md#j2-recovery-explicit-interrupted-settlements)) |
 | After kind 14 `run` create_note, before kind 15 | The memory store resolves the receipt by the derived memory operation ID | HM3 recovery, with the identity derived instead of read from kind 17 |
 | After kind 15 | Complete call | None |
 

@@ -1,7 +1,9 @@
 # Tool job controller
 
-Status: design, 2026-10-12, revised 2026-10-14 and 2026-10-15; not implemented.
-J1 is ready for implementation; J2 is gated as before. The owner
+Status: design, 2026-10-12, revised 2026-10-14, 2026-10-15 and 2026-10-22.
+J1 is implemented (2026-10-16). J2 is ready for implementation under
+[J2 implementation details](#j2-implementation-details) (2026-10-22). J3–J6
+are not yet implementation-ready; their interface design is a later pass. The owner
 selected the direction and three decisions on 2026-10-12: conversation-scoped
 jobs, record-only completion and a yield window with a small preview. Later owner
 decisions replace the preview and add person-origin jobs; see
@@ -9,7 +11,10 @@ decisions replace the preview and add person-origin jobs; see
 the owner resolved every blocking decision of the readiness audit; see
 [owner decisions of 2026-10-14](#owner-decisions-of-2026-10-14).
 
-Readiness: packet J1 is ready for implementation. The owner's
+Readiness: packet J1 is implemented, and packet J2 is ready for implementation.
+The owner decision of 2026-10-21 on per-agent queues and the owner resolutions
+of the J2–J5 readiness audit are recorded in
+[J2 implementation details](#j2-implementation-details). The owner's
 [execution threat model](execution-threat-model.md#owner-decisions) decision EX4
 (2026-10-15) puts secret filtering into the J1 capture path. The
 [secret detection design](secret-detection.md) defines it; J1's filter is its
@@ -47,10 +52,11 @@ The controller therefore retains each stream from offset 0. It never keeps only
 a rolling tail. A capture that stops early keeps its contiguous prefix.
 
 This separates three things that the current [exec_cmd tool](exec-cmd-tool.md) couples:
-process lifetime, output retention and model disclosure. Today one call blocks its
-turn for at most 60 seconds (`asura-service/src/tools.rs:189`), then returns up to
-6144 bytes from the end of each stream into the model result
-(`asura-platform/src/exec_cmd/capture.rs:72`).
+process lifetime, output retention and model disclosure. Since J1 (2026-10-16)
+one call runs inside its turn with no timeout and blocks the turn until the
+command ends or the turn is cancelled. J1 retains each stream whole, but the
+model result still carries up to 6,144 redacted bytes from the end of each
+stream (`render_tail`, `asura-platform/src/exec_cmd/capture.rs`) until J3.
 
 | Decision | Selected by the owner, 2026-10-12 |
 | --- | --- |
@@ -70,7 +76,7 @@ by the [context composer](context-composer.md) (conversation projections items 5
 | [Tool output views](tool-output-views.md#required-behavior) rules 1–4 | Owner, 2026-10-13 | One retained stream per tool output. Person and model views are chosen separately. No tool defines a fixed preview. Journal result records hold a payload reference, a digest and a short summary, never output text. Frame sizes stay fixed transport units. |
 | Tool output views [required change](tool-output-views.md#required-design-changes) for this design, with [PC12](person-command-mode.md#decisions) | Owner, 2026-10-14 | Until the context composer exists, job results carry no output text. The model pages with `job read`. |
 | [PCR6, PCR11](person-command-mode.md#required-behavior), [PC5, PC7, PC8, PC9, PC10](person-command-mode.md#decisions) | Owner, 2026-10-13 and 2026-10-14 | Person-origin jobs: a person execution profile and grant, stop then kill at once on a second request, a 2 s stop grace, dispatch with no active turn in the conversation, model `cancel` of a person job returns `not_permitted`, and accepted work continues when a client goes away. |
-| [Person job controller amendments](person-command-mode.md#job-controller-amendments) | Proposed mechanisms | `JobCancel.kill`, `JobObserve.at_end`, origin and input ID on job records and replies, and person job ID derivation. J2 includes them. |
+| [Person job controller amendments](person-command-mode.md#job-controller-amendments) | Proposed mechanisms | J2 includes the controller parts: person origin and input ID on job records, the person job ID, kill escalation with the `K` lease byte, and person waiters in the agent queue ([J2 scope](#j2-scope)). The control fields `JobCancel.kill` and `JobObserve.at_end` belong to J4. |
 | [Execution threat model review](execution-threat-model.md#owner-decisions) EX4, EX5, EX10, EX11, EX12 | Owner, 2026-10-14 and 2026-10-15 | See [threat model review of 2026-10-15](#threat-model-review-of-2026-10-15). |
 | [Asura state isolation](asura-state-isolation.md) (PX3, SI3) | Implemented, 2026-10-14 | Every exec_cmd profile denies `~/.asura` except the call's scratch. The guardian receives the Asura home at FD 10 (`asura-platform/src/exec_cmd/guardian.rs:199`); person extra roots use FDs 11–17. Jobs inherit this unchanged. |
 
@@ -117,6 +123,16 @@ Each row names the section that applies it.
 | S1 | Pin, unpin, delete and note are journal records keyed by job ID, with commands `/job pin`, `/job unpin`, `/job delete` and `/job note`, and a model `job note`. Notes stay with the conversation journal. | [Retained output lifetime](#retained-output-lifetime) |
 | S2 | Value classes, ages and tie-break are defined now (S2-1 to S2-3). | [Retained output lifetime](#retained-output-lifetime) |
 
+Later owner decisions amend three rows above. Each is applied in
+[J2 implementation details](#j2-implementation-details).
+
+| ID | Decision | Amends |
+| --- | --- | --- |
+| AQ1 | Owner, 2026-10-21: "I plan to support subagents. We will need a queue for each agent (main and sub). Enqueue, explain why (briefly)." Queues, lanes and slots are per agent. The main agent is the first instance; the agent is a keyed dimension so subagents add instances. Blocked work, including a person `!` command when slots are full, is enqueued with a brief reason that names what blocks it, not refused. No job slot is reserved. | J2a-1 ("further starts return `busy`") and J2a-2 ("2 per conversation" becomes 2 per agent) |
+| WB1 | Owner, 2026-10-21: wind-down bounds that act only after a closure has fired stay: TERM-to-KILL grace, the L3 cleanup bound (2.5 s) and shutdown cleanup (2 s). The `yield_seconds` default stays; it ends the call's wait, not the job. The 2 s page-read `busy` is replaced: a page read waits for the storage reply or for the caller's cancel or detach. | "Wind-down bounds" row (page read 2 s removed) |
+| EN1 | Owner, 2026-10-21: J3 and J4 ship and are enabled together. exec_cmd must not run as a job until the EX12 outlived-turn notice and `/jobs` cancel exist. | [Delivery](#tj-p1-delivery-order) |
+| RV1 | Owner, 2026-10-21: J2 delivers the identity-change, journal-outage and shutdown revocation triggers. The EX11 setting is designed before J3 is enabled. TJ-14 is partial in J2, with the gap stated. | [Revocation](#security-and-authority), TJ-14 |
+
 ## Terms
 
 | Term | Meaning |
@@ -128,7 +144,11 @@ Each row names the section that applies it.
 | Readable watermark | Byte count of a stream that storage has written and reported; reads never exceed it |
 | Job notice | Service-written status block for a later turn; it never contains job output |
 | Job closure | A condition that ends a job: completion, cancel, revocation, restart or capture fault |
-| Wind-down bound | A fixed bound on one of Asura's own operations, such as a page read or cleanup; it never ends a job's normal run |
+| Wind-down bound | A fixed bound on one of Asura's own operations that acts only after a closure has fired, such as the TERM-to-KILL grace or cleanup; it never ends a job's normal run |
+| Agent | One model agent instance that owns an input lane, a job queue and job slots. Today each conversation has one main agent (agent 0); subagents add instances later |
+| Agent job queue | The controller's FIFO of job starts for one agent that wait for a start condition; each entry shows its blocking reason |
+| Job slot | One running job's resources: a slot worker, a capture worker and a 1 MiB-step quota reservation |
+| Job reservation ledger | The journal capacity that every unsettled job holds for its cancel and settlement records, independent of any turn |
 
 ## Canonical ownership
 
@@ -147,11 +167,12 @@ scheduler or payload store.
 | Model session and native tool callbacks | Supervised Swift helper; it never receives payload paths or streams |
 
 Ownership transfer: today the exec_cmd worker lives in the turn's active state
-(`asura-service/src/conversation.rs:487`), and the conversation owner holds one
-active turn (`conversation.rs:584`). Turn terminal and ToolResult publication
-wait for its settlement (`conversation.rs:3466`, `conversation.rs:3486`). Under this
-design, the controller owns each job slot and its worker from intent onward.
-The turn waits only for handle delivery, never for job settlement.
+(`Active::exec_cmd_worker`, `asura-service/src/conversation.rs:470` at commit
+`a088a65`), and the conversation owner holds one active turn (`Owner::active`,
+`conversation.rs:576`). Turn terminal and ToolResult publication wait for its
+settlement. Under this design, the controller owns each job slot and its worker
+from intent onward. The turn waits only for handle delivery, never for job
+settlement. J2 builds the controller beside the J1 path; J3 moves exec_cmd onto it.
 
 ### TJ-O1: ownership and data flow
 
@@ -191,15 +212,18 @@ flowchart LR
 ### Starting a job
 
 Proposed mechanism: every `exec_cmd` call runs as a job. `exec_cmd` gains an optional
-`yield_seconds` argument. It loses `timeout_seconds`, because jobs have no
-lifetime (J2a-1). Model field 3 of `ExecCmd` (`contracts/model/v1/model.proto:79`)
-becomes reserved, and a call that still sets it is rejected as invalid
-arguments. Other tools stay synchronous until they adopt the controller.
+`yield_seconds` argument in the service's argument parser and the helper's tool
+description. `timeout_seconds` was already removed (owner, 2026-10-17); the
+model wire has no typed arguments (`ToolCall` fields 10–19 are reserved), so no
+wire field changes. Other tools stay synchronous until they adopt the controller.
 
-1. The conversation owner checks arguments, grant, duplicate identity, slots and
-   quota. Duplicate detection runs first, so a retry returns the existing job.
-2. A missing slot or quota returns `busy` before any intent is written.
-3. The controller commits a durable job intent, then rechecks grant and project
+1. The conversation owner checks arguments, grant and duplicate identity.
+   Duplicate detection runs first, so a retry returns the existing job.
+2. The controller accepts the job into the agent's job queue and commits a
+   durable job intent. A blocked start waits in the queue with its reason
+   ([agents, queues and slots](#agents-queues-and-slots)); only a full queue
+   returns `busy`.
+3. When a slot and quota are granted, the controller rechecks grant and project
    identity and starts the process.
 4. The call waits for the job to settle or for the yield window to expire.
 5. The owner commits the starting call's ToolResult. This is handle delivery.
@@ -210,21 +234,18 @@ arguments. Other tools stay synchronous until they adopt the controller.
 In both cases the result states how many bytes remain unread. The model can then
 continue the turn, call `job` commands, or finish its answer while the job runs.
 
-Behavior change: today the default timeout is 30 seconds
-(`conversation.rs:236`), the maximum is 60, and the result carries the end of
-each stream. Under jobs a call returns after at most the 10-second default yield,
-and its result carries no output text. A command that runs longer than 10
-seconds returns a handle instead of its outcome. A command that today stops at
-its timeout runs until it ends or is cancelled. Every command needs `job read`
-for its output. Regression tests must cover short and long commands.
+Behavior change: since J1 a call has no timeout and blocks its turn until the
+command ends or the turn is cancelled, and the result carries the redacted end
+of each stream. Under jobs a call returns after at most the 10-second default
+yield, and its result carries no output text. A command that runs longer than 10
+seconds returns a handle instead of its outcome, and the turn continues. Every
+command needs `job read` for its output. Regression tests must cover short and
+long commands.
 
-Proposed mechanism: a model job ID is the first 16 bytes of SHA-256 over ASCII
-`asura.model.job`, one zero byte, then the operation ID, the generation as 8
-big-endian bytes and the ordinal as 4 big-endian bytes. If all 16 bytes are zero,
-the final byte becomes 1. The domain string separates model job IDs from
-[person job IDs](person-command-mode.md#durable-records). A retried start with
-the same operation, generation, ordinal and arguments derives the same ID and
-returns the existing job; changed arguments conflict.
+Job IDs use one derivation for every origin: see
+[job identity](#job-identity). A retried start with the same operation,
+generation, ordinal and arguments derives the same ID and returns the existing
+job; changed arguments conflict.
 
 ### Reconnecting to a job
 
@@ -349,9 +370,9 @@ sequenceDiagram
     participant G as Platform guardian
     participant S as Payload adapter
     M->>C: exec_cmd(command, yield 10 s)
-    C->>K: Check duplicate, slot and quota
-    K->>J: Commit intent, quota and record reservations
-    K->>K: Recheck grant and project identity
+    C->>K: Check duplicate, enqueue in the agent queue
+    K->>J: Commit kind 26 intent, ledger reserves kinds 27 and 28
+    K->>K: Slot and 1 MiB granted, then recheck grant and project identity
     K->>G: Spawn owned process group
     K->>S: Open staging streams
     K-->>C: Yield expired: handle, running, bytes so far
@@ -418,48 +439,52 @@ journal records only settled facts.
 
 ### TJ-S1: job lifecycle
 
-Arrows name triggers. `Interrupted` and `CleanupUnconfirmed` never claim that
-effects did not occur. Busy and quota rejections happen before intent and have
-no state here. No transition is driven by a job lifetime (J2a-1).
+Selected design, revised for J2 on 2026-10-22. Arrows name triggers; the
+`Live` composite groups every state that restart interrupts. `Interrupted`
+and `CleanupUnconfirmed` never claim that effects did not occur. A blocked
+start waits in `Queued` with its reason (owner, 2026-10-21, AQ1); only a full
+queue is refused, before any record, and has no state here. No transition is
+driven by a job lifetime (J2a-1). Guardian notice kinds are in
+[guardian contract additions](#guardian-contract-additions).
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Admitted: Intent, quota and record reservations committed
-    Admitted --> Starting: Slot worker begins setup
-    Admitted --> NotStarted: Grant or identity recheck fails
-    Starting --> Running: Guardian returns owned job
-    Starting --> NotStarted: Setup failure proves no owned process
-    Running --> Stopping: Cancel trigger
-    Running --> Draining: Leader-exit notice (kind 5)
-    Running --> CapturePaused: Quota cannot grow after expiry attempt, or ENOSPC
-    CapturePaused --> Running: Space freed, reservation extended
-    CapturePaused --> Stopping: Cancel trigger
-    CapturePaused --> Draining: Leader-exit notice, reading resumes
-    Draining --> Stopping: Cancel trigger, including quota or ENOSPC
-    Stopping --> Draining: Owned group signalled
-    Draining --> Finalizing: Leader reaped, group gone, pipes at EOF
-    Draining --> CleanupUnconfirmed: Cleanup bound expires
-    CleanupUnconfirmed --> Finalizing: Late settlement observed
-    NotStarted --> Recorded: Settlement without effect committed
-    Finalizing --> Recorded: Settlement with outcome and digests committed
-    Recorded --> [*]: Payload install completes or is reconciled
-    Admitted --> Interrupted: Restart
-    Starting --> Interrupted: Restart
-    Running --> Interrupted: Restart
-    CapturePaused --> Interrupted: Restart
-    Stopping --> Interrupted: Restart
-    Draining --> Interrupted: Restart
-    CleanupUnconfirmed --> Interrupted: Restart
-    Finalizing --> Interrupted: Restart before settlement commit
-    Interrupted --> [*]
+    [*] --> Live: Job accepted into the agent queue
+    state Live {
+        state origin <<choice>>
+        [*] --> origin
+        origin --> Queued: Model origin, kind 26 committed
+        origin --> Starting: Person origin, slot and 1 MiB granted, kind 26 committed
+        Queued --> Starting: Start conditions hold, slot and 1 MiB granted
+        Queued --> Recording: Cancel trigger, outcome not_started
+        Starting --> Running: Spawned notice (kind 1)
+        Starting --> Recording: Setup failure or cancel before spawn, not_started
+        Running --> Stopping: Cancel trigger, T written
+        Running --> Draining: Leader-exit notice (kind 5)
+        Running --> CapturePaused: Quota short after expiry, or ENOSPC
+        CapturePaused --> Running: Space freed, reservation extended
+        CapturePaused --> Stopping: Cancel trigger, T written
+        CapturePaused --> Draining: Leader-exit notice, reading resumes
+        Stopping --> Stopping: Person kill, K written
+        Stopping --> Draining: Leader-exit notice (kind 5)
+        Draining --> Draining: Cancel trigger incl. quota or ENOSPC, capture discards
+        Stopping --> CleanupUnconfirmed: Cleanup-unconfirmed notice (kind 4)
+        Draining --> CleanupUnconfirmed: Cleanup-unconfirmed notice (kind 4)
+        Draining --> Finalizing: Settled notice (kind 2), pipes at EOF
+        CleanupUnconfirmed --> Finalizing: Late settled notice, cleanup late
+        Finalizing --> Recording: Capture sealed, or L3 passed after a cancel trigger
+    }
+    Recording --> Recorded: Kind 28 committed
+    Recorded --> [*]: Slot released after scratch cleanup, install completes
+    Live --> Interrupted: Restart before kind 28 commits
+    Interrupted --> [*]: Next start commits kind 28 interrupted
 ```
 
-Verified guardian behavior (code, commit `3cf424b`): when the leader exits, the
-guardian sends TERM to the group at once and KILL 500 ms later
-(`asura-platform/src/exec_cmd/guardian.rs:304-326`, `guardian.rs:37-38`). It reports
-the exit only after the group is empty and the leader is reaped
-(`guardian.rs:327-347`). Its notices have kinds 1–4 only
-(`asura-platform/src/exec_cmd/protocol.rs:47-52`).
+The guardian sends TERM to the owned group at once when the leader exits and
+KILL after the profile's grace, then runs the
+[escapee sweep](escapee-control.md#guardian-implementation-refinements-2026-10-21).
+It reports the settled notice only after the leader is reaped, the group is
+empty, the pipes are at EOF and no attributed descendant remains.
 
 Required behavior (owner, 2026-10-14, J2b): the guardian adds notice kind 5,
 leader exited, sent when it observes the leader's exit and before the group's
@@ -467,12 +492,15 @@ final settlement. The controller enters `Draining` on that notice. The guardian
 keeps signalling the group as it does now. A paused job that receives the notice
 resumes reading, because capture never pauses in `Draining`.
 
-Cancel triggers are model or client cancel, person stop and kill for person jobs,
-a capture fault other than ENOSPC, quota or ENOSPC during `Draining`, and every
-revocation trigger in the [security section](#security-and-authority). A turn
-ending, steering, `/new` or the TUI `/cancel` of a turn is not a trigger after
-handle delivery. `CleanupUnconfirmed` keeps its slot and counts toward live job
-limits. `CapturePaused` also keeps its slot; see
+Cancel triggers are model or client cancel, a turn that ends before handle
+delivery, person stop and kill for person jobs, a capture fault other than
+ENOSPC, quota or ENOSPC during `Draining`, and every revocation trigger in the
+[security section](#security-and-authority). A turn ending, steering, `/new` or
+the TUI `/cancel` of a turn is not a trigger after handle delivery. A cancel
+trigger in `Draining` changes the recorded reason and makes capture discard;
+the guardian is already stopping the group. `CleanupUnconfirmed` keeps its slot
+and counts toward live job limits until a late settled notice or restart.
+`CapturePaused` also keeps its slot; see
 [retained output lifetime](#retained-output-lifetime).
 
 ### Job closures and wind-down bounds
@@ -488,22 +516,27 @@ The job closures are:
 | Capture fault other than ENOSPC | Exhaustion of Asura's capture path |
 
 No closure guarantees that an unattended job ends. A live job holds one of the
-known-size job slots, so further starts return `busy` until the person cancels
-it through `/jobs`. A stall closure for jobs will come from tool-loop trace
-evidence under [tool output views rule 5](tool-output-views.md#tool-loop-trace-evidence).
+known-size job slots, so further starts wait in the agent's job queue with the
+reason `agent_slots` or `service_slots` until the person cancels a job through
+`/jobs` (owner, 2026-10-21, AQ1). A stall closure for jobs will come from
+tool-loop trace evidence under
+[tool output views rule 5](tool-output-views.md#tool-loop-trace-evidence).
 
-Required behavior (owner, 2026-10-14): these wind-down bounds limit Asura's own
-operations. They never end a job's normal run and are not job closures.
+Required behavior (owner, 2026-10-14, amended 2026-10-21 by WB1): these
+wind-down bounds limit Asura's own operations. Each acts only after a closure
+has fired. They never end a job's normal run and are not job closures.
 
-| Bound | Value | Source |
-| --- | --- | --- |
-| TERM to KILL grace | 500 ms model jobs; 2 s person jobs (PC8) | Owner, 2026-10-14 |
-| Page read storage step | 2 s | Owner, 2026-10-14 |
-| Shutdown cleanup | 2 s | Owner, 2026-10-14 |
+| Bound | Value | Starts at | Source |
+| --- | --- | --- | --- |
+| TERM to KILL grace | 500 ms for profile `model-1`; 2 s for the person profiles (PC8) | The first stop signal to the owned group | Owner, 2026-10-14 |
+| Cleanup until unconfirmed (L3) | 2.5 s | The first stop signal (guardian) or the cancel trigger (capture settlement, J1-Q1) | Limit review; owner, 2026-10-21 (WB1) |
+| Shutdown cleanup | 2 s | Shutdown | Owner, 2026-10-14 |
 
-The cleanup bound before `CleanupUnconfirmed` (2.5 s, exec_cmd limit L3, kept by
-the [limit review](tool-output-views.md#limit-review)) only decides when
-cleanup is reported as unconfirmed after the job has already ended.
+The L3 bound only decides when cleanup or capture settlement is reported as
+unconfirmed; it never releases a slot or deletes scratch. A page read has no
+time bound (WB1): it ends on the storage reply, or on the caller's cancel or
+detach ([page reads](#page-reads-without-a-step-bound)). The `yield_seconds`
+window of J3 ends the starting call's wait, not the job.
 
 Required behavior (owner, 2026-10-15): job setup and client observation have
 no time bound.
@@ -511,8 +544,9 @@ no time bound.
 - **Setup** ends when the process is spawned, on cancel, or on a setup fault.
   The existing 2-second exec_cmd setup budget (L2) is removed in J1 (J1-Q4, owner,
   2026-10-15); see [J1 timeout and setup budget removal](#j1-timeout-and-setup-budget-removal).
-- **`JobObserve`** returns on new output past the client's offset, job
-  settlement, client detach or cancel. It has no polling timer.
+- **`JobObserve`** returns on new output past the client's offset, a job state
+  change, job settlement, client detach or cancel. It has no polling timer and
+  no hold time.
 
 ### Capture, watermark and page contract amendments
 
@@ -560,14 +594,14 @@ When implemented, this design changes these existing contracts for jobs:
 | Existing clause | Change |
 | --- | --- |
 | exec_cmd: command stops at turn end, steering or generation invalidation | Only before handle delivery |
-| exec_cmd: `timeout_seconds` 1–60 (`tools.rs:189`); guardian rejects deadlines over 60 s (`guardian.rs:322`) | Removed. J1 removes the timeout and adds the guardian's no-deadline mode (J1-Q3); `timeout_seconds` and the guardian's numeric deadline mode are removed (owner, 2026-10-17). Jobs have no lifetime (J2a-1) |
-| Helper and control validation of `timeout_seconds` 1–60 (`swift/model-helper/Sources/HelperCore/ToolBridge.swift:185`, `asura-control/src/model.rs:394`) | `timeout_seconds` removed; `yield_seconds` validated instead |
-| exec_cmd: one exec_cmd worker per active turn (`conversation.rs:487`) and one active turn (`conversation.rs:584`), so one live exec_cmd job service-wide | Controller slots under the limits below |
-| exec_cmd intent: ToolIntent record kind 14 with tool kind 16 stores the timeout as 1–60,000 ms and 1–60 s (`asura-storage/src/authority/conversation/codec.rs:289-305`) | J1: kind 14 `ToolCall` with no timeout (kind 22 retired 2026-10-18); J2: job intent record (R3) |
-| exec_cmd result: end of each stream, at most 6144 bytes (`exec_cmd/capture.rs:72`) | No output text (PC12) |
-| Model tools: ToolResult record kind 15 holds result text (`types.rs:415-423`) | All tools use jobs and the reference-only result kind (EX4, owner 2026-10-15, superseding R3's "legacy tools keep kind 15") |
-| Guardian: notices of kinds 1–4 (`protocol.rs:47-52`) | Adds kind 5, leader exited (J2b) |
-| Guardian: any byte on the lease pipe is a protocol fault (`guardian.rs:389-399`) | Stop-control bytes, below |
+| exec_cmd: `timeout_seconds` 1–60; guardian rejects deadlines over 60 s | Done: J1 removed the timeout (J1-Q3); `timeout_seconds` and the guardian's numeric deadline mode were removed (owner, 2026-10-17). Jobs have no lifetime (J2a-1). J2 replaces the guardian's deadline argument with a profile token |
+| Service argument parser and helper tool description of exec_cmd | `timeout_seconds` already removed (2026-10-17); J3 adds `yield_seconds` |
+| exec_cmd: one exec_cmd worker per active turn (`Active::exec_cmd_worker`) and one active turn, so one live exec_cmd job service-wide | Controller slots per agent and per service under the limits below (J2 builds them; J3 moves exec_cmd onto them) |
+| exec_cmd intent: the old ToolIntent kind 14 with a timeout | Done: kind 14 `ToolCall` with no timeout (kind 22 retired 2026-10-18). J2 adds kind 26 `JobIntent` after a job-mode kind 14 ([J2 records](#j2-records-kinds-26-27-and-28)) |
+| exec_cmd result: redacted end of each stream, at most 6,144 bytes (`render_tail`) | No output text (PC12), from J3 |
+| Model tools: ToolResult record kind 15 holds result text | All tools use jobs and the reference-only result kind (EX4, owner 2026-10-15, superseding R3's "legacy tools keep kind 15"); the kind is designed with J3 |
+| Guardian: notices of kinds 1–4 and 6 (`protocol.rs`) | Adds kind 5, leader exited (J2b), and kind 2 reasons 2 and 11 ([guardian contract additions](#guardian-contract-additions)) |
+| Guardian: any byte on the lease pipe is a protocol fault (`lease_reason`, `guardian.rs`) | Stop-control bytes `T` and `K` (J2) |
 | Retention: one active capture | One capture worker per job slot (R4) |
 | Retention: install payloads, then record the outcome | Record settlement with digests, then install (R2) |
 | Retention: reserve a call's 64 MiB maximum before spawn | 1 MiB initial reservation in 1 MiB steps (R1) |
@@ -575,35 +609,40 @@ When implemented, this design changes these existing contracts for jobs:
 | Retention: pages always bind a descriptor digest | `live` and `unverified_prefix` page states above |
 | Retention: a text offset inside a UTF-8 scalar rejects | The start snaps forward to the next boundary (R5) |
 
-Proposed mechanism, adopted from the
-[person design](person-command-mode.md#platform-changes) for every job: the lease
-pipe accepts single bytes. `T` starts TERM and the profile's grace timer; `K`
-sends KILL at once. EOF still means service loss and stops the group as today.
-Model job cancel writes `T`. At most 2 bytes are written, below `PIPE_BUF`.
+Selected (engineering), adopted from the
+[person design](person-command-mode.md#platform-changes) for every job and
+delivered in J2: the lease pipe accepts single bytes. `T` starts TERM and the
+profile's grace timer; `K` sends KILL at once. EOF still means service loss and
+stops the group as today. Model job cancel writes `T`. At most 2 bytes are
+written, below `PIPE_BUF`. The byte rules are in
+[guardian contract additions](#guardian-contract-additions).
 
 ### Arguments and limits
 
 Each count is configurable within a fixed maximum (J2a-2). Defaults are owner
-decisions of 2026-10-14; the maxima are proposed values. Other retention limits
-remain unless this table changes them.
+decisions of 2026-10-14; per-agent counts follow AQ1 (owner, 2026-10-21); the
+maxima are proposed values. The configuration keys are in
+[J2 configuration](#j2-configuration-keys). Other retention limits remain
+unless this table changes them.
 
 | Boundary | Default and overload result | Maximum (proposed) |
 | --- | --- | --- |
 | `yield_seconds` | 0–30, default 10; 0 returns the handle immediately after spawn | 30 |
 | Job lifetime | None (J2a-1) | — |
-| Live jobs | 4 per service and 2 per conversation, including `CleanupUnconfirmed`, `CapturePaused` and person jobs; another start returns `busy` before intent | 16 per service, 8 per conversation |
+| Live jobs | 4 per service and 2 per agent, including `CleanupUnconfirmed`, `CapturePaused` and person jobs; another start waits in the agent's job queue with its reason (AQ1) | 16 per service, 8 per agent |
+| Agent job queue | 8 waiting starts per agent; the next start returns `busy` with reason `queue_full`; 64 unsettled jobs per service, then `busy` with `jobs_full` | 16 per agent; 64 per service, fixed |
 | Retained output per job | No per-job cap (J1d); the shared quota applies | — |
 | Quota | 1 GiB total, configurable; 1 MiB initial reservation per job; 1 MiB growth steps; 16 MiB recovery reserve, fixed (R1) | Configured total bounded by available disk at startup |
 | Capture | One capture worker per job slot, each with a 512 KiB transfer queue (R4); a full queue stops reading that job's pipes until it drains | Follows live jobs |
 | Preview | None; until the composer exists, results carry no output text (PC12) | — |
-| `read` page | At most 8 KiB source bytes, within the existing 16 KiB result limit until the composer replaces it (L21) | 8 KiB |
+| `read` page | At most 8 KiB source bytes, within the 16 KiB per-result limit (L21, kept by owner rule) | 8 KiB |
 | `wait` | Ends on job end, new output or turn cancellation; optional model time | — |
 | `list` | At most 8 jobs | 8 |
 | Job notice | At most 8 entries; command at most 8192 bytes; no byte cap (J5a) | 8 entries |
-| Page reads | 2 page-read workers (R4); 1 reserved for the model | 2 |
+| Page reads | 2 page-read workers (R4); 1 reserved for the model (J2a-2; this reserves a read worker, not a job slot); 8 queued; a read waits for its reply with no time bound (WB1) | 2 workers; 0–1 reserved |
 | Client viewers | Counted per attachment; 8 pending `JobRead` or `JobObserve` requests per service; the 9th returns `busy` | 32 per service |
 | Client page | `JobRead` and `JobObserve` return at most 8 KiB source bytes | 8 KiB |
-| Journal reservations | Cancel request and settlement frames reserved at intent; at most one cancel request record per job | — |
+| Journal reservations | The [job reservation ledger](#replay-order-and-the-job-reservation-ledger) holds one kind 27 and one kind 28 frame per unsettled job from kind 26 until settlement; at most one kind 27 per job | 64 jobs × 4,473 bytes |
 
 Existing turn limits remain. Each `job` command counts toward the 200 tool calls
 of a turn (L20; owner, 2026-10-18). Its result is subject to the 16 KiB
@@ -630,36 +669,38 @@ is never placed in system instructions. The context composer places it once it e
 
 Required behavior (owner, 2026-10-14, R3): new format-1 record kinds for job
 intent, cancel and settlement, and a reference-only result kind for job tools.
-Kinds are allocated at integration in delivery order: J1's descriptor records,
-then the J2 kinds, then the person design's queue entry. No existing record or
-data changes. The job tools take the next free tool kinds after 16, one per
-command, at integration.
+Kinds are allocated in delivery order: J1 used kind 23; J2 allocates kinds 26,
+27 and 28 ([J2 records](#j2-records-kinds-26-27-and-28)); J3 allocates the
+reference-only result kind; the person design's queue entry follows. The job
+tool's commands take the next free [operation codes](tool-call-records.md#operation-codes)
+after 10 when J3 is designed.
 
-| Record | Binds |
-| --- | --- |
-| Job intent | Job ID, origin, conversation, project, originating operation, generation and ordinal (model origin) or input ID (person origin), command and cwd digests, grant snapshot, quota reservation, reserved record capacity; no timeout |
-| Job cancel requested | Job ID, requester (model turn, client, person or revocation), reason; at most one per job. A person kill after a stop writes no second record (J2d). |
-| Job settlement | Job ID, outcome (`not_started`, exited, signalled, cancelled, `interrupted`), reason (including `person_stop`, `person_kill`, `quota`, `enospc`, `capture_fault`, `shutdown`, `revocation`), exit status, capture state, byte counts, digests and a payload reference per stream, and pause facts: first pause time, total paused duration and bytes lost (J2c) |
-| Job result | Reference-only result for a `job` command: operation, generation, ordinal, job ID, stream, offsets and page digest; never page text |
-| Job retention | Pin, unpin, delete or note, keyed by job ID, with author and, for a note, its text (S1) |
+| Record | Kind | Binds |
+| --- | --- | --- |
+| Job intent | 26 (J2) | Origin, agent and the origin reference: operation, generation and ordinal (model origin) or input ID (person origin). Job ID, conversation, project, profile, command, cwd, quota reservation and reserved capacity are derived, never stored (TCR-O5) |
+| Job cancel requested | 27 (J2) | Job ID, requester, reason and kill flag; at most one per job. A person kill after a stop writes no second record (J2d) |
+| Job settlement | 28 (J2) | Job ID, outcome, reason, exit facts, cleanup facts, escapee count, elapsed time, and the capture facts of kind 23 with a line count per stream, including the pause facts (J2c). Payload IDs are derived from the job ID |
+| Job result | J3 | Reference-only result for a `job` command: operation, generation, ordinal, job ID, stream, offsets and page digest; never page text |
+| Job retention | J6 | Pin, unpin, delete or note, keyed by job ID, with author and, for a note, its text (S1) |
 
 No record holds output text (tool output views rule 3). Under EX4 (owner,
-2026-10-15) the job intent's command is the rewritten command: a detected secret
-appears only as its per-execution variable name, never as its value. The person design adds
-person-origin fields, line counts, elapsed time and a cleanup flag
-([durable records](person-command-mode.md#durable-records)).
+2026-10-15) the command that a job runs is the rewritten command; it is stored
+once, in kind 14 for a model job and in kind PCQ for a person job, never in the
+job records.
 
 Records stay with the conversation that started the job (J4a). The writer
-accepts cancel, settlement and retention records when no turn is active. They
-bind the job ID and its originating conversation, and cancel and settlement use
-capacity reserved at intent. Cancellation signals the process group immediately;
-the cancel record is written asynchronously and never delays the signal. Replay
-rebuilds job state from these records. A record never resumes a process.
+accepts cancel and settlement records when no turn is active and while the
+journal is held at its quota, because the
+[job reservation ledger](#replay-order-and-the-job-reservation-ledger) holds
+their capacity from intent to settlement. Cancellation signals the process group
+immediately; the cancel record is written asynchronously and never delays the
+signal. Replay rebuilds job state from these records. A record never resumes a
+process.
 
-Proposed mechanism: at recovery, the controller writes an explicit settlement
-with outcome `interrupted` for each intent without a settlement, using the
-reserved capacity. Notices and listings then read a recorded fact rather than an
-inference from missing records.
+Selected (engineering, 2026-10-22): at recovery, the controller writes an
+explicit kind 28 with outcome `interrupted` for each job without a settlement
+([J2 recovery](#j2-recovery-explicit-interrupted-settlements)). Notices and
+listings then read a recorded fact, and the ledger and checkpoint stay bounded.
 
 ## Retained output lifetime
 
@@ -722,7 +763,7 @@ under quota pressure.
 | Open person or model read | While the read or viewer is open |
 | Model reference | While the model used the handle in the current or previous turn |
 
-Held output can fill the quota. New jobs then return `busy` with reason `quota`
+Held output can fill the quota. New job starts then wait in their agent queue with reason `quota` (AQ1)
 until a hold ends or the person deletes output.
 
 Required behavior (owner, 2026-10-13, extended 2026-10-14 by R6 and J2a-1): when a
@@ -761,7 +802,8 @@ group members, keeps the captured prefix and records the stop reason `quota` or
 
 ### TJ-R1: failure and restart handling
 
-Selected design. Arrows lead to the recorded outcome. No branch respawns a job.
+Selected design, revised 2026-10-22. Arrows lead to the recorded outcome. No
+branch respawns a job.
 
 ```mermaid
 flowchart TD
@@ -773,7 +815,7 @@ flowchart TD
     Bound -->|No| Unconf2[capture_unconfirmed: unverified prefix, result delivered, worker kept]
     Unconf2 --> Recorded
     Kind -->|I/O fault other than ENOSPC| Stall[Stop capture, keep prefix, request cancel]
-    Kind -->|Journal unavailable| Unavail[Cancel all live jobs]
+    Kind -->|Journal unavailable| Unavail[Cancel all live jobs, start none, no record possible]
     Kind -->|Quota cannot grow, or ENOSPC| Expire[Expire eligible output]
     Expire --> Freed{Enough space freed?}
     Freed -->|Yes| Continue[Extend reservation, continue capture]
@@ -781,14 +823,15 @@ flowchart TD
     Freed -->|No, job Draining| Settle
     Paused -->|Space freed| Continue
     Paused -->|Cancel trigger or leader exit| Settle
-    Kind -->|Cleanup bound expires| Unconf[CleanupUnconfirmed: keep slot and scratch]
+    Kind -->|Guardian cleanup-unconfirmed notice| Unconf[CleanupUnconfirmed: keep slot and scratch]
+    Unconf -->|Late settled notice| Settle
     Kind -->|Service restart or crash| Restart[Guardian sees lease EOF and kills group]
     Stall --> Settle[Normal settlement path]
-    Unavail --> Settle
+    Unavail -->|Next service start| Replay
     Settle --> Recorded[Commit settlement with pause facts, then install]
     Restart --> Replay{Settlement committed?}
     Replay -->|Yes| Install[Verify digest and complete install]
-    Replay -->|No| Interrupted[Write interrupted settlement: effects may have occurred]
+    Replay -->|No| Interrupted[Write kind 28 interrupted: effects may have occurred]
     Interrupted --> Partial[Keep staging bytes as unverified prefix]
 ```
 
@@ -804,19 +847,25 @@ flowchart TD
 - **Quota cannot grow or disk full:** the controller expires eligible output,
   then pauses capture if space is still short. See
   [retained output lifetime](#retained-output-lifetime).
-- **Stalled read:** a page request has a 2-second storage bound. Expiry of that
-  bound returns `busy`; the retained read worker stays held until it settles.
-- **Journal unavailable:** the owner enters its existing repair path and cancels
-  all live jobs, as it cancels the exec_cmd job today (`conversation.rs:3155-3166`).
-  Settlement records wait for repair and use their reserved capacity.
-- **Quota exhausted:** new jobs return `busy` with reason `quota`. Running jobs
-  keep their reservations.
+- **Stalled read:** a page request waits for the storage reply with no time
+  bound (WB1). The caller's cancel or detach withdraws a queued request; a read
+  already on a worker continues, its reply is discarded, and the worker stays
+  held until the call returns. A ninth queued request returns `busy`.
+- **Journal unavailable:** a fenced or repair-required writer makes the owner
+  storage-unavailable, as today (`conversation.rs:3643-3648` at `a088a65`
+  cancels the exec_cmd job). The controller cancels all live jobs and starts
+  none. No job record can be written; the next start writes `interrupted`
+  ([journal outage](#journal-outage-hold-and-shutdown)). A journal held at its
+  quota is not unavailable: kinds 27 and 28 still commit from the ledger.
+- **Quota exhausted:** new starts wait in the agent's job queue with reason
+  `quota` (AQ1). Running jobs keep their reservations.
 - **Unattended job:** a job nobody cancels runs until it ends, holding its slot.
-  When slots are full, starts return `busy`; the person cancels through `/jobs`.
+  When slots are full, starts wait in the agent's job queue with reason
+  `agent_slots` or `service_slots`; the person cancels through `/jobs`.
 - **Stale handle:** an unknown job, or a job outside the caller's conversation or
   project, returns `not_found` without revealing whether it exists elsewhere.
 - **Duplicate call:** an identical retried start returns the existing job, even at
-  the slot limit. Changed arguments under the same call identity conflict.
+  the slot or queue limit. Changed arguments under the same call identity conflict.
 - **Restart:** a restart never reattaches to a process, signals a journaled PID or
   runs a job again. Interrupted jobs stay listable and readable.
 - **Graceful shutdown:** shutdown closes job admission and cancels live jobs. A job
@@ -841,7 +890,7 @@ instead; they have network access by owner decision (PCR7). The full threat
 model review (T1) covered this and was completed on 2026-10-15.
 
 Verified behavior (code): `read_authorized` and `execute_authorized` are constant
-`true` in the turn grant (`conversation.rs:202-212`, at commit `7db114d`). The read
+`true` in the turn grant (`conversation.rs:256-258`, at commit `a088a65`). The read
 check below and the policy revocation trigger therefore have no person-controlled
 input until the EX11 setting (owner, 2026-10-14) is built.
 
@@ -852,15 +901,18 @@ retained identity on every request. A client request defaults to the client's
 selected project and may cover every registered project, as described in
 [TUI behavior](#tui-behavior).
 
-**Revocation triggers.** Each trigger cancels the affected live jobs:
+**Revocation triggers.** Each trigger cancels the affected live jobs and
+settles their queued starts as `not_started`. RV1 (owner, 2026-10-21) scopes
+J2 to three of them; [revocation in J2](#revocation-in-j2) states the gap.
 
-| Trigger | Affected jobs |
-| --- | --- |
-| Project unregistered or retained identity changes | All jobs of that project |
-| EX11 execution setting turned off, globally or for a project (owner, 2026-10-14) | Live model jobs in scope; new execution is refused. Person jobs are not affected. The setting needs its own design. |
-| Execution grant revoked for a project or principal | Jobs started under that grant |
-| Journal unavailable | All live jobs |
-| Service shutdown, including exit of a TUI-launched backend | All live jobs |
+| Trigger | Affected jobs | Delivered in |
+| --- | --- | --- |
+| Retained project identity changes | All jobs of that project | J2 |
+| Project unregistered | All jobs of that project | No unregister operation exists; it is added with the operation |
+| EX11 execution setting turned off, globally or for a project (owner, 2026-10-14) | Live model jobs in scope; new execution is refused. Person jobs are not affected. | Designed before J3 is enabled (RV1) |
+| Execution grant revoked for a project or principal | Jobs started under that grant | With EX11; the grant flags are constants today |
+| Journal unavailable | All live jobs | J2 |
+| Service shutdown, including exit of a TUI-launched backend | All live jobs | J2 |
 
 `/new` and client exit are not revocation triggers (J4a, PC5).
 
@@ -874,8 +926,8 @@ settlement and retention-command metadata; it never stores output or note text.
 | --- | --- |
 | AE-01 | The reactor handles readiness, bounded state changes and page dispatch. `wait` and `JobObserve` park replies; `JobRead` is one bounded page; they never block the reactor. |
 | AE-02 | Blocking calls: spawn and setup, filesystem writes, hashing, sync, install, page reads and expiry deletion. Each slot uses the existing retained setup and cleanup worker stages and one capture worker; page reads use 2 retained page-read workers (R4). Pipe reads are nonblocking reactor reads with an 8 KiB quantum per stream. |
-| AE-03 | Limits in the table above. Every overload returns `busy`, pauses capture or stops capture with an explicit reason. The model keeps a reserved page-read worker. |
-| AE-04 | Jobs have no deadline (J2a-1). Their cancellation owners are model, client and person cancel, revocation, shutdown and lease EOF. Asura's own operations keep the [wind-down bounds](#job-closures-and-wind-down-bounds). `wait` ends on events or the optional model time. Turn cancellation ends waits and reads, and jobs only before handle delivery. A paused capture has no time expiry; the same cancellation owners end it. |
+| AE-03 | Limits in the table above. A blocked start waits in its agent's job queue with an explicit reason (AQ1); a full queue returns `busy`; capture overload pauses or stops capture with an explicit reason. The model keeps a reserved page-read worker. |
+| AE-04 | Jobs, queued starts and page reads have no deadline (J2a-1, WB1). Their cancellation owners are model, client and person cancel, revocation, shutdown and lease EOF. Asura's own operations keep the [wind-down bounds](#job-closures-and-wind-down-bounds), which act only after a closure. `wait` ends on events or the optional model time. Turn cancellation ends waits and reads, and jobs only before handle delivery. A paused capture has no time expiry; the same cancellation owners end it. |
 | AE-05 | No respawn after an unknown outcome. Replay rebuilds state, writes `interrupted` settlements and completes installs. Duplicate starts return the existing job. |
 | AE-06 | Shutdown closes admission, cancels live jobs and follows existing guardian cleanup within the 2-second shutdown bound. Unsettled cleanup keeps its ownership. |
 | AE-07 | Acceptance cases below require real process, storage-stall, journal-fault and restart evidence, with typing and Inspect within 100 ms under load, as retention case RG-03 requires. |
@@ -895,13 +947,13 @@ real model provider and the TUI PTY harness.
 | TJ-05 | Read while running | Watermark bound, `live` pages, cursor after install | Live flood, offsets stable across install | TUI attach shows growing output |
 | TJ-06 | Model and client cancel | Request versus settled state, one cancel record; `T` lease byte | TERM then KILL, cleanup evidence | `/job cancel` and model `cancel` |
 | TJ-07 | Idle completion | No turn started, notice bound by the input digest | Settlement without active turn | Next turn receives notice only |
-| TJ-08 | Limits, busy and duplicates | Busy before intent, duplicate first, model job ID vectors; configured counts above their maxima reject | Third job per conversation, fifth per service | Visible busy result |
+| TJ-08 | Limits, queues and duplicates | Blocked start queued with its reason; full queue `busy` before any record; duplicate first; job ID vectors; configured counts above their maxima reject | Third job of one agent queued with `agent_slots`, fifth per service with `service_slots`; each starts when a slot frees | Visible queued reason |
 | TJ-09 | Quota limits | Capture stop and pause reasons | Quota fill from retained jobs; no per-job cap stops a model job | Paused and stopped captures labelled |
-| TJ-10 | Stalled storage and observer saturation | Read `busy`, reserved model read | Blocked writer and reader, 8 pending client reads | Controls stay responsive within 100 ms |
+| TJ-10 | Stalled storage and observer saturation | A read waits for its reply; cancel and detach withdraw a queued read; reserved model read; ninth queued read `busy` | Blocked writer and reader, 8 pending client reads | Controls stay responsive within 100 ms |
 | TJ-11 | Restart at each checkpoint | Replay of intent-only, running, finalizing, settled-not-installed; `interrupted` settlement written once | Crash at each point; guardian cleanup; uninstalled staging becomes an unverified prefix | Interrupted job listed and readable |
 | TJ-12 | Cross-conversation and cross-project access | Model `not_found` without disclosure | Model denied other conversations and projects; client denied unregistered projects | — |
 | TJ-13 | `/new` and exit with live jobs | Neither cancels; records stay with the originating conversation | Jobs survive `/new` and client exit and keep recording to the prior conversation; TUI-launched backend exit stops them through shutdown | PTY: `/new`, then `/jobs` lists the jobs; exit and reattach lists them |
-| TJ-14 | Revocation triggers | Each trigger cancels the right jobs | Unregister, identity change; EX11 setting off globally and per project once it exists | — |
+| TJ-14 | Revocation triggers | Each trigger cancels the right jobs | J2: identity change; unregister once the operation exists; EX11 setting off globally and per project once it exists (RV1) | — |
 | TJ-15 | Journal unavailable and full | Reserved settlement capacity | Writer fault during live job | Repair then settlement recorded |
 | TJ-16 | Graceful shutdown | Shutdown reason recorded | Settle within and beyond the 2 s bound | TUI-owned backend exit |
 | TJ-17 | Default exec_cmd behavior change | Short commands and commands over 60 s; `timeout_seconds` rejected | A command over 60 s runs to completion | Native model handles both |
@@ -909,7 +961,7 @@ real model provider and the TUI PTY harness.
 | TJ-19 | Model reads both streams from the start | Separate cursors; the starting result does not advance them | `read` at 0 for `stdout` and `stderr`, running and settled | Native model reads `stderr` after `stdout` |
 | TJ-20 | Prefix retained after capture stop | Retained range reported | Capture fault keeps bytes from 0 | Viewer shows stop reason and range |
 | TJ-21 | Value-ordered expiry | Class from outcome, person, model and content signals; ages 30, 14 and 3 days from last use; tie-break order | Quota pressure expires Routine, then Used, then Failed; held output survives | Viewer shows expired output with its summary |
-| TJ-22 | Expiry holds | Each hold type blocks expiry and ends correctly | Pin, evidence link, open read and model reference under quota pressure | Held quota returns `busy` until cleanup |
+| TJ-22 | Expiry holds | Each hold type blocks expiry and ends correctly | Pin, evidence link, open read and model reference under quota pressure | Held quota queues starts with reason `quota` until cleanup |
 | TJ-23 | Summary and attributed notes | Service summary fields; note author recorded | Notes survive log expiry | Person and model notes shown with authors |
 | TJ-24 | Growing reservation and capture pause | 1 MiB steps; `CapturePaused` transitions; pause facts in settlement | Expiry attempted first; pipes not read while paused; resume on freed space; cancel ends the pause; no time expiry | PTY: paused job shown with reason, then resumes |
 | TJ-25 | Person's all-projects view | Project labels; cross-project cancel confirmation state | `/jobs all` lists every registered project; quota `busy` names holders | PTY: list all, open another project's job, confirm and decline cancel |
@@ -928,22 +980,33 @@ not claimed by these cases.
 
 ### TJ-P1: delivery order
 
-Selected plan. Arrows mean prerequisites. Each packet needs its unit, integration
-and end-to-end tests before the next starts.
+Selected plan, revised 2026-10-22. Arrows mean prerequisites. Each packet
+delivers its unit and integration tests before the next packet starts. A packet
+that changes user-visible behavior also needs its end-to-end tests before it is
+enabled. J2 changes no user-visible behavior: the exec_cmd tool is not switched,
+and no control message or person command exists yet. Its end-to-end cases
+therefore run with J3 and J4, and J2 states this as a proof limit
+([J2 validation](#j2-validation)). J3 and J4 are enabled together (owner,
+2026-10-21, EN1): exec_cmd runs as a job only when the EX12 outlived-turn notice
+and `/jobs` cancel exist. The EX11 setting is designed before that enablement
+(RV1).
 
 ```mermaid
 flowchart TD
-    RP[Retention packet changes: G1, R1, R2, R4, R5] --> J1[J1: staging capture, secret filter, descriptors, text pages, quota]
+    RP[Retention packet changes: G1, R1, R2, R4, R5] --> J1[J1: staging capture, secret filter, descriptors, text pages, quota, implemented]
     SD[EX4: secret detection slices SL1, SL2, implemented] --> J1
-    ESC[EX5: escapee detection and termination, escapee-control.md, met 2026-10-21 for model jobs] --> J2[J2: controller core with model and person origin]
-    QUAL[EX10: exec_cmd qualification per local provider, met 2026-10-20] --> J2
+    ESC[EX5: escapee control, met 2026-10-21 for model jobs] --> J2[J2: controller core, agent queues, job records, guardian contract]
+    QUAL[EX10: exec_cmd qualification, met 2026-10-20] --> J2
     J1 --> J2
-    J2 --> J3[J3: model job tool and exec_cmd adoption]
-    J2 --> J4[J4: control API, TUI jobs and retention commands]
+    J2 --> J3[J3: exec_cmd as a job, job tool, reference-only results]
+    J2 --> J4[J4: control API, TUI jobs, EX12 notice, retention commands]
+    EX11[EX11 execution setting design] --> EN
+    J3 --> EN{Enable J3 and J4 together, EN1}
+    J4 --> EN
+    EN --> J5[J5: job notices in turn input]
     J2 --> J6[J6: expiry, value classes and holds]
-    J3 --> J5[J5: job notices in turn input]
     J4 --> J6
-    J4 --> Q[Real process, restart and PTY qualification]
+    EN --> Q[Real process, restart and PTY qualification]
     J5 --> Q
     J6 --> Q
 ```
@@ -951,9 +1014,9 @@ flowchart TD
 | Packet | Delivers | Decisions it uses |
 | --- | --- | --- |
 | J1 | Retention item 3 under the existing exec_cmd tool: secret filtering at capture and command rewrite (EX4, SL3), incremental hashing, staging, settle-then-install, kinds 14 and 23 (kind 22 retired 2026-10-18), `live` and `unverified_prefix` text pages, quota and growing-reservation accounting with interim expiry, capture and page-read workers, and removal of the exec_cmd timeout and setup budget. The model result keeps its shape with redacted tails; full output is retained. Graph projection is excluded. See [J1 and SL3 implementation details](#j1-and-sl3-implementation-details). | G1, R1, R2, R3 (kinds 14, 23), R4, R5, R6, EX4, J1-Q1 to J1-Q4 |
-| J2 | Controller core: slots, job records, no lifetime, lease stop-control bytes, leader-exit notice, `CapturePaused` for quota and ENOSPC, revocation, journal outage, restart and shutdown, and the person-origin amendments. Driven by integration tests; the exec_cmd tool is not yet switched. | T1 (done), EX5 (met 2026-10-21 for model jobs), EX10, R3, J1d, J2a-1, J2a-2, J2b, J2c, J2d |
-| J3 | `exec_cmd` adoption with yield and no output text, removal of `timeout_seconds`, the `job` tool including `wait` and `note`, and reference-only results. Shipped together, because results carry no output text. | R3, R5, `job wait`, S1 |
-| J4 | Control messages, `/jobs`, the viewer, cancel and kill, `at_end`, and `/job pin`, `unpin`, `delete` and `note`, with their command flowcharts | J2a-2, J4a, S1 |
+| J2 | Controller core: per-agent job queues and slots, kinds 26–28 with the job reservation ledger, one job ID domain and job-keyed payload IDs, the guardian profile token, lease bytes `T` and `K`, leader-exit notice, `CleanupUnconfirmed` without the repair path, `CapturePaused` per job, identity-change, journal-outage, restart and shutdown handling, page reads without a step bound, configuration keys, audit events and the controller parts of the person-origin amendments. Driven by worker-layer integration tests; the exec_cmd tool is not yet switched. See [J2 implementation details](#j2-implementation-details). | T1 (done), EX5 (met), EX10 (met), R3, J1d, J2a-1, J2a-2, J2b, J2c, J2d, AQ1, WB1, RV1 |
+| J3 | `exec_cmd` adoption with yield and no output text, the `job` tool including `wait` and `note`, reference-only results and retirement of kind 23. Enabled together with J4 (EN1). (`timeout_seconds` was already removed on 2026-10-17.) | R3, R5, `job wait`, S1, EN1 |
+| J4 | Control messages, `/jobs`, the viewer, cancel and kill, `at_end`, the EX12 outlived-turn notice, and `/job pin`, `unpin`, `delete` and `note`, with their command flowcharts. Enabled together with J3 (EN1). | J2a-2, J4a, S1, EX12, EN1 |
 | J5 | Job notices before the prompt, bound by the turn input digest | J5a |
 | J6 | Automatic expiry with value classes, ages, tie-break and holds | S2 |
 
@@ -988,10 +1051,13 @@ It does not add the job controller, job handles or job tools.
 
 What later packets keep or replace:
 
-- **J2** adds job slots, job records, `CapturePaused` as a job state, the
-  `CleanupUnconfirmed` state and the leader-exit notice. It reuses the J1
-  capture worker, payload store, ledger and page pool unchanged. Kinds 22 and
-  23 stay valid; J2 allocates its job records at the next free kinds.
+- **J2** adds agent queues and job slots, kinds 26–28, `CapturePaused` as a
+  job state, the `CleanupUnconfirmed` state and the leader-exit notice. It
+  extends the J1 capture worker (line counts, job-keyed identity), the payload
+  store (job-keyed payload IDs, kind 28 recovery facts) and the page pool (no
+  step bound). Kind 22 stays retired. Kind 23 stays for J1-mode exec_cmd calls
+  until J3 switches exec_cmd to jobs and retires it; see
+  [J2 implementation details](#j2-implementation-details).
 - **J3** switches
   results to the reference-only kind, removes the J1 tails (L13, L17) and
   exposes pages to the model through `job read`.
@@ -1019,7 +1085,7 @@ wind-down bounds remain in J1. No other timer ends or refuses J1 work.
 | --- | --- | --- |
 | TERM to KILL grace (L4) | 500 ms | Model exec_cmd process group |
 | Cleanup until unconfirmed (L3) | 2.5 s from the cancel trigger | Process and scratch cleanup, as today; capture settlement after a cancel trigger (J1-Q1) |
-| Page read storage step | 2 s | One page read on a page-read worker |
+| Page read storage step | 2 s (removed in J2, WB1) | One page read on a page-read worker |
 | Shutdown cleanup | 2 s | Pending installs and live captures at shutdown |
 
 Retry delays and poll ticks are not bounds: they never end or refuse work.
@@ -1332,10 +1398,11 @@ store. It is the only caller of `payload_io.rs`.
   [composer interface](context-composer.md#interfaces-to-the-job-controller-and-journal)
   lists.
 - **Page-read pool.** Two retained workers, one reserved for model requests,
-  and a queue of 8. A ninth queued request returns `busy`. A read that has not
-  returned within its 2 s step returns `busy`; its worker stays held until the
-  call returns, and no replacement worker starts. J1 has no page consumer; J3
-  and J4 add the model and client callers.
+  and a queue of 8. A ninth queued request returns `busy`. In J1 a read that
+  has not returned within its 2 s step returns `busy`; its worker stays held
+  until the call returns, and no replacement worker starts. J2 removes the step
+  (owner, 2026-10-21, WB1; [page reads](#page-reads-without-a-step-bound)). J1
+  has no page consumer; J3 and J4 add the model and client callers.
 
 ##### Quota ledger
 
@@ -1379,7 +1446,9 @@ never across I/O.
   at most 60 s apart (owner, 2026-10-19). It retries at once and restarts the sequence when an event may
   free space: a call settles, output expires or is deleted, a pending install
   ends, or the person acts. The retry never ends or refuses work. While any capture is paused, admission returns `busy` with reason
-  `capture_paused`.
+  `capture_paused`. This rule applies only to J1-mode exec_cmd calls; job
+  starts use the [J2 start conditions](#start-conditions-and-blocking-reasons),
+  in which a paused job holds only its own slot.
 
 ##### Recovery
 
@@ -1626,13 +1695,13 @@ sequenceDiagram
 | Panic inside `detector_error` | Capture fault: stop requested | Kind 23 `incomplete`, `detector_fault` |
 | Sink full after a cancel trigger | Later bytes of that stream discarded and counted | Kind 23 `incomplete`, `discarded_after_cancel` |
 | No sealed report 2.5 s after a cancel trigger | Result delivered; worker kept in the pending-install list; staging is an unverified prefix | Kind 23 `unconfirmed` |
-| Process or scratch cleanup passes its L3 bound | Today's repair path, `authority_repair_required` | Unchanged |
+| Process or scratch cleanup passes its L3 bound | Today's repair path, `authority_repair_required` (J1-mode calls; jobs use `CleanupUnconfirmed`, [J2](#cleanupunconfirmed-and-late-settlement)) | Unchanged |
 | Install fault | Staging kept; recovery installs after the digest check | None |
 | Journal append slow for kind 14, 23 or 15 | The append and its observation wait; no fence and no turn failure (J1-0). New writer requests beyond 8 slots get `busy` | None until it commits |
 | Journal quota reached | The turn pauses before the next `run` kind 14; a running call's kind 23 and kind 15 still commit ([segmented journal](segmented-journal.md#holding-and-resuming)) | None written while held |
 | Journal append I/O error for kind 14, 23 or 15 | Journal fenced; today's storage-unavailable path; turn fails | Unchanged |
 | Crash or restart at any point | No rerun; [derived recovery](#replay-order-and-reservation) | None written at recovery |
-| Page read stalls | `busy` after the 2 s step; worker held until it returns | None |
+| Page read stalls | `busy` after the 2 s step; worker held until it returns (J1; J2 waits for the reply, WB1) | None |
 | Unsafe payload object at startup | Payload store unavailable; exec_cmd `busy` | Kind 14 busy |
 
 ### J1 asynchronous execution
@@ -1904,15 +1973,1142 @@ Proof limits added by the implementation:
 | G20 CC2 interface | Payload ID object kinds and page states |
 | G21 L10 and page reads | [Timeout removal](#j1-timeout-and-setup-budget-removal) |
 
+## J2 implementation details
+
+Status: ready for implementation, 2026-10-22. This section is the governing
+design for packet J2. It resolves every J2 gap of the J2–J5 readiness audit of
+2026-10-21 ([gap resolution](#j2-gap-resolution)). It applies the owner
+decisions AQ1, WB1, EN1 and RV1 of 2026-10-21 and the standing owner rules: no
+default time bounds, no per-turn totals, no backward compatibility, one source
+of truth per fact. Mechanisms marked "selected (engineering)" are engineering
+choices under the [iteration rules](../design-process.md#iteration-and-escalation),
+not owner decisions. Protocol numbering remains `0.1`; journal format remains
+`1`. Nothing in this section is implemented.
+
+### J2 scope
+
+J2 builds the job controller core beside the J1 exec_cmd path. It adds no
+user-visible behavior: the exec_cmd tool is not switched, and no control message
+or person command exists yet. Worker-layer integration tests drive it.
+
+| Area | J2 delivers | Later packet |
+| --- | --- | --- |
+| Identity | One job ID derivation for every origin; payload IDs keyed by job ID ([job identity](#job-identity)) | — |
+| Admission | Per-agent job queues, slots and start conditions with brief blocking reasons ([agents, queues and slots](#agents-queues-and-slots)) | J3 shows queued state to the model; J4 to the person |
+| Records | Kinds 26, 27 and 28, replay rules, the job reservation ledger, closure classification, checkpoint and index entries ([J2 records](#j2-records-kinds-26-27-and-28)) | J3 retires kind 23 and adds the reference-only result kind |
+| Recovery | Explicit `interrupted` settlements at start ([J2 recovery](#j2-recovery-explicit-interrupted-settlements)) | — |
+| Guardian | Profile token, lease bytes `T` and `K`, notice kind 5, kind 2 reasons 2 and 11 ([guardian contract additions](#guardian-contract-additions)) | P1 adds the person profile tokens |
+| Slots | The exec_cmd worker becomes the slot worker; capture workers count lines; `CleanupUnconfirmed` replaces the repair path for jobs ([interfaces](#slot-worker-capture-worker-and-controller-interfaces)) | — |
+| Revocation | Identity change, journal outage, shutdown, restart ([revocation in J2](#revocation-in-j2)) | EX11 setting before J3 is enabled (RV1); unregister with its operation |
+| Pages | Page reads wait for their reply; no 2 s step ([page reads](#page-reads-without-a-step-bound)) | J3 and J4 add callers |
+| Operations | Configuration keys and audit events ([configuration](#j2-configuration-keys), [audit](#j2-audit-events)) | — |
+| Person origin | Controller parts: person origin and input ID in kind 26, person waiters in the agent queue, kill escalation, model cancel `not_permitted` | P2 adds kind PCQ and enables person-origin replay; P1 the person profiles |
+
+Not in J2: the exec_cmd switch, `yield_seconds`, the `job` tool and its
+results (J3); control messages, `/jobs`, the viewer and the EX12 notice (J4);
+job notices (J5); expiry classes and holds (J6); the person profiles, kind PCQ
+and the person submit path (P1–P4); the EX11 setting.
+
+### J2 decisions
+
+| ID | Decision | Status |
+| --- | --- | --- |
+| AQ1 | Queues, lanes and slots are per agent; blocked work is enqueued with a brief reason; no reserved job slots | Owner, 2026-10-21 |
+| WB1 | Wind-down bounds after a closure stay; the `yield_seconds` default stays; the page-read 2 s `busy` is replaced by waiting for the reply or the caller's cancel or detach | Owner, 2026-10-21 |
+| EN1 | J3 and J4 are enabled together | Owner, 2026-10-21 |
+| RV1 | J2 revocation covers identity change, journal outage and shutdown; EX11 is designed before J3 is enabled | Owner, 2026-10-21 |
+| J2-E1 | Kinds 26 `JobIntent`, 27 `JobCancelRequested` and 28 `JobSettled`, the next free kinds after 25 | Selected (engineering) |
+| J2-E2 | Kind 28 carries the capture facts of kind 23 plus job facts; a job never has kind 23 | Selected (engineering) |
+| J2-E3 | Kind 26 stores only the origin, the agent and the origin reference; every other intent fact is derived (TCR-O5) | Selected (engineering) |
+| J2-E4 | A job reservation ledger in `reserve()`, independent of the active operation | Selected (engineering) |
+| J2-E5 | Explicit `interrupted` settlement at start, not derived recovery | Selected (engineering) |
+| J2-E6 | One job ID domain `asura.job` with an origin byte; payload IDs keyed by job ID | Selected (engineering) |
+| J2-E7 | A model start is durable when it is queued; a person start is durable only when it gets a slot | Selected (engineering) |
+| J2-E8 | Guardian profile token in argv; `T` and `K` valid for every profile; kind 2 reason 2 for `T`, 11 for `K` | Selected (engineering) |
+| J2-E9 | `CleanupUnconfirmed` holds its slot and writes no settlement until a late settled notice or restart; no owner repair state | Selected (engineering) |
+| J2-E10 | Identity change is detected by the existing identity rechecks, not by a new poll | Selected (engineering) |
+| J2-E11 | A person job counts toward the main agent of its conversation | Selected (engineering) |
+
+### J2 ownership
+
+Search for an existing owner found the exec_cmd worker (slot setup, cleanup and
+the reactor-side job), the capture worker, the payload owner and the conversation
+owner's serialized journal ticket. J2 extends each of them. The only new module
+is the controller, because no owner holds cross-turn job state, agent queues or
+the job record outbox.
+
+| Behavior | Owner in J2 | Code |
+| --- | --- | --- |
+| Admission, agent queues, start conditions, job states, cancel, revocation, the job record outbox, events and audit | Job controller (new), on the reactor, owned by the conversation owner | `asura-service/src/job_controller.rs`, `job_controller/*.rs` |
+| Setup and cleanup threads, the reactor-side `ExecCmdJob`, the L3 capture bound | Slot worker: the exec_cmd worker, extended | `asura-service/src/exec_cmd_worker.rs` |
+| Scan, stage, hash, line counts, pause, install | Capture worker, one per slot | `asura-service/src/capture_worker.rs` |
+| Payload recovery, store, page pool, pending-install list | Payload owner | `asura-service/src/payload_owner.rs` |
+| Journal appends of job records, revocation wiring, shutdown, start-time recovery | Conversation owner | `asura-service/src/conversation.rs` |
+| Guardian argv, lease bytes, notices | Platform exec_cmd owner | `asura-platform/src/exec_cmd.rs`, `exec_cmd/{guardian,protocol,spawn}.rs`, the private route in `asura-cli/src/app.rs` |
+| Kinds 26–28, job ID, replay, ledger, checkpoint, index | Storage authority | `asura-storage/src/authority/**` |
+| Payload IDs, ledger reservations, pages, recovery facts | Storage payload store | `asura-storage/src/payload/` |
+| `jobs.*` keys and job audit event types | Storage configuration and audit schema | `asura-storage/src/config.rs`, `asura-storage/src/audit/types.rs` |
+
+#### TJ-O2: J2 module view
+
+Selected design. Solid arrows are calls on the reactor thread; dashed arrows
+cross a thread or process boundary through a bounded channel, a ticket or a
+pipe, and their replies return the same way. Subgraphs are threads; the payload
+recovery worker is omitted here and shown in TJ-Q5.
+
+```mermaid
+flowchart TB
+    subgraph Reactor[Service reactor thread]
+        Owner[Conversation owner: serialized journal ticket]
+        Ctl[Job controller: agent queues, states, record outbox]
+        Slot[Slot worker per slot: ExecCmdJob, phases, L3 bound]
+        PO[Payload owner: store, page pool, pending installs]
+    end
+    subgraph Threads[Retained worker threads]
+        JW[Journal worker]
+        Setup[Slot setup or cleanup thread]
+        Cap[Capture worker per slot]
+        Pages[2 page-read workers]
+    end
+    G[Guardian process per job]
+    Owner -->|submit, cancel, revoke, close, recover| Ctl
+    Ctl -->|next record| Owner
+    Owner -.->|append kinds 26, 27, 28| JW
+    Ctl -->|start, stop Term or Kill, poll| Slot
+    Slot -->|SlotEvent| Ctl
+    Ctl -->|reserve 1 MiB, pending installs| PO
+    Slot -.->|prepare, spawn, scratch cleanup| Setup
+    Slot -.->|lease byte T or K| G
+    G -.->|notices 1, 5, 4, 6, 2 and output pipes| Slot
+    Slot -.->|chunks, 512 KiB queue| Cap
+    PO -.->|page requests| Pages
+```
+
+### Job identity
+
+Selected (engineering, J2-E6). Every job, of any origin, has one ID:
+
+- **Job ID.** The first 16 bytes of SHA-256 over ASCII `asura.job`, one zero
+  byte, the origin byte, then the origin reference. Origin 1 (model): the
+  operation ID, the generation (8 bytes, big-endian) and the ordinal (4 bytes,
+  big-endian). Origin 2 (person): the input ID. If all 16 bytes are zero, the
+  final byte becomes 1.
+- **Scope.** The derivation replaces `asura.exec_cmd.job`
+  (`exec_cmd_job_id`, `asura-storage/src/authority/conversation/codec.rs`), the
+  proposed `asura.model.job` and the proposed `asura.person.job`. A J1-mode
+  exec_cmd call uses the model-origin derivation, so its guardian job hex
+  changes. No compatibility is kept (owner, 2026-10-17).
+- **Payload ID.** The first 16 bytes of SHA-256 over ASCII `asura.payload`,
+  one zero byte, the installation ID, the job ID and the object kind byte (1
+  `stdout`, 2 `stderr`, 3 `result`). An all-zero result becomes 1 in its final
+  byte. Person jobs therefore have payload IDs, and every future origin gets
+  them without a new rule.
+- **Effect on existing files.** Payload files that J1 wrote before J2 no longer
+  match a derived ID. Recovery deletes them under the existing orphan rule. They
+  are retained tool output, which already expires; journal history is untouched.
+
+Unit vectors fix the job ID and payload ID for one model and one person
+reference, the zero-byte rule, and a change to each input (J2T-04).
+
+### Agents, queues and slots
+
+Required behavior (owner, 2026-10-21, AQ1): queues, lanes and slots are per
+agent. Blocked work is enqueued, not refused, with a brief reason that names
+what blocks it. No job slot is reserved.
+
+Selected (engineering). An **agent key** is the pair (conversation ID, agent
+number). Agent 0 is the conversation's main agent, the only instance today.
+A subagent design assigns numbers from 1; until then replay rejects any other
+number. Each agent has:
+
+- an **input lane**: for agent 0, the conversation's lane in the
+  [managed input queue](managed-input-queue.md), unchanged;
+- an **agent job queue**: a FIFO of starts that wait for a start condition;
+- a **live job count**: its jobs from `Starting` to `Recording`, including
+  `CapturePaused` and `CleanupUnconfirmed`.
+
+A person job counts toward the main agent of its conversation (J2-E11),
+because it is dispatched from that agent's lane and blocks it.
+
+#### Queue entries
+
+Selected (engineering, J2-E7). The two origins enter the same FIFO with
+different durability, because their recovery needs differ.
+
+| Origin | Durable record of the entry | Kind 26 written | After a restart |
+| --- | --- | --- | --- |
+| Model | Kind 26, committed before the entry exists | At enqueue | The job is unsettled; start writes `interrupted`. The handle the model may hold stays valid |
+| Person | The lane head, kind PCQ (P2); the controller holds an in-memory waiter | When the slot and quota are granted | No kind 26 exists; the lane head replays as `Held` (MQ07R) and the person can resume it |
+
+A queued model job that never started is still settled `interrupted` after a
+restart, with "effects may have occurred". This is conservative: J2 writes no
+start record, so the journal cannot prove that it did not start.
+
+#### Start conditions and blocking reasons
+
+The controller evaluates the head of each agent queue. The first condition that
+fails gives the reason that the entry shows. The texts are the brief reasons
+that AQ1 requires; J3 and J4 display them.
+
+| Order | Condition | Reason code | Brief text |
+| --- | --- | --- | --- |
+| 1 | Start-time recovery finished | `recovering` | waiting: recovering jobs after restart |
+| 2 | Journal available | `journal_unavailable` | waiting: journal unavailable |
+| 3 | Journal not held, for a pending kind 26 | `journal_held` | waiting: journal space is full |
+| 4 | Payload store ready | `payload_unavailable` | waiting: output store is recovering |
+| 5 | Agent live jobs below `jobs.liveAgent` | `agent_slots` | waiting: 2 of 2 jobs running for this agent |
+| 6 | Service live jobs below `jobs.liveService` | `service_slots` | waiting: 4 of 4 jobs running |
+| 7 | Pending-install list below 4 | `pending_installs` | waiting: 4 finished jobs still saving output |
+| 8 | 1 MiB reserved after an expiry attempt | `quota` or `disk_space` | waiting: output quota full, or: disk space low |
+
+Numbers in the texts are the live values. Reasons 5 and 6 also name a job in
+`CleanupUnconfirmed` when one holds a slot, for example
+`waiting: 2 of 2 jobs running for this agent (1 awaiting cleanup)`.
+
+Selection. Within an agent queue, order is FIFO and a blocked head blocks the
+entries behind it. Across agents, the controller rotates among agents whose head
+can start, beginning after the agent it served last, as the managed queue
+rotates lanes. Selected (engineering).
+
+Wake events. The controller re-evaluates the heads when a slot is released, a
+pending install ends, the ledger frees space (settlement, expiry, deletion),
+the payload store becomes ready, recovery finishes, or the journal leaves its
+held state. A head blocked by `disk_space` is also rechecked on the paced delays
+1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart (owner pattern of 2026-10-19).
+That pacing ends nothing. No other timer exists.
+
+Bounds. A queue is known-size (AE-03). These submissions get `busy` before any
+record, with the reason and its text:
+
+| Bound | Reason code | Brief text |
+| --- | --- | --- |
+| `jobs.queuedAgent` entries in the agent queue | `queue_full` | busy: 8 jobs already waiting for this agent |
+| 64 unsettled jobs in the service (fixed) | `jobs_full` | busy: 64 jobs not yet settled |
+| Controller closed for shutdown | `closed` | busy: service is stopping |
+
+A duplicate start returns the existing job even at these bounds. Changed
+arguments under the same identity get `conflict`.
+
+No reserved slots (AQ1). Person and model entries share the agent and service
+counts in arrival order. The page-read worker reserved for the model (J2a-2)
+is a read worker, not a job slot, so AQ1 does not remove it.
+
+##### TJ-F2: start decision
+
+Selected design. Arrows are decisions in order; the loop back to `Wait` ends
+only on a wake event, a cancel trigger, revocation or shutdown.
+
+```mermaid
+flowchart TD
+    Submit["submit(start)"] --> Dup{"Same identity already exists?"}
+    Dup -->|Same arguments| Existing["Return the existing job"]
+    Dup -->|Changed arguments| Conflict["conflict, no record"]
+    Dup -->|New| Bounds{"Closed, 64 unsettled, or agent queue full?"}
+    Bounds -->|Yes| Busy["busy: closed, jobs_full or queue_full, no record"]
+    Bounds -->|No| Origin{"Origin?"}
+    Origin -->|Model| Intent["Append kind 26, entry joins the agent queue"]
+    Origin -->|Person| Waiter["Waiter joins the agent queue, no record"]
+    Intent --> Head
+    Waiter --> Head
+    Head{"Entry at queue head and agent selected by rotation?"} -->|No| Wait["Queued: show reason of the head's first failing condition"]
+    Head -->|Yes| Conds{"Conditions 1-8 hold?"}
+    Conds -->|No| Wait
+    Wait -->|"Wake event"| Head
+    Wait -->|"Cancel, revocation or shutdown"| Gone["Model: kind 28 not_started, person: waiter removed"]
+    Conds -->|Yes| Grant["Take slot, reserve 1 MiB"]
+    Grant --> PersonIntent{"Person origin?"}
+    PersonIntent -->|Yes| Append26["Append kind 26"]
+    PersonIntent -->|No| Start["Slot worker starts setup"]
+    Append26 --> Start
+```
+
+### J2 records: kinds 26, 27 and 28
+
+Selected (engineering, J2-E1 to J2-E3). Encodings follow the existing codec:
+integers are big-endian, an ID is 16 bytes, a digest is 32 bytes, and a flag is
+one byte, 0 or 1. Any other value is `Corrupt`.
+
+#### Kind 26: JobIntent
+
+| # | Field | Encoding | Bounds and rule |
+| --- | --- | --- | --- |
+| 1 | origin | u8 | 1 model, 2 person. In J2 replay rejects 2; P2 enables it with kind PCQ |
+| 2 | agent | u32 | 0, the main agent. Another value is `Corrupt` until a subagent design assigns it |
+| 3 | origin reference | model: operation ID, generation (u64), ordinal (u32); person: input ID | Model: names a kind 14 under the [replay rules](#replay-order-and-the-job-reservation-ledger) |
+
+Maximum payload 34 bytes (model) or 22 bytes (person); maximum frame 218 bytes.
+
+Replay derives every other intent fact from one source (TCR-O5):
+
+| Value | Derivation |
+| --- | --- |
+| Job ID, payload IDs | [Job identity](#job-identity) |
+| Conversation and project | The operation's kind 21, or the input's kind PCQ |
+| Profile | `model-1` for origin 1; for origin 2, `person-1` or `person-outside-1` from kind PCQ's outside flag |
+| Command and cwd | Kind 14 stored arguments, or kind PCQ |
+| Grant snapshot | The origin reference, the profile and the agent: the turn's grant through its kind 21, or the person grant through kind PCQ. No separate encoding exists |
+| Initial quota reservation | The constant 1,048,576 |
+| Ledger capacity | The constants of the [ledger](#replay-order-and-the-job-reservation-ledger) |
+| Owner generation at intent | The frame header |
+
+#### Kind 27: JobCancelRequested
+
+| # | Field | Encoding | Bounds and rule |
+| --- | --- | --- | --- |
+| 1 | job ID | ID | An unsettled job |
+| 2 | requester | u8 | 1 model, 2 client, 3 person, 4 service |
+| 3 | reason | u8 | A reason code that the [reason table](#job-reason-codes) allows for the requester |
+| 4 | kill | flag | 1 only with requester 3 and reason 5 `person_kill`; a kill after a stop writes no second record (J2d) |
+
+Payload 19 bytes; frame 203 bytes. At most one per job. The controller writes
+kind 27 for the first accepted cancel trigger of a job while the journal is
+available. A job may settle without one: a normal exit, or a trigger during a
+journal outage.
+
+#### Kind 28: JobSettled
+
+| # | Field | Encoding | Bounds and rule |
+| --- | --- | --- | --- |
+| 1 | job ID | ID | An unsettled job |
+| 2 | outcome | u8 | 1 exited, 2 signalled, 3 cancelled, 4 not_started, 5 interrupted |
+| 3 | reason | u8 | [Reason table](#job-reason-codes) |
+| 4 | exit kind | u8 | 0 unknown, 1 exited, 2 signalled |
+| 5 | exit value | u32 | 0 when unknown; 0–255 exited; 1–127 signalled |
+| 6 | cleanup | u8 | 0 none, 1 confirmed, 2 late (a settled notice after a cleanup-unconfirmed notice) |
+| 7 | unconfirmed reason | u8 | 0, or 9 or 13 (the kind 4 reason) when cleanup is 2 |
+| 8 | escapees | u32 | The kind 6 value; 0 when cleanup is 0 |
+| 9 | elapsed | u64 | Milliseconds from the spawned notice to the settled notice; 0 with no process |
+| 10 | capture state | u8 | 1 `complete`, 2 `incomplete`, 3 `unconfirmed`, 4 `not_started`, 5 `interrupted` |
+| 11 | capture reason | u8 | Kind 23 field 5 codes 0–6 |
+| 12 | redaction ran | u8 | 1; 0 only for capture state 5 |
+| 13 | stdout facts | stream block | Below |
+| 14 | stderr facts | stream block | Below |
+| 15–17 | distinct numbers, number count, numbers | As kind 23 fields 11–13 | As kind 23 |
+| 18–20 | pause count, first pause, paused total | u32, u64, u64 | As kind 23 fields 14–16 (J2c) |
+| 21 | final reservation | u64 | As kind 23 field 17 |
+
+Each stream block is the [kind 23 stream block](#kind-23-capturesettled)
+followed by the line count (u64): the number of newline bytes (0x0A) in the
+stored, redacted bytes. Counting stored bytes keeps the count equal to what a
+reader of the retained stream sees.
+
+Outcome rules (a broken rule is `Corrupt`):
+
+| Outcome | Reason | Exit | Cleanup, escapees, elapsed | Capture state |
+| --- | --- | --- | --- | --- |
+| exited | 0, or 1–10 for a trigger after the leader exited | Kind 1 | Cleanup 1 or 2 | 1–3 |
+| signalled | As exited | Kind 2 | Cleanup 1 or 2 | 1–3 |
+| cancelled | 1–8: the first cancel trigger came before the leader exited | Kind 1 or 2 | Cleanup 1 or 2 | 1–3 |
+| not_started | 1–7 (cancel before spawn) or 12–18 | 0, value 0 | All 0 | 4, with the kind 23 `not_started` rules |
+| interrupted | 11 | 0, value 0 | All 0 | 5: capture reason 0, every stream field 0, no numbers, pause facts 0, reservation 0 |
+
+The reason of a settled job is its first cancel trigger, except that
+`person_kill` replaces `person_stop` after an escalation (J2d). Capture states
+1–4 keep the [kind 23 field rules](#kind-23-capturesettled).
+
+Maximum payload 4,086 bytes: 37 bytes of job facts, 3 bytes of capture header,
+1,494 bytes per stream (kind 23's 1,486 plus the 8-byte line count), 1,030
+bytes for numbers, 20 for pause facts and 8 for the reservation. Maximum frame
+4,270 bytes.
+
+##### Job reason codes
+
+| Code | Name | Kind 27 requester | Kind 28 outcomes |
+| --- | --- | --- | --- |
+| 0 | none | — | exited, signalled |
+| 1 | `model_cancel` | model | exited, signalled, cancelled, not_started |
+| 2 | `turn_ended` (turn cancelled, steered or invalidated before handle delivery) | model | As 1 |
+| 3 | `client_cancel` | client | As 1 |
+| 4 | `person_stop` | person | As 1 |
+| 5 | `person_kill` | person (kill flag 1) | As 1 |
+| 6 | `identity_changed` | service | As 1 |
+| 7 | `shutdown` | service | As 1 |
+| 8 | `capture_fault` | service | exited, signalled, cancelled |
+| 9 | `quota` (in `Draining`) | service | exited, signalled |
+| 10 | `enospc` (in `Draining`) | service | exited, signalled |
+| 11 | `restart` | — | interrupted |
+| 12 | `cwd_unavailable` | — | not_started |
+| 13 | `project_changed` | — | not_started |
+| 14 | `sandbox_unavailable` | — | not_started |
+| 15 | `spawn_failed` | — | not_started |
+| 16 | `capture_unavailable` | — | not_started |
+| 17 | `protocol_fault` | — | not_started |
+| 18 | `setup_failed` | — | not_started |
+
+The codec holds the table explicitly. Later reasons, such as the EX11 setting,
+`project_unregistered` and the person `outside_sandbox_off`, take the next free
+codes when their packets are designed.
+
+#### Relation to kinds 14, 15 and 23
+
+| Path | Record order |
+| --- | --- |
+| J1-mode exec_cmd call, until J3 | 14 `run` → 23 → 15 (unchanged) |
+| Job-mode model call: J2 records; the only exec_cmd mode after J3 | 14 `run` → 26 → 15 (handle delivery). Kind 27 and kind 28 come before or after kind 15, and may follow the operation's terminal |
+| Person job, after P2 | PCQ … 26 → 27 (optional) → 28 |
+
+Kind 28 replaces kind 23 for a job; a job-mode call never has kind 23. Kind 15
+remains the call's result record until J3 designs the reference-only kind. J3
+retires kind 23 when no J1-mode path remains; its number then stays unassigned.
+
+### Replay order and the job reservation ledger
+
+Required behavior: replay applies these rules. They extend the
+[kind 14 replay rules](tool-call-records.md#replay-recovery-and-restart) and
+the [J1 order](#replay-order-and-reservation).
+
+| ID | Rule | Replay result when broken |
+| --- | --- | --- |
+| JR1 | A model-origin kind 26 names the active operation's last kind 14, with that operation's generation. That kind 14 has decision `run` and operation code 10, and no kind 23, kind 15 or kind 26. The operation has no terminal | `Corrupt` |
+| JR2 | A person-origin kind 26 | `Corrupt` in J2; P2 replaces this rule with its kind PCQ rules |
+| JR3 | The agent field is 0 | `Corrupt` |
+| JR4 | A kind 14 with a kind 26 gets no kind 23. Its kind 15 follows the kind 26 | `Corrupt` |
+| JR5 | A kind 26 derives a job ID that an earlier kind 26 derived | `Corrupt` |
+| JR6 | Kind 27 names an unsettled job, at most once; its requester, reason and kill flag agree with the reason table; its frame owner generation equals that of the job's kind 26 | `Corrupt` |
+| JR7 | Kind 28 names an unsettled job, once, and follows the outcome rules. Outcome `interrupted` requires a frame owner generation greater than that of the job's kind 26; every other outcome requires an equal one | `Corrupt` |
+| JR8 | Kinds 27 and 28 may follow the operation's terminal, appear during another operation, or appear with no active operation | Accepted |
+| JR9 | At most 64 unsettled jobs after any record | `Limit` |
+| JR10 | A terminal while a job-mode call lacks kind 15 | Accepted: the turn is interrupted as for any `run` call; the job stays unsettled |
+
+The existing kind 14 rule "every earlier `run` call of the operation has its
+kind 15" is unchanged: handle delivery resolves the call, not job settlement.
+
+Ledger (J2-E4). The writer's `reserve()` (`conversation/state.rs`) adds, for
+every unsettled job, independent of the active operation:
+
+| Frame | Bytes | Held from | Released at |
+| --- | --- | --- | --- |
+| Kind 28 | `HEADER + TRAILER + 4,086` = 4,270 | Kind 26 | Kind 28 |
+| Kind 27 | `HEADER + TRAILER + 19` = 203 | Kind 26 | Kind 27 or kind 28 |
+
+A job-mode call does not hold the J1 kind 23 reservation; the operation still
+holds its kind 15 reservation until kind 15. With 64 unsettled jobs the ledger
+holds at most 286,272 bytes and 128 frames.
+
+Closure classification. Kinds 27 and 28 are closure records (`is_closure`,
+`authority/journal.rs`), so they commit while the journal is held at its quota
+([SJ-D18](segmented-journal.md#quota-and-disk-space)). Kind 26 is a normal
+record: the writer accepts it only when its bytes, the roll reserve and the
+closure reservation after it fit (SJ-D19). Otherwise it is held with
+`journal_quota` or `journal_disk_space`, and the start waits with reason
+`journal_held`.
+
+Checkpoint. A checkpoint adds the unsettled jobs: for each, the locators of its
+kind 26 and kind 27 (zero when absent), in kind 26 order, at most 64. Loading
+rebuilds the derived values from those frames, as SJ-D17 does for tool calls.
+A job settled since the checkpoint stays in the delta until the roll emits its
+index entries, as SJ-D15 does for terminal operations. An unsettled job pins
+its conversation and project in the recent sets.
+
+Index entries. The roll after a job's kind 28 emits:
+
+| Tag | Key | Value |
+| --- | --- | --- |
+| `W` job | Job ID, 0 | Conversation ID, origin, kind 26, kind 27 and kind 28 locators (zero when absent) |
+| `X` payload | Payload ID, 0 | Form byte 2 (job): job ID, kind 26 and kind 28 locators, last-use sequence (kind 28). Form byte 1 keeps today's J1-call value |
+
+`PayloadFacts` answers a job payload from the delta, the checkpoint's unsettled
+jobs or the `X` entry. A listing of a conversation's jobs is designed with J3
+and J4.
+
+##### TJ-D2: job record order and replay
+
+Selected design. Arrows are the record order that replay accepts for one
+job-mode call; a dashed arrow is optional. Labels name the rule that rejects
+other orders.
+
+```mermaid
+flowchart TD
+    K14["Kind 14 run, operation code 10"] -->|"JR1: before kind 23 or 15"| K26["Kind 26 JobIntent, origin model"]
+    K14 -->|"No kind 26: J1 mode"| K23["Kind 23 CaptureSettled"]
+    K23 --> K15J1["Kind 15, call resolved"]
+    K26 -->|"JR4: no kind 23"| Live["Job unsettled: ledger holds kinds 27 and 28"]
+    Live -.->|"JR6: at most once"| K27["Kind 27 JobCancelRequested"]
+    Live -->|"Handle delivery"| K15["Kind 15, call resolved"]
+    K27 -.-> K28
+    Live --> K28["Kind 28 JobSettled"]
+    K15 -->|"JR8: any later position"| K28
+    K15 --> K8["Kind 8 terminal of the operation"]
+    K8 -->|"JR8"| K28
+    Restart["Kind 3 OwnerGeneration"] -->|"JR7: only outcome interrupted"| K28
+    K28 --> Done["Settled: ledger released, W and X at next roll"]
+```
+
+### Writing job records
+
+Selected (engineering). The conversation owner keeps its single serialized
+journal ticket. The controller never submits to the writer; it holds a
+**record outbox** of at most 3 records per unsettled job (192 in total). When
+the ticket is free, the owner submits in this order:
+
+1. the active turn's records, in their existing order;
+2. kinds 28 and 27 from the outbox, oldest first;
+3. kind 26 from the outbox, oldest first;
+4. new foreground commands.
+
+Closure records therefore never wait behind new work. The owner reports each
+reply with `record_done`. A kind 26 reply of `journal_quota` or
+`journal_disk_space` leaves the entry waiting with `journal_held`; the owner
+resubmits when the hold ends. Any other writer error makes the journal
+unavailable ([journal outage](#journal-outage-hold-and-shutdown)).
+
+For a model job, kind 26 must commit before setup starts, and before kind 15
+of its call. For a person job, the slot and the 1 MiB reservation are taken
+before kind 26 is appended; they are released if kind 26 fails. Settlement
+precedes installation (R2): the capture worker installs only after kind 28
+commits.
+
+### J2 recovery: explicit interrupted settlements
+
+Selected (engineering, J2-E5). At start the controller writes a kind 28 with
+outcome `interrupted` and reason `restart` for each unsettled job. J1 derives
+recovery for its calls instead; J2 does not, for these reasons:
+
+- **Bounds.** A derived interrupted job would stay unsettled for ever. The
+  checkpoint's job list, the 64-job bound and the ledger would then fill with
+  dead jobs. An explicit settlement releases all three.
+- **One fact.** Listings, notices and the model read a recorded outcome, not
+  an inference from missing records and owner generations.
+- **Cost.** One closure frame of at most 4,270 bytes per interrupted job, which
+  the ledger already holds, so it fits while the journal is held.
+
+The guardian of an interrupted job saw lease EOF when the old service ended and
+stopped its group; a restart never reattaches to it or signals a journaled PID.
+
+##### TJ-Q5: start-time job recovery
+
+Selected design. Solid arrows are calls or appends; dashed arrows are replies.
+The `par` block shows that payload recovery runs at the same time.
+
+```mermaid
+sequenceDiagram
+    participant O as Conversation owner
+    participant W as Journal worker
+    participant K as Job controller
+    participant P as Payload owner and recovery worker
+    O->>W: Open and replay: checkpoint, then tail
+    W-->>O: Replay with unsettled jobs, at most 64
+    O->>W: Append kind 3 OwnerGeneration
+    W-->>O: Committed
+    O->>K: recover(unsettled jobs)
+    Note over K: Admission state recovering, submissions wait with reason recovering
+    par Interrupted settlements
+        loop Each unsettled job, oldest first
+            K->>O: next record: kind 28 interrupted, reason restart
+            O->>W: Append kind 28 (closure record, fits while held)
+            W-->>O: Committed
+            O->>K: record_done
+        end
+    and Payload recovery
+        P->>W: PayloadFacts in batches of 128
+        W-->>P: Job payloads: no kind 28 or interrupted gives unverified prefix
+        P->>P: Install verified staging, keep prefixes, delete orphans
+    end
+    K->>K: All settlements committed and payload store ready
+    Note over K: Admission opens and queued heads are evaluated
+    alt Writer fenced or repair required
+        W-->>O: Error
+        O->>K: journal_unavailable
+        Note over K: Admission never opens in this run
+    end
+```
+
+Payload recovery maps a job's payload state from its records: no kind 28 or an
+`interrupted` kind 28 gives an `unverified_prefix`, eligible for interim expiry;
+`complete` or `incomplete` verifies length and digest and installs from staging;
+`unconfirmed` keeps an `unverified_prefix`; `not_started` deletes a stray
+staging file. These are the J1 [derived recovery](#replay-order-and-reservation)
+actions keyed by job.
+
+### Guardian contract additions
+
+Selected (engineering, J2-E8) for the platform exec_cmd owner. The status
+notice stays an internal native primitive, not a versioned wire protocol
+([escapee control](escapee-control.md#guardian-status-notice-extensions)).
+
+**Argument vector.** The private route becomes
+`--asura-exec-cmd-guardian JOBHEX PROFILE COMMAND`, plus the test-support fault
+argument after the command when that feature is built. `PROFILE` is an ASCII
+token. J2 accepts `model-1`; packet P1 adds `person-1` and `person-outside-1`.
+An unknown token makes the guardian exit with status 1 before any effect and
+before any notice; the service then sees status EOF with no notice and settles
+the job `not_started` with reason `protocol_fault`. The total argv bound stays
+8,704 bytes. The token replaces the removed deadline argument.
+
+| Profile token | Sandbox | TERM-to-KILL grace | Packet |
+| --- | --- | --- | --- |
+| `model-1` | The exec_cmd Seatbelt profile | 500 ms | J2 |
+| `person-1` | The person profile | 2 s (PC8) | P1 |
+| `person-outside-1` | None | 2 s (PC8) | P1 |
+
+**Lease bytes.** The service writes at most one `T` and one `K` per job, at
+most 2 bytes into an empty pipe, below `PIPE_BUF`:
+
+| Input on FD 3 | Guardian action | Kind 2 reason when it caused the stop |
+| --- | --- | --- |
+| `T` | First stop: TERM to the owned group now, KILL after the profile's grace. A later `T` is ignored | 2 `cancel` |
+| `K` | KILL to the owned group now; escalates an earlier `T` or leader-exit stop | 11 `kill`, which replaces 2 |
+| EOF | First stop as today; after an earlier stop it only ends lease polling | 4 `lease_ended` |
+| Any other byte, or a read error | Lease protocol fault, handled as EOF | 4 |
+
+After its first stop the guardian keeps polling FD 3 for `K` and EOF on its
+existing 100 ms loop. After EOF it stops polling FD 3, so a hung-up pipe never
+spins the loop. A leader exit with no lease input gives reason 0. Reason 12
+`escapee_terminated` still replaces the lease reason when escapees were killed.
+`K` is valid for every profile; the controller sends it only for a person kill.
+
+Service side. `ExecCmdJob::stop(StopKind::Term)` and `stop(StopKind::Kill)`
+each write one byte with a nonblocking `write`. A `WouldBlock` or an error
+closes the lease instead, and the guardian stops the group on EOF; a failed
+write therefore never leaves a job running without a stop. Dropping the job at
+service exit closes the lease, as today.
+
+**Notice kind 5, leader exited.** Required by J2b (owner, 2026-10-14):
+
+| Bytes | Value |
+| --- | --- |
+| 4 | Kind 5 |
+| 5 | Reason 0 |
+| 6 | Exit kind: 1 exited (`si_code` `CLD_EXITED`) or 2 signalled (`CLD_KILLED`, `CLD_DUMPED`) |
+| 7 | Cleanup 0 |
+| 24–27 | Exit code 0–255 or signal 1–127 (`si_status` of the `waitid` `WNOWAIT` result) |
+
+The guardian sends kind 5 once, when its `WNOWAIT` wait first observes the
+leader's exit, before its group stop signal and before any escapee sweep.
+
+**Order rules.** These extend the
+[escapee control order rules](escapee-control.md#guardian-status-notice-extensions).
+Any other sequence is a protocol fault that initiates cleanup:
+
+1. Kind 1 comes first, or kind 3 is the only notice.
+2. Kind 5 appears at most once, after kind 1.
+3. Kind 4 appears at most once, after kind 1 and before kinds 6 and 2. It may
+   come before or after kind 5.
+4. Kind 6 appears at most once, immediately before kind 2 with reason 12.
+5. Kind 2 is last. It requires an earlier kind 5, and its exit kind and value
+   equal those of kind 5. It accepts reasons 0, 2, 4, 11 and 12.
+
+The longest sequences are 1, 5, 4, 6, 2 and 1, 4, 5, 6, 2: five notices and
+160 bytes. The existing limits of 5 notices and a 192-byte receive buffer
+(`MAX_NOTICES`, `STATUS_BUFFER`, `asura-platform/src/exec_cmd.rs`) hold. Reason
+1 stays unassigned; reason 3 `output_limit`, which nothing produces since J1,
+becomes unassigned with `StopReason::OutputLimit`; reason 10 is never assigned.
+
+##### TJ-S3: guardian notice order
+
+Selected design. States are the reader's position in the notice sequence;
+arrows name the notice received. A notice that has no arrow from the current
+state is a protocol fault.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Start
+    Start --> SetupFailed: Kind 3 setup_failed
+    Start --> Spawned: Kind 1 spawned
+    Spawned --> LeaderExited: Kind 5, exit facts E
+    Spawned --> Unconfirmed: Kind 4, reason 9 or 13
+    Unconfirmed --> UnconfirmedExited: Kind 5, exit facts E
+    LeaderExited --> ExitedUnconfirmed: Kind 4, reason 9 or 13
+    LeaderExited --> Reported: Kind 6, count at least 1
+    ExitedUnconfirmed --> Reported: Kind 6, count at least 1
+    UnconfirmedExited --> Reported: Kind 6, count at least 1
+    LeaderExited --> Settled: Kind 2, reason 0, 2, 4 or 11, exit E, cleanup confirmed
+    ExitedUnconfirmed --> Settled: Kind 2, exit E, cleanup late
+    UnconfirmedExited --> Settled: Kind 2, exit E, cleanup late
+    Reported --> Settled: Kind 2, reason 12, exit E
+    SetupFailed --> [*]
+    Settled --> [*]
+```
+
+### Slot worker, capture worker and controller interfaces
+
+Selected (engineering). All controller, slot and owner methods below run on the
+reactor thread. Each does bounded in-memory work: no file, journal or process
+wait, and at most one nonblocking 1-byte lease write (AE-01). Blocking calls run
+only on the threads named in [J2 asynchronous execution](#j2-asynchronous-execution).
+
+```rust
+// asura-service/src/job_controller.rs: owned by conversation::Owner.
+pub(crate) struct AgentKey { pub conversation: Id, pub agent: u32 } // agent 0 = main
+pub(crate) enum Origin { Model { operation: Id, generation: u64, ordinal: u32 }, Person { input: Id } }
+pub(crate) enum Profile { Model1 } // P1 adds Person1 and PersonOutside1
+pub(crate) struct StartRequest {
+    pub origin: Origin, pub agent: AgentKey, pub scope: tools::ExecutionScope,
+    pub profile: Profile, pub command: String, pub cwd: String,
+    pub secrets: Vec<SecretVariable>, pub secret_command: Option<SecretCommand>,
+    pub redaction: JobRedaction, pub duplicate_digest: [u8; 32], // keyed, memory only
+}
+pub(crate) enum Admission { Accepted { job: Id }, Existing { job: Id }, Conflict, Busy(BusyReason) }
+pub(crate) enum BusyReason { QueueFull, JobsFull, Closed }
+pub(crate) enum BlockReason { Recovering, JournalUnavailable, JournalHeld, PayloadUnavailable,
+    AgentSlots, ServiceSlots, PendingInstalls, Quota, DiskSpace }
+pub(crate) enum Requester { Model, Client, Person, Service }
+pub(crate) enum CancelReply { Accepted(JobState), AlreadySettled(Outcome), NotPermitted, NotFound }
+pub(crate) enum JobEvent { Queued(Id, BlockReason), Started(Id), State(Id, JobState), Settled(Id, Outcome) }
+
+impl JobController {
+    pub fn new(limits: JobLimits, emitter: Option<audit::Emitter>) -> Self;
+    pub fn recover(&mut self, unsettled: Vec<journal::UnsettledJob>);
+    pub fn submit(&mut self, request: StartRequest, now: Instant) -> Admission;
+    pub fn cancel(&mut self, job: Id, by: Requester, reason: JobReason, kill: bool) -> CancelReply;
+    pub fn revoke_project(&mut self, project: Id, reason: JobReason);
+    pub fn journal_unavailable(&mut self);
+    pub fn close(&mut self); // shutdown: no new admission
+    pub fn interests(&self, out: &mut Vec<PollInterest>);
+    pub fn next_deadline(&self, now: Instant) -> Option<Instant>;
+    pub fn poll(&mut self, now: Instant, payloads: &mut Payloads);
+    pub fn next_record(&mut self) -> Option<(Id, journal::Record)>;
+    pub fn record_done(&mut self, job: Id, result: writer::Result<u64>);
+    pub fn drain_events(&mut self, out: &mut Vec<JobEvent>); // at most 64 per call
+    pub fn status(&self, job: Id) -> Option<JobStatus>;
+    pub fn settled(&self) -> bool; // no live slot and no unsent closure record
+}
+
+// The controller drives slots through this trait (job_controller/port.rs).
+// exec_cmd_worker::Worker implements it; unit tests use a fixture slot.
+pub(crate) trait SlotPort {
+    fn start(&mut self, start: SlotStart) -> Result<(), SlotStartError>;
+    fn stop(&mut self, kind: StopKind); // Term or Kill; idempotent; never blocks
+    fn discard_capture(&mut self); // cancel trigger in Draining: capture discards
+    fn interests(&self, out: &mut Vec<PollInterest>);
+    fn next_deadline(&self, now: Instant) -> Option<Instant>;
+    fn poll(&mut self, now: Instant, out: &mut Vec<SlotEvent>); // at most 8 events
+    fn idle(&self) -> bool;
+}
+pub(crate) struct SlotStart { pub job: Id, pub profile: Profile, pub runtime: RuntimeDirectory,
+    pub scope: tools::ExecutionScope, pub command: String, pub cwd: String,
+    pub secrets: Vec<SecretVariable>, pub secret_command: Option<SecretCommand>,
+    pub capture: capture_worker::Start }
+pub(crate) enum SlotEvent {
+    Spawned,                                         // kind 1
+    SetupFailed(JobReason),                          // codes 12-18; no process
+    LeaderExited(Exit),                              // kind 5
+    CleanupUnconfirmed(UnconfirmedReason),           // kind 4, or guardian lost
+    CapturePaused(PauseReason), CaptureResumed, CaptureFault(CaptureReason),
+    ProcessSettled { exit: Exit, cleanup: Cleanup, escapees: u32, elapsed_ms: u64 }, // kind 2
+    CaptureSettled(CaptureOutcome),                  // sealed report, or L3 unconfirmed
+    ScratchCleaned, ScratchRetained,
+    IdentityChanged,                                 // pre-spawn recheck mismatch
+}
+```
+
+Interface rules:
+
+- **Capture worker.** `capture_worker::Start::call` becomes `job` (the job
+  ID); the store keys reservations and staging by the job's payload IDs. Each
+  `StreamReport` gains `lines: u64`. The messages (`Room`, `Paused`, `Resumed`,
+  `Fault`, `Sealed`, `Installed`, `Abandoned`) and the 8-message channel with a
+  reactor wake are unchanged. After `CaptureSettled`, the slot hands the
+  capture handle to the payload owner's pending-install list (at most 4).
+- **Slot worker.** The exec_cmd worker keeps its phases (`Setup`, `Running`,
+  `Cleanup`, `Finalizing`) and its J1 call API until J3 removes it. In job
+  mode it reports `SlotEvent`s instead of building kinds 23 and 15, never sets
+  its repair flag, and never makes the owner unavailable. The L3 capture bound
+  after a cancel trigger stays in the slot worker (J1-Q1).
+- **Controller.** It builds kinds 26–28 from slot events, applies the
+  [TJ-S1](#tj-s1-job-lifecycle) transitions and the start conditions, holds the
+  record outbox, and emits audit events. `cancel` and `revoke_project` change
+  state, call `SlotPort::stop` or remove a queue entry, and queue kind 27; they
+  never wait for the journal.
+- **Conversation owner.** It owns the controller beside `Payloads`, polls it
+  in its reactor step, appends its records, forwards identity mismatches,
+  journal unavailability, shutdown and recovery, and maps `JobEvent`s to client
+  observers (J4) and the model (J3).
+- **Cancellation owners.** Setup: the slot's cancel flag. Running process: the
+  lease bytes and EOF. Capture: the capture handle's cancel and abandon. Page
+  reads: the caller's ticket cancel. Journal waits: the owner's ticket and the
+  J1-0 room wait. Recovery: the recovery cancel.
+- **Recovery.** The controller persists nothing outside the journal. After a
+  restart it starts empty and receives the unsettled jobs from replay.
+
+##### TJ-Q4: J2 start, stop and settlement
+
+Selected design. Solid arrows are calls, writes or records; dashed arrows are
+replies, events or notices. The `alt` block shows the person kill and the
+cleanup-unconfirmed branch.
+
+```mermaid
+sequenceDiagram
+    participant O as Conversation owner
+    participant K as Job controller
+    participant S as Slot worker
+    participant C as Capture worker
+    participant G as Guardian
+    participant J as Journal worker
+    O->>K: submit(model start)
+    K-->>O: Accepted(job), kind 26 in outbox
+    O->>J: Append kind 26
+    J-->>O: Committed
+    O->>K: record_done
+    K->>K: Head of agent queue, conditions hold: slot and 1 MiB
+    K->>S: start(SlotStart)
+    S->>C: Start worker for the job
+    S->>G: Spawn with JOBHEX model-1 COMMAND
+    G-->>S: Kind 1 spawned
+    S-->>K: Spawned
+    loop While running
+        G-->>S: stdout and stderr bytes
+        S->>C: Chunks while the 512 KiB queue has room
+    end
+    O->>K: cancel(job, client, client_cancel)
+    K->>S: stop(Term)
+    S->>G: Write T on the lease
+    K->>O: Kind 27 in outbox
+    O->>J: Append kind 27 (closure record)
+    G-->>S: Kind 5 leader exited, exit facts
+    S-->>K: LeaderExited: Stopping to Draining
+    alt Person kill escalation
+        K->>S: stop(Kill)
+        S->>G: Write K on the lease
+    else Escapee cannot be verified gone
+        G-->>S: Kind 4 reason 13
+        S-->>K: CleanupUnconfirmed: slot held, no record
+    end
+    G-->>S: Kind 2 settled, pipes at EOF
+    S-->>K: ProcessSettled
+    C-->>S: Sealed report with digests and line counts
+    S-->>K: CaptureSettled
+    K->>O: Kind 28 in outbox
+    O->>J: Append kind 28 (closure record)
+    J-->>O: Committed
+    O->>K: record_done
+    K->>C: Install payloads (R2)
+    S-->>K: ScratchCleaned
+    K->>K: Release slot, wake queue heads
+```
+
+### CleanupUnconfirmed and late settlement
+
+Selected (engineering, J2-E9), consistent with the escapee control rule that a
+late settlement releases the slot
+([what the current exec_cmd path consumes](escapee-control.md#what-the-current-exec_cmd-path-consumes)):
+
+- **Entry.** Kind 4 (reason 9 or 13) in `Stopping` or `Draining`. A guardian
+  protocol fault or a lost guardian after kind 1 also enters it: the slot
+  closes the lease, and no later notice from that guardian is trusted.
+- **Held.** The job keeps its slot, scratch and capture worker, and counts
+  toward the agent and service live counts. Queue heads show
+  `(1 awaiting cleanup)` in their reason.
+- **No record.** No settlement is written in this state. The conversation
+  owner stays available; the J1 `authority_repair_required` path does not apply
+  to jobs.
+- **Late settlement.** A later kind 2, from the guardian's paced sweep, moves
+  the job to `Finalizing`. Kind 28 records cleanup 2 `late` with the kind 4
+  reason. A late settlement never claims that the earlier unknown outcome was
+  clean (AE-05).
+- **No late settlement.** A process stuck in the kernel, or a lost guardian,
+  keeps the job until restart; the next start writes `interrupted`. No timer
+  releases the slot or deletes the scratch (exec_cmd cleanup rule). Shutdown
+  does not wait for it beyond its 2 s bound.
+- **Requests.** A cancel request is accepted and recorded with kind 27 if none
+  exists; `K` is still written for a person kill. Neither changes the state.
+- **Scratch after settlement.** Scratch cleanup runs on the slot's cleanup
+  thread with its existing L3 bound. On success the slot is released. A failure
+  or an expired bound keeps the cleanup token and the slot; the job's record is
+  already final. The slot stays held until restart, and the retained scratch
+  stays on disk, because no start-time scratch sweep exists (existing limit).
+
+### Revocation in J2
+
+Required behavior (owner, 2026-10-21, RV1): J2 delivers the identity-change,
+journal-outage and shutdown triggers. A revocation settles each queued start of
+the affected jobs as `not_started` and sends `T` to each live one, with the
+trigger's reason.
+
+Selected (engineering, J2-E10). Identity change is detected by the existing
+identity rechecks; J2 adds no poll:
+
+| Detector | Existing code | Effect |
+| --- | --- | --- |
+| Slot setup recheck before spawn | `exec_cmd_worker.rs` (`ProjectIdentity::open`, device and inode compare) | This job: `not_started`, `project_changed`. The project's other jobs: revoked, `identity_changed` |
+| Tool executor recheck on every project tool call | `tools.rs` (`ProjectIdentity::open`) | The project's jobs: revoked, `identity_changed` |
+| Turn admission and person dispatch | `Owner::project_identity` (`conversation.rs`) | The project's jobs: revoked, `identity_changed` |
+
+Gap (TJ-14 partial, stated under RV1): a project whose directory is replaced
+while no start, tool call, turn or dispatch touches it is not detected until
+the next such event. Project unregistration has no operation yet; its trigger is
+added with that operation. The EX11 execution setting and grant revocation are
+designed before J3 is enabled. Until then `read_authorized` and
+`execute_authorized` remain constants.
+
+### Journal outage, hold and shutdown
+
+- **Unavailable.** A fenced, repair-required or `capacity_exhausted` writer
+  makes the owner storage-unavailable, as today. The owner calls
+  `journal_unavailable`. The controller sends `T` to every live job, starts
+  nothing and drops its outbox. Queued model jobs stay in memory. Person
+  waiters stay at their lane heads. The next start writes `interrupted` for
+  every unsettled job.
+- **Held at the quota.** Kind 26 waits with `journal_held`. Kinds 27 and 28
+  commit from the ledger. Live jobs continue.
+- **Shutdown (AE-06).** `close` refuses new submissions with `closed`.
+  Queued model jobs settle `not_started` with reason `shutdown`. Person waiters
+  are removed; their lane heads replay as `Held`. Live jobs get `T` with
+  reason `shutdown`. The owner waits for the job settlements within the 2 s
+  shutdown cleanup bound, then exits; the lease EOF stops what remains, and
+  the next start writes `interrupted`. A second stop request forces exit
+  (AE-06). The owner lock rule is unchanged.
+
+### Page reads without a step bound
+
+Required behavior (owner, 2026-10-21, WB1). The page pool (`PagePool`,
+`asura-storage/src/payload/pages.rs`) removes `PAGE_STEP`:
+
+- A `Ticket` waits for its worker's reply with no time bound.
+- The caller's cancel or detach withdraws a queued request at once. A request
+  already on a worker continues; its reply is discarded, and the worker stays
+  held until the call returns. No replacement worker starts.
+- Pool shutdown ends every waiting ticket with `cancelled`.
+- Bounds stay: 2 workers, 1 reserved for model requests, a queue of 8, and
+  `busy` for a ninth queued request.
+
+Closures under AE-04: the reply, the caller's cancel or detach, and shutdown.
+J2 proves the pool at the storage and worker layers; J3 and J4 add callers.
+
+### J2 configuration keys
+
+Selected (engineering) for the J2a-2 counts. The
+[configuration commands](config-commands.md#schema-and-command-behavior) table
+lists these keys as designed, not implemented.
+
+| Key | Type and bounds | Default | Applies |
+| --- | --- | --- | --- |
+| `jobs.liveService` | Integer, 1–16 | 4 (J2a-2) | At service start |
+| `jobs.liveAgent` | Integer, 1–8 | 2 (J2a-2, AQ1) | At service start; the effective value is the smaller of this and `jobs.liveService` |
+| `jobs.queuedAgent` | Integer, 1–16 | 8 | At service start |
+| `jobs.clientViewers` | Integer, 1–32 | 8 (J2a-2) | At service start; J4 consumes it |
+| `jobs.modelReservedPageReads` | Integer, 0–1 | 1 (J2a-2) | At service start |
+
+`jobs` is written only when set away from its defaults. `get jobs` returns the
+whole mapping; `set jobs` takes the whole mapping; each leaf has its own get
+and set. A value outside its range is `config_invalid_value`. Each successful
+set emits `config.changed` with the leaf's setting name. Start-time reading
+follows `retention.quotaBytes`; a running service does not change its limits.
+
+### J2 audit events
+
+Selected (engineering). The existing audit emitter records four events. The
+audit schema number does not change. No event holds a command, cwd,
+environment, path, PID, note text or output. The escapee count is a number only
+([escapee control security](escapee-control.md#security)).
+
+| Event `kind` | Emitted when | Details |
+| --- | --- | --- |
+| `job.queued` | A job first waits for a start condition | `project`, `conversation`, `job`, `origin`, `agent`, `reason` (block reason code) |
+| `job.started` | The spawned notice arrives | `project`, `conversation`, `job`, `origin`, `agent`, `profile`; `operation`, `generation`, `ordinal` (model) or `input` (person) |
+| `job.cancel_requested` | Kind 27 commits | `project`, `conversation`, `job`, `requester`, `reason`, `kill` |
+| `job.settled` | Kind 28 commits | `project`, `conversation`, `job`, `outcome`, `reason`, `exit_kind`, `exit_value`, `cleanup`, `unconfirmed_reason`, `escapees`, `capture_state`, `stdout_bytes`, `stderr_bytes`, `elapsed_ms`, `pause_count` |
+
+`job.queued` is emitted once per job, so a job that changes reasons adds no
+events. The person packets add `outside_sandbox: true` to `job.started`,
+`job.cancel_requested` and `job.settled` for a `!!` job (PCR25).
+`Event::project()` returns `project` for all four.
+
+### J2 asynchronous execution
+
+| Rule | How J2 meets it |
+| --- | --- |
+| AE-01 | The controller, slots and owner do bounded in-memory work on the reactor. Pipe and status reads stay nonblocking with the 8 KiB quantum. The only write is one nonblocking lease byte. Records go through the owner's ticket; replies wake the reactor. |
+| AE-02 | Blocking calls and their isolation: project open, prepare and spawn on the slot setup thread; scratch deletion on the slot cleanup thread; `openat`, `write`, `fsync`, `renameatx_np`, `unlinkat`, `fstatfs` and hashing on the capture worker; `pread` on the 2 page-read workers; directory listing on the payload recovery worker; journal I/O on the journal worker; `waitid`, signals, `proc_listpids` and `sandbox_check` in the guardian process. Each slot has at most 2 threads at once: one setup or cleanup thread and one capture worker. |
+| AE-03 | Numeric limits in [J2 numeric limits](#j2-numeric-limits). A blocked start waits in its bounded agent queue with a reason; a full queue or the 64-job bound returns `busy`; capture overload backpressures, pauses or stops capture. Rotation across agents keeps one agent from starving another; cancel and revocation never wait behind a queue. |
+| AE-04 | No time limit ends a job, a queued start or a page read. Closures: completion, cancel, revocation, journal outage, shutdown, restart, capture fault and known-size bounds. Wind-down bounds act only after a closure: TERM-to-KILL grace, L3 and shutdown cleanup. Pacing that ends nothing: the guardian's 100 ms loop, the reactor's 100 ms job tick, the paused-capture retry and the `disk_space` recheck. An abandoned wait states its effect: `CleanupUnconfirmed` and `unconfirmed` capture say the work may continue. |
+| AE-05 | No job respawns. Explicit `interrupted` settlements; duplicate starts return the existing job; installs complete from verified staging; a late settlement never proves an earlier unknown outcome clean. |
+| AE-06 | Shutdown closes admission, settles queued starts, stops live jobs and waits within the 2 s bound. `CleanupUnconfirmed` keeps its ownership. |
+| AE-07 | [J2 validation](#j2-validation) runs real guardians, real storage on a constrained disk image, a held writer, crash injection and 16 concurrent jobs, with reactor responsiveness measured. |
+
+### J2 numeric limits
+
+Only known-size limits apply.
+
+| Resource | Limit | Overload result |
+| --- | --- | --- |
+| Live jobs | `jobs.liveService` (default 4, at most 16); `jobs.liveAgent` per agent (default 2, at most 8) | Queued with `service_slots` or `agent_slots` |
+| Agent job queue | `jobs.queuedAgent` per agent (default 8, at most 16) | `busy`, `queue_full` |
+| Unsettled jobs | 64 per service, fixed; equals the checkpoint and ledger bound | `busy`, `jobs_full`; replay `Limit` above it |
+| Agents with entries | At most 64 agents with model entries plus 16 person waiters, from the bounds above and the 16 unresolved inputs | — |
+| Record outbox | 3 per unsettled job, 192 in total | Not reachable |
+| Kind 26 | 34-byte payload, 218-byte frame | — |
+| Kind 27 | 19-byte payload, 203-byte frame; one per job | — |
+| Kind 28 | 4,086-byte payload, 4,270-byte frame | — |
+| Ledger | 4,473 bytes and 2 frames per unsettled job; 286,272 bytes and 128 frames at 64 | Kind 26 held at the quota |
+| Slot threads | 2 per slot at most; 32 at 16 slots | — |
+| Capture workers | Live jobs plus 4 pending installs; 20 at most | Queued with `pending_installs` |
+| Transfer queue | 8 chunks, 64 KiB each, 512 KiB per worker (R4) | Pipe reads stop |
+| Lease bytes | 2 per job | Not reachable |
+| Guardian notices | 5 notices, 160 bytes; 192-byte buffer | Protocol fault |
+| Slot events | 8 per slot per poll | Next poll |
+| Controller events | 64 per drain | Next drain |
+| Page-read pool | 2 workers, 0–1 model-reserved, 8 queued | `busy` for the ninth |
+| Quota | As J1: 1 MiB initial and step, 16 MiB recovery reserve | Queued with `quota` or `disk_space`; pause while running |
+
+### J2 failure handling
+
+| Case | Result | Record |
+| --- | --- | --- |
+| Agent or service slots full | Start queued with its reason; starts when a slot is released | Kind 26 at enqueue (model) |
+| Agent queue full, or 64 unsettled jobs | `busy` with `queue_full` or `jobs_full` | None |
+| Quota or disk short at start | Expiry first; then queued with `quota` or `disk_space` | Kind 26 at enqueue (model) |
+| Payload store recovering or unavailable | Queued with `payload_unavailable` | As above |
+| Journal held at its quota | Kind 26 waits with `journal_held`; kinds 27 and 28 commit | Closure records only |
+| Journal unavailable | All live jobs stopped; nothing starts; outbox dropped | None until the next start writes `interrupted` |
+| Cancel of a queued job | Entry removed | Kind 27, kind 28 `not_started` with the cancel reason |
+| Cancel before spawn | Setup cancel flag; a late returned job gets `T` at once | Kind 28 `not_started`, or `cancelled` if it spawned |
+| Setup failure | No process | Kind 28 `not_started`, reasons 12–18 |
+| Guardian protocol fault or loss after spawn | Lease closed; `CleanupUnconfirmed` until restart | None until `interrupted` |
+| Kind 4 | `CleanupUnconfirmed`; slot held | None until a late kind 2 or restart |
+| Late kind 2 | Settlement with cleanup `late`; slot released after scratch cleanup | Kind 28 |
+| Scratch cleanup fails or passes L3 | Slot and scratch token held until restart | Kind 28 already committed |
+| Capture stall while running | Backpressure only (J1-Q1) | None until settlement |
+| No sealed report 2.5 s after a cancel trigger | Capture `unconfirmed`; worker to the pending-install list | Kind 28 capture state 3 |
+| Capture fault other than ENOSPC | Cancel trigger, prefix kept | Kind 28 `cancelled`, `capture_fault` |
+| Quota or ENOSPC while running | Expiry, then `CapturePaused` | Pause facts in kind 28 |
+| Quota or ENOSPC in `Draining` | Capture discards; reason recorded | Kind 28 exited or signalled, `quota` or `enospc` |
+| Identity change detected | Project's jobs revoked | Kinds 27 and 28 with `identity_changed` |
+| Shutdown | Admission closed; queued settled; live stopped; 2 s bound | Kinds 27 and 28 with `shutdown`, else `interrupted` later |
+| Crash or restart | Guardian sees lease EOF; no rerun | Kind 28 `interrupted` at the next start |
+| Page read stalls | The read waits; the caller's cancel or detach withdraws it | None |
+
+### J2 validation
+
+Required test layers follow [engineering](../engineering.md#required-test-layers).
+Unit tests use deterministic fixtures: a fixture `SlotPort`, fixture journal
+frames and fixture notices. Integration tests use the real journal writer, real
+payload store, real slot and capture workers and the real guardian under
+`sandbox-exec`, driven by a worker-layer harness (`test_support.rs`, feature
+`test-support`) that writes a fixture turn with a `run` exec_cmd kind 14 and
+then calls the controller. Each integration case ends with the
+[raw-byte sweep](secret-detection.md#validation).
+
+| ID | Case (TJ and EC cases covered) | Unit | Integration |
+| --- | --- | --- | --- |
+| J2T-01 | Codecs | Kinds 26–28 round trip at every bound and maximum size; each invalid field `Corrupt`; reason and requester tables fixed; person-origin layout; no output, command or path field (TJ-26) | Real writer appends kinds 26–28 and reopens |
+| J2T-02 | Replay order (JR1–JR10) | Each rule, every invalid order, the owner-generation rules, the 64 bound, person origin rejected | Writer refuses kind 26 when the reservation cannot fit; holds it at the quota while kinds 27 and 28 commit |
+| J2T-03 | Ledger and checkpoint | `reserve()` sizes for 0, 1 and 64 jobs, with and without kind 27; checkpoint equals full replay with live jobs (SJ-05 property); `W` and `X` entries | Roll with live jobs; restart from the checkpoint; `PayloadFacts` for a job payload from delta, checkpoint and index |
+| J2T-04 | Identity vectors | Job ID and payload ID vectors for both origins, the zero rule, each input change; J1 calls use the same derivation | J1 orphan files from the old derivation deleted at recovery |
+| J2T-05 | Guardian argv and lease bytes (TJ-06, TJ-27 part) | Token parse; unknown token refuses before any effect; `T`, second `T`, `K`, EOF after `T`, unknown byte; reason precedence 2, 11, 4, 12 | TERM-ignoring command: `T` gives KILL 500 ms later, reason 2; `K` gives KILL at once, reason 11; EOF still stops the group; no loop spin after EOF |
+| J2T-06 | Kind 5 and notice order (TJ-29) | Kind 5 shape; every valid order of 1, 5, 4, 6, 2; kind 2 without kind 5; unequal exit facts; second kind 5 | Leader exits while a member writes: kind 5 before kind 2; `Draining` entered; a paused capture resumes on kind 5 |
+| J2T-07 | Lifecycle (TJ-S1) | Every transition with fixture slot events; request versus settled state; one kind 27; `person_kill` after `person_stop`; cancel of a queued job gives `not_started` | Real cancel in each of `Queued`, `Starting`, `Running`, `CapturePaused`, `Draining` |
+| J2T-08 | Agent queues and start conditions (TJ-08, AQ1) | FIFO per agent; rotation across two agents; each block reason in order; person waiter and model entry share counts; `queue_full`, `jobs_full`, `closed`; duplicate returns the existing job at every bound; changed arguments conflict; limits above their maxima reject | Agent with 2 running and 1 queued (`agent_slots`); fifth service job queued (`service_slots`); each starts when a slot is released, with no timer |
+| J2T-09 | Capture pause per job (TJ-24, TJ-28) | `CapturePaused` holds only its own slot; no global `capture_paused` rule for jobs | Constrained APFS image: one job pauses while a second starts and runs; resume on freed space; in `Draining` ENOSPC records `enospc` |
+| J2T-10 | `CleanupUnconfirmed` (EC-I8, EC-D2) | Kind 4 enters it; no record; slot counted; late kind 2 gives cleanup `late` | Guardian faults `undyable` and `unverifiable:5`: slot held, owner stays available, another agent's job starts; late settlement releases the slot |
+| J2T-11 | Escapee count (EC "left for J2", EC-E1 part) | Kind 6 value to kind 28 and `job.settled` | `all_kinds` escapee fixture through the controller: kind 28 escapees 3, cleanup confirmed |
+| J2T-12 | Recovery (TJ-11) | Unsettled jobs give one `interrupted` each under the new owner generation; replay rejects `interrupted` in the same generation; admission waits with `recovering` | Child-process abort with a job queued, starting, running, finalizing, settled not installed, and settled: one `interrupted` per unsettled job, installs once, never reruns; guardian stops the group on lease EOF |
+| J2T-13 | Journal outage and hold (TJ-15) | Outage stops live jobs, drops the outbox, starts nothing | Writer fault during a live job: job stopped; next start writes `interrupted`. Quota hold: kind 26 waits, kinds 27 and 28 commit |
+| J2T-14 | Shutdown (TJ-16) | Queued settle `shutdown`; live get `T`; new submissions `closed` | Settle within and beyond the 2 s bound; the later start writes `interrupted` for the rest |
+| J2T-15 | Identity revocation (TJ-14 part) | Each detector revokes only its project's jobs | Replace the project directory during a running job; a tool call in the project detects it; the job stops with `identity_changed`; another project's job continues |
+| J2T-16 | Page reads (TJ-10 part, WB1) | Wait for reply; cancel withdraws a queued read; detach discards a running reply; ninth `busy`; model reservation | A gated read held 5 s returns its page after release with no `busy`; the worker stays held meanwhile |
+| J2T-17 | Records after turn end | Kind 28 after the terminal and during another conversation's turn | A job outlives its fixture turn and settles during a second conversation's turn |
+| J2T-18 | Scale and responsiveness (AE-07) | Rotation fairness | 16 configured live jobs with output floods: owner Inspect and cancel within 100 ms; capture memory within 6 MiB per worker; both agents start jobs |
+| J2T-19 | Stalled storage (TJ-10 part, J1-Q1) | Bound decision after a cancel trigger | Gated scanner: backpressure only; after cancel, capture `unconfirmed` at 2.5 s; a full pending-install list queues with `pending_installs` |
+| J2T-20 | Audit events | Names, fields and absent text for all four; one `job.queued` per job | Real emitter writes them in order |
+| J2T-21 | Configuration keys | Bounds, defaults, effective minimum, mapping get and set | Set, restart, limits applied |
+| J2T-22 | Line counts and prefix (TJ-20) | Newline counts over stored bytes | Counts equal the retained streams; a capture fault keeps bytes from 0 with `capture_fault` |
+| J2T-23 | J1 path unchanged | — | The J1T regression suite and the CLI lifecycle gate pass with the J1 exec_cmd path |
+| J2T-24 | Person origin at the controller (TJ-27 part) | Person waiter has no record until the grant; kind 26 person layout; `K` escalation; model cancel `not_permitted` | — (P2 enables replay; P1 the person profiles) |
+
+End-to-end: none in J2. Required end-to-end cases TJ-01 to TJ-07, TJ-13,
+TJ-17 to TJ-19 and EC-E1 need the exec_cmd switch (J3) or the client job API
+(J4). They run with J3 and J4, which are enabled together (EN1), before exec_cmd
+runs as a job. This is a J2 proof limit, not a passing result.
+
+Environments: the macOS 27 development host with `sandbox-exec`, a scratch
+installation, and a constrained APFS image made with `hdiutil` for J2T-09.
+Release qualification is not claimed.
+
+### J2 proof limits
+
+- No end-to-end evidence until J3 and J4. J2 proves behavior at the unit and
+  worker-integration layers only.
+- No production caller exists in J2: the exec_cmd tool keeps its J1 path, and
+  person commands wait for P1–P4. The controller runs only in tests.
+- Person-origin replay, the person profiles and their 2 s grace wait for P1 and
+  P2; J2 tests the person origin at the controller and codec only.
+- Identity change in an idle project is detected only by the next start, tool
+  call, turn or dispatch in it.
+- A queued model job interrupted by a restart is reported "effects may have
+  occurred" although it never started.
+- A slot held by `CleanupUnconfirmed` or retained scratch stays held until
+  restart; retained scratch stays on disk.
+- One development host; `/bin/sh`, APFS and `sandbox-exec` behavior elsewhere is
+  not claimed.
+
+### J2 code packets
+
+Selected plan for the code. Each packet owns its paths alone while it runs; no
+two packets edit one file. Each delivers its unit and integration tests and runs
+`cargo test` for its crates before it hands over. The primary agent integrates.
+
+| Packet | Owned paths | Depends on | Delivers |
+| --- | --- | --- | --- |
+| J2-A Platform guardian | `asura-platform/src/exec_cmd.rs`; `asura-platform/src/exec_cmd/{guardian,protocol,spawn,tests}.rs`; `asura-platform/tests/exec_cmd_process.rs`; the private guardian route in `asura-cli/src/app.rs` | — | Profile token, lease bytes, kind 5, order and reason rules, `StopKind`, `ExecCmdRequest::profile`, removal of reason 3; J2T-05, J2T-06 |
+| J2-B Journal records | `asura-storage/src/authority/conversation/{types,codec,state,mod}.rs`; `asura-storage/src/authority/{journal,checkpoint,index,fixture}.rs`; `asura-storage/src/authority/index/run.rs`; `asura-storage/src/authority/journal/{memory,tests}.rs`; `asura-storage/src/authority/writer/{mod,state}.rs`; `asura-storage/tests/{authority_conversation,authority_replay,journal_writer,segmented_journal}.rs` | — | Kinds 26–28, job ID, JR1–JR10, ledger, closure classification, checkpoint jobs, `W` and `X` entries, `UnsettledJob`, `PayloadFacts` job form; J2T-01 to J2T-04 (storage parts), J2T-17 (unit) |
+| J2-G Configuration and audit schema | `asura-storage/src/config.rs`; `asura-storage/src/audit/{types,mod,tests}.rs` | — | `jobs.*` keys, job audit event types and setting names; J2T-20, J2T-21 (unit) |
+| J2-C Payload store | `asura-storage/src/payload/{id,store,recovery,pages,mod}.rs`; `asura-storage/tests/payload_store.rs` | J2-B | Job-keyed payload IDs and reservations, job recovery facts, page pool without `PAGE_STEP`; J2T-04 (payload), J2T-16 |
+| J2-D1 Slot and capture workers | `asura-service/src/exec_cmd_worker.rs`; `asura-service/src/exec_cmd_worker/tests.rs`; `asura-service/src/capture_worker.rs`; `asura-service/tests/capture_worker.rs` | J2-A, J2-C | Job mode of the slot worker with the `SlotPort` methods, `StopKind`, notice events, line counts, job-keyed capture; J2T-22 |
+| J2-D2 Controller | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` (new); the `mod job_controller;` line of `asura-service/src/lib.rs` | J2-B, J2-G | Queues, start conditions, lifecycle, outbox, recovery, revocation, audit construction, `SlotPort` trait and fixture; J2T-07, J2T-08, J2T-24 and the unit parts of J2T-09 to J2T-15 |
+| J2-E Integration | `asura-service/src/conversation.rs` and `asura-service/src/conversation/*.rs`; `asura-service/src/{payload_owner,audit,tools,test_support}.rs`; `asura-service/tests/job_controller_flow.rs` (new); `docs/user/{commands,guide}.md` for the `jobs` keys; the J2 evidence in this design | All | `impl SlotPort for exec_cmd_worker::Worker`, the owner's record order, identity, outage, shutdown and recovery wiring, payload owner job admission, audit emission; the integration parts of J2T-05 to J2T-23 |
+
+##### TJ-P2: J2 packet order
+
+Selected plan. Arrows mean "must merge before". Packets in one row may run in
+parallel because their paths are disjoint.
+
+```mermaid
+flowchart TD
+    A["J2-A platform guardian"] --> D1["J2-D1 slot and capture workers"]
+    B["J2-B journal records"] --> C["J2-C payload store"]
+    C --> D1
+    B --> D2["J2-D2 controller"]
+    G["J2-G configuration and audit schema"] --> D2
+    D1 --> E["J2-E integration and evidence"]
+    D2 --> E
+    A --> E
+    G --> E
+    E --> Gate{"J2T unit and integration pass, J1T regressions pass?"}
+    Gate -->|Yes| Done["J2 implemented, e2e carried by J3 and J4"]
+    Gate -->|No| Fix["Fix in the owning packet, or revise this design first"]
+```
+
+### J2 gap resolution
+
+Each gap of the J2–J5 readiness audit (2026-10-21) for J2, and where it is
+resolved.
+
+| Gap | Resolved in |
+| --- | --- |
+| No kind numbers or layouts for intent, cancel, settlement | [Kinds 26–28](#j2-records-kinds-26-27-and-28) |
+| Settlement field lists disagree (this design, person design, escapee control) | Kind 28 is the one source; the other designs link to it |
+| Relation to kind 23 stream blocks, numbers, loss spans, discards, reservation | Kind 28 carries kind 23's capture facts; [relation to kinds 14, 15 and 23](#relation-to-kinds-14-15-and-23) |
+| "Kinds 22 and 23 stay valid" | Corrected: kind 22 retired; kind 23 stays for J1-mode calls until J3 |
+| Intent duplicates kind 14 or PCQ facts; grant snapshot undefined | Kind 26 stores the origin reference only; derivation table |
+| Replay order undefined | [JR1–JR10](#replay-order-and-the-job-reservation-ledger), TJ-D2 |
+| Records after turn end; `reserve()` tied to the active operation; closure list | Job reservation ledger; kinds 27 and 28 are closure records; [writing job records](#writing-job-records) |
+| Explicit versus derived recovery | [Explicit](#j2-recovery-explicit-interrupted-settlements) for jobs; derived for J1 calls |
+| Two job ID domains; person jobs without payload IDs; "ledger unchanged" | [Job identity](#job-identity); J1 delivery note corrected |
+| J1 capacity rules do not fit 4–16 jobs | [Start conditions](#start-conditions-and-blocking-reasons); `capture_paused` applies to J1 calls only |
+| Per-agent queues (owner, 2026-10-21) | [Agents, queues and slots](#agents-queues-and-slots); person command mode lane text |
+| Kind 5 layout; reason for a model `T`; profile or grace token; notice budget | [Guardian contract additions](#guardian-contract-additions) |
+| `CleanupUnconfirmed` settlement and the repair path | [CleanupUnconfirmed and late settlement](#cleanupunconfirmed-and-late-settlement) |
+| Revocation scope | [Revocation in J2](#revocation-in-j2) |
+| Configuration keys; audit names and fields | [Configuration](#j2-configuration-keys), [audit](#j2-audit-events) |
+| Time bounds | [Wind-down bounds](#job-closures-and-wind-down-bounds), [page reads](#page-reads-without-a-step-bound) |
+| J3 and J4 together; e2e before the next packet | [TJ-P1](#tj-p1-delivery-order) |
+| J2 test matrix | [J2 validation](#j2-validation) |
+| Slot worker and controller interface | [Interfaces](#slot-worker-capture-worker-and-controller-interfaces) |
+| Code split | [J2 code packets](#j2-code-packets) |
+| Contradictions and stale text | This design and the linked designs, recorded in [design verification](#design-verification) |
+
 ## Open decisions
 
-No open owner decision blocks J1–J6. J1 is ready for implementation; SL1 and
-SL2 of the [secret detection design](secret-detection.md#delivery) are
-implemented. The EX5 prerequisite of J2 was met on 2026-10-21 for sandboxed
+No open owner decision blocks J2. J1 is implemented, and J2 is ready for
+implementation. The EX5 prerequisite of J2 was met on 2026-10-21 for sandboxed
 model jobs ([evidence](escapee-control.md#implementation-evidence-2026-10-21));
 the EX10 prerequisite was met
-on 2026-10-20 ([qualification results](exec-cmd-tool.md#qualification-results-2026-10-20)). These remain for
-later designs:
+on 2026-10-20 ([qualification results](exec-cmd-tool.md#qualification-results-2026-10-20)).
+The interface design of J3–J5 (the reference-only result kind, `job` tool
+arguments, control messages, notice entries) is a later design pass; it is not
+an owner decision. The EX11 setting needs its own design before J3 is enabled
+(RV1). These remain for later designs:
 
 1. **Other tools:** EX4 (owner, 2026-10-15) states that all tools use jobs. The
    earlier assumption that short typed tools remain synchronous no longer holds.
@@ -1925,6 +3121,9 @@ later designs:
 3. **Raw pages:** their encoding and the remaining RG-11 coverage (R5).
 4. **Maxima:** the proposed fixed maxima in [arguments and limits](#arguments-and-limits)
    need measured qualification.
+5. **Subagents:** the subagent design assigns agent numbers from 1 and their
+   input lanes; J2 keys every queue and count by agent so that design adds
+   instances only (AQ1).
 
 ## Alternatives considered
 
@@ -1979,5 +3178,20 @@ observation, replay and queue-worker bounds as [journal step J1-0](conversation-
 a J1 prerequisite. New diagrams TJ-S2 and TJ-Q3, and changed diagrams
 TJ-R1 and TJ-P1, were rendered with Mermaid CLI 12.0.0 and inspected. No code
 or test was run.
+
+Recorded on 2026-10-22: [J2 implementation details](#j2-implementation-details)
+was added from the J2–J5 readiness audit of 2026-10-21, applying the owner
+decisions AQ1, WB1, EN1 and RV1. Code facts were checked by read-only
+inspection at commit `a088a65` (guardian argv and lease handling, notice
+decoder and reader limits, record kinds, `reserve()`, `is_closure`, payload ID,
+page pool step, exec_cmd worker repair path, owner journal ticket). Stale text
+was corrected: the 60 s and tail figures, the 30 s default, the model wire field,
+the job ID domains, the page-read bound, the global `capture_paused` rule for
+jobs, `busy` for blocked starts, the conversation line citations, the durable
+records table, the J2 delivery row and TJ-P1. TJ-Q1, TJ-S1, TJ-R1 and TJ-P1
+changed; TJ-O2, TJ-F2, TJ-D2, TJ-S3, TJ-Q4, TJ-Q5 and TJ-P2 are new. Each was
+rendered with Mermaid CLI 12.0.0 and inspected; TJ-O2 was redrawn top-down
+after its first render was unreadable at document width. Local links and
+anchors in every changed document were checked. No code or test was run.
 
 Return to the [design index](README.md).

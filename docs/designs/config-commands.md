@@ -25,6 +25,15 @@ the working directory or an environment override. Tests use scratch runtime root
 | `providers.mlx.models` | Up to 64 exact asset keys, each with a bounded capability list; see below | Empty mapping |
 | `providers.ollama.endpoint` | ASCII URL, at most 2048 bytes; numeric-loopback host over HTTP or HTTPS. Set rejects other hosts with `config_remote_endpoint_restricted` under the [loopback restriction](model-provider-integration.md#loopback-endpoint-restriction--selected-2026-10-13) | `http://127.0.0.1:11434` at inference admission |
 | `personCommands.allowOutsideSandbox` | Boolean. Proposed with [person command mode](person-command-mode.md#required-behavior) PCR23 (owner, 2026-10-19), not implemented. `false` refuses `!!` person commands; `!` commands are unaffected. A successful set applies to the next `!!` submit and to setup of a queued one; a running command continues. Written only when set away from its default; `set personCommands` takes the whole mapping | `true` |
+| `jobs.liveService` | Integer, 1 through 16. Designed with [tool job packet J2](tool-job-controller.md#j2-configuration-keys), not implemented. Live jobs in the service; read at service start | `4` (owner J2a-2) |
+| `jobs.liveAgent` | Integer, 1 through 8. Designed with J2, not implemented. Live jobs per agent; the effective value is the smaller of this and `jobs.liveService`; read at service start | `2` (owner J2a-2, AQ1) |
+| `jobs.queuedAgent` | Integer, 1 through 16. Designed with J2, not implemented. Starts that may wait in one agent's job queue; read at service start | `8` |
+| `jobs.clientViewers` | Integer, 1 through 32. Designed with J2, not implemented; consumed by J4. Pending client job reads per service; read at service start | `8` (owner J2a-2) |
+| `jobs.modelReservedPageReads` | Integer, 0 through 1. Designed with J2, not implemented. Page-read workers reserved for model requests; read at service start | `1` (owner J2a-2) |
+
+The `jobs` mapping follows `retention`: it is written only when set away from
+its defaults, `set jobs` takes the whole mapping, and each leaf has its own get
+and set. Values outside a range are `config_invalid_value`.
 
 The owner accepted `journal.quotaBytes`, its range and its 4 GiB default on
 2026-10-19; it is implemented with the [segmented journal](segmented-journal.md#configuration).

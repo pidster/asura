@@ -367,7 +367,7 @@ behavior; it is not the target.
 | One model request | Model helper | Completion; context window full (`context_limit`). No output cap (owner, 2026-10-19) | Cancel, steer |
 | Requests within a turn | Model helper | Completion; the tool-call limit below; context window full (provider context error); provider failure; helper exit. No request count and no token total (owner, 2026-10-18) | Cancel, steer |
 | Tool calls within a turn | Service | Exhaustion: 200 calls (the 201st is recorded as `limit` and ends the turn), 16 KiB per result; journal full. No turn result-byte total (owner, 2026-10-18) | Cancel, steer |
-| Tool job (designed, not implemented) | Service | Completion; capture fault. No lifetime deadline (owner, 2026-10-14). Temporary ending `CapturePaused` on quota or ENOSPC, with no time expiry. A stall closure will come from tool-loop trace evidence. `job wait` ends on events or an optional model time. See [job closures](tool-job-controller.md#job-closures-and-wind-down-bounds). | Cancel, person stop and kill, revocation, restart |
+| Tool job (designed, not implemented; J2 ready) | Service | Completion; capture fault. No lifetime deadline (owner, 2026-10-14). Temporary ending `CapturePaused` on quota or ENOSPC, with no time expiry. A blocked start waits in its agent's job queue with a reason (owner, 2026-10-21); a full queue is a known-size exhaustion. A stall closure will come from tool-loop trace evidence. `job wait` ends on events or an optional model time. See [job closures](tool-job-controller.md#job-closures-and-wind-down-bounds). | Cancel, person stop and kill, revocation, journal outage, shutdown, restart |
 | Retry and reconnect | Service and client | Exhaustion: attempt limits | Cancel, drain |
 
 ## Failure, security and operations
@@ -377,7 +377,8 @@ behavior; it is not the target.
   restart. The mapping must state, per loop, whether suspension survives restart.
 - **Security:** a resume event must come from a resolver that holds authority for
   that loop. A resource condition grants nothing. A suspended job keeps its
-  original grant, sandbox and lifetime; suspension never extends authority.
+  original grant and sandbox, and gains no lifetime (jobs have none, J2a-1);
+  suspension never extends authority.
 - **Operations:** each attached operator records its reason in the ending event.
   Clients show the reason and any suspension chain. Numeric limits are open.
 
@@ -425,7 +426,8 @@ Open decisions for the per-loop mapping:
    suspends the process, or stops it. Resolved for job capture by the owner on
    2026-10-14 (R6, J2a-1): quota exhaustion and ENOSPC on Asura's own capture
    writes pause capture (`CapturePaused`) and do not suspend the process; other
-   I/O faults and stalls cancel the job. The pause has no time expiry; cancel,
+   I/O faults cancel the job. A storage stall only backpressures the producer
+   and never cancels (J1-Q1, owner, 2026-10-15). The pause has no time expiry; cancel,
    revocation, leader exit and restart end it. Its pause facts are recorded in
    the settlement, not in separate records, an exemption from the durability rule
    above (J2c). Jobs have no guaranteed-end closure until the stall closure

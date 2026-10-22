@@ -162,10 +162,10 @@ scheduler, queue, payload store or journal.
 | Submit transport | Existing serial queue sender | New typed request |
 | Validation, queue order, dispatch, person grant | Rust conversation owner (`asura-service/src/conversation.rs`) | New queue entry kind |
 | Durable values for queued commands | [Secret store](secret-store.md) worker over `asura-platform::keychain` | New (PC15) |
-| Job slot, setup, capture, retention, settlement, cancel | Job controller from J2 | Person origin: no yield window, no deadline, kill escalation |
-| Spawn, sandbox, guardian, process group | `asura-platform::exec_cmd` | Person and outside profiles, no-deadline mode, stop-control bytes |
+| Job slot, setup, capture, retention, settlement, cancel | Job controller from J2 | Person origin: no yield window, no deadline, kill escalation, waiter in the main agent's job queue (J2) |
+| Spawn, sandbox, guardian, process group | `asura-platform::exec_cmd` | Person and outside profile tokens and profiles (P1). The no-deadline mode (J1) and the stop-control bytes (J2) already exist |
 | Retained streams and pages | Payload adapter from J1 | None |
-| Durable records and replay | Storage authority writer (`asura-storage/src/authority`) | Format-1 kind PCQ; person origin on J2 job records |
+| Durable records and replay | Storage authority writer (`asura-storage/src/authority`) | Format-1 kind PCQ; person-origin replay of the J2 kind 26 |
 | Notice composition | Job notices from J5 | Person entry labels |
 | Model view of output | Context composer; until it exists, model `job read` (PC12) | None here |
 | Model input | Swift model helper | None. The notice arrives as prompt and history text. |
@@ -388,8 +388,8 @@ outbox rejection rule.
 
 Required behavior: PCR11. Proposed mechanism:
 
-- While the selected conversation's person job is `Running` or
-  `CapturePaused`, the first Ctrl-C sends `JobCancel` for that job. The
+- While the selected conversation's person job is `Running`, `CapturePaused`
+  or `Draining`, the first Ctrl-C sends `JobCancel` for that job. The
   controller sends TERM, then KILL 2 s later (PC8). The hint shows `stopping · Ctrl-C again kills`.
 - While it is `Stopping`, a second Ctrl-C sends `JobCancel` with `kill` set. The
   controller sends KILL at once.
@@ -399,16 +399,20 @@ Required behavior: PCR11. Proposed mechanism:
 - `/cancel` in message mode stops a running person job, like the first Ctrl-C.
   A repeated `/cancel` is idempotent; it never escalates to kill. Command mode
   treats `/cancel` as shell text.
-- A person job starts only while its conversation has no active model turn,
-  and the lane does not advance until the job settles. `/cancel` and Ctrl-C
-  therefore have one target in the selected conversation at a time.
+- A person job is dispatched only from the head of its main agent's input
+  lane while that agent has no active model turn, and the lane does not advance
+  until the job settles. `/cancel` and Ctrl-C therefore have one target in the
+  selected conversation at a time. Blocked commands wait with a brief reason
+  ([queue integration](#queue-integration)); none is refused for being blocked.
 - With a person command queued but not dispatched, Ctrl-C keeps the quit rule.
   Queued and running commands continue after the TUI exits (PC5). When the TUI
   launched the backend, the exit confirmation counts them and states that
   they will stop, as the job controller requires for live jobs.
-- The status row shows `running <excerpt> · 42 s · Ctrl-C stops it`. The
-  elapsed time comes from `JobObserve` replies; with no new output, the 1 s
-  long-poll still refreshes it.
+- The status row shows `running <excerpt> · 42 s · Ctrl-C stops it`. The TUI
+  computes the elapsed time from the job's start time in the last job state it
+  received and its existing status-row redraw. `JobObserve` has no hold time:
+  it returns on new output, a state change, settlement, detach or cancel
+  ([job closures](tool-job-controller.md#job-closures-and-wind-down-bounds)).
 - A paused capture shows `paused: output quota full · Ctrl-C stops it`.
 
 Model jobs that outlive their turn are not targets of these keys. The person
@@ -424,8 +428,8 @@ Proposed design. Arrows show the key routing decision and the request sent.
 ```mermaid
 flowchart TD
     Key["Ctrl-C or /cancel"] --> Running{"Selected conversation's person job state?"}
-    Running -->|"Running or CapturePaused"| First["JobCancel: TERM now, KILL after grace"]
-    Running -->|"Stopping, key is Ctrl-C"| Kill["JobCancel with kill: KILL now"]
+    Running -->|"Running, CapturePaused or Draining"| First["JobCancel: T, TERM now, KILL after grace"]
+    Running -->|"Stopping, key is Ctrl-C"| Kill["JobCancel with kill: K, KILL now"]
     Running -->|"Stopping, key is /cancel"| Same["No new request, notice repeats state"]
     Running -->|"No person job running"| Existing{"Key?"}
     Existing -->|"Ctrl-C"| Quit["Existing quit rule (ui.rs:1598)"]
@@ -464,9 +468,9 @@ Proposed mechanism:
   after the last one seen, so a flood skips ahead instead of
   falling behind. The reply replaces the cached fold and marks the view dirty.
   Pacing comes only from flow control: the long-poll returns when new bytes
-  arrive or after 1 s, and the render loop already holds a redraw while
-  terminal output is pending (`tui/mod.rs:282-288`). There is no refresh
-  timer.
+  arrive or the job's state changes, and the render loop already holds a
+  redraw while terminal output is pending (`tui/mod.rs:282-288`). There is no
+  refresh timer and no hold time.
 - In log focus, Enter or Space on the entry opens the job viewer at the end of
   stdout (PC11). Escape returns to the log. The fold never expands inline.
 - The footer is `↳ exit 0 · 4 lines · 1.2 s · src/ui`. Other outcomes read
@@ -698,20 +702,22 @@ execution setting governs model execution and does not affect person jobs.
 
 ### Job controller amendments
 
-Proposed mechanism. A person job is a tool job with these differences. J2 must
-include them before this design is implemented.
+Proposed mechanism. A person job is a tool job with these differences. J2
+delivers their controller parts
+([J2 scope](tool-job-controller.md#j2-scope)); the person packets add the
+profiles, kind PCQ and the submit path.
 
 | Job controller rule | Person job |
 | --- | --- |
-| Started by a model `exec_cmd` call with a yield window | Started by dispatch of a kind-PCQ queue entry; no yield window and no starting ToolResult |
+| Started by a model `exec_cmd` call with a yield window | Started by dispatch of a kind-PCQ queue entry; no yield window and no starting ToolResult. Until a slot is granted it is an in-memory waiter in the main agent's job queue, and kind 26 is written only at the grant |
 | Handle delivery is the starting call's ToolResult | No handle delivery step. The client knows the job ID at queue acceptance, because it derives from the input ID. |
 | No job lifetime for any job (owner, 2026-10-14, J2a-1) | No deadline (PCR11). Closures are person stop and kill, revocation and shutdown; a client disconnect is not one (PC5). |
 | `CapturePaused` has no time expiry for any job (owner, 2026-10-14) | A paused person job waits for freed space, a person stop or another cancel trigger |
-| Cancel: TERM, then KILL | Adds `kill`: KILL at once. A kill request after a stop request escalates. |
+| Cancel: TERM, then KILL | Adds `kill`: KILL at once (lease byte `K`). A kill request after a stop request escalates. |
 | Execution profile from the turn's grant | Person or outside profile and person grant |
 | Setup builds a sandbox profile | The outside profile builds none; setup re-reads `personCommands.allowOutsideSandbox` and takes the environment from the per-input store |
-| Job intent binds operation, generation and ordinal | Job intent binds origin `person` and the input ID instead |
-| Live jobs: 2 per conversation, 4 per service | Person jobs count toward both |
+| Job intent binds operation, generation and ordinal | Kind 26 binds origin 2 (person) and the input ID instead |
+| Live jobs: 2 per agent, 4 per service (AQ1) | A person job counts toward the main agent of its conversation and the service; no slot is reserved for it |
 | Model `job` commands cover the conversation's jobs | `list`, `status`, `read` and `wait` cover person jobs; `cancel` returns `not_permitted` (PC10, selected) |
 
 ### Control API additions
@@ -800,9 +806,17 @@ messages:
 - At dispatch the owner requires the lane head, no active model turn in the
   conversation. It then asks the job
   controller to admit the job.
-- A controller `busy` result, for a slot or for quota, leaves the command queued
-  at the lane head with the reason shown. Dispatch retries when a slot or quota
-  frees. It never rejects the command for `busy`.
+- Queues, lanes and slots are per agent (owner, 2026-10-21, AQ1). The input
+  lane is the main agent's lane. Blocked work waits with a brief reason that
+  names what blocks it; it is never refused for being blocked. While a model
+  turn is active the head shows `waiting: model turn running`. When the
+  controller cannot start the job, the command stays at the lane head as a
+  waiter in the main agent's job queue, with the controller's
+  [blocking reason](tool-job-controller.md#start-conditions-and-blocking-reasons),
+  for example `waiting: 2 of 2 jobs running for this agent`. It starts when the
+  condition clears; no timer retries it. Only the controller's known-size queue
+  bounds return `busy` (`queue_full`, `jobs_full`); the command then stays queued
+  at the lane head and dispatch tries again on the next wake event.
 - The lane does not advance until the person job settles. A message queued
   after a command therefore starts a turn that sees the command's outcome.
 - A queued person command counts toward the existing 16 unresolved inputs.
@@ -811,17 +825,18 @@ messages:
   reads its Keychain item and runs it; it is refused with `secrets_lost` only
   when the item is missing.
 - A `!!` command queues, reorders, holds and drops exactly as a `!` command.
-- The order revision advances on kind PCQ, and on dispatch through the job
-  intent.
+- The order revision advances on kind PCQ, and on dispatch through kind 26.
 
 ### Durable records
 
 Proposed mechanism: one additive format-1 record kind, plus person origin on the
-job records that J2 allocates. Kinds 1–20 are allocated (`types.rs:228-245`;
-[admission](conversation-admission.md#format-1-and-record-kinds)).
+job records that J2 allocates (kinds 26–28,
+[J2 records](tool-job-controller.md#j2-records-kinds-26-27-and-28)). The
+allocated kinds are listed in
+[admission](conversation-admission.md#format-1-and-record-kinds).
 Required behavior (owner, 2026-10-14, R3): kinds are allocated in delivery order,
 so the job controller's J1 and J2 kinds come first and this record takes the next
-free kind at integration. Kind PCQ is no longer claimed. This design calls the
+free kind at integration. This design calls the
 record kind PCQ (`PersonCommandQueued`) until the number is allocated.
 
 ToolIntent kind 14 cannot hold a person command: its `operation`, `generation`
@@ -832,12 +847,13 @@ an existing kind by value, which the admission contract forbids.
 | Record | Payload, in order |
 | --- | --- |
 | Kind PCQ `PersonCommandQueued` | request ID, request digest, input ID, project ID, conversation ID, expected generation, new-conversation flag, outside-sandbox flag, command (1–8192 bytes; the PCR19 rewrite or `eval "$ASURA_SECRET_COMMAND"`, never a secret value), display-only command (absent, or the filtered copy for the whole-command variable, PC14), cwd (1–1024 bytes), sanitized PATH (1–4096 bytes; empty for `!!`), PC3 client environment (at most 9 entries, one per allowed name; empty for `!!`), initial order revision. The `!!` launch environment is never recorded. |
-| J2 job intent, origin person | job ID, origin `person`, input ID, project device and inode, cwd device and inode, profile ID (`person-1` or `person-outside-1`), outside-sandbox flag, root-set digest (absent for `person-outside-1`), grant snapshot, quota reservation, reserved record capacity, order revision; no deadline |
-| J2 job cancel requested | job ID, requester `person` or `revocation`, kill flag, reason |
-| J2 job settlement | job ID, outcome, exit status, capture state, byte and line counts per stream, digests and payload reference per stream, elapsed milliseconds, cleanup-confirmed flag |
+| Kind 26 `JobIntent`, origin person | Origin 2, agent 0 and the input ID. Job ID, profile ID (from the outside-sandbox flag), project, cwd, grant and reservations are derived, never stored. P2 may add the person facts it needs, such as a root-set digest, to this layout in place |
+| Kind 27 `JobCancelRequested` | Job ID, requester `person` or `service`, reason, kill flag |
+| Kind 28 `JobSettled` | Job ID, outcome, reason, exit facts, cleanup facts, escapee count, elapsed milliseconds, and capture facts with byte and line counts and digests per stream. Payload IDs derive from the job ID |
 
-No record holds output text (PCR14). The service-written job summary is
-derived from these facts.
+The job controller design is the one source of these layouts; this table
+summarizes them. No record holds output text (PCR14). The service-written job
+summary is derived from these facts.
 
 Settlement outcomes for a person job use the job controller's outcomes with
 these reasons:
@@ -846,8 +862,8 @@ these reasons:
 | --- | --- |
 | Exited | Exit code |
 | Signalled | Signal number, when no stop was requested |
-| Cancelled | `person_stop`, `person_kill`, `shutdown`, `revocation` |
-| Not started | `cwd_unavailable`, `project_changed`, `sandbox_unavailable`, `spawn_failed`, `outside_sandbox_off` (`!!` only) |
+| Cancelled | `person_stop`, `person_kill`, `shutdown`, `identity_changed` and later revocation reasons |
+| Not started | A cancel before spawn (its cancel reason), `cwd_unavailable`, `project_changed`, `sandbox_unavailable`, `spawn_failed`, `outside_sandbox_off` (`!!` only; its code is allocated by P2) |
 | Interrupted | Recorded at recovery after a restart; effects unknown |
 
 The request digest covers record kind PCQ, project, conversation, expected
@@ -861,19 +877,22 @@ Replay requires a person-origin job intent's profile ID to match the kind-PCQ
 outside-sandbox flag: `person-outside-1` exactly when the flag is set. A
 mismatch rejects the stream.
 
-The job ID is the first 16 bytes of SHA-256 over ASCII `asura.person.job`, one
-zero byte, then the input ID. If all 16 bytes are zero, the final byte becomes 1.
-The domain string separates person job IDs from model job IDs.
+The job ID uses the one [job identity](tool-job-controller.md#job-identity)
+derivation: SHA-256 over ASCII `asura.job`, one zero byte, origin byte 2 and
+the input ID, cut to 16 bytes. The origin byte separates person job IDs from
+model job IDs. Payload IDs derive from the job ID.
 
 Replay rules:
 
-- A person-origin job intent requires a kind-PCQ input that is the lane head, not
-  dropped and not started.
+- A person-origin kind 26 requires a kind-PCQ input that is the lane head, not
+  dropped and not started. Until P2 adds this rule, replay rejects person-origin
+  kind 26 (J2 rule JR2).
 - A kind PCQ without a job intent replays as `Held` under a later owner
   generation.
-- Job intent, cancel and settlement replay under the job controller's rules. An
-  intent without settlement at recovery becomes `Interrupted`. The service never
-  relaunches it.
+- Kinds 26–28 replay under the job controller's rules. At start the service
+  writes kind 28 `interrupted` for a kind 26 without a settlement. It never
+  relaunches the job. A command still waiting for a slot has no kind 26 and
+  replays as `Held`.
 - Replay rejects any kind it does not recognize; public inspection must not
   skip unsupported kinds. No compatibility with older binaries is required
   (owner, 2026-10-17).
@@ -885,11 +904,11 @@ supervisor is added.
 
 | Change | Detail |
 | --- | --- |
-| Profile selection | `ExecCmdRequest` gains `profile: Model \| Person(PersonRoots) \| PersonOutside`. It carries no deadline ([J1-Q3](tool-job-controller.md#j1-timeout-and-setup-budget-removal)). The guardian argv gains a profile token after the job ID. Validated descriptors still authorize the entrypoint. |
-| No-deadline mode | Every job runs with deadline argument `0` (owner, 2026-10-14, J2a-1). The guardian skips the deadline check (`guardian.rs:186`) and keeps its 100 ms lease poll. Every other existing check stays for both profiles. |
-| Stop control | The lease pipe accepts single bytes: `T` starts TERM and the grace timer; `K` sends KILL at once. EOF still means service loss. Today any byte is a protocol fault (`guardian.rs:389-399`). At most 2 bytes are written, below `PIPE_BUF`. The job controller adopts the same bytes for model job cancel. |
-| Grace | Person profile: 2 s (PC8). The model keeps 500 ms. |
-| Notice reasons | Status notice reason values 10 person stop and 11 person kill in the existing 32-byte notice. The decoder rejects reasons above 9 today (`asura-platform/src/exec_cmd/protocol.rs:29`) and accepts kind-2 reasons 0–4 only (`protocol.rs:48`), so it must change with them. |
+| Profile selection | `ExecCmdRequest::profile` and the guardian argv profile token exist from J2 with `model-1` only ([guardian contract additions](tool-job-controller.md#guardian-contract-additions)). P1 adds `Person(PersonRoots)` and `PersonOutside`, with tokens `person-1` and `person-outside-1`. Validated descriptors still authorize the entrypoint. |
+| No-deadline mode | Done in J1: the guardian has no deadline argument or mode (owner, 2026-10-17). It keeps its 100 ms lease poll. Every other existing check stays for both profiles. |
+| Stop control | Delivered by J2 for every profile: `T` starts TERM and the profile's grace timer; `K` sends KILL at once. EOF still means service loss. At most 2 bytes are written, below `PIPE_BUF`. |
+| Grace | Selected by the profile token: `person-1` and `person-outside-1` 2 s (PC8); `model-1` keeps 500 ms. |
+| Notice reasons | Delivered by J2 for every profile: kind 2 reason 2 `cancel` for a `T` stop and 11 `kill` for `K`. Reason 10 is not used. The controller, not the guardian, records `person_stop` or `person_kill`. |
 | Environment | Person: built from the validated request: sanitized PATH, account HOME, `TMPDIR`, PC3 variables. Outside: the validated launch environment as sent. Both add EX4 secret variables. Model environment unchanged. |
 | Outside spawn | For `PersonOutside` the guardian execs `/bin/sh -c COMMAND` without `sandbox-exec` and compiles no profile. Lease, process group, descriptor closing, stop bytes, grace and reaping are the person profile's. |
 | Extra roots | Person: read-only directory FDs 11–17 for `$TMPDIR` and existing cache directories; validated like FDs 7–9. Outside: none |
@@ -906,8 +925,8 @@ Proposed mechanism:
   and dispatches the person job to the job controller with the person grant.
 - The job controller owns the slot, setup, capture, settlement and cancel. Its
   slot worker accepts a person launch as well as a model launch.
-- The controller counts newlines per stream while capturing, with saturating
-  counters over every byte received.
+- The capture worker counts newline bytes per stream in the stored, redacted
+  bytes, and kind 28 records the counts (J2).
 - The person command does not use `tools::validate_authority` or a turn's tool
   budget.
 - The person notice is a job notice entry composed by J5 at the next turn's
@@ -918,8 +937,10 @@ Proposed mechanism:
 Proposed design. Arrows show triggering events with guards. The queue states
 come first. After dispatch the job follows the
 [job lifecycle TJ-S1](tool-job-controller.md#tj-s1-job-lifecycle), with
-the person differences shown here. `Stopping` records a requested stop; the
-completed effect is a later settlement.
+the person differences shown here, revised 2026-10-22 for J2. `Stopping`
+records a requested stop; the completed effect is a later settlement.
+`Waiting` is the in-memory waiter of the main agent's job queue; it writes no
+record.
 
 ```mermaid
 stateDiagram-v2
@@ -929,26 +950,33 @@ stateDiagram-v2
     Held --> Queued: durable Resume
     Queued --> Dropped: durable Drop
     Held --> Dropped: durable Drop
-    Queued --> Queued: lane head but controller busy, reason shown
-    Queued --> Admitted: lane head, no active turn, job intent committed
-    Admitted --> NotStarted: grant, identity, setup failure or !! switch off
-    Admitted --> Running: guardian reports spawned
+    Queued --> Waiting: lane head, no active turn, waiter joins the agent job queue
+    Waiting --> Waiting: start blocked, brief reason shown
+    Waiting --> Held: owner restart, no kind 26 exists
+    Waiting --> Admitted: slot and 1 MiB granted, kind 26 committed
+    Admitted --> NotStarted: grant, identity, setup failure, !! switch off, or stop before spawn
+    Admitted --> Running: guardian spawned notice
     Running --> CapturePaused: quota cannot grow after expiry attempt
     CapturePaused --> Running: freed space extends the reservation
-    Running --> Stopping: person stop, revocation or shutdown
-    CapturePaused --> Stopping: person stop, revocation or shutdown
-    Stopping --> Stopping: person kill sends KILL now
-    Running --> Recorded: group and pipes settle, settlement committed
-    Stopping --> Recorded: group settles, settlement cancelled
-    Stopping --> CleanupUnconfirmed: cleanup deadline expires
-    CleanupUnconfirmed --> Recorded: late settlement
-    NotStarted --> Recorded: settlement without effect
+    Running --> Stopping: person stop, revocation or shutdown (T)
+    CapturePaused --> Stopping: person stop, revocation or shutdown (T)
+    Stopping --> Stopping: person kill sends K
+    Running --> Draining: leader-exit notice
+    CapturePaused --> Draining: leader-exit notice
+    Stopping --> Draining: leader-exit notice
+    Draining --> Recorded: group and pipes settle, kind 28 committed
+    Stopping --> CleanupUnconfirmed: cleanup-unconfirmed notice
+    Draining --> CleanupUnconfirmed: cleanup-unconfirmed notice
+    CleanupUnconfirmed --> Recorded: late settled notice, kind 28 cleanup late
+    NotStarted --> Recorded: kind 28 not_started
     Admitted --> Interrupted: restart
     Running --> Interrupted: restart
     CapturePaused --> Interrupted: restart
     Stopping --> Interrupted: restart
+    Draining --> Interrupted: restart
+    CleanupUnconfirmed --> Interrupted: restart
     Recorded --> [*]
-    Interrupted --> [*]
+    Interrupted --> [*]: next start commits kind 28 interrupted
     Rejected --> [*]
     Dropped --> [*]
 ```
@@ -1033,11 +1061,11 @@ flowchart TD
     Queued --> Ready{"Lane head and no active turn?"}
     Ready -->|No| Wait["Remain queued"]
     Ready -->|Yes| Admit{"Job controller admits?"}
-    Admit -->|"busy: slot or quota"| Wait
+    Admit -->|"Blocked: waits with the controller's reason"| Wait
     Admit -->|Yes| Start["Job intent committed, setup starts"]
     Start --> Setup{"Setup outcome?"}
     Setup -->|"cwd, identity, sandbox failure or !! switch off"| NotStarted["Settlement: not started"]
-    Setup -->|"Person stop, revocation or shutdown"| Cancelled["Settlement: cancelled, nothing ran"]
+    Setup -->|"Person stop, revocation or shutdown"| Cancelled["Settlement: not started with the cancel reason, nothing ran"]
     Setup -->|Spawned| Run["Running until exit or stop"]
     Cancelled --> Settle
     Run --> Settle["Settlement with outcome, digests, counts"]
@@ -1117,14 +1145,14 @@ command may have changed files.
 | Keychain locked, denied or unavailable at submit | Refused with the matching `secret_store_*` reason; draft and mode kept; nothing journaled; never a disk fallback |
 | Command secret in a form the rewrite cannot handle | The command runs through the whole-command variable (PC14, SO5); the journal holds the display-only filtered copy |
 | Guardian or shell spawn fails | Not started, `spawn_failed` |
-| Setup is slow | Setup has no time bound ([J1-Q4](tool-job-controller.md#j1-timeout-and-setup-budget-removal), owner, 2026-10-16). It ends on spawn, a cancel or a setup fault. A cancel before spawn records Cancelled with its reason; nothing runs. The slot stays retained until the worker finishes |
-| Job slot or quota unavailable at dispatch | The command stays queued at the lane head with the reason shown; dispatch retries when space frees |
+| Setup is slow | Setup has no time bound ([J1-Q4](tool-job-controller.md#j1-timeout-and-setup-budget-removal), owner, 2026-10-16). It ends on spawn, a cancel or a setup fault. A cancel before spawn records not started with its cancel reason; nothing runs. The slot stays retained until the worker finishes |
+| Job slot or quota unavailable at dispatch | The command waits at the lane head in the main agent's job queue with the controller's brief reason (AQ1); it starts when the condition clears |
 | Quota cannot grow while running | Expiry first, then `CapturePaused`; the person sees the reason and can stop the command |
 | Command writes outside its roots | `!`: the OS denies it; the command sees `Operation not permitted`; the outcome is its own exit status. `!!`: the write succeeds, as in the person's terminal |
 | `!!` command changes `~/.asura`, signals the service or uses the control socket | No mitigation; the effect is the person's own (EXD-1). A changed journal or configuration is handled by the existing corruption and validation paths when next read |
 | Person stop | TERM to the group, KILL after grace; cancelled, `person_stop` |
 | Person kill | KILL at once; cancelled, `person_kill` |
-| Cleanup not confirmed | `CleanupUnconfirmed` keeps the slot; settlement after late settlement; no replacement runs |
+| Cleanup not confirmed | `CleanupUnconfirmed` keeps the slot and writes no settlement until a late settled notice or restart; no replacement runs ([J2](tool-job-controller.md#cleanupunconfirmed-and-late-settlement)) |
 | Service crash or kill while running | Guardian sees lease EOF and stops the group. Recovery records `Interrupted`; the staging bytes stay as an unverified prefix. Never relaunched. |
 | Service restart with queued commands | Commands become `Held`; explicit Resume needed |
 | Client disconnects or exits | The command continues; any TUI can view or cancel it; a TUI-launched backend's exit stops it through shutdown (PC5) |
@@ -1132,8 +1160,8 @@ command may have changed files.
 | Duplicate submit after a lost reply | The same request ID returns the original input ID; one command only |
 | Stop request lost | TUI shows stop unconfirmed; the person can repeat; stop is idempotent |
 | Job intent append uncertain | Scheduling fences; nothing spawns until resolved |
-| Settlement append fails | The job controller's repair path applies; staged output stays; no second spawn |
-| Storage stalls while running | The job controller stops capture and cancels; the retained prefix is labelled |
+| Settlement append fails | The journal is unavailable: the controller stops live jobs and starts none; staged output stays; the next start writes `interrupted`; no second spawn |
+| Storage stalls while running | Backpressure only: pipe reads stop and the command's writes block; nothing is lost and nothing is cancelled (J1-Q1). After a person stop, capture that has not settled 2.5 s later is recorded `unconfirmed` |
 | Service shutdown while running | Admission closes; the job is cancelled with `shutdown`; shutdown keeps its owner lock until settlement |
 
 ## Asynchronous execution
@@ -1149,7 +1177,7 @@ the person path adds.
 | Read PATH at TUI launch | TUI startup, in memory | 4096 bytes |
 | Copy the launch environment | TUI startup, in memory | The process environment, already in memory; the submit bound is 49,152 bytes |
 | Submit RPC | Existing serial queue sender; one in flight | No time bound; ends on the reply, the person's cancel or a lost connection ([client waits](command-flows.md#client-waits-without-time-bounds), owner, 2026-10-16) |
-| `JobRead`, `JobObserve`, `JobCancel` | TUI job worker from J4 | No time bound, as for submit. The service holds an observe for at most 1 s; that long-poll is pacing and ends nothing |
+| `JobRead`, `JobObserve`, `JobCancel` | TUI job worker from J4 | No time bound, as for submit. An observe returns on new output, a state change, settlement, detach or cancel; it has no hold time |
 | Journal append and flush | Existing eight-slot journal worker | No time bound ([J1-0](conversation-admission.md#journal-step-j1-0-journal-waits-without-a-time-bound)); 8-slot queue, then `busy` |
 | `getpwuid_r`, `confstr`, open and stat of roots | Job slot setup worker | No time bound ([J1-Q4](tool-job-controller.md#j1-timeout-and-setup-budget-removal)); ends on completion, cancel or a setup fault |
 | `current_exe`, project identity, profile, guardian spawn | Job slot setup worker | Same as above |
@@ -1166,7 +1194,7 @@ how much output is retained or shown to the model.
 
 | Resource | Limit |
 | --- | --- |
-| Running person jobs | 1 per conversation lane; counted in the controller's 2 per conversation and 4 per service |
+| Running person jobs | 1 per main-agent lane; counted in the controller's 2 per agent and 4 per service (AQ1) |
 | Queued inputs including commands | 16 unresolved, existing |
 | Local outbox | 16 rows, existing |
 | Command | 1–8192 UTF-8 bytes |
@@ -1187,15 +1215,15 @@ how much output is retained or shown to the model.
 | Command runtime | None (PCR11) | The person through stop and kill; revocation; shutdown; lease EOF |
 | Capture pause | None | Freed space resumes; the same cancellation owners end it |
 | Stop grace | 2 s (PC8), a wind-down bound after the person's stop | Guardian |
-| Cleanup after KILL | 2.5 s before unconfirmed | Guardian and job controller |
+| Cleanup after the first stop signal (L3) | 2.5 s before unconfirmed, a wind-down bound | Guardian and job controller |
 
 AE-04 requires every wait and every piece of work to end through a
 [loop-closure](loop-closure.md) condition, with a cancellation owner at each
 blocking boundary. No fixed time limit ends work by default (owner, 2026-10-15).
 The cancellation owners above are those closures. The stop grace is a wind-down
-bound: it starts only after the person asked to stop. The cleanup-confirmation
-interval is unchanged by this design; its classification under AE-04 is an open
-question for the owner.
+bound: it starts only after the person asked to stop. The L3 cleanup bound is
+also a wind-down bound: it acts only after a closure has fired and only decides
+when cleanup is reported unconfirmed (owner, 2026-10-21, WB1).
 
 ### Recovery and lifecycle
 
@@ -1203,8 +1231,9 @@ question for the owner.
   idempotent. Cancel is idempotent per job.
 - AE-06: shutdown closes admission, cancels a running person job, waits for
   settlement and keeps the owner lock while ownership is unsettled.
-- Overload: a full queue returns a definite `busy`. A busy controller leaves
-  the command queued. Control and cancel keep reserved capacity.
+- Overload: a full input queue returns a definite `busy`. A blocked controller
+  start leaves the command queued with its reason. Control and cancel keep
+  reserved capacity.
 - Stalled dependency: a stalled journal, setup or storage leaves the TUI
   responsive. Ctrl-C still sends cancel requests, and quit stays available.
 
@@ -1235,8 +1264,10 @@ design implements its required controls:
 
 ## Audit and telemetry
 
-Proposed mechanism: person jobs use the job controller's audit events for start,
-cancel and settlement, with origin `person`, the input ID and profile ID. Each
+Proposed mechanism: person jobs use the job controller's
+[audit events](tool-job-controller.md#j2-audit-events) `job.queued`,
+`job.started`, `job.cancel_requested` and `job.settled`, with origin `person`,
+the input ID and profile ID. Each
 of these events for a `!!` job also carries `outside_sandbox: true` (PCR25), as
 Wisp's `command.outcome` does. A refused `!!` submit carries it on the queue
 rejection event. The audit schema number does not change. No event contains
@@ -1385,17 +1416,17 @@ flowchart TD
     OD["PC13 and EXD-1: !! decision, 2026-10-19"] --> Ready
     SD["EX4: secret detection design"] --> J1
     SD --> Ready
-    J1["J1: staging capture, secret filter, live pages, install order"] --> J2["J2: job controller with person-origin amendments"]
+    J1["J1: staging capture, secret filter, live pages, install order"] --> J2["J2: job controller with agent queues, lease bytes T and K, profile token, person origin at the controller"]
     J2 --> J4["J4: client job API and viewer"]
     J2 --> J3["J3: model job tool"]
-    J2 --> J5["J5: job notices"]
-    J3 --> JG{"J2-J5 delivered?"}
-    J4 --> JG
-    J5 --> JG
+    J3 --> EN{"J3 and J4 enabled together"}
+    J4 --> EN
+    EN --> J5["J5: job notices"]
+    J5 --> JG{"J2-J5 delivered?"}
     Ready --> JG
     JG -->|"No: person packets wait"| JW["Hold P1 and P2"]
-    JG -->|Yes| P1["P1 platform: person and outside profiles, no-deadline guardian, lease bytes, extra roots"]
-    JG -->|Yes| P2["P2 storage: kind PCQ with outside flag, person origin on job records, replay"]
+    JG -->|Yes| P1["P1 platform: person and outside profiles and tokens, extra roots"]
+    JG -->|Yes| P2["P2 storage: kind PCQ with outside flag, person-origin replay of kind 26"]
     P1 --> P3["P3 service: queue entry, dispatch, person grant, switch, environment store, notice entry"]
     P2 --> P3
     CK["Config key personCommands.allowOutsideSandbox"] --> P3
@@ -1406,6 +1437,8 @@ flowchart TD
 ```
 
 Each packet delivers its unit and integration tests before the next starts.
+J2 already delivers the lease bytes, the profile token mechanism and the
+person origin at the controller; P1 and P2 add only the person-specific parts.
 Qualification runs the mandatory CLI lifecycle gate and the PTY journey. Each
 packet carries its `!` and `!!` parts together; the `!!` parts are small
 additions to the same owners.
@@ -1627,5 +1660,13 @@ Recorded on 2026-10-20: PC14 recorded; PCO1 resolved; PQ1 and PQ2 added,
 then answered (PC15) the same day.
 PCM-O1 and PCM-Q1 gained the secret store and were re-rendered with Mermaid
 CLI 12.0.0 and inspected. No code or test was run.
+
+Recorded on 2026-10-22: aligned with the job controller's J2 design. Lanes,
+queues and slots are per agent and blocked commands wait with a brief reason
+(owner, 2026-10-21, AQ1); the J2 record layouts, job ID and audit events are
+linked rather than restated; stale text on the deadline argument, lease bytes,
+notice reasons, the 1 s observe hold, storage stalls and the L3 classification
+was corrected. PCM-F1, PCM-F2, PCM-S1 and PCM-P1 changed and were rendered
+with Mermaid CLI 12.0.0 and inspected. No code or test was run.
 
 Return to the [design index](README.md).

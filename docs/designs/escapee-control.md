@@ -294,7 +294,7 @@ flowchart TD
     EOF -->|Yes| Settled["owned_group_settled + escapee facts"]
     EOF -->|No| Unconf
     Settled --> Done["Leader reaped last; job controller records cleanup_confirmed"]
-    Unconf --> Repair["Job controller repair/drain; slot retained"]
+    Unconf --> Repair["Job controller: CleanupUnconfirmed, slot retained, no record until a late settlement"]
 ```
 
 ## Contracts
@@ -318,13 +318,15 @@ adds kind 5). This design adds:
 | Reason 12 | escapee_terminated | On a kind 2 settled notice: the gate passed only after escapees were terminated; exit `value`/`exit_kind` keep the leader's outcome |
 | Reason 13 | escapee_unterminated | On a kind 4 cleanup_unconfirmed notice: a descendant could not be verified gone |
 
-The notice budget rises to at most 5 notices and a 192-byte buffer, above the at
-most four the guardian emits: spawned, leader-exit (kind 5, J2b), escapee_report
-(kind 6), and one terminal notice (settled or cleanup_unconfirmed). At 192 bytes
-the sole writer still writes well below the 512-byte `PIPE_BUF`, so valid notices
-cannot fill the pipe even if the service never reads. The notice decoder shape rules
-(`protocol.rs`) extend to accept kind 6, reasons 12–13 and the person-command
-reasons 10–11 together. Changed kinds, duplicate kind 6, out-of-order or trailing
+The notice budget is at most 5 notices and a 192-byte buffer. The guardian
+emits at most five: spawned, leader exit (kind 5, J2b), cleanup_unconfirmed
+(kind 4), escapee_report (kind 6) and settled (kind 2), because a kind 4 can
+precede a late kind 2. The five use 160 bytes. At 192 bytes the sole writer
+still writes well below the 512-byte `PIPE_BUF`, so valid notices cannot fill
+the pipe even if the service never reads. The notice decoder shape rules
+(`protocol.rs`) accept kind 6 and reasons 12–13; J2 adds kind 5 and kind 2
+reasons 2 (`cancel`, lease byte `T`) and 11 (`kill`, lease byte `K`)
+([guardian contract additions](tool-job-controller.md#guardian-contract-additions)). Changed kinds, duplicate kind 6, out-of-order or trailing
 bytes stay protocol faults that initiate cleanup and never prove absence of an
 effect.
 
@@ -334,15 +336,16 @@ decoder treats each of these as a protocol fault: kind 6 with a zero value, a
 nonzero exit kind or the cleanup bit; a second kind 4 or kind 6; kind 2 with
 reason 12 without kind 6 before it; and kind 6 followed by anything but kind 2
 with reason 12. Kind 4 accepts reasons 9 and 13. Kind 2 accepts reasons 0–4 and
-12. Reasons 10 and 11 stay rejected until the person-command packet adds them.
+12 today. J2 adds kind 5 and its order rules, and changes kind 2 to reasons 0,
+2, 4, 11 and 12; reason 10 is never assigned.
 
 ### What J2 consumes
 
 | Fact | Source | J2 use |
 | --- | --- | --- |
 | `cleanup_confirmed` true | Kind 2 settled with cleanup bit 1 (gate passed) | The job's settlement records confirmed cleanup; `CleanupUnconfirmed` state is not entered |
-| escapee count | Kind 6 value | Recorded in the settlement facts (alongside the J2c pause facts); shown in the job summary and audit as a count, never as process detail |
-| `cleanup_unconfirmed` reason 13 | Kind 4 | The job enters `CleanupUnconfirmed`, keeps its slot and scratch, and the controller follows its existing repair/drain path |
+| escapee count | Kind 6 value | Recorded in kind 28 field 8 (beside the J2c pause facts) and in the `job.settled` audit event; shown in the job summary as a count, never as process detail |
+| `cleanup_unconfirmed` reason 9 or 13 | Kind 4 | The job enters `CleanupUnconfirmed`, keeps its slot and scratch, and writes no settlement. A late kind 2 settles it with cleanup `late` and releases the slot; otherwise restart settles it `interrupted`. No owner repair state ([J2](tool-job-controller.md#cleanupunconfirmed-and-late-settlement)) |
 
 The [job lifecycle TJ-S1](tool-job-controller.md#tj-s1-job-lifecycle) is
 unchanged in shape: the escapee scan runs inside the existing `Draining →
@@ -449,8 +452,8 @@ the new notices and the service exec_cmd worker uses them:
 | Kind 4 with no later kind 2 | Job not settled; `cleanup_unconfirmed()` returns the reason | Slot and scratch stay held; a cancel trigger leads to the existing L3 repair path |
 | Kind 6 value | `escapees` | The kind 15 header line ends with ` escapees=<n>` when n is not zero. It is a number only |
 
-The durable escapee count in the settlement facts (kind 23) and the audit count
-belong to J2, as [what J2 consumes](#what-j2-consumes) states.
+The durable escapee count in the settlement facts (kind 28, not kind 23) and
+the audit count belong to J2, as [what J2 consumes](#what-j2-consumes) states.
 
 ### Delivery scope
 
@@ -464,8 +467,8 @@ Left to the person-command packets, which add the person guardian path:
   guardian path exists (EC-E2);
 - the `!!` profile: the `ASURA_JOB_<jobhex>` variable, the `KERN_PROCARGS2` scan,
   EC-D1 counting without signals, and its 2 s grace (EC-I9, EC-I10, EC-E4);
-- notice reasons 10 and 11 (person stop and kill). The decoder rejects them
-  until that packet defines and emits them.
+- nothing for stop and kill: J2 delivers the lease bytes `T` and `K` and
+  their kind 2 reasons 2 and 11 for every profile; reason 10 is not used.
 
 ## Failure handling and recovery
 
@@ -546,7 +549,7 @@ states initial state, trigger and required result.
 | ID | Case | Required result |
 | --- | --- | --- |
 | EC-U1 | Settlement gate evaluation | The gate returns settled only when leader reaped, group empty, pipes at EOF and attributed set zero; any false input yields unconfirmed |
-| EC-U2 | Notice encode/decode for kind 6 and reasons 12, 13 (with 10, 11) | Round-trips; unknown kind/reason, duplicate kind 6, trailing bytes are protocol faults |
+| EC-U2 | Notice encode/decode for kind 6 and reasons 12, 13 (J2 adds kind 5 and reasons 2, 11 under J2T-06) | Round-trips; unknown kind/reason, duplicate kind 6, trailing bytes are protocol faults |
 | EC-U3 | PID-reuse re-check | A changed start-time/pgid tuple suppresses the signal; the fixpoint rescans |
 | EC-U4 | Freeze fixpoint round cap | Exceeding the configured maximum yields unverifiable, never an infinite loop |
 | EC-U5 | Buffer over-size and odd-length results | Each maps to unverifiable (cleanup_unconfirmed), never to "absent" |
@@ -619,7 +622,7 @@ Proof limits:
   the TUI with a native model. The native exec_cmd journey ran as a regression
   check only; it does not start escapees.
 - EC-I9, EC-I10, EC-E2 and EC-E4 belong to the person-command packets.
-- The durable escapee count in kind 23 and audit is J2 work.
+- The durable escapee count in kind 28 and audit is J2 work (J2T-11).
 
 ## Decisions
 
@@ -739,5 +742,10 @@ and its tests followed on 2026-10-21; see
 [implementation evidence](#implementation-evidence-2026-10-21). Diagrams were rendered
 with the local Mermaid CLI and inspected (renderer version recorded with the
 check).
+
+Recorded on 2026-10-22: the notice budget, the reasons that J2 adds, the
+`CleanupUnconfirmed` consumption and the durable escapee count (kind 28) were
+aligned with the job controller's J2 design. EC-F1 changed and was rendered
+with Mermaid CLI 12.0.0 and inspected. No code or test was run.
 
 Return to the [design index](README.md).
