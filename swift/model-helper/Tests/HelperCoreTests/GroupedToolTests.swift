@@ -23,7 +23,9 @@ private actor ForwardedCalls {
         (MemoryTool(handler: handler), #"{"command":"create_note","body":"  note\nbody é\u0000 ","source_version":"0123456789abcdef0123456789abcdef"}"#),
         (MemoryTool(handler: handler), #"{"command":"get_note"}"#),
         (ServiceTool(handler: handler), #"{"command":"tools","limit":1}"#),
-        (ExecCmdTool(handler: handler), #"{"command":"printf fixture","cwd":"src/../other"}"#)
+        (ExecCmdTool(handler: handler), #"{"command":"printf fixture","cwd":"src/../other","yield_seconds":31}"#),
+        (JobTool(handler: handler), #"{"command":"read","job":"XYZ","stream":"stdout","limit":0}"#),
+        (JobTool(handler: handler), #"{"command":"list","before":0,"text":"unexpected"}"#)
     ]
     var expected: [ToolProposal] = []
     for (tool, json) in inputs {
@@ -33,7 +35,7 @@ private actor ForwardedCalls {
         expected.append(ToolProposal(name: tool.name, arguments: content.jsonString, source: .generatedContent))
     }
     #expect(await calls.calls == expected)
-    #expect(await calls.calls.map(\.name) == ["project", "project", "memory", "memory", "service", "exec_cmd"])
+    #expect(await calls.calls.map(\.name) == ["project", "project", "memory", "memory", "service", "exec_cmd", "job", "job"])
 }
 
 private func forward(_ tool: any Tool, _ content: GeneratedContent) async throws -> String {
@@ -42,6 +44,7 @@ private func forward(_ tool: any Tool, _ content: GeneratedContent) async throws
     case let value as MemoryTool: return try await value.call(arguments: content)
     case let value as ServiceTool: return try await value.call(arguments: content)
     case let value as ExecCmdTool: return try await value.call(arguments: content)
+    case let value as JobTool: return try await value.call(arguments: content)
     default: throw HelperError.protocolFault
     }
 }
@@ -59,9 +62,10 @@ private func forward(_ tool: any Tool, _ content: GeneratedContent) async throws
 
 @Test func groupedSchemasAdvertiseOnlyTypedCommands() throws {
     let tools = makeProjectTools { _ in throw HelperError.unavailable }
-    #expect(tools.map(\.name) == ["project", "memory", "service", "exec_cmd"])
-    let commands = [["read_file", "list_directory"], ["list_notes", "get_note", "note_sources", "create_note"], ["status", "tools", "audit"]]
-    for (tool, expected) in zip(tools.prefix(3), commands) {
+    #expect(tools.map(\.name) == ["project", "memory", "service", "exec_cmd", "job"])
+    let commands = [["read_file", "list_directory"], ["list_notes", "get_note", "note_sources", "create_note"], ["status", "tools", "audit"],
+        [], ["list", "status", "read", "wait", "cancel", "note"]]
+    for (tool, expected) in zip(tools, commands) where !expected.isEmpty {
         let schema = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(tool.parameters)) as? [String: Any])
         let properties = try #require(schema["properties"] as? [String: Any])
         let required = try #require(schema["required"] as? [String])
@@ -70,7 +74,7 @@ private func forward(_ tool: any Tool, _ content: GeneratedContent) async throws
         #expect(Set(try #require(command["enum"] as? [String])) == Set(expected))
     }
     let exec = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(tools[3].parameters)) as? [String: Any])
-    #expect(Set((try #require(exec["properties"] as? [String: Any])).keys) == ["command", "cwd"])
+    #expect(Set((try #require(exec["properties"] as? [String: Any])).keys) == ["command", "cwd", "yield_seconds"])
     #expect(Set(exec["required"] as? [String] ?? []) == ["command"])
 }
 
@@ -87,5 +91,7 @@ private func forward(_ tool: any Tool, _ content: GeneratedContent) async throws
         == encoder.encode(ServiceTool.Generation.Arguments.generationSchema))
     #expect(try encoder.encode(ExecCmdTool(handler: handler).parameters)
         == encoder.encode(ExecCmdTool.Generation.Arguments.generationSchema))
+    #expect(try encoder.encode(JobTool(handler: handler).parameters)
+        == encoder.encode(JobTool.Generation.Arguments.generationSchema))
     #expect(projectToolSchemaBytes() > 0)
 }

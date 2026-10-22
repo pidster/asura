@@ -36,7 +36,7 @@ func disabledToolsNeverAdvertiseMemoryDefinitions(selector: String) async throws
         snapshot: { _ in })
     let names = await probe.names
     #expect(names.count == 2)
-    #expect(Set(names[1]) == Set(["project", "memory", "service", "exec_cmd"]))
+    #expect(Set(names[1]) == Set(["project", "memory", "service", "exec_cmd", "job"]))
 }
 
 @Test func generatedMemoryCreateSchemaAndDecodingPreserveWriteFields() throws {

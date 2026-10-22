@@ -14,8 +14,9 @@ import Testing
     }
     let schema = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(tool.parameters)) as? [String: Any])
     let properties = try #require(schema["properties"] as? [String: Any])
-    // No time bound: the native schema offers no timeout argument.
-    #expect(Set(properties.keys) == ["command", "cwd"])
+    // No time bound: the native schema offers no timeout argument. The yield
+    // window only ends the call's wait, never the job (J3).
+    #expect(Set(properties.keys) == ["command", "cwd", "yield_seconds"])
     #expect(Set(schema["required"] as? [String] ?? []) == ["command"])
     let output = try await tool.call(arguments: GeneratedContent(json: #"{"command":"printf fixture","cwd":"."}"#))
     #expect(output.hasPrefix("Tool failed: timeout\n"))
