@@ -36,6 +36,8 @@ struct Config {
     retention: Retention,
     #[serde(default, skip_serializing_if = "Journal::is_default")]
     journal: Journal,
+    #[serde(default, skip_serializing_if = "Jobs::is_default")]
+    jobs: Jobs,
     /// The model thinking level (thinking-level.md); absent is `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
@@ -100,6 +102,117 @@ impl Default for Journal {
 impl Journal {
     fn is_default(&self) -> bool {
         self.quota_bytes == journal_quota_bytes()
+    }
+}
+/// Tool job counts (tool-job-controller.md, J2 configuration keys; owner
+/// J2a-2 and AQ1). Each field is `(default, minimum, maximum)`.
+pub const JOBS_LIVE_SERVICE: (u32, u32, u32) = (4, 1, 16);
+pub const JOBS_LIVE_AGENT: (u32, u32, u32) = (2, 1, 8);
+pub const JOBS_QUEUED_AGENT: (u32, u32, u32) = (8, 1, 16);
+pub const JOBS_CLIENT_VIEWERS: (u32, u32, u32) = (8, 1, 32);
+pub const JOBS_MODEL_RESERVED_PAGE_READS: (u32, u32, u32) = (1, 0, 1);
+/// The `jobs` mapping, read at service start; written only away from its
+/// defaults.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Jobs {
+    #[serde(default = "live_service", rename = "liveService")]
+    live_service: u64,
+    #[serde(default = "live_agent", rename = "liveAgent")]
+    live_agent: u64,
+    #[serde(default = "queued_agent", rename = "queuedAgent")]
+    queued_agent: u64,
+    #[serde(default = "client_viewers", rename = "clientViewers")]
+    client_viewers: u64,
+    #[serde(
+        default = "model_reserved_page_reads",
+        rename = "modelReservedPageReads"
+    )]
+    model_reserved_page_reads: u64,
+}
+fn live_service() -> u64 {
+    JOBS_LIVE_SERVICE.0.into()
+}
+fn live_agent() -> u64 {
+    JOBS_LIVE_AGENT.0.into()
+}
+fn queued_agent() -> u64 {
+    JOBS_QUEUED_AGENT.0.into()
+}
+fn client_viewers() -> u64 {
+    JOBS_CLIENT_VIEWERS.0.into()
+}
+fn model_reserved_page_reads() -> u64 {
+    JOBS_MODEL_RESERVED_PAGE_READS.0.into()
+}
+const JOBS_FIELDS: [&str; 5] = [
+    "liveService",
+    "liveAgent",
+    "queuedAgent",
+    "clientViewers",
+    "modelReservedPageReads",
+];
+impl Default for Jobs {
+    fn default() -> Self {
+        Self {
+            live_service: live_service(),
+            live_agent: live_agent(),
+            queued_agent: queued_agent(),
+            client_viewers: client_viewers(),
+            model_reserved_page_reads: model_reserved_page_reads(),
+        }
+    }
+}
+impl Jobs {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    fn valid(&self) -> bool {
+        let within = |value: u64, (_, min, max): (u32, u32, u32)| {
+            (u64::from(min)..=u64::from(max)).contains(&value)
+        };
+        within(self.live_service, JOBS_LIVE_SERVICE)
+            && within(self.live_agent, JOBS_LIVE_AGENT)
+            && within(self.queued_agent, JOBS_QUEUED_AGENT)
+            && within(self.client_viewers, JOBS_CLIENT_VIEWERS)
+            && within(
+                self.model_reserved_page_reads,
+                JOBS_MODEL_RESERVED_PAGE_READS,
+            )
+    }
+    /// The effective limits of a validated mapping.
+    fn limits(&self) -> JobLimits {
+        let narrow = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+        let live_service = narrow(self.live_service);
+        JobLimits {
+            live_service,
+            live_agent: narrow(self.live_agent).min(live_service),
+            queued_agent: narrow(self.queued_agent),
+            client_viewers: narrow(self.client_viewers),
+            model_reserved_page_reads: narrow(self.model_reserved_page_reads),
+        }
+    }
+}
+/// The effective job limits that a service applies from start to stop
+/// (tool-job-controller.md, J2 configuration keys).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobLimits {
+    /// Live jobs in the service (`jobs.liveService`).
+    pub live_service: u32,
+    /// Live jobs per agent: the smaller of `jobs.liveAgent` and
+    /// `jobs.liveService`.
+    pub live_agent: u32,
+    /// Starts that may wait in one agent's job queue (`jobs.queuedAgent`).
+    pub queued_agent: u32,
+    /// Pending client job reads per service (`jobs.clientViewers`; J4).
+    pub client_viewers: u32,
+    /// Page-read workers reserved for model requests
+    /// (`jobs.modelReservedPageReads`).
+    pub model_reserved_page_reads: u32,
+}
+impl Default for JobLimits {
+    fn default() -> Self {
+        Jobs::default().limits()
     }
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -295,6 +408,7 @@ impl Config {
             || !(crate::payload::MIN_QUOTA..=crate::payload::MAX_QUOTA)
                 .contains(&self.retention.quota_bytes)
             || !(JOURNAL_MIN_QUOTA..=JOURNAL_MAX_QUOTA).contains(&self.journal.quota_bytes)
+            || !self.jobs.valid()
             || self
                 .thinking
                 .as_deref()
@@ -356,6 +470,12 @@ impl Config {
             "retention.quotaBytes" => yaml(&self.retention.quota_bytes),
             "journal" => yaml(&self.journal),
             "journal.quotaBytes" => yaml(&self.journal.quota_bytes),
+            "jobs" => yaml(&self.jobs),
+            "jobs.liveService" => yaml(&self.jobs.live_service),
+            "jobs.liveAgent" => yaml(&self.jobs.live_agent),
+            "jobs.queuedAgent" => yaml(&self.jobs.queued_agent),
+            "jobs.clientViewers" => yaml(&self.jobs.client_viewers),
+            "jobs.modelReservedPageReads" => yaml(&self.jobs.model_reserved_page_reads),
             "thinking" => yaml(&THINKING_LEVELS[usize::from(self.thinking())]),
             _ => Err("config_unknown_key"),
         }
@@ -426,6 +546,36 @@ impl Config {
             }
             "journal.quotaBytes" => {
                 self.journal.quota_bytes = value.as_u64().ok_or("config_invalid_value")?
+            }
+            "jobs" => {
+                // The whole mapping: every field present, no other field.
+                let Value::Mapping(ref fields) = value else {
+                    return Err("config_invalid_value");
+                };
+                if fields.len() != JOBS_FIELDS.len()
+                    || JOBS_FIELDS
+                        .iter()
+                        .any(|field| !fields.contains_key(Value::String((*field).into())))
+                {
+                    return Err("config_invalid_value");
+                }
+                self.jobs = serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
+            }
+            "jobs.liveService" => {
+                self.jobs.live_service = value.as_u64().ok_or("config_invalid_value")?
+            }
+            "jobs.liveAgent" => {
+                self.jobs.live_agent = value.as_u64().ok_or("config_invalid_value")?
+            }
+            "jobs.queuedAgent" => {
+                self.jobs.queued_agent = value.as_u64().ok_or("config_invalid_value")?
+            }
+            "jobs.clientViewers" => {
+                self.jobs.client_viewers = value.as_u64().ok_or("config_invalid_value")?
+            }
+            "jobs.modelReservedPageReads" => {
+                self.jobs.model_reserved_page_reads =
+                    value.as_u64().ok_or("config_invalid_value")?
             }
             "thinking" => {
                 let Value::String(level) = value else {
@@ -578,6 +728,12 @@ pub fn execute(
                 | "retention.quotaBytes"
                 | "journal"
                 | "journal.quotaBytes"
+                | "jobs"
+                | "jobs.liveService"
+                | "jobs.liveAgent"
+                | "jobs.queuedAgent"
+                | "jobs.clientViewers"
+                | "jobs.modelReservedPageReads"
                 | "thinking"
         )
     {
@@ -619,6 +775,15 @@ pub fn retention_quota(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result
 pub fn journal_quota(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result<u64> {
     let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     Ok(Config::read(&snapshot.bytes)?.journal.quota_bytes)
+}
+
+/// The effective job limits (J2), read once at service start like
+/// `retention.quotaBytes`; a running service keeps them until it stops. The
+/// read runs on the caller's worker with the bounded read pipeline and has no
+/// time bound; it ends on completion, an error or cancel.
+pub fn job_limits(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result<JobLimits> {
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
+    Ok(Config::read(&snapshot.bytes)?.jobs.limits())
 }
 
 /// Startup-only typed audit settings from the canonical validated YAML snapshot.
@@ -1349,5 +1514,290 @@ mod tests {
         // Cancellation ends the read.
         let cancelled = AtomicBool::new(true);
         assert!(journal_quota(runtime.clone(), &cancelled).is_err());
+    }
+    const JOBS_KEYS: [(&str, (u32, u32, u32)); 5] = [
+        ("jobs.liveService", JOBS_LIVE_SERVICE),
+        ("jobs.liveAgent", JOBS_LIVE_AGENT),
+        ("jobs.queuedAgent", JOBS_QUEUED_AGENT),
+        ("jobs.clientViewers", JOBS_CLIENT_VIEWERS),
+        (
+            "jobs.modelReservedPageReads",
+            JOBS_MODEL_RESERVED_PAGE_READS,
+        ),
+    ];
+    /// J2T-21 unit layer: the `jobs` keys have their J2a-2 defaults and
+    /// bounds, reject out-of-range and mistyped values with
+    /// `config_invalid_value`, and are written only away from the defaults.
+    #[test]
+    fn j2t_21_jobs_keys_defaults_bounds_and_persistence() {
+        assert_eq!(JOBS_LIVE_SERVICE, (4, 1, 16));
+        assert_eq!(JOBS_LIVE_AGENT, (2, 1, 8));
+        assert_eq!(JOBS_QUEUED_AGENT, (8, 1, 16));
+        assert_eq!(JOBS_CLIENT_VIEWERS, (8, 1, 32));
+        assert_eq!(JOBS_MODEL_RESERVED_PAGE_READS, (1, 0, 1));
+        let config = Config::read(b"").unwrap();
+        for (key, (default, _, _)) in JOBS_KEYS {
+            assert_eq!(config.get(key).unwrap(), format!("{default}\n"), "{key}");
+        }
+        assert_eq!(
+            config.get("jobs").unwrap(),
+            "liveService: 4\nliveAgent: 2\nqueuedAgent: 8\nclientViewers: 8\nmodelReservedPageReads: 1\n"
+        );
+        assert!(!yaml(&config).unwrap().contains("jobs"));
+        assert!(!config.get("").unwrap().contains("jobs"));
+        assert_eq!(
+            JobLimits::default(),
+            JobLimits {
+                live_service: 4,
+                live_agent: 2,
+                queued_agent: 8,
+                client_viewers: 8,
+                model_reserved_page_reads: 1,
+            }
+        );
+        for (key, (_, min, max)) in JOBS_KEYS {
+            let mut config = Config::default();
+            for good in [min, max] {
+                config.set(key, &good.to_string()).unwrap();
+                assert_eq!(config.get(key).unwrap(), format!("{good}\n"), "{key}");
+            }
+            let before = yaml(&config).unwrap();
+            let below = if min == 0 {
+                "-1".to_owned()
+            } else {
+                (min - 1).to_string()
+            };
+            for bad in [
+                below.as_str(),
+                &(max + 1).to_string(),
+                "-1",
+                "true",
+                "'1'",
+                "{x: 1}",
+            ] {
+                assert_eq!(
+                    config.set(key, bad),
+                    Err("config_invalid_value"),
+                    "accepted {key}: {bad}"
+                );
+            }
+            // The strict YAML reader rejects these before typing.
+            for bad in ["1.5", "null", "[1]", "!tag 1"] {
+                assert!(config.set(key, bad).is_err(), "accepted {key}: {bad}");
+            }
+            // A rejected set is not observable through a fresh config; the
+            // caller persists only after a successful set.
+            assert_eq!(
+                Config::read(before.as_bytes()).unwrap().get(key).unwrap(),
+                format!("{max}\n")
+            );
+        }
+        let mut config = Config::default();
+        config.set("jobs.liveService", "16").unwrap();
+        let text = yaml(&config).unwrap();
+        assert!(text.contains("jobs:\n  liveService: 16\n"), "{text}");
+        let again = Config::read(text.as_bytes()).unwrap();
+        assert_eq!(again.jobs.live_service, 16);
+        assert_eq!(again.jobs.live_agent, 2);
+        // Setting the default again omits the mapping: there is no deletion
+        // syntax, so this is the reset.
+        config.set("jobs.liveService", "4").unwrap();
+        assert!(!yaml(&config).unwrap().contains("jobs"));
+        assert_eq!(
+            Config::default().set("jobs.other", "1"),
+            Err("config_unknown_key")
+        );
+        assert_eq!(
+            Config::default().get("jobs.other"),
+            Err("config_unknown_key")
+        );
+    }
+    /// J2T-21 unit layer: `set jobs` takes the whole mapping, and stored
+    /// documents obey the same bounds and closed schema.
+    #[test]
+    fn j2t_21_jobs_mapping_set_requires_every_field() {
+        let mut config = Config::default();
+        config
+            .set(
+                "jobs",
+                "{liveService: 16, liveAgent: 8, queuedAgent: 16, clientViewers: 32, modelReservedPageReads: 0}",
+            )
+            .unwrap();
+        assert_eq!(
+            config.get("jobs").unwrap(),
+            "liveService: 16\nliveAgent: 8\nqueuedAgent: 16\nclientViewers: 32\nmodelReservedPageReads: 0\n"
+        );
+        assert_eq!(config.get("jobs.modelReservedPageReads").unwrap(), "0\n");
+        for bad in [
+            "{}",
+            "{liveService: 4}",
+            "{liveService: 4, liveAgent: 2, queuedAgent: 8, clientViewers: 8}",
+            "{liveService: 4, liveAgent: 2, queuedAgent: 8, clientViewers: 8, modelReservedPageReads: 1, other: 1}",
+            "{liveService: 0, liveAgent: 2, queuedAgent: 8, clientViewers: 8, modelReservedPageReads: 1}",
+            "{liveService: 4, liveAgent: 9, queuedAgent: 8, clientViewers: 8, modelReservedPageReads: 1}",
+            "{liveService: 4, liveAgent: 2, queuedAgent: 17, clientViewers: 8, modelReservedPageReads: 1}",
+            "{liveService: 4, liveAgent: 2, queuedAgent: 8, clientViewers: 33, modelReservedPageReads: 1}",
+            "{liveService: 4, liveAgent: 2, queuedAgent: 8, clientViewers: 8, modelReservedPageReads: 2}",
+            "{liveService: true, liveAgent: 2, queuedAgent: 8, clientViewers: 8, modelReservedPageReads: 1}",
+            "{liveService: '4', liveAgent: 2, queuedAgent: 8, clientViewers: 8, modelReservedPageReads: 1}",
+            "4",
+        ] {
+            let mut copy = Config::default();
+            assert_eq!(
+                copy.set("jobs", bad),
+                Err("config_invalid_value"),
+                "accepted {bad}"
+            );
+        }
+        for bad in [
+            "{liveService: null, liveAgent: 2, queuedAgent: 8, clientViewers: 8, modelReservedPageReads: 1}",
+            "null",
+        ] {
+            assert!(
+                Config::default().set("jobs", bad).is_err(),
+                "accepted {bad}"
+            );
+        }
+        for document in [
+            "jobs: {liveService: 0}",
+            "jobs: {liveService: 17}",
+            "jobs: {liveAgent: 0}",
+            "jobs: {liveAgent: 9}",
+            "jobs: {queuedAgent: 17}",
+            "jobs: {clientViewers: 0}",
+            "jobs: {modelReservedPageReads: 2}",
+            "jobs: {liveService: '4'}",
+            "jobs: {liveService: null}",
+            "jobs: {liveService: 4, liveService: 4}",
+            "jobs: {other: 1}",
+            "jobs: null",
+            "jobs: 4",
+        ] {
+            assert!(
+                Config::read(document.as_bytes()).is_err(),
+                "accepted {document}"
+            );
+        }
+        // Absent fields inherit their defaults.
+        let partial = Config::read(b"jobs: {liveAgent: 1}").unwrap();
+        assert_eq!(partial.jobs.live_service, 4);
+        assert_eq!(partial.jobs.live_agent, 1);
+        assert!(Config::read(b"jobs: {}").unwrap().jobs.is_default());
+    }
+    /// J2T-21 unit layer: the effective per-agent limit is the smaller of
+    /// `jobs.liveAgent` and `jobs.liveService`; `get` still reports the
+    /// configured value.
+    #[test]
+    fn j2t_21_effective_live_agent_is_the_smaller_value() {
+        let mut config = Config::default();
+        config.set("jobs.liveService", "1").unwrap();
+        config.set("jobs.liveAgent", "8").unwrap();
+        assert_eq!(config.get("jobs.liveAgent").unwrap(), "8\n");
+        let limits = config.jobs.limits();
+        assert_eq!(limits.live_service, 1);
+        assert_eq!(limits.live_agent, 1);
+        config.set("jobs.liveService", "16").unwrap();
+        assert_eq!(config.jobs.limits().live_agent, 8);
+        config.set("jobs.liveAgent", "3").unwrap();
+        config.set("jobs.liveService", "3").unwrap();
+        assert_eq!(config.jobs.limits().live_agent, 3);
+    }
+    /// J2T-21 unit layer against a scratch runtime: `execute` gets and sets
+    /// the keys and reports no applied value (they apply at service start);
+    /// `job_limits` reads the persisted effective limits; invalid stored
+    /// values fail every reader and are never overwritten.
+    #[test]
+    fn j2t_21_job_limits_read_scratch_runtime() {
+        use std::os::unix::fs::DirBuilderExt;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Scratch(
+            format!(
+                "/private/tmp/asura-jobs-{:x}",
+                u128::from_ne_bytes(asura_platform::random_id())
+            )
+            .into(),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root.0)
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
+        let cancel = AtomicBool::new(false);
+        let call = |key, value| execute(runtime.clone(), key, value, &cancel);
+        assert_eq!(
+            job_limits(runtime.clone(), &cancel),
+            Ok(JobLimits::default())
+        );
+        let file = root.0.join(".asura/config.yaml");
+        assert_eq!(
+            call("jobs.liveService", Some("2")),
+            Ok(Reply {
+                value_yaml: "2\n".into(),
+                journal_quota: None
+            })
+        );
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("jobs:\n  liveService: 2\n")
+        );
+        assert_eq!(
+            job_limits(runtime.clone(), &cancel).unwrap(),
+            JobLimits {
+                live_service: 2,
+                live_agent: 2,
+                ..JobLimits::default()
+            }
+        );
+        call(
+            "jobs",
+            Some("{liveService: 3, liveAgent: 5, queuedAgent: 1, clientViewers: 32, modelReservedPageReads: 0}"),
+        )
+        .unwrap();
+        assert_eq!(
+            job_limits(runtime.clone(), &cancel).unwrap(),
+            JobLimits {
+                live_service: 3,
+                live_agent: 3,
+                queued_agent: 1,
+                client_viewers: 32,
+                model_reserved_page_reads: 0,
+            }
+        );
+        assert_eq!(call("jobs.liveAgent", None).unwrap().value_yaml, "5\n");
+        assert!(call("", None).unwrap().value_yaml.contains("jobs:\n"));
+        let before = std::fs::read(&file).unwrap();
+        for (key, value) in [
+            ("jobs.liveService", "17"),
+            ("jobs.modelReservedPageReads", "2"),
+            ("jobs", "{liveService: 4}"),
+            ("jobs.other", "1"),
+        ] {
+            assert!(call(key, Some(value)).is_err(), "accepted {key}: {value}");
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        // Setting every default removes the mapping from the file.
+        call(
+            "jobs",
+            Some("{liveService: 4, liveAgent: 2, queuedAgent: 8, clientViewers: 8, modelReservedPageReads: 1}"),
+        )
+        .unwrap();
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("jobs"));
+        std::fs::write(&file, b"jobs: {liveService: 0}\n").unwrap();
+        let invalid = std::fs::read(&file).unwrap();
+        assert_eq!(
+            job_limits(runtime.clone(), &cancel),
+            Err("config_invalid_value")
+        );
+        assert_eq!(call("jobs", None), Err("config_invalid_value"));
+        assert!(call("jobs.liveService", Some("4")).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), invalid);
+        let cancelled = AtomicBool::new(true);
+        assert!(job_limits(runtime.clone(), &cancelled).is_err());
     }
 }
