@@ -295,6 +295,8 @@ Tool record kinds after the [tool call records](tool-call-records.md) change
 | 28 | `JobSettled` | Designed with J2, not implemented: a job's outcome and capture facts; a closure record. J4 adds the settled wall-clock time. |
 | 29 | `JobResult` | Designed with J3, not implemented: the reference-only result of an exec_cmd or `job` call ([kind 29](tool-job-controller.md#kind-29-jobresult)). |
 | 30 | `JobRetention` | Designed with J4, not implemented: a pin, unpin, delete or note for one job ([kind 30](tool-job-controller.md#kind-30-jobretention)). |
+| 31 | `PersonCommandQueued` | Designed with person command packet P2, not implemented: a queued `!` or `!!` command, replacing kind 18 for that input ([kind 31](person-command-mode.md#kind-31-personcommandqueued)). |
+| 32 | `ExecutionPathRecord` | Designed with packet P5, not implemented: model build-path changes, acknowledgements and approvals ([kind 32](execution-path-guard.md#kind-32-executionpathrecord)). |
 
 Public inspection validates all transitions before returning the installation
 summary. It must not skip unsupported kinds or return a valid prefix after an

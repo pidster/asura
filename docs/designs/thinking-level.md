@@ -107,7 +107,7 @@ bar shows the level as not applied.
 | TL-09 | Model streams thinking then answer | Turn runs | Thinking text reaches the journal in kind 25 segments and the client in event windows; the log shows `▸ Thinking · N chars` above the answer. |
 | TL-10 | Turn with thinking is history | Next turn composes | The model input history holds the prompt and answer only; no thinking text. |
 | TL-11 | Response selection on a turn with thinking | `t` | The block opens and shows the text; `t` again folds it. |
-| TL-12 | Thinking longer than 61,440 bytes | Turn runs | Several kind 25 segments; a client assembles the whole thinking text; no frame exceeds 64 KiB. |
+| TL-12 | Thinking longer than 61,440 bytes | Turn runs | Several kind 25 segments; a client assembles the whole thinking text through windows of at most 60,928 bytes combined; no frame exceeds 64 KiB, including an event with the J4 outlived fields. |
 | TL-13 | Service restarts | Client reads history | Thinking text and the recorded level come from the journal. |
 | TL-14 | Invalid value | `/think maximum` or `config set thinking 7` | Rejected; file and draft unchanged. |
 | TL-15 | Helper sends a request outside its controls, a thinking offset beyond held text or invalid UTF-8 | Revision or Begin | Protocol fault; the turn fails truthfully. |
@@ -160,8 +160,8 @@ flowchart TB
     Helper -->|"SnapshotEnd thinking part, revision at most 61,440 B"| MO["Service model owner"]
     MO -->|"validated thinking part"| Conv["Conversation thinking state"]
     Conv -->|"kind 25 segment, at most 61,440 B"| J[("Journal")]
-    Conv -->|"live thinking window, shared 61,440 B"| Client["Client assembly"]
-    J -->|"terminal thinking window, shared 61,440 B"| Client
+    Conv -->|"live thinking window, shared 60,928 B"| Client["Client assembly"]
+    J -->|"terminal thinking window, shared 60,928 B"| Client
     Client -->|"assembled thinking"| Log["TUI folded block"]
     Conv -.->|"never"| Composer["Context composer"]
 ```
@@ -276,13 +276,13 @@ request from the kind 21 frame, the thinking length, and one thinking window.
 | `ModelContext` | Fields 7 `reasoning` (bool) and 8 `thinking_controls` (uint32), from the live Hello. |
 | `ServiceObservation` | Field 7 `thinking_level`: the configured level. |
 
-Windows share one budget of 61,440 bytes per event. The thinking window comes
+Windows share one budget of 60,928 bytes per event (`MAX_RESPONSE_WINDOW_BYTES`, lowered from 61,440 on 2026-10-22; see the [window bound](response-text-transfer.md#event-window-bound-2026-10-22)). The thinking window comes
 first; the response window gets the remaining bytes. When `thinking_text` is
 present, the client truncates its thinking to `thinking_offset` and appends it;
 the thinking then has `thinking_bytes` bytes. Live thinking cuts use the same
 16-cut log as the response. A client holds everything when it holds both
 `text_bytes` and `thinking_bytes`. The frame proof TCR-D26 still holds: the two
-text fields together carry at most 61,440 bytes, and the five new scalar fields
+text fields together carry at most 60,928 bytes, and the five new scalar fields
 add at most 37 bytes.
 
 ### Observation and journaling sequence
@@ -480,9 +480,9 @@ permission is added. The level is not secret. Ollama endpoints stay loopback.
 
 | Rule | Application |
 | --- | --- |
-| AE-01 | The reactor applies revisions and selects windows without waiting; one window copies at most 61,440 bytes. Config reads and writes stay on the config worker. |
+| AE-01 | The reactor applies revisions and selects windows without waiting; one window copies at most 60,928 bytes. Config reads and writes stay on the config worker. |
 | AE-02 | No new blocking call. Journal I/O stays on the writer thread; provider I/O stays in the helper. |
-| AE-03 | Revision ≤ 61,440 B combined; kind 25 ≤ 61,440 B; event windows ≤ 61,440 B combined; pause at 122,880 B per part; 16 cuts per part; 65,536 pieces per part; config value ≤ 4 KiB. |
+| AE-03 | Revision ≤ 61,440 B combined; kind 25 ≤ 61,440 B; event windows ≤ 60,928 B combined; pause at 122,880 B per part; 16 cuts per part; 65,536 pieces per part; config value ≤ 4 KiB. |
 | AE-04 | Pause ends when a segment commits; the turn ends on terminal, cancel, helper exit, protocol fault or shutdown. No time bound. |
 | AE-05 | Kind 21 and kind 25 are append-only; replay rebuilds thinking; the request is recomputed from nothing at replay because it is recorded. |
 | AE-06 | Shutdown cancels the helper; the terminal flush writes thinking before kind 8. |

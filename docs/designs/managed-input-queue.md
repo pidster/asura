@@ -160,7 +160,9 @@ The service returns pending entries in that order; the TUI uses `order_position`
 for presentation and move anchors.
 
 The queue keeps at most 16 unresolved service inputs across all projects, each
-at most 32 KiB. The client outbox keeps at most 16 local pending inputs and one
+at most 32 KiB. This is the one source of the limit; queued person commands
+(kind 31, [person command mode](person-command-mode.md#queue-integration)) count
+toward it. The client outbox keeps at most 16 local pending inputs and one
 RPC in flight. Full capacity rejects a new Enter visibly and retains the draft.
 The service never acknowledges before its journal flush. The existing 64 KiB
 frame and 8 MiB journal caps remain; capacity or storage exhaustion rejects

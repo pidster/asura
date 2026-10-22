@@ -480,6 +480,8 @@ stateDiagram-v2
         Stopping --> CleanupUnconfirmed: Cleanup-unconfirmed notice (kind 4)
         Draining --> CleanupUnconfirmed: Cleanup-unconfirmed notice (kind 4)
         Draining --> Finalizing: Settled notice (kind 2), pipes at EOF
+        Draining --> Draining: !! kind 2 reason 15, capture continues, ShellExited (OD2)
+        Draining --> Finalizing: !! pipes reach EOF after kind 2, or a cancel closes capture
         CleanupUnconfirmed --> Finalizing: Late settled notice, cleanup late
         Finalizing --> Recording: Capture sealed, or L3 passed after a cancel trigger
     }
@@ -493,7 +495,11 @@ The guardian sends TERM to the owned group at once when the leader exits and
 KILL after the profile's grace, then runs the
 [escapee sweep](escapee-control.md#guardian-implementation-refinements-2026-10-21).
 It reports the settled notice only after the leader is reaped, the group is
-empty, the pipes are at EOF and no attributed descendant remains.
+empty, the pipes are at EOF and no attributed descendant remains. Exception
+for profile `person-outside-1` (PQ3, decided on 2026-10-22 under PC13): the
+guardian does not signal the group at leader exit, counts live group members
+and env-marked escapees as survivors, and sends kind 2 after reaping the
+leader ([`!!` survivors](person-command-mode.md#outside-survivors-and-lane-release)).
 
 Required behavior (owner, 2026-10-14, J2b): the guardian adds notice kind 5,
 leader exited, sent when it observes the leader's exit and before the group's
@@ -696,7 +702,7 @@ after 10 when J3 is designed.
 
 No record holds output text (tool output views rule 3). Under EX4 (owner,
 2026-10-15) the command that a job runs is the rewritten command; it is stored
-once, in kind 14 for a model job and in kind PCQ for a person job, never in the
+once, in kind 14 for a model job and in kind 31 for a person job, never in the
 job records.
 
 Records stay with the conversation that started the job (J4a). The writer
@@ -2014,11 +2020,11 @@ or person command exists yet. Worker-layer integration tests drive it.
 | Revocation | Identity change, journal outage, shutdown, restart ([revocation in J2](#revocation-in-j2)) | EX11 setting before J3 is enabled (RV1); unregister with its operation |
 | Pages | Page reads wait for their reply; no 2 s step ([page reads](#page-reads-without-a-step-bound)) | J3 and J4 add callers |
 | Operations | Configuration keys and audit events ([configuration](#j2-configuration-keys), [audit](#j2-audit-events)) | — |
-| Person origin | Controller parts: person origin and input ID in kind 26, person waiters in the agent queue, kill escalation, model cancel `not_permitted` | P2 adds kind PCQ and enables person-origin replay; P1 the person profiles |
+| Person origin | Controller parts: person origin and input ID in kind 26, person waiters in the agent queue, kill escalation, model cancel `not_permitted` | P2 adds kind 31 and enables person-origin replay; P1 the person profiles |
 
 Not in J2: the exec_cmd switch, `yield_seconds`, the `job` tool and its
 results (J3); control messages, `/jobs`, the viewer and the EX12 notice (J4);
-job notices (J5); expiry classes and holds (J6); the person profiles, kind PCQ
+job notices (J5); expiry classes and holds (J6); the person profiles, kind 31
 and the person submit path (P1–P4); the EX11 setting.
 
 ### J2 decisions
@@ -2150,7 +2156,7 @@ different durability, because their recovery needs differ.
 | Origin | Durable record of the entry | Kind 26 written | After a restart |
 | --- | --- | --- | --- |
 | Model | Kind 26, committed before the entry exists | At enqueue | The job is unsettled; start writes `interrupted`. The handle the model may hold stays valid |
-| Person | The lane head, kind PCQ (P2); the controller holds an in-memory waiter | When the slot and quota are granted | No kind 26 exists; the lane head replays as `Held` (MQ07R) and the person can resume it |
+| Person | The lane head, kind 31 (P2); the controller holds an in-memory waiter | When the slot and quota are granted | No kind 26 exists; the lane head replays as `Held` (MQ07R) and the person can resume it |
 
 A queued model job that never started is still settled `interrupted` after a
 restart, with "effects may have occurred". This is conservative: J2 writes no
@@ -2244,7 +2250,7 @@ one byte, 0 or 1. Any other value is `Corrupt`.
 
 | # | Field | Encoding | Bounds and rule |
 | --- | --- | --- | --- |
-| 1 | origin | u8 | 1 model, 2 person. In J2 replay rejects 2; P2 enables it with kind PCQ |
+| 1 | origin | u8 | 1 model, 2 person. In J2 replay rejects 2; P2 enables it with kind 31 |
 | 2 | agent | u32 | 0, the main agent. Another value is `Corrupt` until a subagent design assigns it |
 | 3 | origin reference | model: operation ID, generation (u64), ordinal (u32); person: input ID | Model: names a kind 14 under the [replay rules](#replay-order-and-the-job-reservation-ledger) |
 
@@ -2255,10 +2261,10 @@ Replay derives every other intent fact from one source (TCR-O5):
 | Value | Derivation |
 | --- | --- |
 | Job ID, payload IDs | [Job identity](#job-identity) |
-| Conversation and project | The operation's kind 21, or the input's kind PCQ |
-| Profile | `model-1` for origin 1; for origin 2, `person-1` or `person-outside-1` from kind PCQ's outside flag |
-| Command and cwd | Kind 14 stored arguments, or kind PCQ |
-| Grant snapshot | The origin reference, the profile and the agent: the turn's grant through its kind 21, or the person grant through kind PCQ. No separate encoding exists |
+| Conversation and project | The operation's kind 21, or the input's kind 31 |
+| Profile | `model-1` for origin 1; for origin 2, `person-1` or `person-outside-1` from kind 31's outside flag (field 7 bit 1) |
+| Command and cwd | Kind 14 stored arguments, or kind 31 |
+| Grant snapshot | The origin reference, the profile and the agent: the turn's grant through its kind 21, or the person grant through kind 31. No separate encoding exists |
 | Initial quota reservation | The constant 1,048,576 |
 | Ledger capacity | The constants of the [ledger](#replay-order-and-the-job-reservation-ledger) |
 | Owner generation at intent | The frame header |
@@ -2288,10 +2294,10 @@ journal outage.
 | 5 | exit value | u32 | 0 when unknown; 0–255 exited; 1–127 signalled |
 | 6 | cleanup | u8 | 0 none, 1 confirmed, 2 late (a settled notice after a cleanup-unconfirmed notice) |
 | 7 | unconfirmed reason | u8 | 0, or 9 or 13 (the kind 4 reason) when cleanup is 2 |
-| 8 | escapees | u32 | The kind 6 value; 0 when cleanup is 0 |
+| 8 | escapees | u32 | The kind 6 value; 0 when cleanup is 0. For profile `person-1` and `model-1` the count of escapees killed; for `person-outside-1` the count of survivors left running (EC-D1). The profile is derived from kind 26 and kind 31, so no field records the meaning |
 | 9 | elapsed | u64 | Milliseconds from the spawned notice to the settled notice; 0 with no process |
 | 10 | capture state | u8 | 1 `complete`, 2 `incomplete`, 3 `unconfirmed`, 4 `not_started`, 5 `interrupted` |
-| 11 | capture reason | u8 | Kind 23 field 5 codes 0–6 |
+| 11 | capture reason | u8 | Kind 23 field 5 codes 0–6, and 7 `closed_after_cancel` (P2): a cancel closed the capture read ends after a `!!` shell exited while a survivor held the pipes (OD2) |
 | 12 | redaction ran | u8 | 1; 0 only for capture state 5 |
 | 13 | stdout facts | stream block | Below |
 | 14 | stderr facts | stream block | Below |
@@ -2308,15 +2314,24 @@ Outcome rules (a broken rule is `Corrupt`):
 
 | Outcome | Reason | Exit | Cleanup, escapees, elapsed | Capture state |
 | --- | --- | --- | --- | --- |
-| exited | 0, or 1–10 for a trigger after the leader exited | Kind 1 | Cleanup 1 or 2 | 1–3 |
+| exited | 0, or 1–10 or 19 for a trigger after the leader exited | Kind 1 | Cleanup 1 or 2 | 1–3 |
 | signalled | As exited | Kind 2 | Cleanup 1 or 2 | 1–3 |
-| cancelled | 1–8: the first cancel trigger came before the leader exited | Kind 1 or 2 | Cleanup 1 or 2 | 1–3 |
-| not_started | 1–7 (cancel before spawn) or 12–18 | 0, value 0 | All 0 | 4, with the kind 23 `not_started` rules |
+| cancelled | 1–8 or 19: the first cancel trigger came before the leader exited | Kind 1 or 2 | Cleanup 1 or 2 | 1–3 |
+| not_started | 1–7 or 19 (cancel or revocation before spawn), 12–18, or 20 (`!!` switch off at slot grant) | 0, value 0 | All 0 | 4, with the kind 23 `not_started` rules |
 | interrupted | 11 | 0, value 0 | All 0 | 5: capture reason 0, every stream field 0, no numbers, pause facts 0, reservation 0 |
 
 The reason of a settled job is its first cancel trigger, except that
 `person_kill` replaces `person_stop` after an escalation (J2d). Capture states
-1–4 keep the [kind 23 field rules](#kind-23-capturesettled).
+1–4 keep the [kind 23 field rules](#kind-23-capturesettled), extended for
+capture reason 7: `incomplete` accepts reasons 1–5 and 7; reason 7 requires
+outcome exited or signalled, a reason other than 0, a profile of
+`person-outside-1`, both digests present and no EOF flag required.
+
+No rule requires the kind 28 reason to equal the kind 27 reason (recorded
+2026-10-22 from packet J2-B). Kind 27 records the first accepted cancel
+request; kind 28 records the settled reason under the rules above, which may
+differ, for example `person_kill` after a `person_stop` request, or reason 0
+when the process had settled before the request took effect.
 
 Maximum payload 4,086 bytes: 37 bytes of job facts, 3 bytes of capture header,
 1,494 bytes per stream (kind 23's 1,486 plus the 8-byte line count), 1,030
@@ -2346,10 +2361,13 @@ bytes for numbers, 20 for pause facts and 8 for the reservation. Maximum frame
 | 16 | `capture_unavailable` | — | not_started |
 | 17 | `protocol_fault` | — | not_started |
 | 18 | `setup_failed` | — | not_started |
+| 19 | `execution_off` ([EX11](execution-setting.md)) | service | exited, signalled, cancelled, not_started |
+| 20 | `outside_sandbox_off` (person `!!` switch off at slot grant) | — | not_started |
 
-The codec holds the table explicitly. Later reasons, such as the EX11 setting,
-`project_unregistered` and the person `outside_sandbox_off`, take the next free
-codes when their packets are designed.
+The codec holds the table explicitly. J34-S adds code 19 and P2 adds code 20
+([person command mode](person-command-mode.md#job-records-for-person-jobs)).
+A later reason, such as `project_unregistered`, takes the next free code when
+its packet is designed.
 
 #### Relation to kinds 14, 15 and 23
 
@@ -2357,7 +2375,7 @@ codes when their packets are designed.
 | --- | --- |
 | J1-mode exec_cmd call, until J3 | 14 `run` → 23 → 15 (unchanged) |
 | Job-mode model call: J2 records; the only exec_cmd mode after J3 | 14 `run` → 26 → 15 (handle delivery). Kind 27 and kind 28 come before or after kind 15, and may follow the operation's terminal |
-| Person job, after P2 | PCQ … 26 → 27 (optional) → 28 |
+| Person job, after P2 | 31 … 26 → 27 (optional) → 28 |
 
 Kind 28 replaces kind 23 for a job; a job-mode call never has kind 23. Kind 15
 remains the call's result record until J3 designs the reference-only kind. J3
@@ -2372,7 +2390,7 @@ the [J1 order](#replay-order-and-reservation).
 | ID | Rule | Replay result when broken |
 | --- | --- | --- |
 | JR1 | A model-origin kind 26 names the active operation's last kind 14, with that operation's generation. That kind 14 has decision `run` and operation code 10, and no kind 23, kind 15 or kind 26. The operation has no terminal | `Corrupt` |
-| JR2 | A person-origin kind 26 | `Corrupt` in J2; P2 replaces this rule with its kind PCQ rules |
+| JR2 | A person-origin kind 26 | `Corrupt` in J2; P2 replaces this rule with PR1–PR6 ([person replay rules](person-command-mode.md#replay-rules-for-person-commands)) |
 | JR3 | The agent field is 0 | `Corrupt` |
 | JR4 | A kind 14 with a kind 26 gets no kind 23. Its kind 15 follows the kind 26 | `Corrupt` |
 | JR5 | A kind 26 derives a job ID that an earlier kind 26 derived | `Corrupt` |
@@ -2551,7 +2569,7 @@ the job `not_started` with reason `protocol_fault`. The total argv bound stays
 | --- | --- | --- | --- |
 | `model-1` | The exec_cmd Seatbelt profile | 500 ms | J2 |
 | `person-1` | The person profile | 2 s (PC8) | P1 |
-| `person-outside-1` | None | 2 s (PC8) | P1 |
+| `person-outside-1` | None; no group stop at leader exit (PQ3, decided under PC13); live group members are survivors | 2 s (PC8), for a stop before the shell exits | P1 |
 
 **Lease bytes.** The service writes at most one `T` and one `K` per job, at
 most 2 bytes into an empty pipe, below `PIPE_BUF`:
@@ -2565,9 +2583,19 @@ most 2 bytes into an empty pipe, below `PIPE_BUF`:
 
 After its first stop the guardian keeps polling FD 3 for `K` and EOF on its
 existing 100 ms loop. After EOF it stops polling FD 3, so a hung-up pipe never
-spins the loop. A leader exit with no lease input gives reason 0. Reason 12
-`escapee_terminated` still replaces the lease reason when escapees were killed.
+spins the loop. A leader exit with no lease input gives reason 0. A `K` after a
+leader-exit stop gives reason 11 (recorded 2026-10-22 from packet J2-A). Reason
+12 `escapee_terminated` still replaces the lease reason when escapees were
+killed; for `person-outside-1`, reasons 14 `escapees_left_running` and 15
+`escapees_hold_output` replace it when survivors were counted (P1,
+[escapee control](escapee-control.md#guardian-status-notice-extensions)).
 `K` is valid for every profile; the controller sends it only for a person kill.
+
+Result reason (recorded 2026-10-22 from packet J2-A). `ExecCmdResult.reason`
+takes the guardian's kind 2 reason first. Only when that reason is 0 or 12
+does it take the reason of the service's own stop request, so a service stop
+that the guardian reported as `cancel`, `kill` or `lease_ended` keeps the
+guardian's reason.
 
 Service side. `ExecCmdJob::stop(StopKind::Term)` and `stop(StopKind::Kill)`
 each write one byte with a nonblocking `write`. A `WouldBlock` or an error
@@ -2596,9 +2624,12 @@ Any other sequence is a protocol fault that initiates cleanup:
 2. Kind 5 appears at most once, after kind 1.
 3. Kind 4 appears at most once, after kind 1 and before kinds 6 and 2. It may
    come before or after kind 5.
-4. Kind 6 appears at most once, immediately before kind 2 with reason 12.
+4. Kind 6 appears at most once, immediately before kind 2 with reason 12
+   (`model-1`, `person-1`) or reason 14 or 15 (`person-outside-1`).
 5. Kind 2 is last. It requires an earlier kind 5, and its exit kind and value
-   equal those of kind 5. It accepts reasons 0, 2, 4, 11 and 12.
+   equal those of kind 5. It accepts reasons 0, 2, 4, 11 and 12; for
+   `person-outside-1` it accepts 0, 2, 4, 11, 14 and 15 and never 12. Reasons
+   12, 14 and 15 require kind 6 before them.
 
 The longest sequences are 1, 5, 4, 6, 2 and 1, 4, 5, 6, 2: five notices and
 160 bytes. The existing limits of 5 notices and a 192-byte receive buffer
@@ -2627,7 +2658,7 @@ stateDiagram-v2
     LeaderExited --> Settled: Kind 2, reason 0, 2, 4 or 11, exit E, cleanup confirmed
     ExitedUnconfirmed --> Settled: Kind 2, exit E, cleanup late
     UnconfirmedExited --> Settled: Kind 2, exit E, cleanup late
-    Reported --> Settled: Kind 2, reason 12, exit E
+    Reported --> Settled: Kind 2, reason 12 (sandboxed) or 14 or 15 (person-outside-1), exit E
     SetupFailed --> [*]
     Settled --> [*]
 ```
@@ -2656,7 +2687,8 @@ pub(crate) enum BlockReason { Recovering, JournalUnavailable, JournalHeld, Paylo
     AgentSlots, ServiceSlots, PendingInstalls, Quota, DiskSpace }
 pub(crate) enum Requester { Model, Client, Person, Service }
 pub(crate) enum CancelReply { Accepted(JobState), AlreadySettled(Outcome), NotPermitted, NotFound }
-pub(crate) enum JobEvent { Queued(Id, BlockReason), Started(Id), State(Id, JobState), Settled(Id, Outcome) }
+pub(crate) enum JobEvent { Queued(Id, BlockReason), Started(Id), State(Id, JobState), Settled(Id, Outcome),
+    ShellExited(Id, Exit, u32) } // P3-K: a `!!` job's kind 2 reason 15; survivors still hold output (OD2)
 
 impl JobController {
     pub fn new(limits: JobLimits, emitter: Option<audit::Emitter>) -> Self;
@@ -2682,6 +2714,7 @@ pub(crate) trait SlotPort {
     fn start(&mut self, start: SlotStart) -> Result<(), SlotStartError>;
     fn stop(&mut self, kind: StopKind); // Term or Kill; idempotent; never blocks
     fn discard_capture(&mut self); // cancel trigger in Draining: capture discards
+    fn close_capture(&mut self); // P3-T: cancel after a `!!` kind 2 reason 15: close the read ends, seal with reason 7
     fn interests(&self, out: &mut Vec<PollInterest>);
     fn next_deadline(&self, now: Instant) -> Option<Instant>;
     fn poll(&mut self, now: Instant, out: &mut Vec<SlotEvent>); // at most 8 events
@@ -2697,7 +2730,8 @@ pub(crate) enum SlotEvent {
     LeaderExited(Exit),                              // kind 5
     CleanupUnconfirmed(UnconfirmedReason),           // kind 4, or guardian lost
     CapturePaused(PauseReason), CaptureResumed, CaptureFault(CaptureReason),
-    ProcessSettled { exit: Exit, cleanup: Cleanup, escapees: u32, elapsed_ms: u64 }, // kind 2
+    ProcessSettled { exit: Exit, cleanup: Cleanup, escapees: u32, elapsed_ms: u64,
+        output_held: bool }, // kind 2; output_held for reason 15 (P3-T)
     CaptureSettled(CaptureOutcome),                  // sealed report, or L3 unconfirmed
     ScratchCleaned, ScratchRetained,
     IdentityChanged,                                 // pre-spawn recheck mismatch
@@ -2732,6 +2766,23 @@ Interface rules:
   J1-0 room wait. Recovery: the recovery cancel.
 - **Recovery.** The controller persists nothing outside the journal. After a
   restart it starts empty and receives the unsettled jobs from replay.
+- **`UnsettledJob`** (recorded 2026-10-22 as packet J2-B implemented it,
+  `asura-storage/src/authority/conversation/types.rs`): one unsettled job from
+  replay with `job` (ID), `origin`, `agent`, `conversation` (from the origin's
+  kind 21 or kind 31), `project`, `owner_generation` (the kind 26 frame
+  header), `time` (kind 26 field 4), `intent` (the kind 26 locator, whose
+  sequence orders the jobs), `cancel` (the kind 27 facts, once committed) and
+  `payloads` (the derived stdout and stderr payload IDs).
+- **Payload IDs** (J2-C, recorded 2026-10-22). `payload::payload_id` takes
+  (installation, job, kind) and is the single derivation of
+  [job identity](#job-identity); no caller derives a payload ID another way.
+  `PayloadFact.operation` for a person-origin job is defined by P2: it holds
+  no operation, and the fact carries the input ID instead.
+- **Journal hold.** A kind 26 held at the journal quota waits until the
+  writer's own recheck finds room: its paced recheck (1, 1, 2, 3, 5 … s, at
+  most 60 s) or the next command it executes. A kind 27 or 28 commit frees
+  ledger bytes but does not end the hold by itself (recorded 2026-10-22 from
+  packet J2-B).
 
 ##### TJ-Q4: J2 start, stop and settlement
 
@@ -2941,9 +2992,8 @@ names are the kind 4 reason names of the
 | `reason` of `job.queued` | `recovering`, `journal_unavailable`, `journal_held`, `payload_unavailable`, `agent_slots`, `service_slots`, `pending_installs`, `quota`, `disk_space` |
 | `profile` | `model-1`; the person packets add `person-1` and `person-outside-1` |
 
-The person packets also add `outside_sandbox` to `job.started`,
-`job.cancel_requested` and `job.settled` (PCR25). The person packets add `outside_sandbox: true` to `job.started`,
-`job.cancel_requested` and `job.settled` for a `!!` job (PCR25).
+The person packets add `outside_sandbox` to `job.started`,
+`job.cancel_requested` and `job.settled`, true for a `!!` job (PCR25).
 `Event::project()` returns `project` for all four.
 
 ### J2 asynchronous execution
@@ -3082,7 +3132,7 @@ two packets edit one file. Each delivers its unit and integration tests and runs
 
 | Packet | Owned paths | Depends on | Delivers |
 | --- | --- | --- | --- |
-| J2-A Platform guardian | `asura-platform/src/exec_cmd.rs`; `asura-platform/src/exec_cmd/{guardian,protocol,spawn,tests}.rs`; `asura-platform/tests/exec_cmd_process.rs`; the private guardian route in `asura-cli/src/app.rs` | — | Profile token, lease bytes, kind 5, order and reason rules, `StopKind`, `ExecCmdRequest::profile`, removal of reason 3; J2T-05, J2T-06 |
+| J2-A Platform guardian | `asura-platform/src/exec_cmd.rs`; `asura-platform/src/exec_cmd/{guardian,protocol,spawn,tests}.rs`; `asura-platform/tests/exec_cmd_process.rs`; the private guardian route in `asura-cli/src/app.rs`; the guardian dispatch lines (the `ExecCmdRequest` construction and `profile` argument) in `asura-service/tests/{capture_flow,conversation_flow,tool_call_flow}.rs`, `asura-service/src/capture_worker.rs` and the `exec_cmd_worker.rs` call sites, which changed with the request shape (recorded 2026-10-22; merged together as `f6e8cff`) | — | Profile token, lease bytes, kind 5, order and reason rules, `StopKind`, `ExecCmdRequest::profile`, removal of reason 3; J2T-05, J2T-06 |
 | J2-B Journal records | `asura-storage/src/authority/conversation/{types,codec,state,mod}.rs`; `asura-storage/src/authority/{journal,checkpoint,index,fixture}.rs`; `asura-storage/src/authority/index/run.rs`; `asura-storage/src/authority/journal/{memory,tests}.rs`; `asura-storage/src/authority/writer/{mod,state}.rs`; `asura-storage/tests/{authority_conversation,authority_replay,journal_writer,segmented_journal}.rs` | — | Kinds 26–28, job ID, JR1–JR10, ledger, closure classification, checkpoint jobs, `W` and `X` entries, `UnsettledJob`, `PayloadFacts` job form; J2T-01 to J2T-04 (storage parts), J2T-17 (unit) |
 | J2-G Configuration and audit schema | `asura-storage/src/config.rs`; `asura-storage/src/audit/{types,mod,tests}.rs` | — | `jobs.*` keys, job audit event types and setting names; J2T-20, J2T-21 (unit) |
 | J2-C Payload store | `asura-storage/src/payload/{id,store,recovery,pages,mod}.rs`; `asura-storage/tests/payload_store.rs` | J2-B | Job-keyed payload IDs and reservations, job recovery facts, page pool without `PAGE_STEP`; J2T-04 (payload), J2T-16 |
@@ -3479,7 +3529,7 @@ records what it consumed. Page states 5–8 have source length 0.
 `count` entries of job ID (ID), state (u8), reason (u8), reason numbers
 (3 × u8), stdout bytes (u64) and stderr bytes (u64). An entry in state 9
 stores zero bytes; its facts come from kind 28. Origin, command excerpt and the
-next `before` value are read from the job's kind 26, kind 14 or PCQ.
+next `before` value are read from the job's kind 26, kind 14 or kind 31.
 
 **Wait block** (code 14 with outcome `ok`): the state block, then wait end
 (u8): 1 `settled`, 2 `new_output`, 3 `time`, 4 `already_settled`.
@@ -3599,6 +3649,7 @@ result adds `cancel: requested` or `cancel: already settled`.
 | cancelled, 3 `client_cancel` | `cancelled by the person (/job cancel)` | `stopped by the person (signal N)` |
 | cancelled, 4 `person_stop`, 5 `person_kill` | — | `stopped by the person (signal N)`, `killed by the person (signal 9)` |
 | cancelled, 6, 7, 8, 19 | `cancelled: <r>` | `stopped: <r>` |
+| exited or signalled after shell exit, `!!` with escapees N > 0 | — | `exit N` or `signal N`, then `; N background processes left running`; with capture reason 7, `; output capture stopped by the person` first |
 | not_started, r | `not started: <r>` | `not started: <r>` |
 | interrupted, 11 | `interrupted by a service restart; effects unknown` | same |
 
@@ -3608,7 +3659,9 @@ Reason texts `<r>`: 6 `project directory changed`, 7 `service shutdown`, 8
 `project changed before start`, 14 `sandbox unavailable`, 15
 `process start failed`, 16 `output capture unavailable`, 17
 `guardian protocol fault`, 18 `setup failed`, 19
-`the person turned execution off`; reasons 1–5 use the column text.
+`the person turned execution off`, 20
+`running outside the sandbox is turned off`; reasons 1–5 use the column
+text. Capture reason 7 reads `output capture stopped after the shell exited`.
 Capture state text: `complete`, `incomplete: <capture reason>`,
 `unconfirmed: output may be partial`, `not started`, `interrupted`.
 
@@ -3908,7 +3961,7 @@ New journal worker reads, each bounded:
 | Read | Reply |
 | --- | --- |
 | `Jobs { scope, before, limit ≤ 9 }` | Entries newest first by kind 26 sequence, merged from live state, delta and runs, each with its kind 26, 27 and 28 records, the command source locator and the retention summary (pinned, deleted, note count) from `E`; at most 9 entries and 40 KiB |
-| `JobFacts { job }` | One job's records, command and cwd from its kind 14 or PCQ, and its `E` entries with their kind 30 frames (at most 64) |
+| `JobFacts { job }` | One job's records, command and cwd from its kind 14 or kind 31, and its `E` entries with their kind 30 frames (at most 64) |
 | `Settlements { conversation, after, through, limit ≤ 9 }` | `U` entries in the range, newest first, with their kind 28 and command source (J5) |
 
 A scope of all projects also checks each entry's project against the registry;
@@ -3966,10 +4019,10 @@ message JobEntry {
   optional JobOrigin origin = 4; optional bool outside_sandbox = 5;
   optional string command = 6;          // first line of the stored command, at most 192 bytes
   optional JobState state = 7;
-  optional uint32 block_reason = 8;     // J2 block reason 1-9 when QUEUED; pause reason when CAPTURE_PAUSED
+  optional uint32 block_reason = 8;     // J2 block reason 1-9 when QUEUED; pause reason 2 quota or 3 enospc when CAPTURE_PAUSED
   optional string reason_text = 9;      // the brief reason, for example "waiting: 2 of 2 jobs running for this agent"
   optional uint32 outcome = 10;         // kind 28 outcome 1-5, SETTLED only
-  optional uint32 reason = 11;          // job reason code 0-19
+  optional uint32 reason = 11;          // job reason code 0-20
   optional uint32 exit_kind = 12; optional uint32 exit_value = 13;
   optional uint64 stdout_bytes = 14; optional uint64 stderr_bytes = 15;
   optional uint64 stdout_lines = 16; optional uint64 stderr_lines = 17;   // SETTLED only
@@ -3980,8 +4033,10 @@ message JobEntry {
   optional uint64 sequence = 25;        // kind 26 frame sequence
   optional bool cancel_requested = 26;
   optional bytes input_id = 27;         // person-origin jobs (PCM)
+  optional uint32 left_running = 28;    // P3-C: `!!` survivors from kind 6 (live DRAINING after kind 2, or SETTLED)
+  optional bool shell_exited = 29;      // P3-C: `!!` job DRAINING after kind 2 reason 15 (OD2)
 }
-message JobInspect { optional bytes job_id = 1; optional bytes project_id = 2; }
+message JobInspect { optional bytes job_id = 1; optional bytes project_id = 2; }  // project_id: optional fence
 message JobDetail {
   optional JobEntry entry = 1;
   optional string command = 2;          // whole stored command, at most 8192 bytes
@@ -4004,6 +4059,7 @@ message JobObserve {
   optional bool at_end = 5;
   optional JobState after_state = 6;    // the state the client last saw
 }
+// JobRead and JobObserve project_id: optional fence; a mismatch is project_mismatch.
 message JobPage {
   optional JobEntry entry = 1;
   repeated JobStreamPage pages = 2;     // one, or two for at_end without a stream
@@ -4018,9 +4074,10 @@ message JobCancel {
   optional bytes expected_project_id = 3;
   optional bool kill = 4;               // person-origin jobs only
 }
+// JobCancel and JobRetain require expected_project_id.
 message JobCancelReply {
   optional bytes request_id = 1; optional JobEntry entry = 2;
-  optional bool requested = 3;          // false when the job had settled
+  optional bool requested = 3;          // false only when the entry is SETTLED
   optional string error = 4;
 }
 message JobRetain {
@@ -4044,8 +4101,26 @@ message JobRetainReply {
 Codec rules, applied before admission as for every `0.1` message: strict
 presence, sizes, enum ranges and direction. IDs are 16 bytes and not zero.
 `JobList` scope PROJECT needs `project_id`; CONVERSATION needs both IDs; ALL
-needs neither. `JobRead.limit` is 1–8,192. `JobObserve` without a stream needs
-`at_end`. `JobRetain.note` is present only with NOTE; DELETE needs `confirmed`.
+needs neither. `JobRead.limit` is 1–8,192. `JobRetain.note` is present only
+with NOTE; DELETE needs `confirmed`. Rules recorded 2026-10-22 from packet
+J34-W:
+
+- `JobCancel` and `JobRetain` require `expected_project_id`. `JobInspect`,
+  `JobRead` and `JobObserve` take `project_id` as an optional fence; when it is
+  present and differs from the job's project, the reply is `project_mismatch`.
+- `JobRead` needs `stream`, and needs `offset` unless `at_end` is set; with
+  `at_end`, `offset` is absent.
+- `JobObserve` with a `stream` needs `offset`. Without a `stream` it needs
+  `at_end` and no `offset`.
+- `JobEntry.block_reason` holds a J2 block reason 1–9 only in state QUEUED,
+  and a pause reason only in state CAPTURE_PAUSED: 2 `quota` or 3 `enospc`,
+  the kind 28 capture reason codes. Any other value is invalid.
+- `JobCancelReply.requested` is `false` only when `entry.state` is SETTLED.
+- `JobEntry` fields 28 and 29 appear only for an origin-person entry with
+  `outside_sandbox`; `shell_exited` only in state DRAINING.
+- A client that detects an invalid job mutation before sending reports
+  `outcome_unconfirmed`, as for every mutation whose outcome it does not
+  know; it never reports a local validation failure as a service refusal.
 `JobCancel.kill` is accepted only for a person-origin job (`kill_not_permitted`
 otherwise), because J2 sends `K` only for a person kill. Enum values equal the
 journal codes; the codec maps them explicitly. `outlived_job_ids` holds at most
@@ -4065,6 +4140,17 @@ Error tokens:
 | `unavailable` | Journal unavailable, or payload store unavailable |
 | `invalid_cursor` | `before` names no kind 26 sequence in scope |
 | `outcome_unconfirmed` | Client-side only, for a cancelled or lost mutation |
+
+Each reply accepts only its own error tokens; the codec rejects any other:
+
+| Reply | Error tokens |
+| --- | --- |
+| `JobListReply` | `not_found`, `busy`, `unavailable`, `invalid_cursor` |
+| `JobDetail`, `JobPage` | `not_found`, `project_mismatch`, `busy`, `unavailable` |
+| `JobCancelReply` | `not_found`, `project_mismatch`, `kill_not_permitted`, `unavailable` |
+| `JobRetainReply` | `not_found`, `project_mismatch`, `not_settled`, `notes_full`, `retention_full`, `note_invalid`, `unavailable` |
+
+`outcome_unconfirmed` is client-side only and never appears on the wire.
 
 A draining service answers job requests with the existing `Draining` error code.
 
@@ -4294,6 +4380,7 @@ project view, because they are not project records. The audit tool's
 | Page pool queue | 8, shared with model reads | `busy` |
 | `JobList` page | 1–8 entries, 40 KiB | `next_before` |
 | `JobRead`, `JobObserve` page | 8,192 bytes per stream; two streams with `at_end` | — |
+| `ConversationEvent` frame with J4 fields | Worst case 65,322 bytes with the 60,928-byte text window, 214 bytes under the 65,536-byte frame ([window bound](response-text-transfer.md#control-observation-windows)) | Codec refuses a larger window |
 | Notes | 16 per job, 2,048 bytes each | `notes_full`, `note_invalid` |
 | Retention records | 64 per job | `retention_full` |
 | `outlived_job_ids` | 8 per event | Count in `outlived_jobs` |
@@ -4478,7 +4565,7 @@ the notice at composition (J5-E2):
 - The writer's `Prepare` reply gains the notice inputs: S, the last committed
   frame sequence when the writer builds the reply; the up to 9 newest
   settlements in (P, S] from `Settlements`; each with its kind 26 and kind 28
-  records and its command source (kind 14 or PCQ); and the live count at S.
+  records and its command source (kind 14 or kind 31); and the live count at S.
 - The composer renders the block into the context block before the prompt. The
   input digest in kind 21 covers it.
 - Kind 21's composition block gains field `notice_through` (u64) = S.
@@ -4570,10 +4657,13 @@ Rules:
 - A model-origin entry starts `[A job you started has settled.]`. A person entry
   uses the [person notice](person-command-mode.md#person-notice-and-model-view)
   label; a `!!` entry adds `, outside the sandbox,` (PCR24).
-- `command` is the stored command: the kind 14 `command` value, or the kind PCQ
+- `command` is the stored command: the kind 14 `command` value, or the kind 31
   command or its display-only copy (PC14). At most 8,192 bytes (J5a).
 - `directory` is the stored cwd.
-- `result` uses the [outcome text](#model-result-text) for the job's origin.
+- `result` uses the [outcome text](#model-result-text) for the job's origin,
+  including survivors left running by a `!!` job.
+- A released `!!` job (OD2, [person command mode](person-command-mode.md#outside-survivors-and-lane-release))
+  has no entry until its kind 28; the live line counts it.
 - `output` gives lines and bytes per stream from kind 28. A capture state other
   than `complete` adds `; capture <state text>`.
 - `job` is the full handle.
@@ -4636,7 +4726,7 @@ composer revision increases with this change.
 | J5T-03 | `notice_through` replay | Decreasing value and a value at or above the own sequence give `Corrupt` | Restart replays turns with notices | — |
 | J5T-04 | Reconstruction | Same digest from the same records | CC-I7 with notices: digest unchanged after restart | — |
 | J5T-05 | Fidelity | Reduction oldest first; `context_limit` when even reduced does not fit | Small-window model gets reference lines | — |
-| J5T-06 | Person entries | `!` and `!!` labels, every result text | Fixture PCQ records until P2 | With the person packets |
+| J5T-06 | Person entries | `!` and `!!` labels, every result text | Fixture kind 31 records until P2 | With the person packets |
 | J5T-07 | No output and no payload state | Entry text holds neither | Raw-byte sweep of model input | — |
 
 Unit vectors (J5T-V): a fixed fixture journal and the exact expected bytes of
@@ -4799,5 +4889,18 @@ mapping through `Setting::for_config_key` (J2-E owns `config_worker.rs`), the
 `set jobs` setting name and the audit value spellings. TJ-Q6, TJ-F3, TJ-D3,
 TJ-Q7, TJ-S4, TJ-P3, TJ-Q8 and TJ-F4 are new; TJ-Q1 and TJ-P2 changed. Each
 was rendered with Mermaid CLI and inspected. No code or test was run.
+
+Recorded on 2026-10-22 (code packet findings and person readiness audit):
+J2-A's ownership of the guardian dispatch lines in the service tests and call
+sites (merged together as `f6e8cff`), reason 11 for `K` after a leader-exit
+stop and the `ExecCmdResult.reason` precedence; J2-B's `UnsettledJob`, the
+absent kind 27 to 28 reason-equality rule and the journal hold ending only on
+the writer's recheck; J2-C's single `payload_id` derivation and P2's
+`PayloadFact.operation` for person jobs; J34-W's request and reply rules, the
+pause reason code set and the 60,928-byte event window; reason 20 wired into
+kind 28, `JobEntry` and the J3 text; capture reason 7, kind 2 reasons 14 and
+15, `ShellExited` and `close_capture` for OD2; the duplicate audit sentence
+removed. TJ-S1 and TJ-S3 changed and were rendered with Mermaid CLI 12.0.0
+and inspected. No code or test was run.
 
 Return to the [design index](README.md).

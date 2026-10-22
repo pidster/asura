@@ -66,7 +66,7 @@ Dependencies:
   settlement order (R2), the 512 KiB transfer queue (R4) and text pages (R5).
 - [Retained results](result-retention-graph-packet.md#capture-contract):
   capture contract, descriptors and page contract.
-- [Person command mode](person-command-mode.md): kind PCQ, the PC3
+- [Person command mode](person-command-mode.md): kind 31, the PC3
   environment allow-list and PCR19.
 - [exec_cmd tool](exec-cmd-tool.md) and the platform exec_cmd owner
   (`rust/crates/asura-platform/src/exec_cmd.rs`): spawn, guardian and fixed
@@ -180,7 +180,7 @@ owner, and the platform spawn path.
 | Scanning of output chunks | The job slot's capture worker, before the payload adapter hashes and stages bytes | R4 assigns one capture worker per slot. The scan is the worker's first stage. |
 | Hashing, staging, descriptors and pages | Existing payload adapter (`asura-storage`), unchanged except that it accepts only redacted chunks | The adapter's append API takes a `secrets::Redacted` value that only the scanner constructs, so the type system rejects raw bytes. |
 | Model command rewrite and whole-command variable | Conversation owner, in tool validation before the intent append | The intent is the first record of a command. |
-| Person command rewrite and whole-command variable | Conversation owner, in submit validation; the [secret store](secret-store.md) item is written before the kind PCQ append | Kind PCQ is the first record of a person command. |
+| Person command rewrite and whole-command variable | Conversation owner, in submit validation; the [secret store](secret-store.md) item is written before the kind 31 append | Kind 31 is the first record of a person command. |
 | Secret variables through spawn | Platform exec_cmd owner and guardian | They own the environment and argument vector. |
 
 Rejected owners:
@@ -545,7 +545,7 @@ origin, so "propagated" below is a count.
 | Record | Added fields, in order |
 | --- | --- |
 | Job intent (kind 14 `ToolCall` for model exec_cmd) | Secret variables: at most 16 entries of kind, in number order (kind 14 field 16 entries 1 to k; k is derived from the stored command). Rule-set revision and digest (fields 18–19). No value or value digest. |
-| Kind PCQ | The same secret variable list (SL5) |
+| Kind 31 `PersonCommandQueued` | Fields 14–22, mirroring kind 14 fields 15–23: number count and kinds, unnumbered count, command flags (display cut, whole-command variable), rule-set revision and digest, and the fallback reason, kind and word ([kind 31](person-command-mode.md#kind-31-personcommandqueued), SL5) |
 | Descriptor, per stream | Redaction ran (always true for new captures); rule-set revision and digest; observed bytes (raw count); stored bytes; replacements; unnumbered replacements; per-kind counts, at most 48 entries; loss span count, withheld bytes and the first 64 spans; degraded flag |
 | Job settlement | Numbers by kind and origin (command, output, propagated) for the first 256 numbers; total distinct numbers |
 
@@ -575,7 +575,7 @@ reader that finds such a descriptor from a test build treats it as unverified.
 ## Command rewrite
 
 Required behavior (SD7 as extended by SO1, EX4). The rewrite runs once per command, before the
-first record that would hold it: the model's intent, or the person's kind PCQ.
+first record that would hold it: the model's intent, or the person's kind 31.
 The same function serves both origins.
 
 ### Steps
@@ -713,7 +713,7 @@ secret in the command line:
   a build defect; every command is refused.
 
 For these, model origin records the display-redacted intent with the refused
-decision, and person origin returns the reason before kind PCQ. Nothing is
+decision, and person origin returns the reason before kind 31. Nothing is
 spawned. The reason never contains a value.
 
 The kept refusals are checked before the rewrite, in this order: the rule set
@@ -734,7 +734,7 @@ returns any other refusal code, including `too_many_secrets` and
 1. The conversation owner holds the whole raw command as the value of one
    variable, `ASURA_SECRET_COMMAND`. No numbered variable is passed with it.
    Person origin writes it to the durable [secret store](secret-store.md)
-   before kind PCQ. Model origin holds it in memory, because a model call never
+   before kind 31. Model origin holds it in memory, because a model call never
    runs again after a restart (SO6).
 2. The executable command is the fixed text `eval "$ASURA_SECRET_COMMAND"`.
    The guardian preamble first moves the variable to an unexported shell
@@ -744,7 +744,7 @@ returns any other refusal code, including `too_many_secrets` and
 3. The record holds a display-redacted command: every detected value replaced
    by its numbered placeholder, under the ordinary numbering, with a
    whole-command flag. Model origin uses kind 14 fields 14 and 20–23
-   ([SL7](#sl7-model-whole-command-variable)); person origin uses kind PCQ.
+   ([SL7](#sl7-model-whole-command-variable)); person origin uses kind 31.
    The log, the job viewer, notices and model results show the display text
    and say that it is a filtered copy.
 4. The capture worker receives each detected value as a literal, so an echo of
@@ -820,7 +820,7 @@ sequenceDiagram
     else rewritten
         Rw-->>Own: rewritten command, names, values
         Own->>KS: values (person: Keychain item first)
-        Own->>J: call record or kind PCQ with rewritten command and names
+        Own->>J: call record or kind 31 with rewritten command and names
         Own->>Ctl: admit job, values
         Ctl->>Cap: literals and first free number
         Ctl->>Set: ExecCmdRequest with rewritten command, values
@@ -883,10 +883,13 @@ Exposure that remains:
 - A process the command starts can still receive the value through an
   argument, as the original command intended.
 
-Rejected for the guardian path: a dedicated descriptor carrying the values.
-It would keep them out of the guardian's environment, but `sh` still holds them
-in its own, so the exposure class does not change. It would add a descriptor
-protocol beyond the person design's FDs 11–17.
+Rejected for the guardian path: a dedicated descriptor carrying the secret
+values. It would keep them out of the guardian's environment, but `sh` still
+holds them in its own, so the exposure class does not change. The person
+profiles do use a descriptor, FD 11, for the non-secret child environment and
+the `!!` launch environment ([person environment descriptor](person-command-mode.md#platform-changes),
+2026-10-22), because those entries must not act on the guardian process. The
+secret values stay on this environment path.
 
 ## Tool call argument redaction
 
@@ -1001,22 +1004,26 @@ mechanism for each case:
 
 ### Queued person commands
 
-A person command is rewritten at submit, before kind PCQ. Its values must wait
+A person command is rewritten at submit, before kind 31. Its values must wait
 until dispatch, which can follow other queued work and a restart. The
 [secret store design](secret-store.md) is canonical for where they wait (SO6):
 
 - The values, any whole-command variable (SO5), and for a `!!` command the TUI
   launch environment ([outside environment](person-command-mode.md#outside-profile-environment))
-  are written to one Keychain item before kind PCQ.
-- The request digest of kind PCQ covers the rewritten or display-only command,
+  are written to one Keychain item before kind 31.
+- The request digest of kind 31 covers the rewritten or display-only command,
   never the raw one. An exact retry compares a keyed digest of the values
   stored in the item; different values under the same request ID conflict.
-- Dispatch reads the item and moves the values into the job admission.
-  Settlement, Drop and a rejected append delete the item.
-- After a restart the command is `Held` (MQ07R). Resume reads the item. Only a
-  missing or mismatched item gives `secrets_lost`; the TUI says "This
-  command's secrets are no longer in the Keychain. Drop it and enter it
-  again."
+- Dispatch reads the item and moves the values into the job admission. For a
+  whole-command input, dispatch re-plans the literals from the stored raw
+  command with the running rule set; a rule-set revision different from kind
+  31's holds the input with `secret_rules_changed`
+  ([secret store rule 4](secret-store.md#ordering-rules)). The conversation
+  owner deletes the item after settlement, Drop or a rejected append.
+- After a restart the command is `Held` (MQ07R). Resume makes no Keychain
+  call; dispatch reads the item. A missing or mismatched item gives
+  `secrets_lost`; the TUI says "This command's secrets are no longer in the
+  Keychain. Drop it and enter it again."
 
 ## Security
 
@@ -1112,7 +1119,7 @@ on any fixture secret's raw bytes.
 | SDI-07 | `printenv`, `env` and the shell's `set` after a rewritten command | `printenv` and `env` show no secret variable; `set` output shows the placeholder, not the value |
 | SDI-08 | Echo of a command secret on stdout and stderr | Both map to the variable's number |
 | SDI-09 | A second sandboxed model job runs `ps -E` and a `KERN_PROCARGS2` read against the first job's `sh` | Record the result. A readable value is a threat model finding, not a pass. |
-| SDI-10 | Restart while a job prints secrets; restart with a queued person command holding secrets | Unverified prefix holds redacted bytes only; the queued command is `Held`, and Resume runs it with its values from the scratch Keychain item (SO6) |
+| SDI-10 | Restart while a job prints secrets; restart with a queued person command holding secrets | Unverified prefix holds redacted bytes only; the queued command is `Held`; after Resume, dispatch runs it with its values from the scratch Keychain item (SO6) |
 | SDI-11 | Concurrent jobs at the slot limit, each printing secrets | Numbers are independent per job; memory per job within SDM-04 |
 
 ### End to end
@@ -1215,7 +1222,7 @@ flowchart TD
     SL3 --> SL7["SL7: whole-command variable for model exec_cmd (SO5)"]
     SL7 --> SL5
     SS1["SS1: Keychain secret store (SO6)"] --> SL5
-    J2 --> SL5["SL5 with person packets P2-P4: submit rewrite, Keychain items, resume"]
+    J2 --> SL5["SL5 with person packets P2 and P3-E: submit rewrite, Keychain items, dispatch read"]
     TA["Tool adoption design"] --> SL6["SL6: typed tool results filtered"]
 ```
 
@@ -1225,7 +1232,7 @@ flowchart TD
 | SL2 | `ExecCmdRequest` secret variables, environment construction, guardian validation and preamble, zeroization | SDU-13; SDI-06, SDI-07, SDI-09 |
 | SL3 | Inside J1: scanner on each capture worker before hashing; redaction fields in descriptors; loss markers; the model result tail from the redacted stream; model exec_cmd command rewrite and refusal before the intent | SDU-14; SDI-01–SDI-05, SDI-08, SDI-11; SDE-01 (exec_cmd result part), SDE-02, SDE-04; SDM-04 |
 | SL4 | With J3 and J4: counts in job results, notices, pages and the viewer | SDE-01 (`job read` part), SDE-05 |
-| SL5 | With person packets: submit rewrite, the whole-command variable for person origin, Keychain items with the `!!` launch environment through SS1, kind PCQ variable list and display-only text, resume after restart (SO6) | SDI-10; SDU-16 person part; SDE-03 |
+| SL5 | With person packets P2 and P3-E ([packet split](person-command-mode.md#packet-split)): submit rewrite, the whole-command variable for person origin, Keychain items with the `!!` launch environment through SS1, kind 31 fields 14–22 and display-only text, dispatch read and literal re-plan, resume after restart (SO6). The SS-I cases of the [secret store](secret-store.md#integration-sl5-and-p3-person-command-path) run here | SDI-10; SDU-16 person part; SDE-03; SS-I1 to SS-I11 |
 | SL7 | Before J2, independent of it: the [model whole-command variable](#sl7-model-whole-command-variable). Changes implemented SL3 behavior | SDU-16 model part, SDU-17; SDI-12; SDE-06 |
 | SL6 | With the tool adoption design: whole-buffer scanning of typed tool results before their records | Defined by that design |
 
@@ -1620,5 +1627,11 @@ Recorded at SL2 on 2026-10-15: the refinements, results and the SDI-09
 finding are in [SL2 implementation](#sl2-implementation). No dependency was
 added. After the owner selected guardian erasure, SD-Q1 gained the erasure
 step. SD-Q1 was re-rendered with Mermaid CLI 12.0.0 and inspected.
+
+Recorded on 2026-10-22: SL5 aligned with the person command readiness audit:
+kind 31 fields, dispatch-only item reads, the literal re-plan, the FD 11
+environment descriptor for non-secret entries and the SL5 packet mapping.
+SD-P1 changed and was rendered with Mermaid CLI 12.0.0 and inspected. No code
+or test was run.
 
 Return to the [design index](README.md).

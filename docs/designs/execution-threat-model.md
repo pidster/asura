@@ -368,7 +368,7 @@ Each must be designed before its code. None is selected by this document.
 | Provider credentials in Keychain, with the D1 credential review | EX14, EX8, EX7 | Remote providers |
 | Spend ceilings and cost confirmation | EX15 | Remote providers |
 | Note deletion and review mark | EX6 | Memory note changes |
-| Approval flow with digest re-check, build-path list and change detection | EX1, PX1 | Person command packet P4 |
+| Approval flow with digest re-check, build-path list and change detection. Designed 2026-10-22: [execution path guard](execution-path-guard.md) | EX1, PX1, OD3 | Person command packet P5; capability 8 waits for it (OD3) |
 
 ## Remaining items
 
@@ -433,7 +433,7 @@ flowchart TD
     Model["Model output in the log"] -->|"PT1: suggested command"| Person["Person types or pastes a command"]
     Person --> TUI["TUI command mode"]
     TUI -->|"command, cwd, PATH (PT7)"| Svc["Service: queue, person grant"]
-    Svc -->|"kind PCQ, job records without output"| Journal[("Journal")]
+    Svc -->|"kind 31, job records without output"| Journal[("Journal")]
     Box -->|"PT5: output, secrets replaced at capture"| Retained[("Retained job streams")]
     Svc -->|"spawn"| Box
     subgraph Box["sandbox-exec: person profile, no timeout (PT8)"]
@@ -516,7 +516,7 @@ are caught).
 
 | ID | Case |
 | --- | --- |
-| PX-V1 | Writes to `~/.zshrc`, `~/.ssh/config`, `~/.gitconfig` and `~/.asura` fail; writes to the project, `$TMPDIR` and an existing cache directory succeed |
+| PX-V1 | Writes to `~/.zshrc`, `~/.ssh/config`, `~/.gitconfig` and `~/.asura` fail; writes to the project, `$TMPDIR`, an existing cache directory and the job's own scratch directory (OD1) succeed |
 | PX-V2 | A model exec_cmd write to `.git/hooks/pre-commit`, a nested `.git/hooks/`, `.git/config` and `.envrc` fails; after person approval, the hook runs under `!git commit`; record what it can read, write and reach |
 | PX-V9 | The model edits `build.rs` and `package.json`; the next `!cargo build` shows the change warning naming both files; a second command without new model writes shows none |
 | PX-V11 | An approved hook changes after approval; the next person command warns again before it runs, and Asura does not rely on the changed file |
@@ -528,6 +528,9 @@ are caught).
 | PX-V12 | `!curl -H "Authorization: Bearer <fixture token>" …` runs with the token through one per-execution variable; the journal and viewer show only the variable name; a single-quoted variant also runs, through the whole-command variable, and no record holds the token (owner, 2026-10-20) |
 | PX-V7 | The TUI exits while a command runs: the command continues and a second TUI cancels it; with a TUI-launched backend, exit stops it and no process remains in the owned group |
 | PX-V8 | Audit records for person commands contain no command, PATH or output bytes |
+
+The [person command validation mapping](person-command-mode.md#threat-model-validation-mapping)
+names the test cases that prove each PX-V case (2026-10-22).
 
 ### Person command decisions
 
@@ -572,7 +575,12 @@ are caught).
    - Every exec_cmd profile explicitly denies reads, writes and connections under
      `~/.asura`, except the profile's own private scratch directory, which the
      guardian allows by its exact descriptor. The person profile needs this
-     because it reads the home directory and has network access.
+     because it reads the home directory and has network access. Owner
+     decision OD1 (2026-10-22) confirms the exception for the `!` profile: a
+     `!` command may write its own empty job scratch directory, so the EX5
+     marker attributes its escapees; HOME and `$TMPDIR` stay the person's, and
+     the directory is deleted when the job ends
+     ([person command mode](person-command-mode.md#owner-decisions-of-2026-10-22)).
    - Asura's state and control plane are reachable only through typed,
      authorized interfaces. The owner expects agent management tools later;
      they will be registry tools with their own grant, an agent principal and
@@ -638,7 +646,7 @@ The person types `!!` and a command. Asura runs it "like my terminal" (owner,
 - the exec_cmd tool function's spawn path, with no sandbox profile (owner,
   2026-10-20);
 - a person switch, `personCommands.allowOutsideSandbox`, default `true`;
-- audit, kind PCQ and the job intent mark it `outside_sandbox` true;
+- audit, kind 31 and the job intent mark it `outside_sandbox` true;
 - the model notice adds `, outside the sandbox,`.
 
 A `!` command keeps every approved rule, including the sandbox and PX3.
@@ -656,7 +664,7 @@ full authority. Labels name the threats below.
 flowchart TD
     Person["Person types !! and a command"] --> TUI["TUI outside mode: red box, !! marker, warning"]
     TUI -->|"command, cwd, launch environment (PT12)"| Svc["Service: switch check, queue, person grant"]
-    Svc -->|"kind PCQ and job records, no environment"| Journal[("Journal")]
+    Svc -->|"kind 31 and job records, no environment"| Journal[("Journal")]
     Svc -->|"spawn, no sandbox-exec"| Cmd["/bin/sh -c command and children"]
     Cmd -->|"output, secrets replaced at capture (EX4)"| Retained[("Retained job streams")]
     ModelWrites["Earlier model exec_cmd writes"] -.->|"PT2: hooks, build scripts"| Proj[("Project")]
@@ -732,9 +740,10 @@ submit until settlement or Drop. Model call values stay in memory.
 
 | ID | Threat | Mitigation | Accepted exposure |
 | --- | --- | --- | --- |
-| SS-T1 | A same-user process reads the item | Default ACL trusts only the creating binary; other readers get a prompt or, with user interaction off, a refusal. | Same-UID is one principal under D1; a process that can prompt the person may still persuade them. Accepted. |
+| SS-T1 | A same-user process reads the item | Default ACL trusts only the creating binary; other readers get a prompt or, with user interaction off, a refusal (-25293, probe SS-P2 (b), 2026-10-22). | Same-UID is one principal under D1; a process that can prompt the person may still persuade them. Accepted. |
 | SS-T2 | The keychain file is copied or backed up | The file is encrypted under the login password. Items never sync. | An attacker with the file and the login password reads the values. Accepted. |
-| SS-T3 | An item outlives its command | Delete after settlement or Drop; startup sweep of unreferenced items; one item per input. | A failed delete keeps the item until the next sweep. |
+| SS-T3 | An item outlives its command, or another process deletes it early | Delete after settlement or Drop; startup sweep of unreferenced items; one item per input. Probe SS-P2 (c), 2026-10-22: another same-UID binary deleted an Asura item without a prompt. | A failed delete keeps the item until the next sweep. An early deletion by another same-UID process is a denial of service: the command is held with `secrets_lost` and must be entered again. No value is disclosed. Accepted under D1. |
+| SS-T7 | An item call reaches the wrong keychain | Probe SS-P2 (d), 2026-10-22: an add against a missing keychain reference wrote to the login keychain. The worker pre-checks the target's status before every call and never calls an item function after a non-zero status ([target pre-check](secret-store.md#target-pre-check)). Tests follow the [testing rules](secret-store.md#testing-rules). | A test that deletes its scratch keychain while the worker runs could race; the rules forbid that order. Production does not delete its target. |
 | SS-T4 | An item is replayed into another command | Service and account attributes name the installation and input; the payload binding digest covers project, conversation, input and request digest. | None found. |
 | SS-T5 | A Keychain prompt blocks the service | User interaction is disabled for the service process; a would-be prompt fails. | None found. |
 | SS-T6 | A `!!` command reads the item | It runs as the person with no sandbox (EXD-1). | Accepted under EXD-1. |
@@ -767,7 +776,7 @@ did not involve a model or the TUI. EX-V4, EX-V6 and EX-V7 did not run.
 Recorded on 2026-10-15: this revision records the owner's review of EX1–EX16
 and approval of the person section. The trust boundary diagram was corrected:
 non-loopback endpoints are shown as refused, and the `~/.asura` denial is shown.
-The person command trust view was updated for capture filtering, kind PCQ and
+The person command trust view was updated for capture filtering, kind 31 and
 the PX3 denial. Both diagrams were re-rendered with Mermaid CLI 12.0.0 and
 inspected. No code or test was run for this revision.
 
@@ -787,5 +796,10 @@ model jobs. EX-V9 ran at the platform layer and through the real service with a
 scripted model; EX-V5's old result is kept as the EC-V-OLD regression. See the
 [escapee control evidence](escapee-control.md#implementation-evidence-2026-10-21).
 No diagram in this document changed.
+
+Recorded on 2026-10-22: OD1 recorded under PX3; the approval-flow follow-up
+now points to the execution path guard (P5); SS-T1 and SS-T3 updated and
+SS-T7 added from the SS1-K probe results; PX-V cases mapped to person command
+tests. No diagram changed. No code or test was run.
 
 Return to the [design index](README.md).

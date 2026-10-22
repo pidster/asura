@@ -90,7 +90,7 @@ owner is introduced.
 | Concern | Owner | Change |
 | --- | --- | --- |
 | Spawn, process group, wait/reap | exec_cmd guardian (`asura-platform`) | Unchanged |
-| Owned-group signalling (TERM then KILL) | Guardian | Unchanged; keeps the 500 ms (model/`!`) and 2 s (`!!`/person) grace |
+| Owned-group signalling (TERM then KILL) | Guardian | Unchanged; keeps the 500 ms grace for `model-1` and the 2 s grace (PC8) for both person profiles, `person-1` (`!`) and `person-outside-1` (`!!`) |
 | Descendant scan and attribution | Guardian | New: `sandbox_check` marker scan (sandboxed jobs); `KERN_PROCARGS2` env-marker plus ppid-chain walk (`!!`) |
 | Pipe-holder detection | Guardian | New: `proc_pidfdinfo`/`PROC_PIDFDPIPEINFO` handle match |
 | Freeze-then-kill of escapees | Guardian | New: `SIGSTOP` to a fixpoint, then `SIGKILL` |
@@ -154,7 +154,10 @@ filter returns "denied" for a non-existent path regardless of the profile
 
 - **Marker** = the job's private scratch directory (FD 9), which the guardian
   created and pinned (`cleanup.rs`), and which only this job's profile grants
-  for writing among job profiles.
+  for writing among job profiles. The `person-1` profile grants it too (owner
+  decision OD1, 2026-10-22, [person command mode](person-command-mode.md#owner-decisions-of-2026-10-22)):
+  a `!` command may write its own empty job scratch directory, while HOME and
+  `$TMPDIR` stay the person's. The directory is deleted when the job ends.
 - **Decoy** = the Asura home `tmp` directory (FD 10 path + `/tmp`), which exists,
   which every job profile denies (`(deny … (subpath asura))`, re-allowing only
   the job's own scratch), and which a broad daemon may write. The guardian
@@ -172,7 +175,8 @@ returns 0 for its descendants, as for every other process the person started.
 The guardian attributes `!!` descendants by two independent signals:
 
 1. **Owned process group** (existing): every in-group member, found with
-   `proc_listpids(PROC_PGRP_ONLY, leader_pgid)`, is a descendant.
+   `proc_listpids(PROC_PGRP_ONLY, leader_pgid)`, is a descendant. After the
+   shell exits, each live member is a survivor (PQ3).
 2. **Job-marker environment variable.** The guardian sets a per-job variable
    `ASURA_JOB_<jobhex>=1` in the `!!` child environment (added beside the EX4
    secret variables, before `exec`). The scan reads each candidate's arguments
@@ -191,6 +195,22 @@ their count as an escapee fact and leaves them running, as the person's terminal
 would. This is [EC-D1](#decisions-under-existing-owner-rules), decided under the
 existing owner rule for `!!` ("like my terminal", following Wisp; PC13, owner
 2026-10-19) and EXD-1. Model and `!` jobs still freeze-then-kill their escapees.
+
+A survivor may keep the capture pipes open after the shell exits. Owner
+decision OD2 (2026-10-22) makes the job handle it: the guardian reports the
+group settled without waiting for capture EOF, and the job controller keeps the
+job `Draining` and capturing until the survivor closes the pipes or the person
+cancels the job. The guardian marks this case with kind 2 reason 15 so the
+controller can advance the person's queue lane
+([`!!` survivors](person-command-mode.md#outside-survivors-and-lane-release)).
+For `person-outside-1` the guardian also does not stop the owned group when
+the shell exits (PQ3, decided on 2026-10-22 under existing owner rule PC13,
+"like my terminal"). A background process that stays in the shell's group,
+such as `nohup server &`, is a survivor like a detached one: counted in kind
+6, left running, and it keeps the job draining while it holds the output.
+Model and `!` jobs keep the J2b group stop at leader exit. A cancel of a `!!`
+job before its shell exits still sends TERM to the group, then KILL after the
+2 s grace.
 
 ### Pipe-holder detection and settlement
 
@@ -233,7 +253,7 @@ This phase runs **after** the existing owned-group TERM-then-KILL grace, which
 gives a cooperative in-group command its chance to exit cleanly on `SIGTERM`.
 Escapees have already left the group and the cooperative path, so they receive
 `SIGSTOP`/`SIGKILL` without a grace period. The owner-approved grace bounds
-(500 ms model/`!`, 2 s `!!`/person) are unchanged and are not applied to escapees.
+(500 ms for `model-1`, 2 s for `person-1` and `person-outside-1`) are unchanged and are not applied to escapees.
 
 **PID-reuse safety.** Between listing and signalling, a PID could be reused. The
 guardian pins each attributed descendant by `(pid, pbi_start_tvsec,
@@ -262,10 +282,12 @@ existing unverifiable-cleanup path does. The job controller surfaces
 closes the false-confirmation finding: while an escapee lives, the scan is
 non-zero, the gate fails, and cleanup is reported unconfirmed.
 
-For `!!` jobs the gate uses the owned group and the pipe EOF only; the env-marker
-scan reports and does not kill (EC-D1). A `!!` job therefore confirms cleanup of
-its owned group as the person's terminal would, and reports any env-marked
-survivors as an escapee fact, not as a cleanup failure.
+For `!!` jobs the gate needs only the leader reaped. The group is not
+stopped at shell exit and need not be empty (PQ3); its live members are
+survivors. The gate does not require capture EOF (OD2, 2026-10-22). The env-marker scan reports and does not kill (EC-D1), and it
+also checks whether a survivor holds a capture pipe. A `!!` job therefore
+confirms cleanup of its owned group as the person's terminal would, and
+reports env-marked survivors as an escapee fact, not as a cleanup failure.
 
 ### EC-F1: detection and termination flow
 
@@ -275,25 +297,29 @@ by an unverifiable result (`cleanup_unconfirmed`); no time limit ends it.
 
 ```mermaid
 flowchart TD
-    Start["Cancel trigger or leader exit"] --> Group["TERM then KILL owned group (existing grace)"]
+    Start["Cancel trigger or leader exit"] --> Kind{"!! and leader exit with no stop?"}
+    Kind -->|"Yes (PQ3)"| Env
+    Kind -->|No| Group["TERM then KILL owned group (existing grace)"]
     Group --> Reaped["Leader exited (unreaped fence), group empty?"]
     Reaped -->|No| Group
     Reaped -->|Yes| Scan{"Sandboxed job?"}
     Scan -->|"Yes (model / !)"| Mark["Scan UID PIDs: sandboxed + writes scratch + denies decoy"]
-    Scan -->|"No (!!)"| Env["Scan: owned group + ASURA_JOB env marker"]
+    Scan -->|"No (!! after a stop)"| Env["Reap leader; scan owned group + ASURA_JOB env marker"]
     Mark --> Set{"Attributed set empty?"}
-    Env --> EnvSet{"Env-marked survivors?"}
+    Env --> EnvSet{"Survivors: live group members or env-marked?"}
     Set -->|No| Freeze["SIGSTOP set to fixpoint (at most 1024 scans), then SIGKILL; re-verify start-time"]
     Freeze --> Verify{"Set reaches zero?"}
     Verify -->|Yes| EOF
     Verify -->|"No: uninterruptible / unverifiable"| Unconf["cleanup_unconfirmed: keep slot and scratch"]
     Set -->|Yes| EOF["Capture and status pipes at EOF?"]
-    EnvSet -->|"Yes (EC-D1)"| ReportOut["Record escapee count; leave running"]
-    EnvSet -->|No| EOF
-    ReportOut --> EOF
+    EnvSet -->|"Yes (EC-D1, PQ3)"| ReportOut["Record survivor count incl. live group members; leave running; note capture-pipe holders"]
+    EnvSet -->|No| OutSettled["owned_group_settled with lease reason; no EOF wait"]
+    ReportOut --> OutSettled2["Kind 6 count, kind 2 reason 14, or 15 when a survivor holds a pipe; no EOF wait (OD2)"]
     EOF -->|Yes| Settled["owned_group_settled + escapee facts"]
     EOF -->|No| Unconf
     Settled --> Done["Leader reaped last; job controller records cleanup_confirmed"]
+    OutSettled --> Drain["Job controller: Draining until capture EOF or cancel"]
+    OutSettled2 --> Drain
     Unconf --> Repair["Job controller: CleanupUnconfirmed, slot retained, no record until a late settlement"]
 ```
 
@@ -314,9 +340,11 @@ adds kind 5). This design adds:
 
 | Field | Value | Meaning |
 | --- | --- | --- |
-| Kind 6 | escapee_report | Emitted once during cleanup when the scan found descendants outside the owned group; `value` = count terminated (sandboxed) or env-marked found (`!!`), bounded to the scan limit |
-| Reason 12 | escapee_terminated | On a kind 2 settled notice: the gate passed only after escapees were terminated; exit `value`/`exit_kind` keep the leader's outcome |
+| Kind 6 | escapee_report | Emitted once during cleanup when the scan found descendants outside the owned group; `value` = count terminated (`model-1`, `person-1`) or env-marked survivors left running (`person-outside-1`), bounded to the scan limit |
+| Reason 12 | escapee_terminated | On a kind 2 settled notice: the gate passed only after escapees were terminated; exit `value`/`exit_kind` keep the leader's outcome. Not valid for `person-outside-1` |
 | Reason 13 | escapee_unterminated | On a kind 4 cleanup_unconfirmed notice: a descendant could not be verified gone |
+| Reason 14 | escapees_left_running | `person-outside-1` only (P1, 2026-10-22): on kind 2 after kind 6; survivors were left running and none holds a capture pipe |
+| Reason 15 | escapees_hold_output | `person-outside-1` only (P1, 2026-10-22): on kind 2 after kind 6; at least one survivor holds a capture pipe, so capture continues after the settled notice (OD2) |
 
 The notice budget is at most 5 notices and a 192-byte buffer. The guardian
 emits at most five: spawned, leader exit (kind 5, J2b), cleanup_unconfirmed
@@ -330,21 +358,26 @@ reasons 2 (`cancel`, lease byte `T`) and 11 (`kill`, lease byte `K`)
 bytes stay protocol faults that initiate cleanup and never prove absence of an
 effect.
 
-Order rules (2026-10-21). After kind 1, the guardian may send one kind 4 and
-then one kind 6; kind 6 is always the notice immediately before kind 2. The
-decoder treats each of these as a protocol fault: kind 6 with a zero value, a
-nonzero exit kind or the cleanup bit; a second kind 4 or kind 6; kind 2 with
-reason 12 without kind 6 before it; and kind 6 followed by anything but kind 2
-with reason 12. Kind 4 accepts reasons 9 and 13. Kind 2 accepts reasons 0–4 and
-12 today. J2 adds kind 5 and its order rules, and changes kind 2 to reasons 0,
-2, 4, 11 and 12; reason 10 is never assigned.
+Order rules (2026-10-21, amended 2026-10-22). After kind 1, the guardian may
+send one kind 4 and then one kind 6; kind 6 is always the notice immediately
+before kind 2. The decoder treats each of these as a protocol fault: kind 6
+with a zero value, a nonzero exit kind or the cleanup bit; a second kind 4 or
+kind 6; kind 2 with reason 12, 14 or 15 without kind 6 before it; and kind 6
+followed by anything but kind 2 with reason 12 (`model-1`, `person-1`) or
+reason 14 or 15 (`person-outside-1`). The decoder knows the job's profile
+token, so reason 12 for `person-outside-1` and reasons 14 and 15 for any other
+profile are protocol faults. Kind 4 accepts reasons 9 and 13. J2 changes kind
+2 to reasons 0, 2, 4, 11 and 12; P1 adds 14 and 15. Reason 10 is never
+assigned. The [J2 order rules](tool-job-controller.md#guardian-contract-additions)
+are the one list.
 
 ### What J2 consumes
 
 | Fact | Source | J2 use |
 | --- | --- | --- |
 | `cleanup_confirmed` true | Kind 2 settled with cleanup bit 1 (gate passed) | The job's settlement records confirmed cleanup; `CleanupUnconfirmed` state is not entered |
-| escapee count | Kind 6 value | Recorded in kind 28 field 8 (beside the J2c pause facts) and in the `job.settled` audit event; shown in the job summary as a count, never as process detail |
+| escapee count | Kind 6 value | Recorded in kind 28 field 8 (beside the J2c pause facts) and in the `job.settled` audit event; shown in the job summary as a count, never as process detail. Its meaning follows the profile, derived from the job's records: escapees killed for `model-1` and `person-1`, survivors left running for `person-outside-1` |
+| survivor holds output | Kind 2 reason 15 | The controller keeps the job `Draining` with capture running and emits `ShellExited`, which advances the person's lane (OD2) |
 | `cleanup_unconfirmed` reason 9 or 13 | Kind 4 | The job enters `CleanupUnconfirmed`, keeps its slot and scratch, and writes no settlement. A late kind 2 settles it with cleanup `late` and releases the slot; otherwise restart settles it `interrupted`. No owner repair state ([J2](tool-job-controller.md#cleanupunconfirmed-and-late-settlement)) |
 
 The [job lifecycle TJ-S1](tool-job-controller.md#tj-s1-job-lifecycle) is
@@ -359,11 +392,14 @@ state. A requested kill is not a confirmed termination.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> GroupStop: Cancel trigger or leader exit
+    [*] --> GroupStop: Cancel trigger, or leader exit (model and !)
+    [*] --> Scanning: !! leader exit with no stop (PQ3), group not signalled
     GroupStop --> Draining: Owned group signalled and empty, leader exited, not yet reaped
     Draining --> Scanning: Descendant scan (sandboxed) or env scan (!!)
     Scanning --> Draining: Attributed set non-empty → freeze-then-kill, rescan
-    Scanning --> GateCheck: Attributed set empty (or !! group empty)
+    Scanning --> GateCheck: Attributed set empty (sandboxed)
+    Scanning --> OutsideSettled: !! leader reaped, group and env survivors counted, not signalled
+    OutsideSettled --> [*]: owned_group_settled, reason 14 or 15, controller drains capture (OD2)
     GateCheck --> Settled: Pipes at EOF → owned_group_settled
     GateCheck --> Unconfirmed: Pipe held, or survivor unverifiable
     Scanning --> Unconfirmed: Survivor uninterruptible or scan unverifiable
@@ -424,7 +460,10 @@ start time, that the guardian sent `SIGKILL` to during cleanup. The guardian
 keeps at most `kern.maxprocperuid` identities; past that, the count stays at
 that limit. When the count is not zero, the guardian sends kind 6 immediately
 before the kind 2 settled notice, and the kind 2 reason is 12. A count of zero
-sends no kind 6, and the kind 2 reason stays the lease reason (0 or 4).
+sends no kind 6, and the kind 2 reason stays the lease reason (0 or 4). For
+`person-outside-1` (P1) the kind 6 value counts env-marked survivors found by
+the final scan, by PID and start time; they are not signalled, and kind 2 then
+carries reason 14 or 15.
 
 **Setup.** Before it spawns the command, the guardian derives the marker (FD 9
 path) and decoy (FD 10 path plus `/tmp`) and checks that the marker lies inside
@@ -466,7 +505,8 @@ Left to the person-command packets, which add the person guardian path:
 - the `!` profile (`person-1`): it reuses this sweep unchanged once the person
   guardian path exists (EC-E2);
 - the `!!` profile: the `ASURA_JOB_<jobhex>` variable, the `KERN_PROCARGS2` scan,
-  EC-D1 counting without signals, and its 2 s grace (EC-I9, EC-I10, EC-E4);
+  EC-D1 counting without signals, no group stop at shell exit (PQ3), kind 2 reasons 14 and 15, the gate without
+  an EOF wait (OD2), and its 2 s grace (EC-I9, EC-I10, EC-I12, EC-E4);
 - nothing for stop and kill: J2 delivers the lease bytes `T` and `K` and
   their kind 2 reasons 2 and 11 for every profile; reason 10 is not used.
 
@@ -482,6 +522,8 @@ Left to the person-command packets, which add the person guardian path:
 | Process exits between the PID listing and its `sandbox_check` | `sandbox_check` returns 1 for an absent or zombie PID (EC-V-GONE); the process is not attributed; this is not an error |
 | Freeze phase reaches 1024 scans | `SIGKILL` to the current attributed set, then unverifiable: kind 4 reason 13 once, paced sweeps continue |
 | `!!` escapee with scrubbed environment and new session | Not attributable; residual accepted under EXD-1; not a cleanup failure for the owned group |
+| `!!` survivor holds the capture pipes after the shell exits | Kind 6 count, kind 2 reason 15; the job stays `Draining` and keeps capturing until EOF or a person cancel (OD2); the survivor is never signalled |
+| `!!` survivor that is not attributable holds the pipes | Kind 2 with the lease reason; the job drains until EOF; the person can cancel it, which closes capture |
 | Scanner itself is killed (service/guardian death) | Existing lease-EOF path: the guardian on service death still signals the owned group; an already-escaped descendant is the documented residual, unchanged for the no-guardian case |
 | Service restart during cleanup | Unchanged: restart never reattaches to a process or signals a journaled PID; interrupted jobs stay listable; a restarted service cannot rediscover a prior job's escapees, because the marker depends on the live job's pinned scratch/decoy descriptors (recorded limit) |
 
@@ -567,7 +609,9 @@ states initial state, trigger and required result.
 | EC-I6 | Two concurrent jobs | Each job's scan attributes and kills only its own escapee, with the selected Asura `tmp` decoy; the other job's escapee keeps running until its own job settles (EC-V-ISO used each other's scratch as decoy) |
 | EC-I7 | Nested `sandbox-exec` attempt by the command | Refused by the OS; the command stays in the job profile; attribution still holds (EC-V-NEST) |
 | EC-I8 | Uninterruptible/undyable survivor (injected stuck state) | `cleanup_unconfirmed` reason 13; slot and scratch retained; a later rescan to zero records late settlement without asserting cleanliness |
-| EC-I9 | `!!` escapee that kept its environment | Found by the `ASURA_JOB` env-marker scan via `KERN_PROCARGS2`; counted in the kind 6 notice; not signalled; still running after settlement (EC-D1) |
+| EC-I9 | `!!` escapee that kept its environment and closed its output | Found by the `ASURA_JOB` env-marker scan via `KERN_PROCARGS2`; kind 6 count 1, then kind 2 reason 14; not signalled; still running after settlement (EC-D1) |
+| EC-I13 | `!!` shell starts an in-group `nohup` writer and exits (PQ3) | No signal to the group at shell exit; kind 6 counts the member; kind 2 reason 15; the writer keeps running; under `person-1` the same command's group is stopped at shell exit |
+| EC-I12 | `!!` escapee that kept its environment and keeps writing stdout after the shell exits (OD2) | Kind 6 count 1, then kind 2 reason 15 without waiting for EOF; the guardian exits; the survivor's later output is captured; it is never signalled |
 | EC-I10 | `!!` escapee with scrubbed environment and new session | Not attributable; recorded as the EXD-1 residual; the owned group still settles |
 | EC-I11 | Scan cost under load | A full UID scan completes within the 100 ms guardian poll with the host's process count (EC-V-TIME) |
 
@@ -578,7 +622,7 @@ states initial state, trigger and required result.
 | EC-E1 | Native-model exec_cmd job spawns a `setsid` escapee | The job settles with `cleanup_confirmed`; the escapee count shows in the job summary; the model sees no surviving effect after settlement |
 | EC-E2 | `!` person command spawns a `setsid` escapee | `/jobs` shows the job settled and cleaned; the escapee is gone |
 | EC-E3 (EX-V9) | `setsid`, double-fork and pipe-holding escapees under a job | Each is detected and terminated, settlement completes, and cleanup is never reported confirmed while one lives — the threat model's required EX-V9 outcome |
-| EC-E4 | `!!` command spawns a detached background process the person wants kept | The process keeps running after the job settles; the job summary shows the escapee count; the model notice and audit mark `outside_sandbox` (EC-D1) |
+| EC-E4 | `!!` command spawns a detached background process the person wants kept | The process keeps running after the job settles; the job summary shows `background processes left running`; the model notice and audit mark `outside_sandbox` (EC-D1). With output held open, the lane advances while the job drains (PC-E18) |
 
 Environments: macOS 27 development host (recorded build 26A428) with the native
 process harness, scratch Asura home and scratch project, the system model and a
@@ -659,9 +703,10 @@ mechanism inside the guardian's existing ownership and trust model.
   daemons return "allowed" for an arbitrary write path, giving 15 false positives
   in the probe. The decoy removes them.
 - **Freeze-then-kill of env-marked `!!` survivors.** Rejected by EC-D1: a `!!`
-  command works like the person's terminal, where a deliberately backgrounded
-  process (for example `!!brew services start …` or `!!nohup …`) outlives the
-  shell. Killing it would break that use. An env-scrubbed escapee would still be
+  command works like the person's terminal, where a deliberately detached
+  process (for example `!!brew services start …`, or a daemon that starts a
+  new session) outlives the shell. A `nohup` process that stays in the shell's
+  group survives too (PQ3, decided under PC13). Killing it would break that use. An env-scrubbed escapee would still be
   missed, so killing would not remove the residual either.
 - **Perpetual service-wide process sweep.** Rejected as a non-goal: the
   settlement gate catches an escapee before confirming cleanup, so a job's
@@ -682,7 +727,11 @@ detached background process running after the shell exits; Wisp does the same.
 The guardian records the count of env-marked survivors in the kind 6 notice and
 the job summary, and does not signal them. Model and `!` jobs still terminate
 their escapees with freeze-then-kill. The env-scrubbed `!!` escapee remains the
-stated residual.
+stated residual. Owner decision OD2 (2026-10-22) adds what happens when a
+survivor holds the job's output: the job keeps capturing it, the person's lane
+advances, and a person cancel stops capture without killing the survivor, which
+may then get EPIPE on its next write. The earlier reading that the job settles
+at once with output `incomplete` is withdrawn.
 
 **EC-D2. A failed or unverifiable escapee scan reports cleanup unconfirmed.**
 Decided under existing owner rule: never present an unknown outcome as success
@@ -747,5 +796,12 @@ Recorded on 2026-10-22: the notice budget, the reasons that J2 adds, the
 `CleanupUnconfirmed` consumption and the durable escapee count (kind 28) were
 aligned with the job controller's J2 design. EC-F1 changed and was rendered
 with Mermaid CLI 12.0.0 and inspected. No code or test was run.
+
+Recorded on 2026-10-22 (second revision): the person command readiness audit
+was resolved. OD1 makes the `!` job scratch writable, so the marker applies to
+`!`; the person grace is 2 s for both person profiles throughout; OD2 changes
+the `!!` gate and adds kind 2 reasons 14 and 15 and EC-I12. EC-F1 and the
+cleanup state view changed and were rendered with Mermaid CLI 12.0.0 and
+inspected. No code or test was run.
 
 Return to the [design index](README.md).

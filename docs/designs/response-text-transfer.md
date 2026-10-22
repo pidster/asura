@@ -9,7 +9,8 @@ It removes the three per-operation output totals. The
 contract. Wire protocol 0.1 and journal format 1 do not change.
 [Thinking level](thinking-level.md#model-channel-modelproto) extends each
 revision with an optional thinking part and each event with a thinking window
-that shares the 61,440-byte window budget.
+that shares the event window budget, 60,928 bytes since 2026-10-22
+([window bound](#event-window-bound-2026-10-22)).
 
 ## Owner decision and scope
 
@@ -73,8 +74,8 @@ flowchart TB
     Model -->|Validated revision| Response["Conversation response state"]
     Response -->|"Kind 24 segment, at most 61,440 B"| Journal[("Journal")]
     Response -->|"Kind 8 tail, at most 61,440 B"| Journal
-    Response -->|"Live window, at most 61,440 B"| Client["Control client assembly"]
-    Journal -->|"Terminal window, at most 61,440 B"| Client
+    Response -->|"Live window, at most 60,928 B"| Client["Control client assembly"]
+    Journal -->|"Terminal window, at most 60,928 B"| Client
     Client -->|Assembled text| TUI["TUI transcript"]
     Response -.->|"Pause credit while tail is at least 122,880 B"| Model
 ```
@@ -135,7 +136,8 @@ charges 64 bytes against the existing 16 MiB replay memory limit.
 bytes the client holds. `ConversationEvent` gains field 13, `text_offset`, and
 field 14, `text_bytes`. When `text` is present, the client truncates its copy to
 `text_offset` bytes and appends `text`; the response then has `text_bytes` bytes
-in total. `text` is at most 61,440 bytes and ends on a character boundary.
+in total. `text` is at most 60,928 bytes (`MAX_RESPONSE_WINDOW_BYTES`) and
+ends on a character boundary.
 
 - Live (kind 2): `text_offset` is the smaller of the held count and the lowest
   cut since the client's cursor. The service keeps the 16 most recent cuts. A
@@ -150,8 +152,25 @@ in total. `text` is at most 61,440 bytes and ends on a character boundary.
   observes again immediately while it holds fewer.
 
 The event frame proof (TCR-D26) stays valid: the window replaces the former
-whole-response text at the same 61,440-byte bound, and the two new fields add at
-most 22 bytes.
+whole-response text, and the two new fields add at most 22 bytes. The window
+bound is 60,928 bytes since 2026-10-22.
+
+#### Event window bound (2026-10-22)
+
+Selected (engineering), recorded from packet J34-W. With the J4 fields
+`outlived_jobs` and `outlived_job_ids` (8 IDs), the worst-case
+`ConversationEvent` measured by J34-W is 65,834 bytes at a 61,440-byte window:
+298 bytes over the 65,536-byte frame. `MAX_RESPONSE_WINDOW_BYTES`, the one
+shared budget for response and thinking window text, is lowered from 61,440
+to 60,928 bytes (119 × 512). The worst case becomes 65,322 bytes, 214 bytes
+under the frame. Both bounds need a 3-byte length prefix, so the cut removes
+exactly 512 bytes. 60,928 is the largest multiple of 512 that clears the
+298-byte excess; the 214-byte margin covers a varint growth of one byte per
+counter field without another change. Only the event window changes: model
+revisions (`MAX_REVISION_BYTES`), kind 24 and 25 segments and the kind 8
+terminal tail stay at 61,440 bytes, because they travel in other frames. A
+client assembles a response from more windows; no text is lost. RT-10 and
+TL-12 test the new worst case.
 
 ### Response revision and journaling sequence
 
@@ -187,7 +206,7 @@ sequenceDiagram
         end
     end
     C->>R: Observe with cursor and held bytes
-    R-->>C: Window of at most 61,440 B, text_offset, text_bytes
+    R-->>C: Window of at most 60,928 B, text_offset, text_bytes
     H->>M: Terminal with cumulative counts
     R->>W: Kind 24 segments until the tail fits 61,440 B
     R->>W: Kind 8 terminal with text offset and tail
@@ -244,9 +263,9 @@ characters before display.
 
 | Rule | Application |
 | --- | --- |
-| AE-01 | The reactor applies revisions, selects windows and submits journal commands without waiting. Window selection copies at most 61,440 bytes. |
+| AE-01 | The reactor applies revisions, selects windows and submits journal commands without waiting. Window selection copies at most 60,928 bytes. |
 | AE-02 | No new blocking call. Journal I/O stays in the writer thread. |
-| AE-03 | Model transfer at most 61,440 B; credit 65,536 B; journal segment and terminal tail at most 61,440 B; event window at most 61,440 B; output pauses at 122,880 unjournaled bytes, so at most 184,320 bytes wait for the journal; 16 recent cuts; journal capacity 8 MiB bounds a response's total size. |
+| AE-03 | Model transfer at most 61,440 B; credit 65,536 B; journal segment and terminal tail at most 61,440 B; event window at most 60,928 B; output pauses at 122,880 unjournaled bytes, so at most 184,320 bytes wait for the journal; 16 recent cuts; journal capacity 8 MiB bounds a response's total size. |
 | AE-04 | Pause ends when a segment commits; the turn ends on terminal, cancel, helper exit, protocol fault or shutdown. No time bound. |
 | AE-05 | Kind 24 and kind 8 are append-only; replay rebuilds the text. Restart preserves the journaled prefix. |
 | AE-06 | Shutdown cancels the helper; the terminal flush uses the same segment rule. |
@@ -265,7 +284,7 @@ characters before display.
 | RT-07 | Journal capacity ends the turn truthfully | Real writer refuses a kind 24 segment beyond capacity and still commits the cancel and terminal; the conversation owner maps the refusal to cancel cause 3 and one tail | — | — |
 | RT-08 | Restart keeps the journaled prefix | Writer restart terminal records `text offset` equal to the journaled length | — | — |
 | RT-09 | Replay rejects an invalid kind 24 or kind 8 offset | Offset above length, terminal operation, wrong generation, no-op record | — | — |
-| RT-10 | The maximum event frame stays within 64 KiB | Event with a 61,440-byte window, both new fields and nine tools encodes within the frame | — | — |
+| RT-10 | The maximum event frame stays within 64 KiB | Event with a 60,928-byte window, both new fields, the J4 outlived fields with 8 IDs and nine tools encodes within the frame at 65,322 bytes or less; a 60,929-byte window is refused | — | — |
 
 Live-model journeys could not force a response above 61,440 bytes under the
 2,048-token per-request cap that applied when this design was qualified (removed,
