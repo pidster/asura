@@ -256,8 +256,14 @@ fn config_persists_across_service_restart_and_rejects_without_mutation() {
             .unwrap()
             .value_yaml
             .as_deref(),
-        Some("audit:\n  enabled: true\n  keepFiles: 5\n  maxFileBytes: 10485760\n")
+        Some(
+            "audit:\n  enabled: true\n  keepFiles: 5\n  maxFileBytes: 10485760\n\
+             execution:\n  enabled: true\n  projects: {}\n"
+        )
     );
+    // The listing shows `execution` with its defaults, but the file is not
+    // created and holds `execution` only when set away from them
+    // (execution-setting.md, configuration).
     assert!(!scratch.0.join(".asura/config.yaml").exists());
     assert!(
         client
@@ -282,6 +288,7 @@ fn config_persists_across_service_restart_and_rejects_without_mutation() {
     );
     let path = scratch.0.join(".asura/config.yaml");
     let before = fs::read(&path).unwrap();
+    assert!(!String::from_utf8_lossy(&before).contains("execution"));
     assert_eq!(
         client
             .config("", None, &|| false)
@@ -289,7 +296,11 @@ fn config_persists_across_service_restart_and_rejects_without_mutation() {
             .value_yaml
             .unwrap()
             .as_bytes(),
-        before
+        [
+            before.as_slice(),
+            b"execution:\n  enabled: true\n  projects: {}\n"
+        ]
+        .concat()
     );
     assert_eq!(fs::read(&path).unwrap(), before);
     for (key, value) in [
