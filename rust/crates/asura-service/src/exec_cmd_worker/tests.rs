@@ -20,6 +20,7 @@ fn settled_process() -> Process {
         exit_code: Some(0),
         signal: None,
         reason: None,
+        setup_reason: 0,
         cleanup_confirmed: true,
         escapees: 0,
     })
@@ -184,6 +185,7 @@ fn settled_setup_failures_never_become_successful_command_results() {
         signal: None,
         reason: None,
         failure: None,
+        setup_reason: 0,
         cleanup_confirmed: true,
         escapees: 0,
     };
@@ -247,6 +249,7 @@ fn sl7_whole_command_result_says_filtered_beside_display() {
         exit_code: Some(3),
         signal: None,
         reason: None,
+        setup_reason: 0,
         cleanup_confirmed: true,
         escapees: 0,
     };
@@ -521,6 +524,57 @@ fn j2t_15_setup_recheck_mismatch_reports_identity_changed() {
     }
 }
 
+/// Scratch directories of exec_cmd jobs left in `home`.
+fn scratch_left(home: &Home) -> Vec<String> {
+    match std::fs::read_dir(home.path.join(".asura/tmp")) {
+        Ok(entries) => entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("exec-cmd-"))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// J2T-25 slot part (J2-A2): a guardian that exits before any notice. The
+/// unit test binary is not a guardian: run with the guardian argv it
+/// refuses the arguments and exits with no status byte, as a guardian with
+/// an unknown profile token does. The job settles `protocol_fault` with
+/// capture `not_started`; the platform releases the scratch token, so the
+/// scratch is deleted (`ScratchCleaned`) and the slot is released, and a
+/// second job then uses the same slot. The controller's kind 28 with the
+/// real guardian is J2-E's flow case.
+#[test]
+fn j2t_25_guardian_exit_before_any_notice_releases_scratch_and_slot() {
+    let home = Home::new(64 * MIB);
+    let mut worker = Worker::default();
+    for round in 0..2 {
+        worker
+            .start_job(home.start(asura_platform::random_id(), home.scope()))
+            .unwrap();
+        let mut events = poll_until_idle(&mut worker);
+        assert_eq!(
+            names(&events),
+            ["setup_failed", "capture_settled", "scratch_cleaned"],
+            "round {round}"
+        );
+        assert!(
+            matches!(events[0], SlotEvent::SetupFailed(JobReason::ProtocolFault)),
+            "round {round}"
+        );
+        assert_port_order(&events);
+        let outcome = capture_outcome(events.get_mut(1));
+        assert_eq!(outcome.state, CaptureState::NotStarted, "round {round}");
+        if let Some(capture) = outcome.capture.take() {
+            capture.abandon();
+        }
+        assert!(worker.idle(), "round {round}: slot released");
+        assert!(
+            scratch_left(&home).is_empty(),
+            "round {round}: scratch deleted"
+        );
+    }
+}
+
 /// TJ-S1 `Starting` → `Recording` (J2T-07 slot part): a stop before spawn
 /// sets the setup cancel flag; setup ends with no process and no reason of
 /// its own (the controller's first trigger is the reason), and capture
@@ -703,24 +757,21 @@ fn draining_short_reports_the_quota_trigger() {
 
 /// Guardian setup failures (kind 3) and setup stages map to the kind 28
 /// `not_started` reasons; a cancelled setup has no reason of its own.
+/// J2T-25 unit (J2-A2): kind 3 reasons 5, 6, 7 and 8 give job reasons 15,
+/// 14, 13 and 17; reason 9 and no reason give `setup_failed`.
 #[test]
 fn setup_failures_map_to_not_started_reasons() {
-    assert_eq!(
-        guardian_setup_reason(Some(ExecCmdError::Denied)),
-        JobReason::ProjectChanged
-    );
-    assert_eq!(
-        guardian_setup_reason(Some(ExecCmdError::Protocol)),
-        JobReason::ProtocolFault
-    );
-    assert_eq!(
-        guardian_setup_reason(Some(ExecCmdError::Unavailable)),
-        JobReason::SpawnFailed
-    );
-    assert_eq!(
-        guardian_setup_reason(Some(ExecCmdError::CleanupUnconfirmed)),
-        JobReason::SetupFailed
-    );
+    for (reason, job_reason, code) in [
+        (5, JobReason::SpawnFailed, 15),
+        (6, JobReason::SandboxUnavailable, 14),
+        (7, JobReason::ProjectChanged, 13),
+        (8, JobReason::ProtocolFault, 17),
+        (9, JobReason::SetupFailed, 18),
+        (0, JobReason::SetupFailed, 18),
+    ] {
+        assert_eq!(guardian_setup_reason(reason), job_reason, "reason {reason}");
+        assert_eq!(job_reason as u8, code, "reason {reason}");
+    }
     let home = Home::new(64 * MIB);
     let scope = home.scope();
     let failure = |error| Failure {
@@ -765,6 +816,7 @@ fn setup_failures_map_to_not_started_reasons() {
             exit_code: Some(3),
             signal: None,
             reason: None,
+            setup_reason: 0,
             cleanup_confirmed: true,
             escapees: 0,
         }),

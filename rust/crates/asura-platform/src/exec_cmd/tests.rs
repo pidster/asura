@@ -369,6 +369,7 @@ fn notice_fixture() -> (ExecCmdJob, std::os::fd::OwnedFd) {
             status: read,
             status_bytes: Vec::new(),
             status_eof: false,
+            status_received: false,
             notices: 0,
             spawned: false,
             last_kind: 0,
@@ -973,5 +974,163 @@ fn j2t_06_notice_order_faults() {
         assert_eq!(polled, Err(ExecCmdError::Protocol), "{label}");
         assert!(job.faulted() && !job.settled(), "{label}");
         assert!(job.result().is_none(), "{label}");
+    }
+}
+
+/// J2T-25 platform unit (J2-A2): the result carries the guardian's kind 3
+/// reason beside the folded failure, and 0 for any other terminal notice.
+#[test]
+fn j2t_25_result_carries_the_kind_3_reason() {
+    for (reason, failure) in [
+        (5, ExecCmdError::Unavailable),
+        (6, ExecCmdError::Unavailable),
+        (7, ExecCmdError::Denied),
+        (8, ExecCmdError::Protocol),
+        (9, ExecCmdError::CleanupUnconfirmed),
+    ] {
+        let (job, polled) = feed(&[notice(3, reason, 0, true, 0)]);
+        assert_eq!(polled, Ok(()), "reason {reason}");
+        let result = job.result().unwrap();
+        assert_eq!(result.setup_reason, reason);
+        assert_eq!(result.failure, Some(failure), "reason {reason}");
+    }
+    let (job, polled) = feed(&[
+        notice(1, 0, 0, false, 0),
+        notice(5, 0, 1, false, 0),
+        notice(2, 0, 1, true, 0),
+    ]);
+    assert_eq!(polled, Ok(()));
+    let result = job.result().unwrap();
+    assert_eq!((result.setup_reason, result.failure), (0, None));
+}
+
+/// A real scratch cleanup token in a private fixture home.
+fn scratch_token(f: &Fixture) -> ExecCmdCleanup {
+    let runtime = RuntimeDirectory::scratch(&f.0, true).unwrap();
+    let project = f.0.join("project");
+    fs::create_dir(&project).unwrap();
+    let project =
+        ProjectIdentity::open(project.to_str().unwrap(), &runtime.state_boundary()).unwrap();
+    match PreparedExecCmd::prepare(runtime, &project, request(), &AtomicBool::new(false)) {
+        Ok(mut prepared) => prepared.cleanup.take().unwrap(),
+        Err(e) => panic!("{:?}", e.reason),
+    }
+}
+
+/// J2T-25 platform unit (J2-A2): an unsettled job releases its scratch
+/// token only when the guardian was reaped, its status pipe reached EOF
+/// with no byte, and both capture pipes reached EOF. Each condition false
+/// keeps the token; a received status byte also ends `release_pending`.
+#[test]
+fn j2t_25_pre_notice_token_release_needs_every_condition() {
+    // Reaped, status EOF, no status byte, stdout EOF, stderr EOF.
+    let all = [true; 5];
+    let mut cases = vec![("all hold", all)];
+    for (i, label) in [
+        "guardian not reaped",
+        "status pipe open",
+        "a status byte arrived",
+        "stdout open",
+        "stderr open",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut conditions = all;
+        conditions[i] = false;
+        cases.push((label, conditions));
+    }
+    for (label, [reaped, status_eof, no_byte, out_eof, err_eof]) in cases {
+        let f = Fixture::new();
+        let (mut job, _status) = notice_fixture();
+        job.cleanup = Some(scratch_token(&f));
+        job.reaped = reaped;
+        job.status_eof = status_eof;
+        job.status_received = !no_byte;
+        job.out.eof = out_eof;
+        job.err.eof = err_eof;
+        job.fault = true;
+        assert!(!job.settled(), "{label}");
+        let released = label == "all hold";
+        assert_eq!(job.release_pending(), !released && no_byte, "{label}");
+        let token = job.take_cleanup();
+        assert_eq!(token.is_some(), released, "{label}");
+        assert_eq!(job.cleanup.is_some(), !released, "{label}: the token stays");
+        if let Some(mut token) = token {
+            let scratch = spawn::path(token.directory.as_raw_fd()).unwrap();
+            token
+                .run(
+                    Instant::now() + Duration::from_secs(2),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            assert!(!Path::new(&scratch).exists());
+            assert!(!job.release_pending());
+        }
+    }
+}
+
+/// Poll a faulted fixture job until its three pipes reach EOF; the poll
+/// errors are the expected protocol fault. Test limit only: 10 s.
+fn pump_faulted(job: &mut ExecCmdJob) {
+    let limit = Instant::now() + Duration::from_secs(10);
+    while !(job.status_eof && job.out.eof && job.err.eof) {
+        let _ = job.poll(Instant::now());
+        assert!(Instant::now() < limit, "fixture pipes did not reach EOF");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// J2T-25 platform unit through the pipes: status EOF with no byte is a
+/// protocol fault that releases the token once both capture pipes end; an
+/// open capture writer keeps it until that pipe ends; a partial notice or
+/// a kind 1 before EOF keeps it.
+#[test]
+fn j2t_25_pre_notice_token_release_through_the_pipes() {
+    // No byte, then EOF everywhere: released.
+    let f = Fixture::new();
+    let (mut job, status) = notice_fixture();
+    job.cleanup = Some(scratch_token(&f));
+    drop(status);
+    pump_faulted(&mut job);
+    assert!(job.faulted() && !job.spawned() && !job.settled());
+    assert!(job.take_cleanup().is_some(), "no notice, every pipe ended");
+
+    // A held capture writer keeps the token until its pipe ends.
+    let f = Fixture::new();
+    let (mut job, status) = notice_fixture();
+    let (out, out_write) = spawn::pipe(false).unwrap();
+    job.out = Capture::new(out, Stream::Stdout);
+    job.cleanup = Some(scratch_token(&f));
+    drop(status);
+    let limit = Instant::now() + Duration::from_secs(10);
+    while !(job.status_eof && job.err.eof) {
+        let _ = job.poll(Instant::now());
+        assert!(Instant::now() < limit, "fixture pipes did not reach EOF");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(job.faulted() && !job.out.eof);
+    assert!(job.release_pending());
+    assert!(job.take_cleanup().is_none(), "stdout is still open");
+    write_all(&out_write, b"late");
+    drop(out_write);
+    pump_faulted(&mut job);
+    assert!(job.take_cleanup().is_some(), "stdout ended");
+
+    // A partial notice or a kind 1: a status byte arrived; the token stays.
+    for (label, bytes) in [
+        ("partial notice", vec![b'A']),
+        ("kind 1", notice(1, 0, 0, false, 0).encode([7; 16]).to_vec()),
+    ] {
+        let f = Fixture::new();
+        let (mut job, status) = notice_fixture();
+        job.cleanup = Some(scratch_token(&f));
+        write_all(&status, &bytes);
+        drop(status);
+        pump_faulted(&mut job);
+        assert!(job.faulted() && !job.settled(), "{label}");
+        assert!(!job.release_pending(), "{label}");
+        assert!(job.take_cleanup().is_none(), "{label}");
+        assert!(job.cleanup.is_some(), "{label}: the token stays");
     }
 }

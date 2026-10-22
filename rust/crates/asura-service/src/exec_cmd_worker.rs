@@ -671,9 +671,13 @@ impl Slot {
     }
     /// A protocol fault or a lost guardian: the lease is closed and no
     /// later notice is trusted. After kind 1 the job is `CleanupUnconfirmed`
-    /// until restart; before it (for example an unknown profile token) no
-    /// command ran, and the scratch token stays with the faulted job.
-    fn lost(&mut self, mut job: ExecCmdJob) {
+    /// until restart. Before it (for example an unknown profile token) the
+    /// job settles `protocol_fault` with no process, and the slot keeps
+    /// polling while the platform may release the scratch token (J2-A2):
+    /// once the guardian is reaped with no notice and both capture pipes
+    /// ended, the scratch is deleted and the slot released. A status byte,
+    /// or a release that cannot happen, keeps token and slot until restart.
+    fn lost(&mut self, mut job: ExecCmdJob, now: Instant, wake: Option<&WakeSender>) {
         job.close_lease();
         if self.spawned_at.is_some() {
             if !self.unconfirmed {
@@ -683,7 +687,16 @@ impl Slot {
                 ));
             }
         } else {
-            self.no_process(JobReason::ProtocolFault);
+            if self.process != SlotProcess::None {
+                self.no_process(JobReason::ProtocolFault);
+            }
+            if let Some(token) = job.take_cleanup() {
+                return self.cleanup(token, now, wake);
+            }
+            if job.release_pending() {
+                self.phase = SlotPhase::Running(job);
+                return;
+            }
             self.scratch = Some(SlotEvent::ScratchRetained);
         }
         self.phase = SlotPhase::Held {
@@ -693,6 +706,12 @@ impl Slot {
     }
     fn running(&mut self, mut job: ExecCmdJob, now: Instant, wake: Option<&WakeSender>) {
         let faulted = job.poll(now).is_err() || job.faulted();
+        if self.process == SlotProcess::None {
+            // A fault before any notice already settled the job with no
+            // process: only the token release remains. A notice read late
+            // never adds events; it only keeps the token.
+            return self.lost(job, now, wake);
+        }
         if self.spawned_at.is_none() && job.spawned() {
             self.spawned_at = Some(now);
             self.events.push_back(SlotEvent::Spawned);
@@ -714,22 +733,22 @@ impl Slot {
             self.events.push_back(SlotEvent::CleanupUnconfirmed(reason));
         }
         if faulted {
-            return self.lost(job);
+            return self.lost(job, now, wake);
         }
         if !job.settled() {
             self.phase = SlotPhase::Running(job);
             return;
         }
         let Some(result) = job.result() else {
-            return self.lost(job);
+            return self.lost(job, now, wake);
         };
         if result.failure.is_some() {
             // Kind 3: the guardian could not start the command.
-            self.no_process(guardian_setup_reason(result.failure));
+            self.no_process(guardian_setup_reason(result.setup_reason));
         } else {
             // The platform admits kind 2 only with kind 5's exit facts.
             let Some(exit) = job.leader_exit().or_else(|| exit_of(&result)) else {
-                return self.lost(job);
+                return self.lost(job, now, wake);
             };
             self.process = SlotProcess::Settled;
             self.events.push_back(SlotEvent::ProcessSettled {
@@ -957,15 +976,17 @@ fn not_started_outcome(
     }
 }
 
-/// The kind 28 reason of a guardian setup failure (notice kind 3). The
-/// platform result folds reasons 5 `spawn_failed` and 6
-/// `sandbox_unavailable` into `Unavailable`; both report `spawn_failed`.
+/// The kind 28 reason of a guardian setup failure, from the notice kind 3
+/// reason in `ExecCmdResult::setup_reason` (J2-A2): 5 `spawn_failed`,
+/// 6 `sandbox_unavailable`, 7 `denied` as `project_changed`, 8
+/// `protocol_fault`; any other reason is `setup_failed`.
 #[cfg_attr(not(test), allow(dead_code))] // J2 job mode: no production caller until J3
-fn guardian_setup_reason(failure: Option<ExecCmdError>) -> JobReason {
-    match failure {
-        Some(ExecCmdError::Denied) => JobReason::ProjectChanged,
-        Some(ExecCmdError::Protocol) => JobReason::ProtocolFault,
-        Some(ExecCmdError::Unavailable | ExecCmdError::Io) => JobReason::SpawnFailed,
+fn guardian_setup_reason(setup_reason: u8) -> JobReason {
+    match setup_reason {
+        5 => JobReason::SpawnFailed,
+        6 => JobReason::SandboxUnavailable,
+        7 => JobReason::ProjectChanged,
+        8 => JobReason::ProtocolFault,
         _ => JobReason::SetupFailed,
     }
 }

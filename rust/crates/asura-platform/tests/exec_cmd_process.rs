@@ -564,9 +564,31 @@ fn j2t_05_lease_bytes(home: &Path) {
         0,
         "the guardian touched scratch"
     );
+    // J2T-25 (J2-A2): once the guardian is reaped and both capture pipes
+    // end with no notice, the platform releases the scratch token; the
+    // cleanup deletes the scratch.
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut token = loop {
+        if let Some(token) = job.take_cleanup() {
+            break token;
+        }
+        assert!(job.release_pending(), "the token can still be released");
+        assert!(Instant::now() < until, "pre-notice token not released");
+        asura_platform::poll(&job.interests(), Duration::from_millis(20)).unwrap();
+        assert_eq!(job.poll(Instant::now()), Err(ExecCmdError::Protocol));
+    };
+    assert!(!job.release_pending() && !job.settled() && job.result().is_none());
+    token
+        .run(
+            Instant::now() + Duration::from_secs(2),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(!scratch.exists(), "the released token deleted the scratch");
     drop(job);
-    fs::remove_dir(&scratch).unwrap();
-    println!("J2T-05: unknown profile token refused before any effect or notice");
+    println!(
+        "J2T-05/J2T-25: unknown profile token refused before any effect or notice; scratch released"
+    );
 
     let resistant = "trap '' TERM; printf '%s' $$ > j2-pid; while :; do sleep 0.05; done";
     // `T`: TERM is ignored, KILL follows the 500 ms grace; reason 2.

@@ -106,9 +106,14 @@ pub enum UnconfirmedReason {
 /// passed with no earlier `cleanup_unconfirmed` notice; a late settlement
 /// releases resources but never asserts that cleanup was clean.
 /// `escapees` counts the escapees the guardian terminated (notice kind 6).
+/// `setup_reason` is the guardian's kind 3 reason (5–9), or 0 when the
+/// terminal notice is not kind 3; `failure` folds reasons 5 and 6 into
+/// `Unavailable`, so a job maps reason 6 to `sandbox_unavailable` from here
+/// (tool-job-controller.md, J2-A2).
 #[derive(Clone, Debug)]
 pub struct ExecCmdResult {
     pub failure: Option<ExecCmdError>,
+    pub setup_reason: u8,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub reason: Option<StopReason>,
@@ -484,6 +489,7 @@ impl PreparedExecCmd {
             status: status_read,
             status_bytes: Vec::with_capacity(STATUS_BUFFER),
             status_eof: false,
+            status_received: false,
             notices: 0,
             spawned: false,
             last_kind: 0,
@@ -517,6 +523,9 @@ pub struct ExecCmdJob {
     status: OwnedFd,
     status_bytes: Vec<u8>,
     status_eof: bool,
+    /// Whether any status byte arrived; a notice that failed to decode
+    /// counts, so the pre-spawn token release never follows one.
+    status_received: bool,
     notices: u8,
     spawned: bool,
     /// Kind of the previous notice; 0 before the first.
@@ -635,6 +644,7 @@ impl ExecCmdJob {
             if n == 0 {
                 self.status_eof = true;
             } else if n > 0 {
+                self.status_received = true;
                 if self.status_bytes.len() + n as usize > STATUS_BUFFER {
                     return Err(ExecCmdError::Protocol);
                 }
@@ -756,6 +766,7 @@ impl ExecCmdJob {
             } else {
                 None
             },
+            setup_reason: if n.kind == 3 { n.reason } else { 0 },
             exit_code: (n.exit_kind == 1).then_some(n.value as i32),
             signal: (n.exit_kind == 2).then_some(n.value as i32),
             // The guardian's reason names the stop that acted. Reasons 1
@@ -775,12 +786,33 @@ impl ExecCmdJob {
             escapees: self.escapees,
         })
     }
+    /// The scratch cleanup token, once no process can hold the scratch:
+    /// after settlement, or when the guardian ended before any notice
+    /// ([`Self::ended_before_notice`]). Otherwise `None`, and the token stays.
     pub fn take_cleanup(&mut self) -> Option<ExecCmdCleanup> {
-        if self.settled() {
+        if self.settled() || self.ended_before_notice() {
             self.cleanup.take()
         } else {
             None
         }
+    }
+    /// Whether [`Self::take_cleanup`] may still release the token of a job
+    /// that has not settled: no status byte arrived and the guardian or a
+    /// capture pipe has not ended yet. False once a status byte arrived,
+    /// because the guardian may then have spawned the command.
+    pub fn release_pending(&self) -> bool {
+        self.cleanup.is_some() && !self.status_received && !self.ended_before_notice()
+    }
+    /// J2-A2 (tool-job-controller.md): the guardian was reaped, its status
+    /// pipe reached EOF with no byte, so no notice arrived, and both capture
+    /// pipes reached EOF. The guardian returns before `spawn::launch`
+    /// succeeds with at most kind 3; after the launch it always attempts
+    /// kind 1 and returns only from its settlement gate (pinned by the
+    /// guardian's `j2t_25_no_return_after_launch_without_a_notice`). So no
+    /// command was spawned, or its group is gone; an open capture pipe
+    /// means a process may still hold the scratch, and the token stays.
+    fn ended_before_notice(&self) -> bool {
+        self.reaped && self.status_eof && !self.status_received && self.out.eof && self.err.eof
     }
 }
 

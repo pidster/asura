@@ -1252,4 +1252,76 @@ mod tests {
             assert_eq!(leader_exit(code, status), None, "{code} {status}");
         }
     }
+    /// J2T-25 unit (J2-A2): pins the order the service's pre-spawn token
+    /// release rests on. Every return before `spawn::launch` succeeds sends
+    /// at most kind 3 and spawns nothing; after the launch the guardian
+    /// always attempts kind 1 and enters its stop loop, which returns only
+    /// from the settlement gate after the leader is reaped. A change that
+    /// returns after the launch without a notice fails here.
+    #[test]
+    fn j2t_25_no_return_after_launch_without_a_notice() {
+        // Comments removed, so prose neither satisfies nor breaks a check.
+        let code: String = include_str!("guardian.rs")
+            .lines()
+            .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code.find("\nfn guardian(").expect("fn guardian");
+        let body = &code[start..start + code[start..].find("\n}\n").expect("end")];
+        let at = |needle: &str, from: usize| {
+            from + body[from..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} after {from}"))
+        };
+        // `::exit(` and `::_exit(` name process exits, not `leader_exit(`.
+        let exits = [
+            "return",
+            "?",
+            "break",
+            "panic!",
+            ".unwrap()",
+            ".expect(",
+            "::exit(",
+            "::_exit(",
+        ];
+        let assert_no_exit = |label: &str, text: &str| {
+            for exit in exits {
+                assert!(!text.contains(exit), "{label}: {exit} in {text}");
+            }
+        };
+        assert_eq!(body.matches("spawn::launch(").count(), 1);
+        assert_eq!(body.matches("kind: 1,").count(), 1);
+        assert_eq!(body.matches("kind: 3,").count(), 1);
+        let launch = at("spawn::launch(", 0);
+        // The launch is the setup's last fallible step.
+        let matched = at("let (pid, mut table) = match setup {", launch);
+        assert_no_exit("after the launch in setup", &body[launch..matched]);
+        // The setup failure arm sends kind 3 only and spawns nothing.
+        let ok_arm = at("Ok(spawned) => spawned,", matched);
+        let err_arm = at("Err(error) => {", matched);
+        assert!(ok_arm < err_arm);
+        let arm_end = at("return Ok(());", err_arm);
+        let arm = &body[err_arm..arm_end];
+        assert!(arm.contains("kind: 3,"), "{arm}");
+        assert_eq!(arm.matches("notice(").count(), 1, "{arm}");
+        // From the match to the stop loop: kind 1 is attempted, no exit.
+        let tail = arm_end + "return Ok(());".len();
+        let loop_at = at("\n    loop {", tail);
+        let kind_1 = at("kind: 1,", tail);
+        assert!(kind_1 < loop_at);
+        assert_no_exit("between the launch and the stop loop", &body[tail..loop_at]);
+        // The stop loop returns once, from the settlement gate after the
+        // leader is reaped; its fallible notices are kinds 6 and 2 there.
+        let stop_loop = &body[loop_at..];
+        let gate = stop_loop.find("Gate::Settled =>").expect("settlement gate");
+        let reap = gate + stop_loop[gate..].find("waitpid(pid").expect("leader reap");
+        assert_eq!(stop_loop.matches("return").count(), 1);
+        assert!(stop_loop.find("return").unwrap() > reap);
+        for (index, _) in stop_loop.match_indices('?') {
+            assert!(index > reap, "fallible step before the gate: {index}");
+        }
+        for exit in ["panic!", ".unwrap()", ".expect(", "::exit(", "::_exit("] {
+            assert!(!stop_loop.contains(exit), "{exit} in the stop loop");
+        }
+    }
 }
