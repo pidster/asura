@@ -954,8 +954,10 @@ redacts it before the record, on the reactor, with the ready rule set
   no numbers, so it needs no number map and no per-call key.
 - **Typed placeholders stay.** Text that the person typed, including
   `$ASURA_SECRET_<n>` or `${ASURA_SECRET_<n>}`, is kept as typed. The
-  not-placeholder predicate keeps a placeholder from matching any rule, so the
-  scan never replaces one.
+  not-placeholder predicate keeps most rules from matching a placeholder, and
+  `note_redacted` also keeps any detected span that is exactly one placeholder
+  token, because SR-42, SR-46 and SR-47 have no predicate (found by J34-A,
+  2026-10-22; SDU-19 covers those three rules).
 - **Rationale.** A kind 30 record has no number table, and neither replay nor
   any reader checks that a numbered placeholder in a note was inserted by the
   redactor. TCR-D4 rewrites model-written placeholders in kind 14 because
