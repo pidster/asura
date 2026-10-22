@@ -9,6 +9,7 @@ mod context_observer;
 mod conversation;
 mod exec_cmd_worker;
 mod job_controller;
+mod job_text;
 mod payload_owner;
 pub mod secret_store;
 // Real service fixtures share the canonical process-wide writer owner.

@@ -2961,7 +2961,7 @@ impl Owner {
         // SL3, SL7: the exec_cmd command is rewritten, or planned for the
         // whole-command variable, before the record.
         let rewrite = match &parsed.arguments {
-            Ok(tools::Arguments::ExecCmd { command, cwd }) => {
+            Ok(tools::Arguments::ExecCmd { command, cwd, .. }) => {
                 Some(secrets::rewrite_exec_cmd_call(command, cwd))
             }
             _ => None,

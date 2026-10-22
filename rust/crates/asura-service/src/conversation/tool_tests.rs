@@ -1947,6 +1947,7 @@ fn tcr_u13_replay_exec_cmd_ids_equal_live_derivation() {
         arguments: tools::Arguments::ExecCmd {
             command: "printf ok".into(),
             cwd: ".".into(),
+            yield_seconds: tools::DEFAULT_YIELD_SECONDS as u32,
         },
     };
     tool.call = Some(call.clone());
