@@ -18,7 +18,8 @@ pub use arguments::{
 pub use rewrite::{
     MAX_REWRITTEN_COMMAND_BYTES, MAX_WHOLE_COMMAND_NUMBERS, Plan, Refusal, RefusalCode, Rewrite,
     SECRET_COMMAND_NAME, SecretCommand, SecretVariable, WHOLE_COMMAND, WHOLE_COMMAND_NOTICE,
-    WholeCommand, display_redacted, rewrite_command, rewrite_exec_cmd_call,
+    WholeCommand, display_redacted, note_redacted, rewrite_command, rewrite_exec_cmd_call,
+    rewrite_exec_cmd_call_with,
 };
 pub use rules::{RULE_SET_DIGEST, RULE_SET_REVISION, RuleSet, SelfCheckError};
 pub use stream::{
@@ -159,15 +160,36 @@ pub fn placeholder(number: u32) -> String {
     format!("$ASURA_SECRET_{number}")
 }
 
+/// The compiled rule set and its self-check result, compiled once.
+type RuleCell = OnceLock<Result<RuleSet, SelfCheckError>>;
+/// The process's one rule set cell.
+static RULES: RuleCell = OnceLock::new();
+
 /// The process's compiled rule set, or the self-check failure that makes
 /// every job start and command refuse with `secret_detection_unavailable`.
-/// Compiled once; later calls return the same result.
+/// Compiles on first use; later calls return the same result. A call while
+/// another thread compiles waits for that compile, so only worker threads
+/// and tests call it (the warm thread, the capture worker), never the
+/// reactor (secret-detection.md, rule set readiness, SD-S2).
 pub fn detection() -> Result<&'static RuleSet, SelfCheckError> {
-    static RULES: OnceLock<Result<RuleSet, SelfCheckError>> = OnceLock::new();
-    RULES
-        .get_or_init(RuleSet::compile)
-        .as_ref()
-        .map_err(Clone::clone)
+    detection_in(&RULES, RuleSet::compile)
+}
+fn detection_in(
+    cell: &RuleCell,
+    compile: impl FnOnce() -> Result<RuleSet, SelfCheckError>,
+) -> Result<&RuleSet, SelfCheckError> {
+    cell.get_or_init(compile).as_ref().map_err(Clone::clone)
+}
+
+/// The compiled rule set if it is ready, for reactor code. `None` means not
+/// ready: no thread has finished compiling it. It reads `OnceLock::get`
+/// only, so it never compiles and never blocks, also while another thread
+/// compiles. `Some(Err)` is a failed self-check, and callers fail closed.
+pub fn compiled() -> Option<Result<&'static RuleSet, SelfCheckError>> {
+    compiled_in(&RULES)
+}
+fn compiled_in(cell: &RuleCell) -> Option<Result<&RuleSet, SelfCheckError>> {
+    cell.get().map(|rules| rules.as_ref().map_err(Clone::clone))
 }
 
 #[cfg(test)]

@@ -269,15 +269,32 @@ pub const MAX_REWRITTEN_COMMAND_BYTES: usize = 8192;
 /// order: detection unavailable, a reserved placeholder in the command, then
 /// the whole-buffer scan of `cwd` (a detected span or withheld bytes refuse
 /// with `secret_in_cwd`). Then [`plan`]. The person path reuses it.
+/// It compiles the rule set on first use, so only worker threads and tests
+/// call it; reactor code calls [`rewrite_exec_cmd_call_with`].
 pub fn rewrite_exec_cmd_call(command: &str, cwd: &str) -> Result<Plan, Refusal> {
-    rewrite_exec_cmd_call_with(detection(), command, cwd)
+    exec_cmd_call_checked(detection(), command, cwd)
 }
-pub(crate) fn rewrite_exec_cmd_call_with(
+/// The call path over a self-check result: a failed self-check refuses with
+/// `secret_detection_unavailable` before any other check.
+pub(crate) fn exec_cmd_call_checked(
     rules: Result<&'static RuleSet, super::SelfCheckError>,
     command: &str,
     cwd: &str,
 ) -> Result<Plan, Refusal> {
-    let rules = rules.map_err(|_| refuse(RefusalCode::DetectionUnavailable, None, None))?;
+    match rules {
+        Ok(rules) => rewrite_exec_cmd_call_with(rules, command, cwd),
+        Err(_) => Err(refuse(RefusalCode::DetectionUnavailable, None, None)),
+    }
+}
+/// [`rewrite_exec_cmd_call`] with a ready rule set, for a reactor caller
+/// that read it from [`super::compiled`]. That caller refuses with
+/// `secret_detection_unavailable` itself for a failed self-check or a set
+/// that is not ready. This function never compiles.
+pub fn rewrite_exec_cmd_call_with(
+    rules: &'static RuleSet,
+    command: &str,
+    cwd: &str,
+) -> Result<Plan, Refusal> {
     if references_placeholder(command.as_bytes()) {
         return Err(refuse(RefusalCode::PlaceholderNotAvailable, None, None));
     }
@@ -370,6 +387,43 @@ fn whole_command(rules: &'static RuleSet, command: &str, reason: Refusal) -> Who
 /// display-redacted record of a refused command. Holds no value.
 pub fn display_redacted(rules: &'static RuleSet, command: &str) -> String {
     String::from_utf8_lossy(redact_whole(rules, command.as_bytes()).as_bytes()).into_owned()
+}
+
+/// A person note with each detected span replaced by the unnumbered
+/// placeholder `$ASURA_SECRET_0` (secret-detection.md, person note
+/// redaction). A whole-buffer scan, as in [`display_redacted`]. It assigns
+/// no numbers, so it needs no number map and no key. Placeholders the person
+/// typed, numbered or braced, stay as typed: the not-placeholder predicate
+/// keeps most rules from matching one, and a span that is exactly a
+/// placeholder token (a rule without that predicate, such as SR-42 after
+/// `htpasswd -b`) is kept as well. Withheld bytes (a line over 64 KiB,
+/// which the 2,048-byte note limit rules out) or a span that splits a
+/// character give `[withheld]`, so the result never holds a value.
+pub fn note_redacted(rules: &'static RuleSet, text: &str) -> String {
+    let bytes = text.as_bytes();
+    let (spans, withheld) = scan_spans(rules, bytes);
+    if withheld {
+        return super::WITHHELD_TEXT.to_owned();
+    }
+    let unnumbered = super::placeholder(0);
+    let mut out = Zeroizing::new(Vec::with_capacity(
+        bytes.len() + unnumbered.len() * spans.len(),
+    ));
+    let mut cursor = 0;
+    for span in &spans {
+        let range = span.start as usize..span.end as usize;
+        if is_placeholder_token(&bytes[range.clone()]) {
+            continue;
+        }
+        out.extend_from_slice(&bytes[cursor..range.start]);
+        out.extend_from_slice(unnumbered.as_bytes());
+        cursor = range.end;
+    }
+    out.extend_from_slice(&bytes[cursor..]);
+    match std::str::from_utf8(&out) {
+        Ok(redacted) => redacted.to_owned(),
+        Err(_) => super::WITHHELD_TEXT.to_owned(),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -483,6 +537,17 @@ fn within(span: &RawSpan, inserted: &[std::ops::Range<u64>]) -> bool {
 }
 
 /// `$ASURA_SECRET_<n>` or `${ASURA_SECRET_<n>}` anywhere in the command.
+/// Whether `value` is exactly one placeholder token, `$ASURA_SECRET_<n>` or
+/// `${ASURA_SECRET_<n>}`, with at least one digit.
+pub(crate) fn is_placeholder_token(value: &[u8]) -> bool {
+    let digits = if let Some(rest) = value.strip_prefix(b"${ASURA_SECRET_") {
+        rest.strip_suffix(b"}")
+    } else {
+        value.strip_prefix(b"$ASURA_SECRET_")
+    };
+    digits.is_some_and(|d| !d.is_empty() && d.iter().all(u8::is_ascii_digit))
+}
+
 fn references_placeholder(bytes: &[u8]) -> bool {
     const NAME: &[u8] = b"ASURA_SECRET_";
     (0..bytes.len()).any(|i| {

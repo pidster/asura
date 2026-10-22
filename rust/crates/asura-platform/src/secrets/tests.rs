@@ -1,4 +1,4 @@
-//! Unit tests SDU-01–SDU-12. Fixture secrets are assembled at run time so no
+//! Unit tests SDU-01–SDU-12, SDU-16, SDU-18 and SDU-19. Fixture secrets are assembled at run time so no
 //! token-shaped literal is committed.
 use super::rewrite::{Refusal, RefusalCode, WHOLE_COMMAND, display_redacted, rewrite};
 use super::rules::{Candidate, merge};
@@ -1400,7 +1400,7 @@ fn j1t_03_rewritten_command_length_limit() {
     };
     let fits = build(MAX_REWRITTEN_COMMAND_BYTES);
     assert!(fits.len() < MAX_REWRITTEN_COMMAND_BYTES);
-    let rewrite = rewrite_exec_cmd_call_with(Ok(rules()), &fits, ".")
+    let rewrite = rewrite_exec_cmd_call_with(rules(), &fits, ".")
         .unwrap()
         .rewritten()
         .unwrap();
@@ -1408,7 +1408,7 @@ fn j1t_03_rewritten_command_length_limit() {
     assert_eq!(rewrite.variables.len(), 1);
     let over = build(MAX_REWRITTEN_COMMAND_BYTES + 1);
     assert!(over.len() <= MAX_REWRITTEN_COMMAND_BYTES);
-    let plan = rewrite_exec_cmd_call_with(Ok(rules()), &over, ".").unwrap();
+    let plan = rewrite_exec_cmd_call_with(rules(), &over, ".").unwrap();
     assert_eq!(plan.command(), WHOLE_COMMAND);
     let whole = plan.whole_command().unwrap();
     assert_eq!(whole.reason.code, RefusalCode::RewrittenCommandTooLong);
@@ -1425,20 +1425,20 @@ fn j1t_03_rewritten_command_length_limit() {
 fn j1_cwd_secret_and_detection_unavailable_refuse() {
     use super::rewrite::rewrite_exec_cmd_call_with;
     let gh = github();
-    let refusal = rewrite_exec_cmd_call_with(Ok(rules()), "ls", &cat(&["dir/", &gh])).unwrap_err();
+    let refusal = rewrite_exec_cmd_call_with(rules(), "ls", &cat(&["dir/", &gh])).unwrap_err();
     assert_eq!(refusal.code, RefusalCode::SecretInCwd);
     assert_eq!(refusal.code.as_str(), "secret_in_cwd");
     assert!(!refusal.to_string().contains(&gh));
-    assert!(rewrite_exec_cmd_call_with(Ok(rules()), "ls", "src/bin").is_ok());
+    assert!(rewrite_exec_cmd_call_with(rules(), "ls", "src/bin").is_ok());
     let unavailable =
-        rewrite_exec_cmd_call_with(Err(super::SelfCheckError::Digest), "ls", ".").unwrap_err();
+        rewrite::exec_cmd_call_checked(Err(super::SelfCheckError::Digest), "ls", ".").unwrap_err();
     assert_eq!(unavailable.code, RefusalCode::DetectionUnavailable);
     // A command the rewrite cannot move still refuses for a cwd secret.
     let quoted = cat(&["echo '", &gh, "'"]);
-    let refusal = rewrite_exec_cmd_call_with(Ok(rules()), &quoted, &gh).unwrap_err();
+    let refusal = rewrite_exec_cmd_call_with(rules(), &quoted, &gh).unwrap_err();
     assert_eq!(refusal.code, RefusalCode::SecretInCwd);
     let placeholder = cat(&["echo '", &gh, "' $ASURA_SECRET_2"]);
-    let refusal = rewrite_exec_cmd_call_with(Ok(rules()), &placeholder, ".").unwrap_err();
+    let refusal = rewrite_exec_cmd_call_with(rules(), &placeholder, ".").unwrap_err();
     assert_eq!(refusal.code, RefusalCode::PlaceholderNotAvailable);
 }
 
@@ -1497,7 +1497,7 @@ fn sdu_16_whole_command_variable_for_every_unmovable_form() {
     let mut reasons = Vec::new();
     for form in &forms {
         let refusal = rewrite(rules(), form).err();
-        let plan = rewrite_exec_cmd_call_with(Ok(rules()), form, ".")
+        let plan = rewrite_exec_cmd_call_with(rules(), form, ".")
             .unwrap_or_else(|r| panic!("{form:?} refused: {r}"));
         assert_eq!(plan.command(), WHOLE_COMMAND, "{form:?}");
         let whole = plan.whole_command().unwrap();
@@ -1555,19 +1555,15 @@ fn sdu_16_whole_command_variable_for_every_unmovable_form() {
     // The kept refusals still refuse.
     let kept = [
         (
-            rewrite_exec_cmd_call_with(
-                Ok(rules()),
-                &cat(&["echo '", &gh, "' $ASURA_SECRET_1"]),
-                ".",
-            ),
+            rewrite_exec_cmd_call_with(rules(), &cat(&["echo '", &gh, "' $ASURA_SECRET_1"]), "."),
             PlaceholderNotAvailable,
         ),
         (
-            rewrite_exec_cmd_call_with(Ok(rules()), &cat(&["echo '", &gh, "'"]), &gh),
+            rewrite_exec_cmd_call_with(rules(), &cat(&["echo '", &gh, "'"]), &gh),
             SecretInCwd,
         ),
         (
-            rewrite_exec_cmd_call_with(
+            rewrite::exec_cmd_call_checked(
                 Err(SelfCheckError::Digest),
                 &cat(&["echo '", &gh, "'"]),
                 ".",
@@ -1580,6 +1576,156 @@ fn sdu_16_whole_command_variable_for_every_unmovable_form() {
         assert!(code.kept());
     }
     // An ordinary command is unchanged and runs as itself.
-    let plain = rewrite_exec_cmd_call_with(Ok(rules()), "ls -la", ".").unwrap();
+    let plain = rewrite_exec_cmd_call_with(rules(), "ls -la", ".").unwrap();
     assert_eq!(plain.command(), "ls -la");
+}
+
+/// SDU-18 (rule set readiness, SD-S2): `compiled()` is `None` before any
+/// compile and the same set after; a `compiled()` call while another thread
+/// compiles returns at once with `None` and never compiles itself. A private
+/// cell stands in for the process cell, which other tests in this process
+/// may already have filled; the gate holds the other thread's compile open.
+#[test]
+fn sdu_18_compiled_never_compiles_and_never_blocks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    let cell = RuleCell::new();
+    assert!(compiled_in(&cell).is_none());
+    let compiles = AtomicUsize::new(0);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (cell_ref, compiles_ref) = (&cell, &compiles);
+    let ready = std::thread::scope(|scope| {
+        let warmer = scope.spawn(move || {
+            detection_in(cell_ref, move || {
+                let compiles = compiles_ref;
+                compiles.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).expect("started");
+                release_rx.recv().expect("release");
+                RuleSet::compile()
+            })
+        });
+        started_rx.recv().expect("compile started");
+        // The other thread is inside the compile and waits for the gate:
+        // a blocking or compiling `compiled_in` would never return here.
+        for _ in 0..1000 {
+            assert!(compiled_in(&cell).is_none());
+        }
+        assert_eq!(compiles.load(Ordering::SeqCst), 1);
+        release_tx.send(()).expect("release");
+        warmer.join().expect("warmer").expect("self-check")
+    });
+    let after = compiled_in(&cell).expect("ready").expect("self-check");
+    assert!(std::ptr::eq(after, ready));
+    let again = detection_in(&cell, || unreachable!("compiled once")).expect("self-check");
+    assert!(std::ptr::eq(again, ready));
+    assert_eq!(compiles.load(Ordering::SeqCst), 1);
+    // A failed self-check reads as `Some(Err)`, never as not ready.
+    let failed = RuleCell::new();
+    assert!(detection_in(&failed, || Err(SelfCheckError::Digest)).is_err());
+    assert!(matches!(
+        compiled_in(&failed),
+        Some(Err(SelfCheckError::Digest))
+    ));
+    // The process accessors share one cell: after `detection()`,
+    // `compiled()` returns the same set.
+    let process = detection().expect("self-check");
+    let read = compiled().expect("ready").expect("self-check");
+    assert!(std::ptr::eq(process, read));
+}
+
+/// SDU-19 (person note redaction): each detected span becomes
+/// `$ASURA_SECRET_0`; equal secrets both become it; typed placeholders stay
+/// as typed; text without a secret is unchanged; no value is in the result.
+#[test]
+fn sdu_19_note_redaction_is_unnumbered_and_keeps_typed_placeholders() {
+    use super::rewrite::note_redacted;
+    let zero = placeholder(0);
+    // Every SDU-02 secret shape, one per line, as a note.
+    let mut shapes = 0;
+    for (line, expected) in rule_vectors() {
+        let spans = scan_spans(rules(), line.as_bytes()).0;
+        let out = note_redacted(rules(), &line);
+        if expected.is_empty() {
+            assert_eq!(out, line, "{line}");
+            continue;
+        }
+        shapes += 1;
+        let mut want = String::new();
+        let mut cursor = 0;
+        for span in &spans {
+            want.push_str(&line[cursor..span.start as usize]);
+            want.push_str(&zero);
+            cursor = span.end as usize;
+        }
+        want.push_str(&line[cursor..]);
+        assert_eq!(out, want, "{line}");
+        // No value is left: a rescan finds nothing but the placeholders
+        // (rules without the not-placeholder predicate match those).
+        for value in values(&out) {
+            assert_eq!(value, zero, "{line} -> {out}");
+        }
+        for n in 1..=16u32 {
+            assert!(!out.contains(&placeholder(n)), "{out}");
+        }
+    }
+    assert!(shapes >= 40, "{shapes}");
+    // The multi-line SDU-02 text: six secrets, one key block.
+    let gh = github();
+    let text = [
+        cat(&["token: ", &gh]),
+        cat(&["aws_access_key_id = ", &aws()]),
+        cat(&["STRIPE=", &stripe()]),
+        cat(&["let key = \"", &anthropic(), "\""]),
+        cat(&[
+            "postgres://app:",
+            "hunter2",
+            "-prod",
+            "@db.internal:5432/app",
+        ]),
+        begin("RSA "),
+        "MIIEowIBAAKCAQEA".to_string(),
+        end("RSA "),
+    ]
+    .join("\n");
+    let out = note_redacted(rules(), &text);
+    assert_eq!(out.matches(&zero).count(), 6, "{out}");
+    for value in values(&text) {
+        assert!(!out.contains(&value), "{out}");
+    }
+    assert!(out.ends_with(&cat(&["\n", &zero])), "{out}");
+    // Two equal secrets: both unnumbered, no number shared or assigned.
+    let twice = cat(&["first ", &gh, " then ", &gh]);
+    assert_eq!(
+        note_redacted(rules(), &twice),
+        cat(&["first ", &zero, " then ", &zero])
+    );
+    // Typed placeholders stay as typed, also where a rule's value would sit.
+    for typed in [
+        "see $ASURA_SECRET_3 in the output",
+        "token: ${ASURA_SECRET_12}",
+        "export GITHUB_TOKEN=$ASURA_SECRET_3",
+        "password=\"${ASURA_SECRET_12}\"",
+        "postgres://app:$ASURA_SECRET_3@db.internal:5432/app",
+        // Rules without the not-placeholder predicate: SR-42, SR-46, SR-47.
+        "htpasswd -b /etc/htpasswd admin $ASURA_SECRET_3",
+        "htpasswd -b /etc/htpasswd admin \"${ASURA_SECRET_12}\"",
+        "machine h login u password $ASURA_SECRET_3",
+        "WIFI:S:home;T:WPA;P:${ASURA_SECRET_12};;",
+    ] {
+        assert_eq!(note_redacted(rules(), typed), typed);
+    }
+    let mixed = cat(&["$ASURA_SECRET_3 came from ", &gh, " and ${ASURA_SECRET_12}"]);
+    assert_eq!(
+        note_redacted(rules(), &mixed),
+        cat(&[
+            "$ASURA_SECRET_3 came from ",
+            &zero,
+            " and ${ASURA_SECRET_12}"
+        ])
+    );
+    // A note with no secret is unchanged.
+    let plain = "kept for the release notes; rerun after the fix";
+    assert_eq!(note_redacted(rules(), plain), plain);
+    assert_eq!(note_redacted(rules(), ""), "");
 }
