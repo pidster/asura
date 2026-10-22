@@ -7,7 +7,12 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const LIMIT: usize = 16 * 1024;
+/// The whole-file bound of a private configuration file: 64 KiB
+/// (execution-setting.md, configuration; ES-E6). It holds the largest
+/// `execution.projects` mapping of 1,024 overrides beside the other keys.
+/// A read past it, or a replacement larger than it, is `TooLarge`.
+pub const CONFIG_FILE_LIMIT: usize = 64 * 1024;
+const LIMIT: usize = CONFIG_FILE_LIMIT;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateFileError {
     UnsafeOrIo,
@@ -267,8 +272,13 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let absent = read().unwrap();
         absent.replace(b"model: temporary", &cancel).unwrap();
+        // ES-02: the bound is 64 KiB. A file of exactly the bound reads;
+        // one byte more is `TooLarge`.
+        assert_eq!(LIMIT, 65_536);
+        std::fs::write(&path, vec![b'x'; LIMIT]).unwrap();
+        assert_eq!(read().unwrap().bytes.len(), LIMIT);
         std::fs::write(&path, vec![b'x'; LIMIT + 1]).unwrap();
-        assert!(read().is_err());
+        assert_eq!(read().err(), Some(PrivateFileError::TooLarge));
         std::fs::remove_file(&path).unwrap();
         // A new file appearing after the absent snapshot must not be overwritten.
         read()
@@ -278,7 +288,15 @@ mod tests {
         assert!(absent.replace(b"model: lost", &cancel).is_err());
         std::fs::remove_file(&path).unwrap();
         let absent = read().unwrap();
-        assert!(absent.replace(&vec![b'x'; LIMIT + 1], &cancel).is_err());
+        assert_eq!(
+            absent.replace(&vec![b'x'; LIMIT + 1], &cancel),
+            Err(PrivateFileError::TooLarge)
+        );
+        assert!(!path.exists());
+        absent.replace(&vec![b'x'; LIMIT], &cancel).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), LIMIT as u64);
+        std::fs::remove_file(&path).unwrap();
+        let absent = read().unwrap();
         cancel.store(true, Ordering::Release);
         assert!(absent.replace(b"model: cancelled", &cancel).is_err());
         assert!(!path.exists());

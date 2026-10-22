@@ -2418,4 +2418,98 @@ mod tests {
         let cancelled = AtomicBool::new(true);
         assert!(execution_setting(runtime.clone(), &cancelled).is_err());
     }
+    /// ES-02 file bound (execution-setting.md, configuration; ES-E6): 1,024
+    /// leaf sets persist and read back under the 64 KiB file bound, and a
+    /// write that would pass the bound gives `config_too_large` and changes
+    /// nothing.
+    #[test]
+    fn es_02_file_bound_holds_1024_overrides_and_refuses_a_larger_file() {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Scratch(
+            format!(
+                "/private/tmp/asura-bound-{:x}",
+                u128::from_ne_bytes(asura_platform::random_id())
+            )
+            .into(),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root.0)
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
+        let cancel = AtomicBool::new(false);
+        let file = root.0.join(".asura/config.yaml");
+        assert_eq!(asura_platform::CONFIG_FILE_LIMIT, 65_536);
+        // 1,024 leaf sets, alternating on and off, each a whole-file write.
+        for index in 1..=EXECUTION_MAX_PROJECTS {
+            let value = if index % 2 == 0 { "on" } else { "off" };
+            execute(
+                runtime.clone(),
+                &format!("execution.projects.{index:032x}"),
+                Some(value),
+                &cancel,
+            )
+            .unwrap();
+        }
+        let size = std::fs::metadata(&file).unwrap().len();
+        assert!(
+            size > 16 * 1024 && size <= asura_platform::CONFIG_FILE_LIMIT as u64,
+            "{size}"
+        );
+        let setting = execution_setting(runtime.clone(), &cancel).unwrap();
+        assert_eq!(setting.projects.len(), EXECUTION_MAX_PROJECTS);
+        for index in 1..=EXECUTION_MAX_PROJECTS {
+            let mut project = [0u8; 16];
+            project.copy_from_slice(&(index as u128).to_be_bytes());
+            assert_eq!(setting.projects.get(&project), Some(&(index % 2 == 0)));
+        }
+        // Fill the file close to the bound with 64 MLX models of long
+        // names, then grow it past the bound with a long `model` value.
+        let base = std::fs::read_to_string(&file).unwrap();
+        let config = |length: usize, model: &str| {
+            let mut text = format!("model: {model}\n{base}");
+            text.push_str("providers:\n  mlx:\n    models:\n");
+            for index in 0..MAPPING_ENTRIES {
+                let name = format!("{index:02}{}", "m".repeat(length - 2));
+                text.push_str(&format!(
+                    "      {name}: {{capabilities: [toolCalling, guidedGeneration, reasoning, vision]}}\n"
+                ));
+            }
+            text
+        };
+        let size = |text: String| yaml(&Config::read(text.as_bytes()).unwrap()).unwrap().len();
+        let long = "x".repeat(1024);
+        let limit = asura_platform::CONFIG_FILE_LIMIT;
+        let length = (3..=256)
+            .find(|length| {
+                size(config(*length, "small")) <= limit && size(config(*length, &long)) > limit
+            })
+            .unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).truncate(true).mode(0o600);
+        std::io::Write::write_all(
+            &mut options.open(&file).unwrap(),
+            config(length, "seed").as_bytes(),
+        )
+        .unwrap();
+        // A set within the bound succeeds; one past it changes nothing.
+        execute(runtime.clone(), "model", Some("small"), &cancel).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        assert!(before.len() <= limit);
+        assert_eq!(
+            execute(runtime.clone(), "model", Some(&long), &cancel).err(),
+            Some("config_too_large")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert_eq!(
+            execution_setting(runtime, &cancel).unwrap().projects.len(),
+            EXECUTION_MAX_PROJECTS
+        );
+    }
 }
