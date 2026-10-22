@@ -12,9 +12,11 @@ Implementation state, 2026-10-22: packet J34-G is merged on `main` (`09eaa67`,
 `2bc01d8`). It delivers the keys, the leaf form, their `Setting` entries, the
 `execution.changed` event type and job reasons 19 and 20 in the audit enum.
 Reason 19 in the journal codec is implemented by J34-S on the J3 integration
-branch, not merged. The service behavior, the 64 KiB configuration file bound
-and the TUI are not implemented; they land with the J3 integration branch
-([code packets](#code-packets)).
+branch, not merged. On the same branch J34-K implements the controller's
+revocation scope and the check at slot grant, J3-R the refusal reason and
+J4-T the TUI. The owner's state, revocation wiring and audit emission and the
+64 KiB configuration file bound are not implemented; they land with J34-E on
+the J3 integration branch ([code packets](#code-packets)).
 
 ## Owner decision
 
@@ -219,8 +221,13 @@ It repeats no model text (TCR-D12).
 The job controller checks the effective value once more when it grants a slot to
 a model-origin queue head. This check cannot fail in a correct implementation,
 because a change revokes queued model jobs in the same reactor step (below). If
-it does fail, the controller settles the job `not_started` with reason
-`execution_off` and records the inconsistency in the `job.settled` audit event.
+it does fail, the controller settles the job `not_started` with kind 27
+(requester service) and kind 28, reason `execution_off`, and logs the warning
+`job_execution_off_at_grant`. Selected (engineering, 2026-10-22, from the
+J34-K report): no audit field records the inconsistency. The failure is a
+defect signal, which the log line carries; the settlement is audited as any
+revocation is, and a field would be a constant in every correct run
+([controller views and waits](tool-job-controller.md#controller-views-waits-and-stored-bytes)).
 
 ### Revocation on change
 
@@ -238,7 +245,7 @@ The controller applies the J2 revocation rule to model-origin jobs only:
 
 | Job state | Effect | Records |
 | --- | --- | --- |
-| Queued | Entry removed | Kind 27 (requester service) and kind 28 `not_started`, reason `execution_off` |
+| Queued | Entry removed | Kind 27 (requester service) and kind 28 `not_started`, reason `execution_off`. When the job's kind 26 is still in the outbox or held at the quota, it commits first; the start is never withdrawn while the journal is available ([TJ-S1](tool-job-controller.md#tj-s1-job-lifecycle)) |
 | Starting | Setup cancel flag | Kind 27, then kind 28 `not_started`, or `cancelled` if it spawned |
 | Running, `CapturePaused`, `Stopping`, `Draining` | `T` on the lease if none was sent | Kind 27 if none exists; kind 28 with reason `execution_off` unless an earlier trigger set the reason |
 | `CleanupUnconfirmed` | Kind 27 if none exists | Settles later, as J2 describes |
@@ -318,6 +325,24 @@ the existing configuration worker. It needs no new control message.
 After a set that turns the selected project off, the reply line reads
 `execution off for <project name>: running model jobs in this project are being stopped · /jobs`.
 The TUI does not count the jobs itself; `/jobs` shows them settle.
+
+Reply texts for the other sets (selected, engineering; recorded 2026-10-22 as
+packet J4-T implemented them in `asura-cli/src/tui/ui/execution.rs`):
+
+| Command | Reply line after the value is persisted |
+| --- | --- |
+| `/execution on` | `execution: on (default) · projects without an override run model commands` |
+| `/execution off` | `execution: off (default) · model jobs in projects without an override are being stopped · /jobs` |
+| `/execution project on` | `execution on for <project name> (project override)` |
+| `/execution project inherit` | `execution for <project name> follows the default` |
+
+A usage error shows
+`Use /execution, /execution on|off or /execution project on|off|inherit; draft retained`.
+A lost or cancelled reply shows
+`Execution setting outcome unconfirmed; read it again with /execution`.
+`/execution` is dispatched from the separate `JOB_COMMANDS` list until J34-E
+adds its row to `docs/user/commands.md` and merges the list
+([J4 TUI](tool-job-controller.md#j4-tui)).
 
 While the selected project's effective value is off, the status row shows
 `exec off`. The TUI learns the value from `JobListReply.execution_enabled`
@@ -443,7 +468,7 @@ harness with a scripted loopback model.
 | ES-02 | Key validation and size | Bounds, 1,025th entry, bad ID, `inherit` removes, whole-mapping set, leaf get; a value over 4 KiB gives `config_value_too_large`; 1,024 leaf sets persist and read back under the 64 KiB file bound; a write over the file bound gives `config_too_large` and changes nothing | Set, restart, value kept; 1,024 overrides survive a restart | — |
 | ES-03 | Effective value | Override beats global in all four combinations | — | `/execution` shows each source |
 | ES-04 | Refusal | Kind 14 `denied` reason 1 and its rendered text; no submit to the controller | Model call after `/execution project off` is refused; nothing spawned | Scripted model's exec_cmd shows the refusal in the activity row |
-| ES-05 | Revocation of live model jobs (EX-V10, TJ-14) | Revoke scope spares person jobs and other projects; queued give `not_started`, live give `T`; one kind 27 | Two running model jobs in project A and one in project B; turning A off stops A's jobs with `execution_off`; B's job continues | PTY: `/execution project off` while a model job runs; `/jobs` shows it settle with `execution_off` |
+| ES-05 | Revocation of live model jobs (EX-V10, TJ-14) | Revoke scope spares person jobs and other projects; queued give `not_started`, live give `T`; one kind 27; a queued start whose kind 26 is still in the outbox gives kinds 26, 27 and 28; a value that is off at slot grant gives `not_started` with kinds 27 and 28 and the `job_execution_off_at_grant` log line | Two running model jobs in project A and one in project B; turning A off stops A's jobs with `execution_off`; B's job continues | PTY: `/execution project off` while a model job runs; `/jobs` shows it settle with `execution_off` |
 | ES-06 | Global off | Every project's model jobs revoked | Global off with jobs in two projects | PTY: `/execution off` |
 | ES-07 | Off to on | Nothing revoked; next call runs | Call after `/execution on` runs | — |
 | ES-08 | Person jobs unaffected (ES-R5) | Revoke scope excludes person origin | Shared with the person-command packets: a `!` job continues | Deferred to the person-command packets |
@@ -466,10 +491,11 @@ two writers ([J3 and J4 code packets](tool-job-controller.md#j3-and-j4-code-pack
 | Keys, leaf form, `execution.changed` type, reasons 19 and 20 in the audit enum | J34-G configuration and audit schema (merged) | `asura-storage/src/config.rs`, `asura-storage/src/audit/{types,mod,tests}.rs` |
 | 64 KiB configuration file bound and its ES-02 cases | J34-E integration | `asura-platform/src/config.rs` and its tests; the ES-02 file-bound case in `asura-storage/src/config.rs` |
 | Reason codes 19 and 20 in the codec and kind 14 field 10 reason 1 | J34-S storage records (on the J3 integration branch) | `asura-storage/src/authority/conversation/{types,codec}.rs` |
-| Controller `revoke` scope with origin filter | J34-K controller extensions | `asura-service/src/job_controller.rs`, `job_controller/*.rs` |
+| Controller `revoke` scope with origin filter and the check at slot grant | J34-K controller extensions (implemented on the J3 integration branch, `c63d7ca`) | `asura-service/src/job_controller.rs`, `job_controller/*.rs` |
+| A queued model start revoked with its kind 26 still queued: kinds 26, 27 and 28, never withdrawn | J34-K2 (on the J3 integration branch) | `asura-service/src/job_controller.rs`, `job_controller/*.rs` |
 | Refusal reason and rendered text in the tool authority check | J3-R tool parsing and result text | `asura-service/src/tools.rs` |
 | Owner state, per-call grant, revocation wiring, audit emission (one `execution.changed` per changed entry) | J34-E integration | `asura-service/src/conversation.rs`, `audit.rs`, `config_worker.rs` |
-| `/execution` and the status indicator | J4-T TUI | `asura-cli/src/tui/{ui,config,jobs}.rs` |
+| `/execution` and the status indicator | J4-T TUI (implemented on the J3 integration branch, `f7f50c3`) | `asura-cli/src/tui/{ui,config,jobs}.rs` |
 | User documentation for the keys and command | J34-E | `docs/user/{commands,guide}.md` |
 
 ## Decisions
@@ -509,6 +535,10 @@ Recorded on 2026-10-22 (revision): written from the J34-G packet report and
 the merged code (`asura-storage/src/config.rs`, `asura-storage/src/audit/types.rs`,
 `asura-platform/src/config.rs`) at commit `1a5991a`. Decisions ES-E6 and ES-E7
 were added, and the `config.changed` setting of a leaf set was confirmed. No
+diagram changed. No code or test was run by the design writer.
+
+Recorded on 2026-10-22 (J4-T report): the `/execution` reply texts were
+recorded from the code at commit `f7f50c3` on the J3 integration branch. No
 diagram changed. No code or test was run by the design writer.
 
 Return to the [design index](README.md).

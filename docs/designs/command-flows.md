@@ -182,11 +182,15 @@ flowchart LR
     Outbox -->|No| Confirm["Open exit confirmation"]
 ```
 
-Designed additions, not implemented (2026-10-22): `/jobs` and `/job` route to
-the TUI job worker ([CF12](#cf12-job-list)–[CF14](#cf14-job-retention-commands)),
-and `/execution` routes to the configuration worker
-([ES-F2](execution-setting.md#es-f2-execution-command-flow)). When they are
-implemented, CF04's chart gains these branches.
+Designed additions (2026-10-22): `/jobs` and `/job` route to the TUI job
+worker ([CF12](#cf12-job-list)–[CF14](#cf14-job-retention-commands)), and
+`/execution` routes to the configuration worker
+([ES-F2](execution-setting.md#es-f2-execution-command-flow)). Packet J4-T
+implemented them on the J3 integration branch (`f7f50c3`, not merged). They
+are dispatched from a separate `JOB_COMMANDS` list, so Tab completion and help
+do not list them until J34-E adds their rows to `docs/user/commands.md` and
+merges the list into `LOCAL_COMMANDS`. When the branch merges, CF04's chart
+gains these branches.
 
 ### CF04b: Local command completion
 
@@ -213,6 +217,15 @@ confirmation. Ctrl+D acts only with an empty draft. It exits when the local outb
 empty; otherwise it opens the exit confirmation, as `/quit` does. Slash `/quit` and `/exit`
 need no draft-discard confirmation. They open the exit confirmation when the
 local outbox holds unreceipted input. Repeated action key events do not submit twice.
+
+Job count at exit (J4-T on the J3 integration branch, recorded 2026-10-22):
+for a TUI-launched backend whose status `JobList` reports live jobs, each of
+these exit paths also opens the exit confirmation when the draft and the local
+outbox are empty. Its title is then `Exit?` and its next line is
+`N jobs are still running in all projects; they stop when the service stops.`
+The choices stay `[Keep editing]` and `Discard and exit`. An attached backend
+that the TUI did not launch adds no confirmation, because its jobs continue
+after the client exits ([J4 TUI](tool-job-controller.md#j4-tui)).
 
 ## CF05: Initialization and authority outcomes
 
@@ -794,7 +807,8 @@ stale health, empty windows, overflow scrolling, repeated use and owned-child cl
 ## CF12: Job list
 
 Selected design, 2026-10-22, for [tool job packet J4](tool-job-controller.md#j4-tui);
-not implemented. `/jobs` lists the selected project's jobs of every conversation;
+implemented by J4-T on the J3 integration branch, not merged; its PTY journey
+has not run. `/jobs` lists the selected project's jobs of every conversation;
 `/jobs all` lists every registered project's jobs. The TUI job worker's request
 slot sends `JobList`; the wait has no time bound and ends on the reply, `/cancel`
 or Escape, or a lost connection. Arrows are the next action or a guarded result.
@@ -823,7 +837,8 @@ flowchart TD
 
 ## CF13: Job viewer and job cancel
 
-Selected design, 2026-10-22, for J4; not implemented. `/job ID` opens the viewer;
+Selected design, 2026-10-22, for J4; implemented by J4-T on the J3
+integration branch, not merged. `/job ID` opens the viewer;
 `/job cancel ID` requests cancellation. `ID` is a full handle or a unique prefix
 of at least 6 hexadecimal digits among the cached list entries. Closing the
 viewer never cancels the job.
@@ -856,7 +871,8 @@ flowchart TD
 
 ## CF14: Job retention commands
 
-Selected design, 2026-10-22, for J4; not implemented. `/job pin ID`,
+Selected design, 2026-10-22, for J4; implemented by J4-T on the J3
+integration branch, not merged. `/job pin ID`,
 `/job unpin ID`, `/job delete ID` and `/job note ID TEXT` send `JobRetain`.
 The service writes kind 30 only when the action changes something.
 

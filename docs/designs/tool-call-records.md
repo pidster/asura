@@ -825,7 +825,10 @@ They may cite a call by operation, generation and ordinal. They do not copy
 argument text. The service emits a `ToolFinished` audit event for every call
 with a nonzero operation code, whether it ran or not, with the rendered status
 as its outcome. A call with operation code 0 emits no tool audit event, because
-the audit tool table has no entry for it (TCR-D14).
+the audit tool table has no entry for it (TCR-D14). The `job` commands, codes
+11–16, get their own audit tool values with J3
+([audit of job tool calls](tool-job-controller.md#audit-of-job-tool-calls)),
+so they emit `tool.finished` like every other call.
 
 ## Asynchronous execution
 

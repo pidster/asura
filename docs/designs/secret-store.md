@@ -978,7 +978,7 @@ pacing only, it ends nothing) has four copies today:
 | Copy | Code |
 | --- | --- |
 | Journal writer held recheck | `asura-storage/src/authority/writer/mod.rs` |
-| Job controller `disk_space` recheck | `DiskRecheck`, `asura-service/src/job_controller.rs` |
+| Job controller `disk_space` recheck, and from J34-E the [jobs limits read retry](tool-job-controller.md#start-time-limits-read-failure), which reuses this type | `DiskRecheck`, `asura-service/src/job_controller.rs`; its use in `conversation/jobs.rs` |
 | Capture worker paused-capture retry | `Backoff`, `asura-service/src/capture_worker.rs` |
 | Locked-at-dispatch recheck | `Recheck`, `asura-service/src/secret_store.rs` |
 
@@ -991,7 +991,8 @@ wake and reset rules.
 
 - **Owned paths:** `asura-platform/src/pacing.rs` (new) and its `pub mod`
   line in `asura-platform/src/lib.rs`; the pacing code and its unit tests in
-  the four files above and in `job_controller/tests.rs`,
+  the four files above, the retry's use in `conversation/jobs.rs`, and in
+  `job_controller/tests.rs`,
   `capture_worker/tests.rs` and `secret_store/tests.rs`.
 - **Order:** after the J3 integration branch merges, because J34-K and J3-D
   edit `job_controller.rs` and `capture_worker.rs` there; before P3-K and
