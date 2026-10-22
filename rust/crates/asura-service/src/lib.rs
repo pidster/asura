@@ -8,6 +8,7 @@ mod context_manager;
 mod context_observer;
 mod conversation;
 mod exec_cmd_worker;
+mod job_control;
 mod job_controller;
 mod job_text;
 mod payload_owner;
