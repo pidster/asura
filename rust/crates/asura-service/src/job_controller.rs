@@ -202,7 +202,10 @@ impl OriginFilter {
 }
 
 /// The job states of TJ-S1. `Withdrawn` names a start that left before any
-/// record: a person waiter, or a start whose kind 26 never committed.
+/// record: a person waiter, a person job before its kind 26 is submitted or
+/// while it is held, or, while the journal is unavailable, a start whose
+/// kind 26 never committed. A model start is never withdrawn while the
+/// journal is available (J34-K2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JobState {
     Queued,
@@ -810,8 +813,14 @@ impl JobController {
         };
         match job.state {
             JobState::Queued => {
-                if job.intent != Intent::Committed && job.intent != Intent::InFlight {
-                    // A waiter, or a kind 26 not yet submitted: no record.
+                // TJ-S1 withdrawal rule: only a person waiter, or a start
+                // whose kind 26 never committed while the journal is
+                // unavailable, leaves with no record. A model start keeps
+                // its kind 26 queued (also when held at the quota); kinds
+                // 27 and 28 follow it.
+                let waiter = job.intent == Intent::None;
+                let unrecordable = self.journal_down && job.intent != Intent::Committed;
+                if waiter || unrecordable {
                     self.withdraw(id);
                     return JobState::Withdrawn;
                 }
@@ -868,9 +877,11 @@ impl JobController {
         }
     }
 
-    /// Removes a start that has no committed record: a person waiter, a
-    /// person job granted but before kind 26, or a model start whose kind
-    /// 26 is still in the outbox or failed.
+    /// Removes a start that has no committed record and will get none: a
+    /// person waiter, a person job granted but before its kind 26 is
+    /// submitted or while it is held, or, while the journal is unavailable,
+    /// a start whose kind 26 never committed. A model start is never
+    /// withdrawn while the journal is available (TJ-S1, J34-K2).
     fn withdraw(&mut self, id: Id) {
         self.dequeue(id);
         self.intents.retain(|j| *j != id);
@@ -1162,8 +1173,9 @@ impl JobController {
         let Some(job) = self.jobs.get_mut(&id) else {
             return;
         };
-        if job.cancel.is_some() {
-            // Cancelled while its kind 26 was in flight: no record at all.
+        if job.origin.is_person() && job.cancel.is_some() {
+            // A person job cancelled while its kind 26 was in flight: no
+            // record at all (TJ-S1).
             self.withdraw(id);
             return;
         }
@@ -1172,6 +1184,9 @@ impl JobController {
             // head of its agent queue with `journal_held`.
             self.requeue_person(id);
         } else {
+            // A model start waits with `journal_held`; when it was cancelled
+            // or revoked, its kinds 27 and 28 follow the kind 26 after the
+            // hold ends (TJ-S1).
             job.intent = Intent::Pending;
             self.intents.push_front(id);
         }

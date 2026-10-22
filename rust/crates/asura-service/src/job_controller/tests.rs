@@ -562,22 +562,33 @@ fn j2t_24_person_waiter_cancel_writes_nothing() {
 
 // ----- Outbox order -----
 
-/// Kind 26 commits before its kinds 27 and 28; a start cancelled before
-/// its kind 26 is submitted gets no record at all; closure records go
-/// before new kind 26 records.
+/// Kind 26 commits before its kinds 27 and 28; closure records go before
+/// new kind 26 records. J3T-21 (TJ-S1, J34-K2): a model start cancelled
+/// before its kind 26 is submitted, or while it is in flight, is never
+/// withdrawn: the cancel replies `Accepted(Recording)` and kinds 26, 27
+/// and 28 (`not_started`, the trigger's reason) commit in that order.
 #[test]
 fn outbox_orders_intent_before_closures() {
     let mut h = Harness::new(limits(1, 1, 8));
-    // Cancel before submission: withdrawn, no record.
+    // Cancel before submission: kind 26 stays queued, 27 and 28 follow.
     let Admission::Accepted { job } = h.submit(model(1), conversation(1), P1) else {
         panic!("accepted");
     };
     assert_eq!(
         h.ctl
             .cancel(job, Requester::Model, JobReason::TurnEnded, false),
-        CancelReply::Accepted(JobState::Withdrawn)
+        CancelReply::Accepted(JobState::Recording)
     );
-    assert!(h.commit().is_empty());
+    let records = h.commit();
+    assert_eq!(kinds(&records), [26, 27, 28]);
+    assert_eq!(cancels(&records)[0].job, job);
+    let s = settled(&records)[0];
+    assert_eq!(
+        (s.job, s.outcome, s.reason),
+        (job, Outcome::NotStarted, JobReason::TurnEnded)
+    );
+    assert_eq!(h.state(job), Some(JobState::Recorded));
+    assert!(h.started().is_empty(), "a cancelled start never starts");
 
     // Cancel while kind 26 is in flight: 27 and 28 wait for its commit.
     let Admission::Accepted { job } = h.submit(model(2), conversation(1), P1) else {
@@ -585,28 +596,161 @@ fn outbox_orders_intent_before_closures() {
     };
     let (id, record) = h.ctl.next_record().expect("kind 26");
     assert_eq!((id, record.kind()), (job, 26));
-    h.ctl
-        .cancel(job, Requester::Model, JobReason::TurnEnded, false);
+    assert_eq!(
+        h.ctl
+            .cancel(job, Requester::Model, JobReason::TurnEnded, false),
+        CancelReply::Accepted(JobState::Recording)
+    );
     assert!(h.ctl.next_record().is_none(), "one record in flight");
     h.ctl.record_done(job, Ok(1));
     let records = h.commit();
     assert_eq!(kinds(&records), [27, 28]);
-    assert_eq!(settled(&records)[0].outcome, Outcome::NotStarted);
+    let s = settled(&records)[0];
+    assert_eq!(
+        (s.outcome, s.reason),
+        (Outcome::NotStarted, JobReason::TurnEnded)
+    );
 
-    // In flight then refused for any reason other than a hold: the journal
-    // is unavailable and nothing more is written.
+    // The closure (kind 27 of a running job) goes before a new kind 26.
     let mut h = Harness::new(limits(1, 1, 8));
     let running = h.model(1, conversation(1), P1);
     h.script(running, [SlotEvent::Spawned]);
     h.submit(model(2), conversation(1), P1);
     h.ctl
         .cancel(running, Requester::Client, JobReason::ClientCancel, false);
-    // The closure (kind 27 of `running`) goes before the new kind 26.
     let (_, first) = h.ctl.next_record().expect("record");
     assert_eq!(first.kind(), 27);
     h.ctl.record_done(running, Ok(1));
     let (_, second) = h.ctl.next_record().expect("record");
     assert_eq!(second.kind(), 26);
+}
+
+/// J3T-21: a model kind 26 held at the quota and cancelled during the hold
+/// stays queued; kinds 26, 27 and 28 commit after `journal_hold_ended`.
+#[test]
+fn j3t_21_held_model_start_cancelled_records_after_the_hold() {
+    let mut h = Harness::new(limits(4, 2, 8));
+    let Admission::Accepted { job } = h.submit(model(1), conversation(1), P1) else {
+        panic!("accepted");
+    };
+    let (id, _) = h.ctl.next_record().expect("kind 26");
+    h.ctl.record_done(id, Err(writer::Error::JournalQuota));
+    h.poll();
+    assert_eq!(h.reason(job), Some(BlockReason::JournalHeld));
+    assert_eq!(
+        h.ctl
+            .cancel(job, Requester::Model, JobReason::ModelCancel, false),
+        CancelReply::Accepted(JobState::Recording)
+    );
+    assert!(h.commit().is_empty(), "held: nothing commits");
+    h.ctl.journal_hold_ended();
+    let records = h.commit();
+    assert_eq!(kinds(&records), [26, 27, 28]);
+    let s = settled(&records)[0];
+    assert_eq!(
+        (s.job, s.outcome, s.reason),
+        (job, Outcome::NotStarted, JobReason::ModelCancel)
+    );
+    assert!(h.started().is_empty());
+}
+
+/// J3T-21: a model start cancelled while its kind 26 is in flight, whose
+/// reply is then a quota hold, keeps its kind 26 queued; kinds 26, 27 and
+/// 28 commit after the hold.
+#[test]
+fn j3t_21_in_flight_model_start_cancelled_then_held() {
+    let mut h = Harness::new(limits(4, 2, 8));
+    let Admission::Accepted { job } = h.submit(model(1), conversation(1), P1) else {
+        panic!("accepted");
+    };
+    let (id, _) = h.ctl.next_record().expect("kind 26");
+    assert_eq!(
+        h.ctl
+            .cancel(job, Requester::Model, JobReason::TurnEnded, false),
+        CancelReply::Accepted(JobState::Recording)
+    );
+    h.ctl.record_done(id, Err(writer::Error::JournalDiskSpace));
+    assert!(h.commit().is_empty(), "held: nothing commits");
+    assert!(h.ctl.status(job).is_some(), "not withdrawn");
+    h.ctl.journal_hold_ended();
+    let records = h.commit();
+    assert_eq!(kinds(&records), [26, 27, 28]);
+    assert_eq!(settled(&records)[0].reason, JobReason::TurnEnded);
+}
+
+/// J3T-21: `revoke` with `execution_off` of a queued model start whose kind
+/// 26 is still in the outbox gives kinds 26, 27 and 28, requester service.
+#[test]
+fn j3t_21_revoked_model_start_with_kind_26_in_the_outbox() {
+    let mut h = Harness::new(limits(4, 2, 8));
+    let Admission::Accepted { job } = h.submit(model(1), conversation(1), P1) else {
+        panic!("accepted");
+    };
+    h.ctl
+        .revoke(Some(P1), OriginFilter::Model, JobReason::ExecutionOff);
+    let records = h.commit();
+    assert_eq!(kinds(&records), [26, 27, 28]);
+    let c = cancels(&records)[0];
+    assert_eq!(
+        (c.job, c.requester, c.reason),
+        (job, JobRequester::Service, JobReason::ExecutionOff)
+    );
+    let s = settled(&records)[0];
+    assert_eq!(
+        (s.outcome, s.reason),
+        (Outcome::NotStarted, JobReason::ExecutionOff)
+    );
+    assert!(h.started().is_empty());
+}
+
+/// J3T-21: while the journal is unavailable a model start whose kind 26
+/// never committed is withdrawn: `Accepted(Withdrawn)` and nothing written.
+#[test]
+fn j3t_21_journal_unavailable_withdraws_a_model_start() {
+    let mut h = Harness::new(limits(4, 2, 8));
+    let Admission::Accepted { job } = h.submit(model(1), conversation(1), P1) else {
+        panic!("accepted");
+    };
+    h.ctl.journal_unavailable();
+    assert_eq!(
+        h.ctl
+            .cancel(job, Requester::Model, JobReason::TurnEnded, false),
+        CancelReply::Accepted(JobState::Withdrawn)
+    );
+    assert!(h.commit().is_empty());
+    assert_eq!(h.ctl.status(job), None);
+}
+
+/// J3T-21: a person job granted its slot is still withdrawn before its kind
+/// 26 is submitted, and when its kind 26 is held after a cancel in flight.
+#[test]
+fn j3t_21_person_job_before_kind_26_is_withdrawn() {
+    let mut h = Harness::new(limits(4, 2, 8));
+    let Admission::Accepted { job } = h.submit(person(5), conversation(1), P1) else {
+        panic!("accepted");
+    };
+    h.poll();
+    assert_eq!(h.state(job), Some(JobState::Starting));
+    assert_eq!(
+        h.ctl
+            .cancel(job, Requester::Person, JobReason::PersonStop, false),
+        CancelReply::Accepted(JobState::Withdrawn)
+    );
+    assert!(h.commit().is_empty());
+
+    let Admission::Accepted { job } = h.submit(person(6), conversation(1), P1) else {
+        panic!("accepted");
+    };
+    h.poll();
+    let (id, record) = h.ctl.next_record().expect("kind 26");
+    assert_eq!((id, record.kind()), (job, 26));
+    h.ctl
+        .cancel(job, Requester::Person, JobReason::PersonStop, false);
+    h.ctl.record_done(id, Err(writer::Error::JournalQuota));
+    h.ctl.journal_hold_ended();
+    assert!(h.commit().is_empty(), "held person job: no record");
+    assert_eq!(h.ctl.status(job), None);
+    assert!(h.started().is_empty());
 }
 
 /// A model kind 26 held at the journal quota waits with `journal_held`

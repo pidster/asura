@@ -53,9 +53,11 @@ pub(crate) enum WaitEnding {
     StateChanged,
     /// A parked `JobList`: the revision differs from `after_revision`.
     Revision(u64),
-    /// The job left without a settlement record: withdrawn before its
-    /// kind 26 was submitted, or abandoned when the journal became
-    /// unavailable. The caller reads the journal or reports `unavailable`.
+    /// The job left without a settlement record: a person job withdrawn
+    /// before its kind 26 committed, or a job withdrawn or abandoned while
+    /// the journal is unavailable. A model job ends this way only while the
+    /// journal is unavailable (TJ-S1). The caller reads the journal or
+    /// reports `unavailable`.
     Withdrawn,
     /// Shutdown: a parked client request is answered with `Draining`.
     Closed,
