@@ -2216,7 +2216,8 @@ change in the payload port's `ready`, `pending_installs` or `space_epoch`.
 expiry, deletion), so the controller never polls the ledger. A head blocked by
 `disk_space` is also rechecked on the paced delays 1, 1, 2, 3, 5, 8 s and so
 on, at most 60 s apart (owner pattern of 2026-10-19). That pacing ends
-nothing. No other timer exists. The pacing code is one of four copies that the
+nothing. Each recheck also asks the payload owner to measure free space again
+([disk-space recheck](#disk-space-recheck)). No other timer exists. The pacing code is one of four copies that the
 [shared pacing helper](secret-store.md#shared-pacing-helper-pace-1) replaces.
 
 Bounds. A queue is known-size (AE-03). These submissions get `busy` before any
@@ -2278,6 +2279,93 @@ flowchart TD
     PersonIntent -->|Yes| Append26["Append kind 26"]
     PersonIntent -->|No| Start["Slot worker starts setup"]
     Append26 --> Start
+```
+
+#### Disk-space recheck
+
+Selected (engineering, 2026-10-22, from the J2-E report). Packets J34-K and
+J34-E implement it.
+
+**Problem.** J2-E chooses `disk_space` when the effective quota is below the
+configured `retention.quotaBytes`. The payload store sets the effective quota
+only at payload recovery, from one `fstatfs`. Space freed outside the ledger,
+for example a file the person deletes, therefore never reaches the store. The
+paced recheck re-runs admission against the old value, and the head waits
+until a ledger space event happens.
+
+**Mechanism.**
+
+1. `PayloadPort` gains `fn refresh_space(&mut self)`. It is nonblocking: it
+   sets a pending-measurement flag in the payload owner and wakes the payload
+   maintenance worker. One flag exists, so a request while a measurement is
+   pending or running adds nothing. The flag is not a deletion-queue entry,
+   so it never meets the deletion queue bound of 8.
+2. At each paced `disk_space` recheck, the controller re-evaluates the head as
+   before. If the head is still blocked by `disk_space`, it calls
+   `refresh_space`. It never calls it for `quota` or any other reason.
+3. The maintenance worker takes the flag before its next deletion. It calls
+   `PayloadStore::set_quota(configured)`, which runs the blocking `fstatfs`
+   and recomputes the effective quota from the configured value, the retained
+   bytes and the free space. It then wakes the reactor with the result.
+4. On the reactor, the payload owner compares the new effective quota with the
+   previous one. A changed value adds one to its space epoch, as a ledger space
+   event does. The controller then re-evaluates its heads through the existing
+   `space_epoch` wake. An unchanged value adds nothing; the next paced recheck
+   asks again.
+5. A lower value is applied as well: free space used outside Asura then limits
+   later admissions. A running capture still meets ENOSPC through its own
+   writes and pauses as before.
+
+**Failure.** An `fstatfs` error keeps the previous effective quota. The
+payload owner logs `payload_space_unmeasured` once per run of consecutive
+failures. The head keeps `disk_space`, and the next paced recheck asks again.
+No time bound ends the wait; a cancel trigger, revocation or shutdown removes
+the entry. Before recovery or after the store becomes unavailable,
+`refresh_space` does nothing, and condition 4 (`payload_unavailable`) applies.
+
+**Ownership.** J34-K adds `refresh_space` to `PayloadPort`
+(`job_controller/port.rs`), the call in the paced recheck and the fixture
+port. J34-E implements it in `payload_owner.rs` on the maintenance worker that
+it builds for deletions.
+
+**Tests.** Unit (J34-K): the paced recheck calls `refresh_space` only while
+the head is blocked by `disk_space`, once per recheck. Unit (J34-E): a changed
+effective quota adds one epoch; an unchanged one adds none; a second request
+during a measurement adds no second measurement; an `fstatfs` error keeps the
+old value. Integration (J34-E, J2T-09 extension): on a constrained APFS image,
+a file outside Asura fills the volume and a start waits with `disk_space`;
+the harness deletes that file; the start begins after the next recheck with
+no ledger event. End to end: J34E-07 adds this step.
+
+##### TJ-Q9: disk-space recheck
+
+Selected design. Solid arrows are calls or requests; dashed arrows are
+replies or wakes. The loop repeats only on the paced delays; it ends when the
+head starts, or on a cancel trigger, revocation or shutdown.
+
+```mermaid
+sequenceDiagram
+    participant K as Job controller
+    participant P as Payload owner
+    participant M as Payload maintenance worker
+    participant S as Payload store
+    loop Each paced recheck while the head waits with disk_space
+        K->>P: admit(job)
+        P-->>K: Short::DiskSpace
+        K->>P: refresh_space()
+        P->>M: Set the measurement flag (one at most)
+        M->>S: set_quota(configured): fstatfs
+        S-->>M: New effective quota, or an error
+        M-->>P: Result, reactor wake
+        alt Effective quota changed
+            P->>P: Space epoch plus one
+            P-->>K: space_epoch changed: re-evaluate heads
+            K->>P: admit(job)
+            P-->>K: Admitted, or a short again
+        else Unchanged, or fstatfs error
+            P->>P: Keep the quota, log an error once
+        end
+    end
 ```
 
 ### J2 records: kinds 26, 27 and 28
@@ -2809,7 +2897,8 @@ pub(crate) struct CaptureOutcome {
 pub(crate) trait PayloadPort {
     fn ready(&self) -> bool;               // condition 4
     fn pending_installs(&self) -> usize;   // condition 7, at most 4
-    fn space_epoch(&self) -> u64;          // grows on settlement, expiry, deletion
+    fn space_epoch(&self) -> u64;          // grows on settlement, expiry, deletion, a changed measurement
+    fn refresh_space(&mut self);           // J34-K and J34-E: measure free space again (disk-space recheck)
     fn admit(&mut self, job: Id, origin: &Origin) -> Result<Admitted, Short>; // condition 8
     fn release(&mut self, job: Id, victims: &[Victim]); // reservation of a job that never started
     fn committed(&mut self, job: Id, settled: &JobSettled, sequence: u64,
@@ -2913,8 +3002,8 @@ job-mode mappings from guardian and capture facts to slot events:
 | No process (setup failed, refused or cancelled) | Capture state `not_started`; the staging files are deleted |
 | No sealed report from the capture worker | Capture becomes `unconfirmed` only after the L3 bound (2.5 s) that a cancel trigger starts; without a cancel trigger the slot waits for the sealed report (J1-Q1) |
 | Guardian lost or protocol fault after kind 1 | The slot closes the lease; `CleanupUnconfirmed(CleanupFailed)`; the slot is held until a late settlement or restart |
-| Guardian lost or protocol fault before kind 1 | `SetupFailed(ProtocolFault)`; capture `not_started`; `ScratchRetained`, because the platform keeps the scratch cleanup token of a faulted job. [J2-A2](#j2-code-packets) releases the token when no command was spawned |
-| Guardian setup failure (kind 3) | Reason 7 `denied` gives `project_changed`; reason 8 gives `protocol_fault`; reasons 5 `spawn_failed` and 6 `sandbox_unavailable` both give `spawn_failed`, because `ExecCmdResult` folds them. [J2-A2](#j2-code-packets) separates reason 6 so that it gives `sandbox_unavailable` (14) |
+| Guardian lost or protocol fault before kind 1 | `SetupFailed(ProtocolFault)` once; capture `not_started`. Since [J2-A2](#j2-a2-platform-follow-up): when `take_cleanup` returns the token, the slot deletes the scratch and reports `ScratchCleaned`; while `ExecCmdJob::release_pending()` is true it keeps polling; otherwise it reports `ScratchRetained` |
+| Guardian setup failure (kind 3) | `guardian_setup_reason` maps `ExecCmdResult.setup_reason` (since J2-A2): 5 `spawn_failed` to 15, 6 `sandbox_unavailable` to 14, 7 `denied` to 13 `project_changed`, 8 to 17 `protocol_fault`, any other value to 18 `setup_failed` |
 | Scratch cleanup | Runs on the slot's cleanup thread with its own 2.5 s bound, separate from the capture L3 bound; an expired bound or a failure gives `ScratchRetained` |
 | `close_capture` | A no-op until P3-T |
 | `ProcessSettled.output_held` | Always `false` in J2; P3-T sets it for kind 2 reason 15 |
@@ -3136,9 +3225,9 @@ The person packets add `outside_sandbox` to `job.started`,
 | Rule | How J2 meets it |
 | --- | --- |
 | AE-01 | The controller, slots and owner do bounded in-memory work on the reactor. Pipe and status reads stay nonblocking with the 8 KiB quantum. The only write is one nonblocking lease byte. Records go through the owner's ticket; replies wake the reactor. |
-| AE-02 | Blocking calls and their isolation: project open, prepare and spawn on the slot setup thread; scratch deletion on the slot cleanup thread; `openat`, `write`, `fsync`, `renameatx_np`, `unlinkat`, `fstatfs` and hashing on the capture worker; `pread` on the 2 page-read workers; directory listing on the payload recovery worker; journal I/O on the journal worker; `waitid`, signals, `proc_listpids` and `sandbox_check` in the guardian process. Each slot has at most 2 threads at once: one setup or cleanup thread and one capture worker. |
+| AE-02 | Blocking calls and their isolation: project open, prepare and spawn on the slot setup thread; scratch deletion on the slot cleanup thread; `openat`, `write`, `fsync`, `renameatx_np`, `unlinkat`, `fstatfs` and hashing on the capture worker; `pread` on the 2 page-read workers; directory listing on the payload recovery worker; the disk-space `fstatfs` on the payload maintenance worker (J34-E); the `jobs` limits read on its one `asura-job-limits` thread; journal I/O on the journal worker; `waitid`, signals, `proc_listpids` and `sandbox_check` in the guardian process. Each slot has at most 2 threads at once: one setup or cleanup thread and one capture worker. |
 | AE-03 | Numeric limits in [J2 numeric limits](#j2-numeric-limits). A blocked start waits in its bounded agent queue with a reason; a full queue or the 64-job bound returns `busy`; capture overload backpressures, pauses or stops capture. Rotation across agents keeps one agent from starving another; cancel and revocation never wait behind a queue. |
-| AE-04 | No time limit ends a job, a queued start or a page read. Closures: completion, cancel, revocation, journal outage, shutdown, restart, capture fault and known-size bounds. Wind-down bounds act only after a closure: TERM-to-KILL grace, L3 and shutdown cleanup. Pacing that ends nothing: the guardian's 100 ms loop, the reactor's 100 ms job tick, the paused-capture retry and the `disk_space` recheck. An abandoned wait states its effect: `CleanupUnconfirmed` and `unconfirmed` capture say the work may continue. |
+| AE-04 | No time limit ends a job, a queued start or a page read. Closures: completion, cancel, revocation, journal outage, shutdown, restart, capture fault and known-size bounds. Wind-down bounds act only after a closure: TERM-to-KILL grace, L3 and shutdown cleanup. Pacing that ends nothing: the guardian's 100 ms loop, the reactor's 100 ms job tick, the paused-capture retry, the `disk_space` recheck and the limits read retry (J34-E). An abandoned wait states its effect: `CleanupUnconfirmed` and `unconfirmed` capture say the work may continue. |
 | AE-05 | No job respawns. Explicit `interrupted` settlements; duplicate starts return the existing job; installs complete from verified staging; a late settlement never proves an earlier unknown outcome clean. |
 | AE-06 | Shutdown closes admission, settles queued starts, stops live jobs and waits within the 2 s bound. `CleanupUnconfirmed` keeps its ownership. |
 | AE-07 | [J2 validation](#j2-validation) runs real guardians, real storage on a constrained disk image, a held writer, crash injection and 16 concurrent jobs, with reactor responsiveness measured. |
@@ -3182,9 +3271,11 @@ Only known-size limits apply.
 | Cancel before spawn | Setup cancel flag; a late returned job gets `T` at once | Kind 28 `not_started`, or `cancelled` if it spawned |
 | Setup failure | No process | Kind 28 `not_started`, reasons 12–18 |
 | Guardian protocol fault or loss after spawn | Lease closed; `CleanupUnconfirmed` until restart | None until `interrupted` |
-| Guardian exits before any notice (for example an unknown profile token) | Until J2-A2: `SetupFailed(ProtocolFault)`, `ScratchRetained`, slot held until restart. After J2-A2: the platform releases the cleanup token, the scratch is deleted and the slot is released | Kind 28 `not_started`, `protocol_fault` |
+| Guardian exits normally before any notice (for example an unknown profile token) | `SetupFailed(ProtocolFault)`; the platform releases the cleanup token (J2-A2), the scratch is deleted and the slot is released | Kind 28 `not_started`, `protocol_fault` |
+| Guardian ends by a signal before any notice | `SetupFailed(ProtocolFault)`; the token stays, because the command may be alive; `ScratchRetained`, slot held until restart | Kind 28 `not_started`, `protocol_fault` |
+| Start-time read of the `jobs` limits fails | No controller yet: the owner retries the read on the paced delays ([limits read failure](#start-time-limits-read-failure)); model exec_cmd calls wait before their decision | None until the controller exists |
 | Kind 4 | `CleanupUnconfirmed`; slot held | None until a late kind 2 or restart |
-| Late kind 2 | Settlement with cleanup `late`; slot released after scratch cleanup | Kind 28 |
+| Late kind 2 | Settlement with cleanup `late` and the kind 4 reason: 13 `escapee_unterminated` after an unverifiable or unfinished escapee sweep, 9 `cleanup_failed` otherwise ([escapee control](escapee-control.md)); slot released after scratch cleanup | Kind 28 |
 | Scratch cleanup fails or passes L3 | Slot and scratch token held until restart | Kind 28 already committed |
 | Capture stall while running | Backpressure only (J1-Q1) | None until settlement |
 | No sealed report 2.5 s after a cancel trigger | Capture `unconfirmed`; worker to the pending-install list | Kind 28 capture state 3 |
@@ -3195,6 +3286,76 @@ Only known-size limits apply.
 | Shutdown | Admission closed; queued settled; live stopped; 2 s bound | Kinds 27 and 28 with `shutdown`, else `interrupted` later |
 | Crash or restart | Guardian sees lease EOF; no rerun | Kind 28 `interrupted` at the next start |
 | Page read stalls | The read waits; the caller's cancel or detach withdraws it | None |
+
+#### Start-time limits read failure
+
+Implemented by J2-E (recorded 2026-10-22): the conversation owner reads the
+`jobs` limits once at service start on one `asura-job-limits` thread. If the
+thread cannot start or the read fails (an I/O error or an invalid
+`config.yaml`), the owner logs `job_limits_unavailable` and builds no
+controller for the rest of the run. Start-time job recovery then never runs,
+and no job is admitted.
+
+Selected (engineering, 2026-10-22): replace this with a paced retry. A
+controller that stays absent until restart is not recoverable (AE-05), and the
+person can repair `config.yaml` with `/config set` while the service runs.
+
+1. After a failed read, the owner starts the next read after the paced delays
+   1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart. The pacing ends nothing.
+   One read runs at a time. J34-K makes the controller's existing pacing type
+   `pub(crate)` for this use, so no fifth copy appears;
+   [PACE-1](secret-store.md#shared-pacing-helper-pace-1) later replaces that
+   type with the shared helper.
+2. The owner logs `job_limits_unavailable` at the first failure of a run of
+   failures, and `job_limits_read` when a later read succeeds. It does not log
+   each retry.
+3. A successful read builds the controller. Start-time recovery, journal
+   unavailability and shutdown are then applied as for a first-time read.
+4. Shutdown cancels the running read and stops the retries.
+
+While no controller exists:
+
+- The journal's unsettled jobs stay unsettled. No process runs for them,
+  because their guardians stopped on lease EOF. The next successful read
+  writes their `interrupted` settlements.
+- A model `exec_cmd` call waits before step 3 of the
+  [call flow](#exec_cmd-as-a-job), before kind 14 is appended. The wait ends
+  when the controller exists, then the call continues; on turn cancel, steer
+  or invalidation, with decision `cancelled`; or on shutdown.
+- A `job` call that needs the controller (`status` of an unsettled job,
+  `wait` on an unsettled job, `cancel`) gets `unavailable`. `list`, `read` and
+  the `status` of a settled job read the journal and payload store as usual.
+- A J4 control request that needs live job facts replies `unavailable`.
+
+Packet J34-E implements the retry and the waits in
+`asura-service/src/conversation/jobs.rs` and the call path. Tests: unit, a
+fixture read that fails twice and then succeeds gives reads after 1 s and 1 s,
+one read at a time, and a controller after the third read; shutdown during a
+retry cancels it; an exec_cmd call waits and then proceeds; a turn cancel
+during the wait records `cancelled`. Integration (J34-E): a service starts
+with an invalid `jobs` value in `config.yaml`; a model call waits; the harness
+writes a valid file; after the next read the call runs and the earlier
+unsettled jobs settle `interrupted`.
+
+##### TJ-F5: start-time limits read
+
+Selected design. Arrows are outcomes in order. The loop back to `Wait` is
+pacing only; it ends on a successful read or shutdown.
+
+```mermaid
+flowchart TD
+    Start["Service start: owner starts the limits read"] --> Read{"Read result"}
+    Read -->|"Limits"| Build["Build the controller; start-time recovery"]
+    Read -->|"Thread not started, I/O error or invalid file"| Log["Log job_limits_unavailable once per run of failures"]
+    Log --> Wait["Wait the next paced delay: 1, 1, 2, 3, 5 ... s, at most 60 s"]
+    Wait -->|"Delay passed"| Read
+    Wait -->|Shutdown| Stop["Cancel the read; no controller"]
+    Log --> Calls{"Call during the wait"}
+    Calls -->|"exec_cmd"| Park["Wait before the decision; turn cancel gives cancelled"]
+    Calls -->|"job call needing the controller"| Unavail["unavailable"]
+    Park -->|"Controller built"| Submit["Continue at submit"]
+    Build --> Submit
+```
 
 ### J2 validation
 
@@ -3256,9 +3417,8 @@ Release qualification is not claimed.
   call, turn or dispatch in it.
 - A queued model job interrupted by a restart is reported "effects may have
   occurred" although it never started.
-- Until J2-A2 merges, a guardian setup failure with kind 3 reason 6 is
-  recorded as `spawn_failed`, not `sandbox_unavailable`, and a guardian that
-  exits before any notice holds its slot and scratch until restart.
+- A guardian that a signal ends before any notice holds its slot and scratch
+  until restart, because the command may be alive (J2-A2 normal-exit rule).
 - A slot held by `CleanupUnconfirmed` or retained scratch stays held until
   restart; retained scratch stays on disk.
 - One development host; `/bin/sh`, APFS and `sandbox-exec` behavior elsewhere is
@@ -3294,23 +3454,58 @@ same workspace run. Unit additions: `config_worker` maps every `jobs` key
 through `Setting::for_config_key` (J2T-21), and `payload_owner` decides
 `quota` or `disk_space` and counts space events.
 
+Recorded 2026-10-22 from the J2-E report:
+
+- **Record order.** `dispatch_foreground` now runs after the active turn's
+  records and the controller's outbox records, as
+  [writing job records](#writing-job-records) orders them (step 4).
+- **Late cleanup reason.** The `unverifiable:5` fault settles with cleanup
+  `late` and reason 13 `escapee_unterminated`, not 9. This matches the
+  escapee rule: 13 after an unverifiable or unfinished escapee sweep, 9
+  otherwise. Tests and texts accept 9 or 13 by cause.
+- **Unused items.** `job_controller.rs`, `job_controller/port.rs` and
+  `job_controller/reasons.rs` carry per-item `dead_code` allowances for items
+  that only J3 submits use. J34-K removes each allowance when its item gains
+  a caller. `asura-service/Cargo.toml` has a `[[test]] job_controller_flow`
+  entry.
+
 Not shown by J2-E, and left as limits:
 
 - **Person origin.** JR2 rejects a person-origin kind 26 until P2, so the
   harness launches model-origin jobs only. Agent fairness uses distinct
-  conversations (agent 0 each).
+  conversations (agent 0 each). Selected (engineering): J2 delivers no
+  person-origin launcher. The worker-layer launcher of person jobs comes with
+  the person packets: P2 makes the person kind 26 valid in replay, P3-K adds
+  the person profiles at slot grant, and P3-E adds the harness submit in
+  `test_support.rs`, its owned path. Until P3-E, fairness and queue tests use
+  separate agents or conversations with model-origin jobs, and the person
+  origin is tested at the controller and codec only (J2T-24).
 - **Tool-call and turn-admission detectors.** The owner calls the identity
   hook from the tool executor's `Changed` recheck and from a `stale_project`
   reply to turn admission. The harness has no model turn, so it calls the same
-  hook directly; only the setup recheck runs end to end.
+  hook directly; only the setup recheck runs end to end. J34-E covers both
+  detectors with real scripted-model turns (J3T-12 and J2T-15 on the job
+  path).
 - **ENOSPC on a constrained image** (J2T-09 `Draining` with `enospc`), the
   full pending-install list (J2T-19) and per-worker capture memory (J2T-18)
   are not measured here; the J1 capture worker cases cover the capture parts.
+  J34-E measures them in its integration run.
 - **`jobs.modelReservedPageReads`** is read but not applied: `PagePool::start`
-  reserves one model worker with no parameter.
+  reserves one model worker with no parameter. Selected (engineering): J34-E
+  applies it. `PagePool::start` in `asura-storage/src/payload/pages.rs` gains
+  the reserved count (0 or 1), and `payload_owner.rs` passes the configured
+  value. Tests: J2T-16 unit cases with 0 and 1 reserved workers; J2T-21
+  integration sets the key to 0, restarts, and shows two gated client page
+  reads running at once; at 1, the second client read waits while the reserved
+  worker stays free for a model read.
 - **Disk-space recheck.** `disk_space` is chosen when the effective quota is
   below the configured one. The effective quota is set at payload recovery
   only, so a recheck finds new free space only after a ledger space event.
+  The [disk-space recheck](#disk-space-recheck) design fixes it in J34-K and
+  J34-E.
+- **Limits read failure.** A failed start-time read leaves no controller for
+  the run. The [paced retry](#start-time-limits-read-failure) replaces this in
+  J34-E.
 
 ### J2 code packets
 
@@ -3326,8 +3521,8 @@ two packets edit one file. Each delivers its unit and integration tests and runs
 | J2-C Payload store (merged, `90bef70, 8b0d3c7`) | `asura-storage/src/payload/{id,store,recovery,pages,mod}.rs`; `asura-storage/tests/payload_store.rs` | J2-B | Job-keyed payload IDs and reservations, job recovery facts, page pool without `PAGE_STEP`; J2T-04 (payload), J2T-16 |
 | J2-D1 Slot and capture workers (merged, `1a5991a`) | `asura-service/src/exec_cmd_worker.rs`; `asura-service/src/exec_cmd_worker/tests.rs`; `asura-service/src/capture_worker.rs`; `asura-service/tests/capture_worker.rs` | J2-A, J2-C | Job mode of the slot worker, `impl SlotPort for exec_cmd_worker::Worker` and `slot_factory(wake)`, `StopKind`, notice events, line counts, job-keyed capture, the [slot mapping choices](#slot-mapping-choices); J2T-22 |
 | J2-D2 Controller (merged, `c81db33`) | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` (new); the `mod job_controller;` line of `asura-service/src/lib.rs` | J2-B, J2-G | Queues, start conditions, lifecycle, outbox, recovery, revocation, audit construction, `SlotPort` trait and fixture; J2T-07, J2T-08, J2T-24 and the unit parts of J2T-09 to J2T-15 |
-| J2-A2 Platform follow-up | `asura-platform/src/exec_cmd.rs`; `asura-platform/src/exec_cmd/{guardian,protocol,tests}.rs`; `asura-platform/tests/exec_cmd_process.rs`; the `guardian_setup_reason` function in `asura-service/src/exec_cmd_worker.rs` and its cases in `exec_cmd_worker/tests.rs` | J2-D1 | The kind 3 reason in `ExecCmdResult` and the pre-spawn cleanup token release ([J2-A2](#j2-a2-platform-follow-up)); J2T-25 |
-| J2-E Integration | `asura-service/src/conversation.rs` and `asura-service/src/conversation/*.rs`; `asura-service/src/{payload_owner,audit,tools,test_support,config_worker}.rs`; `asura-service/tests/job_controller_flow.rs` (new); for the `call` to `job` rename only, `asura-service/src/{capture_worker,exec_cmd_worker}.rs`, `exec_cmd_worker/tests.rs`, `job_controller/fixture.rs` and `asura-service/tests/capture_worker.rs`; `docs/user/{commands,guide}.md` for the `jobs` keys; the J2 evidence in this design | All, including J2-A2 | The rename of `capture_worker::Start::call` and `Handle::call` to `job`, the owner's record order, identity, outage, shutdown and recovery wiring, payload owner job admission, audit emission, `config.changed` through `Setting::for_config_key` in `config_worker.rs`; the integration parts of J2T-05 to J2T-23 |
+| J2-A2 Platform follow-up (merged, `7b3d26d`, `ed1ab7b`) | `asura-platform/src/exec_cmd.rs`; `asura-platform/src/exec_cmd/{guardian,protocol,tests}.rs`; `asura-platform/tests/exec_cmd_process.rs`; in `asura-service/src/exec_cmd_worker.rs`, the `guardian_setup_reason` function and the pre-notice paths of `Slot::lost` and `Slot::running` (recorded 2026-10-22), and their cases in `exec_cmd_worker/tests.rs` | J2-D1 | The kind 3 reason in `ExecCmdResult` and the pre-spawn cleanup token release ([J2-A2](#j2-a2-platform-follow-up)); J2T-25 |
+| J2-E Integration (merged, `cf7973e`) | `asura-service/src/conversation.rs` and `asura-service/src/conversation/*.rs`; `asura-service/src/{payload_owner,audit,tools,test_support,config_worker}.rs`; `asura-service/tests/job_controller_flow.rs` (new); for the `call` to `job` rename only, `asura-service/src/{capture_worker,exec_cmd_worker}.rs`, `exec_cmd_worker/tests.rs`, `job_controller/fixture.rs` and `asura-service/tests/capture_worker.rs`; `docs/user/{commands,guide}.md` for the `jobs` keys; the J2 evidence in this design | All, including J2-A2 | The rename of `capture_worker::Start::call` and `Handle::call` to `job`, the owner's record order, identity, outage, shutdown and recovery wiring, payload owner job admission, audit emission, `config.changed` through `Setting::for_config_key` in `config_worker.rs`; the integration parts of J2T-05 to J2T-23 |
 
 ##### TJ-P2: J2 packet order
 
@@ -3342,8 +3537,8 @@ flowchart TD
     C --> D1
     B --> D2["J2-D2 controller (merged)"]
     G["J2-G configuration and audit schema (merged)"] --> D2
-    D1 --> A2["J2-A2 platform follow-up: kind 3 reason, pre-spawn cleanup token"]
-    A2 -->|"exec_cmd_worker.rs: one writer at a time"| E["J2-E integration and evidence"]
+    D1 --> A2["J2-A2 platform follow-up: kind 3 reason, pre-spawn cleanup token (merged)"]
+    A2 -->|"exec_cmd_worker.rs: one writer at a time"| E["J2-E integration and evidence (merged)"]
     D2 --> E
     A --> E
     G --> E
@@ -3377,6 +3572,29 @@ edit `exec_cmd_worker.rs` and only one writer may own a file at a time.
    the launch without a notice fails the test.
 3. **No other change.** The notice order rules, lease bytes, profiles and
    argv contract are unchanged.
+
+Recorded 2026-10-22 from the J2-A2 report (commits `7b3d26d` and `ed1ab7b`):
+
+- **API.** `ExecCmdResult.setup_reason: u8` and
+  `ExecCmdJob::release_pending()` are new. `guardian_setup_reason(u8)` maps
+  5 to 15, 6 to 14, 7 to 13, 8 to 17 and any other value to 18.
+- **Normal exit required.** The pre-notice token release also requires that
+  the guardian exited normally (`WIFEXITED`), not by a signal. Selected
+  (engineering) for safety: a signal can end the guardian between
+  `spawn::launch` and kind 1 while the command is alive, so a signal death
+  keeps the token, and the slot reports `ScratchRetained`.
+- **Slot paths in `exec_cmd_worker.rs`.** `Slot::lost` before kind 1 reports
+  `SetupFailed(ProtocolFault)` once. It then runs the scratch cleanup if
+  `take_cleanup` returns the token. While `release_pending()` is true (the
+  guardian or a capture pipe has not ended, and no signal death was seen), it
+  stays in `Running` and keeps polling. Otherwise it reports
+  `ScratchRetained`. `Slot::running` sends a job that settled with no process
+  to `lost`, so both paths share these rules.
+- **Intermittent failure seen once.** The `asura-platform` `journal_io` test
+  `sj_f19_second_writer_is_owner_busy_and_tmp_publish_is_exclusive` failed
+  once with `OwnerBusy` on reopen during the J2-A2 run and passed 7 reruns. It
+  is unrelated to J2-A2 and is recorded as a known intermittent failure, not a
+  pass.
 
 J2T-25 covers it: a unit case for each kind 3 reason through
 `guardian_setup_reason`, a platform unit case for each token-release
@@ -3427,8 +3645,10 @@ queues (AQ1) and no output text in results (PC12). Mechanisms marked "selected
 (engineering)" are engineering choices under the
 [iteration rules](../design-process.md#iteration-and-escalation). Protocol
 numbering remains `0.1`; journal format remains `1`. Implementation state on
-2026-10-22: the J3 storage records (J34-S) are implemented on the J3
-integration branch, not merged; nothing else in this section is implemented.
+2026-10-22: on the J3 integration branch, not merged, J34-S (storage
+records), J3-H (helper), J34-C (payload store) and J3-D (retirement of the J1
+path) are implemented; the rest of this section is not. Until J34-E, a model
+`exec_cmd` call on the branch is recorded `denied` and runs nothing.
 
 ### J3 scope
 
@@ -3829,6 +4049,28 @@ Selected (engineering, J3-E9). After J3 there is one exec_cmd path.
 | `capture_paused`, `pending_full`, `payload_unavailable` admission | `payload_owner.rs`, `conversation.rs` | J2 start conditions |
 | `X` form 1 (J1 call) | `asura-storage/src/authority/index.rs` | Form 2 only |
 
+#### J1T cases after J3-D
+
+Recorded 2026-10-22 from the J3-D report (commit `b83d572`). J3-D removed the
+test cases whose behavior J3 retires. It kept the cases whose behavior J3
+keeps; they fail on the branch in the designed `denied` state until J34-E
+ports them to the job path.
+
+| Removed by J3-D | Reason |
+| --- | --- |
+| Kind 23 and kind 15 exec_cmd unit tests | Kind 23 is gone; an exec_cmd call resolves with kind 29 (JR11) |
+| `tcr_u13` live run identity | `ExecCmdRun` and the per-turn exec_cmd live state are gone; J2T-04 vectors cover the job ID derivation, and J34-E checks that each submitted job ID equals it (J3T-04) |
+| `render_tail` tests and kind 15 tail assertions | No tails after J3; pages replace them (J3T-08) |
+| `capture_flow` `quota_busy` and the admission parts of `overload` | The J1 busy codes are retired; a blocked start queues (J3T-07, J3T-14) |
+
+| Ported by J34-E to the job path | Required result after the port |
+| --- | --- |
+| `capture_flow`, all 8 cases: `secrets`, `whole`, `setup`, `overload` (capture part), `crash`, `big`, `timeout`, `escapees` | Each case reads kinds 28 and 29 and passes, with the raw-byte sweep |
+| `tool_call_flow` `secret` and `restart` | Pass with the exec_cmd call running as a job |
+| PTY journeys `--exec-cmd-capture` and `--tool-call-records` (`asura-cli/tests/lifecycle.rs`) | Pass on the job path; SDE-06 is shown again by `--exec-cmd-capture` |
+
+J3T-15 passes only when every ported case passes.
+
 ### Model result text
 
 Selected (engineering). The conversation owner renders each result from kind 29
@@ -3925,6 +4167,31 @@ jobs: 2 shown, newest first; more: use job list with before 1832
 **Handle delivery** (code 10) is the state block. Status 6 adds the first line
 `cancelled: the turn ended before this result; the job was cancelled`.
 
+**Filtered command (SL7).** Selected (engineering, 2026-10-22, from the J3-D
+report). When the call's kind 14 has exec_cmd flag bit 1 (whole-command,
+[SL7](secret-detection.md#sl7-model-whole-command-variable)), the handle
+delivery text has the line
+`command filtered: run from a secret variable: <display>` directly after the
+`job:` line. `<display>` is the stored display text (the `command` value of kind 14
+field 14), cut
+to at most 2,048 bytes as SL7 cuts it: never inside a placeholder, `…` at the
+cut, control characters as spaces. It is the only place that shows the
+display text in full. A `status` result of such a job has the line
+`command filtered: run from a secret variable` (no display) directly after
+its `command:` line, because `command:` already shows the excerpt. `read`,
+`wait`, `cancel`, `note` and `list` results add nothing; a list row's excerpt
+is the display text already. The line is not output text (PC12): it is
+rendered from kind 14, never from captured bytes. The longest handle delivery
+text stays under 3,000 bytes, within L21.
+
+Owner: J3-R renders the line in `job_text.rs` from the kind 14 facts that the
+renderer receives. `WHOLE_COMMAND_NOTICE` in `asura-platform` stays the one
+source of the words. J34-E then deletes `filtered_line` from
+`conversation/exec_cmd_call.rs`, where J3-D left it, and ports its unit test
+to `job_text.rs`, so one function cuts the display text. J3T-16 gains golden
+texts for both lines. `ToolProgress.command_filtered` (field 13) and the TUI
+activity row are unchanged.
+
 **Other outcomes.**
 
 | Outcome | Text |
@@ -3975,6 +4242,48 @@ and adds `job` with
 `Job commands: list(before?), status(job), read(job, stream, offset?, limit?), wait(job, seconds?), cancel(job), note(job, text).`
 The helper's `projectToolSchemaBytes` grows with the new declarations; the
 context composer counts it as overhead `S` (CC-I13). `/tools` lists five tools.
+
+### Audit of job tool calls
+
+Selected (engineering, 2026-10-22, from the J3-D report). TCR-D14 already
+requires one `tool.finished` event for every call with a nonzero operation
+code ([tool call records](tool-call-records.md#context-composer-and-views)).
+The audit `Tool` enum has no value for the `job` commands, so J3-D emits none
+for codes 11–16. The job events do not cover these calls: `list`, `status`,
+`read`, `wait` and `note` change no job, and `job.cancel_requested` describes
+the job, not the call. The audit design therefore adds six `Tool` values,
+one per operation, as it already has one value per memory operation:
+
+| Operation code | Command | Audit `Tool` value |
+| --- | --- | --- |
+| 11 | `list` | `job_list` 11 |
+| 12 | `status` | `job_status` 12 |
+| 13 | `read` | `job_read` 13 |
+| 14 | `wait` | `job_wait` 14 |
+| 15 | `cancel` | `job_cancel` 15 |
+| 16 | `note` | `job_note` 16 |
+
+- **Fields.** `tool.finished` keeps its fields: `project`, `operation`,
+  `generation`, `ordinal`, `tool` and `outcome`. It gains no job ID: kind 29
+  names the job, and the event cites the call by operation, generation and
+  ordinal. It holds no argument text, note text, page text or output.
+- **Outcome.** The rendered status of the call's kind 29, mapped as for every
+  other tool: `success` 1, `denied` 2, `invalid_arguments` 3, `unavailable` 4,
+  `timeout` 5, `cancelled` 6, `limit` 7. Through the
+  [kind 29 status table](#kind-29-jobresult), `not_found` gives
+  `invalid_arguments`, `not_permitted` gives `denied`, and `busy` and
+  `unavailable` give `unavailable`.
+- **Order.** The event is emitted after kind 29 commits, as for every
+  `tool.finished`. A `job cancel` emits both `tool.finished` for the call and
+  `job.cancel_requested` when kind 27 commits; they describe different facts.
+- **Wire.** `AuditEntry.tool` already carries the code as `uint32`, so the
+  control contract does not change. The recent audit read and `/audit` show
+  the new values by name.
+
+Packet J34-E implements it: the six values in
+`asura-storage/src/audit/{types,tests}.rs` and the mapping in
+`conversation/audit_tools.rs`, replacing the `return None` for codes 11–16.
+Tests: J3T-20 below.
 
 ### J3 failure handling
 
@@ -4048,6 +4357,7 @@ model of `test_support.rs`. End-to-end cases run with J4 under
 | J3T-17 | No output text (TJ-26, TV2) | Kind 29 and the handle-delivery text hold no output | Raw-byte sweep: no job output in the journal |
 | J3T-18 | Responsiveness (AE-07) | — | Parked `wait` plus a 16-job flood: owner Inspect and cancel within 100 ms |
 | J3T-19 | Helper declarations | Swift unit: five tools, names, guide texts, schema bytes | Helper and service agree on `S` (CC-I13) |
+| J3T-20 | Audit of job calls (TCR-D14) | Each code 11–16 maps to its `Tool` value; each kind 29 status to its outcome; no text field; serde names `job_list` … `job_note` | One `tool.finished` per `job` call after kind 29 commits; a `job cancel` also gives `job.cancel_requested`; the raw-byte sweep finds no note or output text in the audit log |
 
 ### J3 proof limits
 
@@ -4067,10 +4377,11 @@ together with J3 (owner, 2026-10-21, EN1). It applies owner decisions J2a-2,
 J4a, S1, EX12, PC5 and the standing owner rules. Mechanisms marked "selected
 (engineering)" are engineering choices. Protocol numbering remains `0.1`;
 journal format remains `1`. Implementation state on 2026-10-22: the J4
-control contract and client calls (J34-W) are merged on `main`; the J4
-records (kind 30, wall times, listing entries) are implemented by J34-S on the
-J3 integration branch, not merged; nothing else in this section is
-implemented.
+control contract and client calls (J34-W) are merged on `main`. On the J3
+integration branch, not merged, J34-S implements the J4 records (kind 30,
+wall times, listing entries), J34-C the pin hold and delete in the payload
+store, and J4-T the TUI. The control handler (J4-R) and the service wiring
+(J34-E) are not implemented, so no J4 request is served yet.
 
 ### J4 scope
 
@@ -4492,6 +4803,44 @@ later replaces the interim expiry with value classes and keeps both.
 - **Quota.** Freed bytes wake queue heads blocked by `quota` (J2 wake events)
   and a paused capture's retry.
 
+Recorded 2026-10-22 from the J34-C report (commit `a43765a` on the J3
+integration branch):
+
+- **API.** `Ledger::{set_pinned, pinned, deleted}`;
+  `PayloadStore::delete_job(installation, job) -> Result<(), DeleteError>`
+  with `DeleteError::{NotSettled, Payload}`; `PageState::Deleted`;
+  `TEXT_LIMIT` 8,192 (the delivered-text bound); `RecoveryReport.deleted`.
+  `ExecCmdCall::settled` and `ExecCmdSettlement` are deleted. Removing them
+  also needed one-line edits outside the J34-C paths: the `state.rs`
+  constructor and two test assertions.
+- **Delete order.** `delete_job` returns `NotSettled` while the ledger still
+  holds the job live. The payload owner (J34-E) settles the ledger in
+  `PayloadPort::committed` when kind 28 commits, and queues a delete only
+  after kind 30 `delete` commits. The control handler refuses a live job's
+  delete with `not_settled` before kind 30. Because both commits are handled
+  in order on the reactor, a queued delete always finds the job settled. If
+  `NotSettled` still occurs, the payload owner logs
+  `payload_delete_not_settled`, leaves the files, and the next start's
+  recovery completes the delete from `PayloadFacts`.
+- **Deletion queue.** J34-E builds the maintenance-worker deletion queue of
+  8 in `payload_owner.rs`. A committed delete is never refused, because its
+  kind 30 is already durable. When the queue is full, the payload owner keeps
+  the job ID in a pending list and moves it to the queue when a place frees.
+  Each job is deleted at most once (a second delete changes nothing and
+  writes no kind 30), so the pending list never holds more jobs than the
+  ledger holds. The same worker
+  runs the [disk-space measurement](#disk-space-recheck).
+- **Person origin.** `PayloadFacts` gives `RepairRequired` for a person-origin
+  job payload until P2 defines its facts. No person-origin job exists before
+  P2, because JR2 rejects its kind 26, so pin and delete of a person job are
+  not reachable until then. P2 delivers the person-origin pin and delete
+  facts.
+- **Test helper.** The `known_calls` test helper sets `pinned` to false for
+  unsettled jobs, because replay has no `E` entry for them. Production reads
+  the pin state from `PayloadFacts`.
+- **Stale comments.** `asura-storage/src/payload/id.rs` still mentions
+  "J1-mode" calls. No J1 mode exists after J3; J34-E removes those comments.
+
 ### J4 TUI
 
 Selected (engineering). The TUI owns presentation and the job worker; the
@@ -4557,6 +4906,38 @@ notice whenever a job outlives its turn, however the turn ended (EX12).
 `N jobs are still running in all projects; they stop when the service stops.`,
 with `N` from `live_in_service` of the status `JobList`. With `N` = 0 the line
 is absent.
+
+Recorded 2026-10-22 from the J4-T report (commit `f7f50c3` on the J3
+integration branch). Nothing job-related is shown for a service without
+`CAPABILITY_JOBS`.
+
+- **Exit confirmation.** For a TUI-launched backend with `N` > 0, Ctrl+Q,
+  Ctrl+C, Ctrl+D, `/quit` and `/exit` open the exit confirmation even when the
+  draft and the local outbox are empty. Its title is then `Exit?`, followed by
+  the job line above. The choices stay `[Keep editing]` and
+  `Discard and exit`; Enter on `Discard and exit` exits and the service stops
+  the jobs through shutdown. An attached backend that the TUI did not launch
+  shows no job line and adds no confirmation
+  ([CF04b](command-flows.md#cf04b-local-command-completion)).
+- **Status slot.** The status attachment sends `JobList` with limit 1; it
+  needs only the counts and the revision.
+- **Command list.** `/jobs`, `/job` and `/execution` are in a separate
+  `JOB_COMMANDS` list in `tui/ui.rs`. They dispatch, but Tab completion and
+  help do not show them yet, because the help-index test requires a row in
+  `docs/user/commands.md` for every listed command. J34-E adds the three rows
+  and merges `JOB_COMMANDS` into `LOCAL_COMMANDS` in the same change.
+- **Router source.** The router's source bitmask in `tui/events.rs` is a `u8`
+  and all 8 bits are used, so the job worker shares `Source::QueueWatch`.
+  Widening the mask to `u16` and giving the job worker its own source is an
+  optional follow-up; it changes no behavior.
+- **No kill command.** J4 designs no TUI command that sets `JobCancel.kill`.
+  The person kill comes with P3: the second Ctrl-C on a running person job.
+- **Fields 28 and 29.** `JobEntry` fields 28 `left_running` and 29
+  `shell_exited` are not in `control.proto` until P3-C. Until then the TUI
+  does not render `shell exited · N background processes writing`.
+- **PTY journeys.** `--jobs`, `--job-viewer`, `--job-retention` and
+  `--execution-setting` are written in `asura-cli/tests/tui_pty.py` but have
+  not run. J34-E adds them to `asura-cli/tests/lifecycle.rs` and runs them.
 
 ##### TJ-S4: job viewer states
 
@@ -4677,14 +5058,14 @@ primary agent integrates and inspects each result.
 | J34-S Storage records (implemented on the J3 integration branch, `5ca5087`; not merged) | `asura-storage/src/authority/**`; `asura-storage/tests/{authority_conversation,authority_replay,journal_writer,segmented_journal}.rs` | J2 merged | Kinds 29 and 30; wall times in kinds 26 and 28 and the new ledger constants; kind 14 field 10 reasons, codes 11–16, fault 16, `job` in `TOOL_NAMES`; reasons 19 and 20; JR11–JR17; kind 23 removal; reservations; `C`, `L`, `M`, `Y`, `U`, `E` entries; `X` form 1 removal; reads `Jobs`, `JobFacts`, `Settlements`; `PayloadFacts` retention state; J3T-02, J3T-03, J4T-02, J4T-03 |
 | J34-G Configuration and audit schema (merged, `09eaa67`, `2bc01d8`) | `asura-storage/src/config.rs`; `asura-storage/src/audit/{types,mod,tests}.rs` | J2 merged | `execution.*` keys and the leaf form; `Setting` entries for them in `for_config_key`; `execution.changed`; job reasons 19 and 20 in the audit enum; ES-02 (unit) |
 | J34-W Control contract and client (merged, `a80c142`, `64da4f3`) | `contracts/control/v1/control.proto`; `asura-control/src/{lib,wire}.rs`; `asura-control/src/jobs.rs` (new); `asura-client/src/lib.rs` | — | Messages 57–67, enums, `CAPABILITY_JOBS`, `ToolProgress.job_id`, outlived fields, `AuditEntry.job`, codecs and client calls; J4T-01 |
-| J3-H Helper (on branch `j3-h`; lands on the J3 integration branch) | `swift/model-helper/Sources/HelperCore/ToolBridge.swift`; its Swift tests | — | `JobTool`, exec_cmd guide texts, schema bytes; J3T-19 |
-| J34-C Payload store | `asura-storage/src/payload/{store,recovery,pages,mod}.rs`; `asura-storage/tests/payload_store.rs`; after J34-S, the `ExecCmdCall::settled` field and the `ExecCmdSettlement` type in `asura-storage/src/authority/conversation/types.rs` | J34-S | Pin hold, delete, page state `deleted`, the delivered-text bound; drops the last read of `ExecCmdCall::settled` in `payload/recovery.rs`, then deletes that field and `ExecCmdSettlement`, which J34-S kept as always `None`; J4T-06 (storage) |
-| J34-K Controller extensions | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | J34-S, J3-D | Snapshots, yield and model waits, observe parking, revision, live counts, outlived derivation, `revoke` with an origin filter, the EX11 check at slot grant; unit parts of J3T-04 to J3T-10, J4T-04, J4T-08, ES-05 |
-| J3-D Slot and capture retirement | `asura-service/src/exec_cmd_worker.rs`, `exec_cmd_worker/tests.rs`; `asura-service/src/capture_worker.rs`, `asura-service/tests/capture_worker.rs`; `asura-platform/src/exec_cmd/capture.rs`; `asura-platform/src/exec_cmd.rs`; for the J1 call path removal only, `asura-service/src/conversation.rs`, `conversation/{exec_cmd_call,tool_tests}.rs`, `asura-service/src/{payload_owner,tools}.rs` and `asura-service/tests/capture_flow.rs` | J34-S, J34-C | Removal of the J1 call API, kind 23 builders and `render_tail`, and of every kind 23 and J1 busy-code use in `asura-service`, so the crate compiles again on the branch ([branch order](#tj-p3-j3-and-j4-packet-order-and-enablement)); J3T-15 |
-| J3-R Tool parsing and result text | `asura-service/src/tools.rs`; `asura-service/src/tools/{parse,parse_tests}.rs`; `asura-service/src/job_text.rs` (new) | J34-S, J3-D | `job` and exec_cmd arguments, registry text, the `execution_off` refusal, the renderer; J3T-01, J3T-14, J3T-16 |
+| J3-H Helper (implemented on the J3 integration branch, `b366b37`) | `swift/model-helper/Sources/HelperCore/ToolBridge.swift`; its Swift tests | — | `JobTool`, exec_cmd guide texts, schema bytes; J3T-19 |
+| J34-C Payload store (implemented on the J3 integration branch, `a43765a`) | `asura-storage/src/payload/{store,recovery,pages,mod}.rs`; `asura-storage/tests/payload_store.rs`; after J34-S, the `ExecCmdCall::settled` field and the `ExecCmdSettlement` type in `asura-storage/src/authority/conversation/types.rs`, with the one-line edits that their removal needed in the `state.rs` constructor and two test assertions (recorded 2026-10-22) | J34-S | Pin hold, delete, page state `deleted`, the delivered-text bound; drops the last read of `ExecCmdCall::settled` in `payload/recovery.rs`, then deletes that field and `ExecCmdSettlement`, which J34-S kept as always `None`; J4T-06 (storage) |
+| J34-K Controller extensions | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | J34-S, J3-D | Snapshots, yield and model waits, observe parking, revision, live counts, outlived derivation, `revoke` with an origin filter, the EX11 check at slot grant; `PayloadPort::refresh_space` and its call in the paced `disk_space` recheck ([disk-space recheck](#disk-space-recheck)); the pacing type made `pub(crate)` for the [limits read retry](#start-time-limits-read-failure); removal of the J2 `dead_code` allowances as items gain callers; unit parts of J3T-04 to J3T-10, J4T-04, J4T-08, ES-05 |
+| J3-D Slot and capture retirement (implemented on the J3 integration branch, `b83d572`) | `asura-service/src/exec_cmd_worker.rs`, `exec_cmd_worker/tests.rs`; `asura-service/src/capture_worker.rs`, `capture_worker/tests.rs`, `asura-service/tests/capture_worker.rs`; `asura-platform/src/exec_cmd/capture.rs`; `asura-platform/src/exec_cmd.rs`, `exec_cmd/tests.rs`, `asura-platform/tests/exec_cmd_process.rs` and `tests/support/escapees.rs`; for the J1 call path removal only, `asura-service/src/conversation.rs`, `conversation/{exec_cmd_call,tool_tests,audit_tools,memory_create_tests}.rs`, `asura-service/src/{payload_owner,tools,test_support}.rs`, `tools/parse.rs`, `job_controller/reasons.rs` and `asura-service/tests/capture_flow.rs` (recorded 2026-10-22: the paths beyond the first plan were needed to compile; J3-R, J34-K and J34-E own them later) | J34-S, J34-C | Removal of the J1 call API, kind 23 builders and `render_tail`, and of every kind 23 and J1 busy-code use in `asura-service`, so the crate compiles again on the branch ([branch order](#tj-p3-j3-and-j4-packet-order-and-enablement)); the `job` entry in `REGISTRY`, so `TOOL_NAMES` equals the registry; the removal of the [retired J1T cases](#j1t-cases-after-j3-d); J3T-15 (unit) |
+| J3-R Tool parsing and result text | `asura-service/src/tools.rs`; `asura-service/src/tools/{parse,parse_tests}.rs`; `asura-service/src/job_text.rs` (new) | J34-S, J3-D | `job` and exec_cmd arguments, registry text, the `execution_off` refusal, the renderer with the [SL7 filtered line](#model-result-text); J3T-01, J3T-14, J3T-16 |
 | J4-R Job control handler | `asura-service/src/job_control.rs` (new) | J34-W, J34-K | Request handling, parked requests, viewer bound, the registry check of an all-projects listing; unit parts of J4T-04 to J4T-07 |
-| J4-T TUI | `asura-cli/src/tui/jobs.rs` (new); `asura-cli/src/tui/{ui,mod,config}.rs`; `asura-cli/src/tui/ui/*.rs`; `asura-cli/tests/tui_pty.py` (job journeys) | J34-W | Job worker, list, viewer, commands, EX12 notice, status row, exit count, `/execution`; J4T-11 and the PTY journeys |
-| J34-E Integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (including new `job_tool.rs`, `audit_tools.rs`); `asura-service/src/{lib,payload_owner,audit,config_worker,test_support}.rs`; `asura-service/tests/{job_tool_flow,job_control_flow}.rs` (new); `asura-platform/src/config.rs` and its tests, and the ES-02 file-bound case in `asura-storage/src/config.rs`, for the [configuration file bound](execution-setting.md#configuration); `docs/user/{commands,guide,keys}.md`; the J3, J4 and EX11 evidence in the designs | All above | The exec_cmd switch, the 64 KiB configuration file bound, kind 29 append, yield window wiring, `job` dispatch, job request routing and capability, execution setting state and revocation, audit emission, job events in the audit read; integration parts of every J3T, J4T and ES case |
+| J4-T TUI (implemented on the J3 integration branch, `f7f50c3`) | `asura-cli/src/tui/jobs.rs` (new); `asura-cli/src/tui/{ui,mod,config}.rs`; `asura-cli/src/tui/ui/*.rs`; `asura-cli/tests/tui_pty.py` (job journeys) | J34-W | Job worker, list, viewer, commands, EX12 notice, status row, exit count, `/execution`; J4T-11 and the PTY journeys |
+| J34-E Integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (including new `job_tool.rs`, `audit_tools.rs`, and `jobs.rs` for the limits read retry); `asura-service/src/{lib,payload_owner,audit,config_worker,test_support}.rs`; `asura-service/tests/{job_tool_flow,job_control_flow}.rs` (new) and the ports in `asura-service/tests/{capture_flow,tool_call_flow,job_controller_flow}.rs`; `asura-platform/src/config.rs` and its tests, and the ES-02 file-bound case in `asura-storage/src/config.rs`, for the [configuration file bound](execution-setting.md#configuration); the six job values in `asura-storage/src/audit/{types,tests}.rs`; the reserved-worker parameter of `PagePool::start` in `asura-storage/src/payload/pages.rs` and the stale J1-mode comments in `asura-storage/src/payload/id.rs`; for the `JOB_COMMANDS` merge only, `asura-cli/src/tui/ui.rs`; `asura-cli/tests/lifecycle.rs`; `docs/user/{commands,guide,keys}.md`; the J3, J4 and EX11 evidence in the designs | All above | The exec_cmd switch, the 64 KiB configuration file bound, kind 29 append, yield window wiring, `job` dispatch, job request routing and capability, execution setting state and revocation, audit emission, job events in the audit read; the [audit of job calls](#audit-of-job-tool-calls); the maintenance worker with its deletion queue of 8 and the [disk-space measurement](#disk-space-recheck); `jobs.modelReservedPageReads` applied; the [limits read retry](#start-time-limits-read-failure); `filtered_line` removed from `exec_cmd_call.rs`; the `commands.md` rows for `/jobs`, `/job` and `/execution` with `JOB_COMMANDS` merged into `LOCAL_COMMANDS`; the four job PTY modes in `lifecycle.rs`; the [J1T ports](#j1t-cases-after-j3-d); the identity detectors through real turns; integration parts of every J3T, J4T and ES case and of J2T-09, J2T-18 and J2T-19 |
 
 ##### TJ-P3: J3 and J4 packet order and enablement
 
@@ -4705,11 +5086,12 @@ Order on the branch. Each step names the crates whose tests run green at that
 step; a packet hands over only when they pass.
 
 1. **J34-S** storage records (done, `5ca5087`).
-2. **J3-H** helper, merged in from branch `j3-h`: `swift test`. It is
-   independent of the Rust steps.
+2. **J3-H** helper, merged in from branch `j3-h` (done, `b366b37`):
+   `swift test`. It is independent of the Rust steps.
 3. **J34-C** payload store, including the removal of `ExecCmdCall::settled`
-   and `ExecCmdSettlement`: `cargo test -p asura-storage` passes again.
-4. **J3-D** slot and capture retirement. It also removes every kind 23 and J1
+   and `ExecCmdSettlement` (done, `a43765a`): `cargo test -p asura-storage`
+   passes again.
+4. **J3-D** slot and capture retirement (done, `b83d572`). It also removes every kind 23 and J1
    busy-code use from the conversation owner, the payload owner and the tool
    parser, so `asura-service` compiles: `cargo test -p asura-platform -p
    asura-service`. Between J3-D and J34-E a model `exec_cmd` call on the
@@ -4717,12 +5099,19 @@ step; a packet hands over only when they pass.
    branch is never merged in that state. J3-D removes the J1T cases of retired
    behavior (kind 23, the J1 tails, the J1 busy codes); J34-E ports the cases
    whose behavior J3 keeps (capture, redaction, quota, pause, pages) to the
-   job path.
+   job path ([J1T cases after J3-D](#j1t-cases-after-j3-d)). Recorded
+   2026-10-22: to compile, J3-D also edited `test_support.rs`,
+   `conversation/audit_tools.rs`, `conversation/memory_create_tests.rs`,
+   `job_controller/reasons.rs`, `tools/parse.rs`, `capture_worker/tests.rs`
+   and the platform tests `exec_cmd/tests.rs`, `tests/exec_cmd_process.rs`
+   and `tests/support/escapees.rs`, and added the `job` entry to `REGISTRY`
+   so that `TOOL_NAMES` equals the registry. Each of those files has one
+   writer at a time on the branch.
 5. **J34-K** controller extensions and **J3-R** parsing and result text, in
    parallel (disjoint paths): `cargo test -p asura-service`.
 6. **J4-R** job control handler, after J34-K: `cargo test -p asura-service`.
-7. **J4-T** TUI: `cargo test -p asura-cli`. It needs only J34-W, so it may run
-   at any point on the branch.
+7. **J4-T** TUI (done, `f7f50c3`): `cargo test -p asura-cli`. It needs only
+   J34-W, so it may run at any point on the branch.
 8. **J34-E** integration: the full workspace `cargo test`, `swift test`, the
    J3T, J4T and ES integration cases and the
    [joint end-to-end cases](#j3-and-j4-end-to-end-validation).
@@ -4735,13 +5124,13 @@ flowchart TD
     W["J34-W control contract and client (merged on main)"] --> Branch
     subgraph Branch["J3 integration branch"]
         S["1 J34-S storage records (done)"]
-        H["2 J3-H helper: swift test"]
-        C["3 J34-C payload store: asura-storage green"]
-        D["4 J3-D retirement: asura-service compiles"]
+        H["2 J3-H helper: swift test (done)"]
+        C["3 J34-C payload store: asura-storage green (done)"]
+        D["4 J3-D retirement: asura-service compiles (done)"]
         K["5 J34-K controller extensions"]
         R["5 J3-R parsing and result text"]
         CR["6 J4-R job control handler"]
-        T["7 J4-T TUI"]
+        T["7 J4-T TUI (done)"]
         E["8 J34-E integration"]
         S --> C
         C --> D
@@ -4778,7 +5167,7 @@ cases use the system model and a verified local Ollama model.
 | J34E-04 | TJ-05, TJ-18 | PTY | `/job ID` while running shows growing output; Tab keeps positions; follow tracks the end; opened from an activity row with `j` |
 | J34E-05 | TJ-06 | PTY and native | `/job cancel` and model `job cancel` each stop a job; the viewer shows the result |
 | J34E-06 | TJ-08 | PTY | Third job of one agent shows `queued (waiting: 2 of 2 jobs running for this agent)` to the model and in `/jobs` |
-| J34E-07 | TJ-09, TJ-24, TJ-28 | PTY with a constrained APFS image | A paused job is shown with its reason and resumes after `/job delete` frees space |
+| J34E-07 | TJ-09, TJ-24, TJ-28 | PTY with a constrained APFS image | A paused job is shown with its reason and resumes after `/job delete` frees space; a start waiting with `disk_space` begins after a file outside Asura is deleted ([disk-space recheck](#disk-space-recheck)) |
 | J34E-08 | TJ-13 | PTY | `/new` and exit keep jobs; reattach lists them; a TUI-launched backend's exit confirmation counts them |
 | J34E-09 | TJ-25 | PTY | `/jobs all`; cross-project cancel confirmation accepted and declined |
 | J34E-10 | TJ-31, TJ-23 | PTY | `/job pin`, `/job note`, `/job delete`; model `job note`; the detail panel shows both notes with authors |
@@ -5202,5 +5591,20 @@ J34-S reports and the code at commit `1a5991a` on `main`
 `5ca5087` on branch `j34-s`. TJ-S1, TJ-P2 and TJ-P3 changed and were rendered
 with Mermaid CLI 12.0.0 and inspected. No code or test was run by the design
 writer.
+
+Recorded on 2026-10-22 (J2-A2, J2-E, J34-C, J4-T and J3-D reports): written
+from those reports and the code at `cf7973e` on `main`
+(`exec_cmd_worker.rs`, `asura-platform/src/exec_cmd.rs`,
+`conversation/jobs.rs`, `payload_owner.rs`, `asura-storage/src/payload/store.rs`)
+and `b83d572` on the J3 integration branch (`audit_tools.rs`,
+`audit/types.rs`, `exec_cmd_call.rs`, `payload/{store,pages,id}.rs`,
+`tui/ui.rs`, `tui/ui/execution.rs`, `capture_flow.rs`, `tool_call_flow.rs`,
+`asura-cli/tests/lifecycle.rs`). Engineering selections: the audit values for
+`job` calls, the SL7 line in the job result text, the disk-space measurement
+on each paced recheck, the paced limits read retry, the person-origin launcher
+in the person packets, `jobs.modelReservedPageReads` in J34-E, the delete
+order and the deletion queue overflow. TJ-Q9 and TJ-F5 are new; TJ-P2 and
+TJ-P3 changed. Each was rendered with Mermaid CLI and inspected. No code or
+test was run by the design writer.
 
 Return to the [design index](README.md).

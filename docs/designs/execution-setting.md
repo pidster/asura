@@ -319,6 +319,24 @@ After a set that turns the selected project off, the reply line reads
 `execution off for <project name>: running model jobs in this project are being stopped · /jobs`.
 The TUI does not count the jobs itself; `/jobs` shows them settle.
 
+Reply texts for the other sets (selected, engineering; recorded 2026-10-22 as
+packet J4-T implemented them in `asura-cli/src/tui/ui/execution.rs`):
+
+| Command | Reply line after the value is persisted |
+| --- | --- |
+| `/execution on` | `execution: on (default) · projects without an override run model commands` |
+| `/execution off` | `execution: off (default) · model jobs in projects without an override are being stopped · /jobs` |
+| `/execution project on` | `execution on for <project name> (project override)` |
+| `/execution project inherit` | `execution for <project name> follows the default` |
+
+A usage error shows
+`Use /execution, /execution on|off or /execution project on|off|inherit; draft retained`.
+A lost or cancelled reply shows
+`Execution setting outcome unconfirmed; read it again with /execution`.
+`/execution` is dispatched from the separate `JOB_COMMANDS` list until J34-E
+adds its row to `docs/user/commands.md` and merges the list
+([J4 TUI](tool-job-controller.md#j4-tui)).
+
 While the selected project's effective value is off, the status row shows
 `exec off`. The TUI learns the value from `JobListReply.execution_enabled`
 ([J4 control messages](tool-job-controller.md#j4-control-messages)), which its
@@ -469,7 +487,7 @@ two writers ([J3 and J4 code packets](tool-job-controller.md#j3-and-j4-code-pack
 | Controller `revoke` scope with origin filter | J34-K controller extensions | `asura-service/src/job_controller.rs`, `job_controller/*.rs` |
 | Refusal reason and rendered text in the tool authority check | J3-R tool parsing and result text | `asura-service/src/tools.rs` |
 | Owner state, per-call grant, revocation wiring, audit emission (one `execution.changed` per changed entry) | J34-E integration | `asura-service/src/conversation.rs`, `audit.rs`, `config_worker.rs` |
-| `/execution` and the status indicator | J4-T TUI | `asura-cli/src/tui/{ui,config,jobs}.rs` |
+| `/execution` and the status indicator | J4-T TUI (implemented on the J3 integration branch, `f7f50c3`) | `asura-cli/src/tui/{ui,config,jobs}.rs` |
 | User documentation for the keys and command | J34-E | `docs/user/{commands,guide}.md` |
 
 ## Decisions
@@ -509,6 +527,10 @@ Recorded on 2026-10-22 (revision): written from the J34-G packet report and
 the merged code (`asura-storage/src/config.rs`, `asura-storage/src/audit/types.rs`,
 `asura-platform/src/config.rs`) at commit `1a5991a`. Decisions ES-E6 and ES-E7
 were added, and the `config.changed` setting of a leaf set was confirmed. No
+diagram changed. No code or test was run by the design writer.
+
+Recorded on 2026-10-22 (J4-T report): the `/execution` reply texts were
+recorded from the code at commit `f7f50c3` on the J3 integration branch. No
 diagram changed. No code or test was run by the design writer.
 
 Return to the [design index](README.md).

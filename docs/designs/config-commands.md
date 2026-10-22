@@ -453,8 +453,13 @@ unknown codes cannot become free-form strings. Wire reason codes are none 0,
 request_conflict 1, generation_conflict 2, unavailable 3, denied 4, invalid 5,
 busy 6, limit 7, timeout 8, cancelled 9 and internal 10. Tool codes follow the
 registry: read-file 1, list-directory 2, service-status 3, memory-list 4,
-memory-get 5, memory-sources 6, tool-inventory 7 and audit-read 8.
-This first slice does not record
+memory-get 5, memory-sources 6, tool-inventory 7, audit-read 8, exec-cmd 9
+and memory-create 10. The J3 `job` tool adds one code per command: job-list
+11, job-status 12, job-read 13, job-wait 14, job-cancel 15 and job-note 16
+(serialized `job_list` … `job_note`; selected, engineering, 2026-10-22; packet
+J34-E; [audit of job tool calls](tool-job-controller.md#audit-of-job-tool-calls)).
+A `job` call's `tool.finished` holds the same fields as any other call and no
+job ID, note or output text. This first slice does not record
 queue events; admission metadata still explains stale expected generations.
 
 The canonical conversation owner emits admission outcomes and supplies current

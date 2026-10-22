@@ -1255,7 +1255,7 @@ landed before J2. It needs no Keychain: model values stay in memory.
 | Guardian | Accepts `ASURA_SECRET_COMMAND` as the only secret variable when present, 1–8192 bytes, erased like the others; the preamble covers it. Any numbered variable beside it, or any command other than the fixed `eval` text, is refused. | `asura-platform/src/exec_cmd` guardian and request validation (`ExecCmdRequest.secret_command`) |
 | Call admission | A `WholeCommand` result admits the call with decision `run`; the spawn command is `eval "$ASURA_SECRET_COMMAND"`. Bit 1 and the fallback reason are written only when admission ends in `run`; a `busy`, `denied` or `cancelled` call records neither. | `asura-service/src/conversation.rs` (`decide`), `conversation/exec_cmd_call.rs` |
 | Kind 14 | Stores the display text in field 14's `command`, sets exec_cmd flag bit 1 (whole-command), and keeps the reason in fields 21–23 as the fallback reason. See the [tool call record amendment](tool-call-records.md#sl7-amendment-owner-2026-10-20). | `asura-storage` kind 14 codec and replay |
-| Views | The TUI activity row and the model's result say `command filtered: run from a secret variable` beside the display text. Control `ToolProgress` field 13 `command_filtered` carries the mark. | Service result rendering (`exec_cmd_worker.rs`), `conversation.rs` (`ToolProgress`), TUI activity |
+| Views | The TUI activity row and the model's result say `command filtered: run from a secret variable` beside the display text. Control `ToolProgress` field 13 `command_filtered` carries the mark. | Service result rendering (`exec_cmd_worker.rs` in SL7; `conversation/exec_cmd_call.rs` after J3-D; `job_text.rs` after J3-R and J34-E), `conversation.rs` (`ToolProgress`), TUI activity |
 
 The model's result places the line `command filtered: run from a secret
 variable: <display>` after its first line, which replay reads the exit code
@@ -1263,6 +1263,18 @@ from. The line shows at most 2,048 bytes of the display text. The cut never
 splits a placeholder, and `…` marks it. Control characters become spaces. With
 two tails of at most 6,144 bytes each, the result stays below its
 16,384-byte limit.
+
+J3 amendment (selected, engineering, 2026-10-22). After J3 an exec_cmd
+result carries no output text and no exit-code first line (PC12). The line
+moves into the job result text: the handle delivery result shows
+`command filtered: run from a secret variable: <display>` directly after its
+`job:` line, with the same 2,048-byte cut, and a `job status` result shows
+`command filtered: run from a secret variable` after its `command:` line. The
+[job result text](tool-job-controller.md#model-result-text) owns the
+placement; `job_text.rs` renders it from kind 14 bit 1 and the stored display
+text, and `WHOLE_COMMAND_NOTICE` stays the one source of the words. The
+J1 tails no longer exist, so the 16,384-byte argument above no longer
+applies; the handle delivery text stays under 3,000 bytes.
 
 The TUI shows the mark on the decision line below the arguments:
 `· service admitted · command filtered: run from a secret variable`.
@@ -1633,5 +1645,10 @@ kind 31 fields, dispatch-only item reads, the literal re-plan, the FD 11
 environment descriptor for non-secret entries and the SL5 packet mapping.
 SD-P1 changed and was rendered with Mermaid CLI 12.0.0 and inspected. No code
 or test was run.
+
+Recorded on 2026-10-22 (J3-D report): the SL7 result line was placed in the
+job result text, with code facts checked at commit `b83d572` on the J3
+integration branch (`conversation/exec_cmd_call.rs` `filtered_line`). No
+diagram changed. No code or test was run by the design writer.
 
 Return to the [design index](README.md).

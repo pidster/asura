@@ -350,8 +350,9 @@ it does not claim successful model generation. No user journal or database was c
 
 ## Job list and job viewer
 
-Selected design, 2026-10-22, for [tool job packet J4](tool-job-controller.md#j4-tui);
-not implemented. The job list and the job viewer are overlays above the
+Selected design, 2026-10-22, for [tool job packet J4](tool-job-controller.md#j4-tui).
+Packet J4-T implemented it on the J3 integration branch (`f7f50c3`, not
+merged) with unit tests for J4T-11 and the transitions below. The job list and the job viewer are overlays above the
 composer. They take keys while open. Rendering and key handling perform no I/O;
 the TUI job worker sends every request.
 
@@ -396,3 +397,7 @@ stateDiagram-v2
 Validation: unit tests cover each transition, key routing, narrow layouts and
 the hint text; the PTY journeys `--jobs`, `--job-viewer` and `--job-retention`
 cover them end to end ([J3 and J4 end-to-end validation](tool-job-controller.md#j3-and-j4-end-to-end-validation)).
+The journeys are written in `tui_pty.py` but have not run: J34-E adds them to
+`asura-cli/tests/lifecycle.rs` and runs them against the integrated service.
+No TUI command or key sets the kill flag of a job cancel; the person kill
+comes with P3's second Ctrl-C.
