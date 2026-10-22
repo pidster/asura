@@ -1706,6 +1706,8 @@ impl Replay {
         // behind the previous turn's (J5, `notice_through` replay rule).
         let notice_through = p.composition.notice_through;
         require(notice_through < frame.sequence && notice_through >= previous)?;
+        // The live count at S is at most the unsettled-job bound (J5-E8).
+        require(p.composition.notice_live as usize <= MAX_UNSETTLED_JOBS)?;
         let mut prior = BTreeSet::new();
         let mut last_generation = 0;
         for id in &p.prior_operations {

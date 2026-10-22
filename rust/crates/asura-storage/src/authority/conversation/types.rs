@@ -217,6 +217,11 @@ pub struct Composition {
     /// below the kind 21's own sequence and at least the conversation's
     /// previous kind 21 cursor.
     pub notice_through: u64,
+    /// The conversation's unsettled job count at `notice_through` (J5-E8),
+    /// so a past turn's notice can be rebuilt without a history scan. Replay
+    /// requires it to be at most [`MAX_UNSETTLED_JOBS`]; it stays in the
+    /// kind 21 frame only.
+    pub notice_live: u32,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartAuthorized {

@@ -2711,13 +2711,14 @@ fn j5_prepare(writer: &mut WriterHandle, project: Id, generation: u64) -> Prepar
     .prepared
     .unwrap()
 }
-/// The second turn of conversation 33 with cursor `notice`, admitted.
+/// The second turn of conversation 33 with cursor `notice` and live count
+/// `live`, admitted.
 fn j5_accept(
     writer: &mut WriterHandle,
     revision: &mut u64,
     project: Id,
     configuration_digest: Hash,
-    notice: u64,
+    (notice, live): (u64, u32),
 ) -> Result<()> {
     let mut turn = j1_turn(project, configuration_digest);
     turn.request = [40; 16];
@@ -2729,6 +2730,7 @@ fn j5_accept(
     turn.prompt = "next".into();
     turn.prior_operations = vec![[35; 16]];
     turn.composition.notice_through = notice;
+    turn.composition.notice_live = live;
     turn.digest = request_digest(Request::Submit {
         project,
         conversation: Some([33; 16]),
@@ -2757,9 +2759,9 @@ fn j5_accept(
 /// P from the previous kind 21, S the last committed sequence, the
 /// settlements in (P, S] with their kind 14 and the live count. A kind 28
 /// that commits after `Prepare` is in the next turn's range only. Kind 21
-/// with a cursor at or above its own sequence is `Invalid` and writes
-/// nothing (the revision check of the next append proves it); the accepted
-/// cursor survives a restart. Cursors below P are covered by the unit cases.
+/// with a cursor at or above its own sequence, or a live count above 64
+/// (J5-E8), is `Invalid` and writes nothing (the revision check of the next
+/// append proves it); the accepted cursor and count survive a restart. Cursors below P are covered by the unit cases.
 #[test]
 fn j5t_02_real_writer_prepare_returns_notice_inputs_and_checks_the_cursor() {
     let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
@@ -2818,6 +2820,7 @@ fn j5t_02_real_writer_prepare_returns_notice_inputs_and_checks_the_cursor() {
     let notice = prepared.notice;
     let through = revision;
     assert_eq!((notice.after, notice.through, notice.live), (0, through, 1));
+    let notice_live = notice.live;
     assert_eq!(notice.settlements.len(), 1);
     let entry = &notice.settlements[0];
     assert_eq!(entry.listing.job, j2_job(1));
@@ -2844,17 +2847,28 @@ fn j5t_02_real_writer_prepare_returns_notice_inputs_and_checks_the_cursor() {
                 &mut revision,
                 project,
                 configuration_digest,
-                notice
+                (notice, notice_live)
             ),
             Err(Error::Invalid)
         );
     }
+    // A live count above the unsettled-job bound is invalid.
+    assert_eq!(
+        j5_accept(
+            &mut writer,
+            &mut revision,
+            project,
+            configuration_digest,
+            (through, 65)
+        ),
+        Err(Error::Invalid)
+    );
     j5_accept(
         &mut writer,
         &mut revision,
         project,
         configuration_digest,
-        through,
+        (through, notice_live),
     )
     .unwrap();
     close(&mut writer);

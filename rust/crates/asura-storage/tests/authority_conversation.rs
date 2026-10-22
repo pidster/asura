@@ -330,6 +330,7 @@ fn composed_turns_record_budget_and_account_for_omitted_history() {
             overhead_tokens: 300,
             bytes_per_token_milli: 1000,
             notice_through: 0,
+            notice_live: 0,
         };
         p
     };
@@ -4268,8 +4269,9 @@ fn noticed_turn(notice: u64) -> TurnAccepted {
     p
 }
 /// J5T-03 (unit): kind 21 `notice_through` is a big-endian u64 after the
-/// budget fields and before the two thinking codes, and round-trips; a
-/// truncated cursor does not decode. Replay requires the cursor below the
+/// budget fields, followed by `notice_live` (a big-endian u32, J5-E8) and
+/// the two thinking codes, and both round-trip; a truncated block does not
+/// decode. Replay requires the cursor below the
 /// record's own sequence and at least the conversation's previous kind 21
 /// cursor: a decreasing value, or one at or above the own sequence, is
 /// `Corrupt`.
@@ -4282,22 +4284,27 @@ fn j5t_03_notice_through_is_encoded_and_replay_checks_its_range() {
     };
     // Codec vector.
     let mut wide = first(0x0102_0304_0506_0708);
+    wide.composition.notice_live = 0x0A0B_0C0D;
     wide.thinking_level = 2;
     wide.thinking_request = 3;
     let payload = turn_payload(&wide, 0x0102_0304_0506_0709);
     let narrow = turn_payload(&first(0), 4);
     assert_eq!(payload.len(), narrow.len());
     assert_eq!(
-        payload[payload.len() - 10..],
-        [1, 2, 3, 4, 5, 6, 7, 8, 2, 3]
+        payload[payload.len() - 14..],
+        [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 2, 3]
     );
-    assert_eq!(narrow[narrow.len() - 10..], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(narrow[narrow.len() - 14..], [0; 14]);
     assert_eq!(
         decode_record(21, &payload).unwrap(),
         Record::TurnAccepted(Box::new(wide))
     );
     assert!(decode_record(21, &payload[..payload.len() - 1]).is_err());
-    let mut without = payload[..payload.len() - 10].to_vec();
+    // Without `notice_live`, or without both notice fields, the block is short.
+    let mut without_live = payload[..payload.len() - 6].to_vec();
+    without_live.extend([2, 3]);
+    assert!(decode_record(21, &without_live).is_err());
+    let mut without = payload[..payload.len() - 14].to_vec();
     without.extend([2, 3]);
     assert!(decode_record(21, &without).is_err());
 
@@ -4342,6 +4349,60 @@ fn j5t_03_notice_through_is_encoded_and_replay_checks_its_range() {
             assert_eq!(latest.notice_through, notice);
         } else {
             assert_eq!(result.unwrap_err(), ReplayError::Corrupt, "{notice}");
+        }
+    }
+}
+
+/// J5T-03 (unit, J5-E8): replay accepts a kind 21 `notice_live` up to the
+/// unsettled-job bound of 64 and rejects 65 and above as `Corrupt`, on the
+/// first turn and on a later one. The count stays in the frame: a replayed
+/// kind 21 decodes with it.
+#[test]
+fn j5t_03_notice_live_replay_bound() {
+    assert_eq!(MAX_UNSETTLED_JOBS, 64);
+    for (live, ok) in [
+        (0, true),
+        (1, true),
+        (64, true),
+        (65, false),
+        (u32::MAX, false),
+    ] {
+        // First turn.
+        let mut p = turn();
+        p.composition.notice_live = live;
+        let mut j = Journal::base();
+        j.append(Record::TurnAccepted(Box::new(p.clone())));
+        let result = inspect(&j.bytes);
+        if ok {
+            let state = result.unwrap();
+            let locator = state.operations[&id(10)].accepted_frame;
+            let frame = &j.bytes[locator.offset as usize..][..locator.length as usize];
+            assert_eq!(
+                decode_record(21, &frame[144..frame.len() - 40]).unwrap(),
+                Record::TurnAccepted(Box::new(p))
+            );
+        } else {
+            assert_eq!(result.unwrap_err(), ReplayError::Corrupt, "{live}");
+        }
+        // Second turn, after a first turn with 64 live jobs.
+        let mut j = Journal::base();
+        let mut p = turn();
+        p.composition.notice_live = 64;
+        j.append(Record::TurnAccepted(Box::new(p)));
+        j.append(start());
+        j.append(Record::TurnTerminal(terminal(
+            TerminalKind::Complete,
+            Cause::None,
+            true,
+        )));
+        let mut second = noticed_turn(3);
+        second.composition.notice_live = live;
+        j.append(Record::TurnAccepted(Box::new(second)));
+        let result = inspect(&j.bytes);
+        if ok {
+            assert!(result.is_ok(), "{live}");
+        } else {
+            assert_eq!(result.unwrap_err(), ReplayError::Corrupt, "{live}");
         }
     }
 }

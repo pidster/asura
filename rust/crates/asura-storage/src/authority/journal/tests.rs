@@ -85,11 +85,19 @@ impl Harness {
     }
     /// Accepted and started: returns (conversation, operation, generation).
     fn start(&mut self, project: Id, conversation: Option<Id>) -> (Id, Id, u64) {
-        self.start_with(project, conversation, 0)
+        self.start_with(project, conversation, 0, 0)
     }
-    /// [`Self::start`] with kind 21 `notice_through` = `notice` (J5).
-    fn start_with(&mut self, project: Id, conversation: Option<Id>, notice: u64) -> (Id, Id, u64) {
-        let (record, target, operation, generation) = self.accepted(project, conversation, notice);
+    /// [`Self::start`] with kind 21 `notice_through` = `notice` and
+    /// `notice_live` = `live` (J5).
+    fn start_with(
+        &mut self,
+        project: Id,
+        conversation: Option<Id>,
+        notice: u64,
+        live: u32,
+    ) -> (Id, Id, u64) {
+        let (record, target, operation, generation) =
+            self.accepted(project, conversation, notice, live);
         self.append(record).unwrap();
         let helper = self.fresh();
         self.append(Record::StartAuthorized(StartAuthorized {
@@ -108,6 +116,7 @@ impl Harness {
         project: Id,
         conversation: Option<Id>,
         notice: u64,
+        live: u32,
     ) -> (Record, Id, Id, u64) {
         let target = conversation.unwrap_or_else(|| self.fresh());
         let expected = conversation.map_or(0, |c| self.completed.get(&c).map_or(0, |v| v.1));
@@ -139,6 +148,7 @@ impl Harness {
             composition: Composition {
                 omitted_turns: completed as u32,
                 notice_through: notice,
+                notice_live: live,
                 ..Composition::default()
             },
             thinking_level: 0,
@@ -1554,6 +1564,26 @@ fn j4t_03_listing_merges_runs_delta_and_live_and_checkpoint_keeps_the_model_note
 
 // ----- J5 job notices (tool-job-controller.md, J5T-01 to J5T-03). -----
 
+/// The `notice_live` of an operation's kind 21, read from its frame: the
+/// count stays in the frame only (J5-E8).
+fn accepted_live(journal: &mut Journal<MemoryFiles>, operation: Id) -> u32 {
+    let (state, mut store) = journal.store();
+    let locator = match state.operations.get(&operation) {
+        Some(op) => op.accepted_frame,
+        None => {
+            state
+                .operation_facts(operation, &mut store)
+                .unwrap()
+                .unwrap()
+                .accepted
+        }
+    };
+    match store.frame(&locator).unwrap() {
+        Record::TurnAccepted(turn) if turn.operation == operation => turn.composition.notice_live,
+        other => panic!("kind 21 expected: {other:?}"),
+    }
+}
+
 /// The jobs of a notice read, in its order (newest kind 28 first), with
 /// each command source's ordinal.
 fn notice_jobs(notice: &JobNotice) -> Vec<(Id, u32)> {
@@ -1637,7 +1667,7 @@ fn j5t_02_notice_read_is_exactly_once_and_cursor_survives_restart() {
     h.append(exited(jobs[9])).unwrap();
     let late = h.state().sequence;
     assert!(late > through);
-    let (_, op2, gen2) = h.start_with(project, Some(conversation), through);
+    let (_, op2, gen2) = h.start_with(project, Some(conversation), through, notice.live);
     {
         let (state, mut store) = h.journal.store();
         // Turn 2's range (0, S] never holds the late settlement.
@@ -1655,10 +1685,11 @@ fn j5t_02_notice_read_is_exactly_once_and_cursor_survives_restart() {
     }
     assert!(!h.journal.runs().is_empty());
     let files = h.files();
-    let reopened = open(files.clone(), false).unwrap();
+    let mut reopened = open(files.clone(), false).unwrap();
     assert!(reopened.state().base > 0);
     assert_eq!(canonical(reopened.state()), canonical(&genesis(&files)));
     assert_eq!(reopened.state().operations[&op2].notice_through, through);
+    assert_eq!(accepted_live(&mut reopened, op2), 2);
     assert_eq!(
         reopened.state().conversations[&conversation]
             .latest
@@ -1677,6 +1708,7 @@ fn j5t_02_notice_read_is_exactly_once_and_cursor_survives_restart() {
     let files = h.files();
     let mut reopened = open(files.clone(), true).unwrap();
     assert_eq!(canonical(reopened.state()), canonical(&genesis(&files)));
+    assert_eq!(accepted_live(&mut reopened, op2), 2);
     {
         let (state, mut store) = reopened.store();
         assert!(
@@ -1702,12 +1734,12 @@ fn j5t_02_notice_read_is_exactly_once_and_cursor_survives_restart() {
     let sequence = reopened.state().sequence;
     h.journal = reopened;
     let before = segments(&h.files());
-    let (decreasing, ..) = h.accepted(project, Some(conversation), through - 1);
+    let (decreasing, ..) = h.accepted(project, Some(conversation), through - 1, 0);
     assert_eq!(h.append(decreasing), Err(Failure::Invalid));
     assert_eq!(h.state().sequence, sequence);
     assert_eq!(segments(&h.files()), before);
     // The equal cursor is accepted.
-    let (_, op4, _) = h.start_with(project, Some(conversation), through);
+    let (_, op4, _) = h.start_with(project, Some(conversation), through, 0);
     assert_eq!(
         h.state().conversations[&conversation]
             .latest
@@ -1715,4 +1747,92 @@ fn j5t_02_notice_read_is_exactly_once_and_cursor_survives_restart() {
             .operation,
         op4
     );
+}
+
+/// An index that counts the frames read through it (J5T-10).
+struct CountingIndex<'a> {
+    inner: &'a mut dyn Index,
+    frames: usize,
+}
+impl Index for CountingIndex<'_> {
+    fn get(&mut self, key: &Key) -> Result<Option<Value>, ReplayError> {
+        self.inner.get(key)
+    }
+    fn range(
+        &mut self,
+        lo: &Key,
+        hi: &Key,
+        descending: bool,
+        limit: usize,
+    ) -> Result<Vec<(Key, Value)>, ReplayError> {
+        self.inner.range(lo, hi, descending, limit)
+    }
+    fn frame(&mut self, locator: &Locator) -> Result<Record, ReplayError> {
+        self.frames += 1;
+        self.inner.frame(locator)
+    }
+    fn frame_owner(&mut self, locator: &Locator) -> Result<(u64, Record), ReplayError> {
+        self.frames += 1;
+        self.inner.frame_owner(locator)
+    }
+}
+
+/// J5T-10 (unit, J5-E9): the notice read goes through the shared job
+/// listing read. A settlement with a kind 27 reads 4 frames (kind 26, 27,
+/// 28 and the kind 14 command source); 9 such settlements read 36, with
+/// index runs and without.
+#[test]
+fn j5t_10_notice_read_reads_four_frames_per_settlement() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (conversation, op, generation) = h.start(project, None);
+    let jobs: Vec<Id> = (1..=10).map(|n| h.job(op, generation, n)).collect();
+    for job in &jobs {
+        h.append(cancel(*job, JobReason::ModelCancel)).unwrap();
+        h.append(exited(*job)).unwrap();
+    }
+    h.finish(conversation, op, generation, 0);
+    let count = |h: &mut Harness, after: u64, through: u64| {
+        let (state, mut store) = h.journal.store();
+        let mut counting = CountingIndex {
+            inner: &mut store,
+            frames: 0,
+        };
+        let one = state
+            .job_settlements(conversation, after, through, 1, &mut counting)
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(one[0].cancel.is_some() && one[0].settled.is_some());
+        assert_eq!(counting.frames, 4);
+        counting.frames = 0;
+        let notice = state
+            .job_notice(conversation, after, &mut counting)
+            .unwrap();
+        assert_eq!(notice.settlements.len(), MAX_NOTICE_SETTLEMENTS);
+        assert!(
+            notice
+                .settlements
+                .iter()
+                .all(|s| s.listing.cancel.is_some())
+        );
+        assert_eq!(counting.frames, 36);
+    };
+    let through = h.state().sequence;
+    count(&mut h, 0, through);
+    // The same bound once the settled jobs' entries are in index runs.
+    let (other, op2, gen2) = h.start(project, None);
+    let text = "z".repeat(61_440);
+    for n in 0..300u64 {
+        h.segment(op2, gen2, n * 61_440, &text).unwrap();
+    }
+    h.finish(other, op2, gen2, 300 * 61_440);
+    assert!(!h.journal.runs().is_empty());
+    assert!(
+        h.state()
+            .delta_tag(Tag::Settlement)
+            .iter()
+            .all(|(key, _)| key.id != conversation)
+    );
+    let through = h.state().sequence;
+    count(&mut h, 0, through);
 }
