@@ -1,20 +1,24 @@
-//! J1 payload store against private scratch homes: pages (J1T-10), the
-//! page-read pool (J1T-11), staging captures (J1T-19) and derived recovery
-//! (J1T-22). Ledger arithmetic (J1T-08) is unit-tested in `payload/store.rs`.
+//! Payload store against private scratch homes: pages (J1T-10), the
+//! page-read pool without a step bound (J2T-16), staging captures (J1T-19),
+//! derived recovery (J1T-22) and job-keyed payloads and job recovery
+//! (J2T-04). Ledger arithmetic (J1T-08) is unit-tested in `payload/store.rs`.
 use asura_platform::RuntimeDirectory;
 use asura_platform::payload_io::gate::{self, Fault, Point};
 use asura_platform::secrets::{JobRedaction, Redacted, Stream, detection};
 use asura_storage::authority::conversation::{
     ActiveBinding, ArgumentForm, CaptureReason, CaptureSettled, CaptureState, CaptureStream, Cause,
-    Composition, Hash, INITIAL_RESERVATION, Id, PendingInit, ProjectRegistered, Record, Replay,
-    Request, StartAuthorized, TerminalKind, ToolCall, ToolCallSource, ToolDecision, ToolOperation,
-    ToolResult, TurnAccepted, TurnTerminal, encode_frame, exec_cmd_job_id, replay, request_digest,
+    Composition, Hash, INITIAL_RESERVATION, Id, JobIntent, JobOrigin, PendingInit,
+    ProjectRegistered, Record, Replay, Request, StartAuthorized, TerminalKind, ToolCall,
+    ToolCallSource, ToolDecision, ToolOperation, ToolResult, TurnAccepted, TurnTerminal,
+    encode_frame, exec_cmd_job_id, job_id, replay, request_digest,
 };
 use asura_storage::authority::conversation::{FrameContext, SecretKind};
+use asura_storage::authority::writer::{PayloadFact, Settlement};
 use asura_storage::payload::{
-    DEFAULT_QUOTA, Location, MIB, ObjectKind, Origin, PAGE_STEP, Page, PagePool, PageRequest,
-    PageState, PayloadError, PayloadState, PayloadStore, RECOVERY_RESERVE, RecoveryError,
-    StreamIndex, Victim, payload_id, read_page, recover,
+    DEFAULT_QUOTA, FACT_BATCH, Location, MIB, ObjectKind, Origin, PAGE_QUEUE, Page, PagePool,
+    PageReply, PageRequest, PageState, PayloadError, PayloadState, PayloadStore, RECOVERY_RESERVE,
+    RecoveryError, StreamIndex, Victim, job_payloads, payload_id, read_page, recover,
+    recover_with_facts,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -22,7 +26,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn id(n: u64) -> Id {
     let mut id = [0; 16];
@@ -98,20 +102,19 @@ fn redacted(bytes: &[u8]) -> Redacted {
     out
 }
 
-// Calls of operation id(10), generation 1, installation id(1).
+// Calls of operation id(10), generation 1, installation id(1), keyed by
+// their model-origin job IDs.
 fn payloads(ordinal: u32) -> [Id; 2] {
     [
-        payload_id(id(1), id(10), 1, ordinal, ObjectKind::Stdout),
-        payload_id(id(1), id(10), 1, ordinal, ObjectKind::Stderr),
+        payload_id(id(1), call(ordinal), ObjectKind::Stdout),
+        payload_id(id(1), call(ordinal), ObjectKind::Stderr),
     ]
 }
 fn call(ordinal: u32) -> Id {
     exec_cmd_job_id(id(10), 1, ordinal)
 }
 fn admit(store: &PayloadStore, ordinal: u32) -> [Id; 2] {
-    let victims = store
-        .admit(id(1), id(10), 1, ordinal, call(ordinal))
-        .unwrap();
+    let victims = store.admit(id(1), call(ordinal), id(10)).unwrap();
     assert!(victims.is_empty());
     payloads(ordinal)
 }
@@ -366,7 +369,7 @@ fn j1t_10_page_states_offsets_and_scope() {
     // Expired: interim expiry deletes the oldest call in this run.
     f.store
         .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
-    let victims = f.store.admit(id(1), id(10), 1, 4, call(4)).unwrap();
+    let victims = f.store.admit(id(1), call(4), id(10)).unwrap();
     assert_eq!(
         victims,
         [Victim {
@@ -463,10 +466,9 @@ fn j1t_10_live_page_at_the_watermark_never_splits_a_scalar() {
     assert_eq!((second.text.as_str(), second.next_offset), ("😀\n", 6));
 }
 
-// ---------------------------------------------------------------- J1T-11
+// ---------------------------------------------------------------- J2T-16
 
-#[test]
-fn j1t_11_reserved_model_worker_queue_limit_and_abandoned_tickets() {
+fn pool_fixture() -> (Fixture, PagePool, PageRequest) {
     let f = fixture();
     let [out, _] = settled_call(&f, 1, CaptureState::Complete, b"pool\n", b"", 1, true);
     let pool = PagePool::start(f.store.clone()).unwrap();
@@ -476,54 +478,132 @@ fn j1t_11_reserved_model_worker_queue_limit_and_abandoned_tickets() {
         limit: 64,
         scope: None,
     };
+    (f, pool, request)
+}
+fn complete(reply: PageReply) -> String {
+    let PageReply::Page(page) = reply else {
+        panic!("cancelled");
+    };
+    assert_eq!(page.state, PageState::Complete);
+    page.text
+}
+
+/// J2T-16 (WB1): a gated read held 5 s returns its page after release, with
+/// no `busy`; the worker stays held meanwhile and no replacement starts.
+#[test]
+fn j2t_16_gated_read_waits_for_its_reply_with_no_step() {
+    let (_f, pool, request) = pool_fixture();
     pool.hold_for_test(true);
-    // The general worker takes a client request and stays held.
     let client = pool.submit(request, Origin::Client).unwrap();
     wait_until(|| pool.queued() == 0);
-    assert!(client.poll(Instant::now()).is_none());
+    // A second client request waits behind the held general worker: no
+    // replacement worker takes it, and the reserved worker never does.
+    let behind = pool.submit(request, Origin::Client).unwrap();
+    let held = Instant::now();
+    while held.elapsed() < Duration::from_secs(5) {
+        assert!(client.poll().is_none(), "no busy and no page while held");
+        assert!(behind.poll().is_none());
+        assert_eq!((pool.running(), pool.queued()), (1, 1));
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    pool.hold_for_test(false);
+    assert_eq!(complete(client.wait()), "pool\n");
+    assert_eq!(complete(behind.wait()), "pool\n");
+    wait_until(|| pool.running() == 0);
+}
+
+/// J2T-16: the caller's cancel withdraws a queued read at once and frees its
+/// queue place; the ninth queued request is `busy`.
+#[test]
+fn j2t_16_cancel_withdraws_a_queued_read_and_the_ninth_is_busy() {
+    let (_f, pool, request) = pool_fixture();
+    pool.hold_for_test(true);
+    let running = pool.submit(request, Origin::Client).unwrap();
+    wait_until(|| pool.queued() == 0);
+    let mut queued: Vec<_> = (1..=PAGE_QUEUE)
+        .map(|n| {
+            let ticket = pool.submit(request, Origin::Client).unwrap();
+            assert_eq!(pool.queued(), n);
+            ticket
+        })
+        .collect();
+    for origin in [Origin::Client, Origin::Model] {
+        assert_eq!(pool.submit(request, origin).err(), Some(PageState::Busy));
+    }
+    // Cancel: the queue place is free at once, before any worker moves.
+    queued.remove(3).cancel();
+    assert_eq!(pool.queued(), PAGE_QUEUE - 1);
+    // Detach (drop) of a queued ticket withdraws it too.
+    drop(queued.remove(0));
+    assert_eq!(pool.queued(), PAGE_QUEUE - 2);
+    let refill = pool.submit(request, Origin::Client).unwrap();
+    assert_eq!(pool.queued(), PAGE_QUEUE - 1);
+    pool.hold_for_test(false);
+    assert_eq!(complete(running.wait()), "pool\n");
+    for ticket in queued {
+        assert_eq!(complete(ticket.wait()), "pool\n");
+    }
+    assert_eq!(complete(refill.wait()), "pool\n");
+}
+
+/// J2T-16: detaching a running read discards its reply; the worker stays
+/// held until the read returns and then serves the queue.
+#[test]
+fn j2t_16_detach_discards_a_running_reply_and_the_worker_stays_held() {
+    let (_f, pool, request) = pool_fixture();
+    pool.hold_for_test(true);
+    let running = pool.submit(request, Origin::Client).unwrap();
+    wait_until(|| pool.queued() == 0);
+    let next = pool.submit(request, Origin::Client).unwrap();
+    drop(running);
+    // The general worker is still held by the detached read.
+    assert_eq!((pool.running(), pool.queued()), (1, 1));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(next.poll().is_none());
+    assert_eq!(pool.running(), 1);
+    pool.hold_for_test(false);
+    assert_eq!(complete(next.wait()), "pool\n");
+    wait_until(|| pool.running() == 0);
+}
+
+/// J2T-16: one worker is reserved for model requests; client requests never
+/// take it. A reply is returned once.
+#[test]
+fn j2t_16_reserved_model_worker() {
+    let (_f, pool, request) = pool_fixture();
+    pool.hold_for_test(true);
+    let client = pool.submit(request, Origin::Client).unwrap();
+    wait_until(|| pool.queued() == 0);
     // The reserved worker still takes a model request.
     let model = pool.submit(request, Origin::Model).unwrap();
     wait_until(|| pool.queued() == 0);
-    // Client requests never take the reserved worker: they queue.
-    let mut queued = Vec::new();
-    for n in 1..=8 {
-        queued.push(pool.submit(request, Origin::Client).unwrap());
-        assert_eq!(pool.queued(), n);
-    }
-    // The ninth queued request, client or model, is busy.
-    assert_eq!(
-        pool.submit(request, Origin::Client).err(),
-        Some(PageState::Busy)
-    );
-    assert_eq!(
-        pool.submit(request, Origin::Model).err(),
-        Some(PageState::Busy)
-    );
-    // After its step a ticket answers busy and abandons its request: the
-    // running one on the general worker and the first queued one.
-    let late = Instant::now() + PAGE_STEP;
-    assert_eq!(client.poll(late).unwrap().state, PageState::Busy);
-    assert_eq!(queued[0].poll(late).unwrap().state, PageState::Busy);
+    assert_eq!(pool.running(), 2);
+    // Client requests queue while both workers are held.
+    let queued = pool.submit(request, Origin::Client).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(pool.queued(), 1);
     pool.hold_for_test(false);
-    let page = model.wait();
-    assert_eq!(
-        (page.state, page.text.as_str()),
-        (PageState::Complete, "pool\n")
-    );
-    // The general worker serves the queue in order; the last one answers
-    // only after both abandoned jobs were passed.
-    for ticket in &queued[1..] {
-        assert_eq!(ticket.wait().text, "pool\n");
+    wait_until(|| pool.running() == 0 && pool.queued() == 0);
+    for ticket in [&client, &model, &queued] {
+        assert_eq!(complete(ticket.poll().unwrap()), "pool\n");
+        assert!(ticket.poll().is_none(), "a reply is returned once");
     }
-    // Abandoned jobs were skipped: their slots never received a page.
-    for ticket in [&client, &queued[0]] {
-        assert!(
-            ticket
-                .poll(Instant::now())
-                .is_none_or(|p| p.state == PageState::Busy)
-        );
-    }
+}
+
+/// J2T-16: pool shutdown ends every waiting ticket, queued or running, with
+/// `Cancelled`; later requests are `busy`.
+#[test]
+fn j2t_16_shutdown_cancels_every_waiting_ticket() {
+    let (_f, pool, request) = pool_fixture();
+    pool.hold_for_test(true);
+    let running = pool.submit(request, Origin::Client).unwrap();
+    wait_until(|| pool.queued() == 0);
+    let queued = pool.submit(request, Origin::Client).unwrap();
+    let waiter = std::thread::spawn(move || queued.wait());
     pool.close();
+    assert_eq!(running.wait(), PageReply::Cancelled);
+    assert_eq!(waiter.join().unwrap(), PageReply::Cancelled);
+    assert_eq!(pool.queued(), 0);
     assert_eq!(
         pool.submit(request, Origin::Model).err(),
         Some(PageState::Busy)
@@ -713,6 +793,31 @@ impl Journal {
             text: "reply".into(),
         }));
     }
+    /// A job-mode call: kind 14 `run`, kind 26 and kind 15 (handle
+    /// delivery). Returns the job ID and the kind 26 sequence.
+    fn job(&mut self, ordinal: u32) -> (Id, u64) {
+        self.admitted(ordinal);
+        let origin = JobOrigin::Model {
+            operation: id(10),
+            generation: 1,
+            ordinal,
+        };
+        let intent = self.append(Record::JobIntent(JobIntent {
+            origin,
+            agent: 0,
+            time: 1_760_000_000_000,
+        }));
+        self.append(Record::ToolResult(ToolResult {
+            operation: id(10),
+            generation: 1,
+            ordinal,
+            status: 1,
+            text: "job".into(),
+            next_offset: None,
+            truncated: false,
+        }));
+        (job_id(&origin), intent)
+    }
     fn replay(&self) -> Replay {
         replay(&self.bytes, &AtomicBool::new(false)).unwrap()
     }
@@ -860,13 +965,10 @@ fn j1t_22_derived_recovery_applies_every_table_row() {
     // unverified prefixes use their kind 22 sequence.
     assert!(last_use.windows(2).all(|w| w[0] < w[1]) && last_use[4] < intent6 && intent6 < intent8);
     let mut order = Vec::new();
-    for ordinal in 100.. {
+    for ordinal in 100u32.. {
         f.store
             .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
-        let Ok(victims) = f
-            .store
-            .admit(id(1), id(99), 1, ordinal, id(1000 + u64::from(ordinal)))
-        else {
+        let Ok(victims) = f.store.admit(id(1), id(1000 + u64::from(ordinal)), id(99)) else {
             break;
         };
         for victim in victims {
@@ -994,7 +1096,7 @@ fn j1t_22_interrupted_prefix_without_terminal_is_expirable() {
     );
     f.store
         .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
-    let victims = f.store.admit(id(1), id(99), 1, 1, id(1000)).unwrap();
+    let victims = f.store.admit(id(1), id(1000), id(99)).unwrap();
     assert_eq!(victims.len(), 1);
     assert_eq!(victims[0].call, call(1));
     f.store.delete_victim(victims[0]).unwrap();
@@ -1044,4 +1146,311 @@ fn j1t_22_install_fault_leaves_staging_that_recovery_installs() {
     assert_eq!(report.installed, 2);
     assert_eq!(f.home.read("objects", ids[0]).unwrap(), body(1));
     assert!(f.home.read("staging", ids[0]).is_none());
+}
+
+// ---------------------------------------------------------------- J2T-04
+
+/// The retired J1 derivation: operation, generation and ordinal instead of
+/// the job ID. Payload files that J1 wrote under it no longer match.
+fn retired_payload_id(installation: Id, ordinal: u32, kind: u8) -> Id {
+    let mut hash = Sha256::new();
+    hash.update(b"asura.payload\0");
+    hash.update(installation);
+    hash.update(id(10));
+    hash.update(1u64.to_be_bytes());
+    hash.update(ordinal.to_be_bytes());
+    hash.update([kind]);
+    let mut out = [0; 16];
+    out.copy_from_slice(&hash.finalize()[..16]);
+    out
+}
+
+/// J2T-04 (integration): payload files of the retired J1 derivation are
+/// orphans and recovery deletes them; the same call's files under its
+/// job-keyed IDs are recovered.
+#[test]
+fn j2t_04_j1_orphans_of_the_old_derivation_are_deleted_at_recovery() {
+    let f = open(64 * 1024 * MIB);
+    let mut journal = Journal::started();
+    journal.admitted(1);
+    journal.settled(1, CaptureState::Complete, recorded(1));
+    let [o1, e1] = payloads(1);
+    assert_eq!([o1, e1], job_payloads(id(1), call(1)));
+    let old = [
+        retired_payload_id(id(1), 1, 1),
+        retired_payload_id(id(1), 1, 2),
+    ];
+    assert!(old.iter().all(|id| ![o1, e1].contains(id)));
+    f.home.put("objects", old[0], &body(1));
+    f.home.put("objects", old[1], &tail(1));
+    f.home.put("staging", old[0], &body(1));
+    f.home.put("objects", o1, &body(1));
+    f.home.put("objects", e1, &tail(1));
+    let report = recover(
+        &f.store,
+        Some(&journal.replay()),
+        DEFAULT_QUOTA,
+        &no_cancel(),
+    )
+    .unwrap();
+    assert_eq!(report.orphans_deleted, 3);
+    assert_eq!(report.retained, 13);
+    for payload in old {
+        assert!(f.home.read("objects", payload).is_none());
+        assert!(f.home.read("staging", payload).is_none());
+        assert_eq!(f.store.payload_state(payload), None);
+    }
+    assert_eq!(
+        f.store.payload_state(o1),
+        Some((PayloadState::Complete, Location::Objects, 10))
+    );
+    assert_eq!(page(&f.store, o1, 0, 64).text, "payload 1\n");
+}
+
+/// J2T-04 (integration): a live job's capture stages under the job's
+/// payload IDs, for the model and the person origin alike.
+#[test]
+fn j2t_04_job_capture_stages_under_job_keyed_ids() {
+    let f = fixture();
+    for origin in [
+        JobOrigin::Model {
+            operation: id(10),
+            generation: 1,
+            ordinal: 9,
+        },
+        JobOrigin::Person { input: id(77) },
+    ] {
+        let job = job_id(&origin);
+        assert!(f.store.admit(id(1), job, id(10)).unwrap().is_empty());
+        let [out, err] = job_payloads(id(1), job);
+        assert_eq!(out, payload_id(id(1), job, ObjectKind::Stdout));
+        assert_eq!(err, payload_id(id(1), job, ObjectKind::Stderr));
+        let mut capture = f.store.create_capture(job).unwrap();
+        assert_eq!(capture.call(), job);
+        capture
+            .append(StreamIndex::Stdout, &redacted(b"job\n"), 0)
+            .1
+            .unwrap();
+        capture.sync().unwrap();
+        assert_eq!(f.home.read("staging", out).unwrap(), b"job\n");
+        assert_eq!(f.home.read("staging", err).unwrap(), b"");
+        let [(a, da), (b, db)] = capture.seal();
+        f.store.settle(
+            job,
+            CaptureState::Complete,
+            [(a, Some(da)), (b, Some(db))],
+            5,
+            false,
+        );
+        f.store.install(job).unwrap();
+        assert_eq!(f.home.read("objects", out).unwrap(), b"job\n");
+        assert_eq!(page(&f.store, out, 0, 64).state, PageState::Complete);
+    }
+}
+
+/// One `PayloadFacts` answer of the job form, as the journal writer builds
+/// it: `call` is the job ID, `intent_sequence` the kind 26 sequence and
+/// `settled` the kind 28 capture facts (none when unsettled or
+/// `interrupted`); an unsettled job is `active`.
+fn job_fact(job: Id, intent: u64, settled: Option<Settlement>, active: bool) -> Vec<PayloadFact> {
+    let payloads = job_payloads(id(1), job);
+    payloads
+        .iter()
+        .map(|payload| PayloadFact {
+            payload: *payload,
+            call: job,
+            operation: id(10),
+            payloads,
+            intent_sequence: intent,
+            settled,
+            active,
+        })
+        .collect()
+}
+
+/// J2T-04 and TJ-Q5 (integration): job payload recovery from `PayloadFacts`
+/// maps each job's state from kinds 26 and 28: `complete` or `incomplete`
+/// verifies and installs from staging; `unconfirmed`, no kind 28 and an
+/// `interrupted` kind 28 keep an unverified prefix, eligible for interim
+/// expiry by kind 26 sequence; `not_started` deletes stray staging files;
+/// files no job derives are orphans. Facts are asked in batches of at most
+/// 128 payload IDs.
+#[test]
+fn j2t_04_job_recovery_from_payload_facts() {
+    let f = open(64 * 1024 * MIB);
+    let home = &f.home;
+    let job = |n: u32| {
+        job_id(&JobOrigin::Model {
+            operation: id(10),
+            generation: 1,
+            ordinal: n,
+        })
+    };
+    let ids = |n: u32| job_payloads(id(1), job(n));
+    let mut facts = Vec::new();
+    // Job 1: complete, staging only, digests match: installed.
+    let [o1, e1] = ids(1);
+    home.put("staging", o1, &body(1));
+    home.put("staging", e1, &tail(1));
+    facts.extend(job_fact(
+        job(1),
+        10,
+        Some((CaptureState::Complete, 40, recorded(1))),
+        false,
+    ));
+    // Job 2: incomplete, object installed.
+    let [o2, e2] = ids(2);
+    home.put("objects", o2, &body(2));
+    home.put("objects", e2, &tail(2));
+    facts.extend(job_fact(
+        job(2),
+        11,
+        Some((CaptureState::Incomplete, 41, recorded(2))),
+        false,
+    ));
+    // Job 3: unconfirmed prefix.
+    let [o3, _] = ids(3);
+    home.put("staging", o3, &body(3));
+    facts.extend(job_fact(
+        job(3),
+        12,
+        Some((CaptureState::Unconfirmed, 42, [(10, None), (0, None)])),
+        false,
+    ));
+    // Job 4: not_started with stray staging files.
+    let [o4, e4] = ids(4);
+    home.put("staging", o4, b"");
+    home.put("staging", e4, b"");
+    facts.extend(job_fact(
+        job(4),
+        13,
+        Some((CaptureState::NotStarted, 43, [(0, None), (0, None)])),
+        false,
+    ));
+    // Job 5: unsettled (no kind 28), active.
+    let [o5, e5] = ids(5);
+    home.put("staging", o5, &body(5));
+    home.put("staging", e5, &tail(5));
+    facts.extend(job_fact(job(5), 14, None, true));
+    // Job 6: an `interrupted` kind 28 carries no capture facts.
+    let [o6, _] = ids(6);
+    home.put("staging", o6, &body(6));
+    facts.extend(job_fact(job(6), 15, None, false));
+    // Orphans: no job derives them; 300 of them to exercise batching.
+    for n in 0..300u64 {
+        home.put("staging", id(0xF000_0000 + n), b"orphan");
+    }
+    let mut asked = Vec::new();
+    let mut answer = |batch: Vec<Id>| -> Result<Vec<PayloadFact>, RecoveryError> {
+        assert!(!batch.is_empty() && batch.len() <= FACT_BATCH);
+        asked.push(batch.len());
+        Ok(facts
+            .iter()
+            .filter(|fact| batch.contains(&fact.payload))
+            .cloned()
+            .collect())
+    };
+    let report = recover_with_facts(&f.store, &mut answer, DEFAULT_QUOTA, &no_cancel()).unwrap();
+    assert_eq!(asked.iter().sum::<usize>(), 300 + 10);
+    assert!(asked.len() >= 3);
+    assert_eq!(report.installed, 2);
+    assert_eq!(report.corrupt, 0);
+    assert_eq!(report.missing, 0);
+    assert_eq!(report.unverified, 4);
+    assert_eq!(report.orphans_deleted, 300);
+    assert_eq!(report.strays_deleted, 2);
+    // 13 + 13 + 10 + 13 + 10.
+    assert_eq!(report.retained, 59);
+    assert_eq!(f.store.used(), 59);
+    let state = |payload| f.store.payload_state(payload).unwrap();
+    for (payload, total) in [(o1, 10), (e1, 3)] {
+        assert_eq!(
+            state(payload),
+            (PayloadState::Complete, Location::Objects, total)
+        );
+        assert!(home.read("staging", payload).is_none());
+    }
+    assert_eq!(page(&f.store, o1, 0, 64).digest, Some(sha(&body(1))));
+    assert_eq!(state(o2), (PayloadState::Incomplete, Location::Objects, 10));
+    for payload in [o3, o5, e5, o6] {
+        assert_eq!(state(payload).0, PayloadState::UnverifiedPrefix);
+        assert_eq!(
+            page(&f.store, payload, 0, 64).state,
+            PageState::UnverifiedPrefix
+        );
+    }
+    for payload in [o4, e4] {
+        assert!(home.read("staging", payload).is_none());
+        assert_eq!(f.store.payload_state(payload), None);
+    }
+    // Interim expiry: last use is kind 28 when settled with capture facts,
+    // else kind 26: jobs 3 to 6 (12..15) before jobs 1 and 2 (40, 41).
+    let mut order = Vec::new();
+    for n in 0u64.. {
+        f.store
+            .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
+        let Ok(victims) = f.store.admit(id(1), id(5000 + n), id(99)) else {
+            break;
+        };
+        for victim in victims {
+            order.push((1..=6).find(|k| job(*k) == victim.call).unwrap());
+            f.store.delete_victim(victim).unwrap();
+        }
+        f.store.release(id(5000 + n));
+    }
+    assert_eq!(order, [3, 5, 6, 1, 2]);
+    assert_eq!(f.store.used(), 0);
+}
+
+/// J2T-04 (integration): a replay's unsettled job is known to recovery: its
+/// staging prefix is kept as an unverified prefix with the kind 26 sequence
+/// as last use, never deleted as an orphan; a job-mode call has no J1 form.
+#[test]
+fn j2t_04_unsettled_job_from_replay_keeps_its_prefix() {
+    let f = open(64 * 1024 * MIB);
+    let mut journal = Journal::started();
+    journal.admitted(1);
+    journal.settled(1, CaptureState::Complete, recorded(1));
+    let (job, intent) = journal.job(2);
+    assert_eq!(job, call(2), "a job-mode call's job is its call's");
+    let [o2, e2] = job_payloads(id(1), job);
+    assert_eq!([o2, e2], payloads(2));
+    f.home.put("staging", o2, &body(2));
+    let [o1, e1] = payloads(1);
+    f.home.put("objects", o1, &body(1));
+    f.home.put("objects", e1, &tail(1));
+    let replay = journal.replay();
+    assert_eq!(replay.jobs[&job].intent.sequence, intent);
+    let known = asura_storage::payload::known_calls(&replay);
+    assert_eq!(
+        known.len(),
+        2,
+        "one J1 call and one job, no J1 form of the job"
+    );
+    let report = recover(&f.store, Some(&replay), DEFAULT_QUOTA, &no_cancel()).unwrap();
+    assert_eq!(report.orphans_deleted, 0);
+    assert_eq!(report.unverified, 1);
+    assert_eq!(
+        f.store.payload_state(o2),
+        Some((PayloadState::UnverifiedPrefix, Location::Staging, 10))
+    );
+    assert_eq!(
+        f.store.payload_state(e2),
+        Some((PayloadState::Missing, Location::None, 0))
+    );
+    // Call 1's kind 23 precedes the job's kind 26, so call 1 expires first.
+    let mut order = Vec::new();
+    for n in 0u64.. {
+        f.store
+            .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
+        let Ok(victims) = f.store.admit(id(1), id(6000 + n), id(99)) else {
+            break;
+        };
+        for victim in victims {
+            order.push(victim.call);
+            f.store.delete_victim(victim).unwrap();
+        }
+        f.store.release(id(6000 + n));
+    }
+    assert_eq!(order, [call(1), job]);
 }

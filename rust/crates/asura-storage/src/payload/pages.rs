@@ -1,20 +1,17 @@
-//! Text pages over retained payloads and the page-read pool (J1). J1 has no
-//! page consumer; J3 and J4 add the model and client callers.
+//! Text pages over retained payloads and the page-read pool. A page read
+//! waits for its reply with no time bound (owner, 2026-10-21, WB1); J3 and
+//! J4 add the model and client callers.
 use super::store::{Location, PayloadId, PayloadState, PayloadStore};
 use crate::authority::conversation::{Hash, Id};
 use asura_platform::payload_io::PayloadError;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 /// Source bytes per page.
 pub const PAGE_LIMIT: usize = 8192;
 /// Queued page requests; the next one is `busy`.
 pub const PAGE_QUEUE: usize = 8;
-/// The page read storage step (owner-approved wind-down bound): a read not
-/// returned within it answers `busy` and the read continues on its worker.
-pub const PAGE_STEP: Duration = Duration::from_secs(2);
 
 /// Page states, as the composer interface lists them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,11 +239,51 @@ pub enum Origin {
     Client,
 }
 
-#[derive(Default)]
+/// The answer to a submitted page read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PageReply {
+    Page(Page),
+    /// The pool shut down before the read replied.
+    Cancelled,
+}
+
+/// One request's reply slot, shared by its ticket and the worker.
+#[derive(Debug)]
+enum Reply {
+    /// Queued or on a worker; the ticket waits.
+    Waiting,
+    Ready(PageReply),
+    /// The ticket took the reply.
+    Taken,
+    /// The caller cancelled or detached; a later reply is discarded.
+    Withdrawn,
+}
 struct Slot {
-    page: Mutex<Option<Page>>,
+    reply: Mutex<Reply>,
     ready: Condvar,
-    abandoned: std::sync::atomic::AtomicBool,
+}
+impl Slot {
+    fn new() -> Self {
+        Self {
+            reply: Mutex::new(Reply::Waiting),
+            ready: Condvar::new(),
+        }
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, Reply> {
+        self.reply.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Delivers a reply to a waiting ticket; any other state discards it.
+    fn deliver(&self, reply: PageReply) {
+        let mut state = self.lock();
+        if matches!(*state, Reply::Waiting) {
+            *state = Reply::Ready(reply);
+            drop(state);
+            self.ready.notify_all();
+        }
+    }
+    fn withdrawn(&self) -> bool {
+        matches!(*self.lock(), Reply::Withdrawn)
+    }
 }
 struct Job {
     request: PageRequest,
@@ -256,6 +293,8 @@ struct Job {
 #[derive(Default)]
 struct Queue {
     jobs: VecDeque<Job>,
+    /// Slots of the requests on a worker, so shutdown can end their tickets.
+    running: Vec<Arc<Slot>>,
     closed: bool,
     held_for_test: bool,
 }
@@ -268,56 +307,73 @@ fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Queue> {
     shared.queue.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A submitted page read.
+/// A submitted page read. It waits for its reply with no time bound
+/// (owner, WB1). Closures: the reply, the caller's cancel or detach
+/// ([`Ticket::cancel`], or dropping the ticket), and pool shutdown, which
+/// answers [`PageReply::Cancelled`].
 pub struct Ticket {
     slot: Arc<Slot>,
-    submitted: Instant,
+    pool: Weak<Shared>,
 }
 impl Ticket {
-    /// Nonblocking: the page, or `busy` once the 2 s step has passed without
-    /// one. A `busy` answer abandons the request; a running read continues
-    /// on its worker, which stays held until the call returns.
-    pub fn poll(&self, now: Instant) -> Option<Page> {
-        if let Some(page) = self
-            .slot
-            .page
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            return Some(page);
+    /// Nonblocking: the reply once it has arrived. It is returned once.
+    pub fn poll(&self) -> Option<PageReply> {
+        let mut state = self.slot.lock();
+        match std::mem::replace(&mut *state, Reply::Taken) {
+            Reply::Ready(reply) => Some(reply),
+            other => {
+                *state = other;
+                None
+            }
         }
-        if now >= self.submitted + PAGE_STEP {
-            self.slot.abandoned.store(true, Ordering::Release);
-            return Some(Page::empty(PageState::Busy, 0));
-        }
-        None
     }
-    /// Worker-side wait for the page, bounded by the 2 s page step.
-    pub fn wait(&self) -> Page {
-        let end = self.submitted + PAGE_STEP;
-        let mut page = self.slot.page.lock().unwrap_or_else(|e| e.into_inner());
+    /// Blocking: waits for the reply with no time bound. Worker threads
+    /// only, never the reactor. A reply already taken by [`Self::poll`]
+    /// answers `Cancelled`.
+    pub fn wait(self) -> PageReply {
+        let mut state = self.slot.lock();
         loop {
-            if let Some(page) = page.take() {
-                return page;
+            match std::mem::replace(&mut *state, Reply::Taken) {
+                Reply::Ready(reply) => return reply,
+                Reply::Waiting => {
+                    *state = Reply::Waiting;
+                    state = self
+                        .slot
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                Reply::Taken | Reply::Withdrawn => return PageReply::Cancelled,
             }
-            let now = Instant::now();
-            if now >= end {
-                self.slot.abandoned.store(true, Ordering::Release);
-                return Page::empty(PageState::Busy, 0);
-            }
-            page = self
-                .slot
-                .ready
-                .wait_timeout(page, end - now)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
         }
+    }
+    /// The caller's cancel: withdraws a queued request at once, freeing its
+    /// queue place. A request already on a worker continues; its reply is
+    /// discarded and the worker stays held until the read returns.
+    pub fn cancel(self) {}
+    fn withdraw(&self) {
+        // Lock order: queue, then slot (as the workers and shutdown).
+        let pool = self.pool.upgrade();
+        let mut queue = pool.as_deref().map(lock);
+        if let Some(queue) = queue.as_mut() {
+            queue.jobs.retain(|job| !Arc::ptr_eq(&job.slot, &self.slot));
+        }
+        let mut state = self.slot.lock();
+        if matches!(*state, Reply::Waiting | Reply::Ready(_)) {
+            *state = Reply::Withdrawn;
+        }
+    }
+}
+impl Drop for Ticket {
+    /// Detach: the same as [`Ticket::cancel`].
+    fn drop(&mut self) {
+        self.withdraw();
     }
 }
 
 /// Two retained page-read workers, one reserved for model requests, and a
-/// queue of 8 (J1 numeric limits). No replacement worker ever starts.
+/// queue of 8 (J2 numeric limits). No replacement worker ever starts, and no
+/// time bound ends a read.
 pub struct PagePool {
     shared: Arc<Shared>,
 }
@@ -329,21 +385,26 @@ impl PagePool {
             queue: Mutex::new(Queue::default()),
             work: Condvar::new(),
         });
+        let pool = Self {
+            shared: shared.clone(),
+        };
         for (index, model_only) in [(0, false), (1, true)] {
             let shared = shared.clone();
+            // A failed start drops `pool`, which closes the started worker.
             std::thread::Builder::new()
                 .name(format!("asura-page-read-{index}"))
                 .spawn(move || worker(&shared, model_only))?;
         }
-        Ok(Self { shared })
+        Ok(pool)
     }
-    /// Queues a request; the ninth queued request is `busy`.
+    /// Queues a request; the ninth queued request is `busy`, as is any
+    /// request after shutdown.
     pub fn submit(&self, request: PageRequest, origin: Origin) -> Result<Ticket, PageState> {
         let mut queue = lock(&self.shared);
         if queue.closed || queue.jobs.len() >= PAGE_QUEUE {
             return Err(PageState::Busy);
         }
-        let slot = Arc::new(Slot::default());
+        let slot = Arc::new(Slot::new());
         queue.jobs.push_back(Job {
             request,
             origin,
@@ -353,12 +414,16 @@ impl PagePool {
         self.shared.work.notify_all();
         Ok(Ticket {
             slot,
-            submitted: Instant::now(),
+            pool: Arc::downgrade(&self.shared),
         })
     }
     /// Queued requests not yet taken by a worker.
     pub fn queued(&self) -> usize {
         lock(&self.shared).jobs.len()
+    }
+    /// Requests on a worker, including withdrawn ones still reading.
+    pub fn running(&self) -> usize {
+        lock(&self.shared).running.len()
     }
     /// Test hook: workers hold each taken request until released.
     #[cfg(any(test, feature = "test-support"))]
@@ -366,10 +431,18 @@ impl PagePool {
         lock(&self.shared).held_for_test = held;
         self.shared.work.notify_all();
     }
-    /// Stops new requests; workers exit after their current read.
+    /// Shutdown: stops new requests and ends every waiting ticket, queued or
+    /// on a worker, with `Cancelled`. Workers exit after their current read.
     pub fn close(&self) {
-        lock(&self.shared).closed = true;
+        let mut queue = lock(&self.shared);
+        queue.closed = true;
+        let queued: Vec<Job> = queue.jobs.drain(..).collect();
+        let running = queue.running.clone();
+        drop(queue);
         self.shared.work.notify_all();
+        for slot in queued.iter().map(|job| &job.slot).chain(running.iter()) {
+            slot.deliver(PageReply::Cancelled);
+        }
     }
 }
 impl Drop for PagePool {
@@ -390,36 +463,78 @@ fn worker(shared: &Shared, model_only: bool) {
                     .iter()
                     .position(|job| !model_only || job.origin == Origin::Model);
                 if let Some(position) = position {
-                    break queue.jobs.remove(position).expect("queued job");
+                    let job = queue.jobs.remove(position).expect("queued job");
+                    queue.running.push(job.slot.clone());
+                    break job;
                 }
                 queue = shared.work.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         };
-        // Test hold: the read stays in progress on this worker.
-        loop {
-            let queue = lock(shared);
-            if !queue.held_for_test || queue.closed {
-                break;
+        // Test hold: the request stays on this worker until released or
+        // shutdown; each changes the flag and wakes the workers.
+        {
+            let mut queue = lock(shared);
+            while queue.held_for_test && !queue.closed {
+                queue = shared.work.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
-            drop(
-                shared
-                    .work
-                    .wait_timeout(queue, Duration::from_millis(5))
-                    .unwrap_or_else(|e| e.into_inner()),
-            );
         }
-        if job.slot.abandoned.load(Ordering::Acquire) {
-            continue;
+        // A request withdrawn before its read began is skipped.
+        if !job.slot.withdrawn() {
+            let page = read_page(&shared.store, job.request);
+            job.slot.deliver(PageReply::Page(page));
         }
-        let page = read_page(&shared.store, job.request);
-        *job.slot.page.lock().unwrap_or_else(|e| e.into_inner()) = Some(page);
-        job.slot.ready.notify_all();
+        lock(shared)
+            .running
+            .retain(|slot| !Arc::ptr_eq(slot, &job.slot));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn ticket() -> Ticket {
+        Ticket {
+            slot: Arc::new(Slot::new()),
+            pool: Weak::new(),
+        }
+    }
+    fn page(text: &str) -> PageReply {
+        let mut page = Page::empty(PageState::Complete, 0);
+        page.text = text.into();
+        PageReply::Page(page)
+    }
+    /// J2T-16 (unit): a ticket waits for its reply with no time bound and
+    /// takes it once; a reply after withdrawal is discarded.
+    #[test]
+    fn j2t_16_ticket_waits_for_its_reply_and_discards_after_withdrawal() {
+        let waiting = ticket();
+        assert!(waiting.poll().is_none());
+        let slot = waiting.slot.clone();
+        let waiter = std::thread::spawn(move || waiting.wait());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!waiter.is_finished(), "no step ends the wait");
+        slot.deliver(page("a"));
+        assert_eq!(waiter.join().unwrap(), page("a"));
+        // A second reply to a taken slot is discarded.
+        slot.deliver(page("b"));
+        assert!(matches!(*slot.lock(), Reply::Taken));
+        // Poll takes the reply once.
+        let polled = ticket();
+        polled.slot.deliver(page("c"));
+        assert_eq!(polled.poll(), Some(page("c")));
+        assert_eq!(polled.poll(), None);
+        // Withdrawal (cancel or detach, with or without a live pool).
+        let detached = ticket();
+        let slot = detached.slot.clone();
+        detached.cancel();
+        assert!(slot.withdrawn());
+        slot.deliver(page("d"));
+        assert!(slot.withdrawn(), "the late reply is discarded");
+        // Shutdown's reply reaches a waiting ticket.
+        let closing = ticket();
+        closing.slot.deliver(PageReply::Cancelled);
+        assert_eq!(closing.wait(), PageReply::Cancelled);
+    }
     #[test]
     fn snapping_moves_the_start_forward_and_trims_the_end_back() {
         let text = "aé€😀b".as_bytes(); // 1 + 2 + 3 + 4 + 1 bytes

@@ -313,19 +313,10 @@ pub fn exec_cmd_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
         ordinal,
     })
 }
-/// The stdout and stderr payload IDs of a job (job identity): the first 16
-/// bytes of SHA-256 over ASCII `asura.payload`, one zero byte, the
-/// installation ID, the job ID and the object kind byte (1 stdout, 2
-/// stderr). An all-zero result becomes 1 in its final byte.
+/// The stdout and stderr payload IDs of a job: the single derivation
+/// [`crate::payload::payload_id`] (job identity).
 pub fn job_payload_ids(installation: Id, job: Id) -> [Id; 2] {
-    [1u8, 2].map(|kind| {
-        let mut hash = Sha256::new();
-        hash.update(b"asura.payload\0");
-        hash.update(installation);
-        hash.update(job);
-        hash.update([kind]);
-        derived_id(hash)
-    })
+    crate::payload::job_payloads(installation, job)
 }
 impl CreateNoteIdentity {
     pub fn derive(binding: [Id; 3], turn: Id, generation: u64, ordinal: u32) -> Result<Self> {

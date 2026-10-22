@@ -1,13 +1,14 @@
-//! Retained exec_cmd output payloads (J1): identities, the quota ledger, staging,
-//! text pages and derived recovery. The only caller of platform payload I/O.
+//! Retained tool output payloads: identities keyed by job ID, the quota
+//! ledger, staging, text pages and recovery for J1-mode exec_cmd calls and
+//! jobs. The only caller of platform payload I/O.
 mod id;
 mod pages;
 mod recovery;
 mod store;
 pub use asura_platform::payload_io::PayloadError;
-pub use id::{ObjectKind, payload_id};
+pub use id::{ObjectKind, job_payloads, payload_id};
 pub use pages::{
-    Origin, PAGE_LIMIT, PAGE_QUEUE, PAGE_STEP, Page, PagePool, PageRequest, PageState, Ticket,
+    Origin, PAGE_LIMIT, PAGE_QUEUE, Page, PagePool, PageReply, PageRequest, PageState, Ticket,
     read_page,
 };
 pub use recovery::{

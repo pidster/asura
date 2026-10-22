@@ -1253,19 +1253,11 @@ fn j2t_03_w_and_x_entries_and_checkpoint_jobs() {
         assert_eq!(job.cancel.unwrap().reason, JobReason::PersonStop);
         assert_eq!((job.conversation, job.project), (conversation, project));
         assert_eq!(job.payloads, job_payload_ids(installation, second));
-        // The job-mode calls have no `X` form 1 entries.
-        let j1 = crate::payload::payload_id(
-            installation,
-            operation,
-            generation,
-            1,
-            crate::payload::ObjectKind::Stdout,
-        );
-        assert!(
-            state
-                .get(&Key::new(Tag::Payload, j1, 0), store)
-                .unwrap()
-                .is_none()
+        // The job-mode calls have no `X` form 1 entries: a call's payload
+        // IDs are its job's (one derivation), whose entries are form 2.
+        assert_eq!(
+            crate::payload::job_payloads(installation, exec_cmd_job_id(operation, generation, 1)),
+            payloads
         );
         assert!(state.job_state([0x77; 16], store).unwrap().is_none());
     };

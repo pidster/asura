@@ -1031,8 +1031,7 @@ pub struct ExecCmdCall {
     /// command (field 15).
     pub secret_variables: u16,
     pub job: Id,
-    /// J1 mode: `payload::payload_id` of the call. Job mode: the job's
-    /// payload IDs ([`job_payload_ids`](super::job_payload_ids)).
+    /// `payload::payload_id` of `job`, in J1 and job mode alike.
     pub stdout_payload: Id,
     pub stderr_payload: Id,
     pub intent_sequence: u64,

@@ -1,9 +1,12 @@
-//! Derived recovery (J1): restart writes no record for an exec_cmd call. Replay
-//! and the payload directories derive each call's capture state. Runs on the
+//! Payload recovery at service start. Replay facts and the payload
+//! directories derive each payload's state: for a J1-mode exec_cmd call from
+//! its kinds 14 and 23 (J1 derived recovery), for a job from its kinds 26 and
+//! 28 (TJ-Q5). Both are keyed by job ID; a file no call or job derives is an
+//! orphan, including a file of the retired J1 derivation. Runs on the
 //! retained recovery worker with no time bound; shutdown cancels it between
 //! steps.
 use super::store::{Location, PayloadId, PayloadState, PayloadStore};
-use crate::authority::conversation::{CaptureState, Hash, Id, Replay};
+use crate::authority::conversation::{CaptureState, Hash, Id, JobOrigin, Replay};
 use asura_platform::payload_io::{PayloadDirectory, PayloadError, PayloadFile};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,15 +15,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// What recovery did, for logs and tests.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecoveryReport {
-    /// Staging files verified against kind 23 and installed.
+    /// Staging files verified against kind 23 or kind 28 and installed.
     pub installed: u32,
-    /// Payloads whose length or digest disagrees with kind 23.
+    /// Payloads whose length or digest disagrees with kind 23 or kind 28.
     pub corrupt: u32,
-    /// Payloads kind 23 names with no file.
+    /// Payloads a settlement names with no file.
     pub missing: u32,
-    /// Unverified prefixes kept (interrupted or `unconfirmed`).
+    /// Unverified prefixes kept (interrupted, unsettled or `unconfirmed`).
     pub unverified: u32,
-    /// Files no `run` exec_cmd kind 14 names, deleted (identity violation).
+    /// Files no J1-mode call or job derives, deleted (identity violation).
     pub orphans_deleted: u32,
     /// Stray staging files of `not_started` calls or of installed objects, deleted.
     pub strays_deleted: u32,
@@ -28,8 +31,8 @@ pub struct RecoveryReport {
     pub retained: u64,
 }
 
-/// Recovery failed: the payload store is unavailable, and exec_cmd admission
-/// answers `busy` with `payload_unavailable`.
+/// Recovery failed: the payload store is unavailable; exec_cmd admission
+/// answers `busy` and job starts wait, both with `payload_unavailable`.
 #[derive(Debug)]
 pub enum RecoveryError {
     Cancelled,
@@ -81,18 +84,22 @@ fn digest(file: &PayloadFile, cancel: &AtomicBool) -> Result<(u64, Hash), Recove
     }
 }
 
-/// Kind 23 as recovery uses it: state, journal sequence, and stored bytes
-/// and digest per stream.
+/// A settlement as recovery uses it: state, journal sequence, and stored
+/// bytes and digest per stream. Kind 23 for a J1-mode call; kind 28 for a
+/// job, where an `interrupted` kind 28 gives none.
 type Settled = (CaptureState, u64, [(u64, Option<Hash>); 2]);
 
-/// The replay facts recovery needs for one admitted exec_cmd call. Built from a
-/// replay on the caller's thread, so the recovery worker never holds a
-/// replay snapshot (the journal writer allows only one retained snapshot).
+/// The replay facts recovery needs for one J1-mode exec_cmd call or one job.
+/// Built from a replay or the journal's `PayloadFacts` on the caller's
+/// thread, so the recovery worker never holds a replay snapshot (the journal
+/// writer allows only one retained snapshot).
 #[derive(Clone, Debug)]
 pub struct Known {
+    /// The job ID (a J1-mode call's model-origin job ID).
     call: Id,
     operation: Id,
     payloads: [PayloadId; 2],
+    /// Kind 14 (J1 call) or kind 26 (job) sequence.
     intent_sequence: u64,
     settled: Option<Settled>,
 }
@@ -110,9 +117,11 @@ impl From<&crate::authority::writer::PayloadFact> for Known {
 }
 /// Payload IDs asked of the journal in one `PayloadFacts` request.
 pub const FACT_BATCH: usize = 128;
-/// Recovery from the payload directories and the journal's `X` facts: each
-/// file on disk is looked up in batches of 128; a file no `run` exec_cmd
-/// kind 14 names is an orphan (segmented journal, `PayloadFacts`).
+/// Recovery from the payload directories and the journal's `PayloadFacts`:
+/// each file on disk is looked up in batches of 128. A fact of the job form
+/// carries the job ID as `call`, the kind 26 sequence and the kind 28
+/// capture facts (none while unsettled or when `interrupted`). A file the
+/// journal does not derive is an orphan (segmented journal, `PayloadFacts`).
 pub fn recover_with_facts(
     store: &PayloadStore,
     facts: &mut dyn FnMut(
@@ -146,16 +155,23 @@ pub fn recover_with_facts(
         cancel,
     )
 }
-/// The exec_cmd calls of the operations a replay holds in memory (the
-/// active operation and the delta), for [`recover_known`] in tests.
+/// The J1-mode exec_cmd calls of the operations a replay holds in memory
+/// (the active operation and the delta) and its unsettled jobs, for
+/// [`recover_known`] in tests. A job settled in the delta is not included:
+/// a replay holds only its locators, and the production path answers it
+/// through [`recover_with_facts`].
 pub fn known_calls(replay: &Replay) -> Vec<Known> {
     let mut known = Vec::new();
     for (operation, op) in &replay.operations {
         for tool in &op.tools {
-            // Only a `run` exec_cmd kind 14 has derived job and payload IDs.
+            // Only a `run` exec_cmd kind 14 has derived job and payload IDs;
+            // a job-mode call's facts are its job's (below).
             let Some(call) = tool.exec_cmd.as_deref() else {
                 continue;
             };
+            if call.job_intent.is_some() {
+                continue;
+            }
             known.push(Known {
                 call: call.job,
                 operation: *operation,
@@ -167,6 +183,20 @@ pub fn known_calls(replay: &Replay) -> Vec<Known> {
                     .map(|s| (s.state, s.sequence, s.streams)),
             });
         }
+    }
+    // Unsettled jobs: an unverified prefix whose last use is kind 26.
+    for job in replay.jobs.values() {
+        // Person origin replays only after P2.
+        let JobOrigin::Model { operation, .. } = job.origin else {
+            continue;
+        };
+        known.push(Known {
+            call: job.job,
+            operation,
+            payloads: job.payloads,
+            intent_sequence: job.intent.sequence,
+            settled: None,
+        });
     }
     known
 }
@@ -194,7 +224,7 @@ pub fn recover_known(
     let mut objects = list_all(store, PayloadDirectory::Objects, cancel)?;
     let mut report = RecoveryReport::default();
     let named: BTreeSet<PayloadId> = known.iter().flat_map(|k| k.payloads).collect();
-    // Orphans: no `run` exec_cmd kind 14 names them.
+    // Orphans: no J1-mode call or job derives them.
     for (directory, files) in [
         (PayloadDirectory::Staging, &mut staging),
         (PayloadDirectory::Objects, &mut objects),
@@ -288,8 +318,9 @@ pub fn recover_known(
                     payloads[index] = entry;
                 }
             }
-            // Interrupted (no kind 23) or `unconfirmed`: an unverified prefix.
-            // Its last use is the kind 14 sequence.
+            // Interrupted (no kind 23; no kind 28 or an `interrupted` one) or
+            // `unconfirmed`: an unverified prefix. Its last use is the
+            // intent sequence (kind 14, or kind 26 for a job).
             None | Some((CaptureState::Unconfirmed, _, _)) => {
                 for (index, id) in call.payloads.into_iter().enumerate() {
                     let (location, bytes) = if let Some(bytes) = staging.get(&id).copied() {
@@ -317,8 +348,9 @@ pub fn recover_known(
                 }
             }
         }
-        // After a restart no call is live, so every recovered call is
-        // settled, unheld and expirable (its operation has ended).
+        // After a restart no call or job is live, so every recovered one is
+        // settled, unheld and expirable (its operation has ended; a job left
+        // unsettled is settled `interrupted` by the controller).
         store.recovered(call.call, call.operation, payloads, last_use, on_disk, true);
         report.retained += on_disk;
     }

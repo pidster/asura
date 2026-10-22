@@ -1,7 +1,9 @@
-//! The payload store (J1): quota ledger, catalog, staging captures and the
-//! interim quota-pressure expiry (J1-Q2). The state mutex is held only for
-//! arithmetic and map updates, never across I/O (AE-01).
-use super::id::{ObjectKind, payload_id};
+//! The payload store: quota ledger, catalog, staging captures and the
+//! interim quota-pressure expiry (J1-Q2). Reservations, staging and catalog
+//! entries are keyed by job ID (J2-E6); a J1-mode exec_cmd call is keyed by
+//! its model-origin job ID. The state mutex is held only for arithmetic and
+//! map updates, never across I/O (AE-01).
+use super::id::job_payloads;
 use crate::authority::conversation::{CaptureState, Hash, Id};
 use asura_platform::RuntimeDirectory;
 use asura_platform::payload_io::{PayloadError, PayloadFile, PayloadRoot, StagingFile};
@@ -68,7 +70,10 @@ pub enum Location {
 
 #[derive(Clone, Debug)]
 pub(super) struct PayloadEntry {
+    /// The job ID.
     pub call: Id,
+    /// The operation that owns the payload: the model origin's operation.
+    /// Page scope and the interim expiry of an unverified prefix use it.
     pub operation: Id,
     pub state: PayloadState,
     pub location: Location,
@@ -83,10 +88,14 @@ struct CallEntry {
     reservation: u64,
     /// Bytes counted as retained after settlement or recovery.
     retained: u64,
-    /// Journal sequence of kind 23 (or kind 14 for an unverified prefix).
+    /// Journal sequence of the settlement (kind 23 or kind 28), or of the
+    /// intent (kind 14, or kind 26 for a job) for an unverified prefix.
     last_use: u64,
     settled: bool,
     expirable: bool,
+    /// The owning operation has ended. An `unconfirmed` settlement after
+    /// that is expirable at once: a job may outlive its turn (J2T-17).
+    ended: bool,
     holds: u32,
     deleting: bool,
 }
@@ -207,38 +216,18 @@ impl Ledger {
             listener.space_event();
         }
     }
-    /// Reactor admission (arithmetic only): reserves 1 MiB for a new call.
-    /// Expirable calls may count as available; they are marked for deletion
-    /// and returned for the new capture worker to delete before it creates
-    /// its staging files.
-    pub fn admit(
-        &self,
-        installation: Id,
-        operation: Id,
-        generation: u64,
-        ordinal: u32,
-        call: Id,
-    ) -> Result<Vec<Victim>, Short> {
+    /// Reactor admission (arithmetic only): reserves 1 MiB for a new job
+    /// (or J1-mode call, by its job ID) and registers its two payload IDs
+    /// ([`job_payloads`]). `operation` owns the payloads. Expirable jobs may
+    /// count as available; they are marked for deletion and returned for the
+    /// new capture worker to delete before it creates its staging files.
+    pub fn admit(&self, installation: Id, job: Id, operation: Id) -> Result<Vec<Victim>, Short> {
+        let call = job;
         let mut state = lock(self);
         let chosen = state.select(RESERVATION_STEP).ok_or(Short::Quota)?;
         let victims = state.take_victims(chosen);
         state.used += RESERVATION_STEP;
-        let payloads = [
-            payload_id(
-                installation,
-                operation,
-                generation,
-                ordinal,
-                ObjectKind::Stdout,
-            ),
-            payload_id(
-                installation,
-                operation,
-                generation,
-                ordinal,
-                ObjectKind::Stderr,
-            ),
-        ];
+        let payloads = job_payloads(installation, job);
         state.calls.insert(
             call,
             CallEntry {
@@ -248,6 +237,7 @@ impl Ledger {
                 last_use: 0,
                 settled: false,
                 expirable: false,
+                ended: false,
                 holds: 0,
                 deleting: false,
             },
@@ -338,9 +328,11 @@ impl Ledger {
         drop(state);
         self.space_event();
     }
-    /// Settlement after kind 23 commits: the reservation is released and the
-    /// stored bytes count as retained. `held` keeps it from expiry while a
-    /// pending install or an abandoned worker owns it.
+    /// Settlement after kind 23 (J1) or kind 28 (job) commits: the
+    /// reservation is released and the stored bytes count as retained.
+    /// `held` keeps it from expiry while a pending install or an abandoned
+    /// worker owns it. An `unconfirmed` prefix is expirable only once its
+    /// operation has ended, which may be before the settlement.
     pub fn settle(
         &self,
         call: Id,
@@ -358,7 +350,7 @@ impl Ledger {
         entry.retained = retained;
         entry.last_use = last_use;
         entry.settled = true;
-        entry.expirable = !matches!(capture, CaptureState::Unconfirmed);
+        entry.expirable = capture != CaptureState::Unconfirmed || entry.ended;
         if held {
             entry.holds += 1;
         }
@@ -398,7 +390,8 @@ impl Ledger {
             payload.watermark = None;
         }
     }
-    /// Marks an unverified prefix expirable once its operation has ended.
+    /// Marks an unverified prefix expirable once its operation has ended. A
+    /// job still live then becomes expirable when it settles.
     pub fn operation_ended(&self, operation: Id) {
         let mut state = lock(self);
         let calls: BTreeSet<Id> = state
@@ -408,10 +401,11 @@ impl Ledger {
             .map(|p| p.call)
             .collect();
         for call in calls {
-            if let Some(entry) = state.calls.get_mut(&call)
-                && entry.settled
-            {
-                entry.expirable = true;
+            if let Some(entry) = state.calls.get_mut(&call) {
+                entry.ended = true;
+                if entry.settled {
+                    entry.expirable = true;
+                }
             }
         }
         drop(state);
@@ -485,6 +479,7 @@ impl Ledger {
                 last_use,
                 settled: true,
                 expirable,
+                ended: true,
                 holds: 0,
                 deleting: false,
             },
@@ -716,6 +711,7 @@ impl Capture {
 
 #[cfg(test)]
 mod tests {
+    use super::super::id::{ObjectKind, payload_id};
     use super::*;
     #[test]
     fn effective_quota_is_bounded_by_disk_and_configuration() {
@@ -740,10 +736,10 @@ mod tests {
         id
     }
     fn stream_id(n: u32, kind: ObjectKind) -> PayloadId {
-        payload_id(INSTALLATION, operation(n), 1, 1, kind)
+        payload_id(INSTALLATION, call_id(n), kind)
     }
     fn admit(ledger: &Ledger, n: u32) -> Result<Vec<Victim>, Short> {
-        ledger.admit(INSTALLATION, operation(n), 1, 1, call_id(n))
+        ledger.admit(INSTALLATION, call_id(n), operation(n))
     }
     fn streams(stdout: u64, stderr: u64) -> [(u64, Option<Hash>); 2] {
         [(stdout, Some([1; 32])), (stderr, Some([2; 32]))]
@@ -1169,5 +1165,62 @@ mod tests {
             Some((PayloadState::UnverifiedPrefix, Location::None, 25))
         );
         assert_eq!(ledger.used(), 25);
+    }
+
+    /// J2-C: reservations and catalog entries are keyed by job ID; the
+    /// payload IDs are the job's.
+    #[test]
+    fn j2t_04_admission_is_keyed_by_job_id() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        let job = call_id(7);
+        ledger.admit(INSTALLATION, job, operation(7)).unwrap();
+        assert_eq!(
+            ledger.payloads_of(job),
+            Some(job_payloads(INSTALLATION, job))
+        );
+        for kind in [ObjectKind::Stdout, ObjectKind::Stderr] {
+            let id = payload_id(INSTALLATION, job, kind);
+            assert_eq!(
+                ledger.payload_state(id),
+                Some((PayloadState::Live, Location::None, 0))
+            );
+            assert_eq!(lock(&ledger).payloads[&id].call, job);
+        }
+        assert_eq!(ledger.reservation(job), RESERVATION_STEP);
+        ledger.grow(job).unwrap();
+        assert_eq!(ledger.reservation(job), 2 * RESERVATION_STEP);
+    }
+
+    /// A job that outlives its turn: its operation ends while it is live; an
+    /// `unconfirmed` settlement afterwards is expirable once nothing holds it.
+    #[test]
+    fn unconfirmed_job_settled_after_its_operation_ended_is_expirable() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        admit(&ledger, 1).unwrap();
+        admit(&ledger, 2).unwrap();
+        ledger.operation_ended(operation(1));
+        for n in [1, 2] {
+            ledger.settle(
+                call_id(n),
+                CaptureState::Unconfirmed,
+                [(MIB, None), (0, None)],
+                u64::from(n),
+                true,
+            );
+        }
+        tighten(&ledger, 0);
+        // Both are held by their pending-install entries.
+        assert_eq!(admit(&ledger, 10), Err(Short::Quota));
+        ledger.unhold(call_id(1));
+        ledger.unhold(call_id(2));
+        let victims = admit(&ledger, 10).unwrap();
+        assert_eq!(victim_calls(&victims), [call_id(1)]);
+        delete_all(&ledger, &victims);
+        // Job 2's operation has not ended: it waits.
+        assert_eq!(admit(&ledger, 11), Err(Short::Quota));
+        ledger.operation_ended(operation(2));
+        assert_eq!(victim_calls(&admit(&ledger, 11).unwrap()), [call_id(2)]);
     }
 }

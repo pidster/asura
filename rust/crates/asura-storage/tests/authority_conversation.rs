@@ -2352,11 +2352,11 @@ fn tcr_u13_replay_recomputes_derived_identities() {
     assert_eq!(call.job, exec_cmd_job_id(id(10), 1, 1));
     assert_eq!(
         call.stdout_payload,
-        payload_id(id(1), id(10), 1, 1, ObjectKind::Stdout)
+        payload_id(id(1), call.job, ObjectKind::Stdout)
     );
     assert_eq!(
         call.stderr_payload,
-        payload_id(id(1), id(10), 1, 1, ObjectKind::Stderr)
+        payload_id(id(1), call.job, ObjectKind::Stderr)
     );
     let Record::ToolCall(stored) = decode_record(
         14,
@@ -2376,7 +2376,7 @@ fn tcr_u13_replay_recomputes_derived_identities() {
     // Another installation derives other payload IDs.
     assert_ne!(
         call.stdout_payload,
-        payload_id(id(2), id(10), 1, 1, ObjectKind::Stdout)
+        payload_id(id(2), call.job, ObjectKind::Stdout)
     );
 }
 /// TCR-U17: one source for each fact. Encoded kind 14, 15 and 23 payloads
@@ -2417,8 +2417,8 @@ fn tcr_u17_no_fact_is_stored_twice() {
     let ids = create_call(2).identity;
     let derived: Vec<Vec<u8>> = vec![
         job.to_vec(),
-        payload_id(id(1), id(10), 1, 1, ObjectKind::Stdout).to_vec(),
-        payload_id(id(1), id(10), 1, 1, ObjectKind::Stderr).to_vec(),
+        payload_id(id(1), job, ObjectKind::Stdout).to_vec(),
+        payload_id(id(1), job, ObjectKind::Stderr).to_vec(),
         ids.operation.to_vec(),
         ids.object.to_vec(),
         ids.version.to_vec(),

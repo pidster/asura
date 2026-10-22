@@ -2434,8 +2434,8 @@ pub(crate) fn apply_result_projection(
     }
 }
 pub(crate) fn exec_cmd_call(installation: Id, p: &ToolCall, sequence: u64) -> Box<ExecCmdCall> {
-    let payload =
-        |kind| crate::payload::payload_id(installation, p.operation, p.generation, p.ordinal, kind);
+    let job = exec_cmd_job_id(p.operation, p.generation, p.ordinal);
+    let [stdout_payload, stderr_payload] = crate::payload::job_payloads(installation, job);
     Box::new(ExecCmdCall {
         fixed_command: p.whole_command.then_some(WHOLE_COMMAND),
         secret_variables: if p.whole_command {
@@ -2443,9 +2443,9 @@ pub(crate) fn exec_cmd_call(installation: Id, p: &ToolCall, sequence: u64) -> Bo
         } else {
             p.number_kinds.len() as u16
         },
-        job: exec_cmd_job_id(p.operation, p.generation, p.ordinal),
-        stdout_payload: payload(crate::payload::ObjectKind::Stdout),
-        stderr_payload: payload(crate::payload::ObjectKind::Stderr),
+        job,
+        stdout_payload,
+        stderr_payload,
         intent_sequence: sequence,
         settled: None,
         job_intent: None,
@@ -2532,8 +2532,6 @@ pub fn tool_from_frames(
                     }) =>
             {
                 exec.job_intent = Some(frame);
-                [exec.stdout_payload, exec.stderr_payload] =
-                    job_payload_ids(installation, exec.job);
             }
             _ => return Err(ReplayError::Corrupt),
         }

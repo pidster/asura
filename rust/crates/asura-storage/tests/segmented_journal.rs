@@ -808,9 +808,7 @@ fn sj34_payload_facts_after_rolls() {
         session.finish(operation, generation, 50 * MAX_TEXT as u64, "");
         payloads.push(asura_storage::payload::payload_id(
             installation,
-            operation,
-            generation,
-            1,
+            exec_cmd_job_id(operation, generation, 1),
             asura_storage::payload::ObjectKind::Stdout,
         ));
     }

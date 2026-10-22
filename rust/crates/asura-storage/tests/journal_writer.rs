@@ -1830,11 +1830,19 @@ fn j1t_01_real_writer_appends_kinds_14_23_15_and_reopens() {
     assert_eq!(derived_whole.job, exec_cmd_job_id([35; 16], 1, 3));
     assert_eq!(
         derived.stdout_payload,
-        payload_id(installation, [35; 16], 1, 1, ObjectKind::Stdout)
+        payload_id(
+            installation,
+            exec_cmd_job_id([35; 16], 1, 1),
+            ObjectKind::Stdout
+        )
     );
     assert_eq!(
         derived.stderr_payload,
-        payload_id(installation, [35; 16], 1, 1, ObjectKind::Stderr)
+        payload_id(
+            installation,
+            exec_cmd_job_id([35; 16], 1, 1),
+            ObjectKind::Stderr
+        )
     );
     let settlement = derived.settled.as_ref().unwrap();
     assert_eq!(settlement.state, CaptureState::Incomplete);
