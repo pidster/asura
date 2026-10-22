@@ -35,6 +35,19 @@ pub(super) fn nonblocking(fd: RawFd) -> Result<(), ExecCmdError> {
         Ok(())
     }
 }
+/// `F_SETNOSIGPIPE` from the installed SDK `<sys/fcntl.h>`; the libc crate
+/// does not define it for Apple targets.
+const F_SETNOSIGPIPE: libc::c_int = 73;
+/// A write to this descriptor after its reader closed fails with `EPIPE`
+/// instead of raising SIGPIPE.
+pub(super) fn no_sigpipe(fd: RawFd) -> Result<(), ExecCmdError> {
+    // SAFETY: sets a per-descriptor flag on the caller-owned descriptor.
+    if unsafe { libc::fcntl(fd, F_SETNOSIGPIPE, 1) } < 0 {
+        Err(ExecCmdError::Io)
+    } else {
+        Ok(())
+    }
+}
 pub(super) fn pipe(nonblocking_write: bool) -> Result<(OwnedFd, OwnedFd), ExecCmdError> {
     let (read, write) = crate::startup::pipe().map_err(|_| ExecCmdError::Io)?;
     nonblocking(read.as_raw_fd())?;

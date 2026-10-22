@@ -4,6 +4,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 fn request() -> ExecCmdRequest {
     ExecCmdRequest {
         job_id: [7; 16],
+        profile: Profile::Model1,
         command: "printf ok".into(),
         cwd: None,
         secrets: Vec::new(),
@@ -103,7 +104,7 @@ fn notices_reject_identity_reserved_and_invalid_outcomes() {
     let id = [9; 16];
     let n = Notice {
         kind: 2,
-        reason: 1,
+        reason: 2,
         exit_kind: 2,
         cleanup: true,
         value: 15,
@@ -317,7 +318,9 @@ fn spawn_rejects_replaced_project_and_retains_scratch() {
 }
 #[test]
 fn guardian_normal_invocation_without_private_descriptors_fails_closed() {
-    assert_eq!(run_guardian("not-a-job", "printf no"), 1);
+    assert_eq!(run_guardian("not-a-job", "model-1", "printf no"), 1);
+    let job = "0123456789abcdef0123456789abcdef";
+    assert_eq!(run_guardian(job, "model-2", "printf no"), 1);
 }
 
 #[test]
@@ -369,6 +372,7 @@ fn notice_fixture() -> (ExecCmdJob, std::os::fd::OwnedFd) {
             notices: 0,
             spawned: false,
             last_kind: 0,
+            leader: None,
             unconfirmed: None,
             escapees: 0,
             terminal: None,
@@ -425,8 +429,7 @@ fn settled_setup_failure_is_never_a_successful_exec_cmd_exit() {
         32
     );
     drop(write);
-    job.poll(Instant::now()).unwrap();
-    job.poll(Instant::now()).unwrap();
+    pump(&mut job).unwrap();
     let result = job.result().unwrap();
     assert_eq!(result.failure, Some(ExecCmdError::Denied));
     assert_eq!(result.exit_code, None);
@@ -452,19 +455,20 @@ fn j1t_15_interests_follow_sink_room_and_cancel() {
     let interests = job.interests();
     assert_eq!(interests.len(), 1);
     assert_eq!(interests[0].fd, job.status.as_raw_fd());
-    job.stop(StopReason::Cancelled);
+    job.stop(StopKind::Term);
     assert_eq!(job.interests().len(), 3, "drain to EOF after cancel");
 }
-/// J1T-07 unit: nothing produces `OutputLimit`; more than 64 MiB of output
-/// does not stop the job (J1-Q2).
+/// J1T-07 unit: more than 64 MiB of output does not stop the job (J1-Q2);
+/// reason 3 `output_limit` is unassigned (J2).
 #[test]
 fn j1t_07_no_output_limit_producer() {
     let (mut job, _write) = notice_fixture();
     job.out.total = 80 * 1024 * 1024;
     job.err.total = 80 * 1024 * 1024;
     let _ = job.poll(Instant::now());
-    assert_ne!(job.stop, Some(StopReason::OutputLimit));
-    assert!(job.stop.is_none() || job.fault);
+    assert_eq!(job.stop, None, "output never requests a stop");
+    let id = [9; 16];
+    assert!(Notice::decode(&notice(2, 3, 1, true, 0).encode(id), id).is_err());
 }
 /// J1T-05/J1T-06 unit: setup and poll check only cancellation; there is
 /// no request deadline and no guardian reason 1.
@@ -477,7 +481,9 @@ fn j1t_05_no_deadline_checks_cancel_only() {
     let (mut job, _write) = notice_fixture();
     job.lease = None;
     let _ = job.poll(Instant::now() + Duration::from_secs(3600));
-    assert_ne!(job.stop, Some(StopReason::OutputLimit));
+    assert_eq!(job.stop, None, "no time-based stop");
+    let id = [9; 16];
+    assert!(Notice::decode(&notice(2, 1, 1, true, 0).encode(id), id).is_err());
 }
 
 fn notice(kind: u8, reason: u8, exit_kind: u8, cleanup: bool, value: u32) -> Notice {
@@ -487,6 +493,21 @@ fn notice(kind: u8, reason: u8, exit_kind: u8, cleanup: bool, value: u32) -> Not
         exit_kind,
         cleanup,
         value,
+    }
+}
+/// Poll a fixture job until it faults or all three pipes reach EOF. macOS
+/// has no `pipe2`, so a process another test forks at the same moment can
+/// briefly hold a fixture writer; a fixed number of polls was flaky. Test
+/// limit only: 10 s.
+fn pump(job: &mut ExecCmdJob) -> Result<(), ExecCmdError> {
+    let limit = Instant::now() + Duration::from_secs(10);
+    loop {
+        job.poll(Instant::now())?;
+        if job.status_eof && job.out.eof && job.err.eof {
+            return Ok(());
+        }
+        assert!(Instant::now() < limit, "fixture pipes did not reach EOF");
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 /// Write the notices, end the status pipe and poll until the job settles
@@ -502,13 +523,7 @@ fn feed(notices: &[Notice]) -> (ExecCmdJob, Result<(), ExecCmdError>) {
         );
     }
     drop(write);
-    let mut result = Ok(());
-    for _ in 0..3 {
-        result = job.poll(Instant::now());
-        if result.is_err() {
-            break;
-        }
-    }
+    let result = pump(&mut job);
     (job, result)
 }
 /// EC-U2: kind 6 and reasons 12 and 13 round-trip; their invalid shapes,
@@ -523,6 +538,10 @@ fn ec_u2_escapee_notice_shapes_round_trip_and_reject_invalid() {
         notice(2, 12, 2, true, 9),
         notice(4, 13, 0, false, 0),
         notice(4, 9, 0, false, 0),
+        notice(2, 11, 2, true, 9),
+        notice(2, 2, 1, true, 0),
+        notice(5, 0, 1, false, 255),
+        notice(5, 0, 2, false, 127),
     ] {
         let decoded = Notice::decode(&valid.encode(id), id).expect("valid shape");
         assert_eq!(
@@ -552,7 +571,7 @@ fn ec_u2_escapee_notice_shapes_round_trip_and_reject_invalid() {
         ("kind 4 exit", notice(4, 13, 1, false, 0)),
         ("kind 3 reason 12", notice(3, 12, 0, true, 0)),
         ("reason 10", notice(2, 10, 1, true, 0)),
-        ("reason 11", notice(2, 11, 2, true, 9)),
+        ("reason 11 on kind 4", notice(4, 11, 0, false, 0)),
         ("reason 14", notice(4, 14, 0, false, 0)),
         ("kind 7", notice(7, 0, 0, false, 0)),
     ] {
@@ -564,9 +583,10 @@ fn ec_u2_escapee_notice_shapes_round_trip_and_reject_invalid() {
 #[test]
 fn ec_u2_escapee_notice_order_and_settlement_facts() {
     let spawned = notice(1, 0, 0, false, 0);
+    let exited = notice(5, 0, 1, false, 0);
     let report = notice(6, 0, 0, false, 3);
     let settled = notice(2, 12, 1, true, 0);
-    let (job, polled) = feed(&[spawned, report, settled]);
+    let (job, polled) = feed(&[spawned, exited, report, settled]);
     assert_eq!(polled, Ok(()));
     let result = job.result().expect("settled");
     assert!(result.cleanup_confirmed);
@@ -582,7 +602,13 @@ fn ec_u2_escapee_notice_order_and_settlement_facts() {
         ("escapee", 13, UnconfirmedReason::EscapeeUnterminated),
         ("cleanup", 9, UnconfirmedReason::CleanupFailed),
     ] {
-        let (job, polled) = feed(&[spawned, notice(4, reason, 0, false, 0), report, settled]);
+        let (job, polled) = feed(&[
+            spawned,
+            exited,
+            notice(4, reason, 0, false, 0),
+            report,
+            settled,
+        ]);
         assert_eq!(polled, Ok(()), "{label}");
         assert_eq!(job.cleanup_unconfirmed(), Some(expected));
         let result = job.result().expect("late settlement");
@@ -598,7 +624,7 @@ fn ec_u2_escapee_notice_order_and_settlement_facts() {
         );
     }
     // No escapees: no kind 6, the lease reason stays, no count in the text.
-    let (job, polled) = feed(&[spawned, notice(2, 4, 2, true, 9)]);
+    let (job, polled) = feed(&[spawned, notice(5, 0, 2, false, 9), notice(2, 4, 2, true, 9)]);
     assert_eq!(polled, Ok(()));
     let result = job.result().unwrap();
     assert!(result.cleanup_confirmed);
@@ -622,21 +648,31 @@ fn ec_u2_escapee_notice_order_and_settlement_facts() {
 #[test]
 fn ec_u2_escapee_notice_order_faults() {
     let spawned = notice(1, 0, 0, false, 0);
+    let exited = notice(5, 0, 1, false, 0);
     let report = notice(6, 0, 0, false, 1);
     let unknown = notice(4, 13, 0, false, 0);
     let settled = notice(2, 12, 1, true, 0);
     let plain = notice(2, 0, 1, true, 0);
     for (label, sequence) in [
-        ("duplicate kind 6", vec![spawned, report, report, settled]),
+        (
+            "duplicate kind 6",
+            vec![spawned, exited, report, report, settled],
+        ),
         (
             "kind 4 after kind 6",
-            vec![spawned, report, unknown, settled],
+            vec![spawned, exited, report, unknown, settled],
         ),
-        ("duplicate kind 4", vec![spawned, unknown, unknown, plain]),
-        ("plain settle after kind 6", vec![spawned, report, plain]),
-        ("reason 12 without kind 6", vec![spawned, settled]),
+        (
+            "duplicate kind 4",
+            vec![spawned, unknown, unknown, exited, plain],
+        ),
+        (
+            "plain settle after kind 6",
+            vec![spawned, exited, report, plain],
+        ),
+        ("reason 12 without kind 6", vec![spawned, exited, settled]),
         ("kind 6 before spawned", vec![report, settled]),
-        ("kind 6 after settled", vec![spawned, plain, report]),
+        ("kind 6 after settled", vec![spawned, exited, plain, report]),
         (
             "setup failure after spawned",
             vec![spawned, notice(3, 5, 0, true, 0)],
@@ -650,7 +686,7 @@ fn ec_u2_escapee_notice_order_faults() {
     // Trailing partial bytes after a valid settlement.
     let (mut job, write) = notice_fixture();
     let mut bytes = Vec::new();
-    for n in [spawned, report, settled] {
+    for n in [spawned, exited, report, settled] {
         bytes.extend_from_slice(&n.encode([7; 16]));
     }
     bytes.extend_from_slice(b"ASSH");
@@ -660,7 +696,282 @@ fn ec_u2_escapee_notice_order_faults() {
         bytes.len() as isize
     );
     drop(write);
-    let _ = job.poll(Instant::now());
-    assert_eq!(job.poll(Instant::now()), Err(ExecCmdError::Protocol));
+    assert_eq!(pump(&mut job), Err(ExecCmdError::Protocol));
     assert!(!job.settled());
+}
+
+/// J2T-05 unit: the profile token is exact; P1's person tokens are not
+/// accepted yet; `model-1` has the 500 ms grace.
+#[test]
+fn j2t_05_profile_token_parse() {
+    assert_eq!(Profile::parse("model-1"), Some(Profile::Model1));
+    assert_eq!(Profile::Model1.token(), "model-1");
+    assert_eq!(Profile::Model1.grace_ns(), 500_000_000);
+    for token in [
+        "",
+        "model-2",
+        "Model-1",
+        "model-1 ",
+        "model",
+        "person-1",
+        "person-outside-1",
+    ] {
+        assert_eq!(Profile::parse(token), None, "{token:?}");
+    }
+}
+/// A notice fixture whose lease is a real pipe; returns the job, the
+/// status writer and the lease reader.
+fn lease_fixture() -> (ExecCmdJob, std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    let (mut job, status) = notice_fixture();
+    let (read, write) = spawn::pipe(true).unwrap();
+    spawn::no_sigpipe(write.as_raw_fd()).unwrap();
+    job.lease = Some(write);
+    (job, status, read)
+}
+fn lease_bytes(read: &std::os::fd::OwnedFd) -> Vec<u8> {
+    let mut buf = [0u8; 16];
+    // SAFETY: owned nonblocking fixture pipe and a live output buffer.
+    let n = unsafe { libc::read(read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+    buf[..n.max(0) as usize].to_vec()
+}
+/// J2T-05 unit, service side: at most one `T` and one `K` reach the lease;
+/// a later `T` is ignored; `K` escalates `T`; a failed write closes the
+/// lease instead of leaving the job running without a stop.
+#[test]
+fn j2t_05_stop_writes_at_most_one_t_and_one_k() {
+    let (mut job, _status, read) = lease_fixture();
+    job.stop(StopKind::Term);
+    job.stop(StopKind::Term);
+    assert_eq!(lease_bytes(&read), b"T");
+    job.stop(StopKind::Kill);
+    job.stop(StopKind::Kill);
+    job.stop(StopKind::Term);
+    assert_eq!(lease_bytes(&read), b"K");
+    assert!(job.lease.is_some(), "successful writes keep the lease");
+    assert_eq!(job.stop, Some(StopKind::Kill));
+
+    let (mut job, _status, read) = lease_fixture();
+    job.stop(StopKind::Kill);
+    job.stop(StopKind::Term);
+    assert_eq!(lease_bytes(&read), b"K", "no T after K");
+
+    // The reader is gone: EPIPE (no SIGPIPE) closes the lease.
+    let (mut job, _status, read) = lease_fixture();
+    drop(read);
+    job.stop(StopKind::Term);
+    assert!(job.lease.is_none(), "a failed write closes the lease");
+    assert_eq!(job.stop, Some(StopKind::Term));
+
+    // A full pipe: WouldBlock closes the lease.
+    let (mut job, _status, _read) = lease_fixture();
+    let fd = job.lease.as_ref().unwrap().as_raw_fd();
+    let chunk = [0u8; 4096];
+    // SAFETY: nonblocking writes from a live buffer into the owned fixture
+    // pipe until it reports full.
+    while unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) } > 0 {}
+    job.stop(StopKind::Term);
+    assert!(job.lease.is_none(), "WouldBlock closes the lease");
+
+    // A protocol fault closes the lease; no stop request is invented.
+    let (mut job, status, _read) = lease_fixture();
+    let bytes = notice(5, 0, 1, false, 0).encode([7; 16]);
+    // SAFETY: fixed bytes into the owned fixture pipe, below PIPE_BUF.
+    assert_eq!(
+        unsafe { libc::write(status.as_raw_fd(), bytes.as_ptr().cast(), 32) },
+        32
+    );
+    assert_eq!(job.poll(Instant::now()), Err(ExecCmdError::Protocol));
+    assert!(job.faulted() && job.lease.is_none() && job.stop.is_none());
+}
+/// J2T-06 unit: kind 5 shape: reason 0, exit kind 1 (code 0–255) or 2
+/// (signal 1–127), no cleanup bit.
+#[test]
+fn j2t_06_leader_exit_notice_shape() {
+    let id = [9; 16];
+    for valid in [
+        notice(5, 0, 1, false, 0),
+        notice(5, 0, 1, false, 255),
+        notice(5, 0, 2, false, 1),
+        notice(5, 0, 2, false, 127),
+    ] {
+        let bytes = valid.encode(id);
+        assert_eq!((bytes[4], bytes[5], bytes[7]), (5, 0, 0));
+        assert_eq!(bytes[24..28], valid.value.to_be_bytes());
+        assert!(Notice::decode(&bytes, id).is_ok(), "{valid:?}");
+    }
+    for (label, invalid) in [
+        ("no exit", notice(5, 0, 0, false, 0)),
+        ("reason", notice(5, 2, 1, false, 0)),
+        ("cleanup bit", notice(5, 0, 1, true, 0)),
+        ("code 256", notice(5, 0, 1, false, 256)),
+        ("signal 0", notice(5, 0, 2, false, 0)),
+        ("signal 128", notice(5, 0, 2, false, 128)),
+        ("exit kind 3", notice(5, 0, 3, false, 1)),
+    ] {
+        assert!(Notice::decode(&invalid.encode(id), id).is_err(), "{label}");
+    }
+    // The longest sequences, 1, 5, 4, 6, 2 and 1, 4, 5, 6, 2, fit.
+    assert_eq!(usize::from(MAX_NOTICES) * 32, 160);
+    const { assert!(160 <= STATUS_BUFFER && STATUS_BUFFER < 512) };
+}
+/// J2T-06 unit: every valid order of kinds 1, 5, 4, 6 and 2 settles with
+/// the kind 5 exit facts; kind 4 makes the settlement late.
+#[test]
+fn j2t_06_every_valid_notice_order_settles() {
+    let spawned = notice(1, 0, 0, false, 0);
+    let exited = notice(5, 0, 2, false, 9);
+    let unknown = notice(4, 13, 0, false, 0);
+    let report = notice(6, 0, 0, false, 2);
+    let settle = |reason| notice(2, reason, 2, true, 9);
+    for (label, sequence, confirmed, escapees, reason) in [
+        ("1 5 2/0", vec![spawned, exited, settle(0)], true, 0, None),
+        (
+            "1 5 2/2",
+            vec![spawned, exited, settle(2)],
+            true,
+            0,
+            Some(StopReason::Cancelled),
+        ),
+        (
+            "1 5 2/4",
+            vec![spawned, exited, settle(4)],
+            true,
+            0,
+            Some(StopReason::LeaseEnded),
+        ),
+        (
+            "1 5 2/11",
+            vec![spawned, exited, settle(11)],
+            true,
+            0,
+            Some(StopReason::Killed),
+        ),
+        (
+            "1 5 4 2",
+            vec![spawned, exited, unknown, settle(11)],
+            false,
+            0,
+            Some(StopReason::Killed),
+        ),
+        (
+            "1 4 5 2",
+            vec![spawned, unknown, exited, settle(2)],
+            false,
+            0,
+            Some(StopReason::Cancelled),
+        ),
+        (
+            "1 5 6 2",
+            vec![spawned, exited, report, settle(12)],
+            true,
+            2,
+            None,
+        ),
+        (
+            "1 5 4 6 2",
+            vec![spawned, exited, unknown, report, settle(12)],
+            false,
+            2,
+            None,
+        ),
+        (
+            "1 4 5 6 2",
+            vec![spawned, unknown, exited, report, settle(12)],
+            false,
+            2,
+            None,
+        ),
+    ] {
+        let (job, polled) = feed(&sequence);
+        assert_eq!(polled, Ok(()), "{label}");
+        assert!(job.spawned(), "{label}");
+        assert_eq!(job.leader_exit(), Some(Exit::Signalled(9)), "{label}");
+        let result = job.result().unwrap_or_else(|| panic!("{label}: settled"));
+        assert_eq!(result.cleanup_confirmed, confirmed, "{label}");
+        assert_eq!(result.escapees, escapees, "{label}");
+        assert_eq!(result.reason, reason, "{label}");
+        assert_eq!(
+            (result.signal, result.exit_code),
+            (Some(9), None),
+            "{label}"
+        );
+    }
+    // The service's own request names the stop when reason 12 replaced it.
+    let (mut job, status, _read) = lease_fixture();
+    job.stop(StopKind::Kill);
+    for n in [spawned, exited, report, settle(12)] {
+        let bytes = n.encode([7; 16]);
+        // SAFETY: fixed bytes into the owned fixture pipe, below PIPE_BUF.
+        assert_eq!(
+            unsafe { libc::write(status.as_raw_fd(), bytes.as_ptr().cast(), 32) },
+            32
+        );
+    }
+    drop(status);
+    pump(&mut job).unwrap();
+    assert_eq!(job.result().unwrap().reason, Some(StopReason::Killed));
+    // Kind 5 alone: the leader exited, the job is not settled.
+    let (mut job, status) = notice_fixture();
+    for n in [spawned, notice(5, 0, 1, false, 3)] {
+        let bytes = n.encode([7; 16]);
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::write(status.as_raw_fd(), bytes.as_ptr().cast(), 32) },
+            32
+        );
+    }
+    job.poll(Instant::now()).unwrap();
+    assert_eq!(job.leader_exit(), Some(Exit::Exited(3)));
+    assert!(!job.settled());
+}
+/// J2T-06 unit: kind 2 without kind 5, unequal exit facts, a second kind
+/// 5, kind 5 before kind 1 and kind 6 before kind 5 are protocol faults.
+#[test]
+fn j2t_06_notice_order_faults() {
+    let spawned = notice(1, 0, 0, false, 0);
+    let exited = notice(5, 0, 1, false, 4);
+    let report = notice(6, 0, 0, false, 1);
+    let unknown = notice(4, 9, 0, false, 0);
+    for (label, sequence) in [
+        (
+            "kind 2 without kind 5",
+            vec![spawned, notice(2, 0, 1, true, 4)],
+        ),
+        (
+            "kind 2 without kind 5 after kind 4",
+            vec![spawned, unknown, notice(2, 2, 1, true, 4)],
+        ),
+        (
+            "unequal exit value",
+            vec![spawned, exited, notice(2, 0, 1, true, 5)],
+        ),
+        (
+            "unequal exit kind",
+            vec![spawned, exited, notice(2, 0, 2, true, 4)],
+        ),
+        (
+            "second kind 5",
+            vec![spawned, exited, exited, notice(2, 0, 1, true, 4)],
+        ),
+        ("kind 5 before kind 1", vec![exited, spawned]),
+        ("kind 5 alone first", vec![exited]),
+        (
+            "kind 6 before kind 5",
+            vec![spawned, report, exited, notice(2, 12, 1, true, 4)],
+        ),
+        ("kind 5 after kind 6", vec![spawned, exited, report, exited]),
+        (
+            "kind 5 after kind 2",
+            vec![spawned, exited, notice(2, 0, 1, true, 4), exited],
+        ),
+        (
+            "kind 5 after kind 3",
+            vec![notice(3, 5, 0, true, 0), exited],
+        ),
+    ] {
+        let (job, polled) = feed(&sequence);
+        assert_eq!(polled, Err(ExecCmdError::Protocol), "{label}");
+        assert!(job.faulted() && !job.settled(), "{label}");
+        assert!(job.result().is_none(), "{label}");
+    }
 }

@@ -1,7 +1,7 @@
 //! Native process qualification; private guardian dispatch is identical to the CLI.
 use asura_platform::exec_cmd::{
-    ExecCmdError, ExecCmdRequest, ExecCmdResult, OutputSink, PreparedExecCmd, StopReason, Stream,
-    Tails, run_guardian,
+    ExecCmdError, ExecCmdRequest, ExecCmdResult, Exit, OutputSink, PreparedExecCmd, Profile,
+    StopKind, StopReason, Stream, Tails, run_guardian,
 };
 use asura_platform::secrets::{RefusalCode, SecretVariable, WHOLE_COMMAND, rewrite_command};
 use asura_platform::{ProjectIdentity, RuntimeDirectory};
@@ -16,16 +16,16 @@ use std::time::{Duration, Instant};
 mod escapees;
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    if let [_, flag, id, command] = args.as_slice()
+    if let [_, flag, id, profile, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
-        std::process::exit(run_guardian(id, command));
+        std::process::exit(run_guardian(id, profile, command));
     }
-    if let [_, flag, id, command, fault] = args.as_slice()
+    if let [_, flag, id, profile, command, fault] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
         std::process::exit(asura_platform::exec_cmd::run_guardian_for_test(
-            id, command, fault,
+            id, profile, command, fault,
         ));
     }
     if let [_, flag, home] = args.as_slice()
@@ -158,6 +158,7 @@ fn prepare_with(
         home,
         ExecCmdRequest {
             job_id: asura_platform::random_id(),
+            profile: Profile::Model1,
             command: command.into(),
             cwd: None,
             secrets,
@@ -196,7 +197,7 @@ fn settle(mut job: JobGuard, timeout: Duration, cancel: bool) -> Outcome {
     while !job.settled() {
         assert!(Instant::now() < end, "exec_cmd failed to settle");
         if cancel && !cancelled && started.elapsed() > Duration::from_millis(200) {
-            job.stop(StopReason::Cancelled);
+            job.stop(StopKind::Term);
             cancelled = true;
         }
         asura_platform::poll(&job.interests(), Duration::from_millis(20)).unwrap();
@@ -266,6 +267,8 @@ fn qualification() {
     state_isolation(&f.0);
     escapees::escapees(&f.0);
     guardian_refusals(&f.0);
+    j2t_05_lease_bytes(&f.0);
+    j2t_06_leader_exit_notice(&f.0);
     secret_environment_refusals(&f.0);
     secret_variables(&f.0);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -439,6 +442,7 @@ fn guardian_refusals(home: &Path) {
             &project,
             ExecCmdRequest {
                 job_id: asura_platform::random_id(),
+                profile: Profile::Model1,
                 command: "printf ran > refused-marker".into(),
                 cwd: None,
                 secrets: Vec::new(),
@@ -481,6 +485,192 @@ fn guardian_refusals(home: &Path) {
                 .unwrap();
         }
     }
+}
+/// Pump a job until `done` or settlement; the limit bounds only this test.
+fn pump_job(job: &mut JobGuard, what: &str, mut done: impl FnMut(&JobGuard) -> bool) {
+    let until = Instant::now() + Duration::from_secs(15);
+    while !done(job) && !job.settled() {
+        assert!(Instant::now() < until, "{what}");
+        asura_platform::poll(&job.interests(), Duration::from_millis(20)).unwrap();
+        job.poll(Instant::now()).unwrap();
+    }
+}
+/// Settle a stopped job, run its scratch cleanup and return its result.
+fn finish_stopped(mut job: JobGuard, what: &str) -> ExecCmdResult {
+    pump_job(&mut job, what, |_| false);
+    let result = job.result().unwrap();
+    job.take_cleanup()
+        .unwrap()
+        .run(
+            Instant::now() + Duration::from_secs(2),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    result
+}
+/// J2T-05 integration with the real guardian under `sandbox-exec`: an
+/// unknown profile token refuses before any effect and any notice; `T`
+/// stops a TERM-ignoring group with KILL after the 500 ms grace, reason 2;
+/// `K` kills at once, reason 11; `K` escalates `T`; lease EOF still stops
+/// the group, reason 4.
+fn j2t_05_lease_bytes(home: &Path) {
+    // Unknown token: status 1 before any effect; the service sees status
+    // EOF with no notice, a protocol fault, and no command ran.
+    let runtime = RuntimeDirectory::scratch(home, true).unwrap();
+    let project = ProjectIdentity::open(
+        home.join("project").to_str().unwrap(),
+        &runtime.state_boundary(),
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let id = asura_platform::random_id();
+    let mut prepared = PreparedExecCmd::prepare(
+        runtime,
+        &project,
+        ExecCmdRequest {
+            job_id: id,
+            profile: Profile::Model1,
+            command: "printf ran > unknown-profile-marker".into(),
+            cwd: None,
+            secrets: Vec::new(),
+            secret_command: None,
+        },
+        &cancel,
+    )
+    .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
+    prepared.profile_token_for_test("model-2");
+    let mut job = prepared
+        .spawn(
+            &std::env::current_exe().unwrap(),
+            &cancel,
+            Box::new(Collected::default()),
+        )
+        .unwrap_or_else(|e| panic!("spawn: {:?}", e.reason));
+    let until = Instant::now() + Duration::from_secs(5);
+    let outcome = loop {
+        assert!(Instant::now() < until, "unknown profile failed to end");
+        asura_platform::poll(&job.interests(), Duration::from_millis(20)).unwrap();
+        if let Err(error) = job.poll(Instant::now()) {
+            break error;
+        }
+    };
+    assert_eq!(outcome, ExecCmdError::Protocol);
+    assert!(!job.spawned() && job.faulted() && !job.settled());
+    assert!(!home.join("project/unknown-profile-marker").exists());
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    let scratch = home.join(format!(".asura/tmp/exec-cmd-{hex}"));
+    assert_eq!(
+        fs::read_dir(&scratch).unwrap().count(),
+        0,
+        "the guardian touched scratch"
+    );
+    drop(job);
+    fs::remove_dir(&scratch).unwrap();
+    println!("J2T-05: unknown profile token refused before any effect or notice");
+
+    let resistant = "trap '' TERM; printf '%s' $$ > j2-pid; while :; do sleep 0.05; done";
+    // `T`: TERM is ignored, KILL follows the 500 ms grace; reason 2.
+    let mut job = prepare(home, resistant, Duration::from_secs(5));
+    pump_job(&mut job, "T job running", |_| {
+        home.join("project/j2-pid").exists()
+    });
+    let stopped = Instant::now();
+    job.stop(StopKind::Term);
+    job.stop(StopKind::Term);
+    let result = finish_stopped(job, "T stop settles");
+    let elapsed = stopped.elapsed();
+    assert_eq!(result.reason, Some(StopReason::Cancelled), "{result:?}");
+    assert_eq!(result.signal, Some(9), "{result:?}");
+    assert!(result.cleanup_confirmed);
+    assert!(elapsed >= Duration::from_millis(500), "{elapsed:?}");
+    group_absent(&home.join("project/j2-pid"));
+    fs::remove_file(home.join("project/j2-pid")).unwrap();
+    println!("J2T-05: T gave KILL after {elapsed:?}, reason 2");
+
+    // `K`: KILL at once; reason 11.
+    let mut job = prepare(home, resistant, Duration::from_secs(5));
+    pump_job(&mut job, "K job running", |_| {
+        home.join("project/j2-pid").exists()
+    });
+    let stopped = Instant::now();
+    job.stop(StopKind::Kill);
+    let result = finish_stopped(job, "K stop settles");
+    let elapsed = stopped.elapsed();
+    assert_eq!(result.reason, Some(StopReason::Killed), "{result:?}");
+    assert_eq!(result.signal, Some(9), "{result:?}");
+    assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    group_absent(&home.join("project/j2-pid"));
+    fs::remove_file(home.join("project/j2-pid")).unwrap();
+    println!("J2T-05: K gave KILL after {elapsed:?}, reason 11");
+
+    // `K` escalates `T` inside the grace: reason 11 replaces 2.
+    let mut job = prepare(home, resistant, Duration::from_secs(5));
+    pump_job(&mut job, "T then K job running", |_| {
+        home.join("project/j2-pid").exists()
+    });
+    let stopped = Instant::now();
+    job.stop(StopKind::Term);
+    pump_job(&mut job, "T read", |_| {
+        stopped.elapsed() >= Duration::from_millis(150)
+    });
+    job.stop(StopKind::Kill);
+    let result = finish_stopped(job, "T then K settles");
+    let elapsed = stopped.elapsed();
+    assert_eq!(result.reason, Some(StopReason::Killed), "{result:?}");
+    assert_eq!(result.signal, Some(9), "{result:?}");
+    assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    group_absent(&home.join("project/j2-pid"));
+    fs::remove_file(home.join("project/j2-pid")).unwrap();
+    println!("J2T-05: K escalated T after {elapsed:?}, reason 11");
+
+    // Lease EOF with no byte still stops the group; reason 4.
+    let mut job = prepare(
+        home,
+        "printf '%s' $$ > j2-pid; sleep 30 & wait",
+        Duration::from_secs(5),
+    );
+    pump_job(&mut job, "EOF job running", |_| {
+        home.join("project/j2-pid").exists()
+    });
+    job.close_lease();
+    let result = finish_stopped(job, "EOF stop settles");
+    assert_eq!(result.reason, Some(StopReason::LeaseEnded), "{result:?}");
+    assert_eq!(result.signal, Some(15), "{result:?}");
+    group_absent(&home.join("project/j2-pid"));
+    fs::remove_file(home.join("project/j2-pid")).unwrap();
+    println!("J2T-05: lease EOF stopped the group, reason 4");
+}
+/// J2T-06 integration: the leader exits while a TERM-ignoring member
+/// writes. Kind 5 arrives first, output keeps flowing, and kind 2 later
+/// repeats its exit facts; a signalled leader reports its signal.
+fn j2t_06_leader_exit_notice(home: &Path) {
+    let mut job = prepare(
+        home,
+        "(trap '' TERM; while :; do printf x; sleep 0.02; done) & sleep 0.2; exit 3",
+        Duration::from_secs(5),
+    );
+    pump_job(&mut job, "kind 5", |job| job.leader_exit().is_some());
+    assert!(!job.settled(), "kind 5 precedes kind 2");
+    assert_eq!(job.leader_exit(), Some(Exit::Exited(3)));
+    let at_exit = job.1.0.lock().unwrap().total[0];
+    pump_job(&mut job, "member output after kind 5", |job| {
+        job.1.0.lock().unwrap().total[0] > at_exit
+    });
+    assert!(!job.settled(), "the member still writes after kind 5");
+    let result = finish_stopped(job, "leader-exit settlement");
+    assert_eq!(result.exit_code, Some(3), "{result:?}");
+    assert_eq!((result.signal, result.reason), (None, None), "{result:?}");
+    assert!(result.cleanup_confirmed);
+    println!("J2T-06: kind 5 before kind 2; output flowed after the leader exit");
+
+    let mut job = prepare(home, "kill -KILL $$", Duration::from_secs(5));
+    pump_job(&mut job, "signalled kind 5", |job| {
+        job.leader_exit().is_some()
+    });
+    assert_eq!(job.leader_exit(), Some(Exit::Signalled(9)));
+    let result = finish_stopped(job, "signalled settlement");
+    assert_eq!((result.exit_code, result.signal), (None, Some(9)));
+    println!("J2T-06: a signalled leader reported signal 9 in kinds 5 and 2");
 }
 /// SI-I4 and SI-I5: the Asura home is denied under both spellings; scratch works.
 fn state_isolation(home: &Path) {
@@ -565,7 +755,7 @@ impl std::ops::DerefMut for JobGuard {
 impl Drop for JobGuard {
     fn drop(&mut self) {
         if !self.0.settled() {
-            self.0.stop(StopReason::Cancelled);
+            self.0.stop(StopKind::Term);
             let until = Instant::now() + Duration::from_secs(7);
             while !self.0.settled() && Instant::now() < until {
                 let _ = asura_platform::poll(&self.0.interests(), Duration::from_millis(20));
@@ -698,6 +888,7 @@ fn secret_environment_refusals(home: &Path) {
             &project,
             ExecCmdRequest {
                 job_id: asura_platform::random_id(),
+                profile: Profile::Model1,
                 command: "printf ran > secret-refused-marker".into(),
                 cwd: None,
                 secrets: Vec::new(),
@@ -807,6 +998,7 @@ fn secret_variables(home: &Path) {
             home,
             ExecCmdRequest {
                 job_id: asura_platform::random_id(),
+                profile: Profile::Model1,
                 command: WHOLE_COMMAND.into(),
                 cwd: None,
                 secrets: Vec::new(),

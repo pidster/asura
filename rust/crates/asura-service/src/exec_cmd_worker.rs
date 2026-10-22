@@ -15,7 +15,7 @@ use asura_platform::{
     events::WakeSender,
     exec_cmd::{
         ExecCmdCleanup, ExecCmdError, ExecCmdFailure, ExecCmdJob, ExecCmdRequest, ExecCmdResult,
-        PreparedExecCmd, StopReason, Tails, render_tail,
+        PreparedExecCmd, Profile, StopKind, StopReason, Tails, render_tail,
     },
     secrets::{SecretCommand, SecretVariable},
 };
@@ -235,6 +235,7 @@ impl Worker {
         };
         let request = ExecCmdRequest {
             job_id: intent.job,
+            profile: Profile::Model1,
             command: intent.command.clone(),
             cwd: Some(intent.cwd.clone()),
             secrets,
@@ -366,8 +367,8 @@ impl Worker {
         active.phase = Some(match phase {
             Phase::Setup(work) if work.thread.is_finished() => match work.thread.join() {
                 Ok(Ok(mut job)) => {
-                    if let Some(reason) = active.stop {
-                        job.stop(reason);
+                    if active.stop.is_some() {
+                        job.stop(StopKind::Term);
                     }
                     Phase::Running(job)
                 }
@@ -406,7 +407,8 @@ impl Worker {
                     if active.process.is_none() {
                         active.process = Some(Process::Failed(ExecCmdError::Protocol));
                     }
-                    job.stop(StopReason::Cancelled);
+                    // The platform closed the lease on the fault.
+                    job.close_lease();
                     active.cleanup_deadline.get_or_insert(now + CLEANUP_BOUND);
                     if let Some(capture) = &active.capture {
                         capture.cancel();
@@ -572,7 +574,7 @@ fn stop(active: &mut Active, reason: StopReason, now: Instant) {
     }
     match active.phase.as_mut() {
         Some(Phase::Setup(work)) => work.cancel.store(true, Ordering::Release),
-        Some(Phase::Running(job)) => job.stop(active.stop.unwrap_or(reason)),
+        Some(Phase::Running(job)) => job.stop(StopKind::Term),
         _ => {}
     }
 }
@@ -707,8 +709,7 @@ fn mapped_result(
         return failed(intent, ExecCmdError::Protocol);
     }
     let status = match result.reason {
-        Some(StopReason::OutputLimit) => 7,
-        Some(StopReason::Cancelled | StopReason::LeaseEnded) => 6,
+        Some(StopReason::Cancelled | StopReason::Killed | StopReason::LeaseEnded) => 6,
         None => 1,
     };
     let text = with_filtered(intent, result.render_text(tails, capture.as_str()));

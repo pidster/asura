@@ -18,9 +18,11 @@ pub use escapee::scan_for_test as escapee_scan_for_test;
 pub use guardian::run_guardian;
 #[cfg(feature = "test-support")]
 pub use guardian::run_guardian_for_test;
+pub use protocol::Profile;
 use protocol::{
-    KIND_ESCAPEE_REPORT, Notice, REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED,
-    REASON_ESCAPEE_UNTERMINATED,
+    KIND_ESCAPEE_REPORT, KIND_LEADER_EXITED, LEASE_KILL, LEASE_TERM, Notice, REASON_CANCEL,
+    REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED, REASON_ESCAPEE_UNTERMINATED, REASON_KILL,
+    REASON_LEASE_ENDED,
 };
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -39,11 +41,55 @@ pub enum ExecCmdError {
     CleanupUnconfirmed,
     Io,
 }
+/// Why a settled job stopped. Reason 3 `output_limit` is unassigned since
+/// J1; nothing produces it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StopReason {
+    /// Lease byte `T` (kind 2 reason 2), or a service stop request.
     Cancelled,
-    OutputLimit,
+    /// Lease byte `K` (kind 2 reason 11).
+    Killed,
+    /// Lease EOF or a lease fault (kind 2 reason 4).
     LeaseEnded,
+}
+/// A service stop request (tool-job-controller.md, guardian contract
+/// additions). Each writes one lease byte with a nonblocking `write`; a
+/// `WouldBlock` or an error closes the lease instead, which the guardian
+/// handles as EOF, so a failed write never leaves the job running.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopKind {
+    /// `T`: TERM now, KILL after the profile's grace. Ignored after any
+    /// earlier stop request.
+    Term,
+    /// `K`: KILL now. Escalates an earlier `T`; ignored after an earlier `K`.
+    Kill,
+}
+impl StopKind {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Term => LEASE_TERM,
+            Self::Kill => LEASE_KILL,
+        }
+    }
+}
+/// The leader's exit facts from notice kind 5; the settled notice repeats
+/// them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Exit {
+    /// Exit code 0–255 (`CLD_EXITED`).
+    Exited(u8),
+    /// Signal 1–127 (`CLD_KILLED` or `CLD_DUMPED`).
+    Signalled(u8),
+}
+impl Exit {
+    fn from_notice(notice: &Notice) -> Option<Self> {
+        let value = u8::try_from(notice.value).ok()?;
+        match notice.exit_kind {
+            1 => Some(Self::Exited(value)),
+            2 => Some(Self::Signalled(value)),
+            _ => None,
+        }
+    }
 }
 /// Why the guardian reported `cleanup_unconfirmed` (notice kind 4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,7 +136,7 @@ impl ExecCmdResult {
             match self.reason {
                 None => "none",
                 Some(StopReason::Cancelled) => "cancelled",
-                Some(StopReason::OutputLimit) => "output_limit",
+                Some(StopReason::Killed) => "killed",
                 Some(StopReason::LeaseEnded) => "lease_ended",
             },
             tails.truncated,
@@ -130,9 +176,11 @@ pub const MAX_COMMAND_BYTES: usize = 8192;
 /// omit values.
 ///
 /// The command has no time bound: it ends on completion or cancel, and setup
-/// checks only cancellation.
+/// checks only cancellation. `profile` selects the guardian's sandbox and
+/// grace through its argv token.
 pub struct ExecCmdRequest {
     pub job_id: [u8; 16],
+    pub profile: Profile,
     pub command: String,
     pub cwd: Option<String>,
     pub secrets: Vec<SecretVariable>,
@@ -152,6 +200,8 @@ pub struct PreparedExecCmd {
     secret_environment_for_test: Option<Vec<Vec<u8>>>,
     #[cfg(feature = "test-support")]
     guardian_fault_for_test: Option<String>,
+    #[cfg(feature = "test-support")]
+    profile_token_for_test: Option<String>,
     cleanup: Option<ExecCmdCleanup>,
 }
 fn check(cancel: &AtomicBool) -> Result<(), ExecCmdError> {
@@ -278,6 +328,8 @@ impl PreparedExecCmd {
             secret_environment_for_test: None,
             #[cfg(feature = "test-support")]
             guardian_fault_for_test: None,
+            #[cfg(feature = "test-support")]
+            profile_token_for_test: None,
             cleanup: Some(cleanup),
         };
         if let Err(reason) = check(cancel) {
@@ -304,10 +356,16 @@ impl PreparedExecCmd {
     }
     /// Pass one escapee-control fault to the guardian (`group-only`,
     /// `undyable` or `unverifiable:<n>`); the test executable must dispatch
-    /// the five-argument form to [`run_guardian_for_test`].
+    /// `MARKER JOBHEX PROFILE COMMAND FAULT` to [`run_guardian_for_test`].
     #[cfg(feature = "test-support")]
     pub fn guardian_fault_for_test(&mut self, fault: &str) {
         self.guardian_fault_for_test = Some(fault.into());
+    }
+    /// Replace the argv profile token, to qualify the guardian's refusal
+    /// of an unknown token.
+    #[cfg(feature = "test-support")]
+    pub fn profile_token_for_test(&mut self, token: &str) {
+        self.profile_token_for_test = Some(token.into());
     }
     /// After a successful spawn ownership always transfers to ExecCmdJob.
     /// The request's secret values are dropped (and zeroed) whether or not
@@ -365,6 +423,7 @@ impl PreparedExecCmd {
             .ok_or(ExecCmdError::Protocol)?
             .directory;
         let (lease_read, lease_write) = spawn::pipe(true)?;
+        spawn::no_sigpipe(lease_write.as_raw_fd())?;
         let (status_read, status_write) = spawn::pipe(true)?;
         let (out_read, out_write) = spawn::pipe(false)?;
         let (err_read, err_write) = spawn::pipe(false)?;
@@ -375,8 +434,13 @@ impl PreparedExecCmd {
             executable.to_string_lossy().into_owned(),
             "--asura-exec-cmd-guardian".into(),
             hex(self.request.job_id),
+            self.request.profile.token().into(),
             self.request.command.clone(),
         ];
+        #[cfg(feature = "test-support")]
+        if let Some(token) = &self.profile_token_for_test {
+            args[3] = token.clone();
+        }
         #[cfg(feature = "test-support")]
         args.extend(self.guardian_fault_for_test.clone());
         if args.iter().map(|value| value.len() + 1).sum::<usize>() > 8704 {
@@ -423,6 +487,7 @@ impl PreparedExecCmd {
             notices: 0,
             spawned: false,
             last_kind: 0,
+            leader: None,
             unconfirmed: None,
             escapees: 0,
             terminal: None,
@@ -442,8 +507,8 @@ fn hex(id: [u8; 16]) -> String {
 }
 /// Status receive bound: five 32-byte notices fit (escapee-control.md).
 const STATUS_BUFFER: usize = 192;
-/// Most notices one guardian may send: spawned, leader exit (J2b),
-/// escapee report, cleanup unconfirmed and settled.
+/// Most notices one guardian may send: spawned, leader exit, cleanup
+/// unconfirmed, escapee report and settled, 160 bytes in all.
 const MAX_NOTICES: u8 = 5;
 pub struct ExecCmdJob {
     pid: libc::pid_t,
@@ -456,13 +521,16 @@ pub struct ExecCmdJob {
     spawned: bool,
     /// Kind of the previous notice; 0 before the first.
     last_kind: u8,
+    /// Kind 5 facts: exit kind and value.
+    leader: Option<(u8, u32)>,
     unconfirmed: Option<UnconfirmedReason>,
     escapees: u32,
     terminal: Option<Notice>,
     out: Capture,
     err: Capture,
     sink: Box<dyn OutputSink>,
-    stop: Option<StopReason>,
+    /// The strongest stop request so far.
+    stop: Option<StopKind>,
     cleanup: Option<ExecCmdCleanup>,
     job_id: [u8; 16],
     alternate: bool,
@@ -481,7 +549,7 @@ impl ExecCmdJob {
     pub fn interests(&self) -> Vec<PollInterest> {
         let mut result = Vec::with_capacity(3);
         let room = self.sink.room();
-        let stopping = self.stop.is_some();
+        let stopping = self.stopping();
         for (fd, wanted) in [
             (self.status.as_raw_fd(), !self.status_eof),
             (self.out.fd(), self.out.wants_read(room, stopping)),
@@ -505,17 +573,44 @@ impl ExecCmdJob {
             Some(Instant::now() + Duration::from_millis(100))
         }
     }
-    pub fn stop(&mut self, reason: StopReason) {
-        if self.stop.is_none() {
-            self.stop = Some(reason)
+    /// A stop request: at most one `T` and one `K` reach the lease, each
+    /// with one nonblocking 1-byte write into a pipe that holds at most 2
+    /// bytes. Idempotent; never blocks. After a cancel trigger both output
+    /// pipes are read to EOF.
+    pub fn stop(&mut self, kind: StopKind) {
+        let send = match (self.stop, kind) {
+            (None, _) | (Some(StopKind::Term), StopKind::Kill) => true,
+            (Some(_), _) => false,
+        };
+        if !send {
+            return;
         }
-        self.lease.take();
+        self.stop = Some(kind);
+        if let Some(lease) = &self.lease {
+            let byte = [kind.byte()];
+            // SAFETY: one-byte write, below PIPE_BUF, from a live buffer to
+            // the owned nonblocking lease writer; SIGPIPE is off for it.
+            let written = unsafe { libc::write(lease.as_raw_fd(), byte.as_ptr().cast(), 1) };
+            if written != 1 {
+                // WouldBlock or an error: EOF stops the group instead.
+                self.lease = None;
+            }
+        }
+    }
+    /// Close the lease: the guardian stops the group on EOF, or only ends
+    /// lease polling after an earlier stop. Used for a protocol fault or a
+    /// lost guardian, after which no notice is trusted.
+    pub fn close_lease(&mut self) {
+        self.lease = None;
+    }
+    fn stopping(&self) -> bool {
+        self.stop.is_some() || self.fault
     }
     pub fn poll(&mut self, _now: Instant) -> Result<(), ExecCmdError> {
         let result = self.poll_inner();
         if result.is_err() {
             self.fault = true;
-            self.stop(StopReason::Cancelled)
+            self.close_lease();
         }
         result
     }
@@ -526,7 +621,7 @@ impl ExecCmdJob {
             (&mut self.out, &mut self.err)
         };
         self.alternate = !self.alternate;
-        let stopping = self.stop.is_some();
+        let stopping = self.stop.is_some() || self.fault;
         self.sink.flush();
         first.drain(DRAIN_BUDGET, self.sink.as_mut(), stopping)?;
         second.drain(DRAIN_BUDGET, self.sink.as_mut(), stopping)?;
@@ -571,19 +666,25 @@ impl ExecCmdJob {
         }
         Ok(())
     }
-    /// Order rules: spawned first; at most one kind 4 and one kind 6, both
-    /// before the terminal notice; kind 6 only immediately before kind 2
-    /// with reason 12, and reason 12 only after kind 6.
+    /// Order rules (tool-job-controller.md, TJ-S3): kind 1 first, or kind 3
+    /// alone; at most one kind 5, after kind 1; at most one kind 4, after
+    /// kind 1 and before kinds 6 and 2, either side of kind 5; at most one
+    /// kind 6, after kind 5 and immediately before kind 2 with reason 12;
+    /// kind 2 last, after kind 5 and with its exit facts; at most five.
     fn accept(&mut self, notice: Notice) -> Result<(), ExecCmdError> {
         self.notices += 1;
         if self.notices > MAX_NOTICES || self.terminal.is_some() {
             return Err(ExecCmdError::Protocol);
         }
         let after_report = self.last_kind == KIND_ESCAPEE_REPORT;
+        let exit = (notice.exit_kind, notice.value);
         match notice.kind {
             1 if self.notices == 1 => self.spawned = true,
             3 if self.notices == 1 => self.terminal = Some(notice),
-            2 if self.spawned && (notice.reason == REASON_ESCAPEE_TERMINATED) == after_report => {
+            KIND_LEADER_EXITED if self.spawned && self.leader.is_none() => self.leader = Some(exit),
+            2 if self.leader == Some(exit)
+                && (notice.reason == REASON_ESCAPEE_TERMINATED) == after_report =>
+            {
                 self.terminal = Some(notice)
             }
             4 if self.spawned && self.unconfirmed.is_none() && !after_report => {
@@ -593,13 +694,34 @@ impl ExecCmdJob {
                     _ => return Err(ExecCmdError::Protocol),
                 })
             }
-            KIND_ESCAPEE_REPORT if self.spawned && self.escapees == 0 => {
+            KIND_ESCAPEE_REPORT if self.leader.is_some() && self.escapees == 0 => {
                 self.escapees = notice.value
             }
             _ => return Err(ExecCmdError::Protocol),
         }
         self.last_kind = notice.kind;
         Ok(())
+    }
+    /// Whether notice kind 1 arrived: the command was spawned.
+    pub fn spawned(&self) -> bool {
+        self.spawned
+    }
+    /// The leader's exit from notice kind 5, once it arrived. Output may
+    /// still flow from other group members until settlement.
+    pub fn leader_exit(&self) -> Option<Exit> {
+        let (exit_kind, value) = self.leader?;
+        Exit::from_notice(&Notice {
+            kind: KIND_LEADER_EXITED,
+            reason: 0,
+            exit_kind,
+            cleanup: false,
+            value,
+        })
+    }
+    /// Whether the job faulted: a protocol fault, a lost guardian or an
+    /// I/O error. The lease is closed and no later notice is trusted.
+    pub fn faulted(&self) -> bool {
+        self.fault
     }
     /// The guardian's `cleanup_unconfirmed` report, if one arrived. The job
     /// keeps its slot and scratch until a later settled notice.
@@ -636,15 +758,19 @@ impl ExecCmdJob {
             },
             exit_code: (n.exit_kind == 1).then_some(n.value as i32),
             signal: (n.exit_kind == 2).then_some(n.value as i32),
-            // Reason 1 (the removed deadline) is unassigned. Reason 12
-            // replaces the lease reason; the service's own stop record
-            // keeps the stop reason.
-            reason: self.stop.or(match n.reason {
-                2 => Some(StopReason::Cancelled),
-                3 => Some(StopReason::OutputLimit),
-                4 => Some(StopReason::LeaseEnded),
-                _ => None,
-            }),
+            // The guardian's reason names the stop that acted. Reasons 1
+            // and 3 are unassigned. Reason 12 replaces the lease reason and
+            // reason 0 means the leader exited first; then the service's
+            // own stop request, if any, names it.
+            reason: match n.reason {
+                REASON_CANCEL => Some(StopReason::Cancelled),
+                REASON_KILL => Some(StopReason::Killed),
+                REASON_LEASE_ENDED => Some(StopReason::LeaseEnded),
+                _ => self.stop.map(|kind| match kind {
+                    StopKind::Term => StopReason::Cancelled,
+                    StopKind::Kill => StopReason::Killed,
+                }),
+            },
             cleanup_confirmed: self.unconfirmed.is_none(),
             escapees: self.escapees,
         })

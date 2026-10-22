@@ -49,17 +49,14 @@ impl Notice {
         };
         let shape = match n.kind {
             1 => n.reason == 0 && n.exit_kind == 0 && !n.cleanup,
-            2 => {
-                (n.reason <= 4 || n.reason == REASON_ESCAPEE_TERMINATED)
-                    && n.exit_kind != 0
-                    && n.cleanup
-            }
+            2 => SETTLED_REASONS.contains(&n.reason) && n.exit_kind != 0 && n.cleanup,
             3 => (5..=9).contains(&n.reason) && n.exit_kind == 0 && n.cleanup,
             4 => {
                 (n.reason == REASON_CLEANUP_FAILED || n.reason == REASON_ESCAPEE_UNTERMINATED)
                     && n.exit_kind == 0
                     && !n.cleanup
             }
+            KIND_LEADER_EXITED => n.reason == 0 && n.exit_kind != 0 && !n.cleanup,
             KIND_ESCAPEE_REPORT => n.reason == 0 && !n.cleanup,
             _ => false,
         };
@@ -70,6 +67,25 @@ impl Notice {
         }
     }
 }
+/// Kind 5: the leader exited; exit kind and value are its `waitid` facts
+/// (tool-job-controller.md, guardian contract additions).
+pub(super) const KIND_LEADER_EXITED: u8 = 5;
+/// Kind 2 reasons: 0 leader exit, 2 `cancel` (lease `T`), 4 `lease_ended`,
+/// 11 `kill` (lease `K`), 12 `escapee_terminated`. Reasons 1, 3 and 10 are
+/// unassigned.
+pub(super) const SETTLED_REASONS: [u8; 5] = [
+    0,
+    REASON_CANCEL,
+    REASON_LEASE_ENDED,
+    REASON_KILL,
+    REASON_ESCAPEE_TERMINATED,
+];
+/// Kind 2 reason 2: the first stop came from lease byte `T`.
+pub(super) const REASON_CANCEL: u8 = 2;
+/// Kind 2 reason 4: the first stop came from lease EOF or a lease fault.
+pub(super) const REASON_LEASE_ENDED: u8 = 4;
+/// Kind 2 reason 11: lease byte `K` killed the group; replaces reason 2.
+pub(super) const REASON_KILL: u8 = 11;
 /// Kind 6: escapees were terminated during cleanup; value is their count.
 pub(super) const KIND_ESCAPEE_REPORT: u8 = 6;
 /// Kind 4 reason 9: cleanup did not settle by the 2.5 s report point.
@@ -78,3 +94,40 @@ pub(super) const REASON_CLEANUP_FAILED: u8 = 9;
 pub(super) const REASON_ESCAPEE_TERMINATED: u8 = 12;
 /// Kind 4 reason 13: a descendant could not be verified gone.
 pub(super) const REASON_ESCAPEE_UNTERMINATED: u8 = 13;
+/// Lease byte `T` on FD 3: the first stop, TERM now and KILL after the
+/// profile's grace.
+pub(super) const LEASE_TERM: u8 = b'T';
+/// Lease byte `K` on FD 3: KILL the owned group now.
+pub(super) const LEASE_KILL: u8 = b'K';
+
+/// The guardian profile, passed as an ASCII token in the private argv
+/// (tool-job-controller.md, guardian contract additions). It selects the
+/// sandbox and the TERM-to-KILL grace. J2 has `model-1` only; packet P1
+/// adds the person profiles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Profile {
+    /// `model-1`: the exec_cmd Seatbelt profile, 500 ms grace.
+    Model1,
+}
+impl Profile {
+    /// The argv token.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Model1 => "model-1",
+        }
+    }
+    /// The exact token, or `None` for any other text.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "model-1" => Some(Self::Model1),
+            _ => None,
+        }
+    }
+    /// TERM-to-KILL grace after the first stop, in nanoseconds. A wind-down
+    /// bound after a closure; it ends nothing by itself.
+    pub(super) const fn grace_ns(self) -> u64 {
+        match self {
+            Self::Model1 => 500_000_000,
+        }
+    }
+}

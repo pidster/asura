@@ -2413,7 +2413,9 @@ fn main() {
         .is_some_and(|a| a == "--asura-exec-cmd-guardian")
     {
         let code = match args.as_slice() {
-            [_, _, job, command] => asura_platform::exec_cmd::run_guardian(job, command),
+            [_, _, job, profile, command] => {
+                asura_platform::exec_cmd::run_guardian(job, profile, command)
+            }
             _ => 2,
         };
         std::process::exit(code);

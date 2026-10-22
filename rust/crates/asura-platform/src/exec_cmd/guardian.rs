@@ -1,7 +1,8 @@
 use super::escapee::{self, FREEZE_ROUND_LIMIT, Gate, GateFacts, Libproc, Sweep, Tally};
 use super::protocol::{
-    KIND_ESCAPEE_REPORT, Notice, REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED,
-    REASON_ESCAPEE_UNTERMINATED,
+    KIND_ESCAPEE_REPORT, KIND_LEADER_EXITED, LEASE_KILL, LEASE_TERM, Notice, Profile,
+    REASON_CANCEL, REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED, REASON_ESCAPEE_UNTERMINATED,
+    REASON_KILL, REASON_LEASE_ENDED,
 };
 use super::{ExecCmdError, MAX_COMMAND_BYTES, spawn};
 use crate::runtime::{open_at, stat_fd};
@@ -202,16 +203,127 @@ impl CleanupSafety {
             self.fence_valid = false;
         }
     }
-    fn kill_due(&self, clock_fault: bool, elapsed: u64, already_killed: bool) -> bool {
-        self.fence_valid && !already_killed && (clock_fault || elapsed >= 500_000_000)
+    /// KILL is due once the profile's grace has passed since the first stop.
+    fn kill_due(&self, clock_fault: bool, elapsed: u64, already_killed: bool, grace: u64) -> bool {
+        self.fence_valid && !already_killed && (clock_fault || elapsed >= grace)
+    }
+}
+
+/// One input read from the lease (FD 3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeaseInput {
+    /// Byte `T`.
+    Term,
+    /// Byte `K`.
+    Kill,
+    /// EOF, any other byte, or a read error: handled as EOF.
+    End,
+}
+/// Classify one 1-byte `read` of the lease. `None` means no input yet.
+fn lease_input(n: isize, byte: u8, would_block: bool) -> Option<LeaseInput> {
+    match n {
+        1 if byte == LEASE_TERM => Some(LeaseInput::Term),
+        1 if byte == LEASE_KILL => Some(LeaseInput::Kill),
+        n if n < 0 && would_block => None,
+        _ => Some(LeaseInput::End),
+    }
+}
+fn read_lease(fd: i32) -> Option<LeaseInput> {
+    let mut b = [0u8; 1];
+    // SAFETY: one-byte read from the validated nonblocking lease descriptor
+    // into a live one-byte buffer.
+    let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
+    lease_input(n, b[0], n < 0 && spawn::would_block())
+}
+/// Lease reads per loop pass. The service writes at most `T` and `K`; a
+/// third byte is always handled as EOF, which ends lease polling.
+const LEASE_READS: usize = 3;
+/// The group signal one input asks for. `Kill` outranks `Term`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Signal {
+    None,
+    Term,
+    Kill,
+}
+/// The guardian's stop decision and kind 2 reason
+/// (tool-job-controller.md, guardian contract additions): the first stop
+/// sets the reason (2 `T`, 4 EOF or fault, 0 leader exit or lost report);
+/// `K` sets 11 and replaces it; a later `T` is ignored; EOF after a stop
+/// only ends lease polling. Reason 12 replaces the result at settlement.
+#[derive(Debug, Eq, PartialEq)]
+struct StopState {
+    stopped: bool,
+    reason: u8,
+    lease_open: bool,
+}
+impl StopState {
+    fn new() -> Self {
+        Self {
+            stopped: false,
+            reason: 0,
+            lease_open: true,
+        }
+    }
+    fn lease(&mut self, input: LeaseInput) -> Signal {
+        match input {
+            LeaseInput::Term if !self.stopped => {
+                self.stopped = true;
+                self.reason = REASON_CANCEL;
+                Signal::Term
+            }
+            LeaseInput::Term => Signal::None,
+            LeaseInput::Kill => {
+                self.stopped = true;
+                self.reason = REASON_KILL;
+                Signal::Kill
+            }
+            LeaseInput::End => {
+                self.lease_open = false;
+                if self.stopped {
+                    Signal::None
+                } else {
+                    self.stopped = true;
+                    self.reason = REASON_LEASE_ENDED;
+                    Signal::Term
+                }
+            }
+        }
+    }
+    /// Leader exit, or a status report that can no longer be sent.
+    fn unprompted(&mut self) -> Signal {
+        if self.stopped {
+            Signal::None
+        } else {
+            self.stopped = true;
+            Signal::Term
+        }
+    }
+    fn settled_reason(&self, escapees: u32) -> u8 {
+        if escapees > 0 {
+            REASON_ESCAPEE_TERMINATED
+        } else {
+            self.reason
+        }
+    }
+}
+/// Kind 5 exit facts from a `waitid` result: 1 and the exit code for
+/// `CLD_EXITED`, 2 and the signal for `CLD_KILLED` or `CLD_DUMPED`.
+fn leader_exit(code: i32, status: i32) -> Option<(u8, u32)> {
+    match code {
+        libc::CLD_EXITED if (0..=255).contains(&status) => Some((1, status as u32)),
+        libc::CLD_KILLED | libc::CLD_DUMPED if (1..=127).contains(&status) => {
+            Some((2, status as u32))
+        }
+        _ => None,
     }
 }
 
 /// Private entrypoint; inherited descriptors must pass validation before any effect.
-/// The command has no time bound: it runs until it ends, its lease closes
-/// or its leader exits.
-pub fn run_guardian(jobhex: &str, command: &str) -> i32 {
-    match guardian(jobhex, command, Faults::default()) {
+/// The command has no time bound: it runs until it ends, its lease asks
+/// for a stop or closes, or its leader exits. An unknown profile token
+/// exits with status 1 before any effect and before any notice.
+pub fn run_guardian(jobhex: &str, profile: &str, command: &str) -> i32 {
+    match guardian(jobhex, profile, command, Faults::default()) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -219,11 +331,11 @@ pub fn run_guardian(jobhex: &str, command: &str) -> i32 {
 /// The guardian with one escapee-control fault (escapee-control.md,
 /// test-support faults). An unknown fault refuses before any effect.
 #[cfg(feature = "test-support")]
-pub fn run_guardian_for_test(jobhex: &str, command: &str, fault: &str) -> i32 {
+pub fn run_guardian_for_test(jobhex: &str, profile: &str, command: &str, fault: &str) -> i32 {
     let Some(fault) = escapee::Fault::parse(fault) else {
         return 1;
     };
-    match guardian(jobhex, command, Faults(fault)) {
+    match guardian(jobhex, profile, command, Faults(fault)) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -330,7 +442,7 @@ fn separate_from_state(project: &str, scratch: &str, asura: &str) -> Result<(), 
     }
     Ok(())
 }
-fn profile(project: &str, scratch: &str, asura: &str) -> Result<String, ExecCmdError> {
+fn seatbelt(project: &str, scratch: &str, asura: &str) -> Result<String, ExecCmdError> {
     let quote = |s: &str| crate::git_observer::quoted(s).map_err(|_| ExecCmdError::Denied);
     let roots = [
         "/bin",
@@ -380,8 +492,14 @@ fn notice(fd: i32, n: Notice, id: [u8; 16]) -> Result<(), ExecCmdError> {
         Err(ExecCmdError::Protocol)
     }
 }
-fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdError> {
+fn guardian(
+    jobhex: &str,
+    profile: &str,
+    command: &str,
+    faults: Faults,
+) -> Result<(), ExecCmdError> {
     let id = parse_id(jobhex)?;
+    let profile = Profile::parse(profile).ok_or(ExecCmdError::Invalid)?;
     if command.is_empty() || command.len() > MAX_COMMAND_BYTES || command.contains('\0') {
         return Err(ExecCmdError::Invalid);
     }
@@ -406,12 +524,15 @@ fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdEr
             return Err(ExecCmdError::Denied);
         }
         separate_from_state(&project, &scratch, &asura)?;
-        let profile = profile(&project, &scratch, &asura)?;
+        let sandbox = match profile {
+            Profile::Model1 => seatbelt(&project, &scratch, &asura)?,
+        };
         // EX5: marker, decoy, PID buffer and capture pipe handles exist
         // before the command does; a failure refuses the job.
         let mut table = Libproc::new(&scratch, &asura, escapee::capture_handles([5, 6])?)?;
         faults.apply(&mut table);
-        if lease_reason(3)?.is_some() {
+        // Any lease input before the command exists refuses the job.
+        if read_lease(3).is_some() {
             return Err(ExecCmdError::Cancelled);
         }
         let null = open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDONLY, 0)
@@ -428,7 +549,7 @@ fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdEr
         let args = vec![
             "/usr/bin/sandbox-exec".into(),
             "-p".into(),
-            profile,
+            sandbox,
             "/bin/sh".into(),
             "-c".into(),
             script,
@@ -493,9 +614,13 @@ fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdEr
         id,
     )
     .is_ok();
-    let mut stopping = None;
-    let mut reason = 0;
+    let mut stop = StopState::new();
+    // Clock sample of the first stop; the grace and the 2.5 s report
+    // point count from it.
+    let mut stopping: Option<u64> = None;
     let mut killed = false;
+    // Kind 5 facts: kind 2 repeats them.
+    let mut leader: Option<(u8, u32)> = None;
     let mut reported_unknown = false;
     let mut safety = CleanupSafety::new(first_sample);
     // SAFETY: getpid has no preconditions.
@@ -526,12 +651,51 @@ fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdEr
             report_ok = false;
         }
         let exited = waiting == 0 && info.si_pid == pid;
-        if stopping.is_none() {
-            let lease = lease_reason(3).unwrap_or(Some(4));
-            // Lease closure and leader exit stop the group; reason 1 is unassigned.
-            if lease.is_some() || exited || !report_ok {
-                reason = lease.unwrap_or(0);
-                stopping = Some(now);
+        // Kind 5 once, when the leader's exit is first observed: before the
+        // group stop signal and before any escapee sweep.
+        if exited && leader.is_none() {
+            // SAFETY: waitid filled `info` for this exited child.
+            leader = leader_exit(info.si_code, unsafe { info.si_status() });
+            match leader {
+                Some((exit_kind, value)) if report_ok => {
+                    report_ok = notice(
+                        4,
+                        Notice {
+                            kind: KIND_LEADER_EXITED,
+                            reason: 0,
+                            exit_kind,
+                            cleanup: false,
+                            value,
+                        },
+                        id,
+                    )
+                    .is_ok();
+                }
+                Some(_) => {}
+                // Unknown exit facts cannot be reported consistently.
+                None => report_ok = false,
+            }
+        }
+        // Lease input, then leader exit: `T`, `K` and EOF set the reason
+        // first; reason 1 is unassigned.
+        let mut signal = Signal::None;
+        for _ in 0..LEASE_READS {
+            if !stop.lease_open {
+                break;
+            }
+            match read_lease(3) {
+                Some(input) => signal = signal.max(stop.lease(input)),
+                None => break,
+            }
+        }
+        if exited || !report_ok {
+            signal = signal.max(stop.unprompted());
+        }
+        if stop.stopped && stopping.is_none() {
+            stopping = Some(now);
+        }
+        match signal {
+            Signal::Term => {
                 // SAFETY: leader has never been reaped; its PID fences this owned group.
                 if safety.fence_valid {
                     unsafe {
@@ -539,9 +703,24 @@ fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdEr
                     }
                 }
             }
+            Signal::Kill => {
+                // SAFETY: as above; `K` kills the owned group now.
+                if safety.fence_valid && !killed {
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                killed = true;
+            }
+            Signal::None => {}
         }
         if let Some(start) = stopping {
-            if safety.kill_due(clock_fault, now.saturating_sub(start), killed) {
+            if safety.kill_due(
+                clock_fault,
+                now.saturating_sub(start),
+                killed,
+                profile.grace_ns(),
+            ) {
                 if safety.fence_valid {
                     unsafe {
                         libc::kill(-pid, libc::SIGKILL);
@@ -569,13 +748,9 @@ fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdEr
                         // group and escapee signals end.
                         let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
                         if reaped == pid {
-                            let (exit_kind, value) = if libc::WIFEXITED(status) {
-                                (1, libc::WEXITSTATUS(status) as u32)
-                            } else {
-                                (2, libc::WTERMSIG(status) as u32)
-                            };
                             let escapees = tally.count();
-                            if report_ok {
+                            // Kind 2 repeats the kind 5 exit facts.
+                            if let (true, Some((exit_kind, value))) = (report_ok, leader) {
                                 if escapees > 0 {
                                     notice(
                                         4,
@@ -593,11 +768,7 @@ fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdEr
                                     4,
                                     Notice {
                                         kind: 2,
-                                        reason: if escapees > 0 {
-                                            REASON_ESCAPEE_TERMINATED
-                                        } else {
-                                            reason
-                                        },
+                                        reason: stop.settled_reason(escapees),
                                         exit_kind,
                                         cleanup: true,
                                         value,
@@ -634,9 +805,11 @@ fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdEr
                 reported_unknown = true;
             }
         }
-        // One bounded polling wait; lease closure and absolute expiry are rechecked.
+        // One paced polling wait of at most 100 ms. FD 3 is watched until
+        // its EOF, so `K` after a stop wakes the loop and a hung-up lease
+        // never spins it.
         let mut pfd = libc::pollfd {
-            fd: if stopping.is_none() { 3 } else { -1 },
+            fd: if stop.lease_open { 3 } else { -1 },
             events: libc::POLLIN,
             revents: 0,
         };
@@ -653,17 +826,6 @@ fn unconfirmed(reason: u8) -> Notice {
         exit_kind: 0,
         cleanup: false,
         value: 0,
-    }
-}
-fn lease_reason(fd: i32) -> Result<Option<u8>, ExecCmdError> {
-    let mut b = [0u8; 1];
-    let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
-    if n == 0 {
-        Ok(Some(4))
-    } else if n < 0 && spawn::would_block() {
-        Ok(None)
-    } else {
-        Err(ExecCmdError::Protocol)
     }
 }
 fn group_only_leader(pid: libc::pid_t) -> Result<bool, ExecCmdError> {
@@ -693,7 +855,7 @@ mod tests {
     use super::*;
     #[test]
     fn profile_denies_state_after_existing_rules_then_restores_scratch() {
-        let text = profile("/p", "/h/.asura/tmp/exec-cmd-1", "/h/.asura").unwrap();
+        let text = seatbelt("/p", "/h/.asura/tmp/exec-cmd-1", "/h/.asura").unwrap();
         let deny = text
             .find("(deny file-read* file-write* process-exec file-map-executable (subpath \"/h/.asura\"))")
             .expect("state deny");
@@ -713,7 +875,7 @@ mod tests {
         );
         assert!(deny < exec && exec < write && write < metadata);
         assert!(text.ends_with(")"));
-        let quoted = profile("/p", "/h/.as\"ura/tmp/s", "/h/.as\"ura").unwrap();
+        let quoted = seatbelt("/p", "/h/.as\"ura/tmp/s", "/h/.as\"ura").unwrap();
         assert!(quoted.contains("(subpath \"/h/.as\\\"ura\")"));
     }
     fn numbers(entries: &[&[u8]]) -> Result<Vec<u8>, ExecCmdError> {
@@ -911,7 +1073,7 @@ mod tests {
         }
         std::fs::write(asura.join("secret"), b"state").unwrap();
         std::fs::write(home.join("visible"), b"project").unwrap();
-        let text = profile(
+        let text = seatbelt(
             home.to_str().unwrap(),
             scratch.to_str().unwrap(),
             asura.to_str().unwrap(),
@@ -979,7 +1141,7 @@ mod tests {
         assert!(!safety.fence_valid);
         safety.observe_wait(0, None);
         assert!(!safety.fence_valid);
-        assert!(!safety.kill_due(true, u64::MAX, false));
+        assert!(!safety.kill_due(true, u64::MAX, false, 500_000_000));
     }
     #[test]
     fn repeated_clock_failure_advances_cleanup_and_kills_only_owned_group() {
@@ -987,14 +1149,107 @@ mod tests {
         let (first, fault) = safety.sample_clock(Err(ExecCmdError::Io));
         assert!(first >= 1_000);
         assert!(fault);
-        assert!(safety.kill_due(fault, 0, false));
+        let grace = Profile::Model1.grace_ns();
+        assert!(safety.kill_due(fault, 0, false, grace));
         let (second, fault) = safety.sample_clock(Err(ExecCmdError::Io));
         assert!(second > first);
         assert!(fault);
-        assert!(!safety.kill_due(fault, 0, true));
-        assert!(!safety.kill_due(false, 499_999_999, false));
-        assert!(safety.kill_due(false, 500_000_000, false));
+        assert!(!safety.kill_due(fault, 0, true, grace));
+        assert!(!safety.kill_due(false, 499_999_999, false, grace));
+        assert!(safety.kill_due(false, 500_000_000, false, grace));
+        assert!(!safety.kill_due(false, 1_999_999_999, false, 2_000_000_000));
+        assert!(safety.kill_due(false, 2_000_000_000, false, 2_000_000_000));
         safety.observe_wait(-1, Some(libc::EINVAL));
-        assert!(!safety.kill_due(fault, second - first, false));
+        assert!(!safety.kill_due(fault, second - first, false, grace));
+    }
+    /// J2T-05 unit: lease reads. `T` and `K` are stop bytes; EOF, any
+    /// other byte and a read error are handled as EOF; no data is no input.
+    #[test]
+    fn j2t_05_lease_input_classification() {
+        assert_eq!(lease_input(1, b'T', false), Some(LeaseInput::Term));
+        assert_eq!(lease_input(1, b'K', false), Some(LeaseInput::Kill));
+        for byte in [b't', b'k', 0, b'x', 0xff] {
+            assert_eq!(lease_input(1, byte, false), Some(LeaseInput::End), "{byte}");
+        }
+        assert_eq!(lease_input(0, 0, false), Some(LeaseInput::End), "EOF");
+        assert_eq!(lease_input(-1, 0, true), None, "would block");
+        assert_eq!(lease_input(-1, 0, false), Some(LeaseInput::End), "error");
+    }
+    /// J2T-05 unit: `T`, a second `T`, `K`, EOF after `T`, an unknown byte,
+    /// and the reason precedence 2, 11, 4, 12.
+    #[test]
+    fn j2t_05_lease_bytes_and_reason_precedence() {
+        use LeaseInput::{End, Kill, Term};
+        // T: first stop with TERM, reason 2; a second T is ignored.
+        let mut s = StopState::new();
+        assert_eq!(s.lease(Term), Signal::Term);
+        assert_eq!(s.reason, REASON_CANCEL);
+        assert_eq!(s.lease(Term), Signal::None);
+        assert_eq!(s.reason, REASON_CANCEL);
+        // K escalates T: KILL now, reason 11 replaces 2.
+        assert_eq!(s.lease(Kill), Signal::Kill);
+        assert_eq!(s.reason, REASON_KILL);
+        assert_eq!(s.lease(Term), Signal::None, "T after K is ignored");
+        // EOF after the stop only ends lease polling.
+        assert!(s.lease_open);
+        assert_eq!(s.lease(End), Signal::None);
+        assert!(!s.lease_open);
+        assert_eq!(s.reason, REASON_KILL);
+        // Reason 12 replaces the lease reason only with escapees.
+        assert_eq!(s.settled_reason(0), REASON_KILL);
+        assert_eq!(s.settled_reason(3), REASON_ESCAPEE_TERMINATED);
+
+        // EOF after T keeps reason 2.
+        let mut s = StopState::new();
+        s.lease(Term);
+        assert_eq!(s.lease(End), Signal::None);
+        assert_eq!((s.reason, s.lease_open), (REASON_CANCEL, false));
+        assert_eq!(s.unprompted(), Signal::None, "leader exit after a stop");
+        assert_eq!(s.settled_reason(0), REASON_CANCEL);
+
+        // K first: KILL now, reason 11.
+        let mut s = StopState::new();
+        assert_eq!(s.lease(Kill), Signal::Kill);
+        assert_eq!((s.stopped, s.reason), (true, REASON_KILL));
+
+        // EOF or an unknown byte (End) first: TERM, reason 4, polling ends.
+        let mut s = StopState::new();
+        assert_eq!(s.lease(End), Signal::Term);
+        assert_eq!((s.reason, s.lease_open), (REASON_LEASE_ENDED, false));
+        assert_eq!(s.settled_reason(0), REASON_LEASE_ENDED);
+        assert_eq!(s.settled_reason(1), REASON_ESCAPEE_TERMINATED);
+
+        // Leader exit with no lease input: TERM, reason 0; K escalates it.
+        let mut s = StopState::new();
+        assert_eq!(s.unprompted(), Signal::Term);
+        assert_eq!(s.reason, 0);
+        assert!(s.lease_open, "lease polling continues after the stop");
+        assert_eq!(s.lease(Term), Signal::None);
+        assert_eq!(s.reason, 0, "T after a leader-exit stop is ignored");
+        assert_eq!(s.lease(Kill), Signal::Kill);
+        assert_eq!(s.reason, REASON_KILL);
+
+        // In one pass, K outranks T.
+        assert_eq!(Signal::Term.max(Signal::Kill), Signal::Kill);
+        assert_eq!(Signal::None.max(Signal::Term), Signal::Term);
+    }
+    /// J2T-06 unit: kind 5 facts from `waitid`.
+    #[test]
+    fn j2t_06_leader_exit_facts() {
+        assert_eq!(leader_exit(libc::CLD_EXITED, 0), Some((1, 0)));
+        assert_eq!(leader_exit(libc::CLD_EXITED, 255), Some((1, 255)));
+        assert_eq!(leader_exit(libc::CLD_KILLED, 9), Some((2, 9)));
+        assert_eq!(leader_exit(libc::CLD_DUMPED, 6), Some((2, 6)));
+        assert_eq!(leader_exit(libc::CLD_KILLED, 127), Some((2, 127)));
+        for (code, status) in [
+            (libc::CLD_EXITED, 256),
+            (libc::CLD_EXITED, -1),
+            (libc::CLD_KILLED, 0),
+            (libc::CLD_KILLED, 128),
+            (libc::CLD_STOPPED, 17),
+            (0, 0),
+        ] {
+            assert_eq!(leader_exit(code, status), None, "{code} {status}");
+        }
     }
 }

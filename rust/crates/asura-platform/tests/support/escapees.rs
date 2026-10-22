@@ -56,6 +56,7 @@ fn job(home: &Path, command: &str, fault: Option<&str>) -> (JobGuard, [u8; 16]) 
     let cancel = AtomicBool::new(false);
     let request = ExecCmdRequest {
         job_id: id,
+        profile: Profile::Model1,
         command: command.into(),
         cwd: None,
         secrets: Vec::new(),
@@ -75,6 +76,23 @@ fn job(home: &Path, command: &str, fault: Option<&str>) -> (JobGuard, [u8; 16]) 
         )
         .unwrap_or_else(|e| panic!("spawn: {:?}", e.reason));
     (JobGuard(spawned, collected), id)
+}
+/// Total CPU time of a live process in milliseconds, from `ps -o time=`
+/// (`[h:]m:ss.cc`).
+fn cpu_ms(pid: i32) -> u64 {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let mut total = 0.0f64;
+    for part in text.trim().split(':') {
+        total = total * 60.0
+            + part
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("ps time {text:?}"));
+    }
+    (total * 1000.0).round() as u64
 }
 fn pump(job: &mut ExecCmdJob) {
     asura_platform::poll(&job.interests(), Duration::from_millis(20)).unwrap();
@@ -360,6 +378,21 @@ fn undying_pipe_holder(home: &Path, project: &Path) {
     for _ in 0..10 {
         pump(&mut job);
     }
+    // J2T-05: lease EOF after the leader-exit stop only ends lease
+    // polling; the hung-up lease never spins the guardian's paced loop.
+    job.close_lease();
+    let guardian = job.guardian_pid_for_test();
+    let before = cpu_ms(guardian);
+    let window = Instant::now();
+    while window.elapsed() < Duration::from_secs(1) {
+        pump(&mut job);
+    }
+    let used = cpu_ms(guardian) - before;
+    assert!(
+        used < 250,
+        "guardian used {used} ms of CPU in 1 s after EOF"
+    );
+    println!("J2T-05: {used} ms guardian CPU in 1 s after lease EOF; no spin");
     assert!(holder.alive(), "the fault keeps the holder alive");
     assert!(!job.settled(), "never settled while an escapee lives");
     assert_eq!(

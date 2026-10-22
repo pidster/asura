@@ -394,8 +394,12 @@ pub fn entry_with_logs(
         .first()
         .is_some_and(|a| a == "--asura-exec-cmd-guardian")
     {
+        // `JOBHEX PROFILE COMMAND`; the guardian refuses an unknown profile
+        // token with status 1 before any effect.
         return match args.as_slice() {
-            [_, job, command] => asura_platform::exec_cmd::run_guardian(job, command),
+            [_, job, profile, command] => {
+                asura_platform::exec_cmd::run_guardian(job, profile, command)
+            }
             _ => 2,
         };
     }
