@@ -32,6 +32,7 @@ pub use config::{PrivateFileError, PrivateFileSnapshot};
 mod lifetime;
 pub use lifetime::{ServiceLease, ServiceLifetime};
 pub mod exec_cmd;
+pub mod keychain;
 mod runtime;
 pub mod secrets;
 mod startup;
