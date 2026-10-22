@@ -1,23 +1,26 @@
-//! Payload store against private scratch homes: pages (J1T-10), the
-//! page-read pool without a step bound (J2T-16), staging captures (J1T-19),
-//! derived recovery (J1T-22) and job-keyed payloads and job recovery
-//! (J2T-04). Ledger arithmetic (J1T-08) is unit-tested in `payload/store.rs`.
+//! Payload store against private scratch homes: pages (J1T-10) and the
+//! delivered-text bound (J3T-08), the page-read pool without a step bound
+//! (J2T-16), staging captures (J1T-19), derived job recovery (J1T-22 rows,
+//! now from kind 28 facts), job-keyed payloads and job recovery (J2T-04),
+//! and the person pin hold and delete (J4T-06, storage). Ledger arithmetic
+//! (J1T-08) is unit-tested in `payload/store.rs`.
 use asura_platform::RuntimeDirectory;
 use asura_platform::payload_io::gate::{self, Fault, Point};
 use asura_platform::secrets::{JobRedaction, Redacted, Stream, detection};
 use asura_storage::authority::conversation::{
-    ActiveBinding, ArgumentForm, CaptureReason, CaptureSettled, CaptureState, CaptureStream, Cause,
-    Composition, Hash, INITIAL_RESERVATION, Id, JobIntent, JobOrigin, PendingInit,
+    ActiveBinding, ArgumentForm, CaptureState, Cause, Composition, Hash, Id, JobIntent, JobOrigin,
+    JobResult, JobResultBody, JobResultOutcome, JobRunState, JobSnapshot, PendingInit,
     ProjectRegistered, Record, Replay, Request, StartAuthorized, TerminalKind, ToolCall,
-    ToolCallSource, ToolDecision, ToolOperation, ToolResult, TurnAccepted, TurnTerminal,
-    encode_frame, exec_cmd_job_id, job_id, replay, request_digest,
+    ToolCallSource, ToolDecision, ToolOperation, TurnAccepted, TurnTerminal, encode_frame,
+    exec_cmd_job_id, job_id, replay, request_digest,
 };
 use asura_storage::authority::conversation::{FrameContext, SecretKind};
 use asura_storage::authority::writer::{PayloadFact, Settlement};
 use asura_storage::payload::{
-    DEFAULT_QUOTA, FACT_BATCH, Location, MIB, ObjectKind, Origin, PAGE_QUEUE, Page, PagePool,
-    PageReply, PageRequest, PageState, PayloadError, PayloadState, PayloadStore, RECOVERY_RESERVE,
-    RecoveryError, StreamIndex, Victim, job_payloads, payload_id, read_page, recover,
+    DEFAULT_QUOTA, DeleteError, FACT_BATCH, Known, Location, MIB, ObjectKind, Origin, PAGE_LIMIT,
+    PAGE_QUEUE, Page, PagePool, PageReply, PageRequest, PageState, PayloadError, PayloadState,
+    PayloadStore, RECOVERY_RESERVE, RecoveryError, RecoveryReport, SpaceListener, StreamIndex,
+    TEXT_LIMIT, Victim, job_payloads, payload_id, read_page, recover, recover_known,
     recover_with_facts,
 };
 use sha2::{Digest, Sha256};
@@ -719,7 +722,7 @@ impl Journal {
             tool_operation: Some(ToolOperation::ExecCmd),
             decision: ToolDecision::Run,
             fault: None,
-            busy: None,
+            reason: None,
             form: ArgumentForm::Canonical,
             arguments_bytes: 40,
             arguments: "{\"command\":\"printf \\\"$ASURA_SECRET_1\\\"\",\"cwd\":\".\"}".into(),
@@ -731,54 +734,6 @@ impl Journal {
             whole_command: false,
             refusal: None,
         })))
-    }
-    /// Kind 23 then kind 15; returns the kind 23 sequence.
-    fn settled(
-        &mut self,
-        ordinal: u32,
-        state: CaptureState,
-        streams: [(u64, Option<Hash>); 2],
-    ) -> u64 {
-        let stream = |(stored, digest): (u64, Option<Hash>)| CaptureStream {
-            observed_bytes: stored,
-            stored_bytes: stored,
-            digest,
-            eof: state == CaptureState::Complete,
-            ..CaptureStream::default()
-        };
-        let (reason, exit_kind, exit_value) = match state {
-            CaptureState::Complete => (CaptureReason::None, 1, 0),
-            CaptureState::Incomplete => (CaptureReason::Quota, 1, 0),
-            CaptureState::Unconfirmed => (CaptureReason::SettlementUnconfirmed, 1, 0),
-            CaptureState::NotStarted => (CaptureReason::StorageFault, 0, 0),
-        };
-        let sequence = self.append(Record::CaptureSettled(Box::new(CaptureSettled {
-            operation: id(10),
-            generation: 1,
-            ordinal,
-            state,
-            reason,
-            exit_kind,
-            exit_value,
-            stdout: stream(streams[0]),
-            stderr: stream(streams[1]),
-            distinct_numbers: 0,
-            numbers: vec![],
-            pause_count: 0,
-            first_pause_ms: 0,
-            paused_ms: 0,
-            final_reservation: INITIAL_RESERVATION,
-        })));
-        self.append(Record::ToolResult(ToolResult {
-            operation: id(10),
-            generation: 1,
-            ordinal,
-            status: 1,
-            text: "failure=None exit_code=0 signal=none reason=none truncated=false cleanup_confirmed=true\nstdout:\n\nstderr:\n".into(),
-            next_offset: None,
-            truncated: false,
-        }));
-        sequence
     }
     fn failed(&mut self) {
         self.append(Record::TurnTerminal(TurnTerminal {
@@ -793,8 +748,9 @@ impl Journal {
             text: "reply".into(),
         }));
     }
-    /// A job-mode call: kind 14 `run`, kind 26 and kind 15 (handle
-    /// delivery). Returns the job ID and the kind 26 sequence.
+    /// An exec_cmd job call: kind 14 `run`, kind 26 and kind 29 (handle
+    /// delivery, JR11 and JR13). Returns the job ID and the kind 26
+    /// sequence.
     fn job(&mut self, ordinal: u32) -> (Id, u64) {
         self.admitted(ordinal);
         let origin = JobOrigin::Model {
@@ -807,15 +763,21 @@ impl Journal {
             agent: 0,
             time: 1_760_000_000_000,
         }));
-        self.append(Record::ToolResult(ToolResult {
+        self.append(Record::JobResult(Box::new(JobResult {
             operation: id(10),
             generation: 1,
             ordinal,
-            status: 1,
-            text: "job".into(),
-            next_offset: None,
-            truncated: false,
-        }));
+            status: JobResultOutcome::Ok.status(),
+            outcome: JobResultOutcome::Ok,
+            job: [0; 16],
+            body: JobResultBody::State(JobSnapshot {
+                state: JobRunState::Running,
+                numbers: [0; 3],
+                elapsed_ms: 7,
+                stdout_bytes: 5,
+                stderr_bytes: 0,
+            }),
+        })));
         (job_id(&origin), intent)
     }
     fn replay(&self) -> Replay {
@@ -837,65 +799,95 @@ fn recorded(ordinal: u32) -> [(u64, Option<Hash>); 2] {
 fn no_cancel() -> AtomicBool {
     AtomicBool::new(false)
 }
+/// The recovery facts of one settled or unsettled job of operation id(10),
+/// as the journal's `PayloadFacts` answers them for its first payload.
+fn fact(job: Id, intent: u64, settled: Option<Settlement>) -> PayloadFact {
+    let payloads = job_payloads(id(1), job);
+    PayloadFact {
+        payload: payloads[0],
+        call: job,
+        operation: id(10),
+        payloads,
+        intent_sequence: intent,
+        settled,
+        active: false,
+        pinned: false,
+        deleted: false,
+    }
+}
+/// Recovery from the given job facts, one per job.
+fn recover_facts(
+    store: &PayloadStore,
+    facts: &[PayloadFact],
+    quota: u64,
+) -> Result<RecoveryReport, RecoveryError> {
+    recover_known(
+        store,
+        facts.iter().map(Known::from).collect(),
+        quota,
+        &no_cancel(),
+    )
+}
+/// Kind 28 capture facts of a job whose streams hold `body` and `tail`.
+fn settled(state: CaptureState, sequence: u64, ordinal: u32) -> Option<Settlement> {
+    Some((state, sequence, recorded(ordinal)))
+}
 
+/// J1T-22 rows for jobs (TJ-Q5): each job's payload state derives from its
+/// kind 26 and kind 28 facts and the files on disk.
 #[test]
 fn j1t_22_derived_recovery_applies_every_table_row() {
     let f = open(20 * MIB);
     let home = &f.home;
-    let mut journal = Journal::started();
+    let mut facts = Vec::new();
+    // Job n: kind 26 at 10 n, kind 28 at 10 n + 5.
     let mut last_use = Vec::new();
+    let mut row = |n: u32, state: Option<CaptureState>, streams| {
+        let sequence = u64::from(n) * 10 + 5;
+        facts.push(fact(
+            call(n),
+            u64::from(n) * 10,
+            state.map(|state| (state, sequence, streams)),
+        ));
+        last_use.push(sequence);
+        payloads(n)
+    };
     // 1: complete, object installed (plus a stray staging copy).
-    journal.admitted(1);
-    last_use.push(journal.settled(1, CaptureState::Complete, recorded(1)));
-    let [o1, e1] = payloads(1);
+    let [o1, e1] = row(1, Some(CaptureState::Complete), recorded(1));
     home.put("objects", o1, &body(1));
     home.put("objects", e1, &tail(1));
     home.put("staging", o1, &body(1));
-    // 2: complete, object whose length differs from kind 23.
-    journal.admitted(2);
-    last_use.push(journal.settled(2, CaptureState::Complete, recorded(2)));
-    let [o2, e2] = payloads(2);
+    // 2: complete, object whose length differs from kind 28.
+    let [o2, e2] = row(2, Some(CaptureState::Complete), recorded(2));
     home.put("objects", o2, b"payload 2!\n");
     home.put("objects", e2, &tail(2));
     // 3: complete, staging only, digest matches: installed.
-    journal.admitted(3);
-    last_use.push(journal.settled(3, CaptureState::Complete, recorded(3)));
-    let [o3, e3] = payloads(3);
+    let [o3, e3] = row(3, Some(CaptureState::Complete), recorded(3));
     home.put("staging", o3, &body(3));
     home.put("staging", e3, &tail(3));
     // 4: incomplete, staging only; stdout digest mismatch (same length).
-    journal.admitted(4);
-    last_use.push(journal.settled(4, CaptureState::Incomplete, recorded(4)));
-    let [o4, e4] = payloads(4);
+    let [o4, e4] = row(4, Some(CaptureState::Incomplete), recorded(4));
     home.put("staging", o4, b"payload X\n");
     home.put("staging", e4, &tail(4));
     // 5: complete, no files.
-    journal.admitted(5);
-    last_use.push(journal.settled(5, CaptureState::Complete, recorded(5)));
-    let [o5, e5] = payloads(5);
-    // 6: unconfirmed, staging prefix.
-    let intent6 = journal.admitted(6);
-    journal.settled(6, CaptureState::Unconfirmed, [(10, None), (3, None)]);
-    let [o6, e6] = payloads(6);
+    let [o5, e5] = row(5, Some(CaptureState::Complete), recorded(5));
+    // 6: unconfirmed, staging prefix; its last use is its kind 26.
+    let [o6, e6] = row(6, Some(CaptureState::Unconfirmed), [(10, None), (3, None)]);
     home.put("staging", o6, &body(6));
     home.put("staging", e6, &tail(6));
     // 7: not_started with stray staging files.
-    journal.admitted(7);
-    journal.settled(7, CaptureState::NotStarted, [(0, None), (0, None)]);
-    let [o7, e7] = payloads(7);
+    let [o7, e7] = row(7, Some(CaptureState::NotStarted), [(0, None), (0, None)]);
     home.put("staging", o7, b"");
     home.put("staging", e7, b"");
-    // 8: admitted kind 22 without kind 23, then a terminal.
-    let intent8 = journal.admitted(8);
-    journal.failed();
-    let [o8, e8] = payloads(8);
+    // 8: kind 26 without kind 28 (or an `interrupted` one).
+    let [o8, e8] = row(8, None, [(0, None), (0, None)]);
     home.put("staging", o8, &body(8));
     home.put("staging", e8, &tail(8));
-    // Orphans: no kind 22 names them.
+    // Orphans: no job derives them.
     home.put("staging", [0xAA; 16], b"orphan");
     home.put("objects", [0xBB; 16], b"orphan");
-    let replay = journal.replay();
-    let report = recover(&f.store, Some(&replay), DEFAULT_QUOTA, &no_cancel()).unwrap();
+    let (intent6, intent8) = (60, 80);
+    let report = recover_facts(&f.store, &facts, DEFAULT_QUOTA).unwrap();
     // Bytes on disk afterwards, by call: 13 + 14 + 13 + 13 + 0 + 13 + 13.
     assert_eq!(report.installed, 3);
     assert_eq!(report.corrupt, 2);
@@ -961,8 +953,8 @@ fn j1t_22_derived_recovery_applies_every_table_row() {
     // Row: orphans are deleted.
     assert!(home.read("staging", [0xAA; 16]).is_none());
     assert!(home.read("objects", [0xBB; 16]).is_none());
-    // Every recovered call is expirable, oldest last use first; the
-    // unverified prefixes use their kind 22 sequence.
+    // Every recovered job is expirable, oldest last use first; the
+    // unverified prefixes use their kind 26 sequence.
     assert!(last_use.windows(2).all(|w| w[0] < w[1]) && last_use[4] < intent6 && intent6 < intent8);
     let mut order = Vec::new();
     for ordinal in 100u32.. {
@@ -990,13 +982,11 @@ fn j1t_22_derived_recovery_applies_every_table_row() {
 #[test]
 fn j1t_22_configured_quota_bounds_the_effective_quota() {
     let f = open(64 * 1024 * MIB);
-    let mut journal = Journal::started();
-    journal.admitted(1);
-    journal.settled(1, CaptureState::Complete, recorded(1));
     let [o1, e1] = payloads(1);
     f.home.put("objects", o1, &body(1));
     f.home.put("objects", e1, &tail(1));
-    let report = recover(&f.store, Some(&journal.replay()), 64 * MIB, &no_cancel()).unwrap();
+    let facts = [fact(call(1), 10, settled(CaptureState::Complete, 15, 1))];
+    let report = recover_facts(&f.store, &facts, 64 * MIB).unwrap();
     assert_eq!(report.retained, 13);
     assert_eq!((f.store.used(), f.store.quota()), (13, 64 * MIB));
 }
@@ -1038,15 +1028,8 @@ fn j1t_22_unsafe_entries_make_recovery_fail() {
         f.home.put("objects", o1, &body(1));
         f.home.put("objects", e1, &tail(1));
         make_unsafe(&f.home);
-        let mut journal = Journal::started();
-        journal.admitted(1);
-        journal.settled(1, CaptureState::Complete, recorded(1));
-        let result = recover(
-            &f.store,
-            Some(&journal.replay()),
-            DEFAULT_QUOTA,
-            &no_cancel(),
-        );
+        let facts = [fact(call(1), 10, settled(CaptureState::Complete, 15, 1))];
+        let result = recover_facts(&f.store, &facts, DEFAULT_QUOTA);
         assert!(
             matches!(result, Err(RecoveryError::Payload(PayloadError::Unsafe))),
             "case {index}: {result:?}"
@@ -1075,7 +1058,8 @@ fn j1t_22_cancel_stops_recovery_before_any_change() {
 fn j1t_22_interrupted_prefix_without_terminal_is_expirable() {
     let f = open(64 * 1024 * MIB);
     let mut journal = Journal::started();
-    journal.admitted(1);
+    // A job left unsettled, with no terminal, as a crash leaves it.
+    journal.job(1);
     let [o1, e1] = payloads(1);
     f.home.put("staging", o1, &body(1));
     let report = recover(
@@ -1133,16 +1117,8 @@ fn j1t_22_install_fault_leaves_staging_that_recovery_installs() {
     // A restart: a fresh store over the same directories.
     let runtime = RuntimeDirectory::scratch(&f.home.0, false).unwrap();
     let restarted = PayloadStore::open(&runtime).unwrap();
-    let mut journal = Journal::started();
-    journal.admitted(1);
-    journal.settled(1, CaptureState::Complete, recorded(1));
-    let report = recover(
-        &restarted,
-        Some(&journal.replay()),
-        DEFAULT_QUOTA,
-        &no_cancel(),
-    )
-    .unwrap();
+    let facts = [fact(call(1), 10, settled(CaptureState::Complete, 15, 1))];
+    let report = recover_facts(&restarted, &facts, DEFAULT_QUOTA).unwrap();
     assert_eq!(report.installed, 2);
     assert_eq!(f.home.read("objects", ids[0]).unwrap(), body(1));
     assert!(f.home.read("staging", ids[0]).is_none());
@@ -1171,9 +1147,6 @@ fn retired_payload_id(installation: Id, ordinal: u32, kind: u8) -> Id {
 #[test]
 fn j2t_04_j1_orphans_of_the_old_derivation_are_deleted_at_recovery() {
     let f = open(64 * 1024 * MIB);
-    let mut journal = Journal::started();
-    journal.admitted(1);
-    journal.settled(1, CaptureState::Complete, recorded(1));
     let [o1, e1] = payloads(1);
     assert_eq!([o1, e1], job_payloads(id(1), call(1)));
     let old = [
@@ -1186,13 +1159,8 @@ fn j2t_04_j1_orphans_of_the_old_derivation_are_deleted_at_recovery() {
     f.home.put("staging", old[0], &body(1));
     f.home.put("objects", o1, &body(1));
     f.home.put("objects", e1, &tail(1));
-    let report = recover(
-        &f.store,
-        Some(&journal.replay()),
-        DEFAULT_QUOTA,
-        &no_cancel(),
-    )
-    .unwrap();
+    let facts = [fact(call(1), 10, settled(CaptureState::Complete, 15, 1))];
+    let report = recover_facts(&f.store, &facts, DEFAULT_QUOTA).unwrap();
     assert_eq!(report.orphans_deleted, 3);
     assert_eq!(report.retained, 13);
     for payload in old {
@@ -1248,24 +1216,36 @@ fn j2t_04_job_capture_stages_under_job_keyed_ids() {
     }
 }
 
-/// One `PayloadFacts` answer of the job form, as the journal writer builds
-/// it: `call` is the job ID, `intent_sequence` the kind 26 sequence and
-/// `settled` the kind 28 capture facts (none when unsettled or
+/// One `PayloadFacts` answer of the job form per payload, as the journal
+/// writer builds it: `call` is the job ID, `intent_sequence` the kind 26
+/// sequence and `settled` the kind 28 capture facts (none when unsettled or
 /// `interrupted`); an unsettled job is `active`.
 fn job_fact(job: Id, intent: u64, settled: Option<Settlement>, active: bool) -> Vec<PayloadFact> {
-    let payloads = job_payloads(id(1), job);
-    payloads
+    let first = PayloadFact {
+        active,
+        ..fact(job, intent, settled)
+    };
+    first
+        .payloads
         .iter()
         .map(|payload| PayloadFact {
             payload: *payload,
-            call: job,
-            operation: id(10),
-            payloads,
-            intent_sequence: intent,
-            settled,
-            active,
+            ..first.clone()
         })
         .collect()
+}
+/// A facts answer for `recover_with_facts` from a fixed list.
+fn answer(
+    facts: &[PayloadFact],
+) -> impl FnMut(Vec<Id>) -> Result<Vec<PayloadFact>, RecoveryError> + '_ {
+    move |batch: Vec<Id>| {
+        assert!(!batch.is_empty() && batch.len() <= FACT_BATCH);
+        Ok(facts
+            .iter()
+            .filter(|fact| batch.contains(&fact.payload))
+            .cloned()
+            .collect())
+    }
 }
 
 /// J2T-04 and TJ-Q5 (integration): job payload recovery from `PayloadFacts`
@@ -1341,14 +1321,10 @@ fn j2t_04_job_recovery_from_payload_facts() {
         home.put("staging", id(0xF000_0000 + n), b"orphan");
     }
     let mut asked = Vec::new();
+    let mut facts_of = answer(&facts);
     let mut answer = |batch: Vec<Id>| -> Result<Vec<PayloadFact>, RecoveryError> {
-        assert!(!batch.is_empty() && batch.len() <= FACT_BATCH);
         asked.push(batch.len());
-        Ok(facts
-            .iter()
-            .filter(|fact| batch.contains(&fact.payload))
-            .cloned()
-            .collect())
+        facts_of(batch)
     };
     let report = recover_with_facts(&f.store, &mut answer, DEFAULT_QUOTA, &no_cancel()).unwrap();
     assert_eq!(asked.iter().sum::<usize>(), 300 + 10);
@@ -1404,29 +1380,25 @@ fn j2t_04_job_recovery_from_payload_facts() {
 
 /// J2T-04 (integration): a replay's unsettled job is known to recovery: its
 /// staging prefix is kept as an unverified prefix with the kind 26 sequence
-/// as last use, never deleted as an orphan; a job-mode call has no J1 form.
+/// as last use, never deleted as an orphan; a job with no files has two
+/// missing payloads.
 #[test]
 fn j2t_04_unsettled_job_from_replay_keeps_its_prefix() {
     let f = open(64 * 1024 * MIB);
     let mut journal = Journal::started();
-    journal.admitted(1);
-    journal.settled(1, CaptureState::Complete, recorded(1));
+    let (first, first_intent) = journal.job(1);
     let (job, intent) = journal.job(2);
-    assert_eq!(job, call(2), "a job-mode call's job is its call's");
+    // The jobs outlive their turn.
+    journal.failed();
+    assert_eq!(job, call(2), "an exec_cmd call's job is its call's");
     let [o2, e2] = job_payloads(id(1), job);
     assert_eq!([o2, e2], payloads(2));
     f.home.put("staging", o2, &body(2));
-    let [o1, e1] = payloads(1);
-    f.home.put("objects", o1, &body(1));
-    f.home.put("objects", e1, &tail(1));
     let replay = journal.replay();
     assert_eq!(replay.jobs[&job].intent.sequence, intent);
+    assert_eq!(replay.jobs[&first].intent.sequence, first_intent);
     let known = asura_storage::payload::known_calls(&replay);
-    assert_eq!(
-        known.len(),
-        2,
-        "one J1 call and one job, no J1 form of the job"
-    );
+    assert_eq!(known.len(), 2, "both unsettled jobs");
     let report = recover(&f.store, Some(&replay), DEFAULT_QUOTA, &no_cancel()).unwrap();
     assert_eq!(report.orphans_deleted, 0);
     assert_eq!(report.unverified, 1);
@@ -1438,19 +1410,243 @@ fn j2t_04_unsettled_job_from_replay_keeps_its_prefix() {
         f.store.payload_state(e2),
         Some((PayloadState::Missing, Location::None, 0))
     );
-    // Call 1's kind 23 precedes the job's kind 26, so call 1 expires first.
+    f.store
+        .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
+    for payload in job_payloads(id(1), first) {
+        assert_eq!(
+            f.store.payload_state(payload),
+            Some((PayloadState::Missing, Location::None, 0))
+        );
+    }
+    // Oldest kind 26 first: the empty job 1, then job 2's prefix.
+    let victims = f.store.admit(id(1), id(6000), id(99)).unwrap();
+    assert_eq!(
+        victims.iter().map(|v| v.call).collect::<Vec<_>>(),
+        [first, job]
+    );
+}
+
+// ---------------------------------------------------------------- J3T-08
+
+/// J3T-08 (storage): the delivered text of a page never exceeds 8,192
+/// bytes. Output that is four fifths invalid bytes (each 3 bytes of U+FFFD)
+/// makes the reader stop before 8,192 source bytes; following
+/// `next_offset` reads every byte once and reassembles the lossy text.
+#[test]
+fn j3t_08_page_text_never_exceeds_the_bound() {
+    let f = open(64 * 1024 * MIB);
+    let source: Vec<u8> = (0..3 * PAGE_LIMIT)
+        .map(|n| if n % 5 == 0 { b'a' } else { 0xFF })
+        .collect();
+    let [o1, e1] = payloads(1);
+    f.home.put("objects", o1, &source);
+    f.home.put("objects", e1, b"");
+    let facts = [fact(
+        call(1),
+        10,
+        Some((
+            CaptureState::Complete,
+            15,
+            [
+                (source.len() as u64, Some(sha(&source))),
+                (0, Some(sha(b""))),
+            ],
+        )),
+    )];
+    recover_facts(&f.store, &facts, DEFAULT_QUOTA).unwrap();
+    let first = page(&f.store, o1, 0, PAGE_LIMIT);
+    assert_eq!(first.state, PageState::Complete);
+    assert!(first.text.len() <= TEXT_LIMIT);
+    assert!(
+        first.next_offset < PAGE_LIMIT as u64,
+        "the reader stopped early"
+    );
+    let mut offset = 0;
+    let mut pages = 0;
+    let mut joined = String::new();
+    while offset < source.len() as u64 {
+        let p = page(&f.store, o1, offset, PAGE_LIMIT);
+        assert!(p.text.len() <= TEXT_LIMIT && p.next_offset > offset);
+        assert_eq!(p.start, offset);
+        joined.push_str(&p.text);
+        offset = p.next_offset;
+        pages += 1;
+    }
+    assert_eq!(joined, String::from_utf8_lossy(&source));
+    assert!(pages > 3);
+}
+
+// ---------------------------------------------------------------- J4T-06
+
+/// Counts space events, as the J2 queue-head wake and a paused capture's
+/// retry receive them.
+#[derive(Default)]
+struct Wakes(std::sync::atomic::AtomicU32);
+impl SpaceListener for Wakes {
+    fn space_event(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+impl Wakes {
+    fn count(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+fn listen(store: &PayloadStore) -> Arc<Wakes> {
+    let wakes = Arc::new(Wakes::default());
+    let listener: Arc<dyn SpaceListener> = wakes.clone();
+    store.listen(&listener);
+    wakes
+}
+
+/// J4T-06 (storage): a pinned job survives interim expiry under quota
+/// pressure; its files and pages stay. Unpinned, it is a victim again.
+#[test]
+fn j4t_06_pin_survives_interim_expiry_under_quota_pressure() {
+    let f = fixture();
+    let [o1, e1] = settled_call(&f, 1, CaptureState::Complete, b"keep\n", b"", 1, true);
+    let [o2, _] = settled_call(&f, 2, CaptureState::Complete, b"drop\n", b"", 2, true);
+    f.store.set_pinned(call(1), true);
+    f.store
+        .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
+    // Job 1 is the oldest; the pin makes job 2 the victim.
+    let victims = f.store.admit(id(1), call(3), id(10)).unwrap();
+    assert_eq!(
+        victims.iter().map(|v| v.call).collect::<Vec<_>>(),
+        [call(2)]
+    );
+    f.store.delete_victim(victims[0]).unwrap();
+    assert_eq!(page(&f.store, o2, 0, 64).state, PageState::Expired);
+    f.store.release(call(3));
+    // Under quota pressure only the pinned job is left: nothing is chosen.
+    f.store
+        .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
+    assert!(f.store.admit(id(1), call(4), id(10)).is_err());
+    assert_eq!(f.home.read("objects", o1).unwrap(), b"keep\n");
+    assert!(f.home.read("objects", e1).is_some());
+    assert_eq!(page(&f.store, o1, 0, 64).text, "keep\n");
+    let wakes = listen(&f.store);
+    f.store.set_pinned(call(1), false);
+    assert_eq!(wakes.count(), 1, "unpin wakes waiters");
+    let victims = f.store.admit(id(1), call(4), id(10)).unwrap();
+    assert_eq!(
+        victims.iter().map(|v| v.call).collect::<Vec<_>>(),
+        [call(1)]
+    );
+}
+
+/// J4T-06 (storage): a person delete removes both stream files, frees their
+/// quota and wakes a `quota` head; pages answer `deleted`. A live job is
+/// refused and keeps its files. Deleting again is `Ok`.
+#[test]
+fn j4t_06_delete_frees_quota_and_wakes_a_quota_head() {
+    let f = fixture();
+    let [o1, e1] = settled_call(&f, 1, CaptureState::Complete, b"out\n", b"err\n", 1, true);
+    // A staging copy is deleted too.
+    f.home.put("staging", e1, b"err\n");
+    // A live job.
+    admit(&f.store, 3);
+    let mut capture = f.store.create_capture(call(3)).unwrap();
+    // The pin keeps expiry from freeing the space: only the delete can.
+    f.store.set_pinned(call(1), true);
+    let wakes = listen(&f.store);
+    f.store
+        .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
+    assert!(
+        f.store.admit(id(1), call(2), id(10)).is_err(),
+        "a quota head"
+    );
+    // A live job's output cannot be deleted.
+    capture
+        .append(StreamIndex::Stdout, &redacted(b"live\n"), 0)
+        .1
+        .unwrap();
+    assert!(matches!(
+        f.store.delete_job(id(1), call(3)),
+        Err(DeleteError::NotSettled)
+    ));
+    assert_eq!(f.home.read("staging", payloads(3)[0]).unwrap(), b"live\n");
+    assert_eq!(page(&f.store, payloads(3)[0], 0, 64).state, PageState::Live);
+    let used = f.store.used();
+    let before = wakes.count();
+    f.store.delete_job(id(1), call(1)).unwrap();
+    assert_eq!(f.store.used(), used - 8, "the 8 retained bytes are free");
+    assert!(wakes.count() > before, "freed bytes wake the quota head");
+    for payload in [o1, e1] {
+        assert!(f.home.read("objects", payload).is_none());
+        assert!(f.home.read("staging", payload).is_none());
+        for offset in [0, 2, 99] {
+            let p = page(&f.store, payload, offset, 64);
+            assert_eq!(
+                (p.state, p.text.as_str(), p.next_offset),
+                (PageState::Deleted, "", offset)
+            );
+        }
+    }
+    // The woken head is admitted now.
+    assert!(f.store.admit(id(1), call(2), id(10)).unwrap().is_empty());
+    f.store.delete_job(id(1), call(1)).unwrap();
+    assert_eq!(page(&f.store, o1, 0, 64).state, PageState::Deleted);
+}
+
+/// J4T-06 (storage): a crash after the kind 30 `delete` committed and before
+/// the files were gone; recovery sees the delete in `PayloadFacts` and
+/// completes it: files deleted, nothing retained, pages `deleted`. A pinned
+/// job keeps its pin hold across the restart.
+#[test]
+fn j4t_06_crash_after_delete_commit_completes_at_recovery() {
+    let f = open(64 * 1024 * MIB);
+    let [o1, e1] = payloads(1);
+    f.home.put("objects", o1, &body(1));
+    f.home.put("objects", e1, &tail(1));
+    f.home.put("staging", e1, &tail(1));
+    let [o2, e2] = payloads(2);
+    f.home.put("objects", o2, &body(2));
+    f.home.put("objects", e2, &tail(2));
+    let [o3, e3] = payloads(3);
+    f.home.put("objects", o3, &body(3));
+    f.home.put("objects", e3, &tail(3));
+    let mut facts = Vec::new();
+    for (n, pinned, deleted) in [(1, true, true), (2, true, false), (3, false, false)] {
+        for mut fact in job_fact(
+            call(n),
+            u64::from(n) * 10,
+            settled(CaptureState::Complete, u64::from(n) * 10 + 5, n),
+            false,
+        ) {
+            fact.pinned = pinned;
+            fact.deleted = deleted;
+            facts.push(fact);
+        }
+    }
+    let report =
+        recover_with_facts(&f.store, &mut answer(&facts), DEFAULT_QUOTA, &no_cancel()).unwrap();
+    assert_eq!(report.deleted, 3);
+    assert_eq!(report.orphans_deleted, 0);
+    assert_eq!(report.retained, 26);
+    assert_eq!(f.store.used(), 26);
+    for payload in [o1, e1] {
+        assert!(f.home.read("objects", payload).is_none());
+        assert!(f.home.read("staging", payload).is_none());
+        assert_eq!(f.store.payload_state(payload), None);
+        assert_eq!(page(&f.store, payload, 0, 64).state, PageState::Deleted);
+    }
+    assert!(f.store.pinned(call(2)) && !f.store.pinned(call(3)));
+    assert_eq!(page(&f.store, o2, 0, 64).text, "payload 2\n");
+    // Under quota pressure job 3 expires; the pinned job 2 never does.
     let mut order = Vec::new();
     for n in 0u64.. {
         f.store
             .set_effective_quota(f.store.used() + MIB - 1, 64 * 1024 * MIB);
-        let Ok(victims) = f.store.admit(id(1), id(6000 + n), id(99)) else {
+        let Ok(victims) = f.store.admit(id(1), id(7000 + n), id(99)) else {
             break;
         };
         for victim in victims {
             order.push(victim.call);
             f.store.delete_victim(victim).unwrap();
         }
-        f.store.release(id(6000 + n));
+        f.store.release(id(7000 + n));
     }
-    assert_eq!(order, [call(1), job]);
+    assert_eq!(order, [call(3)]);
+    assert_eq!(f.home.read("objects", o2).unwrap(), body(2));
 }

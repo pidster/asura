@@ -1106,22 +1106,8 @@ pub struct ExecCmdCall {
     pub stdout_payload: Id,
     pub stderr_payload: Id,
     pub intent_sequence: u64,
-    /// Always `None`: kind 23 is retired (J3-E9, JR17). Kept only until the
-    /// payload recovery packet (J34-C) drops its last reader; then removed
-    /// with [`ExecCmdSettlement`].
-    pub settled: Option<ExecCmdSettlement>,
     /// The call's kind 26 frame, once committed.
     pub job_intent: Option<Locator>,
-}
-/// Retired with kind 23; see [`ExecCmdCall::settled`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecCmdSettlement {
-    pub state: CaptureState,
-    pub reason: CaptureReason,
-    pub sequence: u64,
-    /// Stored bytes and digest per stream (stdout, stderr).
-    pub streams: [(u64, Option<Hash>); 2],
-    pub frame: Locator,
 }
 
 /// Replay projection of one kind 14 call and its later records. Bounded

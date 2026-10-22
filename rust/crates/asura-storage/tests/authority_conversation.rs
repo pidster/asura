@@ -1841,7 +1841,7 @@ fn j3t_03_exec_cmd_call_is_a_job_resolved_by_kind_29() {
     assert_eq!(tool.arguments, EXEC_ARGUMENTS);
     assert_eq!(call.job, exec_cmd_job_id(id(10), 1, 1));
     assert_eq!(call.intent_sequence, journal.sequence);
-    assert!(call.job_intent.is_none() && call.settled.is_none() && tool.unresolved());
+    assert!(call.job_intent.is_none() && tool.unresolved());
     let journal = started_with([run_exec(1), r26(1)]);
     let tool = exec_cmd(&journal);
     assert!(tool.exec_cmd.as_deref().unwrap().job_intent.is_some() && tool.unresolved());
@@ -2928,7 +2928,7 @@ fn j2t_02_job_mode_orders_replay_and_derive_job_facts() {
         assert!(state.jobs.is_empty(), "{records:?}");
         let tool = &state.operations[&id(10)].tools[0];
         let exec = tool.exec_cmd.as_deref().unwrap();
-        assert!(exec.job_intent.is_some() && exec.settled.is_none());
+        assert!(exec.job_intent.is_some());
         assert_eq!(exec.job, job(1));
         assert_eq!(
             [exec.stdout_payload, exec.stderr_payload],

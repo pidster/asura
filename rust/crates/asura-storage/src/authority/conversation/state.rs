@@ -2803,7 +2803,6 @@ pub(crate) fn exec_cmd_call(installation: Id, p: &ToolCall, sequence: u64) -> Bo
         stdout_payload,
         stderr_payload,
         intent_sequence: sequence,
-        settled: None,
         job_intent: None,
     })
 }

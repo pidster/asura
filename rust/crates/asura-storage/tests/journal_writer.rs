@@ -1888,8 +1888,6 @@ fn j3t_02_real_writer_appends_kinds_14_26_29_and_reopens() {
             ObjectKind::Stderr
         )
     );
-    // Kind 23 is retired: the call's job holds its facts (J3-E9).
-    assert!(derived.settled.is_none());
     let job_frame = derived.job_intent.unwrap();
     assert_eq!(tools[0].result_status, Some(1));
     assert_eq!(tools[1].decision, ToolDecision::Refused);
