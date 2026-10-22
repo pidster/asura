@@ -177,6 +177,14 @@ pub enum Setting {
     JobsClientViewers,
     #[serde(rename = "jobs.modelReservedPageReads")]
     JobsModelReservedPageReads,
+    /// The whole `execution` mapping (execution-setting.md, EX11).
+    Execution,
+    #[serde(rename = "execution.enabled")]
+    ExecutionEnabled,
+    /// `execution.projects`, and every leaf `execution.projects.<id>`; the
+    /// project of a leaf set is in `execution.changed`, not in the setting.
+    #[serde(rename = "execution.projects")]
+    ExecutionProjects,
 }
 impl Setting {
     /// The setting that a successful `ConfigSet` of `key` reports in
@@ -198,7 +206,14 @@ impl Setting {
             "jobs.queuedAgent" => Self::JobsQueuedAgent,
             "jobs.clientViewers" => Self::JobsClientViewers,
             "jobs.modelReservedPageReads" => Self::JobsModelReservedPageReads,
-            _ => return None,
+            "execution" => Self::Execution,
+            "execution.enabled" => Self::ExecutionEnabled,
+            "execution.projects" => Self::ExecutionProjects,
+            // The leaf form: only a valid project ID names a key.
+            leaf => match leaf.strip_prefix("execution.projects.") {
+                Some(project) if id::parse(project).is_ok() => Self::ExecutionProjects,
+                _ => return None,
+            },
         })
     }
 }
@@ -264,6 +279,10 @@ pub enum JobReason {
     CaptureUnavailable = 16,
     ProtocolFault = 17,
     SetupFailed = 18,
+    /// The person turned execution off for the job's project (EX11).
+    ExecutionOff = 19,
+    /// The person `!!` switch was off when the job's slot was granted (PCR23).
+    OutsideSandboxOff = 20,
 }
 impl JobReason {
     /// Whether kind 27 allows this reason for `requester` (reason table).
@@ -275,7 +294,12 @@ impl JobReason {
             JobRequester::Person => matches!(self, R::PersonStop | R::PersonKill),
             JobRequester::Service => matches!(
                 self,
-                R::IdentityChanged | R::Shutdown | R::CaptureFault | R::Quota | R::Enospc
+                R::IdentityChanged
+                    | R::Shutdown
+                    | R::CaptureFault
+                    | R::Quota
+                    | R::Enospc
+                    | R::ExecutionOff
             ),
         }
     }
@@ -328,6 +352,24 @@ pub enum JobCaptureState {
     Unconfirmed = 3,
     NotStarted = 4,
     Interrupted = 5,
+}
+/// The scope of an execution change (execution-setting.md, audit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionScope {
+    /// `execution.enabled`, the global default.
+    Global,
+    /// One `execution.projects` entry.
+    Project,
+}
+/// A configured execution value. `inherit` is the absent project override;
+/// the global default is always `on` or `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionValue {
+    On,
+    Off,
+    Inherit,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -486,6 +528,19 @@ pub enum Event {
         elapsed_ms: u64,
         pause_count: u32,
     },
+    /// The owner applied a persisted execution change (EX11). `project` is
+    /// present for project scope alone; `revoked_projects` counts the
+    /// projects this change turned from on to off. Not a project record: it
+    /// stays out of the project view (J4-E8), so `project()` is `None`.
+    #[serde(rename = "execution.changed")]
+    ExecutionChanged {
+        scope: ExecutionScope,
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "optional_id")]
+        project: Option<Id>,
+        from: ExecutionValue,
+        to: ExecutionValue,
+        revoked_projects: u32,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Record {
@@ -624,6 +679,29 @@ impl Event {
                 job,
                 ..
             } => nonzero(project) && nonzero(conversation) && nonzero(job) && self.settled_facts(),
+            Self::ExecutionChanged {
+                scope,
+                project,
+                from,
+                to,
+                revoked_projects,
+            } => match scope {
+                // The global default is never `inherit`; only a change to
+                // off turns projects off.
+                ExecutionScope::Global => {
+                    project.is_none()
+                        && *from != ExecutionValue::Inherit
+                        && *to != ExecutionValue::Inherit
+                        && (*revoked_projects == 0 || *to == ExecutionValue::Off)
+                }
+                // One project: at most that project turns off, and only when
+                // its override becomes `off`, or `inherit` of a global off.
+                ExecutionScope::Project => {
+                    project.as_ref().is_some_and(nonzero)
+                        && *revoked_projects <= 1
+                        && (*revoked_projects == 0 || *to != ExecutionValue::On)
+                }
+            },
         };
         if valid { Ok(()) } else { Err(Error::Invalid) }
     }
@@ -669,14 +747,16 @@ impl Event {
             && *cleanup == JobCleanup::None
             && *escapees == 0
             && *elapsed_ms == 0;
+        // Code 19 `execution_off` follows the cancel reasons 1-8; code 20
+        // `outside_sandbox_off` is a slot-grant refusal (job reason codes).
+        let process_reason = code <= 10 || *reason == JobReason::ExecutionOff;
+        let cancel_reason = (1..=8).contains(&code) || *reason == JobReason::ExecutionOff;
         let outcome_rules = match outcome {
-            JobOutcome::Exited => code <= 10 && *exit_kind == JobExitKind::Exited && ran,
-            JobOutcome::Signalled => code <= 10 && *exit_kind == JobExitKind::Signalled && ran,
-            JobOutcome::Cancelled => {
-                (1..=8).contains(&code) && *exit_kind != JobExitKind::Unknown && ran
-            }
+            JobOutcome::Exited => process_reason && *exit_kind == JobExitKind::Exited && ran,
+            JobOutcome::Signalled => process_reason && *exit_kind == JobExitKind::Signalled && ran,
+            JobOutcome::Cancelled => cancel_reason && *exit_kind != JobExitKind::Unknown && ran,
             JobOutcome::NotStarted => {
-                ((1..=7).contains(&code) || (12..=18).contains(&code))
+                ((1..=7).contains(&code) || (12..=20).contains(&code))
                     && no_process
                     && *capture_state == JobCaptureState::NotStarted
             }

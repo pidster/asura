@@ -630,6 +630,8 @@ fn j2t_20_job_enum_names_and_codes() {
         (JobReason::CaptureUnavailable, "capture_unavailable"),
         (JobReason::ProtocolFault, "protocol_fault"),
         (JobReason::SetupFailed, "setup_failed"),
+        (JobReason::ExecutionOff, "execution_off"),
+        (JobReason::OutsideSandboxOff, "outside_sandbox_off"),
     ];
     for (code, (reason, text)) in reasons.iter().enumerate() {
         assert_eq!(*reason as u8, code as u8);
@@ -785,6 +787,7 @@ fn j2t_20_job_events_validate_design_rules() {
         (JobRequester::Service, JobReason::CaptureFault),
         (JobRequester::Service, JobReason::Quota),
         (JobRequester::Service, JobReason::Enospc),
+        (JobRequester::Service, JobReason::ExecutionOff),
     ];
     for requester in [
         JobRequester::Model,
@@ -792,7 +795,7 @@ fn j2t_20_job_events_validate_design_rules() {
         JobRequester::Person,
         JobRequester::Service,
     ] {
-        for code in 0..=18u8 {
+        for code in 0..=20u8 {
             let reason: JobReason =
                 serde_json::from_value(serde_json::to_value(code_reason(code)).unwrap()).unwrap();
             let expected = allowed.contains(&(requester, reason));
@@ -990,6 +993,8 @@ fn code_reason(code: u8) -> &'static str {
         "capture_unavailable",
         "protocol_fault",
         "setup_failed",
+        "execution_off",
+        "outside_sandbox_off",
     ][usize::from(code)]
 }
 
@@ -1032,6 +1037,336 @@ fn j2t_20_job_setting_names_match_config_keys() {
         assert_eq!(Setting::for_config_key(key), Some(setting), "{key}");
     }
     for key in ["", "thinking", "providers.ollama.endpoint", "jobs.other"] {
+        assert_eq!(Setting::for_config_key(key), None, "{key}");
+    }
+}
+
+/// J34-G: job reason 19 `execution_off` (EX11) and 20 `outside_sandbox_off`
+/// (PCR23) follow the job reason table. Kind 27 accepts 19 from the service
+/// alone and never 20; kind 28 accepts 19 for exited, signalled, cancelled
+/// and not_started, and 20 for not_started alone.
+#[test]
+fn j34g_reasons_19_and_20_follow_the_reason_table() {
+    assert_eq!(JobReason::ExecutionOff as u8, 19);
+    assert_eq!(JobReason::OutsideSandboxOff as u8, 20);
+    for requester in [
+        JobRequester::Model,
+        JobRequester::Client,
+        JobRequester::Person,
+        JobRequester::Service,
+    ] {
+        assert_eq!(
+            cancel_requested(requester, JobReason::ExecutionOff, false)
+                .validate()
+                .is_ok(),
+            requester == JobRequester::Service,
+            "{requester:?}"
+        );
+        assert_eq!(
+            cancel_requested(requester, JobReason::OutsideSandboxOff, false).validate(),
+            Err(Error::Invalid),
+            "{requester:?}"
+        );
+        assert_eq!(
+            cancel_requested(requester, JobReason::ExecutionOff, true).validate(),
+            Err(Error::Invalid),
+            "kill {requester:?}"
+        );
+    }
+    let exited = |reason| {
+        settled(|e| {
+            if let Event::JobSettled { reason: r, .. } = e {
+                *r = reason;
+            }
+        })
+    };
+    let signalled = |reason| {
+        settled(|e| {
+            if let Event::JobSettled {
+                outcome,
+                reason: r,
+                exit_kind,
+                exit_value,
+                ..
+            } = e
+            {
+                *outcome = JobOutcome::Signalled;
+                *r = reason;
+                *exit_kind = JobExitKind::Signalled;
+                *exit_value = 15;
+            }
+        })
+    };
+    let cancelled = |reason| {
+        settled(|e| {
+            if let Event::JobSettled {
+                outcome,
+                reason: r,
+                exit_kind,
+                exit_value,
+                ..
+            } = e
+            {
+                *outcome = JobOutcome::Cancelled;
+                *r = reason;
+                *exit_kind = JobExitKind::Signalled;
+                *exit_value = 15;
+            }
+        })
+    };
+    let not_started = |reason| {
+        settled(|e| {
+            if let Event::JobSettled {
+                outcome,
+                reason: r,
+                exit_kind,
+                exit_value,
+                cleanup,
+                escapees,
+                capture_state,
+                stdout_bytes,
+                elapsed_ms,
+                ..
+            } = e
+            {
+                *outcome = JobOutcome::NotStarted;
+                *r = reason;
+                *exit_kind = JobExitKind::Unknown;
+                *exit_value = 0;
+                *cleanup = JobCleanup::None;
+                *escapees = 0;
+                *capture_state = JobCaptureState::NotStarted;
+                *stdout_bytes = 0;
+                *elapsed_ms = 0;
+            }
+        })
+    };
+    let interrupted = |reason| {
+        settled(|e| {
+            if let Event::JobSettled {
+                outcome,
+                reason: r,
+                exit_kind,
+                exit_value,
+                cleanup,
+                escapees,
+                capture_state,
+                stdout_bytes,
+                elapsed_ms,
+                ..
+            } = e
+            {
+                *outcome = JobOutcome::Interrupted;
+                *r = reason;
+                *exit_kind = JobExitKind::Unknown;
+                *exit_value = 0;
+                *cleanup = JobCleanup::None;
+                *escapees = 0;
+                *capture_state = JobCaptureState::Interrupted;
+                *stdout_bytes = 0;
+                *elapsed_ms = 0;
+            }
+        })
+    };
+    let off = JobReason::ExecutionOff;
+    let outside = JobReason::OutsideSandboxOff;
+    for event in [
+        exited(off),
+        signalled(off),
+        cancelled(off),
+        not_started(off),
+    ] {
+        event.validate().unwrap();
+        let value = job_record(event);
+        assert_eq!(Record::decode(&value.encode().unwrap()).unwrap(), value);
+    }
+    let text = String::from_utf8(job_record(cancelled(off)).encode().unwrap()).unwrap();
+    assert!(text.contains("\"reason\":\"execution_off\""), "{text}");
+    not_started(outside).validate().unwrap();
+    let text = String::from_utf8(job_record(not_started(outside)).encode().unwrap()).unwrap();
+    assert!(
+        text.contains("\"reason\":\"outside_sandbox_off\""),
+        "{text}"
+    );
+    for event in [
+        exited(outside),
+        signalled(outside),
+        cancelled(outside),
+        interrupted(outside),
+        interrupted(off),
+    ] {
+        assert_eq!(event.validate(), Err(Error::Invalid), "{event:?}");
+    }
+    // A code past the table never decodes.
+    let text = String::from_utf8(job_record(cancelled(off)).encode().unwrap()).unwrap();
+    assert_eq!(
+        Record::decode(
+            text.replace("execution_off", "project_unregistered")
+                .as_bytes()
+        ),
+        Err(Error::MalformedRecord)
+    );
+}
+
+fn execution_changed(
+    scope: ExecutionScope,
+    project: Option<Id>,
+    from: ExecutionValue,
+    to: ExecutionValue,
+    revoked_projects: u32,
+) -> Event {
+    Event::ExecutionChanged {
+        scope,
+        project,
+        from,
+        to,
+        revoked_projects,
+    }
+}
+
+/// ES-11 unit layer: `execution.changed` has its name, exact fields and
+/// value spellings, round-trips, holds no command or path text, and stays
+/// out of the project view.
+#[test]
+fn es_11_execution_changed_names_fields_and_round_trip() {
+    use ExecutionScope::{Global, Project};
+    use ExecutionValue::{Inherit, Off, On};
+    for (event, fields, parts) in [
+        (
+            execution_changed(Global, None, On, Off, 3),
+            &["scope", "from", "to", "revoked_projects"][..],
+            &[
+                "\"scope\":\"global\"",
+                "\"from\":\"on\"",
+                "\"to\":\"off\"",
+                "\"revoked_projects\":3",
+            ][..],
+        ),
+        (
+            execution_changed(Project, Some([3; 16]), Inherit, Off, 1),
+            &["scope", "project", "from", "to", "revoked_projects"][..],
+            &[
+                "\"scope\":\"project\"",
+                "\"project\":\"03030303030303030303030303030303\"",
+                "\"from\":\"inherit\"",
+                "\"to\":\"off\"",
+                "\"revoked_projects\":1",
+            ][..],
+        ),
+    ] {
+        assert_eq!(event.project(), None, "not a project record (J4-E8)");
+        let value = job_record(event);
+        let bytes = value.encode().unwrap();
+        assert_eq!(Record::decode(&bytes).unwrap(), value);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["kind"], "execution.changed");
+        let mut names: Vec<&str> = json["details"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut expected = fields.to_vec();
+        names.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+        let text = String::from_utf8(bytes).unwrap();
+        for part in parts {
+            assert!(text.contains(part), "{part} in {text}");
+        }
+        // The closed schema rejects text fields, nulls, duplicates and
+        // unknown values.
+        for field in ["command", "cwd", "path", "name", "note"] {
+            let broken = text.replacen("\"scope\"", &format!("\"{field}\":\"x\",\"scope\""), 1);
+            assert_eq!(
+                Record::decode(broken.as_bytes()),
+                Err(Error::MalformedRecord),
+                "{broken}"
+            );
+        }
+        for broken in [
+            text.replacen("\"to\":\"off\"", "\"to\":\"off\",\"to\":\"off\"", 1),
+            text.replacen("\"to\":\"off\"", "\"to\":null", 1),
+            text.replacen("\"to\":\"off\"", "\"to\":\"maybe\"", 1),
+            text.replacen("\"scope\":", "\"scope\":\"other\",\"x\":", 1),
+        ] {
+            assert_eq!(
+                Record::decode(broken.as_bytes()),
+                Err(Error::MalformedRecord),
+                "{broken}"
+            );
+        }
+    }
+}
+
+/// ES-11 unit layer: `execution.changed` validation. Global scope has no
+/// project and no `inherit`; project scope names one nonzero project and
+/// turns at most that project off.
+#[test]
+fn es_11_execution_changed_validates_scope_rules() {
+    use ExecutionScope::{Global, Project};
+    use ExecutionValue::{Inherit, Off, On};
+    for event in [
+        execution_changed(Global, None, On, Off, 0),
+        execution_changed(Global, None, On, Off, 70_000),
+        execution_changed(Global, None, Off, On, 0),
+        execution_changed(Global, None, On, On, 0),
+        execution_changed(Project, Some([3; 16]), On, Off, 1),
+        execution_changed(Project, Some([3; 16]), Inherit, Off, 0),
+        execution_changed(Project, Some([3; 16]), On, Inherit, 1),
+        execution_changed(Project, Some([3; 16]), Off, On, 0),
+        execution_changed(Project, Some([3; 16]), Off, Inherit, 0),
+    ] {
+        event.validate().unwrap();
+        job_record(event).encode().unwrap();
+    }
+    for event in [
+        execution_changed(Global, Some([3; 16]), On, Off, 0),
+        execution_changed(Global, None, Inherit, Off, 0),
+        execution_changed(Global, None, On, Inherit, 0),
+        execution_changed(Global, None, Off, On, 1),
+        execution_changed(Project, None, On, Off, 1),
+        execution_changed(Project, Some([0; 16]), On, Off, 1),
+        execution_changed(Project, Some([3; 16]), On, Off, 2),
+        execution_changed(Project, Some([3; 16]), Off, On, 1),
+    ] {
+        assert_eq!(event.validate(), Err(Error::Invalid), "{event:?}");
+        assert_eq!(job_record(event).encode(), Err(Error::Invalid));
+    }
+}
+
+/// ES-02 and J34-G: every `execution` key maps to its `config.changed`
+/// setting; a leaf maps to `execution.projects` only with a valid ID.
+#[test]
+fn es_02_execution_setting_names_match_config_keys() {
+    for (name, setting) in [
+        ("execution", Setting::Execution),
+        ("execution.enabled", Setting::ExecutionEnabled),
+        ("execution.projects", Setting::ExecutionProjects),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&setting).unwrap(),
+            format!("\"{name}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<Setting>(&format!("\"{name}\"")).unwrap(),
+            setting
+        );
+        assert_eq!(Setting::for_config_key(name), Some(setting));
+    }
+    let leaf = crate::config::execution_project_key(&[0xab; 16]);
+    assert_eq!(
+        Setting::for_config_key(&leaf),
+        Some(Setting::ExecutionProjects)
+    );
+    for key in [
+        "execution.projects.",
+        "execution.projects.00000000000000000000000000000000",
+        "execution.projects.ABABABABABABABABABABABABABABABAB",
+        "execution.projects.abababababababababababababababab.x",
+        "execution.other",
+        "executionx",
+    ] {
         assert_eq!(Setting::for_config_key(key), None, "{key}");
     }
 }

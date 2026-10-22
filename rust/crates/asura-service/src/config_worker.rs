@@ -165,6 +165,7 @@ mod tests {
             Ok(Reply {
                 value_yaml: "true\n".into(),
                 journal_quota: None,
+                execution: None,
             }),
         )
     }
@@ -235,6 +236,7 @@ mod tests {
                 Ok(Reply {
                     value_yaml: "67108864\n".into(),
                     journal_quota: Some(67_108_864),
+                    execution: None,
                 }),
             );
             assert_eq!(worker.take_journal_quota(), None);
@@ -262,6 +264,7 @@ mod tests {
             Ok(Reply {
                 value_yaml: "4294967296\n".into(),
                 journal_quota: None,
+                execution: None,
             }),
         );
         settle(&mut worker, release);
@@ -355,6 +358,7 @@ mod reactor_tests {
                         Ok(Reply {
                             value_yaml: "true\n".into(),
                             journal_quota: None,
+                            execution: None,
                         })
                     });
                     admitted_tx.send(()).unwrap();

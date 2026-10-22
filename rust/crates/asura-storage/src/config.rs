@@ -3,6 +3,7 @@ use asura_platform::{PrivateFileError, PrivateFileSnapshot, RuntimeDirectory};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +39,8 @@ struct Config {
     journal: Journal,
     #[serde(default, skip_serializing_if = "Jobs::is_default")]
     jobs: Jobs,
+    #[serde(default, skip_serializing_if = "Execution::is_default")]
+    execution: Execution,
     /// The model thinking level (thinking-level.md); absent is `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
@@ -215,6 +218,106 @@ impl Default for JobLimits {
         Jobs::default().limits()
     }
 }
+/// Most `execution.projects` entries (execution-setting.md, configuration).
+pub const EXECUTION_MAX_PROJECTS: usize = 1024;
+const EXECUTION_PROJECTS_PREFIX: &str = "execution.projects.";
+/// One project override value.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Switch {
+    On,
+    Off,
+}
+/// The person's execution setting (EX11): the global default and the
+/// per-project overrides, keyed by project ID text. Written only away from
+/// its defaults.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Execution {
+    #[serde(default = "enabled")]
+    enabled: bool,
+    #[serde(default)]
+    projects: BTreeMap<String, Switch>,
+}
+impl Default for Execution {
+    fn default() -> Self {
+        Self {
+            enabled: enabled(),
+            projects: BTreeMap::new(),
+        }
+    }
+}
+impl Execution {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    fn valid(&self) -> bool {
+        self.projects.len() <= EXECUTION_MAX_PROJECTS
+            && self.projects.keys().all(|id| project_id(id).is_some())
+    }
+    /// The effective setting of a validated mapping.
+    fn setting(&self) -> ExecutionSetting {
+        ExecutionSetting {
+            enabled: self.enabled,
+            projects: self
+                .projects
+                .iter()
+                .filter_map(|(id, value)| Some((project_id(id)?, *value == Switch::On)))
+                .collect(),
+        }
+    }
+}
+/// A project ID as configuration text: 32 lowercase hexadecimal digits, not
+/// all zero.
+fn project_id(text: &str) -> Option<[u8; 16]> {
+    if text.len() != 32
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let mut id = [0; 16];
+    for (index, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    (id != [0; 16]).then_some(id)
+}
+/// The leaf key `execution.projects.<id>` of a project.
+pub fn execution_project_key(project: &[u8; 16]) -> String {
+    use std::fmt::Write;
+    let mut key = String::with_capacity(EXECUTION_PROJECTS_PREFIX.len() + 32);
+    key.push_str(EXECUTION_PROJECTS_PREFIX);
+    for byte in project {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+/// The effective execution setting (execution-setting.md, EX11): the global
+/// default and at most 1,024 project overrides, `true` for `on`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionSetting {
+    /// `execution.enabled`, the value for every project without an override.
+    pub enabled: bool,
+    /// `execution.projects`: project ID to override.
+    pub projects: BTreeMap<[u8; 16], bool>,
+}
+impl Default for ExecutionSetting {
+    fn default() -> Self {
+        Execution::default().setting()
+    }
+}
+impl ExecutionSetting {
+    /// The override for `project`, if one exists.
+    pub fn project_override(&self, project: &[u8; 16]) -> Option<bool> {
+        self.projects.get(project).copied()
+    }
+    /// The effective value for `project`: its override, else the global
+    /// default (ES-R1, ES-R2).
+    pub fn effective(&self, project: &[u8; 16]) -> bool {
+        self.project_override(project).unwrap_or(self.enabled)
+    }
+}
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Providers {
@@ -318,8 +421,36 @@ impl Default for Audit {
 // Parse a small closed tree before deriving the typed schema. This preserves
 // duplicate detection and rejects custom YAML tags/nulls. Typed schema validation
 // permits bounded sequences only in capability declarations.
-struct Strict(u8);
-impl<'de> DeserializeSeed<'de> for Strict {
+/// Where a parsed value sits: only `execution.projects` may hold more than
+/// 64 entries (at most 1,024).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Root,
+    Execution,
+    Projects,
+    Other,
+}
+const MAPPING_ENTRIES: usize = 64;
+/// Depth, scope, and the flag set when `execution.projects` passes its
+/// bound, so that a 1,025th entry is `config_invalid_value`.
+struct Strict<'a>(u8, Scope, &'a Cell<bool>);
+impl Strict<'_> {
+    fn entries(&self) -> usize {
+        if self.1 == Scope::Projects {
+            EXECUTION_MAX_PROJECTS
+        } else {
+            MAPPING_ENTRIES
+        }
+    }
+    fn child(&self, key: &Value) -> Scope {
+        match (self.1, key.as_str()) {
+            (Scope::Root, Some("execution")) => Scope::Execution,
+            (Scope::Execution, Some("projects")) => Scope::Projects,
+            _ => Scope::Other,
+        }
+    }
+}
+impl<'de> DeserializeSeed<'de> for Strict<'_> {
     type Value = Value;
     fn deserialize<D: de::Deserializer<'de>>(
         self,
@@ -328,7 +459,7 @@ impl<'de> DeserializeSeed<'de> for Strict {
         deserializer.deserialize_any(self)
     }
 }
-impl<'de> Visitor<'de> for Strict {
+impl<'de> Visitor<'de> for Strict<'_> {
     type Value = Value;
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         formatter.write_str("a bounded configuration scalar or mapping")
@@ -353,7 +484,7 @@ impl<'de> Visitor<'de> for Strict {
             return Err(de::Error::custom("nesting limit"));
         }
         let mut values = Vec::new();
-        while let Some(value) = sequence.next_element_seed(Strict(6))? {
+        while let Some(value) = sequence.next_element_seed(Strict(6, Scope::Other, self.2))? {
             if values.len() >= 4 || !value.is_string() {
                 return Err(de::Error::custom("invalid capability sequence"));
             }
@@ -366,22 +497,31 @@ impl<'de> Visitor<'de> for Strict {
             return Err(de::Error::custom("nesting limit"));
         }
         let mut values = Mapping::new();
-        while let Some(key) = map.next_key_seed(Strict(6))? {
-            if !matches!(key, Value::String(_)) || values.contains_key(&key) || values.len() >= 64 {
+        while let Some(key) = map.next_key_seed(Strict(6, Scope::Other, self.2))? {
+            if !matches!(key, Value::String(_)) || values.contains_key(&key) {
                 return Err(de::Error::custom("invalid or duplicate key"));
             }
-            let value = map.next_value_seed(Strict(self.0 + 1))?;
+            if values.len() >= self.entries() {
+                self.2.set(self.1 == Scope::Projects);
+                return Err(de::Error::custom("entry limit"));
+            }
+            let value = map.next_value_seed(Strict(self.0 + 1, self.child(&key), self.2))?;
             values.insert(key, value);
         }
         Ok(Value::Mapping(values))
     }
 }
-fn parse(bytes: &[u8]) -> Result<Value> {
+fn parse(bytes: &[u8], scope: Scope) -> Result<Value> {
     let mut documents = serde_yaml_ng::Deserializer::from_slice(bytes);
     let document = documents.next().ok_or("config_invalid_yaml")?;
-    let value = Strict(0)
-        .deserialize(document)
-        .map_err(|_| "config_invalid_yaml")?;
+    let over = Cell::new(false);
+    let value = Strict(0, scope, &over).deserialize(document).map_err(|_| {
+        if over.get() {
+            "config_invalid_value"
+        } else {
+            "config_invalid_yaml"
+        }
+    })?;
     if documents.next().is_some() {
         return Err("config_invalid_yaml");
     }
@@ -392,7 +532,7 @@ impl Config {
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return Ok(Self::default());
         }
-        let value = parse(bytes)?;
+        let value = parse(bytes, Scope::Root)?;
         if !value.is_mapping() {
             return Err("config_invalid_schema");
         }
@@ -409,6 +549,7 @@ impl Config {
                 .contains(&self.retention.quota_bytes)
             || !(JOURNAL_MIN_QUOTA..=JOURNAL_MAX_QUOTA).contains(&self.journal.quota_bytes)
             || !self.jobs.valid()
+            || !self.execution.valid()
             || self
                 .thinking
                 .as_deref()
@@ -448,8 +589,27 @@ impl Config {
         self.providers.mlx.models.get(asset)?.mask().ok()
     }
     fn get(&self, key: &str) -> Result<String> {
+        if let Some(project) = key.strip_prefix(EXECUTION_PROJECTS_PREFIX) {
+            project_id(project).ok_or("config_invalid_value")?;
+            return yaml(&match self.execution.projects.get(project) {
+                Some(Switch::On) => "on",
+                Some(Switch::Off) => "off",
+                None => "inherit",
+            });
+        }
         match key {
-            "" => yaml(self),
+            "" => {
+                // The complete effective configuration lists `execution`
+                // with its defaults (execution-setting.md, configuration).
+                let mut value =
+                    serde_yaml_ng::to_value(self).map_err(|_| "config_encode_failed")?;
+                if let Value::Mapping(fields) = &mut value {
+                    let execution = serde_yaml_ng::to_value(&self.execution)
+                        .map_err(|_| "config_encode_failed")?;
+                    fields.insert(Value::String("execution".into()), execution);
+                }
+                yaml(&value)
+            }
             "model" => yaml(self.model.as_ref().ok_or("config_model_unset")?),
             "providers" => yaml(&self.providers),
             "providers.ollama" => yaml(&self.providers.ollama),
@@ -476,6 +636,9 @@ impl Config {
             "jobs.queuedAgent" => yaml(&self.jobs.queued_agent),
             "jobs.clientViewers" => yaml(&self.jobs.client_viewers),
             "jobs.modelReservedPageReads" => yaml(&self.jobs.model_reserved_page_reads),
+            "execution" => yaml(&self.execution),
+            "execution.enabled" => yaml(&self.execution.enabled),
+            "execution.projects" => yaml(&self.execution.projects),
             "thinking" => yaml(&THINKING_LEVELS[usize::from(self.thinking())]),
             _ => Err("config_unknown_key"),
         }
@@ -484,7 +647,30 @@ impl Config {
         if text.len() > 4096 {
             return Err("config_value_too_large");
         }
-        let value = parse(text.as_bytes())?;
+        let scope = match key {
+            "execution" => Scope::Execution,
+            "execution.projects" => Scope::Projects,
+            _ => Scope::Other,
+        };
+        let value = parse(text.as_bytes(), scope)?;
+        if let Some(project) = key.strip_prefix(EXECUTION_PROJECTS_PREFIX) {
+            project_id(project).ok_or("config_invalid_value")?;
+            let Value::String(switch) = value else {
+                return Err("config_invalid_value");
+            };
+            // `inherit` removes the entry: absent is the global default.
+            let switch = match switch.as_str() {
+                "on" => Some(Switch::On),
+                "off" => Some(Switch::Off),
+                "inherit" => None,
+                _ => return Err("config_invalid_value"),
+            };
+            match switch {
+                Some(switch) => self.execution.projects.insert(project.to_owned(), switch),
+                None => self.execution.projects.remove(project),
+            };
+            return self.validate();
+        }
         match key {
             "model" => {
                 let Value::String(model) = value else {
@@ -576,6 +762,34 @@ impl Config {
             "jobs.modelReservedPageReads" => {
                 self.jobs.model_reserved_page_reads =
                     value.as_u64().ok_or("config_invalid_value")?
+            }
+            "execution" => {
+                // The whole mapping: both fields present, no other field.
+                let Value::Mapping(ref fields) = value else {
+                    return Err("config_invalid_value");
+                };
+                if fields.len() != 2
+                    || ["enabled", "projects"]
+                        .iter()
+                        .any(|field| !fields.contains_key(Value::String((*field).into())))
+                {
+                    return Err("config_invalid_value");
+                }
+                self.execution =
+                    serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
+            }
+            "execution.enabled" => {
+                let Value::Bool(enabled) = value else {
+                    return Err("config_invalid_value");
+                };
+                self.execution.enabled = enabled;
+            }
+            "execution.projects" => {
+                if !value.is_mapping() {
+                    return Err("config_invalid_value");
+                }
+                self.execution.projects =
+                    serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
             }
             "thinking" => {
                 let Value::String(level) = value else {
@@ -703,6 +917,9 @@ pub struct Reply {
     /// The new effective `journal.quotaBytes` after a persisted set of
     /// `journal` or `journal.quotaBytes`, which applies at once; else `None`.
     pub journal_quota: Option<u64>,
+    /// The new effective execution setting after a persisted set of any
+    /// `execution` key, which applies at once (EX11); else `None`.
+    pub execution: Option<ExecutionSetting>,
 }
 
 pub fn execute(
@@ -734,8 +951,12 @@ pub fn execute(
                 | "jobs.queuedAgent"
                 | "jobs.clientViewers"
                 | "jobs.modelReservedPageReads"
+                | "execution"
+                | "execution.enabled"
+                | "execution.projects"
                 | "thinking"
         )
+        && !key.starts_with(EXECUTION_PROJECTS_PREFIX)
     {
         return Err("config_unknown_key");
     }
@@ -744,6 +965,7 @@ pub fn execute(
     let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     let mut config = Config::read(&snapshot.bytes)?;
     let mut journal_quota = None;
+    let mut execution = None;
     if let Some(value) = value {
         config.set(key, value)?;
         let serialized = yaml(&config)?;
@@ -753,12 +975,16 @@ pub fn execute(
         if matches!(key, "journal" | "journal.quotaBytes") {
             journal_quota = Some(config.journal.quota_bytes);
         }
+        if key == "execution" || key.starts_with("execution.") {
+            execution = Some(config.execution.setting());
+        }
     } else if cancel.load(Ordering::Acquire) {
         return Err("config_cancelled");
     }
     Ok(Reply {
         value_yaml: config.get(key)?,
         journal_quota,
+        execution,
     })
 }
 
@@ -784,6 +1010,19 @@ pub fn journal_quota(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result<u
 pub fn job_limits(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result<JobLimits> {
     let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     Ok(Config::read(&snapshot.bytes)?.jobs.limits())
+}
+
+/// The effective execution setting (EX11), read once at service start with
+/// the rest of the configuration; later changes arrive in `Reply::execution`.
+/// The read runs on the caller's worker with the bounded read pipeline and has
+/// no time bound; it ends on completion, an error or cancel. An invalid file
+/// is an error: the service never runs with a guessed value.
+pub fn execution_setting(
+    runtime: RuntimeDirectory,
+    cancel: &AtomicBool,
+) -> Result<ExecutionSetting> {
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
+    Ok(Config::read(&snapshot.bytes)?.execution.setting())
 }
 
 /// Startup-only typed audit settings from the canonical validated YAML snapshot.
@@ -1080,9 +1319,10 @@ mod tests {
         let mut config = Config::read(b"").unwrap();
         assert_eq!(config.get("model"), Err("config_model_unset"));
         assert_eq!(config.get("audit.keepFiles").unwrap(), "5\n");
+        // `execution` is listed with its defaults (execution-setting.md).
         assert_eq!(
             config.get("").unwrap(),
-            "audit:\n  enabled: true\n  keepFiles: 5\n  maxFileBytes: 10485760\n"
+            "audit:\n  enabled: true\n  keepFiles: 5\n  maxFileBytes: 10485760\nexecution:\n  enabled: true\n  projects: {}\n"
         );
         config.set("model", "'provider:model'").unwrap();
         config.set("audit.enabled", "false").unwrap();
@@ -1422,7 +1662,8 @@ mod tests {
             call("journal.quotaBytes", None),
             Ok(Reply {
                 value_yaml: "4294967296\n".into(),
-                journal_quota: None
+                journal_quota: None,
+                execution: None
             })
         );
         let file = root.0.join(".asura/config.yaml");
@@ -1437,7 +1678,8 @@ mod tests {
             call("journal.quotaBytes", Some("67108864")),
             Ok(Reply {
                 value_yaml: "67108864\n".into(),
-                journal_quota: Some(JOURNAL_MIN_QUOTA)
+                journal_quota: Some(JOURNAL_MIN_QUOTA),
+                execution: None
             })
         );
         assert!(
@@ -1453,7 +1695,8 @@ mod tests {
             call("journal", Some("{quotaBytes: 1099511627776}")),
             Ok(Reply {
                 value_yaml: "quotaBytes: 1099511627776\n".into(),
-                journal_quota: Some(JOURNAL_MAX_QUOTA)
+                journal_quota: Some(JOURNAL_MAX_QUOTA),
+                execution: None
             })
         );
         assert_eq!(
@@ -1738,7 +1981,8 @@ mod tests {
             call("jobs.liveService", Some("2")),
             Ok(Reply {
                 value_yaml: "2\n".into(),
-                journal_quota: None
+                journal_quota: None,
+                execution: None
             })
         );
         assert!(
@@ -1799,5 +2043,379 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), invalid);
         let cancelled = AtomicBool::new(true);
         assert!(job_limits(runtime.clone(), &cancelled).is_err());
+    }
+    const PROJECT_A: &str = "0123456789abcdef0123456789abcdef";
+    const PROJECT_B: &str = "fedcba9876543210fedcba9876543210";
+    fn id(text: &str) -> [u8; 16] {
+        project_id(text).unwrap()
+    }
+    /// A document with `count` distinct project overrides.
+    fn overrides(count: usize) -> String {
+        let mut text = String::from("execution:\n  projects:\n");
+        for index in 1..=count {
+            text.push_str(&format!("    '{index:032x}': off\n"));
+        }
+        text
+    }
+    /// ES-01 and ES-03 unit layer: with no key every project is on; an
+    /// override beats the global default in all four combinations.
+    #[test]
+    fn es_01_es_03_default_on_and_override_wins() {
+        let setting = Config::default().execution.setting();
+        assert_eq!(setting, ExecutionSetting::default());
+        assert!(setting.enabled);
+        assert!(setting.projects.is_empty());
+        assert!(setting.effective(&id(PROJECT_A)));
+        assert_eq!(setting.project_override(&id(PROJECT_A)), None);
+        for (global, project, expected) in [
+            ("true", "on", true),
+            ("true", "off", false),
+            ("false", "on", true),
+            ("false", "off", false),
+        ] {
+            let mut config = Config::default();
+            config.set("execution.enabled", global).unwrap();
+            config
+                .set(&format!("execution.projects.{PROJECT_A}"), project)
+                .unwrap();
+            let setting = config.execution.setting();
+            assert_eq!(setting.effective(&id(PROJECT_A)), expected);
+            assert_eq!(setting.project_override(&id(PROJECT_A)), Some(expected));
+            // A project without an override follows the global default.
+            assert_eq!(setting.effective(&id(PROJECT_B)), global == "true");
+        }
+    }
+    /// ES-02 unit layer: leaf get and set, `inherit` removes, whole-mapping
+    /// sets, written only away from the defaults.
+    #[test]
+    fn es_02_execution_keys_get_set_and_inherit() {
+        let leaf = format!("execution.projects.{PROJECT_A}");
+        assert_eq!(execution_project_key(&id(PROJECT_A)), leaf);
+        let mut config = Config::default();
+        assert_eq!(config.get("execution.enabled").unwrap(), "true\n");
+        assert_eq!(config.get("execution.projects").unwrap(), "{}\n");
+        assert_eq!(
+            config.get("execution").unwrap(),
+            "enabled: true\nprojects: {}\n"
+        );
+        assert_eq!(config.get(&leaf).unwrap(), "inherit\n");
+        assert!(!yaml(&config).unwrap().contains("execution"));
+        config.set(&leaf, "off").unwrap();
+        assert_eq!(config.get(&leaf).unwrap(), "off\n");
+        let written = yaml(&config).unwrap();
+        assert_eq!(
+            written,
+            format!(
+                "audit:\n  enabled: true\n  keepFiles: 5\n  maxFileBytes: 10485760\nexecution:\n  enabled: true\n  projects:\n    {PROJECT_A}: off\n"
+            )
+        );
+        // The written file reads back to the same setting.
+        let again = Config::read(written.as_bytes()).unwrap();
+        assert_eq!(again.execution.setting(), config.execution.setting());
+        config.set(&leaf, "on").unwrap();
+        assert_eq!(config.get(&leaf).unwrap(), "on\n");
+        config.set(&leaf, "inherit").unwrap();
+        assert_eq!(config.get(&leaf).unwrap(), "inherit\n");
+        assert!(config.execution.projects.is_empty());
+        // Removing an absent entry is idempotent.
+        config.set(&leaf, "inherit").unwrap();
+        assert!(!yaml(&config).unwrap().contains("execution"));
+        config.set("execution.enabled", "false").unwrap();
+        assert!(!config.execution.setting().effective(&id(PROJECT_A)));
+        assert!(
+            yaml(&config)
+                .unwrap()
+                .contains("execution:\n  enabled: false\n  projects: {}\n")
+        );
+        // `set execution` takes the whole mapping.
+        config
+            .set(
+                "execution",
+                &format!("{{enabled: true, projects: {{'{PROJECT_A}': off, '{PROJECT_B}': on}}}}"),
+            )
+            .unwrap();
+        let setting = config.execution.setting();
+        assert!(setting.enabled);
+        assert_eq!(
+            setting.projects,
+            BTreeMap::from([(id(PROJECT_A), false), (id(PROJECT_B), true)])
+        );
+        assert_eq!(
+            config.get("execution.projects").unwrap(),
+            format!("{PROJECT_A}: off\n{PROJECT_B}: on\n")
+        );
+        config
+            .set("execution.projects", &format!("{{'{PROJECT_B}': off}}"))
+            .unwrap();
+        assert_eq!(
+            config.execution.setting().projects,
+            BTreeMap::from([(id(PROJECT_B), false)])
+        );
+        config.set("execution.projects", "{}").unwrap();
+        assert!(!yaml(&config).unwrap().contains("execution"));
+        // The complete listing shows the mapping with its defaults.
+        assert!(
+            config
+                .get("")
+                .unwrap()
+                .ends_with("execution:\n  enabled: true\n  projects: {}\n")
+        );
+    }
+    /// ES-02 unit layer: types, values, IDs and the 1,024-entry bound.
+    #[test]
+    fn es_02_execution_values_ids_and_bounds_are_validated() {
+        let leaf = format!("execution.projects.{PROJECT_A}");
+        for (key, value) in [
+            ("execution.enabled", "on"),
+            ("execution.enabled", "'true'"),
+            ("execution.enabled", "1"),
+            (leaf.as_str(), "true"),
+            (leaf.as_str(), "ON"),
+            (leaf.as_str(), "yes"),
+            (leaf.as_str(), "1"),
+            (leaf.as_str(), "[on]"),
+            ("execution.projects", "on"),
+            ("execution.projects", "[]"),
+            (
+                "execution.projects",
+                "{'0123456789abcdef0123456789abcdef': inherit}",
+            ),
+            (
+                "execution.projects",
+                "{'0123456789abcdef0123456789abcdef': true}",
+            ),
+            (
+                "execution.projects",
+                "{'0123456789ABCDEF0123456789ABCDEF': on}",
+            ),
+            (
+                "execution.projects",
+                "{'00000000000000000000000000000000': on}",
+            ),
+            ("execution.projects", "{'0123456789abcdef': on}"),
+            ("execution", "{enabled: true}"),
+            ("execution", "{projects: {}}"),
+            ("execution", "{enabled: true, projects: {}, other: 1}"),
+            ("execution", "{enabled: on, projects: {}}"),
+            ("execution", "true"),
+        ] {
+            assert_eq!(
+                Config::default().set(key, value),
+                Err("config_invalid_value"),
+                "accepted {key}: {value}"
+            );
+        }
+        for value in ["null", "!tag on", "~"] {
+            assert!(Config::default().set(&leaf, value).is_err(), "{value}");
+            assert!(
+                Config::default().set("execution.enabled", value).is_err(),
+                "{value}"
+            );
+        }
+        // Leaf keys with a bad project ID.
+        for project in [
+            "0123456789ABCDEF0123456789ABCDEF",
+            "00000000000000000000000000000000",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789abcdef0123456789abcdeg",
+            "",
+        ] {
+            let key = format!("execution.projects.{project}");
+            assert_eq!(
+                Config::default().set(&key, "on"),
+                Err("config_invalid_value"),
+                "{key}"
+            );
+            assert_eq!(Config::default().get(&key), Err("config_invalid_value"));
+        }
+        assert_eq!(
+            Config::default().get("execution.other"),
+            Err("config_unknown_key")
+        );
+        assert_eq!(
+            Config::default().set("execution.other", "on"),
+            Err("config_unknown_key")
+        );
+        // Stored documents obey the same schema.
+        for document in [
+            "execution: {enabled: on}",
+            "execution: {enabled: null}",
+            "execution: {other: true}",
+            "execution: {projects: {'0123456789ABCDEF0123456789ABCDEF': on}}",
+            "execution: {projects: {'0123456789abcdef0123456789abcdef': inherit}}",
+            "execution: {projects: {'0123456789abcdef0123456789abcdef': on, '0123456789abcdef0123456789abcdef': off}}",
+            "execution: {projects: []}",
+            "execution: null",
+        ] {
+            assert!(
+                Config::read(document.as_bytes()).is_err(),
+                "accepted {document}"
+            );
+        }
+        // 1,024 entries are accepted; a 1,025th is `config_invalid_value`,
+        // stored or set through the leaf.
+        let full = Config::read(overrides(EXECUTION_MAX_PROJECTS).as_bytes()).unwrap();
+        assert_eq!(
+            full.execution.setting().projects.len(),
+            EXECUTION_MAX_PROJECTS
+        );
+        assert_eq!(
+            Config::read(overrides(EXECUTION_MAX_PROJECTS + 1).as_bytes()).err(),
+            Some("config_invalid_value")
+        );
+        let mut copy = Config::read(overrides(EXECUTION_MAX_PROJECTS).as_bytes()).unwrap();
+        assert_eq!(
+            copy.set(&format!("execution.projects.{PROJECT_A}"), "off"),
+            Err("config_invalid_value")
+        );
+        // An existing entry may still change, and `inherit` frees a place.
+        let mut copy = Config::read(overrides(EXECUTION_MAX_PROJECTS).as_bytes()).unwrap();
+        let first = format!("execution.projects.{:032x}", 1);
+        copy.set(&first, "on").unwrap();
+        copy.set(&first, "inherit").unwrap();
+        copy.set(&format!("execution.projects.{PROJECT_A}"), "off")
+            .unwrap();
+        // The wider bound applies to `execution.projects` alone.
+        let mut wide = String::from("providers:\n  mlx:\n    models:\n");
+        for index in 0..=MAPPING_ENTRIES {
+            wide.push_str(&format!("      m{index}: {{capabilities: []}}\n"));
+        }
+        assert_eq!(
+            Config::read(wide.as_bytes()).err(),
+            Some("config_invalid_yaml")
+        );
+        let mut misplaced = String::from("projects:\n");
+        for index in 1..=MAPPING_ENTRIES + 1 {
+            misplaced.push_str(&format!("  '{index:032x}': off\n"));
+        }
+        assert_eq!(
+            Config::read(misplaced.as_bytes()).err(),
+            Some("config_invalid_yaml")
+        );
+    }
+    /// ES-02 unit layer against a scratch runtime: sets persist and report
+    /// the applied setting; reads report none; `execution_setting` reads the
+    /// persisted value; a rejected set or an invalid file changes nothing.
+    #[test]
+    fn es_02_execution_setting_persists_in_scratch_runtime() {
+        use std::os::unix::fs::DirBuilderExt;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Scratch(
+            format!(
+                "/private/tmp/asura-exec-{:x}",
+                u128::from_ne_bytes(asura_platform::random_id())
+            )
+            .into(),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root.0)
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
+        let cancel = AtomicBool::new(false);
+        let call = |key: &str, value: Option<&str>| execute(runtime.clone(), key, value, &cancel);
+        let leaf = format!("execution.projects.{PROJECT_A}");
+        assert_eq!(
+            execution_setting(runtime.clone(), &cancel),
+            Ok(ExecutionSetting::default())
+        );
+        assert_eq!(
+            call(&leaf, None),
+            Ok(Reply {
+                value_yaml: "inherit\n".into(),
+                journal_quota: None,
+                execution: None
+            })
+        );
+        let off = ExecutionSetting {
+            enabled: true,
+            projects: BTreeMap::from([(id(PROJECT_A), false)]),
+        };
+        assert_eq!(
+            call(&leaf, Some("off")),
+            Ok(Reply {
+                value_yaml: "off\n".into(),
+                journal_quota: None,
+                execution: Some(off.clone())
+            })
+        );
+        let file = root.0.join(".asura/config.yaml");
+        assert!(std::fs::read_to_string(&file).unwrap().contains(&format!(
+            "execution:\n  enabled: true\n  projects:\n    {PROJECT_A}: off\n"
+        )));
+        assert_eq!(execution_setting(runtime.clone(), &cancel), Ok(off.clone()));
+        let reply = call("execution.enabled", Some("false")).unwrap();
+        assert_eq!(
+            reply.execution,
+            Some(ExecutionSetting {
+                enabled: false,
+                ..off.clone()
+            })
+        );
+        let reply = call(
+            "execution",
+            Some(&format!(
+                "{{enabled: true, projects: {{'{PROJECT_B}': on}}}}"
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            reply.execution,
+            Some(ExecutionSetting {
+                enabled: true,
+                projects: BTreeMap::from([(id(PROJECT_B), true)]),
+            })
+        );
+        assert_eq!(
+            call("execution.projects", Some("{}")).unwrap().execution,
+            Some(ExecutionSetting::default())
+        );
+        assert!(
+            !std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("execution")
+        );
+        // Other keys report no execution setting.
+        assert_eq!(call("audit.keepFiles", Some("6")).unwrap().execution, None);
+        assert!(
+            call("", None)
+                .unwrap()
+                .value_yaml
+                .contains("execution:\n  enabled: true\n  projects: {}\n")
+        );
+        // A rejected set leaves the file unchanged.
+        call(&leaf, Some("off")).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        for (key, value) in [
+            (leaf.as_str(), "maybe"),
+            ("execution.projects.0123456789ABCDEF0123456789ABCDEF", "on"),
+            ("execution.enabled", "on"),
+            ("execution", "{enabled: true}"),
+            ("execution.other", "on"),
+        ] {
+            assert!(call(key, Some(value)).is_err(), "accepted {key}: {value}");
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        // An invalid file fails every reader and is never overwritten.
+        std::fs::write(
+            &file,
+            b"execution: {projects: {'0123456789ABCDEF0123456789ABCDEF': on}}\n",
+        )
+        .unwrap();
+        let invalid = std::fs::read(&file).unwrap();
+        assert_eq!(
+            execution_setting(runtime.clone(), &cancel),
+            Err("config_invalid_value")
+        );
+        assert!(call(&leaf, Some("on")).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), invalid);
+        let cancelled = AtomicBool::new(true);
+        assert!(execution_setting(runtime.clone(), &cancelled).is_err());
     }
 }
