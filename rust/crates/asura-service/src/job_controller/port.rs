@@ -148,6 +148,31 @@ pub(crate) trait PayloadPort {
     /// settlement; the worker is abandoned and its staging stays an
     /// unverified prefix for the next start's recovery.
     fn abandon(&mut self, job: Id, capture: Option<capture_worker::Handle>);
+    /// The stored bytes of a live job's stdout and stderr: the readable
+    /// watermark of each payload (J3 state block, `job wait` and
+    /// `JobObserve` new-output ends). Arithmetic on the ledger; it never
+    /// blocks. The controller reads it at each poll and keeps the maximum.
+    ///
+    /// The default reports nothing stored: until the payload owner reads
+    /// the ledger watermark (J34-E, with a public watermark read from the
+    /// payload store), snapshots show 0 bytes and no wait ends on new
+    /// output.
+    fn stored(&self, job: Id) -> [u64; 2] {
+        let _ = job;
+        [0; 2]
+    }
+    /// The disk-space recheck (TJ-Q9): measure free space again. Called
+    /// at a paced recheck only while a queue head stays blocked by
+    /// `disk_space`, once per recheck. Nonblocking: it sets the payload
+    /// owner's one pending-measurement flag and wakes its maintenance
+    /// worker; a request while a measurement is pending adds nothing. A
+    /// changed effective quota reaches the controller as a `space_epoch`
+    /// change. Before recovery, or after the store becomes unavailable, it
+    /// does nothing.
+    ///
+    /// The default does nothing until the payload owner implements it
+    /// (J34-E, on the payload maintenance worker).
+    fn refresh_space(&mut self) {}
 }
 
 /// A granted reservation: the capture worker's store and the victims it

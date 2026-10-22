@@ -110,6 +110,10 @@ pub(super) struct FixturePayloads {
     pub committed: Vec<(Id, u64, Outcome, bool)>,
     pub abandoned: Vec<(Id, bool)>,
     pub victims: Vec<Victim>,
+    /// Stored bytes per job (the watermark the payload owner reads).
+    pub stored: BTreeMap<Id, [u64; 2]>,
+    /// `refresh_space` calls (TJ-Q9 disk-space recheck).
+    pub refreshes: usize,
     store: Arc<PayloadStore>,
 }
 impl FixturePayloads {
@@ -124,6 +128,8 @@ impl FixturePayloads {
             committed: Vec::new(),
             abandoned: Vec::new(),
             victims: Vec::new(),
+            stored: BTreeMap::new(),
+            refreshes: 0,
             store: Arc::new(PayloadStore::open(runtime).expect("payload store")),
         }
     }
@@ -163,6 +169,12 @@ impl PayloadPort for FixturePayloads {
     }
     fn abandon(&mut self, job: Id, capture: Option<capture_worker::Handle>) {
         self.abandoned.push((job, capture.is_some()));
+    }
+    fn stored(&self, job: Id) -> [u64; 2] {
+        self.stored.get(&job).copied().unwrap_or_default()
+    }
+    fn refresh_space(&mut self) {
+        self.refreshes += 1;
     }
 }
 

@@ -1,7 +1,12 @@
 //! The job controller (tool-job-controller.md, J2 implementation details):
 //! per-agent job queues, slots and start conditions, the job lifecycle
 //! (TJ-S1), cancel and revocation, the record outbox for kinds 26 to 28,
-//! start-time recovery, and the job audit events.
+//! start-time recovery, and the job audit events. J3 and J4 add job
+//! views (kind 29 state blocks and live listings), parked waits (the yield
+//! window, the model's `job wait`, client observes and listings), the job
+//! revision, live counts, the outlived-turn derivation (EX12), revocation
+//! with an origin filter and the EX11 check at slot grant
+//! (tool-job-controller.md, J3 and J4 implementation details).
 //!
 //! The conversation owner holds the controller on the reactor beside its
 //! `Payloads`. Every method does bounded in-memory work: no file, journal or
@@ -13,6 +18,8 @@
 
 mod port;
 mod reasons;
+mod views;
+mod waits;
 
 #[cfg(test)]
 mod fixture;
@@ -26,6 +33,10 @@ pub(crate) use port::{
     SlotStart, SlotStartError,
 };
 pub(crate) use reasons::{BlockReason, BusyReason, Counts, MAX_UNSETTLED, block_text};
+#[allow(unused_imports)] // J34-E and J4-R name these types
+pub(crate) use views::{JobView, MAX_OUTLIVED_IDS, Outlived};
+#[allow(unused_imports)] // J34-E and J4-R name these types
+pub(crate) use waits::{CLIENT_WAITS, TurnWaitEnd, WaitDone, WaitEnding, WaitKey, WaitStart};
 
 use crate::{capture_worker, tools};
 use asura_platform::{
@@ -45,6 +56,7 @@ use asura_storage::config::JobLimits;
 use asura_storage::payload::Victim;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use waits::Parked;
 
 /// Controller events per drain (J2 numeric limits).
 pub(crate) const EVENTS_PER_DRAIN: usize = 64;
@@ -55,9 +67,9 @@ pub(crate) const PENDING_INSTALLS: usize = crate::payload_owner::PENDING_INSTALL
 /// Settled jobs whose identity the controller remembers after it releases
 /// them, so a duplicate start still returns the existing job.
 const RETIRED: usize = MAX_UNSETTLED;
-/// The `disk_space` recheck: 1, 1, 2, 3, 5, 8 s and so on, at most 60 s
-/// apart (owner pattern of 2026-10-19). Pacing only; it ends nothing.
-const DISK_RECHECK_MAX: Duration = Duration::from_secs(60);
+/// The paced delays: 1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart
+/// (owner pattern of 2026-10-19). Pacing only; it ends nothing.
+const PACING_MAX: Duration = Duration::from_secs(60);
 
 /// An agent: (conversation ID, agent number). Agent 0 is the main agent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -109,7 +121,7 @@ impl Origin {
         }
     }
     /// The one job ID of this origin ([job identity](J2-E6)).
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
     pub(crate) fn job_id(&self) -> Id {
         journal::job_id(&self.journal())
     }
@@ -127,7 +139,7 @@ impl Origin {
 /// One start. The secrets and redaction move into the slot at its start;
 /// `duplicate_digest` is a keyed digest of the arguments, held in memory
 /// only, that tells a duplicate start from a conflicting one.
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 pub(crate) struct StartRequest {
     pub origin: Origin,
     pub agent: AgentKey,
@@ -142,7 +154,7 @@ pub(crate) struct StartRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 pub(crate) enum Admission {
     Accepted { job: Id },
     Existing { job: Id },
@@ -151,7 +163,7 @@ pub(crate) enum Admission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 pub(crate) enum Requester {
     Model,
     Client,
@@ -159,13 +171,32 @@ pub(crate) enum Requester {
     Service,
 }
 impl Requester {
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
     fn journal(self) -> JobRequester {
         match self {
             Self::Model => JobRequester::Model,
             Self::Client => JobRequester::Client,
             Self::Person => JobRequester::Person,
             Self::Service => JobRequester::Service,
+        }
+    }
+}
+
+/// Which origins a revocation reaches (EX11 revokes model jobs only,
+/// ES-R5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OriginFilter {
+    All,
+    #[cfg_attr(not(test), allow(dead_code))] // J34-E revokes on an execution change
+    Model,
+    #[allow(dead_code)] // the person-command packets revoke person jobs
+    Person,
+}
+impl OriginFilter {
+    fn admits(self, origin: &Origin) -> bool {
+        match self {
+            Self::All => true,
+            Self::Model => !origin.is_person(),
+            Self::Person => origin.is_person(),
         }
     }
 }
@@ -189,7 +220,6 @@ pub(crate) enum JobState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 pub(crate) enum CancelReply {
     /// The requested state; the settled state follows from slot events.
     Accepted(JobState),
@@ -212,7 +242,7 @@ pub(crate) enum JobEvent {
 
 /// What the controller knows of one job.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 pub(crate) struct JobStatus {
     pub state: JobState,
     pub origin: Origin,
@@ -338,6 +368,17 @@ struct Job {
     /// The journal became unavailable: no settlement will be recorded.
     abandoned: bool,
     recovered: bool,
+    /// The spawned notice: the elapsed time of a state block runs from it.
+    spawned_at: Option<Instant>,
+    /// Why a `CapturePaused` job paused (state block reason).
+    pause: Option<journal::JobPauseReason>,
+    /// The kind 26 frame sequence once committed: it orders listings
+    /// (J3-E5) and the outlived count (EX12).
+    sequence: Option<u64>,
+    /// Kind 26 field 4, the intent wall time.
+    intent_ms: u64,
+    /// Stored bytes per stream (the readable watermark) at the last poll.
+    stored: [u64; 2],
 }
 impl Job {
     fn new(
@@ -384,28 +425,40 @@ impl Job {
             scratch_retained: false,
             abandoned: false,
             recovered: false,
+            spawned_at: None,
+            pause: None,
+            sequence: None,
+            intent_ms: 0,
+            stored: [0; 2],
         }
     }
 }
 
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 struct Retired {
     job: Id,
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    // submit reads it (J34-E)
     digest: [u8; 32],
     origin: Origin,
     agent: AgentKey,
+    project: Id,
+    sequence: Option<u64>,
+    intent_ms: u64,
     outcome: Outcome,
 }
 
-/// The paced `disk_space` recheck: the Fibonacci step and the next time.
+/// Fibonacci pacing: the step and the next time. The controller's
+/// `disk_space` recheck uses it, and the owner's start-time limits read
+/// retry (TJ-F5) reuses it until PACE-1 replaces it with the shared helper.
 #[derive(Clone, Copy, Debug)]
-struct DiskRecheck {
+pub(crate) struct Pacing {
     at: Instant,
     previous: Duration,
     current: Duration,
 }
-impl DiskRecheck {
-    fn start(now: Instant) -> Self {
+impl Pacing {
+    /// The first step: `now` plus 1 s.
+    pub(crate) fn start(now: Instant) -> Self {
         let first = Duration::from_secs(1);
         Self {
             at: now + first,
@@ -413,11 +466,17 @@ impl DiskRecheck {
             current: first,
         }
     }
-    fn advance(&mut self, now: Instant) {
-        let next = (self.previous + self.current).min(DISK_RECHECK_MAX);
+    /// The next step from `now`: 1, 1, 2, 3, 5, 8 s and so on, at most
+    /// 60 s.
+    pub(crate) fn advance(&mut self, now: Instant) {
+        let next = (self.previous + self.current).min(PACING_MAX);
         self.previous = self.current;
         self.current = next;
         self.at = now + next;
+    }
+    /// When the paced step is due.
+    pub(crate) fn at(&self) -> Instant {
+        self.at
     }
 }
 
@@ -447,7 +506,19 @@ pub(crate) struct JobController {
     /// A wake event since the last head evaluation.
     dirty: bool,
     seen: Option<(bool, usize, u64)>,
-    disk: Option<DiskRecheck>,
+    disk: Option<Pacing>,
+    /// The job revision (J4 control handler): increments on every
+    /// admission, start, state change and settlement, and on the owner's
+    /// retention and execution setting changes. In memory; 1 at start.
+    revision: u64,
+    /// Parked waits: at most one per agent (yield window or `job wait`,
+    /// AE-03) and at most `CLIENT_WAITS` client observes and listings.
+    waits: BTreeMap<WaitKey, Parked>,
+    /// Ended waits for the owner, oldest first.
+    done: VecDeque<WaitDone>,
+    /// The EX11 effective value of a project, checked at slot grant for a
+    /// model-origin head. Absent: execution is on.
+    execution: Option<Box<dyn Fn(Id) -> bool>>,
 }
 
 impl JobController {
@@ -495,6 +566,10 @@ impl JobController {
             dirty: true,
             seen: None,
             disk: None,
+            revision: 1,
+            waits: BTreeMap::new(),
+            done: VecDeque::new(),
+            execution: None,
         }
     }
 
@@ -524,6 +599,8 @@ impl JobController {
                 JobState::Interrupted,
             );
             job.intent = Intent::Committed;
+            job.sequence = Some(u.intent.sequence);
+            job.intent_ms = u.time;
             job.recovered = true;
             job.reason = JobReason::Restart;
             job.settled = Some(Box::new(JobSettled::interrupted(u.job, now)));
@@ -541,7 +618,7 @@ impl JobController {
 
     // ----- Admission -----
 
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
     pub(crate) fn submit(&mut self, request: StartRequest, _now: Instant) -> Admission {
         let id = request.origin.job_id();
         if let Some(job) = self.jobs.get(&id) {
@@ -612,7 +689,7 @@ impl JobController {
 
     /// Jobs with a kind 26 (or about to get one) and no committed kind 28,
     /// plus person waiters: the 64-job bound.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
     fn unsettled(&self) -> usize {
         self.jobs
             .values()
@@ -622,7 +699,6 @@ impl JobController {
 
     // ----- Cancel and revocation -----
 
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
     pub(crate) fn cancel(
         &mut self,
         job: Id,
@@ -666,9 +742,27 @@ impl JobController {
     /// (`identity_changed`, or `shutdown`): queued starts settle
     /// `not_started`, live jobs get `T`.
     pub(crate) fn revoke_project(&mut self, project: Id, reason: JobReason) {
-        self.revoke(|j| j.project == project, None, reason);
+        self.revoke(Some(project), OriginFilter::All, reason);
     }
-    fn revoke(&mut self, filter: impl Fn(&Job) -> bool, except: Option<Id>, reason: JobReason) {
+    /// Revokes the jobs of `project` (every project when `None`) whose
+    /// origin passes `origin`, with a service reason. EX11 calls it with
+    /// `OriginFilter::Model` and `execution_off` for each project turned
+    /// off (ES-05): queued model starts settle `not_started` with kinds 27
+    /// and 28, starting and live jobs get `T` and one kind 27, person jobs
+    /// and other projects are untouched (ES-R5).
+    pub(crate) fn revoke(&mut self, project: Option<Id>, origin: OriginFilter, reason: JobReason) {
+        self.revoke_where(
+            |j| project.is_none_or(|p| j.project == p) && origin.admits(&j.origin),
+            None,
+            reason,
+        );
+    }
+    fn revoke_where(
+        &mut self,
+        filter: impl Fn(&Job) -> bool,
+        except: Option<Id>,
+        reason: JobReason,
+    ) {
         if reason.requester() != Some(JobRequester::Service) {
             return;
         }
@@ -874,7 +968,20 @@ impl JobController {
             return;
         }
         self.closed = true;
-        self.revoke(|_| true, None, JobReason::Shutdown);
+        self.revoke_where(|_| true, None, JobReason::Shutdown);
+        self.close_client_waits();
+    }
+
+    /// The owner's EX11 effective value of a project, read when a slot is
+    /// granted to a model-origin queue head. The owner keeps the one copy
+    /// of the setting; the closure reads it.
+    #[cfg_attr(not(test), allow(dead_code))] // J34-E adds the production caller
+    pub(crate) fn set_execution(&mut self, check: Box<dyn Fn(Id) -> bool>) {
+        self.execution = Some(check);
+        self.dirty = true;
+    }
+    fn execution_on(&self, project: Id) -> bool {
+        self.execution.as_ref().is_none_or(|check| check(project))
     }
 
     // ----- Reactor -----
@@ -890,7 +997,8 @@ impl JobController {
             .values()
             .filter_map(|j| j.slot.as_ref())
             .filter_map(|s| s.next_deadline(now))
-            .chain(self.disk.map(|d| d.at))
+            .chain(self.disk.map(|d| d.at()))
+            .chain(self.wait_deadline())
             .min()
     }
 
@@ -911,9 +1019,10 @@ impl JobController {
                 slot.poll(now, &mut events);
             }
             for event in events.drain(..) {
-                self.slot_event(id, event, payloads);
+                self.slot_event(id, event, now, payloads);
             }
         }
+        self.refresh_stored(payloads);
         self.deliver(payloads);
         self.release_slots();
         let seen = (
@@ -921,11 +1030,23 @@ impl JobController {
             payloads.pending_installs(),
             payloads.space_epoch(),
         );
-        let due = self.disk.is_some_and(|d| now >= d.at);
+        let due = self.disk.is_some_and(|d| now >= d.at());
         if self.dirty || due || self.seen != Some(seen) {
             self.seen = Some(seen);
             self.dirty = false;
             self.evaluate(now, payloads, due);
+        }
+        self.check_waits(now);
+    }
+
+    /// Reads each live capture's stored bytes from the payload owner (the
+    /// readable watermark), for state blocks and the `new output` ends.
+    fn refresh_stored(&mut self, payloads: &dyn PayloadPort) {
+        for job in self.jobs.values_mut() {
+            if job.slot_started && job.committed.is_none() && !job.abandoned {
+                let [out, err] = payloads.stored(job.id);
+                job.stored = [job.stored[0].max(out), job.stored[1].max(err)];
+            }
         }
     }
 
@@ -969,13 +1090,14 @@ impl JobController {
         let id = self.intents.pop_front()?;
         let job = self.jobs.get_mut(&id)?;
         job.intent = Intent::InFlight;
+        job.intent_ms = wall_ms();
         self.in_flight = Some((id, Kind::Intent));
         Some((
             id,
             journal::Record::JobIntent(JobIntent {
                 origin: job.origin.journal(),
                 agent: job.agent.agent,
-                time: wall_ms(),
+                time: job.intent_ms,
             }),
         ))
     }
@@ -994,7 +1116,7 @@ impl JobController {
             return;
         }
         match (kind, result) {
-            (Kind::Intent, Ok(_)) => self.intent_committed(id),
+            (Kind::Intent, Ok(sequence)) => self.intent_committed(id, sequence),
             (Kind::Intent, Err(writer::Error::JournalQuota | writer::Error::JournalDiskSpace)) => {
                 self.journal_held = true;
                 self.intent_held(id);
@@ -1019,12 +1141,14 @@ impl JobController {
         }
     }
 
-    fn intent_committed(&mut self, id: Id) {
+    fn intent_committed(&mut self, id: Id, sequence: u64) {
         self.dirty = true;
+        self.bump_revision();
         let Some(job) = self.jobs.get_mut(&id) else {
             return;
         };
         job.intent = Intent::Committed;
+        job.sequence = Some(sequence);
         if job.state == JobState::Starting
             && job.cancel.is_none()
             && let Some(start) = job.held_start.take()
@@ -1171,19 +1295,29 @@ impl JobController {
             digest: job.digest,
             origin: job.origin,
             agent: job.agent,
+            project: job.project,
+            sequence: job.sequence,
+            intent_ms: job.intent_ms,
             outcome: job.settled.map_or(Outcome::Interrupted, |s| s.outcome),
         });
     }
 
     // ----- Slot events -----
 
-    fn slot_event(&mut self, id: Id, event: SlotEvent, payloads: &mut dyn PayloadPort) {
+    fn slot_event(
+        &mut self,
+        id: Id,
+        event: SlotEvent,
+        now: Instant,
+        payloads: &mut dyn PayloadPort,
+    ) {
         let Some(job) = self.jobs.get_mut(&id) else {
             return;
         };
         match event {
             SlotEvent::Spawned => {
                 job.spawned = true;
+                job.spawned_at = Some(now);
                 if job.state == JobState::Starting {
                     // A cancel before spawn: the slot wrote `T` at once.
                     job.state = if job.cancel.is_some() {
@@ -1205,7 +1339,7 @@ impl JobController {
             SlotEvent::IdentityChanged => {
                 job.no_process = Some(JobReason::ProjectChanged);
                 let project = job.project;
-                self.revoke(
+                self.revoke_where(
                     |j| j.project == project,
                     Some(id),
                     JobReason::IdentityChanged,
@@ -1234,7 +1368,13 @@ impl JobController {
                 }
             }
             SlotEvent::CapturePaused(pause) => match job.state {
-                JobState::Running => self.set_state(id, JobState::CapturePaused),
+                JobState::Running => {
+                    job.pause = Some(match pause {
+                        capture_worker::PauseReason::Quota => journal::JobPauseReason::Quota,
+                        capture_worker::PauseReason::Enospc => journal::JobPauseReason::DiskSpace,
+                    });
+                    self.set_state(id, JobState::CapturePaused);
+                }
                 JobState::Draining | JobState::Finalizing => {
                     // Quota or ENOSPC in `Draining` is a cancel trigger:
                     // capture discards and the reason is recorded.
@@ -1255,6 +1395,7 @@ impl JobController {
             },
             SlotEvent::CaptureResumed => {
                 if job.state == JobState::CapturePaused {
+                    job.pause = None;
                     self.set_state(id, JobState::Running);
                 }
             }
@@ -1445,6 +1586,7 @@ impl JobController {
                     agents.rotate_left(split);
                 }
                 let mut started = false;
+                let mut execution_off = None;
                 for agent in agents {
                     let Some(head) = self.queues.get(&agent).and_then(|q| q.front()).copied()
                     else {
@@ -1454,6 +1596,13 @@ impl JobController {
                         continue;
                     };
                     let mut block = self.head_block(agent, job, payloads);
+                    if block.is_ok() && !job.origin.is_person() && !self.execution_on(job.project) {
+                        // EX11: a change revokes queued model starts in
+                        // the same reactor step, so this cannot hold in a
+                        // correct owner; settle the head `not_started`.
+                        execution_off = Some(head);
+                        break;
+                    }
                     let mut admitted = None;
                     if block.is_ok() {
                         match payloads.admit(head, &job.origin) {
@@ -1476,6 +1625,18 @@ impl JobController {
                         (Ok(()), None) => {}
                     }
                 }
+                if let Some(head) = execution_off {
+                    tracing::warn!("job_execution_off_at_grant");
+                    self.trigger(
+                        head,
+                        Trigger {
+                            requester: JobRequester::Service,
+                            reason: JobReason::ExecutionOff,
+                            kill: false,
+                        },
+                    );
+                    continue;
+                }
                 if !started {
                     break;
                 }
@@ -1483,9 +1644,13 @@ impl JobController {
         }
         self.disk = match (disk_blocked, self.disk) {
             (false, _) => None,
-            (true, None) => Some(DiskRecheck::start(now)),
+            (true, None) => Some(Pacing::start(now)),
             (true, Some(mut d)) => {
                 if disk_due {
+                    // TJ-Q9: the head is still blocked by `disk_space` at
+                    // this paced recheck: ask the payload owner to measure
+                    // free space again, once per recheck.
+                    payloads.refresh_space();
                     d.advance(now);
                 }
                 Some(d)
@@ -1612,6 +1777,7 @@ impl JobController {
         out.extend(self.events.drain(..n));
     }
     fn event(&mut self, event: JobEvent) {
+        self.bump_revision();
         let same = |e: &JobEvent| match (e, &event) {
             (JobEvent::State(a, _), JobEvent::State(b, _)) => a == b,
             (JobEvent::Queued(a, _), JobEvent::Queued(b, _)) => a == b,
@@ -1629,7 +1795,7 @@ impl JobController {
         }
     }
 
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
     pub(crate) fn status(&self, job: Id) -> Option<JobStatus> {
         if let Some(j) = self.jobs.get(&job) {
             let text = j.block.map(|reason| {
@@ -1680,7 +1846,7 @@ impl JobController {
     }
 }
 
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 fn duplicate(existing: [u8; 32], proposed: [u8; 32], job: Id) -> Admission {
     if existing == proposed {
         Admission::Existing { job }

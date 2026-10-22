@@ -4,7 +4,7 @@
 //! two tables in step at compile time.
 use asura_storage::audit as record;
 use asura_storage::authority::conversation::{
-    JobCaptureState, JobCleanup, JobOutcome, JobReason, JobRequester,
+    JobBlockReason, JobCaptureState, JobCleanup, JobOutcome, JobReason, JobRequester,
 };
 
 /// The fixed bound on unsettled jobs in the service: the checkpoint and
@@ -39,6 +39,20 @@ impl BlockReason {
             Self::DiskSpace => A::DiskSpace,
         }
     }
+    /// The kind 29 state block reason (codes 1 to 9 in condition order).
+    pub(crate) fn journal(self) -> JobBlockReason {
+        match self {
+            Self::Recovering => JobBlockReason::Recovering,
+            Self::JournalUnavailable => JobBlockReason::JournalUnavailable,
+            Self::JournalHeld => JobBlockReason::JournalHeld,
+            Self::PayloadUnavailable => JobBlockReason::PayloadUnavailable,
+            Self::AgentSlots => JobBlockReason::AgentSlots,
+            Self::ServiceSlots => JobBlockReason::ServiceSlots,
+            Self::PendingInstalls => JobBlockReason::PendingInstalls,
+            Self::Quota => JobBlockReason::Quota,
+            Self::DiskSpace => JobBlockReason::DiskSpace,
+        }
+    }
 }
 
 /// The live values that the brief texts of reasons 5 to 7 show.
@@ -54,7 +68,6 @@ pub(crate) struct Counts {
 }
 
 /// The brief text of a blocking reason with its live values.
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 pub(crate) fn block_text(reason: BlockReason, counts: &Counts) -> String {
     let cleanup = |n: usize| {
         if n == 0 {
@@ -91,13 +104,13 @@ pub(crate) fn block_text(reason: BlockReason, counts: &Counts) -> String {
 
 /// Why a submission was refused before any record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 pub(crate) enum BusyReason {
     QueueFull,
     JobsFull,
     Closed,
 }
-#[cfg_attr(not(test), allow(dead_code))] // J3 and J4 show the code and text
+#[cfg_attr(not(test), allow(dead_code))] // J34-E and J4-T show the code and text
 impl BusyReason {
     pub(crate) fn code(self) -> &'static str {
         match self {

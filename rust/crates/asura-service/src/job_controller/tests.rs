@@ -1449,3 +1449,6 @@ fn service_cancel_and_reactor_hooks() {
     assert!(interests.is_empty());
     assert!(h.slots.borrow().closes.is_empty());
 }
+
+// J3 and J4 controller extensions (J34-K).
+mod j34;
