@@ -4564,7 +4564,7 @@ sequenceDiagram
 | Step | Owned paths | Tests |
 | --- | --- | --- |
 | J34-C2 `Ledger::stored` | `asura-storage/src/payload/store.rs` and its unit tests; `asura-storage/tests/payload_store.rs` | Unit: `None` for an unknown job; the live watermark of each stream; the recorded total after `settle`, after `abandoned` and after recovery; no regression when an unconfirmed settlement keeps the watermark. Integration: a real capture's stored bytes equal the staging file sizes after each append |
-| J3-D2 stored signal | `asura-service/src/capture_worker.rs`, `capture_worker/tests.rs`, `asura-service/tests/capture_worker.rs`; in `asura-service/src/exec_cmd_worker.rs`, the `take_stored` call in `Slot::step`, and its case in `exec_cmd_worker/tests.rs` | Unit: a burst of appends with no clear gives one wake; a clear then an append gives a second wake; a discarded chunk and a zero-byte write give none; the channel receives no new message kind; the slot clears the flag when its event queue is full. Integration: a real flood of 64 chunks; after the last append a wake arrives and `Ledger::stored` equals the bytes written |
+| J3-D2 stored signal | `asura-service/src/capture_worker.rs`, `capture_worker/tests.rs`, `asura-service/tests/capture_worker.rs`; in `asura-service/src/exec_cmd_worker.rs`, the `take_stored` call in `Slot::step`, and its case in `exec_cmd_worker/tests.rs` | Unit: a burst of appends with no clear gives one wake; a clear then an append gives a second wake; a discarded chunk and a zero-byte write give none; the channel receives no new message kind; the slot clears the flag when its event queue is full. Integration: a real flood of 64 chunks; after the last append a wake arrives and `Ledger::stored` equals the bytes written. J3-D2 delivered this case in the crate (`j3t_22_flood_ends_with_a_wake_and_every_byte_stored`), because `capture_worker` is `pub(crate)` and `test_support` did not expose the wake or `take_stored`; J34-E adds the `tests/capture_worker.rs` case through a `test-support`-gated entry (recorded 2026-10-22) |
 | J34-E payload owner | `asura-service/src/payload_owner.rs`; for the default body of `PayloadPort::stored` only, `job_controller/port.rs`, after J34-K2 | Integration: J3T-08 shows growing stored bytes while a job runs; J3T-09 and J4T-04 end on the last output of a job that then writes nothing more |
 
 ### J3 failure handling
@@ -4664,8 +4664,11 @@ journal format remains `1`. Implementation state on 2026-10-22: the J4
 control contract and client calls (J34-W) are merged on `main`. On the J3
 integration branch, not merged, J34-S implements the J4 records (kind 30,
 wall times, listing entries), J34-C the pin hold and delete in the payload
-store, and J4-T the TUI. The control handler (J4-R) and the service wiring
-(J34-E) are not implemented, so no J4 request is served yet.
+store, J4-T the TUI and J4-R the control handler (`5b7f55b`). The J4-R
+report found five gaps, which this section now designs: the storage step
+J34-S2, the platform step J34-A and the handler step J4-R2
+([TJ-P3](#tj-p3-j3-and-j4-packet-order-and-enablement)). The service wiring
+(J34-E) is not implemented, so no J4 request is served yet.
 
 ### J4 scope
 
@@ -4753,11 +4756,15 @@ the service refuses more with `notes_full` or `retention_full`. Replay checks
 the field rules and that the named job exists; the counts are append-time
 bounds of the service.
 
-A person note's text is display-redacted before the record: each detected
-secret becomes the unnumbered placeholder `$ASURA_SECRET_0`, so the record
-holds no secret and no number table. A model note's text is the `text` field of
-its kind 14 stored arguments, already redacted; kind 30 holds no second copy
-(TCR-O5).
+A person note's text is redacted before the record by
+[person note redaction](secret-detection.md#person-note-redaction): each
+detected secret becomes the unnumbered placeholder `$ASURA_SECRET_0`, so the
+record holds no secret and no number table. A placeholder that the person
+typed, such as `$ASURA_SECRET_3`, stays as typed, so a note can cite the job's
+output placeholders (selected, engineering, 2026-10-22, from the J4-R report).
+A model note's text is the `text` field of its kind 14 stored arguments,
+already redacted; kind 30 holds no second copy (TCR-O5). The `JobFacts` read
+returns that text with the note ([listings](#job-listings-and-index-entries)).
 
 Maximum payload 2,094 bytes; maximum frame 2,278 bytes. While a model `note`
 call is pending, `reserve()` holds a model-note frame of 242 bytes beside its
@@ -4791,8 +4798,8 @@ New journal worker reads, each bounded:
 
 | Read | Reply |
 | --- | --- |
-| `Jobs { scope, before, limit ≤ 9 }` | Entries newest first by kind 26 sequence, merged from live state, delta and runs, each with its kind 26, 27 and 28 records, the command source locator and the retention summary (pinned, deleted, note count) from `E`; at most 9 entries and 40 KiB |
-| `JobFacts { job }` | One job's records, command and cwd from its kind 14 or kind 31, and its `E` entries with their kind 30 frames (at most 64) |
+| `Jobs { scope, before, limit ≤ 9 }` | Entries newest first by kind 26 sequence, merged from live state, delta and runs, each with its kind 26, 27 and 28 records, the command source locator, the command excerpt and the retention summary (pinned, deleted, note count) from `E`; `before_found`; at most 9 entries and 40 KiB |
+| `JobFacts { job }` | One job's records, command and cwd from its kind 14 or kind 31, its `E` entries with their kind 30 frames (at most 64), and the cited text of each model note (at most 16) |
 | `Settlements { conversation, after, through, limit ≤ 9 }` | `U` entries in the range, newest first, with their kind 28 and command source (J5) |
 
 A scope of all projects also checks each entry's project against the registry;
@@ -4801,6 +4808,51 @@ journal has no unregister record, so the journal worker's `Jobs` read returns
 every project's entries and cannot apply this check. The job control handler
 (J4-R) applies it to the reply, against the service's project registry
 (recorded 2026-10-22 from J34-S).
+
+**Excerpts, model note texts and the cursor check** (selected, engineering,
+2026-10-22, from the J4-R report; step J34-S2). The J4-R handler needed one
+`JobFacts` read for each listed entry to get its command, a second `Jobs`
+read to check a cursor, and could not show model notes. The journal worker
+now returns these facts in the reads it already serves:
+
+- **Command excerpt.** `JobListing` gains `excerpt: String`, the
+  `JobEntry.command` text: the first line of the stored command, at most 192
+  bytes including the `…` mark, cut at a UTF-8 boundary, control characters
+  as spaces. The journal worker builds it from the command source frame while
+  it builds the listing. For a model job the source is the kind 14's stored
+  `command` argument, which is the display text for a whole-command call
+  (SL7); a person job's kind 31 source follows in P2. One frame read per
+  entry, at most 9 per `Jobs` read, runs on the journal worker. Storage owns
+  the two functions, `exec_cmd_command(&ToolCall) -> Option<String>` and
+  `command_excerpt(&str) -> String`, in the new
+  `asura-storage/src/authority/conversation/job_command.rs`, exported with the
+  other journal types. The copies in `job_control.rs` (`command_excerpt`) and
+  `job_text.rs` (`exec_cmd_command`) are deleted. The model's 200-byte
+  `status` excerpt stays in `job_text.rs`, because it is a different text.
+- **Size.** Per entry the records hold at most 41 + 19 + 4,094 bytes (kinds
+  26, 27 and 28) and the excerpt 192 bytes: 4,346 bytes. Nine entries hold
+  39,114 bytes, within the 40 KiB (40,960-byte) bound.
+- **Cursor check.** The `Jobs` reply gains `before_found: bool`. It is true
+  when `before` is present and a job of the scope has its kind 26 at exactly
+  that sequence, in the live state, the delta or the runs. The journal worker
+  answers it with one index or state lookup. The handler replies
+  `invalid_cursor` when it is false. The extra `Jobs { before + 1, limit 1 }`
+  read of J4-R is removed. This was chosen over keeping that read because it
+  removes a journal round trip from every paged list, and the journal worker
+  already holds the keys.
+- **Model note texts.** `JobRecords` gains
+  `model_notes: Vec<(Locator, String)>`: for each kind 30 `note` by the model,
+  its kind 30 locator and the `text` argument of the cited kind 14, as
+  stored (redacted). The journal worker finds the cited frame with
+  `state.rs::call_frame(operation, ordinal, index)` and checks that it is a
+  `run` with code 16 for this job, as JR16 requires. A cited frame that cannot
+  be read, or holds no `text` string, makes the read `Corrupt`, as for the
+  read's other frames. At most 16 notes, so the read adds at most 16 frame
+  reads and 32,768 bytes of text.
+- **Fixture.** The new fields change the one struct literal of `JobListing`
+  and `JobRecords` outside storage, in `asura-service/src/job_control/tests.rs`.
+  J34-S2 adds the fields there, so `asura-service` still compiles; J4-R2 then
+  owns the file.
 
 `E` bound (selected, engineering, confirmed 2026-10-22 from J34-S). Replay's
 retention summary of one job reads at most 64 `E` entries and returns `Limit`
@@ -5031,8 +5083,59 @@ journal worker's reads and the payload owner's page pool. No handler blocks.
 - **Retain.** The handler validates, redacts a person note, appends kind 30 and
   replies after the commit. A held journal makes the request wait for room; the
   person's cancel ends the wait with `outcome_unconfirmed` (J1-0 client rule).
+- **Note redaction readiness** (selected, engineering, 2026-10-22, from the
+  J4-R report). The handler never compiles the secret rule set. `Ctx` gains
+  `rules: Option<Result<&'static RuleSet, SelfCheckError>>`, which the owner
+  fills from `secrets::compiled()` at each call
+  ([rule set readiness](secret-detection.md#rule-set-readiness)). A note
+  retain that finds `None` after its checks waits in the new `Wait::Rules`
+  and keeps its retain turn. `JobControl::poll` resumes it when `rules` is
+  `Some`. `Some(Ok)` redacts with `secrets::note_redacted`; `Some(Err)` replies
+  `unavailable`. The wait ends on readiness, detach, the person's cancel
+  (`outcome_unconfirmed` in the client) or shutdown (`Draining`); it has no
+  time bound. `JobControl::waiting_for_rules()` tells the owner that a note
+  waits, so the owner retries a failed warm-thread spawn.
 - **Inspect.** Live facts from the controller; records, command, cwd and notes
-  from `JobFacts`.
+  from `JobFacts`. `JobDetail.notes` lists person notes (author 1) and model
+  notes (author 2, text from `JobRecords.model_notes`) together, oldest first
+  by kind 30 sequence, at most 16.
+- **List.** One `Jobs` read per journal page gives each entry, its excerpt
+  and the cursor check; the handler reads no `JobFacts` for a listing. A
+  live-only list with `before` sends one `Jobs { before, limit 1 }` read for
+  `before_found` only; when the journal is unavailable it skips the check,
+  because the live list works from memory.
+- **Page wake** (selected, engineering, 2026-10-22, from the J4-R report).
+  `PagePool::start` takes the reactor's `WakeSender`. After a page worker
+  stores a reply in its ticket, it calls `notify`; a failed notify is
+  ignored, as for the other worker wakes. On the wake the owner calls
+  `JobControl::poll`, which reads the tickets without blocking. Model page
+  reads are polled on the same wake. Before this, the pool signalled only a
+  condition variable, so a reply waited for an unrelated reactor event.
+
+Recorded 2026-10-22 from the J4-R report (`5b7f55b` on the J3 integration
+branch). These choices settle details that the rules above leave open:
+
+- **Viewer counting.** `JobRead`, `JobObserve` and a parked `JobList` count
+  toward `jobs.clientViewers` from acceptance until the reply, including
+  their journal waits. `JobControl::new` clamps `clientViewers` to 1–32.
+- **Retains.** One retain runs at a time in the service. The others wait in
+  a queue that the attachment bound (32) limits. The handler remembers the
+  replies of the last 64 retains, for repeated request IDs.
+- **Held append.** A retain held at the journal quota appends again when the
+  owner's `journal_held` changes from true to false. A refusal that the owner
+  never reported as a hold is retried once, then waits for the owner to
+  report the hold and its end, so no busy loop arises.
+- **Cancel race.** When `cancel` returns `AlreadySettled` but the journal does
+  not yet show kind 28, the handler parks a settle wait and reads again, at
+  most 3 times. Then it replies `requested: true` with the live entry.
+- **Writer busy.** A journal writer `Busy` gives `unavailable` for
+  `JobCancel` and `JobRetain`.
+- **Live list without the journal.** Entries come from memory, with an empty
+  `command` and no retention fields.
+- **Pages without a read.** For an `expired`, `missing`, `corrupt` or
+  `deleted` page, the reply holds the kind 28 totals and an empty page. A
+  stale cursor gives an empty page at the total. An unspawned job gives an
+  empty `live` page. A `not_started` job gives an empty `complete` page.
 
 ##### TJ-Q7: viewer follow and detach
 
@@ -5050,6 +5153,9 @@ sequenceDiagram
     U->>W: Open viewer on stdout at 0
     W->>H: JobRead(job, stdout, 0, 8192) on the request attachment
     H->>P: Page request
+    P->>P: Worker stores the page in the ticket
+    P->>H: Wake the reactor
+    H->>P: Poll the ticket
     P-->>H: Page, state live
     H-->>W: JobPage
     W-->>U: Cache page, render
@@ -5058,7 +5164,8 @@ sequenceDiagram
     H->>K: Park: new bytes, state change or settlement
     K-->>H: stdout passed offset
     H->>P: Page at offset
-    P-->>H: Page
+    P->>H: Wake the reactor
+    P-->>H: Page, polled from the ticket
     H-->>W: JobPage
     W->>H: Next JobObserve
     U->>W: Escape closes the viewer
@@ -5266,6 +5373,9 @@ project view, because they are not project records. The audit tool's
 | Viewer bound or page queue full | `busy`; the viewer shows it and offers `r` |
 | Journal unavailable | List of live jobs works from memory; settled reads, retain and inspect give `unavailable` |
 | Journal held at its quota | Retain waits for room; cancel still commits from the ledger |
+| Secret rule set not yet compiled | A note retain waits in `Wait::Rules` until the warm wake; other requests are unaffected ([rule set readiness](secret-detection.md#rule-set-readiness)) |
+| Secret rule set failed its self-check | A note retain replies `unavailable`; pin, unpin and delete proceed |
+| Cited kind 14 of a model note unreadable | `JobFacts` is `Corrupt`; `JobInspect` replies `unavailable` |
 | Job's project unregistered | `not_found` |
 | Delete of a live job | `not_settled` |
 | Deleted output | Pages `deleted`; the viewer shows the summary and notes |
@@ -5276,8 +5386,8 @@ project view, because they are not project records. The audit tool's
 
 | Rule | How J4 meets it |
 | --- | --- |
-| AE-01 | The handler does in-memory work on the reactor; reads and pages go to the journal worker and the page pool; the TUI renders from its cache. |
-| AE-02 | Blocking calls: index and frame reads on the journal worker, `pread` on the page workers, `unlinkat` on the payload maintenance worker, client socket waits on the TUI job worker's threads. |
+| AE-01 | The handler does in-memory work on the reactor; reads and pages go to the journal worker and the page pool; the TUI renders from its cache. Note redaction scans at most 2,048 bytes with the compiled rule set; the handler never compiles it and waits on the warm wake instead. A page reply wakes the reactor. |
+| AE-02 | Blocking calls: index and frame reads on the journal worker (including the excerpt and model note frames), `pread` on the page workers, `unlinkat` on the payload maintenance worker, the rule set compile on `asura-secret-rules`, client socket waits on the TUI job worker's threads. |
 | AE-03 | `jobs.clientViewers` parked or pending requests; the page queue of 8; list pages of 8; 16 notes; deletion queue of 8; the TUI's 64-entry cache and 4 pages per stream. |
 | AE-04 | No time bound: parked requests end on an event, detach or shutdown; client waits end on the reply, cancel or a lost connection. |
 | AE-05 | Cancel and pin state are idempotent; delete completes from the record after a crash. |
@@ -5309,9 +5419,9 @@ real guardians. End-to-end cases are in
 | ID | Case (TJ cases covered) | Unit | Integration |
 | --- | --- | --- | --- |
 | J4T-01 | Control codecs | Every message and enum at bounds; each invalid combination; direction; error tokens | Round trip through `asura-client` |
-| J4T-02 | Kind 30 and wall times | Codec bounds; rules; redaction of a person note; model note cites its call | Writer appends and reopens; ledger sizes updated |
-| J4T-03 | Index entries and reads | `L`, `M`, `Y`, `U`, `E` emitted at the roll; merges of live, delta and runs | 20 jobs over three rolls listed by scope and page; restart from a checkpoint |
-| J4T-04 | Parked requests (TJ-10) | Observe ends on bytes, state, settlement; list on revision; detach drops; no timer | Ninth pending request `busy`; page queue `busy` separate |
+| J4T-02 | Kind 30 and wall times | Codec bounds; rules; redaction of a person note with `$ASURA_SECRET_0` and a typed placeholder kept; model note cites its call | Writer appends and reopens; ledger sizes updated |
+| J4T-03 | Index entries and reads | `L`, `M`, `Y`, `U`, `E` emitted at the roll; merges of live, delta and runs; the excerpt of each entry (first line, 192 bytes, `…`, control characters, UTF-8 cut, whole-command display text); `before_found` true and false per scope; model note texts in `JobFacts`, and `Corrupt` for an unreadable cited frame | 20 jobs over three rolls listed by scope and page with their excerpts; model and person notes after a restart from a checkpoint |
+| J4T-04 | Parked requests (TJ-10) | Observe ends on bytes, state, settlement; list on revision; detach drops; no timer; a page reply's wake alone completes a `JobRead` | Ninth pending request `busy`; page queue `busy` separate; a `JobRead` reply arrives with no other reactor event |
 | J4T-05 | Cancel and kill (TJ-06) | Requester and reason by origin; `kill_not_permitted`; settled `requested: false` | `/job cancel` path stops a real job; one kind 27 |
 | J4T-06 | Retention (TJ-31) | Pin, unpin, delete, note rules; unchanged replies; limits | Pin survives interim expiry under quota pressure; delete frees quota and wakes a `quota` head; crash after delete commit completes at recovery |
 | J4T-07 | Cross-project (TJ-25) | `project_mismatch`; all-projects scope labels | Another project's job listed and cancelled with the right expectation |
@@ -5320,6 +5430,7 @@ real guardians. End-to-end cases are in
 | J4T-10 | Audit view | Kinds 4–7 mapping; no command text | `/audit` shows job events |
 | J4T-11 | TUI worker | Slots, caches, prefix resolution, age text, notice text, status text | — |
 | J4T-12 | Responsiveness (TJ-10, AE-07) | — | 8 followers on floods: Inspect within 100 ms |
+| J4T-13 | Handler follow-ups (J4-R report) | A note waits while `rules` is `None` and keeps its retain turn; it resumes on `Some(Ok)`, replies `unavailable` on `Some(Err)` and ends on detach; a list makes one `Jobs` read per journal page and no `JobFacts` read; `invalid_cursor` from `before_found`, also for a live-only list; `JobDetail` lists person and model notes oldest first | A gated warm thread (SDI-13): a `/job note` waits while typing responds within 100 ms, then commits; a typed `$ASURA_SECRET_3` stays in the note; a model `job note` and a person note both appear in `JobInspect` with their authors |
 
 ### J4 proof limits
 
@@ -5347,12 +5458,15 @@ primary agent integrates and inspects each result.
 | J34-K Controller extensions (implemented on the J3 integration branch, `c63d7ca`) | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | J34-S, J3-D | Snapshots, yield and model waits, observe parking, revision, live counts, outlived derivation, `revoke` with an origin filter, the EX11 check at slot grant; `PayloadPort::refresh_space` and its call in the paced `disk_space` recheck ([disk-space recheck](#disk-space-recheck)); the pacing type made `pub(crate)` for the [limits read retry](#start-time-limits-read-failure); removal of the J2 `dead_code` allowances as items gain callers; unit parts of J3T-04 to J3T-10, J4T-04, J4T-08, ES-05 |
 | J3-D Slot and capture retirement (implemented on the J3 integration branch, `b83d572`) | `asura-service/src/exec_cmd_worker.rs`, `exec_cmd_worker/tests.rs`; `asura-service/src/capture_worker.rs`, `capture_worker/tests.rs`, `asura-service/tests/capture_worker.rs`; `asura-platform/src/exec_cmd/capture.rs`; `asura-platform/src/exec_cmd.rs`, `exec_cmd/tests.rs`, `asura-platform/tests/exec_cmd_process.rs` and `tests/support/escapees.rs`; for the J1 call path removal only, `asura-service/src/conversation.rs`, `conversation/{exec_cmd_call,tool_tests,audit_tools,memory_create_tests}.rs`, `asura-service/src/{payload_owner,tools,test_support}.rs`, `tools/parse.rs`, `job_controller/reasons.rs` and `asura-service/tests/capture_flow.rs` (recorded 2026-10-22: the paths beyond the first plan were needed to compile; J3-R, J34-K and J34-E own them later) | J34-S, J34-C | Removal of the J1 call API, kind 23 builders and `render_tail`, and of every kind 23 and J1 busy-code use in `asura-service`, so the crate compiles again on the branch ([branch order](#tj-p3-j3-and-j4-packet-order-and-enablement)); the `job` entry in `REGISTRY`, so `TOOL_NAMES` equals the registry; the removal of the [retired J1T cases](#j1t-cases-after-j3-d); J3T-15 (unit) |
 | J3-R Tool parsing and result text (implemented on the J3 integration branch, `840f28d`) | `asura-service/src/tools.rs`; `asura-service/src/tools/{parse,parse_tests}.rs`; `asura-service/src/job_text.rs` (new) | J34-S, J3-D | `job` and exec_cmd arguments, registry text, the `execution_off` refusal, the renderer with the [SL7 filtered line](#model-result-text); J3T-01, J3T-14, J3T-16 |
-| J34-K2 Model starts never withdrawn | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | J34-K | The [withdrawal rule](#tj-s1-job-lifecycle): `trigger` withdraws a `Queued` start only for a person waiter or while the journal is unavailable, and otherwise settles it `not_started` with its kind 26 still queued; `intent_held` keeps a cancelled model start's kind 26 queued and withdraws only a person job; doc comments of `withdraw` and `WaitEnding::Withdrawn`; `outbox_orders_intent_before_closures` updated and the new unit cases of J3T-21 |
-| J34-C2 Ledger stored bytes | `asura-storage/src/payload/store.rs`; `asura-storage/tests/payload_store.rs` | J34-C | `Ledger::stored(job) -> Option<[u64; 2]>` ([stored bytes](#controller-views-waits-and-stored-bytes)); its unit and integration cases (J3T-22) |
-| J3-D2 Capture stored signal | `asura-service/src/capture_worker.rs`, `capture_worker/tests.rs`, `asura-service/tests/capture_worker.rs`; in `asura-service/src/exec_cmd_worker.rs`, the `take_stored` call in `Slot::step`, and its case in `exec_cmd_worker/tests.rs` | J3-D | The stored flag, the coalesced wake and `Handle::take_stored` ([TJ-Q10](#tj-q10-stored-bytes-reach-a-waiting-caller)); its unit and integration cases (J3T-22) |
-| J4-R Job control handler | `asura-service/src/job_control.rs` (new) | J34-W, J34-K | Request handling, parked requests, viewer bound, the registry check of an all-projects listing; unit parts of J4T-04 to J4T-07 |
+| J34-K2 Model starts never withdrawn (implemented on the J3 integration branch, `6915e9c`) | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | J34-K | The [withdrawal rule](#tj-s1-job-lifecycle): `trigger` withdraws a `Queued` start only for a person waiter or while the journal is unavailable, and otherwise settles it `not_started` with its kind 26 still queued; `intent_held` keeps a cancelled model start's kind 26 queued and withdraws only a person job; doc comments of `withdraw` and `WaitEnding::Withdrawn`; `outbox_orders_intent_before_closures` updated and the new unit cases of J3T-21 |
+| J34-C2 Ledger stored bytes (implemented on the J3 integration branch, `7b362b1`) | `asura-storage/src/payload/store.rs`; `asura-storage/tests/payload_store.rs` | J34-C | `Ledger::stored(job) -> Option<[u64; 2]>` ([stored bytes](#controller-views-waits-and-stored-bytes)); its unit and integration cases (J3T-22) |
+| J3-D2 Capture stored signal (implemented on the J3 integration branch, `c52fd3e`) | `asura-service/src/capture_worker.rs`, `capture_worker/tests.rs`, `asura-service/tests/capture_worker.rs`; in `asura-service/src/exec_cmd_worker.rs`, the `take_stored` call in `Slot::step`, and its case in `exec_cmd_worker/tests.rs` | J3-D | The stored flag, the coalesced wake and `Handle::take_stored` ([TJ-Q10](#tj-q10-stored-bytes-reach-a-waiting-caller)); its unit cases and the in-crate flood case `j3t_22_flood_ends_with_a_wake_and_every_byte_stored` on a real store (J3T-22). The `tests/capture_worker.rs` case moved to J34-E (recorded 2026-10-22) |
+| J4-R Job control handler (implemented on the J3 integration branch, `5b7f55b`) | `asura-service/src/job_control.rs` (new), `job_control/tests.rs` | J34-W, J34-K | Request handling, parked requests, viewer bound, the registry check of an all-projects listing; unit parts of J4T-04 to J4T-07 |
+| J34-S2 Listing excerpts, model note texts and the cursor check | `asura-storage/src/authority/**`; `asura-storage/tests/{authority_conversation,authority_replay,journal_writer,segmented_journal}.rs`; for the new fields only, the `JobListing` and `JobRecords` fixture in `asura-service/src/job_control/tests.rs` | J4-R | `JobListing.excerpt`, the `Jobs` reply's `before_found`, `JobRecords.model_notes`, and `exec_cmd_command` and `command_excerpt` in the new `authority/conversation/job_command.rs` ([listings](#job-listings-and-index-entries)); storage parts of J4T-03 |
+| J34-A Secret rule set readiness and note redaction | `asura-platform/src/secrets.rs`, `secrets/rewrite.rs`, `secrets/tests.rs` | — | `secrets::compiled()`; `secrets::note_redacted`; `rewrite_exec_cmd_call_with(rules: &'static RuleSet, command, cwd)` made public, so a reactor caller passes the ready set; SDU-18, SDU-19 ([rule set readiness](secret-detection.md#rule-set-readiness), [person note redaction](secret-detection.md#person-note-redaction)) |
+| J4-R2 Handler follow-ups | `asura-service/src/job_control.rs`, `job_control/tests.rs` | J34-S2, J34-A | `Ctx.rules`, `Wait::Rules`, `waiting_for_rules()`; note redaction with `note_redacted`, deleting `unnumbered`; lists from `JobListing.excerpt` without `JobFacts` reads, deleting `command_excerpt`; `invalid_cursor` from `before_found`, deleting the extra cursor read; model notes in `JobDetail` ([J4 control handler](#j4-control-handler)); unit parts of J4T-13 |
 | J4-T TUI (implemented on the J3 integration branch, `f7f50c3`) | `asura-cli/src/tui/jobs.rs` (new); `asura-cli/src/tui/{ui,mod,config}.rs`; `asura-cli/src/tui/ui/*.rs`; `asura-cli/tests/tui_pty.py` (job journeys) | J34-W | Job worker, list, viewer, commands, EX12 notice, status row, exit count, `/execution`; J4T-11 and the PTY journeys |
-| J34-E Integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (including new `job_tool.rs`, `audit_tools.rs`, and `jobs.rs` for the limits read retry); `asura-service/src/{lib,payload_owner,audit,config_worker,test_support}.rs`; for the capture reason texts and the SL7 test port, `asura-service/src/job_text.rs`; for the default body of `PayloadPort::stored` only, `asura-service/src/job_controller/port.rs`; `asura-service/tests/{job_tool_flow,job_control_flow}.rs` (new) and the ports in `asura-service/tests/{capture_flow,tool_call_flow,job_controller_flow}.rs`; `asura-platform/src/config.rs` and its tests, and the ES-02 file-bound case in `asura-storage/src/config.rs`, for the [configuration file bound](execution-setting.md#configuration); the six job values in `asura-storage/src/audit/{types,tests}.rs`; the reserved-worker parameter of `PagePool::start` in `asura-storage/src/payload/pages.rs` and the stale J1-mode comments in `asura-storage/src/payload/id.rs`; for the `JOB_COMMANDS` merge only, `asura-cli/src/tui/ui.rs`; `asura-cli/tests/lifecycle.rs`; `docs/user/{commands,guide,keys}.md`; the J3, J4 and EX11 evidence in the designs | All above | The exec_cmd switch, the 64 KiB configuration file bound, kind 29 append, yield window wiring, `job` dispatch, job request routing and capability, execution setting state and revocation, audit emission, job events in the audit read; the [audit of job calls](#audit-of-job-tool-calls); the maintenance worker with its deletion queue of 8 and the [disk-space measurement](#disk-space-recheck); `jobs.modelReservedPageReads` applied; the [limits read retry](#start-time-limits-read-failure); `filtered_line` removed from `exec_cmd_call.rs`; the `commands.md` rows for `/jobs`, `/job` and `/execution` with `JOB_COMMANDS` merged into `LOCAL_COMMANDS`; the four job PTY modes in `lifecycle.rs`; the [J1T ports](#j1t-cases-after-j3-d); the identity detectors through real turns; `PayloadPort::stored` in `payload_owner.rs` from `Ledger::stored`, with the trait's default body removed from `job_controller/port.rs`; the [capture reason texts](#model-result-text) in `asura-service/src/job_text.rs` with the J3T-16 golden texts; `Rejection::decision()` at the `validate_authority` call in `conversation.rs`, so a refusal records `execution_off`; a poll of the controller before each view taken for kind 29 or a reply; a code 10 kind 29 held until the job's kind 26 commits ([writing job records](#writing-job-records)); integration parts of every J3T, J4T and ES case and of J2T-09, J2T-18 and J2T-19 |
+| J34-E Integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (including new `job_tool.rs`, `audit_tools.rs`, and `jobs.rs` for the limits read retry); `asura-service/src/{lib,payload_owner,audit,config_worker,test_support}.rs`; `asura-service/src/secret_rules.rs` (new); for the capture reason texts, the SL7 test port and the switch to the storage `exec_cmd_command`, `asura-service/src/job_text.rs`; for the default body of `PayloadPort::stored` only, `asura-service/src/job_controller/port.rs`; `asura-service/tests/{job_tool_flow,job_control_flow}.rs` (new); the J3T-22 stored-signal case in `asura-service/tests/capture_worker.rs`; and the ports in `asura-service/tests/{capture_flow,tool_call_flow,job_controller_flow}.rs`; `asura-platform/src/config.rs` and its tests, and the ES-02 file-bound case in `asura-storage/src/config.rs`, for the [configuration file bound](execution-setting.md#configuration); the six job values in `asura-storage/src/audit/{types,tests}.rs`; the reserved-worker and wake parameters of `PagePool::start` in `asura-storage/src/payload/pages.rs` and their callers in `asura-service/tests/capture_worker.rs` and `asura-storage/tests/payload_store.rs` and the stale J1-mode comments in `asura-storage/src/payload/id.rs`; for the `JOB_COMMANDS` merge only, `asura-cli/src/tui/ui.rs`; `asura-cli/tests/lifecycle.rs`; `docs/user/{commands,guide,keys}.md`; the J3, J4 and EX11 evidence in the designs | All above | The exec_cmd switch, the 64 KiB configuration file bound, kind 29 append, yield window wiring, `job` dispatch, job request routing and capability, execution setting state and revocation, audit emission, job events in the audit read; the [audit of job calls](#audit-of-job-tool-calls); the maintenance worker with its deletion queue of 8 and the [disk-space measurement](#disk-space-recheck); `jobs.modelReservedPageReads` applied; the [limits read retry](#start-time-limits-read-failure); `filtered_line` removed from `exec_cmd_call.rs`; the `commands.md` rows for `/jobs`, `/job` and `/execution` with `JOB_COMMANDS` merged into `LOCAL_COMMANDS`; the four job PTY modes in `lifecycle.rs`; the [J1T ports](#j1t-cases-after-j3-d); the identity detectors through real turns; `PayloadPort::stored` in `payload_owner.rs` from `Ledger::stored`, with the trait's default body removed from `job_controller/port.rs`; the [capture reason texts](#model-result-text) in `asura-service/src/job_text.rs` with the J3T-16 golden texts; `Rejection::decision()` at the `validate_authority` call in `conversation.rs`, so a refusal records `execution_off`; a poll of the controller before each view taken for kind 29 or a reply; a code 10 kind 29 held until the job's kind 26 commits ([writing job records](#writing-job-records)); the [rule set readiness](secret-detection.md#rule-set-readiness) wiring: the `asura-secret-rules` warm thread spawned at start in `secret_rules.rs`, its wake, the spawn retry when a turn start or `JobControl::waiting_for_rules()` needs the set, `Ctx.rules` filled from `secrets::compiled()`, no model turn sent to the helper while the set is not ready, `compiled()` and `rewrite_exec_cmd_call_with` at the tool call decision in `conversation.rs` in place of `detection()`, and the warm call removed from the payload recovery thread; the `WakeSender` passed to `PagePool::start` and `JobControl::poll` on its wake ([page wake](#j4-control-handler)); `job_text::exec_cmd_command` replaced by the storage function; a `test-support`-gated entry in `test_support.rs` that starts a capture worker on a real store with a test wake and exposes `take_stored`, and the `tests/capture_worker.rs` case with it: a real flood of 64 chunks, then one wake after the last append, and `Ledger::stored` equal to the bytes written (J3T-22); integration parts of every J3T, J4T and ES case, SDI-13 and J2T-09, J2T-18 and J2T-19 |
 
 ##### TJ-P3: J3 and J4 packet order and enablement
 
@@ -5397,20 +5511,26 @@ step; a packet hands over only when they pass.
 5. **J34-K** controller extensions (done, `c63d7ca`) and **J3-R** parsing
    and result text (done, `840f28d`), in parallel (disjoint paths):
    `cargo test -p asura-service`.
-6. **J4-R** job control handler, after J34-K: `cargo test -p asura-service`.
+6. **J4-R** job control handler, after J34-K (done, `5b7f55b`):
+   `cargo test -p asura-service`.
 7. **Follow-up steps** from the J34-K report (selected, engineering,
-   2026-10-22). They run in parallel with each other and with J4-R, because
+   2026-10-22). They ran in parallel with each other and with J4-R, because
    their paths are disjoint: **J34-K2** model starts never withdrawn
-   (`job_controller.rs`, `job_controller/*.rs`) and **J3-D2** the capture
-   stored signal (`capture_worker*`, the `Slot::step` call): `cargo test -p
-   asura-service`; **J34-C2** `Ledger::stored` (`payload/store.rs`):
-   `cargo test -p asura-storage`.
-8. **J4-T** TUI (done, `f7f50c3`): `cargo test -p asura-cli`. It needs only
+   (done, `6915e9c`) and **J3-D2** the capture stored signal (done,
+   `c52fd3e`): `cargo test -p asura-service`; **J34-C2** `Ledger::stored`
+   (done, `7b362b1`): `cargo test -p asura-storage`.
+8. **Follow-up steps** from the J4-R report (selected, engineering,
+   2026-10-22). **J34-S2** listing excerpts, model note texts and the cursor
+   check, after J4-R: `cargo test -p asura-storage -p asura-service`.
+   **J34-A** secret rule set readiness and note redaction, in parallel with
+   J34-S2 (disjoint paths): `cargo test -p asura-platform`. **J4-R2** handler
+   follow-ups, after both: `cargo test -p asura-service`.
+9. **J4-T** TUI (done, `f7f50c3`): `cargo test -p asura-cli`. It needs only
    J34-W, so it may run at any point on the branch.
-9. **J34-E** integration: the full workspace `cargo test`, `swift test`, the
-   J3T, J4T and ES integration cases and the
-   [joint end-to-end cases](#j3-and-j4-end-to-end-validation).
-10. **Gate**, then one merge of the branch to `main`, then EN1.
+10. **J34-E** integration, after J4-R2: the full workspace `cargo test`,
+    `swift test`, the J3T, J4T, ES and SDI-13 integration cases and the
+    [joint end-to-end cases](#j3-and-j4-end-to-end-validation).
+11. **Gate**, then one merge of the branch to `main`, then EN1.
 
 ```mermaid
 flowchart TD
@@ -5424,12 +5544,15 @@ flowchart TD
         D["4 J3-D retirement: asura-service compiles (done)"]
         K["5 J34-K controller extensions (done)"]
         R["5 J3-R parsing and result text (done)"]
-        CR["6 J4-R job control handler"]
-        K2["7 J34-K2 model starts never withdrawn"]
-        C2["7 J34-C2 Ledger::stored"]
-        D2["7 J3-D2 capture stored signal"]
-        T["8 J4-T TUI (done)"]
-        E["9 J34-E integration"]
+        CR["6 J4-R job control handler (done)"]
+        K2["7 J34-K2 model starts never withdrawn (done)"]
+        C2["7 J34-C2 Ledger::stored (done)"]
+        D2["7 J3-D2 capture stored signal (done)"]
+        S2["8 J34-S2 excerpts, model note texts, cursor check"]
+        A["8 J34-A rule set readiness and note redaction"]
+        R2["8 J4-R2 handler follow-ups"]
+        T["9 J4-T TUI (done)"]
+        E["10 J34-E integration"]
         S --> C
         C --> D
         D --> K
@@ -5438,9 +5561,12 @@ flowchart TD
         K --> K2
         C --> C2
         D --> D2
+        CR --> S2
+        S2 --> R2
+        A --> R2
         H --> E
         R --> E
-        CR --> E
+        R2 --> E
         K2 --> E
         C2 --> E
         D2 --> E
@@ -5763,6 +5889,11 @@ Each J3–J5 gap of the readiness audit of 2026-10-21, and where it is resolved.
 | No path for live stored bytes; no reactor wake when output is stored (J34-K findings) | [Stored bytes](#controller-views-waits-and-stored-bytes), TJ-Q10; steps J34-C2 and J3-D2 |
 | Audit field for the EX11 check at slot grant (J34-K finding) | Dropped for the log line ([controller views and waits](#controller-views-waits-and-stored-bytes)) |
 | List entry elapsed time; capture reason texts (J3-R findings) | [Model result text](#model-result-text) |
+| Model notes missing from `JobDetail`; one journal read per listed entry; the extra cursor read (J4-R findings) | [Listings](#job-listings-and-index-entries); step J34-S2, then J4-R2 |
+| Page replies do not wake the reactor (J4-R finding) | [J4 control handler](#j4-control-handler) page wake; J34-E |
+| Note redaction compiles the rule set on the reactor (J4-R finding, an AE-01 breach) | [Rule set readiness](secret-detection.md#rule-set-readiness); steps J34-A, J4-R2 and J34-E |
+| Note redaction renumbers placeholders the person typed (J4-R finding) | [Person note redaction](secret-detection.md#person-note-redaction): typed placeholders kept; step J34-A |
+| `tests/capture_worker.rs` stored-signal case not added (J3-D2 finding) | [Stored bytes](#controller-views-waits-and-stored-bytes) tests; J34-E |
 
 ## Open decisions
 
@@ -5925,5 +6056,19 @@ the coalesced stored signal; no audit field for the EX11 check at slot grant;
 no elapsed time in a list entry, so kind 29 keeps its 528-byte frame; capture
 reason texts. TJ-Q10 is new; TJ-S1 and TJ-P3 changed. Each was rendered with
 Mermaid CLI and inspected. No code or test was run by the design writer.
+
+Recorded on 2026-10-22 (J4-R and J3-D2 reports): written from those reports
+and the code at `5b7f55b` on the J3 integration branch (`job_control.rs`,
+`job_text.rs`, `payload_owner.rs`, `conversation.rs`,
+`asura-platform/src/secrets.rs`, `secrets/rewrite.rs`,
+`asura-storage/src/authority/conversation/{types,state}.rs`,
+`authority/writer/{mod,state}.rs`, `payload/pages.rs`). Engineering
+selections: the storage step J34-S2 (excerpts in `Jobs`, `before_found` in
+place of the extra cursor read, model note texts in `JobFacts`); the platform
+step J34-A and the handler step J4-R2; the rule set readiness rules, with one
+warm thread and waiting reactor users; person note redaction that keeps typed
+placeholders; the page wake; the J3-D2 test placement; the recorded J4-R
+handler choices. TJ-P3 and TJ-Q7 changed and were rendered with Mermaid CLI and
+inspected. No code or test was run by the design writer.
 
 Return to the [design index](README.md).
