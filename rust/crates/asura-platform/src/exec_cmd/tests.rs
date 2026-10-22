@@ -368,6 +368,9 @@ fn notice_fixture() -> (ExecCmdJob, std::os::fd::OwnedFd) {
             status_eof: false,
             notices: 0,
             spawned: false,
+            last_kind: 0,
+            unconfirmed: None,
+            escapees: 0,
             terminal: None,
             out: Capture::new(out, Stream::Stdout),
             err: Capture::new(err, Stream::Stderr),
@@ -475,4 +478,189 @@ fn j1t_05_no_deadline_checks_cancel_only() {
     job.lease = None;
     let _ = job.poll(Instant::now() + Duration::from_secs(3600));
     assert_ne!(job.stop, Some(StopReason::OutputLimit));
+}
+
+fn notice(kind: u8, reason: u8, exit_kind: u8, cleanup: bool, value: u32) -> Notice {
+    Notice {
+        kind,
+        reason,
+        exit_kind,
+        cleanup,
+        value,
+    }
+}
+/// Write the notices, end the status pipe and poll until the job settles
+/// or faults. Returns the job and the first poll error.
+fn feed(notices: &[Notice]) -> (ExecCmdJob, Result<(), ExecCmdError>) {
+    let (mut job, write) = notice_fixture();
+    for n in notices {
+        let bytes = n.encode([7; 16]);
+        // SAFETY: fixed bytes into the owned fixture pipe, below PIPE_BUF.
+        assert_eq!(
+            unsafe { libc::write(write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) },
+            32
+        );
+    }
+    drop(write);
+    let mut result = Ok(());
+    for _ in 0..3 {
+        result = job.poll(Instant::now());
+        if result.is_err() {
+            break;
+        }
+    }
+    (job, result)
+}
+/// EC-U2: kind 6 and reasons 12 and 13 round-trip; their invalid shapes,
+/// and the person reasons 10 and 11 not yet defined, are protocol faults.
+#[test]
+fn ec_u2_escapee_notice_shapes_round_trip_and_reject_invalid() {
+    let id = [9; 16];
+    for valid in [
+        notice(6, 0, 0, false, 1),
+        notice(6, 0, 0, false, 8000),
+        notice(2, 12, 1, true, 0),
+        notice(2, 12, 2, true, 9),
+        notice(4, 13, 0, false, 0),
+        notice(4, 9, 0, false, 0),
+    ] {
+        let decoded = Notice::decode(&valid.encode(id), id).expect("valid shape");
+        assert_eq!(
+            (
+                decoded.kind,
+                decoded.reason,
+                decoded.exit_kind,
+                decoded.cleanup,
+                decoded.value
+            ),
+            (
+                valid.kind,
+                valid.reason,
+                valid.exit_kind,
+                valid.cleanup,
+                valid.value
+            )
+        );
+    }
+    for (label, invalid) in [
+        ("kind 6 zero count", notice(6, 0, 0, false, 0)),
+        ("kind 6 reason", notice(6, 12, 0, false, 1)),
+        ("kind 6 exit", notice(6, 0, 1, false, 1)),
+        ("kind 6 cleanup", notice(6, 0, 0, true, 1)),
+        ("kind 2 reason 13", notice(2, 13, 1, true, 0)),
+        ("kind 4 reason 12", notice(4, 12, 0, false, 0)),
+        ("kind 4 exit", notice(4, 13, 1, false, 0)),
+        ("kind 3 reason 12", notice(3, 12, 0, true, 0)),
+        ("reason 10", notice(2, 10, 1, true, 0)),
+        ("reason 11", notice(2, 11, 2, true, 9)),
+        ("reason 14", notice(4, 14, 0, false, 0)),
+        ("kind 7", notice(7, 0, 0, false, 0)),
+    ] {
+        assert!(Notice::decode(&invalid.encode(id), id).is_err(), "{label}");
+    }
+}
+/// EC-U2 order: valid sequences settle with their facts; a late settlement
+/// after kind 4 never confirms cleanup.
+#[test]
+fn ec_u2_escapee_notice_order_and_settlement_facts() {
+    let spawned = notice(1, 0, 0, false, 0);
+    let report = notice(6, 0, 0, false, 3);
+    let settled = notice(2, 12, 1, true, 0);
+    let (job, polled) = feed(&[spawned, report, settled]);
+    assert_eq!(polled, Ok(()));
+    let result = job.result().expect("settled");
+    assert!(result.cleanup_confirmed);
+    assert_eq!(result.escapees, 3);
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.reason, None, "reason 12 is not a stop reason");
+    assert!(
+        result
+            .render_text(&Tails::default(), "complete")
+            .contains("cleanup_confirmed=true capture=complete escapees=3\nstdout:")
+    );
+    for (label, reason, expected) in [
+        ("escapee", 13, UnconfirmedReason::EscapeeUnterminated),
+        ("cleanup", 9, UnconfirmedReason::CleanupFailed),
+    ] {
+        let (job, polled) = feed(&[spawned, notice(4, reason, 0, false, 0), report, settled]);
+        assert_eq!(polled, Ok(()), "{label}");
+        assert_eq!(job.cleanup_unconfirmed(), Some(expected));
+        let result = job.result().expect("late settlement");
+        assert!(
+            !result.cleanup_confirmed,
+            "{label}: late is never confirmed"
+        );
+        assert_eq!(result.escapees, 3);
+        assert!(
+            result
+                .render_text(&Tails::default(), "complete")
+                .contains("cleanup_confirmed=false capture=complete escapees=3\n")
+        );
+    }
+    // No escapees: no kind 6, the lease reason stays, no count in the text.
+    let (job, polled) = feed(&[spawned, notice(2, 4, 2, true, 9)]);
+    assert_eq!(polled, Ok(()));
+    let result = job.result().unwrap();
+    assert!(result.cleanup_confirmed);
+    assert_eq!(result.escapees, 0);
+    assert!(
+        !result
+            .render_text(&Tails::default(), "complete")
+            .contains("escapees")
+    );
+    // Kind 4 alone never settles.
+    let (job, _) = feed(&[spawned, notice(4, 13, 0, false, 0)]);
+    assert!(!job.settled());
+    assert_eq!(
+        job.cleanup_unconfirmed(),
+        Some(UnconfirmedReason::EscapeeUnterminated)
+    );
+}
+/// EC-U2 order faults: duplicate kind 6 or kind 4, kind 6 not followed by
+/// kind 2 reason 12, reason 12 without kind 6, notices before spawned,
+/// after the terminal notice, or beyond five; trailing bytes.
+#[test]
+fn ec_u2_escapee_notice_order_faults() {
+    let spawned = notice(1, 0, 0, false, 0);
+    let report = notice(6, 0, 0, false, 1);
+    let unknown = notice(4, 13, 0, false, 0);
+    let settled = notice(2, 12, 1, true, 0);
+    let plain = notice(2, 0, 1, true, 0);
+    for (label, sequence) in [
+        ("duplicate kind 6", vec![spawned, report, report, settled]),
+        (
+            "kind 4 after kind 6",
+            vec![spawned, report, unknown, settled],
+        ),
+        ("duplicate kind 4", vec![spawned, unknown, unknown, plain]),
+        ("plain settle after kind 6", vec![spawned, report, plain]),
+        ("reason 12 without kind 6", vec![spawned, settled]),
+        ("kind 6 before spawned", vec![report, settled]),
+        ("kind 6 after settled", vec![spawned, plain, report]),
+        (
+            "setup failure after spawned",
+            vec![spawned, notice(3, 5, 0, true, 0)],
+        ),
+    ] {
+        let (job, polled) = feed(&sequence);
+        assert_eq!(polled, Err(ExecCmdError::Protocol), "{label}");
+        assert!(!job.settled(), "{label}");
+        assert!(job.result().is_none(), "{label}");
+    }
+    // Trailing partial bytes after a valid settlement.
+    let (mut job, write) = notice_fixture();
+    let mut bytes = Vec::new();
+    for n in [spawned, report, settled] {
+        bytes.extend_from_slice(&n.encode([7; 16]));
+    }
+    bytes.extend_from_slice(b"ASSH");
+    // SAFETY: owned fixture pipe, 100 bytes below PIPE_BUF.
+    assert_eq!(
+        unsafe { libc::write(write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) },
+        bytes.len() as isize
+    );
+    drop(write);
+    let _ = job.poll(Instant::now());
+    assert_eq!(job.poll(Instant::now()), Err(ExecCmdError::Protocol));
+    assert!(!job.settled());
 }

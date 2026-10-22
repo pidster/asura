@@ -12,12 +12,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 static CLEAN: AtomicBool = AtomicBool::new(true);
 use std::time::{Duration, Instant};
+#[path = "support/escapees.rs"]
+mod escapees;
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     if let [_, flag, id, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
         std::process::exit(run_guardian(id, command));
+    }
+    if let [_, flag, id, command, fault] = args.as_slice()
+        && flag == "--asura-exec-cmd-guardian"
+    {
+        std::process::exit(asura_platform::exec_cmd::run_guardian_for_test(
+            id, command, fault,
+        ));
     }
     if let [_, flag, home] = args.as_slice()
         && flag == "--lease-holder"
@@ -255,6 +264,7 @@ fn qualification() {
     assert_ne!(result.exit_code, Some(0));
     assert!(!outside.exists());
     state_isolation(&f.0);
+    escapees::escapees(&f.0);
     guardian_refusals(&f.0);
     secret_environment_refusals(&f.0);
     secret_variables(&f.0);

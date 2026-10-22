@@ -19,8 +19,10 @@ approved. The owner answered J1-Q1 to J1-Q4 on 2026-10-15, and
 governing J1 design. J1 also applies the
 [result retention packet](result-retention-graph-packet.md#review-decisions-and-delivery-dependencies)
 changes that the 2026-10-14 decisions record. The full review of findings
-EX1–EX16 (T1) was completed on 2026-10-15. J2 and the packets after it wait
-for EX5 escapee detection and termination. The EX10 exec_cmd qualification of
+EX1–EX16 (T1) was completed on 2026-10-15. EX5 escapee detection and
+termination, which J2 and the packets after it waited for, was implemented for
+sandboxed model jobs on 2026-10-21
+([evidence](escapee-control.md#implementation-evidence-2026-10-21)). The EX10 exec_cmd qualification of
 each local provider was met on 2026-10-20
 ([qualification results](exec-cmd-tool.md#qualification-results-2026-10-20)); see
 [threat model review](#threat-model-review-of-2026-10-15).
@@ -82,7 +84,7 @@ selected here.
 | ID | Decision | Effect on this design |
 | --- | --- | --- |
 | EX4 | Owner, 2026-10-15. All tools use jobs; there are no legacy tools. Secrets are detected with Wisp's ported rules (SD1 corrects "rules plus a classifier"; no classifier) and replaced with placeholders at capture, before storage; secrets only. A secret in a command becomes a per-execution variable such as `$ASURA_SECRET_1`; the log keeps only its name; an unsafe rewrite is refused. | Supersedes R3's "legacy tools keep kind 15". The J1 capture path filters secrets under the [secret detection design](secret-detection.md). Retained streams, pages, journal records and both views hold placeholders. Job intent records the rewritten command. How other tools adopt jobs is a follow-up design. |
-| EX5 | Owner, 2026-10-14. Detect and terminate escapees reliably before J2: `setsid` and new-session escapes, pipe-holding escapees that block settlement, and false `cleanup_confirmed`. Selected: [escapee control](escapee-control.md), 2026-10-20. | J2 prerequisite. The guardian's settlement gate now confirms cleanup only when no attributed descendant remains; J2 consumes the gate and the escapee facts (see [what J2 consumes](escapee-control.md#what-j2-consumes)). Without it a pipe-holding escapee could hold a slot indefinitely, since jobs have no lifetime (J2a-1). |
+| EX5 | Owner, 2026-10-14. Detect and terminate escapees reliably before J2: `setsid` and new-session escapes, pipe-holding escapees that block settlement, and false `cleanup_confirmed`. Selected: [escapee control](escapee-control.md), 2026-10-20. | J2 prerequisite, met on 2026-10-21 for sandboxed model jobs. The guardian's settlement gate confirms cleanup only when no attributed descendant remains; J2 consumes the gate and the escapee facts (see [what J2 consumes](escapee-control.md#what-j2-consumes)). Without it a pipe-holding escapee could hold a slot indefinitely, since jobs have no lifetime (J2a-1). The person guardian path adds the same sweep with the person-command packets. |
 | EX10 | Owner, 2026-10-14. Run SH-E1-style exec_cmd qualification for each local tool-capable provider (CoreAI, MLX, Ollama models) before J2. | J2 prerequisite, met 2026-10-20: the campaign is recorded in [exec_cmd qualification results](exec-cmd-tool.md#qualification-results-2026-10-20) with no service-class defect. Model verdicts do not hold J2 because EX10 keeps exec_cmd offered (EXQ-2, [decisions](exec-cmd-tool.md#qualification-decisions)). |
 | EX11 | Owner, 2026-10-14. A person execution setting: global default plus a per-project override, default on. A change is a revocation trigger: turning it off refuses new execution and cancels live model jobs in scope. | Added to [revocation triggers](#security-and-authority) and TJ-14. The setting needs its own design. |
 | EX12 | Owner, 2026-10-14. The client shows a visible notice whenever a job outlives its turn. | Added to [turn end](#turn-end-steering-cancellation-and-completion). Proposed placement: J4. |
@@ -828,11 +830,11 @@ that started the job. A job continues after that turn ends, with no lifetime
 bound. This is a deliberate change: effects can now continue without an active
 turn. The original grant snapshot, sandbox, environment, scratch, network denial
 and descendant limits apply unchanged. The unbounded lifetime widens none of them.
-A `setsid` escapee currently survives cleanup and can write the project after
-settlement (threat model EX5, probe of 2026-10-14); J2 waits for its detection
-and termination under the [escapee control design](escapee-control.md), which
-gates cleanup confirmation on a zero-descendant scan so the escapee is killed
-before `cleanup_confirmed`.
+Before 2026-10-21 a `setsid` escapee survived cleanup and could write the
+project after settlement (threat model EX5, probe of 2026-10-14). The
+[escapee control design](escapee-control.md), implemented for sandboxed model
+jobs on 2026-10-21, gates cleanup confirmation on a zero-descendant scan, so the
+escapee is killed before `cleanup_confirmed`. J2 consumes that gate.
 Every profile denies `~/.asura` except the call's scratch (SI3, implemented).
 Person jobs use the [person profile and grant](person-command-mode.md#authority-and-grant)
 instead; they have network access by owner decision (PCR7). The full threat
@@ -933,7 +935,7 @@ and end-to-end tests before the next starts.
 flowchart TD
     RP[Retention packet changes: G1, R1, R2, R4, R5] --> J1[J1: staging capture, secret filter, descriptors, text pages, quota]
     SD[EX4: secret detection slices SL1, SL2, implemented] --> J1
-    ESC[EX5: escapee detection and termination, escapee-control.md] --> J2[J2: controller core with model and person origin]
+    ESC[EX5: escapee detection and termination, escapee-control.md, met 2026-10-21 for model jobs] --> J2[J2: controller core with model and person origin]
     QUAL[EX10: exec_cmd qualification per local provider, met 2026-10-20] --> J2
     J1 --> J2
     J2 --> J3[J3: model job tool and exec_cmd adoption]
@@ -949,7 +951,7 @@ flowchart TD
 | Packet | Delivers | Decisions it uses |
 | --- | --- | --- |
 | J1 | Retention item 3 under the existing exec_cmd tool: secret filtering at capture and command rewrite (EX4, SL3), incremental hashing, staging, settle-then-install, kinds 14 and 23 (kind 22 retired 2026-10-18), `live` and `unverified_prefix` text pages, quota and growing-reservation accounting with interim expiry, capture and page-read workers, and removal of the exec_cmd timeout and setup budget. The model result keeps its shape with redacted tails; full output is retained. Graph projection is excluded. See [J1 and SL3 implementation details](#j1-and-sl3-implementation-details). | G1, R1, R2, R3 (kinds 14, 23), R4, R5, R6, EX4, J1-Q1 to J1-Q4 |
-| J2 | Controller core: slots, job records, no lifetime, lease stop-control bytes, leader-exit notice, `CapturePaused` for quota and ENOSPC, revocation, journal outage, restart and shutdown, and the person-origin amendments. Driven by integration tests; the exec_cmd tool is not yet switched. | T1 (done), EX5, EX10, R3, J1d, J2a-1, J2a-2, J2b, J2c, J2d |
+| J2 | Controller core: slots, job records, no lifetime, lease stop-control bytes, leader-exit notice, `CapturePaused` for quota and ENOSPC, revocation, journal outage, restart and shutdown, and the person-origin amendments. Driven by integration tests; the exec_cmd tool is not yet switched. | T1 (done), EX5 (met 2026-10-21 for model jobs), EX10, R3, J1d, J2a-1, J2a-2, J2b, J2c, J2d |
 | J3 | `exec_cmd` adoption with yield and no output text, removal of `timeout_seconds`, the `job` tool including `wait` and `note`, and reference-only results. Shipped together, because results carry no output text. | R3, R5, `job wait`, S1 |
 | J4 | Control messages, `/jobs`, the viewer, cancel and kill, `at_end`, and `/job pin`, `unpin`, `delete` and `note`, with their command flowcharts | J2a-2, J4a, S1 |
 | J5 | Job notices before the prompt, bound by the turn input digest | J5a |
@@ -1906,7 +1908,9 @@ Proof limits added by the implementation:
 
 No open owner decision blocks J1–J6. J1 is ready for implementation; SL1 and
 SL2 of the [secret detection design](secret-detection.md#delivery) are
-implemented. J2 waits for the EX5 prerequisite; the EX10 prerequisite was met
+implemented. The EX5 prerequisite of J2 was met on 2026-10-21 for sandboxed
+model jobs ([evidence](escapee-control.md#implementation-evidence-2026-10-21));
+the EX10 prerequisite was met
 on 2026-10-20 ([qualification results](exec-cmd-tool.md#qualification-results-2026-10-20)). These remain for
 later designs:
 

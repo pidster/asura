@@ -165,7 +165,7 @@ Setup and filesystem operations run in one retained platform setup worker, with 
 two-second logical deadline and cancellation checks. Never start a replacement
 worker before actual settlement. Steady-state pipe and guardian status readiness
 feed the existing reactor through nonblocking descriptors. The guardian uses bounded
-readiness/timers and a fixed 128-byte maximum status receive buffer; no generic RPC
+readiness/timers and a fixed 192-byte maximum status receive buffer; no generic RPC
 server, command dispatcher or model access is added.
 
 On cancellation, expiry, steering, generation invalidation, turn end, output limit
@@ -199,10 +199,12 @@ cooperative build/test commands and guarantees its owned-group cleanup only. If
 an escape is observed, report cleanup_unconfirmed. An undetected escaped
 descendant is a documented limit; never claim all descendants are absent. For
 sandboxed jobs, the [escapee control design](escapee-control.md) (EX5,
-2026-10-20) supersedes this limit before J2: it attributes a job's descendants
+2026-10-20) supersedes this limit: it attributes a job's descendants
 with a per-job `sandbox_check` marker, terminates them freeze-then-kill, and
-gates cleanup confirmation on a zero-descendant scan. The `!!` profile keeps a
-reduced residual under EXD-1. The guardian protects against service death,
+gates cleanup confirmation on a zero-descendant scan. It is implemented for the
+model exec_cmd path (2026-10-21; see its
+[implementation evidence](escapee-control.md#implementation-evidence-2026-10-21)).
+The `!!` profile keeps a reduced residual under EXD-1. The guardian protects against service death,
 not a malicious same-user actor killing the guardian. Do not invent unsupported
 sandbox operations to hide this limit or add a repeated approval gate.
 
@@ -322,21 +324,23 @@ new version number or RPC service. Encoding is exactly:
 | Bytes | Meaning |
 | --- | --- |
 | 0–3 | ASCII `ASSH` |
-| 4 | Kind:1 spawned,2 settled,3 setup_failed,4 cleanup_unconfirmed |
-| 5 | Reason:0 none,1 unassigned (former timeout, removed 2026-10-17),2 cancel,3 output_limit,4 lease_ended,5 spawn_failed,6 sandbox_unavailable,7 identity_invalid,8 protocol_fault,9 cleanup_failed |
+| 4 | Kind:1 spawned,2 settled,3 setup_failed,4 cleanup_unconfirmed,6 escapee_report ([escapee control](escapee-control.md#guardian-status-notice-extensions)) |
+| 5 | Reason:0 none,1 unassigned (former timeout, removed 2026-10-17),2 cancel,3 output_limit,4 lease_ended,5 spawn_failed,6 sandbox_unavailable,7 identity_invalid,8 protocol_fault,9 cleanup_failed,12 escapee_terminated (kind 2),13 escapee_unterminated (kind 4) |
 | 6 | Exit kind:0 absent,1 exit_code,2 signal |
 | 7 | Cleanup:0 unconfirmed,1 owned_group_settled |
 | 8–23 | Exact nonzero 16-byte job ID |
 | 24–27 | Big-endian u32 exit/signal value; zero when absent |
 | 28–31 | Reserved, all zero |
 
-At most three notices are accepted; buffer at most 128 bytes. Spawned has absent
+At most five notices are accepted; buffer at most 192 bytes. Spawned has absent
 exit, none reason and unconfirmed cleanup. Setup_failed has absent exit, a fixed
 failure reason and settled cleanup only if no command exists. Settled has an exit
 code 0–255 or signal 1–127 and settled cleanup. Cleanup_unconfirmed never sets the
-settled bit. Unknown values, changed job IDs, duplicate/out-of-order notices,
+settled bit. Escapee_report carries the escapee count in bytes 24–27; the
+[escapee control design](escapee-control.md#guardian-status-notice-extensions)
+fixes its order rules. Unknown values, changed job IDs, duplicate/out-of-order notices,
 trailing bytes and partial EOF are protocol faults that initiate cleanup; they
-never prove absence of an effect. The sole writer emits at most 96 bytes total into an initially empty private
+never prove absence of an effect. The sole writer emits at most 160 bytes total into an initially empty private
 pipe. This is below the POSIX minimum PIPE_BUF of 512 bytes, so valid notices
 cannot fill the pipe even if the service never reads. An unexpected WouldBlock
 is a protocol fault that triggers retained cleanup; there is no retry queue. The service must
@@ -414,7 +418,9 @@ after exit and before result acknowledgement. Verify no repeated side effect, no
 PID-based restart reattachment, explicit unconfirmed outcome, retained cleanup slot
 and responsiveness of status/input/cancel under stalled setup or reap.
 
-SH-I3: deliberately escaped-session fixture documents the owned-group limit. The
+SH-I3: deliberately escaped-session fixture documents the owned-group limit; for
+sandboxed jobs the [escapee control](escapee-control.md#validation) cases
+EC-I1–EC-I8 replace that limit with detection and termination. The
 test parent explicitly owns and cleans this fixture; it must never leave a daemon.
 Do not turn a group-empty assertion into an all-descendant claim. Prove ordinary
 owned children absent before scratch deletion and test cleanup-unconfirmed retention.

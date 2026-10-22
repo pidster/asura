@@ -1197,6 +1197,124 @@ fn native() -> Result<()> {
     Ok(())
 }
 
+/// The (start seconds, start microseconds) of a live, non-zombie process.
+fn started(pid: i32) -> Option<(u64, u64)> {
+    // SAFETY: plain-data output; zero is a valid bit pattern.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: a complete output buffer of the stated size; read-only query.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (got == size && info.pbi_status != libc::SZOMB)
+        .then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+/// EC-E3 (EX-V9) and EC-E1 at the service level: the real service, helper,
+/// guardian and sandbox run a model exec_cmd call whose command starts
+/// `setsid`, double-fork and pipe-holding escapees. Each is detected and
+/// killed, the call settles, its result confirms cleanup only after all
+/// three are gone and shows the count, and no escapee writes the project
+/// afterwards. Then a late settlement (unverifiable scans, test-support
+/// fault) settles with cleanup_confirmed=false, releases the scratch and
+/// the slot, and the next call runs.
+fn escapees() -> Result<()> {
+    let (fixture, model, project, directory) = setup("escapees")?;
+    std::fs::write(
+        directory.join("escapee.pl"),
+        include_str!("../../asura-platform/tests/fixtures/escapee.pl"),
+    )?;
+    let command = "/usr/bin/perl escapee.pl setsid s; /usr/bin/perl escapee.pl doublefork d; \
+        /usr/bin/perl escapee.pl pipehold p; \
+        while [ ! -e s.pid ] || [ ! -e d.pid ] || [ ! -e p.pid ]; do sleep 0.05; done; \
+        sleep 0.3; exit 0";
+    model.script(&[Step::ExecCmd(command.into()), Step::Final]);
+    let operation = submit(&fixture, project, "Escape.")?;
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    let calls = exec_cmd_calls(&fixture, operation)?;
+    let result = calls[0].result.as_ref().ok_or("kind 15")?;
+    assert_eq!(result.status, 1, "{}", result.text);
+    assert!(
+        result.text.starts_with(
+            "failure=None exit_code=0 signal=none reason=none truncated=false cleanup_confirmed=true capture=complete escapees=3\nstdout:\n"
+        ),
+        "{}",
+        result.text
+    );
+    let settled = calls[0].settled.as_ref().ok_or("kind 23")?;
+    assert_eq!(settled.state, CaptureState::Complete);
+    assert!(settled.stdout.eof && settled.stderr.eof, "capture EOF");
+    for tag in ["s", "d", "p"] {
+        let pid: i32 = std::fs::read_to_string(directory.join(format!("{tag}.pid")))?
+            .trim()
+            .parse()?;
+        assert!(
+            started(pid).is_none(),
+            "{tag} escapee alive after settlement"
+        );
+        let beat = directory.join(format!("{tag}.beat"));
+        let before = std::fs::metadata(&beat)?.len();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            std::fs::metadata(&beat)?.len(),
+            before,
+            "{tag} escapee wrote the project after settlement"
+        );
+    }
+    // Late settlement through the service: scans unverifiable five times.
+    std::fs::write(
+        fixture.home.join("exec-cmd-guardian-fault"),
+        "unverifiable:5",
+    )?;
+    model.script(&[Step::ExecCmd("printf late-output".into()), Step::Final]);
+    let operation = submit(&fixture, project, "Late.")?;
+    let event = finish(&fixture, operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    std::fs::remove_file(fixture.home.join("exec-cmd-guardian-fault"))?;
+    let calls = exec_cmd_calls(&fixture, operation)?;
+    let result = calls[0].result.as_ref().ok_or("kind 15")?;
+    assert_eq!(result.status, 1, "{}", result.text);
+    assert!(
+        result
+            .text
+            .contains("cleanup_confirmed=false capture=complete\nstdout:\nlate-output"),
+        "{}",
+        result.text
+    );
+    // The slot and scratch were released: the next call runs and confirms.
+    model.script(&[Step::ExecCmd("printf again".into()), Step::Final]);
+    let operation = submit(&fixture, project, "Again.")?;
+    assert_eq!(
+        finish(&fixture, operation, Duration::from_secs(60))?.kind,
+        Some(3)
+    );
+    let calls = exec_cmd_calls(&fixture, operation)?;
+    let result = calls[0].result.as_ref().ok_or("kind 15")?;
+    assert!(
+        result
+            .text
+            .contains("cleanup_confirmed=true capture=complete\nstdout:\nagain"),
+        "{}",
+        result.text
+    );
+    let scratch: Vec<_> = std::fs::read_dir(fixture.home.join(".asura/tmp"))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("exec-cmd-"))
+        .collect();
+    assert!(scratch.is_empty(), "scratch left: {scratch:?}");
+    println!(
+        "PASS EC-E3/EC-E1 setsid, double-fork and pipe-holding escapees killed before cleanup_confirmed (escapees=3); late settlement released the slot with cleanup_confirmed=false"
+    );
+    Ok(())
+}
+
 fn child(home: &Path) -> Result<()> {
     asura_platform::journal_gate::install_file_gate(home);
     tracing_subscriber::fmt()
@@ -1218,6 +1336,13 @@ fn main() {
     {
         std::process::exit(asura_platform::exec_cmd::run_guardian(job, command));
     }
+    if let [_, flag, job, command, fault] = args.as_slice()
+        && flag == "--asura-exec-cmd-guardian"
+    {
+        std::process::exit(asura_platform::exec_cmd::run_guardian_for_test(
+            job, command, fault,
+        ));
+    }
     if args.get(1).map(String::as_str) == Some("--capture-child") {
         if let Err(error) = child(Path::new(&args[2])) {
             eprintln!("capture child failed: {error}");
@@ -1230,7 +1355,7 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 8] = [
+    let cases: [Case; 9] = [
         ("secrets", secrets_turn),
         ("whole", whole_command_turn),
         ("setup", setup_budget_removed),
@@ -1239,6 +1364,7 @@ fn main() {
         ("crash", crash_points),
         ("big", no_output_stop),
         ("timeout", timeout_removed),
+        ("escapees", escapees),
     ];
     if selected.contains(&"native") {
         if let Err(error) = native() {

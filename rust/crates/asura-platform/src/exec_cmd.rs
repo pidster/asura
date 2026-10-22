@@ -1,6 +1,7 @@
 //! Bounded noninteractive command process owner. Filesystem work is worker-only.
 mod capture;
 mod cleanup;
+mod escapee;
 mod guardian;
 mod protocol;
 mod spawn;
@@ -12,8 +13,15 @@ use crate::{PollInterest, ProjectIdentity, RuntimeDirectory, StateBoundary};
 use capture::Capture;
 pub use capture::{DRAIN_BUDGET, OutputSink, READ_BUFFER, Stream, render_tail};
 pub use cleanup::ExecCmdCleanup;
+#[cfg(feature = "test-support")]
+pub use escapee::scan_for_test as escapee_scan_for_test;
 pub use guardian::run_guardian;
-use protocol::Notice;
+#[cfg(feature = "test-support")]
+pub use guardian::run_guardian_for_test;
+use protocol::{
+    KIND_ESCAPEE_REPORT, Notice, REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED,
+    REASON_ESCAPEE_UNTERMINATED,
+};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
@@ -37,8 +45,21 @@ pub enum StopReason {
     OutputLimit,
     LeaseEnded,
 }
+/// Why the guardian reported `cleanup_unconfirmed` (notice kind 4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnconfirmedReason {
+    /// Reason 9: cleanup did not settle by the 2.5 s report point.
+    CleanupFailed,
+    /// Reason 13: a descendant could not be verified gone (EX5).
+    EscapeeUnterminated,
+}
 /// Process facts of a settled job. Output is never kept here: the service's
 /// capture worker owns the redacted stream and its tails (J1, G10).
+///
+/// `cleanup_confirmed` is true only when the guardian's settlement gate
+/// passed with no earlier `cleanup_unconfirmed` notice; a late settlement
+/// releases resources but never asserts that cleanup was clean.
+/// `escapees` counts the escapees the guardian terminated (notice kind 6).
 #[derive(Clone, Debug)]
 pub struct ExecCmdResult {
     pub failure: Option<ExecCmdError>,
@@ -46,6 +67,7 @@ pub struct ExecCmdResult {
     pub signal: Option<i32>,
     pub reason: Option<StopReason>,
     pub cleanup_confirmed: bool,
+    pub escapees: u32,
 }
 /// Rendered model-visible tails of the redacted streams (see [`render_tail`]).
 #[derive(Clone, Debug, Default)]
@@ -56,10 +78,11 @@ pub struct Tails {
 }
 impl ExecCmdResult {
     /// Kind 15 text: today's shape, with the redacted tails and the capture
-    /// state as `capture=<state>` at the end of the header line.
+    /// state as `capture=<state>` at the end of the header line, followed by
+    /// ` escapees=<n>` when the guardian terminated escapees (EX5).
     pub fn render_text(&self, tails: &Tails, capture: &str) -> String {
         format!(
-            "failure={:?} exit_code={} signal={} reason={} truncated={} cleanup_confirmed={} capture={}\nstdout:\n{}\nstderr:\n{}",
+            "failure={:?} exit_code={} signal={} reason={} truncated={} cleanup_confirmed={} capture={}{}\nstdout:\n{}\nstderr:\n{}",
             self.failure,
             self.exit_code
                 .map_or_else(|| "none".into(), |n| n.to_string()),
@@ -73,6 +96,11 @@ impl ExecCmdResult {
             tails.truncated,
             self.cleanup_confirmed,
             capture,
+            if self.escapees > 0 {
+                format!(" escapees={}", self.escapees)
+            } else {
+                String::new()
+            },
             tails.stdout,
             tails.stderr
         )
@@ -122,6 +150,8 @@ pub struct PreparedExecCmd {
     omit_state_for_test: bool,
     #[cfg(feature = "test-support")]
     secret_environment_for_test: Option<Vec<Vec<u8>>>,
+    #[cfg(feature = "test-support")]
+    guardian_fault_for_test: Option<String>,
     cleanup: Option<ExecCmdCleanup>,
 }
 fn check(cancel: &AtomicBool) -> Result<(), ExecCmdError> {
@@ -246,6 +276,8 @@ impl PreparedExecCmd {
             omit_state_for_test: false,
             #[cfg(feature = "test-support")]
             secret_environment_for_test: None,
+            #[cfg(feature = "test-support")]
+            guardian_fault_for_test: None,
             cleanup: Some(cleanup),
         };
         if let Err(reason) = check(cancel) {
@@ -269,6 +301,13 @@ impl PreparedExecCmd {
     #[cfg(feature = "test-support")]
     pub fn replace_secret_environment_for_test(&mut self, entries: Vec<Vec<u8>>) {
         self.secret_environment_for_test = Some(entries);
+    }
+    /// Pass one escapee-control fault to the guardian (`group-only`,
+    /// `undyable` or `unverifiable:<n>`); the test executable must dispatch
+    /// the five-argument form to [`run_guardian_for_test`].
+    #[cfg(feature = "test-support")]
+    pub fn guardian_fault_for_test(&mut self, fault: &str) {
+        self.guardian_fault_for_test = Some(fault.into());
     }
     /// After a successful spawn ownership always transfers to ExecCmdJob.
     /// The request's secret values are dropped (and zeroed) whether or not
@@ -331,12 +370,15 @@ impl PreparedExecCmd {
         let (err_read, err_write) = spawn::pipe(false)?;
         let null =
             open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDWR, 0).map_err(|_| ExecCmdError::Io)?;
-        let args = vec![
+        #[allow(unused_mut)]
+        let mut args = vec![
             executable.to_string_lossy().into_owned(),
             "--asura-exec-cmd-guardian".into(),
             hex(self.request.job_id),
             self.request.command.clone(),
         ];
+        #[cfg(feature = "test-support")]
+        args.extend(self.guardian_fault_for_test.clone());
         if args.iter().map(|value| value.len() + 1).sum::<usize>() > 8704 {
             return Err(ExecCmdError::Invalid);
         }
@@ -376,10 +418,13 @@ impl PreparedExecCmd {
             reaped: false,
             lease: Some(lease_write),
             status: status_read,
-            status_bytes: Vec::with_capacity(128),
+            status_bytes: Vec::with_capacity(STATUS_BUFFER),
             status_eof: false,
             notices: 0,
             spawned: false,
+            last_kind: 0,
+            unconfirmed: None,
+            escapees: 0,
             terminal: None,
             out: Capture::new(out_read, Stream::Stdout),
             err: Capture::new(err_read, Stream::Stderr),
@@ -395,6 +440,11 @@ impl PreparedExecCmd {
 fn hex(id: [u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
+/// Status receive bound: five 32-byte notices fit (escapee-control.md).
+const STATUS_BUFFER: usize = 192;
+/// Most notices one guardian may send: spawned, leader exit (J2b),
+/// escapee report, cleanup unconfirmed and settled.
+const MAX_NOTICES: u8 = 5;
 pub struct ExecCmdJob {
     pid: libc::pid_t,
     reaped: bool,
@@ -404,6 +454,10 @@ pub struct ExecCmdJob {
     status_eof: bool,
     notices: u8,
     spawned: bool,
+    /// Kind of the previous notice; 0 before the first.
+    last_kind: u8,
+    unconfirmed: Option<UnconfirmedReason>,
+    escapees: u32,
     terminal: Option<Notice>,
     out: Capture,
     err: Capture,
@@ -479,31 +533,21 @@ impl ExecCmdJob {
         self.sink.flush();
         // No combined output stop (J1-Q2): the shared quota and pause apply.
         if !self.status_eof {
-            let mut buf = [0u8; 128];
+            let mut buf = [0u8; STATUS_BUFFER];
             // SAFETY: owned nonblocking descriptor and valid output buffer.
             let n =
                 unsafe { libc::read(self.status.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n == 0 {
                 self.status_eof = true;
             } else if n > 0 {
-                if self.status_bytes.len() + n as usize > 128 {
+                if self.status_bytes.len() + n as usize > STATUS_BUFFER {
                     return Err(ExecCmdError::Protocol);
                 }
                 self.status_bytes.extend_from_slice(&buf[..n as usize]);
                 while self.status_bytes.len() >= 32 {
                     let notice = Notice::decode(&self.status_bytes[..32], self.job_id)?;
                     self.status_bytes.drain(..32);
-                    self.notices += 1;
-                    if self.notices > 3 || self.terminal.is_some() {
-                        return Err(ExecCmdError::Protocol);
-                    }
-                    match notice.kind {
-                        1 if !self.spawned && self.notices == 1 => self.spawned = true,
-                        2 if self.spawned => self.terminal = Some(notice),
-                        3 if !self.spawned && self.notices == 1 => self.terminal = Some(notice),
-                        4 if self.spawned && self.notices == 2 => {}
-                        _ => return Err(ExecCmdError::Protocol),
-                    }
+                    self.accept(notice)?;
                 }
             } else if !spawn::would_block() {
                 return Err(ExecCmdError::Io);
@@ -526,6 +570,45 @@ impl ExecCmdJob {
             return Err(ExecCmdError::Protocol);
         }
         Ok(())
+    }
+    /// Order rules: spawned first; at most one kind 4 and one kind 6, both
+    /// before the terminal notice; kind 6 only immediately before kind 2
+    /// with reason 12, and reason 12 only after kind 6.
+    fn accept(&mut self, notice: Notice) -> Result<(), ExecCmdError> {
+        self.notices += 1;
+        if self.notices > MAX_NOTICES || self.terminal.is_some() {
+            return Err(ExecCmdError::Protocol);
+        }
+        let after_report = self.last_kind == KIND_ESCAPEE_REPORT;
+        match notice.kind {
+            1 if self.notices == 1 => self.spawned = true,
+            3 if self.notices == 1 => self.terminal = Some(notice),
+            2 if self.spawned && (notice.reason == REASON_ESCAPEE_TERMINATED) == after_report => {
+                self.terminal = Some(notice)
+            }
+            4 if self.spawned && self.unconfirmed.is_none() && !after_report => {
+                self.unconfirmed = Some(match notice.reason {
+                    REASON_CLEANUP_FAILED => UnconfirmedReason::CleanupFailed,
+                    REASON_ESCAPEE_UNTERMINATED => UnconfirmedReason::EscapeeUnterminated,
+                    _ => return Err(ExecCmdError::Protocol),
+                })
+            }
+            KIND_ESCAPEE_REPORT if self.spawned && self.escapees == 0 => {
+                self.escapees = notice.value
+            }
+            _ => return Err(ExecCmdError::Protocol),
+        }
+        self.last_kind = notice.kind;
+        Ok(())
+    }
+    /// The guardian's `cleanup_unconfirmed` report, if one arrived. The job
+    /// keeps its slot and scratch until a later settled notice.
+    pub fn cleanup_unconfirmed(&self) -> Option<UnconfirmedReason> {
+        self.unconfirmed
+    }
+    /// Escapees the guardian reported terminated (notice kind 6).
+    pub fn escapees(&self) -> u32 {
+        self.escapees
     }
     pub fn settled(&self) -> bool {
         self.reaped
@@ -553,14 +636,17 @@ impl ExecCmdJob {
             },
             exit_code: (n.exit_kind == 1).then_some(n.value as i32),
             signal: (n.exit_kind == 2).then_some(n.value as i32),
-            // Reason 1 (the removed deadline) is unassigned.
+            // Reason 1 (the removed deadline) is unassigned. Reason 12
+            // replaces the lease reason; the service's own stop record
+            // keeps the stop reason.
             reason: self.stop.or(match n.reason {
                 2 => Some(StopReason::Cancelled),
                 3 => Some(StopReason::OutputLimit),
                 4 => Some(StopReason::LeaseEnded),
                 _ => None,
             }),
-            cleanup_confirmed: true,
+            cleanup_confirmed: self.unconfirmed.is_none(),
+            escapees: self.escapees,
         })
     }
     pub fn take_cleanup(&mut self) -> Option<ExecCmdCleanup> {

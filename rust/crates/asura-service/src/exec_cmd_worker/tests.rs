@@ -21,6 +21,7 @@ fn settled_process() -> Process {
         signal: None,
         reason: None,
         cleanup_confirmed: true,
+        escapees: 0,
     })
 }
 fn finalizing(cleanup_deadline: Option<Instant>, stop: Option<StopReason>) -> Worker {
@@ -181,6 +182,7 @@ fn settled_setup_failures_never_become_successful_command_results() {
         reason: None,
         failure: None,
         cleanup_confirmed: true,
+        escapees: 0,
     };
     for (error, status) in [
         (ExecCmdError::Invalid, 3),
@@ -243,6 +245,7 @@ fn sl7_whole_command_result_says_filtered_beside_display() {
         signal: None,
         reason: None,
         cleanup_confirmed: true,
+        escapees: 0,
     };
     let tails = Tails {
         stdout: "$ASURA_SECRET_1\n".into(),

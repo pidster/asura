@@ -1,6 +1,10 @@
 # Escapee detection and termination
 
-Status: design, 2026-10-20; not implemented. This design resolves the
+Status: design, 2026-10-20; implemented on 2026-10-21 for the model exec_cmd
+path (sandboxed model jobs), with the
+[implementation evidence](#implementation-evidence-2026-10-21) below. The `!`
+and `!!` person-profile parts wait for the person-command packets
+([delivery scope](#delivery-scope)). This design resolves the
 [execution threat model](execution-threat-model.md#owner-decisions) decision
 **EX5** (owner, 2026-10-14): Asura must reliably detect and terminate escapees
 before [tool job](tool-job-controller.md#delivery-dependencies) packet J2. It is
@@ -272,14 +276,14 @@ by an unverifiable result (`cleanup_unconfirmed`); no time limit ends it.
 ```mermaid
 flowchart TD
     Start["Cancel trigger or leader exit"] --> Group["TERM then KILL owned group (existing grace)"]
-    Group --> Reaped["Leader reaped, group empty?"]
+    Group --> Reaped["Leader exited (unreaped fence), group empty?"]
     Reaped -->|No| Group
     Reaped -->|Yes| Scan{"Sandboxed job?"}
     Scan -->|"Yes (model / !)"| Mark["Scan UID PIDs: sandboxed + writes scratch + denies decoy"]
     Scan -->|"No (!!)"| Env["Scan: owned group + ASURA_JOB env marker"]
     Mark --> Set{"Attributed set empty?"}
     Env --> EnvSet{"Env-marked survivors?"}
-    Set -->|No| Freeze["SIGSTOP set to fixpoint, then SIGKILL; re-verify start-time"]
+    Set -->|No| Freeze["SIGSTOP set to fixpoint (at most 1024 scans), then SIGKILL; re-verify start-time"]
     Freeze --> Verify{"Set reaches zero?"}
     Verify -->|Yes| EOF
     Verify -->|"No: uninterruptible / unverifiable"| Unconf["cleanup_unconfirmed: keep slot and scratch"]
@@ -289,7 +293,7 @@ flowchart TD
     ReportOut --> EOF
     EOF -->|Yes| Settled["owned_group_settled + escapee facts"]
     EOF -->|No| Unconf
-    Settled --> Done["Job controller records cleanup_confirmed"]
+    Settled --> Done["Leader reaped last; job controller records cleanup_confirmed"]
     Unconf --> Repair["Job controller repair/drain; slot retained"]
 ```
 
@@ -324,6 +328,14 @@ reasons 10–11 together. Changed kinds, duplicate kind 6, out-of-order or trail
 bytes stay protocol faults that initiate cleanup and never prove absence of an
 effect.
 
+Order rules (2026-10-21). After kind 1, the guardian may send one kind 4 and
+then one kind 6; kind 6 is always the notice immediately before kind 2. The
+decoder treats each of these as a protocol fault: kind 6 with a zero value, a
+nonzero exit kind or the cleanup bit; a second kind 4 or kind 6; kind 2 with
+reason 12 without kind 6 before it; and kind 6 followed by anything but kind 2
+with reason 12. Kind 4 accepts reasons 9 and 13. Kind 2 accepts reasons 0–4 and
+12. Reasons 10 and 11 stay rejected until the person-command packet adds them.
+
 ### What J2 consumes
 
 | Fact | Source | J2 use |
@@ -345,7 +357,7 @@ state. A requested kill is not a confirmed termination.
 ```mermaid
 stateDiagram-v2
     [*] --> GroupStop: Cancel trigger or leader exit
-    GroupStop --> Draining: Owned group signalled and empty, leader reaped
+    GroupStop --> Draining: Owned group signalled and empty, leader exited, not yet reaped
     Draining --> Scanning: Descendant scan (sandboxed) or env scan (!!)
     Scanning --> Draining: Attributed set non-empty → freeze-then-kill, rescan
     Scanning --> GateCheck: Attributed set empty (or !! group empty)
@@ -357,6 +369,104 @@ stateDiagram-v2
     Unconfirmed --> [*]: Service records CleanupUnconfirmed, retains slot
 ```
 
+### Guardian implementation refinements (2026-10-21)
+
+Selected mechanism. These refinements fix the details that the sections above
+leave to the implementation. They apply to the model exec_cmd path that exists
+today; the person-profile parts wait for the person-command packets (see
+[delivery scope](#delivery-scope)).
+
+**Where the sweep runs.** The guardian runs one escapee sweep on each pass of its
+existing 100 ms wait loop, and only when all of these hold: the leader has exited
+(observed with `WNOWAIT`), the leader fence is still valid, and `PROC_PGRP_ONLY`
+shows only the leader. The guardian reaps the leader only after a sweep reports
+the attributed set clear. The leader PID is therefore still allocated while the
+guardian signals escapees, and the guardian never signals the leader PID alone.
+The guardian excludes its own PID and the leader PID from every scan.
+
+**One sweep.** A sweep has a freeze phase and a kill phase:
+
+1. Freeze: scan, then send `SIGSTOP` to each attributed process whose status is
+   not `SSTOP`. Repeat until a scan finds every attributed process stopped. The
+   freeze phase runs at most 1024 scans (`FREEZE_ROUND_LIMIT`).
+2. Kill: send `SIGKILL` to each process in the frozen set, then scan once more.
+   An empty result with no capture-pipe holder clears the gate. A non-empty
+   result waits for the next 100 ms pass, which sweeps again.
+3. Round cap: when the freeze phase reaches its limit, the guardian still sends
+   `SIGKILL` to the attributed set of one more scan. It then reports the sweep
+   unverifiable. Killing first is strictly safer than leaving the set running.
+
+Before each `SIGSTOP` or `SIGKILL`, the guardian re-reads `PROC_PIDTBSDINFO`. It
+signals the PID only when the start time and pgid still match the scanned tuple.
+A changed tuple is skipped, and the next scan decides again.
+
+**Exit between listing and query.** `sandbox_check` returns 1 ("denied", errno 0)
+for a PID that does not exist or is a zombie (probe EC-V-GONE). A process that
+exits during a scan therefore fails marker test 2 and is not attributed. This is
+correct: an exited process cannot write, fork or hold a descriptor. Only a
+`sandbox_check` result other than 0 or 1 is unverifiable. `proc_pidinfo` with
+`ESRCH` means the process is gone; any other failure is unverifiable. `kill` with
+`ESRCH` means gone; any other failure is unverifiable.
+
+**When cleanup is reported unconfirmed.** The guardian sends at most one kind 4
+notice. It sends it at once when a sweep is unverifiable (EC-D2), with reason 13.
+Otherwise it keeps the existing 2.5 s report point after the first stop signal:
+if the gate has not passed by then, it sends kind 4 with reason 13 when the last
+sweep left attributed escapees or was unverifiable, and reason 9 in every other
+case. After kind 4 the guardian keeps its paced sweeps. A later clear sweep reaps
+the leader and sends the late settled notice.
+
+**Escapee count.** The kind 6 value counts the distinct processes, by PID and
+start time, that the guardian sent `SIGKILL` to during cleanup. The guardian
+keeps at most `kern.maxprocperuid` identities; past that, the count stays at
+that limit. When the count is not zero, the guardian sends kind 6 immediately
+before the kind 2 settled notice, and the kind 2 reason is 12. A count of zero
+sends no kind 6, and the kind 2 reason stays the lease reason (0 or 4).
+
+**Setup.** Before it spawns the command, the guardian derives the marker (FD 9
+path) and decoy (FD 10 path plus `/tmp`) and checks that the marker lies inside
+the decoy directory. It reads `kern.maxprocperuid` (accepted range 1 to
+1,048,576) and allocates the PID buffer. It records the `PROC_PIDFDPIPEINFO`
+handle and peer handle of FD 5 and FD 6. A failure in any of these steps sends
+the setup-failed notice with reason 6 (`sandbox_unavailable`); no command runs.
+
+**Test-support faults.** With the non-default `test-support` feature, a test may
+add one fault argument to the guardian invocation. `group-only` skips the sweep
+and reproduces the old group-only check (EC-V-OLD). `undyable` suppresses
+`SIGKILL` to escapees, as for a process that cannot be killed (EC-I8).
+`unverifiable:<n>` makes the first n sweeps unverifiable (EC-D2). Production
+builds do not contain this code, and the service never passes the argument.
+
+### What the current exec_cmd path consumes
+
+Required behavior until J2 replaces this path. The platform `ExecCmdJob` reads
+the new notices and the service exec_cmd worker uses them:
+
+| Fact | Platform result | Current use |
+| --- | --- | --- |
+| Kind 2 settled, no earlier kind 4 | `cleanup_confirmed` true | Scratch is removed and the slot is released, as before |
+| Kind 4, reason 9 or 13, then kind 2 (late settlement) | `cleanup_confirmed` false; `cleanup_unconfirmed()` returns the reason | Scratch is removed and the slot is released (AE-05); the result text says `cleanup_confirmed=false` |
+| Kind 4 with no later kind 2 | Job not settled; `cleanup_unconfirmed()` returns the reason | Slot and scratch stay held; a cancel trigger leads to the existing L3 repair path |
+| Kind 6 value | `escapees` | The kind 15 header line ends with ` escapees=<n>` when n is not zero. It is a number only |
+
+The durable escapee count in the settlement facts (kind 23) and the audit count
+belong to J2, as [what J2 consumes](#what-j2-consumes) states.
+
+### Delivery scope
+
+Delivered for the model exec_cmd path (2026-10-21): the sandbox marker and decoy
+scan, pipe-holder detection, freeze-then-kill with the PID-reuse re-check, the
+settlement gate, notice kind 6 and reasons 12 and 13, and the consumption above.
+
+Left to the person-command packets, which add the person guardian path:
+
+- the `!` profile (`person-1`): it reuses this sweep unchanged once the person
+  guardian path exists (EC-E2);
+- the `!!` profile: the `ASURA_JOB_<jobhex>` variable, the `KERN_PROCARGS2` scan,
+  EC-D1 counting without signals, and its 2 s grace (EC-I9, EC-I10, EC-E4);
+- notice reasons 10 and 11 (person stop and kill). The decoder rejects them
+  until that packet defines and emits them.
+
 ## Failure handling and recovery
 
 | Case | Result |
@@ -366,6 +476,8 @@ stateDiagram-v2
 | Escapee in an uninterruptible kernel wait (cannot be killed) | Attributed set stays non-empty; `cleanup_unconfirmed` reason 13; slot and scratch retained; paced rescan continues; a later rescan that reaches zero records a late settlement, which never turns an unknown outcome into proof of no effect |
 | `sandbox_check` or `proc_pidinfo` returns an error or an over-size/odd buffer | Treated as unverifiable: `cleanup_unconfirmed`, slot retained, even when the group and pipes have settled (EC-D2); the paced rescan clears it when the query recovers; never assume the process is absent |
 | PID reused between scan and signal | Start-time/pgid re-check fails; the PID is not signalled; rescan |
+| Process exits between the PID listing and its `sandbox_check` | `sandbox_check` returns 1 for an absent or zombie PID (EC-V-GONE); the process is not attributed; this is not an error |
+| Freeze phase reaches 1024 scans | `SIGKILL` to the current attributed set, then unverifiable: kind 4 reason 13 once, paced sweeps continue |
 | `!!` escapee with scrubbed environment and new session | Not attributable; residual accepted under EXD-1; not a cleanup failure for the owned group |
 | Scanner itself is killed (service/guardian death) | Existing lease-EOF path: the guardian on service death still signals the owned group; an already-escaped descendant is the documented residual, unchanged for the no-guardian case |
 | Service restart during cleanup | Unchanged: restart never reattaches to a process or signals a journaled PID; interrupted jobs stay listable; a restarted service cannot rediscover a prior job's escapees, because the marker depends on the live job's pinned scratch/decoy descriptors (recorded limit) |
@@ -449,7 +561,7 @@ states initial state, trigger and required result.
 | EC-I3 | Pipe-holding `setsid` escapee | Before kill, the capture pipe never reaches EOF; after kill, EOF arrives and the job settles (EC-V-EOF) |
 | EC-I4 | False `cleanup_confirmed` regression | While the escapee lives, the guardian reports `cleanup_unconfirmed`, not settled (the EX-V5 finding, now a passing gate) |
 | EC-I5 | Forking/PID-hopping escapee | Freeze-then-kill reaches zero; no descendant survives the sweep (EC-V-FORK) |
-| EC-I6 | Two concurrent jobs | Each job's scan attributes and kills only its own escapee, using the other's scratch as decoy (EC-V-ISO) |
+| EC-I6 | Two concurrent jobs | Each job's scan attributes and kills only its own escapee, with the selected Asura `tmp` decoy; the other job's escapee keeps running until its own job settles (EC-V-ISO used each other's scratch as decoy) |
 | EC-I7 | Nested `sandbox-exec` attempt by the command | Refused by the OS; the command stays in the job profile; attribution still holds (EC-V-NEST) |
 | EC-I8 | Uninterruptible/undyable survivor (injected stuck state) | `cleanup_unconfirmed` reason 13; slot and scratch retained; a later rescan to zero records late settlement without asserting cleanliness |
 | EC-I9 | `!!` escapee that kept its environment | Found by the `ASURA_JOB` env-marker scan via `KERN_PROCARGS2`; counted in the kind 6 notice; not signalled; still running after settlement (EC-D1) |
@@ -469,6 +581,45 @@ Environments: macOS 27 development host (recorded build 26A428) with the native
 process harness, scratch Asura home and scratch project, the system model and a
 verified local Ollama for the model path. Release qualification is not claimed by
 these cases.
+
+## Implementation evidence (2026-10-21)
+
+Verified behavior on the macOS 27.0 development host (build 26A428), real
+guardian, real `sandbox-exec` and real escapee processes. Code: the escapee
+module `asura-platform/src/exec_cmd/escapee.rs` (scan, sweep, gate, libproc
+and `sandbox_check` wrappers), the guardian loop in `guardian.rs`, the notice
+decoder in `protocol.rs`, the reader in `exec_cmd.rs`, and the service worker
+release in `asura-service/src/exec_cmd_worker.rs`. The fixture escapee is
+`asura-platform/tests/fixtures/escapee.pl` (Perl, 20 s lifetime, release file).
+
+| Case | Evidence | Result |
+| --- | --- | --- |
+| EC-U1 | `exec_cmd::escapee::tests::ec_u1_gate_settles_only_when_every_input_holds` | Pass |
+| EC-U2 | `exec_cmd::tests::ec_u2_escapee_notice_shapes_round_trip_and_reject_invalid`, `ec_u2_escapee_notice_order_and_settlement_facts`, `ec_u2_escapee_notice_order_faults` | Pass; reasons 10 and 11 are rejected until the person packet |
+| EC-U3 | `ec_u3_reused_pid_is_not_signalled`, `ec_u3_gone_before_signal_is_not_signalled` | Pass |
+| EC-U4 | `ec_u4_freeze_round_cap_kills_then_reports_unverifiable` | Pass |
+| EC-U5 | `ec_u5_faults_and_odd_buffers_are_unverifiable` | Pass |
+| EC-U6 | `ec_u6_marker_and_decoy_come_from_pinned_paths` | Pass |
+| Sweep units | `sweep_freezes_all_then_kills_and_counts`, `sweep_reaches_a_fixpoint_over_a_forking_escapee`, `undying_escapee_keeps_the_gate_closed`, `tally_counts_distinct_identities_up_to_the_scan_limit`, `sdk_layout_matches_the_recorded_probe`, `real_table_never_attributes_unsandboxed_or_absent_processes` | Pass |
+| EC-I1, EC-I2, EC-I3 | `exec_cmd_process` `all_kinds`: one job starts `setsid`, double-fork (ppid 1 recorded) and pipe-holding escapees outside the owned group | Pass: settled with `cleanup_confirmed` true, `escapees=3`, no kind 4, both capture pipes at EOF; no escapee alive and no project write after settlement |
+| EC-I4 | `old_group_only_check` (`group-only` fault) and `undying_pipe_holder` | Pass: the old check confirmed cleanup while the escapee lived and wrote the project (EC-V-OLD reproduced); the real gate stayed unsettled while an escapee lived |
+| EC-I5 | `forking`: PID-hopping escapee | Pass: the pid file stopped growing at settlement |
+| EC-I6 | `concurrent`: two jobs with the selected Asura `tmp` decoy | Pass: job A killed only its escapee; job B's escapee kept writing until job B settled and killed it |
+| EC-I7 | `nested_sandbox` | Pass: `sandbox_apply: Operation not permitted`; the later escapee was attributed and killed |
+| EC-I8 | `undying_pipe_holder` (`undyable` fault: `SIGKILL` to escapees suppressed) | Pass: kind 4 reason 13, no settlement and no capture EOF while it lived; frozen, so no project write; after the test removed it, a paced sweep settled late with `cleanup_confirmed` false and `escapees=1` |
+| EC-D2 | `unverifiable_scan` (`unverifiable:5` fault) | Pass: kind 4 reason 13 although group and pipes settled; late settlement with `cleanup_confirmed` false; scratch removed |
+| EC-I11 | `all_kinds`: one real scan from the test process | Pass: 5 processes attributed in about 4.4 ms, below the 100 ms poll |
+| EC-E3 (EX-V9), EC-E1 | `asura-service --test capture_flow -- escapees`: real service, Swift helper, guardian and sandbox, scripted loopback model | Pass: kind 15 header ends `cleanup_confirmed=true capture=complete escapees=3`; kind 23 complete with EOF on both streams; no escapee alive and no project write afterwards. A late settlement through the service (`unverifiable:5`) gave `cleanup_confirmed=false`, released the scratch and slot, and the next call ran |
+
+Proof limits:
+
+- EC-I8 uses an injected fault. A real process in an uninterruptible kernel
+  wait was not produced on the host.
+- EC-E1 and EC-E3 ran with a scripted model through the real helper, not through
+  the TUI with a native model. The native exec_cmd journey ran as a regression
+  check only; it does not start escapees.
+- EC-I9, EC-I10, EC-E2 and EC-E4 belong to the person-command packets.
+- The durable escapee count in kind 23 and audit is J2 work.
 
 ## Decisions
 
@@ -560,7 +711,7 @@ Recorded 2026-10-20 on macOS 27.0 build 26A428 (Darwin 27.0.0, arm64,
 `sandbox-exec` and a Seatbelt profile matching the exec_cmd baseline (system
 roots, project, scratch; `(deny default)`). Fixtures were bounded and killed only
 by command name after the probe. These are verified behaviors of the mechanisms,
-not of Asura's guardian, which is not yet changed.
+not of Asura's guardian, which was not yet changed then.
 
 | Probe | Result |
 | --- | --- |
@@ -573,6 +724,7 @@ not of Asura's guardian, which is not yet changed.
 | EC-V-FORK | Freeze-then-kill cleared a PID-hopping `setsid` escapee in 2 freeze and 2 kill rounds; kill-only also cleared this one-at-a-time fixture |
 | EC-V-ENV | `sysctl(KERN_PROCARGS2)` exposed a child's `ASURA_JOB` environment variable to a same-UID reader, including a `setsid` grandchild that kept its environment |
 | EC-V-TIME | A full UID scan with a path-filtered `sandbox_check` over ~640 processes cost 0.6–7.6 ms; `PROC_PIDTBSDINFO` provided process start time and pgid for PID-reuse re-checks |
+| EC-V-GONE | Recorded 2026-10-21: `sandbox_check(pid, NULL, 0)` and the path-filtered check both return 1 with errno 0 for a nonexistent PID and for a zombie; `PROC_PIDTBSDINFO` and `PROC_PIDLISTFDS` fail with `ESRCH` for both. `proc_bsdinfo` is 136 bytes; `pipe_fdinfo` is 184 bytes, with `pipe_handle` at offset 160 and `pipe_peerhandle` at 168; `SANDBOX_CHECK_NO_REPORT` is `0x40000000` |
 | EC-V-OLD | The current group-only check (`PROC_PGRP_ONLY`) reported "group-only-leader" true while the `setsid` escapee was alive and still writing the project — reproducing the EX-V5 false `cleanup_confirmed` finding this design closes |
 
 ## Design verification
@@ -582,7 +734,9 @@ macOS 27.0 build 26A428, listed above, and by reading the installed SDK headers
 (`sys/event.h`, `sys/proc_info.h`, `libproc.h`) and `libsystem_sandbox` exports.
 The guardian, job controller and person-command designs were read at the current
 tree. No Asura code or test was changed or run; all evidence is of the OS
-mechanisms the design selects, not of an implementation. Diagrams were rendered
+mechanisms the design selects, not of an implementation. The implementation
+and its tests followed on 2026-10-21; see
+[implementation evidence](#implementation-evidence-2026-10-21). Diagrams were rendered
 with the local Mermaid CLI and inspected (renderer version recorded with the
 check).
 

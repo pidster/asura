@@ -259,8 +259,15 @@ impl Worker {
             }
             #[cfg(feature = "test-support")]
             setup_gate(&runtime, cancel);
-            let prepared = PreparedExecCmd::prepare(runtime, &project, request, cancel)
+            #[cfg(feature = "test-support")]
+            let fault = guardian_fault(&runtime);
+            #[allow(unused_mut)]
+            let mut prepared = PreparedExecCmd::prepare(runtime, &project, request, cancel)
                 .map_err(Failure::from)?;
+            #[cfg(feature = "test-support")]
+            if let Some(fault) = fault {
+                prepared.guardian_fault_for_test(&fault);
+            }
             prepared
                 .spawn(&executable, cancel, sink)
                 .map_err(Failure::from)
@@ -406,8 +413,12 @@ impl Worker {
                     }
                 }
                 if job.settled() {
+                    // A late settlement after cleanup_unconfirmed still
+                    // passed the guardian's gate: it releases the scratch
+                    // and slot, and its result says cleanup_confirmed=false
+                    // (escapee-control.md, current exec_cmd path).
                     match job.result() {
-                        Some(result) if result.cleanup_confirmed => {
+                        Some(result) => {
                             if active.process.is_none() {
                                 active.process = Some(Process::Settled(result));
                             }
@@ -516,6 +527,15 @@ fn setup_gate(runtime: &RuntimeDirectory, cancel: &AtomicBool) {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+/// Test-support guardian fault (escapee-control.md): the first line of
+/// `HOME/exec-cmd-guardian-fault`, read on the setup worker only.
+#[cfg(feature = "test-support")]
+fn guardian_fault(runtime: &RuntimeDirectory) -> Option<String> {
+    let home = runtime.scratch_home_for_test()?;
+    let text = std::fs::read_to_string(home.join("exec-cmd-guardian-fault")).ok()?;
+    text.lines().next().map(str::to_owned)
 }
 
 fn drain_capture(active: &mut Active, now: Instant) {

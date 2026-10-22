@@ -1,4 +1,9 @@
-use super::{ExecCmdError, MAX_COMMAND_BYTES, protocol::Notice, spawn};
+use super::escapee::{self, FREEZE_ROUND_LIMIT, Gate, GateFacts, Libproc, Sweep, Tally};
+use super::protocol::{
+    KIND_ESCAPEE_REPORT, Notice, REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED,
+    REASON_ESCAPEE_UNTERMINATED,
+};
+use super::{ExecCmdError, MAX_COMMAND_BYTES, spawn};
 use crate::runtime::{open_at, stat_fd};
 use crate::secrets::rewrite::{MAX_SECRET_VARIABLES, SECRET_COMMAND_NAME, WHOLE_COMMAND};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -206,10 +211,50 @@ impl CleanupSafety {
 /// The command has no time bound: it runs until it ends, its lease closes
 /// or its leader exits.
 pub fn run_guardian(jobhex: &str, command: &str) -> i32 {
-    match guardian(jobhex, command) {
+    match guardian(jobhex, command, Faults::default()) {
         Ok(()) => 0,
         Err(_) => 1,
     }
+}
+/// The guardian with one escapee-control fault (escapee-control.md,
+/// test-support faults). An unknown fault refuses before any effect.
+#[cfg(feature = "test-support")]
+pub fn run_guardian_for_test(jobhex: &str, command: &str, fault: &str) -> i32 {
+    let Some(fault) = escapee::Fault::parse(fault) else {
+        return 1;
+    };
+    match guardian(jobhex, command, Faults(fault)) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+#[cfg(feature = "test-support")]
+struct Faults(escapee::Fault);
+#[cfg(feature = "test-support")]
+impl Default for Faults {
+    fn default() -> Self {
+        Self(escapee::Fault::None)
+    }
+}
+#[cfg(not(feature = "test-support"))]
+#[derive(Default)]
+struct Faults;
+#[cfg(feature = "test-support")]
+impl Faults {
+    /// `group-only` reproduces the old group-only check (EC-V-OLD).
+    fn group_only(&self) -> bool {
+        self.0 == escapee::Fault::GroupOnly
+    }
+    fn apply(&self, table: &mut Libproc) {
+        table.fault = self.0;
+    }
+}
+#[cfg(not(feature = "test-support"))]
+impl Faults {
+    fn group_only(&self) -> bool {
+        false
+    }
+    fn apply(&self, _table: &mut Libproc) {}
 }
 fn parse_id(s: &str) -> Result<[u8; 16], ExecCmdError> {
     if s.len() != 32
@@ -335,7 +380,7 @@ fn notice(fd: i32, n: Notice, id: [u8; 16]) -> Result<(), ExecCmdError> {
         Err(ExecCmdError::Protocol)
     }
 }
-fn guardian(jobhex: &str, command: &str) -> Result<(), ExecCmdError> {
+fn guardian(jobhex: &str, command: &str, faults: Faults) -> Result<(), ExecCmdError> {
     let id = parse_id(jobhex)?;
     if command.is_empty() || command.len() > MAX_COMMAND_BYTES || command.contains('\0') {
         return Err(ExecCmdError::Invalid);
@@ -362,6 +407,10 @@ fn guardian(jobhex: &str, command: &str) -> Result<(), ExecCmdError> {
         }
         separate_from_state(&project, &scratch, &asura)?;
         let profile = profile(&project, &scratch, &asura)?;
+        // EX5: marker, decoy, PID buffer and capture pipe handles exist
+        // before the command does; a failure refuses the job.
+        let mut table = Libproc::new(&scratch, &asura, escapee::capture_handles([5, 6])?)?;
+        faults.apply(&mut table);
         if lease_reason(3)?.is_some() {
             return Err(ExecCmdError::Cancelled);
         }
@@ -404,9 +453,10 @@ fn guardian(jobhex: &str, command: &str) -> Result<(), ExecCmdError> {
             Some(8),
             true,
         )
+        .map(|pid| (pid, table))
     })();
-    let pid = match setup {
-        Ok(pid) => pid,
+    let (pid, mut table) = match setup {
+        Ok(spawned) => spawned,
         Err(error) => {
             notice(
                 4,
@@ -448,6 +498,10 @@ fn guardian(jobhex: &str, command: &str) -> Result<(), ExecCmdError> {
     let mut killed = false;
     let mut reported_unknown = false;
     let mut safety = CleanupSafety::new(first_sample);
+    // SAFETY: getpid has no preconditions.
+    let exclude = [unsafe { libc::getpid() }, pid];
+    let mut tally = Tally::new(table.limit());
+    let mut last_sweep: Option<Result<Sweep, escapee::Unverifiable>> = None;
     loop {
         let (now, clock_fault) = safety.sample_clock(spawn::monotonic_ns());
         // SAFETY: WNOWAIT keeps the direct child PID allocated as a group-signal fence.
@@ -496,49 +550,86 @@ fn guardian(jobhex: &str, command: &str) -> Result<(), ExecCmdError> {
                 killed = true;
             }
             if safety.fence_valid && exited && group_only_leader(pid).unwrap_or(false) {
-                let mut status = 0;
-                // SAFETY: our zombie leader is reaped only after all group signals end.
-                let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-                if reaped == pid {
-                    let (exit_kind, value) = if libc::WIFEXITED(status) {
-                        (1, libc::WEXITSTATUS(status) as u32)
-                    } else {
-                        (2, libc::WTERMSIG(status) as u32)
-                    };
-                    if report_ok {
-                        notice(
-                            4,
-                            Notice {
-                                kind: 2,
-                                reason,
-                                exit_kind,
-                                cleanup: true,
-                                value,
-                            },
-                            id,
-                        )?;
+                // EX5 settlement gate: the leader stays unreaped, as the
+                // group fence, until no attributed descendant remains.
+                let swept = if faults.group_only() {
+                    Ok(Sweep::Clear)
+                } else {
+                    escapee::sweep(&mut table, &exclude, &mut tally, FREEZE_ROUND_LIMIT)
+                };
+                last_sweep = Some(swept);
+                match escapee::gate(GateFacts {
+                    leader_exited: true,
+                    group_empty: true,
+                    sweep: swept.ok(),
+                }) {
+                    Gate::Settled => {
+                        let mut status = 0;
+                        // SAFETY: our zombie leader is reaped only after all
+                        // group and escapee signals end.
+                        let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                        if reaped == pid {
+                            let (exit_kind, value) = if libc::WIFEXITED(status) {
+                                (1, libc::WEXITSTATUS(status) as u32)
+                            } else {
+                                (2, libc::WTERMSIG(status) as u32)
+                            };
+                            let escapees = tally.count();
+                            if report_ok {
+                                if escapees > 0 {
+                                    notice(
+                                        4,
+                                        Notice {
+                                            kind: KIND_ESCAPEE_REPORT,
+                                            reason: 0,
+                                            exit_kind: 0,
+                                            cleanup: false,
+                                            value: escapees,
+                                        },
+                                        id,
+                                    )?;
+                                }
+                                notice(
+                                    4,
+                                    Notice {
+                                        kind: 2,
+                                        reason: if escapees > 0 {
+                                            REASON_ESCAPEE_TERMINATED
+                                        } else {
+                                            reason
+                                        },
+                                        exit_kind,
+                                        cleanup: true,
+                                        value,
+                                    },
+                                    id,
+                                )?;
+                            }
+                            return if report_ok {
+                                Ok(())
+                            } else {
+                                Err(ExecCmdError::Protocol)
+                            };
+                        }
                     }
-                    return if report_ok {
-                        Ok(())
-                    } else {
-                        Err(ExecCmdError::Protocol)
-                    };
+                    // EC-D2: an unverifiable scan is reported at once.
+                    Gate::Unverifiable if !reported_unknown => {
+                        if report_ok {
+                            report_ok =
+                                notice(4, unconfirmed(REASON_ESCAPEE_UNTERMINATED), id).is_ok();
+                        }
+                        reported_unknown = true;
+                    }
+                    Gate::Unverifiable | Gate::Wait => {}
                 }
             }
             if now.saturating_sub(start) >= 2_500_000_000 && !reported_unknown {
+                let reason = match last_sweep {
+                    Some(Ok(Sweep::Remaining(_)) | Err(_)) => REASON_ESCAPEE_UNTERMINATED,
+                    _ => REASON_CLEANUP_FAILED,
+                };
                 if report_ok {
-                    report_ok = notice(
-                        4,
-                        Notice {
-                            kind: 4,
-                            reason: 9,
-                            exit_kind: 0,
-                            cleanup: false,
-                            value: 0,
-                        },
-                        id,
-                    )
-                    .is_ok();
+                    report_ok = notice(4, unconfirmed(reason), id).is_ok();
                 }
                 reported_unknown = true;
             }
@@ -552,6 +643,16 @@ fn guardian(jobhex: &str, command: &str) -> Result<(), ExecCmdError> {
         unsafe {
             libc::poll(&mut pfd, 1, 100);
         }
+    }
+}
+/// Kind 4: cleanup is not confirmed; the paced sweeps continue.
+fn unconfirmed(reason: u8) -> Notice {
+    Notice {
+        kind: 4,
+        reason,
+        exit_kind: 0,
+        cleanup: false,
+        value: 0,
     }
 }
 fn lease_reason(fd: i32) -> Result<Option<u8>, ExecCmdError> {

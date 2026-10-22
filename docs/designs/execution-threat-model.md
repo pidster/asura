@@ -27,9 +27,11 @@ overrides PX3's denial for `!!` commands only.
 The approval does not select a mechanism that a decision leaves to a
 [follow-up design](#required-follow-up-designs), and it does not claim that any
 required outcome is implemented. It completes the review (T1) that gated
-[tool job](tool-job-controller.md#delivery-dependencies) packet J2. J2 now
-waits for the EX5 prerequisite instead; the EX10 prerequisite was met on
-2026-10-20 ([qualification results](exec-cmd-tool.md#qualification-results-2026-10-20)). Remote
+[tool job](tool-job-controller.md#delivery-dependencies) packet J2. The EX5
+prerequisite was met on 2026-10-21 for sandboxed model jobs
+([escapee control evidence](escapee-control.md#implementation-evidence-2026-10-21)),
+and the EX10 prerequisite on 2026-10-20
+([qualification results](exec-cmd-tool.md#qualification-results-2026-10-20)). Remote
 [model providers](model-provider-integration.md) stay refused until the EX13
 grant and EX14 credentials are built.
 
@@ -122,7 +124,7 @@ to `rust/crates/` or `swift/model-helper/Sources/HelperCore/`. The
 | EX2 | exec_cmd exfiltrates data over the network | Profile has no network rule under `(deny default)` (`guardian.rs:158`) | None found. EX-V2 found TCP, UDP, raw, ICMP and Unix socket attempts denied. |
 | EX3 | exec_cmd reads secrets outside the project | Read roots are system roots, project and scratch (`guardian.rs:125-135`). The environment is replaced (`:221-227`). The Asura home arrives at FD 10 (`:66-93`, `:199`), is checked separate from state (`:114-122`, `:203`) and is denied (`:151-156`). | EX-V3 found every outside read denied, including `/private/etc/hosts`, and a clean environment. Ancestor directories of each root allow metadata reads (`:137-149`), so `stat` reveals their names and attributes: a known minor leak. The design lists a developer directory root that the code omits, so `git init` fails. |
 | EX4 | Model reads project secrets such as `.env` and they persist in Asura records | Tool results are bounded to 16 KiB (`asura-service/src/tools.rs:9-10`); the journal is local and private | No secret detection. Raw commands are journaled (`types.rs:401-402`) and result text is journaled (`types.rs:415-423`), rendered by `asura-service/src/exec_cmd_worker.rs:400-429` and `asura-platform/src/exec_cmd.rs:49-67`. Tool jobs would retain each job's complete output under a shared quota (J1d, R1). |
-| EX5 | A tool process outlives its turn or bound | Own process group; TERM (`guardian.rs:316`), then KILL (`:325`) after 500 ms (`:38`) in the stop loop (`:280-387`). At most 256 members checked (`:400-420`). Unknown cleanup is reported after 2.5 s (`:360-376`). Scratch removal checks identity (`asura-platform/src/exec_cmd/cleanup.rs:86-126`). | EX-V5 killed same-group escapes. A `setsid` escapee survives cleanup. It stays confined, but it can write the project after the job settles, and cleanup reports confirmed while it lives. See [EX5 escape findings](#ex5-escape-findings). |
+| EX5 | A tool process outlives its turn or bound | Own process group; TERM (`guardian.rs:316`), then KILL (`:325`) after 500 ms (`:38`) in the stop loop (`:280-387`). At most 256 members checked (`:400-420`). Unknown cleanup is reported after 2.5 s (`:360-376`). Scratch removal checks identity (`asura-platform/src/exec_cmd/cleanup.rs:86-126`). | Before 2026-10-21, EX-V5 killed same-group escapes, but a `setsid` escapee survived cleanup, wrote the project after settlement, and cleanup reported confirmed while it lived. Fixed on 2026-10-21 for sandboxed model jobs by the [escapee control](escapee-control.md#implementation-evidence-2026-10-21) settlement gate (`asura-platform/src/exec_cmd/escapee.rs`). The `!` and `!!` person paths get it with the person-command packets. See [EX5 escape findings](#ex5-escape-findings). |
 | EX6 | Injected content is written to memory and steers later sessions | Notes are labelled untrusted in instructions (`asura-service/src/conversation.rs:21`) and tool descriptions (`tools.rs:33`, `:37`, `:69`; `ToolBridge.swift:124`, `:138`, `:154`, `:233`). Only foreground turns get `memory_write_authorized` (`conversation.rs:206`). Notes are read only on request. | Notes are immutable and cannot be deleted. The person does not review model-written notes, and nothing marks them. |
 | EX7 | Conversation content leaves the device | Turn preparation refuses a non-loopback endpoint (`conversation.rs:1814-1819`). `/config set` refuses one (`asura-storage/src/config.rs:296-298`) under one rule (`:401-413`). The helper checks again (`OllamaBackend.swift:19`, `:58`). Tools need numeric loopback with helper attestation, except on-device providers (`asura-service/src/model_owner.rs:828-847`, `:835`; `endpoint_permitted` `:851-856`). | The endpoint grammar still accepts HTTPS hosts (`config.rs:398`), so an existing file can hold one; it loads but is refused at use. Before 2026-10-13 an HTTPS endpoint received instructions, prior prompts, prior final answers and the current prompt (`conversation.rs:1826-1838`). Prior final answers can quote project content from earlier local turns (inference from the history composition, not tested). |
 | EX8 | Remote endpoint impersonation or interception | System TLS validation; no redirects, cookies, cache or proxy (`OllamaBackend.swift:134-151`) | No credentials are sent today. Credential storage waits for EX14. |
@@ -154,7 +156,10 @@ where marked as code reading:
 Findings 1–5 are closed for sandboxed jobs, and best-effort for `!!`, by the
 [escapee control design](escapee-control.md), whose macOS 27 probes of
 2026-10-20 reproduced finding 4 (EC-V-OLD) and finding 5 (EC-V-EOF) and verified
-the selected mechanisms read-only.
+the selected mechanisms read-only. The design was implemented for sandboxed model
+jobs on 2026-10-21 and verified with real escapees
+([implementation evidence](escapee-control.md#implementation-evidence-2026-10-21));
+the person paths follow with the person-command packets.
 
 ## Proposed capabilities
 
@@ -244,6 +249,8 @@ Each entry gives the decision, the required outcome and where it is applied.
    confirms cleanup only when no attributed descendant remains. It covers the
    `!!` profile best-effort (owned group plus an `ASURA_JOB` environment marker)
    and states the residual accepted under EXD-1. Owns the EX-V9 case (EC-E3).
+   Implemented for sandboxed model jobs on 2026-10-21; the person profiles
+   follow with the person-command packets.
 6. **EX6 — person deletion and a review mark (owner, 2026-10-14).** The person
    can delete a note: the note is tombstoned, and the journal stays
    append-only. A model-written note carries a visible "model-written,
@@ -338,11 +345,11 @@ layer. They did not drive a model or the TUI.
 | EX-V2 | exec_cmd attempts over TCP, UDP, raw sockets, ICMP and Unix sockets, including a stand-in for the control socket. Judge by a listener that receives nothing and by EPERM from the call, not by `curl`, which fails earlier when it cannot read its SSL configuration. | Run 2026-10-14. Every attempt was denied. |
 | EX-V3 | exec_cmd reads of home secrets, `/private/var`, `/private/etc/hosts` and other projects | Run 2026-10-14. Every read was denied, and the environment was clean. `stat` of ancestor directories succeeds: the EX3 metadata leak. |
 | EX-V4 | A planted instruction in a project file and in a memory note; observe model behavior | Not run. It needs a model qualified for tools (EX10) and the planted fixtures. Results apply to the model tested. |
-| EX-V5 | Double-fork, `setsid` and pipe-holding escapes; confirm confinement and cleanup | Run 2026-10-14. Same-group escapes were killed. The `setsid` escapee survived, stayed confined, wrote the project after settlement and left `cleanup_confirmed` true. The pipe-holding case is from code reading. The EX5 design must turn this into a passing case. |
+| EX-V5 | Double-fork, `setsid` and pipe-holding escapes; confirm confinement and cleanup | Run 2026-10-14. Same-group escapes were killed. The `setsid` escapee survived, stayed confined, wrote the project after settlement and left `cleanup_confirmed` true. The pipe-holding case is from code reading. Turned into passing cases on 2026-10-21 by escapee control EC-I1–EC-I4; the old result is kept as the EC-V-OLD regression. |
 | EX-V6 | Endpoint request content captured; confirm only granted data classes leave | Not run. It needs a local HTTPS capture server with a test certificate. Under EX13 it becomes the grant check: file pages and tool results absent by default. |
 | EX-V7 | Provider switch from local to remote mid-conversation; record which history leaves | Not run. It needs a remote endpoint admitted, which waits for EX13 and EX14 (EX7). |
 | EX-V8 | A fixture secret in command output and in a command, for model and person origin | Required, not run. Retained streams, journal, model view and viewer hold placeholders only. The command runs with the real value through one variable, and the log holds only the variable name. A command that cannot be rewritten safely runs through the whole-command variable, from either origin (EX4 amendment, 2026-10-20). Detailed cases are in the [secret detection validation](secret-detection.md#validation). |
-| EX-V9 | `setsid`, double-fork and pipe-holding escapees under a job | Required, not run. Each escapee is detected and terminated, settlement completes, and cleanup is never reported confirmed while one lives. Owned by the [escapee control design](escapee-control.md) as case EC-E3; its [macOS 27 probes](escapee-control.md#probe-evidence-macos-27) of 2026-10-20 verified the underlying mechanisms read-only. |
+| EX-V9 | `setsid`, double-fork and pipe-holding escapees under a job | Run 2026-10-21 for a model exec_cmd job: each escapee was detected and terminated, settlement completed, and cleanup was never reported confirmed while one lived. Owned by the [escapee control design](escapee-control.md) as case EC-E3, at the platform layer and through the real service with a scripted model ([evidence](escapee-control.md#implementation-evidence-2026-10-21)). Not run through the TUI, with a native model, or for person commands. |
 | EX-V10 | The EX11 setting turned off globally and for one project | Required, not run. New execution is refused and live model jobs in scope are cancelled with a revocation reason. |
 | EX-V11 | Model exec_cmd runs `git status` and `git init` with the developer folder readable | Required, not run. Git runs; reads outside the roots stay denied. |
 
@@ -353,7 +360,7 @@ Each must be designed before its code. None is selected by this document.
 | Design | Source | Gates |
 | --- | --- | --- |
 | Secret detection and redaction: rules, placeholders, command variables, capture integration. Selected 2026-10-15: [secret detection](secret-detection.md) | EX4, PX6, SD1–SD9 | Job packet J1; person command mode |
-| Escapee detection and termination: per-job sandbox marker, freeze-then-kill, settlement gate, `!!` best-effort. Selected 2026-10-20: [escapee control](escapee-control.md) | EX5, PT13 | Job packet J2 |
+| Escapee detection and termination: per-job sandbox marker, freeze-then-kill, settlement gate, `!!` best-effort. Selected 2026-10-20: [escapee control](escapee-control.md) | EX5, PT13 | Job packet J2 — met 2026-10-21 for sandboxed model jobs; person profiles with the person-command packets |
 | exec_cmd qualification per local provider (SH-E1 style). Selected and run 2026-10-20: [per-model qualification](exec-cmd-tool.md#per-model-exec_cmd-qualification-ex10) | EX10 | Job packet J2 — met 2026-10-20; verdict threshold EXQ-1 is 5 of 5 (owner, 2026-10-21) |
 | Execution setting: global default and per-project override | EX11 | Revocation trigger TJ-14 |
 | Job-outlived-turn notice | EX12 | Client job packet J4 (proposed placement) |
@@ -470,7 +477,7 @@ flowchart TD
 | PT5 | Secrets in output persist in retained job output and reach the model | Under PX6 and EX4, secret detection runs at capture and replaces each secret with a placeholder before storage. Retained streams, journal, the job viewer and the model see placeholders. A secret in the command becomes a per-execution environment variable; the log keeps its name. Retained output is private and local and expires under the job retention rules. The notice labels the action as the person's and any output as untrusted. | Detection can miss a secret, which is then stored and readable until expiry or deletion. Personal data is not filtered. By PX4, a remote destination receives notices and pages as a local model does; see [remaining items](#remaining-items). |
 | PT6 | A command, or planted code it runs, reaches Asura's control socket or `~/.asura` and acts as the person | The service accepts command submits only on authenticated control attachments, and the model channel has no such message. Under PX3 every profile denies `~/.asura` and the socket. | Implemented for the model profile on 2026-10-14. The person profile must include the same denial when it is built. |
 | PT7 | The client's environment leaks into the service, or a PATH entry runs project-planted binaries | Only PATH and the PC3 allow-list are sent. The service drops empty and relative PATH entries, never adopts the client's PATH into its own environment, and never logs or audits it. HOME comes from the account database. | An absolute PATH entry inside the project, such as a direnv `bin`, still runs project content. Accepted as the person's configuration. |
-| PT8 | A command runs unattended: no timeout and the client has gone | Ctrl-C, `/cancel`, `/job cancel` from any TUI and service shutdown stop it. Guardian lease EOF stops it on service death. | By owner decision (PC5) a command keeps running after the TUI exits, as other accepted work does. It stays listed in `/jobs` for any TUI to cancel. Accepted. A `setsid` escapee is not stopped until the EX5 design is built. |
+| PT8 | A command runs unattended: no timeout and the client has gone | Ctrl-C, `/cancel`, `/job cancel` from any TUI and service shutdown stop it. Guardian lease EOF stops it on service death. | By owner decision (PC5) a command keeps running after the TUI exits, as other accepted work does. It stays listed in `/jobs` for any TUI to cancel. Accepted. A `setsid` escapee from a person command is not stopped until the person-command packets add the EX5 sweep to the person guardian path (built for model jobs on 2026-10-21). |
 
 The model cannot forge a person command. It has no control attachment, and its
 exec_cmd profile has no network access, so it cannot reach the control socket
@@ -774,5 +781,11 @@ for a secret; secrets to the secret store) and stated that `!` and `!!` use the
 exec_cmd tool function. PCO1 is resolved. The owner then answered PQ1 (person profile kept)
 and PQ2 (durable Keychain store, EXD-2) and extended the no-refusal rule to
 model commands. No diagram in this document changed. No code or test was run.
+
+Recorded on 2026-10-21: EX5 escapee control was implemented for sandboxed
+model jobs. EX-V9 ran at the platform layer and through the real service with a
+scripted model; EX-V5's old result is kept as the EC-V-OLD regression. See the
+[escapee control evidence](escapee-control.md#implementation-evidence-2026-10-21).
+No diagram in this document changed.
 
 Return to the [design index](README.md).
