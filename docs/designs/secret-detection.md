@@ -940,6 +940,40 @@ logs raw text.
 - **Memory.** Raw text, typed values and the per-call key are held in
   zeroizing buffers and cleared after the decision.
 
+## Person note redaction
+
+Selected (engineering), 2026-10-22, from the J4-R report. A person note is the
+text of a [kind 30](tool-job-controller.md#kind-30-jobretention) `note` that
+the person writes with `/job note` or `JobRetain`. The job control handler
+redacts it before the record, on the reactor, with the ready rule set
+([rule set readiness](#rule-set-readiness)).
+
+- **Function.** `secrets::note_redacted(rules, text) -> String` scans the text
+  in whole-buffer mode, as `display_redacted` does. It replaces each detected
+  span with the unnumbered placeholder `$ASURA_SECRET_0` directly. It assigns
+  no numbers, so it needs no number map and no per-call key.
+- **Typed placeholders stay.** Text that the person typed, including
+  `$ASURA_SECRET_<n>` or `${ASURA_SECRET_<n>}`, is kept as typed. The
+  not-placeholder predicate keeps a placeholder from matching any rule, so the
+  scan never replaces one.
+- **Rationale.** A kind 30 record has no number table, and neither replay nor
+  any reader checks that a numbered placeholder in a note was inserted by the
+  redactor. TCR-D4 rewrites model-written placeholders in kind 14 because
+  replay makes that check there. Output numbers are per job (SD4), and notes
+  are per job. A person can therefore cite an output placeholder, such as
+  `$ASURA_SECRET_3`, in a note about the same job. Rewriting it to
+  `$ASURA_SECRET_0` would silently remove that reference. The earlier
+  handler, which renumbered every placeholder to 0 after `display_redacted`,
+  is replaced.
+- **Withheld bytes.** The note limit is 2,048 bytes, below the 64 KiB line
+  limit, so no loss marker can occur.
+- **Memory.** The handler holds the raw note in a zeroizing buffer and clears
+  it after redaction.
+
+The function belongs to `asura-platform/src/secrets/rewrite.rs`, beside
+`display_redacted`. It is delivered by step J34-A of
+[TJ-P3](tool-job-controller.md#tj-p3-j3-and-j4-packet-order-and-enablement).
+
 ## Asynchronous execution
 
 This section maps the design to
@@ -948,13 +982,85 @@ controller's own mapping applies to the job.
 
 | Rule | How this design meets it |
 | --- | --- |
-| AE-01 | The reactor reads pipes and enqueues chunks; it never scans. The command rewrite is an in-memory operation on the admission path over a known-size input of at most 8192 bytes. Its cost is measured by SDM-03 as an acceptance criterion; it has no time bound. If SDM-03 misses its figure, the design is revised to move the rewrite to a retained worker before the intent append; a slow rewrite never refuses a command. |
+| AE-01 | The reactor never compiles the rule set: it reads the compiled set without blocking and waits on an event while it is not ready ([rule set readiness](#rule-set-readiness)). The reactor reads pipes and enqueues chunks; it never scans. The command rewrite is an in-memory operation on the admission path over a known-size input of at most 8192 bytes. Its cost is measured by SDM-03 as an acceptance criterion; it has no time bound. If SDM-03 misses its figure, the design is revised to move the rewrite to a retained worker before the intent append; a slow rewrite never refuses a command. |
 | AE-02 | The scanner makes no blocking call. `arc4random_buf` for the per-job key runs once at admission; it does not block and has no failure result. Environment construction runs on the existing setup worker and guardian. Hashing and staging keep their existing isolation. |
 | AE-03 | Limits are in the table below. A slow scan fills the 512 KiB transfer queue; the reactor then stops reading that job's pipes, so the job's writes block in the kernel. Other jobs and controls are unaffected. |
 | AE-04 | Scanning has no time bound (owner, 2026-10-15). `regex::bytes` and Aho–Corasick match in time linear in the input, so a chunk's scan time is proportional to its size; SDM-02 measures it. A slow scan fills the transfer queue and backpressures the producer; it is never a capture fault and never cancels the job. The capture worker checks cancellation between chunks. Turn and job cancellation do not stop capture; the scanner flushes at pipe EOF and at settlement as designed. Capture stop for a storage fault drops the carry. |
 | AE-05 | No raw byte is persisted, so recovery never has raw state to reconcile. Replay never needs a value, because a restarted job never runs again. A queued person command keeps its values in its Keychain item and resumes after a restart (SO6); recovery reconciles items against the journal ([secret store](secret-store.md)). |
 | AE-06 | Shutdown follows the job controller and its shutdown cleanup bound, which belongs to the job, not to the scan. The scanner flushes as the streams end. A job that does not settle within that bound becomes `interrupted`, and its staging holds redacted bytes only. |
-| AE-07 | SDI-04, SDI-05 and SDE-04 require real processes, a gated and a deliberately slowed scanner, a full queue and typing within 100 ms. |
+| AE-07 | SDI-04, SDI-05 and SDE-04 require real processes, a gated and a deliberately slowed scanner, a full queue and typing within 100 ms. SDI-13 requires a gated compile and typing within 100 ms. |
+
+### Rule set readiness
+
+Selected (engineering), 2026-10-22, from the J4-R report. The rule set is
+compiled once per process. `secrets::detection()` compiles it on first use.
+Compiling 46 expressions and running the self-check is not the bounded
+in-memory work that the reactor may do. A call to `detection()` on the reactor before the set exists
+therefore breaks AE-01. A call while another thread compiles also blocks,
+because the reactor then waits on the `OnceLock` initialization. The J4-R
+note redaction and the conversation owner's tool call decision both call
+`detection()` on the reactor today. These rules replace those calls.
+
+- **Two accessors.** `secrets::compiled()` returns
+  `Option<Result<&'static RuleSet, SelfCheckError>>` from `OnceLock::get`. It
+  never compiles and never blocks. `None` means "not ready". Reactor code
+  uses only `compiled()`. `detection()` stays for worker threads and tests,
+  such as the capture worker and the warm thread.
+- **One warmer.** At service start, the conversation owner spawns one
+  retained thread, `asura-secret-rules`, before it serves control requests.
+  The thread calls `detection()`, then calls the reactor's
+  `WakeSender::notify`, then exits. It is the only warmer. The payload
+  recovery thread no longer calls `detection()`.
+- **Reactor users wait.** A reactor user that finds `compiled()` is `None`
+  waits for the warm wake. It does not compile and does not poll. Each
+  waiting user ends on the rule set becoming ready, on its own cancel or
+  detach, or on shutdown. No time bound applies.
+- **Users.** The conversation owner sends no turn to the model helper while
+  the rule set is not ready. The turn stays in its starting state, and the
+  warm wake resumes it. Every tool call decision ([tool call argument
+  redaction](#tool-call-argument-redaction)), exec_cmd rewrite and job
+  admission therefore finds the set ready. A tool call decision that still
+  finds `None` treats it as `detection_unavailable` and fails closed; it never
+  compiles. The job control handler keeps a person note retain waiting
+  ([person note redaction](#person-note-redaction),
+  [J4 control handler](tool-job-controller.md#j4-control-handler)). The person
+  command submit (SL5, P2) follows the same rule.
+- **Self-check failure.** `compiled()` returns `Some(Err)` after a failed
+  self-check. The existing fail-closed rules apply: tool calls keep no text,
+  job starts and commands refuse with `secret_detection_unavailable`, and a
+  person note gets `unavailable`.
+- **Spawn failure.** If the warm thread cannot be spawned, the owner logs
+  `secret_rules_warm_unavailable` and keeps the state `not started`. The next
+  turn start or person note that finds the set not ready tries the spawn
+  again. A waiting user does not retry by itself, so a failing spawn causes
+  no loop. A worker thread that calls `detection()` first compiles the set
+  on its own thread; the next reactor poll then finds it ready.
+
+##### SD-S2: rule set readiness
+
+Selected design. States belong to the service's warm state; arrows name the
+event that moves it. `compiled()` reads only the result.
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotStarted: Service process starts
+    NotStarted --> Warming: Owner spawns asura-secret-rules at start
+    NotStarted --> NotStarted: Spawn fails, log secret_rules_warm_unavailable
+    NotStarted --> Warming: A turn start or person note needs the set, spawn retried
+    NotStarted --> Ready: A worker thread compiled the set first
+    Warming --> Ready: Compile and self-check pass, thread wakes the reactor
+    Warming --> Failed: Self-check fails, thread wakes the reactor
+    Ready --> [*]: Process exits
+    Failed --> [*]: Process exits
+    note right of Warming
+        Reactor users wait: turn starts and person notes.
+        They end on Ready, Failed, cancel, detach or shutdown.
+    end note
+    note right of Failed
+        Fail closed: no tool text kept, starts refused,
+        person note replies unavailable.
+    end note
+```
 
 ### Numeric limits
 
@@ -989,6 +1095,8 @@ mechanism for each case:
 | Case | Result |
 | --- | --- |
 | Rule set fails its startup self-check | The service runs, but refuses every job start and command with `secret_detection_unavailable`. A unit test compiles every rule, so this is a build defect. |
+| Rule set not yet compiled when the reactor needs it | The turn start or person note waits for the warm wake; nothing compiles on the reactor ([rule set readiness](#rule-set-readiness)) |
+| Warm thread cannot be spawned | Log `secret_rules_warm_unavailable`; the next turn start or person note tries the spawn again; waiting users end on readiness, cancel, detach or shutdown |
 | Unfinished line passes 64 KiB | Prefix to the last delimiter released; rest of the line withheld, `line_over_limit` |
 | Private-key block passes 64 KiB | Withheld from BEGIN to END or the first non-body line, `key_block_over_limit` |
 | Scanner internal error on a chunk | The chunk's undecided bytes and the stream's carry are withheld, `detector_error`. The descriptor's degraded flag is set. The job continues. |
@@ -1105,6 +1213,8 @@ on any fixture secret's raw bytes.
 | SDU-14 | Descriptor and intent codecs with redaction fields | Exact round trip; bounds; no value or value digest field |
 | SDU-15 | Fixture loader strips U+200B and keeps secret and none lines only | Counts per file match [fixtures](#fixtures-and-licensing) |
 | SDU-16 | Model and person submits for each SDU-12 form except the three kept refusals, 17 values and a rewrite over 8,192 bytes (SO5) | No refusal; executable command `eval "$ASURA_SECRET_COMMAND"`; display-only text with ordinary placeholder numbers; no record, reply or argument vector holds a value; `placeholder_not_available`, `secret_in_cwd` and `secret_detection_unavailable` still refuse |
+| SDU-18 | `compiled()` before and after `detection()`; a `compiled()` call while another thread compiles | `None` before; the same set after; `compiled()` returns at once while the other thread compiles and never compiles itself |
+| SDU-19 | `note_redacted` with each SDU-02 secret shape, two equal secrets, a typed `$ASURA_SECRET_3` and `${ASURA_SECRET_12}`, and a note with no secret | Every detected span is `$ASURA_SECRET_0`; typed placeholders unchanged; text without a secret unchanged; no value in the result |
 
 ### Integration
 
@@ -1121,6 +1231,7 @@ on any fixture secret's raw bytes.
 | SDI-09 | A second sandboxed model job runs `ps -E` and a `KERN_PROCARGS2` read against the first job's `sh` | Record the result. A readable value is a threat model finding, not a pass. |
 | SDI-10 | Restart while a job prints secrets; restart with a queued person command holding secrets | Unverified prefix holds redacted bytes only; the queued command is `Held`; after Resume, dispatch runs it with its values from the scratch Keychain item (SO6) |
 | SDI-11 | Concurrent jobs at the slot limit, each printing secrets | Numbers are independent per job; memory per job within SDM-04 |
+| SDI-13 | Real service with a test-support gate that holds the warm thread's compile; a turn start and a person note arrive, then the gate opens | The turn and the note wait while control requests answer within 100 ms; both proceed after the warm wake; a failed self-check fixture gives `unavailable` for the note; no reactor call compiles the set |
 
 ### End to end
 
@@ -1650,5 +1761,14 @@ Recorded on 2026-10-22 (J3-D report): the SL7 result line was placed in the
 job result text, with code facts checked at commit `b83d572` on the J3
 integration branch (`conversation/exec_cmd_call.rs` `filtered_line`). No
 diagram changed. No code or test was run by the design writer.
+
+Recorded on 2026-10-22 (J4-R report): [person note redaction](#person-note-redaction)
+and [rule set readiness](#rule-set-readiness) were added, with code facts
+checked at `5b7f55b` on the J3 integration branch (`secrets.rs`
+`detection()`, `secrets/rewrite.rs` `display_redacted`, the
+`detection()` calls in `job_control.rs`, `conversation.rs` and
+`payload_owner.rs`). SD-S2 is new; it was rendered with Mermaid CLI and
+inspected. SDU-18, SDU-19 and SDI-13 are new. No code or test was run by the
+design writer.
 
 Return to the [design index](README.md).
