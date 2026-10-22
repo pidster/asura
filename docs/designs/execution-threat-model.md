@@ -747,7 +747,7 @@ submit until settlement or Drop. Model call values stay in memory.
 | SS-T4 | An item is replayed into another command | Service and account attributes name the installation and input; the payload binding digest covers project, conversation, input and request digest. | None found. |
 | SS-T5 | A Keychain prompt blocks the service | User interaction is disabled for the service process; a would-be prompt fails. | None found. |
 | SS-T6 | A `!!` command reads the item | It runs as the person with no sandbox (EXD-1). | Accepted under EXD-1. |
-| SS-T8 | Copies of values inside the Security framework outlive Asura's zeroizing | Asura passes values in zeroizing buffers and zeroizes its own copies after spawn. `security-framework` 3.7.0 copies a read result out of a `CFData` that is then released without zeroizing; securityd receives and holds values in its own process. | Values can remain in freed memory of the service process and of securityd until it is reused. Asura cannot clear it. Residual, recorded 2026-10-22; it is inherent in the Keychain store that EXD-2 selected. A same-UID reader of process memory is the same principal under D1. |
+| SS-T8 | Copies of values inside the Security framework outlive Asura's zeroizing | Asura passes values in zeroizing buffers and zeroizes its own copies after spawn. `security-framework` 3.7.0 copies a read result out of a `CFData` that is then released without zeroizing; securityd receives and holds values in its own process. | Values can remain in freed memory of the service process and of securityd until it is reused. Asura cannot clear it. Residual, accepted by the owner on 2026-10-22 (EXD-3); it is inherent in the Keychain store that EXD-2 selected. A same-UID reader of process memory is the same principal under D1. Planned replacement: a Secure Enclave key design once release builds are signed (I9). |
 | SS-T9 | A same-UID process writes items under Asura's service attribute | The store never reads or deletes an [unrecognized item](secret-store.md#stranded-and-unrecognized-items); a list returns at most 257 results; the item count includes such items and `/status` reports them. | Such items can fill the 256-item limit, so submits that need the Keychain are refused with `secret_store_full`, and one list can hold 257 large attribute sets in memory. Denial of service only. Accepted under D1. |
 
 **EXD-2 — Durable secret store in the Keychain (owner, 2026-10-20).** The
@@ -803,6 +803,15 @@ Recorded on 2026-10-22: OD1 recorded under PX3; the approval-flow follow-up
 now points to the execution path guard (P5); SS-T1 and SS-T3 updated and
 SS-T7 added from the SS1-K probe results; PX-V cases mapped to person command
 tests. No diagram changed. No code or test was run.
+
+EXD-3 (owner, 2026-10-22): SS-T8 is accepted as a residual for now. The
+owner compared four options: the Keychain storing the value (current), an
+encrypted file with only a key in the Keychain, a Secure Enclave key, and
+memory-only storage. The chosen path keeps the Keychain store now and
+designs a Secure Enclave replacement after release signing (I9): a
+non-exportable enclave key wraps each value, so neither the value nor a
+usable key reaches securityd. That design is a follow-up and needs signed
+builds with Keychain entitlements.
 
 Recorded on 2026-10-22 (second revision): SS-T3 updated and SS-T8 and SS-T9
 added from the SS1-K report and probe SS-P3 of the

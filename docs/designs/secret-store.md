@@ -918,7 +918,7 @@ precedes SS1-S. It delivers:
 | 3 The fixture binary is in `asura-platform` | A thin `secret_store_fixture` binary in `asura-service` over the shared `fixture_main()` ([fixture binary](#fixture-binary)) |
 | 4 Unrecognized accounts have no delete call | Counted and reported, never deleted ([stranded and unrecognized items](#stranded-and-unrecognized-items)) |
 | 5 `list` and `get` memory | List at most 257 results; the codec rejects data over 55,413 bytes ([bounds](#item-count-and-memory-bounds)) |
-| 6 Copies inside the Security framework | Residual [SS-T8](execution-threat-model.md#secret-store-at-rest) |
+| 6 Copies inside the Security framework | Residual [SS-T8](execution-threat-model.md#secret-store-at-rest), owner-accepted (EXD-3, 2026-10-22); Secure Enclave replacement after release signing (I9) |
 | 7 Probe facts | Recorded in [probe results](#probe-results-2026-10-22) |
 
 ## Readiness audit resolution (2026-10-22)
