@@ -580,6 +580,24 @@ impl Ledger {
     pub(super) fn recovered_deleted(&self, payloads: [PayloadId; 2]) {
         lock(self).deleted.extend(payloads);
     }
+    /// The stored bytes of a job's stdout and stderr payloads (TJ-Q10). Per
+    /// stream: the live watermark (acquire load) while a capture holds one,
+    /// otherwise the recorded total (after settlement, abandonment or
+    /// recovery). An `unconfirmed` settlement keeps the watermark, so the
+    /// value never falls below what the still-writing worker stored. `None`
+    /// when the ledger holds no entry for the job. Arithmetic under the
+    /// ledger mutex only; never blocks on I/O.
+    pub fn stored(&self, job: Id) -> Option<[u64; 2]> {
+        let state = lock(self);
+        let payloads = state.calls.get(&job)?.payloads;
+        Some(payloads.map(|id| {
+            state.payloads.get(&id).map_or(0, |p| {
+                p.watermark
+                    .as_ref()
+                    .map_or(p.total, |w| w.load(Ordering::Acquire))
+            })
+        }))
+    }
     /// The live watermark of a payload being captured.
     pub(super) fn watermark(&self, id: PayloadId) -> Option<Arc<AtomicU64>> {
         lock(self)
@@ -1442,5 +1460,141 @@ mod tests {
         ledger.victim_deleted(victim, false);
         assert_eq!(ledger.used(), used);
         assert!(ledger.deleted(ids(4)[0]));
+    }
+
+    // ------------------------------------------------------- J3T-22 (storage)
+
+    /// J3T-22: `None` for a job the ledger does not hold, also after the
+    /// job's entry leaves (release or expiry).
+    #[test]
+    fn j3t_22_stored_is_none_for_an_unknown_job() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        assert_eq!(ledger.stored(call_id(1)), None);
+        admit(&ledger, 1).unwrap();
+        assert_eq!(ledger.stored(call_id(2)), None);
+        ledger.release(call_id(1));
+        assert_eq!(ledger.stored(call_id(1)), None);
+        admit(&ledger, 3).unwrap();
+        settle(&ledger, 3, MIB, 3);
+        tighten(&ledger, 0);
+        let victims = admit(&ledger, 4).unwrap();
+        assert_eq!(victim_calls(&victims), [call_id(3)]);
+        delete_all(&ledger, &victims);
+        assert_eq!(ledger.stored(call_id(3)), None);
+    }
+
+    /// J3T-22: a live job reports each stream's own watermark as it rises.
+    #[test]
+    fn j3t_22_stored_follows_the_live_watermark_of_each_stream() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        admit(&ledger, 1).unwrap();
+        assert_eq!(ledger.stored(call_id(1)), Some([0, 0]));
+        let stdout = ledger.watermark(stream_id(1, ObjectKind::Stdout)).unwrap();
+        let stderr = ledger.watermark(stream_id(1, ObjectKind::Stderr)).unwrap();
+        stdout.store(7, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([7, 0]));
+        stderr.store(3, Ordering::Release);
+        stdout.store(19, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([19, 3]));
+    }
+
+    /// J3T-22: once settled the recorded totals answer, not the dropped
+    /// watermark.
+    #[test]
+    fn j3t_22_stored_is_the_recorded_total_after_settle() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        admit(&ledger, 1).unwrap();
+        let stdout = ledger.watermark(stream_id(1, ObjectKind::Stdout)).unwrap();
+        stdout.store(100, Ordering::Release);
+        ledger.settle(
+            call_id(1),
+            CaptureState::Complete,
+            streams(100, 23),
+            4,
+            false,
+        );
+        assert!(ledger.watermark(stream_id(1, ObjectKind::Stdout)).is_none());
+        // The old counter no longer reaches the ledger.
+        stdout.store(500, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([100, 23]));
+    }
+
+    /// J3T-22: an `unconfirmed` settlement keeps the watermark, so the value
+    /// never falls to the smaller settled total while the worker writes;
+    /// `abandoned` then records the final watermark.
+    #[test]
+    fn j3t_22_stored_does_not_regress_after_an_unconfirmed_settlement() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        admit(&ledger, 1).unwrap();
+        let stdout = ledger.watermark(stream_id(1, ObjectKind::Stdout)).unwrap();
+        let stderr = ledger.watermark(stream_id(1, ObjectKind::Stderr)).unwrap();
+        stdout.store(30, Ordering::Release);
+        stderr.store(4, Ordering::Release);
+        ledger.settle(
+            call_id(1),
+            CaptureState::Unconfirmed,
+            [(10, None), (2, None)],
+            2,
+            false,
+        );
+        assert_eq!(ledger.stored(call_id(1)), Some([30, 4]));
+        stdout.store(45, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([45, 4]));
+        ledger.abandoned(call_id(1), 50);
+        assert_eq!(ledger.stored(call_id(1)), Some([45, 4]));
+        stdout.store(90, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([45, 4]));
+    }
+
+    /// J3T-22: `abandoned` without a prior settlement also records totals.
+    #[test]
+    fn j3t_22_stored_is_the_recorded_total_after_abandoned() {
+        let ledger = Ledger::default();
+        ledger.set_effective_quota(DEFAULT_QUOTA, u64::MAX / 4);
+        admit(&ledger, 1).unwrap();
+        let stderr = ledger.watermark(stream_id(1, ObjectKind::Stderr)).unwrap();
+        stderr.store(12, Ordering::Release);
+        ledger.abandoned(call_id(1), 12);
+        stderr.store(99, Ordering::Release);
+        assert_eq!(ledger.stored(call_id(1)), Some([0, 12]));
+    }
+
+    /// J3T-22: a job registered by recovery answers its recorded totals.
+    #[test]
+    fn j3t_22_stored_is_the_recorded_total_after_recovery() {
+        let ledger = Ledger::default();
+        let [out, err] = [
+            stream_id(5, ObjectKind::Stdout),
+            stream_id(5, ObjectKind::Stderr),
+        ];
+        ledger.recovered(
+            call_id(5),
+            operation(5),
+            [
+                (
+                    out,
+                    PayloadState::Complete,
+                    Location::Objects,
+                    64,
+                    Some([1; 32]),
+                ),
+                (
+                    err,
+                    PayloadState::UnverifiedPrefix,
+                    Location::Staging,
+                    9,
+                    None,
+                ),
+            ],
+            8,
+            73,
+            true,
+        );
+        assert_eq!(ledger.stored(call_id(5)), Some([64, 9]));
+        assert_eq!(ledger.stored(call_id(6)), None);
     }
 }

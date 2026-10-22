@@ -2,7 +2,8 @@
 //! delivered-text bound (J3T-08), the page-read pool without a step bound
 //! (J2T-16), staging captures (J1T-19), derived job recovery (J1T-22 rows,
 //! now from kind 28 facts), job-keyed payloads and job recovery (J2T-04),
-//! and the person pin hold and delete (J4T-06, storage). Ledger arithmetic
+//! the person pin hold and delete (J4T-06, storage) and the ledger's stored
+//! bytes of a real capture (J3T-22, storage). Ledger arithmetic
 //! (J1T-08) is unit-tested in `payload/store.rs`.
 use asura_platform::RuntimeDirectory;
 use asura_platform::payload_io::gate::{self, Fault, Point};
@@ -1649,4 +1650,65 @@ fn j4t_06_crash_after_delete_commit_completes_at_recovery() {
     }
     assert_eq!(order, [call(3)]);
     assert_eq!(f.home.read("objects", o2).unwrap(), body(2));
+}
+
+// ---------------------------------------------------------------- J3T-22
+
+fn file_len(home: &Home, directory: &str, payload: Id) -> u64 {
+    fs::metadata(home.file(directory, payload)).unwrap().len()
+}
+
+/// J3T-22 (storage): during a real capture, `Ledger::stored` equals the
+/// staging file sizes after each append of either stream; after settlement
+/// and install it is the recorded total; an unknown job is `None`.
+#[test]
+fn j3t_22_stored_bytes_equal_the_staging_file_sizes_after_each_append() {
+    let f = fixture();
+    assert_eq!(f.store.stored(call(1)), None);
+    let [out, err] = admit(&f.store, 1);
+    assert_eq!(f.store.stored(call(1)), Some([0, 0]));
+    let mut capture = f.store.create_capture(call(1)).unwrap();
+    assert_eq!(f.store.stored(call(1)), Some([0, 0]));
+    let chunks: [(StreamIndex, &[u8]); 5] = [
+        (StreamIndex::Stdout, b"one\n"),
+        (StreamIndex::Stderr, b"warning: two\n"),
+        (StreamIndex::Stdout, b"three three\n"),
+        (StreamIndex::Stdout, b""),
+        (StreamIndex::Stderr, b"four\n"),
+    ];
+    for (stream, bytes) in chunks {
+        let (written, result) = capture.append(stream, &redacted(bytes), 0);
+        result.unwrap();
+        assert_eq!(written, bytes.len());
+        let sizes = [
+            file_len(&f.home, "staging", out),
+            file_len(&f.home, "staging", err),
+        ];
+        assert_eq!(f.store.stored(call(1)), Some(sizes));
+        assert_eq!(
+            sizes,
+            [
+                capture.stored(StreamIndex::Stdout),
+                capture.stored(StreamIndex::Stderr)
+            ]
+        );
+    }
+    assert_eq!(f.store.stored(call(1)), Some([16, 18]));
+    let [(a, da), (b, db)] = capture.seal();
+    f.store.settle(
+        call(1),
+        CaptureState::Complete,
+        [(a, Some(da)), (b, Some(db))],
+        5,
+        false,
+    );
+    assert_eq!(f.store.stored(call(1)), Some([16, 18]));
+    f.store.install(call(1)).unwrap();
+    assert_eq!(
+        f.store.stored(call(1)),
+        Some([
+            file_len(&f.home, "objects", out),
+            file_len(&f.home, "objects", err)
+        ])
+    );
 }
