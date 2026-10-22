@@ -1250,6 +1250,8 @@ fn setup(
     setup_gate(&runtime, cancel);
     #[cfg(feature = "test-support")]
     let fault = guardian_fault(&runtime);
+    #[cfg(feature = "test-support")]
+    let executable = guardian_executable(&runtime).unwrap_or(executable);
     #[allow(unused_mut)]
     let mut prepared = PreparedExecCmd::prepare(runtime, &project, request, cancel)
         .map_err(|f| (Stage::Prepare, Failure::from(f)))?;
@@ -1280,6 +1282,17 @@ fn guardian_fault(runtime: &RuntimeDirectory) -> Option<String> {
     let home = runtime.scratch_home_for_test()?;
     let text = std::fs::read_to_string(home.join("exec-cmd-guardian-fault")).ok()?;
     text.lines().next().map(str::to_owned)
+}
+
+/// Test-support guardian replacement (J2T-25): the first line of
+/// `HOME/exec-cmd-guardian-executable` names the program the slot starts
+/// in place of the guardian, to qualify a guardian that dies by a signal
+/// before any notice. Read on the setup worker only.
+#[cfg(feature = "test-support")]
+fn guardian_executable(runtime: &RuntimeDirectory) -> Option<std::path::PathBuf> {
+    let home = runtime.scratch_home_for_test()?;
+    let text = std::fs::read_to_string(home.join("exec-cmd-guardian-executable")).ok()?;
+    text.lines().next().map(std::path::PathBuf::from)
 }
 
 fn drain_capture(active: &mut Active, now: Instant) {

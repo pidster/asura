@@ -575,6 +575,60 @@ fn j2t_25_guardian_exit_before_any_notice_releases_scratch_and_slot() {
     }
 }
 
+/// J2T-25 slot part (J2-A2): a guardian that dies by a signal before any
+/// notice may have launched the command, so the job settles
+/// `protocol_fault` with capture `not_started`, but the slot reports
+/// `ScratchRetained`, keeps the scratch and stays held until restart. The
+/// test-support replacement runs a script that kills itself with SIGKILL.
+#[cfg(feature = "test-support")]
+#[test]
+fn j2t_25_guardian_signal_death_before_any_notice_retains_scratch() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = Home::new(64 * MIB);
+    let script = home.path.join("killed-guardian");
+    std::fs::write(&script, "#!/bin/sh\nkill -KILL $$\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        home.path.join("exec-cmd-guardian-executable"),
+        script.to_str().unwrap(),
+    )
+    .unwrap();
+    let mut worker = Worker::default();
+    worker
+        .start_job(home.start(asura_platform::random_id(), home.scope()))
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    let mut events = Vec::new();
+    while !matches!(events.last(), Some(SlotEvent::ScratchRetained)) {
+        worker.poll_job(Instant::now(), &mut events);
+        assert!(
+            Instant::now() < end,
+            "no scratch event: {:?}",
+            names(&events)
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        names(&events),
+        ["setup_failed", "capture_settled", "scratch_retained"]
+    );
+    assert!(matches!(
+        events[0],
+        SlotEvent::SetupFailed(JobReason::ProtocolFault)
+    ));
+    assert_port_order(&events);
+    let outcome = capture_outcome(events.get_mut(1));
+    assert_eq!(outcome.state, CaptureState::NotStarted);
+    if let Some(capture) = outcome.capture.take() {
+        capture.abandon();
+    }
+    let mut more = Vec::new();
+    worker.poll_job(Instant::now(), &mut more);
+    assert!(more.is_empty());
+    assert!(!worker.idle(), "the slot stays held");
+    assert_eq!(scratch_left(&home).len(), 1, "the scratch is retained");
+}
+
 /// TJ-S1 `Starting` → `Recording` (J2T-07 slot part): a stop before spawn
 /// sets the setup cancel flag; setup ends with no process and no reason of
 /// its own (the controller's first trigger is the reason), and capture

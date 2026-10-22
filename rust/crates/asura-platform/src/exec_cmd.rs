@@ -485,6 +485,7 @@ impl PreparedExecCmd {
         Ok(ExecCmdJob {
             pid,
             reaped: false,
+            exited: false,
             lease: Some(lease_write),
             status: status_read,
             status_bytes: Vec::with_capacity(STATUS_BUFFER),
@@ -519,6 +520,8 @@ const MAX_NOTICES: u8 = 5;
 pub struct ExecCmdJob {
     pid: libc::pid_t,
     reaped: bool,
+    /// The reaped guardian exited normally (`WIFEXITED`), not by a signal.
+    exited: bool,
     lease: Option<OwnedFd>,
     status: OwnedFd,
     status_bytes: Vec<u8>,
@@ -664,7 +667,8 @@ impl ExecCmdJob {
             let n = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
             if n == self.pid {
                 self.reaped = true;
-                if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+                self.exited = libc::WIFEXITED(status);
+                if !self.exited || libc::WEXITSTATUS(status) != 0 {
                     self.fault = true;
                 }
             } else if n < 0 && !spawn::interrupted() {
@@ -797,22 +801,34 @@ impl ExecCmdJob {
         }
     }
     /// Whether [`Self::take_cleanup`] may still release the token of a job
-    /// that has not settled: no status byte arrived and the guardian or a
-    /// capture pipe has not ended yet. False once a status byte arrived,
-    /// because the guardian may then have spawned the command.
+    /// that has not settled: no status byte arrived, the guardian did not
+    /// end by a signal, and the guardian or a capture pipe has not ended
+    /// yet. False once a status byte arrived, because the guardian may then
+    /// have spawned the command, and false after a signal death.
     pub fn release_pending(&self) -> bool {
-        self.cleanup.is_some() && !self.status_received && !self.ended_before_notice()
+        self.cleanup.is_some()
+            && !self.status_received
+            && !(self.reaped && !self.exited)
+            && !self.ended_before_notice()
     }
-    /// J2-A2 (tool-job-controller.md): the guardian was reaped, its status
-    /// pipe reached EOF with no byte, so no notice arrived, and both capture
-    /// pipes reached EOF. The guardian returns before `spawn::launch`
-    /// succeeds with at most kind 3; after the launch it always attempts
-    /// kind 1 and returns only from its settlement gate (pinned by the
-    /// guardian's `j2t_25_no_return_after_launch_without_a_notice`). So no
-    /// command was spawned, or its group is gone; an open capture pipe
-    /// means a process may still hold the scratch, and the token stays.
+    /// J2-A2 (tool-job-controller.md): the guardian was reaped after it
+    /// exited normally (`WIFEXITED`, any status), its status pipe reached
+    /// EOF with no byte, so no notice arrived, and both capture pipes
+    /// reached EOF. The guardian returns before `spawn::launch` succeeds
+    /// with at most kind 3; after the launch it always attempts kind 1 and
+    /// returns only from its settlement gate (pinned by the guardian's
+    /// `j2t_25_no_return_after_launch_without_a_notice`). So no command was
+    /// spawned, or its group is gone. A signal may end the guardian between
+    /// the launch and kind 1, with the command alive, so a signal death
+    /// keeps the token; so does an open capture pipe, because a process may
+    /// still hold the scratch.
     fn ended_before_notice(&self) -> bool {
-        self.reaped && self.status_eof && !self.status_received && self.out.eof && self.err.eof
+        self.reaped
+            && self.exited
+            && self.status_eof
+            && !self.status_received
+            && self.out.eof
+            && self.err.eof
     }
 }
 

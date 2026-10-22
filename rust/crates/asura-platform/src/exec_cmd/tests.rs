@@ -365,6 +365,7 @@ fn notice_fixture() -> (ExecCmdJob, std::os::fd::OwnedFd) {
         ExecCmdJob {
             pid: 0,
             reaped: true,
+            exited: true,
             lease: None,
             status: read,
             status_bytes: Vec::new(),
@@ -1018,16 +1019,19 @@ fn scratch_token(f: &Fixture) -> ExecCmdCleanup {
 }
 
 /// J2T-25 platform unit (J2-A2): an unsettled job releases its scratch
-/// token only when the guardian was reaped, its status pipe reached EOF
-/// with no byte, and both capture pipes reached EOF. Each condition false
-/// keeps the token; a received status byte also ends `release_pending`.
+/// token only when the guardian was reaped after a normal exit, its status
+/// pipe reached EOF with no byte, and both capture pipes reached EOF. Each
+/// condition false keeps the token; a received status byte or a signal
+/// death also ends `release_pending`.
 #[test]
 fn j2t_25_pre_notice_token_release_needs_every_condition() {
-    // Reaped, status EOF, no status byte, stdout EOF, stderr EOF.
-    let all = [true; 5];
+    // Reaped, exited normally, status EOF, no status byte, stdout EOF,
+    // stderr EOF.
+    let all = [true; 6];
     let mut cases = vec![("all hold", all)];
     for (i, label) in [
         "guardian not reaped",
+        "guardian ended by a signal",
         "status pipe open",
         "a status byte arrived",
         "stdout open",
@@ -1040,11 +1044,12 @@ fn j2t_25_pre_notice_token_release_needs_every_condition() {
         conditions[i] = false;
         cases.push((label, conditions));
     }
-    for (label, [reaped, status_eof, no_byte, out_eof, err_eof]) in cases {
+    for (label, [reaped, exited, status_eof, no_byte, out_eof, err_eof]) in cases {
         let f = Fixture::new();
         let (mut job, _status) = notice_fixture();
         job.cleanup = Some(scratch_token(&f));
         job.reaped = reaped;
+        job.exited = exited;
         job.status_eof = status_eof;
         job.status_received = !no_byte;
         job.out.eof = out_eof;
@@ -1052,7 +1057,11 @@ fn j2t_25_pre_notice_token_release_needs_every_condition() {
         job.fault = true;
         assert!(!job.settled(), "{label}");
         let released = label == "all hold";
-        assert_eq!(job.release_pending(), !released && no_byte, "{label}");
+        assert_eq!(
+            job.release_pending(),
+            !released && no_byte && !(reaped && !exited),
+            "{label}"
+        );
         let token = job.take_cleanup();
         assert_eq!(token.is_some(), released, "{label}");
         assert_eq!(job.cleanup.is_some(), !released, "{label}: the token stays");
@@ -1133,4 +1142,47 @@ fn j2t_25_pre_notice_token_release_through_the_pipes() {
         assert!(job.take_cleanup().is_none(), "{label}");
         assert!(job.cleanup.is_some(), "{label}: the token stays");
     }
+}
+
+/// J2T-25 platform unit with a real process: a "guardian" that ends by
+/// SIGKILL before any notice, with both capture pipes at EOF, keeps the
+/// scratch token, because a signal may end the real guardian between the
+/// launch and kind 1 while the command is alive.
+#[test]
+fn j2t_25_signal_death_before_any_notice_keeps_the_token() {
+    let f = Fixture::new();
+    let runtime = RuntimeDirectory::scratch(&f.0, true).unwrap();
+    let project = f.0.join("project");
+    fs::create_dir(&project).unwrap();
+    let project =
+        ProjectIdentity::open(project.to_str().unwrap(), &runtime.state_boundary()).unwrap();
+    let script = f.0.join("killed-guardian");
+    fs::write(&script, "#!/bin/sh\nkill -KILL $$\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let cancel = AtomicBool::new(false);
+    let prepared = match PreparedExecCmd::prepare(runtime, &project, request(), &cancel) {
+        Ok(v) => v,
+        Err(e) => panic!("{:?}", e.reason),
+    };
+    let mut job = match prepared.spawn(&script, &cancel, Box::new(TestSink::default())) {
+        Ok(job) => job,
+        Err(e) => panic!("{:?}", e.reason),
+    };
+    let limit = Instant::now() + Duration::from_secs(10);
+    while !(job.reaped && job.status_eof && job.out.eof && job.err.eof) {
+        let _ = job.poll(Instant::now());
+        assert!(Instant::now() < limit, "killed guardian did not end");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!job.exited, "ended by a signal");
+    assert!(job.faulted() && !job.spawned() && !job.settled());
+    assert!(!job.status_received);
+    assert!(!job.release_pending());
+    assert!(job.take_cleanup().is_none());
+    // Test hygiene only: remove the scratch the job keeps.
+    job.cleanup
+        .take()
+        .expect("the token stays")
+        .run(Instant::now() + Duration::from_secs(2), &cancel)
+        .unwrap();
 }
