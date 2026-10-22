@@ -192,6 +192,9 @@ fn wait_step(active: &Active) -> Option<pb::ConversationWaitStep> {
 /// `turn` holds the window as its text and `text_offset`.
 fn terminal_event(turn: &journal::TurnTerminal, text_bytes: u64) -> pb::ConversationEvent {
     pb::ConversationEvent {
+        // The conversation owner derives the outlived jobs (J4, EX12).
+        outlived_jobs: None,
+        outlived_job_ids: Vec::new(),
         // A terminal turn waits on nothing; steps are never journaled.
         waiting_step: None,
         operation_id: Some(turn.operation.to_vec()),
@@ -1758,6 +1761,9 @@ impl Owner {
                 Body::ConversationEvent(pb::ConversationEvent {
                     operation_id: Some(operation.to_vec()),
                     generation: Some(active.turn.generation),
+                    // Outlived jobs appear on terminal events only.
+                    outlived_jobs: None,
+                    outlived_job_ids: Vec::new(),
                     cursor: Some(active.cursor.max(after)),
                     kind: Some(if snapshot { 2 } else { 1 }),
                     waiting_step: (!snapshot)
@@ -4108,6 +4114,8 @@ impl Owner {
                     tools::not_run_result(tool.decision, tool.fault, tool.busy, tool.refusal);
                 pb::ToolProgress {
                     ordinal: Some(index as u32 + 1),
+                    // J4T-09: wired by the integration packet.
+                    job_id: None,
                     name: Some(prefix(&tool.name, 64)),
                     state: Some(match (&rendered, tool.result_status) {
                         (Some(_), _) | (None, Some(2..)) => 3,

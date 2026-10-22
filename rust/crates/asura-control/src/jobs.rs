@@ -29,8 +29,13 @@ pub const MAX_OUTLIVED_JOB_IDS: usize = 8;
 pub const MAX_LIVE_JOBS: u32 = 64;
 /// The highest J2 block reason code (1 `recovering` to 9 `disk_space`).
 pub const MAX_BLOCK_REASON: u32 = 9;
-/// The highest job reason code: 19 `execution_off` (EX11).
-pub const MAX_JOB_REASON: u32 = 19;
+/// The highest job reason code: 20 `outside_sandbox_off` (person `!!`).
+pub const MAX_JOB_REASON: u32 = 20;
+/// Job reason 19 `execution_off` (EX11), a service cancel trigger.
+pub const REASON_EXECUTION_OFF: u32 = 19;
+/// Pause reasons of a paused capture: the kind 28 capture reason codes
+/// 2 `quota` and 3 `enospc`.
+pub const PAUSE_REASONS: [u32; 2] = [2, 3];
 
 /// Reply `error` tokens (J4-E4).
 pub mod error {
@@ -281,8 +286,9 @@ pub(crate) fn entry(v: &pb::JobEntry) -> bool {
         // A queued job always shows why it waits (AQ1).
         (1, Some(n)) => (1..=MAX_BLOCK_REASON).contains(&n),
         (1, None) => false,
-        // A paused capture shows its pause reason.
-        (4, reason) => reason.is_none_or(|n| (1..=255).contains(&n)),
+        // A paused capture shows its pause reason: 2 quota or 3 enospc.
+        (4, Some(n)) => PAUSE_REASONS.contains(&n),
+        (4, None) => true,
         (_, reason) => reason.is_none(),
     };
     let exit = match (v.exit_kind, v.exit_value) {

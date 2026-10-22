@@ -1006,11 +1006,13 @@ mod tests {
                     result_bytes: Some(65536),
                     truncated: Some(true),
                     exit_code: Some(i32::MIN),
-                    // The J4 job fields are not part of this proof: with
-                    // them the worst case exceeds the frame (reported gap).
-                    job_id: None,
+                    // J4T-09: the job an admitted call names.
+                    job_id: Some(vec![0xff; 16]),
                 })
                 .collect(),
+            // EX12: the largest outlived count and its 8 IDs.
+            outlived_jobs: Some(u32::MAX),
+            outlived_job_ids: (1..=8u8).map(|n| vec![n; 16]).collect(),
             statistics: Some(pb::TurnStatistics {
                 elapsed_ms: Some(u64::MAX),
                 // No request count or token total (owner, 2026-10-18).
@@ -1024,8 +1026,18 @@ mod tests {
         };
         let message = envelope(Body::ConversationEvent(event));
         assert!(valid(message.body.as_ref().unwrap()));
+        // RT-10 and TCR-D26: the worst case with the J4 fields is 65,322
+        // bytes at the 60,928-byte window, within the 65,536-byte frame.
+        assert_eq!(MAX_RESPONSE_WINDOW_BYTES, 60_928);
+        assert!(prost::Message::encoded_len(&message) <= 65_322);
         let frame = crate::encode_frame(&message).unwrap();
         assert!(frame.len() <= crate::MAX_FRAME_BYTES + crate::HEADER_BYTES);
+        // A window one byte over the bound is refused.
+        let mut over = message.clone();
+        if let Some(Body::ConversationEvent(v)) = over.body.as_mut() {
+            v.text = Some("a".repeat(MAX_RESPONSE_WINDOW_BYTES / 2 + 1));
+        }
+        assert!(!valid(over.body.as_ref().unwrap()));
         assert_eq!(
             crate::decode_body(&frame[crate::HEADER_BYTES..]).unwrap(),
             message

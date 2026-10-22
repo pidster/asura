@@ -418,7 +418,8 @@ fn job_entry_cross_field_rules() {
         ("model inside", |e| e.outside_sandbox = Some(false), true),
         ("model input", |e| e.input_id = Some(vec![5; 16]), false),
         ("reason 19", |e| e.reason = Some(19), true),
-        ("reason 20", |e| e.reason = Some(20), false),
+        ("reason 20", |e| e.reason = Some(20), true),
+        ("reason 21", |e| e.reason = Some(21), false),
         ("notes 16", |e| e.notes = Some(16), true),
         ("notes 17", |e| e.notes = Some(17), false),
         ("live outcome", |e| e.outcome = Some(1), false),
@@ -493,6 +494,30 @@ fn job_entry_cross_field_rules() {
             true,
         ),
         ("paused no reason", |e| e.state = Some(4), true),
+        (
+            "paused enospc",
+            |e| {
+                e.state = Some(4);
+                e.block_reason = Some(3)
+            },
+            true,
+        ),
+        (
+            "paused reason 1",
+            |e| {
+                e.state = Some(4);
+                e.block_reason = Some(1)
+            },
+            false,
+        ),
+        (
+            "paused reason 4",
+            |e| {
+                e.state = Some(4);
+                e.block_reason = Some(4)
+            },
+            false,
+        ),
         ("state 9 needs outcome", |e| e.state = Some(9), false),
     ];
     for (name, change, ok) in changes {
@@ -1258,9 +1283,27 @@ fn audit_job_events_map_kinds_4_to_7() {
         (
             "settled reason 20",
             pb::AuditEntry {
-                outcome: Some(1),
+                outcome: Some(4),
                 reason: Some(20),
                 ..job_event(7)
+            },
+            true,
+        ),
+        (
+            "settled reason 21",
+            pb::AuditEntry {
+                outcome: Some(4),
+                reason: Some(21),
+                ..job_event(7)
+            },
+            false,
+        ),
+        (
+            "cancel reason 20",
+            pb::AuditEntry {
+                outcome: Some(4),
+                reason: Some(20),
+                ..job_event(6)
             },
             false,
         ),

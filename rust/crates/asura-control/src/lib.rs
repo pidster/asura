@@ -16,9 +16,12 @@ pub const HEADER_BYTES: usize = 12;
 /// tool calls of the turn (tool-call-records.md TCR-D31). The count keeps the
 /// TCR-D26 frame proof beside the response window.
 pub const MAX_TOOL_PROGRESS_ENTRIES: usize = 9;
-/// Response bytes in one `ConversationEvent` window: a per-event bound, not a
-/// response total (response-text-transfer.md).
-pub const MAX_RESPONSE_WINDOW_BYTES: usize = 61_440;
+/// Response and thinking bytes in one `ConversationEvent` window: a per-event
+/// bound, not a response total (response-text-transfer.md). 60,928 bytes
+/// (119 x 512) since 2026-10-22, so the worst-case event with the J4 job
+/// fields fits the frame (event window bound, TCR-D26). Model revisions and
+/// journal segments stay at 61,440 bytes in their own frames.
+pub const MAX_RESPONSE_WINDOW_BYTES: usize = 60_928;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     BadMagic,

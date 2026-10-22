@@ -5202,6 +5202,8 @@ mod tests {
             event: Some(asura_control::pb::ConversationEvent {
                 operation_id: Some(vec![4; 16]),
                 cursor: Some(u64::MAX),
+                outlived_jobs: None,
+                outlived_job_ids: Vec::new(),
                 generation: Some(1),
                 kind: Some(6),
                 // RT-03 (TUI): the whole assembled response is shown, with

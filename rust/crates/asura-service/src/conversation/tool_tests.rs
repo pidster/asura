@@ -2178,9 +2178,11 @@ fn tl09_tl12_thinking_segments_pause_windows_and_flush_before_terminal() {
     };
     assert_eq!(event.thinking_offset, Some(0));
     assert_eq!(event.thinking_bytes, Some(thinking.len() as u64));
+    // The event window (60,928 bytes) is smaller than a kind 25 segment.
+    let budget = asura_control::MAX_RESPONSE_WINDOW_BYTES;
     let window = event.thinking_text.unwrap();
-    assert!(window.len() + event.text.as_ref().unwrap().len() <= SEGMENT);
-    assert!(thinking.starts_with(&window) && window.len() > SEGMENT - 2);
+    assert!(window.len() + event.text.as_ref().unwrap().len() <= budget);
+    assert!(thinking.starts_with(&window) && window.len() > budget - 2);
     assert_eq!(event.text.as_deref(), Some(""));
     // A client holding all thinking gets the whole response.
     let event = match journaled

@@ -79,7 +79,7 @@ fn entry(v: &pb::AuditEntry) -> bool {
 /// reason (6, 7); `operation`, `generation` and `ordinal` the model origin of
 /// a started job (5). No command, cwd, note or output text exists here.
 fn job_entry(v: &pb::AuditEntry) -> bool {
-    use crate::jobs::{MAX_BLOCK_REASON, MAX_JOB_REASON};
+    use crate::jobs::{MAX_BLOCK_REASON, MAX_JOB_REASON, REASON_EXECUTION_OFF};
     let common = id(&v.job)
         && id(&v.conversation)
         && v.request.is_none()
@@ -111,7 +111,7 @@ fn job_entry(v: &pb::AuditEntry) -> bool {
                 no_origin
                     && v.outcome.is_some_and(|n| (1..=4).contains(&n))
                     && v.reason
-                        .is_some_and(|n| (1..=10).contains(&n) || n == MAX_JOB_REASON)
+                        .is_some_and(|n| (1..=10).contains(&n) || n == REASON_EXECUTION_OFF)
             }
             Some(7) => {
                 no_origin
