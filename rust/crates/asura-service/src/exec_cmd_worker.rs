@@ -1057,7 +1057,7 @@ impl Worker {
             secret_command,
             mut capture,
         } = start;
-        if job == [0; 16] || scope.project == [0; 16] || capture.call != job {
+        if job == [0; 16] || scope.project == [0; 16] || capture.job != job {
             return Err(SlotStartError::Invalid);
         }
         capture.wake = self.wake.clone();
@@ -1198,7 +1198,6 @@ impl SlotPort for Worker {
 /// The controller's slot factory: each granted job gets a new slot worker
 /// registered with the reactor's wake, so setup, cleanup and capture
 /// completions wake the reactor.
-#[cfg_attr(not(test), allow(dead_code))] // J2-E's owner wiring calls it
 pub(crate) fn slot_factory(wake: Option<WakeSender>) -> SlotFactory {
     Box::new(move || {
         let mut worker = Worker::default();

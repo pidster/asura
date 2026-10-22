@@ -50,6 +50,12 @@ path = "tests/conversation_flow.rs"
 harness = false
 
 [[test]]
+name = "job_controller_flow"
+path = "tests/job_controller_flow.rs"
+harness = false
+required-features = ["test-support"]
+
+[[test]]
 name = "secret_store"
 path = "tests/secret_store.rs"
 required-features = ["test-support"]

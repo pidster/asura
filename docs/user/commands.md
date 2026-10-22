@@ -82,6 +82,25 @@ as each page arrives. Press Ctrl-C to stop it.
 `/tools` take no arguments. Results open in a panel above the input box; Escape
 closes it.
 
+## Job limits
+
+The `jobs` settings limit how many command jobs the service runs and queues.
+The service reads them when it starts, so a change applies after the service
+restarts. `/config get jobs` shows all five; `/config set jobs.liveAgent 3`
+changes one.
+
+| Setting | Meaning |
+| --- | --- |
+| `jobs.liveService` | Jobs that run at the same time in the service, 1 to 16 |
+| `jobs.liveAgent` | Jobs that run at the same time for one conversation, 1 to 8. The service uses the smaller of this and `jobs.liveService` |
+| `jobs.queuedAgent` | Jobs that wait for one conversation, 1 to 16. The service refuses a job above this limit |
+| `jobs.clientViewers` | Job output reads that clients may have waiting, 1 to 32 |
+| `jobs.modelReservedPageReads` | Output readers kept for the model, 0 or 1 |
+
+A job that cannot start yet waits and shows why, for example
+`waiting: 2 of 2 jobs running for this agent`. It starts when a running job
+ends. A value outside its range gives `config_invalid_value`.
+
 ## Journal space
 
 The service records conversations and projects in its journal. The journal has

@@ -54,6 +54,7 @@ pub(crate) struct Counts {
 }
 
 /// The brief text of a blocking reason with its live values.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 pub(crate) fn block_text(reason: BlockReason, counts: &Counts) -> String {
     let cleanup = |n: usize| {
         if n == 0 {
@@ -90,11 +91,13 @@ pub(crate) fn block_text(reason: BlockReason, counts: &Counts) -> String {
 
 /// Why a submission was refused before any record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 pub(crate) enum BusyReason {
     QueueFull,
     JobsFull,
     Closed,
 }
+#[cfg_attr(not(test), allow(dead_code))] // J3 and J4 show the code and text
 impl BusyReason {
     pub(crate) fn code(self) -> &'static str {
         match self {

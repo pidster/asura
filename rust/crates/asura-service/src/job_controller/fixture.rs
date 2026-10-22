@@ -45,7 +45,7 @@ impl SlotPort for FixtureSlot {
         if self.job.is_some() {
             return Err(SlotStartError::Busy);
         }
-        assert_eq!(start.capture.call, start.job, "capture keyed by job");
+        assert_eq!(start.capture.job, start.job, "capture keyed by job");
         let _ = &start.runtime;
         self.job = Some(start.job);
         log.started.push(start.job);

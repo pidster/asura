@@ -23,7 +23,7 @@ pub(crate) trait SlotPort {
     fn start(&mut self, start: SlotStart) -> Result<(), SlotStartError>;
     fn stop(&mut self, kind: StopKind); // Term or Kill; idempotent; never blocks
     fn discard_capture(&mut self); // cancel trigger in Draining: capture discards
-    #[cfg_attr(test, allow(dead_code))] // P3-T calls it
+    #[allow(dead_code)] // P3-T calls it
     fn close_capture(&mut self); // P3-T: cancel after a `!!` kind 2 reason 15: close the read ends, seal with reason 7
     fn interests(&self, out: &mut Vec<PollInterest>);
     fn next_deadline(&self, now: Instant) -> Option<Instant>;
@@ -78,7 +78,7 @@ pub(crate) enum SlotEvent {
         cleanup: JobCleanup,
         escapees: u32,
         elapsed_ms: u64,
-        #[cfg_attr(test, allow(dead_code))] // P3-T reads it
+        #[allow(dead_code)] // P3-T reads it
         output_held: bool,
     }, // kind 2; output_held for reason 15 (P3-T)
     CaptureSettled(Box<CaptureOutcome>), // sealed report, or L3 unconfirmed

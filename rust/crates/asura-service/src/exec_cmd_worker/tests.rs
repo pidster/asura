@@ -337,7 +337,7 @@ impl Home {
             .unwrap();
         capture_worker::Start {
             store: self.store.clone(),
-            call: job,
+            job,
             victims,
             redaction: asura_platform::secrets::JobRedaction::new(
                 asura_platform::secrets::detection().unwrap(),
@@ -482,7 +482,7 @@ fn start_job_refuses_busy_and_invalid_starts() {
     );
     let mut worker = Worker::default();
     let mut start = home.start(asura_platform::random_id(), home.scope());
-    start.capture.call = asura_platform::random_id();
+    start.capture.job = asura_platform::random_id();
     assert_eq!(worker.start_job(start).err(), Some(SlotStartError::Invalid));
     let mut scope = home.scope();
     scope.project = [0; 16];

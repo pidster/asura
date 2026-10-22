@@ -10,9 +10,6 @@
 //! its serialized ticket is free and reports each reply with
 //! [`JobController::record_done`]. No timer ends a job or a queued start
 //! (J2a-1, AQ1); the only pacing is the `disk_space` recheck.
-// J2 has no production caller: packet J2-E wires the controller into the
-// conversation owner, and J3 switches exec_cmd onto it.
-#![cfg_attr(not(test), allow(dead_code))]
 
 mod port;
 mod reasons;
@@ -112,6 +109,7 @@ impl Origin {
         }
     }
     /// The one job ID of this origin ([job identity](J2-E6)).
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
     pub(crate) fn job_id(&self) -> Id {
         journal::job_id(&self.journal())
     }
@@ -129,6 +127,7 @@ impl Origin {
 /// One start. The secrets and redaction move into the slot at its start;
 /// `duplicate_digest` is a keyed digest of the arguments, held in memory
 /// only, that tells a duplicate start from a conflicting one.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 pub(crate) struct StartRequest {
     pub origin: Origin,
     pub agent: AgentKey,
@@ -143,6 +142,7 @@ pub(crate) struct StartRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 pub(crate) enum Admission {
     Accepted { job: Id },
     Existing { job: Id },
@@ -151,6 +151,7 @@ pub(crate) enum Admission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 pub(crate) enum Requester {
     Model,
     Client,
@@ -158,6 +159,7 @@ pub(crate) enum Requester {
     Service,
 }
 impl Requester {
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
     fn journal(self) -> JobRequester {
         match self {
             Self::Model => JobRequester::Model,
@@ -187,6 +189,7 @@ pub(crate) enum JobState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 pub(crate) enum CancelReply {
     /// The requested state; the settled state follows from slot events.
     Accepted(JobState),
@@ -203,12 +206,13 @@ pub(crate) enum JobEvent {
     Settled(Id, Outcome),
     /// P3-K: a `!!` job's kind 2 reason 15; survivors still hold output
     /// (OD2). Never emitted in J2.
-    #[cfg_attr(test, allow(dead_code))]
+    #[allow(dead_code)] // P3-K emits it
     ShellExited(Id, Exit, u32),
 }
 
 /// What the controller knows of one job.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 pub(crate) struct JobStatus {
     pub state: JobState,
     pub origin: Origin,
@@ -384,6 +388,7 @@ impl Job {
     }
 }
 
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 struct Retired {
     job: Id,
     digest: [u8; 32],
@@ -449,7 +454,6 @@ impl JobController {
     /// `limits` come from the service-start configuration; `slots` creates
     /// one slot per granted job; `runtime` is the service runtime that each
     /// slot's setup uses.
-    #[cfg_attr(test, allow(dead_code))] // J2-E's owner wiring calls it
     pub(crate) fn new(
         limits: JobLimits,
         emitter: Option<crate::audit::Emitter>,
@@ -537,6 +541,7 @@ impl JobController {
 
     // ----- Admission -----
 
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
     pub(crate) fn submit(&mut self, request: StartRequest, _now: Instant) -> Admission {
         let id = request.origin.job_id();
         if let Some(job) = self.jobs.get(&id) {
@@ -607,6 +612,7 @@ impl JobController {
 
     /// Jobs with a kind 26 (or about to get one) and no committed kind 28,
     /// plus person waiters: the 64-job bound.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
     fn unsettled(&self) -> usize {
         self.jobs
             .values()
@@ -616,6 +622,7 @@ impl JobController {
 
     // ----- Cancel and revocation -----
 
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
     pub(crate) fn cancel(
         &mut self,
         job: Id,
@@ -1554,7 +1561,7 @@ impl JobController {
             secret_command: body.secret_command,
             capture: capture_worker::Start {
                 store: admitted.store,
-                call: id,
+                job: id,
                 victims: admitted.victims,
                 redaction: body.redaction,
                 wake: None,
@@ -1622,6 +1629,7 @@ impl JobController {
         }
     }
 
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
     pub(crate) fn status(&self, job: Id) -> Option<JobStatus> {
         if let Some(j) = self.jobs.get(&job) {
             let text = j.block.map(|reason| {
@@ -1672,6 +1680,7 @@ impl JobController {
     }
 }
 
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J3 adds the production caller
 fn duplicate(existing: [u8; 32], proposed: [u8; 32], job: Id) -> Admission {
     if existing == proposed {
         Admission::Existing { job }

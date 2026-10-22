@@ -231,7 +231,7 @@ impl Home {
         let rules = asura_platform::secrets::detection().unwrap();
         let handle = start(Start {
             store: self.store.clone(),
-            call: job,
+            job,
             victims,
             redaction: JobRedaction::new(rules, &[]),
             wake: None,

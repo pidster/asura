@@ -1,15 +1,21 @@
 //! The conversation owner's payload state (J1): the retained recovery worker,
 //! the ready store and page-read pool, and the pending-install list of at
-//! most 4 capture workers that outlive their call.
+//! most 4 capture workers that outlive their call. It is also the job
+//! controller's payload port (J2): admission, release, settlement and
+//! abandonment of each job's reservation and capture worker.
 use crate::capture_worker::{self, Message};
+use crate::job_controller::{Admitted, Origin, PayloadPort, Short};
 use asura_platform::RuntimeDirectory;
 use asura_platform::events::WakeSender;
-use asura_storage::authority::conversation::{ExecCmdBusyReason, Replay};
+use asura_storage::authority::conversation::{
+    CaptureState, ExecCmdBusyReason, Id, JobCaptureState, JobSettled, Replay,
+};
 use asura_storage::authority::writer::{self, WriterClient};
 use asura_storage::payload::{
-    PagePool, PayloadStore, RecoveryError, RecoveryReport, recover_with_facts,
+    PagePool, PayloadStore, RecoveryError, RecoveryReport, SpaceListener, Victim,
+    recover_with_facts,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -62,7 +68,24 @@ pub(crate) const PENDING_INSTALLS: usize = 4;
 /// Shutdown cleanup bound for pending installs and live captures.
 pub(crate) const SHUTDOWN_BOUND: Duration = Duration::from_secs(2);
 
-type Recovered = Result<(Arc<PayloadStore>, RecoveryReport), &'static str>;
+/// The recovered store, its report and the configured `retention.quotaBytes`.
+type Recovered = Result<(Arc<PayloadStore>, RecoveryReport, u64), &'static str>;
+
+/// Counts the ledger's space events (settlement, expiry, deletion) for the
+/// job controller's `space_epoch` and wakes the reactor. The ledger calls it
+/// outside its lock; it does one atomic add and one nonblocking wake.
+struct SpaceEpoch {
+    count: AtomicU64,
+    wake: Option<WakeSender>,
+}
+impl SpaceListener for SpaceEpoch {
+    fn space_event(&self) {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        if let Some(wake) = &self.wake {
+            let _ = wake.notify();
+        }
+    }
+}
 
 enum State {
     Idle,
@@ -74,6 +97,11 @@ enum State {
     Ready {
         store: Arc<PayloadStore>,
         _pages: Option<PagePool>,
+        /// The configured `retention.quotaBytes`: an effective quota below
+        /// it means free disk space limits the store.
+        configured: u64,
+        /// Kept alive while the ledger holds its weak reference.
+        epoch: Arc<SpaceEpoch>,
     },
     Unavailable,
 }
@@ -82,6 +110,9 @@ pub(crate) struct Payloads {
     state: State,
     pending: Vec<capture_worker::Handle>,
     shutdown: Option<Instant>,
+    /// The installation ID from replay: the payload ID derivation input.
+    installation: Id,
+    wake: Option<WakeSender>,
 }
 impl Default for Payloads {
     fn default() -> Self {
@@ -89,6 +120,8 @@ impl Default for Payloads {
             state: State::Idle,
             pending: Vec::new(),
             shutdown: None,
+            installation: [0; 16],
+            wake: None,
         }
     }
 }
@@ -106,9 +139,11 @@ impl Payloads {
         if !matches!(self.state, State::Idle) || self.shutdown.is_some() {
             return;
         }
-        let (Some(_), Some(client)) = (replay, client) else {
+        let (Some(replay), Some(client)) = (replay, client) else {
             return;
         };
+        self.installation = replay.installation_id;
+        self.wake = wake.cloned();
         // The worker asks the journal for the facts of the payloads on disk
         // in batches of 128 (`PayloadFacts`); it never holds a snapshot.
         let runtime = runtime.clone();
@@ -131,7 +166,7 @@ impl Payloads {
                         |payloads: Vec<[u8; 16]>| journal_facts(&client, payloads, &token);
                     let report = recover_with_facts(&store, &mut facts, quota, &token)
                         .map_err(|_| "payload_unavailable")?;
-                    Ok((Arc::new(store), report))
+                    Ok((Arc::new(store), report, quota))
                 })();
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
                 if let Some(wake) = wake {
@@ -181,7 +216,7 @@ impl Payloads {
             let taken = result.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(outcome) = taken {
                 self.state = match outcome {
-                    Ok((store, report)) => {
+                    Ok((store, report, configured)) => {
                         tracing::debug!(
                             installed = report.installed,
                             corrupt = report.corrupt,
@@ -194,9 +229,16 @@ impl Payloads {
                             "payload_recovery_complete"
                         );
                         let pages = PagePool::start(store.clone()).ok();
+                        let epoch = Arc::new(SpaceEpoch {
+                            count: AtomicU64::new(0),
+                            wake: self.wake.clone(),
+                        });
+                        store.listen(&(epoch.clone() as Arc<dyn SpaceListener>));
                         State::Ready {
                             store,
                             _pages: pages,
+                            configured,
+                            epoch,
                         }
                     }
                     Err(reason) => {
@@ -220,7 +262,7 @@ impl Payloads {
             }
             if handle.exited {
                 if let Some(store) = &store {
-                    store.unhold(handle.call);
+                    store.unhold(handle.job);
                 }
                 false
             } else {
@@ -249,6 +291,123 @@ impl Payloads {
         self.shutdown.map(|started| started + SHUTDOWN_BOUND)
     }
 }
+/// The job controller's admission (conditions 4, 7 and 8) and the
+/// settlement of each job's reservation and capture worker. Every method is
+/// arithmetic on the ledger or a flag on a worker: nothing blocks (AE-01).
+impl PayloadPort for Payloads {
+    fn ready(&self) -> bool {
+        self.store().is_some()
+    }
+    fn pending_installs(&self) -> usize {
+        self.pending.len()
+    }
+    fn space_epoch(&self) -> u64 {
+        match &self.state {
+            State::Ready { epoch, .. } => epoch.count.load(Ordering::Acquire),
+            _ => 0,
+        }
+    }
+    /// Reserves 1 MiB after an expiry attempt. A short is `DiskSpace` when
+    /// free space, not the configured quota, sets the effective quota.
+    fn admit(&mut self, job: Id, origin: &Origin) -> Result<Admitted, Short> {
+        let State::Ready {
+            store, configured, ..
+        } = &self.state
+        else {
+            return Err(Short::Quota);
+        };
+        let owner = match *origin {
+            Origin::Model { operation, .. } => operation,
+            Origin::Person { input } => input,
+        };
+        match store.admit(self.installation, job, owner) {
+            Ok(victims) => Ok(Admitted {
+                store: store.clone(),
+                victims,
+            }),
+            Err(_) => Err(short(store.quota(), *configured)),
+        }
+    }
+    fn release(&mut self, job: Id, victims: &[Victim]) {
+        if let Some(store) = self.store() {
+            store.restore_victims(victims);
+            store.release(job);
+        }
+    }
+    /// Kind 28 committed: the ledger settles (or releases a job that never
+    /// staged), then the worker installs (R2), discards its `not_started`
+    /// staging, or stays abandoned after `unconfirmed`; it joins the
+    /// pending-install list until it exits.
+    fn committed(
+        &mut self,
+        job: Id,
+        settled: &JobSettled,
+        sequence: u64,
+        capture: Option<capture_worker::Handle>,
+    ) {
+        let state = ledger_state(settled.capture_state);
+        if let Some(store) = self.store() {
+            match state {
+                Some(state) => store.settle(
+                    job,
+                    state,
+                    [
+                        (
+                            settled.stdout.capture.stored_bytes,
+                            settled.stdout.capture.digest,
+                        ),
+                        (
+                            settled.stderr.capture.stored_bytes,
+                            settled.stderr.capture.digest,
+                        ),
+                    ],
+                    sequence,
+                    capture.is_some(),
+                ),
+                None => store.release(job),
+            }
+        }
+        if let Some(handle) = capture {
+            match state {
+                Some(CaptureState::Unconfirmed) => handle.abandon(),
+                Some(_) => handle.install(),
+                None => handle.discard(),
+            }
+            self.pending.push(handle);
+        }
+    }
+    /// The journal became unavailable before kind 28: no settlement. The
+    /// worker stops and keeps its staging as an unverified prefix for the
+    /// next start's recovery.
+    fn abandon(&mut self, _job: Id, capture: Option<capture_worker::Handle>) {
+        if let Some(handle) = capture {
+            handle.abandon();
+            self.pending.push(handle);
+        }
+    }
+}
+
+/// Condition 8's short: the effective quota below the configured one means
+/// free disk space limits the store (`disk_space`); otherwise `quota`.
+fn short(effective: u64, configured: u64) -> Short {
+    if effective < configured {
+        Short::DiskSpace
+    } else {
+        Short::Quota
+    }
+}
+
+/// The ledger state of a kind 28 capture state; `None` for a job that
+/// staged nothing (`not_started`, `interrupted`).
+fn ledger_state(state: JobCaptureState) -> Option<CaptureState> {
+    match state {
+        JobCaptureState::Complete => Some(CaptureState::Complete),
+        JobCaptureState::Incomplete => Some(CaptureState::Incomplete),
+        JobCaptureState::Unconfirmed => Some(CaptureState::Unconfirmed),
+        JobCaptureState::NotStarted | JobCaptureState::Interrupted => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +415,46 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    /// Condition 8: the payload owner decides `quota` or `disk_space`
+    /// from the effective and configured quota (J2 interfaces).
+    #[test]
+    fn short_is_disk_space_only_when_free_space_sets_the_quota() {
+        assert_eq!(short(64 << 20, 64 << 20), Short::Quota);
+        assert_eq!(short(10 << 20, 64 << 20), Short::DiskSpace);
+        assert_eq!(short(0, 64 << 20), Short::DiskSpace);
+    }
+    /// Kind 28 capture states map to the ledger's: a job that staged
+    /// nothing releases its reservation instead of settling.
+    #[test]
+    fn job_capture_states_map_to_the_ledger() {
+        assert_eq!(
+            ledger_state(JobCaptureState::Complete),
+            Some(CaptureState::Complete)
+        );
+        assert_eq!(
+            ledger_state(JobCaptureState::Incomplete),
+            Some(CaptureState::Incomplete)
+        );
+        assert_eq!(
+            ledger_state(JobCaptureState::Unconfirmed),
+            Some(CaptureState::Unconfirmed)
+        );
+        assert_eq!(ledger_state(JobCaptureState::NotStarted), None);
+        assert_eq!(ledger_state(JobCaptureState::Interrupted), None);
+    }
+    /// The space epoch counts each ledger space event.
+    #[test]
+    fn space_epoch_counts_ledger_space_events() {
+        let epoch = Arc::new(SpaceEpoch {
+            count: AtomicU64::new(0),
+            wake: None,
+        });
+        let ledger = asura_storage::payload::Ledger::default();
+        ledger.listen(&(epoch.clone() as Arc<dyn SpaceListener>));
+        ledger.space_event();
+        ledger.release([1; 16]);
+        assert_eq!(epoch.count.load(Ordering::Acquire), 2);
+    }
     type Facts = Result<Vec<writer::PayloadFact>, RecoveryError>;
     fn fact(payload: [u8; 16]) -> writer::PayloadFact {
         writer::PayloadFact {

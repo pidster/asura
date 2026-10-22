@@ -1,6 +1,7 @@
 //! Serialized admission in the existing reactor; filesystem effects belong to storage.
 mod audit_tools;
 mod exec_cmd_call;
+mod jobs;
 mod memory_create;
 mod memory_tools;
 mod response;
@@ -553,6 +554,11 @@ enum Job {
     SensorInspect(pb::Envelope),
     SensorStore(journal::Id, journal::Id),
     SensorReconcile(journal::Id),
+    /// One job record from the controller's outbox (kinds 26 to 28).
+    Controller(journal::Id),
+    /// A worker-layer harness record or command (`test-support` only).
+    #[cfg(feature = "test-support")]
+    Fixture,
 }
 pub(crate) struct Owner {
     create_recovery: Option<memory_create::Mutation>,
@@ -601,6 +607,11 @@ pub(crate) struct Owner {
     journal_status: Option<writer::JournalStatus>,
     /// Registrations from recent project pages, newest last; at most 256.
     known_projects: VecDeque<journal::ProjectRegistered>,
+    /// The job controller and its wiring (J2).
+    jobs: jobs::Jobs,
+    /// The reply to the last harness record or command.
+    #[cfg(feature = "test-support")]
+    fixture: Option<writer::Result<writer::Reply>>,
 }
 impl Owner {
     pub(crate) fn new(runtime: RuntimeDirectory, package: Option<PackageIdentity>) -> Self {
@@ -643,6 +654,9 @@ impl Owner {
             known_projects: VecDeque::new(),
             journal_quota: None,
             journal_status: None,
+            jobs: jobs::Jobs::default(),
+            #[cfg(feature = "test-support")]
+            fixture: None,
         }
     }
     /// The queued input under preparation and its pre-acceptance step.
@@ -1209,14 +1223,17 @@ impl Owner {
         self.wake = Some(wake);
     }
     pub(crate) fn interests(&self) -> Vec<asura_platform::PollInterest> {
-        self.active
+        let mut interests = self
+            .active
             .as_ref()
             .map(|active| {
                 let mut interests = active.model.interests();
                 interests.extend(active.exec_cmd_worker.interests());
                 interests
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.jobs.interests(&mut interests);
+        interests
     }
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
         let model = self
@@ -1273,12 +1290,15 @@ impl Owner {
             .chain(tool)
             .chain(closing)
             .chain(self.payloads.next_deadline())
+            .chain(self.jobs.next_deadline(now))
             .chain(self.observations.iter().map(|(_, deadline)| *deadline))
             .min()
     }
     pub(crate) fn open(&mut self) {
         if !self.started && !self.closing {
             self.started = true;
+            // The job limits are read once at start, off the reactor.
+            self.jobs.start(&self.runtime, self.wake.as_ref());
             if let Err(e) = self.submit(writer::Command::Open, Job::Open) {
                 self.unavailable = Some(storage_error(e));
             }
@@ -1996,6 +2016,22 @@ impl Owner {
             Err(cause) => {
                 let message = storage_error(cause);
                 tracing::warn!(stage = "writer", class = message, "model_helper_diagnostic");
+                if cause == writer::Error::StaleProject {
+                    // Turn admission found the project replaced: its jobs
+                    // are revoked with `identity_changed` (J2-E10).
+                    let project = match &job {
+                        Job::Accept => self.active.as_ref().map(|a| a.turn.project),
+                        Job::QueuePrepare(input) => self
+                            .replay
+                            .as_ref()
+                            .and_then(|r| r.inputs.get(input))
+                            .map(|i| i.project),
+                        _ => None,
+                    };
+                    if let Some(project) = project {
+                        self.jobs.identity_changed(project);
+                    }
+                }
                 match job {
                     Job::SensorLoad(project) | Job::SensorReconcile(project) => {
                         self.sensor_failed.insert(project);
@@ -2021,6 +2057,20 @@ impl Owner {
                         tracing::warn!(reason = message, "sensor_write_unconfirmed");
                     }
                     Job::Open => self.unavailable = Some(message),
+                    Job::Controller(job) => {
+                        // A held kind 26 waits for the hold to end; any other
+                        // writer error makes the journal unavailable.
+                        let held = matches!(
+                            cause,
+                            writer::Error::JournalQuota | writer::Error::JournalDiskSpace
+                        );
+                        self.jobs.record_done(job, Err(cause));
+                        if !held {
+                            self.unavailable = Some(message);
+                        }
+                    }
+                    #[cfg(feature = "test-support")]
+                    Job::Fixture => self.fixture = Some(Err(cause)),
                     Job::AutoInitialize => {
                         self.automatic_initialization.fail(cause);
                         self.unavailable = Some(message);
@@ -2156,6 +2206,17 @@ impl Owner {
         };
         self.replay = value.replay;
         match job {
+            Job::Controller(job) => {
+                let sequence = self.replay.as_ref().map_or(0, |r| r.sequence);
+                self.jobs.record_done(job, Ok(sequence));
+            }
+            #[cfg(feature = "test-support")]
+            Job::Fixture => {
+                self.fixture = Some(Ok(writer::Reply {
+                    replay: self.replay.clone(),
+                    ..value
+                }))
+            }
             Job::Open => {
                 self.create_recovery = self
                     .replay
@@ -3508,6 +3569,16 @@ impl Owner {
             && let Some(tool) = &mut active.tool
             && let Some(call) = &tool.call
         {
+            if matches!(
+                outcome,
+                Err(tools::ExecutionError::Host(
+                    asura_platform::ProjectReadError::Changed
+                ))
+            ) {
+                // The tool executor's recheck found the project replaced:
+                // its jobs are revoked (J2-E10).
+                self.jobs.identity_changed(active.turn.project);
+            }
             let mut result = tool_result(call, outcome);
             if result.text.len() > active.tool_budget.result_capacity() {
                 result.status = 7;
@@ -3555,6 +3626,7 @@ impl Owner {
             self.writer.as_ref().map(|w| w.client()),
             self.wake.as_ref(),
         );
+        self.poll_jobs(now);
         if self
             .active
             .as_ref()
@@ -3562,13 +3634,16 @@ impl Owner {
         {
             self.unavailable = Some("authority_repair_required");
         }
-        self.dispatch_foreground(now);
         self.capture_memory_create();
         self.capture_memory_tool();
         self.capture_sensor_tool(now);
         self.capture_audit_tool();
         self.capture_inventory_tool();
+        // The ticket order (J2): the active turn's records, then the job
+        // closure records and kind 26, then new foreground commands.
         self.drive(now);
+        self.drive_jobs();
+        self.dispatch_foreground(now);
         self.capture_sensor_tool(now);
         self.capture_audit_tool();
         self.capture_inventory_tool();
@@ -3584,6 +3659,7 @@ impl Owner {
                 .is_none_or(memory_create::Mutation::settled)
             && self.pending.is_none()
             && self.sensor_owner.as_ref().is_none_or(|o| o.settled())
+            && self.jobs.settled(now)
             && let Some(writer) = &self.writer
         {
             writer.close();
@@ -3605,6 +3681,10 @@ impl Owner {
                     active.cancel.get_or_insert(journal::Cause::Steering);
                 }
             } else if self.pending.is_none() && !self.journal_held() {
+                // Job records go before a new turn's preparation.
+                if self.drive_jobs() {
+                    return;
+                }
                 // New turns wait while the journal holds normal records.
                 if let Some(input) = self.replay.as_ref().and_then(|r| r.ready_input())
                     && let Err(e) = self.submit(
@@ -3888,7 +3968,7 @@ impl Owner {
                                     secret_command,
                                     capture: crate::capture_worker::Start {
                                         store,
-                                        call: exec_cmd.run.job,
+                                        job: exec_cmd.run.job,
                                         victims: std::mem::take(&mut exec_cmd.victims),
                                         redaction,
                                         wake,
@@ -4300,6 +4380,7 @@ impl Owner {
     pub(crate) fn shutdown(&mut self) {
         self.closing = true;
         self.payloads.shutdown(Instant::now());
+        self.jobs.close(Instant::now());
         if let Some(active) = &self.active {
             active.revoke_create();
         }
@@ -4314,7 +4395,104 @@ impl Owner {
             && self.pending.is_none()
             && self.sensor_owner.as_ref().is_none_or(|o| o.settled())
             && self.payloads.settled(Instant::now())
+            && self.jobs.settled(Instant::now())
             && self.writer.as_mut().is_none_or(|writer| writer.settled())
+    }
+    /// The job controller's reactor step: the writer's hold state, the
+    /// journal outage, then the controller's poll with the payload port.
+    fn poll_jobs(&mut self, now: Instant) {
+        // Start-time recovery: the first replay of this run (Open, or the
+        // automatic initialization of a new installation) gives the
+        // unsettled jobs; each gets an explicit `interrupted` kind 28
+        // before admission opens (J2-E5).
+        if !self.jobs.replay_taken()
+            && !matches!(self.pending, Some((_, Job::Open | Job::AutoInitialize)))
+            && let Some(replay) = &self.replay
+        {
+            self.jobs.replayed(replay.unsettled_jobs());
+        }
+        self.jobs.hold(self.journal_held());
+        if self.unavailable.is_some() {
+            self.jobs.journal_unavailable();
+        }
+        self.jobs.poll(
+            now,
+            &self.runtime,
+            self.wake.as_ref(),
+            self.audit_emitter.as_ref(),
+            &mut self.payloads,
+        );
+    }
+    /// Appends the controller's next record when the ticket is free:
+    /// closure records (kinds 28 and 27) before kind 26. Returns whether a
+    /// record took the ticket.
+    fn drive_jobs(&mut self) -> bool {
+        if self.pending.is_some() || self.unavailable.is_some() || self.replay.is_none() {
+            return false;
+        }
+        let Some((job, record)) = self.jobs.next_record() else {
+            return false;
+        };
+        if let Err(e) = self.append(record, Job::Controller(job), None) {
+            self.jobs.record_done(job, Err(e));
+            self.unavailable = Some(storage_error(e));
+            self.jobs.journal_unavailable();
+            return false;
+        }
+        true
+    }
+
+    // ----- Worker-layer harness (`test-support` only; never in production) -----
+
+    /// Submits a harness record or command on the serialized ticket.
+    /// Returns `false` while the ticket is busy.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_submit(&mut self, command: writer::Command) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        self.fixture = None;
+        if let Err(e) = self.submit(command, Job::Fixture) {
+            self.fixture = Some(Err(e));
+        }
+        true
+    }
+    /// The serialized ticket is free.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_idle(&self) -> bool {
+        self.pending.is_none()
+    }
+    /// The reply to the last harness submission, once.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_reply(&mut self) -> Option<writer::Result<writer::Reply>> {
+        self.fixture.take()
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_replay(&self) -> Option<&Arc<journal::Replay>> {
+        self.replay.as_ref()
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_jobs(&mut self) -> Option<&mut crate::job_controller::JobController> {
+        self.jobs.controller()
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_job_events(&mut self) -> Vec<crate::job_controller::JobEvent> {
+        self.jobs.take_events()
+    }
+    /// The identity recheck of a tool call or turn admission (J2-E10).
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_identity_changed(&mut self, project: journal::Id) {
+        self.jobs.identity_changed(project);
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_unavailable(&self) -> Option<&'static str> {
+        self.unavailable
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_writer_close(&self) {
+        if let Some(writer) = &self.writer {
+            writer.close();
+        }
     }
 }
 

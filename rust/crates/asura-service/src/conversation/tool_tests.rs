@@ -119,6 +119,9 @@ impl Fixture {
                 payloads: Default::default(),
                 foreground: VecDeque::new(),
                 dispatching_foreground: false,
+                jobs: Default::default(),
+                #[cfg(feature = "test-support")]
+                fixture: None,
             },
         };
         fixture.set_tool("service", r#"{"command":"status"}"#);

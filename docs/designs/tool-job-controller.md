@@ -2016,10 +2016,11 @@ default time bounds, no per-turn totals, no backward compatibility, one source
 of truth per fact. Mechanisms marked "selected (engineering)" are engineering
 choices under the [iteration rules](../design-process.md#iteration-and-escalation),
 not owner decisions. Protocol numbering remains `0.1`; journal format remains
-`1`. Implemented on `main` (2026-10-22): J2-A, J2-B, J2-C, J2-G, J2-D1 and
-J2-D2. Not implemented: J2-A2 and J2-E, so the controller has no production
-caller yet. Facts recorded from the merged packets are marked "recorded
-2026-10-22".
+`1`. Implemented on `main` (2026-10-22): J2-A, J2-B, J2-C, J2-G, J2-D1,
+J2-D2 and J2-A2. J2-E (integration) is implemented and its evidence is in
+[J2 evidence](#j2-evidence). The conversation owner holds the controller, but
+no production code submits a start until J3 switches exec_cmd. Facts recorded
+from the merged packets are marked "recorded 2026-10-22".
 
 ### J2 scope
 
@@ -3262,6 +3263,54 @@ Release qualification is not claimed.
   restart; retained scratch stays on disk.
 - One development host; `/bin/sh`, APFS and `sandbox-exec` behavior elsewhere is
   not claimed.
+
+### J2 evidence
+
+Verified behavior, 2026-10-22, packet J2-E, macOS 27 development host with
+`sandbox-exec`. The worker-layer harness (`JobHarness` in
+`asura-service/src/test_support.rs`) runs the real conversation owner with its
+controller, the real journal writer, payload store, slot and capture workers
+and the real guardian. It writes fixture turns with `run` exec_cmd kind 14
+records and submits model-origin starts. `tests/job_controller_flow.rs` runs
+these cases; each ends with the raw-byte sweep:
+
+| Case | J2T integration parts |
+| --- | --- |
+| `lifecycle` | J2T-01 (kinds 26–28 through the owner), J2T-07 (`Running`), J2T-17, J2T-20 (real emitter, order), J2T-22 (line counts equal the installed stream) |
+| `queues` | J2T-08 (`agent_slots`, `service_slots`, start on release with no timer), J2T-21 (set, restart, limit applied) |
+| `cancels` | J2T-07 (`Queued`, `Starting` under the setup gate, `Draining`) |
+| `recovery` | J2T-12 (SIGKILL of a child with a settled, two running and one queued job: one `interrupted` each, nothing reruns, groups stop on lease EOF, admission opens) |
+| `outage` | J2T-02 and J2T-13 (kind 26 held with `journal_held` while kinds 27 and 28 commit; writer fault stops a live job, the next start writes `interrupted`) |
+| `shutdown` | J2T-14 (queued `not_started` and live `cancelled` with `shutdown`; an `undyable` job passes the 2 s bound and is `interrupted` at the next start), J2T-10 |
+| `identity` | J2T-15 (the setup recheck settles `project_changed` and revokes the project's running job; another project continues until the owner's identity hook revokes it) |
+| `cleanup` | J2T-10 (`unverifiable:5`: slot held, owner available, another agent's job runs, late settlement records cleanup `late`, reason 13), J2T-11 (escapees 3, cleanup confirmed) |
+| `protocol_fault` | J2T-25 (a guardian that exits before any notice: `not_started`, `protocol_fault`, scratch deleted, the slot reused with `jobs.liveService` 1) |
+| `quota_pause` | J2T-09, quota form (a 64 MiB quota pauses only the flooding job while another runs; a third start waits with `quota`; pause facts in kind 28) |
+| `scale` | J2T-18 (16 live jobs over two agents with output floods; longest owner poll 3.8–7.9 ms; cancel accepted in under 1 ms) |
+
+J2T-23: the J1T regression suites (`capture_flow`, `capture_worker`,
+`tool_call_flow`, `conversation_flow`) and the CLI lifecycle gate ran in the
+same workspace run. Unit additions: `config_worker` maps every `jobs` key
+through `Setting::for_config_key` (J2T-21), and `payload_owner` decides
+`quota` or `disk_space` and counts space events.
+
+Not shown by J2-E, and left as limits:
+
+- **Person origin.** JR2 rejects a person-origin kind 26 until P2, so the
+  harness launches model-origin jobs only. Agent fairness uses distinct
+  conversations (agent 0 each).
+- **Tool-call and turn-admission detectors.** The owner calls the identity
+  hook from the tool executor's `Changed` recheck and from a `stale_project`
+  reply to turn admission. The harness has no model turn, so it calls the same
+  hook directly; only the setup recheck runs end to end.
+- **ENOSPC on a constrained image** (J2T-09 `Draining` with `enospc`), the
+  full pending-install list (J2T-19) and per-worker capture memory (J2T-18)
+  are not measured here; the J1 capture worker cases cover the capture parts.
+- **`jobs.modelReservedPageReads`** is read but not applied: `PagePool::start`
+  reserves one model worker with no parameter.
+- **Disk-space recheck.** `disk_space` is chosen when the effective quota is
+  below the configured one. The effective quota is set at payload recovery
+  only, so a recheck finds new free space only after a ledger space event.
 
 ### J2 code packets
 

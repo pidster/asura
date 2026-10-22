@@ -116,17 +116,8 @@ impl Worker {
                 Some(pb::envelope::Body::ConfigSet(v)) => v.key.as_deref(),
                 _ => None,
             };
-            let setting = match key {
-                Some("model") => Some(Setting::Model),
-                Some("audit") => Some(Setting::Audit),
-                Some("audit.enabled") => Some(Setting::AuditEnabled),
-                Some("audit.keepFiles") => Some(Setting::AuditKeepFiles),
-                Some("audit.maxFileBytes") => Some(Setting::AuditMaxFileBytes),
-                Some("providers.mlx.models") => Some(Setting::ProvidersMlxModels),
-                Some("retention.quotaBytes") => Some(Setting::RetentionQuotaBytes),
-                Some("journal" | "journal.quotaBytes") => Some(Setting::JournalQuotaBytes),
-                _ => None,
-            };
+            // One mapping from a key to its audit setting (J2-G).
+            let setting = key.and_then(Setting::for_config_key);
             if let (Some(setting), Some(outcome)) = (setting, outcome) {
                 self.audit_event = Some(Event::ConfigChanged { setting, outcome });
             }
@@ -273,6 +264,47 @@ mod tests {
         let (mut worker, release) = blocked(true);
         settle(&mut worker, release);
         assert_eq!(worker.take_journal_quota(), None);
+    }
+    /// J2T-21 (worker part): every `jobs` key, and the whole mapping, emits
+    /// `config.changed` with its own setting through `for_config_key`.
+    #[test]
+    fn j2t_21_jobs_keys_emit_config_changed_with_their_setting() {
+        use asura_storage::audit::{ConfigOutcome, Event, Setting};
+        for (key, setting) in [
+            ("jobs", Setting::Jobs),
+            ("jobs.liveService", Setting::JobsLiveService),
+            ("jobs.liveAgent", Setting::JobsLiveAgent),
+            ("jobs.queuedAgent", Setting::JobsQueuedAgent),
+            ("jobs.clientViewers", Setting::JobsClientViewers),
+            (
+                "jobs.modelReservedPageReads",
+                Setting::JobsModelReservedPageReads,
+            ),
+        ] {
+            let (mut worker, release) = blocked_with(
+                true,
+                key,
+                Ok(Reply {
+                    value_yaml: "2\n".into(),
+                    journal_quota: None,
+                    execution: None,
+                }),
+            );
+            settle(&mut worker, release);
+            assert_eq!(
+                worker.take_audit_event(),
+                Some(Event::ConfigChanged {
+                    setting,
+                    outcome: ConfigOutcome::Persisted,
+                }),
+                "{key}"
+            );
+        }
+        // A refused set emits nothing.
+        let (mut worker, release) =
+            blocked_with(true, "jobs.liveAgent", Err("config_invalid_value"));
+        settle(&mut worker, release);
+        assert_eq!(worker.take_audit_event(), None);
     }
     #[test]
     fn held_job_has_no_deadline_and_replies_on_completion() {

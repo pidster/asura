@@ -360,7 +360,7 @@ pub(crate) struct Start {
     pub store: Arc<PayloadStore>,
     /// The job ID: the store keys the reservation and staging by it and by
     /// its derived payload IDs (J2-E6). A J1-mode call passes its job ID.
-    pub call: Id,
+    pub job: Id,
     pub victims: Vec<Victim>,
     pub redaction: JobRedaction,
     pub wake: Option<WakeSender>,
@@ -370,7 +370,7 @@ pub(crate) struct Start {
 
 /// The reactor's handle of one capture worker.
 pub(crate) struct Handle {
-    pub call: Id,
+    pub job: Id,
     shared: Arc<Shared>,
     messages: Receiver<Message>,
     thread: JoinHandle<()>,
@@ -495,7 +495,7 @@ pub(crate) fn start(spec: Start) -> std::io::Result<Handle> {
         })),
         shared: shared.clone(),
     };
-    let call = spec.call;
+    let job = spec.job;
     let worker_shared = shared.clone();
     let thread = std::thread::Builder::new()
         .name("asura-capture".into())
@@ -504,7 +504,7 @@ pub(crate) fn start(spec: Start) -> std::io::Result<Handle> {
             Worker::new(spec, rx, worker_shared, messages_tx).run();
         })?;
     Ok(Handle {
-        call,
+        job,
         shared,
         messages,
         thread,
@@ -622,7 +622,7 @@ impl Worker {
     ) -> Self {
         Self {
             store: spec.store,
-            call: spec.call,
+            call: spec.job,
             victims: spec.victims,
             redaction: Some(spec.redaction),
             wake: spec.wake,

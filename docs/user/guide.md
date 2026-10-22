@@ -374,12 +374,18 @@ Settings are in `~/.asura/config.yaml`. Use these commands:
 | `audit.maxFileBytes` | 1 to 1099511627776 | `10485760` |
 | `providers.ollama.endpoint` | An `http` or `https` URL on `127.0.0.1` or `::1` | `http://127.0.0.1:11434` |
 | `journal.quotaBytes` | 67108864 (64 MiB) to 1099511627776 (1 TiB) | `4294967296` (4 GiB) |
+| `jobs.liveService` | 1 to 16 | `4` |
+| `jobs.liveAgent` | 1 to 8 | `2` |
+| `jobs.queuedAgent` | 1 to 16 | `8` |
+| `jobs.clientViewers` | 1 to 32 | `8` |
+| `jobs.modelReservedPageReads` | 0 or 1 | `1` |
 
 Values use YAML. Quote text that contains spaces or punctuation. A model change
 applies to the next message. Audit changes apply after the service restarts.
 A `journal.quotaBytes` change applies at once. It limits the service journal,
 which holds conversations and projects. It is separate from
 `retention.quotaBytes`. See [Journal space](commands.md#journal-space).
+The `jobs` settings limit command jobs. See [Job limits](commands.md#job-limits).
 If Asura cannot confirm a change, use `/config get` before you try again.
 
 ## Audit and tools
