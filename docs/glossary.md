@@ -50,7 +50,13 @@ schemas and runtime mechanisms remain with their governing designs.
 | Job slot | The resources of one running tool job: a slot worker, a capture worker and its quota reservation; counted per agent and per service |
 | Job reservation ledger | The journal capacity that each unsettled tool job holds for its cancel and settlement records, independent of any turn; see [J2 records](designs/tool-job-controller.md#replay-order-and-the-job-reservation-ledger) |
 | Wind-down bound | A fixed bound on one of Asura's own operations that acts only after a closure has fired, such as the TERM-to-KILL grace or the cleanup bound; it never ends the work it serves |
-| Job handle | Opaque service-derived job ID used to reconnect to a tool job; it is not an access token |
+| Job handle | Opaque service-derived job ID used to reconnect to a tool job, written as 32 lowercase hexadecimal digits; it is not an access token |
+| Job result record | Journal kind 29 `JobResult`: the reference-only result of an exec_cmd or `job` call; it holds facts no other record holds and never output text; see [kind 29](designs/tool-job-controller.md#kind-29-jobresult) |
+| Yield window | The time an exec_cmd call waits for its job before returning the handle: `yield_seconds`, 0–30, default 10; it ends the call's wait, never the job |
+| Job notice | Service-written block before the prompt that lists the conversation's jobs that settled since the previous turn's notice cursor; it never contains output; see [J5](designs/tool-job-controller.md#notice-selection) |
+| Notice cursor | Kind 21 `notice_through`: the last journal frame the turn's notice considered; the next turn's notice starts after it |
+| Job retention record | Journal kind 30 `JobRetention`: a person pin, unpin, delete or note, or a model note, for one job; see [kind 30](designs/tool-job-controller.md#kind-30-jobretention) |
+| Execution setting | The person's switch for model command execution: a global default and per-project overrides, default on; turning it off refuses new model execution and revokes model jobs in scope; see the [execution setting](designs/execution-setting.md) |
 | Escapee | A command descendant that left the guardian's owned process group, by `setsid`/new session or by double-fork reparenting to `launchd`; see [escapee control](designs/escapee-control.md) |
 | Job marker | A per-job test, evaluated with `sandbox_check`, that attributes a sandboxed process to one job: it may write the job's own scratch and may not write the job's decoy path; see [escapee control](designs/escapee-control.md#attribution-the-per-job-sandbox-marker-model-and--jobs) |
 | Settlement gate | The condition the guardian requires before it reports `owned_group_settled`: leader reaped, owned group empty, capture/status pipes at EOF, and for sandboxed jobs zero attributed descendants; see [escapee control](designs/escapee-control.md#the-settlement-gate-and-cleanup_confirmed) |

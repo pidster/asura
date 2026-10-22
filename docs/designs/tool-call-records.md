@@ -414,7 +414,7 @@ then UTF-8, flags as one byte 0 or 1. Any other value is `Corrupt`.
 | 7 | operation code | u8 | 0 none, or the [operation table](#operation-codes) value |
 | 8 | decision | u8 | The [decision table](#decisions) value |
 | 9 | fault | u8 | 0, or the [fault table](#faults) value. Not 0 only with `invalid_arguments` or `unknown_tool` |
-| 10 | busy reason | u8 | 0 unless `busy`; then 1 `quota`, 2 `capture_paused`, 3 `pending_full`, 4 `payload_unavailable` |
+| 10 | busy reason | u8 | 0 unless `busy`; then 1 `quota`, 2 `capture_paused`, 3 `pending_full`, 4 `payload_unavailable`. Designed change with J3: the field becomes the decision reason, with `busy` codes 1 `queue_full`, 2 `jobs_full`, 3 `closed` and `denied` code 1 `execution_off` ([J3 kind 14 changes](tool-job-controller.md#j3-kind-14-changes)) |
 | 11 | argument form | u8 | 1 verbatim, 2 canonical, 3 unparsed text, 4 not retained |
 | 12 | not-retained reason | u8 | 0 unless form 4; then 1 `oversized`, 2 `detection_unavailable`, 3 `unverifiable_escape` |
 | 13 | arguments bytes | u32 | Received argument size |
@@ -500,7 +500,7 @@ facts and the frame's installation ID.
 | 17 `MemoryCreateIntent` | Retired. Its IDs are derived. Its body size, body digest and command digest are dropped; the memory store is their one source. Decoding returns `UnsupportedFormat`. |
 | 22 `ExecCmdIntent` | Retired. Kind 14 fields 20–23 hold its facts; the rest are derived. Decoding returns `UnsupportedFormat`. |
 | 23 `CaptureSettled` | Kept and changed. It follows a kind 14 exec_cmd record with decision `run`. Its rule-set fields 9–10 are removed (they repeated kind 14 fields 18–19); replay reads the rule set from kind 14. The maximum payload is 4,066 bytes ([kind 23](tool-job-controller.md#kind-23-capturesettled), TCR-D3). |
-| 15 `ToolResult` | Layout kept. Written only after a call that runs. A create_note result stores empty text (TCR-D1). |
+| 15 `ToolResult` | Layout kept. Written only after a call that runs. A create_note result stores empty text (TCR-D1). From J3 (designed) exec_cmd and `job` calls resolve with kind 29 `JobResult` instead ([kind 29](tool-job-controller.md#kind-29-jobresult)). |
 
 An old development journal does not open. The service reports
 `UnsupportedFormat` or `Corrupt` and changes nothing. The person removes the
@@ -521,6 +521,7 @@ rule against deleting user data).
 | 8 | memory | `note_sources` |
 | 9 | memory | `create_note` |
 | 10 | exec_cmd | `exec_cmd` |
+| 11–16 | job | `list`, `status`, `read`, `wait`, `cancel`, `note`; designed with [tool job packet J3](tool-job-controller.md#j3-kind-14-changes), not implemented |
 
 Code 0 means the service could not determine an operation: an unregistered
 name, unparsed text, or a missing or unknown `command` field.
@@ -583,6 +584,7 @@ before ordinal 201 is `limit` (TCR-D9, owner 2026-10-18).
 | 13 | `name_over_limit` |
 | 14 | `invalid_text` (NUL or other forbidden byte) |
 | 15 | `unregistered_name` (with `unknown_tool` only) |
+| 16 | `invalid_job_id`; designed with J3, not implemented |
 
 The parser reports the lowest fault code that applies (TCR-D11):
 
@@ -746,7 +748,7 @@ Replay accepts kind 14 under these rules. A broken rule is `Corrupt`.
 | Field 15 equals the highest placeholder number in fields 5 and 14, and every number from 1 to field 15 appears. Field 17 equals the number of unnumbered placeholder tokens in fields 5 and 14 (TCR-D4). For an admitted exec_cmd call, the derived variable count is at most 16. |
 | A `run` exec_cmd record names a nonzero rule set (fields 18–19); kind 23 has no rule-set fields of its own (TCR-D3). |
 | A create_note kind 15 holds empty text (TCR-D1). |
-| A `run` exec_cmd record needs kind 23 before kind 15, unless a kind 26 `JobIntent` follows it (a job-mode call, designed with [J2](tool-job-controller.md#replay-order-and-the-job-reservation-ledger)); then no kind 23 follows and kind 15 follows kind 26. Another `run` record needs kind 15 only. A record that does not run is followed by no kind 15 or kind 23. |
+| A `run` exec_cmd record needs kind 23 before kind 15, unless a kind 26 `JobIntent` follows it (a job-mode call, designed with [J2](tool-job-controller.md#replay-order-and-the-job-reservation-ledger)); then no kind 23 follows and kind 15 follows kind 26; from J3, kind 29 replaces that kind 15 (JR11–JR13). Another `run` record needs kind 15 only. A record that does not run is followed by no kind 15 or kind 23. |
 
 The writer's `reserve()` accepts kind 14 only when the journal can still hold
 the record and the frames that must follow it (TCR-D16). After a `run` record

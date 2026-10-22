@@ -30,6 +30,8 @@ the working directory or an environment override. Tests use scratch runtime root
 | `jobs.queuedAgent` | Integer, 1 through 16. Designed with J2, not implemented. Starts that may wait in one agent's job queue; read at service start | `8` |
 | `jobs.clientViewers` | Integer, 1 through 32. Designed with J2, not implemented; consumed by J4. Pending client job reads per service; read at service start | `8` (owner J2a-2) |
 | `jobs.modelReservedPageReads` | Integer, 0 through 1. Designed with J2, not implemented. Page-read workers reserved for model requests; read at service start | `1` (owner J2a-2) |
+| `execution.enabled` | Boolean. Designed with the [execution setting](execution-setting.md#configuration) (EX11), not implemented. The global default for model command execution; a set applies at once and revokes model jobs of projects turned off | `true` (owner EX11) |
+| `execution.projects` | Mapping of at most 1,024 project IDs (32 lowercase hex) to `on` or `off`. Designed with EX11, not implemented. The leaf `execution.projects.<id>` sets `on`, `off` or `inherit` (removes the entry) | Empty mapping |
 
 The `jobs` mapping follows `retention`: it is written only when set away from
 its defaults, `set jobs` takes the whole mapping, and each leaf has its own get

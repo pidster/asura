@@ -292,7 +292,9 @@ Tool record kinds after the [tool call records](tool-call-records.md) change
 | 23 | `CaptureSettled` | Changed: rule-set fields 9–10 removed; follows a `run` exec_cmd kind 14 without a kind 26. See [kind 23](tool-job-controller.md#kind-23-capturesettled). J3 retires it. |
 | 26 | `JobIntent` | Designed with tool job packet J2, not implemented: origin, agent and origin reference of a job ([J2 records](tool-job-controller.md#j2-records-kinds-26-27-and-28)). |
 | 27 | `JobCancelRequested` | Designed with J2, not implemented: the first cancel request of a job; a closure record. |
-| 28 | `JobSettled` | Designed with J2, not implemented: a job's outcome and capture facts; a closure record. |
+| 28 | `JobSettled` | Designed with J2, not implemented: a job's outcome and capture facts; a closure record. J4 adds the settled wall-clock time. |
+| 29 | `JobResult` | Designed with J3, not implemented: the reference-only result of an exec_cmd or `job` call ([kind 29](tool-job-controller.md#kind-29-jobresult)). |
+| 30 | `JobRetention` | Designed with J4, not implemented: a pin, unpin, delete or note for one job ([kind 30](tool-job-controller.md#kind-30-jobretention)). |
 
 Public inspection validates all transitions before returning the installation
 summary. It must not skip unsupported kinds or return a valid prefix after an

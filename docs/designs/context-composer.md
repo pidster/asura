@@ -276,8 +276,10 @@ Rules (D6):
 Under D9 (= J5a) the composer serializes one labelled, service-written **context
 block** as the leading part of the `ModelInput.prompt` field, before the
 person's text. The helper therefore needs no change for it, and the turn input
-digest binds it. The block holds, in order: the omitted-range line, job notice
-entries and person notice entries. Notice entries carry no output text until
+digest binds it. The block holds, in order: the omitted-range line, then the
+job notice: its header, one entry per settled job of either origin in
+settlement order, and the overflow and live lines
+([J5 notice text](tool-job-controller.md#notice-text)). Notice entries carry no output text until
 CC3 (PC12); from CC3 the composer may add an output view after an entry, inside
 the untrusted-data label. `TurnAccepted.prompt` keeps the person's exact text.
 
@@ -616,7 +618,7 @@ It never receives paths or file descriptors.
 
 | Interface | Direction | Content |
 | --- | --- | --- |
-| Candidate records | Writer → composer | Turn identities, prompts, terminal text, kind 14 [tool call records](tool-call-records.md#context-composer-and-views) (redacted name, operation code, decision, fault, argument form and stored text), result records (kind 15 text for current non-job tools, or the reference-only kind with reference, digest, summary, outcome and capture state), and the job records (kinds 26–28) from which J5 derives job and person notices; notices have no record of their own |
+| Candidate records | Writer → composer | Turn identities, prompts, terminal text, kind 14 [tool call records](tool-call-records.md#context-composer-and-views) (redacted name, operation code, decision, fault, argument form and stored text), result records (kind 15 text for current non-job tools, or kind 29 `JobResult` for exec_cmd and `job` calls, rendered by the [J3 result text](tool-job-controller.md#model-result-text)), and the J5 notice inputs from `Prepare`: the cursor, the settlements with their kinds 26 and 28 and command sources, and the live count ([J5 binding point](tool-job-controller.md#binding-point)); notices have no record of their own |
 | Page request | Composer → job controller | Handle or result ID, stream, offset, limit, representation `text` (J1 serves text pages only, R5); uses the reserved model page-read worker |
 | Page reply | Job controller → composer | Bytes, source offset, next offset, total retained bytes, state (`live`, `complete`, `unverified_prefix`, `expired`, `busy`, `denied`, …), digest or watermark |
 | Manifest digest | Conversation owner → writer | Added to `TurnAccepted` (and to request records in stage B) as additive format-1 fields, with the composer revision |
@@ -854,15 +856,17 @@ decisions, except item 8, which the owner selected.
    total input. The 32 KiB `MAX_PROMPT` bound stays on `TurnAccepted.prompt`,
    the person's own text. History entries are at most 2,048 (two per shown turn),
    which replaces the 32-entry check.
-6. **Turn record.** A new record kind 21, `TurnAcceptedV2`, is the next free kind
-   in delivery order (job controller R3). It carries every `TurnAccepted` field
-   plus `omitted_turns` (u32), `manifest_digest`, `composer_revision` (u32) and the
-   N1 budget inputs `window_tokens`, `output_reservation`, `overhead_tokens` and
-   `bytes_per_token_milli` (u32 each). Its `prior_operations` lists the shown prior
-   turns (full or reference), at most 1,024, in generation order. Replay accepts
-   both kinds; new turns write kind 21. Replay requires the shown operations to be
-   completed turns of the conversation in increasing generation, and the shown
-   count plus `omitted_turns` to equal the conversation's completed prior turns.
+6. **Turn record.** Kind 21 `TurnAccepted` is the only accepted-turn record;
+   the earlier kind 5 without composition is removed and replay rejects it
+   (owner, 2026-10-17: no backward compatibility). Its composition block holds
+   `omitted_turns` (u32), `manifest_digest`, `composer_revision` (u32), the N1
+   budget inputs `window_tokens`, `output_reservation`, `overhead_tokens` and
+   `bytes_per_token_milli` (u32 each), and, from J5, `notice_through` (u64), the
+   [notice cursor](tool-job-controller.md#binding-point). Its `prior_operations`
+   lists the shown prior turns (full or reference), at most 1,024, in generation
+   order. Replay requires the shown operations to be completed turns of the
+   conversation in increasing generation, and the shown count plus
+   `omitted_turns` to equal the conversation's completed prior turns.
 7. **Manifest digest.** SHA-256 over a deterministic binary encoding owned by the
    `context` module: format byte, composer revision, budget fields, then each
    segment (kind, role, fidelity, source identity, source digest, byte length,

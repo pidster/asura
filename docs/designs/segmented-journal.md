@@ -542,7 +542,7 @@ stateDiagram-v2
 | `O` operation | Operation ID, 0 | Conversation, generation, terminal kind, cause, response length, piece count, call count, accepted and terminal locators | Roll after terminal |
 | `P` response piece | Operation ID, start offset | Kept length, locator of the kind 24 or kind 8 frame | With `O` |
 | `H` thinking piece | Operation ID, start offset | Kept length, locator of the kind 25 frame | With `O`; the thinking length is the end of the last `H` piece ([thinking level](thinking-level.md#journal-format-1)) |
-| `C` tool call | Operation ID, ordinal | Decision, kind 14, kind 15 and kind 23 locators (zero when absent) | With `O` |
+| `C` tool call | Operation ID, ordinal | Decision, kind 14, kind 15 and kind 23 locators (zero when absent). From J3 (designed): decision, kind 14 locator and the result locator (kind 15 or 29) | With `O` |
 | `T` turn | Conversation ID, generation | Operation ID, terminal kind, accepted locator, completed turns through this generation (SJ-D12) | With `O` |
 | `I` input | Input ID, 0 | Status, kind 18 locator, promotion locator, dispatched operation | Roll after the input settles |
 | `X` payload | Payload ID, 0 | Form 1 (J1 call): operation ID, generation, ordinal, kind 14 locator, kind 23 locator, last-use sequence. Form 2 (job, J2 designed): job ID, kind 26 and kind 28 locators, last-use sequence | Form 1 with `O`; form 2 with `W` |
@@ -554,6 +554,11 @@ stateDiagram-v2
 | `V` conversation | Conversation ID, 0 | Project ID, locator of the creating frame | Roll after creation |
 | `K` project conversation | Project ID, creation sequence | Conversation ID | Roll after creation |
 | `A` project activity | Project ID, accepted sequence | Conversation ID, operation ID, generation | Roll after acceptance |
+| `L` conversation job | Conversation ID, kind 26 sequence | Job ID (J4 designed) | With `W` |
+| `M` project job | Project ID, kind 26 sequence | Job ID, conversation ID (J4 designed) | With `W` |
+| `Y` job | Zero ID, kind 26 sequence | Job ID, project ID (J4 designed) | With `W` |
+| `U` conversation settlement | Conversation ID, kind 28 sequence | Job ID (J4 designed, read by J5 notices) | With `W` |
+| `E` job retention | Job ID, kind 30 sequence | Action, author, kind 30 locator (J4 designed) | Roll after the kind 30 |
 
 `G` covers installation, graph, task, operation, input and dispatch-request
 IDs; `J` and `V` cover project and conversation IDs for the generated-ID check. The newest entry under a prefix

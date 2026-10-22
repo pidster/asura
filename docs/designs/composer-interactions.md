@@ -347,3 +347,52 @@ The optional native answer journey failed on its first prompt with `outputLimit`
 before the queue scenario. It does not provide native answer success evidence for
 this correction. The passing lifecycle case proves durable admission and cleanup;
 it does not claim successful model generation. No user journal or database was changed.
+
+## Job list and job viewer
+
+Selected design, 2026-10-22, for [tool job packet J4](tool-job-controller.md#j4-tui);
+not implemented. The job list and the job viewer are overlays above the
+composer. They take keys while open. Rendering and key handling perform no I/O;
+the TUI job worker sends every request.
+
+| View | Keys |
+| --- | --- |
+| Job list (`/jobs`, `/jobs all`) | Up, Down select; Enter opens the viewer; `c` cancel; `p` pin or unpin; `d` delete (with confirmation); `n` opens a one-line note editor, Enter sends, Escape discards; PageDown past the last row loads the next page; `r` retries a failed load; Escape closes |
+| Job viewer | Tab switches between `stdout` and `stderr`, keeping each position; Up, Down, PageUp, PageDown scroll; Home, End go to the first byte or the current end; `f` toggles follow; `i` opens the detail panel; `r` retries; Escape closes |
+| Detail panel | Up, Down scroll; Escape returns to the viewer |
+| Response navigation | `j` opens the viewer for the selected response's job, or a chooser of its jobs |
+
+The hint row names these keys. The list and viewer keep the existing grey-blue
+panel colour and selection palette. The viewer's header shows job state or
+result, stream, visible byte range, total bytes and page state. Confirmation
+prompts (`y` or `n`) hold focus until answered; Escape answers no.
+
+### Job view focus flow
+
+Selected design. Arrows describe key events and worker outcomes.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Editor
+  Editor --> JobList: /jobs or /jobs all, reply received
+  Editor --> Viewer: /job ID, page received
+  History --> Viewer: j on a response with one job
+  History --> Chooser: j on a response with several jobs
+  Chooser --> Viewer: Enter
+  Chooser --> History: Escape
+  JobList --> Viewer: Enter
+  JobList --> Confirm: c on another project's job, or d
+  Confirm --> JobList: y sends, n or Escape cancels
+  JobList --> NoteEditor: n
+  NoteEditor --> JobList: Enter sends, Escape discards
+  JobList --> Editor: Escape
+  Viewer --> Detail: i
+  Detail --> Viewer: Escape
+  Viewer --> JobList: Escape, when opened from the list
+  Viewer --> Editor: Escape, when opened from a command
+  Viewer --> History: Escape, when opened from response navigation
+```
+
+Validation: unit tests cover each transition, key routing, narrow layouts and
+the hint text; the PTY journeys `--jobs`, `--job-viewer` and `--job-retention`
+cover them end to end ([J3 and J4 end-to-end validation](tool-job-controller.md#j3-and-j4-end-to-end-validation)).

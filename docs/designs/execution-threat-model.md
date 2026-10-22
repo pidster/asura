@@ -362,8 +362,8 @@ Each must be designed before its code. None is selected by this document.
 | Secret detection and redaction: rules, placeholders, command variables, capture integration. Selected 2026-10-15: [secret detection](secret-detection.md) | EX4, PX6, SD1–SD9 | Job packet J1; person command mode |
 | Escapee detection and termination: per-job sandbox marker, freeze-then-kill, settlement gate, `!!` best-effort. Selected 2026-10-20: [escapee control](escapee-control.md) | EX5, PT13 | Job packet J2 — met 2026-10-21 for sandboxed model jobs; person profiles with the person-command packets |
 | exec_cmd qualification per local provider (SH-E1 style). Selected and run 2026-10-20: [per-model qualification](exec-cmd-tool.md#per-model-exec_cmd-qualification-ex10) | EX10 | Job packet J2 — met 2026-10-20; verdict threshold EXQ-1 is 5 of 5 (owner, 2026-10-21) |
-| Execution setting: global default and per-project override | EX11 | Revocation trigger TJ-14 |
-| Job-outlived-turn notice | EX12 | Client job packet J4 (proposed placement) |
+| Execution setting: global default and per-project override. Designed 2026-10-22: [execution setting](execution-setting.md) | EX11 | Revocation trigger TJ-14; J3 and J4 enablement |
+| Job-outlived-turn notice. Designed 2026-10-22 in [J4](tool-job-controller.md#j4-tui) | EX12 | Client job packet J4 |
 | Destination grant by data class and project | EX13, EX7 | Remote providers |
 | Provider credentials in Keychain, with the D1 credential review | EX14, EX8, EX7 | Remote providers |
 | Spend ceilings and cost confirmation | EX15 | Remote providers |

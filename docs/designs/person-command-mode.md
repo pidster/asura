@@ -723,10 +723,10 @@ profiles, kind PCQ and the submit path.
 ### Control API additions
 
 Proposed mechanism within protocol `0.1`. The submit needs one new envelope body
-field: `ConversationQueueCommandSubmit`, at the next unused number at
-integration, after the job controller's J4 messages (R3, owner, 2026-10-14).
-Field 57 is no longer claimed. The capability enum
-gains the next unused value, `CAPABILITY_PERSON_COMMAND`.
+field: `ConversationQueueCommandSubmit`, at the next unused number after the
+job controller's J4 messages (R3, owner, 2026-10-14). J4 takes fields 57–67,
+so the submit is expected at field 68. The capability enum gains the next
+unused value after `CAPABILITY_JOBS` (7), `CAPABILITY_PERSON_COMMAND`.
 
 ```proto
 // Person-typed `!` command, queued in a conversation lane.
@@ -836,8 +836,16 @@ allocated kinds are listed in
 [admission](conversation-admission.md#format-1-and-record-kinds).
 Required behavior (owner, 2026-10-14, R3): kinds are allocated in delivery order,
 so the job controller's J1 and J2 kinds come first and this record takes the next
-free kind at integration. This design calls the
+free kind at integration. J3 takes kind 29 and J4 kind 30, so PCQ is expected
+to take kind 31. This design calls the
 record kind PCQ (`PersonCommandQueued`) until the number is allocated.
+
+Audit and profile notes for the person packets (recorded 2026-10-22 from
+packet J2-G): the audit `JobProfile` value has only `model-1`; packet P1 adds
+`person-1` and `person-outside-1`, and the person packets add `outside_sandbox`
+to `job.started`, `job.cancel_requested` and `job.settled` (PCR25). The person
+`not_started` reason `outside_sandbox_off` takes code 20, after J3's code 19
+`execution_off`.
 
 ToolIntent kind 14 cannot hold a person command: its `operation`, `generation`
 and `ordinal` bind it to an admitted turn, and replay attaches it to that
@@ -929,8 +937,9 @@ Proposed mechanism:
   bytes, and kind 28 records the counts (J2).
 - The person command does not use `tools::validate_authority` or a turn's tool
   budget.
-- The person notice is a job notice entry composed by J5 at the next turn's
-  start authorization.
+- The person notice is a job notice entry that J5 composes when the next turn's
+  input is composed, before kind 21
+  ([J5 binding point](tool-job-controller.md#binding-point)).
 
 ### PCM-S1: person command lifecycle
 
@@ -1079,13 +1088,15 @@ for the notice. Until the composer exists, the model gets no output with the
 notice and pages the streams with `job read` (PC12, selected).
 
 The person notice is the entry for a person job in the job controller's job
-notice. J5 composes it at the start authorization of the next turn in the
-conversation, from journal records only. It covers person jobs that settled
-after the previous `TurnAccepted`. The start authorization binds the notice
-digest, so replay reconstructs the same turn input. `TurnAccepted.prompt` keeps
-the person's exact text. Placement in the model input follows the job
-controller's open decision on notice placement. The model helper needs no
-change.
+notice. J5 composes it when the next turn of the conversation is composed,
+from journal records only. The job controller's
+[notice selection](tool-job-controller.md#notice-selection) rule is the one
+source: a turn lists the jobs, of either origin, that settled after the
+previous turn's notice cursor, at most 8 with an overflow line. The kind 21
+input digest binds the notice, so replay reconstructs the same turn input.
+`TurnAccepted.prompt` keeps the person's exact text. The
+[J5 notice text](tool-job-controller.md#notice-text) places it in the context
+block. The model helper needs no change.
 
 Each person entry has fixed labels and no output text:
 

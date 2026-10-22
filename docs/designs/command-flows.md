@@ -182,6 +182,12 @@ flowchart LR
     Outbox -->|No| Confirm["Open exit confirmation"]
 ```
 
+Designed additions, not implemented (2026-10-22): `/jobs` and `/job` route to
+the TUI job worker ([CF12](#cf12-job-list)–[CF14](#cf14-job-retention-commands)),
+and `/execution` routes to the configuration worker
+([ES-F2](execution-setting.md#es-f2-execution-command-flow)). When they are
+implemented, CF04's chart gains these branches.
+
 ### CF04b: Local command completion
 
 Implemented completion. Arrows describe selection or cancellation; no service
@@ -784,3 +790,96 @@ The command reads only the bounded committed-record projection. It does not read
 files, browse archives, start inference or imply that an absent event never occurred.
 Validation includes invalid limits, no project, two-project isolation, disabled and
 stale health, empty windows, overflow scrolling, repeated use and owned-child cleanup.
+
+## CF12: Job list
+
+Selected design, 2026-10-22, for [tool job packet J4](tool-job-controller.md#j4-tui);
+not implemented. `/jobs` lists the selected project's jobs of every conversation;
+`/jobs all` lists every registered project's jobs. The TUI job worker's request
+slot sends `JobList`; the wait has no time bound and ends on the reply, `/cancel`
+or Escape, or a lost connection. Arrows are the next action or a guarded result.
+
+```mermaid
+flowchart TD
+    Cmd["/jobs or /jobs all"] --> Arity{"No argument, or the single argument all?"}
+    Arity -->|No| Usage["Show usage; draft kept"]
+    Arity -->|Yes| Cap{"Service lists CAPABILITY_JOBS?"}
+    Cap -->|No| NoCap["Show: this service does not support jobs"]
+    Cap -->|Yes| Proj{"/jobs: project selected?"}
+    Proj -->|No| NoProj["Show: select a project first; draft kept"]
+    Proj -->|"Yes, or /jobs all"| Slot{"Job request slot free?"}
+    Slot -->|No| Pending["Show job request pending; draft kept"]
+    Slot -->|Yes| Send["JobList: scope, limit 8"]
+    Send -->|"Reply with entries"| Panel["Open list panel, newest first"]
+    Send -->|"Reply error: busy or unavailable"| Err["Show the error; r retries"]
+    Send -->|"/cancel, Escape or lost connection"| Stop["Stop waiting; show request cancelled"]
+    Panel -->|"Down past the last row and next_before present"| More["JobList with before"]
+    More -->|Reply| Panel
+    More -->|"invalid_cursor"| Restart["Reload from the newest page"]
+    Panel -->|Enter| Viewer["Open the viewer: CF13"]
+    Panel -->|"c, p, d or n on a row"| Retain["Cancel or retention: CF13 and CF14"]
+    Panel -->|Escape| Close["Close the panel; nothing sent"]
+```
+
+## CF13: Job viewer and job cancel
+
+Selected design, 2026-10-22, for J4; not implemented. `/job ID` opens the viewer;
+`/job cancel ID` requests cancellation. `ID` is a full handle or a unique prefix
+of at least 6 hexadecimal digits among the cached list entries. Closing the
+viewer never cancels the job.
+
+```mermaid
+flowchart TD
+    Cmd["/job ID or /job cancel ID"] --> Resolve{"ID resolves?"}
+    Resolve -->|"Malformed"| Usage["Show usage; draft kept"]
+    Resolve -->|"Ambiguous prefix"| Many["List the matching handles; draft kept"]
+    Resolve -->|"No cached match"| Hint["Show: use /jobs, or give the full handle"]
+    Resolve -->|Yes| Which{"Command"}
+    Which -->|"/job ID"| Read["JobRead stdout at 0"]
+    Read -->|Page| View["Viewer: header, page, keys"]
+    Read -->|"not_found"| NF["Show job not found"]
+    Read -->|"busy"| Busy["Show busy; r retries"]
+    Read -->|"Lost connection or Escape"| Gone["Close; nothing changed"]
+    View -->|"f at end of a live stream"| Follow["JobObserve on the observe attachment"]
+    Follow -->|"New bytes, state change or settlement"| View
+    View -->|Escape| Closed["Viewer closed; job unaffected"]
+    Which -->|"/job cancel ID"| Other{"Job outside the selected project?"}
+    Other -->|Yes| Confirm{"Confirm: cancel job in project NAME?"}
+    Confirm -->|No| Kept["Nothing sent"]
+    Confirm -->|Yes| Cancel["JobCancel with expected_project_id"]
+    Other -->|No| Cancel
+    Cancel -->|"requested true"| Stopping["Show stopping; /jobs shows the settlement"]
+    Cancel -->|"requested false"| Settled["Show already settled with its result"]
+    Cancel -->|"not_found or project_mismatch"| Refused["Show the error; nothing changed"]
+    Cancel -->|"/cancel or lost connection"| Unconf["Show cancel outcome unconfirmed; repeat is safe"]
+```
+
+## CF14: Job retention commands
+
+Selected design, 2026-10-22, for J4; not implemented. `/job pin ID`,
+`/job unpin ID`, `/job delete ID` and `/job note ID TEXT` send `JobRetain`.
+The service writes kind 30 only when the action changes something.
+
+```mermaid
+flowchart TD
+    Cmd["/job pin, unpin, delete or note"] --> Parse{"ID resolves; note TEXT 1-2048 bytes?"}
+    Parse -->|No| Usage["Show usage or the ID error; draft kept"]
+    Parse -->|Yes| Del{"delete?"}
+    Del -->|Yes| Confirm{"Confirm: delete output; summary and notes stay?"}
+    Confirm -->|No| Kept["Nothing sent"]
+    Confirm -->|Yes| Send["JobRetain with confirmed"]
+    Del -->|No| Send2["JobRetain"]
+    Send --> Reply{"Reply"}
+    Send2 --> Reply
+    Reply -->|"changed true"| Done["Show pinned, unpinned, deleted or note added"]
+    Reply -->|"changed false"| Same["Show already in that state"]
+    Reply -->|"not_settled"| Live["Show: a running job's output cannot be deleted"]
+    Reply -->|"notes_full, retention_full or note_invalid"| Lim["Show the limit; draft kept"]
+    Reply -->|"not_found, project_mismatch or unavailable"| Err["Show the error"]
+    Reply -->|"/cancel, Escape or lost connection"| Unconf["Show outcome unconfirmed; check /job ID before repeating a note"]
+```
+
+The `/execution` command flowchart is
+[ES-F2](execution-setting.md#es-f2-execution-command-flow). Diagram
+verification for CF12–CF14 is recorded in the
+[tool job controller](tool-job-controller.md#design-verification).
