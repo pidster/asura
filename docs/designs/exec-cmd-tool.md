@@ -53,7 +53,7 @@ an exec_cmd guardian. Do not copy a complete model owner or add a generic orches
 
 | Argument | Contract |
 | --- | --- |
-| `command` | Required string, 1–8192 UTF-8 bytes, no NUL; exact bytes passed as the single argument after `-c`. When the [secret detection](secret-detection.md#environment-path) rewrite created secret variables, the argument is the guardian's fixed preamble followed by the rewritten command (owner, 2026-10-15). |
+| `command` | Required string, 1–8192 UTF-8 bytes, no NUL; exact bytes passed as the single argument after `-c`. From J3 the service parser also rejects every other control character except tab and newline with fault 14 `invalid_text` ([exec_cmd as a job](tool-job-controller.md#exec_cmd-as-a-job)). When the [secret detection](secret-detection.md#environment-path) rewrite created secret variables, the argument is the guardian's fixed preamble followed by the rewritten command (owner, 2026-10-15). |
 | `cwd` | Optional project-relative directory, at most 1024 UTF-8 bytes; absent or `.` means project root; reject absolute paths, NUL and parent traversal |
 | `timeout_seconds` | Removed (owner, 2026-10-17). The command has no time limit; it ends on exit, turn cancel or shutdown |
 

@@ -453,7 +453,8 @@ journal records only settled facts.
 
 ### TJ-S1: job lifecycle
 
-Selected design, revised for J2 on 2026-10-22. Arrows name triggers; the
+Selected design, revised for J2 on 2026-10-22 and for the withdrawal rule
+later the same day (from packet J34-K). Arrows name triggers; the
 `Live` composite groups every state that restart interrupts. `Interrupted`
 and `CleanupUnconfirmed` never claim that effects did not occur. A blocked
 start waits in `Queued` with its reason (owner, 2026-10-21, AQ1); only a full
@@ -466,9 +467,9 @@ stateDiagram-v2
     [*] --> Live: Job accepted into the agent queue
     state Live {
         [*] --> Queued: Model start (kind 26 in the outbox) or person waiter
-        Queued --> Withdrawn: Cancel or revocation with no kind 26 submitted
+        Queued --> Withdrawn: Person waiter cancelled, or journal unavailable before kind 26 commits
         Queued --> Starting: Start conditions hold, slot and 1 MiB granted
-        Queued --> Recording: Cancel trigger after kind 26, outcome not_started
+        Queued --> Recording: Model start cancelled or revoked, not_started, after its kind 26
         Starting --> Withdrawn: Person job cancelled before its kind 26 is submitted
         Starting --> Running: Spawned notice (kind 1)
         Starting --> Recording: Setup failure or cancel before spawn, not_started
@@ -499,8 +500,28 @@ stateDiagram-v2
 `Withdrawn` and `Interrupted` are `JobState` values (recorded 2026-10-22 from
 packet J2-D2). `Withdrawn` names a start removed before any record committed:
 a person waiter, a person job granted its slot whose kind 26 was not yet
-submitted, or a model start whose kind 26 was still in the outbox. A cancel of
-such a start replies `Accepted(Withdrawn)` and writes nothing. `Interrupted` is
+submitted or was held at the journal quota, or, while the journal is
+unavailable, a model start whose kind 26 never committed. A cancel of such a start replies `Accepted(Withdrawn)` and
+writes nothing.
+
+Selected (engineering, 2026-10-22, from the J34-K report): while the journal
+is available, a model-origin start is never withdrawn. A cancel or revocation
+of a queued model start leaves its kind 26 in the outbox, also when the
+journal holds it at the quota (`journal_held`). The controller settles the
+job `not_started` with the trigger's reason, and kinds 27 and 28 follow the
+kind 26 ([writing job records](#writing-job-records)). The cancel replies
+`Accepted(Recording)`. Reasons:
+
+- **The call is already recorded.** From J3 the owner appends the call's kind
+  14 before kind 26. Kind 29 of operation code 10 must follow the call's kind
+  26 (JR13), so the call can be resolved only when kind 26 exists.
+- **One revocation rule.** The [execution setting](execution-setting.md#revocation-on-change)
+  revokes a queued model job with kinds 27 and 28. A withdrawal would write
+  nothing for some queued jobs and two records for others.
+
+Withdrawal stays for person waiters, which have no kind 14 and no kind 26
+before their grant, and for every start while the journal is unavailable,
+when no record can be written. `Interrupted` is
 the state of a job that replay returned unsettled; the controller holds it
 until its kind 28 `interrupted` commits ([J2 recovery](#j2-recovery-explicit-interrupted-settlements)).
 A person waiter is a `Queued` job with no kind 26; the person grant path
@@ -2607,14 +2628,21 @@ the ticket is free, the owner submits in this order:
 3. kind 26 from the outbox, oldest first;
 4. new foreground commands.
 
-Closure records therefore never wait behind new work. The owner reports each
+Closure records therefore never wait behind new work. One exception keeps
+replay order: a job's kinds 27 and 28 wait until that job's own kind 26
+commits, because JR6 and JR7 accept them only for a job that an earlier kind
+26 names. This applies to a model start cancelled or revoked while its kind
+26 is still in the outbox or held at the quota (TJ-S1). The owner reports each
 reply with `record_done`. A kind 26 reply of `journal_quota` or
 `journal_disk_space` leaves the entry waiting with `journal_held`; the owner
 resubmits when the hold ends. Any other writer error makes the journal
 unavailable ([journal outage](#journal-outage-hold-and-shutdown)).
 
-For a model job, kind 26 must commit before setup starts, and before kind 15
-of its call. For a person job, the slot and the 1 MiB reservation are taken
+For a model job, kind 26 must commit before setup starts, and before kind 29
+of its call (JR13). When the call's turn ends before that kind 26 commits,
+the owner holds the call's kind 29 (status 6) and the turn's later records
+until the kind 26 commits, and submits that kind 26 ahead of the held turn
+records (selected, engineering, 2026-10-22, from the J34-K report). For a person job, the slot and the 1 MiB reservation are taken
 before kind 26 is appended; they are released if kind 26 fails. Settlement
 precedes installation (R2): the capture worker installs only after kind 28
 commits.
@@ -3100,7 +3128,10 @@ late settlement releases the slot
 Required behavior (owner, 2026-10-21, RV1): J2 delivers the identity-change,
 journal-outage and shutdown triggers. A revocation settles each queued start of
 the affected jobs as `not_started` and sends `T` to each live one, with the
-trigger's reason.
+trigger's reason. A queued model start whose kind 26 is still in the outbox
+is settled the same way: kind 26 commits first, then kinds 27 and 28
+([TJ-S1](#tj-s1-job-lifecycle)). Only a person waiter is withdrawn without a
+record.
 
 Selected (engineering, J2-E10). Identity change is detected by the existing
 identity rechecks; J2 adds no poll:
@@ -3124,10 +3155,14 @@ designed before J3 is enabled. Until then `read_authorized` and
   makes the owner storage-unavailable, as today. The owner calls
   `journal_unavailable`. The controller sends `T` to every live job, starts
   nothing and drops its outbox. Queued model jobs stay in memory. Person
-  waiters stay at their lane heads. The next start writes `interrupted` for
-  every unsettled job.
+  waiters stay at their lane heads. A cancel or revocation of a queued start
+  whose kind 26 never committed now withdraws it, because no record can be
+  written. The next start writes `interrupted` for every unsettled job.
 - **Held at the quota.** Kind 26 waits with `journal_held`. Kinds 27 and 28
-  commit from the ledger. Live jobs continue.
+  commit from the ledger. Live jobs continue. A cancel or revocation of a
+  model start whose kind 26 is held keeps that kind 26 in the outbox; the
+  job's kinds 27 and 28 follow when the hold ends and kind 26 commits. A
+  person job whose kind 26 is held is withdrawn (TJ-S1).
 - **Shutdown (AE-06).** `close` refuses new submissions with `closed`.
   Queued model jobs settle `not_started` with reason `shutdown`. Person waiters
   are removed; their lane heads replay as `Held`. Live jobs get `T` with
@@ -3376,7 +3411,7 @@ then calls the controller. Each integration case ends with the
 | J2T-04 | Identity vectors | Job ID and payload ID vectors for both origins, the zero rule, each input change; J1 calls use the same derivation | J1 orphan files from the old derivation deleted at recovery |
 | J2T-05 | Guardian argv and lease bytes (TJ-06, TJ-27 part) | Token parse; unknown token refuses before any effect; `T`, second `T`, `K`, EOF after `T`, unknown byte; reason precedence 2, 11, 4, 12 | TERM-ignoring command: `T` gives KILL 500 ms later, reason 2; `K` gives KILL at once, reason 11; EOF still stops the group; no loop spin after EOF |
 | J2T-06 | Kind 5 and notice order (TJ-29) | Kind 5 shape; every valid order of 1, 5, 4, 6, 2; kind 2 without kind 5; unequal exit facts; second kind 5 | Leader exits while a member writes: kind 5 before kind 2; `Draining` entered; a paused capture resumes on kind 5 |
-| J2T-07 | Lifecycle (TJ-S1) | Every transition with fixture slot events; request versus settled state; one kind 27; `person_kill` after `person_stop`; cancel of a queued job gives `not_started` | Real cancel in each of `Queued`, `Starting`, `Running`, `CapturePaused`, `Draining` |
+| J2T-07 | Lifecycle (TJ-S1) | Every transition with fixture slot events; request versus settled state; one kind 27; `person_kill` after `person_stop`; cancel of a queued job gives `not_started`; a model start cancelled with its kind 26 in the outbox, in flight or held gives kinds 26, 27 and 28 in that order; `Withdrawn` only for a person waiter, a person job before its kind 26, or any start while the journal is unavailable | Real cancel in each of `Queued`, `Starting`, `Running`, `CapturePaused`, `Draining` |
 | J2T-08 | Agent queues and start conditions (TJ-08, AQ1) | FIFO per agent; rotation across two agents; each block reason in order; person waiter and model entry share counts; `queue_full`, `jobs_full`, `closed`; duplicate returns the existing job at every bound; changed arguments conflict; limits above their maxima reject | Agent with 2 running and 1 queued (`agent_slots`); fifth service job queued (`service_slots`); each starts when a slot is released, with no timer |
 | J2T-09 | Capture pause per job (TJ-24, TJ-28) | `CapturePaused` holds only its own slot; no global `capture_paused` rule for jobs | Constrained APFS image: one job pauses while a second starts and runs; resume on freed space; in `Draining` ENOSPC records `enospc` |
 | J2T-10 | `CleanupUnconfirmed` (EC-I8, EC-D2) | Kind 4 enters it; no record; slot counted; late kind 2 gives cleanup `late` | Guardian faults `undyable` and `unverifiable:5`: slot held, owner stays available, another agent's job starts; late settlement releases the slot |
@@ -3646,9 +3681,12 @@ queues (AQ1) and no output text in results (PC12). Mechanisms marked "selected
 [iteration rules](../design-process.md#iteration-and-escalation). Protocol
 numbering remains `0.1`; journal format remains `1`. Implementation state on
 2026-10-22: on the J3 integration branch, not merged, J34-S (storage
-records), J3-H (helper), J34-C (payload store) and J3-D (retirement of the J1
-path) are implemented; the rest of this section is not. Until J34-E, a model
-`exec_cmd` call on the branch is recorded `denied` and runs nothing.
+records), J3-H (helper), J34-C (payload store), J3-D (retirement of the J1
+path), J34-K (controller extensions, `c63d7ca`) and J3-R (parsing and result
+text, `840f28d`) are implemented. The follow-up steps J34-K2, J34-C2 and
+J3-D2 and the integration J34-E are not
+([branch order](#tj-p3-j3-and-j4-packet-order-and-enablement)). Until J34-E,
+a model `exec_cmd` call on the branch is recorded `denied` and runs nothing.
 
 ### J3 scope
 
@@ -3712,10 +3750,16 @@ text.
 
 | Field | Type and bounds | Absent | Fault when invalid |
 | --- | --- | --- | --- |
-| `command` | String, 1–8,192 UTF-8 bytes, no NUL or control byte other than tab and newline | Required: 6 `missing_field` | 8 `wrong_type`, 9 `out_of_range`, 14 `invalid_text` |
+| `command` | String, 1–8,192 UTF-8 bytes, no control character other than tab and newline | Required: 6 `missing_field` | 8 `wrong_type`, 9 `out_of_range`, 14 `invalid_text` |
 | `cwd` | String, project-relative, at most 1,024 bytes, no `..` component | `.` | 10 `unsafe_path` |
 | `yield_seconds` | Integer, 0–30 | 10 | 8 `wrong_type`, 9 `out_of_range` |
 | Any other field | — | — | 7 `unexpected_field` |
+
+A control character is a character of Unicode general category Cc: U+0000 to
+U+001F and U+007F to U+009F. The `command` rule rejects each of them except
+tab (U+0009) and newline (U+000A), so a carriage return or an escape gives
+fault 14. Before J3-R the service rejected NUL only (recorded 2026-10-22 from
+the J3-R report, `840f28d`).
 
 **Call flow.** Selected (engineering). The conversation owner, on the reactor:
 
@@ -3735,7 +3779,9 @@ text.
    that ends at the first of the closures below.
 6. When the window ends, builds kind 29 from the controller's snapshot and
    appends it. This is handle delivery. Then sends the rendered `ToolResult`
-   to the helper.
+   to the helper. The window end is produced inside the controller's `poll`,
+   so the owner polls the controller in the same reactor step before it takes
+   the snapshot (recorded 2026-10-22 from the J34-K report).
 
 If kind 14 or kind 26 fails to commit, the journal is unavailable: the
 controller drops its outbox and the entry, and no process starts
@@ -3749,7 +3795,7 @@ controller drops its outbox and the entry, and no process starts
 | Kind 28 committed for the job | State `settled`; status 1 |
 | `yield_seconds` seconds passed since kind 26 committed, with `yield_seconds` > 0 | The snapshot at that moment (`queued`, `starting`, `running`, …); status 1 |
 | `yield_seconds` = 0 and the job spawned, or it is queued with a block reason | The snapshot; status 1. A job in setup with no block reason is waited for until it spawns, fails setup or is cancelled |
-| Turn cancelled, steered or invalidated, or helper exit | The controller cancels the job with requester model, reason 2 `turn_ended`; the snapshot after the request; status 6. The kind 29 commits before the turn terminal; the helper receives no `ToolResult` (TCR-D8) |
+| Turn cancelled, steered or invalidated, or helper exit | The controller cancels the job with requester model, reason 2 `turn_ended`; the snapshot after the request; status 6. The kind 29 commits after the job's kind 26 (JR13) and before the turn terminal; the helper receives no `ToolResult` (TCR-D8) |
 | Revocation, journal unavailable or shutdown reaches the job | The job is cancelled by that trigger; the window continues until kind 28 commits or the window time passes, as above |
 
 Before handle delivery the model does not know the handle, so a turn that ends
@@ -3802,7 +3848,7 @@ and `memory` tools. A field that the chosen command does not take is fault 7
 | --- | --- | --- | --- |
 | `command` | One of `list`, `status`, `read`, `wait`, `cancel`, `note` | All | 6 `missing_field`; another value is 5 `unknown_command` |
 | `job` | 32 lowercase hexadecimal digits, not all zero | All except `list` | 6 `missing_field`; a malformed value is 16 `invalid_job_id` |
-| `stream` | `stdout` or `stderr` | `read` | 6 `missing_field` |
+| `stream` | `stdout` or `stderr` | `read` | 6 `missing_field`; another string is 9 `out_of_range` (selected, engineering, from the J3-R report) |
 | `offset` | Integer, 0 to 2^63 − 1 | `read` | The turn cursor for the stream |
 | `limit` | Integer, 1–8,192 | `read` | 8,192 |
 | `seconds` | Integer, 1–3,600 | `wait` | No time; only events end the wait |
@@ -3828,7 +3874,10 @@ job exists elsewhere. `cancel` of a person-origin job gives `not_permitted`
 (PC10). Each command needs the turn's `read_authorized` grant and runs the tool
 executor's existing project identity recheck first; a mismatch revokes the
 project's jobs with `identity_changed` (J2-E10) and the call gets `not_found`.
-`cancel` and `note` are allowed while execution is off (ES-E3).
+`cancel` and `note` are allowed while execution is off (ES-E3). A `job` call
+for a remote destination is `denied`, as exec_cmd, memory and audit calls
+are: job state and output never go to a remote destination (recorded
+2026-10-22 from the J3-R report).
 
 **Turn cursor (J3-E4).** The model keeps one cursor per job and stream within
 the turn. It starts at 0. A `read` sets it to the page's next offset. A `read`
@@ -4105,7 +4154,10 @@ For state 9 the lines `state: settled`, `result: <outcome text>`,
 `stdout: N lines, B bytes, U unread`, `stderr: …`, `elapsed:` from kind 28 and
 `capture: <capture state>` replace the live lines, and `next:` reads
 `job read with stream stdout or stderr`. `origin` is `you`, `the person` or
-`the person, outside the sandbox`. A `status` result adds
+`the person, outside the sandbox`. Kind 26 does not hold the person profile,
+so `Origin::of` in `job_text.rs` takes it as an argument; until P2 defines
+where the renderer reads the profile of a person job, no caller passes
+`person-outside-1` (recorded 2026-10-22 from the J3-R report). A `status` result adds
 `command: <excerpt>`, the first line of the stored command, at most 200 bytes,
 cut at a UTF-8 boundary with `…`. A `wait` result adds
 `wait ended: settled`, `new output`, `time` or `already settled`. A `cancel`
@@ -4135,9 +4187,27 @@ Reason texts `<r>`: 6 `project directory changed`, 7 `service shutdown`, 8
 `guardian protocol fault`, 18 `setup failed`, 19
 `the person turned execution off`, 20
 `running outside the sandbox is turned off`; reasons 1–5 use the column
-text. Capture reason 7 reads `output capture stopped after the shell exited`.
-Capture state text: `complete`, `incomplete: <capture reason>`,
+text. Capture state text: `complete`, `incomplete: <capture reason>`,
 `unconfirmed: output may be partial`, `not started`, `interrupted`.
+
+Capture reason texts (selected, engineering, 2026-10-22, from the J3-R
+report, which showed the stored names because no text was designed). The
+model sees prose for capture reasons as it does for job reasons:
+
+| Code | Stored name | Text |
+| --- | --- | --- |
+| 1 | `storage_fault` | `output storage failed` |
+| 2 | `quota` | `output quota full` |
+| 3 | `enospc` | `disk full` |
+| 4 | `detector_fault` | `secret detection failed` |
+| 5 | `discarded_after_cancel` | `output after the cancel was discarded` |
+| 6 | `settlement_unconfirmed` | `capture settlement not confirmed` |
+| 7 | `closed_after_cancel` | `output capture stopped after the shell exited` |
+
+J3-R shows the stored names; packet J34-E replaces them with these texts in
+`job_text.rs` and updates the J3T-16 golden texts. `CaptureReason` has no
+value 7 yet; the person packet that adds `closed_after_cancel` (P2) adds its
+text in the same change.
 
 **Page result.**
 
@@ -4160,9 +4230,17 @@ no `next_offset`; the text states it.
 
 ```text
 jobs: 2 shown, newest first; more: use job list with before 1832
-- 7f3a09c2e4b15d68a0c3f1e2d4b5a697 · you · running 12.4 s · stdout 20480 B (20480 unread) · stderr 0 B · cargo build
+- 7f3a09c2e4b15d68a0c3f1e2d4b5a697 · you · running · stdout 20480 B (20480 unread) · stderr 0 B · cargo build
 - 0b44d1e9a6c27f30e85d9a1c3b6f2e47 · the person · exit 0 · stdout 112 B · stderr 0 B · git status --short
 ```
+
+A list entry shows no elapsed time (selected, engineering, 2026-10-22, from
+the J3-R report). The kind 29 list entry has no elapsed field, and adding 8
+bytes to each of 8 entries would raise the maximum kind 29 payload from 344
+to 408 bytes and the frame from 528 to 592 bytes. That frame is the
+reservation that every pending `run` call with code 10–16 holds, so kind 29
+keeps its present size and the example shows no time. `job status` shows the
+elapsed time of one job.
 
 **Handle delivery** (code 10) is the state block. Status 6 adds the first line
 `cancelled: the turn ended before this result; the job was cancelled`.
@@ -4207,6 +4285,30 @@ activity row are unchanged.
 Every result stays within the 16,384-byte per-result limit (L21, kept): a page
 is at most 8,192 bytes of text plus a header under 512 bytes; a list is at most
 8 entries of under 512 bytes each.
+
+**Rendering choices** (selected, engineering; recorded 2026-10-22 from the
+J3-R report, `840f28d`). These settle text details that the rules above leave
+open. J3T-16 has a golden text for each.
+
+- A job before spawn has no `elapsed:` line and no byte lines. A settled job
+  with outcome `not_started` or `interrupted` has no `elapsed:` line.
+- An unread count is shown only when it is greater than 0.
+- A settled state block has its lines in this order: `state:`, `result:`,
+  `stdout:`, `stderr:`, `elapsed:`, `capture:`.
+- `command:` follows `origin:`.
+- `wait ended:` and `cancel:` come directly before `next:`.
+- A live person job's `next:` line omits `job cancel to stop`, because the
+  model cannot cancel it (PC10).
+- A queued job's slots awaiting cleanup are a nested suffix of its brief
+  reason, for example
+  `queued (waiting: 2 of 2 jobs running for this agent (1 awaiting cleanup))`.
+  The suffix is omitted when the count is 0.
+- `(signal N)` in the person outcome texts appears only when the process was
+  signalled.
+- In the outcome table, a cell `—` has no designed text for that origin.
+  The renderer uses the other origin's text, so every combination renders.
+- An empty readable page reads `bytes: none at S of T (state)`.
+- Page states 5–8 render only the `job:`, `stream:` and replacement lines.
 
 ### Helper tool definitions
 
@@ -4285,6 +4387,186 @@ Packet J34-E implements it: the six values in
 `conversation/audit_tools.rs`, replacing the `return None` for codes 11–16.
 Tests: J3T-20 below.
 
+### Controller views, waits and stored bytes
+
+Recorded 2026-10-22 from the J34-K report (`c63d7ca` on the J3 integration
+branch), with the designs for the three gaps that the report found. Every
+function below runs on the reactor and does bounded in-memory work: at most
+the 64 unsettled jobs, the 64 remembered settled jobs and 32 client waits
+(AE-01).
+
+**Interface added by J34-K.**
+
+```rust
+// job_controller/views.rs
+pub(crate) struct JobView { pub job: Id, pub origin: Origin, pub agent: AgentKey,
+    pub project: Id, pub sequence: Option<u64>, // kind 26 frame sequence once committed
+    pub intent_ms: u64, pub snapshot: JobSnapshot, // the kind 29 state block
+    pub text: Option<String>, pub cancel: Option<JobReason>, pub outcome: Option<Outcome> }
+pub(crate) struct Outlived { pub count: u32, pub jobs: Vec<Id> } // at most 8 IDs (EX12)
+impl JobController {
+    pub fn revision(&self) -> u64;
+    pub fn bump_revision(&mut self);
+    pub fn view(&self, job: Id, now: Instant) -> Option<JobView>;
+    pub fn live_views(&self, scope: Option<JobScope>, now: Instant) -> Vec<JobView>;
+    pub fn live_count(&self, scope: Option<JobScope>) -> u32;
+    pub fn outlived(&self, operation: Id) -> Outlived;
+}
+// job_controller/waits.rs
+pub(crate) enum WaitKey { Agent(AgentKey), Client(u64) }
+pub(crate) enum WaitEnding { Settled, AlreadySettled, NewOutput, Time, Ready,
+    StateChanged, Revision(u64), Withdrawn, Closed }
+pub(crate) enum WaitStart { Parked, Done(WaitEnding), NotLive, Busy }
+pub(crate) enum TurnWaitEnd { Yield { job: Id, reply: CancelReply }, Wait { job: Id } }
+impl JobController {
+    pub fn await_yield(&mut self, agent: AgentKey, job: Id, seconds: u32) -> WaitStart;
+    pub fn await_job(&mut self, agent: AgentKey, job: Id, seconds: Option<u32>,
+        now: Instant) -> WaitStart;
+    pub fn end_turn_wait(&mut self, agent: AgentKey) -> Option<TurnWaitEnd>;
+    pub fn observe(&mut self, key: u64, job: Id, stream: Option<(OutputStream, u64)>,
+        after_state: Option<JobRunState>) -> WaitStart;
+    pub fn park_list(&mut self, key: u64, after_revision: u64) -> WaitStart;
+    pub fn cancel_wait(&mut self, key: WaitKey) -> bool;
+    pub fn drain_waits(&mut self, out: &mut Vec<WaitDone>);
+}
+// job_controller.rs
+pub(crate) enum OriginFilter { All, Model, Person }
+impl JobController {
+    pub fn revoke(&mut self, project: Option<Id>, origin: OriginFilter, reason: JobReason);
+    pub fn set_execution(&mut self, check: Box<dyn Fn(Id) -> bool>); // EX11 value at slot grant
+}
+pub(crate) struct Pacing; // start, advance, at: 1, 1, 2, 3, 5 … s, at most 60 s (TJ-F5 reuses it)
+// job_controller/port.rs, PayloadPort
+fn stored(&self, job: Id) -> [u64; 2]; // stdout and stderr stored bytes; never blocks
+fn refresh_space(&mut self);            // TJ-Q9
+```
+
+`revoke_project(p, r)` is `revoke(Some(p), OriginFilter::All, r)`. `views.rs`
+and `waits.rs` carry a module-level `dead_code` allowance outside tests until
+J34-E and J4-R add their production callers; J34-E removes the allowances
+whose items then have callers.
+
+**Rules recorded from J34-K.**
+
+- **Poll before a snapshot.** A yield window or a wait ends inside `poll`.
+  The owner therefore polls the controller in the same reactor step before it
+  reads a view for kind 29 or a reply.
+- **Person waiters.** A person waiter has no kind 26 and no sequence, so
+  `live_views` and `live_count` omit it. The person-command packets decide how
+  `/jobs` and the counts show a waiter when person starts exist (P2–P3).
+- **Withdrawn waits.** `WaitEnding::Withdrawn` ends a wait on a job that left
+  with no record. After J34-K2 this happens to a model job only while the
+  journal is unavailable ([TJ-S1](#tj-s1-job-lifecycle)).
+- **EX11 check at slot grant.** The controller reads the owner's effective
+  value through `set_execution` when it grants a slot to a model-origin queue
+  head. If the value is off, it settles the job `not_started` with kinds 27
+  (requester service) and 28, reason 19 `execution_off`, and logs the warning
+  `job_execution_off_at_grant`. Selected (engineering, 2026-10-22): the
+  `job.settled` event gains no field for this case. The check cannot fail in
+  a correct implementation, because a change revokes queued model jobs in the
+  same reactor step. A failure is therefore a defect signal for the
+  developer, which the log line carries. The settlement itself is audited as
+  any revocation is: `job.cancel_requested` and `job.settled` with reason
+  `execution_off`. An audit field would be a constant in every correct run.
+
+**Stored bytes from the ledger (gap 1).** `PayloadPort::stored` has a
+default body that returns zeros, because the ledger's watermark read is
+`pub(super)` in `asura-storage`. Until the gap is closed, views show 0 bytes
+and no `job wait` or `JobObserve` ends on new output. Selected (engineering):
+
+- `Ledger::stored(&self, job: Id) -> Option<[u64; 2]>` in
+  `asura-storage/src/payload/store.rs` returns the stored bytes of the job's
+  stdout and stderr payloads. For each stream it is the live watermark
+  (acquire load) while a capture holds one, otherwise the payload's recorded
+  total (after settlement, abandonment or recovery). It returns `None` when
+  the ledger holds no entry for the job. It is arithmetic under the ledger
+  mutex: no I/O and no wait other than that lock, whose holders do map
+  updates only. `Ledger::watermark` stays `pub(super)`.
+- The payload owner (`impl PayloadPort for Payloads`, `payload_owner.rs`)
+  implements `PayloadPort::stored` as `Ledger::stored(job)`, or `[0, 0]` when
+  the store is not ready or the ledger has no entry. The controller keeps the
+  maximum of each value it has read, so a later zero never lowers a shown
+  count. In the same change J34-E removes the trait's default body, so each
+  implementor answers; the fixture (`FixturePayloads`) returns its scripted
+  values.
+
+**The stored signal (gap 2).** The capture worker raises the watermark on its
+own thread after each staging write and sends nothing to the reactor. The
+reactor wakes for pipe reads, but the write that follows the last read can
+finish after the reactor has already read the ledger. Nothing then wakes it,
+so a `job wait` or `JobObserve` could miss the job's last output until an
+unrelated event. Selected (engineering):
+
+- **Signal.** `capture_worker::Shared` gains `stored: AtomicBool`. After a
+  `Capture::append` that stored at least one byte has raised the watermark,
+  the worker runs `stored.swap(true, AcqRel)`. If the previous value was
+  `false`, it calls the reactor wake (`WakeSender::notify`). The signal is a
+  flag and a wake, not a value in the 8-message channel, so it never takes
+  room that `Sealed` (a blocking send) or `Paused` needs.
+- **Clear.** `capture_worker::Handle::take_stored(&self) -> bool` runs
+  `stored.swap(false, AcqRel)`. The slot calls it at the start of every
+  `step`, before it drains capture messages and even when its event queue is
+  full. In `JobController::poll` every slot polls before `refresh_stored`
+  reads the ledger, so the clear always precedes the read.
+- **No lost advance.** If the worker's swap finds `false`, it wakes the
+  reactor, and a later poll reads the ledger. If it finds `true`, the clear has
+  not run yet; the clear's acquire-release swap then makes the new watermark
+  visible to the read that follows it.
+- **Coalescing bound.** At most one signal is outstanding per capture worker,
+  so a worker causes at most one reactor wake between two polls, and one poll
+  sees at most one signal per live job: at most 64. No byte count or time
+  interval gates the signal. A byte threshold would hide small output that a
+  wait must see, and the owner rule forbids default time bounds.
+- **Ends nothing.** The signal changes no job state and produces no slot
+  event, record or audit event. It is not a closure. A wait ends only when the
+  controller compares the values that `stored` returns with the wait's base
+  values (`NewOutput`). A discarded chunk (after a cancel trigger in
+  `Draining`) raises no watermark and gives no signal.
+
+##### TJ-Q10: stored bytes reach a waiting caller
+
+Selected design. Solid arrows are calls, stores or wakes; dashed arrows are
+returns. One loop iteration is one staging write.
+
+```mermaid
+sequenceDiagram
+    participant C as Capture worker thread
+    participant L as Payload ledger
+    participant R as Reactor
+    participant S as Slot worker
+    participant K as Job controller
+    participant P as Payload owner
+    loop Each staging write of at least one byte
+        C->>L: Raise the watermark (release)
+        C->>C: swap stored flag to true
+        alt Flag was false
+            C->>R: Wake
+        else Flag was true
+            Note over C: No wake: a signal is outstanding
+        end
+    end
+    R->>K: poll(now, payloads)
+    K->>S: poll: step
+    S->>S: Capture handle take_stored(): swap flag to false
+    K->>P: stored(job)
+    P->>L: Ledger::stored(job)
+    L-->>P: [stdout, stderr]
+    P-->>K: Stored bytes, kept as the maximum
+    alt Bytes passed a wait's base
+        K-->>R: Wait ended: NewOutput (drain_waits)
+    else No wait passed
+        Note over K: Nothing ends
+    end
+```
+
+**Ownership and tests.**
+
+| Step | Owned paths | Tests |
+| --- | --- | --- |
+| J34-C2 `Ledger::stored` | `asura-storage/src/payload/store.rs` and its unit tests; `asura-storage/tests/payload_store.rs` | Unit: `None` for an unknown job; the live watermark of each stream; the recorded total after `settle`, after `abandoned` and after recovery; no regression when an unconfirmed settlement keeps the watermark. Integration: a real capture's stored bytes equal the staging file sizes after each append |
+| J3-D2 stored signal | `asura-service/src/capture_worker.rs`, `capture_worker/tests.rs`, `asura-service/tests/capture_worker.rs`; in `asura-service/src/exec_cmd_worker.rs`, the `take_stored` call in `Slot::step`, and its case in `exec_cmd_worker/tests.rs` | Unit: a burst of appends with no clear gives one wake; a clear then an append gives a second wake; a discarded chunk and a zero-byte write give none; the channel receives no new message kind; the slot clears the flag when its event queue is full. Integration: a real flood of 64 chunks; after the last append a wake arrives and `Ledger::stored` equals the bytes written |
+| J34-E payload owner | `asura-service/src/payload_owner.rs`; for the default body of `PayloadPort::stored` only, `job_controller/port.rs`, after J34-K2 | Integration: J3T-08 shows growing stored bytes while a job runs; J3T-09 and J4T-04 end on the last output of a job that then writes nothing more |
+
 ### J3 failure handling
 
 | Case | Result | Record |
@@ -4358,6 +4640,8 @@ model of `test_support.rs`. End-to-end cases run with J4 under
 | J3T-18 | Responsiveness (AE-07) | — | Parked `wait` plus a 16-job flood: owner Inspect and cancel within 100 ms |
 | J3T-19 | Helper declarations | Swift unit: five tools, names, guide texts, schema bytes | Helper and service agree on `S` (CC-I13) |
 | J3T-20 | Audit of job calls (TCR-D14) | Each code 11–16 maps to its `Tool` value; each kind 29 status to its outcome; no text field; serde names `job_list` … `job_note` | One `tool.finished` per `job` call after kind 29 commits; a `job cancel` also gives `job.cancel_requested`; the raw-byte sweep finds no note or output text in the audit log |
+| J3T-21 | Model start never withdrawn (TJ-S1, J34-K2) | `outbox_orders_intent_before_closures`: a model start cancelled before its kind 26 is submitted replies `Accepted(Recording)` and commits kinds 26, 27 and 28 (`not_started`, `turn_ended`); the same while kind 26 is in flight; a held kind 26 cancelled during the hold commits 26, 27, 28 after `journal_hold_ended`; `revoke` with `execution_off` of a queued model start with kind 26 in the outbox gives the same three records; with the journal unavailable the cancel replies `Accepted(Withdrawn)` and nothing is written; person waiter cancel unchanged (J2T-24) | A turn cancelled before its kind 26 commits: kind 14, then kind 26, then kind 29 status 6 before the terminal; kinds 27 and 28 after kind 26 in any later position (JR8); replay accepts the journal (JR13) |
+| J3T-22 | Stored bytes and the stored signal (TJ-Q10) | The J34-C2 and J3-D2 cases in [stored bytes](#controller-views-waits-and-stored-bytes); the controller keeps the maximum of `stored` | A job that writes once and then sleeps: a parked `job wait` and a parked `JobObserve` end with `new output` after that write, with no other event |
 
 ### J3 proof limits
 
@@ -5060,12 +5344,15 @@ primary agent integrates and inspects each result.
 | J34-W Control contract and client (merged, `a80c142`, `64da4f3`) | `contracts/control/v1/control.proto`; `asura-control/src/{lib,wire}.rs`; `asura-control/src/jobs.rs` (new); `asura-client/src/lib.rs` | — | Messages 57–67, enums, `CAPABILITY_JOBS`, `ToolProgress.job_id`, outlived fields, `AuditEntry.job`, codecs and client calls; J4T-01 |
 | J3-H Helper (implemented on the J3 integration branch, `b366b37`) | `swift/model-helper/Sources/HelperCore/ToolBridge.swift`; its Swift tests | — | `JobTool`, exec_cmd guide texts, schema bytes; J3T-19 |
 | J34-C Payload store (implemented on the J3 integration branch, `a43765a`) | `asura-storage/src/payload/{store,recovery,pages,mod}.rs`; `asura-storage/tests/payload_store.rs`; after J34-S, the `ExecCmdCall::settled` field and the `ExecCmdSettlement` type in `asura-storage/src/authority/conversation/types.rs`, with the one-line edits that their removal needed in the `state.rs` constructor and two test assertions (recorded 2026-10-22) | J34-S | Pin hold, delete, page state `deleted`, the delivered-text bound; drops the last read of `ExecCmdCall::settled` in `payload/recovery.rs`, then deletes that field and `ExecCmdSettlement`, which J34-S kept as always `None`; J4T-06 (storage) |
-| J34-K Controller extensions | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | J34-S, J3-D | Snapshots, yield and model waits, observe parking, revision, live counts, outlived derivation, `revoke` with an origin filter, the EX11 check at slot grant; `PayloadPort::refresh_space` and its call in the paced `disk_space` recheck ([disk-space recheck](#disk-space-recheck)); the pacing type made `pub(crate)` for the [limits read retry](#start-time-limits-read-failure); removal of the J2 `dead_code` allowances as items gain callers; unit parts of J3T-04 to J3T-10, J4T-04, J4T-08, ES-05 |
+| J34-K Controller extensions (implemented on the J3 integration branch, `c63d7ca`) | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | J34-S, J3-D | Snapshots, yield and model waits, observe parking, revision, live counts, outlived derivation, `revoke` with an origin filter, the EX11 check at slot grant; `PayloadPort::refresh_space` and its call in the paced `disk_space` recheck ([disk-space recheck](#disk-space-recheck)); the pacing type made `pub(crate)` for the [limits read retry](#start-time-limits-read-failure); removal of the J2 `dead_code` allowances as items gain callers; unit parts of J3T-04 to J3T-10, J4T-04, J4T-08, ES-05 |
 | J3-D Slot and capture retirement (implemented on the J3 integration branch, `b83d572`) | `asura-service/src/exec_cmd_worker.rs`, `exec_cmd_worker/tests.rs`; `asura-service/src/capture_worker.rs`, `capture_worker/tests.rs`, `asura-service/tests/capture_worker.rs`; `asura-platform/src/exec_cmd/capture.rs`; `asura-platform/src/exec_cmd.rs`, `exec_cmd/tests.rs`, `asura-platform/tests/exec_cmd_process.rs` and `tests/support/escapees.rs`; for the J1 call path removal only, `asura-service/src/conversation.rs`, `conversation/{exec_cmd_call,tool_tests,audit_tools,memory_create_tests}.rs`, `asura-service/src/{payload_owner,tools,test_support}.rs`, `tools/parse.rs`, `job_controller/reasons.rs` and `asura-service/tests/capture_flow.rs` (recorded 2026-10-22: the paths beyond the first plan were needed to compile; J3-R, J34-K and J34-E own them later) | J34-S, J34-C | Removal of the J1 call API, kind 23 builders and `render_tail`, and of every kind 23 and J1 busy-code use in `asura-service`, so the crate compiles again on the branch ([branch order](#tj-p3-j3-and-j4-packet-order-and-enablement)); the `job` entry in `REGISTRY`, so `TOOL_NAMES` equals the registry; the removal of the [retired J1T cases](#j1t-cases-after-j3-d); J3T-15 (unit) |
-| J3-R Tool parsing and result text | `asura-service/src/tools.rs`; `asura-service/src/tools/{parse,parse_tests}.rs`; `asura-service/src/job_text.rs` (new) | J34-S, J3-D | `job` and exec_cmd arguments, registry text, the `execution_off` refusal, the renderer with the [SL7 filtered line](#model-result-text); J3T-01, J3T-14, J3T-16 |
+| J3-R Tool parsing and result text (implemented on the J3 integration branch, `840f28d`) | `asura-service/src/tools.rs`; `asura-service/src/tools/{parse,parse_tests}.rs`; `asura-service/src/job_text.rs` (new) | J34-S, J3-D | `job` and exec_cmd arguments, registry text, the `execution_off` refusal, the renderer with the [SL7 filtered line](#model-result-text); J3T-01, J3T-14, J3T-16 |
+| J34-K2 Model starts never withdrawn | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | J34-K | The [withdrawal rule](#tj-s1-job-lifecycle): `trigger` withdraws a `Queued` start only for a person waiter or while the journal is unavailable, and otherwise settles it `not_started` with its kind 26 still queued; `intent_held` keeps a cancelled model start's kind 26 queued and withdraws only a person job; doc comments of `withdraw` and `WaitEnding::Withdrawn`; `outbox_orders_intent_before_closures` updated and the new unit cases of J3T-21 |
+| J34-C2 Ledger stored bytes | `asura-storage/src/payload/store.rs`; `asura-storage/tests/payload_store.rs` | J34-C | `Ledger::stored(job) -> Option<[u64; 2]>` ([stored bytes](#controller-views-waits-and-stored-bytes)); its unit and integration cases (J3T-22) |
+| J3-D2 Capture stored signal | `asura-service/src/capture_worker.rs`, `capture_worker/tests.rs`, `asura-service/tests/capture_worker.rs`; in `asura-service/src/exec_cmd_worker.rs`, the `take_stored` call in `Slot::step`, and its case in `exec_cmd_worker/tests.rs` | J3-D | The stored flag, the coalesced wake and `Handle::take_stored` ([TJ-Q10](#tj-q10-stored-bytes-reach-a-waiting-caller)); its unit and integration cases (J3T-22) |
 | J4-R Job control handler | `asura-service/src/job_control.rs` (new) | J34-W, J34-K | Request handling, parked requests, viewer bound, the registry check of an all-projects listing; unit parts of J4T-04 to J4T-07 |
 | J4-T TUI (implemented on the J3 integration branch, `f7f50c3`) | `asura-cli/src/tui/jobs.rs` (new); `asura-cli/src/tui/{ui,mod,config}.rs`; `asura-cli/src/tui/ui/*.rs`; `asura-cli/tests/tui_pty.py` (job journeys) | J34-W | Job worker, list, viewer, commands, EX12 notice, status row, exit count, `/execution`; J4T-11 and the PTY journeys |
-| J34-E Integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (including new `job_tool.rs`, `audit_tools.rs`, and `jobs.rs` for the limits read retry); `asura-service/src/{lib,payload_owner,audit,config_worker,test_support}.rs`; `asura-service/tests/{job_tool_flow,job_control_flow}.rs` (new) and the ports in `asura-service/tests/{capture_flow,tool_call_flow,job_controller_flow}.rs`; `asura-platform/src/config.rs` and its tests, and the ES-02 file-bound case in `asura-storage/src/config.rs`, for the [configuration file bound](execution-setting.md#configuration); the six job values in `asura-storage/src/audit/{types,tests}.rs`; the reserved-worker parameter of `PagePool::start` in `asura-storage/src/payload/pages.rs` and the stale J1-mode comments in `asura-storage/src/payload/id.rs`; for the `JOB_COMMANDS` merge only, `asura-cli/src/tui/ui.rs`; `asura-cli/tests/lifecycle.rs`; `docs/user/{commands,guide,keys}.md`; the J3, J4 and EX11 evidence in the designs | All above | The exec_cmd switch, the 64 KiB configuration file bound, kind 29 append, yield window wiring, `job` dispatch, job request routing and capability, execution setting state and revocation, audit emission, job events in the audit read; the [audit of job calls](#audit-of-job-tool-calls); the maintenance worker with its deletion queue of 8 and the [disk-space measurement](#disk-space-recheck); `jobs.modelReservedPageReads` applied; the [limits read retry](#start-time-limits-read-failure); `filtered_line` removed from `exec_cmd_call.rs`; the `commands.md` rows for `/jobs`, `/job` and `/execution` with `JOB_COMMANDS` merged into `LOCAL_COMMANDS`; the four job PTY modes in `lifecycle.rs`; the [J1T ports](#j1t-cases-after-j3-d); the identity detectors through real turns; integration parts of every J3T, J4T and ES case and of J2T-09, J2T-18 and J2T-19 |
+| J34-E Integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (including new `job_tool.rs`, `audit_tools.rs`, and `jobs.rs` for the limits read retry); `asura-service/src/{lib,payload_owner,audit,config_worker,test_support}.rs`; for the capture reason texts and the SL7 test port, `asura-service/src/job_text.rs`; for the default body of `PayloadPort::stored` only, `asura-service/src/job_controller/port.rs`; `asura-service/tests/{job_tool_flow,job_control_flow}.rs` (new) and the ports in `asura-service/tests/{capture_flow,tool_call_flow,job_controller_flow}.rs`; `asura-platform/src/config.rs` and its tests, and the ES-02 file-bound case in `asura-storage/src/config.rs`, for the [configuration file bound](execution-setting.md#configuration); the six job values in `asura-storage/src/audit/{types,tests}.rs`; the reserved-worker parameter of `PagePool::start` in `asura-storage/src/payload/pages.rs` and the stale J1-mode comments in `asura-storage/src/payload/id.rs`; for the `JOB_COMMANDS` merge only, `asura-cli/src/tui/ui.rs`; `asura-cli/tests/lifecycle.rs`; `docs/user/{commands,guide,keys}.md`; the J3, J4 and EX11 evidence in the designs | All above | The exec_cmd switch, the 64 KiB configuration file bound, kind 29 append, yield window wiring, `job` dispatch, job request routing and capability, execution setting state and revocation, audit emission, job events in the audit read; the [audit of job calls](#audit-of-job-tool-calls); the maintenance worker with its deletion queue of 8 and the [disk-space measurement](#disk-space-recheck); `jobs.modelReservedPageReads` applied; the [limits read retry](#start-time-limits-read-failure); `filtered_line` removed from `exec_cmd_call.rs`; the `commands.md` rows for `/jobs`, `/job` and `/execution` with `JOB_COMMANDS` merged into `LOCAL_COMMANDS`; the four job PTY modes in `lifecycle.rs`; the [J1T ports](#j1t-cases-after-j3-d); the identity detectors through real turns; `PayloadPort::stored` in `payload_owner.rs` from `Ledger::stored`, with the trait's default body removed from `job_controller/port.rs`; the [capture reason texts](#model-result-text) in `asura-service/src/job_text.rs` with the J3T-16 golden texts; `Rejection::decision()` at the `validate_authority` call in `conversation.rs`, so a refusal records `execution_off`; a poll of the controller before each view taken for kind 29 or a reply; a code 10 kind 29 held until the job's kind 26 commits ([writing job records](#writing-job-records)); integration parts of every J3T, J4T and ES case and of J2T-09, J2T-18 and J2T-19 |
 
 ##### TJ-P3: J3 and J4 packet order and enablement
 
@@ -5107,15 +5394,23 @@ step; a packet hands over only when they pass.
    and `tests/support/escapees.rs`, and added the `job` entry to `REGISTRY`
    so that `TOOL_NAMES` equals the registry. Each of those files has one
    writer at a time on the branch.
-5. **J34-K** controller extensions and **J3-R** parsing and result text, in
-   parallel (disjoint paths): `cargo test -p asura-service`.
+5. **J34-K** controller extensions (done, `c63d7ca`) and **J3-R** parsing
+   and result text (done, `840f28d`), in parallel (disjoint paths):
+   `cargo test -p asura-service`.
 6. **J4-R** job control handler, after J34-K: `cargo test -p asura-service`.
-7. **J4-T** TUI (done, `f7f50c3`): `cargo test -p asura-cli`. It needs only
+7. **Follow-up steps** from the J34-K report (selected, engineering,
+   2026-10-22). They run in parallel with each other and with J4-R, because
+   their paths are disjoint: **J34-K2** model starts never withdrawn
+   (`job_controller.rs`, `job_controller/*.rs`) and **J3-D2** the capture
+   stored signal (`capture_worker*`, the `Slot::step` call): `cargo test -p
+   asura-service`; **J34-C2** `Ledger::stored` (`payload/store.rs`):
+   `cargo test -p asura-storage`.
+8. **J4-T** TUI (done, `f7f50c3`): `cargo test -p asura-cli`. It needs only
    J34-W, so it may run at any point on the branch.
-8. **J34-E** integration: the full workspace `cargo test`, `swift test`, the
+9. **J34-E** integration: the full workspace `cargo test`, `swift test`, the
    J3T, J4T and ES integration cases and the
    [joint end-to-end cases](#j3-and-j4-end-to-end-validation).
-9. **Gate**, then one merge of the branch to `main`, then EN1.
+10. **Gate**, then one merge of the branch to `main`, then EN1.
 
 ```mermaid
 flowchart TD
@@ -5127,20 +5422,28 @@ flowchart TD
         H["2 J3-H helper: swift test (done)"]
         C["3 J34-C payload store: asura-storage green (done)"]
         D["4 J3-D retirement: asura-service compiles (done)"]
-        K["5 J34-K controller extensions"]
-        R["5 J3-R parsing and result text"]
+        K["5 J34-K controller extensions (done)"]
+        R["5 J3-R parsing and result text (done)"]
         CR["6 J4-R job control handler"]
-        T["7 J4-T TUI (done)"]
-        E["8 J34-E integration"]
+        K2["7 J34-K2 model starts never withdrawn"]
+        C2["7 J34-C2 Ledger::stored"]
+        D2["7 J3-D2 capture stored signal"]
+        T["8 J4-T TUI (done)"]
+        E["9 J34-E integration"]
         S --> C
         C --> D
         D --> K
         D --> R
         K --> CR
+        K --> K2
+        C --> C2
+        D --> D2
         H --> E
-        K --> E
         R --> E
         CR --> E
+        K2 --> E
+        C2 --> E
+        D2 --> E
         T --> E
     end
     E --> Gate{"Workspace tests, J3T, J4T and ES cases, joint end-to-end cases pass?"}
@@ -5456,6 +5759,10 @@ Each J3–J5 gap of the readiness audit of 2026-10-21, and where it is resolved.
 | Notice unit vectors | [J5 validation](#j5-validation) |
 | EX11 setting | [Execution setting](execution-setting.md) |
 | Job events in the audit read (J2-G finding) | [Audit view](#job-events-in-the-recent-audit-read) |
+| Withdrawal of a model start conflicts with JR13 and the revocation table (J34-K finding) | [TJ-S1](#tj-s1-job-lifecycle) withdrawal rule; step J34-K2 |
+| No path for live stored bytes; no reactor wake when output is stored (J34-K findings) | [Stored bytes](#controller-views-waits-and-stored-bytes), TJ-Q10; steps J34-C2 and J3-D2 |
+| Audit field for the EX11 check at slot grant (J34-K finding) | Dropped for the log line ([controller views and waits](#controller-views-waits-and-stored-bytes)) |
+| List entry elapsed time; capture reason texts (J3-R findings) | [Model result text](#model-result-text) |
 
 ## Open decisions
 
@@ -5606,5 +5913,17 @@ in the person packets, `jobs.modelReservedPageReads` in J34-E, the delete
 order and the deletion queue overflow. TJ-Q9 and TJ-F5 are new; TJ-P2 and
 TJ-P3 changed. Each was rendered with Mermaid CLI and inspected. No code or
 test was run by the design writer.
+
+Recorded on 2026-10-22 (J3-R and J34-K reports): written from those reports
+and the code at `c63d7ca` and `840f28d` on the J3 integration branch
+(`job_controller.rs`, `job_controller/{port,views,waits}.rs`,
+`job_controller/tests.rs`, `job_controller/tests/j34.rs`, `capture_worker.rs`,
+`exec_cmd_worker.rs`, `payload_owner.rs`, `asura-storage/src/payload/store.rs`,
+`job_text.rs`, `tools.rs`, `tools/parse.rs`). Engineering selections: a model
+start is never withdrawn while the journal is available; `Ledger::stored` and
+the coalesced stored signal; no audit field for the EX11 check at slot grant;
+no elapsed time in a list entry, so kind 29 keeps its 528-byte frame; capture
+reason texts. TJ-Q10 is new; TJ-S1 and TJ-P3 changed. Each was rendered with
+Mermaid CLI and inspected. No code or test was run by the design writer.
 
 Return to the [design index](README.md).
