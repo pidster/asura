@@ -859,7 +859,7 @@ impl<F: JournalFiles> Journal<F> {
         self.fits_with(needed, self.state.reserved_bytes)
     }
     /// The closure reservation is the one the state holds after the record:
-    /// a `run` kind 14 reserves its kind 15 and kind 23 (TCR-D16).
+    /// a `run` kind 14 reserves its kind 15 or kind 29 (TCR-D16, J3).
     fn fits_with(&self, needed: u64, reserved: usize) -> bool {
         self.usage() + needed + ROLL_RESERVE + reserved as u64 <= self.effective_quota()
     }
@@ -1346,18 +1346,18 @@ impl<F: JournalFiles> Journal<F> {
 }
 
 /// Closure records always fit beside the roll reserve: kind 8, 7, 6 and 3,
-/// plus the kind 23 and kind 15 of the pending `run` call, whose bytes the
-/// closure reservation already holds, and a kind 14 `cancelled` record,
-/// which a cancel needs before its terminal (SJ-D18). Kinds 27 and 28 are
-/// closure records too: the job ledger holds their bytes (J2-E4). Kind 26
-/// is a normal record.
+/// plus the kind 15 of the pending `run` call, whose bytes the closure
+/// reservation already holds, and a kind 14 `cancelled` record, which a
+/// cancel needs before its terminal (SJ-D18). Kinds 27 and 28 are closure
+/// records too: the job ledger holds their bytes (J2-E4). Kind 26 is a
+/// normal record, and so are kinds 29 and 30 (J3, J4): at the quota they
+/// wait, and the turn shows the journal-paused step (SJ-D19).
 pub fn is_closure(record: &Record) -> bool {
     match record {
         Record::TurnTerminal(_)
         | Record::CancelRequested(_)
         | Record::OwnerGeneration
         | Record::StartAuthorized(_)
-        | Record::CaptureSettled(_)
         | Record::ToolResult(_)
         | Record::JobCancelRequested(_)
         | Record::JobSettled(_) => true,

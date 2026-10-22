@@ -1023,7 +1023,7 @@ fn exec_call(operation: Id, generation: u64, ordinal: u32) -> Record {
         tool_operation: Some(ToolOperation::ExecCmd),
         decision: ToolDecision::Run,
         fault: None,
-        busy: None,
+        reason: None,
         form: ArgumentForm::Canonical,
         arguments_bytes: 18,
         arguments: "{\"command\":\"true\"}".into(),
@@ -1047,16 +1047,23 @@ fn intent(operation: Id, generation: u64, ordinal: u32) -> Record {
         time: 1_760_000_000_000,
     })
 }
+/// Handle delivery: the call's kind 29 with a `running` snapshot (J3).
 fn handle(operation: Id, generation: u64, ordinal: u32) -> Record {
-    Record::ToolResult(ToolResult {
+    Record::JobResult(Box::new(JobResult {
         operation,
         generation,
         ordinal,
         status: 1,
-        text: "job".into(),
-        next_offset: None,
-        truncated: false,
-    })
+        outcome: JobResultOutcome::Ok,
+        job: [0; 16],
+        body: JobResultBody::State(JobSnapshot {
+            state: JobRunState::Running,
+            numbers: [0; 3],
+            elapsed_ms: 1,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        }),
+    }))
 }
 fn exited(job: Id) -> Record {
     let stream = || JobStream {
@@ -1376,4 +1383,155 @@ fn j2t_02_kind_26_is_held_at_the_quota_while_27_and_28_commit() {
     assert!(h.journal.recheck());
     h.append(intent(operation, generation, 2)).unwrap();
     assert_eq!(h.state().jobs.len(), 1);
+}
+
+// ----- J3 and J4 (tool-job-controller.md, J3T-03 and J4T-03). -----
+
+/// A `run` `job` call with operation code `op` (11 to 16).
+fn job_tool(operation: Id, generation: u64, ordinal: u32, op: ToolOperation) -> Record {
+    let Record::ToolCall(call) = exec_call(operation, generation, ordinal) else {
+        unreachable!()
+    };
+    let arguments = format!("{{\"command\":\"{}\"}}", op.as_str());
+    Record::ToolCall(Box::new(ToolCall {
+        name: "job".into(),
+        name_bytes: 3,
+        tool_operation: Some(op),
+        form: ArgumentForm::Verbatim,
+        arguments_bytes: arguments.len() as u32,
+        arguments,
+        ..*call
+    }))
+}
+fn retention(job: Id, action: RetentionAction, author: RetentionAuthor) -> Record {
+    Record::JobRetention(Box::new(JobRetention {
+        job,
+        action,
+        author,
+        time: 1_760_000_000_007,
+        note: if action == RetentionAction::Note && matches!(author, RetentionAuthor::Person { .. })
+        {
+            "person note".into()
+        } else {
+            String::new()
+        },
+    }))
+}
+/// J4T-03 (unit): the listing read merges a settled job whose `L`, `M`,
+/// `Y`, `U` and `E` entries are in an index run, a settled job in the
+/// delta and a live job; J3T-03: a checkpoint taken while a `job note`
+/// call waits for its kind 29 keeps the call's model note (the follow
+/// locator), so the reopened state and its reservation equal the genesis
+/// replay.
+#[test]
+fn j4t_03_listing_merges_runs_delta_and_live_and_checkpoint_keeps_the_model_note() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let person = RetentionAuthor::Person { request: id(900) };
+    let (conversation, operation, generation) = h.start(project, None);
+    let first = h.job(operation, generation, 1);
+    h.append(exited(first)).unwrap();
+    h.append(retention(first, RetentionAction::Pin, person))
+        .unwrap();
+    h.finish(conversation, operation, generation, 0);
+    // Force rolls: the first job's entries move to an index run.
+    let (_, op2, gen2) = h.start(project, Some(conversation));
+    let text = "z".repeat(61_440);
+    for n in 0..150u64 {
+        h.segment(op2, gen2, n * 61_440, &text).unwrap();
+    }
+    assert!(!h.journal.runs().is_empty());
+    let second = h.job(op2, gen2, 1);
+    let third = h.job(op2, gen2, 2);
+    h.append(exited(third)).unwrap();
+    // A pending `job note` call with its model note committed.
+    h.append(job_tool(op2, gen2, 3, ToolOperation::JobNote))
+        .unwrap();
+    h.append(retention(
+        second,
+        RetentionAction::Note,
+        RetentionAuthor::Model {
+            operation: op2,
+            generation: gen2,
+            ordinal: 3,
+        },
+    ))
+    .unwrap();
+    let check = |state: &Replay, store: &mut dyn Index| {
+        let listed: Vec<Id> = state
+            .jobs(JobScope::Conversation(conversation), None, 9, store)
+            .unwrap()
+            .iter()
+            .map(|l| l.job)
+            .collect();
+        assert_eq!(listed, vec![third, second, first]);
+        let all = state.jobs(JobScope::AllProjects, None, 9, store).unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all[0].settled.is_some() && all[1].settled.is_none());
+        assert_eq!(
+            all[2].retention,
+            JobRetentionSummary {
+                pinned: true,
+                deleted: false,
+                notes: 0,
+                records: 1,
+            }
+        );
+        assert_eq!(all[1].retention.notes, 1);
+        let settlements = state
+            .job_settlements(conversation, 0, u64::MAX - 1, 9, store)
+            .unwrap();
+        assert_eq!(
+            settlements.iter().map(|l| l.job).collect::<Vec<_>>(),
+            vec![third, first]
+        );
+    };
+    {
+        let (state, mut store) = h.journal.store();
+        // The first job's entries are in a run; the third's in the delta.
+        assert!(state.delta_tag(Tag::ConversationJob).len() == 1);
+        check(&state, &mut store);
+    }
+    // More rolls with the note call pending: the checkpoint holds it.
+    for n in 150..300u64 {
+        h.segment(op2, gen2, n * 61_440, &text).unwrap();
+    }
+    let note_frame = h.state().operations[&op2].tools[2].note;
+    assert!(note_frame.is_some());
+    let files = h.files();
+    let mut reopened = open(files.clone(), false).unwrap();
+    assert!(reopened.state().base > 0);
+    let replayed = genesis(&files);
+    assert_eq!(canonical(reopened.state()), canonical(&replayed));
+    let tool = &reopened.state().operations[&op2].tools[2];
+    assert_eq!(tool.note, note_frame);
+    assert!(tool.unresolved());
+    assert_eq!(
+        (
+            reopened.state().reserved_bytes,
+            reopened.state().reserved_frames
+        ),
+        (replayed.reserved_bytes, replayed.reserved_frames)
+    );
+    {
+        let (state, mut store) = reopened.store();
+        assert!(state.delta_tag(Tag::ConversationJob).is_empty());
+        check(&state, &mut store);
+        // JR16 after the checkpoint: the note call's kind 29 replays.
+    }
+    h.append(Record::JobResult(Box::new(JobResult {
+        operation: op2,
+        generation: gen2,
+        ordinal: 3,
+        status: 1,
+        outcome: JobResultOutcome::Ok,
+        job: second,
+        body: JobResultBody::None,
+    })))
+    .unwrap();
+    let files = h.files();
+    assert_eq!(
+        canonical(open(files.clone(), false).unwrap().state()),
+        canonical(&genesis(&files))
+    );
 }

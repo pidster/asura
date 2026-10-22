@@ -15,8 +15,12 @@ const PIECE_CHARGE: usize = 64;
 const START_CAPACITY: usize = HEADER + TRAILER + 72;
 const CANCEL_CAPACITY: usize = HEADER + TRAILER + 25;
 const OWNER_CAPACITY: usize = HEADER + TRAILER;
-/// One maximum kind 23 frame: 4,286 bytes.
-const CAPTURE_CAPACITY: usize = HEADER + TRAILER + super::codec::MAX_CAPTURE_SETTLED_PAYLOAD;
+/// One kind 15 frame of maximum size: the result of codes 1 to 9.
+const RESULT_CAPACITY: usize = HEADER + TRAILER + 43 + 16_384;
+/// One maximum kind 29 frame: the result of codes 10 to 16 (J3).
+pub const JOB_RESULT_CAPACITY: usize = HEADER + TRAILER + MAX_JOB_RESULT_PAYLOAD;
+/// One kind 30 model-note frame, held while a `job note` call lacks it.
+pub const MODEL_NOTE_CAPACITY: usize = HEADER + TRAILER + MODEL_NOTE_PAYLOAD;
 /// The job reservation ledger (J2-E4): one maximum kind 28 frame (4,278
 /// bytes) per unsettled job, and one kind 27 frame (203 bytes) until its
 /// kind 27 or kind 28.
@@ -298,7 +302,8 @@ impl Replay {
         );
         self.delta_charge += REQUEST_CHARGE;
     }
-    /// Terminal operations in the delta, as `O`, `P`, `C`, `T` and `X` entries.
+    /// Terminal operations in the delta, as `O`, `P`, `H`, `C` and `T`
+    /// entries.
     fn operation_entries(&self, tag: Tag) -> Vec<(Key, Value)> {
         let mut out = Vec::new();
         for (id, op) in &self.operations {
@@ -352,11 +357,6 @@ impl Replay {
                             Entry::Call {
                                 decision: tool.decision as u8,
                                 intent: tool.intent_frame,
-                                settled: tool
-                                    .exec_cmd
-                                    .as_deref()
-                                    .and_then(ExecCmdCall::follow_frame)
-                                    .unwrap_or(Locator::NONE),
                                 result: tool.result_frame.unwrap_or(Locator::NONE),
                             }
                             .encode(),
@@ -373,29 +373,6 @@ impl Replay {
                     }
                     .encode(),
                 )),
-                Tag::Payload => {
-                    for (index, tool) in op.tools.iter().enumerate() {
-                        // A job-mode call's payloads are the job's (form 2,
-                        // emitted at its kind 28).
-                        let Some(exec) =
-                            tool.exec_cmd.as_deref().filter(|e| e.job_intent.is_none())
-                        else {
-                            continue;
-                        };
-                        let settled = exec.settled.as_ref();
-                        let value = Entry::Payload {
-                            operation: *id,
-                            generation: op.generation,
-                            ordinal: index as u32 + 1,
-                            intent: tool.intent_frame,
-                            settled: settled.map_or(Locator::NONE, |s| s.frame),
-                            last_use: settled.map_or(exec.intent_sequence, |s| s.sequence),
-                        }
-                        .encode();
-                        out.push((Key::new(Tag::Payload, exec.stdout_payload, 0), value));
-                        out.push((Key::new(Tag::Payload, exec.stderr_payload, 0), value));
-                    }
-                }
                 _ => {}
             }
         }
@@ -437,17 +414,6 @@ impl Replay {
             Tag::Operation | Tag::Piece | Tag::Thinking | Tag::Call | Tag::Turn => {
                 self.operation_entries(tag)
             }
-            // Form 1 from terminal operations, form 2 from settled jobs.
-            Tag::Payload => {
-                let mut out = self.operation_entries(tag);
-                out.extend(
-                    self.delta
-                        .entries
-                        .range(Key::first(tag)..=Key::last(tag))
-                        .map(|(k, v)| (*k, *v)),
-                );
-                out
-            }
             _ => self
                 .delta
                 .entries
@@ -470,21 +436,12 @@ impl Replay {
         let mut count = self.requests.len() + self.delta.generated.len() + self.delta.entries.len();
         for op in self.operations.values().filter(|op| op.terminal.is_some()) {
             count += 2 + op.response.pieces.len() + op.thinking.pieces.len() + op.tools.len();
-            count += 2 * op
-                .tools
-                .iter()
-                .filter(|t| {
-                    t.exec_cmd
-                        .as_deref()
-                        .is_some_and(|e| e.job_intent.is_none())
-                })
-                .count();
         }
         count as u64
     }
     fn delta_get(&self, key: &Key) -> Option<Value> {
         match key.tag {
-            Tag::Request | Tag::Generated | Tag::Payload | Tag::Turn => self
+            Tag::Request | Tag::Generated | Tag::Turn => self
                 .delta_tag(key.tag)
                 .into_iter()
                 .find(|(k, _)| k == key)
@@ -1105,9 +1062,17 @@ impl Replay {
                     _ => false,
                 };
                 // Job closure records are independent of the operation
-                // (JR8); JR6 and JR7 decide them.
+                // (JR8); JR6 and JR7 decide them. A person's kind 30 is
+                // independent of the operation too; a model note needs an
+                // operation of this owner generation.
+                let person_retention = matches!(
+                    &record,
+                    Record::JobRetention(p)
+                        if matches!(p.author, RetentionAuthor::Person { .. })
+                );
                 require(
                     reconciliation
+                        || person_retention
                         || matches!(
                             record,
                             Record::OwnerGeneration
@@ -1358,10 +1323,11 @@ impl Replay {
                 self.tool_call(*p, frame)?;
                 self.active_activity(sequence);
             }
-            Record::CaptureSettled(p) => {
-                self.capture_settled(*p, frame)?;
+            Record::JobResult(p) => {
+                self.job_result(*p, frame, index)?;
                 self.active_activity(sequence);
             }
+            Record::JobRetention(p) => self.job_retention(*p, frame, index)?,
             Record::ToolResult(p) => {
                 self.tool_result(p, frame)?;
                 self.active_activity(sequence);
@@ -1420,14 +1386,9 @@ impl Replay {
         // Only a `run` call is followed by kind 15 (TCR-R5).
         require(tool.unresolved())?;
         let operation = tool.tool_operation.ok_or(ReplayError::Corrupt)?;
+        // JR11: codes 10 to 16 resolve with kind 29, never kind 15.
+        require(!operation.job_result())?;
         match operation {
-            // J1 order: run 14, 23, 15. Job mode (JR4): run 14, 26, 15.
-            ToolOperation::ExecCmd => require(
-                tool.exec_cmd
-                    .as_deref()
-                    .is_some_and(|call| call.settled.is_some() || call.job_intent.is_some())
-                    && p.next_offset.is_none(),
-            )?,
             // TCR-D1: the text is rendered from the derived identity.
             ToolOperation::CreateNote => require(
                 p.next_offset.is_none()
@@ -1435,8 +1396,7 @@ impl Replay {
                     && p.text.is_empty()
                     && matches!(p.status, 1 | 2 | 4 | 5 | 6 | 7),
             )?,
-            // The structural codec cannot see the operation. exec_cmd is
-            // the sole exception for captured timeout/cancel/limit tails.
+            // The structural codec cannot see the operation.
             _ if p.status != 1 => require(p.next_offset.is_none() && !p.truncated)?,
             // TCR-D25: no limit or offset comparison; replay never parses
             // the stored arguments again.
@@ -1496,18 +1456,187 @@ impl Replay {
         op.tools.push(tool_record(p, frame, create, exec_cmd));
         Ok(())
     }
-    /// Kind 23 settles the pending `run` exec_cmd kind 14, once, before kind 15.
-    fn capture_settled(&mut self, p: CaptureSettled, frame: Locator) -> Result<()> {
+    // ----- J3 kind 29 and J4 kind 30 (JR11 to JR17). -----
+
+    /// The job a kind 29 or kind 30 names, under JR15: a job whose kind 26
+    /// is earlier, in `conversation`. Returns its kind 26 sequence and
+    /// whether its kind 28 is earlier.
+    fn conversation_job(
+        &self,
+        job: Id,
+        conversation: Id,
+        index: &mut dyn Index,
+    ) -> Result<(u64, bool)> {
+        match self.job_state(job, index)? {
+            Some(JobState::Unsettled(j)) if j.conversation == conversation => {
+                Ok((j.intent.sequence, false))
+            }
+            Some(JobState::Settled(j)) if j.conversation == conversation => {
+                Ok((j.intent.sequence, true))
+            }
+            _ => Err(ReplayError::Corrupt),
+        }
+    }
+    /// Kind 29 under JR11 to JR16: the pending `run` call with operation
+    /// code 10 to 16, once, with the outcome, status and body that its code
+    /// allows.
+    fn job_result(&mut self, p: JobResult, frame: Locator, index: &mut dyn Index) -> Result<()> {
+        use JobResultOutcome as O;
+        use ToolOperation as T;
         p.validate()?;
         let owner = self.owner_generation;
         let op = self.operation_mut(p.operation, p.generation)?;
         require(op.owner_generation == owner && p.ordinal as usize == op.tools.len())?;
-        let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
-        require(tool.result_frame.is_none())?;
-        let exec_cmd = tool.exec_cmd.as_deref_mut().ok_or(ReplayError::Corrupt)?;
-        // JR4: a kind 14 with a kind 26 gets no kind 23.
-        require(exec_cmd.settled.is_none() && exec_cmd.job_intent.is_none())?;
-        exec_cmd.settled = Some(settlement(&p, frame));
+        let conversation = op.conversation;
+        let tool = op.tools.last().ok_or(ReplayError::Corrupt)?;
+        require(tool.unresolved())?;
+        let code = tool.tool_operation.ok_or(ReplayError::Corrupt)?;
+        // JR11 and the outcome table.
+        require(code.job_result() && p.outcome.allows(code))?;
+        // JR12: the body form of the code and outcome.
+        let body = match (&p.body, code, p.outcome) {
+            (JobResultBody::State(_), T::ExecCmd, O::Ok | O::Cancelled)
+            | (JobResultBody::State(_), T::JobStatus | T::JobCancel, O::Ok)
+            | (JobResultBody::List { .. }, T::JobList, O::Ok)
+            | (JobResultBody::Page(_), T::JobRead, O::Ok)
+            | (JobResultBody::Wait(..), T::JobWait, O::Ok) => true,
+            (JobResultBody::None, T::ExecCmd, _) => false,
+            (JobResultBody::None, T::JobNote, _) => true,
+            (JobResultBody::None, _, outcome) => outcome != O::Ok,
+            _ => false,
+        };
+        require(body)?;
+        // Field 6: zero for codes 10 and 11 and with `not_found`; otherwise
+        // a job of the conversation (JR15).
+        let named = !matches!(code, T::ExecCmd | T::JobList) && p.outcome != O::NotFound;
+        require((p.job != [0; 16]) == named)?;
+        // JR13: the exec_cmd call's job is derived, and its kind 26 is
+        // earlier.
+        let job = match code {
+            T::ExecCmd => {
+                let exec = tool.exec_cmd.as_deref().ok_or(ReplayError::Corrupt)?;
+                require(exec.job_intent.is_some())?;
+                Some(exec.job)
+            }
+            _ if named => Some(p.job),
+            _ => None,
+        };
+        // JR16: a model note `ok` follows the kind 30 that cites this call.
+        if code == T::JobNote && p.outcome == O::Ok {
+            require(tool.note.is_some_and(|(noted, _)| noted == p.job))?;
+        }
+        let settled = match job {
+            Some(job) => self.conversation_job(job, conversation, index)?.1,
+            None => false,
+        };
+        // JR14: state 9 only after the job's kind 28.
+        match &p.body {
+            JobResultBody::State(s) | JobResultBody::Wait(s, _) => {
+                require(s.state != JobRunState::Settled || settled)?;
+            }
+            JobResultBody::List { entries, .. } => {
+                // JR15 per entry; newest first by kind 26 sequence.
+                let mut last = u64::MAX;
+                for entry in entries {
+                    let (intent, settled) =
+                        self.conversation_job(entry.job, conversation, index)?;
+                    require(intent < last && (entry.state != JobRunState::Settled || settled))?;
+                    last = intent;
+                }
+            }
+            JobResultBody::Page(_) | JobResultBody::None => {}
+        }
+        let tool = self
+            .operation_mut(p.operation, p.generation)?
+            .tools
+            .last_mut()
+            .ok_or(ReplayError::Corrupt)?;
+        tool.result_frame = Some(frame);
+        tool.result_status = Some(p.status);
+        tool.job_result = Some(Box::new(p));
+        Ok(())
+    }
+    /// The retention state of one job from its `E` entries in the delta and
+    /// the runs. More than 64 entries is `Limit`: the service never writes
+    /// them, and the read stays bounded.
+    pub fn job_retention_summary(
+        &self,
+        job: Id,
+        index: &mut dyn Index,
+    ) -> Result<JobRetentionSummary> {
+        let entries = self.range(
+            &Key::new(Tag::Retention, job, 0),
+            &Key::new(Tag::Retention, job, u64::MAX),
+            false,
+            MAX_JOB_RETENTION_RECORDS + 1,
+            index,
+        )?;
+        if entries.len() > MAX_JOB_RETENTION_RECORDS {
+            return Err(ReplayError::Limit);
+        }
+        let mut summary = JobRetentionSummary::default();
+        for (_, value) in entries {
+            let Entry::Retention { action, .. } = Entry::decode(Tag::Retention, &value)? else {
+                return Err(ReplayError::Corrupt);
+            };
+            summary.apply(RetentionAction::from_code(action).ok_or(ReplayError::Corrupt)?);
+        }
+        Ok(summary)
+    }
+    /// Kind 30: the named job exists; pin, unpin and delete change the
+    /// state; a model note cites the pending `run` `job note` call of this
+    /// owner generation, once, for a job of its conversation. Emits the
+    /// job's `E` entry.
+    fn job_retention(
+        &mut self,
+        p: JobRetention,
+        frame: Locator,
+        index: &mut dyn Index,
+    ) -> Result<()> {
+        p.validate()?;
+        let (project, conversation, settled) = match self.job_state(p.job, index)? {
+            Some(JobState::Unsettled(job)) => (job.project, job.conversation, false),
+            Some(JobState::Settled(job)) => {
+                let project = self
+                    .find_conversation(job.conversation, index)?
+                    .ok_or(ReplayError::Corrupt)?
+                    .project;
+                (project, job.conversation, true)
+            }
+            None => return Err(ReplayError::Corrupt),
+        };
+        let summary = self.job_retention_summary(p.job, index)?;
+        require(summary.allows(p.action, settled))?;
+        if let RetentionAuthor::Model {
+            operation,
+            generation,
+            ordinal,
+        } = p.author
+        {
+            let owner = self.owner_generation;
+            let op = self.operation_mut(operation, generation)?;
+            require(
+                op.owner_generation == owner
+                    && op.conversation == conversation
+                    && ordinal as usize == op.tools.len(),
+            )?;
+            let tool = op.tools.last_mut().ok_or(ReplayError::Corrupt)?;
+            require(
+                tool.unresolved()
+                    && tool.tool_operation == Some(ToolOperation::JobNote)
+                    && tool.note.is_none(),
+            )?;
+            tool.note = Some((p.job, frame));
+        }
+        self.emit(
+            Key::new(Tag::Retention, p.job, frame.sequence),
+            Entry::Retention {
+                action: p.action as u8,
+                author: p.author.code(),
+                frame,
+            },
+        )?;
+        self.record_activity(project, Some(conversation), frame.sequence);
         Ok(())
     }
     fn accept(
@@ -2072,7 +2201,7 @@ impl Replay {
             return Err(ReplayError::Corrupt);
         };
         // JR1: the active operation's last kind 14, a `run` exec_cmd with no
-        // kind 23, 15 or 26, in a nonterminal operation of this generation.
+        // kind 29 or 26, in a nonterminal operation of this generation.
         let op = self.operation_mut(operation, generation)?;
         require(op.owner_generation == owner && ordinal as usize == op.tools.len())?;
         let tool = op.tools.last().ok_or(ReplayError::Corrupt)?;
@@ -2083,7 +2212,7 @@ impl Replay {
                 && tool
                     .exec_cmd
                     .as_deref()
-                    .is_some_and(|e| e.settled.is_none() && e.job_intent.is_none()),
+                    .is_some_and(|e| e.job_intent.is_none()),
         )?;
         let job = self.derive_job(&p, owner, frame, index)?;
         // JR5: a job ID is derived once in the whole journal.
@@ -2123,7 +2252,8 @@ impl Replay {
         Ok(())
     }
     /// Kind 28 under JR7 and JR8. The settlement releases the ledger and
-    /// emits the job's `W` entry and the `X` form 2 entries of its payloads.
+    /// emits the job's `W` entry, the `X` form 2 entries of its payloads and
+    /// its listing entries `L`, `M`, `Y` and `U` (J4).
     fn job_settled(&mut self, p: JobSettled, owner: u64, frame: Locator) -> Result<()> {
         p.validate()?;
         let job = self.jobs.get(&p.job).ok_or(ReplayError::Corrupt)?;
@@ -2132,6 +2262,12 @@ impl Replay {
         } else {
             owner == job.owner_generation
         })?;
+        // Reason 20 is the `!!` switch of a person job (profile
+        // `person-outside-1`); a model job never records it.
+        require(
+            p.reason != JobReason::OutsideSandboxOff
+                || matches!(job.origin, JobOrigin::Person { .. }),
+        )?;
         let job = self.jobs.remove(&p.job).ok_or(ReplayError::Corrupt)?;
         let cancel = job.cancel.map_or(Locator::NONE, |c| c.frame);
         self.emit(
@@ -2155,6 +2291,29 @@ impl Replay {
                 },
             )?;
         }
+        let at = job.intent.sequence;
+        self.emit(
+            Key::new(Tag::ConversationJob, job.conversation, at),
+            Entry::ConversationJob { job: job.job },
+        )?;
+        self.emit(
+            Key::new(Tag::ProjectJob, job.project, at),
+            Entry::ProjectJob {
+                job: job.job,
+                conversation: job.conversation,
+            },
+        )?;
+        self.emit(
+            Key::new(Tag::AllJobs, [0; 16], at),
+            Entry::AllJobs {
+                job: job.job,
+                project: job.project,
+            },
+        )?;
+        self.emit(
+            Key::new(Tag::Settlement, job.conversation, frame.sequence),
+            Entry::Settlement { job: job.job },
+        )?;
         self.record_activity(job.project, Some(job.conversation), frame.sequence);
         Ok(())
     }
@@ -2231,6 +2390,215 @@ impl Replay {
             Some(_) => return Err(ReplayError::Corrupt),
             None => None,
         })
+    }
+    // ----- J4 job listings: `L`, `M`, `Y`, `U` and `E` reads. -----
+
+    /// The kind 14 locator of a model call: the in-memory operation's call,
+    /// or its `C` entry.
+    fn call_frame(&self, operation: Id, ordinal: u32, index: &mut dyn Index) -> Result<Locator> {
+        if let Some(op) = self.operations.get(&operation) {
+            return op
+                .tools
+                .get((ordinal as usize).wrapping_sub(1))
+                .map(|tool| tool.intent_frame)
+                .ok_or(ReplayError::Corrupt);
+        }
+        match self.entry(&Key::new(Tag::Call, operation, u64::from(ordinal)), index)? {
+            Some(Entry::Call { intent, .. }) => Ok(intent),
+            _ => Err(ReplayError::Corrupt),
+        }
+    }
+    /// One job's records and listing facts, unsettled or settled; `None`
+    /// for an ID of no job.
+    pub fn job_listing(&self, job: Id, index: &mut dyn Index) -> Result<Option<JobListing>> {
+        let (conversation, intent_frame, cancel_frame, settled_frame) =
+            match self.job_state(job, index)? {
+                None => return Ok(None),
+                Some(JobState::Unsettled(j)) => (
+                    j.conversation,
+                    j.intent,
+                    j.cancel.map_or(Locator::NONE, |c| c.frame),
+                    Locator::NONE,
+                ),
+                Some(JobState::Settled(j)) => (j.conversation, j.intent, j.cancel, j.settled),
+            };
+        let project = self
+            .find_conversation(conversation, index)?
+            .ok_or(ReplayError::Corrupt)?
+            .project;
+        let Record::JobIntent(intent) = index.frame(&intent_frame)? else {
+            return Err(ReplayError::Corrupt);
+        };
+        require(job_id(&intent.origin) == job)?;
+        let cancel = if cancel_frame.is_none() {
+            None
+        } else {
+            match index.frame(&cancel_frame)? {
+                Record::JobCancelRequested(c) if c.job == job => Some(c),
+                _ => return Err(ReplayError::Corrupt),
+            }
+        };
+        let settled = if settled_frame.is_none() {
+            None
+        } else {
+            match index.frame(&settled_frame)? {
+                Record::JobSettled(s) if s.job == job => Some(s),
+                _ => return Err(ReplayError::Corrupt),
+            }
+        };
+        // The command source: the model call's kind 14. A person job's
+        // kind 31 arrives with P2; replay rejects person origin until then.
+        let command = match intent.origin {
+            JobOrigin::Model {
+                operation, ordinal, ..
+            } => self.call_frame(operation, ordinal, index)?,
+            JobOrigin::Person { .. } => return Err(ReplayError::Corrupt),
+        };
+        Ok(Some(JobListing {
+            job,
+            conversation,
+            project,
+            intent,
+            intent_frame,
+            cancel,
+            cancel_frame,
+            settled,
+            settled_frame,
+            command,
+            retention: self.job_retention_summary(job, index)?,
+        }))
+    }
+    /// One newest-first page of jobs by kind 26 sequence, below `before`:
+    /// the unsettled jobs in memory merged with the settled jobs' `L`, `M`
+    /// or `Y` entries in the delta and the runs. At most `limit` entries; a
+    /// job of an unregistered project is skipped in the all-projects scope.
+    pub fn jobs(
+        &self,
+        scope: JobScope,
+        before: Option<u64>,
+        limit: usize,
+        index: &mut dyn Index,
+    ) -> Result<Vec<JobListing>> {
+        let before = before.unwrap_or(u64::MAX);
+        let (tag, id) = match scope {
+            JobScope::Conversation(conversation) => (Tag::ConversationJob, conversation),
+            JobScope::Project(project) => (Tag::ProjectJob, project),
+            JobScope::AllProjects => (Tag::AllJobs, [0; 16]),
+        };
+        let mut found: Vec<(u64, Id)> = self
+            .jobs
+            .values()
+            .filter(|job| {
+                job.intent.sequence < before
+                    && match scope {
+                        JobScope::Conversation(c) => job.conversation == c,
+                        JobScope::Project(p) => job.project == p,
+                        JobScope::AllProjects => true,
+                    }
+            })
+            .map(|job| (job.intent.sequence, job.job))
+            .collect();
+        let settled = self.range(
+            &Key::new(tag, id, 0),
+            &Key::new(tag, id, before),
+            true,
+            limit,
+            index,
+        )?;
+        for (key, value) in settled {
+            let job = match Entry::decode(tag, &value)? {
+                Entry::ConversationJob { job }
+                | Entry::ProjectJob { job, .. }
+                | Entry::AllJobs { job, .. } => job,
+                _ => return Err(ReplayError::Corrupt),
+            };
+            found.push((key.disc, job));
+        }
+        found.sort_unstable_by(|a, b| b.cmp(a));
+        require(found.windows(2).all(|pair| pair[0].1 != pair[1].1))?;
+        let mut out = Vec::with_capacity(limit.min(found.len()));
+        for (sequence, job) in found {
+            if out.len() == limit {
+                break;
+            }
+            let listing = self.job_listing(job, index)?.ok_or(ReplayError::Corrupt)?;
+            require(listing.intent_frame.sequence == sequence)?;
+            if scope == JobScope::AllProjects
+                && self.find_project(listing.project, index)?.is_none()
+            {
+                continue;
+            }
+            out.push(listing);
+        }
+        Ok(out)
+    }
+    /// One job's listing, its kind 14 and its kind 30 records in order (at
+    /// most 64).
+    pub fn job_records(&self, job: Id, index: &mut dyn Index) -> Result<Option<JobRecords>> {
+        let Some(listing) = self.job_listing(job, index)? else {
+            return Ok(None);
+        };
+        let Record::ToolCall(command) = index.frame(&listing.command)? else {
+            return Err(ReplayError::Corrupt);
+        };
+        let entries = self.range(
+            &Key::new(Tag::Retention, job, 0),
+            &Key::new(Tag::Retention, job, u64::MAX),
+            false,
+            MAX_JOB_RETENTION_RECORDS + 1,
+            index,
+        )?;
+        if entries.len() > MAX_JOB_RETENTION_RECORDS {
+            return Err(ReplayError::Limit);
+        }
+        let mut retention = Vec::with_capacity(entries.len());
+        for (_, value) in entries {
+            let Entry::Retention { frame, .. } = Entry::decode(Tag::Retention, &value)? else {
+                return Err(ReplayError::Corrupt);
+            };
+            match index.frame(&frame)? {
+                Record::JobRetention(p) if p.job == job => retention.push((frame, *p)),
+                _ => return Err(ReplayError::Corrupt),
+            }
+        }
+        Ok(Some(JobRecords {
+            listing,
+            command,
+            retention,
+        }))
+    }
+    /// A conversation's job settlements with a kind 28 sequence in
+    /// `after < sequence <= through`, newest first, at most `limit` (J5).
+    pub fn job_settlements(
+        &self,
+        conversation: Id,
+        after: u64,
+        through: u64,
+        limit: usize,
+        index: &mut dyn Index,
+    ) -> Result<Vec<JobListing>> {
+        if after >= through {
+            return Ok(Vec::new());
+        }
+        let found = self.range(
+            &Key::new(Tag::Settlement, conversation, after.saturating_add(1)),
+            &Key::new(Tag::Settlement, conversation, through.saturating_add(1)),
+            true,
+            limit,
+            index,
+        )?;
+        let mut out = Vec::with_capacity(found.len());
+        for (key, value) in found {
+            let Entry::Settlement { job } = Entry::decode(Tag::Settlement, &value)? else {
+                return Err(ReplayError::Corrupt);
+            };
+            let listing = self.job_listing(job, index)?.ok_or(ReplayError::Corrupt)?;
+            require(
+                listing.conversation == conversation && listing.settled_frame.sequence == key.disc,
+            )?;
+            out.push(listing);
+        }
+        Ok(out)
     }
     /// Projects and conversations named by the active operation or an
     /// unresolved input never leave memory.
@@ -2309,17 +2677,21 @@ impl Replay {
             let op = self.operations.get(&id).ok_or(ReplayError::Corrupt)?;
             self.reserved_bytes = TERMINAL_CAPACITY;
             self.reserved_frames = 1;
-            // A `run` kind 14 holds its kind 15 and, for exec_cmd, its kind 23
-            // (TCR-D16). A call that does not run holds nothing more.
+            // A `run` kind 14 holds its result: kind 15 for codes 1 to 9,
+            // kind 29 for codes 10 to 16 (TCR-D16, J3). A `job note` call
+            // also holds its kind 30 model note until it commits. A call
+            // that does not run holds nothing more; the job ledger holds a
+            // job's closure frames.
             if let Some(tool) = op.tools.last().filter(|tool| tool.unresolved()) {
-                self.reserved_bytes += HEADER + TRAILER + 43 + 16_384;
+                let code = tool.tool_operation.ok_or(ReplayError::Corrupt)?;
+                self.reserved_bytes += if code.job_result() {
+                    JOB_RESULT_CAPACITY
+                } else {
+                    RESULT_CAPACITY
+                };
                 self.reserved_frames += 1;
-                // A job-mode call holds no kind 23; the job ledger holds
-                // its closure frames.
-                if tool.exec_cmd.as_deref().is_some_and(|exec_cmd| {
-                    exec_cmd.settled.is_none() && exec_cmd.job_intent.is_none()
-                }) {
-                    self.reserved_bytes += CAPTURE_CAPACITY;
+                if code == ToolOperation::JobNote && tool.note.is_none() {
+                    self.reserved_bytes += MODEL_NOTE_CAPACITY;
                     self.reserved_frames += 1;
                 }
             }
@@ -2391,11 +2763,15 @@ pub fn job_ledger<'a>(jobs: impl IntoIterator<Item = &'a UnsettledJob>) -> (usiz
         }
     })
 }
-impl ExecCmdCall {
-    /// The record that follows a `run` exec_cmd kind 14 (the `C` entry's
-    /// second locator): kind 23 in J1 mode, kind 26 in job mode.
+impl ToolRecord {
+    /// The record between a `run` kind 14 and its result that replay needs
+    /// to resume the call (the checkpoint's second locator): the kind 26 of
+    /// an exec_cmd call, or the kind 30 model note of a `job note` call.
     pub fn follow_frame(&self) -> Option<Locator> {
-        self.settled.as_ref().map(|s| s.frame).or(self.job_intent)
+        self.exec_cmd
+            .as_deref()
+            .and_then(|exec| exec.job_intent)
+            .or(self.note.map(|(_, frame)| frame))
     }
 }
 /// Display projections of a kind 15 result (bounded prefixes, never authority).
@@ -2409,29 +2785,9 @@ pub(crate) fn apply_result_projection(
     tool.preview = Some(match operation {
         ToolOperation::GetNote => format!("captured {} bytes", p.text.len()),
         ToolOperation::CreateNote => String::new(),
-        ToolOperation::ExecCmd => {
-            let output = p
-                .text
-                .split_once("\nstdout:\n")
-                .map(|(_, body)| body)
-                .unwrap_or("");
-            let (stdout, stderr) = output.split_once("\nstderr:\n").unwrap_or((output, ""));
-            display_prefix(if stdout.is_empty() { stderr } else { stdout }, 128)
-        }
         _ => display_prefix(&p.text, 128),
     });
     tool.truncated = Some(p.truncated);
-    if operation == ToolOperation::ExecCmd {
-        tool.exit_code = p
-            .text
-            .lines()
-            .next()
-            .and_then(|line| {
-                line.split_whitespace()
-                    .find_map(|field| field.strip_prefix("exit_code="))
-            })
-            .and_then(|value| value.parse().ok());
-    }
 }
 pub(crate) fn exec_cmd_call(installation: Id, p: &ToolCall, sequence: u64) -> Box<ExecCmdCall> {
     let job = exec_cmd_job_id(p.operation, p.generation, p.ordinal);
@@ -2451,18 +2807,7 @@ pub(crate) fn exec_cmd_call(installation: Id, p: &ToolCall, sequence: u64) -> Bo
         job_intent: None,
     })
 }
-pub(crate) fn settlement(p: &CaptureSettled, frame: Locator) -> ExecCmdSettlement {
-    ExecCmdSettlement {
-        state: p.state,
-        reason: p.reason,
-        sequence: frame.sequence,
-        streams: [
-            (p.stdout.stored_bytes, p.stdout.digest),
-            (p.stderr.stored_bytes, p.stderr.digest),
-        ],
-        frame,
-    }
-}
+
 pub(crate) fn tool_record(
     p: ToolCall,
     frame: Locator,
@@ -2476,7 +2821,7 @@ pub(crate) fn tool_record(
         tool_operation: p.tool_operation,
         decision: p.decision,
         fault: p.fault,
-        busy: p.busy,
+        reason: p.reason,
         refusal: p.refusal,
         whole_command: p.whole_command,
         form: p.form,
@@ -2487,18 +2832,21 @@ pub(crate) fn tool_record(
         result_bytes: 0,
         preview: None,
         truncated: None,
-        exit_code: None,
         create,
         exec_cmd,
+        job_result: None,
+        note: None,
     }
 }
-/// Rebuilds the display projection of a tool call from its frames.
+/// Rebuilds the projection of a tool call from its frames: the kind 14,
+/// the record that follows it ([`ToolRecord::follow_frame`]: kind 26 or a
+/// kind 30 model note), when known, and its result (kind 15 or kind 29).
 pub fn tool_from_frames(
     installation: Id,
     binding: [Id; 3],
     project: Id,
     intent: (Locator, Record),
-    settled: Option<(Locator, Record)>,
+    follow: Option<(Locator, Record)>,
     result: Option<(Locator, Record)>,
 ) -> Result<ToolRecord> {
     let Record::ToolCall(call) = intent.1 else {
@@ -2518,32 +2866,49 @@ pub fn tool_from_frames(
         .transpose()?;
     let mut exec = (run && call.tool_operation == Some(ToolOperation::ExecCmd))
         .then(|| exec_cmd_call(installation, &call, intent.0.sequence));
-    // The record after kind 14: kind 23 (J1 mode) or kind 26 (job mode).
-    if let Some((frame, record)) = settled {
-        let exec = exec.as_deref_mut().ok_or(ReplayError::Corrupt)?;
-        match record {
-            Record::CaptureSettled(p) => exec.settled = Some(settlement(&p, frame)),
-            Record::JobIntent(p)
-                if p.origin
-                    == (JobOrigin::Model {
-                        operation: call.operation,
-                        generation: call.generation,
-                        ordinal: call.ordinal,
-                    }) =>
-            {
-                exec.job_intent = Some(frame);
-            }
-            _ => return Err(ReplayError::Corrupt),
+    let origin = JobOrigin::Model {
+        operation: call.operation,
+        generation: call.generation,
+        ordinal: call.ordinal,
+    };
+    let reference = RetentionAuthor::Model {
+        operation: call.operation,
+        generation: call.generation,
+        ordinal: call.ordinal,
+    };
+    let mut note = None;
+    match follow {
+        None => {}
+        Some((frame, Record::JobIntent(p))) if p.origin == origin => {
+            exec.as_deref_mut().ok_or(ReplayError::Corrupt)?.job_intent = Some(frame);
         }
+        Some((frame, Record::JobRetention(p)))
+            if run
+                && call.tool_operation == Some(ToolOperation::JobNote)
+                && p.author == reference =>
+        {
+            note = Some((p.job, frame));
+        }
+        Some(_) => return Err(ReplayError::Corrupt),
     }
     let operation = call.tool_operation;
     let mut tool = tool_record(*call, intent.0, create, exec);
-    if let Some((frame, record)) = result {
-        let Record::ToolResult(p) = record else {
-            return Err(ReplayError::Corrupt);
-        };
-        tool.result_frame = Some(frame);
-        apply_result_projection(&mut tool, operation.ok_or(ReplayError::Corrupt)?, &p);
+    tool.note = note;
+    match result {
+        None => {}
+        Some((frame, Record::ToolResult(p))) => {
+            let operation = operation.ok_or(ReplayError::Corrupt)?;
+            require(run && !operation.job_result())?;
+            tool.result_frame = Some(frame);
+            apply_result_projection(&mut tool, operation, &p);
+        }
+        Some((frame, Record::JobResult(p))) => {
+            require(run && operation.is_some_and(ToolOperation::job_result))?;
+            tool.result_frame = Some(frame);
+            tool.result_status = Some(p.status);
+            tool.job_result = Some(p);
+        }
+        Some(_) => return Err(ReplayError::Corrupt),
     }
     Ok(tool)
 }

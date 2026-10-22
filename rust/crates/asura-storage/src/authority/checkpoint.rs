@@ -188,14 +188,9 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
             w.u32(op.tools.len() as u32);
             for tool in &op.tools {
                 locator(&mut w, &tool.intent_frame);
-                // Kind 23 (J1 mode) or kind 26 (job mode).
-                option_locator(
-                    &mut w,
-                    tool.exec_cmd
-                        .as_deref()
-                        .and_then(ExecCmdCall::follow_frame)
-                        .as_ref(),
-                );
+                // The kind 26 of an exec_cmd call, or the kind 30 model
+                // note of a `job note` call.
+                option_locator(&mut w, tool.follow_frame().as_ref());
                 option_locator(&mut w, tool.result_frame.as_ref());
             }
             // The response, then the thinking text (thinking-level.md).
@@ -472,14 +467,14 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
             state.initialization.request,
         ];
         let mut tools = Vec::with_capacity(frames.len());
-        for (intent, settled, result) in frames {
+        for (intent, follow, result) in frames {
             let read =
                 |index: &mut dyn Index, at: Locator| Ok::<_, ReplayError>((at, index.frame(&at)?));
             let intent = read(index, intent)?;
-            let settled = settled.map(|at| read(index, at)).transpose()?;
+            let follow = follow.map(|at| read(index, at)).transpose()?;
             let result = result.map(|at| read(index, at)).transpose()?;
-            let tool =
-                tool_from_frames(installation_id, binding, project, intent, settled, result)?;
+            let tool = tool_from_frames(installation_id, binding, project, intent, follow, result)?;
+
             tools.push(tool);
         }
         state.operations.insert(

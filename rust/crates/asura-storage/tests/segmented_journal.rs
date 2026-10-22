@@ -518,7 +518,7 @@ fn sj28_two_hundred_large_tool_calls_span_segment_files() {
                 tool_operation: Some(ToolOperation::ReadFile),
                 decision: ToolDecision::Denied,
                 fault: None,
-                busy: None,
+                reason: None,
                 form: ArgumentForm::Verbatim,
                 arguments_bytes: arguments.len() as u32,
                 arguments: arguments.clone(),
@@ -720,7 +720,7 @@ fn sj23_sj25_stalled_roll_and_shutdown_during_roll() {
     }
 }
 
-/// SJ-34: payload facts of exec_cmd calls are found through `X` entries
+/// SJ-34: payload facts of exec_cmd jobs are found through `X` entries
 /// after their operations leave memory; unknown payloads have none.
 #[test]
 fn sj34_payload_facts_after_rolls() {
@@ -732,68 +732,8 @@ fn sj34_payload_facts_after_rolls() {
     let mut payloads = Vec::new();
     for _ in 0..4 {
         let (_, operation, generation) = session.start_turn(project, None);
-        session
-            .append(Record::ToolCall(Box::new(ToolCall {
-                operation,
-                generation,
-                ordinal: 1,
-                source: ToolCallSource::GeneratedContent,
-                name: "exec_cmd".into(),
-                name_bytes: 8,
-                tool_operation: Some(ToolOperation::ExecCmd),
-                decision: ToolDecision::Run,
-                fault: None,
-                busy: None,
-                form: ArgumentForm::Canonical,
-                arguments_bytes: 20,
-                arguments: "{\"command\":\"true\"}".into(),
-                number_kinds: Vec::new(),
-                unnumbered: 0,
-                rule_set_revision: 1,
-                rule_set_digest: [3; 32],
-                command_cut: false,
-                whole_command: false,
-                refusal: None,
-            })))
-            .unwrap();
-        session
-            .append(Record::CaptureSettled(Box::new(CaptureSettled {
-                operation,
-                generation,
-                ordinal: 1,
-                state: CaptureState::Complete,
-                reason: CaptureReason::None,
-                exit_kind: 1,
-                exit_value: 0,
-                stdout: CaptureStream {
-                    eof: true,
-                    digest: Some([0xe3; 32]),
-                    ..CaptureStream::default()
-                },
-                stderr: CaptureStream {
-                    eof: true,
-                    digest: Some([0xe3; 32]),
-                    ..CaptureStream::default()
-                },
-                distinct_numbers: 0,
-                numbers: Vec::new(),
-                pause_count: 0,
-                first_pause_ms: 0,
-                paused_ms: 0,
-                final_reservation: INITIAL_RESERVATION,
-            })))
-            .ok();
-        session
-            .append(Record::ToolResult(ToolResult {
-                operation,
-                generation,
-                ordinal: 1,
-                status: 1,
-                text: "exit_code=0\nstdout:\n\nstderr:\n".into(),
-                next_offset: None,
-                truncated: false,
-            }))
-            .ok();
+        let job = j2_job_call(&session, operation, generation, 1);
+        session.append(j2_exited(job)).unwrap();
         // Fill so that rolls move the operation into a run.
         let text = "y".repeat(MAX_TEXT);
         for k in 0..50u64 {
@@ -1470,7 +1410,7 @@ fn j2_job_call(session: &Session, operation: Id, generation: u64, ordinal: u32) 
             tool_operation: Some(ToolOperation::ExecCmd),
             decision: ToolDecision::Run,
             fault: None,
-            busy: None,
+            reason: None,
             form: ArgumentForm::Canonical,
             arguments_bytes: 20,
             arguments: "{\"command\":\"true\"}".into(),
@@ -1495,19 +1435,27 @@ fn j2_job_call(session: &Session, operation: Id, generation: u64, ordinal: u32) 
             time: 1_760_000_000_000,
         }))
         .unwrap();
+    // Handle delivery (J3): the call's kind 29.
     session
-        .append(Record::ToolResult(ToolResult {
+        .append(Record::JobResult(Box::new(JobResult {
             operation,
             generation,
             ordinal,
             status: 1,
-            text: "job".into(),
-            next_offset: None,
-            truncated: false,
-        }))
+            outcome: JobResultOutcome::Ok,
+            job: [0; 16],
+            body: JobResultBody::State(JobSnapshot {
+                state: JobRunState::Running,
+                numbers: [0; 3],
+                elapsed_ms: 1,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            }),
+        })))
         .unwrap();
     job_id(&origin)
 }
+
 fn j2_exited(job: Id) -> Record {
     let stream = JobStream {
         capture: CaptureStream {
@@ -1647,6 +1595,284 @@ fn j2t_03_rolls_with_live_jobs_restart_and_payload_facts() {
         .unwrap();
     assert!(state(&session.writer).jobs.is_empty());
     check(&session, false);
+    let mut session = session;
+    close(&mut session.writer);
+}
+
+fn j4_retention(job: Id, action: RetentionAction) -> Record {
+    Record::JobRetention(Box::new(JobRetention {
+        job,
+        action,
+        author: RetentionAuthor::Person {
+            request: random_id(),
+        },
+        time: 1_760_000_000_009,
+        note: if action == RetentionAction::Note {
+            "keep this run for the release notes".into()
+        } else {
+            String::new()
+        },
+    }))
+}
+/// Every page of a `Jobs` read, 8 entries per page with the ninth as the
+/// `more` probe, following the kind 26 sequence of the last entry shown.
+fn j4_list(session: &Session, scope: JobScope) -> Vec<JobListing> {
+    let mut out = Vec::new();
+    let mut before = None;
+    loop {
+        let page = run(
+            &session.writer,
+            Command::Jobs {
+                scope,
+                before,
+                limit: MAX_JOB_LISTING_READ,
+            },
+        )
+        .unwrap()
+        .jobs;
+        let more = page.len() > MAX_JOB_LIST_ENTRIES;
+        out.extend(page.into_iter().take(MAX_JOB_LIST_ENTRIES));
+        if !more {
+            return out;
+        }
+        before = Some(out.last().unwrap().intent_frame.sequence);
+    }
+}
+
+/// J4T-03 (integration): 20 jobs over three rolls, in two conversations
+/// of two projects, are listed by scope and page through `Jobs`, with
+/// `JobFacts` and `Settlements`, before and after a restart from the
+/// checkpoint. Settled jobs come from the `L`, `M` and `Y` entries of
+/// index runs and the delta; the live job from the checkpoint.
+#[test]
+fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
+    use RetentionAction::*;
+    let _guard = WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut session = Session::start(&scratch);
+    let first = session.register(&scratch, 1);
+    let second = session.register(&scratch, 2);
+    let text = "y".repeat(MAX_TEXT);
+    let mut x_conversation = None;
+    let mut y_conversation = None;
+    let (mut x_jobs, mut y_jobs) = (Vec::new(), Vec::new());
+    let mut bases = std::collections::BTreeSet::new();
+    let mut live = None;
+    let mut x_operations = Vec::new();
+    for (round, (x_count, y_count)) in [(4, 3), (4, 3), (3, 3)].into_iter().enumerate() {
+        let (conversation, operation, generation) = session.start_turn(first, x_conversation);
+        x_conversation = Some(conversation);
+        x_operations.push(operation);
+        for ordinal in 1..=x_count {
+            let job = j2_job_call(&session, operation, generation, ordinal);
+            // The last job of the last round stays live.
+            if round == 2 && ordinal == x_count {
+                live = Some(job);
+            } else {
+                session.append(j2_exited(job)).unwrap();
+            }
+            x_jobs.push(job);
+        }
+        // Fill past one 8 MiB segment file so that a roll writes an index run.
+        for k in 0..140u64 {
+            session
+                .append(Record::ResponseText(ResponseText {
+                    operation,
+                    generation,
+                    offset: k * MAX_TEXT as u64,
+                    text: text.clone(),
+                }))
+                .unwrap();
+        }
+        session.finish(operation, generation, 140 * MAX_TEXT as u64, "");
+        let (conversation, operation, generation) = session.start_turn(second, y_conversation);
+        y_conversation = Some(conversation);
+        for ordinal in 1..=y_count {
+            let job = j2_job_call(&session, operation, generation, ordinal);
+            session.append(j2_exited(job)).unwrap();
+            y_jobs.push(job);
+        }
+        session.finish(operation, generation, 0, "done");
+        bases.insert(state(&session.writer).base);
+    }
+    let (x, y) = (x_conversation.unwrap(), y_conversation.unwrap());
+    let live = live.unwrap();
+    // Retention: a pin and a note on X's first job; a delete on Y's first.
+    session.append(j4_retention(x_jobs[0], Pin)).unwrap();
+    session.append(j4_retention(x_jobs[0], Note)).unwrap();
+    session.append(j4_retention(y_jobs[0], Delete)).unwrap();
+    bases.remove(&0);
+    assert!(bases.len() >= 3, "three rolls: {bases:?}");
+    assert_eq!(x_jobs.len() + y_jobs.len(), 20);
+    let newest = |jobs: &[Id]| jobs.iter().rev().copied().collect::<Vec<_>>();
+    let mut all = Vec::new();
+    for (round, (x_count, y_count)) in [(4, 3), (4, 3), (3, 3)].into_iter().enumerate() {
+        let x_start = round * 4;
+        let y_start = round * 3;
+        all.extend_from_slice(&x_jobs[x_start..x_start + x_count]);
+        all.extend_from_slice(&y_jobs[y_start..y_start + y_count]);
+    }
+    let check = |session: &Session| {
+        // A terminal operation's calls rebuilt from `C` entries: each
+        // resolved by its kind 29, its job's kind 26 found through `W`.
+        let tools = run(
+            &session.writer,
+            Command::ReadResponse {
+                operation: x_operations[0],
+                offset: 0,
+                thinking_offset: 0,
+            },
+        )
+        .unwrap()
+        .tools
+        .unwrap();
+        assert_eq!(tools.len(), 4);
+        for (ordinal, tool) in tools.iter().enumerate() {
+            let exec = tool.exec_cmd.as_deref().unwrap();
+            assert_eq!(exec.job, x_jobs[ordinal]);
+            assert!(exec.job_intent.is_some() && !tool.unresolved());
+            assert_eq!(tool.result_status, Some(1));
+            assert!(tool.job_result.is_some());
+        }
+        let ids = |listings: &[JobListing]| listings.iter().map(|l| l.job).collect::<Vec<_>>();
+        let by_x = j4_list(session, JobScope::Conversation(x));
+        assert_eq!(ids(&by_x), newest(&x_jobs));
+        assert_eq!(
+            ids(&j4_list(session, JobScope::Conversation(y))),
+            newest(&y_jobs)
+        );
+        assert_eq!(
+            ids(&j4_list(session, JobScope::Project(first))),
+            newest(&x_jobs)
+        );
+        assert_eq!(
+            ids(&j4_list(session, JobScope::Project(second))),
+            newest(&y_jobs)
+        );
+        let everything = j4_list(session, JobScope::AllProjects);
+        assert_eq!(ids(&everything), newest(&all));
+        for listing in &everything {
+            let in_x = x_jobs.contains(&listing.job);
+            assert_eq!(listing.conversation, if in_x { x } else { y });
+            assert_eq!(listing.project, if in_x { first } else { second });
+            assert_eq!(listing.settled.is_none(), listing.job == live);
+            assert_eq!(listing.settled_frame.is_none(), listing.job == live);
+            assert_eq!(job_id(&listing.intent.origin), listing.job);
+            assert_eq!(listing.command.sequence + 1, listing.intent_frame.sequence);
+        }
+        let x_first = by_x.last().unwrap();
+        assert_eq!(
+            x_first.retention,
+            JobRetentionSummary {
+                pinned: true,
+                deleted: false,
+                notes: 1,
+                records: 2,
+            }
+        );
+        assert!(
+            everything
+                .iter()
+                .find(|l| l.job == y_jobs[0])
+                .unwrap()
+                .retention
+                .deleted
+        );
+        let facts = run(&session.writer, Command::JobFacts { job: x_jobs[0] })
+            .unwrap()
+            .job_records
+            .unwrap();
+        assert_eq!(facts.listing.job, x_jobs[0]);
+        assert_eq!(facts.command.tool_operation, Some(ToolOperation::ExecCmd));
+        assert_eq!(
+            facts
+                .retention
+                .iter()
+                .map(|(_, r)| (r.action, r.note.is_empty()))
+                .collect::<Vec<_>>(),
+            vec![(Pin, true), (Note, false)]
+        );
+        assert!(
+            run(&session.writer, Command::JobFacts { job: random_id() })
+                .unwrap()
+                .job_records
+                .is_none()
+        );
+        // `Settlements`: X's settled jobs, newest kind 28 first.
+        let settled = run(
+            &session.writer,
+            Command::Settlements {
+                conversation: x,
+                after: 0,
+                through: u64::MAX - 1,
+                limit: 9,
+            },
+        )
+        .unwrap()
+        .jobs;
+        let settled_x: Vec<Id> = newest(&x_jobs)
+            .into_iter()
+            .filter(|job| *job != live)
+            .take(9)
+            .collect();
+        assert_eq!(ids(&settled), settled_x);
+        assert!(
+            settled
+                .windows(2)
+                .all(|p| p[0].settled_frame.sequence > p[1].settled_frame.sequence)
+        );
+        // `PayloadFacts` carries the pin and delete state (J4).
+        let installation = state(&session.writer).installation_id;
+        let facts = run(
+            &session.writer,
+            Command::PayloadFacts {
+                payloads: vec![
+                    job_payload_ids(installation, x_jobs[0])[0],
+                    job_payload_ids(installation, y_jobs[0])[1],
+                    job_payload_ids(installation, live)[0],
+                ],
+            },
+        )
+        .unwrap()
+        .payload_facts;
+        assert_eq!(
+            facts
+                .iter()
+                .map(|f| (f.pinned, f.deleted, f.active))
+                .collect::<Vec<_>>(),
+            vec![
+                (true, false, false),
+                (false, true, false),
+                (false, false, true)
+            ]
+        );
+    };
+    check(&session);
+    // Bounds of the reads.
+    for limit in [0, MAX_JOB_LISTING_READ + 1] {
+        assert!(matches!(
+            session.writer.try_submit(Command::Jobs {
+                scope: JobScope::AllProjects,
+                before: None,
+                limit,
+            }),
+            Err(Error::Invalid)
+        ));
+        assert!(matches!(
+            session.writer.try_submit(Command::Settlements {
+                conversation: x,
+                after: 0,
+                through: 1,
+                limit,
+            }),
+            Err(Error::Invalid)
+        ));
+    }
+    // Restart from the checkpoint and tail: the same listings.
+    close(&mut session.writer);
+    let session = Session::start(&scratch);
+    assert_eq!(state(&session.writer).unsettled_jobs().len(), 1);
+    check(&session);
     let mut session = session;
     close(&mut session.writer);
 }
