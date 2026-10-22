@@ -6,7 +6,7 @@ checkpoint snapshots, sorted index runs and run compaction. It also removes the
 64-project and 256-conversation lifetime totals. The
 [validation status](#validation-status-2026-10-19) lists the evidence and the
 remaining gaps; [implementation refinements](#implementation-refinements-2026-10-19)
-record SJ-D12 to SJ-D27. The owner answered OD-SJ-1 to OD-SJ-5 on 2026-10-19; see
+record SJ-D12 to SJ-D28. The owner answered OD-SJ-1 to OD-SJ-5 on 2026-10-19; see
 [owner decisions](#owner-decisions-2026-10-19).
 Journal format stays **1** and the wire protocol stays **0.1**.
 
@@ -461,9 +461,11 @@ produces. It holds stored facts only:
   conversation and latest operation, and its last activity sequence.
 - The **recent conversation set**: the 256 conversations with the newest
   activity, plus every conversation that the active operation or an unresolved
-  input names. Each entry holds project, generation, the locator of the latest
-  accepted turn and its last activity sequence.
-- The active operation, if any: its kind 21 facts, start, cancel, tool records
+  input names. Each entry holds project, generation, the latest accepted turn
+  (operation, terminal kind, locator and, from J5, `notice_through`) and its last
+  activity sequence.
+- The active operation, if any: its kind 21 facts (from J5 including
+  `notice_through`), start, cancel, tool records
   (at most 201, with their locators) and response pieces (at most 65,536).
 - The queue: order revision, last dispatched lane, unresolved inputs (at most
   16), inputs dispatched to the active operation, and the 64 most recently
@@ -543,7 +545,7 @@ stateDiagram-v2
 | `P` response piece | Operation ID, start offset | Kept length, locator of the kind 24 or kind 8 frame | With `O` |
 | `H` thinking piece | Operation ID, start offset | Kept length, locator of the kind 25 frame | With `O`; the thinking length is the end of the last `H` piece ([thinking level](thinking-level.md#journal-format-1)) |
 | `C` tool call | Operation ID, ordinal | Decision, kind 14, kind 15 and kind 23 locators (zero when absent). From J3 (designed): decision, kind 14 locator and the result locator (kind 15 or 29) | With `O` |
-| `T` turn | Conversation ID, generation | Operation ID, terminal kind, accepted locator, completed turns through this generation (SJ-D12) | With `O` |
+| `T` turn | Conversation ID, generation | Operation ID, terminal kind, accepted locator, completed turns through this generation (SJ-D12), and from J5 the kind 21 `notice_through` (SJ-D28) | With `O` |
 | `I` input | Input ID, 0 | Status, kind 18 locator, promotion locator, dispatched operation | Roll after the input settles |
 | `X` payload | Payload ID, 0 | Form 1 (J1 call): operation ID, generation, ordinal, kind 14 locator, kind 23 locator, last-use sequence. Form 2 (job, J2 designed): job ID, kind 26 and kind 28 locators, last-use sequence | Form 1 with `O`; form 2 with `W` |
 | `W` job | Job ID, 0 | Conversation ID, origin, kind 26, kind 27 and kind 28 locators (J2 designed) | Roll after the job's kind 28 |
@@ -1254,6 +1256,7 @@ direction. Each keeps one source of truth: the frames.
 | SJ-D25 | The inspection witness detects new, removed or renamed control files; damage inside an existing file is detected by frame, page and file digests when read. | A multi-file journal is read through locators; per-file content stamps would cover only files the scan opened. |
 | SJ-D26 | The protocol adds `CONVERSATION_WAIT_STEP_JOURNAL_PAUSED = 5` for a paused turn and inspection reason 17 `checkpoint_rebuild_pending` (state `Recovering`). | The person sees the pause and the rebuild; protocol stays 0.1 under the schema rules. |
 | SJ-D27 | The run list may name at most 64 runs: a roll that would list a 65th holds normal records with `journal_quota` until a merge completes. A complete merge output becomes visible at the next roll. | As designed; recorded because the merge and roll share the writer gate. |
+| SJ-D28 | J5 (recorded 2026-10-23 from step J5-S): the `T` value holds the turn's kind 21 `notice_through` as a u64 at value offsets 49–56, after operation (16), terminal kind (1), accepted locator (24) and completed (8); 57 of 96 bytes are used and the rest stay zero. The recent conversation set's latest turn and the checkpoint's active operation hold the same value. Kind 21's `notice_live` is not indexed. | The writer derives the next turn's notice cursor P from the conversation's latest turn without a frame read, for a conversation in or outside the recent set ([binding point](tool-job-controller.md#binding-point)). The frames stay the source: replay copies the value from kind 21, and SJ-05 proves the copies equal genesis replay. |
 
 ## Owner decisions (2026-10-19)
 
