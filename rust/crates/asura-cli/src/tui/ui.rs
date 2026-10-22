@@ -1,7 +1,9 @@
 //! Local draft and literal presentation of read-only service observations.
 mod activity;
 mod composer;
+mod execution;
 mod help_mode;
+mod job_view;
 mod markdown;
 mod paging;
 mod thinking;
@@ -42,7 +44,9 @@ pub struct View {
 /// Byte range of a slash command's first word when it exactly names a TUI command.
 fn active_command(draft: &str) -> Option<std::ops::Range<usize>> {
     let end = draft.find(char::is_whitespace).unwrap_or(draft.len());
-    (draft.starts_with('/') && LOCAL_COMMANDS.contains(&&draft[..end])).then_some(0..end)
+    let name = &draft[..end];
+    (draft.starts_with('/') && (LOCAL_COMMANDS.contains(&name) || JOB_COMMANDS.contains(&name)))
+        .then_some(0..end)
 }
 
 /// Launch hint naming the other current projects that contain the launch directory.
@@ -105,6 +109,10 @@ const LOCAL_COMMANDS: [&str; 15] = [
     "/help", "/quit", "/exit", "/config", "/init", "/project", "/cancel", "/observe", "/retry",
     "/queue", "/models", "/tools", "/audit", "/new", "/think",
 ];
+/// Job and execution commands (tool-job-controller.md, J4 TUI; execution-setting.md).
+/// They join `LOCAL_COMMANDS`, and so completion and the help index, once
+/// `docs/user/commands.md` has their rows (packet J34-E owns that file).
+const JOB_COMMANDS: [&str; 3] = ["/jobs", "/job", "/execution"];
 
 enum Overlay {
     Commands(CommandHeader, Option<usize>),
@@ -236,6 +244,10 @@ pub struct App {
     thinking_save: Option<(asura_control::thinking::Level, bool)>,
     /// The configured model's reported (reasoning, controls).
     thinking_support: Option<(bool, u32)>,
+    /// Job views, the status facts and the request slot's state (J4 TUI).
+    jobs: job_view::Jobs,
+    /// A pending `/execution` configuration request.
+    execution: Option<execution::Execution>,
 }
 impl App {
     pub fn new() -> Self {
@@ -339,6 +351,8 @@ impl App {
             thinking_level: None,
             thinking_save: None,
             thinking_support: None,
+            jobs: job_view::Jobs::default(),
+            execution: None,
         }
     }
     pub(super) fn take_queue_request(
@@ -951,7 +965,7 @@ impl App {
         self.config_request.take()
     }
     pub(super) fn config_finished(&mut self, outcome: super::config::Outcome) {
-        if self.thinking_saved(&outcome) {
+        if self.thinking_saved(&outcome) || self.execution_finished(&outcome) {
             return;
         }
         if let Some(selector) = self.picker_model_save.take() {
@@ -1361,6 +1375,9 @@ impl App {
             self.focus = Focus::Editor;
             self.observed_model = None;
             self.model_context = None;
+            if self.view.epoch.is_some() {
+                self.jobs_service_changed();
+            }
         }
         if view.connection != "connected" {
             self.model_context = None;
@@ -1614,6 +1631,9 @@ impl App {
     }
     fn handle_event(&mut self, event: Event) -> bool {
         if let Event::Paste(text) = event {
+            if self.jobs.open() {
+                return false;
+            }
             if self.overlay.is_none()
                 && self.focus == Focus::Editor
                 && self.picker.is_none()
@@ -1764,6 +1784,9 @@ impl App {
             }
             return false;
         }
+        if self.capture.is_none() && self.jobs_key(key) {
+            return false;
+        }
         if self.capture.is_some() {
             match key.code {
                 KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL => {
@@ -1791,7 +1814,10 @@ impl App {
         if key.modifiers == KeyModifiers::CONTROL {
             match key.code {
                 KeyCode::Char('q' | 'c') => {
-                    if self.editor.is_empty() && self.local_outbox.is_empty() {
+                    if self.editor.is_empty()
+                        && self.local_outbox.is_empty()
+                        && self.jobs_exit_line().is_none()
+                    {
                         return true;
                     }
                     self.overlay = Some(Overlay::Exit(false));
@@ -1806,7 +1832,7 @@ impl App {
                     if !self.editor.is_empty() {
                         return false;
                     }
-                    if self.local_outbox.is_empty() {
+                    if self.local_outbox.is_empty() && self.jobs_exit_line().is_none() {
                         return true;
                     }
                     self.overlay = Some(Overlay::Exit(false));
@@ -1888,7 +1914,9 @@ impl App {
     /// whose draft is the `/cancel` command; Esc keeps the person's draft.
     /// Returns false when nothing is cancellable.
     fn cancel_current(&mut self, clear: bool) -> bool {
-        if self.audit_draft.is_some() {
+        if self.cancel_job_wait(clear) {
+            // A job wait has no time bound; /cancel and Escape stop it.
+        } else if self.audit_draft.is_some() {
             self.audit_cancel = true;
             if clear {
                 self.editor = Editor::new();
@@ -2237,6 +2265,14 @@ impl App {
             }
             return false;
         }
+        if matches!(name, "/jobs" | "/job") {
+            self.job_command(draft);
+            return false;
+        }
+        if name == "/execution" {
+            self.execution_command(draft);
+            return false;
+        }
         if draft.split_whitespace().next() == Some("/config") {
             if self.config_draft.is_some() {
                 self.notice = "Configuration request busy; draft retained".into();
@@ -2262,7 +2298,9 @@ impl App {
             self.editor = Editor::new();
             self.notice.clear();
             self.overlay = Some(Overlay::Help(0));
-        } else if matches!(name, "/quit" | "/exit") && !self.local_outbox.is_empty() {
+        } else if matches!(name, "/quit" | "/exit")
+            && (!self.local_outbox.is_empty() || self.jobs_exit_line().is_some())
+        {
             self.editor = Editor::new();
             self.overlay = Some(Overlay::Exit(false));
         } else {
@@ -2490,6 +2528,7 @@ impl App {
         }
         let focused = self.overlay.is_none()
             && self.capture.is_none()
+            && !self.jobs.open()
             && self.focus == Focus::Editor
             && self.response_selection.is_none()
             && !self.history_focus
@@ -2540,6 +2579,18 @@ impl App {
         } else {
             unicode_display_width::width(&think) as u16 + 3
         };
+        // `jobs N` and `exec off` lead the right group (J4 TUI, EX11).
+        let job_status = if area.width >= 40 {
+            self.jobs_status_text()
+        } else {
+            String::new()
+        };
+        let think_width = think_width
+            + if job_status.is_empty() {
+                0
+            } else {
+                unicode_display_width::width(&job_status) as u16 + 3
+            };
         let (project, tail, model) = status_groups(
             self.editor.character_count(),
             area.width - think_width,
@@ -2579,6 +2630,10 @@ impl App {
             muted
         };
         let mut right = Vec::new();
+        if !job_status.is_empty() {
+            right.push(Span::styled(job_status, muted.fg(COMMAND_AMBER)));
+            right.push(Span::styled(" · ", muted));
+        }
         if !think.is_empty() {
             right.push(Span::styled(
                 think,
@@ -2627,16 +2682,15 @@ impl App {
         if focused && let Some(cursor) = self.editor.cursor() {
             frame.set_cursor_position(cursor);
         }
-        self.draw_overlay(
-            frame,
-            Rect::new(
-                full_area.x,
-                full_area.y + 2,
-                full_area.width,
-                editor_y.saturating_sub(full_area.y + 2 + strips + tray_height),
-            ),
-            panel,
+        let overlay_area = Rect::new(
+            full_area.x,
+            full_area.y + 2,
+            full_area.width,
+            editor_y.saturating_sub(full_area.y + 2 + strips + tray_height),
         );
+        self.settle_job_viewer(overlay_area.height);
+        self.draw_jobs(frame, overlay_area, panel);
+        self.draw_overlay(frame, overlay_area, panel);
     }
     fn draw_overlay(&mut self, frame: &mut Frame, area: Rect, style: Style) {
         self.panel_scroll_max = 0;
@@ -2680,6 +2734,7 @@ impl App {
             );
             return;
         }
+        let exit_line = self.jobs_exit_line();
         let Some(overlay) = &mut self.overlay else {
             return;
         };
@@ -2782,15 +2837,23 @@ impl App {
                 )
             }
             Overlay::Exit(discard) => format!(
-                "{}\n{}\nTab/arrows select · Enter confirm · Esc cancel",
+                "{}{}\n{}\nTab/arrows select · Enter confirm · Esc cancel",
                 if self.local_outbox.is_empty() {
-                    "Discard draft and exit?".to_string()
+                    if self.editor.is_empty() {
+                        "Exit?".to_string()
+                    } else {
+                        "Discard draft and exit?".to_string()
+                    }
                 } else {
                     format!(
                         "Exit with {} provisional local input(s)? These are not yet durable.",
                         self.local_outbox.len()
                     )
                 },
+                exit_line
+                    .as_ref()
+                    .map(|line| format!("\n{line}"))
+                    .unwrap_or_default(),
                 if *discard {
                     "Keep editing    [Discard and exit]"
                 } else {
@@ -3284,6 +3347,17 @@ fn render_history(
                 (!response.is_empty()).then_some("▪"),
             ),
             (log.filter(|_| live).map(Text::raw), 1, log_style, None),
+            // The EX12 line: jobs that outlived this turn (J4-E6).
+            (
+                history
+                    .activity
+                    .get(index)
+                    .and_then(activity::Activity::outlived_notice)
+                    .map(Text::raw),
+                1,
+                text.fg(COMMAND_AMBER),
+                None,
+            ),
             (Some(Text::default()), 0, text, None),
         ] {
             let Some(content) = content else { continue };

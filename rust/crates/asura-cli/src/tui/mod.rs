@@ -8,6 +8,7 @@ mod events;
 mod heartbeat;
 mod help;
 mod history;
+mod jobs;
 mod models;
 mod observation;
 mod project_admin;
@@ -58,6 +59,7 @@ pub(crate) fn run(
     let mut project_page_worker = project_pages::Worker::default();
     let mut context_worker = context::Worker::default();
     let mut queue_observer = queue_watch::Worker::default();
+    let mut job_worker = jobs::Worker::default();
     conversation_worker.set_notice(router.notice(Source::Conversation));
     config_worker.set_notice(router.notice(Source::Config));
     models_worker.set_notice(router.notice(Source::Models));
@@ -67,6 +69,9 @@ pub(crate) fn run(
     project_page_worker.set_notice(router.notice(Source::Conversation));
     context_worker.set_notice(router.notice(Source::Context));
     queue_observer.set_notice(router.notice(Source::QueueWatch));
+    // The job worker's slots share the retained-observation source; the
+    // router has no free source bit.
+    job_worker.set_notice(router.notice(Source::QueueWatch));
     let result = (|| {
         let mut app = ui::App::new();
         let mut model = observation::Model::default();
@@ -134,6 +139,10 @@ pub(crate) fn run(
             if app.take_project_page_cancel() {
                 project_page_worker.cancel();
             }
+            let jobs_cancelled = app.take_jobs_cancel();
+            if jobs_cancelled {
+                job_worker.cancel_request();
+            }
             let queue_cancelled = app.take_queue_cancel();
             if queue_cancelled {
                 queue_worker.cancel();
@@ -196,6 +205,18 @@ pub(crate) fn run(
             {
                 dirty |= app.queue_observed(update);
             }
+            if has(Source::QueueWatch) || jobs_cancelled {
+                if let Some(finished) = job_worker.poll_request() {
+                    app.jobs_finished(finished);
+                    dirty = true;
+                }
+                if let Some(update) = job_worker.poll_status() {
+                    dirty |= app.jobs_status(update);
+                }
+                if let Some(update) = job_worker.poll_follow() {
+                    dirty |= app.jobs_followed(update);
+                }
+            }
             if has(Source::Context)
                 && let Some(update) = context_worker.poll()
             {
@@ -234,7 +255,10 @@ pub(crate) fn run(
                 (Source::Queue, queue_worker.running()),
                 (Source::Context, context_worker.running()),
                 (Source::Status, worker.running()),
-                (Source::QueueWatch, queue_observer.retained()),
+                (
+                    Source::QueueWatch,
+                    queue_observer.retained() || job_worker.running(),
+                ),
             ] {
                 if !running {
                     router.settled(source);
@@ -316,6 +340,20 @@ pub(crate) fn run(
             // A spawn failure retains the observer's explicit retry deadline;
             // its previous projection expires independently.
             let _ = queue_observer.synchronize(resolve, app.queue_scope(), now);
+            if !job_worker.request_busy()
+                && let Some(request) = app.take_job_request()
+            {
+                if let Err(error) = job_worker.submit(resolve, request.clone()) {
+                    app.jobs_finished(jobs::Finished {
+                        request,
+                        result: Err(jobs::Failure::Unavailable(error.into())),
+                    });
+                }
+                dirty = true;
+            }
+            // Spawn failures retry on the next cycle; the views stay usable.
+            let _ = job_worker.synchronize_status(resolve, app.job_status_scope(), now);
+            let _ = job_worker.synchronize_follow(resolve, app.job_follow());
             output.borrow_mut().pump()?;
             if dirty && !output.borrow().pending() {
                 screen.draw(|frame| app.draw(frame))?;
@@ -336,6 +374,7 @@ pub(crate) fn run(
                 model.next_deadline(),
                 context_worker.next_deadline(),
                 queue_observer.next_deadline(),
+                job_worker.next_deadline(),
                 settlement_at,
             ]
             .into_iter()
@@ -378,6 +417,7 @@ pub(crate) fn run(
     router.cancel();
     context_worker.cancel();
     queue_observer.cancel();
+    job_worker.cancel();
     conversation_worker.disconnect();
     queue_worker.disconnect();
     project_admin_worker.cancel();
@@ -395,6 +435,7 @@ pub(crate) fn run(
     drop(audit_worker);
     drop(context_worker);
     drop(queue_observer);
+    drop(job_worker);
     let joined = worker.join();
     match (result, restored, joined) {
         (Err(error), Err(cleanup), _) => Err(io::Error::new(

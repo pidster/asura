@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking]
+Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting]
+The job journeys (--jobs, --job-viewer, --job-retention, --execution-setting)
+need a service that lists CAPABILITY_JOBS; they run after packet J34-E.
 This verifies process and tty state, not native terminal visual correctness.
 """
 import codecs
@@ -3192,6 +3194,554 @@ def help_mode_backend_stalled(fixture):
     print("PASS help mode with a stalled backend: responsive search, entry and area help")
 
 
+class JobsHarness:
+    """Shared fixture for the J3/J4 job journeys (tool-job-controller.md, J3
+    and J4 end-to-end validation): the real TUI, service and Swift helper
+    with a scripted loopback model.
+
+    Each model request pops one step from `script`:
+    - ("exec_cmd", ARGS) or ("job", ARGS): one tool call;
+    - a callable: called with the tool messages so far, returns a step;
+    - HOLD: the reply waits until `release` is set (a turn that stays live);
+    - a string or None: the final answer text ("COMPLETE" for None).
+
+    Written by packet J4-T. They need the service to list CAPABILITY_JOBS and
+    to run exec_cmd as a job, so they run after packet J34-E (TJ-P3, step 8).
+    """
+    HOLD = object()
+
+    def __init__(self, fixture, source):
+        import threading
+        shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
+        (fixture.root / "asura-model").chmod(0o700)
+        self.fixture = fixture
+        self.script = []
+        self.tool_messages = []
+        self.chats = []
+        self.errors = []
+        self.release = threading.Event()
+        self.stopped = threading.Event()
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.listener.settimeout(0.1)
+        self.endpoint = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.server = threading.Thread(target=self.serve, name="asura-jobs-fixture")
+        self.server.start()
+
+    def project(self, name):
+        path = self.fixture.root / name
+        path.mkdir(mode=0o700, exist_ok=True)
+        return path
+
+    def serve(self):
+        end = time.monotonic() + 600
+        try:
+            while not self.stopped.is_set() and time.monotonic() < end:
+                try:
+                    peer, _ = self.listener.accept()
+                except socket.timeout:
+                    continue
+                with peer:
+                    peer.settimeout(5)
+                    request = bytearray()
+                    header, body, length = b"", b"", 0
+                    while True:
+                        data = peer.recv(65536)
+                        if not data:
+                            break
+                        request.extend(data)
+                        if b"\r\n\r\n" in request:
+                            header, body = request.split(b"\r\n\r\n", 1)
+                            length = next((int(line.split(b":", 1)[1]) for line in header.split(b"\r\n")
+                                           if line.lower().startswith(b"content-length:")), 0)
+                            if len(body) >= length:
+                                break
+                    if request.startswith(b"POST /api/show "):
+                        payload = json.dumps({"capabilities": ["completion", "tools"],
+                                              "model_info": {"fixture.context_length": 16384}}).encode()
+                        peer.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+                        continue
+                    if not request.startswith(b"POST /api/chat "):
+                        continue
+                    chat = json.loads(body[:length])
+                    self.chats.append(chat)
+                    for message in chat["messages"]:
+                        if message.get("role") == "tool":
+                            self.tool_messages.append(message.get("content", ""))
+                    step = self.script.pop(0) if self.script else None
+                    if callable(step):
+                        step = step(self.tool_messages)
+                    if step is JobsHarness.HOLD:
+                        # A live turn: the reply waits for the journey, or
+                        # for the turn's cancel to close the connection.
+                        while not self.release.is_set() and not self.stopped.is_set():
+                            self.release.wait(0.05)
+                        self.release.clear()
+                        step = "RELEASED"
+                    peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                    if step is None or isinstance(step, str):
+                        reply = {"message": {"role": "assistant", "content": step or "COMPLETE"},
+                                 "done": True, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3}
+                    else:
+                        name, arguments = step
+                        reply = {"message": {"role": "assistant", "content": "",
+                                             "tool_calls": [{"function": {"name": name, "arguments": arguments}}]},
+                                 "done": True, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}
+                    try:
+                        peer.sendall(json.dumps(reply).encode() + b"\n")
+                    except OSError:
+                        pass  # A cancelled turn closed the connection.
+        except Exception as error:
+            if not self.stopped.is_set():
+                self.errors.append(error)
+
+    def close(self):
+        self.stopped.set()
+        self.release.set()
+        self.server.join(timeout=3)
+        self.listener.close()
+        assert not self.server.is_alive(), "jobs fixture server cleanup unconfirmed"
+        assert not self.errors, self.errors
+
+    def handles(self):
+        """Job handles from handle-delivery results, oldest first."""
+        found = []
+        for message in self.tool_messages:
+            for handle in re.findall(r"^job: ([0-9a-f]{32})$", message, re.M):
+                if handle not in found:
+                    found.append(handle)
+        return found
+
+    def wait_handles(self, trial, count, limit=40):
+        end = time.monotonic() + limit
+        while len(self.handles()) < count:
+            assert time.monotonic() < end, ("job handles", self.handles(), [m[:300] for m in self.tool_messages[-3:]])
+            trial.read(0.05)
+        return self.handles()
+
+    def wait_chats(self, trial, count, limit=40):
+        end = time.monotonic() + limit
+        while len(self.chats) < count:
+            assert time.monotonic() < end, ("model requests", len(self.chats), count)
+            trial.read(0.05)
+
+    def configure(self, trial, project):
+        trial.resize(160, 48)
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        for key, value in [("providers.ollama.endpoint", self.endpoint), ("model", "ollama:fixture")]:
+            trial.send(f"/config set {key} {value}\r".encode())
+            trial.until(f"Saved {key}".encode(), plain=True)
+            trial.send(b"\x1b")
+            trial.idle(0.1)
+
+    def select(self, trial, project):
+        """Selects a registered project by its directory (CF06b)."""
+        code, listing, _ = self.fixture.command("project", "list")
+        assert code == 0, listing
+        line = next(line for line in listing.decode().splitlines() if str(project) in line)
+        project_id = re.search(r"[0-9a-f]{32}", line).group(0)
+        trial.send(f"/project select {project_id}\r".encode())
+        trial.idle(0.3)
+        return project_id
+
+    def command(self, trial, text, expect, limit=20):
+        offset = len(trial.output)
+        trial.send(text.encode() + b"\r")
+        trial.until(expect.encode(), offset, plain=True, limit=limit)
+
+
+def slow_lines(prefix, count, pause="0.1", stderr=False):
+    target = " >&2" if stderr else ""
+    return (f"i=0; while [ $i -lt {count} ]; do printf '{prefix} %d\\n' $i{target}; "
+            f"i=$((i+1)); sleep {pause}; done")
+
+
+def jobs_journey(fixture, source):
+    """--jobs: J34E-03 (cancel during the yield stops the job; cancel after
+    handle delivery keeps it; the EX12 line), J34E-05 (/job cancel stops a job;
+    the viewer shows the result), J34E-06 (third job of one agent shows the
+    queued reason in /jobs), J34E-08 (/new and exit keep jobs; reattach lists
+    them; a TUI-launched backend's exit confirmation counts them) and J34E-09
+    (/jobs all; cross-project cancel confirmation declined and accepted).
+    Runnable after J34-E."""
+    harness = JobsHarness(fixture, source)
+    project = harness.project("alpha")
+    other = harness.project("beta")
+    trial = None
+    try:
+        # J34E-08 needs a backend that outlives the TUI: start it first.
+        fixture.start()
+        trial = fixture.launch()
+        harness.configure(trial, project)
+        # EX12 and the status row: a job that outlives its turn.
+        harness.script[:] = [("exec_cmd", {"command": "sleep 60", "yield_seconds": 1}), "STARTED-1"]
+        trial.send(b"Start one long job.\r")
+        trial.until(b"STARTED-1", plain=True, limit=40, reject="Incomplete response")
+        trial.until("↳ 1 job kept running after this turn · /jobs to view or cancel".encode(), plain=True, limit=10)
+        trial.until(b"jobs 1", plain=True, limit=10)
+        first = harness.wait_handles(trial, 1)[0]
+        # J34E-06: the third job of one agent waits for a slot.
+        harness.script[:] = [("exec_cmd", {"command": "sleep 60", "yield_seconds": 1}),
+                             ("exec_cmd", {"command": "sleep 61", "yield_seconds": 0}), "STARTED-3"]
+        trial.send(b"Start two more.\r")
+        trial.until(b"STARTED-3", plain=True, limit=40, reject="Incomplete response")
+        assert any("state: queued (waiting: 2 of 2 jobs running for this agent)" in m
+                   for m in harness.tool_messages), [m[:300] for m in harness.tool_messages[-2:]]
+        harness.command(trial, "/jobs", "Jobs · this project")
+        trial.until(b"queued (waiting: 2 of 2 jobs running for this agent)", plain=True, limit=10)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        # J34E-05: /job cancel stops a running job; the viewer shows the result.
+        harness.command(trial, f"/job cancel {first}", "Stopping job " + first[:8])
+        harness.command(trial, f"/job {first}", "Job " + first[:8])
+        trial.until(b"client_cancel", plain=True, limit=20)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        # The queued job starts in the freed slot.
+        harness.command(trial, "/jobs", "Jobs · this project")
+        end = time.monotonic() + 20
+        while "queued (waiting" in trial.screen.text():
+            assert time.monotonic() < end, "queued job did not start after a slot freed"
+            trial.read(0.05)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        # J34E-03: cancel during the yield stops the job (turn_ended)...
+        harness.script[:] = [("exec_cmd", {"command": "sleep 59", "yield_seconds": 30}), None]
+        trial.send(b"Cancel me in the window.\r")
+        harness.wait_chats(trial, len(harness.chats) + 1)
+        trial.idle(1.0)
+        trial.send(b"/cancel\r")
+        trial.until(b"Cancel", plain=True, limit=20)
+        trial.idle(2.0)
+        harness.command(trial, "/jobs", "Jobs · this project")
+        trial.until(b"turn_ended", plain=True, limit=20)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        # ...and cancel after handle delivery keeps the job, with the EX12 line.
+        before = len(harness.handles())
+        harness.script[:] = [("exec_cmd", {"command": "sleep 58", "yield_seconds": 1}), JobsHarness.HOLD]
+        offset = len(trial.output)
+        trial.send(b"Keep me after the handle.\r")
+        kept = harness.wait_handles(trial, before + 1)[-1]
+        harness.wait_chats(trial, len(harness.chats) + 1)
+        trial.send(b"/cancel\r")
+        trial.until("kept running after this turn".encode(), offset, plain=True, limit=20)
+        harness.release.set()
+        harness.command(trial, f"/job {kept}", "Job " + kept[:8] + " · running")
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        # J34E-09: another project's jobs in /jobs all; cancel asks first.
+        trial.send(("/project add " + str(other) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        harness.select(trial, other)
+        harness.command(trial, "/jobs", "No jobs")
+        trial.send(b"\x1b")
+        harness.command(trial, "/jobs all", "Jobs · all projects")
+        trial.until(b"[alpha]", plain=True, limit=10)
+        # The newest row is the kept job of project alpha.
+        trial.send(b"c")
+        trial.until(f"Cancel job {kept[:8]} in project alpha? (y/n)".encode(), plain=True, limit=10)
+        trial.send(b"n")
+        trial.until(b"Nothing sent", plain=True, limit=10)
+        trial.send(b"c")
+        trial.until(b"in project alpha? (y/n)", plain=True, limit=10)
+        trial.send(b"y")
+        trial.until(("Stopping job " + kept[:8]).encode(), plain=True, limit=20)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        harness.select(trial, project)
+        # J34E-08: /new keeps live jobs; they stay listed.
+        harness.script[:] = [("exec_cmd", {"command": "sleep 57", "yield_seconds": 1}), "STARTED-NEW"]
+        trial.send(b"One more before new.\r")
+        trial.until(b"STARTED-NEW", plain=True, limit=40)
+        survivor = harness.handles()[-1]
+        harness.command(trial, "/new", "New conversation ready")
+        harness.command(trial, "/jobs", survivor[:8])
+        trial.send(b"\x1b")
+        # An attached TUI exits without a prompt; the backend keeps the jobs.
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        trial = fixture.launch()
+        trial.resize(160, 48)
+        harness.select(trial, project)
+        harness.command(trial, "/jobs", survivor[:8])
+        trial.until(b"running", plain=True, limit=10)
+        trial.send(b"\x1b")
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.stop()
+        # A TUI-launched backend asks before exit and counts the live jobs.
+        trial = fixture.launch()
+        harness.configure(trial, project)
+        harness.script[:] = [("exec_cmd", {"command": "sleep 56", "yield_seconds": 1}), "STARTED-OWNED"]
+        trial.send(b"Owned backend job.\r")
+        trial.until(b"STARTED-OWNED", plain=True, limit=40)
+        trial.until(b"jobs 1", plain=True, limit=10)
+        trial.send(b"\x11")  # Ctrl+Q
+        trial.until(b"1 job is still running in all projects; it stops when the service stops.",
+                    plain=True, limit=10)
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        trial.send(b"\x11")
+        trial.until(b"it stops when the service stops", plain=True, limit=10)
+        trial.send(b"\t\r")  # Select exit and confirm.
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        trial = None
+        print("PASS J34E-03/05/06/08/09 TUI: EX12 line and status count, queued reason, /job cancel "
+              "with its result, cancel in and after the yield window, /jobs all cross-project "
+              "confirmation, /new and reattach keep jobs, launched-backend exit count")
+    finally:
+        if trial is not None:
+            trial.close()
+        harness.close()
+
+
+def job_viewer_journey(fixture, source):
+    """--job-viewer: J34E-04 (/job ID while running shows growing output; Tab
+    keeps positions; follow tracks the end; opened from an activity row with
+    j) and J34E-11 (restart with a live job: listed as interrupted, pages
+    unverified prefix). Runnable after J34-E."""
+    harness = JobsHarness(fixture, source)
+    project = harness.project("viewer")
+    trial = None
+    backend = None
+    try:
+        trial = fixture.launch()
+        harness.configure(trial, project)
+        command = (slow_lines("out", 300, "0.05") + " & " + slow_lines("err", 300, "0.05", stderr=True)
+                   + "; wait")
+        harness.script[:] = [("exec_cmd", {"command": command, "yield_seconds": 1}), "VIEWER-STARTED"]
+        trial.send(b"Stream two outputs.\r")
+        trial.until(b"VIEWER-STARTED", plain=True, limit=40, reject="Incomplete response")
+        handle = harness.wait_handles(trial, 1)[0]
+        harness.command(trial, f"/job {handle}", f"Job {handle[:8]} · running · stdout")
+        trial.until(b"out 0", plain=True, limit=10)
+        # The output grows: End reads the newer end.
+        trial.idle(1.0)
+        offset = len(trial.output)
+        trial.send(b"\x1b[F")  # End
+        trial.until(b"live", offset, plain=True, limit=10)
+        first_end = max(int(n) for n in re.findall(r"out (\d+)", trial.screen.text()))
+        assert first_end > 0, trial.screen.text()
+        # Tab shows stderr from byte 0; Tab back keeps stdout's position.
+        offset = len(trial.output)
+        trial.send(b"\t")
+        trial.until(b"stderr", offset, plain=True, limit=10)
+        trial.until(b"err 0", offset, plain=True, limit=10)
+        offset = len(trial.output)
+        trial.send(b"\t")
+        trial.until(f"out {first_end}".encode(), offset, plain=True, limit=10)
+        # f follows the end while new output arrives.
+        trial.send(b"f")
+        trial.until(b"following", plain=True, limit=10)
+        trial.until(f"out {first_end + 20}".encode(), plain=True, limit=20)
+        # Typing stays responsive while following (AE-07).
+        # Settlement ends following; the header shows the result.
+        trial.until(b"out 299", plain=True, limit=40)
+        trial.until(f"Job {handle[:8]} · exit 0".encode(), plain=True, limit=20)
+        assert "following" not in trial.screen.text().splitlines()[2], "follow ended at settlement"
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        # From the activity row: F6 response navigation, then j.
+        trial.send(b"\x1b[17~")
+        trial.until(b"Stream two outputs.", plain=True, limit=10)
+        trial.until(b"j job", plain=True, limit=10)
+        trial.send(b"j")
+        trial.until(f"Job {handle[:8]} · exit 0 · stdout".encode(), plain=True, limit=10)
+        trial.send(b"\x1b")
+        trial.until(b"responses", plain=True, limit=10)
+        trial.send(b"\x1b")
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        # J34E-11: a service crash with a live job; the restart records it
+        # interrupted and its pages are an unverified prefix.
+        out = (fixture.root / "foreground.out").open("ab")
+        err = (fixture.root / "foreground.err").open("ab")
+        backend = subprocess.Popen([str(fixture.binary), "service", "run"],
+            cwd=fixture.root, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+        fixture.started = True
+        end = time.monotonic() + remaining()
+        while fixture.status()["service"] != "current":
+            assert backend.poll() is None and time.monotonic() < end, "foreground service not ready"
+            time.sleep(0.01)
+        trial = fixture.launch()
+        harness.configure(trial, project)
+        harness.script[:] = [("exec_cmd", {"command": slow_lines("crash", 600, "0.1"), "yield_seconds": 1}),
+                             "CRASH-STARTED"]
+        trial.send(b"Start then crash.\r")
+        trial.until(b"CRASH-STARTED", plain=True, limit=40)
+        crashed = harness.handles()[-1]
+        trial.idle(1.0)
+        backend.kill()
+        backend.wait(timeout=10)
+        trial.close()
+        fixture.active_trials.remove(trial)
+        trial = None
+        backend = subprocess.Popen([str(fixture.binary), "service", "run"],
+            cwd=fixture.root, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+        end = time.monotonic() + remaining()
+        while fixture.status()["service"] != "current":
+            assert backend.poll() is None and time.monotonic() < end, "restarted service not ready"
+            time.sleep(0.01)
+        trial = fixture.launch()
+        trial.resize(160, 48)
+        harness.select(trial, project)
+        harness.command(trial, "/jobs", crashed[:8])
+        trial.until(b"interrupted", plain=True, limit=10)
+        trial.send(b"\x1b")
+        harness.command(trial, f"/job {crashed}", "unverified prefix")
+        trial.until(b"crash 0", plain=True, limit=10)
+        trial.send(b"\x1b")
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        print("PASS J34E-04/11 TUI: growing output, Tab positions, follow to settlement, "
+              "j from the activity row, restart shows interrupted with an unverified prefix")
+    finally:
+        if trial is not None:
+            trial.close()
+        if backend is not None and backend.poll() is None:
+            backend.terminate()
+            backend.wait(timeout=10)
+        harness.close()
+
+
+def job_retention_journey(fixture, source):
+    """--job-retention: J34E-10 (/job pin, /job note, /job delete; model job
+    note; the detail panel shows both notes with authors). Runnable after
+    J34-E."""
+    harness = JobsHarness(fixture, source)
+    project = harness.project("retain")
+    trial = None
+    try:
+        trial = fixture.launch()
+        harness.configure(trial, project)
+        harness.script[:] = [
+            ("exec_cmd", {"command": "printf 'kept output\\n'", "yield_seconds": 10}),
+            lambda messages: ("job", {"command": "note",
+                                      "job": re.findall(r"^job: ([0-9a-f]{32})$", messages[-1], re.M)[0],
+                                      "text": "model says rerun"}),
+            "NOTED",
+        ]
+        trial.send(b"Run and note.\r")
+        trial.until(b"NOTED", plain=True, limit=40, reject="Incomplete response")
+        handle = harness.wait_handles(trial, 1)[0]
+        short = handle[:8]
+        # Pin, then a repeated pin changes nothing.
+        harness.command(trial, f"/job pin {handle}", f"Pinned job {short}")
+        harness.command(trial, f"/job pin {handle}", f"Job {short} is already pinned")
+        harness.command(trial, f"/job note {handle} person says flaky", f"Note added to job {short}")
+        # The list shows the marks; the prefix form resolves among them.
+        harness.command(trial, "/jobs", short)
+        trial.until(b"pinned", plain=True, limit=10)
+        trial.until("✎2".encode(), plain=True, limit=10)
+        trial.send(b"\x1b")
+        harness.command(trial, f"/job {handle[:6]}", f"Job {short}")
+        trial.until(b"kept output", plain=True, limit=10)
+        trial.send(b"i")
+        trial.until(b"Notes: 2", plain=True, limit=10)
+        trial.until(b"model \xc2\xb7", plain=True, limit=10)
+        trial.until(b"model says rerun", plain=True, limit=10)
+        trial.until(b"you \xc2\xb7", plain=True, limit=10)
+        trial.until(b"person says flaky", plain=True, limit=10)
+        trial.send(b"\x1b")
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        # Delete asks first; n keeps the output, y deletes it.
+        trial.send(f"/job delete {handle}\r".encode())
+        trial.until(f"Delete the output of job {short}? Its summary and notes stay. (y/n)".encode(),
+                    plain=True, limit=10)
+        trial.send(b"n")
+        trial.until(b"Nothing sent", plain=True, limit=10)
+        # The declined command's draft is kept; Enter submits it again.
+        trial.send(b"\r")
+        trial.until(b"(y/n)", plain=True, limit=10)
+        trial.send(b"y")
+        trial.until(f"Deleted the output of job {short}".encode(), plain=True, limit=20)
+        harness.command(trial, f"/job {handle}", "Output deleted; i shows the summary and notes")
+        trial.send(b"i")
+        trial.until(b"person says flaky", plain=True, limit=10)
+        trial.send(b"\x1b\x1b")
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        print("PASS J34E-10 TUI: pin, unchanged pin, person and model notes with authors, "
+              "delete confirmation declined and accepted, deleted output keeps summary and notes")
+    finally:
+        if trial is not None:
+            trial.close()
+        harness.close()
+
+
+def execution_setting_journey(fixture, source):
+    """--execution-setting: J34E-14 (ES-05, ES-06, ES-12): /execution project
+    off stops a running model job with execution_off; the next exec_cmd is
+    refused; a second TUI shows exec off. Also ES-03 (/execution shows each
+    source). Runnable after J34-E."""
+    harness = JobsHarness(fixture, source)
+    project = harness.project("exec")
+    first = second = None
+    try:
+        fixture.start()
+        first = fixture.launch()
+        harness.configure(first, project)
+        harness.command(first, "/execution", "execution: on (default) · this project: on (inherited)")
+        harness.script[:] = [("exec_cmd", {"command": "sleep 60", "yield_seconds": 1}), "EXEC-STARTED"]
+        first.send(b"Start a model job.\r")
+        first.until(b"EXEC-STARTED", plain=True, limit=40, reject="Incomplete response")
+        handle = harness.wait_handles(first, 1)[0]
+        first.until(b"jobs 1", plain=True, limit=10)
+        # A second TUI on the same project.
+        second = fixture.launch()
+        second.resize(160, 48)
+        harness.select(second, project)
+        second.until(b"jobs 1", plain=True, limit=10)
+        harness.command(first, "/execution project off",
+                        "running model jobs in this project are being stopped · /jobs")
+        first.until(b"exec off", plain=True, limit=20)
+        # ES-12: the second TUI's parked status list returns with the change.
+        second.until(b"exec off", plain=True, limit=20)
+        harness.command(first, "/execution", "this project: off (project override)")
+        harness.command(first, "/jobs", handle[:8])
+        first.until(b"execution_off", plain=True, limit=20)
+        first.send(b"\x1b")
+        # ES-04: the next exec_cmd is refused; nothing runs.
+        harness.script[:] = [("exec_cmd", {"command": "printf ran > refused.txt"}), "REFUSED-DONE"]
+        first.send(b"Try again.\r")
+        first.until(b"REFUSED-DONE", plain=True, limit=40)
+        assert any("execution" in m and "off" in m for m in harness.tool_messages[-2:]), harness.tool_messages[-2:]
+        assert not (project / "refused.txt").exists()
+        # ES-06 and ES-07: global off, then project inherit and global on.
+        harness.command(first, "/execution project inherit", "follows the default")
+        harness.command(first, "/execution off", "execution: off (default)")
+        second.until(b"exec off", plain=True, limit=10)
+        harness.command(first, "/execution on", "execution: on (default)")
+        end = time.monotonic() + 20
+        while "exec off" in first.screen.text() or "exec off" in second.screen.text():
+            assert time.monotonic() < end, "exec off remained after /execution on"
+            first.read(0.05)
+            second.read(0.05)
+        for trial in (second, first):
+            trial.send(b"\x01/quit\r")
+            trial.finish()
+        second = first = None
+        fixture.stop()
+        print("PASS J34E-14 TUI: /execution sources, project off stops the model job with "
+              "execution_off, refusal, second TUI shows exec off, global off and on")
+    finally:
+        for trial in (first, second):
+            if trial is not None:
+                trial.close()
+        harness.close()
+
+
 def main():
     global DEADLINE
     assert len(sys.argv) in (2, 3), __doc__
@@ -3216,7 +3766,11 @@ def main():
     segmented = len(sys.argv) == 3 and sys.argv[2] == "--segmented-journal"
     restore = len(sys.argv) == 3 and sys.argv[2] == "--segmented-restore"
     thinking = len(sys.argv) == 3 and sys.argv[2] == "--thinking"
-    assert len(sys.argv) == 2 or thinking or segmented or restore or records or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
+    job_modes = {"--jobs": jobs_journey, "--job-viewer": job_viewer_journey,
+                 "--job-retention": job_retention_journey,
+                 "--execution-setting": execution_setting_journey}
+    job_mode = job_modes.get(sys.argv[2]) if len(sys.argv) == 3 else None
+    assert len(sys.argv) == 2 or job_mode or thinking or segmented or restore or records or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
     if native:
         DEADLINE = time.monotonic() + 240
     if long:
@@ -3240,6 +3794,10 @@ def main():
         return
     fixture = Fixture(source)
     try:
+        if job_mode:
+            DEADLINE = time.monotonic() + 300
+            job_mode(fixture, source)
+            return
         if long_turns:
             long_conversation(fixture, source)
             return
@@ -3322,7 +3880,7 @@ def main():
     finally:
         try:
             fixture.cleanup()
-            if not thinking and not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture and not records and not segmented and not restore and not waits_client and not steps and not steer:
+            if not job_mode and not thinking and not native and not setup and not models and not composer and not queue_history and not queue_reorder and not long and not activity and not multipass and not helpmode and not long_turns and not waits and not capture and not records and not segmented and not restore and not waits_client and not steps and not steer:
                 print("PASS expired work budget still stops independent test backend with fresh cleanup budget")
         except Exception:
             print(f"Fixture cleanup unconfirmed; retained {fixture.root}", file=sys.stderr)
