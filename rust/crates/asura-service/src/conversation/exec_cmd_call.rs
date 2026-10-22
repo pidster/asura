@@ -150,11 +150,11 @@ mod tests {
             assert_eq!(run.job, journal::exec_cmd_job_id([1; 16], 3, ordinal));
             assert_eq!(
                 run.stdout_payload,
-                payload_id([9; 16], [1; 16], 3, ordinal, ObjectKind::Stdout)
+                payload_id([9; 16], run.job, ObjectKind::Stdout)
             );
             assert_eq!(
                 run.stderr_payload,
-                payload_id([9; 16], [1; 16], 3, ordinal, ObjectKind::Stderr)
+                payload_id([9; 16], run.job, ObjectKind::Stderr)
             );
             assert_eq!(
                 (run.command.as_str(), run.cwd.as_str()),

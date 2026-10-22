@@ -3092,10 +3092,8 @@ impl Owner {
                                     store
                                         .admit(
                                             replay.map_or([0; 16], |r| r.installation_id),
-                                            call.operation,
-                                            call.generation,
-                                            call.ordinal,
                                             run.job,
+                                            call.operation,
                                         )
                                         .map(|victims| (store, victims))
                                         .map_err(|_| journal::ExecCmdBusyReason::Quota)

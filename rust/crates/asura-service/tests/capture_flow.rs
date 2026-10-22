@@ -433,9 +433,7 @@ fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
             busy: record.busy,
             stdout_payload: asura_storage::payload::payload_id(
                 replay.installation_id,
-                operation,
-                record.generation,
-                record.ordinal,
+                journal::exec_cmd_job_id(operation, record.generation, record.ordinal),
                 asura_storage::payload::ObjectKind::Stdout,
             ),
         };

@@ -6,7 +6,7 @@ use asura_platform::secrets::{SecretVariable, rewrite_exec_cmd_call};
 use asura_service::test_support::{Job, Outcome, run_jobs};
 use asura_storage::authority::conversation::{CaptureReason, CaptureState, Id, LossReason};
 use asura_storage::payload::{
-    MIB, Origin, PagePool, PageRequest, PageState, PayloadStore, read_page,
+    MIB, Origin, PagePool, PageReply, PageRequest, PageState, PayloadStore, read_page,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -696,28 +696,22 @@ fn pages() -> Result<()> {
     let held = pool
         .submit(request, Origin::Client)
         .map_err(|s| s.as_str())?;
-    let started = Instant::now();
-    let page = held.wait();
-    assert_eq!(page.state, PageState::Busy);
-    assert!(started.elapsed() >= Duration::from_millis(1900));
-    // The general worker is still held; the reserved worker serves a model read.
+    // The general worker is held; the reserved worker takes a model read.
     let model = pool
         .submit(request, Origin::Model)
         .map_err(|s| s.as_str())?;
-    let page = model.wait();
-    assert_eq!(
-        page.state,
-        PageState::Busy,
-        "both workers held by the test hold"
-    );
+    // No step bound (WB1): past the former 2 s step neither read answers.
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(held.poll().is_none() && model.poll().is_none());
     pool.hold_for_test(false);
-    let page = pool
-        .submit(request, Origin::Model)
-        .map_err(|s| s.as_str())?
-        .wait();
-    assert_eq!(page.state, PageState::Complete);
+    for ticket in [held, model] {
+        let PageReply::Page(page) = ticket.wait() else {
+            return Err("page read cancelled".into());
+        };
+        assert_eq!(page.state, PageState::Complete);
+    }
     println!(
-        "PASS J1T-10/J1T-11 live pages under the watermark ({live}), stable offsets, busy after the 2 s step"
+        "PASS J1T-10/J2T-16 live pages under the watermark ({live}), stable offsets, held reads wait for their reply"
     );
     Ok(())
 }

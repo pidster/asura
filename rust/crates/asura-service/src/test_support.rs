@@ -63,7 +63,7 @@ pub fn run_jobs(
         let operation = asura_platform::random_id();
         let job_id = journal::exec_cmd_job_id(operation, 1, 1);
         let victims = store
-            .admit(installation, operation, 1, 1, job_id)
+            .admit(installation, job_id, operation)
             .map_err(|_| "admission: quota".to_string())?;
         let call = tools::Call {
             operation,

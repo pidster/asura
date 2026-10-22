@@ -103,15 +103,9 @@ impl ExecCmdRun {
         let Arguments::ExecCmd { command, cwd } = &call.arguments else {
             return None;
         };
-        let payload = |kind| {
-            asura_storage::payload::payload_id(
-                installation,
-                call.operation,
-                call.generation,
-                call.ordinal,
-                kind,
-            )
-        };
+        let job = journal::exec_cmd_job_id(call.operation, call.generation, call.ordinal);
+        let [stdout_payload, stderr_payload] =
+            asura_storage::payload::job_payloads(installation, job);
         Some(Self {
             operation: call.operation,
             generation: call.generation,
@@ -119,9 +113,9 @@ impl ExecCmdRun {
             command: command.clone(),
             cwd: cwd.clone(),
             filtered: None,
-            job: journal::exec_cmd_job_id(call.operation, call.generation, call.ordinal),
-            stdout_payload: payload(asura_storage::payload::ObjectKind::Stdout),
-            stderr_payload: payload(asura_storage::payload::ObjectKind::Stderr),
+            job,
+            stdout_payload,
+            stderr_payload,
         })
     }
 }
