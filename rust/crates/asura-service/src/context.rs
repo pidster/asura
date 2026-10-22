@@ -5,8 +5,15 @@ use asura_storage::authority::conversation::{Composition, Hash, Id, MAX_COMPOSED
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 
-/// Versions the composition rules and the manifest encoding.
-pub(crate) const COMPOSER_REVISION: u32 = 1;
+mod job_notice;
+#[allow(unused_imports)] // J5-E builds the notice inputs.
+pub(crate) use job_notice::{
+    MAX_NOTICE_ENTRIES, NOTICE_SETTLEMENT_READ, Notice, NoticeError, NoticeInputs, Settlement,
+};
+
+/// Versions the composition rules and the manifest encoding. Revision 2
+/// adds the J5 job notice and its segments.
+pub(crate) const COMPOSER_REVISION: u32 = 2;
 /// Calibration before enough measurements: one token per byte (D2).
 const FALLBACK_MILLI: u32 = 1000;
 /// Upper bound on the learned bytes per token.
@@ -62,12 +69,17 @@ pub(crate) enum Error {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // J5-E records the notice fields.
 pub(crate) struct Composed {
     pub input: Vec<u8>,
     /// Shown prior turns (full or reference), in generation order.
     pub shown: Vec<Id>,
     pub omitted: u32,
     pub manifest_digest: Hash,
+    /// `notice_through` for kind 21: the notice cursor `S` (J5-E2).
+    pub notice_through: u64,
+    /// Notice entries at reference fidelity, oldest first (J5T-05).
+    pub notice_reduced: u32,
 }
 impl Composed {
     pub(crate) fn composition(&self, budget: Budget) -> Composition {
@@ -127,26 +139,31 @@ fn turn_len(turn: &Candidate, fidelity: Fidelity) -> u64 {
 /// The labelled, service-written context block placed before the person's text.
 /// `unlisted` counts older completed turns that `Prepare` did not return
 /// (past its 8 MiB candidate bound); their size is not known here.
-fn context_block(omitted: &[&Candidate], unlisted: u32) -> String {
-    if omitted.is_empty() && unlisted == 0 {
+/// It holds, in order, the omitted-range line and the job notice (D9).
+fn context_block(omitted: &[&Candidate], unlisted: u32, notice: &str) -> String {
+    if omitted.is_empty() && unlisted == 0 && notice.is_empty() {
         return String::new();
     }
     let bytes: usize = omitted
         .iter()
         .map(|t| t.prompt.len() + t.answer.len())
         .sum();
-    if unlisted > 0 {
-        return format!(
-            "<asura-context>\nEarlier turns omitted for space: {} turns, more than {} bytes.\n</asura-context>\n\n",
+    let range = if unlisted > 0 {
+        format!(
+            "Earlier turns omitted for space: {} turns, more than {} bytes.\n",
             omitted.len() as u64 + u64::from(unlisted),
             bytes
-        );
-    }
-    format!(
-        "<asura-context>\nEarlier turns omitted for space: {} turns, {} bytes.\n</asura-context>\n\n",
-        omitted.len(),
-        bytes
-    )
+        )
+    } else if !omitted.is_empty() {
+        format!(
+            "Earlier turns omitted for space: {} turns, {} bytes.\n",
+            omitted.len(),
+            bytes
+        )
+    } else {
+        String::new()
+    };
+    format!("<asura-context>\n{range}{notice}</asura-context>\n\n")
 }
 
 /// Compose one turn-start request. `history` may arrive in any order.
@@ -168,6 +185,28 @@ pub(crate) fn compose_with(
     unlisted: u32,
     budget: Budget,
 ) -> Result<Composed, Error> {
+    compose_turn(
+        instructions,
+        prompt,
+        history,
+        unlisted,
+        &Notice::none([0; 16], 0),
+        budget,
+    )
+}
+/// [`compose_with`] with the turn's job notice (J5). Notice entries are
+/// mandatory: when the budget is short they are reduced to reference
+/// fidelity, oldest first; if even the reduced notice does not fit, the
+/// turn fails with `context_limit`.
+#[cfg_attr(not(test), allow(dead_code))] // J5-E calls it at turn start.
+pub(crate) fn compose_turn(
+    instructions: &str,
+    prompt: &str,
+    history: &[Candidate],
+    unlisted: u32,
+    notice: &Notice,
+    budget: Budget,
+) -> Result<Composed, Error> {
     let limit = budget.bytes().ok_or(Error::ContextLimit {
         mandatory_bytes: 0,
         budget_bytes: 0,
@@ -177,14 +216,23 @@ pub(crate) fn compose_with(
     let turns = &ordered[..ordered.len().min(MAX_COMPOSED_PRIOR)];
     let mandatory = field_len(instructions.len() as u64) + field_len(prompt.len() as u64);
     // Reserve room for the largest possible context block, so the omitted line never
-    // displaces a decision already made.
-    let block_room = context_block_room(history, unlisted);
-    if mandatory + block_room > limit {
-        return Err(Error::ContextLimit {
-            mandatory_bytes: mandatory,
-            budget_bytes: limit,
-        });
-    }
+    // displaces a decision already made. The notice keeps as many entries at
+    // full fidelity as fit; older entries are reduced first.
+    let mut reduced = 0;
+    let (notice_text, block_room) = loop {
+        let text = notice.text(reduced);
+        let room = context_block_room(history, unlisted, &text);
+        if mandatory + room <= limit {
+            break (text, room);
+        }
+        if reduced == notice.entries.len() {
+            return Err(Error::ContextLimit {
+                mandatory_bytes: mandatory + room,
+                budget_bytes: limit,
+            });
+        }
+        reduced += 1;
+    };
     let mut used = mandatory + block_room;
     // Pass 1: references, newest first, until one does not fit.
     // A turn shorter than its reference line is shown in full from the start.
@@ -233,7 +281,7 @@ pub(crate) fn compose_with(
         // Everything older than the shown turns, including any beyond the
         // shown-turn bound, joins one omitted range.
         let omitted = &ordered[fidelity.len()..];
-        let block = context_block(omitted, unlisted);
+        let block = context_block(omitted, unlisted, &notice_text);
         let input = build(instructions, &block, prompt, shown, &fidelity);
         let bytes = model::encode_input(&input).map_err(|_| Error::Invalid)?;
         if bytes.len() as u64 <= limit {
@@ -245,6 +293,8 @@ pub(crate) fn compose_with(
                 shown,
                 &fidelity,
                 omitted,
+                notice,
+                reduced,
             );
             let mut shown_ids: Vec<(u64, Id)> =
                 shown.iter().map(|t| (t.generation, t.operation)).collect();
@@ -254,6 +304,8 @@ pub(crate) fn compose_with(
                 shown: shown_ids.into_iter().map(|(_, id)| id).collect(),
                 omitted: omitted.len() as u32 + unlisted,
                 manifest_digest,
+                notice_through: notice.through,
+                notice_reduced: reduced as u32,
             });
         }
         match upgrades.pop() {
@@ -269,13 +321,13 @@ pub(crate) fn compose_with(
     })
 }
 /// Room for the context block when every candidate is omitted.
-fn context_block_room(history: &[Candidate], unlisted: u32) -> u64 {
-    if history.is_empty() && unlisted == 0 {
+fn context_block_room(history: &[Candidate], unlisted: u32, notice: &str) -> u64 {
+    if history.is_empty() && unlisted == 0 && notice.is_empty() {
         return 0;
     }
     let all: Vec<&Candidate> = history.iter().collect();
-    // The block joins the prompt field; its length can add one varint byte there.
-    context_block(&all, unlisted).len() as u64 + 2
+    // The block joins the prompt field; its length can add varint bytes there.
+    context_block(&all, unlisted, notice).len() as u64 + 2
 }
 fn build(
     instructions: &str,
@@ -306,6 +358,7 @@ fn build(
     }
 }
 /// SHA-256 over the deterministic manifest encoding (context-composer.md, item 7).
+#[allow(clippy::too_many_arguments)] // One input per manifest part, in encoding order.
 fn manifest(
     budget: &Budget,
     instructions: &str,
@@ -314,11 +367,9 @@ fn manifest(
     shown: &[&Candidate],
     fidelity: &[Fidelity],
     omitted: &[&Candidate],
+    notice: &Notice,
+    reduced: usize,
 ) -> Hash {
-    const INSTRUCTIONS: u8 = 1;
-    const HISTORY: u8 = 2;
-    const BLOCK: u8 = 3;
-    const PROMPT: u8 = 4;
     let mut h = Sha256::new();
     h.update([1u8]);
     h.update(COMPOSER_REVISION.to_be_bytes());
@@ -330,15 +381,18 @@ fn manifest(
     ] {
         h.update(value.to_be_bytes());
     }
-    let mut segment =
-        |kind: u8, role: u8, fidelity: u8, source: Id, source_text: &str, shown: &str| {
-            h.update([kind, role, fidelity]);
-            h.update(source);
-            h.update(Sha256::digest(source_text.as_bytes()));
-            h.update((shown.len() as u64).to_be_bytes());
-            h.update(Sha256::digest(shown.as_bytes()));
-        };
+    let segment = |h: &mut Sha256,
+                   kind: u8,
+                   role: u8,
+                   fidelity: u8,
+                   source: Id,
+                   source_text: &str,
+                   shown: &str| {
+        let digest: Hash = Sha256::digest(source_text.as_bytes()).into();
+        h.update(segment_bytes(kind, role, fidelity, source, digest, shown));
+    };
     segment(
+        &mut h,
         INSTRUCTIONS,
         0,
         Fidelity::Full as u8,
@@ -352,6 +406,7 @@ fn manifest(
             Fidelity::Reference => reference_texts(turn),
         };
         segment(
+            &mut h,
             HISTORY,
             1,
             *fidelity as u8,
@@ -360,6 +415,7 @@ fn manifest(
             &user,
         );
         segment(
+            &mut h,
             HISTORY,
             2,
             *fidelity as u8,
@@ -368,8 +424,25 @@ fn manifest(
             &model,
         );
     }
-    segment(BLOCK, 1, Fidelity::Full as u8, [0; 16], block, block);
-    segment(PROMPT, 1, Fidelity::Full as u8, [0; 16], prompt, prompt);
+    segment(
+        &mut h,
+        BLOCK,
+        1,
+        Fidelity::Full as u8,
+        [0; 16],
+        block,
+        block,
+    );
+    h.update(notice_segments(notice, reduced));
+    segment(
+        &mut h,
+        PROMPT,
+        1,
+        Fidelity::Full as u8,
+        [0; 16],
+        prompt,
+        prompt,
+    );
     let mut range: Vec<(u64, Id)> = omitted
         .iter()
         .map(|t| (t.generation, t.operation))
@@ -381,6 +454,69 @@ fn manifest(
         h.update(last.1);
     }
     h.finalize().into()
+}
+
+const INSTRUCTIONS: u8 = 1;
+const HISTORY: u8 = 2;
+const BLOCK: u8 = 3;
+const PROMPT: u8 = 4;
+/// One notice entry; source identity the job ID, source digest the kind 28
+/// frame header's command digest.
+const JOB_NOTICE: u8 = 5;
+/// The header, overflow and live lines; source identity the conversation
+/// ID, source digest [`Notice::summary_digest`].
+const JOB_NOTICE_SUMMARY: u8 = 6;
+
+/// One manifest segment: kind, role, fidelity, source identity, source
+/// digest, shown byte length (u64) and shown content digest.
+fn segment_bytes(
+    kind: u8,
+    role: u8,
+    fidelity: u8,
+    source: Id,
+    source_digest: Hash,
+    shown: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + 16 + 32 + 8 + 32);
+    out.extend_from_slice(&[kind, role, fidelity]);
+    out.extend_from_slice(&source);
+    out.extend_from_slice(&source_digest);
+    out.extend_from_slice(&(shown.len() as u64).to_be_bytes());
+    out.extend_from_slice(&Sha256::digest(shown.as_bytes()));
+    out
+}
+/// The notice segments, after the context block segment: each entry in
+/// settlement order at its fidelity, then the summary segment. None when
+/// the turn has no notice block.
+fn notice_segments(notice: &Notice, reduced: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    if notice.is_empty() {
+        return out;
+    }
+    for (index, entry) in notice.entries.iter().enumerate() {
+        let (fidelity, shown) = if index < reduced {
+            (Fidelity::Reference, &entry.reference)
+        } else {
+            (Fidelity::Full, &entry.full)
+        };
+        out.extend(segment_bytes(
+            JOB_NOTICE,
+            1,
+            fidelity as u8,
+            entry.job,
+            entry.digest,
+            shown,
+        ));
+    }
+    out.extend(segment_bytes(
+        JOB_NOTICE_SUMMARY,
+        1,
+        Fidelity::Full as u8,
+        notice.conversation,
+        notice.summary_digest(),
+        &notice.summary_text(),
+    ));
+    out
 }
 
 /// Per-model bytes-per-token lower bound, learned from measured input tokens (D2).
