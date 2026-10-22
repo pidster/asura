@@ -438,6 +438,10 @@ fn terminal_regressions() -> Result<()> {
         Some("--queue-steer"),
         Some("--segmented-journal"),
         Some("--segmented-restore"),
+        Some("--jobs"),
+        Some("--job-viewer"),
+        Some("--job-retention"),
+        Some("--execution-setting"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);

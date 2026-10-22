@@ -155,6 +155,7 @@ const FIXTURE: &[Chord] = &[
     chord(BROWSER, "Enter", KeyCode::Enter, N, Browser),
     chord(BROWSER, "Space", KeyCode::Char(' '), N, Browser),
     chord(BROWSER, "t", KeyCode::Char('t'), N, Browser),
+    chord(BROWSER, "j", KeyCode::Char('j'), N, Browser),
     chord(BROWSER, "Page Up", KeyCode::PageUp, N, Browser),
     chord(BROWSER, "Page Down", KeyCode::PageDown, N, Browser),
     chord(BROWSER, "Escape", KeyCode::Esc, N, Browser),

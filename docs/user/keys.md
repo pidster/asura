@@ -8,7 +8,8 @@ reference writes Option or Alt for the same key.
 ## Keys anywhere
 
 These keys work in the input box, queue, log and status bar. An open panel or
-dialog takes all keys. In the project and model lists, only the Ctrl+Q, Ctrl+C,
+dialog takes all keys. An open job list or job viewer takes all keys except
+Ctrl and Alt keys. In the project and model lists, only the Ctrl+Q, Ctrl+C,
 Ctrl+D, Ctrl+S, Ctrl+T and Ctrl+V keys in this table work.
 
 | Key | Action |
@@ -108,8 +109,12 @@ Press F6 to open the response browser.
 | Home or End | Choose the first or last response |
 | Enter or Space | Expand or collapse the response's tool activity |
 | t | Open or fold the response's thinking |
+| j | Open the job viewer for the response's command job, or choose one of its jobs |
 | Page Up or Page Down | Scroll the response |
 | Escape or F6 | Return to the input box |
+
+When a response started several jobs, j opens a list of up to 9 of them. Up
+and Down select a job, Enter opens it and Escape returns to the response.
 
 ## Status bar keys
 
@@ -142,6 +147,52 @@ Result panels show `/help`, `/config`, `/models`, `/tools` and `/audit` output.
 | Up, Down, Left or Right | Scroll a result panel that is longer than its space |
 | Tab, Left, Right, Up or Down | Change the choice in a dialog |
 | Enter | Confirm the choice in a dialog |
+| y | Answer yes to a job question, such as `Cancel job ID in project NAME? (y/n)` |
+| n | Answer no to a job question; Escape does the same and nothing is sent |
+
+## Job list keys
+
+Type `/jobs` or `/jobs all` to open the job list.
+
+| Key | Action |
+| --- | --- |
+| Up or Down | Select a job; past the first or last row, show the previous or next page |
+| Page Up or Page Down | Select the first or last row; on that row, show the previous or next page |
+| Enter | Open the job viewer for the selected job |
+| c | Cancel the selected job; a job of another project asks first |
+| p | Pin the selected job, or unpin a pinned job |
+| d | Delete the selected job's output; Asura asks first |
+| n | Write a note for the selected job; Enter adds it and Escape discards it |
+| r | Read the list again after an error |
+| Escape | Close the list |
+
+## Job viewer keys
+
+Type `/job ID`, press Enter in the job list or press j in the response browser
+to open the job viewer.
+
+| Key | Action |
+| --- | --- |
+| Tab | Switch between standard output and standard error; each keeps its position |
+| Up or Down | Scroll one line |
+| Page Up or Page Down | Scroll one page |
+| Home or End | Go to the first byte or to the current end of the output |
+| f | Start or stop following new output |
+| i | Open the job detail panel |
+| r | Read the output again after an error |
+| Escape | Close the viewer; the job keeps running |
+
+While the viewer follows, Down, Page Down and End do nothing. Up, Page Up, Tab
+and Home stop following. While a page loads, only Escape works.
+
+## Job detail keys
+
+Press i in the job viewer to open the job detail panel.
+
+| Key | Action |
+| --- | --- |
+| Up or Down | Scroll the detail panel |
+| Escape | Return to the job viewer |
 
 ## Command list keys
 

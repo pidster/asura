@@ -45,8 +45,7 @@ pub struct View {
 fn active_command(draft: &str) -> Option<std::ops::Range<usize>> {
     let end = draft.find(char::is_whitespace).unwrap_or(draft.len());
     let name = &draft[..end];
-    (draft.starts_with('/') && (LOCAL_COMMANDS.contains(&name) || JOB_COMMANDS.contains(&name)))
-        .then_some(0..end)
+    (draft.starts_with('/') && LOCAL_COMMANDS.contains(&name)).then_some(0..end)
 }
 
 /// Launch hint naming the other current projects that contain the launch directory.
@@ -105,14 +104,29 @@ const INPUT_GLOW: Color = Color::Rgb(0xCF, 0xF1, 0xFF);
 const INPUT_TEXT: Color = Color::Rgb(0xE6, 0xED, 0xF0);
 const COMMAND_AMBER: Color = Color::Rgb(0xE8, 0xB5, 0x77);
 const GAUGE_AMBER: Color = Color::Rgb(0xF2, 0xB9, 0x50);
-const LOCAL_COMMANDS: [&str; 15] = [
-    "/help", "/quit", "/exit", "/config", "/init", "/project", "/cancel", "/observe", "/retry",
-    "/queue", "/models", "/tools", "/audit", "/new", "/think",
+/// The TUI commands: completion, help and dispatch. `/jobs`, `/job` and
+/// `/execution` (tool-job-controller.md, J4 TUI; execution-setting.md)
+/// take arguments and dispatch before the no-argument check.
+const LOCAL_COMMANDS: [&str; 18] = [
+    "/help",
+    "/quit",
+    "/exit",
+    "/config",
+    "/init",
+    "/project",
+    "/cancel",
+    "/observe",
+    "/retry",
+    "/queue",
+    "/models",
+    "/tools",
+    "/audit",
+    "/new",
+    "/think",
+    "/jobs",
+    "/job",
+    "/execution",
 ];
-/// Job and execution commands (tool-job-controller.md, J4 TUI; execution-setting.md).
-/// They join `LOCAL_COMMANDS`, and so completion and the help index, once
-/// `docs/user/commands.md` has their rows (packet J34-E owns that file).
-const JOB_COMMANDS: [&str; 3] = ["/jobs", "/job", "/execution"];
 
 enum Overlay {
     Commands(CommandHeader, Option<usize>),
@@ -4921,7 +4935,7 @@ mod tests {
 
     #[test]
     fn tab_completion_is_contextual_and_never_invokes() {
-        for (prefix, full) in [("/he", "/help"), ("/qui", "/quit"), ("/ex", "/exit")] {
+        for (prefix, full) in [("/he", "/help"), ("/qui", "/quit"), ("/exi", "/exit")] {
             let mut app = App::new();
             app.handle(Event::Paste(prefix.into()));
             assert!(!key(&mut app, KeyCode::Tab, KeyModifiers::NONE));
