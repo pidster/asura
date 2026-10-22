@@ -690,7 +690,7 @@ fn pages() -> Result<()> {
     assert_eq!(before_install.text, after.text);
     assert_eq!(after.state, PageState::Complete);
     assert_eq!(after.digest, outcome.settled.stdout.digest);
-    let pool = PagePool::start(home.store.clone())?;
+    let pool = PagePool::start(home.store.clone(), 1, None)?;
     pool.hold_for_test(true);
     let request = PageRequest {
         payload: outcome.payloads[0],

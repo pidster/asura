@@ -475,7 +475,7 @@ fn j1t_10_live_page_at_the_watermark_never_splits_a_scalar() {
 fn pool_fixture() -> (Fixture, PagePool, PageRequest) {
     let f = fixture();
     let [out, _] = settled_call(&f, 1, CaptureState::Complete, b"pool\n", b"", 1, true);
-    let pool = PagePool::start(f.store.clone()).unwrap();
+    let pool = PagePool::start(f.store.clone(), 1, None).unwrap();
     let request = PageRequest {
         payload: out,
         offset: 0,
@@ -490,6 +490,73 @@ fn complete(reply: PageReply) -> String {
     };
     assert_eq!(page.state, PageState::Complete);
     page.text
+}
+
+/// J34-E page wake (J4 control handler; J4T-04): a worker notifies the
+/// reactor wake after it stores a reply, so the reply is ready when the
+/// wake arrives, with no other event.
+#[test]
+fn j34e_page_reply_wakes_the_reactor_after_it_is_stored() {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    let f = fixture();
+    let [out, _] = settled_call(&f, 1, CaptureState::Complete, b"wake\n", b"", 1, true);
+    let (reader, sender) = asura_platform::events::wake_pair().unwrap();
+    let pool = PagePool::start(f.store.clone(), 1, Some(sender)).unwrap();
+    // SAFETY: `reader` owns the descriptor and outlives this borrow; the
+    // clone is a new descriptor of the same nonblocking socket.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(reader.as_raw_fd()) };
+    let mut wake = std::os::unix::net::UnixStream::from(borrowed.try_clone_to_owned().unwrap());
+    let mut byte = [0u8; 1];
+    assert!(wake.read(&mut byte).is_err(), "no wake before a read");
+    let ticket = pool
+        .submit(
+            PageRequest {
+                payload: out,
+                offset: 0,
+                limit: 64,
+                scope: None,
+            },
+            Origin::Client,
+        )
+        .unwrap();
+    wait_until(|| matches!(wake.read(&mut byte), Ok(1)));
+    assert_eq!(
+        complete(ticket.poll().expect("stored before the wake")),
+        "wake\n"
+    );
+}
+
+/// `jobs.modelReservedPageReads` 0: no worker is reserved, so two client
+/// reads run at once; with 1 the second waits for the general worker.
+#[test]
+fn j34e_model_reserved_page_reads_zero_frees_both_workers() {
+    let f = fixture();
+    let [out, _] = settled_call(&f, 1, CaptureState::Complete, b"both\n", b"", 1, true);
+    let request = PageRequest {
+        payload: out,
+        offset: 0,
+        limit: 64,
+        scope: None,
+    };
+    let pool = PagePool::start(f.store.clone(), 0, None).unwrap();
+    pool.hold_for_test(true);
+    let first = pool.submit(request, Origin::Client).unwrap();
+    let second = pool.submit(request, Origin::Client).unwrap();
+    wait_until(|| pool.running() == 2 && pool.queued() == 0);
+    pool.hold_for_test(false);
+    assert_eq!(complete(first.wait()), "both\n");
+    assert_eq!(complete(second.wait()), "both\n");
+    // A value above 1 still leaves one general worker.
+    let pool = PagePool::start(f.store.clone(), 5, None).unwrap();
+    pool.hold_for_test(true);
+    let first = pool.submit(request, Origin::Client).unwrap();
+    let second = pool.submit(request, Origin::Client).unwrap();
+    wait_until(|| pool.running() == 1);
+    assert_eq!(pool.queued(), 1);
+    pool.hold_for_test(false);
+    assert_eq!(complete(first.wait()), "both\n");
+    assert_eq!(complete(second.wait()), "both\n");
 }
 
 /// J2T-16 (WB1): a gated read held 5 s returns its page after release, with

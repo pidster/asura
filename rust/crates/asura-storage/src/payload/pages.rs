@@ -342,6 +342,10 @@ struct Shared {
     store: Arc<PayloadStore>,
     queue: Mutex<Queue>,
     work: Condvar,
+    /// The reactor wake: a worker notifies it after it stores a reply, so
+    /// the reply reaches the reactor without another event (page wake, J4
+    /// control handler). A failed notify is ignored.
+    wake: Option<asura_platform::events::WakeSender>,
 }
 fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Queue> {
     shared.queue.lock().unwrap_or_else(|e| e.into_inner())
@@ -411,24 +415,37 @@ impl Drop for Ticket {
     }
 }
 
-/// Two retained page-read workers, one reserved for model requests, and a
-/// queue of 8 (J2 numeric limits). No replacement worker ever starts, and no
-/// time bound ends a read.
+/// Page-read workers in the pool (J2 numeric limits).
+pub const PAGE_WORKERS: u32 = 2;
+
+/// Two retained page-read workers, `jobs.modelReservedPageReads` (0 or 1)
+/// of them reserved for model requests, and a queue of 8 (J2 numeric
+/// limits). No replacement worker ever starts, and no time bound ends a
+/// read.
 pub struct PagePool {
     shared: Arc<Shared>,
 }
 impl PagePool {
-    /// Starts both workers. Fails only if a thread cannot start.
-    pub fn start(store: Arc<PayloadStore>) -> std::io::Result<Self> {
+    /// Starts both workers; the last `model_reserved` of them (at most 1)
+    /// take model requests only. `wake` is notified after each stored
+    /// reply. Fails only if a thread cannot start.
+    pub fn start(
+        store: Arc<PayloadStore>,
+        model_reserved: u32,
+        wake: Option<asura_platform::events::WakeSender>,
+    ) -> std::io::Result<Self> {
+        let reserved = model_reserved.min(PAGE_WORKERS - 1);
         let shared = Arc::new(Shared {
             store,
             queue: Mutex::new(Queue::default()),
             work: Condvar::new(),
+            wake,
         });
         let pool = Self {
             shared: shared.clone(),
         };
-        for (index, model_only) in [(0, false), (1, true)] {
+        for index in 0..PAGE_WORKERS {
+            let model_only = index >= PAGE_WORKERS - reserved;
             let shared = shared.clone();
             // A failed start drops `pool`, which closes the started worker.
             std::thread::Builder::new()
@@ -522,6 +539,9 @@ fn worker(shared: &Shared, model_only: bool) {
         if !job.slot.withdrawn() {
             let page = read_page(&shared.store, job.request);
             job.slot.deliver(PageReply::Page(page));
+            if let Some(wake) = &shared.wake {
+                let _ = wake.notify();
+            }
         }
         lock(shared)
             .running
