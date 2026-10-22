@@ -172,6 +172,13 @@ terminal tail stay at 61,440 bytes, because they travel in other frames. A
 client assembles a response from more windows; no text is lost. RT-10 and
 TL-12 test the new worst case.
 
+The journal writer's terminal window read (`ReadResponse`) uses the same
+bound, `MAX_WINDOW_TEXT` in the storage adapter, not the segment size. The
+service checks at compile time that `MAX_WINDOW_TEXT` equals
+`MAX_RESPONSE_WINDOW_BYTES`. Fixed 2026-10-22: the read still returned
+61,440-byte windows, the service could not encode the terminal event, and a
+late client of a long response saw `service_unavailable` (RT-03).
+
 ### Response revision and journaling sequence
 
 Selected design. Solid arrows are messages or journal commands; dashed arrows

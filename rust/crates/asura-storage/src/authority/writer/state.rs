@@ -328,7 +328,7 @@ impl State {
         String::from_utf8(self.text_bytes(Stream::Response, operation, 0, length)?)
             .map_err(|_| Error::RepairRequired)
     }
-    /// At most `budget` bytes (at most `MAX_TEXT`) from the largest character
+    /// At most `budget` bytes (at most `MAX_WINDOW_TEXT`) from the largest character
     /// boundary not after `offset`. Returns the window start and text.
     fn text_window(
         &mut self,
@@ -338,7 +338,7 @@ impl State {
         offset: u64,
         budget: usize,
     ) -> Result<(u64, String)> {
-        let budget = budget.min(MAX_TEXT) as u64;
+        let budget = budget.min(MAX_WINDOW_TEXT) as u64;
         let requested = offset.min(length);
         let lo = requested.saturating_sub(3);
         let fetched_end = length.min(requested + budget + 1);
@@ -1484,9 +1484,9 @@ impl State {
                     operation,
                     thinking_bytes,
                     thinking_offset,
-                    MAX_TEXT,
+                    MAX_WINDOW_TEXT,
                 )?;
-                let budget = MAX_TEXT - thinking_text.len();
+                let budget = MAX_WINDOW_TEXT - thinking_text.len();
                 let (start, text) =
                     self.text_window(Stream::Response, operation, length, offset, budget)?;
                 record.text_offset = start;

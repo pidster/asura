@@ -165,7 +165,7 @@ pub enum Command {
         locator: Locator,
     },
     /// One window of a terminal operation's response: the kind 8 record with
-    /// `text` replaced by at most `MAX_TEXT` bytes starting at the largest
+    /// `text` replaced by at most `MAX_WINDOW_TEXT` bytes starting at the largest
     /// character boundary not after `offset` (response-text-transfer.md).
     ReadResponse {
         operation: Id,

@@ -2096,7 +2096,7 @@ fn rt03_rt08_real_writer_segments_windows_history_and_restart_prefix() {
     loop {
         let (start, text, total) = rt_read(&mut writer, offset);
         assert_eq!(total as usize, full.len());
-        assert!(text.len() <= MAX_TEXT);
+        assert!(text.len() <= MAX_WINDOW_TEXT);
         assert!(start as usize <= assembled.len().max(1));
         assembled.truncate(start as usize);
         assembled.push_str(&text);
@@ -2158,6 +2158,13 @@ fn rt03_rt08_real_writer_segments_windows_history_and_restart_prefix() {
     );
     assert_eq!(op.response.len, MAX_TEXT as u64 + 2);
     drop(recovered);
+    // A window is the control event window, below one segment: a terminal
+    // event that carries it fits one control frame.
+    let (start, text, total) = rt_read(&mut writer, 0);
+    assert_eq!(
+        (start, text.len(), total),
+        (0, MAX_WINDOW_TEXT, MAX_TEXT as u64 + 2)
+    );
     let (start, text, total) = rt_read(&mut writer, MAX_TEXT as u64);
     assert_eq!(
         (start, text.as_str(), total),

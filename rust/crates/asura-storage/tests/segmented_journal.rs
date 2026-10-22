@@ -260,13 +260,14 @@ impl Session {
             reply.response_bytes.unwrap(),
         )
     }
-    /// The whole response through windows of at most 61,440 bytes.
+    /// The whole response through windows of at most 60,928 bytes, the
+    /// control event window.
     fn read_all(&self, operation: Id) -> String {
         let mut text = String::new();
         loop {
             let (start, window, total) = self.read(operation, text.len() as u64);
             assert_eq!(start, text.len() as u64);
-            assert!(window.len() <= MAX_TEXT);
+            assert!(window.len() <= MAX_WINDOW_TEXT);
             text.push_str(&window);
             if text.len() as u64 == total {
                 return text;
@@ -445,7 +446,7 @@ fn tl12_tl13_thinking_spans_segment_files_and_reads_back_whole() {
             let Some(Record::TurnTerminal(terminal)) = reply.record else {
                 panic!("terminal");
             };
-            assert!(window.text.len() + terminal.text.len() <= MAX_TEXT);
+            assert!(window.text.len() + terminal.text.len() <= MAX_WINDOW_TEXT);
             held.truncate(window.offset as usize);
             held.push_str(&window.text);
             text.truncate(terminal.text_offset as usize);

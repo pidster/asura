@@ -1124,7 +1124,7 @@ fn unregistered_name() -> Result<()> {
 /// service holds at most 184,320 unjournaled response bytes and the helper
 /// waits for credit; after release the answer reaches the journal whole, in
 /// kind 24 segments and a kind 8 tail. A client that did not observe during
-/// the turn assembles it whole from windows of at most 61,440 bytes, each in
+/// the turn assembles it whole from windows of at most 60,928 bytes, each in
 /// one control frame of at most 64 KiB, also after a service restart.
 fn long_response() -> Result<()> {
     let (mut fixture, model, project, _) = setup("response")?;
@@ -1193,7 +1193,10 @@ fn long_response() -> Result<()> {
             let frame = asura_control::encode_frame(&envelope)
                 .map_err(|e| format!("event frame: {e:?}"))?;
             assert!(frame.len() <= asura_control::MAX_FRAME_BYTES + asura_control::HEADER_BYTES);
-            assert!(event.text.as_ref().map_or(0, String::len) <= 61_440);
+            assert!(
+                event.text.as_ref().map_or(0, String::len)
+                    <= asura_control::MAX_RESPONSE_WINDOW_BYTES
+            );
             assembly.apply(&event)?;
             windows += 1;
             if assembly.done() {
@@ -1209,7 +1212,7 @@ fn long_response() -> Result<()> {
         text.len(),
         full.len()
     );
-    assert!(windows >= full.len() / 61_440);
+    assert!(windows >= full.len() / asura_control::MAX_RESPONSE_WINDOW_BYTES);
     let (bytes, replay) = fixture.journal()?;
     let op = &replay.operations[&operation];
     assert_eq!(op.response.len, full.len() as u64);
@@ -1474,7 +1477,7 @@ fn thinking() -> Result<()> {
             assert!(
                 event.text.as_ref().map_or(0, String::len)
                     + event.thinking_text.as_ref().map_or(0, String::len)
-                    <= 61_440
+                    <= asura_control::MAX_RESPONSE_WINDOW_BYTES
             );
             assembly.apply(&event)?;
             if assembly.done() {

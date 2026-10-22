@@ -56,6 +56,13 @@ pub const MAX_PROMPT: usize = 32 * 1024;
 /// Response text in one kind 24 segment or one kind 8 tail: a per-frame bound,
 /// not a response total (response-text-transfer.md).
 pub const MAX_TEXT: usize = 60 * 1024;
+/// The shared response and thinking text in one `ReadResponse` window: the
+/// control event window bound (`MAX_RESPONSE_WINDOW_BYTES`, 60,928 bytes
+/// since 2026-10-22), below `MAX_TEXT` so the terminal event that carries
+/// the window fits one control frame (response-text-transfer.md, event
+/// window bound). The service checks that the two bounds agree.
+pub const MAX_WINDOW_TEXT: usize = 60_928;
+const _: () = assert!(MAX_WINDOW_TEXT <= MAX_TEXT);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameContext {

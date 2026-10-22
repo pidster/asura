@@ -4,8 +4,13 @@
 //! no kind 8 tail, so the terminal flush writes all of it as kind 25.
 //! Pure state; the conversation owner submits journal commands and credit.
 use asura_control::MAX_RESPONSE_WINDOW_BYTES;
-use asura_storage::authority::conversation::MAX_TEXT;
+use asura_storage::authority::conversation::{MAX_TEXT, MAX_WINDOW_TEXT};
 use std::collections::VecDeque;
+
+// A terminal window read from the journal travels in the same event as a
+// live window, so the storage bound must equal the control bound
+// (response-text-transfer.md, event window bound).
+const _: () = assert!(MAX_WINDOW_TEXT == MAX_RESPONSE_WINDOW_BYTES);
 
 /// Text in one kind 24 segment or the kind 8 tail.
 pub(super) const SEGMENT_BYTES: usize = MAX_TEXT;

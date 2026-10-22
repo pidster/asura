@@ -768,7 +768,7 @@ runs. Typical journals have fewer than 10 runs.
 | Command | Change |
 | --- | --- |
 | `ReadRecord { range }` | Becomes `ReadRecord { locator }`. The locator must be one that the live state, delta or an index entry names. |
-| `ReadResponse { operation, offset, thinking_offset }` | `O` gives the length and piece count. The worker finds the last `P` entry with start at most `offset` and reads frames until the 61,440-byte window is full. Pieces in different segment files are read in order. |
+| `ReadResponse { operation, offset, thinking_offset }` | `O` gives the length and piece count. The worker finds the last `P` entry with start at most `offset` and reads frames until the window is full: 60,928 bytes of response and thinking text together (`MAX_WINDOW_TEXT`, equal to the control [event window bound](response-text-transfer.md#event-window-bound-2026-10-22)). Pieces in different segment files are read in order. |
 | `History { conversation, before, limit ≤ 8 }` | `before` is the accepted frame sequence of the oldest entry shown (SJ-D14); the `A` entry for it gives the generation. Searches `T` entries in each run and the delta below that generation, adds the active turn on the first page, merges them newest first and returns `limit + 1` to set `has_more`. |
 | `Prepare` | Returns completed prior turns newest first, from `T`, `O` and `P`, until the next turn would pass 8 MiB of prompt and response text. Older turns are reported as `omitted` (SJ-D23). The [context composer](context-composer.md#cc1-implementation-details) already omits turns that do not fit `W`. |
 | `ReadPrompt { operation }` | `O` gives the accepted locator. |

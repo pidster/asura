@@ -505,7 +505,7 @@ mod tests {
             |cursor, (held, _), _, _| {
                 requests.push((cursor, held));
                 let start = held as usize;
-                let mut end = (start + 61_440).min(full.len());
+                let mut end = (start + asura_control::MAX_RESPONSE_WINDOW_BYTES).min(full.len());
                 while !full.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -522,7 +522,7 @@ mod tests {
             |update| updates.push(update),
         )
         .unwrap();
-        assert!(requests.len() >= full.len() / 61_440);
+        assert!(requests.len() >= full.len() / asura_control::MAX_RESPONSE_WINDOW_BYTES);
         assert_eq!(requests[1], (u64::MAX, requests[1].1));
         // Partial terminal windows are not published.
         assert_eq!(updates.len(), 1);
@@ -552,11 +552,12 @@ mod tests {
             |_, (held, held_thinking), _, _| {
                 requests.push((held, held_thinking));
                 let start = held_thinking as usize;
-                let mut end = (start + 61_440).min(thinking.len());
+                let mut end =
+                    (start + asura_control::MAX_RESPONSE_WINDOW_BYTES).min(thinking.len());
                 while !thinking.is_char_boundary(end) {
                     end -= 1;
                 }
-                let room = 61_440 - (end - start);
+                let room = asura_control::MAX_RESPONSE_WINDOW_BYTES - (end - start);
                 let text = &answer[held as usize..answer.len().min(held as usize + room)];
                 Ok(Some(pb::ConversationEvent {
                     generation: Some(1),
@@ -575,7 +576,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(requests[0], (0, 0));
-        assert!(requests[1].1 > 61_000 && requests[1].0 == 0);
+        // The first window is full up to a character boundary.
+        assert!(
+            requests[1].1 >= (asura_control::MAX_RESPONSE_WINDOW_BYTES - 3) as u64
+                && requests[1].0 == 0
+        );
         assert_eq!(updates.len(), 1);
         let event = updates[0].event.as_ref().unwrap();
         assert_eq!(event.thinking_text.as_deref(), Some(thinking.as_str()));
