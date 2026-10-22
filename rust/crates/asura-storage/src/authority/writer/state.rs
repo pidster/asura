@@ -1787,7 +1787,7 @@ impl State {
                 let config = self.config()?;
                 let mut history = Vec::new();
                 let mut omitted = 0;
-                if let Some(id) = conversation {
+                let notice = if let Some(id) = conversation {
                     let found = self
                         .read(|state, store| state.find_conversation(id, store))?
                         .ok_or(Error::Invalid)?;
@@ -1795,9 +1795,18 @@ impl State {
                         return Err(Error::Conflict);
                     }
                     (history, omitted) = self.history(id)?;
+                    // The notice read: P from the previous kind 21, S the
+                    // last committed sequence, on this worker (J5 AE-01).
+                    let after = found.latest.map_or(0, |turn| turn.notice_through);
+                    self.read(|state, store| state.job_notice(id, after, store))?
                 } else if expected_generation != 0 {
                     return Err(Error::Conflict);
-                }
+                } else {
+                    JobNotice {
+                        through: self.state()?.sequence,
+                        ..JobNotice::default()
+                    }
+                };
                 held.validate().map_err(|_| Error::StaleProject)?;
                 let mut reply = self.reply();
                 reply.prepared = Some(Prepared {
@@ -1809,6 +1818,7 @@ impl State {
                     configuration_digest: config.digest,
                     history,
                     omitted,
+                    notice,
                 });
                 return Ok(reply);
             }

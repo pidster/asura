@@ -228,6 +228,11 @@ pub struct Prepared {
     pub history: Vec<(TurnAccepted, TurnTerminal)>,
     /// Older completed turns not returned.
     pub omitted: u32,
+    /// The job notice inputs (J5 binding point): P, S, the up to 9 newest
+    /// settlements in `(P, S]` and the live count at S. The turn's kind 21
+    /// records `notice.through` as `notice_through`. A new conversation
+    /// has P = 0, no settlements and no live jobs.
+    pub notice: JobNotice,
 }
 /// One project as a page lists it.
 #[derive(Clone, Debug)]

@@ -370,6 +370,7 @@ impl Replay {
                         terminal: terminal.kind,
                         accepted: op.accepted_frame,
                         completed: terminal.completed,
+                        notice_through: op.notice_through,
                     }
                     .encode(),
                 )),
@@ -731,6 +732,7 @@ impl Replay {
                     terminal,
                     accepted,
                     completed,
+                    notice_through,
                 } = Entry::decode(Tag::Turn, value)?
                 else {
                     return Err(ReplayError::Corrupt);
@@ -741,6 +743,7 @@ impl Replay {
                         operation,
                         terminal: Some(terminal),
                         accepted,
+                        notice_through,
                     }),
                     completed,
                 )
@@ -1674,11 +1677,13 @@ impl Replay {
                     prompt: &p.prompt,
                 })?,
         )?;
-        let completed = match p.original_conversation {
+        // `previous`: the notice cursor of the conversation's previous kind
+        // 21, 0 for its first turn (J5-E1).
+        let (completed, previous) = match p.original_conversation {
             None => {
                 require(p.generation == 1)?;
                 self.fresh(p.conversation, index)?;
-                0
+                (0, 0)
             }
             Some(id) => {
                 require(self.load_conversation(id, index)?)?;
@@ -1694,9 +1699,13 @@ impl Replay {
                         dispatched.is_some_and(|input| self.inputs[&input].conversation == id),
                     )?;
                 }
-                c.completed
+                (c.completed, c.latest.map_or(0, |l| l.notice_through))
             }
         };
+        // The notice cursor: below the record's own sequence and never
+        // behind the previous turn's (J5, `notice_through` replay rule).
+        let notice_through = p.composition.notice_through;
+        require(notice_through < frame.sequence && notice_through >= previous)?;
         let mut prior = BTreeSet::new();
         let mut last_generation = 0;
         for id in &p.prior_operations {
@@ -1745,6 +1754,7 @@ impl Replay {
             operation: p.operation,
             terminal: None,
             accepted: frame,
+            notice_through,
         });
         self.emit(
             Key::new(Tag::Activity, p.project, sequence),
@@ -1773,6 +1783,7 @@ impl Replay {
                 owner_generation: owner,
                 input_digest: p.input_digest,
                 accepted_frame: frame,
+                notice_through,
                 helper: None,
                 cancel: None,
                 terminal: None,
@@ -2651,6 +2662,21 @@ impl Replay {
         limit: usize,
         index: &mut dyn Index,
     ) -> Result<Vec<JobListing>> {
+        Ok(self
+            .settlement_calls(conversation, after, through, limit, index)?
+            .into_iter()
+            .map(|(listing, _)| listing)
+            .collect())
+    }
+    /// [`Self::job_settlements`] with each job's command source record.
+    fn settlement_calls(
+        &self,
+        conversation: Id,
+        after: u64,
+        through: u64,
+        limit: usize,
+        index: &mut dyn Index,
+    ) -> Result<Vec<(JobListing, Box<ToolCall>)>> {
         if after >= through {
             return Ok(Vec::new());
         }
@@ -2666,13 +2692,48 @@ impl Replay {
             let Entry::Settlement { job } = Entry::decode(Tag::Settlement, &value)? else {
                 return Err(ReplayError::Corrupt);
             };
-            let listing = self.job_listing(job, index)?.ok_or(ReplayError::Corrupt)?;
+            let (listing, call) = self
+                .job_listing_call(job, index)?
+                .ok_or(ReplayError::Corrupt)?;
             require(
                 listing.conversation == conversation && listing.settled_frame.sequence == key.disc,
             )?;
-            out.push(listing);
+            out.push((listing, call));
         }
         Ok(out)
+    }
+    /// The notice inputs of the next turn of `conversation` (J5-E1, the
+    /// `Prepare` notice read). `after` is P, the conversation's previous
+    /// kind 21 `notice_through` (0 for its first turn); S is the last
+    /// committed sequence. Returns the up to [`MAX_NOTICE_SETTLEMENTS`]
+    /// newest settlements in `(P, S]`, newest first, with their command
+    /// source records, and the conversation's live jobs at S: every
+    /// unsettled job, since each has its kind 26 at or before S and no kind
+    /// 28. A P above S is `Corrupt`.
+    pub fn job_notice(
+        &self,
+        conversation: Id,
+        after: u64,
+        index: &mut dyn Index,
+    ) -> Result<JobNotice> {
+        let through = self.sequence;
+        require(after <= through)?;
+        let settlements = self
+            .settlement_calls(conversation, after, through, MAX_NOTICE_SETTLEMENTS, index)?
+            .into_iter()
+            .map(|(listing, command)| NoticeSettlement { listing, command })
+            .collect();
+        let live = self
+            .jobs
+            .values()
+            .filter(|job| job.conversation == conversation)
+            .count();
+        Ok(JobNotice {
+            after,
+            through,
+            settlements,
+            live: u32::try_from(live).map_err(|_| ReplayError::Limit)?,
+        })
     }
     /// Projects and conversations named by the active operation or an
     /// unresolved input never leave memory.
