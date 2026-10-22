@@ -72,6 +72,79 @@ func everyToolNameAndMalformedTextUseTheSameServiceBridge(selector: String) asyn
     #expect(channel.unexpectedToolCalls == 0)
 }
 
+/// One model response with two tool calls: the second callback starts only
+/// after the service has seen the first call, so it arrives while the first is
+/// pending. After the first settles, the next request repeats the second.
+private struct ConcurrentToolScript: ToolModelBackend {
+    let first: ToolProposal
+    let second: ToolProposal
+    let firstSent: AsyncStream<Void>
+    let busyReturned: AsyncStream<ToolResult>.Continuation
+    func status() async -> BackendStatus { BackendStatus(contextTokens: 4096,
+        reportedContextTokens: 4096, contextSource: .system, supportsTools: true,
+        capabilityProfile: try! CapabilityProfile(mask: 1, provenance: .runtime)) }
+    func generate(_ input: ModelInput, snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        throw HelperError.unavailable
+    }
+    func generateWithTools(_ input: ModelInput, handler: @escaping ToolHandler,
+        snapshot: @escaping @Sendable (Snapshot) async throws -> Void) async throws {
+        try await snapshot(Snapshot(text: "", inputContext: (123, 4096)))
+        async let pending = handler(first)
+        // Declared after the async let, so it runs first: a thrown busy
+        // callback finishes the stream and the test fails instead of waiting.
+        defer { busyReturned.finish() }
+        var gate = firstSent.makeAsyncIterator()
+        _ = await gate.next()
+        let busy = try await handler(second)
+        busyReturned.yield(busy)
+        let settled = try await pending
+        let repeated = try await handler(second)
+        try await snapshot(Snapshot(text: [busy.rendered, settled.text, repeated.text].joined(separator: "|"),
+            usageTokens: 1))
+    }
+}
+
+/// EXQ-D1 (model-tool-execution.md, concurrent callback busy reply): a callback
+/// that arrives while another is pending gets the busy reply at once. It sends
+/// no ToolCall and takes no ordinal; the pending call still completes, the
+/// repeated call gets ordinal 2, and the turn completes.
+@Test func concurrentCallbackGetsBusyReplyAndTurnContinues() async throws {
+    let (firstSent, signal) = AsyncStream<Void>.makeStream()
+    let (busyReplies, busyReturned) = AsyncStream<ToolResult>.makeStream()
+    let first = ToolProposal(name: "exec_cmd", arguments: #"{"command":"printf one"}"#, source: .providerJson)
+    let second = ToolProposal(name: "exec_cmd", arguments: #"{"command":"printf two"}"#, source: .providerJson)
+    let channel = try await openToolSession(selector: "system", proposals: [],
+        backend: ConcurrentToolScript(first: first, second: second, firstSent: firstSent,
+            busyReturned: busyReturned))
+    defer { channel.close() }
+    let call = try await channel.nextToolCall()
+    #expect(call.ordinal == 1 && call.arguments == first.arguments)
+    signal.yield()
+    // The busy reply returns while ordinal 1 is still pending, before any
+    // service result; the busy callback sends no frame.
+    var busyIterator = busyReplies.makeAsyncIterator()
+    let busy = try #require(await busyIterator.next())
+    #expect(busy.status == .unavailable && busy.nextOffset == nil && !busy.truncated)
+    try await channel.reply(1, .success, "one")
+    let repeated = try await channel.nextToolCall()
+    #expect(repeated.ordinal == 2 && repeated.name == "exec_cmd" && repeated.arguments == second.arguments)
+    try await channel.reply(2, .success, "two")
+    var observed = Data(); var terminal: Asura_Model_V1_Terminal?
+    while terminal == nil {
+        let message = try await channel.next()
+        switch message.body {
+        case .chunk(let value): observed.append(value.data)
+        case .terminal(let value): terminal = value
+        case .toolCall: channel.unexpectedToolCalls += 1
+        default: break
+        }
+    }
+    #expect(terminal?.outcome == .complete)
+    #expect(channel.unexpectedToolCalls == 0)
+    #expect(String(data: observed, encoding: .utf8) == "Tool failed: unavailable\n"
+        + "tool_busy: call_pending; repeat this call after the pending result|one|two")
+}
+
 /// The helper rejects a non-LIMIT result for the over-limit ordinal as a
 /// protocol fault; recorded ordinals accept any status.
 @Test func overLimitResultMustBeLimit() throws {
@@ -278,13 +351,14 @@ final class ToolSessionChannel: @unchecked Sendable {
 }
 
 /// Opens a turn with tools enabled whose backend proposes `proposals` in order.
-func openToolSession(selector: String, proposals: [ToolProposal]) async throws -> ToolSessionChannel {
+func openToolSession(selector: String, proposals: [ToolProposal],
+    backend: (any ModelBackend)? = nil) async throws -> ToolSessionChannel {
     var fds: [Int32] = [-1, -1]
     #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
     let helper = try Transport(fd: fds[0]); let service = try Transport(fd: fds[1])
     let identity = Data(repeating: 1, count: 32)
     let session = HelperSession(transport: helper, factory: { _, _, _, _ in
-        ToolScript(proposals: proposals, source: .system)
+        backend ?? ToolScript(proposals: proposals, source: .system)
     }, buildID: identity, schemaDigest: identity)
     let running = Task { await session.run() }
     let channel = ToolSessionChannel(helper: helper, service: service, running: running)

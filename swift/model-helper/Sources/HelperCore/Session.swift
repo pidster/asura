@@ -337,7 +337,10 @@ public actor HelperSession {
     /// and arguments are never logged.
     private func requestTool(_ proposal: ToolProposal) async throws -> ToolResult {
         guard phase == .running, pendingFailure == nil, projectToolsEnabled else { throw CancellationError() }
-        guard pendingTool == nil, toolOrdinal < Limits.toolProposals else { throw BackendFailure(.outputLimit) }
+        // A concurrent callback gets the busy reply: no frame, no ordinal, no
+        // record; the turn continues (model-tool-execution.md, EXQ-D1).
+        guard pendingTool == nil else { return ToolResult.busy }
+        guard toolOrdinal < Limits.toolProposals else { throw BackendFailure(.outputLimit) }
         toolOrdinal += 1
         var call = Asura_Model_V1_ToolCall()
         call.ordinal = toolOrdinal

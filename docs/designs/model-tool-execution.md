@@ -269,6 +269,69 @@ with an explicit busy error; they do not create an unbounded continuation queue.
 Cancellation, EOF, timeout or terminal state resumes the pending continuation
 exactly once with failure. Late or mismatched results fault the private channel.
 
+### Concurrent callback busy reply
+
+Required behavior (2026-10-21, fixes defect EXQ-D1 in
+[exec_cmd qualification](exec-cmd-tool.md#qualification-decisions)). A model
+response can hold several tool calls. The SDK can then run their callbacks at the
+same time. The first callback to reach the helper session holds the one
+suspended slot. The helper answers each other callback that arrives while that
+slot is held with the busy reply below. The turn continues.
+
+- The helper does not send a `ToolCall` frame for the busy callback. The busy
+  callback takes no ordinal and does not count toward the 200 recorded calls.
+  The service sees nothing, so no kind 14 or kind 15 record exists for it.
+  A `ToolCall` for it would be a helper fault under TCR-D7.
+- The helper returns `ToolResult` status `unavailable` (4, the busy status of
+  TCR-D12) with the text
+  `tool_busy: call_pending; repeat this call after the pending result`.
+  The model reads the rendered form:
+  `Tool failed: unavailable` on the first line and that text on the second.
+  The text never holds model text.
+- The SDK adds the busy output and the pending call's result to the transcript.
+  The model may then repeat the call in its next request. The repeated call is
+  an ordinary call with the next ordinal.
+- The TUI and journal views show only the calls that reached the service. The
+  busy reply exists only in the turn's SDK transcript. Proof limit: a person
+  cannot see a busy reply after the turn. A record for it would need a new
+  helper-to-service message; this is not proposed here.
+- Loop closure: the first callback of every response takes the slot and one
+  ordinal. Busy replies therefore cannot repeat without ordinals being used. The
+  201st proposal ends the turn with `outputLimit` (known-size exhaustion,
+  TCR-D6). Each request also stops at 201 proposals (Ollama) or 8 waiting
+  native callbacks (`ToolRoundBudget`). The busy reply adds no wait and no
+  time bound.
+- Cancellation, terminal state or EOF while the first call is pending resumes
+  that call with failure, as before. A callback that arrives after the turn
+  leaves `running` gets `CancellationError`, not the busy reply.
+
+Status: selected design. The sequence shows one model response with two tool
+calls. Arrows show messages in time order.
+
+```mermaid
+sequenceDiagram
+    participant SDK as SDK session
+    participant H as Helper session
+    participant S as Service conversation owner
+    SDK->>H: Callback A
+    H->>S: ToolCall ordinal n
+    SDK->>H: Callback B while A pending
+    H-->>SDK: Busy reply, status unavailable, no ordinal
+    S->>H: ToolResult ordinal n
+    H-->>SDK: Result A
+    SDK->>H: Next request repeats B
+    H->>S: ToolCall ordinal n+1
+    S->>H: ToolResult ordinal n+1
+    H-->>SDK: Result B
+```
+
+Validation: Swift unit test `concurrentCallbackGetsBusyReplyAndTurnContinues`
+(helper session over a socket pair) checks that the busy callback sends no
+frame, that the pending call and the repeated call get ordinals 1 and 2, and
+that the turn completes. The Rust service sees no new frame or record, so no
+Rust test changes. The native regression is the EX10 journey with
+`qwen3-coder:latest` (see [exec_cmd qualification](exec-cmd-tool.md#qualification-decisions)).
+
 MT2 durable conversation integration is complete for the activated system path.
 The model owner exposes a pending typed call without another task scheduler.
 The composer context directory is a display and execution-context locator; it is

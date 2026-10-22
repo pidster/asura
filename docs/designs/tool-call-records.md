@@ -776,7 +776,9 @@ record.
 These are also helper faults with no record and `model_protocol_fault`
 (TCR-D7): a `ToolCall` before StartAuthorized commits or with tools disabled;
 an ordinal that is not the next one (a gap, or above 201); and a second call
-while one is pending.
+while one is pending. A helper never sends that second call. It answers the
+model with a busy reply and the call gets no ordinal and no record
+([concurrent callback busy reply](model-tool-execution.md#concurrent-callback-busy-reply)).
 
 ## Context composer and views
 

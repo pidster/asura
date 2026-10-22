@@ -913,9 +913,10 @@ Observations:
    remain failures; the [escape-free variants](#variant-check-2026-10-20) show
    which part fails.
 2. `qwen3-coder` proposes a second tool call while the first is pending. The
-   helper rejects it with `outputLimit` (callback code 103), and the turn fails
-   with `helper_failed`. This is known defect EXQ-D1 (see
-   [decisions](#qualification-decisions)), not a service-invariant failure.
+   helper rejected it with `outputLimit` (callback code 103), and the turn
+   failed with `helper_failed`. This was defect EXQ-D1 (see
+   [decisions](#qualification-decisions)), not a service-invariant failure. It
+   was fixed on 2026-10-21; the row above records the runs before the fix.
 3. "Empty generation" is the helper diagnostic `generated_content_empty`. The
    turn fails with `helper_failed`; no tool runs.
 4. The two unavailable MLX models were not diagnosed further. The fixture home,
@@ -949,18 +950,42 @@ errors. The other models were not rerun with the variants.
 | EXQ-1 | Owner, 2026-10-21 | All 5 of 5 runs must pass for a model to be qualified; fewer passing runs are unreliable |
 | EXQ-2 | Settled by EX10 (owner, 2026-10-14) | The campaign is the J2 prerequisite. Model verdicts do not hold J2, because EX10 keeps exec_cmd offered. Only an open service-class defect holds J2. None is open, so the EX10 prerequisite of J2 is met |
 | EXQ-3 | Engineering choice under the [iteration rules](../design-process.md#iteration-and-escalation) | Keep the exact-bytes pass rule. Add the escape-free EQ-3b and EQ-4b variants so escaping errors are told apart from copying errors |
-| EXQ-4 | Settled by [model tool execution](model-tool-execution.md) (a concurrent callback fails with an explicit busy error) | The helper's turn failure is known defect EXQ-D1, fixed in a separate packet |
+| EXQ-4 | Settled by [model tool execution](model-tool-execution.md#concurrent-callback-busy-reply) (a concurrent callback gets an explicit busy reply) | The helper's turn failure was defect EXQ-D1, fixed 2026-10-21 |
 | EXQ-5 | Settled by EX10 | exec_cmd stays offered to models that fail qualification. Proposed follow-up, not decided: show the person the model's recorded verdict when exec_cmd is offered |
 
-**Known defect EXQ-D1 (not fixed in this change).** Required behavior:
-`model-tool-execution.md` lines 267–268 say "A helper retains at most one
-suspended callback. Concurrent callbacks fail with an explicit busy error".
-Implemented behavior: `swift/model-helper/Sources/HelperCore/Session.swift`
-line 340 throws `BackendFailure(.outputLimit)` when `pendingTool` is not nil.
-The error reaches the Foundation Models session as a tool callback error;
-`Backend.swift` line 41 reports it as `tool_callback 103` (100 +
-`REASON_OUTPUT_LIMIT` 3 in `contracts/model/v1/model.proto`), and the turn fails
-with `helper_failed` (reason 9). Evidence: `qwen3-coder:latest` runs 1, 2, 3 and
-5 of 2026-10-20. The fix belongs in a separate helper packet. It must return the
-designed busy result for the second proposal without ending the turn, and add a
-unit test and a native regression with a parallel-calling model.
+**Defect EXQ-D1, fixed 2026-10-21.** Required behavior:
+[model tool execution](model-tool-execution.md#concurrent-callback-busy-reply)
+says a helper keeps at most one suspended callback and answers a concurrent
+callback with an explicit busy reply. Behavior before the fix:
+`HelperSession.requestTool` threw `BackendFailure(.outputLimit)` when
+`pendingTool` was not nil. `Backend.swift` reported it as `tool_callback 103`
+and the turn failed with `helper_failed` (reason 9). Evidence before the fix:
+`qwen3-coder:latest` runs 1, 2, 3 and 5 of 2026-10-20 (row above, 6 failed
+turns).
+
+Fix: `requestTool` now returns `ToolResult.busy` (status `unavailable`, text
+`tool_busy: call_pending; repeat this call after the pending result`). It sends
+no `ToolCall` frame and uses no ordinal, so the service writes no record. The
+design section linked above defines the reply, its loop closure and its proof
+limit. Unit evidence: `concurrentCallbackGetsBusyReplyAndTurnContinues` passes
+with the fix and fails against the old guard. The full Swift suite passed
+(117 tests).
+
+Native regression, 2026-10-21, after the fix. Environment: macOS build 26A428,
+Ollama 0.40.5, `qwen3-coder:latest` `06c1097efce0`, Asura commit `dff2f96` plus
+this fix and unrelated uncommitted asura-platform work in the tree,
+`asura-model` SHA-256 `01e1188c…2ee2088`. Five serial runs of
+`conversation_flow --native-ollama-exec-cmd-tools`:
+
+| All | EQ-1 | EQ-2 | EQ-3 | EQ-4 | EQ-3b | EQ-4b | Failure modes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0/5 | 5/5 | 5/5 | 0/5 | 3/5 | 2/5 | 4/5 | 2 or 3 exec_cmd calls where one is required (11) |
+
+No turn failed with `helper_failed`, and the helper wrote no
+`asura_model_failure` line. Every failure is model class. The journey reports
+the call count as model class only when the turn completed or was cancelled.
+The model now makes extra recorded calls instead of ending the turn. Proof
+limit: the journey cannot show the busy reply itself, because the service never
+receives it. The fixture home is deleted after each run, so the commands of the
+extra calls were not inspected. `qwen3-coder:latest` remains below the EXQ-1
+threshold.

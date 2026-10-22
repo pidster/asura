@@ -19,6 +19,10 @@ public struct ToolResult: Sendable {
     public init(status: Asura_Model_V1_ToolStatus, text: String, nextOffset: UInt64? = nil, truncated: Bool = false) {
         self.status = status; self.text = text; self.nextOffset = nextOffset; self.truncated = truncated
     }
+    /// The helper's reply to a callback that arrives while another call is
+    /// pending. It never reaches the service (model-tool-execution.md).
+    public static let busy = ToolResult(status: .unavailable,
+        text: "tool_busy: call_pending; repeat this call after the pending result")
     /// A rejection returns its service-written text so the model can correct
     /// the call (TCR-D18). The text never repeats model text.
     public var rendered: String {
