@@ -20,6 +20,8 @@ struct Fixture {
     item: RefCell<Option<Result<(), i32>>>,
     data: RefCell<Option<Result<Vec<u8>, i32>>>,
     accounts: RefCell<Option<Result<Vec<String>, i32>>>,
+    /// The `max` of every list call.
+    list_max: RefCell<Vec<usize>>,
 }
 
 impl Fixture {
@@ -73,9 +75,10 @@ impl Calls for Fixture {
         self.log.borrow_mut().push("delete");
         self.item.borrow_mut().take().expect("unscripted delete")
     }
-    fn accounts(&self, service: &str) -> Result<Vec<String>, i32> {
+    fn accounts(&self, service: &str, max: usize) -> Result<Vec<String>, i32> {
         assert_eq!(service, service_name(&INSTALLATION));
         self.log.borrow_mut().push("list");
+        self.list_max.borrow_mut().push(max);
         self.accounts.borrow_mut().take().expect("unscripted list")
     }
 }
@@ -159,10 +162,60 @@ fn every_item_call_follows_a_precheck() {
         list_with(&f, &INSTALLATION),
         Ok(Listing {
             inputs: vec![[3; 16]],
-            unrecognized: 0
+            unrecognized: 0,
+            truncated: false,
         })
     );
     assert_eq!(f.log(), ["status", "list"]);
+}
+
+/// SS-K2-1: the search asks for at most 257 results; 257 results set
+/// `truncated`; fewer leave it false.
+#[test]
+fn list_is_bounded_and_reports_truncation() {
+    assert_eq!(LIST_BOUND, 257);
+    let accounts = |n: usize, unrecognized: usize| -> Vec<String> {
+        let mut accounts: Vec<String> = (0..n - unrecognized)
+            .map(|i| {
+                let mut input = [0u8; 16];
+                input[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                ItemKey {
+                    installation: INSTALLATION,
+                    input,
+                }
+                .account()
+            })
+            .collect();
+        accounts.extend((0..unrecognized).map(|i| format!("other.{i}")));
+        accounts
+    };
+    for (n, unrecognized, truncated) in [
+        (1, 0, false),
+        (256, 0, false),
+        (256, 2, false),
+        (257, 0, true),
+        (257, 3, true),
+    ] {
+        let f = Fixture::statuses(&[Ok(0x7)]).accounts(Ok(accounts(n, unrecognized)));
+        let listing = list_with(&f, &INSTALLATION).expect("listing");
+        assert_eq!(*f.list_max.borrow(), [257], "{n}");
+        assert_eq!(listing.inputs.len(), n - unrecognized, "{n}");
+        assert_eq!(listing.unrecognized, unrecognized, "{n}");
+        assert_eq!(listing.truncated, truncated, "{n}");
+    }
+    // No match is an empty listing, not truncated.
+    let f = Fixture::statuses(&[Ok(0x7)]).accounts(Err(-25_300));
+    assert_eq!(list_with(&f, &INSTALLATION), Ok(Listing::default()));
+    assert_eq!(*f.list_max.borrow(), [257]);
+    // More results than asked for is a shape the request cannot produce.
+    let f = Fixture::statuses(&[Ok(0x7)]).accounts(Ok(accounts(258, 0)));
+    assert_eq!(
+        list_with(&f, &INSTALLATION),
+        Err(Failure::Unavailable {
+            status: UNEXPECTED_RESULT_STATUS,
+            item_call: true
+        })
+    );
 }
 
 /// SS-U3: -25293 and -25308 map by the unlock bit of a second status call.
@@ -223,7 +276,8 @@ fn status_table_rows() {
         list_with(&f, &INSTALLATION),
         Ok(Listing {
             inputs: vec![[4; 16], [5; 16]],
-            unrecognized: 1
+            unrecognized: 1,
+            truncated: false,
         })
     );
 }
@@ -354,7 +408,8 @@ mod scratch_keychain {
             keychain.list(&INSTALLATION),
             Ok(Listing {
                 inputs: vec![[1; 16]],
-                unrecognized: 0
+                unrecognized: 0,
+                truncated: false,
             })
         );
         assert_eq!(keychain.list(&[0x5a; 16]), Ok(Listing::default()));
@@ -444,6 +499,117 @@ mod scratch_keychain {
             "{deleted:?}"
         );
         eprintln!("R2 delete of another binary's item: {deleted:?}");
+        drop(keychain);
+        scratch.delete_keychain();
+    }
+
+    /// SS1-K2: `fixture_main` writes an account outside the item contract
+    /// through `add_account`, and rejects a service outside it with exit 2
+    /// and no write.
+    #[test]
+    fn fixture_writes_an_unrecognized_account() {
+        let mut scratch = Scratch::new();
+        let Target::Scratch { password, .. } = scratch.target() else {
+            unreachable!()
+        };
+        let run = |service: &str, account: &str| {
+            Command::new(fixture_binary())
+                .arg(scratch.path())
+                .arg(password.as_str())
+                .arg(service)
+                .arg(account)
+                .output()
+                .expect("run keychain fixture")
+        };
+        let output = run(&key(7).service(), "other");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "stored",
+            "fixture stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success());
+        let output = run(&key(7).service(), "other");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "duplicate");
+        assert_eq!(output.status.code(), Some(1));
+        let output = run("asura.other.service", "other");
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.status.code(), Some(2));
+        let keychain = scratch.open();
+        assert_eq!(
+            keychain.list(&INSTALLATION),
+            Ok(Listing {
+                inputs: vec![],
+                unrecognized: 1,
+                truncated: false,
+            })
+        );
+        drop(keychain);
+        scratch.delete_keychain();
+    }
+
+    /// SS1-K2: `add_account` writes only to a scratch target, with the same
+    /// add replies as `Keychain::add`; list counts the account unrecognized.
+    #[test]
+    fn add_account_writes_an_unrecognized_account() {
+        let mut scratch = Scratch::new();
+        let keychain = scratch.open();
+        let target = scratch.target();
+        assert_eq!(
+            scratch::add_account(&Target::Default, &INSTALLATION, "other", b"x"),
+            Err(Failure::Invalid)
+        );
+        assert_eq!(
+            scratch::add_account(target, &INSTALLATION, "", b"x"),
+            Err(Failure::Invalid)
+        );
+        assert_eq!(
+            scratch::add_account(target, &INSTALLATION, "other", b""),
+            Err(Failure::Invalid)
+        );
+        assert_eq!(
+            scratch::add_account(target, &INSTALLATION, "other", b"x"),
+            Ok(Added::Stored)
+        );
+        assert_eq!(
+            scratch::add_account(target, &INSTALLATION, "other", b"x"),
+            Ok(Added::Duplicate)
+        );
+        assert_eq!(keychain.add(&key(1), b"one"), Ok(Added::Stored));
+        assert_eq!(
+            keychain.list(&INSTALLATION),
+            Ok(Listing {
+                inputs: vec![[1; 16]],
+                unrecognized: 1,
+                truncated: false,
+            })
+        );
+        assert_eq!(keychain.list(&[0x5a; 16]), Ok(Listing::default()));
+        drop(keychain);
+        scratch.delete_keychain();
+    }
+
+    /// SS1-K2 and SS-P3: a numeric match limit caps a real file-keychain
+    /// list; a larger limit returns every item.
+    #[test]
+    fn match_limit_caps_the_list() {
+        let mut scratch = Scratch::new();
+        let keychain = scratch.open();
+        for input in 1..=3 {
+            assert_eq!(keychain.add(&key(input), b"v"), Ok(Added::Stored));
+        }
+        let service = service_name(&INSTALLATION);
+        assert_eq!(keychain.status().map(drop), Ok(()));
+        assert_eq!(
+            Calls::accounts(&keychain, &service, 2).map(|a| a.len()),
+            Ok(2)
+        );
+        assert_eq!(
+            Calls::accounts(&keychain, &service, LIST_BOUND).map(|a| a.len()),
+            Ok(3)
+        );
+        let listing = keychain.list(&INSTALLATION).expect("listing");
+        assert_eq!((listing.inputs.len(), listing.truncated), (3, false));
         drop(keychain);
         scratch.delete_keychain();
     }

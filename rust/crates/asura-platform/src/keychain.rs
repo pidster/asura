@@ -1,5 +1,5 @@
 //! macOS Keychain calls for the durable secret store
-//! (`docs/designs/secret-store.md`, packet SS1-K).
+//! (`docs/designs/secret-store.md`, packets SS1-K and SS1-K2).
 //!
 //! Every function that takes a [`Keychain`] or a [`Target`] makes IPC calls
 //! to securityd and can wait without a bound. Call them only on the secret
@@ -33,6 +33,10 @@ pub const ACCOUNT_PREFIX: &str = "input.";
 pub const LABEL: &str = "Asura queued command secrets";
 /// Largest item data the store writes: the largest payload of the design.
 pub const MAX_ITEM_BYTES: usize = 55_413;
+
+/// Most results one list asks for: the 256-item limit plus one. A listing of
+/// this many results is truncated and means "more than 256 items".
+pub const LIST_BOUND: usize = 257;
 
 /// `SecKeychainGetStatus` flag: the keychain is unlocked.
 pub const STATUS_UNLOCKED: u32 = 0x1;
@@ -124,12 +128,15 @@ pub enum Removed {
     Absent,
 }
 
-/// Reply to [`Keychain::list`]: the input IDs of this installation's items.
+/// Reply to [`Keychain::list`]: the input IDs of this installation's items,
+/// from at most [`LIST_BOUND`] results.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Listing {
     pub inputs: Vec<[u8; 16]>,
     /// Items under this service whose account is not `input.<32 hex>`.
     pub unrecognized: usize,
+    /// [`LIST_BOUND`] results returned, so more items may exist than listed.
+    pub truncated: bool,
 }
 
 /// One secret item's service and account attributes.
@@ -300,8 +307,8 @@ impl Keychain {
         delete_with(self, key)
     }
 
-    /// Pre-checks, then lists the items of one installation. Items of other
-    /// installations are never listed.
+    /// Pre-checks, then lists the items of one installation, at most
+    /// [`LIST_BOUND`] of them. Items of other installations are never listed.
     pub fn list(&self, installation: &[u8; 16]) -> Result<Listing, Failure> {
         list_with(self, installation)
     }
@@ -324,7 +331,8 @@ pub(crate) trait Calls {
     fn add(&self, service: &str, account: &str, data: &[u8]) -> Result<(), i32>;
     fn copy(&self, service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>, i32>;
     fn delete(&self, service: &str, account: &str) -> Result<(), i32>;
-    fn accounts(&self, service: &str) -> Result<Vec<String>, i32>;
+    /// The account attributes of at most `max` items under `service`.
+    fn accounts(&self, service: &str, max: usize) -> Result<Vec<String>, i32>;
 }
 
 impl Calls for Keychain {
@@ -373,11 +381,12 @@ impl Calls for Keychain {
             .delete()
             .map_err(|error| error.code())
     }
-    fn accounts(&self, service: &str) -> Result<Vec<String>, i32> {
+    fn accounts(&self, service: &str, max: usize) -> Result<Vec<String>, i32> {
+        let limit = i64::try_from(max).map_err(|_| UNEXPECTED_RESULT_STATUS)?;
         let results = self
             .search(service)
             .load_attributes(true)
-            .limit(Limit::All)
+            .limit(Limit::Max(limit))
             .search()
             .map_err(|error| error.code())?;
         results
@@ -427,11 +436,22 @@ pub(crate) fn add_with<C: Calls + ?Sized>(
     key: &ItemKey,
     data: &[u8],
 ) -> Result<Added, Failure> {
+    add_raw_with(calls, &key.service(), &key.account(), data)
+}
+
+/// The one add path: bounds, pre-check, add and status mapping. Production
+/// reaches it only through [`add_with`] with an [`ItemKey`]'s attributes.
+fn add_raw_with<C: Calls + ?Sized>(
+    calls: &C,
+    service: &str,
+    account: &str,
+    data: &[u8],
+) -> Result<Added, Failure> {
     if data.is_empty() || data.len() > MAX_ITEM_BYTES {
         return Err(Failure::Invalid);
     }
     precheck(calls)?;
-    match calls.add(&key.service(), &key.account(), data) {
+    match calls.add(service, account, data) {
         Ok(()) => Ok(Added::Stored),
         Err(ERR_SEC_DUPLICATE_ITEM) => Ok(Added::Duplicate),
         Err(code) => Err(classify(calls, code)),
@@ -462,9 +482,18 @@ pub(crate) fn list_with<C: Calls + ?Sized>(
     installation: &[u8; 16],
 ) -> Result<Listing, Failure> {
     precheck(calls)?;
-    match calls.accounts(&service_name(installation)) {
+    match calls.accounts(&service_name(installation), LIST_BOUND) {
+        // More results than the match limit is a shape the request cannot
+        // produce.
+        Ok(accounts) if accounts.len() > LIST_BOUND => Err(Failure::Unavailable {
+            status: UNEXPECTED_RESULT_STATUS,
+            item_call: true,
+        }),
         Ok(accounts) => {
-            let mut listing = Listing::default();
+            let mut listing = Listing {
+                truncated: accounts.len() == LIST_BOUND,
+                ..Listing::default()
+            };
             for account in accounts {
                 match parse_account(&account) {
                     Some(input) => listing.inputs.push(input),
@@ -567,6 +596,76 @@ pub mod scratch {
                 status,
                 item_call: false,
             }),
+        }
+    }
+
+    /// Adds one item under `service_name(installation)` with any non-empty
+    /// `account`, so tests can write accounts outside the item contract
+    /// (SS-W9). Opens only a scratch target and uses the same pre-check, add
+    /// and status mapping as [`Keychain::add`].
+    pub fn add_account(
+        target: &Target,
+        installation: &[u8; 16],
+        account: &str,
+        data: &[u8],
+    ) -> Result<Added, Failure> {
+        let Target::Scratch { .. } = target else {
+            return Err(Failure::Invalid);
+        };
+        if account.is_empty() || account.contains('\0') {
+            return Err(Failure::Invalid);
+        }
+        let keychain = Keychain::open(target)?;
+        add_raw_with(&keychain, &service_name(installation), account, data)
+    }
+
+    /// The data every fixture item holds.
+    pub const FIXTURE_DATA: &[u8] = b"asura keychain fixture item";
+
+    /// The body of every keychain fixture binary (SS-I7, SS-W3, SS-W9).
+    ///
+    /// `<fixture> <scratch keychain path> <password> <service> <account>`
+    /// writes one generic-password item into an existing scratch keychain.
+    /// The binary is a different executable from the test that runs it, so
+    /// the item's default ACL does not trust the test binary. An
+    /// `input.<32 hex>` account is written by [`Keychain::add`], any other
+    /// account by [`add_account`]; both pre-check the target first and never
+    /// write to a missing keychain. Prints one reply word: `stored` exits 0,
+    /// `duplicate` or a failure exits 1, a usage error exits 2.
+    pub fn fixture_main() -> std::process::ExitCode {
+        use std::process::ExitCode;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let [path, password, service, account] = args.as_slice() else {
+            eprintln!("usage: <fixture> <keychain path> <password> <service> <account>");
+            return ExitCode::from(2);
+        };
+        let Some(installation) = service.strip_prefix(SERVICE_PREFIX).and_then(parse_hex_id) else {
+            eprintln!("service does not follow the item contract");
+            return ExitCode::from(2);
+        };
+        let target = Target::Scratch {
+            path: PathBuf::from(path),
+            password: Zeroizing::new(password.clone()),
+        };
+        let reply = match ItemKey::parse(service, account) {
+            Some(key) => {
+                Keychain::open(&target).and_then(|keychain| keychain.add(&key, FIXTURE_DATA))
+            }
+            None => add_account(&target, &installation, account, FIXTURE_DATA),
+        };
+        match reply {
+            Ok(Added::Stored) => {
+                println!("stored");
+                ExitCode::SUCCESS
+            }
+            Ok(Added::Duplicate) => {
+                println!("duplicate");
+                ExitCode::from(1)
+            }
+            Err(failure) => {
+                println!("{failure:?}");
+                ExitCode::from(1)
+            }
         }
     }
 }
