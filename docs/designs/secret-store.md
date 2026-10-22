@@ -1,6 +1,8 @@
 # Durable secret store
 
-Status: proposed design, 2026-10-20; revised 2026-10-22 for SS1 code. The
+Status: proposed design, 2026-10-20; revised 2026-10-22 for SS1 code.
+Packets SS1-K, SS1-K2 and SS1-S are implemented on `main` (2026-10-22); the
+person command path (SL5 with P2 and P3) is not. The
 owner selected the required behavior on 2026-10-20 (decision
 [SO6](secret-detection.md#owner-decisions)): the secret store is durable, in
 the macOS Keychain, so a queued person command with secrets and a queued `!!`
@@ -22,9 +24,15 @@ raised seven gaps; this revision resolves them
 showed that a rebuilt service binary can delete the items of the previous
 build. Items that a build still cannot delete are now
 [stranded items](#stranded-and-unrecognized-items). Packet SS1-K2 (a small
-platform follow-up) and then SS1-S are ready for implementation. The rest of
-the store is not implemented. Protocol numbering remains `0.1`; journal
-format remains `1`.
+platform follow-up) and then SS1-S are ready for implementation. Protocol
+numbering remains `0.1`; journal format remains `1`.
+
+Third revision of 2026-10-22: SS1-K2 (`1968bbe`) and SS1-S (`2c17a53`) are
+implemented. The SS1-S report's choices and gaps are recorded in
+[SS1-S implementation record](#ss1-s-implementation-record-2026-10-22). The
+owner's half of the store (put at submit, get at dispatch, delete on
+settlement, the replay live set, audit emission and the observer field) is
+packet P3-E and is not implemented.
 
 ## Scope
 
@@ -97,7 +105,7 @@ its job's later output deletion.
 | --- | --- | --- |
 | Keychain calls: add, read, delete, bounded list, status pre-check; user-interaction lock; scratch keychain create, lock and delete for tests; the fixture writer | Module `asura-platform::keychain` over `security-framework`, plus narrow `extern "C"` wrappers ([unsafe wrappers](#unsafe-wrappers)) | SS1-K delivered; SS1-K2 adds the list bound and the shared fixture function |
 | Status code to `Failure` mapping, including the second `SecKeychainGetStatus` call after -25293 or -25308 | `asura-platform::keychain` (`classify`) | SS1-K delivered ([status mapping](#status-mapping)) |
-| `Failure` to reply mapping, request queue, worker thread, item payload codec, binding check, sweep, item count, stranded and unrecognized counts | New module `asura-service::secret_store` | New (SS1-S) |
+| `Failure` to reply mapping, request queue, worker thread, item payload codec, binding check, sweep, item count, stranded and unrecognized counts | Module `asura-service::secret_store` (`secret_store.rs`, `secret_store/{codec,port,worker}.rs`), declared `pub mod secret_store;` so the integration tests reach it | Implemented (SS1-S, `2c17a53`) |
 | When to write and read | Conversation owner (`asura-service/src/conversation.rs`): `put` at submit, `get` at dispatch | Calls the store |
 | When to delete | Conversation owner: on `JobEvent::Settled` for a person-origin job (after kind 28 commits), after a kind 13 Drop commits, after a definite kind 31 rejection, and on a dispatch `mismatch` | Calls the store; the job controller never calls it |
 | Values in flight to the spawn | Existing secret detection environment path and guardian; the launch environment through the [person environment descriptor](person-command-mode.md#platform-changes) | P1 |
@@ -405,7 +413,7 @@ delete succeed while the keychain is locked, so the sweep runs while locked.
 
 ### SS-F1: startup sweep
 
-Selected design, revised twice on 2026-10-22. Arrows are decisions in order.
+Selected design, revised three times on 2026-10-22. Arrows are decisions in order.
 Every list and delete box is one platform call, which runs the target
 pre-check first. The `Next` loop ends when no listed item is left. The
 `Again` loop ends because each repeat deletes at least one item of a finite
@@ -419,7 +427,7 @@ flowchart TD
     List -->|"Items listed"| Next{"Next listed item?"}
     Next -->|"Account not input.32 hex"| Unrec["Count unrecognized; never read or delete"]
     Unrec --> Next
-    Next -->|"Input item"| Live{"Input live: queued, held, waiting or dispatched without settlement?"}
+    Next -->|"Input item"| Live{"Input live (queued, held, waiting or dispatched without settlement), or stored by this worker and not deleted?"}
     Live -->|Yes| Keep["Keep"]
     Keep --> Next
     Live -->|No| Del["Delete item"]
@@ -433,7 +441,10 @@ flowchart TD
     Again -->|No| Done2["Sweep complete; audit counts; observer: count, stranded, unrecognized"]
 ```
 
-Items of other installation IDs are never listed or touched. A listing that
+Items of other installation IDs are never listed or touched. An item that
+this worker stored and has not deleted counts as live even when the replay
+live set omits it, so a sweep never deletes a just-written item whose kind 31
+is still being appended (recorded 2026-10-22 from SS1-S). A listing that
 is still truncated when the sweep ends sets the count to 257, so `put` is
 refused with `full` until the person removes items.
 
@@ -443,11 +454,11 @@ refused with `full` until the person removes items.
 | --- | --- | --- |
 | `put` | Installation, input ID, binding, payload | `stored`, `exists_same`, `exists_different`, `locked`, `denied`, `unavailable`, `full` |
 | `get` | Installation, input ID, binding | `values`, `missing`, `mismatch`, `locked`, `denied`, `unavailable` |
-| `delete` | Installation, input ID | `deleted`, `absent`, `denied`, `unavailable` |
+| `delete` | Installation, input ID | `deleted`, `absent`, `locked`, `denied`, `unavailable` |
 | `sweep` | Installation, live input IDs from replay | Counts: kept, deleted, failed, stranded, unrecognized; whether the last listing was truncated |
 
-A full worker queue (16 requests) answers `busy` before the request reaches
-the worker.
+A full worker queue (16 requests, counting the request the worker is running)
+answers `busy` before the request reaches the worker.
 
 ### Status mapping
 
@@ -483,10 +494,10 @@ results to replies with this table and nothing else:
 | Platform result | Worker reply |
 | --- | --- |
 | `Added::Stored` | `stored` |
-| `Added::Duplicate` | `get` the item, then compare digests: `exists_same` or `exists_different`; that `get`'s failure gives its own reply |
+| `Added::Duplicate` | `get` the item, then compare digests: `exists_same` or `exists_different`; that `get`'s failure gives its own reply. A `get` that returns `Found::Missing` after the duplicate (the item was deleted between the two calls) gives `unavailable` with status -25300 |
 | `Found::Data`, `Found::Missing` | Decode and bind: `values` or `mismatch`; `missing` |
 | `Removed::Deleted`, `Removed::Absent` | `deleted`, `absent` |
-| `Failure::Locked` | `locked` |
+| `Failure::Locked` | `locked`, for `put`, `get` and `delete` alike; a locked delete leaves an orphan for the next sweep |
 | `Failure::Denied` | `denied`; on a delete, the item becomes stranded |
 | `Failure::Unavailable { status, .. }` | `unavailable`, with `status` in audit and in `last_status` |
 | `Failure::Invalid` | `unavailable` with status 0 and audit reason `invalid_request`. The codec and the item key rules make this unreachable; reaching it is a defect that SS-U10 detects |
@@ -641,7 +652,10 @@ message SecretStoreStatus {
 
 The count is the number of items the last sweep listed, plus the items the
 worker has stored since, minus the items it has deleted since. It is absent
-until the first sweep completes. A `denied` delete adds the input to the
+until the first sweep completes. After a sweep that ends on a truncated
+listing the count stays 257 until a later listing returns fewer. `last_status`
+is cleared to 0 by the next port call that does not fail (recorded 2026-10-22
+from SS1-S). A `denied` delete adds the input to the
 stranded set; a later `deleted` or `absent` reply removes it. The TUI shows
 these fields only in `/status` detail; they are not in the top pane. When
 `stranded_count` is above 0, `/status` shows the
@@ -732,11 +746,11 @@ mapping and a scratch keychain only:
 | SS-U1 | Payload codec at every bound (16 variables of 8,192 bytes in total; whole-command 8,192; 1,024 launch entries and 40,960 bytes), plus one over each; unknown version; trailing bytes; maximum payload 55,413 bytes | Exact round trip; each invalid form rejected |
 | SS-U2 | Binding digest vectors; an item read under another input or installation | `mismatch` |
 | SS-U3 | SS1-K, platform. Status mapping with fixture codes, including -25293 and -25308 with status flags `0x2` and `0x7`, -25244, -25294, -25300 after a pre-check of 0 and a list -25300, and a non-zero pre-check | Each `Failure` as the revised table lists; no item call after a non-zero pre-check |
-| SS-U4 | Ordering: put failure, put then append rejected, append uncertain, `JobEvent::Settled`, Drop | No record before `stored`; delete only after the deciding record; uncertain keeps the item |
+| SS-U4 | P3-E. Ordering: put failure, put then append rejected, append uncertain, `JobEvent::Settled`, Drop | No record before `stored`; delete only after the deciding record; uncertain keeps the item |
 | SS-U5 | Queue: 17th request; full queue on a settlement delete | `busy`; delete left for the sweep |
-| SS-U6 | Sweep decision over a fixture replay state: queued, held, waiting, dispatched, settled, dropped, unknown input | Keep the first four; delete the rest |
-| SS-U7 | Target selection from a scratch runtime root; a production build | Never the default keychain from the harness; `Target::Scratch` absent without `test-support` |
-| SS-U8 | Exact retry with equal and different values; retry after the item was deleted | Original input ID; `request_conflict`; original input ID with no new item |
+| SS-U6 | Store half SS1-S (keep exactly the live set it is given); owner half P3-E (the live set built from a fixture replay state). States: queued, held, waiting, dispatched, settled, dropped, unknown input | Keep the first four; delete the rest |
+| SS-U7 | Store half SS1-S (`Store::new` takes a `Target`); harness half P3-E (`test_support.rs` creates the scratch keychain). Target selection from a scratch runtime root; a production build | Never the default keychain from the harness; `Target::Scratch` absent without `test-support` |
+| SS-U8 | Equal and different values SS1-S (keyed digest); retry after the item was deleted P3-E (needs the kind 31 request digest). Exact retry with equal and different values; retry after the item was deleted | Original input ID; `request_conflict`; original input ID with no new item |
 | SS-U9 | SS1-K, platform. Pre-check order with the recording `Calls` fixture | Every add, get, list and delete is preceded by a status call in the same platform call; a non-zero status prevents the item call |
 | SS-U10 | SS1-S. Scripted port returns each platform result of the [worker reply table](#status-mapping), including `Added::Duplicate` followed by each `get` result, and `Failure::Invalid` | Each worker reply as the table lists; `Invalid` gives `unavailable` with status 0 and audit `invalid_request` |
 | SS-U11 | SS1-S. Sweep over a scripted port: a denied delete; a later sweep where it succeeds; 2 unrecognized accounts; a truncated listing of 257 where the pass deletes 3, then a listing of 254; a truncated listing where the pass deletes nothing; a `denied` delete after settlement | Stranded count 1, then 0; unrecognized counted, never deleted or read; second listing made, then sweep ends; no second listing when nothing was deleted, count 257 and `put` gives `full`; stranded set holds at most 16 IDs while the count keeps the total |
@@ -778,8 +792,10 @@ own thin binary, and the fixture logic exists once:
 - SS1-S adds `asura-service/src/bin/secret_store_fixture.rs`, which calls
   `fixture_main()`, with `[[bin]] name = "secret_store_fixture"`,
   `required-features = ["test-support"]`, `test = false`.
-- The SS-W cases are the integration test `asura-service/tests/secret_store_worker.rs`
-  (`required-features = ["test-support"]`). They run the fixture with
+- The SS-W cases are the integration test `asura-service/tests/secret_store.rs`,
+  declared as `[[test]] name = "secret_store"` with
+  `required-features = ["test-support"]` (recorded 2026-10-22; the design
+  first named it `secret_store_worker.rs`). They run the fixture with
   `env!("CARGO_BIN_EXE_secret_store_fixture")`. A missing feature fails the
   build of the test, not the test run.
 - The fixture's file name differs from the test executable's, so, by probe
@@ -828,8 +844,8 @@ read or written.
 
 ### SS-P: delivery order
 
-Selected plan, revised 2026-10-22. Arrows mean "is a prerequisite of". SS1
-does not depend on the job packets; SL5 needs both. The packet names match the
+Selected plan, revised 2026-10-22 (third revision adds PACE-1). Arrows mean
+"is a prerequisite of". SS1 does not depend on the job packets; SL5 needs both. The packet names match the
 [person command packet split](person-command-mode.md#packet-split).
 
 ```mermaid
@@ -840,7 +856,9 @@ flowchart TD
     Rerun --> SSK["SS1-K delivered: asura-platform::keychain, wrappers, fixture binary"]
     SSK --> Gaps["SS1-K gap resolution and probe SS-P3 (2026-10-22)"]
     Gaps --> SSK2["SS1-K2: list bound 257, fixture_main, add_account; SS-K2-1"]
-    SSK2 --> SSS["SS1-S: worker, KeychainPort, codec, sweep, stranded counts, secret_store_fixture; SS-U and SS-W cases"]
+    SSK2 --> SSS["SS1-S implemented: worker, KeychainPort, codec, sweep, stranded counts, secret_store_fixture; SS-U and SS-W store cases"]
+    SSS --> PACE["PACE-1 shared pacing helper, after the J3 integration branch"]
+    PACE --> SL5
     J["J2-J5 delivered"] --> SL5["SL5 with P2 and P3: SS-I1 to SS-I11"]
     SSS --> SL5
     SL7["SL7: whole-command variable"] --> SL5
@@ -909,6 +927,79 @@ precedes SS1-S. It delivers:
    platform R2 test keeps passing unchanged.
 3. No change to the status mapping, the pre-check or the wrappers.
 
+## SS1-S implementation record (2026-10-22)
+
+Recorded from the SS1-S report and the merged code (`2c17a53`). These are
+selected (engineering) choices of the store; the owner's rules above are
+unchanged.
+
+**Packaging.** The module is `pub mod secret_store;` in `asura-service`,
+because the integration test reaches it through the public path. The SS-W
+cases are `asura-service/tests/secret_store.rs` (`[[test]] name =
+"secret_store"`, `required-features = ["test-support"]`). The fixture binary
+is `secret_store_fixture`, as [fixture binary](#fixture-binary) states.
+
+**Store behavior.**
+
+| Topic | Choice |
+| --- | --- |
+| Queue | The 16-request bound counts the request the worker is running |
+| `put` before the first sweep | When the item count is unknown, `put` lists once before the add, so the 256-item rule always uses a listed count |
+| Items of this worker | An item that this worker stored and has not deleted is never deleted by a sweep, even when the live set omits it. A retried sweep reuses the live set of the original `sweep` request from replay |
+| Pending sweep | A sweep deferred by `unavailable` is retried before the worker's next request, on the worker thread |
+| Duplicate then missing | `Added::Duplicate` followed by `Found::Missing` gives `unavailable` with status -25300 ([status mapping](#status-mapping)) |
+| `last_status` | Cleared to 0 by the next port call that does not fail |
+| `delete` while locked | Replies `locked`; the item stays as an orphan for the next sweep |
+| Truncated listing | After a sweep that ends truncated, the count stays 257 and `put` gives `full` |
+| Locked-at-dispatch pacing | `secret_store::Recheck`: 1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart; the owner resets it when the command leaves the wait. [PACE-1](#shared-pacing-helper-pace-1) replaces it with the shared helper |
+
+**Codec.** Secret variable numbers are strictly ascending. Each secret value
+is at least 1 byte. A launch environment value may be empty; a name may not.
+These add to the [payload](#payload) bounds, which are unchanged.
+
+**Left to P3-E.** SS1-S delivers the store and the worker layer only. These
+need kind 31, replay or the owner, and belong to
+[P3-E](person-command-mode.md#packet-split):
+
+- SS-U4, ordering against kind 31;
+- the owner half of SS-U6, the live set from replay;
+- the harness half of SS-U7, the scratch keychain in `test_support.rs`;
+- the retry-after-delete case of SS-U8, which needs the kind 31 request
+  digest;
+- emission of the `secret_store.*` audit events;
+- wiring of `ServiceObservation` field 8 from `Store::observation`.
+
+### Shared pacing helper (PACE-1)
+
+Selected (engineering, 2026-10-22), from the SS1-S report. The owner's pacing
+pattern of 2026-10-19 (1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart;
+pacing only, it ends nothing) has four copies today:
+
+| Copy | Code |
+| --- | --- |
+| Journal writer held recheck | `asura-storage/src/authority/writer/mod.rs` |
+| Job controller `disk_space` recheck | `DiskRecheck`, `asura-service/src/job_controller.rs` |
+| Capture worker paused-capture retry | `Backoff`, `asura-service/src/capture_worker.rs` |
+| Locked-at-dispatch recheck | `Recheck`, `asura-service/src/secret_store.rs` |
+
+One source of truth: packet **PACE-1** adds one pure type,
+`asura_platform::pacing::Fibonacci`, with the 1 s start, the 60 s cap, a
+`next_delay()` that advances the sequence and a `reset()`. `asura-platform` is
+the lowest crate that both `asura-storage` and `asura-service` depend on; the
+type makes no OS call. The four copies then use it and keep only their own
+wake and reset rules.
+
+- **Owned paths:** `asura-platform/src/pacing.rs` (new) and its `pub mod`
+  line in `asura-platform/src/lib.rs`; the pacing code and its unit tests in
+  the four files above and in `job_controller/tests.rs`,
+  `capture_worker/tests.rs` and `secret_store/tests.rs`.
+- **Order:** after the J3 integration branch merges, because J34-K and J3-D
+  edit `job_controller.rs` and `capture_worker.rs` there; before P3-K and
+  P3-T, which edit the same files.
+- **Validation:** one unit vector in `pacing.rs`
+  (1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 60, 60) and `reset()`; the four existing
+  pacing tests keep their vectors unchanged. No behavior changes.
+
 ## SS1-K gap resolution (2026-10-22)
 
 | Gap from the SS1-K report | Resolution |
@@ -970,5 +1061,11 @@ the repository, run against one scratch keychain that it created and then
 deleted; it made no call on the login keychain. No product code or test was
 written or run. SS-O1, SS-S1, SS-F1 and SS-P changed and were rendered with Mermaid
 CLI and inspected.
+
+Recorded on 2026-10-22 (third revision): written from the SS1-S report and
+the merged code at commit `1a5991a` (`asura-service/src/secret_store.rs`,
+`secret_store/*.rs`, `tests/secret_store.rs`, `Cargo.toml`). SS-F1 and SS-P
+changed and were rendered with Mermaid CLI and inspected. No code or test was run by the
+design writer.
 
 Return to the [design index](README.md).

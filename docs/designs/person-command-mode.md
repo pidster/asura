@@ -1300,8 +1300,10 @@ these reasons:
 | Not started | A cancel before spawn (its cancel reason), 12 `cwd_unavailable`, 13 `project_changed`, 14 `sandbox_unavailable`, 15 `spawn_failed`, 16–18, and 20 `outside_sandbox_off` (`!!` only, at slot grant) |
 | Interrupted | 11 `restart`; effects unknown |
 
-Reason code 20 `outside_sandbox_off` is added to the
-[job reason table](tool-job-controller.md#job-reason-codes) by packet P2.
+Reason code 20 `outside_sandbox_off` is in the
+[job reason table](tool-job-controller.md#job-reason-codes). Packet J34-G
+added it to the audit enum and packet J34-S to the journal codec (recorded
+2026-10-22); P2 no longer adds it, and P3-K is its first producer.
 
 Audit and profile notes (recorded 2026-10-22 from packet J2-G): the audit
 `JobProfile` value has only `model-1`; packet P1 adds `person-1` and
@@ -2013,7 +2015,7 @@ reads or writes `~/.asura` or the login keychain.
 | SS1-K2 Keychain platform follow-up | `asura-platform/src/keychain.rs`; `asura-platform/src/keychain/tests.rs`; `asura-platform/src/bin/keychain_fixture.rs` | SS1-K | List bound of 257 with `Listing.truncated`; `scratch::fixture_main()` and `scratch::add_account` ([SS1-K2](secret-store.md#ss1-k2-platform-follow-up)); SS-K2-1 |
 | SS1-S Secret store worker | `asura-service/src/secret_store.rs` and `asura-service/src/secret_store/*.rs` (new); the `mod secret_store;` line of `asura-service/src/lib.rs`; `asura-service/src/bin/secret_store_fixture.rs` (new, test-support binary); the `[[bin]]` and `[[test]]` entries for them in `asura-service/Cargo.toml`; `asura-service/tests/secret_store_worker.rs` (new) | SS1-K2 | Queue, worker, `KeychainPort` and gated port, payload codec, binding, sweep, stranded and unrecognized counts, counts API; SS-U1, SS-U2, SS-U4 to SS-U8, SS-U10, SS-U11, SS-W1 to SS-W10 |
 | P1 Platform person profiles | `asura-platform/src/exec_cmd.rs`; `asura-platform/src/exec_cmd/{guardian,protocol,spawn,escapee,tests}.rs`; `asura-platform/src/exec_cmd/person.rs` (new: roots, developer directory, FD 11 frame); `asura-platform/tests/exec_cmd_process.rs`; `asura-platform/tests/fixtures/` (new fixtures) | J5 delivered | Tokens `person-1` and `person-outside-1`, FD 11 and FDs 12–19, person Seatbelt profile, job scratch write (OD1), `!!` gate, env-marker scan, kind 2 reasons 14 and 15, `ASURA_JOB_<jobhex>`, PC-P1 probe record (reported to D0); PC-U24, PC-U25, PC-U46, PC-U50 to PC-U52; PC-I2 to PC-I5, PC-I22, PC-I29, PC-I37, PC-I38 at the platform layer; EC-I9, EC-I10 |
-| P2 Storage records | `asura-storage/src/authority/**`; `asura-storage/tests/{authority_conversation,authority_replay,journal_writer,segmented_journal}.rs` | J5 delivered | Kind 31, PR1–PR6 replacing JR2, reason 20, kind 28 capture reason 7, checkpoint and index entries for kind 31, `JobFacts` from kind 31; PC-U20, PC-U21, PC-U42 |
+| P2 Storage records | `asura-storage/src/authority/**`; `asura-storage/tests/{authority_conversation,authority_replay,journal_writer,segmented_journal}.rs` | J5 delivered | Kind 31, PR1–PR6 replacing JR2, kind 28 capture reason 7 (reason 20 is already in the codec from J34-S), checkpoint and index entries for kind 31, `JobFacts` from kind 31; PC-U20, PC-U21, PC-U42 |
 | P2-G Configuration and audit schema | `asura-storage/src/config.rs`; `asura-storage/src/audit/{types,mod,tests}.rs` | J5 delivered | `personCommands.allowOutsideSandbox`; audit profiles `person-1` and `person-outside-1`; `outside_sandbox` fields; `person_command.queued` and `person_command.refused`; `Setting::for_config_key` entry; PC-U45, PC-U58 (unit) |
 | P3-C Control contract and client | `contracts/control/v1/control.proto`; `asura-control/src/{lib,wire,conversation,jobs}.rs`; `asura-client/src/lib.rs` | J5 delivered | Field 68, capability 8, `LaunchVariable`, queue entry fields 16–20, `QueueWaitReason`, `QueueRefusal`, reply fields 9–10, history field 5, `JobEntry` fields 28–29, `ServiceObservation` field 8; PC-U41, PC-U49, PC-U55 |
 | P3-K Controller | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | P2, P2-G | `Profile::Person1` and `PersonOutside1`, switch check at slot grant, reason 20, `ShellExited`, released `Draining`, `close_capture` on cancel; PC-U23, PC-U43 (controller part), PC-U53 |

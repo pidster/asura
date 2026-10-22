@@ -25,13 +25,13 @@ the working directory or an environment override. Tests use scratch runtime root
 | `providers.mlx.models` | Up to 64 exact asset keys, each with a bounded capability list; see below | Empty mapping |
 | `providers.ollama.endpoint` | ASCII URL, at most 2048 bytes; numeric-loopback host over HTTP or HTTPS. Set rejects other hosts with `config_remote_endpoint_restricted` under the [loopback restriction](model-provider-integration.md#loopback-endpoint-restriction--selected-2026-10-13) | `http://127.0.0.1:11434` at inference admission |
 | `personCommands.allowOutsideSandbox` | Boolean. Proposed with [person command mode](person-command-mode.md#required-behavior) PCR23 (owner, 2026-10-19), not implemented. `false` refuses `!!` person commands; `!` commands are unaffected. A successful set applies to the next `!!` submit and to a queued one when the job controller grants its slot, which then settles it `not_started` with reason 20 `outside_sandbox_off`; a running command continues ([switch check](person-command-mode.md#outside-switch-check)). Packet P2-G adds the key and its `Setting::for_config_key` entry. Written only when set away from its default; `set personCommands` takes the whole mapping | `true` |
-| `jobs.liveService` | Integer, 1 through 16. Designed with [tool job packet J2](tool-job-controller.md#j2-configuration-keys), not implemented. Live jobs in the service; read at service start | `4` (owner J2a-2) |
-| `jobs.liveAgent` | Integer, 1 through 8. Designed with J2, not implemented. Live jobs per agent; the effective value is the smaller of this and `jobs.liveService`; read at service start | `2` (owner J2a-2, AQ1) |
-| `jobs.queuedAgent` | Integer, 1 through 16. Designed with J2, not implemented. Starts that may wait in one agent's job queue; read at service start | `8` |
-| `jobs.clientViewers` | Integer, 1 through 32. Designed with J2, not implemented; consumed by J4. Pending client job reads per service; read at service start | `8` (owner J2a-2) |
-| `jobs.modelReservedPageReads` | Integer, 0 through 1. Designed with J2, not implemented. Page-read workers reserved for model requests; read at service start | `1` (owner J2a-2) |
-| `execution.enabled` | Boolean. Designed with the [execution setting](execution-setting.md#configuration) (EX11), not implemented. The global default for model command execution; a set applies at once and revokes model jobs of projects turned off | `true` (owner EX11) |
-| `execution.projects` | Mapping of at most 1,024 project IDs (32 lowercase hex) to `on` or `off`. Designed with EX11, not implemented. The leaf `execution.projects.<id>` sets `on`, `off` or `inherit` (removes the entry) | Empty mapping |
+| `jobs.liveService` | Integer, 1 through 16. Designed with [tool job packet J2](tool-job-controller.md#j2-configuration-keys); implemented in the storage adapter by J2-G; the service reads it from J2-E. Live jobs in the service; read at service start | `4` (owner J2a-2) |
+| `jobs.liveAgent` | Integer, 1 through 8. Implemented in the storage adapter by J2-G; the service reads it from J2-E. Live jobs per agent; the effective value is the smaller of this and `jobs.liveService`; read at service start | `2` (owner J2a-2, AQ1) |
+| `jobs.queuedAgent` | Integer, 1 through 16. Implemented in the storage adapter by J2-G; the service reads it from J2-E. Starts that may wait in one agent's job queue; read at service start | `8` |
+| `jobs.clientViewers` | Integer, 1 through 32. Implemented in the storage adapter by J2-G; consumed by J4. Pending client job reads per service; read at service start | `8` (owner J2a-2) |
+| `jobs.modelReservedPageReads` | Integer, 0 through 1. Implemented in the storage adapter by J2-G; the service reads it from J2-E. Page-read workers reserved for model requests; read at service start | `1` (owner J2a-2) |
+| `execution.enabled` | Boolean. Designed with the [execution setting](execution-setting.md#configuration) (EX11). Implemented in the storage adapter by J34-G (2026-10-22); the service applies it from J34-E. The global default for model command execution; a set applies at once and revokes model jobs of projects turned off | `true` (owner EX11) |
+| `execution.projects` | Mapping of at most 1,024 project IDs (32 lowercase hex) to `on` or `off`; the only mapping allowed more than 64 entries. Designed with EX11; implemented in the storage adapter by J34-G (2026-10-22). The leaf `execution.projects.<id>` sets `on`, `off` or `inherit` (removes the entry). A leaf set reports the setting `execution.projects` in `config.changed` | Empty mapping |
 
 The `jobs` mapping follows `retention`: it is written only when set away from
 its defaults, `set jobs` takes the whole mapping, and each leaf has its own get
@@ -66,8 +66,12 @@ normalized mapping; comments and original formatting are not preserved.
 The service uses pinned `serde_yaml_ng` 0.10.0 and Serde typed structures. Typed
 structures reject unknown/duplicate fields and bound the supported nesting to the
 root, audit and provider mappings, including the capability declarations below.
-Parse single documents only, with at most 16 KiB of file
-bytes and 4 KiB per supplied value. No includes, interpolation or execution.
+Parse single documents only, with at most 64 KiB of file bytes and 4 KiB per
+supplied value. A file over the bound is `config_too_large`; a supplied value
+over 4 KiB is `config_value_too_large`. Both change nothing. The file bound is
+64 KiB from packet J34-E, selected on 2026-10-22 so that 1,024
+`execution.projects` overrides fit ([execution setting ES-E6](execution-setting.md#configuration));
+the code keeps 16 KiB until J34-E merges. No includes, interpolation or execution.
 Dependency source: https://docs.rs/serde_yaml_ng/0.10.0/serde_yaml_ng/ .
 
 Configuration alone is not installation authority. A safe `config.yaml` alongside
@@ -119,7 +123,8 @@ storage `config::execute` and platform `PrivateFileSnapshot` take no deadline
 
 Platform access uses retained validated directory descriptors. Reject symlinks,
 hard-linked files, foreign ownership, nonregular files and unsafe permissions or
-ACLs. Read at most 16 KiB plus one byte and check file identity and change stamps
+ACLs. Read at most the file bound (64 KiB from J34-E, 16 KiB before it) plus one
+byte and check file identity and change stamps
 before accepting or replacing. Serialize service writes; external editors must
 not write concurrently with a command. Detect observed edits and reject them.
 The final check and rename are not a transactional lock against arbitrary external
@@ -692,7 +697,7 @@ and nonempty relative components; absolute paths, dot components, backslashes an
 control characters reject. Each list contains at most four unique known names.
 Unknown fields, duplicate mapping keys, nulls and custom tags remain invalid.
 
-The existing 16 KiB file, 4 KiB set value, isolated config worker,
+The existing file bound, 4 KiB set value, isolated config worker,
 atomic replacement and cancellation rules apply. Parsing permits six container
 levels, at most 64 entries per mapping and four scalar sequence elements.
 Typed validation permits sequences only for the capability lists. No metadata,

@@ -6,8 +6,15 @@ requires. It must be implemented before tool job packets J3 and J4 are enabled
 (owner, 2026-10-21, RV1 and EN1). Mechanisms marked "selected (engineering)"
 are engineering choices under the
 [iteration rules](../design-process.md#iteration-and-escalation), not owner
-decisions. Nothing here is implemented. Protocol numbering remains `0.1`;
-journal format remains `1`.
+decisions. Protocol numbering remains `0.1`; journal format remains `1`.
+
+Implementation state, 2026-10-22: packet J34-G is merged on `main` (`09eaa67`,
+`2bc01d8`). It delivers the keys, the leaf form, their `Setting` entries, the
+`execution.changed` event type and job reasons 19 and 20 in the audit enum.
+Reason 19 in the journal codec is implemented by J34-S on the J3 integration
+branch, not merged. The service behavior, the 64 KiB configuration file bound
+and the TUI are not implemented; they land with the J3 integration branch
+([code packets](#code-packets)).
 
 ## Owner decision
 
@@ -143,6 +150,39 @@ Rules:
   value.
 - `/config` without arguments lists `execution` with its defaults.
 
+Size bounds (selected, engineering, 2026-10-22, decision ES-E6). The
+configuration file has one whole-file bound, and it must hold the largest
+`execution.projects` mapping:
+
+- The written form of one override is at most 44 bytes: 4 spaces of indent,
+  the 32-digit ID (2 quote bytes when the ID reads as a number), `: `, `off`
+  and a newline. 1,024 overrides take at most 45,056 bytes, more than the
+  platform's current 16 KiB file bound
+  (`LIMIT`, `asura-platform/src/config.rs`). With that bound, the real ceiling
+  would be about 370 overrides, not 1,024.
+- The platform file bound becomes 64 KiB (65,536 bytes). The 1,024-entry bound
+  stays. 1,024 overrides then leave about 20 KiB for every other key. The
+  cost is one read buffer of at most 64 KiB plus one byte on the configuration
+  worker, a known-size bound.
+- A write that would pass the file bound fails with `config_too_large` and
+  changes nothing, in the file or in memory. This is the existing safe
+  failure. It can still occur when several keys are near their own maxima at
+  once (for example 64 MLX declarations and 1,024 overrides); the file bound is
+  the one whole-file limit, and each key's bound is a validation rule.
+- The 4 KiB bound on one supplied value is unchanged
+  (`config_value_too_large`). A whole-mapping `set execution` or
+  `set execution.projects` therefore carries at most about 100 overrides. The
+  leaf form `execution.projects.<id>` has no such limit and is the form the
+  TUI uses.
+
+Rejected: lowering the entry bound to 256. The other keys can already exceed
+16 KiB together (64 MLX declarations of up to about 300 bytes each), so a lower
+entry bound would still not make every valid combination fit; it would only
+reduce the setting's capacity. Packet J34-E implements the 64 KiB bound and its
+tests, because the J3 integration branch is the next change that touches the
+configuration path ([code packets](#code-packets)). Until it merges, the code
+keeps 16 KiB.
+
 The leaf form `execution.projects.<id>` is new for configuration commands: it
 is the only key with a variable segment. The configuration key parser accepts
 it only under `execution.projects.`, with the ID rules above. Selected
@@ -190,7 +230,7 @@ When the owner receives new effective values, in the same reactor step it:
 2. for each, calls the controller's `revoke` with scope "project P, model
    origin only" and reason `execution_off`;
 3. replaces its in-memory values;
-4. emits `execution.changed`;
+4. emits one `execution.changed` event per changed entry (ES-E7, [audit](#audit));
 5. bumps the job revision so that a parked `JobList` returns with the new
    `execution_enabled`.
 
@@ -208,10 +248,12 @@ A model job whose turn is still in its yield window is cancelled the same way.
 The starting call's result then reports the job's state with status
 `cancelled` ([J3 exec_cmd as a job](tool-job-controller.md#exec_cmd-as-a-job)).
 
-Job reason code 19 `execution_off` is added to the
+Job reason code 19 `execution_off` is in the
 [job reason table](tool-job-controller.md#job-reason-codes): requester service;
-kind 28 outcomes exited, signalled, cancelled and not_started. J3's storage
-packet adds it to the codec table.
+kind 28 outcomes exited, signalled, cancelled and not_started. J34-G added it,
+with code 20, to the audit enum (merged); J34-S adds both to the journal codec
+(on the J3 integration branch). The audit enum and the codec therefore hold
+code 20 before its first producer, person packet P3-K.
 
 ### ES-Q1: execution change sequence
 
@@ -318,7 +360,33 @@ Selected (engineering). One new event. The audit schema number does not change.
 | --- | --- | --- |
 | `execution.changed` | The owner applies a persisted change | `scope` (`global` or `project`), `project` (project scope only), `from` and `to` (`on`, `off`, `inherit`), `revoked_projects` (count of projects turned off) |
 
-The existing `config.changed` event still records the setting name and outcome.
+Event per entry (selected, engineering, 2026-10-22, decision ES-E7). One
+persisted set can change the global default and many overrides at once, as a
+whole-mapping `set execution` does. One `execution.changed` event cannot
+describe that, so the owner emits one event per changed entry:
+
+1. the global event first, when `enabled` changed (`scope` `global`, `from`
+   and `to` the old and new `enabled`);
+2. then one project event per override entry that was added, changed or
+   removed, in ascending project ID order (`from` and `to` the old and new
+   entry, `inherit` for an absent one).
+
+A set that changes no entry emits no `execution.changed` event;
+`config.changed` is still emitted. Each project turned from on to off is
+counted in exactly one event's `revoked_projects`: in its own project event
+when its override entry changed, otherwise in the global event. The counts
+therefore sum to the number of projects revoked, and the event validation
+holds: a global event counts projects only when `to` is `off`, and a project
+event counts at most its own project. The projects considered are the
+registered projects and the projects named in either override map.
+
+`config.changed` keeps the setting name (confirmed 2026-10-22, as J34-G
+implemented it). A whole-mapping set reports `execution` or
+`execution.projects`; a leaf set `execution.projects.<id>` reports the
+setting `execution.projects`, because the audit `Setting` enum cannot carry a
+project ID. `Setting::for_config_key` maps a leaf only when its ID is valid.
+The project of a leaf set is in its `execution.changed` event.
+
 Revoked jobs appear as `job.cancel_requested` and `job.settled` events with
 reason `execution_off`. No event holds a command or path.
 
@@ -356,7 +424,7 @@ reason `execution_off`. No event holds a command or path.
 | --- | --- |
 | AE-01 | The effective-value lookup, refusal and revocation are bounded in-memory work on the reactor. The only I/O is the configuration file write on the existing worker. |
 | AE-02 | The blocking calls are the existing configuration worker's `openat`, `write`, `fsync` and rename. No new thread. |
-| AE-03 | At most 1,024 overrides. Revocation touches at most the 64 unsettled jobs. The outbox bounds of J2 hold. |
+| AE-03 | At most 1,024 overrides, inside the 64 KiB configuration file bound; at most one `execution.changed` event per changed entry, so at most 1,025 per set. Revocation touches at most the 64 unsettled jobs. The outbox bounds of J2 hold. |
 | AE-04 | No time bound. A set ends on the worker's reply, the person's cancel or a lost connection ([client waits](command-flows.md#client-waits-without-time-bounds)). Revocation uses the job controller's closures and wind-down bounds. |
 | AE-05 | A set is idempotent by value. Revocation is idempotent per job: a second trigger writes no second kind 27. |
 | AE-06 | Shutdown follows the job controller; the setting adds no lifecycle. |
@@ -372,7 +440,7 @@ harness with a scripted loopback model.
 | ID | Case | Unit | Integration | End-to-end |
 | --- | --- | --- | --- | --- |
 | ES-01 | Defaults | No key gives on for every project | Fresh installation runs exec_cmd | — |
-| ES-02 | Key validation | Bounds, 1,025th entry, bad ID, `inherit` removes, whole-mapping set, leaf get | Set, restart, value kept | — |
+| ES-02 | Key validation and size | Bounds, 1,025th entry, bad ID, `inherit` removes, whole-mapping set, leaf get; a value over 4 KiB gives `config_value_too_large`; 1,024 leaf sets persist and read back under the 64 KiB file bound; a write over the file bound gives `config_too_large` and changes nothing | Set, restart, value kept; 1,024 overrides survive a restart | — |
 | ES-03 | Effective value | Override beats global in all four combinations | — | `/execution` shows each source |
 | ES-04 | Refusal | Kind 14 `denied` reason 1 and its rendered text; no submit to the controller | Model call after `/execution project off` is refused; nothing spawned | Scripted model's exec_cmd shows the refusal in the activity row |
 | ES-05 | Revocation of live model jobs (EX-V10, TJ-14) | Revoke scope spares person jobs and other projects; queued give `not_started`, live give `T`; one kind 27 | Two running model jobs in project A and one in project B; turning A off stops A's jobs with `execution_off`; B's job continues | PTY: `/execution project off` while a model job runs; `/jobs` shows it settle with `execution_off` |
@@ -381,7 +449,7 @@ harness with a scripted loopback model.
 | ES-08 | Person jobs unaffected (ES-R5) | Revoke scope excludes person origin | Shared with the person-command packets: a `!` job continues | Deferred to the person-command packets |
 | ES-09 | Unconfirmed set | No in-memory change | Writer fault injected: memory and jobs unchanged | — |
 | ES-10 | Yield window | Revocation during the yield gives the starting call status `cancelled` | Real job in its yield window | — |
-| ES-11 | Audit | `execution.changed` fields; no command text | Real emitter order: `config.changed`, `job.cancel_requested`, `execution.changed`, `job.settled` | — |
+| ES-11 | Audit | `execution.changed` fields; no command text; a whole-mapping set gives one event per changed entry, global first, then projects in ID order, with `revoked_projects` summing to the revoked projects; a set that changes nothing gives none; a leaf set's `config.changed` names `execution.projects` | Real emitter order: `config.changed`, `job.cancel_requested`, `execution.changed`, `job.settled` | — |
 | ES-12 | Status indicator | `exec off` from `execution_enabled` | Change from a second attachment returns the parked `JobList` | PTY: second TUI shows `exec off` |
 | ES-13 | Responsiveness | — | Revocation with 16 live jobs: Inspect within 100 ms | Typing within 100 ms while jobs stop |
 
@@ -395,11 +463,12 @@ two writers ([J3 and J4 code packets](tool-job-controller.md#j3-and-j4-code-pack
 
 | Part | Packet | Owned paths |
 | --- | --- | --- |
-| Keys, leaf form, `execution.changed` type | J34-G configuration and audit schema | `asura-storage/src/config.rs`, `asura-storage/src/audit/{types,mod,tests}.rs` |
-| Reason code 19 and kind 14 field 10 reason 1 | J34-S storage records | `asura-storage/src/authority/conversation/{types,codec}.rs` |
+| Keys, leaf form, `execution.changed` type, reasons 19 and 20 in the audit enum | J34-G configuration and audit schema (merged) | `asura-storage/src/config.rs`, `asura-storage/src/audit/{types,mod,tests}.rs` |
+| 64 KiB configuration file bound and its ES-02 cases | J34-E integration | `asura-platform/src/config.rs` and its tests; the ES-02 file-bound case in `asura-storage/src/config.rs` |
+| Reason codes 19 and 20 in the codec and kind 14 field 10 reason 1 | J34-S storage records (on the J3 integration branch) | `asura-storage/src/authority/conversation/{types,codec}.rs` |
 | Controller `revoke` scope with origin filter | J34-K controller extensions | `asura-service/src/job_controller.rs`, `job_controller/*.rs` |
 | Refusal reason and rendered text in the tool authority check | J3-R tool parsing and result text | `asura-service/src/tools.rs` |
-| Owner state, per-call grant, revocation wiring, audit emission | J34-E integration | `asura-service/src/conversation.rs`, `audit.rs`, `config_worker.rs` |
+| Owner state, per-call grant, revocation wiring, audit emission (one `execution.changed` per changed entry) | J34-E integration | `asura-service/src/conversation.rs`, `audit.rs`, `config_worker.rs` |
 | `/execution` and the status indicator | J4-T TUI | `asura-cli/src/tui/{ui,config,jobs}.rs` |
 | User documentation for the keys and command | J34-E | `docs/user/{commands,guide}.md` |
 
@@ -413,6 +482,8 @@ two writers ([J3 and J4 code packets](tool-job-controller.md#j3-and-j4-code-pack
 | ES-E3 | Execution means model job starts; read tools and `job` commands stay allowed | Selected (engineering), from the owner's wording "execution" and the revocation table |
 | ES-E4 | Leaf key `execution.projects.<id>` with `inherit` | Selected (engineering): removes a lost-update race and gives a way to clear an override |
 | ES-E5 | Keep the exec_cmd tool declared when off; refuse with a fixed text | Selected (engineering): the helper's tool list is fixed per build and counted in the context overhead `S` |
+| ES-E6 | Raise the configuration file bound to 64 KiB; keep 1,024 overrides | Selected (engineering), 2026-10-22: one whole-file known-size bound that holds the largest override mapping; a lower entry bound would not make every key combination fit |
+| ES-E7 | One `execution.changed` event per changed entry, global first, then projects in ID order | Selected (engineering), 2026-10-22: one event cannot describe a whole-mapping set; each revoked project is counted once |
 
 Alternatives considered:
 
@@ -433,5 +504,11 @@ readiness audit. Code facts were checked by read-only inspection at commit
 authority check (`validate_authority`, `tools.rs`) and the configuration key
 table. ES-O1, ES-Q1, ES-F1 and ES-F2 were rendered with Mermaid CLI and
 inspected. No code or test was run.
+
+Recorded on 2026-10-22 (revision): written from the J34-G packet report and
+the merged code (`asura-storage/src/config.rs`, `asura-storage/src/audit/types.rs`,
+`asura-platform/src/config.rs`) at commit `1a5991a`. Decisions ES-E6 and ES-E7
+were added, and the `config.changed` setting of a leaf set was confirmed. No
+diagram changed. No code or test was run by the design writer.
 
 Return to the [design index](README.md).
