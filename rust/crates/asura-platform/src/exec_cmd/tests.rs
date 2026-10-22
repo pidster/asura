@@ -226,19 +226,6 @@ fn j1t_15_after_cancel_full_sink_discards_and_never_rejoins_the_stream() {
     c.drain(DRAIN_BUDGET, &mut sink, true).unwrap();
     assert!(c.eof && sink.ended[1]);
 }
-#[test]
-fn rendered_tail_replaces_short_terminal_controls_and_invalid_utf8() {
-    let (text, truncated) = render_tail(b"ok\x1b[31m\xff\0\n\t");
-    assert_eq!(text, "ok\u{fffd}[31m\u{fffd}\u{fffd}\n\t");
-    assert!(truncated);
-    let mut stream = vec![b'x'; 16384];
-    stream.extend_from_slice(b"\x1b[31m\xff\n");
-    let (text, truncated) = render_tail(&stream);
-    assert!(truncated);
-    assert!(text.len() <= 6144);
-    assert!(text.ends_with("x\u{fffd}[31m\u{fffd}\n"));
-    assert!(!text.contains('\x1b'));
-}
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -595,11 +582,6 @@ fn ec_u2_escapee_notice_order_and_settlement_facts() {
     assert_eq!(result.escapees, 3);
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.reason, None, "reason 12 is not a stop reason");
-    assert!(
-        result
-            .render_text(&Tails::default(), "complete")
-            .contains("cleanup_confirmed=true capture=complete escapees=3\nstdout:")
-    );
     for (label, reason, expected) in [
         ("escapee", 13, UnconfirmedReason::EscapeeUnterminated),
         ("cleanup", 9, UnconfirmedReason::CleanupFailed),
@@ -619,11 +601,6 @@ fn ec_u2_escapee_notice_order_and_settlement_facts() {
             "{label}: late is never confirmed"
         );
         assert_eq!(result.escapees, 3);
-        assert!(
-            result
-                .render_text(&Tails::default(), "complete")
-                .contains("cleanup_confirmed=false capture=complete escapees=3\n")
-        );
     }
     // No escapees: no kind 6, the lease reason stays, no count in the text.
     let (job, polled) = feed(&[spawned, notice(5, 0, 2, false, 9), notice(2, 4, 2, true, 9)]);
@@ -631,11 +608,6 @@ fn ec_u2_escapee_notice_order_and_settlement_facts() {
     let result = job.result().unwrap();
     assert!(result.cleanup_confirmed);
     assert_eq!(result.escapees, 0);
-    assert!(
-        !result
-            .render_text(&Tails::default(), "complete")
-            .contains("escapees")
-    );
     // Kind 4 alone never settles.
     let (job, _) = feed(&[spawned, notice(4, 13, 0, false, 0)]);
     assert!(!job.settled());

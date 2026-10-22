@@ -76,7 +76,6 @@ impl Fixture {
             tool: None,
             tool_budget: tools::Budget::cancellation_driven(),
             tool_executor: tools::Executor::default(),
-            exec_cmd_worker: crate::exec_cmd_worker::Worker::default(),
             tool_cache: vec![],
             secret_key: zeroize::Zeroizing::new([3; 32]),
         };
@@ -213,7 +212,6 @@ pub(super) fn decided(owner: &Owner, value: &mp::ToolCall) -> LiveTool {
         active,
         value,
         digest,
-        &owner.payloads,
         owner.replay.as_deref(),
         asura_platform::secrets::detection(),
     )
@@ -245,13 +243,7 @@ fn propose(fixture: &mut Fixture, value: mp::ToolCall) {
     let replay = owner.replay.clone();
     let active = owner.active.as_mut().unwrap();
     active.model.tool_test_pending(value.ordinal.unwrap());
-    Owner::tool_call(
-        active,
-        value,
-        Instant::now(),
-        &owner.payloads,
-        replay.as_deref(),
-    );
+    Owner::tool_call(active, value, Instant::now(), replay.as_deref());
 }
 fn fresh_turn(fixture: &mut Fixture) {
     let active = fixture.active();
@@ -729,9 +721,10 @@ fn unknown_denied_and_limit_decisions_render_from_codes() {
 
 /// SL7 (owner layer): a single-quoted value is no longer refused. The record
 /// holds the display text and never the value. Bit 1 and the fallback reason
-/// belong only to an admitted `run`, so without a payload store the call is
-/// `busy` without them, and no live secret is kept. A secret in the working
-/// directory is still refused, with fields 21-23 and no value.
+/// belong only to an admitted `run`; until J34-E an exec_cmd call is
+/// `denied` (TJ-P3 step 4), so it has neither, and no live secret is kept. A
+/// secret in the working directory is still refused, with fields 21-23 and
+/// no value.
 #[test]
 fn whole_command_exec_cmd_is_not_refused_and_kept_refusals_remain() {
     let mut fixture = Fixture::new();
@@ -741,11 +734,8 @@ fn whole_command_exec_cmd_is_not_refused_and_kept_refusals_remain() {
     let text = serde_json::json!({ "command": format!("echo '{token}'") }).to_string();
     propose(&mut fixture, wire(1, "exec_cmd", &text));
     let record = pending_record(&mut fixture);
-    assert_eq!(record.decision, journal::ToolDecision::Busy);
-    assert_eq!(
-        record.busy,
-        Some(journal::ExecCmdBusyReason::PayloadUnavailable)
-    );
+    assert_eq!(record.decision, journal::ToolDecision::Denied);
+    assert_eq!(record.reason, None);
     assert!(!record.whole_command && record.refusal.is_none() && !record.command_cut);
     assert_eq!(record.form, journal::ArgumentForm::Canonical);
     assert_eq!(record.arguments, "{\"command\":\"echo '$ASURA_SECRET_1'\"}");
@@ -755,11 +745,14 @@ fn whole_command_exec_cmd_is_not_refused_and_kept_refusals_remain() {
     );
     assert!(!format!("{record:?}").contains(&token));
     let tool = fixture.active().tool.as_ref().unwrap();
-    assert!(tool.call.is_none() && tool.exec_cmd.is_none());
+    assert!(tool.call.is_none());
     fixture.acknowledge(Job::ToolIntent);
     let results = sent(&mut fixture);
     assert_eq!(results.len(), 1);
-    assert!(!results[0].text.clone().unwrap().contains(&token));
+    assert_eq!(
+        (results[0].status, results[0].text.as_deref()),
+        (Some(2), Some("denied"))
+    );
 
     // A kept refusal: the working directory holds a secret.
     let mut fixture = Fixture::new();
@@ -780,7 +773,7 @@ fn whole_command_exec_cmd_is_not_refused_and_kept_refusals_remain() {
     );
     assert!(record.arguments.contains("$ASURA_SECRET_1"));
     assert!(!format!("{record:?}").contains(&token));
-    assert!(fixture.active().tool.as_ref().unwrap().exec_cmd.is_none());
+    assert!(fixture.active().tool.as_ref().unwrap().call.is_none());
     fixture.acknowledge(Job::ToolIntent);
     let results = sent(&mut fixture);
     assert_eq!(results.len(), 1);
@@ -929,14 +922,7 @@ fn tcr_u10_rule_set_unavailable_retains_nothing_and_refuses() {
             }
             let value = wire(ordinal, name, text);
             let active = fixture.owner.active.as_ref().unwrap();
-            let tool = Owner::decide(
-                active,
-                &value,
-                [7; 32],
-                &fixture.owner.payloads,
-                None,
-                Err(SelfCheckError::Set),
-            );
+            let tool = Owner::decide(active, &value, [7; 32], None, Err(SelfCheckError::Set));
             let record = &tool.record;
             assert_eq!(record.decision, expected, "{name} {ordinal} {cancelled}");
             assert_eq!(
@@ -952,7 +938,7 @@ fn tcr_u10_rule_set_unavailable_retains_nothing_and_refuses() {
             );
             assert_eq!(record.tool_operation, None);
             assert_eq!(record.arguments_bytes as usize, text.len());
-            assert!(tool.call.is_none() && tool.exec_cmd.is_none());
+            assert!(tool.call.is_none());
             encodes(record);
             if expected == journal::ToolDecision::Refused {
                 assert_eq!(
@@ -1347,7 +1333,7 @@ fn tool_record(name: &str, decision: journal::ToolDecision) -> journal::ToolReco
         tool_operation: Some(journal::ToolOperation::Tools),
         decision,
         fault: None,
-        busy: None,
+        reason: None,
         refusal: None,
         whole_command: false,
         form: journal::ArgumentForm::Verbatim,
@@ -1359,9 +1345,10 @@ fn tool_record(name: &str, decision: journal::ToolDecision) -> journal::ToolReco
         result_bytes: 0,
         preview: None,
         truncated: None,
-        exit_code: None,
         create: None,
         exec_cmd: None,
+        job_result: None,
+        note: None,
     }
 }
 #[test]
@@ -1495,7 +1482,7 @@ fn exec_cmd_wire(ordinal: u32, command: &str) -> mp::ToolCall {
 /// J1T-03 (owner layer) as changed by SL7: a rewrite over 8,192 bytes is
 /// not refused; it is planned for the whole-command variable at `ToolCall`.
 /// Its kind 14 encodes within one frame, so the append cannot fail on size
-/// and make the service unavailable. (No payload store here: `busy`.)
+/// and make the service unavailable.
 #[test]
 fn j1t_03_overlong_rewrite_is_not_refused() {
     let mut fixture = Fixture::new();
@@ -1510,7 +1497,8 @@ fn j1t_03_overlong_rewrite_is_not_refused() {
     assert!(long.len() <= 8192);
     propose(&mut fixture, exec_cmd_wire(1, &long));
     let record = pending_record(&mut fixture);
-    assert_eq!(record.decision, journal::ToolDecision::Busy);
+    // Until J34-E an exec_cmd call is `denied` (TJ-P3 step 4), not refused.
+    assert_eq!(record.decision, journal::ToolDecision::Denied);
     assert!(record.refusal.is_none());
     assert!(encodes(&record).len() <= 65_050);
     assert!(!record.arguments.contains("Sup3rS3cret"));
@@ -1518,8 +1506,8 @@ fn j1t_03_overlong_rewrite_is_not_refused() {
     assert!(fixture.owner.unavailable.is_none());
 }
 
-/// J1T-04 (owner layer, memory inspection) and busy: with no payload store
-/// the call is recorded `busy` with the rewrite. Neither the live call, the
+/// J1T-04 (owner layer, memory inspection): the call is recorded with the
+/// rewrite (`denied` until J34-E, TJ-P3 step 4). Neither the live call, the
 /// record nor the cache holds the raw command; an equal resend matches and a
 /// different value with the same rewrite is a protocol fault.
 #[test]
@@ -1532,30 +1520,21 @@ fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     let first = exec_cmd_wire(1, &raw);
     propose(&mut fixture, first.clone());
     let record = pending_record(&mut fixture);
-    assert_eq!(record.decision, journal::ToolDecision::Busy);
-    assert_eq!(
-        record.busy,
-        Some(journal::ExecCmdBusyReason::PayloadUnavailable)
-    );
+    assert_eq!(record.decision, journal::ToolDecision::Denied);
+    assert_eq!(record.reason, None);
     assert_eq!(
         record.number_kinds,
         vec![asura_platform::secrets::SecretKind::GithubToken]
     );
     assert!(record.arguments.contains("ASURA_SECRET_1"));
     let tool = fixture.active().tool.as_ref().unwrap();
-    assert!(
-        tool.call.is_none() && tool.exec_cmd.is_none(),
-        "busy keeps no secret"
-    );
+    assert!(tool.call.is_none(), "denied keeps no secret");
     assert!(!format!("{:?}", tool.record).contains(&token));
     fixture.acknowledge(Job::ToolIntent);
     let active = fixture.active();
     assert_eq!(active.tool_cache.len(), 1);
     assert!(!format!("{:?}", active.tool_cache).contains(&token));
-    assert_eq!(
-        active.tool_cache[0].2.text.as_deref(),
-        Some("exec_cmd_busy: payload_unavailable")
-    );
+    assert_eq!(active.tool_cache[0].2.text.as_deref(), Some("denied"));
     propose(&mut fixture, first);
     assert!(fixture.active().failure_reason.is_none());
     let other = ["ghp_", &"qQ2".repeat(12)].concat();
@@ -1948,17 +1927,17 @@ fn tcr_i11_two_hundred_calls_run_and_the_next_is_limit() {
 }
 
 /// TCR-U13 (service part, real journal): replay recomputes the same exec_cmd
-/// job and payload IDs that the live path derives for the same call.
+/// job and payload IDs that the job controller derives for the same call.
 #[test]
 fn tcr_u13_replay_exec_cmd_ids_equal_live_derivation() {
     let mut journaled = Journaled::new();
     propose(&mut journaled, exec_cmd_wire(1, "printf ok"));
-    // No payload store here: the decision is `busy`; the same record with
-    // decision `run` is what an admitted call commits.
+    // Until J34-E the decision is `denied`; the same record with decision
+    // `run` is what an admitted call commits.
     let mut record = journaled.active().tool.as_ref().unwrap().record.clone();
-    assert_eq!(record.decision, journal::ToolDecision::Busy);
+    assert_eq!(record.decision, journal::ToolDecision::Denied);
     record.decision = journal::ToolDecision::Run;
-    record.busy = None;
+    record.reason = None;
     let mut tool = journaled.active().tool.take().unwrap();
     tool.record = record;
     let call = tools::Call {
@@ -1975,14 +1954,20 @@ fn tcr_u13_replay_exec_cmd_ids_equal_live_derivation() {
     journaled.owner.drive(Instant::now());
     assert!(journaled.settle() == "tool_call");
     let replay = journaled.owner.replay.clone().unwrap();
-    let live = crate::exec_cmd_worker::ExecCmdRun::derive(replay.installation_id, &call).unwrap();
+    let job = crate::job_controller::Origin::Model {
+        operation: call.operation,
+        generation: call.generation,
+        ordinal: call.ordinal,
+    }
+    .job_id();
+    let [stdout, stderr] = asura_storage::payload::job_payloads(replay.installation_id, job);
     let derived = replay.operations[&call.operation].tools[0]
         .exec_cmd
         .clone()
         .unwrap();
     assert_eq!(
         (derived.job, derived.stdout_payload, derived.stderr_payload),
-        (live.job, live.stdout_payload, live.stderr_payload)
+        (job, stdout, stderr)
     );
     // Restore an unlocked state for teardown: the call never ran.
     journaled.active().tool = None;

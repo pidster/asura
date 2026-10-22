@@ -86,15 +86,21 @@ pub const REGISTRY: &[Definition] = &[
         name: journal::TOOL_NAMES[3],
         description: "Run one bounded /bin/sh -c command line in the admitted project; returns output and exit status.",
     },
+    // J34-S registered `job` (J3-E2); its commands are parsed from J3-R.
+    Definition {
+        name: journal::TOOL_NAMES[4],
+        description: "Job commands: list(before?), status(job), read(job, stream, offset?, limit?), wait(job, seconds?), cancel(job), note(job, text).",
+    },
 ];
 
 /// The status and text sent for a call that does not run, rendered from the
 /// kind 14 codes alone (TCR-D12). The text never holds model text, so it can
 /// never repeat a secret. Replay and views render it again from the record.
+/// `reason` is kind 14 field 10, the decision reason (J3-E3).
 pub fn not_run_result(
     decision: journal::ToolDecision,
     fault: Option<journal::ToolFault>,
-    busy: Option<journal::ExecCmdBusyReason>,
+    reason: Option<journal::ToolDecisionReason>,
     refusal: Option<journal::ExecCmdRefusal>,
 ) -> Option<(u8, String)> {
     use journal::ToolDecision as D;
@@ -115,13 +121,37 @@ pub fn not_run_result(
             .to_string(),
             None => "refused: secret_detection_unavailable".into(),
         },
-        D::Busy => format!(
-            "exec_cmd_busy: {}",
-            busy.map_or("unknown", journal::ExecCmdBusyReason::as_str)
-        ),
-        D::Denied | D::Limit | D::Cancelled => decision.as_str().into(),
+        D::Busy | D::Denied => match reason.map(|r| (r, decision_reason_text(r))) {
+            Some((reason, text)) => {
+                format!("{}: {}: {text}", decision_prefix(decision), reason.as_str())
+            }
+            None if decision == D::Busy => "exec_cmd_busy: unknown".into(),
+            None => decision.as_str().into(),
+        },
+        D::Limit | D::Cancelled => decision.as_str().into(),
     };
     Some((status, text))
+}
+
+/// The first word of a `busy` or `denied` result with a reason.
+fn decision_prefix(decision: journal::ToolDecision) -> &'static str {
+    match decision {
+        journal::ToolDecision::Busy => "exec_cmd_busy",
+        _ => decision.as_str(),
+    }
+}
+/// The fixed text after a decision reason's name (tool-job-controller.md,
+/// J3 kind 14 changes).
+fn decision_reason_text(reason: journal::ToolDecisionReason) -> &'static str {
+    use journal::ToolDecisionReason as R;
+    match reason {
+        R::QueueFull => {
+            "this agent's job queue is full; wait for a job to settle or cancel one with job cancel"
+        }
+        R::JobsFull => "the service has 64 unsettled jobs; wait for one to settle",
+        R::Closed => "the service is stopping",
+        R::ExecutionOff => "the person turned command execution off for this project; do not retry",
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -809,7 +839,7 @@ mod tests {
     /// TCR-D12: rendered text of calls that do not run holds only codes.
     #[test]
     fn not_run_text_is_rendered_from_codes_only() {
-        use journal::{ExecCmdBusyReason as B, ToolDecision as D, ToolFault as F};
+        use journal::{ToolDecision as D, ToolDecisionReason as R, ToolFault as F};
         assert_eq!(
             not_run_result(D::InvalidArguments, Some(F::MissingField), None, None),
             Some((3, "invalid_arguments: missing_field".into()))
@@ -830,10 +860,40 @@ mod tests {
         let (status, text) = not_run_result(D::Refused, None, None, Some(refusal)).unwrap();
         assert_eq!(status, 3);
         assert!(text.starts_with("Command refused: a `github-token` secret in word 2"));
-        assert_eq!(
-            not_run_result(D::Busy, None, Some(B::Quota), None),
-            Some((4, "exec_cmd_busy: quota".into()))
-        );
+        // J3T-14 (unit, rendered texts): busy codes 1-3 and `denied`
+        // reason 1; the J1 busy codes are retired.
+        for (decision, reason, status, text) in [
+            (
+                D::Busy,
+                R::QueueFull,
+                4,
+                "exec_cmd_busy: queue_full: this agent's job queue is full; wait for a job to settle or cancel one with job cancel",
+            ),
+            (
+                D::Busy,
+                R::JobsFull,
+                4,
+                "exec_cmd_busy: jobs_full: the service has 64 unsettled jobs; wait for one to settle",
+            ),
+            (
+                D::Busy,
+                R::Closed,
+                4,
+                "exec_cmd_busy: closed: the service is stopping",
+            ),
+            (
+                D::Denied,
+                R::ExecutionOff,
+                2,
+                "denied: execution_off: the person turned command execution off for this project; do not retry",
+            ),
+        ] {
+            assert_eq!(reason.decision(), decision);
+            assert_eq!(
+                not_run_result(decision, None, Some(reason), None),
+                Some((status, text.into()))
+            );
+        }
         assert_eq!(
             not_run_result(D::Denied, None, None, None),
             Some((2, "denied".into()))
@@ -1101,7 +1161,7 @@ mod inventory_tests {
     fn inventory_uses_exact_registry_metadata_and_rejects_overflow() {
         assert_eq!(
             REGISTRY.iter().map(|tool| tool.name).collect::<Vec<_>>(),
-            ["project", "memory", "service", "exec_cmd"]
+            ["project", "memory", "service", "exec_cmd", "job"]
         );
         let text = inventory_text().unwrap();
         assert_eq!(text.lines().count(), REGISTRY.len());

@@ -1,15 +1,18 @@
 //! Worker-layer harnesses (feature `test-support` only; never in production
-//! builds). [`run_jobs`] drives real exec_cmd workers and capture workers on
-//! one test reactor for J1, without a journal: settlement and install follow
-//! the same order (R2). [`JobHarness`] drives the real conversation owner
-//! and its job controller for J2.
+//! builds). [`run_jobs`] drives real exec_cmd slot workers and capture
+//! workers on one test reactor, without a journal or controller: it reacts
+//! to slot events as the job controller does and settles the ledger and
+//! installs as kind 28's commit would (R2). [`JobHarness`] drives the real
+//! conversation owner and its job controller for J2.
 use crate::capture_worker;
-use crate::exec_cmd_worker::{Dispatch, ExecCmdRun, Worker};
-use crate::tools::{self, Arguments};
+use crate::exec_cmd_worker::Worker;
+use crate::job_controller::{SlotEvent, SlotPort, SlotStart};
+use crate::tools;
 use asura_platform::RuntimeDirectory;
+use asura_platform::exec_cmd::{Exit, StopKind};
 use asura_platform::secrets::{self, JobRedaction, SecretVariable};
 use asura_storage::authority::conversation::{
-    self as journal, CaptureSettled, CaptureState, Id, ToolResult,
+    self as journal, CaptureNumber, CaptureReason, CaptureState, CaptureStream, Id,
 };
 use asura_storage::authority::writer;
 use asura_storage::payload::{Page, PageRequest, PayloadStore, read_page};
@@ -17,16 +20,36 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// One exec_cmd call for the harness: an already rewritten command and its
+/// One exec_cmd job for the harness: an already rewritten command and its
 /// secret variables (use `secrets::rewrite_exec_cmd_call`).
 pub struct Job {
     pub command: String,
     pub secrets: Vec<SecretVariable>,
 }
-/// What one call settled with, and the `live` stdout pages read while it ran.
+/// The capture facts a job settled with, as kind 28 records them.
+#[derive(Clone, Debug)]
+pub struct Settled {
+    pub state: CaptureState,
+    pub reason: CaptureReason,
+    pub stdout: CaptureStream,
+    pub stderr: CaptureStream,
+    /// Newline counts of the stored stdout and stderr bytes.
+    pub lines: [u64; 2],
+    pub distinct_numbers: u32,
+    pub numbers: Vec<CaptureNumber>,
+    pub pause_count: u32,
+    pub first_pause_ms: u64,
+    pub paused_ms: u64,
+    pub final_reservation: u64,
+}
+/// What one job settled with, and the `live` stdout pages read while it ran.
 pub struct Outcome {
-    pub settled: CaptureSettled,
-    pub result: ToolResult,
+    pub settled: Settled,
+    /// The leader's exit, when a process ran.
+    pub exit: Option<Exit>,
+    /// A cancel trigger reached the job: the harness's cancel or a capture
+    /// fault.
+    pub stopped: bool,
     pub payloads: [Id; 2],
     pub live_pages: Vec<Page>,
     pub elapsed: Duration,
@@ -34,18 +57,35 @@ pub struct Outcome {
 
 struct Running {
     worker: Worker,
-    intent: ExecCmdRun,
+    job: Id,
+    payloads: [Id; 2],
     started: Instant,
+    leader_exited: bool,
+    stopped: bool,
+    exit: Option<Exit>,
     output: Option<Outcome>,
     capture: Option<capture_worker::Handle>,
     pages: Vec<Page>,
 }
+impl Running {
+    /// A cancel trigger, as the controller sends it: `T` before the
+    /// leader's exit, a capture discard after it (TJ-S1).
+    fn trigger(&mut self) {
+        self.stopped = true;
+        if self.leader_exited {
+            SlotPort::discard_capture(&mut self.worker);
+        } else {
+            SlotPort::stop(&mut self.worker, StopKind::Term);
+        }
+    }
+}
 
-/// Runs `jobs` concurrently, each in its own exec_cmd worker and capture
+/// Runs `jobs` concurrently, each in its own exec_cmd slot and capture
 /// worker, in the project at `project`. With `probe_pages`, the stdout page
-/// at offset 0 is read on every reactor turn while a call is live.
-/// `cancel_after` cancels every call after that long. Returns after every
-/// capture worker has installed or been abandoned, or after `limit`.
+/// at offset 0 is read on every reactor turn while a job is live.
+/// `cancel_after` cancels every job after that long. Returns after every
+/// slot is idle and every capture worker has installed or been abandoned,
+/// or after `limit`.
 #[allow(clippy::too_many_arguments)] // A test harness entry; each argument is a case knob.
 pub fn run_jobs(
     runtime: &RuntimeDirectory,
@@ -64,26 +104,22 @@ pub fn run_jobs(
     let mut running = Vec::new();
     for job in jobs {
         let operation = asura_platform::random_id();
-        let job_id = journal::exec_cmd_job_id(operation, 1, 1);
-        let victims = store
-            .admit(installation, job_id, operation)
-            .map_err(|_| "admission: quota".to_string())?;
-        let call = tools::Call {
+        let job_id = journal::job_id(&journal::JobOrigin::Model {
             operation,
             generation: 1,
             ordinal: 1,
-            arguments: Arguments::ExecCmd {
-                command: job.command.clone(),
-                cwd: ".".into(),
-            },
-        };
-        let intent =
-            ExecCmdRun::derive(installation, &call).ok_or_else(|| "exec_cmd call".to_string())?;
+        });
+        let victims = store
+            .admit(installation, job_id, operation)
+            .map_err(|_| "admission: quota".to_string())?;
         let mut worker = Worker::default();
         worker.register(wake.clone());
         let redaction = JobRedaction::new(rules, &job.secrets);
-        worker
-            .start(Dispatch {
+        SlotPort::start(
+            &mut worker,
+            SlotStart {
+                job: job_id,
+                profile: crate::job_controller::Profile::Model1,
                 runtime: runtime.clone(),
                 scope: tools::ExecutionScope {
                     project: [1; 16],
@@ -92,8 +128,8 @@ pub fn run_jobs(
                     inode: identity.inode,
                     boundary: runtime.state_boundary(),
                 },
-                call,
-                intent: intent.clone(),
+                command: job.command,
+                cwd: ".".into(),
                 secrets: job.secrets,
                 secret_command: None,
                 capture: capture_worker::Start {
@@ -104,12 +140,17 @@ pub fn run_jobs(
                     wake: Some(wake.clone()),
                     gate_home: runtime.scratch_home_for_test().map(|p| p.to_path_buf()),
                 },
-            })
-            .map_err(|e| format!("start: {e:?}"))?;
+            },
+        )
+        .map_err(|e| format!("start: {e:?}"))?;
         running.push(Running {
             worker,
-            intent,
+            job: job_id,
+            payloads: asura_storage::payload::job_payloads(installation, job_id),
             started: Instant::now(),
+            leader_exited: false,
+            stopped: false,
+            exit: None,
             output: None,
             capture: None,
             pages: Vec::new(),
@@ -118,6 +159,7 @@ pub fn run_jobs(
     let started = Instant::now();
     let mut sequence = 1u64;
     let mut cancelled = false;
+    let mut events = Vec::new();
     loop {
         let now = Instant::now();
         if now >= started + limit {
@@ -126,54 +168,101 @@ pub fn run_jobs(
         if !cancelled && cancel_after.is_some_and(|after| now >= started + after) {
             cancelled = true;
             for job in &mut running {
-                job.worker
-                    .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
+                if job.output.is_none() {
+                    job.trigger();
+                }
             }
         }
         for job in &mut running {
-            if job.output.is_none() {
-                if probe_pages {
-                    let page = read_page(
-                        store,
-                        PageRequest {
-                            payload: job.intent.stdout_payload,
-                            offset: 0,
-                            limit: 8192,
-                            scope: None,
-                        },
-                    );
-                    job.pages.push(page);
-                }
-                if let Some(output) = job.worker.poll(now) {
-                    sequence += 1;
-                    let s = &output.settled;
-                    if s.state == CaptureState::NotStarted {
-                        store.release(job.intent.job);
-                    } else {
-                        store.settle(
-                            job.intent.job,
-                            s.state,
-                            [
-                                (s.stdout.stored_bytes, s.stdout.digest),
-                                (s.stderr.stored_bytes, s.stderr.digest),
-                            ],
-                            sequence,
-                            output.capture.is_some(),
-                        );
+            if job.output.is_none() && probe_pages {
+                let page = read_page(
+                    store,
+                    PageRequest {
+                        payload: job.payloads[0],
+                        offset: 0,
+                        limit: 8192,
+                        scope: None,
+                    },
+                );
+                job.pages.push(page);
+            }
+            events.clear();
+            SlotPort::poll(&mut job.worker, now, &mut events);
+            for event in events.drain(..) {
+                match event {
+                    SlotEvent::LeaderExited(exit) => {
+                        job.leader_exited = true;
+                        job.exit = Some(exit);
                     }
-                    if let Some(capture) = &output.capture
-                        && s.state != CaptureState::Unconfirmed
-                    {
-                        capture.install();
+                    SlotEvent::ProcessSettled { exit, .. } => {
+                        job.exit.get_or_insert(exit);
                     }
-                    job.capture = output.capture;
-                    job.output = Some(Outcome {
-                        settled: output.settled,
-                        result: output.result,
-                        payloads: [job.intent.stdout_payload, job.intent.stderr_payload],
-                        live_pages: std::mem::take(&mut job.pages),
-                        elapsed: job.started.elapsed(),
-                    });
+                    // The controller's cancel triggers (TJ-S1): a capture
+                    // fault, and a quota or space short while draining.
+                    SlotEvent::CaptureFault(reason) if reason != CaptureReason::Enospc => {
+                        if !job.stopped {
+                            job.trigger();
+                        }
+                    }
+                    SlotEvent::CapturePaused(_) if job.leader_exited => {
+                        if !job.stopped {
+                            job.trigger();
+                        }
+                    }
+                    SlotEvent::CaptureSettled(outcome) => {
+                        let outcome = *outcome;
+                        sequence += 1;
+                        // Kind 28 committed: settle the ledger, then install
+                        // (R2), as `PayloadPort::committed` does.
+                        match outcome.state {
+                            CaptureState::NotStarted => store.release(job.job),
+                            state => store.settle(
+                                job.job,
+                                state,
+                                [
+                                    (
+                                        outcome.stdout.capture.stored_bytes,
+                                        outcome.stdout.capture.digest,
+                                    ),
+                                    (
+                                        outcome.stderr.capture.stored_bytes,
+                                        outcome.stderr.capture.digest,
+                                    ),
+                                ],
+                                sequence,
+                                outcome.capture.is_some(),
+                            ),
+                        }
+                        if let Some(capture) = &outcome.capture {
+                            match outcome.state {
+                                CaptureState::Unconfirmed => capture.abandon(),
+                                CaptureState::NotStarted => capture.discard(),
+                                _ => capture.install(),
+                            }
+                        }
+                        job.capture = outcome.capture;
+                        job.output = Some(Outcome {
+                            settled: Settled {
+                                state: outcome.state,
+                                reason: outcome.reason,
+                                lines: [outcome.stdout.lines, outcome.stderr.lines],
+                                stdout: outcome.stdout.capture,
+                                stderr: outcome.stderr.capture,
+                                distinct_numbers: outcome.distinct_numbers,
+                                numbers: outcome.numbers,
+                                pause_count: outcome.pause_count,
+                                first_pause_ms: outcome.first_pause_ms,
+                                paused_ms: outcome.paused_ms,
+                                final_reservation: outcome.final_reservation,
+                            },
+                            exit: job.exit,
+                            stopped: job.stopped,
+                            payloads: job.payloads,
+                            live_pages: std::mem::take(&mut job.pages),
+                            elapsed: job.started.elapsed(),
+                        });
+                    }
+                    _ => {}
                 }
             }
             if let Some(capture) = &mut job.capture {
@@ -186,14 +275,14 @@ pub fn run_jobs(
         }
         if running
             .iter()
-            .all(|job| job.output.is_some() && job.capture.is_none())
+            .all(|job| job.output.is_some() && job.capture.is_none() && SlotPort::idle(&job.worker))
         {
             break;
         }
-        let mut interests: Vec<asura_platform::PollInterest> = running
-            .iter()
-            .flat_map(|job| job.worker.interests())
-            .collect();
+        let mut interests: Vec<asura_platform::PollInterest> = Vec::new();
+        for job in &running {
+            SlotPort::interests(&job.worker, &mut interests);
+        }
         interests.push(asura_platform::PollInterest {
             fd: std::os::fd::AsRawFd::as_raw_fd(&reader),
             read: true,
@@ -201,7 +290,7 @@ pub fn run_jobs(
         });
         let next = running
             .iter()
-            .filter_map(|job| job.worker.next_deadline(now))
+            .filter_map(|job| SlotPort::next_deadline(&job.worker, now))
             .min()
             .map_or(Duration::from_millis(100), |deadline| {
                 deadline.saturating_duration_since(now)
@@ -552,7 +641,7 @@ impl JobHarness {
             tool_operation: Some(journal::ToolOperation::ExecCmd),
             decision: journal::ToolDecision::Run,
             fault: None,
-            busy: None,
+            reason: None,
             form: journal::ArgumentForm::Canonical,
             arguments_bytes: arguments.len() as u32,
             arguments,
@@ -632,8 +721,9 @@ impl JobHarness {
         Ok((job, self.start_job(pending)?))
     }
 
-    /// Writes the call's kind 15 (handle delivery) after its kind 26
-    /// committed (JR4).
+    /// Writes the call's kind 29 (handle delivery) after its kind 26
+    /// committed (JR11, JR13): outcome `ok` with a `starting` state block,
+    /// as the J3 yield window's result for a job not yet spawned.
     pub fn resolve(&mut self, turn: &Turn, job: Id) -> Result<(), String> {
         self.until(Duration::from_secs(60), |h| h.intent_committed(job))?;
         let ordinal = (1..turn.next)
@@ -646,22 +736,28 @@ impl JobHarness {
             })
             .ok_or("not a call of this turn")?;
         self.append(
-            journal::Record::ToolResult(ToolResult {
+            journal::Record::JobResult(Box::new(journal::JobResult {
                 operation: turn.operation,
                 generation: turn.generation,
                 ordinal,
-                status: 1,
-                text: "job started".into(),
-                truncated: false,
-                next_offset: None,
-            }),
+                status: journal::JobResultOutcome::Ok.status(),
+                outcome: journal::JobResultOutcome::Ok,
+                job: [0; 16],
+                body: journal::JobResultBody::State(journal::JobSnapshot {
+                    state: journal::JobRunState::Starting,
+                    numbers: [0; 3],
+                    elapsed_ms: 0,
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                }),
+            })),
             None,
         )
         .map(|_| ())
-        .map_err(|e| format!("kind 15: {e:?}"))
+        .map_err(|e| format!("kind 29: {e:?}"))
     }
 
-    /// `submit` and `resolve`: the job's kind 26 and the call's kind 15 are
+    /// `submit` and `resolve`: the job's kind 26 and the call's kind 29 are
     /// committed. Fails unless the start was accepted.
     pub fn launch(&mut self, turn: &mut Turn, raw: &str) -> Result<Id, String> {
         let (job, admission) = self.submit(turn, raw)?;

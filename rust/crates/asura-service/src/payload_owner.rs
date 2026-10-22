@@ -1,6 +1,6 @@
-//! The conversation owner's payload state (J1): the retained recovery worker,
+//! The conversation owner's payload state: the retained recovery worker,
 //! the ready store and page-read pool, and the pending-install list of at
-//! most 4 capture workers that outlive their call. It is also the job
+//! most 4 capture workers that outlive their job. It is the job
 //! controller's payload port (J2): admission, release, settlement and
 //! abandonment of each job's reservation and capture worker.
 use crate::capture_worker::{self, Message};
@@ -8,7 +8,7 @@ use crate::job_controller::{Admitted, Origin, PayloadPort, Short};
 use asura_platform::RuntimeDirectory;
 use asura_platform::events::WakeSender;
 use asura_storage::authority::conversation::{
-    CaptureState, ExecCmdBusyReason, Id, JobCaptureState, JobSettled, Replay,
+    CaptureState, Id, JobCaptureState, JobSettled, Replay,
 };
 use asura_storage::authority::writer::{self, WriterClient};
 use asura_storage::payload::{
@@ -63,7 +63,7 @@ impl RecoveryCancel {
         self.client.wake_room_waiters();
     }
 }
-/// Capture workers kept after their call: installing or abandoned.
+/// Capture workers kept after their job: installing or abandoned.
 pub(crate) const PENDING_INSTALLS: usize = 4;
 /// Shutdown cleanup bound for pending installs and live captures.
 pub(crate) const SHUTDOWN_BOUND: Duration = Duration::from_secs(2);
@@ -188,26 +188,6 @@ impl Payloads {
             State::Ready { store, .. } => Some(store),
             _ => None,
         }
-    }
-    /// exec_cmd admission checks before the 1 MiB reservation, in order: a free
-    /// pending-install slot, no paused capture, a ready payload store.
-    pub(crate) fn admission(
-        &self,
-        active_paused: bool,
-    ) -> Result<Arc<PayloadStore>, ExecCmdBusyReason> {
-        if self.pending.len() >= PENDING_INSTALLS {
-            return Err(ExecCmdBusyReason::PendingFull);
-        }
-        if active_paused || self.pending.iter().any(|h| h.paused) {
-            return Err(ExecCmdBusyReason::CapturePaused);
-        }
-        self.store()
-            .cloned()
-            .ok_or(ExecCmdBusyReason::PayloadUnavailable)
-    }
-    /// Moves a worker that outlives its call onto the list.
-    pub(crate) fn push_pending(&mut self, handle: capture_worker::Handle) {
-        self.pending.push(handle);
     }
     /// Collects recovery and drains pending workers; an exited worker leaves
     /// the list and releases its hold.
@@ -465,6 +445,8 @@ mod tests {
             intent_sequence: 5,
             settled: None,
             active: false,
+            pinned: false,
+            deleted: false,
         }
     }
     /// Six ordinary requests fill the queue; returns their tickets.

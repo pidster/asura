@@ -235,13 +235,14 @@ pub(super) fn finished(
 }
 /// One `ToolFinished` event per call with an operation code, run or not
 /// (TCR-D14). It cites the call by operation, generation and ordinal and
-/// never holds argument text.
+/// never holds argument text. The audit `Tool` enum has no `job` tool value
+/// yet, so a `job` command (codes 11 to 16) emits none.
 pub(super) fn tool_finished(
     turn: &asura_storage::authority::conversation::TurnAccepted,
     ordinal: u32,
     operation: asura_storage::authority::conversation::ToolOperation,
     status: u8,
-) -> Event {
+) -> Option<Event> {
     use asura_storage::audit::{Tool, ToolOutcome as O};
     use asura_storage::authority::conversation::ToolOperation as Op;
     let tool = match operation {
@@ -255,6 +256,9 @@ pub(super) fn tool_finished(
         Op::GetNote => Tool::MemoryGetNote,
         Op::NoteSources => Tool::MemoryNoteSources,
         Op::CreateNote => Tool::MemoryCreateNote,
+        Op::JobList | Op::JobStatus | Op::JobRead | Op::JobWait | Op::JobCancel | Op::JobNote => {
+            return None;
+        }
     };
     let outcome = match status {
         1 => O::Success,
@@ -265,14 +269,14 @@ pub(super) fn tool_finished(
         7 => O::Limit,
         _ => O::Unavailable,
     };
-    Event::ToolFinished {
+    Some(Event::ToolFinished {
         project: turn.project,
         operation: turn.operation,
         generation: turn.generation,
         ordinal,
         tool,
         outcome,
-    }
+    })
 }
 
 #[cfg(test)]

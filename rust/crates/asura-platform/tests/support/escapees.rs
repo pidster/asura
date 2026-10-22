@@ -233,11 +233,6 @@ fn all_kinds(home: &Path, project: &Path) {
     assert_eq!(result.escapees, 3, "{result:?}");
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(ended, [true, true], "capture pipes reached EOF");
-    assert!(
-        result
-            .render_text(&Tails::default(), "complete")
-            .contains("cleanup_confirmed=true capture=complete escapees=3\n")
-    );
     for (label, e) in [
         ("setsid", &setsid),
         ("double-fork", &double),

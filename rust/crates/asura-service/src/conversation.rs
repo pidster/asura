@@ -83,20 +83,6 @@ fn error(request: pb::Envelope, message: &str) -> pb::Envelope {
     };
     reply(request, body)
 }
-/// The scratch home whose files drive the test-support capture gates.
-fn gate_home(runtime: &RuntimeDirectory) -> Option<std::path::PathBuf> {
-    #[cfg(feature = "test-support")]
-    {
-        runtime
-            .scratch_home_for_test()
-            .map(std::path::Path::to_path_buf)
-    }
-    #[cfg(not(feature = "test-support"))]
-    {
-        let _ = runtime;
-        None
-    }
-}
 fn storage_error(error: writer::Error) -> &'static str {
     match error {
         writer::Error::Busy => "conversation_busy",
@@ -346,8 +332,6 @@ struct LiveTool {
     /// rewrite, so the raw command is never retained (G8).
     call: Option<tools::Call>,
     create: Option<memory_create::Mutation>,
-    /// A `run` exec_cmd call (J1): secret variables, kind 23 and capture.
-    exec_cmd: Option<Box<exec_cmd_call::ExecCmdLive>>,
     memory_ticket: Option<writer::Ticket>,
     intent_committed: bool,
     dispatched: bool,
@@ -360,14 +344,10 @@ impl LiveTool {
         let record = &mut self.record;
         record.decision = journal::ToolDecision::Cancelled;
         record.fault = None;
-        record.busy = None;
+        record.reason = None;
         record.refusal = None;
         record.command_cut = false;
         record.whole_command = false;
-        if let Some(exec_cmd) = &mut self.exec_cmd {
-            exec_cmd.release_admission();
-        }
-        self.exec_cmd = None;
         self.create = None;
         self.call = None;
     }
@@ -471,7 +451,6 @@ struct Active {
     tool: Option<LiveTool>,
     tool_budget: tools::Budget,
     tool_executor: tools::Executor,
-    exec_cmd_worker: crate::exec_cmd_worker::Worker,
     /// Completed calls by ordinal: the received digest and the result sent.
     tool_cache: Vec<(u32, [u8; 32], mp::ToolResult)>,
     /// Per-turn key for the received-call digest; dropped at turn end.
@@ -536,7 +515,6 @@ enum Job {
     Cancel,
     Finish,
     ToolIntent,
-    CaptureSettled,
     ToolResult,
     /// One kind 24 response segment (response-text-transfer.md).
     ResponseText,
@@ -1226,11 +1204,7 @@ impl Owner {
         let mut interests = self
             .active
             .as_ref()
-            .map(|active| {
-                let mut interests = active.model.interests();
-                interests.extend(active.exec_cmd_worker.interests());
-                interests
-            })
+            .map(|active| active.model.interests())
             .unwrap_or_default();
         self.jobs.interests(&mut interests);
         interests
@@ -1249,11 +1223,6 @@ impl Owner {
             .then_some(now + std::time::Duration::from_millis(10));
         model
             .into_iter()
-            .chain(
-                self.active
-                    .as_ref()
-                    .and_then(|a| a.exec_cmd_worker.next_deadline(now)),
-            )
             .chain((!self.foreground.is_empty() && self.pending.is_none()).then_some(now))
             .chain(
                 (!self.sensor_seeded
@@ -1993,13 +1962,6 @@ impl Owner {
             tool: None,
             tool_budget: tools::Budget::cancellation_driven(),
             tool_executor,
-            exec_cmd_worker: {
-                let mut worker = crate::exec_cmd_worker::Worker::default();
-                if let Some(wake) = &self.wake {
-                    worker.register(wake.clone());
-                }
-                worker
-            },
             tool_cache: Vec::new(),
             secret_key: zeroize::Zeroizing::new({
                 let mut key = [0u8; 32];
@@ -2496,7 +2458,7 @@ impl Owner {
                 if let Some((status, text)) = tools::not_run_result(
                     record.decision,
                     record.fault,
-                    record.busy,
+                    record.reason,
                     record.refusal,
                 ) {
                     let tool = active.tool.take().expect("pending tool");
@@ -2504,13 +2466,14 @@ impl Owner {
                     active.measurements.tool_ms[index] = Some(0);
                     if let (Some(emitter), Some(operation)) =
                         (&self.audit_emitter, tool.record.tool_operation)
-                    {
-                        let _ = emitter.try_emit(audit_tools::tool_finished(
+                        && let Some(event) = audit_tools::tool_finished(
                             &active.turn,
                             tool.ordinal,
                             operation,
                             status,
-                        ));
+                        )
+                    {
+                        let _ = emitter.try_emit(event);
                     }
                     let wire = mp::ToolResult {
                         ordinal: Some(tool.ordinal),
@@ -2535,37 +2498,6 @@ impl Owner {
                     }
                 }
             }
-            Job::CaptureSettled => {
-                let active = self.active.as_mut().expect("active capture settlement");
-                let tool = active.tool.as_mut().expect("pending tool");
-                let exec_cmd = tool.exec_cmd.as_mut().expect("exec_cmd call");
-                let settled = exec_cmd.settled.as_ref().expect("settled capture");
-                exec_cmd.settled_committed = true;
-                let sequence = self.replay.as_ref().map_or(0, |r| r.sequence);
-                if let Some(store) = &exec_cmd.store {
-                    if settled.state == journal::CaptureState::NotStarted {
-                        store.release(exec_cmd.run.job);
-                    } else {
-                        store.settle(
-                            exec_cmd.run.job,
-                            settled.state,
-                            [
-                                (settled.stdout.stored_bytes, settled.stdout.digest),
-                                (settled.stderr.stored_bytes, settled.stderr.digest),
-                            ],
-                            sequence,
-                            exec_cmd.capture.is_some(),
-                        );
-                    }
-                }
-                // The worker installs after kind 23; the turn never waits.
-                if let Some(capture) = exec_cmd.capture.take() {
-                    if settled.state != journal::CaptureState::Unconfirmed {
-                        capture.install();
-                    }
-                    self.payloads.push_pending(capture);
-                }
-            }
             Job::ToolResult => {
                 let active = self.active.as_mut().expect("active tool result");
                 let tool = active.tool.take().expect("pending tool");
@@ -2580,13 +2512,14 @@ impl Owner {
                     });
                 if let (Some(emitter), Some(operation)) =
                     (&self.audit_emitter, tool.record.tool_operation)
-                {
-                    let _ = emitter.try_emit(audit_tools::tool_finished(
+                    && let Some(event) = audit_tools::tool_finished(
                         &active.turn,
                         call.ordinal,
                         operation,
                         result.status,
-                    ));
+                    )
+                {
+                    let _ = emitter.try_emit(event);
                 }
                 let mut wire = tool_wire_result(&result);
                 // TCR-D1: a created note's text is rendered from its derived
@@ -2919,7 +2852,6 @@ impl Owner {
         active: &mut Active,
         value: mp::ToolCall,
         now: Instant,
-        payloads: &crate::payload_owner::Payloads,
         replay: Option<&journal::Replay>,
     ) {
         let ordinal = value.ordinal.unwrap_or(0);
@@ -2947,7 +2879,7 @@ impl Owner {
             return;
         }
         let rules = asura_platform::secrets::detection();
-        let tool = Self::decide(active, &value, digest, payloads, replay, rules);
+        let tool = Self::decide(active, &value, digest, replay, rules);
         if ordinal <= tools::MAX_CALLS && active.tool_budget.record(ordinal).is_err() {
             Self::failed(active, "model_protocol_fault", now);
             return;
@@ -2962,7 +2894,6 @@ impl Owner {
         active: &Active,
         value: &mp::ToolCall,
         digest: [u8; 32],
-        payloads: &crate::payload_owner::Payloads,
         replay: Option<&journal::Replay>,
         rules: Result<
             &'static asura_platform::secrets::RuleSet,
@@ -2988,7 +2919,7 @@ impl Owner {
             tool_operation: None,
             decision: D::Refused,
             fault: None,
-            busy: None,
+            reason: None,
             form: ArgumentForm::NotRetained(NotRetainedReason::DetectionUnavailable),
             arguments_bytes: text.map_or(value.arguments_bytes.unwrap_or(0), |t| t.len() as u32),
             arguments: String::new(),
@@ -3006,7 +2937,6 @@ impl Owner {
             record: record.clone(),
             call: None,
             create: None,
-            exec_cmd: None,
             memory_ticket: None,
             intent_committed: false,
             dispatched: false,
@@ -3109,7 +3039,7 @@ impl Owner {
             };
             record.fault = Some(fault);
         } else if let Ok(arguments) = parsed.arguments {
-            let mut call = tools::Call {
+            let call = tools::Call {
                 operation: active.turn.operation,
                 generation: active.turn.generation,
                 ordinal,
@@ -3143,57 +3073,12 @@ impl Owner {
                         record.refusal = Some(exec_cmd_call::refusal(&refusal));
                         record.command_cut = command_cut;
                     }
-                    Ok(plan) => {
-                        if let tools::Arguments::ExecCmd { command, .. } = &mut call.arguments {
-                            *command = plan.command().to_owned();
-                        }
-                        let live = exec_cmd_call::LiveSecrets::from(plan);
-                        let run = replay.and_then(|r| {
-                            crate::exec_cmd_worker::ExecCmdRun::derive(r.installation_id, &call)
-                                .map(|run| live.filter(run))
-                        });
-                        let admission = run.as_ref().ok_or(None).and_then(|run| {
-                            payloads
-                                .admission(active.exec_cmd_worker.capture_paused())
-                                .and_then(|store| {
-                                    store
-                                        .admit(
-                                            replay.map_or([0; 16], |r| r.installation_id),
-                                            run.job,
-                                            call.operation,
-                                        )
-                                        .map(|victims| (store, victims))
-                                        .map_err(|_| journal::ExecCmdBusyReason::Quota)
-                                })
-                                .map_err(Some)
-                        });
-                        match (run, admission) {
-                            (Some(run), Ok((store, victims))) => {
-                                // SL7: field 20 bit 1 and the fallback reason
-                                // only on the admitted `run`.
-                                if let Some(reason) = &live.reason {
-                                    record.whole_command = true;
-                                    record.refusal = Some(exec_cmd_call::refusal(reason));
-                                    record.command_cut = command_cut;
-                                }
-                                tool.exec_cmd = Some(Box::new(exec_cmd_call::ExecCmdLive {
-                                    run,
-                                    secrets: live.variables,
-                                    secret_command: live.command,
-                                    victims,
-                                    store: Some(store),
-                                    settled: None,
-                                    settled_committed: false,
-                                    capture: None,
-                                }));
-                            }
-                            (_, Err(Some(reason))) => {
-                                record.decision = D::Busy;
-                                record.busy = Some(reason);
-                            }
-                            _ => record.decision = D::Denied,
-                        }
-                    }
+                    // J3 retired the J1 call path (J3-E9). Until J34-E submits
+                    // the call to the job controller, a rewritten exec_cmd
+                    // call is `denied` with reason 0 and runs nothing
+                    // (TJ-P3 step 4). The SL7 bit and fallback reason are
+                    // written only on `run`.
+                    Ok(_) => record.decision = D::Denied,
                 }
             }
             if record.decision == D::Run {
@@ -3247,9 +3132,6 @@ impl Owner {
         {
             active.model.cancel(4, now);
             active.tool_executor.cancel();
-            active
-                .exec_cmd_worker
-                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             active.tool_budget.cancel();
             return;
         }
@@ -3271,9 +3153,6 @@ impl Owner {
         });
         active.model.cancel(4, now);
         active.tool_executor.cancel();
-        active
-            .exec_cmd_worker
-            .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
         active.tool_budget.cancel();
     }
     pub(crate) fn retain_observers(&mut self, attachments: &[[u8; 16]]) {
@@ -3545,7 +3424,7 @@ impl Owner {
                     if !active.tools_enabled || !active.start_committed {
                         Self::failed(active, "model_protocol_fault", now);
                     } else {
-                        Self::tool_call(active, call, now, &self.payloads, self.replay.as_deref());
+                        Self::tool_call(active, call, now, self.replay.as_deref());
                     }
                 }
                 ModelEvent::Terminal {
@@ -3602,23 +3481,6 @@ impl Owner {
             }
             tool.result = Some(result);
         }
-        if let Some(active) = &mut self.active
-            && let Some(output) = active.exec_cmd_worker.poll(now)
-        {
-            let mut result = output.result;
-            if result.text.len() > active.tool_budget.result_capacity() {
-                result.status = 7;
-                result.text.clear();
-                result.truncated = false;
-            }
-            if let Some(tool) = &mut active.tool {
-                tool.result = Some(result);
-                if let Some(exec_cmd) = &mut tool.exec_cmd {
-                    exec_cmd.settled = Some(output.settled);
-                    exec_cmd.capture = output.capture;
-                }
-            }
-        }
         self.payloads.poll();
         self.payloads.ensure_recovery(
             &self.runtime,
@@ -3627,13 +3489,6 @@ impl Owner {
             self.wake.as_ref(),
         );
         self.poll_jobs(now);
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|a| a.exec_cmd_worker.settlement_expired())
-        {
-            self.unavailable = Some("authority_repair_required");
-        }
         self.capture_memory_create();
         self.capture_memory_tool();
         self.capture_sensor_tool(now);
@@ -3712,27 +3567,17 @@ impl Owner {
         }
         if active.terminal.is_some() {
             active.tool_executor.cancel();
-            active
-                .exec_cmd_worker
-                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
         }
         if active.cancel.is_some() {
             active.tool_budget.cancel();
             active.tool_executor.cancel();
-            active
-                .exec_cmd_worker
-                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             active.model.cancel(if self.closing { 3 } else { 1 }, now);
         }
         if self.unavailable.is_some() {
             active.model.cancel(3, now);
             active.tool_executor.cancel();
-            active
-                .exec_cmd_worker
-                .cancel(asura_platform::exec_cmd::StopReason::Cancelled);
             if active.model.is_settled()
                 && active.tool_executor.is_settled()
-                && active.exec_cmd_worker.is_settled()
                 && active
                     .tool
                     .as_ref()
@@ -3744,11 +3589,6 @@ impl Owner {
                     .and_then(|tool| tool.create.as_ref())
                     .is_none_or(memory_create::Mutation::settled)
             {
-                if let Some(exec_cmd) = active.tool.as_mut().and_then(|t| t.exec_cmd.as_mut())
-                    && !exec_cmd.settled_committed
-                {
-                    exec_cmd.release_admission();
-                }
                 self.active = None;
             }
             return;
@@ -3915,73 +3755,6 @@ impl Owner {
                             &call,
                             Err(tools::ExecutionError::Rejected(tools::Rejection::Cancelled)),
                         ));
-                        // Turn cancelled after kind 14, before spawn (J1).
-                        if let Some(exec_cmd) = &mut tool.exec_cmd {
-                            exec_cmd.release_admission();
-                            exec_cmd.settled = Some(exec_cmd_call::not_started(&exec_cmd.run));
-                        }
-                    } else if let Some(exec_cmd) = &mut tool.exec_cmd {
-                        let outcome = tools::validate(
-                            &call,
-                            &tool_grant(&active.turn, active.foreground_user),
-                            &tools::Destination::Local,
-                        )
-                        .map_err(tools::ExecutionError::Rejected)
-                        .and_then(|()| {
-                            let project = self
-                                .replay
-                                .as_ref()
-                                .and_then(|r| {
-                                    r.projects
-                                        .get(&active.turn.project)
-                                        .map(|p| &p.registration)
-                                })
-                                .ok_or(tools::ExecutionError::Rejected(tools::Rejection::Denied))?;
-                            let store = exec_cmd
-                                .store
-                                .clone()
-                                .ok_or(tools::ExecutionError::Rejected(tools::Rejection::Denied))?;
-                            let rules = asura_platform::secrets::detection().map_err(|_| {
-                                tools::ExecutionError::Rejected(tools::Rejection::Denied)
-                            })?;
-                            let redaction = asura_platform::secrets::JobRedaction::new(
-                                rules,
-                                &exec_cmd.secrets,
-                            );
-                            let (secrets, secret_command) =
-                                exec_cmd_call::request_secrets(exec_cmd);
-                            let wake = active.exec_cmd_worker.wake();
-                            active
-                                .exec_cmd_worker
-                                .start(crate::exec_cmd_worker::Dispatch {
-                                    runtime: self.runtime.clone(),
-                                    scope: tools::ExecutionScope {
-                                        project: project.project,
-                                        path: project.location.clone(),
-                                        device: project.device,
-                                        inode: project.inode,
-                                        boundary: self.runtime.state_boundary(),
-                                    },
-                                    call: call.clone(),
-                                    intent: exec_cmd.run.clone(),
-                                    secrets,
-                                    secret_command,
-                                    capture: crate::capture_worker::Start {
-                                        store,
-                                        job: exec_cmd.run.job,
-                                        victims: std::mem::take(&mut exec_cmd.victims),
-                                        redaction,
-                                        wake,
-                                        gate_home: gate_home(&self.runtime),
-                                    },
-                                })
-                        });
-                        if let Err(error) = outcome {
-                            // Never started: `not_started` before the result.
-                            tool.result = Some(tool_result(&call, Err(error)));
-                            exec_cmd.release_admission();
-                            exec_cmd.settled = Some(exec_cmd_call::not_started(&exec_cmd.run));
-                        }
                     } else if call.arguments.is_memory_create() {
                         let authorized = active.foreground_user
                             && active.tools_enabled
@@ -4076,24 +3849,8 @@ impl Owner {
                         }
                     }
                 }
-                // Settle, then install (R2): kind 23 commits before kind 15.
-                if let Some(exec_cmd) = &tool.exec_cmd
-                    && !exec_cmd.settled_committed
-                {
-                    if let Some(settled) = &exec_cmd.settled
-                        && tool.result.is_some()
-                        && active.exec_cmd_worker.is_settled()
-                    {
-                        let record = journal::Record::CaptureSettled(Box::new(settled.clone()));
-                        if let Err(e) = self.append(record, Job::CaptureSettled, None) {
-                            self.unavailable = Some(storage_error(e));
-                        }
-                    }
-                    return;
-                }
                 if let Some(result) = &tool.result
                     && active.tool_executor.is_settled()
-                    && active.exec_cmd_worker.is_settled()
                     && tool
                         .memory_ticket
                         .as_ref()
@@ -4113,7 +3870,6 @@ impl Owner {
         }
         if active.model.is_settled()
             && active.tool_executor.is_settled()
-            && active.exec_cmd_worker.is_settled()
             && active
                 .tool
                 .as_ref()
@@ -4191,7 +3947,7 @@ impl Owner {
             .skip(first)
             .map(|(index, tool)| {
                 let rendered =
-                    tools::not_run_result(tool.decision, tool.fault, tool.busy, tool.refusal);
+                    tools::not_run_result(tool.decision, tool.fault, tool.reason, tool.refusal);
                 pb::ToolProgress {
                     ordinal: Some(index as u32 + 1),
                     // J4T-09: wired by the integration packet.
@@ -4236,7 +3992,8 @@ impl Owner {
                         .map(|(_, text)| prefix(&text, 128))
                         .or_else(|| tool.preview.clone()),
                     truncated: tool.truncated,
-                    exit_code: tool.exit_code,
+                    // Kind 28 holds the exit facts; J34-E derives them.
+                    exit_code: None,
                 }
             })
             .collect()

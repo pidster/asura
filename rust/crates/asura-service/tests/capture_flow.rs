@@ -1,13 +1,20 @@
-//! J1 service-level qualification: the real service, the real Swift helper
-//! against a scripted loopback model endpoint, the real conversation owner,
-//! guardian, sandbox, capture workers, journal and payload store, all in
-//! private scratch homes. Every case ends with the raw-byte sweep.
+//! exec_cmd service-level qualification (the J1T cases): the real service,
+//! the real Swift helper against a scripted loopback model endpoint, the
+//! real conversation owner, guardian, sandbox, capture workers, journal and
+//! payload store, all in private scratch homes. Every case ends with the
+//! raw-byte sweep.
+//!
+//! J3 retired the J1 call path (J3-E9): kind 23, the kind 15 tails and the
+//! J1 busy codes. The settled facts are read from the call's kind 28 and the
+//! result from its kind 29. Between J3-D and J34-E a model exec_cmd call is
+//! recorded `denied` and runs nothing (TJ-P3 step 4), so these cases pass
+//! again only once J34-E ports them to the job path.
 #[path = "support/queue_submit.rs"]
 mod queue_submit;
 use asura_client::Client;
 use asura_control::pb;
 use asura_platform::RuntimeDirectory;
-use asura_storage::authority::conversation::{self as journal, CaptureReason, CaptureState};
+use asura_storage::authority::conversation::{self as journal, CaptureReason, JobCaptureState};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -363,7 +370,6 @@ fn cancel(fixture: &Fixture, operation: [u8; 16]) -> Result<Duration> {
 enum Disposition {
     Admitted,
     Refused,
-    Busy,
     Other(journal::ToolDecision),
 }
 /// One exec_cmd call as the journal states it: the kind 14 record (the only
@@ -374,15 +380,33 @@ struct Intent {
     command: String,
     variables: Vec<journal::SecretKind>,
     refusal: Option<journal::ExecCmdRefusal>,
-    busy: Option<journal::ExecCmdBusyReason>,
     stdout_payload: [u8; 16],
 }
-/// The records of one operation's exec_cmd calls, decoded from the journal.
+/// The records of one operation's exec_cmd calls, decoded from the journal:
+/// kind 14, the job's kind 28 and the call's kind 29.
 struct Call {
     intent: Intent,
     record: journal::ToolCall,
-    settled: Option<journal::CaptureSettled>,
-    result: Option<journal::ToolResult>,
+    settled: Option<journal::JobSettled>,
+    result: Option<journal::JobResult>,
+}
+/// Every record of the journal, in order.
+fn records(bytes: &[u8]) -> Result<Vec<journal::Record>> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset + 12..offset + 16].try_into()?) as usize;
+        let frame = &bytes[offset..offset + length];
+        out.push(
+            journal::decode_record(
+                u16::from_be_bytes([frame[10], frame[11]]),
+                &frame[144..frame.len() - 40],
+            )
+            .map_err(|e| format!("decode: {e:?}"))?,
+        );
+        offset += length;
+    }
+    Ok(out)
 }
 fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
     let (bytes, replay) = fixture.journal()?;
@@ -399,22 +423,21 @@ fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
             )
             .map_err(|e| format!("decode: {e:?}"))?)
         };
+    let all = records(&bytes)?;
     let mut out = Vec::new();
     for tool in &op.tools {
         let journal::Record::ToolCall(record) = decode(tool.intent_frame)? else {
             return Err("kind 14 expected".into());
         };
-        let settled = match tool.exec_cmd.as_ref().and_then(|s| s.settled.as_ref()) {
-            Some(s) => match decode(s.frame)? {
-                journal::Record::CaptureSettled(settled) => Some(*settled),
-                _ => return Err("kind 23 expected".into()),
-            },
-            None => None,
-        };
+        let job = journal::exec_cmd_job_id(operation, record.generation, record.ordinal);
+        let settled = all.iter().find_map(|r| match r {
+            journal::Record::JobSettled(s) if s.job == job => Some((**s).clone()),
+            _ => None,
+        });
         let result = match &tool.result_frame {
             Some(frame) => match decode(*frame)? {
-                journal::Record::ToolResult(result) => Some(result),
-                _ => return Err("kind 15 expected".into()),
+                journal::Record::JobResult(result) => Some(*result),
+                _ => return Err("kind 29 expected".into()),
             },
             None => None,
         };
@@ -424,13 +447,11 @@ fn exec_cmd_calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<Call>> {
             disposition: match record.decision {
                 journal::ToolDecision::Run => Disposition::Admitted,
                 journal::ToolDecision::Refused => Disposition::Refused,
-                journal::ToolDecision::Busy => Disposition::Busy,
                 other => Disposition::Other(other),
             },
             command: arguments["command"].as_str().unwrap_or_default().to_owned(),
             variables: record.number_kinds.clone(),
             refusal: record.refusal,
-            busy: record.busy,
             stdout_payload: asura_storage::payload::payload_id(
                 replay.installation_id,
                 journal::exec_cmd_job_id(operation, record.generation, record.ordinal),
@@ -568,24 +589,20 @@ fn secrets_turn() -> Result<()> {
     );
     let calls = exec_cmd_calls(&fixture, operation)?;
     assert_eq!(calls.len(), 3);
-    // 1. cat .env: placeholders in the result and in what the model saw.
+    // 1. cat .env: placeholders in the stored output. Results carry no
+    // output text (PC12); the J1 tails are retired.
     let cat = &calls[0];
     assert_eq!(cat.intent.disposition, Disposition::Admitted);
-    let settled = cat.settled.as_ref().ok_or("kind 23")?;
-    assert_eq!(settled.state, CaptureState::Complete);
-    let result = cat.result.as_ref().ok_or("kind 15")?;
-    assert!(
-        result.text.contains("GITHUB_TOKEN=$ASURA_SECRET_1"),
-        "{}",
-        result.text
-    );
-    assert!(result.text.contains("capture=complete"));
+    let settled = cat.settled.as_ref().ok_or("kind 28")?;
+    assert_eq!(settled.capture_state, JobCaptureState::Complete);
+    cat.result.as_ref().ok_or("kind 29")?;
     wait_for(Duration::from_secs(5), "install", || {
         object(&fixture, cat.intent.stdout_payload).exists()
     })?;
     let stored = std::fs::read(object(&fixture, cat.intent.stdout_payload))?;
     let digest: [u8; 32] = Sha256::digest(&stored).into();
-    assert_eq!(settled.stdout.digest, Some(digest));
+    assert_eq!(settled.stdout.capture.digest, Some(digest));
+    assert!(holds(&stored, "GITHUB_TOKEN=$ASURA_SECRET_1"));
     // 2. command secret: kind 14 holds the rewrite; the command used the value.
     let rewrite = &calls[1];
     assert!(
@@ -612,30 +629,20 @@ fn secrets_turn() -> Result<()> {
     assert_eq!(quoted.intent.command, "echo '$ASURA_SECRET_1'");
     assert_eq!(quoted.record.form, journal::ArgumentForm::Canonical);
     assert_eq!(
-        quoted.settled.as_ref().map(|s| s.state),
-        Some(CaptureState::Complete)
+        quoted.settled.as_ref().map(|s| s.capture_state),
+        Some(JobCaptureState::Complete)
     );
-    let echoed = quoted.result.as_ref().ok_or("kind 15")?;
-    assert!(
-        echoed
-            .text
-            .contains("command filtered: run from a secret variable: echo '$ASURA_SECRET_1'"),
-        "{}",
-        echoed.text
-    );
-    assert!(
-        echoed.text.contains("stdout:\n$ASURA_SECRET_1\n"),
-        "{}",
-        echoed.text
-    );
+    wait_for(Duration::from_secs(5), "install", || {
+        object(&fixture, quoted.intent.stdout_payload).exists()
+    })?;
+    let echoed = std::fs::read(object(&fixture, quoted.intent.stdout_payload))?;
+    assert_eq!(echoed, b"$ASURA_SECRET_1\n");
     // What the model saw.
     let messages = model.tool_messages();
     assert_eq!(messages.len(), 3, "{messages:?}");
-    assert!(messages[0].contains("$ASURA_SECRET_1"));
     for message in &messages {
         assert!(!message.contains(&first) && !message.contains(&second));
     }
-    assert!(messages[2].contains("command filtered: run from a secret variable"));
     // The service stays available.
     model.script(&[Step::ExecCmd("printf after".into()), Step::Final]);
     let next = submit(&fixture, project, "Again.")?;
@@ -730,26 +737,20 @@ fn whole_command_turn() -> Result<()> {
         .ok_or("derived exec_cmd")?;
     assert_eq!(derived.fixed_command, Some(journal::WHOLE_COMMAND));
     assert_eq!(derived.secret_variables, 1);
-    let settled = call.settled.as_ref().ok_or("kind 23")?;
-    assert_eq!(settled.state, CaptureState::Complete);
-    let result = call.result.as_ref().ok_or("kind 15")?;
-    assert!(result.text.contains("exit_code=0"), "{}", result.text);
-    assert!(
-        result.text.contains(
-            "command filtered: run from a secret variable: printf '%s' '$ASURA_SECRET_1'"
-        ),
-        "{}",
-        result.text
-    );
+    let settled = call.settled.as_ref().ok_or("kind 28")?;
+    assert_eq!(settled.capture_state, JobCaptureState::Complete);
+    assert_eq!((settled.exit_kind, settled.exit_value), (1, 0));
+    call.result.as_ref().ok_or("kind 29")?;
     // The printed value is the command's literal, replaced by its number.
-    assert!(
-        result.text.contains("stdout:\n$ASURA_SECRET_1\n"),
-        "{}",
-        result.text
+    wait_for(Duration::from_secs(5), "install", || {
+        object(&fixture, call.intent.stdout_payload).exists()
+    })?;
+    assert_eq!(
+        std::fs::read(object(&fixture, call.intent.stdout_payload))?,
+        b"$ASURA_SECRET_1"
     );
     let messages = model.tool_messages();
     assert_eq!(messages.len(), 1, "{messages:?}");
-    assert!(messages[0].contains("command filtered: run from a secret variable"));
     assert!(!messages[0].contains(&value));
     drop(model);
     let mut fixture = fixture;
@@ -775,9 +776,10 @@ fn timeout_removed() -> Result<()> {
     let event = finish(&fixture, operation, Duration::from_secs(120))?;
     assert_eq!(event.kind, Some(3));
     let calls = exec_cmd_calls(&fixture, operation)?;
-    let result = calls[0].result.as_ref().ok_or("kind 15")?;
+    let result = calls[0].result.as_ref().ok_or("kind 29")?;
     assert_eq!(result.status, 1);
-    assert!(result.text.contains("exit_code=7"), "{}", result.text);
+    let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
+    assert_eq!((settled.exit_kind, settled.exit_value), (1, 7));
     assert!(started.elapsed() >= Duration::from_secs(65));
     model.script(&[
         Step::ExecCmd("printf '%s' $$ > pid; sleep 300".into()),
@@ -832,8 +834,8 @@ fn setup_budget_removed() -> Result<()> {
     );
     std::fs::remove_file(&hold)?;
     let calls = exec_cmd_calls(&fixture, operation)?;
-    let settled = calls[0].settled.as_ref().ok_or("kind 23")?;
-    assert_eq!(settled.state, CaptureState::NotStarted);
+    let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
+    assert_eq!(settled.capture_state, JobCaptureState::NotStarted);
     assert_eq!(calls[0].result.as_ref().map(|r| r.status), Some(6));
     assert!(!directory.join("marker2").exists());
     assert!(!staging(&fixture, calls[0].intent.stdout_payload).exists());
@@ -857,9 +859,9 @@ fn no_output_stop() -> Result<()> {
         Some(3)
     );
     let calls = exec_cmd_calls(&fixture, operation)?;
-    let settled = calls[0].settled.as_ref().ok_or("kind 23")?;
-    assert_eq!(settled.state, CaptureState::Complete);
-    assert_eq!(settled.stdout.stored_bytes, size);
+    let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
+    assert_eq!(settled.capture_state, JobCaptureState::Complete);
+    assert_eq!(settled.stdout.capture.stored_bytes, size);
     assert!(settled.final_reservation >= size);
     wait_for(Duration::from_secs(20), "install", || {
         object(&fixture, calls[0].intent.stdout_payload).exists()
@@ -875,44 +877,9 @@ fn no_output_stop() -> Result<()> {
     Ok(())
 }
 
-/// J1T-08 integration: quota short at admission with nothing expirable is a
-/// visible `busy` with reason `quota`.
-fn quota_busy() -> Result<()> {
-    let model = Model::start()?;
-    let mut fixture = Fixture::new("busy")?;
-    // Free space reported as 16.5 MiB: the effective quota is 0.5 MiB.
-    std::fs::write(
-        fixture.home.join("payload-free-bytes"),
-        (33 * 512 * 1024).to_string(),
-    )?;
-    fixture.start()?;
-    fixture.wait_ready()?;
-    let (project, directory) = fixture.project("project")?;
-    fixture.model(&model.endpoint)?;
-    model.script(&[Step::ExecCmd("printf ran > marker".into()), Step::Final]);
-    let operation = submit(&fixture, project, "Busy.")?;
-    assert_eq!(
-        finish(&fixture, operation, Duration::from_secs(30))?.kind,
-        Some(3)
-    );
-    let calls = exec_cmd_calls(&fixture, operation)?;
-    assert_eq!(calls[0].intent.disposition, Disposition::Busy);
-    assert_eq!(
-        calls[0].intent.busy,
-        Some(journal::ExecCmdBusyReason::Quota)
-    );
-    // Busy is complete at kind 14; its status 4 text is rendered (TCR-D12).
-    assert!(calls[0].result.is_none());
-    assert!(!directory.join("marker").exists());
-    let messages = model.tool_messages();
-    assert!(messages[0].contains("exec_cmd_busy: quota"), "{messages:?}");
-    println!("PASS J1T-08 visible busy: kind 14 busy quota, no kind 15, nothing ran");
-    Ok(())
-}
-
 /// J1T-21 integration and J1T-15 controls: a stalled scanner only
-/// backpressures; cancel gives `unconfirmed` at 2.5 s; four kept workers
-/// fill the pending-install list and the next call is `pending_full`.
+/// backpressures; cancel gives `unconfirmed` at 2.5 s. (The J1 `pending_full`
+/// busy code is retired: J3 queues a start behind `pending_installs`.)
 fn overload() -> Result<()> {
     let (fixture, model, project, _) = setup("overload")?;
     let gate = fixture.home.join("capture-hold-scan");
@@ -937,9 +904,9 @@ fn overload() -> Result<()> {
         );
         let settled_after = cancel_started.elapsed();
         let calls = exec_cmd_calls(&fixture, operation)?;
-        let settled = calls[0].settled.as_ref().ok_or("kind 23")?;
-        assert_eq!(settled.state, CaptureState::Unconfirmed);
-        assert_eq!(settled.reason, CaptureReason::SettlementUnconfirmed);
+        let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
+        assert_eq!(settled.capture_state, JobCaptureState::Unconfirmed);
+        assert_eq!(settled.capture_reason, CaptureReason::SettlementUnconfirmed);
         assert!(
             settled_after >= Duration::from_millis(2400),
             "{settled_after:?}"
@@ -948,40 +915,10 @@ fn overload() -> Result<()> {
             println!("J1T-21: unconfirmed settled {settled_after:?} after the cancel");
         }
     }
-    model.script(&[Step::ExecCmd("printf ran".into()), Step::Final]);
-    let operation = submit(&fixture, project, "Full list.")?;
-    assert_eq!(
-        finish(&fixture, operation, Duration::from_secs(20))?.kind,
-        Some(3)
-    );
-    let calls = exec_cmd_calls(&fixture, operation)?;
-    assert_eq!(
-        calls[0].intent.busy,
-        Some(journal::ExecCmdBusyReason::PendingFull)
-    );
     std::fs::remove_file(&gate)?;
-    // Released workers abandon and leave the list; admission resumes.
-    let mut admitted = false;
-    for _ in 0..50 {
-        model.script(&[Step::ExecCmd("printf ran".into()), Step::Final]);
-        let operation = submit(&fixture, project, "After release.")?;
-        finish(&fixture, operation, Duration::from_secs(20))?;
-        if calls_admitted(&fixture, operation)? {
-            admitted = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    assert!(admitted, "admission resumed after the kept workers exited");
-    println!(
-        "PASS J1T-21 stalled capture only backpressures; unconfirmed at L3; pending_full; recovery of the list"
-    );
+    println!("PASS J1T-21 stalled capture only backpressures; unconfirmed at L3");
     Ok(())
 }
-fn calls_admitted(fixture: &Fixture, operation: [u8; 16]) -> Result<bool> {
-    Ok(exec_cmd_calls(fixture, operation)?[0].intent.disposition == Disposition::Admitted)
-}
-
 /// J1T-22 (RG-05): crashes at each point; recovery installs once and never
 /// reruns a command.
 fn crash_points() -> Result<()> {
@@ -1018,7 +955,7 @@ fn crash_points() -> Result<()> {
     wait_for(Duration::from_secs(20), "running", || effects("b.txt") == 1)?;
     thread::sleep(Duration::from_millis(300));
     restart(&mut fixture)?;
-    // (c) After sealing, before kind 23 commits.
+    // (c) After sealing, before kind 28 commits.
     model.script(&[
         Step::ExecCmd("printf x >> c.txt; printf sealed".into()),
         Step::Final,
@@ -1036,7 +973,7 @@ fn crash_points() -> Result<()> {
     std::fs::remove_file(fixture.home.join("journal-hold-appends"))?;
     fixture.start()?;
     fixture.wait_ready()?;
-    // (d) After kind 23, install fails: recovery installs after the digest check.
+    // (d) After kind 28, install fails: recovery installs after the digest check.
     std::fs::write(fixture.home.join("payload-fault-install"), b"eio")?;
     model.script(&[
         Step::ExecCmd("printf x >> d.txt; printf installed-later".into()),
@@ -1048,7 +985,7 @@ fn crash_points() -> Result<()> {
     let d_calls = exec_cmd_calls(&fixture, d)?;
     assert!(staging(&fixture, d_calls[0].intent.stdout_payload).exists());
     restart(&mut fixture)?;
-    // (e) After kind 15.
+    // (e) After kind 29.
     model.script(&[
         Step::ExecCmd("printf x >> e.txt; printf done".into()),
         Step::Final,
@@ -1074,10 +1011,15 @@ fn crash_points() -> Result<()> {
         let op = &replay.operations[&operation];
         let terminal = op.terminal.as_ref().ok_or("terminal")?;
         assert_eq!(terminal.kind, journal::TerminalKind::Interrupted, "{label}");
-        let call = op.tools[0].exec_cmd.as_ref().ok_or("exec_cmd")?;
+        op.tools[0].exec_cmd.as_ref().ok_or("exec_cmd")?;
+        // J2 recovery is explicit: an unsettled job gets kind 28
+        // `interrupted` at the next start.
+        let call = &exec_cmd_calls(&fixture, operation)?[0];
         assert!(
-            call.settled.is_none(),
-            "{label}: no record written at recovery"
+            call.settled
+                .as_ref()
+                .is_none_or(|s| s.outcome == journal::JobOutcome::Interrupted),
+            "{label}: interrupted at recovery"
         );
     }
     // (a) never staged; (b) and (c) keep unverified prefixes.
@@ -1101,7 +1043,7 @@ fn crash_points() -> Result<()> {
         b"done"
     );
     println!(
-        "PASS J1T-22 crash before spawn, while running, after sealing, after kind 23 with install pending, after kind 15: derived recovery, install once, no rerun"
+        "PASS J1T-22 crash before spawn, while running, after sealing, after kind 28 with install pending, after kind 29: recovery installs once, no rerun"
     );
     Ok(())
 }
@@ -1135,10 +1077,10 @@ fn native() -> Result<()> {
         call.intent.command
     );
     assert!(!call.intent.command.contains(&secret));
-    let result = call.result.as_ref().ok_or("kind 15")?;
+    let result = call.result.as_ref().ok_or("kind 29")?;
     // The model chooses the exact bytes it sends; the record and the run are
     // what this proves. The command succeeded through its secret variable.
-    assert_eq!(result.status, 1, "{}", result.text);
+    assert_eq!(result.status, 1, "{result:?}");
     assert!(
         call.intent.variables.len() == 1,
         "{:?}",
@@ -1160,9 +1102,10 @@ fn native() -> Result<()> {
     let event = finish(&fixture, long, Duration::from_secs(300))?;
     assert_eq!(event.kind, Some(3), "{event:?}");
     let calls = exec_cmd_calls(&fixture, long)?;
-    let result = calls[0].result.as_ref().ok_or("kind 15")?;
+    let result = calls[0].result.as_ref().ok_or("kind 29")?;
     assert_eq!(result.status, 1);
-    assert!(result.text.contains("slept-65"));
+    let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
+    assert_eq!((settled.exit_kind, settled.exit_value), (1, 0));
     assert!(started.elapsed() >= Duration::from_secs(65));
     fixture.stop()?;
     // Sweep everything except the journal; in the journal, only the turn's
@@ -1237,18 +1180,17 @@ fn escapees() -> Result<()> {
     let event = finish(&fixture, operation, Duration::from_secs(60))?;
     assert_eq!(event.kind, Some(3), "{event:?}");
     let calls = exec_cmd_calls(&fixture, operation)?;
-    let result = calls[0].result.as_ref().ok_or("kind 15")?;
-    assert_eq!(result.status, 1, "{}", result.text);
+    let result = calls[0].result.as_ref().ok_or("kind 29")?;
+    assert_eq!(result.status, 1, "{result:?}");
+    let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
+    assert_eq!((settled.exit_kind, settled.exit_value), (1, 0));
+    assert_eq!(settled.cleanup, journal::JobCleanup::Confirmed);
+    assert_eq!(settled.escapees, 3);
+    assert_eq!(settled.capture_state, JobCaptureState::Complete);
     assert!(
-        result.text.starts_with(
-            "failure=None exit_code=0 signal=none reason=none truncated=false cleanup_confirmed=true capture=complete escapees=3\nstdout:\n"
-        ),
-        "{}",
-        result.text
+        settled.stdout.capture.eof && settled.stderr.capture.eof,
+        "capture EOF"
     );
-    let settled = calls[0].settled.as_ref().ok_or("kind 23")?;
-    assert_eq!(settled.state, CaptureState::Complete);
-    assert!(settled.stdout.eof && settled.stderr.eof, "capture EOF");
     for tag in ["s", "d", "p"] {
         let pid: i32 = std::fs::read_to_string(directory.join(format!("{tag}.pid")))?
             .trim()
@@ -1277,15 +1219,11 @@ fn escapees() -> Result<()> {
     assert_eq!(event.kind, Some(3), "{event:?}");
     std::fs::remove_file(fixture.home.join("exec-cmd-guardian-fault"))?;
     let calls = exec_cmd_calls(&fixture, operation)?;
-    let result = calls[0].result.as_ref().ok_or("kind 15")?;
-    assert_eq!(result.status, 1, "{}", result.text);
-    assert!(
-        result
-            .text
-            .contains("cleanup_confirmed=false capture=complete\nstdout:\nlate-output"),
-        "{}",
-        result.text
-    );
+    let result = calls[0].result.as_ref().ok_or("kind 29")?;
+    assert_eq!(result.status, 1, "{result:?}");
+    let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
+    assert_eq!(settled.cleanup, journal::JobCleanup::Late);
+    assert_eq!(settled.capture_state, JobCaptureState::Complete);
     // The slot and scratch were released: the next call runs and confirms.
     model.script(&[Step::ExecCmd("printf again".into()), Step::Final]);
     let operation = submit(&fixture, project, "Again.")?;
@@ -1294,14 +1232,9 @@ fn escapees() -> Result<()> {
         Some(3)
     );
     let calls = exec_cmd_calls(&fixture, operation)?;
-    let result = calls[0].result.as_ref().ok_or("kind 15")?;
-    assert!(
-        result
-            .text
-            .contains("cleanup_confirmed=true capture=complete\nstdout:\nagain"),
-        "{}",
-        result.text
-    );
+    let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
+    assert_eq!(settled.cleanup, journal::JobCleanup::Confirmed);
+    assert_eq!(settled.capture_state, JobCaptureState::Complete);
     let scratch: Vec<_> = std::fs::read_dir(fixture.home.join(".asura/tmp"))?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with("exec-cmd-"))
@@ -1355,11 +1288,10 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 9] = [
+    let cases: [Case; 8] = [
         ("secrets", secrets_turn),
         ("whole", whole_command_turn),
         ("setup", setup_budget_removed),
-        ("busy", quota_busy),
         ("overload", overload),
         ("crash", crash_points),
         ("big", no_output_stop),

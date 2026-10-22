@@ -356,6 +356,12 @@ fn read_tool(tool: RegisteredTool, m: &mut Members<'_, '_>) -> (Option<Op>, Opti
                 }),
             )
         }
+        // The `job` tool is registered (J34-S) but its commands are parsed
+        // only from J3-R: until then a call is `unknown_tool`.
+        RegisteredTool::Job => {
+            m.fault(Fault::UnregisteredName);
+            (None, None)
+        }
     }
 }
 

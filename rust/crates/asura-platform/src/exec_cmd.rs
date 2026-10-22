@@ -11,7 +11,7 @@ use crate::secrets::rewrite::{MAX_SECRET_VARIABLES, SECRET_COMMAND_NAME, WHOLE_C
 use crate::secrets::{SecretCommand, SecretVariable};
 use crate::{PollInterest, ProjectIdentity, RuntimeDirectory, StateBoundary};
 use capture::Capture;
-pub use capture::{DRAIN_BUDGET, OutputSink, READ_BUFFER, Stream, render_tail};
+pub use capture::{DRAIN_BUDGET, OutputSink, READ_BUFFER, Stream};
 pub use cleanup::ExecCmdCleanup;
 #[cfg(feature = "test-support")]
 pub use escapee::scan_for_test as escapee_scan_for_test;
@@ -100,7 +100,7 @@ pub enum UnconfirmedReason {
     EscapeeUnterminated,
 }
 /// Process facts of a settled job. Output is never kept here: the service's
-/// capture worker owns the redacted stream and its tails (J1, G10).
+/// capture worker owns the redacted stream (G10).
 ///
 /// `cleanup_confirmed` is true only when the guardian's settlement gate
 /// passed with no earlier `cleanup_unconfirmed` notice; a late settlement
@@ -119,43 +119,6 @@ pub struct ExecCmdResult {
     pub reason: Option<StopReason>,
     pub cleanup_confirmed: bool,
     pub escapees: u32,
-}
-/// Rendered model-visible tails of the redacted streams (see [`render_tail`]).
-#[derive(Clone, Debug, Default)]
-pub struct Tails {
-    pub stdout: String,
-    pub stderr: String,
-    pub truncated: bool,
-}
-impl ExecCmdResult {
-    /// Kind 15 text: today's shape, with the redacted tails and the capture
-    /// state as `capture=<state>` at the end of the header line, followed by
-    /// ` escapees=<n>` when the guardian terminated escapees (EX5).
-    pub fn render_text(&self, tails: &Tails, capture: &str) -> String {
-        format!(
-            "failure={:?} exit_code={} signal={} reason={} truncated={} cleanup_confirmed={} capture={}{}\nstdout:\n{}\nstderr:\n{}",
-            self.failure,
-            self.exit_code
-                .map_or_else(|| "none".into(), |n| n.to_string()),
-            self.signal.map_or_else(|| "none".into(), |n| n.to_string()),
-            match self.reason {
-                None => "none",
-                Some(StopReason::Cancelled) => "cancelled",
-                Some(StopReason::Killed) => "killed",
-                Some(StopReason::LeaseEnded) => "lease_ended",
-            },
-            tails.truncated,
-            self.cleanup_confirmed,
-            capture,
-            if self.escapees > 0 {
-                format!(" escapees={}", self.escapees)
-            } else {
-                String::new()
-            },
-            tails.stdout,
-            tails.stderr
-        )
-    }
 }
 pub struct ExecCmdFailure {
     pub reason: ExecCmdError,

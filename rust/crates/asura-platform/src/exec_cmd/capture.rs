@@ -1,6 +1,7 @@
-//! Reactor side of exec_cmd output capture (J1). Pipes are read without
+//! Reactor side of exec_cmd output capture. Pipes are read without
 //! blocking and raw bytes go straight to the service's [`OutputSink`]; no raw
-//! ring or tail is kept here (G10).
+//! ring or tail is kept here (G10). J3 retired the model-visible tails
+//! (`render_tail`, L13, L17): results carry no output text (PC12).
 use super::{ExecCmdError, spawn};
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -106,60 +107,5 @@ impl Capture {
             }
         }
         Ok(())
-    }
-}
-
-/// The model-visible tail of redacted bytes: the last 6,144 bytes, invalid
-/// UTF-8 and control characters other than newline and tab replaced with
-/// U+FFFD. Returns the text and whether anything was cut or replaced. Runs
-/// over redacted bytes only (J1, L13, L17 until J3).
-pub fn render_tail(redacted: &[u8]) -> (String, bool) {
-    let text = String::from_utf8_lossy(redacted);
-    let mut lost = matches!(text, std::borrow::Cow::Owned(_));
-    let chars: Vec<char> = text
-        .chars()
-        .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
-                lost = true;
-                '\u{fffd}'
-            } else {
-                c
-            }
-        })
-        .collect();
-    // Keep the most recent output: a failure's cause is usually at the end.
-    let mut start = chars.len();
-    let mut size = 0;
-    while start > 0 && size + chars[start - 1].len_utf8() <= 6144 {
-        start -= 1;
-        size += chars[start].len_utf8();
-    }
-    lost |= start > 0;
-    (chars[start..].iter().collect(), lost)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn tail_keeps_the_last_6144_bytes_and_replaces_controls() {
-        let (text, cut) = render_tail(b"ok\n");
-        assert_eq!((text.as_str(), cut), ("ok\n", false));
-        let (text, cut) = render_tail(b"a\x07b\tc");
-        assert_eq!((text.as_str(), cut), ("a\u{fffd}b\tc", true));
-        let (text, cut) = render_tail(&[0xff, b'x']);
-        assert_eq!((text.as_str(), cut), ("\u{fffd}x", true));
-        let long: Vec<u8> = (0..8192).map(|i| b'a' + (i % 26) as u8).collect();
-        let (text, cut) = render_tail(&long);
-        assert!(cut);
-        assert_eq!(text.len(), 6144);
-        assert!(long.ends_with(text.as_bytes()));
-        // A multi-byte scalar at the cut is never split.
-        let mut wide = vec![b'x'; 6143];
-        wide.extend_from_slice("é".as_bytes());
-        let (text, cut) = render_tail(&wide);
-        assert!(cut);
-        assert!(text.starts_with('x') && text.ends_with('é'));
-        assert!(text.len() <= 6144);
     }
 }

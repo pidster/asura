@@ -1,47 +1,16 @@
-//! The model exec_cmd path at `ToolCall` (J1, SL3): the rewrite happens before
-//! any record; a `run` call keeps its admission, variables and derived run
-//! identity live. The kind 14 record holds the rewritten command as the only
-//! copy (tool-call-records.md); job and payload IDs are derived (TCR-D23).
-use crate::capture_worker;
-use crate::exec_cmd_worker::ExecCmdRun;
+//! The model exec_cmd path at `ToolCall` (SL3, SL7): the rewrite happens
+//! before any record. The kind 14 record holds the rewritten command as the
+//! only copy (tool-call-records.md). J3 retired the J1 call path (J3-E9);
+//! until J34-E submits exec_cmd calls to the job controller, a model exec_cmd
+//! call that passes the rewrite is recorded `denied` and runs nothing
+//! (tool-job-controller.md, TJ-P3 step 4). The secrets kept here are what
+//! J34-E hands to the controller's `StartRequest`.
 use asura_platform::secrets::{Plan, Refusal, SecretCommand, SecretVariable};
 use asura_storage::authority::conversation as journal;
-use asura_storage::payload::{PayloadStore, Victim};
-use std::sync::Arc;
 
-/// The live state of one `run` exec_cmd call in the conversation owner.
-pub(super) struct ExecCmdLive {
-    pub run: ExecCmdRun,
-    /// Secret variables: the capture literals, and unless `secret_command`
-    /// is set, the numbered variables moved into the request at dispatch.
-    pub secrets: Vec<SecretVariable>,
-    /// SL7: the whole raw command, moved into the request at dispatch as
-    /// `ASURA_SECRET_COMMAND`. Held in memory only (SO6).
-    pub secret_command: Option<SecretCommand>,
-    pub victims: Vec<Victim>,
-    pub store: Option<Arc<PayloadStore>>,
-    /// Kind 23 waiting to append, then whether it committed.
-    pub settled: Option<journal::CaptureSettled>,
-    pub settled_committed: bool,
-    /// The capture worker after settlement, until it moves to the
-    /// pending-install list.
-    pub capture: Option<capture_worker::Handle>,
-}
-impl ExecCmdLive {
-    /// An admitted call that never started: its reservation and victims return.
-    pub(super) fn release_admission(&mut self) {
-        if let Some(store) = self.store.take() {
-            store.restore_victims(&self.victims);
-            store.release(self.run.job);
-        }
-        self.victims.clear();
-        self.secrets.clear();
-        self.secret_command = None;
-    }
-}
-
-/// The live secrets of an admitted plan: the capture literals, the
+/// The live secrets of a rewritten plan: the capture literals, the
 /// whole-command value (SL7) and its fallback reason.
+#[cfg_attr(not(test), allow(dead_code))] // J34-E passes them to `StartRequest`
 pub(super) struct LiveSecrets {
     pub variables: Vec<SecretVariable>,
     pub command: Option<SecretCommand>,
@@ -67,28 +36,22 @@ impl From<Plan> for LiveSecrets {
         }
     }
 }
+#[cfg_attr(not(test), allow(dead_code))] // J34-E passes them to `StartRequest`
 impl LiveSecrets {
-    /// Marks a whole-command run so its result says it was filtered.
-    pub(super) fn filter(&self, mut run: ExecCmdRun) -> ExecCmdRun {
-        run.filtered = self
-            .display
-            .as_deref()
-            .map(crate::exec_cmd_worker::filtered_line);
-        run
+    /// The SL7 line of a whole-command run; `None` for a rewrite.
+    pub(super) fn filtered(&self) -> Option<String> {
+        self.display.as_deref().map(filtered_line)
     }
-}
-
-/// The request secrets at dispatch: the whole-command value alone, or the
-/// numbered variables. Literals stay with the capture worker.
-pub(super) fn request_secrets(
-    live: &mut ExecCmdLive,
-) -> (Vec<SecretVariable>, Option<SecretCommand>) {
-    match live.secret_command.take() {
-        Some(command) => {
-            live.secrets.clear();
-            (Vec::new(), Some(command))
+    /// The request secrets: the whole-command value alone, or the numbered
+    /// variables. Literals stay with the capture worker's redaction.
+    pub(super) fn request(&mut self) -> (Vec<SecretVariable>, Option<SecretCommand>) {
+        match self.command.take() {
+            Some(command) => {
+                self.variables.clear();
+                (Vec::new(), Some(command))
+            }
+            None => (std::mem::take(&mut self.variables), None),
         }
-        None => (std::mem::take(&mut live.secrets), None),
     }
 }
 
@@ -105,75 +68,46 @@ pub(super) fn refusal(refusal: &Refusal) -> journal::ExecCmdRefusal {
     }
 }
 
-/// Kind 23 `not_started` for a `run` call that never dispatched.
-pub(super) fn not_started(run: &ExecCmdRun) -> journal::CaptureSettled {
-    journal::CaptureSettled {
-        operation: run.operation,
-        generation: run.generation,
-        ordinal: run.ordinal,
-        state: journal::CaptureState::NotStarted,
-        reason: journal::CaptureReason::None,
-        exit_kind: 0,
-        exit_value: 0,
-        stdout: journal::CaptureStream::default(),
-        stderr: journal::CaptureStream::default(),
-        distinct_numbers: 0,
-        numbers: Vec::new(),
-        pause_count: 0,
-        first_pause_ms: 0,
-        paused_ms: 0,
-        final_reservation: 0,
+/// Display bytes the model's result shows for a whole-command run (SL7).
+const FILTERED_DISPLAY_BYTES: usize = 2048;
+/// The SL7 line beside the display text: `command filtered: run from a
+/// secret variable: <display>`. The display is cut at 2,048 bytes, never
+/// inside a placeholder, with `…` when cut; control characters become
+/// spaces so the line stays one line. It holds placeholders, never a value.
+#[cfg_attr(not(test), allow(dead_code))] // the J3 result text shows it
+pub(super) fn filtered_line(display: &str) -> String {
+    let mut cut = display.len().min(FILTERED_DISPLAY_BYTES);
+    while !display.is_char_boundary(cut) {
+        cut -= 1;
     }
+    // Never inside `$ASURA_SECRET_<n>`: a cut inside one backs up to its
+    // `$`, the last `$` before the cut.
+    if cut < display.len()
+        && let Some(at) = display[..cut].rfind('$')
+        && let Some(digits) = display[at..].strip_prefix("$ASURA_SECRET_")
+    {
+        let end =
+            at + "$ASURA_SECRET_".len() + digits.bytes().take_while(u8::is_ascii_digit).count();
+        if end > cut {
+            cut = at;
+        }
+    }
+    let mut line = format!("{}: ", asura_platform::secrets::WHOLE_COMMAND_NOTICE);
+    line.extend(
+        display[..cut]
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c }),
+    );
+    if cut < display.len() {
+        line.push('…');
+    }
+    line
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{self, Arguments};
-    use asura_storage::payload::{ObjectKind, payload_id};
 
-    /// TCR-U13 (live part): the live run identity uses the same storage
-    /// derivations that replay recomputes, for every ordinal.
-    #[test]
-    fn tcr_u13_live_run_identity_equals_storage_derivation() {
-        for ordinal in 1..=tools::MAX_CALLS {
-            let call = tools::Call {
-                operation: [1; 16],
-                generation: 3,
-                ordinal,
-                arguments: Arguments::ExecCmd {
-                    command: "printf \"$ASURA_SECRET_1\"".into(),
-                    cwd: "src".into(),
-                },
-            };
-            let run = ExecCmdRun::derive([9; 16], &call).unwrap();
-            assert_eq!(run.job, journal::exec_cmd_job_id([1; 16], 3, ordinal));
-            assert_eq!(
-                run.stdout_payload,
-                payload_id([9; 16], run.job, ObjectKind::Stdout)
-            );
-            assert_eq!(
-                run.stderr_payload,
-                payload_id([9; 16], run.job, ObjectKind::Stderr)
-            );
-            assert_eq!(
-                (run.command.as_str(), run.cwd.as_str()),
-                ("printf \"$ASURA_SECRET_1\"", "src")
-            );
-            let settled = not_started(&run);
-            assert_eq!(
-                (settled.ordinal, settled.state),
-                (ordinal, journal::CaptureState::NotStarted)
-            );
-        }
-        let other = tools::Call {
-            operation: [1; 16],
-            generation: 3,
-            ordinal: 1,
-            arguments: Arguments::ListTools,
-        };
-        assert!(ExecCmdRun::derive([9; 16], &other).is_none());
-    }
     /// A refusal or fallback reason keeps the code, kind and a bounded word
     /// index only (SL7: a single-quoted value runs from a secret variable).
     #[test]
@@ -193,33 +127,12 @@ mod tests {
         // The literal keeps number 1; the request gets the command alone.
         assert_eq!(live.variables.len(), 1);
         assert_eq!(live.variables[0].number(), 1);
-        let call = tools::Call {
-            operation: [1; 16],
-            generation: 3,
-            ordinal: 1,
-            arguments: Arguments::ExecCmd {
-                command: asura_platform::secrets::WHOLE_COMMAND.into(),
-                cwd: ".".into(),
-            },
-        };
-        let run = live.filter(ExecCmdRun::derive([9; 16], &call).unwrap());
-        let line = run.filtered.clone().unwrap();
         assert_eq!(
-            line,
+            live.filtered().unwrap(),
             "command filtered: run from a secret variable: echo '$ASURA_SECRET_1'"
         );
-        let mut exec = ExecCmdLive {
-            run,
-            secrets: std::mem::take(&mut live.variables),
-            secret_command: live.command.take(),
-            victims: Vec::new(),
-            store: None,
-            settled: None,
-            settled_committed: false,
-            capture: None,
-        };
-        let (numbered, command) = request_secrets(&mut exec);
-        assert!(numbered.is_empty() && exec.secrets.is_empty());
+        let (numbered, command) = live.request();
+        assert!(numbered.is_empty() && live.variables.is_empty());
         assert_eq!(
             command.unwrap().value(),
             format!("echo '{token}'").as_bytes()
@@ -228,11 +141,32 @@ mod tests {
         let plan =
             asura_platform::secrets::rewrite_exec_cmd_call(&format!("printf %s \"{token}\""), ".")
                 .unwrap();
-        let live = LiveSecrets::from(plan);
+        let mut live = LiveSecrets::from(plan);
         assert!(live.reason.is_none() && live.command.is_none());
-        exec.secrets = live.variables;
-        let (numbered, command) = request_secrets(&mut exec);
+        assert!(live.filtered().is_none());
+        let (numbered, command) = live.request();
         assert_eq!(numbered.len(), 1);
         assert!(command.is_none());
+    }
+    /// SL7: the filtered line shows the display text, cut at 2,048 bytes
+    /// before a placeholder, on one line.
+    #[test]
+    fn sl7_filtered_line_cuts_before_a_placeholder_and_stays_one_line() {
+        assert_eq!(
+            filtered_line("echo '$ASURA_SECRET_1'\nls"),
+            "command filtered: run from a secret variable: echo '$ASURA_SECRET_1' ls"
+        );
+        let long = format!("{}$ASURA_SECRET_12 tail", "x".repeat(2040));
+        assert_eq!(
+            filtered_line(&long),
+            format!(
+                "command filtered: run from a secret variable: {}…",
+                "x".repeat(2040)
+            )
+        );
+        let fits = format!("{}$ASURA_SECRET_1 tail", "x".repeat(2048 - 15));
+        assert!(filtered_line(&fits).ends_with("$ASURA_SECRET_1…"));
+        let wide = "é".repeat(1100);
+        assert!(filtered_line(&wide).ends_with('…'));
     }
 }

@@ -173,7 +173,6 @@ fn report_streams_clamp_spans_to_stored_bytes() {
         discarded: 3,
         eof: true,
         lines: 4,
-        tail: Vec::new(),
     };
     let report = Report {
         state: CaptureState::Incomplete,
