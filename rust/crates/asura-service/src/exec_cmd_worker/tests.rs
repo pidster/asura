@@ -466,6 +466,38 @@ fn j2t_22_sealed_outcome_carries_line_counts() {
     }
 }
 
+/// J3T-22 slot part (TJ-Q10): every step clears the capture's stored
+/// signal first, even when the slot's event queue is full; the signal adds
+/// no slot event.
+#[test]
+fn j3t_22_step_clears_the_stored_signal_with_a_full_queue() {
+    let home = Home::new(64 * MIB);
+    let job = asura_platform::random_id();
+    let handle = capture_worker::start(home.capture(job)).unwrap();
+    let mut sink = handle.output_sink();
+    let mut slot = Slot::new(SlotPhase::Done, Some(handle));
+    for _ in 0..SLOT_EVENTS {
+        slot.events.push_back(SlotEvent::CaptureResumed);
+    }
+    sink.accept(asura_platform::secrets::Stream::Stdout, b"stored\n");
+    let end = Instant::now() + Duration::from_secs(30);
+    while !slot.capture.as_ref().unwrap().stored_pending() {
+        assert!(Instant::now() < end, "no stored signal");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    slot.step(Instant::now(), None);
+    let capture = slot.capture.as_ref().unwrap();
+    assert!(!capture.stored_pending(), "cleared with a full queue");
+    assert!(!capture.take_stored());
+    assert_eq!(slot.events.len(), SLOT_EVENTS, "the signal adds no event");
+    assert!(
+        slot.events
+            .iter()
+            .all(|e| matches!(e, SlotEvent::CaptureResumed))
+    );
+    slot.capture.take().unwrap().abandon();
+}
+
 /// TJ-S1: the leader's exit moves capture to `Draining`; a quota short
 /// there reaches the controller as `CapturePaused(Quota)`, the `quota`
 /// cancel trigger, and never as a capture fault.

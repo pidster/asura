@@ -351,6 +351,11 @@ impl Slot {
         }
     }
     fn step(&mut self, now: Instant, wake: Option<&WakeSender>) {
+        // TJ-Q10: clear the stored signal first, even when the event queue
+        // is full; the controller reads the ledger after every slot polls.
+        if let Some(capture) = &self.capture {
+            capture.take_stored();
+        }
         self.drain_capture();
         let phase = std::mem::replace(&mut self.phase, SlotPhase::Done);
         match phase {

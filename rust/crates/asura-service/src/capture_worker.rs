@@ -191,10 +191,27 @@ struct Shared {
     queued_bytes: AtomicUsize,
     queued_chunks: AtomicUsize,
     backpressured: AtomicBool,
+    /// The stored signal (TJ-Q10): set after a write that stored at least
+    /// one byte, cleared by [`Handle::take_stored`]. At most one signal is
+    /// outstanding per worker.
+    stored: AtomicBool,
     control: Mutex<Control>,
     changed: Condvar,
 }
 impl Shared {
+    /// The stored signal (TJ-Q10), after a staging write that has already
+    /// raised the watermark. A write of no byte signals nothing. The reactor
+    /// wakes only when no signal was outstanding; the signal ends nothing.
+    /// Returns whether it woke the reactor.
+    fn signal_stored(&self, written: usize, wake: Option<&WakeSender>) -> bool {
+        if written == 0 || self.stored.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        if let Some(wake) = wake {
+            let _ = wake.notify();
+        }
+        true
+    }
     fn control(&self) -> std::sync::MutexGuard<'_, Control> {
         self.control.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -409,6 +426,18 @@ impl Handle {
             c.drop_output = true;
         });
     }
+    /// Clears the stored signal (TJ-Q10) and returns whether one was
+    /// outstanding. The slot calls it at the start of every step, before the
+    /// controller reads the ledger, so stored bytes written after the clear
+    /// signal again.
+    pub(crate) fn take_stored(&self) -> bool {
+        self.shared.stored.swap(false, Ordering::AcqRel)
+    }
+    /// Whether a stored signal is outstanding, without clearing it.
+    #[cfg(test)]
+    pub(crate) fn stored_pending(&self) -> bool {
+        self.shared.stored.load(Ordering::Acquire)
+    }
     /// Drains messages without blocking. The thread's own exit also counts.
     pub(crate) fn drain(&mut self) -> Vec<Message> {
         let mut out = Vec::new();
@@ -465,6 +494,7 @@ pub(crate) fn start(spec: Start) -> std::io::Result<Handle> {
         queued_bytes: AtomicUsize::new(0),
         queued_chunks: AtomicUsize::new(0),
         backpressured: AtomicBool::new(false),
+        stored: AtomicBool::new(false),
         control: Mutex::new(Control::default()),
         changed: Condvar::new(),
     });
@@ -890,6 +920,8 @@ impl Worker {
         }
         let capture = self.capture.as_mut().ok_or(Step::Fault)?;
         let (n, result) = capture.append(store_index(stream), redacted, *written);
+        // `append` has raised the watermark: signal the stored bytes.
+        self.shared.signal_stored(n, self.wake.as_ref());
         self.lines[index(stream)] += newlines(&redacted.as_bytes()[*written..*written + n]);
         *written += n;
         match result {
