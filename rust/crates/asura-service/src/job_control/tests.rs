@@ -215,10 +215,12 @@ impl Journal {
                             settled: None,
                             settled_frame: Locator::NONE,
                             command: Locator::NONE,
+                            excerpt: journal::command_excerpt(&command),
                             retention: Default::default(),
                         },
                         command: Box::new(call(&command)),
                         retention: Vec::new(),
+                        model_notes: Vec::new(),
                     },
                 );
             }

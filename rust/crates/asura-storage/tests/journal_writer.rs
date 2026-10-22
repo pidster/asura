@@ -1752,6 +1752,16 @@ fn j3_job_call(ordinal: u32, op: ToolOperation) -> ToolCall {
         ..j1_call(ordinal, ToolDecision::Run)
     }
 }
+/// A `run` `job note` call for `job` with its stored `text` argument.
+fn j4_note_call(ordinal: u32, job: Id, text: &str) -> ToolCall {
+    let handle: String = job.iter().map(|b| format!("{b:02x}")).collect();
+    let arguments = format!("{{\"command\":\"note\",\"job\":\"{handle}\",\"text\":\"{text}\"}}");
+    ToolCall {
+        arguments_bytes: arguments.len() as u32,
+        arguments,
+        ..j3_job_call(ordinal, ToolOperation::JobNote)
+    }
+}
 fn j3_result(ordinal: u32, job: Id, body: JobResultBody) -> JobResult {
     JobResult {
         operation: [35; 16],
@@ -2547,7 +2557,7 @@ fn j4t_02_real_writer_appends_kind_30_enforces_bounds_and_reopens() {
         j2_handle(1),
         j4_person(job, Pin, ""),
         j4_person(job, Note, &longest),
-        Record::ToolCall(Box::new(j3_job_call(2, ToolOperation::JobNote))),
+        Record::ToolCall(Box::new(j4_note_call(2, job, "rerun after the fix"))),
         Record::JobRetention(Box::new(JobRetention {
             job,
             action: Note,
@@ -2638,6 +2648,13 @@ fn j4t_02_real_writer_appends_kind_30_enforces_bounds_and_reopens() {
         facts.retention[2].1.author,
         RetentionAuthor::Model { ordinal: 2, .. }
     ));
+    // The model note's text comes from its cited kind 14 (J34-S2), and the
+    // listing carries the stored command's excerpt.
+    assert_eq!(
+        facts.model_notes,
+        vec![(facts.retention[2].0, "rerun after the fix".to_string())]
+    );
+    assert_eq!(facts.listing.excerpt, "printf %s \"$ASURA_SECRET_1\"");
     assert_eq!(facts.listing.intent.time, 1_760_000_000_000);
     assert_eq!(
         facts.listing.settled.as_deref().map(|s| s.settled_time),

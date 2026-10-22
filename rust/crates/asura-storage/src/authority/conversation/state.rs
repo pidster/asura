@@ -2411,6 +2411,17 @@ impl Replay {
     /// One job's records and listing facts, unsettled or settled; `None`
     /// for an ID of no job.
     pub fn job_listing(&self, job: Id, index: &mut dyn Index) -> Result<Option<JobListing>> {
+        Ok(self
+            .job_listing_call(job, index)?
+            .map(|(listing, _)| listing))
+    }
+    /// [`Self::job_listing`] with the command source frame it read for the
+    /// excerpt: one frame read per job.
+    fn job_listing_call(
+        &self,
+        job: Id,
+        index: &mut dyn Index,
+    ) -> Result<Option<(JobListing, Box<ToolCall>)>> {
         let (conversation, intent_frame, cancel_frame, settled_frame) =
             match self.job_state(job, index)? {
                 None => return Ok(None),
@@ -2454,7 +2465,13 @@ impl Replay {
             } => self.call_frame(operation, ordinal, index)?,
             JobOrigin::Person { .. } => return Err(ReplayError::Corrupt),
         };
-        Ok(Some(JobListing {
+        let Record::ToolCall(call) = index.frame(&command)? else {
+            return Err(ReplayError::Corrupt);
+        };
+        let excerpt = exec_cmd_command(&call)
+            .map(|text| command_excerpt(&text))
+            .unwrap_or_default();
+        let listing = JobListing {
             job,
             conversation,
             project,
@@ -2465,8 +2482,28 @@ impl Replay {
             settled,
             settled_frame,
             command,
+            excerpt,
             retention: self.job_retention_summary(job, index)?,
-        }))
+        };
+        Ok(Some((listing, call)))
+    }
+    /// Whether a job of the scope has its kind 26 at exactly `sequence`, in
+    /// the live state, the delta or the runs: the `Jobs` cursor check
+    /// (`before_found`). One state or index lookup.
+    pub fn job_at(&self, scope: JobScope, sequence: u64, index: &mut dyn Index) -> Result<bool> {
+        if let Some(job) = self.jobs.values().find(|j| j.intent.sequence == sequence) {
+            return Ok(match scope {
+                JobScope::Conversation(c) => job.conversation == c,
+                JobScope::Project(p) => job.project == p,
+                JobScope::AllProjects => true,
+            });
+        }
+        let key = match scope {
+            JobScope::Conversation(c) => Key::new(Tag::ConversationJob, c, sequence),
+            JobScope::Project(p) => Key::new(Tag::ProjectJob, p, sequence),
+            JobScope::AllProjects => Key::new(Tag::AllJobs, [0; 16], sequence),
+        };
+        Ok(self.entry(&key, index)?.is_some())
     }
     /// One newest-first page of jobs by kind 26 sequence, below `before`:
     /// the unsettled jobs in memory merged with the settled jobs' `L`, `M`
@@ -2535,11 +2572,8 @@ impl Replay {
     /// One job's listing, its kind 14 and its kind 30 records in order (at
     /// most 64).
     pub fn job_records(&self, job: Id, index: &mut dyn Index) -> Result<Option<JobRecords>> {
-        let Some(listing) = self.job_listing(job, index)? else {
+        let Some((listing, command)) = self.job_listing_call(job, index)? else {
             return Ok(None);
-        };
-        let Record::ToolCall(command) = index.frame(&listing.command)? else {
-            return Err(ReplayError::Corrupt);
         };
         let entries = self.range(
             &Key::new(Tag::Retention, job, 0),
@@ -2552,20 +2586,60 @@ impl Replay {
             return Err(ReplayError::Limit);
         }
         let mut retention = Vec::with_capacity(entries.len());
+        let mut model_notes = Vec::new();
         for (_, value) in entries {
             let Entry::Retention { frame, .. } = Entry::decode(Tag::Retention, &value)? else {
                 return Err(ReplayError::Corrupt);
             };
-            match index.frame(&frame)? {
-                Record::JobRetention(p) if p.job == job => retention.push((frame, *p)),
+            let p = match index.frame(&frame)? {
+                Record::JobRetention(p) if p.job == job => p,
                 _ => return Err(ReplayError::Corrupt),
+            };
+            if let (
+                RetentionAction::Note,
+                RetentionAuthor::Model {
+                    operation,
+                    generation,
+                    ordinal,
+                },
+            ) = (p.action, p.author)
+            {
+                if model_notes.len() == MAX_JOB_NOTES {
+                    return Err(ReplayError::Limit);
+                }
+                model_notes.push((
+                    frame,
+                    self.model_note(job, operation, generation, ordinal, index)?,
+                ));
             }
+            retention.push((frame, *p));
         }
         Ok(Some(JobRecords {
             listing,
             command,
             retention,
+            model_notes,
         }))
+    }
+    /// The text of a model note from its cited kind 14: a `run` with code
+    /// 16 for this job (JR16). A frame that cannot be read or holds no
+    /// `text` string is `Corrupt`.
+    fn model_note(
+        &self,
+        job: Id,
+        operation: Id,
+        generation: u64,
+        ordinal: u32,
+        index: &mut dyn Index,
+    ) -> Result<String> {
+        let frame = self.call_frame(operation, ordinal, index)?;
+        let Record::ToolCall(call) = index.frame(&frame)? else {
+            return Err(ReplayError::Corrupt);
+        };
+        require(
+            call.operation == operation && call.generation == generation && call.ordinal == ordinal,
+        )?;
+        super::job_command::model_note_text(&call, job).ok_or(ReplayError::Corrupt)
     }
     /// A conversation's job settlements with a kind 28 sequence in
     /// `after < sequence <= through`, newest first, at most `limit` (J5).

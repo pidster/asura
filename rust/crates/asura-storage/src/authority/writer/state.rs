@@ -1128,9 +1128,16 @@ impl State {
                 before,
                 limit,
             } => {
-                let jobs = self.read(|state, store| state.jobs(scope, before, limit, store))?;
+                let (jobs, before_found) = self.read(|state, store| {
+                    let found = match before {
+                        Some(sequence) => state.job_at(scope, sequence, store)?,
+                        None => false,
+                    };
+                    Ok((state.jobs(scope, before, limit, store)?, found))
+                })?;
                 let mut reply = self.reply();
                 reply.jobs = jobs;
+                reply.before_found = before_found;
                 return Ok(reply);
             }
             Command::JobFacts { job } => {

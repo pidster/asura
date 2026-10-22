@@ -1399,6 +1399,17 @@ fn sj11_sj24_merges_interleave_with_commands_on_real_files() {
 
 /// A job-mode call in a started turn: kinds 14, 26 and 15. Returns the job.
 fn j2_job_call(session: &Session, operation: Id, generation: u64, ordinal: u32) -> Id {
+    j2_job_command(session, operation, generation, ordinal, "true")
+}
+/// [`j2_job_call`] with the stored `command` argument.
+fn j2_job_command(
+    session: &Session,
+    operation: Id,
+    generation: u64,
+    ordinal: u32,
+    command: &str,
+) -> Id {
+    let arguments = serde_json::json!({ "command": command }).to_string();
     session
         .append(Record::ToolCall(Box::new(ToolCall {
             operation,
@@ -1412,8 +1423,8 @@ fn j2_job_call(session: &Session, operation: Id, generation: u64, ordinal: u32) 
             fault: None,
             reason: None,
             form: ArgumentForm::Canonical,
-            arguments_bytes: 20,
-            arguments: "{\"command\":\"true\"}".into(),
+            arguments_bytes: arguments.len() as u32,
+            arguments,
             number_kinds: Vec::new(),
             unnumbered: 0,
             rule_set_revision: 1,
@@ -1620,7 +1631,7 @@ fn j4_list(session: &Session, scope: JobScope) -> Vec<JobListing> {
     let mut out = Vec::new();
     let mut before = None;
     loop {
-        let page = run(
+        let reply = run(
             &session.writer,
             Command::Jobs {
                 scope,
@@ -1628,8 +1639,10 @@ fn j4_list(session: &Session, scope: JobScope) -> Vec<JobListing> {
                 limit: MAX_JOB_LISTING_READ,
             },
         )
-        .unwrap()
-        .jobs;
+        .unwrap();
+        // Each cursor is the kind 26 of a listed job of the scope.
+        assert_eq!(reply.before_found, before.is_some());
+        let page = reply.jobs;
         let more = page.len() > MAX_JOB_LIST_ENTRIES;
         out.extend(page.into_iter().take(MAX_JOB_LIST_ENTRIES));
         if !more {
@@ -1659,12 +1672,24 @@ fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
     let mut bases = std::collections::BTreeSet::new();
     let mut live = None;
     let mut x_operations = Vec::new();
+    // Each job's stored command: a later line, a cut inside a character, or
+    // one short line (the excerpts, J34-S2).
+    let mut commands = std::collections::BTreeMap::new();
+    let command = |job_number: usize| match job_number % 3 {
+        0 => format!("make test-{job_number}\nmake install"),
+        1 => format!("echo {job_number} {}", "é".repeat(150)),
+        _ => format!("cargo\ttest -p crate-{job_number}"),
+    };
+    let mut job_number = 0;
     for (round, (x_count, y_count)) in [(4, 3), (4, 3), (3, 3)].into_iter().enumerate() {
         let (conversation, operation, generation) = session.start_turn(first, x_conversation);
         x_conversation = Some(conversation);
         x_operations.push(operation);
         for ordinal in 1..=x_count {
-            let job = j2_job_call(&session, operation, generation, ordinal);
+            let text = command(job_number);
+            job_number += 1;
+            let job = j2_job_command(&session, operation, generation, ordinal, &text);
+            commands.insert(job, text);
             // The last job of the last round stays live.
             if round == 2 && ordinal == x_count {
                 live = Some(job);
@@ -1688,7 +1713,10 @@ fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
         let (conversation, operation, generation) = session.start_turn(second, y_conversation);
         y_conversation = Some(conversation);
         for ordinal in 1..=y_count {
-            let job = j2_job_call(&session, operation, generation, ordinal);
+            let text = command(job_number);
+            job_number += 1;
+            let job = j2_job_command(&session, operation, generation, ordinal, &text);
+            commands.insert(job, text);
             session.append(j2_exited(job)).unwrap();
             y_jobs.push(job);
         }
@@ -1701,6 +1729,62 @@ fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
     session.append(j4_retention(x_jobs[0], Pin)).unwrap();
     session.append(j4_retention(x_jobs[0], Note)).unwrap();
     session.append(j4_retention(y_jobs[0], Delete)).unwrap();
+    // A model note on X's first job in a later turn of X: its text stays in
+    // the `job note` kind 14 (TCR-O5).
+    let model_note = "keep for the release notes";
+    let (_, note_operation, note_generation) = session.start_turn(first, Some(x));
+    let handle: String = x_jobs[0].iter().map(|b| format!("{b:02x}")).collect();
+    let arguments =
+        serde_json::json!({ "command": "note", "job": handle, "text": model_note }).to_string();
+    session
+        .append(Record::ToolCall(Box::new(ToolCall {
+            operation: note_operation,
+            generation: note_generation,
+            ordinal: 1,
+            source: ToolCallSource::GeneratedContent,
+            name: "job".into(),
+            name_bytes: 3,
+            tool_operation: Some(ToolOperation::JobNote),
+            decision: ToolDecision::Run,
+            fault: None,
+            reason: None,
+            form: ArgumentForm::Verbatim,
+            arguments_bytes: arguments.len() as u32,
+            arguments,
+            number_kinds: Vec::new(),
+            unnumbered: 0,
+            rule_set_revision: 1,
+            rule_set_digest: [3; 32],
+            command_cut: false,
+            whole_command: false,
+            refusal: None,
+        })))
+        .unwrap();
+    session
+        .append(Record::JobRetention(Box::new(JobRetention {
+            job: x_jobs[0],
+            action: Note,
+            author: RetentionAuthor::Model {
+                operation: note_operation,
+                generation: note_generation,
+                ordinal: 1,
+            },
+            time: 1_760_000_000_012,
+            note: String::new(),
+        })))
+        .unwrap();
+    session
+        .append(Record::JobResult(Box::new(JobResult {
+            operation: note_operation,
+            generation: note_generation,
+            ordinal: 1,
+            status: 1,
+            outcome: JobResultOutcome::Ok,
+            job: x_jobs[0],
+            body: JobResultBody::None,
+        })))
+        .unwrap();
+    session.finish(note_operation, note_generation, 0, "noted");
     bases.remove(&0);
     assert!(bases.len() >= 3, "three rolls: {bases:?}");
     assert_eq!(x_jobs.len() + y_jobs.len(), 20);
@@ -1759,15 +1843,62 @@ fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
             assert_eq!(listing.settled_frame.is_none(), listing.job == live);
             assert_eq!(job_id(&listing.intent.origin), listing.job);
             assert_eq!(listing.command.sequence + 1, listing.intent_frame.sequence);
+            // The excerpt of the stored command, at most 192 bytes.
+            assert_eq!(listing.excerpt, command_excerpt(&commands[&listing.job]));
+            assert!(listing.excerpt.len() <= MAX_JOB_COMMAND_EXCERPT_BYTES);
         }
+        let excerpt_of = |job: Id| {
+            everything
+                .iter()
+                .find(|l| l.job == job)
+                .unwrap()
+                .excerpt
+                .clone()
+        };
+        assert_eq!(excerpt_of(x_jobs[0]), "make test-0…");
+        assert_eq!(excerpt_of(x_jobs[1]), format!("echo 1 {}…", "é".repeat(91)));
+        assert_eq!(excerpt_of(x_jobs[2]), "cargo test -p crate-2");
+        // The cursor check: false for a job of another scope and for a
+        // sequence that holds no kind 26.
+        let found = |scope, before| {
+            run(
+                &session.writer,
+                Command::Jobs {
+                    scope,
+                    before: Some(before),
+                    limit: 1,
+                },
+            )
+            .unwrap()
+            .before_found
+        };
+        let y_first = everything.iter().find(|l| l.job == y_jobs[0]).unwrap();
+        let live_listing = everything.iter().find(|l| l.job == live).unwrap();
+        for listing in [by_x.last().unwrap(), live_listing] {
+            let at = listing.intent_frame.sequence;
+            assert!(found(JobScope::Conversation(x), at));
+            assert!(found(JobScope::Project(first), at));
+            assert!(found(JobScope::AllProjects, at));
+            assert!(!found(JobScope::Conversation(y), at));
+            assert!(!found(JobScope::Project(second), at));
+            assert!(!found(JobScope::AllProjects, listing.command.sequence));
+        }
+        assert!(found(
+            JobScope::Conversation(y),
+            y_first.intent_frame.sequence
+        ));
+        assert!(!found(
+            JobScope::Conversation(x),
+            y_first.intent_frame.sequence
+        ));
         let x_first = by_x.last().unwrap();
         assert_eq!(
             x_first.retention,
             JobRetentionSummary {
                 pinned: true,
                 deleted: false,
-                notes: 1,
-                records: 2,
+                notes: 2,
+                records: 3,
             }
         );
         assert!(
@@ -1790,8 +1921,15 @@ fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
                 .iter()
                 .map(|(_, r)| (r.action, r.note.is_empty()))
                 .collect::<Vec<_>>(),
-            vec![(Pin, true), (Note, false)]
+            vec![(Pin, true), (Note, false), (Note, true)]
         );
+        // The person note's text is in its kind 30; the model note's comes
+        // from its cited kind 14.
+        assert_eq!(
+            facts.model_notes,
+            vec![(facts.retention[2].0, model_note.to_string())]
+        );
+        assert_eq!(facts.listing.excerpt, "make test-0…");
         assert!(
             run(&session.writer, Command::JobFacts { job: random_id() })
                 .unwrap()

@@ -4049,6 +4049,153 @@ fn j4t_03_listing_entries_and_reads_over_live_state_and_delta() {
     assert_eq!(settlements(settled_sequence, u64::MAX - 1, &mut index), 0);
     assert_eq!(settlements(0, settled_sequence - 1, &mut index), 0);
 }
+/// The lowercase handle of a job (J3-E8).
+fn handle(job: Id) -> String {
+    job.iter().map(|b| format!("{b:02x}")).collect()
+}
+/// A `run` `job note` call at `ordinal` for `job`, with `text` when given.
+fn note14(ordinal: u32, job: Id, text: Option<&str>) -> Record {
+    let arguments = match text {
+        Some(text) => format!(
+            "{{\"command\":\"note\",\"job\":\"{}\",\"text\":\"{text}\"}}",
+            handle(job)
+        ),
+        None => format!("{{\"command\":\"note\",\"job\":\"{}\"}}", handle(job)),
+    };
+    let Record::ToolCall(call) = job14(ordinal, ToolOperation::JobNote) else {
+        unreachable!()
+    };
+    r14(ToolCall {
+        number_kinds: if arguments.contains("$ASURA_SECRET_1") {
+            vec![SecretKind::GithubToken]
+        } else {
+            vec![]
+        },
+        arguments_bytes: arguments.len() as u32,
+        arguments,
+        ..*call
+    })
+}
+/// J4T-03 (unit, step J34-S2): each listing entry carries its command
+/// excerpt; `before_found` per scope over the live state and the delta;
+/// `JobFacts` returns each model note's text from its cited kind 14, and a
+/// cited frame that cannot be read, or holds no text, is `Corrupt`.
+#[test]
+fn j4t_03_excerpts_cursor_check_and_model_note_texts() {
+    use RetentionAction::*;
+    let multi = "{\"command\":\"echo a\\tb\\nsecond line\",\"cwd\":\".\"}";
+    let records = vec![
+        run_exec(1),
+        r26(1),
+        r29(1, 1),
+        r14(ToolCall {
+            arguments_bytes: multi.len() as u32,
+            arguments: multi.into(),
+            number_kinds: vec![],
+            ..run14(2, ToolOperation::ExecCmd)
+        }),
+        r26(2),
+        r29(2, 1),
+        note14(3, job(1), Some("model says keep $ASURA_SECRET_1")),
+        model_note(3, job(1)),
+        result29(3, JobResultOutcome::Ok, job(1), JobResultBody::None),
+        person(job(1), Note),
+        r28(1),
+    ];
+    let journal = started_with(records.clone());
+    let state = inspect(&journal.bytes).unwrap();
+    let mut index = MemoryIndex {
+        segments: std::collections::BTreeMap::from([(1, &journal.bytes[..])]),
+    };
+    // Excerpts: the stored (redacted) command; a later line is marked and
+    // a tab becomes a space.
+    let listed = state
+        .jobs(JobScope::Conversation(id(8)), None, 9, &mut index)
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|l| (l.job, l.excerpt.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (job(2), "echo a b…"),
+            (job(1), "printf \"$ASURA_SECRET_1\""),
+        ]
+    );
+    let settled_at = listed[1].intent_frame.sequence;
+    let live_at = listed[0].intent_frame.sequence;
+    // The cursor check: a job of the scope at exactly that sequence, settled
+    // (delta) or live.
+    for at in [settled_at, live_at] {
+        for scope in [
+            JobScope::Conversation(id(8)),
+            JobScope::Project(id(6)),
+            JobScope::AllProjects,
+        ] {
+            assert!(state.job_at(scope, at, &mut index).unwrap(), "{scope:?}");
+        }
+        for scope in [JobScope::Conversation(id(41)), JobScope::Project(id(99))] {
+            assert!(!state.job_at(scope, at, &mut index).unwrap(), "{scope:?}");
+        }
+    }
+    // A sequence that holds no kind 26: the kind 14 before it, or past the
+    // end.
+    for at in [settled_at - 1, live_at + 1, state.sequence + 1] {
+        assert!(!state.job_at(JobScope::AllProjects, at, &mut index).unwrap());
+    }
+    // Model note texts: only the model's note, with its kind 30 locator.
+    let records_1 = state.job_records(job(1), &mut index).unwrap().unwrap();
+    assert_eq!(
+        records_1
+            .retention
+            .iter()
+            .map(|(_, r)| r.action)
+            .collect::<Vec<_>>(),
+        vec![Note, Note]
+    );
+    assert_eq!(
+        records_1.model_notes,
+        vec![(
+            records_1.retention[0].0,
+            "model says keep $ASURA_SECRET_1".to_string()
+        )]
+    );
+    assert_eq!(records_1.listing.excerpt, "printf \"$ASURA_SECRET_1\"");
+    assert!(
+        state
+            .job_records(job(2), &mut index)
+            .unwrap()
+            .unwrap()
+            .model_notes
+            .is_empty()
+    );
+    // A cited frame that cannot be read: its bytes are damaged after replay.
+    let cited = state.operations[&id(10)].tools[2].intent_frame;
+    let mut damaged = journal.bytes.clone();
+    damaged[cited.offset as usize + cited.length as usize / 2] ^= 0xff;
+    let mut damaged_index = MemoryIndex {
+        segments: std::collections::BTreeMap::from([(1, &damaged[..])]),
+    };
+    assert_eq!(
+        state.job_records(job(1), &mut damaged_index).unwrap_err(),
+        ReplayError::Corrupt
+    );
+    // The listing does not read the note's frame.
+    assert!(state.job_listing(job(1), &mut damaged_index).is_ok());
+    // A cited call that holds no `text` string replays, but its facts are
+    // `Corrupt`.
+    let mut textless = records;
+    textless[6] = note14(3, job(1), None);
+    let journal = started_with(textless);
+    let state = inspect(&journal.bytes).unwrap();
+    let mut index = MemoryIndex {
+        segments: std::collections::BTreeMap::from([(1, &journal.bytes[..])]),
+    };
+    assert_eq!(
+        state.job_records(job(1), &mut index).unwrap_err(),
+        ReplayError::Corrupt
+    );
+}
 /// Reason 20 belongs to a person `!!` job; a model job never records it.
 #[test]
 fn j3t_03_reason_20_needs_a_person_job_and_reason_19_settles_model_jobs() {

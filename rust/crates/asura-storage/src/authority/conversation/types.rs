@@ -2102,8 +2102,10 @@ pub enum JobScope {
 /// Entries per job listing read: 8 shown and one to detect more.
 pub const MAX_JOB_LISTING_READ: usize = MAX_JOB_LIST_ENTRIES + 1;
 /// One job as the listing reads return it: its kind 26, 27 and 28 records,
-/// the command source locator and the retention summary. A settled job's
-/// facts are read from its kind 28, never stored twice.
+/// the command source locator, the command excerpt and the retention
+/// summary. A settled job's facts are read from its kind 28, never stored
+/// twice. At most 4,346 bytes of records and excerpt, so 9 entries fit the
+/// 40 KiB read bound.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobListing {
     pub job: Id,
@@ -2121,14 +2123,23 @@ pub struct JobListing {
     /// The command source: the model call's kind 14 (a person job's kind
     /// 31 after P2). Command, cwd and excerpt are read from it.
     pub command: Locator,
+    /// The `JobEntry.command` text from the command source: the first line
+    /// of the stored command, at most 192 bytes (`command_excerpt`);
+    /// empty when the source holds no command.
+    pub excerpt: String,
     pub retention: JobRetentionSummary,
 }
 /// One job's facts for `JobInspect` and the model's `status` (the
 /// `JobFacts` read): its listing, the kind 14 that holds its command and
-/// cwd, and its kind 30 records in order, at most 64.
+/// cwd, its kind 30 records in order, at most 64, and the text of each
+/// model note, at most 16.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobRecords {
     pub listing: JobListing,
     pub command: Box<ToolCall>,
     pub retention: Vec<(Locator, JobRetention)>,
+    /// For each kind 30 `note` by the model, in kind 30 order: its kind 30
+    /// locator and the `text` argument of the cited kind 14, as stored
+    /// (redacted). Kind 30 holds no second copy (TCR-O5).
+    pub model_notes: Vec<(Locator, String)>,
 }

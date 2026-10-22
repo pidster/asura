@@ -136,13 +136,16 @@ pub enum Command {
     },
     /// One newest-first page of jobs by kind 26 sequence below `before`,
     /// merged from the live state, the delta and the runs; `limit` 1 to 9
-    /// (J4 `Jobs` read; the model `list` asks for 9 to see `more`).
+    /// (J4 `Jobs` read; the model `list` asks for 9 to see `more`). Each
+    /// entry carries its command excerpt; the reply's `before_found` checks
+    /// the cursor.
     Jobs {
         scope: JobScope,
         before: Option<u64>,
         limit: usize,
     },
-    /// One job's records, its kind 14 and its kind 30 records (J4).
+    /// One job's records, its kind 14, its kind 30 records and its model
+    /// note texts (J4).
     JobFacts {
         job: Id,
     },
@@ -291,6 +294,9 @@ pub struct Reply {
     pub payload_facts: Vec<PayloadFact>,
     /// `Jobs` and `Settlements`: newest first.
     pub jobs: Vec<JobListing>,
+    /// `Jobs` with `before`: a job of the scope has its kind 26 at exactly
+    /// that sequence (the cursor check). False without `before`.
+    pub before_found: bool,
     /// `JobFacts`: `None` for an ID of no job.
     pub job_records: Option<Box<JobRecords>>,
     pub status: Option<JournalStatus>,
