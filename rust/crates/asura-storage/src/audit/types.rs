@@ -142,6 +142,14 @@ pub enum Tool {
     ServiceReadAudit = 8,
     ExecCmd = 9,
     MemoryCreateNote = 10,
+    /// The model `job` tool, one value per operation code 11-16
+    /// (tool-job-controller.md, audit of job tool calls).
+    JobList = 11,
+    JobStatus = 12,
+    JobRead = 13,
+    JobWait = 14,
+    JobCancel = 15,
+    JobNote = 16,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

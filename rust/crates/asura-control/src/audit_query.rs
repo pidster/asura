@@ -66,7 +66,9 @@ fn entry(v: &pb::AuditEntry) -> bool {
                     && v.generation.is_some_and(|n| n > 0)
                     && v.ordinal
                         .is_some_and(|n| (1..=crate::model::MAX_TOOL_ORDINAL).contains(&n))
-                    && v.tool.is_some_and(|n| (1..=10).contains(&n))
+                    // 1-10, and the `job` tool values 11-16 (one per
+                    // operation code, audit of job tool calls).
+                    && v.tool.is_some_and(|n| (1..=16).contains(&n))
                     && v.outcome.is_some_and(|n| (1..=7).contains(&n))
                     && v.reason == Some(0)
             }
@@ -241,7 +243,12 @@ mod tests {
             ..Default::default()
         };
         assert!(reply(&v));
-        v.entries[0].tool = Some(11);
+        // J3T-20: the `job` tool values 11-16 are valid; 17 is not.
+        for tool in 11..=16 {
+            v.entries[0].tool = Some(tool);
+            assert!(reply(&v), "{tool}");
+        }
+        v.entries[0].tool = Some(17);
         assert!(!reply(&v));
     }
     #[test]
