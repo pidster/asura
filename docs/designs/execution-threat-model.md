@@ -742,11 +742,13 @@ submit until settlement or Drop. Model call values stay in memory.
 | --- | --- | --- | --- |
 | SS-T1 | A same-user process reads the item | Default ACL trusts only the creating binary; other readers get a prompt or, with user interaction off, a refusal (-25293, probe SS-P2 (b), 2026-10-22). | Same-UID is one principal under D1; a process that can prompt the person may still persuade them. Accepted. |
 | SS-T2 | The keychain file is copied or backed up | The file is encrypted under the login password. Items never sync. | An attacker with the file and the login password reads the values. Accepted. |
-| SS-T3 | An item outlives its command, or another process deletes it early | Delete after settlement or Drop; startup sweep of unreferenced items; one item per input. Probe SS-P2 (c), 2026-10-22: another same-UID binary deleted an Asura item without a prompt. | A failed delete keeps the item until the next sweep. An early deletion by another same-UID process is a denial of service: the command is held with `secrets_lost` and must be entered again. No value is disclosed. Accepted under D1. |
+| SS-T3 | An item outlives its command, or another process deletes it early | Delete after settlement or Drop; startup sweep of unreferenced items; one item per input. Probes SS-P2 (c) and SS-P3, 2026-10-22: a same-UID binary with the writer's executable file name deleted an Asura item without a prompt; a binary with another file name got -25244. A denied delete leaves a [stranded item](secret-store.md#stranded-and-unrecognized-items) that each sweep retries and `/status` names. | A failed delete keeps the item until the next sweep. A stranded item stays until a binary named `asura` deletes it or the person deletes it in Keychain Access; it holds the values of a command that can no longer run, and counts toward the 256-item limit. An early deletion by another same-UID process is a denial of service: the command is held with `secrets_lost` and must be entered again. No value is disclosed. Accepted under D1. |
 | SS-T7 | An item call reaches the wrong keychain | Probe SS-P2 (d), 2026-10-22: an add against a missing keychain reference wrote to the login keychain. The worker pre-checks the target's status before every call and never calls an item function after a non-zero status ([target pre-check](secret-store.md#target-pre-check)). Tests follow the [testing rules](secret-store.md#testing-rules). | A test that deletes its scratch keychain while the worker runs could race; the rules forbid that order. Production does not delete its target. |
 | SS-T4 | An item is replayed into another command | Service and account attributes name the installation and input; the payload binding digest covers project, conversation, input and request digest. | None found. |
 | SS-T5 | A Keychain prompt blocks the service | User interaction is disabled for the service process; a would-be prompt fails. | None found. |
 | SS-T6 | A `!!` command reads the item | It runs as the person with no sandbox (EXD-1). | Accepted under EXD-1. |
+| SS-T8 | Copies of values inside the Security framework outlive Asura's zeroizing | Asura passes values in zeroizing buffers and zeroizes its own copies after spawn. `security-framework` 3.7.0 copies a read result out of a `CFData` that is then released without zeroizing; securityd receives and holds values in its own process. | Values can remain in freed memory of the service process and of securityd until it is reused. Asura cannot clear it. Residual, recorded 2026-10-22; it is inherent in the Keychain store that EXD-2 selected. A same-UID reader of process memory is the same principal under D1. |
+| SS-T9 | A same-UID process writes items under Asura's service attribute | The store never reads or deletes an [unrecognized item](secret-store.md#stranded-and-unrecognized-items); a list returns at most 257 results; the item count includes such items and `/status` reports them. | Such items can fill the 256-item limit, so submits that need the Keychain are refused with `secret_store_full`, and one list can hold 257 large attribute sets in memory. Denial of service only. Accepted under D1. |
 
 **EXD-2 — Durable secret store in the Keychain (owner, 2026-10-20).** The
 secret store is durable, in the macOS Keychain, so queued commands with
@@ -801,5 +803,10 @@ Recorded on 2026-10-22: OD1 recorded under PX3; the approval-flow follow-up
 now points to the execution path guard (P5); SS-T1 and SS-T3 updated and
 SS-T7 added from the SS1-K probe results; PX-V cases mapped to person command
 tests. No diagram changed. No code or test was run.
+
+Recorded on 2026-10-22 (second revision): SS-T3 updated and SS-T8 and SS-T9
+added from the SS1-K report and probe SS-P3 of the
+[secret store](secret-store.md#probe-results-2026-10-22). No diagram changed.
+No product code or test was run.
 
 Return to the [design index](README.md).
