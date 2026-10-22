@@ -5054,6 +5054,13 @@ Selected (engineering). `job_control.rs` is a module of the conversation owner
 on the reactor. It serves each request from the controller's live state, the
 journal worker's reads and the payload owner's page pool. No handler blocks.
 
+Live-only command excerpt (selected, engineering, 2026-10-23, from J4-R2): the
+controller's `JobView` carries the job's command excerpt, built once at
+admission with storage's `command_excerpt` (the one owner), so a live-only
+list or status row shows the command without a journal read. J34-E adds the
+field and sets it where the owner submits a start; the J4-R2 handler uses it
+for live-only rows.
+
 - **Routing.** `conversation::handles` routes the job bodies. In the request
   validation schedule, `JobCancel` joins priority 0 with `ConversationCancel`;
   `JobList` and `JobObserve` join priority 2; the rest are priority 1.
