@@ -17,7 +17,9 @@
 //!
 //! No request has a time bound (no default time bounds). Each ends on its
 //! reply, the attachment's detach ([`JobControl::retain`]) or shutdown
-//! ([`JobControl::close`], answered `Draining`). Bounds: one pending request
+//! ([`JobControl::close`], answered `Draining`). A person note waits for
+//! the secret rule set ([`Ctx::rules`]) without a time bound; the handler
+//! never compiles the set. Bounds: one pending request
 //! per attachment and at most 32 attachments; `jobs.clientViewers` pending
 //! `JobRead`s, `JobObserve`s and parked `JobList`s (`busy` beyond); the page
 //! pool's queue of 8 (`busy`); 64 remembered retain outcomes.
@@ -27,9 +29,9 @@ use crate::job_controller::{
     CancelReply, JobController, JobReason, JobView, Requester, WaitDone, WaitEnding, WaitKey,
     WaitStart,
 };
-use crate::job_text;
 use asura_control::{jobs as wire, pb};
 use asura_platform::secrets::json::{self, Value};
+use asura_platform::secrets::{self, RuleSet, SelfCheckError};
 use asura_storage::authority::conversation::{
     self as journal, Id, JobBlockReason, JobOrigin, JobPauseReason, JobRecords, JobRetention,
     JobRunState, JobScope, OutputStream, RetentionAction, RetentionAuthor, ToolCall,
@@ -127,6 +129,10 @@ pub(crate) struct Ctx<'a> {
     /// The journal holds normal records at its quota or disk floor: a
     /// retain waits for room before its kind 30 append.
     pub journal_held: bool,
+    /// The secret rule set as `secrets::compiled()` reads it: `None` while
+    /// no thread has compiled it. A person note waits (`Wait::Rules`)
+    /// until it is `Some`; the handler never compiles it (AE-01).
+    pub rules: Option<Result<&'static RuleSet, SelfCheckError>>,
     pub now: Instant,
 }
 
@@ -215,6 +221,9 @@ enum Wait {
     },
     /// A retain waiting for its turn.
     Turn,
+    /// A note retain waiting for the secret rule set; it keeps its retain
+    /// turn. Ends on readiness ([`JobControl::poll`]), detach or shutdown.
+    Rules,
 }
 
 struct PendingPage {
@@ -244,6 +253,7 @@ enum Next {
     Park,
     Pages(Vec<(OutputStream, PageRequest)>),
     Turn,
+    Rules,
 }
 
 /// A registry check result.
@@ -376,27 +386,6 @@ fn model_origin(origin: &JobOrigin) -> bool {
     matches!(origin, JobOrigin::Model { .. })
 }
 
-/// The `JobEntry.command` excerpt: the first line of the stored command,
-/// at most 192 bytes with the `…` mark, control characters as spaces.
-pub(crate) fn command_excerpt(command: &str) -> String {
-    const MAX: usize = wire::MAX_JOB_COMMAND_EXCERPT_BYTES;
-    let first = command.split('\n').next().unwrap_or("");
-    let cut = first.len() < command.len() || first.len() > MAX;
-    let budget = if cut { MAX - '…'.len_utf8() } else { MAX };
-    let mut end = first.len().min(budget);
-    while !first.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut excerpt: String = first[..end]
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if cut {
-        excerpt.push('…');
-    }
-    excerpt
-}
-
 /// The stored, redacted `cwd` argument of an exec_cmd kind 14; `.` when
 /// absent.
 fn exec_cmd_cwd(call: &ToolCall) -> Option<String> {
@@ -483,21 +472,22 @@ fn origin_fields(entry: &mut pb::JobEntry, origin: &JobOrigin) {
     }
 }
 
+fn entry_from_facts(facts: &Facts, view: Option<&JobView>) -> pb::JobEntry {
+    entry_from_listing(&facts.records.listing, view)
+}
+
 /// One job's entry: settled facts from kind 28 once it committed; live
 /// facts from the controller's view while unsettled. A job whose kind 28
 /// the controller holds as committed but the read did not yet see is
-/// `finalizing` (the journal is the source of settled facts).
-fn entry_from_facts(facts: &Facts, view: Option<&JobView>) -> pb::JobEntry {
-    let listing = &facts.records.listing;
+/// `finalizing` (the journal is the source of settled facts). The command
+/// is the listing's excerpt, which the journal worker builds (storage owns
+/// `command_excerpt`).
+fn entry_from_listing(listing: &journal::JobListing, view: Option<&JobView>) -> pb::JobEntry {
     let mut entry = pb::JobEntry {
         job_id: Some(listing.job.to_vec()),
         project_id: Some(listing.project.to_vec()),
         conversation_id: Some(listing.conversation.to_vec()),
-        command: Some(
-            job_text::exec_cmd_command(&facts.records.command)
-                .map(|c| command_excerpt(&c))
-                .unwrap_or_default(),
-        ),
+        command: Some(listing.excerpt.clone()),
         intent_unix_ms: Some(listing.intent.time),
         sequence: Some(listing.intent_frame.sequence),
         cancel_requested: Some(listing.cancel.is_some()),
@@ -697,17 +687,19 @@ fn facts_of(result: Box<writer::Result<writer::Reply>>) -> writer::Result<Option
 enum ListPhase {
     Park,
     Registry,
+    /// A live-only list with `before`: one `Jobs` read for `before_found`.
     Cursor,
     CursorRead,
     Gather,
     GatherRead,
-    Facts,
-    FactsRead,
 }
 
+/// One accepted row: its listing from a `Jobs` read, or `None` for a
+/// live-only row built from the controller's view.
 struct Row {
     sequence: u64,
     job: Id,
+    listing: Option<Box<journal::JobListing>>,
 }
 
 struct ListWork {
@@ -725,8 +717,8 @@ struct ListWork {
     /// Journal listings not yet checked against the registry.
     unchecked: VecDeque<journal::JobListing>,
     raw_done: bool,
-    /// One per shown row; `None` when the journal could not be read.
-    facts: Vec<Option<Facts>>,
+    /// The cursor was checked (`before_found`), or there is none.
+    cursor_checked: bool,
 }
 
 impl ListWork {
@@ -756,7 +748,7 @@ impl ListWork {
             raw_before: v.before,
             unchecked: VecDeque::new(),
             raw_done: false,
-            facts: Vec::new(),
+            cursor_checked: v.before.is_none(),
         }
     }
 
@@ -785,20 +777,24 @@ impl ListWork {
                             Registry::Yes => {}
                         }
                     }
-                    self.phase = ListPhase::Cursor;
+                    self.phase = if self.live_only {
+                        ListPhase::Cursor
+                    } else {
+                        ListPhase::Gather
+                    };
                 }
+                // A live-only list reads no listings; its cursor still
+                // names a kind 26 sequence in scope (`before_found`).
                 ListPhase::Cursor => match self.before {
-                    // The cursor names a kind 26 sequence in scope: the
-                    // newest job at or below it must be that sequence.
-                    Some(before) => {
+                    Some(before) if !self.cursor_checked => {
                         self.phase = ListPhase::CursorRead;
                         return Next::Read(writer::Command::Jobs {
                             scope: self.scope,
-                            before: Some(before.saturating_add(1)),
+                            before: Some(before),
                             limit: 1,
                         });
                     }
-                    None => self.phase = ListPhase::Gather,
+                    _ => self.phase = ListPhase::Gather,
                 },
                 ListPhase::CursorRead => {
                     let Input::Journal(result) = std::mem::replace(&mut input, Input::Resume)
@@ -806,19 +802,15 @@ impl ListWork {
                         return s.error(wire::error::UNAVAILABLE);
                     };
                     match *result {
-                        Ok(reply) => {
-                            let found = reply.jobs.first().is_some_and(|l| {
-                                Some(l.intent_frame.sequence) == self.before
-                                    && self.in_scope_project(l.project)
-                            });
-                            if !found {
-                                return s.error(wire::error::INVALID_CURSOR);
-                            }
+                        Ok(reply) if !reply.before_found => {
+                            return s.error(wire::error::INVALID_CURSOR);
                         }
-                        // The live list works from memory without the journal.
-                        Err(writer::Error::Unavailable) if self.live_only => {}
+                        // The live list works from memory: without the
+                        // journal the check is skipped.
+                        Ok(_) | Err(writer::Error::Unavailable) => {}
                         Err(e) => return s.journal_error(e),
                     }
+                    self.cursor_checked = true;
                     self.phase = ListPhase::Gather;
                 }
                 ListPhase::Gather => {
@@ -835,10 +827,10 @@ impl ListWork {
                             .map(|v| Row {
                                 sequence: v.sequence.unwrap_or(0),
                                 job: v.job,
+                                listing: None,
                             })
                             .collect();
-                        self.phase = ListPhase::Facts;
-                        continue;
+                        return Next::Reply(Box::new(Body::JobListReply(self.reply(s))));
                     }
                     // Check the listings already read against the registry.
                     while let Some(listing) = self.unchecked.front() {
@@ -859,13 +851,13 @@ impl ListWork {
                             self.rows.push(Row {
                                 sequence: listing.intent_frame.sequence,
                                 job: listing.job,
+                                listing: Some(Box::new(listing)),
                             });
                         }
                     }
                     if self.rows.len() > self.limit || self.raw_done {
                         self.unchecked.clear();
-                        self.phase = ListPhase::Facts;
-                        continue;
+                        return Next::Reply(Box::new(Body::JobListReply(self.reply(s))));
                     }
                     self.phase = ListPhase::GatherRead;
                     return Next::Read(writer::Command::Jobs {
@@ -879,10 +871,19 @@ impl ListWork {
                     else {
                         return s.error(wire::error::UNAVAILABLE);
                     };
-                    let jobs = match *result {
-                        Ok(reply) => reply.jobs,
+                    let reply = match *result {
+                        Ok(reply) => reply,
                         Err(e) => return s.journal_error(e),
                     };
+                    // The first page is read below the cursor: its
+                    // `before_found` is the cursor check.
+                    if !self.cursor_checked {
+                        if !reply.before_found {
+                            return s.error(wire::error::INVALID_CURSOR);
+                        }
+                        self.cursor_checked = true;
+                    }
+                    let jobs = reply.jobs;
                     self.raw_done = jobs.len() < journal::MAX_JOB_LISTING_READ;
                     match jobs.last() {
                         Some(last) => self.raw_before = Some(last.intent_frame.sequence),
@@ -896,28 +897,6 @@ impl ListWork {
                         floor.is_none_or(|f| q < f) && self.before.is_none_or(|b| q < b)
                     }));
                     self.phase = ListPhase::Gather;
-                }
-                ListPhase::Facts => {
-                    let shown = self.rows.len().min(self.limit);
-                    if self.facts.len() < shown {
-                        self.phase = ListPhase::FactsRead;
-                        return Next::Read(writer::Command::JobFacts {
-                            job: self.rows[self.facts.len()].job,
-                        });
-                    }
-                    return Next::Reply(Box::new(Body::JobListReply(self.reply(s))));
-                }
-                ListPhase::FactsRead => {
-                    let Input::Journal(result) = std::mem::replace(&mut input, Input::Resume)
-                    else {
-                        return s.error(wire::error::UNAVAILABLE);
-                    };
-                    match facts_of(result) {
-                        Ok(facts) => self.facts.push(facts),
-                        Err(writer::Error::Unavailable) if self.live_only => self.facts.push(None),
-                        Err(e) => return s.journal_error(e),
-                    }
-                    self.phase = ListPhase::Facts;
                 }
             }
         }
@@ -934,13 +913,10 @@ impl ListWork {
         let shown = self.rows.len().min(self.limit);
         let more = self.rows.len() > self.limit;
         let mut entries: Vec<pb::JobEntry> = Vec::with_capacity(shown);
-        for (row, facts) in self.rows.iter().zip(self.facts.iter()).take(shown) {
+        for row in self.rows.iter().take(shown) {
             let view = s.view(row.job);
-            let entry = match facts {
-                Some(f) if f.records.listing.intent_frame.sequence == row.sequence => {
-                    Some(entry_from_facts(f, view.as_ref()))
-                }
-                Some(_) => None,
+            let entry = match &row.listing {
+                Some(listing) => Some(entry_from_listing(listing, view.as_ref())),
                 None => view.as_ref().and_then(entry_from_view),
             };
             // One entry per job, strictly newest first.
@@ -1011,29 +987,14 @@ impl InspectWork {
         }
         let view = s.view(self.job);
         let records = &facts.records;
-        let command = job_text::exec_cmd_command(&records.command).unwrap_or_default();
+        let command = journal::exec_cmd_command(&records.command).unwrap_or_default();
         let cwd = s
             .ctx
             .projects
             .location(facts.project())
             .zip(exec_cmd_cwd(&records.command))
             .and_then(|(location, cwd)| absolute_cwd(&location, &cwd));
-        // Person notes hold their text. A model note's text is its kind 14
-        // `text` argument, which `JobFacts` does not return yet (design gap
-        // reported by J4-R); it is counted in the entry but not listed.
-        let notes = records
-            .retention
-            .iter()
-            .filter(|(_, r)| r.action == RetentionAction::Note)
-            .filter(|(_, r)| matches!(r.author, RetentionAuthor::Person { .. }))
-            .filter(|(_, r)| wire::note_text_valid(&r.note))
-            .take(wire::MAX_JOB_NOTES as usize)
-            .map(|(_, r)| pb::JobNote {
-                author: Some(1),
-                unix_ms: Some(r.time),
-                text: Some(r.note.clone()),
-            })
-            .collect();
+        let notes = detail_notes(records);
         Next::Reply(Box::new(Body::JobDetail(pb::JobDetail {
             entry: Some(entry_from_facts(facts, view.as_ref())),
             command: Some(cut(&command, wire::MAX_JOB_COMMAND_BYTES).replace('\0', " ")),
@@ -1042,6 +1003,37 @@ impl InspectWork {
             error: None,
         })))
     }
+}
+
+/// `JobDetail.notes`: person notes (author 1) with their kind 30 text and
+/// model notes (author 2) with the cited kind 14 `text` from
+/// `JobRecords.model_notes`, together, oldest first by kind 30 sequence,
+/// at most 16.
+fn detail_notes(records: &JobRecords) -> Vec<pb::JobNote> {
+    let mut notes: Vec<(u64, u32, u64, &str)> = records
+        .retention
+        .iter()
+        .filter(|(_, r)| r.action == RetentionAction::Note)
+        .filter_map(|(frame, r)| match r.author {
+            RetentionAuthor::Person { .. } => Some((frame.sequence, 1, r.time, r.note.as_str())),
+            RetentionAuthor::Model { .. } => records
+                .model_notes
+                .iter()
+                .find(|(at, _)| at == frame)
+                .map(|(_, text)| (frame.sequence, 2, r.time, text.as_str())),
+        })
+        .filter(|(.., text)| wire::note_text_valid(text))
+        .collect();
+    notes.sort_by_key(|(sequence, ..)| *sequence);
+    notes
+        .into_iter()
+        .take(wire::MAX_JOB_NOTES as usize)
+        .map(|(_, author, time, text)| pb::JobNote {
+            author: Some(author),
+            unix_ms: Some(time),
+            text: Some(text.to_owned()),
+        })
+        .collect()
 }
 
 // ----- JobRead and JobObserve -----
@@ -1503,6 +1495,8 @@ struct RetainWork {
     expected: Id,
     action: RetentionAction,
     note: Option<String>,
+    /// `note` holds the redacted text.
+    redacted: bool,
     request: Id,
     phase: RetainPhase,
     facts: Option<Facts>,
@@ -1515,6 +1509,7 @@ impl RetainWork {
             action: RetentionAction::from_code(v.action.unwrap_or(0) as u8)
                 .unwrap_or(RetentionAction::Pin),
             note: v.note.clone(),
+            redacted: false,
             request: id(&v.request_id),
             phase: RetainPhase::Start,
             facts: None,
@@ -1570,11 +1565,26 @@ impl RetainWork {
         if self.action == RetentionAction::Delete && !settled {
             return s.error(wire::error::NOT_SETTLED);
         }
-        if self.action == RetentionAction::Note {
-            match self.note.as_deref().map(person_note) {
-                Some(Ok(text)) => self.note = Some(text),
-                Some(Err(token)) => return s.error(token),
-                None => return s.error(wire::error::NOTE_INVALID),
+        if self.action == RetentionAction::Note && !self.redacted {
+            let Some(text) = self.note.as_deref() else {
+                return s.error(wire::error::NOTE_INVALID);
+            };
+            if !wire::note_text_valid(text) {
+                return s.error(wire::error::NOTE_INVALID);
+            }
+            // The rule set is compiled off the reactor; until it is ready
+            // the note waits, keeping its retain turn (no time bound).
+            let rules = match s.ctx.rules.clone() {
+                None => return Next::Rules,
+                Some(Err(_)) => return s.error(wire::error::UNAVAILABLE),
+                Some(Ok(rules)) => rules,
+            };
+            match person_note(rules, text) {
+                Ok(text) => {
+                    self.note = Some(text);
+                    self.redacted = true;
+                }
+                Err(token) => return s.error(token),
             }
         }
         if !summary.allows(self.action, settled) {
@@ -1651,41 +1661,20 @@ impl RetainWork {
     }
 }
 
-/// A person note: the text rule, then display redaction with each detected
-/// secret as the unnumbered placeholder `$ASURA_SECRET_0`, then the rule
-/// again on the redacted text (kind 30 field 6).
-pub(crate) fn person_note(text: &str) -> Result<String, &'static str> {
+/// A person note: the text rule, then redaction with each detected secret
+/// as the unnumbered placeholder `$ASURA_SECRET_0` (`secrets::note_redacted`:
+/// placeholders the person typed stay as typed), then the rule again on the
+/// redacted text (kind 30 field 6). `rules` is the ready set; this never
+/// compiles it.
+pub(crate) fn person_note(rules: &'static RuleSet, text: &str) -> Result<String, &'static str> {
     if !wire::note_text_valid(text) {
         return Err(wire::error::NOTE_INVALID);
     }
-    let rules = asura_platform::secrets::detection().map_err(|_| wire::error::UNAVAILABLE)?;
-    let redacted = unnumbered(&asura_platform::secrets::display_redacted(rules, text));
+    let redacted = secrets::note_redacted(rules, text);
     if !wire::note_text_valid(&redacted) {
         return Err(wire::error::NOTE_INVALID);
     }
     Ok(redacted)
-}
-
-/// Every `$ASURA_SECRET_<n>` and `${ASURA_SECRET_<n>}` becomes number 0:
-/// a note record holds no number table.
-fn unnumbered(text: &str) -> String {
-    const NAME: &str = "ASURA_SECRET_";
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(NAME) {
-        let (head, tail) = rest.split_at(at + NAME.len());
-        out.push_str(head);
-        let placeholder = head[..at].ends_with('$') || head[..at].ends_with("${");
-        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
-        if placeholder && digits > 0 {
-            out.push('0');
-            rest = &tail[digits..];
-        } else {
-            rest = tail;
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 // ----- The handler -----
@@ -1887,12 +1876,26 @@ impl JobControl {
         self.drive(key, Input::Wait, ctx);
     }
 
-    /// Each reactor poll: collects page replies and resumes kind 30
-    /// appends whose journal hold ended. In-memory work only.
+    /// A note retain waits for the secret rule set: the owner retries a
+    /// failed warm-thread spawn while this is true.
+    pub(crate) fn waiting_for_rules(&self) -> bool {
+        self.requests
+            .values()
+            .any(|r| matches!(r.wait, Wait::Rules))
+    }
+
+    /// Each reactor poll: collects page replies, resumes kind 30 appends
+    /// whose journal hold ended, and resumes a note waiting for the rule
+    /// set once `ctx.rules` is `Some`. In-memory work only.
     pub(crate) fn poll(&mut self, ctx: &mut Ctx) {
         let mut ready = Vec::new();
+        let mut rules_ready = Vec::new();
         for (key, request) in self.requests.iter_mut() {
             match &mut request.wait {
+                Wait::Rules if ctx.rules.is_some() => {
+                    request.wait = Wait::None;
+                    rules_ready.push(*key);
+                }
                 Wait::Pages(pages) => {
                     for page in pages.iter_mut() {
                         if page.reply.is_none() {
@@ -1927,6 +1930,9 @@ impl JobControl {
         }
         for (key, replies) in ready {
             self.drive(key, Input::Pages(replies), ctx);
+        }
+        for key in rules_ready {
+            self.drive(key, Input::Resume, ctx);
         }
     }
 
@@ -2067,6 +2073,8 @@ impl JobControl {
                 request.wait = Wait::Turn;
                 self.retain_queue.push_back(key);
             }
+            // The retain keeps `retain_active`: the others stay queued.
+            Next::Rules => request.wait = Wait::Rules,
             Next::Pages(reads) => {
                 let busy = error_body(request_body(request), wire::error::BUSY);
                 let Some(pages) = ctx.pages else {

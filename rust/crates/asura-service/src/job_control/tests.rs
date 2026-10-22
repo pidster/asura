@@ -255,16 +255,22 @@ impl Journal {
             }) => {
                 self.reads.push("Jobs");
                 assert!((1..=9).contains(&limit), "Jobs limit 1 to 9");
-                let mut jobs: Vec<JobListing> = self
+                let in_scope: Vec<JobListing> = self
                     .jobs
                     .values()
                     .map(|r| r.listing.clone())
-                    .filter(|l| before.is_none_or(|b| l.intent_frame.sequence < b))
                     .filter(|l| match scope {
                         JobScope::Conversation(c) => l.conversation == c,
                         JobScope::Project(p) => l.project == p,
                         JobScope::AllProjects => true,
                     })
+                    .collect();
+                // The cursor check: a job of the scope at exactly `before`.
+                reply.before_found =
+                    before.is_some_and(|b| in_scope.iter().any(|l| l.intent_frame.sequence == b));
+                let mut jobs: Vec<JobListing> = in_scope
+                    .into_iter()
+                    .filter(|l| before.is_none_or(|b| l.intent_frame.sequence < b))
                     .collect();
                 jobs.sort_by_key(|l| std::cmp::Reverse(l.intent_frame.sequence));
                 jobs.truncate(limit);
@@ -450,6 +456,8 @@ struct Env {
     pages: Pages,
     pages_ready: bool,
     held: bool,
+    /// `Ctx.rules`: compiled here on the test thread, never on a reactor.
+    rules: Option<Result<&'static RuleSet, SelfCheckError>>,
     now: Instant,
     runtime: RuntimeDirectory,
     _scratch: Scratch,
@@ -466,6 +474,7 @@ impl Env {
             projects: &self.registry,
             installation: INSTALLATION,
             journal_held: self.held,
+            rules: self.rules.clone(),
             now: self.now,
         }
     }
@@ -508,6 +517,7 @@ impl H {
                 pages,
                 pages_ready: true,
                 held: false,
+                rules: Some(asura_platform::secrets::detection()),
                 now: Instant::now(),
                 runtime,
                 _scratch: scratch,
@@ -1477,18 +1487,258 @@ fn read_offsets_at_end_and_states() {
 }
 
 #[test]
-fn excerpt_and_unnumbered_placeholders() {
-    assert_eq!(command_excerpt("ls -la"), "ls -la");
-    assert_eq!(command_excerpt("a\nb"), "a…");
-    assert_eq!(command_excerpt("tab\there"), "tab here");
-    let long = "é".repeat(200);
-    let excerpt = command_excerpt(&long);
-    assert!(excerpt.len() <= 192 && excerpt.ends_with('…'));
-    assert_eq!(
-        unnumbered("$ASURA_SECRET_12 ${ASURA_SECRET_3} ASURA_SECRET_4 $ASURA_SECRET_x"),
-        "$ASURA_SECRET_0 ${ASURA_SECRET_0} ASURA_SECRET_4 $ASURA_SECRET_x"
-    );
+fn priority_classes() {
     assert_eq!(priority(&cancel(1, [1; 16], P1, false)), Some(0));
     assert_eq!(priority(&observe([1; 16], 0)), Some(2));
     assert_eq!(priority(&read([1; 16], 0)), Some(1));
+}
+
+/// The control contract's excerpt bound is the storage bound: the journal
+/// worker builds the excerpt that the codec checks.
+#[test]
+fn excerpt_bound_matches_the_storage_bound() {
+    assert_eq!(
+        wire::MAX_JOB_COMMAND_EXCERPT_BYTES,
+        journal::MAX_JOB_COMMAND_EXCERPT_BYTES
+    );
+}
+
+// ----- J4T-13: handler follow-ups -----
+
+/// J4T-13: a note waits in `Wait::Rules` while the rule set is not ready,
+/// with no time bound, and keeps its retain turn: a later retain stays
+/// queued behind it. Readiness resumes it; the note is redacted with
+/// `note_redacted`, so a typed placeholder stays as typed.
+#[test]
+fn j4t_13_note_waits_for_the_rule_set_and_keeps_its_turn() {
+    let mut h = H::new(8);
+    let job = h.running(1, C1, P1);
+    h.env.rules = None;
+    let text = format!("deploy with --token {} then $ASURA_SECRET_3", secret());
+    assert!(h.send(1, note(1, job, P1, &text)).is_none());
+    assert!(h.jc.waiting_for_rules());
+    assert!(
+        h.send(2, retain(2, job, P1, RetentionAction::Pin))
+            .is_none(),
+        "queued behind the note"
+    );
+    // Time alone ends nothing.
+    h.env.now += std::time::Duration::from_secs(3600);
+    h.settle();
+    assert!(h.take(1).is_none() && h.take(2).is_none());
+    assert!(h.env.journal.appended.is_empty());
+    assert_eq!(h.jc.pending(), 2);
+    // Other requests are unaffected.
+    assert!(detail(h.send(3, inspect(job, None))).error.is_none());
+    h.env.rules = Some(asura_platform::secrets::detection());
+    h.settle();
+    assert!(!h.jc.waiting_for_rules());
+    let reply = retained(h.take(1));
+    assert_eq!(reply.changed, Some(true));
+    assert_eq!(retained(h.take(2)).changed, Some(true));
+    let appended: Vec<_> = h.env.journal.appended.iter().map(|r| r.action).collect();
+    assert_eq!(appended, [RetentionAction::Note, RetentionAction::Pin]);
+    let stored = &h.env.journal.appended[0].note;
+    assert!(!stored.contains(&secret()), "{stored}");
+    assert_eq!(
+        stored,
+        "deploy with --token $ASURA_SECRET_0 then $ASURA_SECRET_3"
+    );
+}
+
+/// J4T-13: a rule set that failed its self-check makes the note
+/// `unavailable`, also for a note already waiting; nothing is written.
+#[test]
+fn j4t_13_failed_rule_set_is_unavailable() {
+    let mut h = H::new(8);
+    let job = h.running(1, C1, P1);
+    h.env.rules = None;
+    assert!(h.send(1, note(1, job, P1, "first")).is_none());
+    h.env.rules = Some(Err(SelfCheckError::Digest));
+    h.settle();
+    let reply = retained(h.take(1));
+    assert_eq!(reply.error.as_deref(), Some(wire::error::UNAVAILABLE));
+    let reply = retained(h.send(1, note(2, job, P1, "second")));
+    assert_eq!(reply.error.as_deref(), Some(wire::error::UNAVAILABLE));
+    assert!(h.env.journal.appended.is_empty());
+    // An invalid note is rejected before the wait.
+    h.env.rules = None;
+    let reply = retained(h.send(1, note(3, job, P1, "bell\u{7}")));
+    assert_eq!(reply.error.as_deref(), Some(wire::error::NOTE_INVALID));
+    assert!(!h.jc.waiting_for_rules());
+}
+
+/// J4T-13: the rule wait ends on detach (nothing written, the next retain
+/// takes the turn) and on shutdown (`Draining`).
+#[test]
+fn j4t_13_rule_wait_ends_on_detach_and_shutdown() {
+    let mut h = H::new(8);
+    let job = h.running(1, C1, P1);
+    h.env.rules = None;
+    assert!(h.send(1, note(1, job, P1, "gone")).is_none());
+    assert!(
+        h.send(2, retain(2, job, P1, RetentionAction::Pin))
+            .is_none()
+    );
+    h.jc.retain(&[[2; 16]], &mut h.env.ctx());
+    h.settle();
+    assert!(!h.jc.waiting_for_rules());
+    assert_eq!(retained(h.take(2)).changed, Some(true));
+    h.env.rules = Some(asura_platform::secrets::detection());
+    h.settle();
+    assert!(h.take(1).is_none());
+    let notes = h.env.journal.appended.iter();
+    assert_eq!(
+        notes.filter(|r| r.action == RetentionAction::Note).count(),
+        0
+    );
+    h.env.rules = None;
+    assert!(h.send(3, note(3, job, P1, "late")).is_none());
+    h.env.ctl.close();
+    h.jc.close(&mut h.env.ctx());
+    h.settle();
+    match h.take(3) {
+        Some(Body::Error(e)) => assert_eq!(e.code, Some(pb::ErrorCode::Draining as i32)),
+        other => panic!("Draining expected, got {other:?}"),
+    }
+    assert_eq!(h.jc.pending(), 0);
+}
+
+/// J4T-13: a list makes one `Jobs` read per journal page and no `JobFacts`
+/// read; each entry's command is the listing's excerpt, and the cursor is
+/// checked with the same read's `before_found`.
+#[test]
+fn j4t_13_list_reads_jobs_only() {
+    let mut h = H::new(8);
+    let mut jobs = Vec::new();
+    for n in 1..=5 {
+        let job = h.running(n, C1, P1);
+        h.finish(job, 1);
+        jobs.push(job);
+    }
+    h.env
+        .journal
+        .jobs
+        .get_mut(&jobs[4])
+        .unwrap()
+        .listing
+        .excerpt = "from the listing".into();
+    h.env.journal.reads.clear();
+    let mut query = list(1, Some(P1), None);
+    query.limit = Some(2);
+    let first = listing(h.send(1, Body::JobList(query.clone())));
+    assert_eq!(h.env.journal.reads, ["Jobs"]);
+    assert_eq!(
+        first.entries[0].command.as_deref(),
+        Some("from the listing")
+    );
+    assert_eq!(
+        first.entries[1].command.as_deref(),
+        Some("cargo build --workspace")
+    );
+    h.env.journal.reads.clear();
+    query.before = first.next_before;
+    let second = listing(h.send(1, Body::JobList(query.clone())));
+    assert_eq!(second.entries.len(), 2);
+    assert_eq!(h.env.journal.reads, ["Jobs"], "no extra cursor read");
+    // A cursor at no kind 26 of the scope: `invalid_cursor` from the same read.
+    h.env.journal.reads.clear();
+    query.before = first.next_before.map(|b| b + 1);
+    let reply = listing(h.send(1, Body::JobList(query.clone())));
+    assert_eq!(reply.error.as_deref(), Some(wire::error::INVALID_CURSOR));
+    assert_eq!(h.env.journal.reads, ["Jobs"]);
+    // A cursor of another conversation's job is not in this scope.
+    query.scope = Some(3);
+    query.conversation_id = Some(C2.to_vec());
+    query.before = first.next_before;
+    let reply = listing(h.send(1, Body::JobList(query)));
+    assert_eq!(reply.error.as_deref(), Some(wire::error::INVALID_CURSOR));
+    assert!(!h.env.journal.reads.contains(&"JobFacts"));
+}
+
+/// J4T-13: a live-only list with `before` sends one `Jobs { before, limit 1 }`
+/// read for `before_found` only: `invalid_cursor` when false; the check is
+/// skipped when the journal is unavailable.
+#[test]
+fn j4t_13_live_only_cursor_check() {
+    let mut h = H::new(8);
+    let older = h.running(1, C1, P1);
+    let newer = h.running(2, C1, P1);
+    let mut query = list(1, Some(P1), None);
+    query.live_only = Some(true);
+    let all = listing(h.send(1, Body::JobList(query.clone())));
+    let ids: Vec<_> = all.entries.iter().map(|e| e.job_id.clone()).collect();
+    assert_eq!(ids, [Some(newer.to_vec()), Some(older.to_vec())]);
+    let cursor = all.entries[0].sequence.expect("sequence");
+    h.env.journal.reads.clear();
+    query.before = Some(cursor);
+    let reply = listing(h.send(1, Body::JobList(query.clone())));
+    assert_eq!(h.env.journal.reads, ["Jobs"]);
+    assert_eq!(reply.entries.len(), 1);
+    assert_eq!(reply.entries[0].job_id.as_deref(), Some(&older[..]));
+    query.before = Some(cursor + 1);
+    let reply = listing(h.send(1, Body::JobList(query.clone())));
+    assert_eq!(reply.error.as_deref(), Some(wire::error::INVALID_CURSOR));
+    // The live list works from memory: no journal, no check.
+    h.env.journal.unavailable = true;
+    let reply = listing(h.send(1, Body::JobList(query)));
+    assert!(reply.error.is_none());
+    assert_eq!(reply.entries.len(), 2);
+}
+
+/// J4T-13: `JobDetail` lists person notes (author 1) and model notes
+/// (author 2, text from `JobRecords.model_notes`) together, oldest first by
+/// kind 30 sequence.
+#[test]
+fn j4t_13_detail_lists_person_and_model_notes() {
+    let mut h = H::new(8);
+    let job = h.running(1, C1, P1);
+    assert_eq!(
+        retained(h.send(1, note(1, job, P1, "person first"))).changed,
+        Some(true)
+    );
+    // A model `job note` committed by the conversation owner: kind 30 cites
+    // its kind 14, and `JobFacts` returns the cited text.
+    h.env.journal.sequence += 1;
+    let frame = Locator {
+        sequence: h.env.journal.sequence,
+        ..Locator::NONE
+    };
+    let records = h.env.journal.jobs.get_mut(&job).unwrap();
+    records.listing.retention.apply(RetentionAction::Note);
+    records.retention.push((
+        frame,
+        JobRetention {
+            job,
+            action: RetentionAction::Note,
+            author: RetentionAuthor::Model {
+                operation: [9; 16],
+                generation: 1,
+                ordinal: 2,
+            },
+            time: 1234,
+            note: String::new(),
+        },
+    ));
+    records.model_notes.push((frame, "model second".into()));
+    assert_eq!(
+        retained(h.send(1, note(2, job, P1, "person third"))).changed,
+        Some(true)
+    );
+    let reply = detail(h.send(1, inspect(job, Some(P1))));
+    let notes: Vec<_> = reply
+        .notes
+        .iter()
+        .map(|n| (n.author, n.text.as_deref()))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            (Some(1), Some("person first")),
+            (Some(2), Some("model second")),
+            (Some(1), Some("person third")),
+        ]
+    );
+    assert_eq!(reply.notes[1].unix_ms, Some(1234));
+    assert_eq!(reply.entry.and_then(|e| e.notes), Some(3));
 }
