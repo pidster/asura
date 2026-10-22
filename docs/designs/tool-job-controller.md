@@ -2248,7 +2248,7 @@ one byte, 0 or 1. Any other value is `Corrupt`.
 | 2 | agent | u32 | 0, the main agent. Another value is `Corrupt` until a subagent design assigns it |
 | 3 | origin reference | model: operation ID, generation (u64), ordinal (u32); person: input ID | Model: names a kind 14 under the [replay rules](#replay-order-and-the-job-reservation-ledger) |
 
-Maximum payload 34 bytes (model) or 22 bytes (person); maximum frame 218 bytes.
+Maximum payload 33 bytes (model) or 21 bytes (person); maximum frame 217 bytes. J4 adds field 4 (see below): 41, 29 and 225 bytes.
 
 Replay derives every other intent fact from one source (TCR-O5):
 
@@ -2969,7 +2969,7 @@ Only known-size limits apply.
 | Unsettled jobs | 64 per service, fixed; equals the checkpoint and ledger bound | `busy`, `jobs_full`; replay `Limit` above it |
 | Agents with entries | At most 64 agents with model entries plus 16 person waiters, from the bounds above and the 16 unresolved inputs | — |
 | Record outbox | 3 per unsettled job, 192 in total | Not reachable |
-| Kind 26 | 34-byte payload, 218-byte frame | — |
+| Kind 26 | 41-byte payload, 225-byte frame (with the J4 time) | — |
 | Kind 27 | 19-byte payload, 203-byte frame; one per job | — |
 | Kind 28 | 4,086-byte payload, 4,270-byte frame | — |
 | Ledger | 4,473 bytes and 2 frames per unsettled job; 286,272 bytes and 128 frames at 64 | Kind 26 held at the quota |
@@ -3842,7 +3842,8 @@ use need one. J4 changes the J2 layouts in place:
 | 28 | 22 settled time | u64 | Unix milliseconds when the record was built; 0 only when the clock read failed |
 
 Replay does not compare the times: a wall clock can move backward. Kind 26
-grows to a 42-byte payload (model) or 30 bytes (person) and a 226-byte frame.
+grows to a 41-byte payload (model) or 29 bytes (person) and a 225-byte frame
+(1 + 4 + 28 + 8; corrected 2026-10-22 from 42, 30 and 226).
 Kind 28 grows to 4,094 bytes and a 4,278-byte frame. The job reservation ledger
 then holds 4,481 bytes per unsettled job, and 286,784 bytes at 64 jobs. J4's
 storage packet updates the J2 constants and tests (J2T-01, J2T-03).

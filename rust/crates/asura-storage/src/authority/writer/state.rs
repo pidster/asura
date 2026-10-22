@@ -1875,7 +1875,9 @@ impl State {
         // The active and delta operations hold their calls in memory.
         for (operation, op) in &state.operations {
             for tool in &op.tools {
+                // A job-mode call's payloads are the job's (below).
                 if let Some(exec) = tool.exec_cmd.as_deref()
+                    && exec.job_intent.is_none()
                     && (exec.stdout_payload == payload || exec.stderr_payload == payload)
                 {
                     return Ok(Some(PayloadFact {
@@ -1893,8 +1895,55 @@ impl State {
                 }
             }
         }
+        // An unsettled job (live state or checkpoint) is still live.
+        if let Some(job) = state
+            .jobs
+            .values()
+            .find(|job| job.payloads.contains(&payload))
+        {
+            return Ok(Some(job_fact(
+                payload,
+                job.origin,
+                job.job,
+                job.payloads,
+                job.intent,
+                None,
+            )?));
+        }
         let entry =
             self.read(|state, store| state.entry(&Key::new(Tag::Payload, payload, 0), store))?;
+        // Form 2: a settled job, from the delta or the runs.
+        if let Some(Entry::JobPayload {
+            job,
+            intent,
+            settled,
+            ..
+        }) = entry
+        {
+            let Record::JobIntent(p) = self.record(intent)? else {
+                return Err(Error::RepairRequired);
+            };
+            let Record::JobSettled(settlement) = self.record(settled)? else {
+                return Err(Error::RepairRequired);
+            };
+            let payloads = job_payload_ids(state.installation_id, job);
+            if job_id(&p.origin) != job || settlement.job != job || !payloads.contains(&payload) {
+                return Err(Error::RepairRequired);
+            }
+            // `interrupted` maps to no settlement: an unverified prefix, as
+            // for a missing kind 28 (TJ-Q5).
+            let settled = settlement.capture_state.capture().map(|capture| {
+                (
+                    capture,
+                    settled.sequence,
+                    [&settlement.stdout, &settlement.stderr]
+                        .map(|s| (s.capture.stored_bytes, s.capture.digest)),
+                )
+            });
+            let mut fact = job_fact(payload, p.origin, job, payloads, intent, settled)?;
+            fact.active = false;
+            return Ok(Some(fact));
+        }
         let Some(Entry::Payload {
             operation,
             generation,
@@ -1938,4 +1987,29 @@ impl State {
             active: false,
         }))
     }
+}
+/// The `PayloadFacts` job form: `call` is the job ID, `operation` the model
+/// origin's operation, `intent_sequence` the kind 26 sequence and `settled`
+/// the kind 28 capture facts. An unsettled job is `active`.
+fn job_fact(
+    payload: Id,
+    origin: JobOrigin,
+    job: Id,
+    payloads: [Id; 2],
+    intent: Locator,
+    settled: Option<Settlement>,
+) -> Result<PayloadFact> {
+    // Person origin replays only after P2.
+    let JobOrigin::Model { operation, .. } = origin else {
+        return Err(Error::RepairRequired);
+    };
+    Ok(PayloadFact {
+        payload,
+        call: job,
+        operation,
+        payloads,
+        intent_sequence: intent.sequence,
+        settled,
+        active: true,
+    })
 }

@@ -287,6 +287,10 @@ impl<F: JournalFiles> Index for Store<'_, F> {
     fn frame(&mut self, locator: &Locator) -> Result<Record, ReplayError> {
         Ok(self.read_frame(locator)?.1)
     }
+    fn frame_owner(&mut self, locator: &Locator) -> Result<(u64, Record), ReplayError> {
+        let (context, record, _) = self.read_frame(locator)?;
+        Ok((context.owner_generation, record))
+    }
 }
 
 /// An in-progress run compaction.
@@ -1344,7 +1348,9 @@ impl<F: JournalFiles> Journal<F> {
 /// Closure records always fit beside the roll reserve: kind 8, 7, 6 and 3,
 /// plus the kind 23 and kind 15 of the pending `run` call, whose bytes the
 /// closure reservation already holds, and a kind 14 `cancelled` record,
-/// which a cancel needs before its terminal (SJ-D18).
+/// which a cancel needs before its terminal (SJ-D18). Kinds 27 and 28 are
+/// closure records too: the job ledger holds their bytes (J2-E4). Kind 26
+/// is a normal record.
 pub fn is_closure(record: &Record) -> bool {
     match record {
         Record::TurnTerminal(_)
@@ -1352,7 +1358,9 @@ pub fn is_closure(record: &Record) -> bool {
         | Record::OwnerGeneration
         | Record::StartAuthorized(_)
         | Record::CaptureSettled(_)
-        | Record::ToolResult(_) => true,
+        | Record::ToolResult(_)
+        | Record::JobCancelRequested(_)
+        | Record::JobSettled(_) => true,
         Record::ToolCall(call) => call.decision == ToolDecision::Cancelled,
         _ => false,
     }

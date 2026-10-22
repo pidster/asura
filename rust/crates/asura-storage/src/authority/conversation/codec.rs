@@ -268,23 +268,64 @@ pub fn capitalize_project_name(name: &str) -> Result<String> {
     }
     Ok(result)
 }
-/// The `asura.exec_cmd.job` identity of one exec_cmd call: the first 16 bytes of
-/// SHA-256 over ASCII `asura.exec_cmd.job`, one zero byte, the operation ID, the
-/// generation and the ordinal (big endian). An all-zero result becomes 1 in its
-/// final byte. Kind 22 and its job use this derivation.
-pub fn exec_cmd_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
-    let mut hash = Sha256::new();
-    hash.update(b"asura.exec_cmd.job\0");
-    hash.update(operation);
-    hash.update(generation.to_be_bytes());
-    hash.update(ordinal.to_be_bytes());
-    let digest = hash.finalize();
+/// The first 16 bytes of a SHA-256 digest; an all-zero result becomes 1 in
+/// its final byte.
+fn derived_id(hash: Sha256) -> Id {
+    id_from_digest(&hash.finalize())
+}
+fn id_from_digest(digest: &[u8]) -> Id {
     let mut id = [0; 16];
     id.copy_from_slice(&digest[..16]);
     if id == [0; 16] {
         id[15] = 1;
     }
     id
+}
+/// The one job ID of every origin (J2-E6): the first 16 bytes of SHA-256
+/// over ASCII `asura.job`, one zero byte, the origin byte, then the origin
+/// reference. Model: the operation ID, the generation and the ordinal (big
+/// endian). Person: the input ID. An all-zero result becomes 1 in its final
+/// byte.
+pub fn job_id(origin: &JobOrigin) -> Id {
+    let mut hash = Sha256::new();
+    hash.update(b"asura.job\0");
+    hash.update([origin.code()]);
+    match origin {
+        JobOrigin::Model {
+            operation,
+            generation,
+            ordinal,
+        } => {
+            hash.update(operation);
+            hash.update(generation.to_be_bytes());
+            hash.update(ordinal.to_be_bytes());
+        }
+        JobOrigin::Person { input } => hash.update(input),
+    }
+    derived_id(hash)
+}
+/// The job ID of one model exec_cmd call: [`job_id`] with the model origin.
+/// A J1-mode call and a job-mode call use the same derivation.
+pub fn exec_cmd_job_id(operation: Id, generation: u64, ordinal: u32) -> Id {
+    job_id(&JobOrigin::Model {
+        operation,
+        generation,
+        ordinal,
+    })
+}
+/// The stdout and stderr payload IDs of a job (job identity): the first 16
+/// bytes of SHA-256 over ASCII `asura.payload`, one zero byte, the
+/// installation ID, the job ID and the object kind byte (1 stdout, 2
+/// stderr). An all-zero result becomes 1 in its final byte.
+pub fn job_payload_ids(installation: Id, job: Id) -> [Id; 2] {
+    [1u8, 2].map(|kind| {
+        let mut hash = Sha256::new();
+        hash.update(b"asura.payload\0");
+        hash.update(installation);
+        hash.update(job);
+        hash.update([kind]);
+        derived_id(hash)
+    })
 }
 impl CreateNoteIdentity {
     pub fn derive(binding: [Id; 3], turn: Id, generation: u64, ordinal: u32) -> Result<Self> {
@@ -860,63 +901,353 @@ fn valid_stream(s: &CaptureStream) -> bool {
             .iter()
             .all(|span| span.stored_offset <= s.stored_bytes)
 }
+/// The capture facts that kinds 23 and 28 share, borrowed for validation.
+struct CaptureFacts<'a> {
+    state: CaptureState,
+    reason: CaptureReason,
+    exit_kind: u8,
+    exit_value: u32,
+    streams: [&'a CaptureStream; 2],
+    distinct_numbers: u32,
+    numbers: &'a [CaptureNumber],
+    final_reservation: u64,
+}
+/// The kind 23 field rules for capture states 1 to 4; kind 28 applies them
+/// unchanged (tool-job-controller.md, kind 28).
+fn valid_capture(c: &CaptureFacts<'_>) -> bool {
+    let streams = c.streams;
+    let digests = streams.iter().all(|s| s.digest.is_some());
+    let no_digest = streams.iter().all(|s| s.digest.is_none());
+    let state = match c.state {
+        CaptureState::Complete => {
+            c.reason == CaptureReason::None
+                && digests
+                && streams.iter().all(|s| s.eof && s.discarded_bytes == 0)
+        }
+        CaptureState::Incomplete => {
+            !matches!(
+                c.reason,
+                CaptureReason::None | CaptureReason::SettlementUnconfirmed
+            ) && digests
+        }
+        CaptureState::Unconfirmed => c.reason == CaptureReason::SettlementUnconfirmed && no_digest,
+        CaptureState::NotStarted => {
+            matches!(c.reason, CaptureReason::None | CaptureReason::StorageFault)
+                && c.exit_kind == 0
+                && no_digest
+                && streams
+                    .iter()
+                    .all(|s| s.observed_bytes == 0 && s.stored_bytes == 0)
+        }
+    };
+    state
+        && valid_exit(c.exit_kind, c.exit_value)
+        && streams.iter().all(|s| valid_stream(s))
+        && c.distinct_numbers <= u32::from(MAX_CAPTURE_NUMBER)
+        && c.numbers.len() <= MAX_CAPTURE_NUMBERS
+        && c.numbers.len() as u64 <= u64::from(c.distinct_numbers)
+        && c.numbers
+            .iter()
+            .all(|n| (1..=MAX_CAPTURE_NUMBER).contains(&n.number))
+        && c.numbers.windows(2).all(|p| p[0].number < p[1].number)
+        && c.final_reservation.is_multiple_of(MIB)
+}
+fn valid_exit(kind: u8, value: u32) -> bool {
+    match kind {
+        0 => value == 0,
+        1 => value <= 255,
+        2 => (1..=127).contains(&value),
+        _ => false,
+    }
+}
 impl CaptureSettled {
     /// Every kind 23 field rule that the record alone determines. Replay adds
     /// the pending `run` exec_cmd kind 14 that it settles.
     pub(crate) fn validate(&self) -> Result<()> {
-        let streams = [&self.stdout, &self.stderr];
-        let digests = streams.iter().all(|s| s.digest.is_some());
-        let no_digest = streams.iter().all(|s| s.digest.is_none());
-        let state = match self.state {
-            CaptureState::Complete => {
-                self.reason == CaptureReason::None
-                    && digests
-                    && streams.iter().all(|s| s.eof && s.discarded_bytes == 0)
-            }
-            CaptureState::Incomplete => {
-                !matches!(
-                    self.reason,
-                    CaptureReason::None | CaptureReason::SettlementUnconfirmed
-                ) && digests
-            }
-            CaptureState::Unconfirmed => {
-                self.reason == CaptureReason::SettlementUnconfirmed && no_digest
-            }
-            CaptureState::NotStarted => {
-                matches!(
-                    self.reason,
-                    CaptureReason::None | CaptureReason::StorageFault
-                ) && self.exit_kind == 0
-                    && no_digest
-                    && streams
-                        .iter()
-                        .all(|s| s.observed_bytes == 0 && s.stored_bytes == 0)
-            }
-        };
-        let exit = match self.exit_kind {
-            0 => self.exit_value == 0,
-            1 => self.exit_value <= 255,
-            2 => (1..=127).contains(&self.exit_value),
-            _ => false,
-        };
         require(
             self.operation != [0; 16]
                 && self.generation >= 1
                 && (1..=MAX_RECORDED_CALLS).contains(&self.ordinal)
-                && state
-                && exit
-                && streams.iter().all(|s| valid_stream(s))
-                && self.distinct_numbers <= u32::from(MAX_CAPTURE_NUMBER)
-                && self.numbers.len() <= MAX_CAPTURE_NUMBERS
-                && self.numbers.len() as u64 <= u64::from(self.distinct_numbers)
-                && self
-                    .numbers
-                    .iter()
-                    .all(|n| (1..=MAX_CAPTURE_NUMBER).contains(&n.number))
-                && self.numbers.windows(2).all(|p| p[0].number < p[1].number)
-                && self.final_reservation.is_multiple_of(MIB),
+                && valid_capture(&CaptureFacts {
+                    state: self.state,
+                    reason: self.reason,
+                    exit_kind: self.exit_kind,
+                    exit_value: self.exit_value,
+                    streams: [&self.stdout, &self.stderr],
+                    distinct_numbers: self.distinct_numbers,
+                    numbers: &self.numbers,
+                    final_reservation: self.final_reservation,
+                }),
         )
     }
+}
+
+// ----- J2 kinds 26, 27 and 28. -----
+
+impl JobIntent {
+    /// Kind 26 rules that the record alone determines: the agent is 0 (JR3)
+    /// and the reference names a valid call or input. Replay adds JR1, JR2
+    /// and JR5.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let reference = match self.origin {
+            JobOrigin::Model {
+                operation,
+                generation,
+                ordinal,
+            } => {
+                operation != [0; 16]
+                    && generation >= 1
+                    && (1..=MAX_RECORDED_CALLS).contains(&ordinal)
+            }
+            JobOrigin::Person { input } => input != [0; 16],
+        };
+        require(self.agent == 0 && reference)
+    }
+}
+impl JobCancelRequested {
+    /// Kind 27 rules that the record alone determines: the requester, reason
+    /// and kill flag agree with the reason table. Replay adds JR6.
+    pub(crate) fn validate(&self) -> Result<()> {
+        require(
+            self.job != [0; 16]
+                && self.reason.requester() == Some(self.requester)
+                && self.kill == (self.reason == JobReason::PersonKill),
+        )
+    }
+}
+impl JobSettled {
+    /// The kind 28 outcome rules and, for capture states 1 to 4, the kind 23
+    /// field rules. Replay adds JR7.
+    pub(crate) fn validate(&self) -> Result<()> {
+        use JobOutcome as O;
+        let process = matches!(self.outcome, O::Exited | O::Signalled | O::Cancelled);
+        let exit = match self.outcome {
+            O::Exited => self.exit_kind == 1,
+            O::Signalled => self.exit_kind == 2,
+            O::Cancelled => matches!(self.exit_kind, 1 | 2),
+            O::NotStarted | O::Interrupted => self.exit_kind == 0,
+        } && valid_exit(self.exit_kind, self.exit_value);
+        let cleanup = if process {
+            self.cleanup != JobCleanup::None
+        } else {
+            self.cleanup == JobCleanup::None && self.escapees == 0 && self.elapsed_ms == 0
+        } && if self.cleanup == JobCleanup::Late {
+            matches!(self.unconfirmed_reason, 9 | 13)
+        } else {
+            self.unconfirmed_reason == 0
+        } && (self.cleanup != JobCleanup::None || self.escapees == 0);
+        let streams = [&self.stdout, &self.stderr];
+        let lines = streams.iter().all(|s| s.lines <= s.capture.stored_bytes);
+        let capture = match (self.outcome, self.capture_state.capture()) {
+            (O::Interrupted, None) => {
+                self.capture_reason == CaptureReason::None
+                    && streams.iter().all(|s| **s == JobStream::default())
+                    && self.distinct_numbers == 0
+                    && self.numbers.is_empty()
+                    && self.pause_count == 0
+                    && self.first_pause_ms == 0
+                    && self.paused_ms == 0
+                    && self.final_reservation == 0
+            }
+            (O::NotStarted, Some(state @ CaptureState::NotStarted))
+            | (
+                O::Exited | O::Signalled | O::Cancelled,
+                Some(
+                    state @ (CaptureState::Complete
+                    | CaptureState::Incomplete
+                    | CaptureState::Unconfirmed),
+                ),
+            ) => valid_capture(&CaptureFacts {
+                state,
+                reason: self.capture_reason,
+                exit_kind: self.exit_kind,
+                exit_value: self.exit_value,
+                streams: [&self.stdout.capture, &self.stderr.capture],
+                distinct_numbers: self.distinct_numbers,
+                numbers: &self.numbers,
+                final_reservation: self.final_reservation,
+            }),
+            _ => false,
+        };
+        require(
+            self.job != [0; 16]
+                && self.reason.allows(self.outcome)
+                && exit
+                && cleanup
+                && lines
+                && capture,
+        )
+    }
+}
+/// Kind 26 field order. Callers validate first; tests use it to build
+/// invalid bytes.
+fn job_intent_fields(w: &mut Writer, p: &JobIntent) {
+    w.byte(p.origin.code());
+    w.u32(p.agent);
+    match p.origin {
+        JobOrigin::Model {
+            operation,
+            generation,
+            ordinal,
+        } => {
+            w.bytes(&operation);
+            w.u64(generation);
+            w.u32(ordinal);
+        }
+        JobOrigin::Person { input } => w.bytes(&input),
+    }
+    w.u64(p.time);
+}
+fn read_job_intent(r: &mut Reader<'_>) -> Result<JobIntent> {
+    let origin = r.byte()?;
+    let agent = r.u32()?;
+    let origin = match origin {
+        1 => JobOrigin::Model {
+            operation: r.array()?,
+            generation: r.u64()?,
+            ordinal: r.u32()?,
+        },
+        2 => JobOrigin::Person { input: r.array()? },
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let value = JobIntent {
+        origin,
+        agent,
+        time: r.u64()?,
+    };
+    value.validate()?;
+    Ok(value)
+}
+/// Kind 27 field order.
+fn job_cancel_fields(w: &mut Writer, p: &JobCancelRequested) {
+    w.bytes(&p.job);
+    w.byte(p.requester as u8);
+    w.byte(p.reason as u8);
+    w.byte(u8::from(p.kill));
+}
+fn read_job_cancel(r: &mut Reader<'_>) -> Result<JobCancelRequested> {
+    let value = JobCancelRequested {
+        job: r.array()?,
+        requester: JobRequester::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
+        reason: JobReason::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?,
+        kill: r.flag()?,
+    };
+    value.validate()?;
+    Ok(value)
+}
+/// Kind 28 field order. Callers validate first; tests use it to build
+/// invalid bytes.
+fn job_settled_fields(w: &mut Writer, p: &JobSettled) {
+    w.bytes(&p.job);
+    w.byte(p.outcome as u8);
+    w.byte(p.reason as u8);
+    w.byte(p.exit_kind);
+    w.u32(p.exit_value);
+    w.byte(p.cleanup as u8);
+    w.byte(p.unconfirmed_reason);
+    w.u32(p.escapees);
+    w.u64(p.elapsed_ms);
+    w.byte(p.capture_state as u8);
+    w.byte(p.capture_reason as u8);
+    // Field 12, redaction ran: 1, and 0 only for capture state 5.
+    w.byte(u8::from(p.capture_state != JobCaptureState::Interrupted));
+    for stream in [&p.stdout, &p.stderr] {
+        write_stream(w, &stream.capture);
+        w.u64(stream.lines);
+    }
+    w.u32(p.distinct_numbers);
+    w.u16(p.numbers.len() as u16);
+    for n in &p.numbers {
+        w.u16(n.number);
+        w.byte(kind_code(n.kind));
+        w.byte(origin_code(n.origin));
+    }
+    w.u32(p.pause_count);
+    w.u64(p.first_pause_ms);
+    w.u64(p.paused_ms);
+    w.u64(p.final_reservation);
+    w.u64(p.settled_time);
+}
+fn read_job_settled(r: &mut Reader<'_>) -> Result<JobSettled> {
+    let job = r.array()?;
+    let outcome = JobOutcome::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+    let reason = JobReason::from_code(r.byte()?).ok_or(ReplayError::Corrupt)?;
+    let exit_kind = r.byte()?;
+    let exit_value = r.u32()?;
+    let cleanup = match r.byte()? {
+        0 => JobCleanup::None,
+        1 => JobCleanup::Confirmed,
+        2 => JobCleanup::Late,
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let unconfirmed_reason = r.byte()?;
+    let escapees = r.u32()?;
+    let elapsed_ms = r.u64()?;
+    let capture_state = match r.byte()? {
+        1 => JobCaptureState::Complete,
+        2 => JobCaptureState::Incomplete,
+        3 => JobCaptureState::Unconfirmed,
+        4 => JobCaptureState::NotStarted,
+        5 => JobCaptureState::Interrupted,
+        _ => return Err(ReplayError::Corrupt),
+    };
+    let capture_reason = capture_reason_from(r.byte()?)?;
+    require(r.byte()? == u8::from(capture_state != JobCaptureState::Interrupted))?;
+    let mut stream = || -> Result<JobStream> {
+        Ok(JobStream {
+            capture: read_stream(r)?,
+            lines: r.u64()?,
+        })
+    };
+    let stdout = stream()?;
+    let stderr = stream()?;
+    let distinct_numbers = r.u32()?;
+    let count = r.u16()? as usize;
+    require(count <= MAX_CAPTURE_NUMBERS)?;
+    let mut numbers = Vec::with_capacity(count);
+    for _ in 0..count {
+        numbers.push(CaptureNumber {
+            number: r.u16()?,
+            kind: kind_from(r.byte()?)?,
+            origin: origin_from(r.byte()?)?,
+        });
+    }
+    let value = JobSettled {
+        job,
+        outcome,
+        reason,
+        exit_kind,
+        exit_value,
+        cleanup,
+        unconfirmed_reason,
+        escapees,
+        elapsed_ms,
+        capture_state,
+        capture_reason,
+        stdout,
+        stderr,
+        distinct_numbers,
+        numbers,
+        pause_count: r.u32()?,
+        first_pause_ms: r.u64()?,
+        paused_ms: r.u64()?,
+        final_reservation: r.u64()?,
+        settled_time: r.u64()?,
+    };
+    value.validate()?;
+    Ok(value)
+}
+fn capture_reason_from(code: u8) -> Result<CaptureReason> {
+    Ok(match code {
+        0 => CaptureReason::None,
+        1 => CaptureReason::StorageFault,
+        2 => CaptureReason::Quota,
+        3 => CaptureReason::Enospc,
+        4 => CaptureReason::DetectorFault,
+        5 => CaptureReason::DiscardedAfterCancel,
+        6 => CaptureReason::SettlementUnconfirmed,
+        _ => return Err(ReplayError::Corrupt),
+    })
 }
 fn require(ok: bool) -> Result<()> {
     if ok {
@@ -1035,16 +1366,7 @@ fn read_capture_settled(r: &mut Reader<'_>) -> Result<CaptureSettled> {
         4 => CaptureState::NotStarted,
         _ => return Err(ReplayError::Corrupt),
     };
-    let reason = match r.byte()? {
-        0 => CaptureReason::None,
-        1 => CaptureReason::StorageFault,
-        2 => CaptureReason::Quota,
-        3 => CaptureReason::Enospc,
-        4 => CaptureReason::DetectorFault,
-        5 => CaptureReason::DiscardedAfterCancel,
-        6 => CaptureReason::SettlementUnconfirmed,
-        _ => return Err(ReplayError::Corrupt),
-    };
+    let reason = capture_reason_from(r.byte()?)?;
     let exit_kind = r.byte()?;
     let exit_value = r.u32()?;
     require(r.byte()? == 1)?;
@@ -1234,6 +1556,18 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             w.string(&p.text, MAX_TEXT)?;
         }
         Record::CaptureSettled(p) => write_capture_settled(&mut w, p)?,
+        Record::JobIntent(p) => {
+            p.validate()?;
+            job_intent_fields(&mut w, p);
+        }
+        Record::JobCancelRequested(p) => {
+            p.validate()?;
+            job_cancel_fields(&mut w, p);
+        }
+        Record::JobSettled(p) => {
+            p.validate()?;
+            job_settled_fields(&mut w, p);
+        }
         Record::ResponseText(p) | Record::ThinkingText(p) => {
             require(!p.text.is_empty() || p.offset > 0)?;
             w.bytes(&p.operation);
@@ -1499,6 +1833,18 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
             require(payload.len() <= MAX_CAPTURE_SETTLED_PAYLOAD)?;
             Record::CaptureSettled(Box::new(read_capture_settled(&mut r)?))
         }
+        26 => {
+            require(payload.len() <= MAX_JOB_INTENT_PAYLOAD)?;
+            Record::JobIntent(read_job_intent(&mut r)?)
+        }
+        27 => {
+            require(payload.len() == JOB_CANCEL_PAYLOAD)?;
+            Record::JobCancelRequested(read_job_cancel(&mut r)?)
+        }
+        28 => {
+            require(payload.len() <= MAX_JOB_SETTLED_PAYLOAD)?;
+            Record::JobSettled(Box::new(read_job_settled(&mut r)?))
+        }
         _ => return Err(ReplayError::UnsupportedFormat),
     };
     if r.offset != payload.len() {
@@ -1600,16 +1946,93 @@ mod tests {
         *bytes.last_mut().unwrap() = 255;
         assert_eq!(decode_record(8, &bytes).unwrap_err(), ReplayError::Corrupt);
     }
+    /// J2T-04 (storage part): one `asura.job` domain with an origin byte,
+    /// fixed vectors for both origins, the zero rule and each input change;
+    /// a J1 call uses the same model-origin derivation; payload IDs keyed by
+    /// job ID. Vectors were computed independently (Python `hashlib`).
     #[test]
-    fn exec_cmd_job_identity_has_fixed_domain() {
-        let expected = [
-            0x7e, 0x66, 0x8e, 0x9f, 0x8f, 0xb9, 0xa0, 0xd0, 0x12, 0x85, 0xb5, 0xc8, 0x42, 0x66,
-            0x70, 0x02,
+    fn j2t_04_job_and_payload_identity_vectors() {
+        let model = JobOrigin::Model {
+            operation: [1; 16],
+            generation: 1,
+            ordinal: 1,
+        };
+        let model_id = [
+            0x4f, 0xdf, 0x69, 0x57, 0xba, 0x94, 0xa9, 0x20, 0xdf, 0x3a, 0x19, 0x62, 0x7d, 0x23,
+            0x17, 0x43,
         ];
-        assert_eq!(exec_cmd_job_id([1; 16], 1, 1), expected);
-        for (operation, generation, ordinal) in [([2; 16], 1, 1), ([1; 16], 2, 1), ([1; 16], 1, 2)]
-        {
-            assert_ne!(exec_cmd_job_id(operation, generation, ordinal), expected);
+        assert_eq!(job_id(&model), model_id);
+        assert_eq!(
+            exec_cmd_job_id([1; 16], 1, 1),
+            model_id,
+            "J1 calls share it"
+        );
+        let person = JobOrigin::Person { input: [7; 16] };
+        assert_eq!(
+            job_id(&person),
+            [
+                0x79, 0xe0, 0xdb, 0x74, 0x2b, 0x4e, 0x16, 0x9a, 0x46, 0x80, 0x08, 0x6f, 0x7a, 0xa9,
+                0x2c, 0x65,
+            ]
+        );
+        for other in [
+            JobOrigin::Model {
+                operation: [2; 16],
+                generation: 1,
+                ordinal: 1,
+            },
+            JobOrigin::Model {
+                operation: [1; 16],
+                generation: 2,
+                ordinal: 1,
+            },
+            JobOrigin::Model {
+                operation: [1; 16],
+                generation: 1,
+                ordinal: 2,
+            },
+            JobOrigin::Person { input: [1; 16] },
+        ] {
+            assert_ne!(job_id(&other), model_id, "{other:?}");
+        }
+        assert_ne!(
+            job_id(&JobOrigin::Person { input: [8; 16] }),
+            job_id(&person)
+        );
+        // The origin byte separates origins whose references share bytes.
+        let mut reference = Sha256::new();
+        reference.update(b"asura.job\0");
+        reference.update([2]);
+        reference.update([1; 16]);
+        assert_eq!(
+            derived_id(reference),
+            job_id(&JobOrigin::Person { input: [1; 16] })
+        );
+        // Zero rule: an all-zero prefix becomes 1 in its final byte.
+        let mut zero = [0; 16];
+        zero[15] = 1;
+        assert_eq!(id_from_digest(&[0; 32]), zero);
+        assert_eq!(id_from_digest(&[0xab; 32]), [0xab; 16]);
+        // Payload IDs: installation, job ID and object kind.
+        let payloads = job_payload_ids([9; 16], model_id);
+        assert_eq!(
+            payloads,
+            [
+                [
+                    0x23, 0x08, 0xfb, 0x33, 0x95, 0xb6, 0x5a, 0x87, 0xbf, 0x96, 0x8a, 0xfb, 0xbd,
+                    0xa5, 0x41, 0x62,
+                ],
+                [
+                    0xa3, 0x50, 0xcc, 0xc2, 0x95, 0xc3, 0x07, 0x9f, 0x57, 0xab, 0xcf, 0x7e, 0x99,
+                    0x1d, 0x97, 0xf7,
+                ],
+            ]
+        );
+        for other in [
+            job_payload_ids([8; 16], model_id),
+            job_payload_ids([9; 16], job_id(&person)),
+        ] {
+            assert!(other.iter().all(|id| !payloads.contains(id)));
         }
     }
 
@@ -3139,5 +3562,799 @@ mod tests {
         // Kind 23 has no string field: its size depends only on entry counts.
         let bytes = round23(settled());
         assert_eq!(bytes.len(), 36 + (101 + 9) + 101 + 6 + 4 + 20 + 8);
+    }
+
+    // J2T-01 (unit): kinds 26, 27 and 28 (tool-job-controller.md, J2 records).
+    fn intent26() -> JobIntent {
+        JobIntent {
+            origin: JobOrigin::Model {
+                operation: [1; 16],
+                generation: 1,
+                ordinal: 1,
+            },
+            agent: 0,
+            time: 1_760_000_000_000,
+        }
+    }
+    fn cancel27(reason: JobReason) -> JobCancelRequested {
+        JobCancelRequested {
+            job: [3; 16],
+            requester: reason.requester().unwrap(),
+            reason,
+            kill: reason == JobReason::PersonKill,
+        }
+    }
+    fn job_stream(capture: CaptureStream) -> JobStream {
+        JobStream {
+            lines: capture.stored_bytes.min(3),
+            capture,
+        }
+    }
+    /// An `exited` settlement with cleanup confirmed and complete capture.
+    fn settled28() -> JobSettled {
+        let base = settled();
+        JobSettled {
+            job: [3; 16],
+            outcome: JobOutcome::Exited,
+            reason: JobReason::None,
+            exit_kind: 1,
+            exit_value: 0,
+            cleanup: JobCleanup::Confirmed,
+            unconfirmed_reason: 0,
+            escapees: 0,
+            elapsed_ms: 5,
+            capture_state: JobCaptureState::Complete,
+            capture_reason: CaptureReason::None,
+            stdout: job_stream(base.stdout),
+            stderr: job_stream(base.stderr),
+            distinct_numbers: base.distinct_numbers,
+            numbers: base.numbers,
+            pause_count: 0,
+            first_pause_ms: 0,
+            paused_ms: 0,
+            final_reservation: INITIAL_RESERVATION,
+            settled_time: 1_760_000_000_002,
+        }
+    }
+    /// A consistent settlement for each outcome and an allowed reason.
+    fn job28(outcome: JobOutcome, reason: JobReason) -> JobSettled {
+        let unstarted = |s: JobStream| JobStream {
+            capture: CaptureStream {
+                observed_bytes: 0,
+                stored_bytes: 0,
+                digest: None,
+                eof: false,
+                ..s.capture
+            },
+            lines: 0,
+        };
+        match outcome {
+            JobOutcome::Exited => JobSettled {
+                reason,
+                ..settled28()
+            },
+            JobOutcome::Signalled => JobSettled {
+                outcome,
+                reason,
+                exit_kind: 2,
+                exit_value: 15,
+                ..settled28()
+            },
+            JobOutcome::Cancelled => JobSettled {
+                outcome,
+                reason,
+                exit_kind: 2,
+                exit_value: 9,
+                capture_state: JobCaptureState::Incomplete,
+                capture_reason: CaptureReason::DiscardedAfterCancel,
+                cleanup: JobCleanup::Late,
+                unconfirmed_reason: 9,
+                escapees: 3,
+                ..settled28()
+            },
+            JobOutcome::NotStarted => {
+                let base = settled28();
+                JobSettled {
+                    outcome,
+                    reason,
+                    exit_kind: 0,
+                    exit_value: 0,
+                    cleanup: JobCleanup::None,
+                    escapees: 0,
+                    elapsed_ms: 0,
+                    capture_state: JobCaptureState::NotStarted,
+                    stdout: unstarted(base.stdout.clone()),
+                    stderr: unstarted(base.stderr.clone()),
+                    final_reservation: 0,
+                    ..base
+                }
+            }
+            JobOutcome::Interrupted => JobSettled {
+                reason,
+                ..JobSettled::interrupted([3; 16], 1_760_000_000_001)
+            },
+        }
+    }
+    fn raw(record: &Record) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        match record {
+            Record::JobIntent(p) => job_intent_fields(&mut w, p),
+            Record::JobCancelRequested(p) => job_cancel_fields(&mut w, p),
+            Record::JobSettled(p) => job_settled_fields(&mut w, p),
+            _ => unreachable!(),
+        }
+        w.0
+    }
+    fn round_job(record: Record) -> Vec<u8> {
+        let bytes = payload(&record).unwrap();
+        assert_eq!(bytes, raw(&record));
+        assert_eq!(decode_record(record.kind(), &bytes).unwrap(), record);
+        bytes
+    }
+    fn invalid_job(record: Record) {
+        assert_eq!(payload(&record), Err(ReplayError::Corrupt), "{record:?}");
+        assert_eq!(
+            decode_record(record.kind(), &raw(&record)),
+            Err(ReplayError::Corrupt),
+            "{record:?}"
+        );
+    }
+    fn r26(p: JobIntent) -> Record {
+        Record::JobIntent(p)
+    }
+    fn r28(p: JobSettled) -> Record {
+        Record::JobSettled(Box::new(p))
+    }
+    #[test]
+    fn j2t_01_kinds_26_to_28_round_trip_every_bound_and_maximum_size() {
+        // Kind 26: model and person layouts; every reference bound.
+        let model = round_job(r26(intent26()));
+        assert_eq!(model.len(), MAX_JOB_INTENT_PAYLOAD);
+        assert_eq!((model[0], &model[1..5]), (1, &[0u8; 4][..]));
+        for (generation, ordinal) in [(1, 1), (u64::MAX, MAX_RECORDED_CALLS)] {
+            round_job(r26(JobIntent {
+                origin: JobOrigin::Model {
+                    operation: [0xff; 16],
+                    generation,
+                    ordinal,
+                },
+                agent: 0,
+                time: 1_760_000_000_000,
+            }));
+        }
+        // Field 4 and kind 28 field 22: any wall time, 0 when the clock read
+        // failed; replay never compares them (J4-E1).
+        for time in [0, 1, u64::MAX] {
+            let bytes = round_job(r26(JobIntent { time, ..intent26() }));
+            assert_eq!(&bytes[33..], &time.to_be_bytes());
+            let bytes = round_job(r28(JobSettled {
+                settled_time: time,
+                ..settled28()
+            }));
+            assert_eq!(&bytes[bytes.len() - 8..], &time.to_be_bytes());
+            round_job(r28(JobSettled::interrupted([3; 16], time)));
+        }
+        let frame = encode_frame(&context(), &r26(intent26())).unwrap();
+        assert_eq!(frame.len(), HEADER + TRAILER + 41);
+        let person = round_job(r26(JobIntent {
+            origin: JobOrigin::Person { input: [7; 16] },
+            agent: 0,
+            time: 1_760_000_000_000,
+        }));
+        assert_eq!(person.len(), 29);
+        assert_eq!(person[0], 2);
+        assert_eq!(&person[5..21], &[7; 16]);
+        assert_eq!(&person[21..], &1_760_000_000_000u64.to_be_bytes());
+        // Kind 27: every reason a cancel trigger may carry.
+        for reason in JobReason::ALL
+            .into_iter()
+            .filter(|r| r.requester().is_some())
+        {
+            let bytes = round_job(Record::JobCancelRequested(cancel27(reason)));
+            assert_eq!(bytes.len(), JOB_CANCEL_PAYLOAD);
+            assert_eq!(bytes[17], reason as u8);
+        }
+        let frame = encode_frame(
+            &context(),
+            &Record::JobCancelRequested(cancel27(JobReason::PersonKill)),
+        )
+        .unwrap();
+        assert_eq!(frame.len(), 203);
+        // Kind 28 at its maximum: every stream entry, 256 numbers.
+        let origins = [NumberOrigin::Command, NumberOrigin::Output];
+        let max = JobSettled {
+            outcome: JobOutcome::Signalled,
+            reason: JobReason::Enospc,
+            exit_kind: 2,
+            exit_value: 127,
+            cleanup: JobCleanup::Late,
+            unconfirmed_reason: 13,
+            escapees: u32::MAX,
+            elapsed_ms: u64::MAX,
+            capture_state: JobCaptureState::Incomplete,
+            capture_reason: CaptureReason::Enospc,
+            stdout: JobStream {
+                capture: full_stream(),
+                lines: u64::MAX,
+            },
+            stderr: JobStream {
+                capture: full_stream(),
+                lines: u64::MAX,
+            },
+            distinct_numbers: 16_384,
+            numbers: (0..256u16)
+                .map(|n| CaptureNumber {
+                    number: if n == 255 { 16_384 } else { n + 1 },
+                    kind: SecretKind::ALL[n as usize % 33],
+                    origin: origins[n as usize % 2],
+                })
+                .collect(),
+            pause_count: u32::MAX,
+            first_pause_ms: u64::MAX,
+            paused_ms: u64::MAX,
+            final_reservation: u64::MAX - (u64::MAX % MIB),
+            ..settled28()
+        };
+        let bytes = round_job(r28(max.clone()));
+        assert_eq!(bytes.len(), MAX_JOB_SETTLED_PAYLOAD);
+        assert_eq!(bytes.len(), 4_094);
+        let frame = encode_frame(&context(), &r28(max)).unwrap();
+        assert_eq!(frame.len(), 4_278);
+        // Every outcome with every reason the table allows.
+        let mut pairs = 0;
+        for reason in JobReason::ALL {
+            for outcome in JobOutcome::ALL.into_iter().filter(|o| reason.allows(*o)) {
+                let bytes = round_job(r28(job28(outcome, reason)));
+                assert_eq!((bytes[16], bytes[17]), (outcome as u8, reason as u8));
+                pairs += 1;
+            }
+        }
+        assert_eq!(pairs, 2 + 7 * 4 + 3 + 2 * 2 + 1 + 7);
+        // Exit and cleanup bounds.
+        for (exit_kind, exit_value) in [(1, 0), (1, 255)] {
+            round_job(r28(JobSettled {
+                exit_kind,
+                exit_value,
+                ..settled28()
+            }));
+        }
+        for (exit_kind, exit_value) in [(2, 1), (2, 127)] {
+            round_job(r28(JobSettled {
+                exit_kind,
+                exit_value,
+                ..job28(JobOutcome::Signalled, JobReason::None)
+            }));
+        }
+        for unconfirmed_reason in [9, 13] {
+            round_job(r28(JobSettled {
+                cleanup: JobCleanup::Late,
+                unconfirmed_reason,
+                ..settled28()
+            }));
+        }
+        // Capture states 1-3 with a process; the kind 23 rules hold.
+        for (state, reason) in [
+            (JobCaptureState::Incomplete, CaptureReason::Quota),
+            (JobCaptureState::Incomplete, CaptureReason::StorageFault),
+            (
+                JobCaptureState::Unconfirmed,
+                CaptureReason::SettlementUnconfirmed,
+            ),
+        ] {
+            let mut p = JobSettled {
+                capture_state: state,
+                capture_reason: reason,
+                ..settled28()
+            };
+            if state == JobCaptureState::Unconfirmed {
+                p.stdout.capture.digest = None;
+                p.stderr.capture.digest = None;
+            }
+            round_job(r28(p));
+        }
+        // Not started with a storage fault (capture unavailable).
+        round_job(r28(JobSettled {
+            capture_reason: CaptureReason::StorageFault,
+            ..job28(JobOutcome::NotStarted, JobReason::CaptureUnavailable)
+        }));
+        // Interrupted: redaction ran is 0 and every capture field is zero.
+        let interrupted = round_job(r28(JobSettled::interrupted([3; 16], 1_760_000_000_001)));
+        assert_eq!(interrupted[37..40], [5, 0, 0]);
+        let time = interrupted.len() - 8;
+        assert!(interrupted[40..time].iter().all(|b| *b == 0));
+        assert_eq!(&interrupted[time..], &1_760_000_000_001u64.to_be_bytes());
+        assert_eq!(round_job(r28(settled28()))[39], 1, "redaction ran");
+    }
+    #[test]
+    fn j2t_01_kinds_26_to_28_reject_each_invalid_field() {
+        // Kind 26.
+        let model = |operation, generation, ordinal| JobIntent {
+            origin: JobOrigin::Model {
+                operation,
+                generation,
+                ordinal,
+            },
+            agent: 0,
+            time: 1_760_000_000_000,
+        };
+        for p in [
+            JobIntent {
+                agent: 1,
+                time: 1_760_000_000_000,
+                ..intent26()
+            },
+            JobIntent {
+                agent: u32::MAX,
+                time: 1_760_000_000_000,
+                ..intent26()
+            },
+            model([0; 16], 1, 1),
+            model([1; 16], 0, 1),
+            model([1; 16], 1, 0),
+            model([1; 16], 1, MAX_RECORDED_CALLS + 1),
+            JobIntent {
+                origin: JobOrigin::Person { input: [0; 16] },
+                agent: 0,
+                time: 1_760_000_000_000,
+            },
+        ] {
+            invalid_job(r26(p));
+        }
+        let mut bytes = raw(&r26(intent26()));
+        for origin in [0, 3, 0xff] {
+            bytes[0] = origin;
+            assert_eq!(decode_record(26, &bytes), Err(ReplayError::Corrupt));
+        }
+        // A model reference in a person layout, or trailing bytes.
+        let mut bytes = raw(&r26(intent26()));
+        bytes[0] = 2;
+        assert_eq!(decode_record(26, &bytes), Err(ReplayError::Corrupt));
+        let mut bytes = raw(&r26(intent26()));
+        bytes.push(0);
+        assert_eq!(decode_record(26, &bytes), Err(ReplayError::Corrupt));
+        bytes.truncate(32);
+        assert_eq!(decode_record(26, &bytes), Err(ReplayError::Corrupt));
+        // Kind 27: requester, reason and kill agree with the reason table.
+        for reason in JobReason::ALL {
+            for code in 1..=4 {
+                let requester = JobRequester::from_code(code).unwrap();
+                for kill in [false, true] {
+                    let p = JobCancelRequested {
+                        job: [3; 16],
+                        requester,
+                        reason,
+                        kill,
+                    };
+                    let valid = reason.requester() == Some(requester)
+                        && kill == (reason == JobReason::PersonKill);
+                    let record = Record::JobCancelRequested(p);
+                    if valid {
+                        round_job(record);
+                    } else {
+                        invalid_job(record);
+                    }
+                }
+            }
+        }
+        invalid_job(Record::JobCancelRequested(JobCancelRequested {
+            job: [0; 16],
+            ..cancel27(JobReason::ModelCancel)
+        }));
+        let good = raw(&Record::JobCancelRequested(cancel27(JobReason::Shutdown)));
+        for (at, value) in [(16, 0), (16, 5), (17, 19), (17, 0xff), (18, 2)] {
+            let mut bytes = good.clone();
+            bytes[at] = value;
+            assert_eq!(decode_record(27, &bytes), Err(ReplayError::Corrupt));
+        }
+        for len in [18, 20] {
+            let mut bytes = good.clone();
+            bytes.resize(len, 0);
+            assert_eq!(decode_record(27, &bytes), Err(ReplayError::Corrupt));
+        }
+        // Kind 28: each reason with each outcome it does not allow.
+        for reason in JobReason::ALL {
+            for outcome in JobOutcome::ALL.into_iter().filter(|o| !reason.allows(*o)) {
+                let allowed = JobOutcome::ALL
+                    .into_iter()
+                    .find(|o| reason.allows(*o))
+                    .unwrap();
+                let p = JobSettled {
+                    reason,
+                    ..job28(outcome, job_reason_for(outcome))
+                };
+                assert!(!reason.allows(outcome) && reason.allows(allowed));
+                invalid_job(r28(p));
+            }
+        }
+        let s = settled28;
+        let signalled = || job28(JobOutcome::Signalled, JobReason::None);
+        let cancelled = || job28(JobOutcome::Cancelled, JobReason::ModelCancel);
+        let not_started = || job28(JobOutcome::NotStarted, JobReason::SpawnFailed);
+        let interrupted = || JobSettled::interrupted([3; 16], 1_760_000_000_001);
+        for p in [
+            JobSettled {
+                job: [0; 16],
+                ..s()
+            },
+            // Exit kind and value per outcome.
+            JobSettled {
+                exit_kind: 2,
+                exit_value: 15,
+                ..s()
+            },
+            JobSettled {
+                exit_kind: 0,
+                ..s()
+            },
+            JobSettled {
+                exit_value: 256,
+                ..s()
+            },
+            JobSettled {
+                exit_kind: 1,
+                exit_value: 0,
+                ..signalled()
+            },
+            JobSettled {
+                exit_value: 0,
+                ..signalled()
+            },
+            JobSettled {
+                exit_value: 128,
+                ..signalled()
+            },
+            JobSettled {
+                exit_kind: 0,
+                exit_value: 0,
+                ..cancelled()
+            },
+            JobSettled {
+                exit_kind: 3,
+                ..cancelled()
+            },
+            JobSettled {
+                exit_kind: 1,
+                ..not_started()
+            },
+            JobSettled {
+                exit_value: 1,
+                ..not_started()
+            },
+            JobSettled {
+                exit_kind: 2,
+                exit_value: 9,
+                ..interrupted()
+            },
+            // Cleanup, unconfirmed reason, escapees and elapsed.
+            JobSettled {
+                cleanup: JobCleanup::None,
+                ..s()
+            },
+            JobSettled {
+                cleanup: JobCleanup::None,
+                ..cancelled()
+            },
+            JobSettled {
+                unconfirmed_reason: 9,
+                ..s()
+            },
+            JobSettled {
+                unconfirmed_reason: 0,
+                ..cancelled()
+            },
+            JobSettled {
+                unconfirmed_reason: 4,
+                ..cancelled()
+            },
+            JobSettled {
+                cleanup: JobCleanup::Confirmed,
+                ..not_started()
+            },
+            JobSettled {
+                escapees: 1,
+                ..not_started()
+            },
+            JobSettled {
+                elapsed_ms: 1,
+                ..not_started()
+            },
+            JobSettled {
+                cleanup: JobCleanup::Late,
+                unconfirmed_reason: 9,
+                ..interrupted()
+            },
+            JobSettled {
+                escapees: 1,
+                ..interrupted()
+            },
+            JobSettled {
+                elapsed_ms: 1,
+                ..interrupted()
+            },
+            // Capture state per outcome.
+            JobSettled {
+                capture_state: JobCaptureState::NotStarted,
+                ..s()
+            },
+            JobSettled {
+                capture_state: JobCaptureState::Interrupted,
+                ..s()
+            },
+            JobSettled {
+                capture_state: JobCaptureState::Complete,
+                ..not_started()
+            },
+            JobSettled {
+                capture_state: JobCaptureState::Interrupted,
+                ..not_started()
+            },
+            JobSettled {
+                capture_state: JobCaptureState::NotStarted,
+                ..interrupted()
+            },
+            // Kind 23 field rules for states 1-4.
+            JobSettled {
+                capture_reason: CaptureReason::Quota,
+                ..s()
+            },
+            JobSettled {
+                capture_reason: CaptureReason::None,
+                ..cancelled()
+            },
+            JobSettled {
+                capture_reason: CaptureReason::Quota,
+                ..not_started()
+            },
+            JobSettled {
+                final_reservation: 1,
+                ..s()
+            },
+            JobSettled {
+                distinct_numbers: 0,
+                ..s()
+            },
+            // Line counts never exceed the stored bytes.
+            JobSettled {
+                stdout: JobStream {
+                    lines: 13,
+                    ..s().stdout
+                },
+                ..s()
+            },
+            JobSettled {
+                stderr: JobStream {
+                    lines: 1,
+                    ..not_started().stderr
+                },
+                ..not_started()
+            },
+            // Interrupted: every capture field zero.
+            JobSettled {
+                capture_reason: CaptureReason::StorageFault,
+                ..interrupted()
+            },
+            JobSettled {
+                stdout: JobStream {
+                    lines: 0,
+                    ..s().stdout
+                },
+                ..interrupted()
+            },
+            JobSettled {
+                stderr: JobStream {
+                    capture: CaptureStream {
+                        eof: true,
+                        ..CaptureStream::default()
+                    },
+                    lines: 0,
+                },
+                ..interrupted()
+            },
+            JobSettled {
+                distinct_numbers: 1,
+                ..interrupted()
+            },
+            JobSettled {
+                numbers: s().numbers,
+                distinct_numbers: 1,
+                ..interrupted()
+            },
+            JobSettled {
+                pause_count: 1,
+                ..interrupted()
+            },
+            JobSettled {
+                first_pause_ms: 1,
+                ..interrupted()
+            },
+            JobSettled {
+                paused_ms: 1,
+                ..interrupted()
+            },
+            JobSettled {
+                final_reservation: MIB,
+                ..interrupted()
+            },
+        ] {
+            invalid_job(r28(p));
+        }
+        // Unknown codes and the redaction byte.
+        let good = raw(&r28(settled28()));
+        for (at, value) in [
+            (16, 0),
+            (16, 6),
+            (17, 19),
+            (23, 3),
+            (37, 0),
+            (37, 6),
+            (38, 7),
+            (39, 0),
+            (39, 2),
+        ] {
+            let mut bytes = good.clone();
+            bytes[at] = value;
+            assert_eq!(decode_record(28, &bytes), Err(ReplayError::Corrupt), "{at}");
+        }
+        let mut bytes = raw(&r28(interrupted()));
+        bytes[39] = 1;
+        assert_eq!(decode_record(28, &bytes), Err(ReplayError::Corrupt));
+        let mut bytes = good;
+        bytes.push(0);
+        assert_eq!(decode_record(28, &bytes), Err(ReplayError::Corrupt));
+    }
+    /// A reason that the table allows for `outcome`.
+    fn job_reason_for(outcome: JobOutcome) -> JobReason {
+        match outcome {
+            JobOutcome::Exited | JobOutcome::Signalled => JobReason::None,
+            JobOutcome::Cancelled => JobReason::ModelCancel,
+            JobOutcome::NotStarted => JobReason::SetupFailed,
+            JobOutcome::Interrupted => JobReason::Restart,
+        }
+    }
+    #[test]
+    fn j2t_01_job_code_tables_are_fixed() {
+        let names = [
+            "none",
+            "model_cancel",
+            "turn_ended",
+            "client_cancel",
+            "person_stop",
+            "person_kill",
+            "identity_changed",
+            "shutdown",
+            "capture_fault",
+            "quota",
+            "enospc",
+            "restart",
+            "cwd_unavailable",
+            "project_changed",
+            "sandbox_unavailable",
+            "spawn_failed",
+            "capture_unavailable",
+            "protocol_fault",
+            "setup_failed",
+        ];
+        for (code, name) in names.iter().enumerate() {
+            let reason = JobReason::from_code(code as u8).unwrap();
+            assert_eq!((reason as u8, reason.as_str()), (code as u8, *name));
+        }
+        assert_eq!(JobReason::from_code(19), None);
+        use JobRequester::*;
+        let requesters = [
+            None,
+            Some(Model),
+            Some(Model),
+            Some(Client),
+            Some(Person),
+            Some(Person),
+            Some(Service),
+            Some(Service),
+            Some(Service),
+            Some(Service),
+            Some(Service),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        for (reason, requester) in JobReason::ALL.into_iter().zip(requesters) {
+            assert_eq!(reason.requester(), requester, "{reason:?}");
+        }
+        assert_eq!(
+            [Model, Client, Person, Service].map(|r| r as u8),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(JobRequester::from_code(0), None);
+        assert_eq!(JobRequester::from_code(5), None);
+        // The outcome column of the reason table: E S C N I.
+        let table: [&str; 19] = [
+            "ES", "ESCN", "ESCN", "ESCN", "ESCN", "ESCN", "ESCN", "ESCN", "ESC", "ES", "ES", "I",
+            "N", "N", "N", "N", "N", "N", "N",
+        ];
+        for (reason, allowed) in JobReason::ALL.into_iter().zip(table) {
+            for (outcome, letter) in JobOutcome::ALL.into_iter().zip(['E', 'S', 'C', 'N', 'I']) {
+                assert_eq!(
+                    reason.allows(outcome),
+                    allowed.contains(letter),
+                    "{reason:?} {outcome:?}"
+                );
+            }
+        }
+        for (code, name) in [
+            "exited",
+            "signalled",
+            "cancelled",
+            "not_started",
+            "interrupted",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let outcome = JobOutcome::from_code(code as u8 + 1).unwrap();
+            assert_eq!((outcome as u8, outcome.as_str()), (code as u8 + 1, *name));
+        }
+        assert_eq!(JobOutcome::from_code(0), None);
+        assert_eq!(JobOutcome::from_code(6), None);
+        assert_eq!(
+            [JobCleanup::None, JobCleanup::Confirmed, JobCleanup::Late].map(|c| c as u8),
+            [0, 1, 2]
+        );
+        assert_eq!(
+            [
+                JobCaptureState::Complete,
+                JobCaptureState::Incomplete,
+                JobCaptureState::Unconfirmed,
+                JobCaptureState::NotStarted,
+                JobCaptureState::Interrupted,
+            ]
+            .map(|s| (s as u8, s.as_str())),
+            [
+                (1, "complete"),
+                (2, "incomplete"),
+                (3, "unconfirmed"),
+                (4, "not_started"),
+                (5, "interrupted"),
+            ]
+        );
+        assert_eq!(
+            [
+                JobOrigin::Model {
+                    operation: [1; 16],
+                    generation: 1,
+                    ordinal: 1
+                }
+                .code(),
+                JobOrigin::Person { input: [1; 16] }.code()
+            ],
+            [1, 2]
+        );
+    }
+    /// TJ-26: no job record holds output, a command or a path. Kinds 26 and
+    /// 27 have fixed sizes; kind 28's size depends only on entry counts.
+    #[test]
+    fn j2t_01_job_records_hold_no_output_command_or_path() {
+        assert_eq!(round_job(r26(intent26())).len(), 41);
+        assert_eq!(
+            round_job(Record::JobCancelRequested(cancel27(
+                JobReason::ClientCancel
+            )))
+            .len(),
+            19
+        );
+        // 37 job facts, 3 capture header, two streams with one kind on
+        // stdout, one number, pause facts and the reservation.
+        let bytes = round_job(r28(settled28()));
+        assert_eq!(
+            bytes.len(),
+            37 + 3 + (101 + 9 + 8) + (101 + 8) + 6 + 4 + 20 + 8 + 8
+        );
+        assert_eq!(
+            round_job(r28(JobSettled::interrupted([3; 16], 1_760_000_000_001))).len(),
+            37 + 3 + 2 * 109 + 6 + 20 + 8 + 8
+        );
     }
 }

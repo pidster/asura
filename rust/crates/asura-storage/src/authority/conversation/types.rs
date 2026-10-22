@@ -320,6 +320,12 @@ pub enum Record {
     /// Kind 25: one thinking text segment, the same layout applied to the
     /// operation's thinking text (thinking-level.md).
     ThinkingText(ResponseText),
+    /// Kind 26 (J2): a job's intent. Every other intent fact is derived.
+    JobIntent(JobIntent),
+    /// Kind 27 (J2): the first accepted cancel trigger of a job.
+    JobCancelRequested(JobCancelRequested),
+    /// Kind 28 (J2): a job's settlement, with the capture facts of kind 23.
+    JobSettled(Box<JobSettled>),
 }
 impl Record {
     pub fn kind(&self) -> u16 {
@@ -343,6 +349,9 @@ impl Record {
             Self::CaptureSettled(_) => 23,
             Self::ResponseText(_) => 24,
             Self::ThinkingText(_) => 25,
+            Self::JobIntent(_) => 26,
+            Self::JobCancelRequested(_) => 27,
+            Self::JobSettled(_) => 28,
         }
     }
 }
@@ -1022,10 +1031,15 @@ pub struct ExecCmdCall {
     /// command (field 15).
     pub secret_variables: u16,
     pub job: Id,
+    /// J1 mode: `payload::payload_id` of the call. Job mode: the job's
+    /// payload IDs ([`job_payload_ids`](super::job_payload_ids)).
     pub stdout_payload: Id,
     pub stderr_payload: Id,
     pub intent_sequence: u64,
     pub settled: Option<ExecCmdSettlement>,
+    /// The kind 26 frame that made this a job-mode call (J2). A job-mode
+    /// call never has kind 23; its facts are the job's (kinds 26 to 28).
+    pub job_intent: Option<Locator>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecCmdSettlement {
@@ -1102,4 +1116,370 @@ pub struct CreateNoteIdentity {
     pub object: Id,
     pub version: Id,
     pub edge: Id,
+}
+
+// ----- J2 job records: kinds 26, 27 and 28 (tool-job-controller.md). -----
+
+/// Unsettled jobs per service: the checkpoint, ledger and replay bound (JR9).
+pub const MAX_UNSETTLED_JOBS: usize = 64;
+/// Kind 26 payload: origin (1), agent (4), the model reference (28) or the
+/// person reference (16), and the intent time (8).
+pub const MAX_JOB_INTENT_PAYLOAD: usize = 41;
+/// Kind 27 payload.
+pub const JOB_CANCEL_PAYLOAD: usize = 19;
+/// Kind 28 maximum payload: 37 bytes of job facts, 3 of capture header,
+/// 1,494 per stream, 1,030 for numbers, 20 for pause facts, 8 for the
+/// reservation and 8 for the settled time.
+pub const MAX_JOB_SETTLED_PAYLOAD: usize = 4_094;
+
+/// Kind 26 fields 1 and 3: who started the job and the reference that
+/// names it. The job ID derives from it ([`job_id`](super::job_id)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobOrigin {
+    /// Origin 1: one `run` exec_cmd kind 14.
+    Model {
+        operation: Id,
+        generation: u64,
+        ordinal: u32,
+    },
+    /// Origin 2: one person input (kind PCQ, P2). Replay rejects it in J2.
+    Person { input: Id },
+}
+impl JobOrigin {
+    pub fn code(&self) -> u8 {
+        match self {
+            Self::Model { .. } => 1,
+            Self::Person { .. } => 2,
+        }
+    }
+}
+/// Kind 26, JobIntent. Replay derives the job ID, payload IDs, conversation,
+/// project, profile, command, cwd and grant from the origin reference
+/// (TCR-O5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobIntent {
+    pub origin: JobOrigin,
+    /// 0, the conversation's main agent.
+    pub agent: u32,
+    /// Field 4 (J4-E1): Unix milliseconds of the service clock when the
+    /// record was built; 0 only when the clock read failed. Replay never
+    /// compares wall times.
+    pub time: u64,
+}
+/// Kind 27 field 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobRequester {
+    Model = 1,
+    Client = 2,
+    Person = 3,
+    Service = 4,
+}
+impl JobRequester {
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Model,
+            2 => Self::Client,
+            3 => Self::Person,
+            4 => Self::Service,
+            _ => return None,
+        })
+    }
+}
+/// Kind 28 field 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobOutcome {
+    Exited = 1,
+    Signalled = 2,
+    Cancelled = 3,
+    NotStarted = 4,
+    Interrupted = 5,
+}
+impl JobOutcome {
+    pub const ALL: [Self; 5] = [
+        Self::Exited,
+        Self::Signalled,
+        Self::Cancelled,
+        Self::NotStarted,
+        Self::Interrupted,
+    ];
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code).checked_sub(1)?).copied()
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exited => "exited",
+            Self::Signalled => "signalled",
+            Self::Cancelled => "cancelled",
+            Self::NotStarted => "not_started",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+/// The one job reason table (kind 27 field 3, kind 28 field 3). The codes
+/// are stored; later reasons take the next free codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum JobReason {
+    None = 0,
+    ModelCancel = 1,
+    /// The turn was cancelled, steered or invalidated before handle delivery.
+    TurnEnded = 2,
+    ClientCancel = 3,
+    PersonStop = 4,
+    PersonKill = 5,
+    IdentityChanged = 6,
+    Shutdown = 7,
+    CaptureFault = 8,
+    /// Quota in `Draining`.
+    Quota = 9,
+    /// ENOSPC in `Draining`.
+    Enospc = 10,
+    Restart = 11,
+    CwdUnavailable = 12,
+    ProjectChanged = 13,
+    SandboxUnavailable = 14,
+    SpawnFailed = 15,
+    CaptureUnavailable = 16,
+    ProtocolFault = 17,
+    SetupFailed = 18,
+}
+impl JobReason {
+    pub const ALL: [Self; 19] = [
+        Self::None,
+        Self::ModelCancel,
+        Self::TurnEnded,
+        Self::ClientCancel,
+        Self::PersonStop,
+        Self::PersonKill,
+        Self::IdentityChanged,
+        Self::Shutdown,
+        Self::CaptureFault,
+        Self::Quota,
+        Self::Enospc,
+        Self::Restart,
+        Self::CwdUnavailable,
+        Self::ProjectChanged,
+        Self::SandboxUnavailable,
+        Self::SpawnFailed,
+        Self::CaptureUnavailable,
+        Self::ProtocolFault,
+        Self::SetupFailed,
+    ];
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code)).copied()
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ModelCancel => "model_cancel",
+            Self::TurnEnded => "turn_ended",
+            Self::ClientCancel => "client_cancel",
+            Self::PersonStop => "person_stop",
+            Self::PersonKill => "person_kill",
+            Self::IdentityChanged => "identity_changed",
+            Self::Shutdown => "shutdown",
+            Self::CaptureFault => "capture_fault",
+            Self::Quota => "quota",
+            Self::Enospc => "enospc",
+            Self::Restart => "restart",
+            Self::CwdUnavailable => "cwd_unavailable",
+            Self::ProjectChanged => "project_changed",
+            Self::SandboxUnavailable => "sandbox_unavailable",
+            Self::SpawnFailed => "spawn_failed",
+            Self::CaptureUnavailable => "capture_unavailable",
+            Self::ProtocolFault => "protocol_fault",
+            Self::SetupFailed => "setup_failed",
+        }
+    }
+    /// The kind 27 requester of a cancel reason; `None` for a reason that
+    /// is never a cancel trigger (0 and 11 to 18).
+    pub fn requester(self) -> Option<JobRequester> {
+        use JobReason::*;
+        Some(match self {
+            ModelCancel | TurnEnded => JobRequester::Model,
+            ClientCancel => JobRequester::Client,
+            PersonStop | PersonKill => JobRequester::Person,
+            IdentityChanged | Shutdown | CaptureFault | Quota | Enospc => JobRequester::Service,
+            None | Restart | CwdUnavailable | ProjectChanged | SandboxUnavailable | SpawnFailed
+            | CaptureUnavailable | ProtocolFault | SetupFailed => return Option::None,
+        })
+    }
+    /// The kind 28 outcomes that the reason table allows for this reason.
+    pub fn allows(self, outcome: JobOutcome) -> bool {
+        use JobOutcome as O;
+        use JobReason::*;
+        match self {
+            None => matches!(outcome, O::Exited | O::Signalled),
+            ModelCancel | TurnEnded | ClientCancel | PersonStop | PersonKill | IdentityChanged
+            | Shutdown => matches!(
+                outcome,
+                O::Exited | O::Signalled | O::Cancelled | O::NotStarted
+            ),
+            CaptureFault => matches!(outcome, O::Exited | O::Signalled | O::Cancelled),
+            Quota | Enospc => matches!(outcome, O::Exited | O::Signalled),
+            Restart => outcome == O::Interrupted,
+            CwdUnavailable | ProjectChanged | SandboxUnavailable | SpawnFailed
+            | CaptureUnavailable | ProtocolFault | SetupFailed => outcome == O::NotStarted,
+        }
+    }
+}
+/// Kind 27, JobCancelRequested: at most one per job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobCancelRequested {
+    pub job: Id,
+    pub requester: JobRequester,
+    pub reason: JobReason,
+    /// Set exactly with requester `person` and reason `person_kill`.
+    pub kill: bool,
+}
+/// Kind 28 field 6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobCleanup {
+    None = 0,
+    Confirmed = 1,
+    /// A settled notice after a cleanup-unconfirmed notice.
+    Late = 2,
+}
+/// Kind 28 field 10: the kind 23 capture states plus `interrupted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobCaptureState {
+    Complete = 1,
+    Incomplete = 2,
+    Unconfirmed = 3,
+    NotStarted = 4,
+    Interrupted = 5,
+}
+impl JobCaptureState {
+    /// The kind 23 state for codes 1 to 4; `None` for `interrupted`.
+    pub fn capture(self) -> Option<CaptureState> {
+        Some(match self {
+            Self::Complete => CaptureState::Complete,
+            Self::Incomplete => CaptureState::Incomplete,
+            Self::Unconfirmed => CaptureState::Unconfirmed,
+            Self::NotStarted => CaptureState::NotStarted,
+            Self::Interrupted => return None,
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        self.capture().map_or("interrupted", CaptureState::as_str)
+    }
+}
+/// Kind 28 stream block: the kind 23 stream block followed by the number of
+/// newline bytes (0x0A) in the stored, redacted bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobStream {
+    pub capture: CaptureStream,
+    pub lines: u64,
+}
+/// Kind 28, JobSettled: once per job. It holds no output, command or path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobSettled {
+    pub job: Id,
+    pub outcome: JobOutcome,
+    pub reason: JobReason,
+    /// 0 unknown, 1 exited, 2 signalled.
+    pub exit_kind: u8,
+    pub exit_value: u32,
+    pub cleanup: JobCleanup,
+    /// 0, or the kind 4 reason (9 or 13) when cleanup is `late`.
+    pub unconfirmed_reason: u8,
+    /// The kind 6 value; 0 when cleanup is `none`.
+    pub escapees: u32,
+    /// Milliseconds from the spawned notice to the settled notice; 0 with
+    /// no process.
+    pub elapsed_ms: u64,
+    pub capture_state: JobCaptureState,
+    /// Kind 23 field 5 codes.
+    pub capture_reason: CaptureReason,
+    pub stdout: JobStream,
+    pub stderr: JobStream,
+    pub distinct_numbers: u32,
+    pub numbers: Vec<CaptureNumber>,
+    pub pause_count: u32,
+    pub first_pause_ms: u64,
+    pub paused_ms: u64,
+    pub final_reservation: u64,
+    /// Field 22 (J4-E1): Unix milliseconds when the record was built; 0
+    /// only when the clock read failed.
+    pub settled_time: u64,
+}
+impl JobSettled {
+    /// The kind 28 of a job that a restart interrupted (J2-E5): reason
+    /// `restart`, every capture field zero, built at `settled_time`.
+    pub fn interrupted(job: Id, settled_time: u64) -> Self {
+        Self {
+            job,
+            outcome: JobOutcome::Interrupted,
+            reason: JobReason::Restart,
+            exit_kind: 0,
+            exit_value: 0,
+            cleanup: JobCleanup::None,
+            unconfirmed_reason: 0,
+            escapees: 0,
+            elapsed_ms: 0,
+            capture_state: JobCaptureState::Interrupted,
+            capture_reason: CaptureReason::None,
+            stdout: JobStream::default(),
+            stderr: JobStream::default(),
+            distinct_numbers: 0,
+            numbers: Vec::new(),
+            pause_count: 0,
+            first_pause_ms: 0,
+            paused_ms: 0,
+            final_reservation: 0,
+            settled_time,
+        }
+    }
+}
+/// The kind 27 facts of an unsettled job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobCancel {
+    pub requester: JobRequester,
+    pub reason: JobReason,
+    pub kill: bool,
+    pub frame: Locator,
+}
+/// One unsettled job in the replay state: a kind 26 without kind 28. The
+/// controller receives these at start and settles each one `interrupted`.
+/// Every field except the frames is derived from kind 26 (TCR-O5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsettledJob {
+    pub job: Id,
+    pub origin: JobOrigin,
+    pub agent: u32,
+    /// The conversation of the origin operation's kind 21.
+    pub conversation: Id,
+    pub project: Id,
+    /// The owner generation in the kind 26 frame header.
+    pub owner_generation: u64,
+    /// Kind 26 field 4: the intent wall time (Unix milliseconds).
+    pub time: u64,
+    /// The kind 26 frame; its sequence orders the unsettled jobs.
+    pub intent: Locator,
+    /// Kind 27, once committed.
+    pub cancel: Option<JobCancel>,
+    /// Derived payload IDs: stdout, stderr.
+    pub payloads: [Id; 2],
+}
+/// The settled facts of a job: its `W` index entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettledJob {
+    pub job: Id,
+    pub conversation: Id,
+    /// Kind 26 field 1.
+    pub origin: u8,
+    pub intent: Locator,
+    /// Kind 27, or `Locator::NONE`.
+    pub cancel: Locator,
+    pub settled: Locator,
+}
+/// What replay knows of one job ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobState {
+    Unsettled(UnsettledJob),
+    Settled(SettledJob),
 }

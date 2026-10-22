@@ -188,12 +188,13 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
             w.u32(op.tools.len() as u32);
             for tool in &op.tools {
                 locator(&mut w, &tool.intent_frame);
+                // Kind 23 (J1 mode) or kind 26 (job mode).
                 option_locator(
                     &mut w,
                     tool.exec_cmd
                         .as_deref()
-                        .and_then(|e| e.settled.as_ref())
-                        .map(|s| &s.frame),
+                        .and_then(ExecCmdCall::follow_frame)
+                        .as_ref(),
                 );
                 option_locator(&mut w, tool.result_frame.as_ref());
             }
@@ -243,6 +244,15 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
     }
     w.u64(state.order_revision);
     w.optional(state.last_dispatched_lane);
+    // Unsettled jobs (J2): kind 26 and kind 27 locators in kind 26 order;
+    // a missing kind 27 is the zero locator.
+    let jobs = state.unsettled_jobs();
+    require(jobs.len() <= MAX_UNSETTLED_JOBS)?;
+    w.u32(jobs.len() as u32);
+    for job in &jobs {
+        locator(&mut w, &job.intent);
+        locator(&mut w, &job.cancel.map_or(Locator::NONE, |c| c.frame));
+    }
     let digest: Hash = Sha256::digest(&w.0).into();
     w.bytes(&digest);
     w.bytes(COMMIT);
@@ -539,6 +549,13 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
     }
     state.order_revision = r.u64()?;
     state.last_dispatched_lane = r.optional()?;
+    let count = r.u32()? as usize;
+    require(count <= MAX_UNSETTLED_JOBS)?;
+    for _ in 0..count {
+        let intent = read_locator(&mut r)?;
+        let cancel = read_locator(&mut r)?;
+        state.load_job(intent, cancel, index)?;
+    }
     r.finish()?;
     state.recompute()?;
     Ok(Checkpoint {

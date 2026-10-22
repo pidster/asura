@@ -47,11 +47,13 @@ pub enum Tag {
     Turn = b'T',
     /// Conversation.
     Conversation = b'V',
-    /// Retained exec_cmd payload.
+    /// Settled job: job ID, 0 (J2).
+    Job = b'W',
+    /// Retained payload: payload ID, 0. Form 1 a J1 exec_cmd call, form 2 a job.
     Payload = b'X',
 }
 impl Tag {
-    pub const ALL: [Tag; 16] = [
+    pub const ALL: [Tag; 17] = [
         Tag::Activity,
         Tag::Call,
         Tag::Identity,
@@ -67,6 +69,7 @@ impl Tag {
         Tag::Segment,
         Tag::Turn,
         Tag::Conversation,
+        Tag::Job,
         Tag::Payload,
     ];
     pub fn from_byte(byte: u8) -> Option<Self> {
@@ -191,6 +194,7 @@ pub enum Entry {
         promoted: Locator,
         operation: Id,
     },
+    /// `X` form 1: a payload of a J1-mode exec_cmd call (kinds 14 and 23).
     Payload {
         operation: Id,
         generation: u64,
@@ -198,6 +202,22 @@ pub enum Entry {
         intent: Locator,
         settled: Locator,
         last_use: u64,
+    },
+    /// `X` form 2: a payload of a job (kinds 26 and 28). The last use is the
+    /// kind 28 sequence.
+    JobPayload {
+        job: Id,
+        intent: Locator,
+        settled: Locator,
+        last_use: u64,
+    },
+    /// `W`: a settled job. Kind 27 is `Locator::NONE` when absent.
+    Job {
+        conversation: Id,
+        origin: u8,
+        intent: Locator,
+        cancel: Locator,
+        settled: Locator,
     },
     Segment {
         last: u64,
@@ -319,7 +339,8 @@ impl Entry {
             Self::Call { .. } => Tag::Call,
             Self::Turn { .. } => Tag::Turn,
             Self::Input { .. } => Tag::Input,
-            Self::Payload { .. } => Tag::Payload,
+            Self::Payload { .. } | Self::JobPayload { .. } => Tag::Payload,
+            Self::Job { .. } => Tag::Job,
             Self::Segment { .. } => Tag::Segment,
             Self::Project { .. } => Tag::Project,
             Self::Name { .. } => Tag::Name,
@@ -400,12 +421,38 @@ impl Entry {
                 settled,
                 last_use,
             } => {
+                out.put(&[1]);
                 out.put(operation);
                 out.u64(*generation);
                 out.u32(*ordinal);
                 out.locator(intent);
                 out.locator(settled);
                 out.u64(*last_use);
+            }
+            Self::JobPayload {
+                job,
+                intent,
+                settled,
+                last_use,
+            } => {
+                out.put(&[2]);
+                out.put(job);
+                out.locator(intent);
+                out.locator(settled);
+                out.u64(*last_use);
+            }
+            Self::Job {
+                conversation,
+                origin,
+                intent,
+                cancel,
+                settled,
+            } => {
+                out.put(conversation);
+                out.put(&[*origin]);
+                out.locator(intent);
+                out.locator(cancel);
+                out.locator(settled);
             }
             Self::Segment {
                 last,
@@ -501,13 +548,29 @@ impl Entry {
                 promoted: r.locator(),
                 operation: r.id(),
             },
-            Tag::Payload => Self::Payload {
-                operation: r.id(),
-                generation: r.u64(),
-                ordinal: r.u32(),
+            Tag::Payload => match r.byte() {
+                1 => Self::Payload {
+                    operation: r.id(),
+                    generation: r.u64(),
+                    ordinal: r.u32(),
+                    intent: r.locator(),
+                    settled: r.locator(),
+                    last_use: r.u64(),
+                },
+                2 => Self::JobPayload {
+                    job: r.id(),
+                    intent: r.locator(),
+                    settled: r.locator(),
+                    last_use: r.u64(),
+                },
+                _ => return Err(ReplayError::Corrupt),
+            },
+            Tag::Job => Self::Job {
+                conversation: r.id(),
+                origin: r.byte(),
                 intent: r.locator(),
+                cancel: r.locator(),
                 settled: r.locator(),
-                last_use: r.u64(),
             },
             Tag::Segment => Self::Segment {
                 last: r.u64(),
@@ -558,6 +621,8 @@ mod tests {
             Key::new(Tag::Call, [1; 16], 1),
             Key::new(Tag::Call, [1; 16], 2),
             Key::new(Tag::Call, [2; 16], 0),
+            Key::new(Tag::Conversation, [0xff; 16], 0),
+            Key::new(Tag::Job, [0; 16], 0),
             Key::new(Tag::Payload, [0; 16], 0),
         ];
         for pair in keys.windows(2) {
@@ -631,6 +696,19 @@ mod tests {
                 settled: locator(14),
                 last_use: 14,
             },
+            Entry::JobPayload {
+                job: [4; 16],
+                intent: locator(19),
+                settled: locator(20),
+                last_use: 20,
+            },
+            Entry::Job {
+                conversation: [5; 16],
+                origin: 1,
+                intent: locator(19),
+                cancel: Locator::NONE,
+                settled: locator(20),
+            },
             Entry::Segment {
                 last: 32_768,
                 bytes: 8 << 20,
@@ -657,6 +735,18 @@ mod tests {
                 generation: 4,
             },
         ];
+        // `X` form byte: 1 a J1 call, 2 a job; any other is Corrupt.
+        for (entry, form) in [(&entries[8], 1), (&entries[9], 2)] {
+            assert_eq!(entry.encode()[0], form);
+            for other in [0, 3, 0xff] {
+                let mut value = entry.encode();
+                value[0] = other;
+                assert_eq!(
+                    Entry::decode(Tag::Payload, &value),
+                    Err(ReplayError::Corrupt)
+                );
+            }
+        }
         for entry in entries {
             let value = entry.encode();
             assert_eq!(Entry::decode(entry.tag(), &value).unwrap(), entry);

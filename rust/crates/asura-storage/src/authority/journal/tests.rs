@@ -1008,3 +1008,380 @@ fn sj36_ten_thousand_conversations_without_a_total() {
         assert_eq!(found.generation, expected, "conversation {index}");
     }
 }
+
+// ----- J2 job records (tool-job-controller.md, J2T-02, J2T-03). -----
+
+/// A `run` exec_cmd kind 14 that fits a job.
+fn exec_call(operation: Id, generation: u64, ordinal: u32) -> Record {
+    Record::ToolCall(Box::new(ToolCall {
+        operation,
+        generation,
+        ordinal,
+        source: ToolCallSource::GeneratedContent,
+        name: "exec_cmd".into(),
+        name_bytes: 8,
+        tool_operation: Some(ToolOperation::ExecCmd),
+        decision: ToolDecision::Run,
+        fault: None,
+        busy: None,
+        form: ArgumentForm::Canonical,
+        arguments_bytes: 18,
+        arguments: "{\"command\":\"true\"}".into(),
+        number_kinds: Vec::new(),
+        unnumbered: 0,
+        rule_set_revision: 1,
+        rule_set_digest: [3; 32],
+        command_cut: false,
+        whole_command: false,
+        refusal: None,
+    }))
+}
+fn intent(operation: Id, generation: u64, ordinal: u32) -> Record {
+    Record::JobIntent(JobIntent {
+        origin: JobOrigin::Model {
+            operation,
+            generation,
+            ordinal,
+        },
+        agent: 0,
+        time: 1_760_000_000_000,
+    })
+}
+fn handle(operation: Id, generation: u64, ordinal: u32) -> Record {
+    Record::ToolResult(ToolResult {
+        operation,
+        generation,
+        ordinal,
+        status: 1,
+        text: "job".into(),
+        next_offset: None,
+        truncated: false,
+    })
+}
+fn exited(job: Id) -> Record {
+    let stream = || JobStream {
+        capture: CaptureStream {
+            observed_bytes: 4,
+            stored_bytes: 4,
+            digest: Some([7; 32]),
+            eof: true,
+            ..CaptureStream::default()
+        },
+        lines: 1,
+    };
+    Record::JobSettled(Box::new(JobSettled {
+        job,
+        outcome: JobOutcome::Exited,
+        reason: JobReason::None,
+        exit_kind: 1,
+        exit_value: 0,
+        cleanup: JobCleanup::Confirmed,
+        unconfirmed_reason: 0,
+        escapees: 0,
+        elapsed_ms: 3,
+        capture_state: JobCaptureState::Complete,
+        capture_reason: CaptureReason::None,
+        stdout: stream(),
+        stderr: stream(),
+        distinct_numbers: 0,
+        numbers: Vec::new(),
+        pause_count: 0,
+        first_pause_ms: 0,
+        paused_ms: 0,
+        final_reservation: INITIAL_RESERVATION,
+        settled_time: 1_760_000_000_002,
+    }))
+}
+fn cancel(job: Id, reason: JobReason) -> Record {
+    Record::JobCancelRequested(JobCancelRequested {
+        job,
+        requester: reason.requester().unwrap(),
+        reason,
+        kill: reason == JobReason::PersonKill,
+    })
+}
+fn interrupted(job: Id) -> Record {
+    Record::JobSettled(Box::new(JobSettled::interrupted(job, 1_760_000_000_001)))
+}
+impl Harness {
+    /// Kind 14 `run` exec_cmd, kind 26 and kind 15 at `ordinal`; returns
+    /// the job ID.
+    fn job(&mut self, operation: Id, generation: u64, ordinal: u32) -> Id {
+        self.append(exec_call(operation, generation, ordinal))
+            .unwrap();
+        self.append(intent(operation, generation, ordinal)).unwrap();
+        self.append(handle(operation, generation, ordinal)).unwrap();
+        exec_cmd_job_id(operation, generation, ordinal)
+    }
+}
+fn unsettled(state: &Replay) -> Vec<UnsettledJob> {
+    state.unsettled_jobs()
+}
+
+/// J2T-03 (unit, SJ-05 property with live jobs): random turns start jobs,
+/// cancel and settle them in later turns (JR8), restart and settle the rest
+/// `interrupted`, across rolls. The checkpoint plus tail equals the genesis
+/// replay, including the unsettled jobs and their derived facts.
+#[test]
+fn j2t_03_checkpoint_with_live_jobs_equals_genesis_replay() {
+    for seed in 1..=3u64 {
+        let mut h = Harness::new();
+        let mut rng = seed;
+        let mut step = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let projects: Vec<Id> = (0..4).map(|n| h.register(seed * 100 + n)).collect();
+        // Unsettled jobs: (job, owner generation of kind 26, kind 27 sent).
+        let mut live: Vec<(Id, u64, bool)> = Vec::new();
+        let mut settled = 0;
+        for _ in 0..160 {
+            let project = projects[(step() % 4) as usize];
+            let (conversation, operation, generation) = h.start(project, None);
+            let owner = h.state().owner_generation;
+            for ordinal in 1..=(step() % 3) as u32 {
+                if live.len() >= MAX_UNSETTLED_JOBS - 2 {
+                    break;
+                }
+                let job = h.job(operation, generation, ordinal);
+                live.push((job, owner, false));
+            }
+            // Cancel and settle older jobs during this turn (JR8).
+            for _ in 0..step() % 3 {
+                if live.is_empty() {
+                    break;
+                }
+                let at = (step() % live.len() as u64) as usize;
+                let (job, job_owner, cancelled) = live[at];
+                if job_owner != owner {
+                    h.append(interrupted(job)).unwrap();
+                    live.remove(at);
+                    settled += 1;
+                } else if !cancelled && step() % 2 == 0 {
+                    h.append(cancel(job, JobReason::ClientCancel)).unwrap();
+                    live[at].2 = true;
+                } else {
+                    h.append(exited(job)).unwrap();
+                    live.remove(at);
+                    settled += 1;
+                }
+            }
+            let text = "r".repeat(61_440);
+            let pieces = step() % 4;
+            for n in 0..pieces {
+                h.segment(operation, generation, n * 61_440, &text).unwrap();
+            }
+            h.finish(conversation, operation, generation, pieces * 61_440);
+            if step() % 17 == 0 {
+                h.append(Record::OwnerGeneration).unwrap();
+            }
+        }
+        assert!(settled > 20 && !live.is_empty(), "seed {seed}");
+        let files = h.files();
+        assert!(segments(&files).len() >= 2, "seed {seed}");
+        assert!(!h.journal.runs().is_empty(), "seed {seed}");
+        let replayed = genesis(&files);
+        assert_eq!(canonical(&replayed), canonical(h.state()), "seed {seed}");
+        assert_eq!(unsettled(&replayed), unsettled(h.state()), "seed {seed}");
+        assert_eq!(unsettled(&replayed).len(), live.len());
+        let reopened = open(files, false).unwrap();
+        assert_eq!(canonical(reopened.state()), canonical(&replayed));
+        assert_eq!(unsettled(reopened.state()), unsettled(&replayed));
+        assert_eq!(
+            (
+                reopened.state().reserved_bytes,
+                reopened.state().reserved_frames
+            ),
+            (replayed.reserved_bytes, replayed.reserved_frames)
+        );
+        // Each unsettled job pins its conversation and project.
+        for job in unsettled(&replayed) {
+            assert!(
+                reopened
+                    .state()
+                    .conversations
+                    .contains_key(&job.conversation)
+            );
+            assert!(reopened.state().projects.contains_key(&job.project));
+        }
+    }
+}
+
+/// J2T-03 (unit): the roll after a job's kind 28 emits its `W` entry and
+/// the `X` form 2 entries of both payloads; before the roll the delta
+/// answers. A checkpoint holds the unsettled job's kind 26 and kind 27
+/// locators and rebuilds it.
+#[test]
+fn j2t_03_w_and_x_entries_and_checkpoint_jobs() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (conversation, operation, generation) = h.start(project, None);
+    let first = h.job(operation, generation, 1);
+    let second = h.job(operation, generation, 2);
+    h.append(cancel(second, JobReason::PersonStop)).unwrap();
+    h.append(exited(first)).unwrap();
+    h.finish(conversation, operation, generation, 0);
+    let installation = h.state().installation_id;
+    let payloads = job_payload_ids(installation, first);
+    let check = |state: &Replay, store: &mut dyn Index| {
+        let Some(JobState::Settled(settled)) = state.job_state(first, store).unwrap() else {
+            panic!("settled");
+        };
+        assert_eq!(settled.conversation, conversation);
+        assert_eq!(settled.origin, 1);
+        assert!(settled.cancel.is_none());
+        for payload in payloads {
+            let Some(Entry::JobPayload {
+                job,
+                intent,
+                settled: at,
+                last_use,
+            }) = state
+                .entry(&Key::new(Tag::Payload, payload, 0), store)
+                .unwrap()
+            else {
+                panic!("X form 2");
+            };
+            assert_eq!((job, intent, at), (first, settled.intent, settled.settled));
+            assert_eq!(last_use, settled.settled.sequence);
+        }
+        let Some(JobState::Unsettled(job)) = state.job_state(second, store).unwrap() else {
+            panic!("unsettled");
+        };
+        assert_eq!(job.cancel.unwrap().reason, JobReason::PersonStop);
+        assert_eq!((job.conversation, job.project), (conversation, project));
+        assert_eq!(job.payloads, job_payload_ids(installation, second));
+        // The job-mode calls have no `X` form 1 entries.
+        let j1 = crate::payload::payload_id(
+            installation,
+            operation,
+            generation,
+            1,
+            crate::payload::ObjectKind::Stdout,
+        );
+        assert!(
+            state
+                .get(&Key::new(Tag::Payload, j1, 0), store)
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.job_state([0x77; 16], store).unwrap().is_none());
+    };
+    // Before a roll: the delta holds the entries.
+    {
+        let (state, mut store) = h.journal.store();
+        assert!(!state.delta_is_empty());
+        check(&state, &mut store);
+    }
+    // Force rolls: the entries move to a run; the checkpoint keeps `second`.
+    let (_, op2, gen2) = h.start(project, None);
+    for n in 0..150u64 {
+        h.segment(op2, gen2, n * 61_440, &"z".repeat(61_440))
+            .unwrap();
+    }
+    assert!(!h.journal.runs().is_empty());
+    let files = h.files();
+    let mut reopened = open(files.clone(), false).unwrap();
+    {
+        let (state, mut store) = reopened.store();
+        assert!(state.base > 0 && state.delta_tag(Tag::Job).is_empty());
+        check(&state, &mut store);
+    }
+    assert_eq!(canonical(reopened.state()), canonical(&genesis(&files)));
+    // The checkpoint lists the job: kind 26 then kind 27 locators.
+    let job = &unsettled(reopened.state())[0];
+    let bytes = canonical(reopened.state());
+    let tail = &bytes[bytes.len() - 40 - 52..bytes.len() - 40];
+    assert_eq!(&tail[..4], &1u32.to_be_bytes());
+    assert_eq!(&tail[4..28], &job.intent.encode());
+    assert_eq!(&tail[28..52], &job.cancel.unwrap().frame.encode());
+}
+
+/// J2T-03 (unit): `reserve()` sizes for 0, 1 and 64 jobs, with and without
+/// kind 27, independent of the active operation; JR9 at the 65th job.
+#[test]
+fn j2t_03_ledger_sizes_for_0_1_and_64_jobs() {
+    assert_eq!(JOB_SETTLED_CAPACITY, 4_278);
+    assert_eq!(JOB_CANCEL_CAPACITY, 203);
+    assert_eq!(job_ledger(&[]), (0, 0));
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (conversation, operation, generation) = h.start(project, None);
+    let reserved = |h: &Harness| (h.state().reserved_bytes, h.state().reserved_frames);
+    let (base, frames) = reserved(&h);
+    let job = h.job(operation, generation, 1);
+    assert_eq!(reserved(&h), (base + 4_481, frames + 2));
+    h.append(cancel(job, JobReason::ModelCancel)).unwrap();
+    assert_eq!(reserved(&h), (base + 4_278, frames + 1));
+    h.finish(conversation, operation, generation, 0);
+    // No active operation: the ledger alone.
+    assert_eq!(reserved(&h), (4_278, 1));
+    h.append(exited(job)).unwrap();
+    assert_eq!(reserved(&h), (0, 0));
+    // 64 unsettled jobs across two turns: 286,784 bytes and 128 frames.
+    let mut jobs = Vec::new();
+    for _ in 0..2 {
+        let (conversation, operation, generation) = h.start(project, None);
+        for ordinal in 1..=32 {
+            jobs.push(h.job(operation, generation, ordinal));
+        }
+        h.finish(conversation, operation, generation, 0);
+    }
+    assert_eq!(reserved(&h), (286_784, 128));
+    assert_eq!(job_ledger(h.state().jobs.values()), (286_784, 128));
+    for job in &jobs {
+        h.append(cancel(*job, JobReason::Shutdown)).unwrap();
+    }
+    assert_eq!(reserved(&h), (64 * 4_278, 64));
+    // JR9: a 65th unsettled job is `Limit`; the journal reports `Exhausted`.
+    let (_, operation, generation) = h.start(project, None);
+    h.append(exec_call(operation, generation, 1)).unwrap();
+    assert_eq!(
+        h.append(intent(operation, generation, 1)),
+        Err(Failure::Exhausted)
+    );
+    h.append(exited(jobs[0])).unwrap();
+    h.append(intent(operation, generation, 1)).unwrap();
+}
+
+/// J2T-02 (unit, journal quota): kind 26 is a normal record held when its
+/// ledger does not fit; kinds 27 and 28 are closure records that commit
+/// while the journal is held (SJ-D18, SJ-D19).
+#[test]
+fn j2t_02_kind_26_is_held_at_the_quota_while_27_and_28_commit() {
+    assert!(!is_closure(&intent([1; 16], 1, 1)));
+    assert!(is_closure(&cancel([1; 16], JobReason::Shutdown)));
+    assert!(is_closure(&interrupted([1; 16])));
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (_, operation, generation) = h.start(project, None);
+    let live = h.job(operation, generation, 1);
+    h.append(exec_call(operation, generation, 2)).unwrap();
+    let usage = h.journal.usage();
+    // Kind 26 replaces the 4,250-byte kind 23 reservation with the 4,481-byte
+    // ledger: 231 more bytes than the 100 left.
+    h.journal
+        .set_quota(usage + ROLL_RESERVE + h.state().reserved_bytes as u64 + 100);
+    let before = segments(&h.files());
+    assert_eq!(
+        h.append(intent(operation, generation, 2)),
+        Err(Failure::Held(HoldReason::Quota))
+    );
+    assert_eq!(segments(&h.files()), before, "nothing written");
+    assert_eq!(h.journal.held(), Some(HoldReason::Quota));
+    // The live job's kinds 27 and 28 commit while held.
+    h.append(cancel(live, JobReason::PersonKill)).unwrap();
+    h.append(exited(live)).unwrap();
+    assert!(h.state().jobs.is_empty());
+    // Still held: the hold ends only when the quota or disk has room again.
+    assert_eq!(
+        h.append(intent(operation, generation, 2)),
+        Err(Failure::Held(HoldReason::Quota))
+    );
+    h.journal.set_quota(1 << 40);
+    assert!(h.journal.recheck());
+    h.append(intent(operation, generation, 2)).unwrap();
+    assert_eq!(h.state().jobs.len(), 1);
+}

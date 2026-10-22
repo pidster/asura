@@ -6,7 +6,8 @@ mod types;
 
 pub(crate) use codec::{Reader, Writer};
 pub use codec::{
-    capitalize_project_name, decode_record, encode_frame, exec_cmd_job_id, request_digest,
+    capitalize_project_name, decode_record, encode_frame, exec_cmd_job_id, job_id, job_payload_ids,
+    request_digest,
 };
 pub use state::*;
 pub use types::*;

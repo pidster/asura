@@ -1457,3 +1457,197 @@ fn sj11_sj24_merges_interleave_with_commands_on_real_files() {
     close(&mut session.writer);
     inspect(&scratch).unwrap();
 }
+
+/// A job-mode call in a started turn: kinds 14, 26 and 15. Returns the job.
+fn j2_job_call(session: &Session, operation: Id, generation: u64, ordinal: u32) -> Id {
+    session
+        .append(Record::ToolCall(Box::new(ToolCall {
+            operation,
+            generation,
+            ordinal,
+            source: ToolCallSource::GeneratedContent,
+            name: "exec_cmd".into(),
+            name_bytes: 8,
+            tool_operation: Some(ToolOperation::ExecCmd),
+            decision: ToolDecision::Run,
+            fault: None,
+            busy: None,
+            form: ArgumentForm::Canonical,
+            arguments_bytes: 20,
+            arguments: "{\"command\":\"true\"}".into(),
+            number_kinds: Vec::new(),
+            unnumbered: 0,
+            rule_set_revision: 1,
+            rule_set_digest: [3; 32],
+            command_cut: false,
+            whole_command: false,
+            refusal: None,
+        })))
+        .unwrap();
+    let origin = JobOrigin::Model {
+        operation,
+        generation,
+        ordinal,
+    };
+    session
+        .append(Record::JobIntent(JobIntent {
+            origin,
+            agent: 0,
+            time: 1_760_000_000_000,
+        }))
+        .unwrap();
+    session
+        .append(Record::ToolResult(ToolResult {
+            operation,
+            generation,
+            ordinal,
+            status: 1,
+            text: "job".into(),
+            next_offset: None,
+            truncated: false,
+        }))
+        .unwrap();
+    job_id(&origin)
+}
+fn j2_exited(job: Id) -> Record {
+    let stream = JobStream {
+        capture: CaptureStream {
+            eof: true,
+            digest: Some([0xe3; 32]),
+            ..CaptureStream::default()
+        },
+        lines: 0,
+    };
+    Record::JobSettled(Box::new(JobSettled {
+        job,
+        outcome: JobOutcome::Exited,
+        reason: JobReason::None,
+        exit_kind: 1,
+        exit_value: 0,
+        cleanup: JobCleanup::Confirmed,
+        unconfirmed_reason: 0,
+        escapees: 0,
+        elapsed_ms: 1,
+        capture_state: JobCaptureState::Complete,
+        capture_reason: CaptureReason::None,
+        stdout: stream.clone(),
+        stderr: stream,
+        distinct_numbers: 0,
+        numbers: Vec::new(),
+        pause_count: 0,
+        first_pause_ms: 0,
+        paused_ms: 0,
+        final_reservation: INITIAL_RESERVATION,
+        settled_time: 1_760_000_000_002,
+    }))
+}
+fn j2_facts(session: &Session, payloads: Vec<Id>) -> Vec<PayloadFact> {
+    run(&session.writer, Command::PayloadFacts { payloads })
+        .unwrap()
+        .payload_facts
+}
+
+/// J2T-03 (integration): rolls with live jobs on real files. Job A settles
+/// before the rolls (its `X` form 2 entries reach an index run), job B stays
+/// unsettled across the rolls (the checkpoint holds it), job C settles after
+/// the last roll (the delta answers). `PayloadFacts` answers each, before
+/// and after a restart from the checkpoint; B's `interrupted` kind 28 then
+/// commits and its facts carry no settlement.
+#[test]
+fn j2t_03_rolls_with_live_jobs_restart_and_payload_facts() {
+    let _guard = WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut session = Session::start(&scratch);
+    let project = session.register(&scratch, 1);
+    let installation = state(&session.writer).installation_id;
+    let (conversation, operation, generation) = session.start_turn(project, None);
+    let a = j2_job_call(&session, operation, generation, 1);
+    session.append(j2_exited(a)).unwrap();
+    let b = j2_job_call(&session, operation, generation, 2);
+    // Fill so that rolls move A's entries into a run and checkpoint B.
+    let text = "y".repeat(MAX_TEXT);
+    for k in 0..160u64 {
+        session
+            .append(Record::ResponseText(ResponseText {
+                operation,
+                generation,
+                offset: k * MAX_TEXT as u64,
+                text: text.clone(),
+            }))
+            .unwrap();
+    }
+    session.finish(operation, generation, 160 * MAX_TEXT as u64, "");
+    let (_, second, second_generation) = session.start_turn(project, None);
+    let c = j2_job_call(&session, second, second_generation, 1);
+    session.append(j2_exited(c)).unwrap();
+    let current = state(&session.writer);
+    assert!(current.base > 0, "a checkpoint exists");
+    let b_job = current.jobs[&b].clone();
+    assert!(
+        b_job.intent.sequence < current.base,
+        "B is in the checkpoint"
+    );
+    assert!(current.sequence > current.base, "C settled in the delta");
+    let base = current.base;
+    drop(current);
+    let [a_out, a_err] = job_payload_ids(installation, a);
+    let [b_out, _] = job_payload_ids(installation, b);
+    let [_, c_err] = job_payload_ids(installation, c);
+    let check = |session: &Session, b_active: bool| {
+        let facts = j2_facts(session, vec![a_out, a_err, b_out, c_err, random_id()]);
+        assert_eq!(facts.len(), 4);
+        for (fact, (payload, job, op)) in facts.iter().zip([
+            (a_out, a, operation),
+            (a_err, a, operation),
+            (b_out, b, operation),
+            (c_err, c, second),
+        ]) {
+            assert_eq!(
+                (fact.payload, fact.call, fact.operation),
+                (payload, job, op)
+            );
+            assert_eq!(fact.payloads, job_payload_ids(installation, job));
+            assert!(fact.payloads.contains(&payload));
+        }
+        for fact in [&facts[0], &facts[3]] {
+            let (state, sequence, streams) = fact.settled.unwrap();
+            assert_eq!(state, CaptureState::Complete);
+            assert!(sequence > fact.intent_sequence);
+            assert_eq!(streams, [(0, Some([0xe3; 32])); 2]);
+            assert!(!fact.active);
+        }
+        assert_eq!(facts[2].intent_sequence, b_job.intent.sequence);
+        assert_eq!(facts[2].settled, None);
+        assert_eq!(facts[2].active, b_active);
+    };
+    check(&session, true);
+    // A's kind 28 is before the checkpoint (its `X` is in a run); C's after.
+    let facts = j2_facts(&session, vec![a_out, c_err]);
+    assert!(facts[0].settled.unwrap().1 < base);
+    assert!(facts[1].settled.unwrap().1 > base);
+    // Restart from the checkpoint and tail: B is still unsettled.
+    close(&mut session.writer);
+    let session = Session::start(&scratch);
+    let reopened = state(&session.writer);
+    let jobs = reopened.unsettled_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!((jobs[0].job, jobs[0].intent), (b, b_job.intent));
+    assert_eq!(
+        (jobs[0].conversation, jobs[0].project),
+        (conversation, project)
+    );
+    assert!(reopened.owner_generation > jobs[0].owner_generation);
+    drop(reopened);
+    check(&session, true);
+    // The start-time recovery settlement (J2-E5).
+    session
+        .append(Record::JobSettled(Box::new(JobSettled::interrupted(
+            b,
+            1_760_000_000_001,
+        ))))
+        .unwrap();
+    assert!(state(&session.writer).jobs.is_empty());
+    check(&session, false);
+    let mut session = session;
+    close(&mut session.writer);
+}

@@ -2718,3 +2718,489 @@ fn tl15_invalid_thinking_records_reject() {
         }
     }
 }
+
+// J2T-02 and J2T-17 (unit): replay order of job records, JR1 to JR10
+// (tool-job-controller.md, replay order and the job reservation ledger).
+fn model_origin(operation: Id, generation: u64, ordinal: u32) -> JobOrigin {
+    JobOrigin::Model {
+        operation,
+        generation,
+        ordinal,
+    }
+}
+fn r26(ordinal: u32) -> Record {
+    r26_for(model_origin(id(10), 1, ordinal))
+}
+fn r26_for(origin: JobOrigin) -> Record {
+    Record::JobIntent(JobIntent {
+        origin,
+        agent: 0,
+        time: 1_760_000_000_000,
+    })
+}
+fn job(ordinal: u32) -> Id {
+    job_id(&model_origin(id(10), 1, ordinal))
+}
+fn r27(ordinal: u32, reason: JobReason) -> Record {
+    r27_for(job(ordinal), reason)
+}
+fn r27_for(job: Id, reason: JobReason) -> Record {
+    Record::JobCancelRequested(JobCancelRequested {
+        job,
+        requester: reason.requester().unwrap(),
+        reason,
+        kill: reason == JobReason::PersonKill,
+    })
+}
+fn settled28(job: Id) -> JobSettled {
+    let stream = JobStream {
+        capture: stream23(5),
+        lines: 2,
+    };
+    JobSettled {
+        job,
+        outcome: JobOutcome::Exited,
+        reason: JobReason::None,
+        exit_kind: 1,
+        exit_value: 3,
+        cleanup: JobCleanup::Confirmed,
+        unconfirmed_reason: 0,
+        escapees: 0,
+        elapsed_ms: 9,
+        capture_state: JobCaptureState::Complete,
+        capture_reason: CaptureReason::None,
+        stdout: stream.clone(),
+        stderr: stream,
+        distinct_numbers: 0,
+        numbers: vec![],
+        pause_count: 0,
+        first_pause_ms: 0,
+        paused_ms: 0,
+        final_reservation: INITIAL_RESERVATION,
+        settled_time: 1_760_000_000_002,
+    }
+}
+fn r28(ordinal: u32) -> Record {
+    Record::JobSettled(Box::new(settled28(job(ordinal))))
+}
+fn r28_for(job: Id) -> Record {
+    Record::JobSettled(Box::new(settled28(job)))
+}
+fn r28i(ordinal: u32) -> Record {
+    Record::JobSettled(Box::new(JobSettled::interrupted(
+        job(ordinal),
+        1_760_000_000_001,
+    )))
+}
+/// A job-mode call: kinds 14, 26 and 15.
+fn job_call(ordinal: u32) -> [Record; 3] {
+    [run_exec(ordinal), r26(ordinal), r15(ordinal, 1)]
+}
+const JOB_LEDGER: usize = 4_278 + 203;
+#[test]
+fn j2t_02_job_mode_orders_replay_and_derive_job_facts() {
+    for records in [
+        // 14, 26, 15 (handle delivery), 27, 28, terminal.
+        vec![
+            run_exec(1),
+            r26(1),
+            r15(1, 1),
+            r27(1, JobReason::ModelCancel),
+            r28(1),
+            complete(),
+        ],
+        // 27 and 28 before kind 15.
+        vec![
+            run_exec(1),
+            r26(1),
+            r27(1, JobReason::PersonKill),
+            r28(1),
+            r15(1, 1),
+            complete(),
+        ],
+        // JR8: 27 and 28 after the operation's terminal.
+        vec![
+            run_exec(1),
+            r26(1),
+            r15(1, 1),
+            complete(),
+            r27(1, JobReason::IdentityChanged),
+            r28(1),
+        ],
+        // A job settles without kind 27.
+        vec![run_exec(1), r26(1), r15(1, 1), r28(1), complete()],
+    ] {
+        let journal = started_with(records.clone());
+        let state = inspect(&journal.bytes).unwrap();
+        assert!(state.jobs.is_empty(), "{records:?}");
+        let tool = &state.operations[&id(10)].tools[0];
+        let exec = tool.exec_cmd.as_deref().unwrap();
+        assert!(exec.job_intent.is_some() && exec.settled.is_none());
+        assert_eq!(exec.job, job(1));
+        assert_eq!(
+            [exec.stdout_payload, exec.stderr_payload],
+            job_payload_ids(id(1), job(1))
+        );
+        assert_eq!(tool.result_status, Some(1));
+    }
+    // An unsettled job: derived identity, conversation, project, owner
+    // generation and payloads; the call's kind 15 resolves the call only.
+    let journal = started_with([run_exec(1), r26(1), r15(1, 1), run_exec(2), r26(2)]);
+    let state = inspect(&journal.bytes).unwrap();
+    let jobs = state.unsettled_jobs();
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs[0].intent.sequence < jobs[1].intent.sequence);
+    let first = &jobs[0];
+    assert_eq!(first.job, job(1));
+    assert_eq!(first.origin, model_origin(id(10), 1, 1));
+    assert_eq!((first.agent, first.owner_generation), (0, 1));
+    assert_eq!((first.conversation, first.project), (id(8), id(6)));
+    assert_eq!(first.payloads, job_payload_ids(id(1), job(1)));
+    assert_eq!(first.cancel, None);
+    assert!(!state.operations[&id(10)].tools[0].unresolved());
+    assert!(state.operations[&id(10)].tools[1].unresolved());
+}
+#[test]
+fn j2t_02_jr1_kind_26_names_the_active_operations_last_run_exec_cmd() {
+    let rejected = |records: Vec<Record>| {
+        assert_eq!(
+            inspect(&started_with(records.clone()).bytes).unwrap_err(),
+            ReplayError::Corrupt,
+            "{records:?}"
+        );
+    };
+    assert!(inspect(&started_with([run_exec(1), r26(1)]).bytes).is_ok());
+    // No kind 14, or not the last kind 14.
+    rejected(vec![r26(1)]);
+    rejected(vec![run_exec(1), r26(1), r15(1, 1), run_exec(2), r26(1)]);
+    rejected(vec![run_exec(1), r23(1), r15(1, 1), run_exec(2), r26(1)]);
+    // Wrong operation, generation or ordinal.
+    rejected(vec![run_exec(1), r26_for(model_origin(id(99), 1, 1))]);
+    rejected(vec![run_exec(1), r26_for(model_origin(id(10), 2, 1))]);
+    rejected(vec![run_exec(1), r26(2)]);
+    // The kind 14 already has kind 23, kind 15 or kind 26.
+    rejected(vec![run_exec(1), r23(1), r26(1)]);
+    rejected(vec![run_exec(1), r23(1), r15(1, 1), r26(1)]);
+    rejected(vec![run_exec(1), r26(1), r26(1)]);
+    rejected(vec![run_exec(1), r26(1), r15(1, 1), r26(1)]);
+    // Not a `run` exec_cmd: another operation, or another decision.
+    rejected(vec![tool_call(), r26(1)]);
+    for decision in [ToolDecision::Refused, ToolDecision::Busy] {
+        rejected(vec![r14(exec14(1, decision)), r26(1)]);
+    }
+    // The operation has a terminal, or is from an older owner generation.
+    rejected(vec![run_exec(1), failed(), r26(1)]);
+    rejected(vec![run_exec(1), Record::OwnerGeneration, r26(1)]);
+    // JR2: person origin waits for P2.
+    rejected(vec![
+        run_exec(1),
+        r26_for(JobOrigin::Person { input: id(30) }),
+    ]);
+    // JR3: the agent field is 0 (a same-size tamper, resealed).
+    let mut journal = started_with([run_exec(1), r26(1)]);
+    tamper_last(&mut journal, |payload| payload[4] = 1);
+    assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
+}
+#[test]
+fn j2t_02_jr4_jr5_jr10_kind_14_with_kind_26_has_no_kind_23_and_turn_rules_hold() {
+    // JR4: no kind 23 after kind 26; kind 15 follows kind 26.
+    expect_rule(
+        "JR4 kind 23",
+        started_with([run_exec(1), r26(1), r15(1, 1)]),
+        started_with([run_exec(1), r26(1), r23(1)]),
+    );
+    expect_rule(
+        "JR4 kind 15 needs kind 23 or 26",
+        started_with([run_exec(1), r26(1), r15(1, 1)]),
+        started_with([run_exec(1), r15(1, 1)]),
+    );
+    // JR5: the job ID of a call is derived once (a repeated kind 26 is the
+    // only way to derive it again).
+    expect_rule(
+        "JR5",
+        started_with([run_exec(1), r26(1), r28(1), r15(1, 1)]),
+        started_with([run_exec(1), r26(1), r28(1), r15(1, 1), r26(1)]),
+    );
+    // The kind 14 rules are unchanged: handle delivery resolves the call.
+    expect_rule(
+        "earlier run has kind 15",
+        started_with([run_exec(1), r26(1), r15(1, 1), run_exec(2)]),
+        started_with([run_exec(1), r26(1), run_exec(2)]),
+    );
+    expect_rule(
+        "complete needs kind 15",
+        started_with([run_exec(1), r26(1), r28(1), r15(1, 1), complete()]),
+        started_with([run_exec(1), r26(1), r28(1), complete()]),
+    );
+    // JR10: a terminal while a job-mode call lacks kind 15 is accepted; the
+    // job stays unsettled.
+    for records in [
+        vec![run_exec(1), r26(1), failed()],
+        vec![
+            run_exec(1),
+            r26(1),
+            cancel_requested(),
+            Record::TurnTerminal(terminal(TerminalKind::Cancelled, Cause::UserCancel, false)),
+        ],
+        vec![
+            run_exec(1),
+            r26(1),
+            Record::OwnerGeneration,
+            Record::TurnTerminal(terminal(TerminalKind::Interrupted, Cause::Restart, false)),
+        ],
+    ] {
+        let state = inspect(&started_with(records).bytes).unwrap();
+        assert_eq!(state.active_operation, None);
+        assert_eq!(state.unsettled_jobs().len(), 1);
+        assert!(state.operations[&id(10)].tools[0].unresolved());
+    }
+}
+#[test]
+fn j2t_02_jr6_kind_27_once_for_an_unsettled_job_of_its_generation() {
+    let base = || vec![run_exec(1), r26(1), r15(1, 1)];
+    let with = |extra: Vec<Record>| {
+        let mut records = base();
+        records.extend(extra);
+        started_with(records)
+    };
+    let valid = with(vec![r27(1, JobReason::ModelCancel)]);
+    let state = inspect(&valid.bytes).unwrap();
+    let cancel = state.jobs[&job(1)].cancel.unwrap();
+    assert_eq!(
+        (cancel.requester, cancel.reason, cancel.kill),
+        (JobRequester::Model, JobReason::ModelCancel, false)
+    );
+    for (name, broken) in [
+        ("unknown job", with(vec![r27(2, JobReason::ModelCancel)])),
+        (
+            "second kind 27",
+            with(vec![
+                r27(1, JobReason::PersonStop),
+                r27(1, JobReason::PersonKill),
+            ]),
+        ),
+        (
+            "after kind 28",
+            with(vec![r28(1), r27(1, JobReason::ClientCancel)]),
+        ),
+        (
+            "later owner generation",
+            with(vec![
+                complete(),
+                Record::OwnerGeneration,
+                r27(1, JobReason::Shutdown),
+            ]),
+        ),
+    ] {
+        expect_rule(name, with(vec![r27(1, JobReason::ModelCancel)]), broken);
+    }
+    // The requester must agree with the reason table (codec).
+    let mut journal = with(vec![r27(1, JobReason::ModelCancel)]);
+    tamper_last(&mut journal, |payload| {
+        payload[16] = JobRequester::Client as u8
+    });
+    assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
+}
+#[test]
+fn j2t_02_jr7_kind_28_once_and_interrupted_only_in_a_later_generation() {
+    let base = || vec![run_exec(1), r26(1), r15(1, 1), complete()];
+    let with = |extra: Vec<Record>| {
+        let mut records = base();
+        records.extend(extra);
+        started_with(records)
+    };
+    expect_rule("unknown job", with(vec![r28(1)]), with(vec![r28(2)]));
+    expect_rule(
+        "second kind 28",
+        with(vec![r28(1)]),
+        with(vec![r28(1), r28(1)]),
+    );
+    expect_rule(
+        "interrupted in the same generation",
+        with(vec![r28(1)]),
+        with(vec![r28i(1)]),
+    );
+    expect_rule(
+        "settlement after restart is interrupted",
+        with(vec![Record::OwnerGeneration, r28i(1)]),
+        with(vec![Record::OwnerGeneration, r28(1)]),
+    );
+    // Outcome rules (codec): exited with a signal exit kind.
+    let mut journal = with(vec![r28(1)]);
+    tamper_last(&mut journal, |payload| payload[18] = 2);
+    assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
+    // Interrupted after two restarts, and while the old operation is still
+    // active before its kind 8 (JR8).
+    let state = inspect(
+        &with(vec![
+            Record::OwnerGeneration,
+            Record::OwnerGeneration,
+            r28i(1),
+        ])
+        .bytes,
+    )
+    .unwrap();
+    assert!(state.jobs.is_empty());
+    let state = inspect(
+        &started_with([
+            run_exec(1),
+            r26(1),
+            Record::OwnerGeneration,
+            r28i(1),
+            Record::TurnTerminal(terminal(TerminalKind::Interrupted, Cause::Restart, false)),
+        ])
+        .bytes,
+    )
+    .unwrap();
+    assert!(state.jobs.is_empty() && state.active_operation.is_none());
+    // The old operation accepts no kind 27 and no new kind 26.
+    for record in [r27(1, JobReason::Shutdown), r26(1)] {
+        assert_eq!(
+            inspect(&started_with([run_exec(1), r26(1), Record::OwnerGeneration, record]).bytes)
+                .unwrap_err(),
+            ReplayError::Corrupt
+        );
+    }
+}
+#[test]
+fn j2t_02_jr9_at_most_64_unsettled_jobs() {
+    let mut journal = Journal::started();
+    for ordinal in 1..=64 {
+        for record in job_call(ordinal) {
+            journal.append(record);
+        }
+    }
+    let state = inspect(&journal.bytes).unwrap();
+    assert_eq!(state.jobs.len(), MAX_UNSETTLED_JOBS);
+    assert_eq!(
+        (state.reserved_bytes, state.reserved_frames),
+        (
+            inspect(&Journal::started().bytes).unwrap().reserved_bytes + 64 * JOB_LEDGER,
+            inspect(&Journal::started().bytes).unwrap().reserved_frames + 128
+        )
+    );
+    let mut over = Journal {
+        bytes: journal.bytes.clone(),
+        ..journal
+    };
+    over.append(run_exec(65));
+    assert!(inspect(&over.bytes).is_ok());
+    over.append(r26(65));
+    assert_eq!(inspect(&over.bytes).unwrap_err(), ReplayError::Limit);
+    // A settlement makes room for the next job.
+    let mut journal = Journal {
+        bytes: journal.bytes.clone(),
+        ..journal
+    };
+    journal.append(r28(1));
+    for record in job_call(65) {
+        journal.append(record);
+    }
+    assert_eq!(inspect(&journal.bytes).unwrap().jobs.len(), 64);
+}
+/// The second conversation's turn: operation `id(43)`.
+fn second_turn() -> [Record; 2] {
+    [
+        Record::TurnAccepted(Box::new(TurnAccepted {
+            request: id(40),
+            digest: request_digest(Request::Submit {
+                project: id(6),
+                conversation: None,
+                expected_generation: 0,
+                prompt: "second",
+            })
+            .unwrap(),
+            conversation: id(41),
+            task: id(42),
+            operation: id(43),
+            prompt: "second".into(),
+            ..turn()
+        })),
+        Record::StartAuthorized(StartAuthorized {
+            operation: id(43),
+            generation: 1,
+            helper: id(44),
+            input_digest: [12; 32],
+        }),
+    ]
+}
+/// J2T-17 (unit): kind 28 after its turn's terminal, during another
+/// conversation's turn and with no active operation; the ledger is
+/// independent of the active operation (J2-E4).
+#[test]
+fn j2t_17_records_after_turn_end_and_during_another_turn() {
+    let [accepted, started] = second_turn();
+    let mut journal = started_with([
+        run_exec(1),
+        r26(1),
+        r15(1, 1),
+        run_exec(2),
+        r26(2),
+        r15(2, 1),
+        complete(),
+    ]);
+    let idle = inspect(&journal.bytes).unwrap();
+    assert_eq!(idle.active_operation, None);
+    assert_eq!(
+        (idle.reserved_bytes, idle.reserved_frames),
+        (2 * JOB_LEDGER, 4)
+    );
+    journal.append(accepted);
+    journal.append(started);
+    // During the second conversation's turn.
+    journal.append(r27(1, JobReason::ClientCancel));
+    journal.append(r28(1));
+    let during = inspect(&journal.bytes).unwrap();
+    assert_eq!(during.active_operation, Some(id(43)));
+    assert_eq!(during.unsettled_jobs().len(), 1);
+    let second = &during.unsettled_jobs()[0];
+    assert_eq!((second.conversation, second.project), (id(8), id(6)));
+    // The first conversation stays resident while its job is unsettled.
+    assert!(during.conversations.contains_key(&id(8)));
+    journal.append(Record::TurnTerminal(TurnTerminal {
+        operation: id(43),
+        ..terminal(TerminalKind::Complete, Cause::None, true)
+    }));
+    // With no active operation.
+    journal.append(r28(2));
+    let done = inspect(&journal.bytes).unwrap();
+    assert!(done.jobs.is_empty());
+    assert_eq!((done.reserved_bytes, done.reserved_frames), (0, 0));
+    // A job ID never settles twice, even after its turn has ended.
+    journal.append(r28_for(job(2)));
+    assert_eq!(inspect(&journal.bytes).unwrap_err(), ReplayError::Corrupt);
+}
+/// J2T-03 (unit): the job-mode call holds the kind 15 reservation until
+/// kind 15 but no kind 23; the ledger holds kinds 27 and 28.
+#[test]
+fn j2t_03_job_mode_call_reserves_the_ledger_instead_of_kind_23() {
+    let reserved = |journal: &Journal| {
+        let state = inspect(&journal.bytes).unwrap();
+        (state.reserved_bytes, state.reserved_frames)
+    };
+    let (base, frames) = reserved(&Journal::started());
+    assert_eq!(
+        reserved(&started_with([run_exec(1)])),
+        (base + RESULT_CAPACITY + CAPTURE_CAPACITY, frames + 2)
+    );
+    assert_eq!(
+        reserved(&started_with([run_exec(1), r26(1)])),
+        (base + RESULT_CAPACITY + JOB_LEDGER, frames + 3)
+    );
+    assert_eq!(
+        reserved(&started_with([
+            run_exec(1),
+            r26(1),
+            r27(1, JobReason::TurnEnded)
+        ])),
+        (base + RESULT_CAPACITY + 4_278, frames + 2)
+    );
+    assert_eq!(
+        reserved(&started_with([run_exec(1), r26(1), r15(1, 1)])),
+        (base + JOB_LEDGER, frames + 2)
+    );
+    assert_eq!(
+        reserved(&started_with([run_exec(1), r26(1), r15(1, 1), r28(1)])),
+        (base, frames)
+    );
+}

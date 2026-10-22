@@ -2202,3 +2202,251 @@ fn rt07_segment_beyond_the_quota_is_held_and_terminal_still_commits() {
     .unwrap();
     close(&mut writer);
 }
+
+// ---------------------------------------------------------- J2 job records
+// tool-job-controller.md, J2T-01 and J2T-02 (integration): kinds 26 to 28
+// through the real writer on real files.
+
+fn j2_intent(ordinal: u32) -> JobIntent {
+    JobIntent {
+        origin: JobOrigin::Model {
+            operation: [35; 16],
+            generation: 1,
+            ordinal,
+        },
+        agent: 0,
+        time: 1_760_000_000_000,
+    }
+}
+fn j2_job(ordinal: u32) -> Id {
+    job_id(&j2_intent(ordinal).origin)
+}
+fn j2_handle(ordinal: u32) -> Record {
+    Record::ToolResult(ToolResult {
+        operation: [35; 16],
+        generation: 1,
+        ordinal,
+        status: 1,
+        text: "job started".into(),
+        next_offset: None,
+        truncated: false,
+    })
+}
+fn j2_cancel(ordinal: u32, reason: JobReason) -> JobCancelRequested {
+    JobCancelRequested {
+        job: j2_job(ordinal),
+        requester: reason.requester().unwrap(),
+        reason,
+        kill: reason == JobReason::PersonKill,
+    }
+}
+fn j2_settled(ordinal: u32) -> JobSettled {
+    JobSettled {
+        job: j2_job(ordinal),
+        outcome: JobOutcome::Cancelled,
+        reason: JobReason::PersonKill,
+        exit_kind: 2,
+        exit_value: 9,
+        cleanup: JobCleanup::Late,
+        unconfirmed_reason: 13,
+        escapees: 3,
+        elapsed_ms: 1_500,
+        capture_state: JobCaptureState::Incomplete,
+        capture_reason: CaptureReason::DiscardedAfterCancel,
+        stdout: JobStream {
+            capture: CaptureStream {
+                observed_bytes: 40,
+                stored_bytes: 33,
+                digest: Some([40; 32]),
+                replacements: 1,
+                literal_replacements: 1,
+                kinds: vec![(SecretKind::GithubToken, 1)],
+                discarded_bytes: 7,
+                ..CaptureStream::default()
+            },
+            lines: 2,
+        },
+        stderr: JobStream {
+            capture: CaptureStream {
+                digest: Some([41; 32]),
+                eof: true,
+                ..CaptureStream::default()
+            },
+            lines: 0,
+        },
+        distinct_numbers: 1,
+        numbers: vec![CaptureNumber {
+            number: 1,
+            kind: SecretKind::GithubToken,
+            origin: NumberOrigin::Command,
+        }],
+        pause_count: 1,
+        first_pause_ms: 10,
+        paused_ms: 20,
+        final_reservation: 2 * INITIAL_RESERVATION,
+        settled_time: 1_760_000_000_002,
+    }
+}
+/// J2T-01 (integration): the real writer appends kinds 26, 27 and 28; the
+/// journal reopens with the job settled and the second job unsettled; after
+/// the restart the `interrupted` kind 28 commits under the new owner
+/// generation; each frame decodes to the appended record.
+#[test]
+fn j2t_01_real_writer_appends_kinds_26_to_28_and_reopens() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    let state = j1_admit_and_start(&mut writer, project, configuration_digest);
+    let installation = state.installation_id;
+    let mut revision = state.revision;
+    drop(state);
+    let records = [
+        Record::ToolCall(Box::new(j1_call(1, ToolDecision::Run))),
+        Record::JobIntent(j2_intent(1)),
+        j2_handle(1),
+        Record::JobCancelRequested(j2_cancel(1, JobReason::PersonStop)),
+        Record::JobSettled(Box::new(j2_settled(1))),
+        Record::ToolCall(Box::new(j1_call(2, ToolDecision::Run))),
+        Record::JobIntent(j2_intent(2)),
+        j2_handle(2),
+    ];
+    for record in records.clone() {
+        submit(&mut writer, &mut revision, record).unwrap();
+    }
+    close(&mut writer);
+    let durable = journal_replay(&scratch);
+    let jobs = durable.unsettled_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job, j2_job(2));
+    assert_eq!(jobs[0].owner_generation, durable.owner_generation);
+    assert_eq!(jobs[0].payloads, job_payload_ids(installation, j2_job(2)));
+    assert_eq!((jobs[0].conversation, jobs[0].project), ([33; 16], project));
+    // A restarted writer: the job is still unsettled under the new owner
+    // generation; the controller's `interrupted` kind 28 commits.
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let reopened = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    assert_eq!(reopened.unsettled_jobs(), jobs);
+    assert!(reopened.owner_generation > jobs[0].owner_generation);
+    let mut revision = reopened.revision;
+    drop(reopened);
+    // A non-interrupted settlement in the new generation is invalid.
+    assert!(matches!(
+        submit(
+            &mut writer,
+            &mut revision,
+            Record::JobSettled(Box::new(j2_settled(2)))
+        ),
+        Err(Error::Invalid)
+    ));
+    let interrupted = Record::JobSettled(Box::new(JobSettled::interrupted(
+        j2_job(2),
+        1_760_000_000_001,
+    )));
+    submit(&mut writer, &mut revision, interrupted.clone()).unwrap();
+    close(&mut writer);
+    let durable = journal_replay(&scratch);
+    assert!(durable.jobs.is_empty());
+    assert_eq!(durable.reserved_frames, 0, "no ledger and no active turn");
+    // Each job frame decodes to the appended record.
+    let bytes = fs::read(
+        scratch
+            .0
+            .join(".asura/state/control/seg-0000000000000001.log"),
+    )
+    .unwrap();
+    let mut expected: Vec<Record> = records
+        .into_iter()
+        .filter(|r| matches!(r.kind(), 26..=28))
+        .collect();
+    expected.push(interrupted);
+    let mut found = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let length =
+            u32::from_be_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()) as usize;
+        let frame = &bytes[offset..offset + length];
+        let kind = u16::from_be_bytes([frame[10], frame[11]]);
+        if (26..=28).contains(&kind) {
+            found.push(decode_record(kind, &frame[144..length - 40]).unwrap());
+        }
+        offset += length;
+    }
+    assert_eq!(found, expected);
+}
+/// J2T-02 (integration): the writer holds kind 26 with `journal_quota` when
+/// its ledger cannot fit and writes nothing; kinds 27 and 28 commit while
+/// the journal is held; raising the quota ends the hold and kind 26 commits.
+#[test]
+fn j2t_02_real_writer_holds_kind_26_at_the_quota_while_27_and_28_commit() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    let state = j1_admit_and_start(&mut writer, project, configuration_digest);
+    let mut revision = state.revision;
+    drop(state);
+    for record in [
+        Record::ToolCall(Box::new(j1_call(1, ToolDecision::Run))),
+        Record::JobIntent(j2_intent(1)),
+        j2_handle(1),
+        Record::ToolCall(Box::new(j1_call(2, ToolDecision::Run))),
+    ] {
+        submit(&mut writer, &mut revision, record).unwrap();
+    }
+    let reserved = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap()
+        .reserved_bytes;
+    let status = wait(&mut writer.try_submit(Command::JournalStatus).unwrap())
+        .unwrap()
+        .status
+        .unwrap();
+    // Kind 26 trades the kind 23 reservation (4,250 bytes) for the job
+    // ledger (4,481 bytes): 231 more than today, beyond the 100 left.
+    wait(
+        &mut writer
+            .try_submit(Command::SetQuota {
+                bytes: status.usage + ROLL_RESERVE + reserved as u64 + 100,
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    let before = segment_bytes(&scratch);
+    assert!(matches!(
+        submit(&mut writer, &mut revision, Record::JobIntent(j2_intent(2))),
+        Err(Error::JournalQuota)
+    ));
+    assert_eq!(segment_bytes(&scratch), before);
+    assert_eq!(writer.status().held, Some(HoldReason::Quota));
+    // Closure records: the live job's kinds 27 and 28.
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::JobCancelRequested(j2_cancel(1, JobReason::PersonKill)),
+    )
+    .unwrap();
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::JobSettled(Box::new(j2_settled(1))),
+    )
+    .unwrap();
+    assert!(segment_bytes(&scratch) > before);
+    assert_eq!(writer.status().held, Some(HoldReason::Quota));
+    wait(
+        &mut writer
+            .try_submit(Command::SetQuota { bytes: 1 << 40 })
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(writer.status().held, None);
+    submit(&mut writer, &mut revision, Record::JobIntent(j2_intent(2))).unwrap();
+    close(&mut writer);
+    let durable = journal_replay(&scratch);
+    assert_eq!(durable.unsettled_jobs()[0].job, j2_job(2));
+}
