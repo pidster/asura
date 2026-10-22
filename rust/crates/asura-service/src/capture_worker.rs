@@ -1,4 +1,5 @@
-//! One retained capture worker per admitted exec_cmd call (J1, SL3).
+//! One retained capture worker per admitted exec_cmd call (J1, SL3) or job
+//! slot (J2). The store keys its reservation and staging by the job ID.
 //!
 //! The reactor side ([`Sink`]) receives raw pipe bytes from the platform
 //! `ExecCmdJob` and moves them to the worker through a bounded transfer queue
@@ -14,7 +15,7 @@ use asura_platform::secrets::{
     JobRedaction, JobSummary, LossSpan, NumberOrigin, Redacted, Stream, StreamStats,
 };
 use asura_storage::authority::conversation::{
-    CaptureNumber, CaptureReason, CaptureState, CaptureStream, Hash, Id,
+    CaptureNumber, CaptureReason, CaptureState, CaptureStream, Hash, Id, JobStream,
 };
 use asura_storage::payload::{
     Capture, PayloadError, PayloadStore, RECOVERY_RESERVE, RESERVATION_STEP, Short, SpaceListener,
@@ -89,6 +90,8 @@ pub(crate) struct StreamReport {
     pub stats: StreamStats,
     pub discarded: u64,
     pub eof: bool,
+    /// Newline bytes (0x0A) in the stored, redacted bytes (kind 28, TJ-20).
+    pub lines: u64,
     /// The last 8 KiB of stored (redacted) bytes.
     pub tail: Vec<u8>,
 }
@@ -135,6 +138,30 @@ impl Report {
             eof: s.eof,
         }
     }
+    /// The kind 28 stream block: the kind 23 block and the line count.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn job_stream(&self, stream: usize) -> JobStream {
+        JobStream {
+            capture: self.stream(stream),
+            lines: self.streams[stream].lines,
+        }
+    }
+}
+
+/// The stream blocks of an `unconfirmed` capture: raw bytes accepted and
+/// discarded by the sink and EOF per stream; nothing stored is claimed.
+pub(crate) fn unconfirmed_streams(sink: &SinkHandle) -> [CaptureStream; 2] {
+    let (accepted, discarded, ended) = sink.counts();
+    std::array::from_fn(|i| CaptureStream {
+        observed_bytes: accepted[i],
+        discarded_bytes: discarded[i],
+        eof: ended[i],
+        ..CaptureStream::default()
+    })
+}
+/// Newline bytes (0x0A) in stored bytes.
+fn newlines(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|b| **b == b'\n').count() as u64
 }
 
 /// Worker to reactor messages (bounded channel of 8 plus a wake).
@@ -155,6 +182,14 @@ struct Control {
     cancel: bool,
     abandon: bool,
     install: bool,
+    /// J2: no process ran; remove staging instead of installing.
+    discard: bool,
+    /// J2 `Draining`: the leader exited, so capture never pauses again; a
+    /// short is a capture fault with reason `quota` or `enospc`.
+    draining: bool,
+    /// J2: a cancel trigger in `Draining`; later chunks are discarded and
+    /// counted.
+    drop_output: bool,
     space: u64,
 }
 /// State shared by the reactor side and the worker.
@@ -319,10 +354,12 @@ impl OutputSink for Sink {
     }
 }
 
-/// What the worker needs: its store, its call, victims to delete before it
+/// What the worker needs: its store, its job, victims to delete before it
 /// creates staging, and the per-job redaction holding the command literals.
 pub(crate) struct Start {
     pub store: Arc<PayloadStore>,
+    /// The job ID: the store keys the reservation and staging by it and by
+    /// its derived payload IDs (J2-E6). A J1-mode call passes its job ID.
     pub call: Id,
     pub victims: Vec<Victim>,
     pub redaction: JobRedaction,
@@ -355,9 +392,32 @@ impl Handle {
             c.abandon = true;
         });
     }
-    /// After kind 23 commits: install both payloads and exit.
+    /// After kind 23 (J1) or kind 28 (J2) commits: install both payloads
+    /// and exit.
     pub(crate) fn install(&self) {
         self.shared.set(|c| c.install = true);
+    }
+    /// J2: the job settles `not_started`. After sealing, the worker removes
+    /// its staging files instead of installing them, and exits.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn discard(&self) {
+        self.shared.set(|c| c.discard = true);
+    }
+    /// J2: the leader exited (`Draining`). A paused worker retries at once;
+    /// from now on a quota or space short does not pause: the worker sends
+    /// `Fault(Quota)` or `Fault(Enospc)` and discards later bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn leader_exited(&self) {
+        self.shared.set(|c| c.draining = true);
+    }
+    /// J2: a cancel trigger in `Draining` (TJ-S1): the worker discards and
+    /// counts every chunk it has not yet staged; staged bytes are kept.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn discard_output(&self) {
+        self.shared.set(|c| {
+            c.cancel = true;
+            c.drop_output = true;
+        });
     }
     /// Drains messages without blocking. The thread's own exit also counts.
     pub(crate) fn drain(&mut self) -> Vec<Message> {
@@ -459,6 +519,8 @@ pub(crate) fn start(spec: Start) -> std::io::Result<Handle> {
 enum Wake {
     Abandon,
     Cancel,
+    /// The leader exited: retry once at once; a short then faults.
+    Drain,
     Space,
     Timer,
 }
@@ -477,8 +539,9 @@ impl Backoff {
         Self(self.1, self.0.saturating_add(self.1).min(Self::CAP_SECS))
     }
 }
-/// Waits for the next retry: abandonment, a cancel trigger, a space event
-/// (retry at once; the sequence restarts) or the backoff delay.
+/// Waits for the next retry: abandonment, a cancel trigger, the leader's
+/// exit, a space event (retry at once; the sequence restarts) or the
+/// backoff delay.
 fn wait_retry(shared: &Shared, space_seen: &mut u64, backoff: &mut Backoff) -> Wake {
     let end = Instant::now() + backoff.delay();
     let mut control = shared.control();
@@ -488,6 +551,9 @@ fn wait_retry(shared: &Shared, space_seen: &mut u64, backoff: &mut Backoff) -> W
         }
         if control.cancel {
             return Wake::Cancel;
+        }
+        if control.draining {
+            return Wake::Drain;
         }
         if control.space != *space_seen {
             *space_seen = control.space;
@@ -533,6 +599,7 @@ struct Worker {
     discarded: [u64; 2],
     eof: [bool; 2],
     degraded: [bool; 2],
+    lines: [u64; 2],
     tails: [VecDeque<u8>; 2],
     fault: Option<CaptureReason>,
     cancelled_while_paused: Option<PauseReason>,
@@ -569,6 +636,7 @@ impl Worker {
             discarded: [0; 2],
             eof: [false; 2],
             degraded: [false; 2],
+            lines: [0; 2],
             tails: [VecDeque::new(), VecDeque::new()],
             fault: None,
             cancelled_while_paused: None,
@@ -599,6 +667,15 @@ impl Worker {
     }
     fn abandoned(&self) -> bool {
         self.shared.control().abandon
+    }
+    fn draining(&self) -> bool {
+        self.shared.control().draining
+    }
+    /// A short in `Draining` (TJ-S1): leave any pause and fault with the
+    /// short's reason; later bytes are discarded and counted.
+    fn short_while_draining(&mut self, reason: PauseReason) {
+        self.leave_pause();
+        self.fault(reason.reason());
     }
     fn wait_retry(&mut self) -> Wake {
         wait_retry(&self.shared, &mut self.space_seen, &mut self.delays)
@@ -656,6 +733,10 @@ impl Worker {
                     self.leave_pause();
                     break;
                 }
+                Err(PayloadError::NoSpace) if self.draining() => {
+                    self.short_while_draining(PauseReason::Enospc);
+                    break;
+                }
                 Err(PayloadError::NoSpace) => {
                     self.enter_pause(PauseReason::Enospc);
                     match self.wait_retry() {
@@ -665,7 +746,7 @@ impl Worker {
                             self.discarding = [true; 2];
                             break;
                         }
-                        Wake::Space | Wake::Timer => {}
+                        Wake::Drain | Wake::Space | Wake::Timer => {}
                     }
                 }
                 Err(_) => {
@@ -695,6 +776,10 @@ impl Worker {
                     self.shared.queued_chunks.fetch_sub(1, Ordering::AcqRel);
                     if self.shared.backpressured.swap(false, Ordering::AcqRel) {
                         self.try_send(Message::Room);
+                    }
+                    if !self.discarding[index(stream)] && self.shared.control().drop_output {
+                        // A cancel trigger in `Draining` (J2): discard from here.
+                        self.discarding = [true; 2];
                     }
                     if self.discarding[index(stream)] || self.capture.is_none() {
                         self.discarded[index(stream)] += bytes.len() as u64;
@@ -822,6 +907,7 @@ impl Worker {
         }
         let capture = self.capture.as_mut().ok_or(Step::Fault)?;
         let (n, result) = capture.append(store_index(stream), redacted, *written);
+        self.lines[index(stream)] += newlines(&redacted.as_bytes()[*written..*written + n]);
         *written += n;
         match result {
             Ok(()) => Ok(()),
@@ -843,6 +929,11 @@ impl Worker {
                     self.fault(CaptureReason::StorageFault);
                     return Written::Fault;
                 }
+                Err(Step::Short(reason)) if self.draining() => {
+                    self.keep_tail(stream, &redacted.as_bytes()[..written]);
+                    self.short_while_draining(reason);
+                    return Written::Fault;
+                }
                 Err(Step::Short(reason)) => {
                     self.enter_pause(reason);
                     match self.wait_retry() {
@@ -854,7 +945,8 @@ impl Worker {
                             self.discarding = [true; 2];
                             return Written::Cancelled;
                         }
-                        Wake::Space | Wake::Timer => {}
+                        // Draining: retry once now; a short then faults.
+                        Wake::Drain | Wake::Space | Wake::Timer => {}
                     }
                 }
             }
@@ -932,6 +1024,7 @@ impl Worker {
                 stats: stats[i].clone(),
                 discarded: self.discarded[i],
                 eof: self.eof[i],
+                lines: if not_started { 0 } else { self.lines[i] },
                 tail: self.tails[i].iter().copied().collect(),
             }
         });
@@ -1008,15 +1101,19 @@ impl Worker {
         if !self.send(Message::Sealed(Box::new(report))) {
             return;
         }
-        // Installing: wait for kind 23 to commit, or abandonment.
-        let install = {
+        // Installing: wait for kind 23 or kind 28 to commit, a not_started
+        // discard, or abandonment.
+        let (install, discard) = {
             let mut control = self.shared.control();
             loop {
                 if control.abandon {
-                    break false;
+                    break (false, false);
+                }
+                if control.discard {
+                    break (false, true);
                 }
                 if control.install {
-                    break true;
+                    break (true, false);
                 }
                 control = self
                     .shared
@@ -1025,6 +1122,12 @@ impl Worker {
                     .unwrap_or_else(|e| e.into_inner());
             }
         };
+        if discard {
+            // No process ran (J2 `not_started`): nothing is retained.
+            self.store.discard_staging(self.call);
+            self.send(Message::Installed);
+            return;
+        }
         if !install {
             self.send(Message::Abandoned);
             return;
