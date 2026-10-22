@@ -579,8 +579,9 @@ can prove alone.
 | SS-W8 | Delete fails once (seam) | Item kept; the next sweep deletes it |
 
 SS-I7 fixture binary (selected, engineering): `asura-platform` gains a
-`test-support` example, `keychain_fixture`, built by Cargo as a separate
-executable. Given a scratch keychain path, a password, a service and an
+`test-support` binary target, `keychain_fixture` (`src/bin/keychain_fixture.rs`,
+`required-features = ["test-support"]`), which `cargo test` builds as a separate
+executable. An example would only be type-checked by `cargo test`, never linked. Given a scratch keychain path, a password, a service and an
 account, it writes one generic-password item. Because it is a different
 binary, the default ACL does not trust the service test binary for that item.
 

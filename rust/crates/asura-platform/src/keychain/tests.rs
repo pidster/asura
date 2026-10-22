@@ -403,10 +403,12 @@ mod scratch_keychain {
             .parent()
             .and_then(Path::parent)
             .expect("target profile directory");
-        let fixture = profile.join("examples/keychain_fixture");
+        // A test-support `[[bin]]`: `cargo test` with the feature builds it
+        // beside the test executables' `deps` directory.
+        let fixture = profile.join("keychain_fixture");
         assert!(
             fixture.is_file(),
-            "{} missing: build with --features test-support",
+            "{} missing: run cargo test with --features test-support",
             fixture.display()
         );
         fixture
