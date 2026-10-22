@@ -2,6 +2,7 @@
 use prost::Message;
 use std::fmt;
 mod audit_query;
+pub mod jobs;
 mod sensor_query;
 pub mod thinking;
 
@@ -156,9 +157,11 @@ fn context_path(value: &Option<String>) -> bool {
 }
 
 fn id(value: &Option<Vec<u8>>) -> bool {
-    value
-        .as_ref()
-        .is_some_and(|v| v.len() == 16 && v.iter().any(|b| *b != 0))
+    value.as_deref().is_some_and(id_slice)
+}
+/// A 16-byte identifier that is not all zero.
+fn id_slice(value: &[u8]) -> bool {
+    value.len() == 16 && value.iter().any(|b| *b != 0)
 }
 fn text(value: &Option<String>, limit: usize) -> bool {
     value.as_ref().is_some_and(|s| {
@@ -274,7 +277,7 @@ pub fn validate_semantics(
             | Body::ConversationQueueDecision(_)
             | Body::ObserveContext(_)
             | Body::ObserveService(_)
-    );
+    ) || jobs::is_request(body);
     if request != (direction == Direction::ClientToServer) {
         return Err(ProtocolError::WrongDirection);
     }
@@ -300,8 +303,8 @@ pub fn validate_semantics(
         Body::HelloReply(v) => {
             text(&v.service_build, 128)
                 && v.max_frame_bytes == Some(MAX_FRAME_BYTES as u32)
-                && (4..=6).contains(&v.capabilities.len())
-                && v.capabilities.iter().all(|c| (1..=6).contains(c))
+                && (4..=7).contains(&v.capabilities.len())
+                && v.capabilities.iter().all(|c| (1..=7).contains(c))
                 && v.capabilities
                     .iter()
                     .enumerate()
@@ -455,6 +458,7 @@ pub fn validate_semantics(
             _ => false,
         },
         body if conversation::handles(body) => conversation::valid(body),
+        body if jobs::handles(body) => jobs::valid(body),
         Body::Stop(v) => v.expected_epoch == envelope.service_epoch,
         Body::Error(v) => {
             v.code

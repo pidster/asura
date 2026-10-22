@@ -93,7 +93,7 @@ fn strict_wire_rejects_ambiguous_and_invalid_encodings() {
         &[
             0x52, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1,
         ], // overflow length
-        &[0x5a, 2, 0x10, 7],          // unknown capability (1 through 6 are defined)
+        &[0x5a, 2, 0x10, 8],          // unknown capability (1 through 7 are defined)
         &[0x5a, 4, 0x12, 0, 0x12, 0], // repeated packed segment
         &[0x5a, 4, 0x12, 0, 0x10, 1], // packed/unpacked mix
         &[0x5a, 6, 0x18, 0x80, 0x80, 0x80, 0x80, 0x10], // uint32 overflow

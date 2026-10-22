@@ -31,8 +31,13 @@ fn entry(v: &pb::AuditEntry) -> bool {
         && optional_id(&v.request)
         && optional_id(&v.conversation)
         && optional_id(&v.operation)
-        && v.reason.is_some_and(|n| n <= 10)
         && match v.kind {
+            Some(1..=3) => v.reason.is_some_and(|n| n <= 10) && v.job.is_none(),
+            Some(4..=7) => job_entry(v),
+            _ => false,
+        }
+        && match v.kind {
+            Some(4..=7) => true,
             Some(1) => {
                 id(&v.request)
                     && v.requested_generation.is_some()
@@ -64,6 +69,54 @@ fn entry(v: &pb::AuditEntry) -> bool {
                     && v.tool.is_some_and(|n| (1..=10).contains(&n))
                     && v.outcome.is_some_and(|n| (1..=7).contains(&n))
                     && v.reason == Some(0)
+            }
+            _ => false,
+        }
+}
+/// Job events (J4-E8): kinds 4 `job.queued`, 5 `job.started`,
+/// 6 `job.cancel_requested` and 7 `job.settled`. `outcome` carries the
+/// requester (6) or the outcome (7); `reason` the block reason (4) or the job
+/// reason (6, 7); `operation`, `generation` and `ordinal` the model origin of
+/// a started job (5). No command, cwd, note or output text exists here.
+fn job_entry(v: &pb::AuditEntry) -> bool {
+    use crate::jobs::{MAX_BLOCK_REASON, MAX_JOB_REASON};
+    let common = id(&v.job)
+        && id(&v.conversation)
+        && v.request.is_none()
+        && v.requested_generation.is_none()
+        && v.current_generation.is_none()
+        && v.tool.is_none();
+    let no_origin = v.operation.is_none() && v.generation.is_none() && v.ordinal.is_none();
+    common
+        && match v.kind {
+            Some(4) => {
+                no_origin
+                    && v.outcome.is_none()
+                    && v.reason
+                        .is_some_and(|n| (1..=MAX_BLOCK_REASON).contains(&n))
+            }
+            Some(5) => {
+                v.outcome.is_none()
+                    && v.reason == Some(0)
+                    && (no_origin
+                        || (id(&v.operation)
+                            && v.generation.is_some_and(|n| n > 0)
+                            && v.ordinal.is_some_and(|n| {
+                                (1..=crate::model::MAX_TOOL_ORDINAL).contains(&n)
+                            })))
+            }
+            // Requesters 1 model, 2 client, 3 person, 4 service; a cancel
+            // reason is a trigger code 1-10 or 19 `execution_off`.
+            Some(6) => {
+                no_origin
+                    && v.outcome.is_some_and(|n| (1..=4).contains(&n))
+                    && v.reason
+                        .is_some_and(|n| (1..=10).contains(&n) || n == MAX_JOB_REASON)
+            }
+            Some(7) => {
+                no_origin
+                    && v.outcome.is_some_and(|n| (1..=5).contains(&n))
+                    && v.reason.is_some_and(|n| n <= MAX_JOB_REASON)
             }
             _ => false,
         }

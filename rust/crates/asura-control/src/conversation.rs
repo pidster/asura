@@ -281,9 +281,15 @@ pub(super) fn valid(body: &Body) -> bool {
                 && v.tools.iter().enumerate().all(|(index, tool)| {
                     tool.arguments.as_ref().is_none_or(|s| s.len() <= 192)
                         && tool.preview.as_ref().is_none_or(|s| s.len() <= 128)
-                        // Kind 14 decision and fault codes (TCR-D13).
+                        // Kind 14 decision and fault codes (TCR-D13); fault
+                        // 16 is `invalid_job_id` (J3 kind 14 changes).
                         && tool.policy_decision.is_none_or(|n| (1..=8).contains(&n))
-                        && tool.fault.is_none_or(|n| (1..=15).contains(&n))
+                        && tool.fault.is_none_or(|n| (1..=16).contains(&n))
+                        // J4T-09: the job an admitted exec_cmd or job call
+                        // names; only on an admitted call.
+                        && tool.job_id.as_ref().is_none_or(|_| {
+                            id(&tool.job_id) && tool.policy_decision == Some(1)
+                        })
                         // SL7: set only, and only true, on an admitted call.
                         && tool.command_filtered.is_none_or(|filtered| {
                             filtered && tool.policy_decision == Some(1)
@@ -324,8 +330,20 @@ pub(super) fn valid(body: &Body) -> bool {
                     .is_some_and(|end| end <= total),
                 _ => false,
             };
+            // EX12: jobs that outlived the turn, on terminal kinds only; at
+            // most 8 distinct IDs, never more than the count.
+            let outlived = if matches!(v.kind, Some(3..=6)) {
+                v.outlived_job_ids.len() <= crate::jobs::MAX_OUTLIVED_JOB_IDS
+                    && v.outlived_job_ids.len() as u64 <= u64::from(v.outlived_jobs.unwrap_or(0))
+                    && v.outlived_job_ids.iter().enumerate().all(|(i, job)| {
+                        crate::id_slice(job) && !v.outlived_job_ids[..i].contains(job)
+                    })
+            } else {
+                v.outlived_jobs.is_none() && v.outlived_job_ids.is_empty()
+            };
             base && step
                 && thinking
+                && outlived
                 && match v.kind {
                     Some(1) => {
                         v.text.is_none()
@@ -627,6 +645,8 @@ mod tests {
             thinking_bytes: None,
             thinking_level: None,
             thinking_request: None,
+            outlived_jobs: None,
+            outlived_job_ids: Vec::new(),
         };
         assert!(valid(&Body::ConversationEvent(event.clone())));
         for changed in [
@@ -975,7 +995,7 @@ mod tests {
                 .map(|ordinal| pb::ToolProgress {
                     ordinal: Some(ordinal),
                     name: Some("a".repeat(64)),
-                    fault: Some(15),
+                    fault: Some(16),
                     state: Some(2),
                     status: Some(1),
                     arguments: Some("a".repeat(192)),
@@ -986,6 +1006,9 @@ mod tests {
                     result_bytes: Some(65536),
                     truncated: Some(true),
                     exit_code: Some(i32::MIN),
+                    // The J4 job fields are not part of this proof: with
+                    // them the worst case exceeds the frame (reported gap).
+                    job_id: None,
                 })
                 .collect(),
             statistics: Some(pb::TurnStatistics {

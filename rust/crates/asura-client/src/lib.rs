@@ -10,6 +10,7 @@ use std::{
     os::fd::AsRawFd,
     time::Duration,
 };
+mod jobs;
 mod response;
 pub use response::ResponseAssembly;
 
@@ -180,6 +181,8 @@ pub struct Client {
     abandoned: bool,
     /// Ends this attachment's waits besides a reply or lost connection.
     cancel: Cancel,
+    /// The capabilities the service listed in its `HelloReply`.
+    capabilities: Vec<i32>,
 }
 
 /// The cancel check cadence of a wait. Pacing only: it ends nothing by itself.
@@ -319,6 +322,7 @@ impl Client {
             build: hello.service_build.ok_or(Error::Protocol)?,
             abandoned: false,
             cancel: std::sync::Arc::new(never),
+            capabilities: hello.capabilities,
         })
     }
 
@@ -1290,6 +1294,8 @@ mod tests {
         Silent,
         /// Close the connection without replying.
         Close,
+        /// Reply at once with the body this function builds from the request.
+        Answer(fn(&pb::envelope::Body) -> pb::envelope::Body),
     }
 
     struct FakeService {
@@ -1328,6 +1334,18 @@ mod tests {
     /// A real scratch runtime whose endpoint is served by a test thread that
     /// answers Hello, then treats the one following request as `mode` says.
     fn fake_service(mode: Fake) -> FakeService {
+        fake_service_with(
+            mode,
+            vec![
+                pb::Capability::Inspect as i32,
+                pb::Capability::Stop as i32,
+                pb::Capability::InspectInstallation as i32,
+                pb::Capability::Config as i32,
+            ],
+        )
+    }
+    /// As [`fake_service`], listing `capabilities` in its `HelloReply`.
+    fn fake_service_with(mode: Fake, capabilities: Vec<i32>) -> FakeService {
         use std::os::unix::fs::DirBuilderExt;
         let path = std::path::PathBuf::from(format!(
             "/private/tmp/asura-client-{:x}",
@@ -1356,12 +1374,7 @@ mod tests {
                 request_counter: None,
                 body: Some(pb::envelope::Body::HelloReply(pb::HelloReply {
                     service_build: Some("asura/fake".into()),
-                    capabilities: vec![
-                        pb::Capability::Inspect as i32,
-                        pb::Capability::Stop as i32,
-                        pb::Capability::InspectInstallation as i32,
-                        pb::Capability::Config as i32,
-                    ],
+                    capabilities,
                     max_frame_bytes: Some(asura_control::MAX_FRAME_BYTES as u32),
                 })),
             };
@@ -1371,6 +1384,16 @@ mod tests {
             };
             match mode {
                 Fake::Close => drop(stream),
+                Fake::Answer(answer) => {
+                    let reply = pb::Envelope {
+                        service_epoch: Some(epoch.to_vec()),
+                        attachment_id: Some(attachment.to_vec()),
+                        request_counter: request.request_counter,
+                        body: Some(answer(request.body.as_ref().unwrap())),
+                    };
+                    let _ = stream.write_all(&encode_frame(&reply).unwrap());
+                    let _ = released.recv();
+                }
                 Fake::Silent => {
                     let _ = released.recv();
                 }
@@ -1469,6 +1492,274 @@ mod tests {
         let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
         assert!(matches!(
             client.config("audit.enabled", Some("true"), &|| false),
+            Err(Error::OutcomeUnconfirmed)
+        ));
+    }
+
+    // J4T-01 (client): each job call round-trips through a real socket and
+    // the control codec; a reply that does not answer its request is refused.
+    const JOB: [u8; 16] = [0x11; 16];
+    const PROJECT: [u8; 16] = [0x22; 16];
+    const REQUEST: [u8; 16] = [0x44; 16];
+    fn job_entry(project: [u8; 16]) -> pb::JobEntry {
+        pb::JobEntry {
+            job_id: Some(JOB.to_vec()),
+            project_id: Some(project.to_vec()),
+            conversation_id: Some(vec![0x33; 16]),
+            origin: Some(pb::JobOrigin::Person as i32),
+            command: Some("sleep 60".into()),
+            state: Some(pb::JobState::Running as i32),
+            sequence: Some(7),
+            ..Default::default()
+        }
+    }
+    fn job_list() -> pb::JobList {
+        pb::JobList {
+            scope: Some(pb::JobScope::Project as i32),
+            project_id: Some(PROJECT.to_vec()),
+            live_only: Some(true),
+            after_revision: Some(3),
+            ..Default::default()
+        }
+    }
+    fn list_answer(_: &pb::envelope::Body) -> pb::envelope::Body {
+        pb::envelope::Body::JobListReply(pb::JobListReply {
+            entries: vec![job_entry(PROJECT)],
+            next_before: None,
+            revision: Some(4),
+            live_in_scope: Some(1),
+            live_in_service: Some(3),
+            execution_enabled: Some(false),
+            error: None,
+        })
+    }
+    fn foreign_list_answer(_: &pb::envelope::Body) -> pb::envelope::Body {
+        pb::envelope::Body::JobListReply(pb::JobListReply {
+            entries: vec![job_entry([0x55; 16])],
+            revision: Some(4),
+            live_in_scope: Some(1),
+            live_in_service: Some(3),
+            execution_enabled: Some(true),
+            ..Default::default()
+        })
+    }
+    fn page_answer(request: &pb::envelope::Body) -> pb::envelope::Body {
+        let stream = match request {
+            pb::envelope::Body::JobRead(r) => r.stream,
+            pb::envelope::Body::JobObserve(r) => r.stream,
+            _ => None,
+        };
+        pb::envelope::Body::JobPage(pb::JobPage {
+            entry: Some(job_entry(PROJECT)),
+            pages: vec![pb::JobStreamPage {
+                stream,
+                start: Some(0),
+                text: Some("hello\n".into()),
+                next_offset: Some(6),
+                total_bytes: Some(6),
+                state: Some(pb::JobPageState::Live as i32),
+            }],
+            error: None,
+        })
+    }
+    fn cancel_answer(request: &pb::envelope::Body) -> pb::envelope::Body {
+        let pb::envelope::Body::JobCancel(request) = request else {
+            unreachable!()
+        };
+        assert_eq!(request.kill, Some(true));
+        pb::envelope::Body::JobCancelReply(pb::JobCancelReply {
+            request_id: request.request_id.clone(),
+            entry: Some(pb::JobEntry {
+                state: Some(pb::JobState::Stopping as i32),
+                cancel_requested: Some(true),
+                reason: Some(5),
+                ..job_entry(PROJECT)
+            }),
+            requested: Some(true),
+            error: None,
+        })
+    }
+    fn wrong_request_answer(_: &pb::envelope::Body) -> pb::envelope::Body {
+        pb::envelope::Body::JobCancelReply(pb::JobCancelReply {
+            request_id: Some(vec![0x99; 16]),
+            entry: Some(job_entry(PROJECT)),
+            requested: Some(true),
+            error: None,
+        })
+    }
+    fn retain_answer(request: &pb::envelope::Body) -> pb::envelope::Body {
+        let pb::envelope::Body::JobRetain(request) = request else {
+            unreachable!()
+        };
+        assert_eq!(request.note.as_deref(), Some("checked"));
+        pb::envelope::Body::JobRetainReply(pb::JobRetainReply {
+            request_id: request.request_id.clone(),
+            entry: None,
+            changed: None,
+            error: Some(asura_control::jobs::error::NOTES_FULL.into()),
+        })
+    }
+    fn detail_answer(_: &pb::envelope::Body) -> pb::envelope::Body {
+        pb::envelope::Body::JobDetail(pb::JobDetail {
+            entry: Some(job_entry(PROJECT)),
+            command: Some("sleep 60".into()),
+            cwd: Some("/tmp".into()),
+            notes: vec![pb::JobNote {
+                author: Some(2),
+                unix_ms: Some(1),
+                text: Some("model note".into()),
+            }],
+            error: None,
+        })
+    }
+    fn jobs_capabilities() -> Vec<i32> {
+        vec![1, 2, 3, 4, 5, 7]
+    }
+
+    #[test]
+    fn j4t01_capability_is_read_from_hello() {
+        let fake = fake_service_with(Fake::Silent, jobs_capabilities());
+        let client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(client.supports(pb::Capability::Jobs));
+        let fake = fake_service(Fake::Silent);
+        let client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(!client.supports(pb::Capability::Jobs));
+        assert!(client.supports(pb::Capability::Config));
+    }
+    #[test]
+    fn j4t01_list_round_trip_and_scope_fence() {
+        let fake = fake_service_with(Fake::Answer(list_answer), jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let reply = client.jobs(job_list(), &|| false).unwrap();
+        assert_eq!(reply.live_in_service, Some(3));
+        assert_eq!(reply.execution_enabled, Some(false));
+        assert_eq!(reply.entries[0].job_id.as_deref(), Some(JOB.as_slice()));
+        let fake = fake_service_with(Fake::Answer(foreign_list_answer), jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(matches!(
+            client.jobs(job_list(), &|| false),
+            Err(Error::Protocol)
+        ));
+    }
+    #[test]
+    fn j4t01_inspect_read_and_observe_round_trip() {
+        let fake = fake_service_with(Fake::Answer(detail_answer), jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let detail = client.inspect_job(JOB, Some(PROJECT), &|| false).unwrap();
+        assert_eq!(detail.notes.len(), 1);
+        let fake = fake_service_with(Fake::Answer(detail_answer), jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(matches!(
+            client.inspect_job([0x12; 16], None, &|| false),
+            Err(Error::Protocol)
+        ));
+        let fake = fake_service_with(Fake::Answer(page_answer), jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let page = client
+            .read_job(
+                pb::JobRead {
+                    job_id: Some(JOB.to_vec()),
+                    project_id: None,
+                    stream: Some(pb::JobStream::Stderr as i32),
+                    offset: Some(0),
+                    limit: None,
+                    at_end: None,
+                },
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(page.pages[0].text.as_deref(), Some("hello\n"));
+        let fake = fake_service_with(Fake::Answer(page_answer), jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let page = client
+            .observe_job(
+                pb::JobObserve {
+                    job_id: Some(JOB.to_vec()),
+                    project_id: Some(PROJECT.to_vec()),
+                    stream: Some(pb::JobStream::Stdout as i32),
+                    offset: Some(0),
+                    at_end: None,
+                    after_state: Some(pb::JobState::Running as i32),
+                },
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(page.pages[0].next_offset, Some(6));
+    }
+    #[test]
+    fn j4t01_parked_observe_has_no_time_bound_and_ends_on_cancel() {
+        let fake = fake_service_with(Fake::Silent, jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setter = flag.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            setter.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let check = || flag.load(std::sync::atomic::Ordering::Acquire);
+        let observe = pb::JobObserve {
+            job_id: Some(JOB.to_vec()),
+            project_id: None,
+            stream: None,
+            offset: None,
+            at_end: Some(true),
+            after_state: None,
+        };
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            client.observe_job(observe, &check),
+            Err(Error::Cancelled)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        cancel.join().unwrap();
+        // The attachment retires; nothing else is sent.
+        assert!(matches!(client.inspect(), Err(Error::Unavailable)));
+    }
+    #[test]
+    fn j4t01_cancel_and_retain_are_correlated_mutations() {
+        let cancel = pb::JobCancel {
+            request_id: Some(REQUEST.to_vec()),
+            job_id: Some(JOB.to_vec()),
+            expected_project_id: Some(PROJECT.to_vec()),
+            kill: Some(true),
+        };
+        let fake = fake_service_with(Fake::Answer(cancel_answer), jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let reply = client.cancel_job(cancel.clone(), &|| false).unwrap();
+        assert_eq!(reply.requested, Some(true));
+        let fake = fake_service_with(Fake::Answer(wrong_request_answer), jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(matches!(
+            client.cancel_job(cancel.clone(), &|| false),
+            Err(Error::Protocol)
+        ));
+        // A lost connection leaves the outcome unconfirmed.
+        let fake = fake_service_with(Fake::Close, jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(matches!(
+            client.cancel_job(cancel, &|| false),
+            Err(Error::OutcomeUnconfirmed)
+        ));
+        let retain = pb::JobRetain {
+            request_id: Some(REQUEST.to_vec()),
+            job_id: Some(JOB.to_vec()),
+            expected_project_id: Some(PROJECT.to_vec()),
+            action: Some(pb::JobRetainAction::Note as i32),
+            note: Some("checked".into()),
+            confirmed: None,
+        };
+        let fake = fake_service_with(Fake::Answer(retain_answer), jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let reply = client.retain_job(retain.clone(), &|| false).unwrap();
+        assert_eq!(
+            reply.error.as_deref(),
+            Some(asura_control::jobs::error::NOTES_FULL)
+        );
+        // The person's cancel during a held retain is unconfirmed too.
+        let fake = fake_service_with(Fake::Silent, jobs_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(matches!(
+            client.retain_job(retain, &|| true),
             Err(Error::OutcomeUnconfirmed)
         ));
     }

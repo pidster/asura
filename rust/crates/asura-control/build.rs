@@ -133,7 +133,8 @@ fn tables(
                 _ => return Err("unsupported descriptor field type".into()),
             };
             let repeated = field.label() == Label::Repeated;
-            if repeated && !matches!(field.r#type(), Type::Enum | Type::Message) {
+            // Repeated bytes are IDs, one length-delimited element each.
+            if repeated && !matches!(field.r#type(), Type::Enum | Type::Message | Type::Bytes) {
                 return Err("unsupported repeated field".into());
             }
             let repeated_limit = match (name.as_str(), field.name()) {
@@ -142,6 +143,11 @@ fn tables(
                 (".asura.control.v1.SensorsReply", "observations") => 16,
                 (".asura.control.v1.AuditReply", "entries") => 16,
                 (".asura.control.v1.SensorsReply", "proposals") => 8,
+                // Tool job controller J4 bounds.
+                (".asura.control.v1.JobListReply", "entries") => 8,
+                (".asura.control.v1.JobDetail", "notes") => 16,
+                (".asura.control.v1.JobPage", "pages") => 2,
+                (".asura.control.v1.ConversationEvent", "outlived_job_ids") => 8,
                 // Two entries per shown turn; the context composer bounds segments.
                 (".asura.model.v1.ModelInput", "history") => 2048,
                 _ => 32,

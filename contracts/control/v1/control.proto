@@ -50,6 +50,19 @@ message Envelope {
     ConversationQueueReorder conversation_queue_reorder = 54;
     ProjectRename project_rename = 55;
     ProjectRenameReply project_rename_reply = 56;
+    // Tool job controller J4 (tool-job-controller.md, J4 control messages).
+    JobList job_list = 57;
+    JobListReply job_list_reply = 58;
+    JobInspect job_inspect = 59;
+    JobDetail job_detail = 60;
+    JobRead job_read = 61;
+    // Replies to JobRead and JobObserve.
+    JobPage job_page = 62;
+    JobObserve job_observe = 63;
+    JobCancel job_cancel = 64;
+    JobCancelReply job_cancel_reply = 65;
+    JobRetain job_retain = 66;
+    JobRetainReply job_retain_reply = 67;
   }
   // Removed operations: direct ConversationSubmit (22) and its reply (23), and
   // the target-bearing ConversationEnqueue (35). Conversation input uses the queue.
@@ -140,6 +153,8 @@ enum Capability {
   CAPABILITY_CONFIG = 4;
   CAPABILITY_CONVERSATION = 5;
   CAPABILITY_SETUP = 6;
+  // Job requests 57-67; listed once J3 and J4 are enabled (EN1).
+  CAPABILITY_JOBS = 7;
 }
 enum Lifecycle {
   LIFECYCLE_UNSPECIFIED = 0;
@@ -258,6 +273,10 @@ message ConversationEvent {
   // The level and the form the turn recorded at acceptance.
   optional ThinkingLevel thinking_level = 18;
   optional ThinkingRequest thinking_request = 19;
+  // EX12: jobs the operation started that had no kind 28 before the terminal
+  // frame. Terminal kinds only; outlived_job_ids holds at most 8 of them.
+  optional uint32 outlived_jobs = 20;
+  repeated bytes outlived_job_ids = 21;
 }
 message ConversationCancel { optional bytes operation_id = 1; optional uint64 generation = 2; }
 message ConversationCancelAccepted { optional bytes operation_id = 1; optional bool terminal = 2; }
@@ -412,13 +431,15 @@ message ToolProgress {
   optional uint64 elapsed_ms = 7; optional uint64 result_bytes = 8;
   optional string preview = 9; optional bool truncated = 10;
   optional sint32 exit_code = 11;
-  // Kind 14 fault code 1-15 of a rejected call (tool-call-records.md, TCR-D13).
+  // Kind 14 fault code 1-16 of a rejected call (tool-call-records.md, TCR-D13).
   // policy_decision carries the kind 14 decision code 1-8.
   optional uint32 fault = 12;
   // SL7: true when an admitted exec_cmd call ran from the whole-command
   // variable (kind 14 field 20 bit 1); arguments then show its display text.
   // Absent otherwise; only with policy_decision 1.
   optional bool command_filtered = 13;
+  // The job an admitted exec_cmd or job call names (operation codes 10, 12-16).
+  optional bytes job_id = 14;
 }
 // Optional observations; complete means every measured request has full input/output counts.
 message TurnStatistics {
@@ -531,10 +552,144 @@ message AuditEntry {
   optional uint32 tool = 13;
   optional uint32 outcome = 14;
   optional uint32 reason = 15;
+  // Job events: kinds 4 job.queued, 5 job.started, 6 job.cancel_requested,
+  // 7 job.settled (J4-E8).
+  optional bytes job = 16;
 }
 message AuditReply {
   optional bytes project_id = 1;
   optional AuditHealth health = 2;
   repeated AuditEntry entries = 3;
+  optional string error = 4;
+}
+
+// Tool job controller J4 (tool-job-controller.md, J4 control messages).
+// Enum values equal the journal codes. Domain errors are reply `error` tokens.
+enum JobScope { JOB_SCOPE_UNSPECIFIED = 0; JOB_SCOPE_PROJECT = 1; JOB_SCOPE_ALL_PROJECTS = 2; JOB_SCOPE_CONVERSATION = 3; }
+enum JobOrigin { JOB_ORIGIN_UNSPECIFIED = 0; JOB_ORIGIN_MODEL = 1; JOB_ORIGIN_PERSON = 2; }
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0; JOB_STATE_QUEUED = 1; JOB_STATE_STARTING = 2; JOB_STATE_RUNNING = 3;
+  JOB_STATE_CAPTURE_PAUSED = 4; JOB_STATE_STOPPING = 5; JOB_STATE_DRAINING = 6;
+  JOB_STATE_CLEANUP_UNCONFIRMED = 7; JOB_STATE_FINALIZING = 8; JOB_STATE_SETTLED = 9;
+}
+enum JobStream { JOB_STREAM_UNSPECIFIED = 0; JOB_STREAM_STDOUT = 1; JOB_STREAM_STDERR = 2; }
+enum JobPageState {
+  JOB_PAGE_STATE_UNSPECIFIED = 0; JOB_PAGE_STATE_LIVE = 1; JOB_PAGE_STATE_COMPLETE = 2;
+  JOB_PAGE_STATE_INCOMPLETE = 3; JOB_PAGE_STATE_UNVERIFIED_PREFIX = 4; JOB_PAGE_STATE_EXPIRED = 5;
+  JOB_PAGE_STATE_MISSING = 6; JOB_PAGE_STATE_CORRUPT = 7; JOB_PAGE_STATE_DELETED = 8;
+}
+enum JobRetainAction {
+  JOB_RETAIN_ACTION_UNSPECIFIED = 0; JOB_RETAIN_ACTION_PIN = 1; JOB_RETAIN_ACTION_UNPIN = 2;
+  JOB_RETAIN_ACTION_DELETE = 3; JOB_RETAIN_ACTION_NOTE = 4;
+}
+message JobList {
+  optional JobScope scope = 1;
+  optional bytes project_id = 2;        // scopes PROJECT and CONVERSATION
+  optional bytes conversation_id = 3;   // scope CONVERSATION
+  optional uint64 before = 4;           // kind 26 sequence of the last entry of the previous page
+  optional uint32 limit = 5;            // 1-8; absent 8
+  optional bool live_only = 6;          // unsettled jobs only
+  optional uint64 after_revision = 7;   // park until the job revision differs
+}
+message JobListReply {
+  repeated JobEntry entries = 1;        // at most limit
+  optional uint64 next_before = 2;      // present when more entries exist
+  optional uint64 revision = 3;
+  optional uint32 live_in_scope = 4;
+  optional uint32 live_in_service = 5;
+  optional bool execution_enabled = 6;  // EX11 effective value; scopes PROJECT and CONVERSATION
+  optional string error = 7;
+}
+message JobEntry {
+  optional bytes job_id = 1;
+  optional bytes project_id = 2;
+  optional bytes conversation_id = 3;
+  optional JobOrigin origin = 4;
+  optional bool outside_sandbox = 5;
+  optional string command = 6;          // first line of the stored command, at most 192 bytes
+  optional JobState state = 7;
+  optional uint32 block_reason = 8;     // J2 block reason 1-9 when QUEUED; pause reason when CAPTURE_PAUSED
+  optional string reason_text = 9;      // the brief reason, for example "waiting: 2 of 2 jobs running for this agent"
+  optional uint32 outcome = 10;         // kind 28 outcome 1-5, SETTLED only
+  optional uint32 reason = 11;          // job reason code 0-19
+  optional uint32 exit_kind = 12;
+  optional uint32 exit_value = 13;
+  optional uint64 stdout_bytes = 14;
+  optional uint64 stderr_bytes = 15;
+  optional uint64 stdout_lines = 16;    // SETTLED only
+  optional uint64 stderr_lines = 17;    // SETTLED only
+  optional uint64 intent_unix_ms = 18;
+  optional uint64 settled_unix_ms = 19;
+  optional uint64 elapsed_ms = 20;
+  optional uint32 capture_state = 21;   // kind 28 capture state 1-5; absent while live
+  optional bool pinned = 22;
+  optional bool deleted = 23;
+  optional uint32 notes = 24;
+  optional uint64 sequence = 25;        // kind 26 frame sequence
+  optional bool cancel_requested = 26;
+  optional bytes input_id = 27;         // person-origin jobs (PCM)
+}
+message JobInspect { optional bytes job_id = 1; optional bytes project_id = 2; }
+message JobDetail {
+  optional JobEntry entry = 1;
+  optional string command = 2;          // whole stored command, at most 8192 bytes
+  optional string cwd = 3;
+  repeated JobNote notes = 4;           // at most 16, oldest first
+  optional string error = 5;
+}
+message JobNote { optional uint32 author = 1; optional uint64 unix_ms = 2; optional string text = 3; }
+message JobRead {
+  optional bytes job_id = 1;
+  optional bytes project_id = 2;
+  optional JobStream stream = 3;
+  optional uint64 offset = 4;
+  optional uint32 limit = 5;            // 1-8192; absent 8192
+  optional bool at_end = 6;             // the last page up to the watermark instead of offset
+}
+message JobObserve {
+  optional bytes job_id = 1;
+  optional bytes project_id = 2;
+  optional JobStream stream = 3;        // absent with at_end: both streams
+  optional uint64 offset = 4;           // bytes the client holds of that stream
+  optional bool at_end = 5;
+  optional JobState after_state = 6;    // the state the client last saw
+}
+message JobPage {
+  optional JobEntry entry = 1;
+  repeated JobStreamPage pages = 2;     // one, or two for at_end without a stream
+  optional string error = 3;
+}
+message JobStreamPage {
+  optional JobStream stream = 1;
+  optional uint64 start = 2;
+  optional string text = 3;
+  optional uint64 next_offset = 4;
+  optional uint64 total_bytes = 5;
+  optional JobPageState state = 6;
+}
+message JobCancel {
+  optional bytes request_id = 1;
+  optional bytes job_id = 2;
+  optional bytes expected_project_id = 3;
+  optional bool kill = 4;               // person-origin jobs only
+}
+message JobCancelReply {
+  optional bytes request_id = 1;
+  optional JobEntry entry = 2;
+  optional bool requested = 3;          // false when the job had settled
+  optional string error = 4;
+}
+message JobRetain {
+  optional bytes request_id = 1;
+  optional bytes job_id = 2;
+  optional bytes expected_project_id = 3;
+  optional JobRetainAction action = 4;
+  optional string note = 5;             // NOTE only: 1-2048 UTF-8 bytes
+  optional bool confirmed = 6;          // required true for DELETE
+}
+message JobRetainReply {
+  optional bytes request_id = 1;
+  optional JobEntry entry = 2;
+  optional bool changed = 3;
   optional string error = 4;
 }
