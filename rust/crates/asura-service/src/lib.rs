@@ -10,6 +10,7 @@ mod conversation;
 mod exec_cmd_worker;
 mod job_controller;
 mod payload_owner;
+pub mod secret_store;
 // Real service fixtures share the canonical process-wide writer owner.
 #[cfg(test)]
 pub(crate) static TEST_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());

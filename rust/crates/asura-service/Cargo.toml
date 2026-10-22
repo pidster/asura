@@ -48,3 +48,14 @@ required-features = ["test-support"]
 name = "conversation_flow"
 path = "tests/conversation_flow.rs"
 harness = false
+
+[[test]]
+name = "secret_store"
+path = "tests/secret_store.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "secret_store_fixture"
+path = "src/bin/secret_store_fixture.rs"
+required-features = ["test-support"]
+test = false

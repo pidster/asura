@@ -1,0 +1,807 @@
+//! SS1-S unit cases over a scripted port. No case makes a Keychain call.
+use super::codec::{self, CodecError, decode, encode};
+use super::*;
+use asura_platform::keychain::{
+    Added, Failure, Found, ItemKey, LIST_BOUND, Listing, MAX_ITEM_BYTES, Removed,
+};
+use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
+use std::sync::Condvar;
+use zeroize::Zeroizing;
+
+const INSTALLATION: [u8; 16] = [0x11; 16];
+const BINDING: [u8; 32] = [0x22; 32];
+const KEY: [u8; 32] = [0x33; 32];
+/// The status an unscripted port call returns, so a test sees it.
+const UNSCRIPTED: i32 = -1;
+
+fn id(n: u16) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id[14..].copy_from_slice(&n.to_be_bytes());
+    id
+}
+
+fn bytes(len: usize, seed: u8) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+            .collect(),
+    )
+}
+
+fn variables(sizes: &[usize]) -> Vec<SecretValue> {
+    sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| SecretValue {
+            number: i as u8 + 1,
+            value: bytes(len, i as u8),
+        })
+        .collect()
+}
+
+/// `entries` launch entries whose names and values total `total` bytes.
+fn environment(entries: usize, total: usize) -> Vec<EnvironmentEntry> {
+    let per = total / entries;
+    (0..entries)
+        .map(|i| {
+            let name_len = per.clamp(1, 8);
+            let extra = if i == entries - 1 {
+                total - per * entries
+            } else {
+                0
+            };
+            EnvironmentEntry {
+                name: bytes(name_len, 0x41),
+                value: bytes(per - name_len + extra, i as u8),
+            }
+        })
+        .collect()
+}
+
+/// The largest payload: 16 variables of 8,192 bytes in total and a launch
+/// environment of 1,024 entries and 40,960 bytes.
+pub(super) fn largest() -> Secrets {
+    Secrets {
+        variables: variables(&[512; 16]),
+        whole_command: None,
+        launch_environment: Some(environment(MAX_ENVIRONMENT_ENTRIES, MAX_ENVIRONMENT_BYTES)),
+    }
+}
+
+fn small(seed: u8) -> Secrets {
+    Secrets {
+        variables: vec![SecretValue {
+            number: 1,
+            value: bytes(8, seed),
+        }],
+        ..Secrets::default()
+    }
+}
+
+// ---- Scripted port -------------------------------------------------------
+
+#[derive(Default)]
+struct ScriptState {
+    adds: VecDeque<Result<Added, Failure>>,
+    gets: VecDeque<Result<Found, Failure>>,
+    deletes: VecDeque<Result<Removed, Failure>>,
+    lists: VecDeque<Result<Listing, Failure>>,
+    log: Vec<(&'static str, Option<[u8; 16]>)>,
+    held: bool,
+    blocked: usize,
+}
+
+/// Returns queued platform results and records every call.
+#[derive(Clone, Default)]
+struct Script(Arc<(Mutex<ScriptState>, Condvar)>);
+
+impl Script {
+    fn with(&self, edit: impl FnOnce(&mut ScriptState)) -> &Self {
+        edit(&mut self.0.0.lock().unwrap());
+        self
+    }
+    fn add(&self, result: Result<Added, Failure>) -> &Self {
+        self.with(|s| s.adds.push_back(result))
+    }
+    fn get(&self, result: Result<Found, Failure>) -> &Self {
+        self.with(|s| s.gets.push_back(result))
+    }
+    fn delete(&self, result: Result<Removed, Failure>) -> &Self {
+        self.with(|s| s.deletes.push_back(result))
+    }
+    fn list(&self, result: Result<Listing, Failure>) -> &Self {
+        self.with(|s| s.lists.push_back(result))
+    }
+    fn log(&self) -> Vec<(&'static str, Option<[u8; 16]>)> {
+        self.0.0.lock().unwrap().log.clone()
+    }
+    fn calls(&self, name: &str) -> usize {
+        self.log().iter().filter(|(call, _)| *call == name).count()
+    }
+    fn hold(&self) {
+        self.with(|s| s.held = true);
+    }
+    fn release(&self) {
+        self.with(|s| s.held = false);
+        self.0.1.notify_all();
+    }
+    fn wait_blocked(&self) {
+        let mut state = self.0.0.lock().unwrap();
+        while state.blocked == 0 {
+            state = self.0.1.wait(state).unwrap();
+        }
+    }
+    fn enter<T>(
+        &self,
+        name: &'static str,
+        input: Option<[u8; 16]>,
+        pick: impl FnOnce(&mut ScriptState) -> Option<Result<T, Failure>>,
+    ) -> Result<T, Failure> {
+        let mut state = self.0.0.lock().unwrap();
+        state.log.push((name, input));
+        state.blocked += 1;
+        self.0.1.notify_all();
+        while state.held {
+            state = self.0.1.wait(state).unwrap();
+        }
+        state.blocked -= 1;
+        pick(&mut state).unwrap_or(Err(Failure::Unavailable {
+            status: UNSCRIPTED,
+            item_call: true,
+        }))
+    }
+}
+
+impl port::KeychainPort for Script {
+    fn add(&self, key: &ItemKey, _: &[u8]) -> Result<Added, Failure> {
+        self.enter("add", Some(key.input), |s| s.adds.pop_front())
+    }
+    fn get(&self, key: &ItemKey) -> Result<Found, Failure> {
+        self.enter("get", Some(key.input), |s| s.gets.pop_front())
+    }
+    fn delete(&self, key: &ItemKey) -> Result<Removed, Failure> {
+        self.enter("delete", Some(key.input), |s| s.deletes.pop_front())
+    }
+    fn list(&self, installation: &[u8; 16]) -> Result<Listing, Failure> {
+        assert_eq!(
+            installation, &INSTALLATION,
+            "only this installation is listed"
+        );
+        self.enter("list", None, |s| s.lists.pop_front())
+    }
+}
+
+fn start(script: &Script) -> Store {
+    let port = script.clone();
+    Store::with_port(INSTALLATION, None, move || Ok(port.clone())).expect("worker")
+}
+
+fn listing(inputs: impl IntoIterator<Item = u16>, unrecognized: usize) -> Listing {
+    let inputs: Vec<[u8; 16]> = inputs.into_iter().map(id).collect();
+    Listing {
+        truncated: inputs.len() + unrecognized == LIST_BOUND,
+        inputs,
+        unrecognized,
+    }
+}
+
+fn data(secrets: &Secrets, binding: &[u8; 32]) -> Found {
+    Found::Data(encode(binding, secrets, &KEY).expect("encode"))
+}
+
+fn unavailable(status: i32) -> Failure {
+    Failure::Unavailable {
+        status,
+        item_call: true,
+    }
+}
+
+fn put(store: &Store, input: u16, secrets: Secrets) -> PutReply {
+    store
+        .put(id(input), BINDING, secrets)
+        .expect("admitted")
+        .wait()
+        .expect("reply")
+}
+fn get(store: &Store, input: u16) -> GetReply {
+    store
+        .get(id(input), BINDING)
+        .expect("admitted")
+        .wait()
+        .expect("reply")
+}
+fn delete(store: &Store, input: u16) -> DeleteReply {
+    store
+        .delete(id(input))
+        .expect("admitted")
+        .wait()
+        .expect("reply")
+}
+fn sweep(store: &Store, live: impl IntoIterator<Item = u16>) -> SweepReport {
+    store
+        .sweep(live.into_iter().map(id).collect())
+        .expect("admitted")
+        .wait()
+        .expect("reply")
+}
+
+// ---- SS-U1: payload codec --------------------------------------------------
+
+/// SS-U1: every bound round trips exactly; one over each is rejected.
+#[test]
+fn ss_u1_codec_bounds() {
+    let max = largest();
+    let payload = encode(&BINDING, &max, &KEY).unwrap();
+    assert_eq!(
+        payload.len(),
+        MAX_ITEM_BYTES,
+        "largest payload is 55,413 bytes"
+    );
+    let decoded = decode(&payload, &BINDING).unwrap();
+    assert_eq!(decoded.secrets, max);
+    assert_eq!(*decoded.key, KEY);
+
+    let whole = Secrets {
+        whole_command: Some(bytes(MAX_WHOLE_COMMAND_BYTES, 9)),
+        launch_environment: Some(Vec::new()),
+        ..Secrets::default()
+    };
+    let payload = encode(&BINDING, &whole, &KEY).unwrap();
+    assert_eq!(decode(&payload, &BINDING).unwrap().secrets, whole);
+    assert_eq!(
+        decode(
+            &encode(&BINDING, &Secrets::default(), &KEY).unwrap(),
+            &BINDING
+        )
+        .unwrap()
+        .secrets,
+        Secrets::default()
+    );
+
+    let mut invalid = Vec::new();
+    // 17 variables; 8,193 bytes in total; number 0; numbers out of order.
+    invalid.push(Secrets {
+        variables: variables(&[1; 17]),
+        ..Secrets::default()
+    });
+    let mut over = variables(&[512; 16]);
+    over[15].value = bytes(513, 1);
+    invalid.push(Secrets {
+        variables: over,
+        ..Secrets::default()
+    });
+    let mut zero = variables(&[1]);
+    zero[0].number = 0;
+    invalid.push(Secrets {
+        variables: zero,
+        ..Secrets::default()
+    });
+    let mut order = variables(&[1, 1]);
+    order[1].number = 1;
+    invalid.push(Secrets {
+        variables: order,
+        ..Secrets::default()
+    });
+    // Whole command of 8,193 bytes, empty, or beside numbered variables.
+    for command in [bytes(MAX_WHOLE_COMMAND_BYTES + 1, 0), bytes(0, 0)] {
+        invalid.push(Secrets {
+            whole_command: Some(command),
+            ..Secrets::default()
+        });
+    }
+    invalid.push(Secrets {
+        variables: variables(&[1]),
+        whole_command: Some(bytes(1, 0)),
+        ..Secrets::default()
+    });
+    // 1,025 entries; 40,961 bytes; an empty name; a 1,025-byte name.
+    invalid.push(Secrets {
+        launch_environment: Some(environment(MAX_ENVIRONMENT_ENTRIES + 1, 2_050)),
+        ..Secrets::default()
+    });
+    invalid.push(Secrets {
+        launch_environment: Some(environment(
+            MAX_ENVIRONMENT_ENTRIES,
+            MAX_ENVIRONMENT_BYTES + 1,
+        )),
+        ..Secrets::default()
+    });
+    for name in [0, MAX_ENVIRONMENT_NAME_BYTES + 1] {
+        invalid.push(Secrets {
+            launch_environment: Some(vec![EnvironmentEntry {
+                name: bytes(name, 0),
+                value: bytes(1, 0),
+            }]),
+            ..Secrets::default()
+        });
+    }
+    for secrets in &invalid {
+        assert_eq!(
+            encode(&BINDING, secrets, &KEY).map(drop),
+            Err(CodecError::Bound),
+            "{secrets:?}"
+        );
+    }
+
+    // Decode rejects what encode would never write.
+    let good = encode(&BINDING, &small(1), &KEY).unwrap();
+    let mut version = good.to_vec();
+    version[0] = 2;
+    assert_eq!(decode(&version, &BINDING).err(), Some(CodecError::Version));
+    let mut trailing = good.to_vec();
+    trailing.push(0);
+    assert_eq!(
+        decode(&trailing, &BINDING).err(),
+        Some(CodecError::Trailing)
+    );
+    assert_eq!(
+        decode(&good[..good.len() - 1], &BINDING).err(),
+        Some(CodecError::Truncated)
+    );
+    let mut flags = good.to_vec();
+    flags[33] = 0x4;
+    assert_eq!(decode(&flags, &BINDING).err(), Some(CodecError::Bound));
+    let mut count = good.to_vec();
+    count[34] = 17;
+    assert_eq!(decode(&count, &BINDING).err(), Some(CodecError::Bound));
+    // A variable length over the 8,192-byte total is refused before a copy.
+    let mut length = good.to_vec();
+    length[36..38].copy_from_slice(&8_193u16.to_be_bytes());
+    assert_eq!(decode(&length, &BINDING).err(), Some(CodecError::Bound));
+    let oversize = vec![VERSION; MAX_ITEM_BYTES + 1];
+    assert_eq!(
+        decode(&oversize, &BINDING).err(),
+        Some(CodecError::Oversize)
+    );
+}
+
+/// The debug form of values shows counts only.
+#[test]
+fn secrets_debug_shows_no_value() {
+    let text = format!("{:?}", small(0x5a));
+    assert_eq!(
+        text,
+        "Secrets { variables: 1, whole_command: false, launch_environment: None }"
+    );
+}
+
+// ---- SS-U2: binding --------------------------------------------------------
+
+/// SS-U2: the binding digest follows its definition; an item read under
+/// another input or installation is `mismatch`.
+#[test]
+fn ss_u2_binding_vectors_and_mismatch() {
+    let (installation, project, conversation, input) = ([1; 16], [2; 16], [3; 16], [4; 16]);
+    let request = [5u8; 32];
+    let mut hash = Sha256::new();
+    hash.update(b"asura.secret-item\0");
+    for part in [&installation, &project, &conversation, &input] {
+        hash.update(part);
+    }
+    hash.update(request);
+    let expected: [u8; 32] = hash.finalize().into();
+    let bound = binding(&installation, &project, &conversation, &input, &request);
+    assert_eq!(bound, expected);
+    for other in [
+        binding(&[9; 16], &project, &conversation, &input, &request),
+        binding(&installation, &[9; 16], &conversation, &input, &request),
+        binding(&installation, &project, &[9; 16], &input, &request),
+        binding(&installation, &project, &conversation, &[9; 16], &request),
+        binding(&installation, &project, &conversation, &input, &[9; 32]),
+    ] {
+        assert_ne!(other, bound);
+    }
+
+    let other_input = binding(&installation, &project, &conversation, &[9; 16], &request);
+    let other_installation = binding(&[9; 16], &project, &conversation, &input, &request);
+    let script = Script::default();
+    script
+        .get(Ok(data(&small(1), &other_input)))
+        .get(Ok(data(&small(1), &other_installation)))
+        .get(Ok(data(&small(1), &bound)));
+    let store = start(&script);
+    for _ in 0..2 {
+        let reply = store.get(input, bound).unwrap().wait().unwrap();
+        assert_eq!(reply, GetReply::Mismatch);
+    }
+    let reply = store.get(input, bound).unwrap().wait().unwrap();
+    assert_eq!(reply, GetReply::Values(small(1)));
+}
+
+// ---- SS-U10: worker reply table -------------------------------------------
+
+/// SS-U10: each platform result of the worker reply table, including
+/// `Added::Duplicate` followed by each `get` result, and `Failure::Invalid`.
+#[test]
+fn ss_u10_reply_table() {
+    let failures = [
+        (Failure::Locked, StoreFailure::Locked),
+        (Failure::Denied, StoreFailure::Denied),
+        (
+            unavailable(-25_294),
+            StoreFailure::Unavailable {
+                status: -25_294,
+                reason: None,
+            },
+        ),
+        (
+            Failure::Invalid,
+            StoreFailure::Unavailable {
+                status: 0,
+                reason: Some("invalid_request"),
+            },
+        ),
+    ];
+    let script = Script::default();
+    script.list(Ok(Listing::default()));
+    let store = start(&script);
+
+    // add
+    script.add(Ok(Added::Stored));
+    assert_eq!(put(&store, 1, small(1)), PutReply::Stored);
+    for (failure, reply) in failures {
+        script.add(Err(failure));
+        assert_eq!(put(&store, 2, small(1)), PutReply::Failed(reply));
+    }
+    // add Duplicate, then each get result.
+    let duplicates = [
+        (Ok(data(&small(1), &BINDING)), PutReply::ExistsSame),
+        (Ok(data(&small(2), &BINDING)), PutReply::ExistsDifferent),
+        (Ok(data(&small(1), &[0x44; 32])), PutReply::ExistsDifferent),
+        (
+            Ok(Found::Missing),
+            PutReply::Failed(StoreFailure::Unavailable {
+                status: -25_300,
+                reason: None,
+            }),
+        ),
+    ];
+    for (found, reply) in duplicates {
+        script.add(Ok(Added::Duplicate)).get(found);
+        assert_eq!(put(&store, 3, small(1)), reply);
+    }
+    for (failure, reply) in failures {
+        script.add(Ok(Added::Duplicate)).get(Err(failure));
+        assert_eq!(put(&store, 3, small(1)), PutReply::Failed(reply));
+    }
+
+    // get
+    script.get(Ok(data(&largest(), &BINDING)));
+    assert_eq!(get(&store, 4), GetReply::Values(largest()));
+    script.get(Ok(Found::Missing));
+    assert_eq!(get(&store, 4), GetReply::Missing);
+    // The codec owns the read bound: 55,414 bytes is `mismatch`.
+    script.get(Ok(Found::Data(Zeroizing::new(vec![
+        VERSION;
+        MAX_ITEM_BYTES + 1
+    ]))));
+    assert_eq!(get(&store, 4), GetReply::Mismatch);
+    for (failure, reply) in failures {
+        script.get(Err(failure));
+        assert_eq!(get(&store, 4), GetReply::Failed(reply));
+    }
+
+    // delete
+    script
+        .delete(Ok(Removed::Deleted))
+        .delete(Ok(Removed::Absent));
+    assert_eq!(delete(&store, 5), DeleteReply::Deleted);
+    assert_eq!(delete(&store, 5), DeleteReply::Absent);
+    for (failure, reply) in failures {
+        script.delete(Err(failure));
+        assert_eq!(delete(&store, 6), DeleteReply::Failed(reply));
+    }
+    // An invalid request never reaches the port.
+    let before = script.log().len();
+    let invalid = Secrets {
+        variables: variables(&[1; 17]),
+        ..Secrets::default()
+    };
+    assert_eq!(
+        put(&store, 7, invalid),
+        PutReply::Failed(StoreFailure::Unavailable {
+            status: 0,
+            reason: Some("invalid_request"),
+        })
+    );
+    assert_eq!(script.log().len(), before);
+    assert_eq!(script.calls("list"), 1, "one listing set the count");
+    drop(store.close().join());
+}
+
+/// `last_status` holds the last unavailable status until a call succeeds.
+#[test]
+fn last_status_follows_unavailable() {
+    let script = Script::default();
+    script
+        .delete(Err(unavailable(-25_294)))
+        .delete(Ok(Removed::Absent));
+    let store = start(&script);
+    delete(&store, 1);
+    assert_eq!(store.observation().last_status, 25_294);
+    delete(&store, 1);
+    assert_eq!(store.observation().last_status, 0);
+}
+
+// ---- SS-U5: queue ----------------------------------------------------------
+
+/// SS-U5: with the worker held inside a call, 16 requests are outstanding;
+/// the 17th and a settlement delete get `busy`. All 16 are answered after
+/// the release.
+#[test]
+fn ss_u5_queue_bound() {
+    let script = Script::default();
+    for _ in 0..QUEUE_BOUND {
+        script.get(Ok(Found::Missing));
+    }
+    script.hold();
+    let store = start(&script);
+    let mut tickets = vec![store.get(id(1), BINDING).unwrap()];
+    script.wait_blocked();
+    for n in 2..=QUEUE_BOUND as u16 {
+        tickets.push(store.get(id(n), BINDING).unwrap());
+    }
+    assert!(!store.has_room());
+    assert_eq!(store.get(id(17), BINDING).err(), Some(Refused::Busy));
+    assert_eq!(store.delete(id(1)).err(), Some(Refused::Busy));
+    assert_eq!(
+        store.put(id(18), BINDING, small(1)).err(),
+        Some(Refused::Busy)
+    );
+    assert_eq!(tickets[0].poll(), Polled::Pending);
+    script.release();
+    for ticket in tickets {
+        assert_eq!(ticket.wait(), Some(GetReply::Missing));
+    }
+    assert!(store.has_room());
+    assert_eq!(script.calls("delete"), 0, "the busy delete never ran");
+}
+
+/// A closed worker still answers the requests already queued.
+#[test]
+fn closed_worker_finishes_queued_requests() {
+    let script = Script::default();
+    script.get(Ok(Found::Missing));
+    let store = start(&script);
+    let ticket = store.get(id(1), BINDING).unwrap();
+    store.close().join().unwrap();
+    assert_eq!(ticket.poll(), Polled::Ready(GetReply::Missing));
+}
+
+// ---- SS-U6 and SS-U11: sweep -----------------------------------------------
+
+/// SS-U6: the store keeps every input of the live set (queued, held,
+/// waiting, dispatched) and deletes every other input (settled, dropped,
+/// unknown). The replay-state classification is the owner's (P3-E).
+#[test]
+fn ss_u6_sweep_keeps_live_inputs() {
+    let script = Script::default();
+    script.list(Ok(listing(1..=7, 0)));
+    for _ in 5..=7 {
+        script.delete(Ok(Removed::Deleted));
+    }
+    let store = start(&script);
+    let report = sweep(&store, 1..=4);
+    assert_eq!(
+        (report.kept, report.deleted, report.listings, report.outcome),
+        (4, 3, 1, Ok(()))
+    );
+    let deleted: Vec<_> = script
+        .log()
+        .into_iter()
+        .filter(|(call, _)| *call == "delete")
+        .map(|(_, input)| input.unwrap())
+        .collect();
+    assert_eq!(deleted, vec![id(5), id(6), id(7)]);
+    assert_eq!(store.observation().item_count, Some(4));
+}
+
+/// SS-U11: stranded and unrecognized counts and truncated listings.
+#[test]
+fn ss_u11_sweep_counts_and_truncation() {
+    let script = Script::default();
+    let store = start(&script);
+
+    // A denied delete strands the item; a later sweep deletes it.
+    script
+        .list(Ok(listing([1], 0)))
+        .delete(Err(Failure::Denied));
+    let report = sweep(&store, []);
+    assert_eq!((report.stranded, report.deleted), (1, 0));
+    let observation = store.observation();
+    assert_eq!(observation.stranded_count, 1);
+    assert_eq!(observation.stranded_inputs, vec![id(1)]);
+    assert_eq!(observation.item_count, Some(1), "a stranded item counts");
+    script
+        .list(Ok(listing([1], 0)))
+        .delete(Ok(Removed::Deleted));
+    let report = sweep(&store, []);
+    assert_eq!((report.stranded, report.deleted), (0, 1));
+    assert_eq!(store.observation().stranded_count, 0);
+    assert_eq!(store.observation().item_count, Some(0));
+
+    // Two unrecognized accounts: counted, never read or deleted.
+    let before = script.log().len();
+    script.list(Ok(listing([], 2)));
+    let report = sweep(&store, []);
+    assert_eq!(report.unrecognized, 2);
+    assert_eq!(script.log()[before..], [("list", None)]);
+    assert_eq!(store.observation().unrecognized_count, 2);
+    assert_eq!(store.observation().item_count, Some(2));
+
+    // A truncated listing of 257 where the pass deletes 3, then 254.
+    let live = 4..=255u16;
+    script.list(Ok(listing(1..=255, 2)));
+    for _ in 0..3 {
+        script.delete(Ok(Removed::Deleted));
+    }
+    script.list(Ok(listing(live.clone(), 2)));
+    let lists = script.calls("list");
+    let report = sweep(&store, live.clone());
+    assert_eq!(script.calls("list") - lists, 2, "second listing made");
+    assert_eq!(
+        (
+            report.deleted,
+            report.kept,
+            report.truncated,
+            report.listings
+        ),
+        (3, 252, false, 2)
+    );
+    assert_eq!(store.observation().item_count, Some(254));
+
+    // A truncated listing where the pass deletes nothing: no second
+    // listing; the count is 257 and `put` gives `full` without an add.
+    script.list(Ok(listing(1..=255, 2)));
+    let lists = script.calls("list");
+    let report = sweep(&store, 1..=255);
+    assert_eq!(script.calls("list") - lists, 1, "no second listing");
+    assert!(report.truncated);
+    assert_eq!(store.observation().item_count, Some(COUNT_TRUNCATED));
+    assert_eq!(put(&store, 300, small(1)), PutReply::Full);
+    assert_eq!(script.calls("add"), 0);
+    // A delete does not lower a truncated count.
+    script.delete(Ok(Removed::Deleted));
+    delete(&store, 1);
+    assert_eq!(store.observation().item_count, Some(COUNT_TRUNCATED));
+
+    // Denied deletes after settlement: the observation holds 16 IDs while
+    // the count keeps the total.
+    for _ in 0..20 {
+        script.delete(Err(Failure::Denied));
+    }
+    for n in 400..420 {
+        assert_eq!(delete(&store, n), DeleteReply::Failed(StoreFailure::Denied));
+    }
+    let observation = store.observation();
+    assert_eq!(observation.stranded_count, 20);
+    assert_eq!(observation.stranded_inputs.len(), OBSERVED_STRANDED);
+    assert_eq!(observation.stranded_inputs[0], id(400));
+    // A later successful delete removes the input from the stranded set.
+    script.delete(Ok(Removed::Absent));
+    delete(&store, 400);
+    assert_eq!(store.observation().stranded_count, 19);
+    assert!(!store.observation().stranded_inputs.contains(&id(400)));
+}
+
+/// A sweep whose listing fails is pending, and the worker retries it before
+/// its next request. Items stored since are kept by the retry.
+#[test]
+fn failed_sweep_is_retried_before_the_next_request() {
+    let script = Script::default();
+    script.list(Err(unavailable(-25_294)));
+    let store = start(&script);
+    let report = sweep(&store, [1]);
+    assert_eq!(
+        report.outcome,
+        Err(StoreFailure::Unavailable {
+            status: -25_294,
+            reason: None,
+        })
+    );
+    let observation = store.observation();
+    assert!(observation.sweep_pending);
+    assert_eq!(
+        observation.item_count, None,
+        "absent until a sweep completes"
+    );
+    assert_eq!(observation.last_status, 25_294);
+
+    // The retry runs before this put; the put lists no more (count known).
+    script
+        .list(Ok(listing([1, 2], 0)))
+        .delete(Ok(Removed::Deleted))
+        .add(Ok(Added::Stored));
+    assert_eq!(put(&store, 3, small(1)), PutReply::Stored);
+    let observation = store.observation();
+    assert!(!observation.sweep_pending);
+    assert_eq!(observation.item_count, Some(2));
+    assert_eq!(
+        script.log(),
+        vec![
+            ("list", None),
+            ("list", None),
+            ("delete", Some(id(2))),
+            ("add", Some(id(3))),
+        ]
+    );
+    // A later sweep keeps the item this worker stored.
+    script.list(Ok(listing([1, 3], 0)));
+    let report = sweep(&store, [1]);
+    assert_eq!((report.kept, report.deleted), (2, 0));
+}
+
+/// A failed open answers `unavailable` and is retried at the next request.
+#[test]
+fn failed_open_is_retried() {
+    let script = Script::default();
+    script.get(Ok(Found::Missing));
+    let mut first = true;
+    let port = script.clone();
+    let store = Store::with_port(INSTALLATION, None, move || {
+        if std::mem::take(&mut first) {
+            Err(unavailable(-25_294))
+        } else {
+            Ok(port.clone())
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        get(&store, 1),
+        GetReply::Failed(StoreFailure::Unavailable {
+            status: -25_294,
+            reason: None,
+        })
+    );
+    assert_eq!(get(&store, 1), GetReply::Missing);
+}
+
+// ---- SS-U7 and SS-U8 -------------------------------------------------------
+
+/// SS-U7 (service part): this crate's unit tests can never open the default
+/// keychain; the request is refused before any Keychain call.
+#[test]
+fn ss_u7_unit_tests_never_open_the_default_keychain() {
+    let store = Store::new(Target::Default, INSTALLATION, None).unwrap();
+    assert_eq!(
+        get(&store, 1),
+        GetReply::Failed(StoreFailure::Unavailable {
+            status: 0,
+            reason: Some("invalid_request"),
+        })
+    );
+}
+
+/// SS-U8 (store part): an exact retry with equal values is `exists_same`,
+/// with different values `exists_different`; neither writes a new item.
+#[test]
+fn ss_u8_exact_retry_compares_keyed_digests() {
+    let script = Script::default();
+    script
+        .list(Ok(Listing::default()))
+        .add(Ok(Added::Duplicate))
+        .get(Ok(data(&largest(), &BINDING)))
+        .add(Ok(Added::Duplicate))
+        .get(Ok(data(&largest(), &BINDING)));
+    let store = start(&script);
+    assert_eq!(put(&store, 1, largest()), PutReply::ExistsSame);
+    let mut changed = largest();
+    changed.variables[3].value[0] ^= 1;
+    assert_eq!(put(&store, 1, changed), PutReply::ExistsDifferent);
+    // Equal values under different keys give different digests.
+    let a = codec::value_digest(&[1; 32], &small(1));
+    assert_ne!(a, codec::value_digest(&[2; 32], &small(1)));
+    assert!(codec::digests_equal(
+        &a,
+        &codec::value_digest(&[1; 32], &small(1))
+    ));
+}
+
+/// The locked recheck pacing: 1, 1, 2, 3, 5, 8 s and so on, at most 60 s.
+#[test]
+fn recheck_is_paced() {
+    let mut recheck = Recheck::default();
+    let delays: Vec<u64> = (0..13).map(|_| recheck.next_delay().as_secs()).collect();
+    assert_eq!(delays, [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 60, 60, 60]);
+}
