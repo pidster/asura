@@ -104,6 +104,7 @@ impl Harness {
             secret_command: None,
             redaction: JobRedaction::new(asura_platform::secrets::detection().expect("rules"), &[]),
             duplicate_digest: [digest; 32],
+            stored_command: "printf secret-command-text".into(),
         }
     }
     fn submit(&mut self, origin: Origin, agent: AgentKey, project: Id) -> Admission {
@@ -925,10 +926,6 @@ fn j2t_08_busy_bounds_and_duplicates() {
     );
     let changed = h.request(model(2), conversation(1), P1, 9);
     assert_eq!(h.ctl.submit(changed, h.now), Admission::Conflict);
-    assert_eq!(
-        BusyReason::QueueFull.text(2),
-        "busy: 2 jobs already waiting for this agent"
-    );
     // The running job counts toward the agent queue bound only while queued.
     assert_eq!(h.started(), [a]);
 
@@ -952,17 +949,10 @@ fn j2t_08_busy_bounds_and_duplicates() {
             job: model(1).job_id()
         }
     );
-    assert_eq!(
-        BusyReason::JobsFull.text(8),
-        "busy: 64 jobs not yet settled"
-    );
 
     // Closed: queued starts settle; their identities are still known.
     h.ctl.close();
     assert_eq!(settled(&h.commit()).len(), 63);
-    assert_eq!(BusyReason::QueueFull.code(), "queue_full");
-    assert_eq!(BusyReason::JobsFull.code(), "jobs_full");
-    assert_eq!(BusyReason::Closed.code(), "closed");
     assert_eq!(
         h.submit(model(101), conversation(9), P1),
         Admission::Busy(BusyReason::Closed)
@@ -973,7 +963,6 @@ fn j2t_08_busy_bounds_and_duplicates() {
             job: model(1).job_id()
         }
     );
-    assert_eq!(BusyReason::Closed.text(8), "busy: service is stopping");
 }
 
 /// J2T-08: person waiters and model entries share the agent and service

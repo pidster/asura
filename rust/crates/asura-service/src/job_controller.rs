@@ -33,10 +33,12 @@ pub(crate) use port::{
     SlotStart, SlotStartError,
 };
 pub(crate) use reasons::{BlockReason, BusyReason, Counts, MAX_UNSETTLED, block_text};
-#[allow(unused_imports)] // J34-E and J4-R name these types
-pub(crate) use views::{JobView, MAX_OUTLIVED_IDS, Outlived};
-#[allow(unused_imports)] // J34-E and J4-R name these types
-pub(crate) use waits::{CLIENT_WAITS, TurnWaitEnd, WaitDone, WaitEnding, WaitKey, WaitStart};
+#[cfg(test)]
+pub(crate) use views::MAX_OUTLIVED_IDS;
+pub(crate) use views::{JobView, Outlived};
+#[cfg(test)]
+pub(crate) use waits::{CLIENT_WAITS, TurnWaitEnd};
+pub(crate) use waits::{WaitDone, WaitEnding, WaitKey, WaitStart};
 
 use crate::{capture_worker, tools};
 use asura_platform::{
@@ -121,7 +123,6 @@ impl Origin {
         }
     }
     /// The one job ID of this origin ([job identity](J2-E6)).
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
     pub(crate) fn job_id(&self) -> Id {
         journal::job_id(&self.journal())
     }
@@ -139,7 +140,10 @@ impl Origin {
 /// One start. The secrets and redaction move into the slot at its start;
 /// `duplicate_digest` is a keyed digest of the arguments, held in memory
 /// only, that tells a duplicate start from a conflicting one.
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
+/// `stored_command` is the stored, redacted command of the job's source
+/// record (a model call's kind 14 `command`, the display text for a
+/// whole-command call): the live-only listing excerpt is built from it at
+/// admission, never from `command`.
 pub(crate) struct StartRequest {
     pub origin: Origin,
     pub agent: AgentKey,
@@ -151,10 +155,10 @@ pub(crate) struct StartRequest {
     pub secret_command: Option<SecretCommand>,
     pub redaction: JobRedaction,
     pub duplicate_digest: [u8; 32],
+    pub stored_command: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 pub(crate) enum Admission {
     Accepted { job: Id },
     Existing { job: Id },
@@ -163,11 +167,13 @@ pub(crate) enum Admission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 pub(crate) enum Requester {
     Model,
     Client,
     Person,
+    /// Service triggers go through `revoke`, `close` and the journal
+    /// outage; tests name it.
+    #[cfg_attr(not(test), allow(dead_code))]
     Service,
 }
 impl Requester {
@@ -186,7 +192,6 @@ impl Requester {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OriginFilter {
     All,
-    #[cfg_attr(not(test), allow(dead_code))] // J34-E revokes on an execution change
     Model,
     #[allow(dead_code)] // the person-command packets revoke person jobs
     Person,
@@ -245,7 +250,7 @@ pub(crate) enum JobEvent {
 
 /// What the controller knows of one job.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct JobStatus {
     pub state: JobState,
     pub origin: Origin,
@@ -382,6 +387,9 @@ struct Job {
     intent_ms: u64,
     /// Stored bytes per stream (the readable watermark) at the last poll.
     stored: [u64; 2],
+    /// The `JobEntry.command` excerpt, built once at admission with
+    /// storage's `command_excerpt` (the one owner).
+    excerpt: String,
 }
 impl Job {
     fn new(
@@ -433,14 +441,13 @@ impl Job {
             sequence: None,
             intent_ms: 0,
             stored: [0; 2],
+            excerpt: String::new(),
         }
     }
 }
 
 struct Retired {
     job: Id,
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
-    // submit reads it (J34-E)
     digest: [u8; 32],
     origin: Origin,
     agent: AgentKey,
@@ -448,6 +455,10 @@ struct Retired {
     sequence: Option<u64>,
     intent_ms: u64,
     outcome: Outcome,
+    /// The committed kind 28, so a result renders the settled facts without
+    /// a journal read; `None` for a restart settlement.
+    settled: Option<Box<JobSettled>>,
+    excerpt: String,
 }
 
 /// Fibonacci pacing: the step and the next time. The controller's
@@ -621,7 +632,6 @@ impl JobController {
 
     // ----- Admission -----
 
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
     pub(crate) fn submit(&mut self, request: StartRequest, _now: Instant) -> Admission {
         let id = request.origin.job_id();
         if let Some(job) = self.jobs.get(&id) {
@@ -656,6 +666,7 @@ impl JobController {
             secret_command,
             redaction,
             duplicate_digest,
+            stored_command,
         } = request;
         let mut job = Job::new(
             id,
@@ -666,6 +677,7 @@ impl JobController {
             JobState::Queued,
         );
         job.profile = profile;
+        job.excerpt = journal::command_excerpt(&stored_command);
         job.body = Some(Body {
             scope,
             profile,
@@ -692,7 +704,6 @@ impl JobController {
 
     /// Jobs with a kind 26 (or about to get one) and no committed kind 28,
     /// plus person waiters: the 64-job bound.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
     fn unsettled(&self) -> usize {
         self.jobs
             .values()
@@ -986,7 +997,6 @@ impl JobController {
     /// The owner's EX11 effective value of a project, read when a slot is
     /// granted to a model-origin queue head. The owner keeps the one copy
     /// of the setting; the closure reads it.
-    #[cfg_attr(not(test), allow(dead_code))] // J34-E adds the production caller
     pub(crate) fn set_execution(&mut self, check: Box<dyn Fn(Id) -> bool>) {
         self.execution = Some(check);
         self.dirty = true;
@@ -1313,7 +1323,12 @@ impl JobController {
             project: job.project,
             sequence: job.sequence,
             intent_ms: job.intent_ms,
-            outcome: job.settled.map_or(Outcome::Interrupted, |s| s.outcome),
+            outcome: job
+                .settled
+                .as_ref()
+                .map_or(Outcome::Interrupted, |s| s.outcome),
+            settled: job.settled.filter(|_| !job.recovered),
+            excerpt: job.excerpt,
         });
     }
 
@@ -1810,7 +1825,8 @@ impl JobController {
         }
     }
 
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
+    /// What the controller knows of one job (tests and the harness).
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn status(&self, job: Id) -> Option<JobStatus> {
         if let Some(j) = self.jobs.get(&job) {
             let text = j.block.map(|reason| {
@@ -1861,7 +1877,6 @@ impl JobController {
     }
 }
 
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 fn duplicate(existing: [u8; 32], proposed: [u8; 32], job: Id) -> Admission {
     if existing == proposed {
         Admission::Existing { job }

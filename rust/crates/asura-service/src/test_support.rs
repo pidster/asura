@@ -456,6 +456,7 @@ impl JobHarness {
     }
 
     /// Steps until `done` holds; `limit` is the test's own budget.
+    #[track_caller]
     pub fn until(
         &mut self,
         limit: Duration,
@@ -467,6 +468,7 @@ impl JobHarness {
                 return Ok(());
             }
             if Instant::now() >= end {
+                eprintln!("harness limit at {}", std::panic::Location::caller());
                 return Err("harness limit reached".into());
             }
             self.step();
@@ -685,6 +687,7 @@ impl JobHarness {
         digest.update(pending.command.as_bytes());
         digest.update([0]);
         digest.update(b".");
+        let stored = pending.command.clone();
         let request = crate::job_controller::StartRequest {
             origin: pending.origin,
             agent: crate::job_controller::AgentKey {
@@ -705,6 +708,7 @@ impl JobHarness {
             secrets: pending.secrets,
             secret_command: None,
             duplicate_digest: digest.finalize().into(),
+            stored_command: stored,
         };
         let admission = self
             .owner

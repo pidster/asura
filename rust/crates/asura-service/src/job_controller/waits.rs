@@ -12,10 +12,8 @@
 //! controller poll; ended waits queue for `drain_waits`. At most one agent
 //! wait per agent (AE-03) and `CLIENT_WAITS` client waits exist.
 //!
-//! The conversation owner (J34-E, agent waits) and the job control handler
-//! (J4-R, client waits) are the production callers; until they land only
-//! the unit tests call these.
-#![cfg_attr(not(test), allow(dead_code))]
+//! The conversation owner (agent waits) and the job control handler
+//! (client waits) are the callers.
 use super::*;
 use journal::{JobRunState, OutputStream};
 

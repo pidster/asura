@@ -9,16 +9,13 @@
 //! result never holds output text (PC12).
 //!
 //! No I/O, no clock, no allocation beyond the bounded result text.
-#![cfg_attr(not(test), allow(dead_code))] // J34-E renders results with it.
 
 use crate::tools::MAX_RESULT_BYTES;
 use asura_platform::secrets::WHOLE_COMMAND_NOTICE;
-use asura_platform::secrets::json::{self, Value};
 use asura_storage::authority::conversation::{
     self as journal, CaptureReason, Id, JobBlockReason, JobCaptureState, JobOrigin, JobOutcome,
     JobPage, JobPageState, JobPauseReason, JobReason, JobResult, JobResultBody, JobResultOutcome,
-    JobRunState, JobSettled, JobSnapshot, MAX_JOB_PAGE, OutputStream, ToolCall, ToolOperation,
-    WaitEnd,
+    JobRunState, JobSettled, JobSnapshot, MAX_JOB_PAGE, OutputStream, ToolOperation, WaitEnd,
 };
 use sha2::{Digest, Sha256};
 
@@ -65,7 +62,8 @@ pub(crate) struct JobView<'a> {
     /// The sequence of the job's kind 26 frame (the `list` cursor, J3-E5).
     pub intent_sequence: u64,
     /// The stored, redacted command: kind 14's `command` for a model job
-    /// ([`exec_cmd_command`]), the person input's record for a person job.
+    /// (storage's `exec_cmd_command`), the person input's record for a
+    /// person job.
     pub command: &'a str,
     /// Kind 14 exec_cmd flag bit 1 (SL7 whole-command): `command` is the
     /// display text and the job ran from the whole-command variable.
@@ -558,10 +556,19 @@ pub(crate) fn capture_text(facts: &JobSettled) -> String {
     }
 }
 
-/// Capture reasons 1-6 have no prose in the design; their stored names
-/// are shown.
+/// The prose of a capture reason (model result text, capture reason
+/// texts). The person packet that adds reason 7 `closed_after_cancel`
+/// (P2) adds its text, `output capture stopped after the shell exited`.
 fn capture_reason_text(reason: CaptureReason) -> &'static str {
-    reason.as_str()
+    match reason {
+        CaptureReason::None => "none",
+        CaptureReason::StorageFault => "output storage failed",
+        CaptureReason::Quota => "output quota full",
+        CaptureReason::Enospc => "disk full",
+        CaptureReason::DetectorFault => "secret detection failed",
+        CaptureReason::DiscardedAfterCancel => "output after the cancel was discarded",
+        CaptureReason::SettlementUnconfirmed => "capture settlement not confirmed",
+    }
 }
 
 fn page_state_text(state: JobPageState) -> &'static str {
@@ -698,22 +705,6 @@ pub(crate) fn command_excerpt(command: &str) -> String {
     excerpt
 }
 
-/// The stored, redacted `command` of an exec_cmd kind 14 (field 14). For a
-/// whole-command call it is the display text (SL7). `None` when the record
-/// holds no parsable command.
-pub(crate) fn exec_cmd_command(call: &ToolCall) -> Option<String> {
-    if call.tool_operation != Some(ToolOperation::ExecCmd) {
-        return None;
-    }
-    let Ok(Value::Object(members)) = json::parse(&call.arguments) else {
-        return None;
-    };
-    members.into_iter().find_map(|(key, value)| match value {
-        Value::String(text) if key == "command" => Some(text),
-        _ => None,
-    })
-}
-
 /// The model's read cursors of one turn (J3-E4), rebuilt from the turn's
 /// kind 29 page results; a new turn starts every cursor at 0. Bounded by
 /// the turn's 200 calls: at most one entry per job and stream.
@@ -760,9 +751,7 @@ impl TurnCursors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asura_storage::authority::conversation::{
-        ArgumentForm, JobListEntry, ToolCallSource, ToolDecision,
-    };
+    use asura_storage::authority::conversation::JobListEntry;
 
     const H: &str = "7f3a09c2e4b15d68a0c3f1e2d4b5a697";
     const H2: &str = "0b44d1e9a6c27f30e85d9a1c3b6f2e47";
@@ -1234,13 +1223,33 @@ mod tests {
             (JobCaptureState::Complete, CaptureReason::None, "complete"),
             (
                 JobCaptureState::Incomplete,
+                CaptureReason::StorageFault,
+                "incomplete: output storage failed",
+            ),
+            (
+                JobCaptureState::Incomplete,
                 CaptureReason::Quota,
-                "incomplete: quota",
+                "incomplete: output quota full",
+            ),
+            (
+                JobCaptureState::Incomplete,
+                CaptureReason::Enospc,
+                "incomplete: disk full",
+            ),
+            (
+                JobCaptureState::Incomplete,
+                CaptureReason::DetectorFault,
+                "incomplete: secret detection failed",
             ),
             (
                 JobCaptureState::Incomplete,
                 CaptureReason::DiscardedAfterCancel,
-                "incomplete: discarded_after_cancel",
+                "incomplete: output after the cancel was discarded",
+            ),
+            (
+                JobCaptureState::Incomplete,
+                CaptureReason::SettlementUnconfirmed,
+                "incomplete: capture settlement not confirmed",
             ),
             (
                 JobCaptureState::Unconfirmed,
@@ -1801,42 +1810,6 @@ mod tests {
         assert_eq!(command_excerpt(&wide), format!("{}…", "é".repeat(100)));
         let odd = format!("a{}", "é".repeat(100));
         assert_eq!(command_excerpt(&odd), format!("a{}…", "é".repeat(99)));
-    }
-
-    /// The stored command comes from the kind 14 arguments only.
-    #[test]
-    fn exec_cmd_command_reads_the_stored_kind_14_command() {
-        let mut call = ToolCall {
-            operation: [1; 16],
-            generation: 1,
-            ordinal: 1,
-            source: ToolCallSource::ProviderJson,
-            name: "exec_cmd".into(),
-            name_bytes: 8,
-            tool_operation: Some(ToolOperation::ExecCmd),
-            decision: ToolDecision::Run,
-            fault: None,
-            reason: None,
-            form: ArgumentForm::Canonical,
-            arguments_bytes: 0,
-            arguments: r#"{"command":"echo '$ASURA_SECRET_1'","cwd":"."}"#.into(),
-            number_kinds: vec![],
-            unnumbered: 0,
-            rule_set_revision: 1,
-            rule_set_digest: [0; 32],
-            command_cut: false,
-            whole_command: false,
-            refusal: None,
-        };
-        assert_eq!(
-            exec_cmd_command(&call).as_deref(),
-            Some("echo '$ASURA_SECRET_1'")
-        );
-        call.tool_operation = Some(ToolOperation::JobList);
-        assert_eq!(exec_cmd_command(&call), None);
-        call.tool_operation = Some(ToolOperation::ExecCmd);
-        call.arguments = "{".into();
-        assert_eq!(exec_cmd_command(&call), None);
     }
 
     /// `origin:` from kind 26 field 1.

@@ -120,6 +120,7 @@ impl PayloadPort for Payloads {
     fn stored(&self, job: Id) -> [u64; 2] {
         self.stored.get(&job).copied().unwrap_or_default()
     }
+    fn refresh_space(&mut self) {}
 }
 
 /// A private scratch home, never `~/.asura`.
@@ -620,6 +621,7 @@ impl H {
                 &[],
             ),
             duplicate_digest: [1; 32],
+            stored_command: command.into(),
         };
         let job = origin.job_id();
         self.env
@@ -1401,7 +1403,11 @@ fn live_list_works_without_the_journal() {
     let reply = listing(h.send(1, Body::JobList(query)));
     assert_eq!(reply.entries.len(), 1);
     assert_eq!(reply.entries[0].job_id.as_deref(), Some(&live[..]));
-    assert_eq!(reply.entries[0].command.as_deref(), Some(""));
+    // The live-only command excerpt from the controller's view.
+    assert_eq!(
+        reply.entries[0].command.as_deref(),
+        Some("cargo build --workspace")
+    );
     let reply = listing(h.send(1, Body::JobList(list(1, Some(P1), None))));
     assert_eq!(reply.error.as_deref(), Some(wire::error::UNAVAILABLE));
     let reply = detail(h.send(1, inspect(live, None)));

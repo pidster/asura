@@ -1215,6 +1215,9 @@ pub struct ExecutionScope {
 pub enum Output {
     File(asura_platform::ProjectPage),
     Directory(asura_platform::ProjectListing),
+    /// The project identity recheck alone (a `job` command): the project
+    /// is the one the turn was admitted for.
+    Checked,
 }
 #[derive(Debug, Eq, PartialEq)]
 pub enum ExecutionError {
@@ -1310,6 +1313,39 @@ impl Executor {
                     .map(Output::Directory)
                     .map_err(ExecutionError::Host),
             }
+        })
+    }
+    /// The project identity recheck that every `job` command runs first
+    /// (tool-job-controller.md, the job tool): the same open and compare as
+    /// a project read, on the same worker, with no read. `Changed` means
+    /// the project was replaced. The conversation owner must commit the
+    /// call's kind 14 first.
+    pub fn recheck(
+        &mut self,
+        call: Call,
+        grant: Grant,
+        destination: Destination,
+        scope: ExecutionScope,
+    ) -> Result<(), ExecutionError> {
+        if self.work.is_some() {
+            return Err(ExecutionError::Rejected(Rejection::Busy));
+        }
+        validate(&call, &grant, &destination).map_err(ExecutionError::Rejected)?;
+        if !matches!(call.arguments, Arguments::Job(_)) || scope.project != grant.project {
+            return Err(ExecutionError::Rejected(Rejection::Denied));
+        }
+        self.spawn(move |cancelled| {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ExecutionError::Rejected(Rejection::Cancelled));
+            }
+            let project = asura_platform::ProjectIdentity::open(&scope.path, &scope.boundary)
+                .map_err(|_| ExecutionError::Host(asura_platform::ProjectReadError::UnsafePath))?;
+            if project.device != scope.device || project.inode != scope.inode {
+                return Err(ExecutionError::Host(
+                    asura_platform::ProjectReadError::Changed,
+                ));
+            }
+            Ok(Output::Checked)
         })
     }
     fn spawn(

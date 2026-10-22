@@ -23,7 +23,6 @@
 //! per attachment and at most 32 attachments; `jobs.clientViewers` pending
 //! `JobRead`s, `JobObserve`s and parked `JobList`s (`busy` beyond); the page
 //! pool's queue of 8 (`busy`); 64 remembered retain outcomes.
-#![cfg_attr(not(test), allow(dead_code))] // J34-E routes requests to it.
 
 use crate::job_controller::{
     CancelReply, JobController, JobReason, JobView, Requester, WaitDone, WaitEnding, WaitKey,
@@ -526,9 +525,10 @@ fn entry_from_listing(listing: &journal::JobListing, view: Option<&JobView>) -> 
 }
 
 /// An entry from the controller alone, while the journal is unavailable
-/// (J4 failure handling: the live list works from memory). It has no
-/// command text and no retention state. `None` for a job whose kind 26
-/// has not committed or that settled.
+/// (J4 failure handling: the live list works from memory). Its command is
+/// the excerpt the controller built at admission (live-only command
+/// excerpt); it has no retention state. `None` for a job whose kind 26 has
+/// not committed or that settled.
 fn entry_from_view(view: &JobView) -> Option<pb::JobEntry> {
     if view.settled() {
         return None;
@@ -537,7 +537,7 @@ fn entry_from_view(view: &JobView) -> Option<pb::JobEntry> {
         job_id: Some(view.job.to_vec()),
         project_id: Some(view.project.to_vec()),
         conversation_id: Some(view.agent.conversation.to_vec()),
-        command: Some(String::new()),
+        command: Some(view.excerpt.clone()),
         intent_unix_ms: Some(view.intent_ms),
         sequence: Some(view.sequence.filter(|s| *s > 0)?),
         cancel_requested: Some(false),
@@ -1699,7 +1699,8 @@ impl JobControl {
         }
     }
 
-    /// Pending requests, for tests and the owner's idle check.
+    /// Pending requests (tests).
+    #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
         self.requests.len()
     }
@@ -1812,7 +1813,8 @@ impl JobControl {
         None
     }
 
-    /// Journal work waits for the owner's ticket.
+    /// Journal work waits for the owner's ticket (tests).
+    #[cfg(test)]
     pub(crate) fn has_journal_work(&self) -> bool {
         !self.outbox.is_empty()
     }

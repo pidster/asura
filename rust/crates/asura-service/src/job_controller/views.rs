@@ -5,9 +5,7 @@
 //! reactor (AE-01): at most the 64 unsettled jobs and the 64 remembered
 //! settled jobs.
 //!
-//! The conversation owner (J34-E) and the job control handler (J4-R) are
-//! the production callers; until they land only the unit tests call these.
-#![cfg_attr(not(test), allow(dead_code))]
+//! The conversation owner and the job control handler are the callers.
 use super::*;
 use journal::{JobBlockReason, JobListEntry, JobRunState, JobScope, JobSnapshot};
 
@@ -35,6 +33,10 @@ pub(crate) struct JobView {
     pub cancel: Option<JobReason>,
     /// The kind 28 outcome once it is built.
     pub outcome: Option<Outcome>,
+    /// The `JobEntry.command` excerpt built at admission (storage's
+    /// `command_excerpt`); empty for a recovered job, whose excerpt comes
+    /// from a journal read.
+    pub excerpt: String,
 }
 impl JobView {
     /// Kind 28 committed: the settled facts are in the journal.
@@ -94,7 +96,22 @@ impl JobController {
             text: None,
             cancel: None,
             outcome: Some(r.outcome),
+            excerpt: r.excerpt.clone(),
         })
+    }
+
+    /// The committed kind 28 of a job this controller holds or remembers;
+    /// `None` before kind 28 commits or for a job it does not know.
+    pub(crate) fn settled_facts(&self, job: Id) -> Option<&JobSettled> {
+        match self.jobs.get(&job) {
+            Some(j) if j.state == JobState::Recorded => j.settled.as_deref(),
+            Some(_) => None,
+            None => self
+                .retired
+                .iter()
+                .find(|r| r.job == job)
+                .and_then(|r| r.settled.as_deref()),
+        }
     }
 
     /// The live jobs of `scope` (every project when `None`), newest first
@@ -192,6 +209,7 @@ impl JobController {
             text,
             cancel: j.cancel.map(|t| t.reason),
             outcome: j.settled.as_ref().map(|s| s.outcome),
+            excerpt: j.excerpt.clone(),
         }
     }
 

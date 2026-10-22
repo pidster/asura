@@ -78,6 +78,7 @@ impl Fixture {
             tool_executor: tools::Executor::default(),
             tool_cache: vec![],
             secret_key: zeroize::Zeroizing::new([3; 32]),
+            cursors: Default::default(),
         };
         let mut fixture = Self {
             path,
@@ -119,6 +120,9 @@ impl Fixture {
                 foreground: VecDeque::new(),
                 dispatching_foreground: false,
                 jobs: Default::default(),
+                execution: Default::default(),
+                rules: Default::default(),
+                outlived: VecDeque::new(),
                 #[cfg(feature = "test-support")]
                 fixture: None,
             },
@@ -213,7 +217,8 @@ pub(super) fn decided(owner: &Owner, value: &mp::ToolCall) -> LiveTool {
         value,
         digest,
         owner.replay.as_deref(),
-        asura_platform::secrets::detection(),
+        Some(asura_platform::secrets::detection()),
+        true,
     )
 }
 /// Every kind 14 a test produces must be accepted by the real codec.
@@ -243,7 +248,7 @@ fn propose(fixture: &mut Fixture, value: mp::ToolCall) {
     let replay = owner.replay.clone();
     let active = owner.active.as_mut().unwrap();
     active.model.tool_test_pending(value.ordinal.unwrap());
-    Owner::tool_call(active, value, Instant::now(), replay.as_deref());
+    Owner::tool_call(active, value, Instant::now(), replay.as_deref(), true);
 }
 fn fresh_turn(fixture: &mut Fixture) {
     let active = fixture.active();
@@ -721,10 +726,9 @@ fn unknown_denied_and_limit_decisions_render_from_codes() {
 
 /// SL7 (owner layer): a single-quoted value is no longer refused. The record
 /// holds the display text and never the value. Bit 1 and the fallback reason
-/// belong only to an admitted `run`; until J34-E an exec_cmd call is
-/// `denied` (TJ-P3 step 4), so it has neither, and no live secret is kept. A
-/// secret in the working directory is still refused, with fields 21-23 and
-/// no value.
+/// belong to the `run` decision; the typed call holds the whole-command
+/// form. A secret in the working directory is still refused, with fields
+/// 21-23 and no value.
 #[test]
 fn whole_command_exec_cmd_is_not_refused_and_kept_refusals_remain() {
     let mut fixture = Fixture::new();
@@ -734,9 +738,13 @@ fn whole_command_exec_cmd_is_not_refused_and_kept_refusals_remain() {
     let text = serde_json::json!({ "command": format!("echo '{token}'") }).to_string();
     propose(&mut fixture, wire(1, "exec_cmd", &text));
     let record = pending_record(&mut fixture);
-    assert_eq!(record.decision, journal::ToolDecision::Denied);
+    assert_eq!(record.decision, journal::ToolDecision::Run);
     assert_eq!(record.reason, None);
-    assert!(!record.whole_command && record.refusal.is_none() && !record.command_cut);
+    assert!(record.whole_command && !record.command_cut);
+    assert_eq!(
+        record.refusal.map(|r| r.code),
+        Some(asura_platform::secrets::RefusalCode::SecretSingleQuoted)
+    );
     assert_eq!(record.form, journal::ArgumentForm::Canonical);
     assert_eq!(record.arguments, "{\"command\":\"echo '$ASURA_SECRET_1'\"}");
     assert_eq!(
@@ -745,14 +753,14 @@ fn whole_command_exec_cmd_is_not_refused_and_kept_refusals_remain() {
     );
     assert!(!format!("{record:?}").contains(&token));
     let tool = fixture.active().tool.as_ref().unwrap();
-    assert!(tool.call.is_none());
+    assert!(matches!(
+        &tool.call.as_ref().unwrap().arguments,
+        tools::Arguments::ExecCmd { command, .. }
+            if command == asura_platform::secrets::WHOLE_COMMAND
+    ));
     fixture.acknowledge(Job::ToolIntent);
-    let results = sent(&mut fixture);
-    assert_eq!(results.len(), 1);
-    assert_eq!(
-        (results[0].status, results[0].text.as_deref()),
-        (Some(2), Some("denied"))
-    );
+    // The job's result is its kind 29; nothing is sent at the intent.
+    assert!(sent(&mut fixture).is_empty());
 
     // A kept refusal: the working directory holds a secret.
     let mut fixture = Fixture::new();
@@ -922,7 +930,14 @@ fn tcr_u10_rule_set_unavailable_retains_nothing_and_refuses() {
             }
             let value = wire(ordinal, name, text);
             let active = fixture.owner.active.as_ref().unwrap();
-            let tool = Owner::decide(active, &value, [7; 32], None, Err(SelfCheckError::Set));
+            let tool = Owner::decide(
+                active,
+                &value,
+                [7; 32],
+                None,
+                Some(Err(SelfCheckError::Set)),
+                true,
+            );
             let record = &tool.record;
             assert_eq!(record.decision, expected, "{name} {ordinal} {cancelled}");
             assert_eq!(
@@ -1497,9 +1512,11 @@ fn j1t_03_overlong_rewrite_is_not_refused() {
     assert!(long.len() <= 8192);
     propose(&mut fixture, exec_cmd_wire(1, &long));
     let record = pending_record(&mut fixture);
-    // Until J34-E an exec_cmd call is `denied` (TJ-P3 step 4), not refused.
-    assert_eq!(record.decision, journal::ToolDecision::Denied);
-    assert!(record.refusal.is_none());
+    // An overlong rewrite runs from the whole-command variable (SO5) as a
+    // job (J3); it is not refused, and the fallback reason is no kept code.
+    assert_eq!(record.decision, journal::ToolDecision::Run);
+    assert!(record.whole_command);
+    assert!(record.refusal.is_some_and(|r| !r.code.kept()));
     assert!(encodes(&record).len() <= 65_050);
     assert!(!record.arguments.contains("Sup3rS3cret"));
     assert!(record.arguments.contains("admin:$ASURA_SECRET_1 x;"));
@@ -1507,9 +1524,9 @@ fn j1t_03_overlong_rewrite_is_not_refused() {
 }
 
 /// J1T-04 (owner layer, memory inspection): the call is recorded with the
-/// rewrite (`denied` until J34-E, TJ-P3 step 4). Neither the live call, the
-/// record nor the cache holds the raw command; an equal resend matches and a
-/// different value with the same rewrite is a protocol fault.
+/// rewrite and runs as a job (J3). Neither the typed call, the record nor
+/// the cache holds the raw command; the value lives only in the start's
+/// secrets until the controller takes them.
 #[test]
 fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     let mut fixture = Fixture::new();
@@ -1520,7 +1537,7 @@ fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     let first = exec_cmd_wire(1, &raw);
     propose(&mut fixture, first.clone());
     let record = pending_record(&mut fixture);
-    assert_eq!(record.decision, journal::ToolDecision::Denied);
+    assert_eq!(record.decision, journal::ToolDecision::Run);
     assert_eq!(record.reason, None);
     assert_eq!(
         record.number_kinds,
@@ -1528,13 +1545,17 @@ fn j1t_04_live_tool_and_cache_hold_no_raw_command() {
     );
     assert!(record.arguments.contains("ASURA_SECRET_1"));
     let tool = fixture.active().tool.as_ref().unwrap();
-    assert!(tool.call.is_none(), "denied keeps no secret");
+    assert!(
+        !format!("{:?}", tool.call).contains(&token),
+        "the typed call keeps the rewrite"
+    );
+    assert!(format!("{:?}", tool.call).contains("ASURA_SECRET_1"));
+    assert!(tool.exec.is_some(), "the start waits for its submit");
     assert!(!format!("{:?}", tool.record).contains(&token));
     fixture.acknowledge(Job::ToolIntent);
-    let active = fixture.active();
-    assert_eq!(active.tool_cache.len(), 1);
-    assert!(!format!("{:?}", active.tool_cache).contains(&token));
-    assert_eq!(active.tool_cache[0].2.text.as_deref(), Some("denied"));
+    // A `run` call is cached only with its kind 29 result; an equal
+    // resend of the pending call matches it.
+    assert!(fixture.active().tool_cache.is_empty());
     propose(&mut fixture, first);
     assert!(fixture.active().failure_reason.is_none());
     let other = ["ghp_", &"qQ2".repeat(12)].concat();
@@ -1932,13 +1953,12 @@ fn tcr_i11_two_hundred_calls_run_and_the_next_is_limit() {
 fn tcr_u13_replay_exec_cmd_ids_equal_live_derivation() {
     let mut journaled = Journaled::new();
     propose(&mut journaled, exec_cmd_wire(1, "printf ok"));
-    // Until J34-E the decision is `denied`; the same record with decision
-    // `run` is what an admitted call commits.
-    let mut record = journaled.active().tool.as_ref().unwrap().record.clone();
-    assert_eq!(record.decision, journal::ToolDecision::Denied);
-    record.decision = journal::ToolDecision::Run;
-    record.reason = None;
+    // The `run` record an admitted call commits; this harness has no
+    // controller, so the start is not submitted.
+    let record = journaled.active().tool.as_ref().unwrap().record.clone();
+    assert_eq!(record.decision, journal::ToolDecision::Run);
     let mut tool = journaled.active().tool.take().unwrap();
+    tool.exec = None;
     tool.record = record;
     let call = tools::Call {
         operation: journaled.active().turn.operation,

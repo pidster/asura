@@ -104,31 +104,11 @@ pub(crate) fn block_text(reason: BlockReason, counts: &Counts) -> String {
 
 /// Why a submission was refused before any record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))] // J34-E and J4-R add the production caller
 pub(crate) enum BusyReason {
     QueueFull,
     JobsFull,
     Closed,
 }
-#[cfg_attr(not(test), allow(dead_code))] // J34-E and J4-T show the code and text
-impl BusyReason {
-    pub(crate) fn code(self) -> &'static str {
-        match self {
-            Self::QueueFull => "queue_full",
-            Self::JobsFull => "jobs_full",
-            Self::Closed => "closed",
-        }
-    }
-    /// The brief text; `queued_agent` is the configured agent queue bound.
-    pub(crate) fn text(self, queued_agent: u32) -> String {
-        match self {
-            Self::QueueFull => format!("busy: {queued_agent} jobs already waiting for this agent"),
-            Self::JobsFull => format!("busy: {MAX_UNSETTLED} jobs not yet settled"),
-            Self::Closed => "busy: service is stopping".into(),
-        }
-    }
-}
-
 pub(crate) fn audit_requester(requester: JobRequester) -> record::JobRequester {
     match requester {
         JobRequester::Model => record::JobRequester::Model,

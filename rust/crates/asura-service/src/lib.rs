@@ -12,6 +12,7 @@ mod job_control;
 mod job_controller;
 mod job_text;
 mod payload_owner;
+mod secret_rules;
 pub mod secret_store;
 // Real service fixtures share the canonical process-wide writer owner.
 #[cfg(test)]
@@ -257,6 +258,8 @@ impl Dispatcher {
                         pb::Capability::Config as i32,
                         pb::Capability::Conversation as i32,
                         pb::Capability::Setup as i32,
+                        // J3 and J4 are enabled together (EN1).
+                        pb::Capability::Jobs as i32,
                     ],
                     max_frame_bytes: Some(asura_control::MAX_FRAME_BYTES as u32),
                 })),
@@ -640,6 +643,11 @@ where
                 if let Some(quota) = job.take_journal_quota() {
                     conversations.set_journal_quota(quota);
                 }
+                // A persisted execution change applies in this reactor step
+                // (EX11, ES-Q1).
+                if let Some(setting) = job.take_execution() {
+                    conversations.set_execution(setting);
+                }
                 if job.settled() {
                     config_job = None;
                 }
@@ -778,6 +786,11 @@ where
                         }
                         let (ticket, request) = client.validation.as_ref()?;
                         let priority = match request.body {
+                            // Job requests: `JobCancel` 0, `JobList` and
+                            // `JobObserve` 2, the rest 1 (J4 routing).
+                            Some(ref body) if job_control::handles(body) => {
+                                job_control::priority(body).unwrap_or(1)
+                            }
                             Some(
                                 pb::envelope::Body::Stop(_)
                                 | pb::envelope::Body::ConversationCancel(_),
@@ -1143,6 +1156,9 @@ where
             }
             if let Some(quota) = job.take_journal_quota() {
                 conversations.set_journal_quota(quota);
+            }
+            if let Some(setting) = job.take_execution() {
+                conversations.set_execution(setting);
             }
             if job.settled() {
                 config_job = None;
