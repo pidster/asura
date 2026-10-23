@@ -7,6 +7,7 @@ pub mod events;
 mod journal_io;
 pub use audit_io::{AuditArchive, AuditDirectory, AuditFile, audit_archive_name};
 mod model_process;
+pub mod pacing;
 pub mod payload_io;
 pub use model_process::ModelProcess;
 pub mod git_observer;
