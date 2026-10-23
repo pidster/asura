@@ -365,8 +365,8 @@ fn notice_fixture() -> (ExecCmdJob, std::os::fd::OwnedFd) {
             unconfirmed: None,
             escapees: 0,
             terminal: None,
-            out: Capture::new(out, Stream::Stdout),
-            err: Capture::new(err, Stream::Stderr),
+            out: Some(Capture::new(out, Stream::Stdout)),
+            err: Some(Capture::new(err, Stream::Stderr)),
             sink: Box::new(TestSink {
                 room: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(512 * 1024)),
                 ..TestSink::default()
@@ -374,6 +374,7 @@ fn notice_fixture() -> (ExecCmdJob, std::os::fd::OwnedFd) {
             stop: None,
             cleanup: None,
             job_id: [7; 16],
+            profile: Profile::Model1,
             alternate: false,
             fault: false,
         },
@@ -432,8 +433,8 @@ fn settled_setup_failure_is_never_a_successful_exec_cmd_exit() {
 fn j1t_15_interests_follow_sink_room_and_cancel() {
     let (job, _write) = notice_fixture();
     let mut job = job;
-    job.out.eof = false;
-    job.err.eof = false;
+    job.out.as_mut().unwrap().eof = false;
+    job.err.as_mut().unwrap().eof = false;
     let room = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(READ_BUFFER));
     job.sink = Box::new(TestSink {
         room: room.clone(),
@@ -452,8 +453,8 @@ fn j1t_15_interests_follow_sink_room_and_cancel() {
 #[test]
 fn j1t_07_no_output_limit_producer() {
     let (mut job, _write) = notice_fixture();
-    job.out.total = 80 * 1024 * 1024;
-    job.err.total = 80 * 1024 * 1024;
+    job.out.as_mut().unwrap().total = 80 * 1024 * 1024;
+    job.err.as_mut().unwrap().total = 80 * 1024 * 1024;
     let _ = job.poll(Instant::now());
     assert_eq!(job.stop, None, "output never requests a stop");
     let id = [9; 16];
@@ -492,7 +493,7 @@ fn pump(job: &mut ExecCmdJob) -> Result<(), ExecCmdError> {
     let limit = Instant::now() + Duration::from_secs(10);
     loop {
         job.poll(Instant::now())?;
-        if job.status_eof && job.out.eof && job.err.eof {
+        if job.status_eof && job.out.as_mut().unwrap().eof && job.err.as_mut().unwrap().eof {
             return Ok(());
         }
         assert!(Instant::now() < limit, "fixture pipes did not reach EOF");
@@ -674,21 +675,37 @@ fn ec_u2_escapee_notice_order_faults() {
     assert!(!job.settled());
 }
 
-/// J2T-05 unit: the profile token is exact; P1's person tokens are not
-/// accepted yet; `model-1` has the 500 ms grace.
+/// J2T-05 unit: the profile token is exact; P1 adds `person-1` and
+/// `person-outside-1` with the 2 s grace (PC8); `model-1` keeps 500 ms.
 #[test]
 fn j2t_05_profile_token_parse() {
-    assert_eq!(Profile::parse("model-1"), Some(Profile::Model1));
-    assert_eq!(Profile::Model1.token(), "model-1");
-    assert_eq!(Profile::Model1.grace_ns(), 500_000_000);
+    for (token, profile, grace, sandboxed) in [
+        ("model-1", Profile::Model1, 500_000_000, true),
+        ("person-1", Profile::Person1, 2_000_000_000, true),
+        (
+            "person-outside-1",
+            Profile::PersonOutside1,
+            2_000_000_000,
+            false,
+        ),
+    ] {
+        assert_eq!(Profile::parse(token), Some(profile));
+        assert_eq!(profile.token(), token);
+        assert_eq!(profile.grace_ns(), grace);
+        assert_eq!(profile.sandboxed(), sandboxed);
+        assert_eq!(profile.person(), profile != Profile::Model1);
+    }
     for token in [
         "",
         "model-2",
         "Model-1",
         "model-1 ",
         "model",
-        "person-1",
-        "person-outside-1",
+        "person",
+        "person-2",
+        "person-outside",
+        "Person-1",
+        "person-outside-1\0",
     ] {
         assert_eq!(Profile::parse(token), None, "{token:?}");
     }
@@ -1024,8 +1041,8 @@ fn j2t_25_pre_notice_token_release_needs_every_condition() {
         job.exited = exited;
         job.status_eof = status_eof;
         job.status_received = !no_byte;
-        job.out.eof = out_eof;
-        job.err.eof = err_eof;
+        job.out.as_mut().unwrap().eof = out_eof;
+        job.err.as_mut().unwrap().eof = err_eof;
         job.fault = true;
         assert!(!job.settled(), "{label}");
         let released = label == "all hold";
@@ -1055,7 +1072,7 @@ fn j2t_25_pre_notice_token_release_needs_every_condition() {
 /// errors are the expected protocol fault. Test limit only: 10 s.
 fn pump_faulted(job: &mut ExecCmdJob) {
     let limit = Instant::now() + Duration::from_secs(10);
-    while !(job.status_eof && job.out.eof && job.err.eof) {
+    while !(job.status_eof && job.out.as_mut().unwrap().eof && job.err.as_mut().unwrap().eof) {
         let _ = job.poll(Instant::now());
         assert!(Instant::now() < limit, "fixture pipes did not reach EOF");
         std::thread::sleep(Duration::from_millis(1));
@@ -1081,16 +1098,16 @@ fn j2t_25_pre_notice_token_release_through_the_pipes() {
     let f = Fixture::new();
     let (mut job, status) = notice_fixture();
     let (out, out_write) = spawn::pipe(false).unwrap();
-    job.out = Capture::new(out, Stream::Stdout);
+    job.out = Some(Capture::new(out, Stream::Stdout));
     job.cleanup = Some(scratch_token(&f));
     drop(status);
     let limit = Instant::now() + Duration::from_secs(10);
-    while !(job.status_eof && job.err.eof) {
+    while !(job.status_eof && job.err.as_mut().unwrap().eof) {
         let _ = job.poll(Instant::now());
         assert!(Instant::now() < limit, "fixture pipes did not reach EOF");
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(job.faulted() && !job.out.eof);
+    assert!(job.faulted() && !job.out.as_mut().unwrap().eof);
     assert!(job.release_pending());
     assert!(job.take_cleanup().is_none(), "stdout is still open");
     write_all(&out_write, b"late");
@@ -1141,7 +1158,11 @@ fn j2t_25_signal_death_before_any_notice_keeps_the_token() {
         Err(e) => panic!("{:?}", e.reason),
     };
     let limit = Instant::now() + Duration::from_secs(10);
-    while !(job.reaped && job.status_eof && job.out.eof && job.err.eof) {
+    while !(job.reaped
+        && job.status_eof
+        && job.out.as_mut().unwrap().eof
+        && job.err.as_mut().unwrap().eof)
+    {
         let _ = job.poll(Instant::now());
         assert!(Instant::now() < limit, "killed guardian did not end");
         std::thread::sleep(Duration::from_millis(1));
@@ -1157,4 +1178,862 @@ fn j2t_25_signal_death_before_any_notice_keeps_the_token() {
         .expect("the token stays")
         .run(Instant::now() + Duration::from_secs(2), &cancel)
         .unwrap();
+}
+
+/// A notice fixture for `profile`.
+fn feed_profile(profile: Profile, notices: &[Notice]) -> (ExecCmdJob, Result<(), ExecCmdError>) {
+    let (mut job, write) = notice_fixture();
+    job.profile = profile;
+    for n in notices {
+        let bytes = n.encode([7; 16]);
+        // SAFETY: fixed bytes into the owned fixture pipe, below PIPE_BUF.
+        assert_eq!(
+            unsafe { libc::write(write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) },
+            32
+        );
+    }
+    drop(write);
+    let result = pump(&mut job);
+    (job, result)
+}
+/// Kind 2 reasons 14 and 15 (escapee-control.md, guardian status notice
+/// extensions): valid shapes; after kind 6 only for `person-outside-1`;
+/// reason 12 never for it; none of 12, 14 or 15 without kind 6.
+#[test]
+fn p1_outside_reasons_follow_the_profile() {
+    let id = [9; 16];
+    for reason in [14, 15] {
+        let n = Notice::decode(&notice(2, reason, 1, true, 0).encode(id), id).unwrap();
+        assert_eq!(n.reason, reason);
+        assert!(Notice::decode(&notice(4, reason, 0, false, 0).encode(id), id).is_err());
+        assert!(Notice::decode(&notice(3, reason, 0, true, 0).encode(id), id).is_err());
+    }
+    assert!(Notice::decode(&notice(2, 16, 1, true, 0).encode(id), id).is_err());
+    let spawned = notice(1, 0, 0, false, 0);
+    let exited = notice(5, 0, 1, false, 0);
+    let report = notice(6, 0, 0, false, 2);
+    for reason in [14, 15] {
+        let (job, polled) = feed_profile(
+            Profile::PersonOutside1,
+            &[spawned, exited, report, notice(2, reason, 1, true, 0)],
+        );
+        assert_eq!(polled, Ok(()), "outside reason {reason}");
+        let settled = job.guardian_settled().unwrap();
+        assert_eq!(settled.escapees, 2);
+        assert_eq!(settled.output_held, reason == 15);
+        assert_eq!(settled.exit, Exit::Exited(0));
+        assert_eq!(job.result().unwrap().escapees, 2);
+    }
+    // No survivor: the lease reason, no kind 6.
+    let (job, polled) = feed_profile(
+        Profile::PersonOutside1,
+        &[spawned, exited, notice(2, 0, 1, true, 0)],
+    );
+    assert_eq!(polled, Ok(()));
+    assert!(!job.guardian_settled().unwrap().output_held);
+    for (label, profile, sequence) in [
+        (
+            "reason 12 for person-outside-1",
+            Profile::PersonOutside1,
+            vec![spawned, exited, report, notice(2, 12, 1, true, 0)],
+        ),
+        (
+            "reason 14 for model-1",
+            Profile::Model1,
+            vec![spawned, exited, report, notice(2, 14, 1, true, 0)],
+        ),
+        (
+            "reason 15 for person-1",
+            Profile::Person1,
+            vec![spawned, exited, report, notice(2, 15, 1, true, 0)],
+        ),
+        (
+            "reason 14 without kind 6",
+            Profile::PersonOutside1,
+            vec![spawned, exited, notice(2, 14, 1, true, 0)],
+        ),
+        (
+            "reason 15 without kind 6",
+            Profile::PersonOutside1,
+            vec![spawned, exited, notice(2, 15, 1, true, 0)],
+        ),
+        (
+            "plain settle after kind 6",
+            Profile::PersonOutside1,
+            vec![spawned, exited, report, notice(2, 0, 1, true, 0)],
+        ),
+    ] {
+        let (job, polled) = feed_profile(profile, &sequence);
+        assert_eq!(polled, Err(ExecCmdError::Protocol), "{label}");
+        assert!(job.guardian_settled().is_none(), "{label}");
+        assert!(job.result().is_none(), "{label}");
+    }
+    // `person-1` keeps reason 12 after kind 6.
+    let (job, polled) = feed_profile(
+        Profile::Person1,
+        &[spawned, exited, report, notice(2, 12, 1, true, 0)],
+    );
+    assert_eq!(polled, Ok(()));
+    assert_eq!(job.result().unwrap().escapees, 2);
+}
+/// OD2: after kind 2 reason 15 the job keeps capturing until EOF;
+/// `close_capture` is refused before the guardian settled, and afterwards
+/// closes both readers, which settles the job without EOF.
+#[test]
+fn p1_survivor_output_drains_until_eof_or_close_capture() {
+    let (mut job, write) = notice_fixture();
+    job.profile = Profile::PersonOutside1;
+    let (out, out_writer) = spawn::pipe(false).unwrap();
+    let (err, err_writer) = spawn::pipe(false).unwrap();
+    job.out = Some(Capture::new(out, Stream::Stdout));
+    job.err = Some(Capture::new(err, Stream::Stderr));
+    assert!(!job.close_capture(), "before any notice");
+    for n in [
+        notice(1, 0, 0, false, 0),
+        notice(5, 0, 1, false, 3),
+        notice(6, 0, 0, false, 1),
+        notice(2, 15, 1, true, 3),
+    ] {
+        let bytes = n.encode([7; 16]);
+        // SAFETY: fixed bytes into the owned fixture pipe.
+        assert_eq!(
+            unsafe { libc::write(write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) },
+            32
+        );
+    }
+    drop(write);
+    let limit = Instant::now() + Duration::from_secs(10);
+    while !job.status_eof {
+        job.poll(Instant::now()).unwrap();
+        assert!(Instant::now() < limit);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The survivor still writes: capture continues, the job is not settled.
+    // SAFETY: a fixed write to the owned fixture writer.
+    assert_eq!(
+        unsafe { libc::write(out_writer.as_raw_fd(), b"late".as_ptr().cast(), 4) },
+        4
+    );
+    job.poll(Instant::now()).unwrap();
+    let settled = job.guardian_settled().unwrap();
+    assert!(settled.output_held);
+    assert_eq!(settled.exit, Exit::Exited(3));
+    assert!(!job.settled(), "capture still open");
+    assert_eq!(job.interests().len(), 2, "both capture pipes stay polled");
+    assert!(job.close_capture());
+    assert!(job.capture_closed());
+    assert!(job.settled());
+    assert!(job.interests().is_empty());
+    let result = job.result().unwrap();
+    assert_eq!((result.exit_code, result.escapees), (Some(3), 1));
+    assert!(result.cleanup_confirmed);
+    drop((out_writer, err_writer));
+}
+
+/// Build an FD 11 frame by hand: roles, then (name, value) entries.
+fn raw_frame(roles: &[u8], entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut body = vec![roles.len() as u8];
+    body.extend_from_slice(roles);
+    body.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for (name, value) in entries {
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name);
+        body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        body.extend_from_slice(value);
+    }
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    frame
+}
+const PERSON_BASE: [(&[u8], &[u8]); 3] = [
+    (b"PATH", b"/usr/bin:/bin"),
+    (b"HOME", b"/Users/p"),
+    (b"TMPDIR", b"/var/folders/x/T/"),
+];
+/// PC-U50: the FD 11 frame codec in the guardian. Exact parse at each
+/// bound; a short frame, trailing bytes, a non-PC3 name or a missing HOME
+/// for `person-1`, a role table without the home first, nine roots, and
+/// every entry fault are `Invalid` (setup-failed reason 5).
+#[test]
+fn pc_u50_frame_codec_bounds_and_faults() {
+    use person::{RootRole, parse_frame};
+    let invalid = |label: &str, frame: &[u8], profile: Profile| {
+        assert_eq!(
+            parse_frame(frame, profile).err(),
+            Some(ExecCmdError::Invalid),
+            "{label}"
+        );
+    };
+    // Exact person-1 parse: roles and entries in order.
+    let mut entries = PERSON_BASE.to_vec();
+    entries.extend([
+        (&b"USER"[..], &b"p"[..]),
+        (b"LOGNAME", b"p"),
+        (b"TERM", b"dumb"),
+        (b"GIT_TERMINAL_PROMPT", b"0"),
+        (b"LANG", b"en_GB.UTF-8"),
+        (b"LC_ALL", b"C"),
+        (b"SSH_AUTH_SOCK", b"/tmp/agent.sock"),
+    ]);
+    let frame = raw_frame(&[1, 2, 3, 4, 4, 4, 4, 4], &entries);
+    let parsed = parse_frame(&frame, Profile::Person1).unwrap();
+    assert_eq!(
+        parsed.roles,
+        [
+            RootRole::Home,
+            RootRole::TempDir,
+            RootRole::Developer,
+            RootRole::Cache,
+            RootRole::Cache,
+            RootRole::Cache,
+            RootRole::Cache,
+            RootRole::Cache
+        ]
+    );
+    let got: Vec<&[u8]> = parsed.entries.iter().map(|e| e.as_slice()).collect();
+    assert_eq!(got[0], b"PATH=/usr/bin:/bin");
+    assert_eq!(got[9], b"SSH_AUTH_SOCK=/tmp/agent.sock");
+    assert_eq!(got.len(), 10);
+    // Outside bounds: 1,024 entries and 40,960 bytes exactly; the largest
+    // frame is within MAX_FRAME_BYTES.
+    let names: Vec<Vec<u8>> = (0..1024).map(|i| format!("V{i:04}").into_bytes()).collect();
+    let name_bytes: usize = names.iter().map(Vec::len).sum();
+    let value = vec![b'v'; (40_960 - name_bytes) / 1024];
+    let mut values: Vec<Vec<u8>> = vec![value; 1024];
+    let used: usize = name_bytes + values.iter().map(Vec::len).sum::<usize>();
+    values[0].extend(std::iter::repeat_n(b'v', 40_960 - used));
+    let full: Vec<(&[u8], &[u8])> = names
+        .iter()
+        .zip(&values)
+        .map(|(n, v)| (n.as_slice(), v.as_slice()))
+        .collect();
+    let frame = raw_frame(&[], &full);
+    assert!(frame.len() <= MAX_FRAME_BYTES);
+    assert_eq!(MAX_FRAME_BYTES, 47_119);
+    assert_eq!(
+        parse_frame(&frame, Profile::PersonOutside1)
+            .unwrap()
+            .entries
+            .len(),
+        1024
+    );
+    let mut over_bytes = values.clone();
+    over_bytes[1].push(b'v');
+    let over: Vec<(&[u8], &[u8])> = names
+        .iter()
+        .zip(&over_bytes)
+        .map(|(n, v)| (n.as_slice(), v.as_slice()))
+        .collect();
+    invalid(
+        "40,961 bytes",
+        &raw_frame(&[], &over),
+        Profile::PersonOutside1,
+    );
+    let mut too_many = full.clone();
+    too_many.push((b"EXTRA", b""));
+    let mut small: Vec<(&[u8], &[u8])> = names.iter().map(|n| (n.as_slice(), &b""[..])).collect();
+    small.push((b"EXTRA", b""));
+    invalid(
+        "1,025 entries",
+        &raw_frame(&[], &small),
+        Profile::PersonOutside1,
+    );
+    let long_name = vec![b'N'; 1024];
+    assert!(
+        parse_frame(
+            &raw_frame(&[], &[(&long_name, b"x")]),
+            Profile::PersonOutside1
+        )
+        .is_ok()
+    );
+    let longer = vec![b'N'; 1025];
+    invalid(
+        "name 1,025 bytes",
+        &raw_frame(&[], &[(&longer, b"x")]),
+        Profile::PersonOutside1,
+    );
+    // Short frames, trailing bytes, a length that disagrees.
+    let good = raw_frame(&[1, 2], &PERSON_BASE);
+    for cut in [0, 3, 4, 5, good.len() - 1] {
+        invalid(&format!("short at {cut}"), &good[..cut], Profile::Person1);
+    }
+    let mut trailing = good.clone();
+    trailing.push(0);
+    invalid("trailing byte", &trailing, Profile::Person1);
+    // person-1 name and role rules.
+    let mut other = PERSON_BASE.to_vec();
+    other.push((b"EDITOR", b"vi"));
+    invalid(
+        "non-PC3 name",
+        &raw_frame(&[1, 2], &other),
+        Profile::Person1,
+    );
+    assert!(parse_frame(&raw_frame(&[], &other), Profile::PersonOutside1).is_ok());
+    invalid(
+        "no HOME",
+        &raw_frame(
+            &[1, 2],
+            &PERSON_BASE[..1]
+                .iter()
+                .chain(&PERSON_BASE[2..])
+                .copied()
+                .collect::<Vec<_>>(),
+        ),
+        Profile::Person1,
+    );
+    invalid(
+        "no PATH",
+        &raw_frame(&[1, 2], &PERSON_BASE[1..]),
+        Profile::Person1,
+    );
+    invalid(
+        "home missing",
+        &raw_frame(&[2, 3], &PERSON_BASE),
+        Profile::Person1,
+    );
+    invalid(
+        "TMPDIR first",
+        &raw_frame(&[2, 1], &PERSON_BASE),
+        Profile::Person1,
+    );
+    invalid(
+        "home twice",
+        &raw_frame(&[1, 2, 1], &PERSON_BASE),
+        Profile::Person1,
+    );
+    invalid(
+        "two developer roots",
+        &raw_frame(&[1, 2, 3, 3], &PERSON_BASE),
+        Profile::Person1,
+    );
+    invalid(
+        "six caches",
+        &raw_frame(&[1, 2, 4, 4, 4, 4, 4, 4], &PERSON_BASE),
+        Profile::Person1,
+    );
+    invalid(
+        "role 5",
+        &raw_frame(&[1, 2, 5], &PERSON_BASE),
+        Profile::Person1,
+    );
+    invalid(
+        "nine roots",
+        &raw_frame(&[1, 2, 3, 4, 4, 4, 4, 4, 4], &PERSON_BASE),
+        Profile::Person1,
+    );
+    invalid(
+        "outside with roots",
+        &raw_frame(&[1, 2], &PERSON_BASE),
+        Profile::PersonOutside1,
+    );
+    invalid("model-1 frame", &raw_frame(&[], &[]), Profile::Model1);
+    // Entry faults for either profile.
+    for (label, name, value) in [
+        ("empty name", &b""[..], &b"x"[..]),
+        ("= in name", b"A=B", b"x"),
+        ("NUL in name", b"A\0B", b"x"),
+        ("NUL in value", b"A", b"x\0y"),
+        ("secret name", b"ASURA_SECRET_1", b"x"),
+        ("secret command", b"ASURA_SECRET_COMMAND", b"x"),
+        ("job marker", b"ASURA_JOB_00", b"1"),
+    ] {
+        invalid(
+            label,
+            &raw_frame(&[], &[(name, value)]),
+            Profile::PersonOutside1,
+        );
+    }
+    invalid(
+        "duplicate",
+        &raw_frame(&[], &[(b"A", b"1"), (b"A", b"2")]),
+        Profile::PersonOutside1,
+    );
+    // The service-side encoder round-trips through the guardian parser.
+    let launch = vec![
+        (b"PATH".to_vec(), b"/bin".to_vec()),
+        (b"DYLD_INSERT_LIBRARIES".to_vec(), b"/x.dylib".to_vec()),
+        (b"EMPTY".to_vec(), Vec::new()),
+    ];
+    let setup = PersonSetup::outside(&launch).unwrap();
+    assert_eq!(setup.names(), ["PATH", "DYLD_INSERT_LIBRARIES", "EMPTY"]);
+    let parsed = parse_frame(&setup.frame(), Profile::PersonOutside1).unwrap();
+    assert!(parsed.roles.is_empty());
+    assert_eq!(
+        parsed.entries[1].as_slice(),
+        b"DYLD_INSERT_LIBRARIES=/x.dylib"
+    );
+    assert_eq!(parsed.entries[2].as_slice(), b"EMPTY=");
+    // The encoder refuses what the parser refuses.
+    for bad in [
+        vec![(b"ASURA_JOB_1".to_vec(), b"1".to_vec())],
+        vec![(b"A=".to_vec(), b"1".to_vec())],
+        vec![
+            (b"A".to_vec(), b"1".to_vec()),
+            (b"A".to_vec(), b"2".to_vec()),
+        ],
+    ] {
+        assert_eq!(
+            PersonSetup::outside(&bad).err(),
+            Some(ExecCmdError::Invalid)
+        );
+    }
+    let many: Vec<(Vec<u8>, Vec<u8>)> = (0..1025)
+        .map(|i| (format!("V{i}").into_bytes(), Vec::new()))
+        .collect();
+    assert_eq!(
+        PersonSetup::outside(&many).err(),
+        Some(ExecCmdError::Invalid)
+    );
+}
+/// PC-U50 through a real pipe: the guardian's reader takes exactly one
+/// frame and its EOF; a short frame, trailing bytes, an oversized length
+/// or lease input end it without a frame.
+#[test]
+fn pc_u50_frame_reader_over_a_pipe() {
+    let read = |bytes: &[u8], stop: bool| {
+        let (r, w) = spawn::pipe(true).unwrap();
+        // SAFETY: bounded write to the owned fixture pipe, below its buffer.
+        assert_eq!(
+            unsafe { libc::write(w.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) },
+            bytes.len() as isize
+        );
+        drop(w);
+        let (lease, _lease_writer) = spawn::pipe(true).unwrap();
+        person::read_frame(r.as_raw_fd(), lease.as_raw_fd(), &mut || stop).map(|f| f.to_vec())
+    };
+    let good = raw_frame(&[1, 2], &PERSON_BASE);
+    assert_eq!(read(&good, false).unwrap(), good);
+    assert_eq!(
+        read(&good[..good.len() - 2], false).err(),
+        Some(ExecCmdError::Invalid)
+    );
+    let mut trailing = good.clone();
+    trailing.extend_from_slice(b"xx");
+    assert_eq!(read(&trailing, false).err(), Some(ExecCmdError::Invalid));
+    assert_eq!(
+        read(&[0, 1, 0, 0], false).err(),
+        Some(ExecCmdError::Invalid),
+        "over the bound"
+    );
+    assert_eq!(read(&[], false).err(), Some(ExecCmdError::Invalid));
+    // An open writer that sends nothing: lease input refuses the job.
+    let (r, _w) = spawn::pipe(true).unwrap();
+    let (lease, _lw) = spawn::pipe(true).unwrap();
+    assert_eq!(
+        person::read_frame(r.as_raw_fd(), lease.as_raw_fd(), &mut || true).err(),
+        Some(ExecCmdError::Cancelled)
+    );
+}
+/// The service-side writer: completion, a closed reader, and cancel.
+#[test]
+fn p1_frame_writer_ends_on_completion_peer_close_or_cancel() {
+    use person::{FrameWrite, write_frame};
+    let frame = vec![7u8; 100_000];
+    let (r, w) = spawn::pipe(true).unwrap();
+    spawn::no_sigpipe(w.as_raw_fd()).unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        let mut file = std::fs::File::from(r);
+        loop {
+            let mut buf = [0u8; 8192];
+            match std::io::Read::read(&mut file, &mut buf) {
+                Ok(0) => break got,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    });
+    assert_eq!(
+        write_frame(w, &frame, &AtomicBool::new(false)),
+        FrameWrite::Complete
+    );
+    assert_eq!(reader.join().unwrap(), frame);
+    let (r, w) = spawn::pipe(true).unwrap();
+    spawn::no_sigpipe(w.as_raw_fd()).unwrap();
+    drop(r);
+    assert_eq!(
+        write_frame(w, &frame, &AtomicBool::new(false)),
+        FrameWrite::PeerClosed
+    );
+    let (_r, w) = spawn::pipe(true).unwrap();
+    assert_eq!(
+        write_frame(w, &frame, &AtomicBool::new(true)),
+        FrameWrite::Cancelled
+    );
+    // A full pipe with no reader progress: cancel ends the paced wait.
+    let (_r, w) = spawn::pipe(true).unwrap();
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let writer = std::thread::spawn(move || write_frame(w, &vec![1u8; 1 << 20], &flag));
+    std::thread::sleep(Duration::from_millis(250));
+    cancel.store(true, Ordering::Release);
+    assert_eq!(writer.join().unwrap(), FrameWrite::Cancelled);
+}
+
+fn person_paths<'a>(caches: Vec<&'a str>, developer: Option<&'a str>) -> person::PersonPaths<'a> {
+    person::PersonPaths {
+        project: "/Users/p/src/proj",
+        scratch: "/Users/p/.asura/tmp/exec-cmd-00",
+        asura: "/Users/p/.asura",
+        home: "/Users/p",
+        tmpdir: "/private/var/folders/x/T",
+        developer,
+        caches,
+        fixed: vec!["/Library", "/Applications", "/private/etc"],
+    }
+}
+/// The `(allow file-write* ...)` rule of a profile.
+fn write_rule(profile: &str) -> &str {
+    let start = profile.find("(allow file-write*").expect("write rule");
+    let mut depth = 0;
+    for (i, c) in profile[start..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &profile[start..start + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    unreachable!("unbalanced write rule")
+}
+/// PC-U25: the person profile from fixture roots. Writes only to the
+/// project, the scratch (OD1), `$TMPDIR` and the existing caches, plus
+/// `/dev/null`; reads under home; the network rule and the Asura-home
+/// socket deny are present; no `mach-lookup`; the Asura deny is after
+/// every allow and the scratch re-allow after it; no command text.
+#[test]
+fn pc_u25_person_profile_from_fixture_roots() {
+    let paths = person_paths(vec!["/Users/p/.cargo", "/Users/p/Library/Caches"], None);
+    let profile = person::seatbelt(&paths).unwrap();
+    assert!(profile.starts_with("(version 1)(deny default)"));
+    assert_eq!(
+        write_rule(&profile),
+        "(allow file-write* (subpath \"/Users/p/src/proj\") (subpath \"/Users/p/.asura/tmp/exec-cmd-00\") (subpath \"/private/var/folders/x/T\") (subpath \"/Users/p/.cargo\") (subpath \"/Users/p/Library/Caches\"))"
+    );
+    assert_eq!(
+        profile.matches("(allow file-write*").count(),
+        2,
+        "rule plus scratch re-allow"
+    );
+    assert!(profile.contains("(allow file-read* file-write* (literal \"/dev/null\"))"));
+    assert!(!write_rule(&profile).contains("(subpath \"/Users/p\")"));
+    let reads = profile
+        .find("(allow process-exec file-map-executable file-read*")
+        .unwrap();
+    let read_rule = &profile[reads..reads + profile[reads..].find("))").unwrap()];
+    for root in [
+        "/bin",
+        "/System",
+        "/Library",
+        "/Applications",
+        "/private/etc",
+        "/Users/p",
+        "/private/var/folders/x/T",
+        "/Users/p/.cargo",
+    ] {
+        assert!(
+            read_rule.contains(&format!("(subpath \"{root}\")")),
+            "{root}"
+        );
+    }
+    assert!(
+        !read_rule.contains("/opt/homebrew"),
+        "absent fixed root omitted"
+    );
+    assert!(profile.contains("(allow network*)"));
+    assert!(profile.contains("(deny network* (remote unix-socket (subpath \"/Users/p/.asura\")))"));
+    assert!(!profile.contains("mach-lookup"));
+    assert!(profile.contains("(allow sysctl-read)"));
+    let deny = profile
+        .find("(deny file-read* file-write* process-exec file-map-executable (subpath \"/Users/p/.asura\"))")
+        .unwrap();
+    let reallow = profile
+        .rfind("(allow file-write* (subpath \"/Users/p/.asura/tmp/exec-cmd-00\"))")
+        .unwrap();
+    assert!(deny > profile.find("(allow network*)").unwrap());
+    assert!(deny > reads && reallow > deny);
+    for text in ["rm -rf", "echo", "$HOME", "COMMAND"] {
+        assert!(!profile.contains(text), "{text}");
+    }
+    // A quote in a descriptor path is escaped, never closes the literal.
+    let mut quoted = person_paths(vec![], None);
+    quoted.project = "/Users/p/we\"ird";
+    assert!(
+        person::seatbelt(&quoted)
+            .unwrap()
+            .contains("(subpath \"/Users/p/we\\\"ird\")")
+    );
+}
+/// PC-U51: with a scratch, a developer directory outside the fixed roots,
+/// and one cache: the scratch write rule is present (OD1), the developer
+/// root is read and exec only, the missing caches are omitted, and no
+/// command or client text appears.
+#[test]
+fn pc_u51_person_profile_with_developer_and_missing_cache() {
+    let paths = person_paths(vec!["/Users/p/.cargo"], Some("/opt/dev"));
+    let profile = person::seatbelt(&paths).unwrap();
+    assert!(write_rule(&profile).contains("(subpath \"/Users/p/.asura/tmp/exec-cmd-00\")"));
+    assert!(profile.contains("(subpath \"/opt/dev\")"));
+    assert!(!write_rule(&profile).contains("/opt/dev"));
+    for cache in [".rustup", ".cache", "Library/Caches", ".npm"] {
+        assert!(!profile.contains(cache), "{cache}");
+    }
+    assert!(profile.contains("(literal \"/opt\")"), "ancestor metadata");
+    for client in ["en_GB", "SSH_AUTH_SOCK", "agent", "PATH"] {
+        assert!(!profile.contains(client), "{client}");
+    }
+}
+/// PC-U52: developer directory selection without running a process.
+#[test]
+fn pc_u52_developer_directory_selection() {
+    use person::{Developer, developer_target};
+    let f = Fixture::new();
+    let root = f.0.clone();
+    let dev = root.join("opt-dev");
+    fs::create_dir(&dev).unwrap();
+    let missing_clt = root.join("no-clt");
+    let link = root.join("xcode_select_link");
+    symlink("/Applications/Xcode.app/Contents/Developer", &link).unwrap();
+    assert_eq!(developer_target(&link, &missing_clt), Developer::Covered);
+    fs::remove_file(&link).unwrap();
+    symlink(&dev, &link).unwrap();
+    assert_eq!(
+        developer_target(&link, &missing_clt),
+        Developer::Root(dev.clone())
+    );
+    fs::remove_file(&link).unwrap();
+    // No link: CommandLineTools under /Library is covered, or omitted.
+    let clt = Path::new("/Library/Developer/CommandLineTools");
+    if clt.is_dir() {
+        assert_eq!(developer_target(&link, clt), Developer::Covered);
+    }
+    assert_eq!(
+        developer_target(&link, &dev),
+        Developer::Root(dev.clone()),
+        "fallback outside the fixed roots"
+    );
+    assert_eq!(developer_target(&link, &missing_clt), Developer::Omitted);
+    symlink("relative/Developer", &link).unwrap();
+    assert_eq!(developer_target(&link, &missing_clt), Developer::Omitted);
+    fs::remove_file(&link).unwrap();
+    symlink(root.join("gone"), &link).unwrap();
+    assert_eq!(
+        developer_target(&link, &missing_clt),
+        Developer::Omitted,
+        "missing target"
+    );
+}
+/// PC-U51 at setup: a fixture home with `.cargo`, a symlinked `.npm` and a
+/// `Library/Caches`; a developer root inside `/Applications` gets no
+/// descriptor, one outside does. The frame carries the PC3 names.
+#[test]
+fn pc_u51_setup_roots_from_a_fixture_home() {
+    let f = Fixture::new();
+    let home = f.0.join("home");
+    let tmp = f.0.join("tmp");
+    let dev = f.0.join("dev");
+    for dir in [
+        &home,
+        &tmp,
+        &dev,
+        &home.join(".cargo"),
+        &home.join("Library/Caches"),
+    ] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    symlink(&tmp, home.join(".npm")).unwrap();
+    let client = vec![(b"LANG".to_vec(), b"en_GB.UTF-8".to_vec())];
+    let setup =
+        PersonSetup::sandboxed_for_test("p", &home, &tmp, Some(&dev), b"/usr/bin:/bin", &client)
+            .unwrap();
+    assert_eq!(
+        setup.roles(),
+        [
+            RootRole::Home,
+            RootRole::TempDir,
+            RootRole::Developer,
+            RootRole::Cache,
+            RootRole::Cache
+        ]
+    );
+    assert_eq!(
+        setup.names(),
+        [
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "USER",
+            "LOGNAME",
+            "TERM",
+            "GIT_TERMINAL_PROMPT",
+            "LANG"
+        ]
+    );
+    let parsed = person::parse_frame(&setup.frame(), Profile::Person1).unwrap();
+    assert_eq!(parsed.roles, setup.roles());
+    let covered = PersonSetup::sandboxed_for_test(
+        "p",
+        &home,
+        &tmp,
+        Some(Path::new("/Applications")),
+        b"/usr/bin",
+        &[],
+    )
+    .unwrap();
+    assert!(!covered.roles().contains(&RootRole::Developer));
+    // A missing home or TMPDIR is `sandbox_unavailable`.
+    let missing = f.0.join("missing");
+    for (h, t) in [(&missing, &tmp), (&home, &missing)] {
+        assert_eq!(
+            PersonSetup::sandboxed_for_test("p", h, t, None, b"/bin", &[]).err(),
+            Some(ExecCmdError::Unavailable)
+        );
+    }
+    // SSH_AUTH_SOCK naming a regular file is dropped; the setup succeeds.
+    fs::write(f.0.join("not-a-socket"), b"").unwrap();
+    let sock = vec![(
+        b"SSH_AUTH_SOCK".to_vec(),
+        f.0.join("not-a-socket")
+            .into_os_string()
+            .into_encoded_bytes(),
+    )];
+    let dropped = PersonSetup::sandboxed_for_test("p", &home, &tmp, None, b"/bin", &sock).unwrap();
+    assert!(!dropped.names().contains(&"SSH_AUTH_SOCK".to_owned()));
+}
+/// PC2 and PC3 at setup: PATH form and client names and values.
+#[test]
+fn p1_setup_checks_path_and_client_variables() {
+    use person::{check_client, check_path};
+    assert!(check_path(b"/usr/bin:/bin").is_ok());
+    let long = format!("/{}", "a".repeat(4095));
+    assert!(check_path(long.as_bytes()).is_ok());
+    let too_long = format!("/{}", "a".repeat(4096));
+    let many = vec!["/b"; 65].join(":");
+    for bad in [
+        &b""[..],
+        b"bin",
+        b"/bin:",
+        b"/bin::/usr/bin",
+        b"/bin\0",
+        too_long.as_bytes(),
+        many.as_bytes(),
+    ] {
+        assert_eq!(check_path(bad), Err(ExecCmdError::Invalid), "{bad:?}");
+    }
+    let ok = vec![
+        (b"LANG".to_vec(), b"en_GB.UTF-8".to_vec()),
+        (b"LC_CTYPE".to_vec(), b"de_DE@euro".to_vec()),
+        (b"SSH_AUTH_SOCK".to_vec(), b"/tmp/s".to_vec()),
+    ];
+    assert!(check_client(&ok).is_ok());
+    for bad in [
+        vec![(b"EDITOR".to_vec(), b"vi".to_vec())],
+        vec![(b"PATH".to_vec(), b"/bin".to_vec())],
+        vec![(b"HOME".to_vec(), b"/x".to_vec())],
+        vec![(b"LANG".to_vec(), b"en GB".to_vec())],
+        vec![(b"LANG".to_vec(), vec![b'a'; 65])],
+        vec![(b"LANG".to_vec(), Vec::new())],
+        vec![(b"SSH_AUTH_SOCK".to_vec(), b"relative".to_vec())],
+        vec![(
+            b"SSH_AUTH_SOCK".to_vec(),
+            [b"/".to_vec(), vec![b'a'; 103]].concat(),
+        )],
+        vec![
+            (b"LANG".to_vec(), b"C".to_vec()),
+            (b"LANG".to_vec(), b"C".to_vec()),
+        ],
+    ] {
+        assert_eq!(check_client(&bad).err(), Some(ExecCmdError::Invalid));
+    }
+}
+/// `prepare` refuses a person profile without its setup, and
+/// `prepare_person` a setup of the other profile or a model request.
+#[test]
+fn p1_prepare_requires_the_matching_person_setup() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("project")).unwrap();
+    let runtime = || RuntimeDirectory::scratch(&f.0, true).unwrap();
+    let project = ProjectIdentity::open(
+        f.0.join("project").to_str().unwrap(),
+        &runtime().state_boundary(),
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let with = |profile| ExecCmdRequest {
+        profile,
+        ..request()
+    };
+    for profile in [Profile::Person1, Profile::PersonOutside1] {
+        let refused = PreparedExecCmd::prepare(runtime(), &project, with(profile), &cancel);
+        assert_eq!(refused.err().map(|e| e.reason), Some(ExecCmdError::Invalid));
+    }
+    let outside = || PersonSetup::outside(&[(b"PATH".to_vec(), b"/bin".to_vec())]).unwrap();
+    for profile in [Profile::Model1, Profile::Person1] {
+        let refused =
+            PreparedExecCmd::prepare_person(runtime(), &project, with(profile), outside(), &cancel);
+        assert_eq!(
+            refused.err().map(|e| e.reason),
+            Some(ExecCmdError::Invalid),
+            "{profile:?}"
+        );
+    }
+    let prepared = PreparedExecCmd::prepare_person(
+        runtime(),
+        &project,
+        with(Profile::PersonOutside1),
+        outside(),
+        &cancel,
+    );
+    let mut prepared = prepared.unwrap_or_else(|e| panic!("{:?}", e.reason));
+    prepared
+        .cleanup
+        .take()
+        .unwrap()
+        .run(Instant::now() + Duration::from_secs(2), &cancel)
+        .unwrap();
+}
+/// The `KERN_PROCARGS2` environment match is exact and skips argv.
+#[test]
+fn p1_environment_marker_match() {
+    let record = |argv: &[&str], env: &[&str]| {
+        let mut r = (argv.len() as i32).to_ne_bytes().to_vec();
+        r.extend_from_slice(b"/bin/x\0\0\0\0");
+        for s in argv.iter().chain(&[""][..0]) {
+            r.extend_from_slice(s.as_bytes());
+            r.push(0);
+        }
+        for s in env {
+            r.extend_from_slice(s.as_bytes());
+            r.push(0);
+        }
+        r.push(0);
+        r
+    };
+    let marker = b"ASURA_JOB_00ff=1";
+    use escapee::environment_holds;
+    assert!(environment_holds(
+        &record(&["x"], &["A=1", "ASURA_JOB_00ff=1"]),
+        marker
+    ));
+    assert!(
+        !environment_holds(&record(&["ASURA_JOB_00ff=1"], &["A=1"]), marker),
+        "argv is not env"
+    );
+    assert!(!environment_holds(
+        &record(&["x"], &["ASURA_JOB_00ff=10"]),
+        marker
+    ));
+    assert!(
+        !environment_holds(&record(&["x"], &["", "ASURA_JOB_00ff=1"]), marker),
+        "after the end"
+    );
+    assert!(!environment_holds(&[1, 0], marker));
+    assert!(!environment_holds(&record(&["a", "b"], &[]), marker));
 }

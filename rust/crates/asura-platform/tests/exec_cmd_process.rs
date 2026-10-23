@@ -1,7 +1,7 @@
 //! Native process qualification; private guardian dispatch is identical to the CLI.
 use asura_platform::exec_cmd::{
-    ExecCmdError, ExecCmdRequest, ExecCmdResult, Exit, OutputSink, PreparedExecCmd, Profile,
-    StopKind, StopReason, Stream, run_guardian,
+    ExecCmdError, ExecCmdRequest, ExecCmdResult, Exit, OutputSink, PersonSetup, PreparedExecCmd,
+    Profile, StopKind, StopReason, Stream, run_guardian,
 };
 use asura_platform::secrets::{RefusalCode, SecretVariable, WHOLE_COMMAND, rewrite_command};
 use asura_platform::{ProjectIdentity, RuntimeDirectory};
@@ -41,6 +41,15 @@ fn main() {
     }
     if args.get(1).is_some_and(|s| s == "--escape") {
         escape_child();
+        return;
+    }
+    if let [_, flag, tag, mode] = args.as_slice()
+        && flag == "--survivor"
+    {
+        survivor(tag, mode);
+        return;
+    }
+    if args.get(1).is_some_and(|s| s == "--noop") {
         return;
     }
     qualification();
@@ -266,6 +275,7 @@ fn qualification() {
     j2t_06_leader_exit_notice(&f.0);
     secret_environment_refusals(&f.0);
     secret_variables(&f.0);
+    person_profiles(&f.0);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -1281,5 +1291,919 @@ fn procargs_probe(pid: i32) {
             }
         }
         Err(errno) => println!("procargs: errno={errno}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1: person profiles (person-command-mode.md, escapee-control.md).
+
+/// A test-owned survivor for the `!!` cases. Modes: `closed` (new session,
+/// output closed), `hold` (new session, keeps the capture pipes and writes
+/// one line), `group` (stays in the shell's process group, keeps the pipes
+/// and writes one line). It writes `<tag>.pid` in its working directory
+/// and ends on `<tag>.release` or after its fixed 20 s lifetime. It never
+/// signals any process.
+fn survivor(tag: &str, mode: &str) {
+    // SAFETY: test-owned child; setsid and descriptor changes affect only it.
+    unsafe {
+        if mode != "group" {
+            assert!(libc::setsid() > 0, "survivor setsid");
+        }
+        if mode == "closed" {
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+            for fd in 0..=2 {
+                libc::dup2(null, fd);
+            }
+            libc::close(null);
+        }
+    }
+    if mode != "closed" {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "held {tag}");
+        let _ = out.flush();
+    }
+    let pid = std::process::id().to_string();
+    fs::write(format!("{tag}.pid.tmp"), pid).unwrap();
+    fs::rename(format!("{tag}.pid.tmp"), format!("{tag}.pid")).unwrap();
+    let end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < end && !Path::new(&format!("{tag}.release")).exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+/// A live, non-zombie process.
+fn alive(pid: i32) -> bool {
+    // SAFETY: plain-data output; zero is a valid bit pattern.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: complete output buffer of the stated size; read-only query.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    got == size && info.pbi_status != libc::SZOMB
+}
+/// End a test-owned survivor through its release file and wait for it.
+fn release_survivor(project: &Path, tag: &str) {
+    let pid: i32 = fs::read_to_string(project.join(format!("{tag}.pid")))
+        .unwrap()
+        .parse()
+        .unwrap();
+    fs::write(project.join(format!("{tag}.release")), b"").unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while alive(pid) {
+        if Instant::now() >= until {
+            CLEAN.store(false, Ordering::Release);
+            panic!("{tag} survivor did not end on release");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+/// The fixture person home: the test home itself, so the Asura home lies
+/// inside it as it does for a real account.
+struct PersonHome {
+    home: PathBuf,
+    tmpdir: PathBuf,
+}
+impl PersonHome {
+    fn new(home: &Path) -> Self {
+        let tmpdir = home.join("person-tmp");
+        for dir in [
+            tmpdir.clone(),
+            home.join(".cargo"),
+            home.join(".ssh"),
+            home.join("Library/Caches"),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+        }
+        fs::set_permissions(home.join(".ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            home.join(".ssh/known_hosts"),
+            b"fixture-host ssh-ed25519 AAAA\n",
+        )
+        .unwrap();
+        fs::write(home.join(".gitconfig"), b"[user]\n\tname = Fixture\n").unwrap();
+        fs::write(home.join(".zshrc"), b"# fixture\n").unwrap();
+        fs::write(home.join(".asura/person-secret"), b"state").unwrap();
+        Self {
+            home: home.to_path_buf(),
+            tmpdir,
+        }
+    }
+    fn sandboxed(&self, client: &[(Vec<u8>, Vec<u8>)]) -> PersonSetup {
+        self.sandboxed_with(None, client)
+    }
+    fn sandboxed_with(
+        &self,
+        developer: Option<&Path>,
+        client: &[(Vec<u8>, Vec<u8>)],
+    ) -> PersonSetup {
+        PersonSetup::sandboxed_for_test(
+            "fixture",
+            &self.home,
+            &self.tmpdir,
+            developer,
+            b"/usr/bin:/bin:/usr/sbin:/sbin",
+            client,
+        )
+        .unwrap()
+    }
+    /// A `!!` launch environment with a scratch HOME and TMPDIR.
+    fn outside(&self, extra: &[(&str, &str)]) -> PersonSetup {
+        let mut launch = vec![
+            (b"PATH".to_vec(), b"/usr/bin:/bin:/usr/sbin:/sbin".to_vec()),
+            (
+                b"HOME".to_vec(),
+                self.home.as_os_str().as_encoded_bytes().to_vec(),
+            ),
+            (
+                b"TMPDIR".to_vec(),
+                self.tmpdir.as_os_str().as_encoded_bytes().to_vec(),
+            ),
+            (b"LANG".to_vec(), b"C".to_vec()),
+        ];
+        launch.extend(
+            extra
+                .iter()
+                .map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec())),
+        );
+        PersonSetup::outside(&launch).unwrap()
+    }
+}
+/// Prepare and spawn a person job with optional guardian fault and frame.
+fn person_job(
+    home: &Path,
+    profile: Profile,
+    command: &str,
+    setup: PersonSetup,
+    fault: Option<&str>,
+    frame: Option<Vec<u8>>,
+) -> JobGuard {
+    person_job_with_id(
+        home,
+        asura_platform::random_id(),
+        profile,
+        command,
+        setup,
+        fault,
+        frame,
+    )
+}
+fn person_job_with_id(
+    home: &Path,
+    job_id: [u8; 16],
+    profile: Profile,
+    command: &str,
+    setup: PersonSetup,
+    fault: Option<&str>,
+    frame: Option<Vec<u8>>,
+) -> JobGuard {
+    let runtime = RuntimeDirectory::scratch(home, true).unwrap();
+    let project = ProjectIdentity::open(
+        home.join("project").to_str().unwrap(),
+        &runtime.state_boundary(),
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let request = ExecCmdRequest {
+        job_id,
+        profile,
+        command: command.into(),
+        cwd: None,
+        secrets: Vec::new(),
+        secret_command: None,
+    };
+    let mut prepared = PreparedExecCmd::prepare_person(runtime, &project, request, setup, &cancel)
+        .unwrap_or_else(|e| panic!("prepare: {:?}", e.reason));
+    if let Some(fault) = fault {
+        prepared.guardian_fault_for_test(fault);
+    }
+    if let Some(frame) = frame {
+        prepared.replace_frame_for_test(frame);
+    }
+    let collected = Collected::default();
+    JobGuard(
+        prepared
+            .spawn(
+                &std::env::current_exe().unwrap(),
+                &cancel,
+                Box::new(collected.clone()),
+            )
+            .unwrap_or_else(|e| panic!("spawn: {:?}", e.reason)),
+        collected,
+    )
+}
+/// Run a person job to settlement and collect its outcome.
+fn person_run(home: &Path, profile: Profile, command: &str, setup: PersonSetup) -> Outcome {
+    settle(
+        person_job(home, profile, command, setup, None, None),
+        Duration::from_secs(20),
+        false,
+    )
+}
+fn person_profiles(home: &Path) {
+    let person = PersonHome::new(home);
+    pc_i2_to_i4_person_profile_files(home, &person);
+    pc_i5_person_profile_network(home, &person);
+    pc_i22_ssh_agent_socket(home, &person);
+    pc_i29_sandbox_exec_unavailable(home, &person);
+    pc_u50_guardian_refuses_bad_frames(home, &person);
+    p1_person_escapee_marker(home, &person);
+    p1_person_grace(home, &person);
+    ec_i9_ec_i10_outside_survivors(home, &person);
+    od2_outside_survivor_holds_output(home, &person);
+    pc_i38_dyld_launch_variable(home, &person);
+    if std::env::var_os("ASURA_TEST_NETWORK").is_some() {
+        pc_i37_mach_probe_steps(home, &person);
+    } else {
+        println!("PC-I37 skipped: set ASURA_TEST_NETWORK=1 to reach github.com and crates.io");
+    }
+}
+/// PC-I2, PC-I3 and PC-I4 with the real guardian and `sandbox-exec`.
+fn pc_i2_to_i4_person_profile_files(home: &Path, person: &PersonHome) {
+    // PC-I2: project, TMPDIR and the ~/.cargo cache are writable.
+    let result = person_run(
+        home,
+        Profile::Person1,
+        "printf a > pc-i2-project && printf b > \"$TMPDIR/pc-i2\" && printf c > \"$HOME/.cargo/pc-i2\" && printf ok",
+        person.sandboxed(&[]),
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(fs::read(home.join("project/pc-i2-project")).unwrap(), b"a");
+    assert_eq!(fs::read(person.tmpdir.join("pc-i2")).unwrap(), b"b");
+    assert_eq!(fs::read(home.join(".cargo/pc-i2")).unwrap(), b"c");
+    println!("PC-I2: project, TMPDIR and ~/.cargo writes succeeded");
+    // PC-I3: dotfiles, ~/.ssh and other home paths are not writable.
+    for (label, target) in [
+        ("~/.zshrc", "$HOME/.zshrc"),
+        ("~/.ssh/x", "$HOME/.ssh/x"),
+        ("~/other", "$HOME/other"),
+        ("~/.asura", "$HOME/.asura/written"),
+        ("job scratch of another path", "$HOME/.asura/tmp/other"),
+    ] {
+        let result = person_run(
+            home,
+            Profile::Person1,
+            &format!("printf x > \"{target}\"; exit $?"),
+            person.sandboxed(&[]),
+        );
+        assert_ne!(result.exit_code, Some(0), "{label}: {result:?}");
+        assert!(
+            result.stderr.contains("Operation not permitted"),
+            "{label}: {result:?}"
+        );
+    }
+    assert_eq!(fs::read(home.join(".zshrc")).unwrap(), b"# fixture\n");
+    for path in [".ssh/x", "other", ".asura/written", ".asura/tmp/other"] {
+        assert!(!home.join(path).exists(), "{path}");
+    }
+    println!("PC-I3: ~/.zshrc, ~/.ssh/x, ~/other and ~/.asura writes were denied by the OS");
+    // PC-I4: home reads succeed; the Asura home stays unreadable.
+    let result = person_run(
+        home,
+        Profile::Person1,
+        "/bin/cat \"$HOME/.ssh/known_hosts\" \"$HOME/.gitconfig\"",
+        person.sandboxed(&[]),
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(
+        result.stdout,
+        "fixture-host ssh-ed25519 AAAA\n[user]\n\tname = Fixture\n"
+    );
+    let result = person_run(
+        home,
+        Profile::Person1,
+        "/bin/cat \"$HOME/.asura/person-secret\"; exit $?",
+        person.sandboxed(&[]),
+    );
+    assert_ne!(result.exit_code, Some(0), "{result:?}");
+    assert!(!result.stdout.contains("state"));
+    // The environment is the FD 11 set: person PATH, home, TMPDIR, fixed
+    // values; nothing from the guardian or the test process.
+    let result = person_run(
+        home,
+        Profile::Person1,
+        "/usr/bin/env",
+        person.sandboxed(&[(b"LANG".to_vec(), b"en_GB.UTF-8".to_vec())]),
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    let mut names: Vec<&str> = result
+        .stdout
+        .lines()
+        .map(|line| line.split('=').next().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "GIT_TERMINAL_PROMPT",
+            "HOME",
+            "LANG",
+            "LOGNAME",
+            "PATH",
+            "PWD",
+            "SHLVL",
+            "TERM",
+            "TMPDIR",
+            "USER",
+            "_"
+        ],
+        "{result:?}"
+    );
+    assert!(
+        result
+            .stdout
+            .contains(&format!("HOME={}\n", home.display()))
+    );
+    assert!(result.stdout.contains("TERM=dumb\n"));
+    println!("PC-I4: ~/.ssh/known_hosts and ~/.gitconfig reads succeeded; ~/.asura stayed denied");
+}
+/// PC-I5: a loopback HTTP fixture and a name lookup succeed under the
+/// person profile; the Asura control socket stays unreachable (PX3), while
+/// a `!!` command reaches it.
+fn pc_i5_person_profile_network(home: &Path, person: &PersonHome) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nperson-ok")
+            .unwrap();
+    });
+    let result = person_run(
+        home,
+        Profile::Person1,
+        &format!("/usr/bin/curl --silent --show-error http://{address}/"),
+        person.sandboxed(&[]),
+    );
+    server.join().unwrap();
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout, "person-ok");
+    let result = person_run(
+        home,
+        Profile::Person1,
+        "/usr/bin/perl -MSocket -e 'my ($e, @r) = Socket::getaddrinfo(\"localhost\", \"80\"); exit($e ? 1 : 0)'",
+        person.sandboxed(&[]),
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    // PX3: a Unix socket under the Asura home refuses the person profile.
+    let socket = home.join(".asura/run/pc-i5.sock");
+    let control = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    control.set_nonblocking(true).unwrap();
+    let connect = format!(
+        "/usr/bin/perl -MIO::Socket::UNIX -e 'IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => shift) or exit 3; exit 0' '{}'; exit $?",
+        socket.display()
+    );
+    let result = person_run(home, Profile::Person1, &connect, person.sandboxed(&[]));
+    assert_eq!(result.exit_code, Some(3), "{result:?}");
+    assert_eq!(
+        control.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "person profile reached the Asura socket"
+    );
+    let result = person_run(home, Profile::PersonOutside1, &connect, person.outside(&[]));
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert!(
+        control.accept().is_ok(),
+        "!! reaches the control socket (EXD-1)"
+    );
+    drop(control);
+    fs::remove_file(&socket).unwrap();
+    println!("PC-I5: loopback HTTP and lookup succeeded; the Asura socket was denied to ! only");
+}
+/// PC-I22: a fixture SSH agent answers through the sandbox; a variable
+/// naming a regular file is dropped and the command still runs.
+fn pc_i22_ssh_agent_socket(home: &Path, person: &PersonHome) {
+    let socket = home.join("pc-i22.sock");
+    let key = home.join("pc-i22-key");
+    let status = std::process::Command::new("/usr/bin/ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "pc-i22-fixture",
+            "-f",
+        ])
+        .arg(&key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut agent = std::process::Command::new("/usr/bin/ssh-agent")
+        .arg("-D")
+        .arg("-a")
+        .arg(&socket)
+        .stdout(std::process::Stdio::null())
+        .env_clear()
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < until, "fixture agent socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let added = std::process::Command::new("/usr/bin/ssh-add")
+        .arg(&key)
+        .env_clear()
+        .env("SSH_AUTH_SOCK", &socket)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(added.success());
+    let sock = |path: &Path| {
+        vec![(
+            b"SSH_AUTH_SOCK".to_vec(),
+            path.as_os_str().as_encoded_bytes().to_vec(),
+        )]
+    };
+    let result = person_run(
+        home,
+        Profile::Person1,
+        "/usr/bin/ssh-add -l",
+        person.sandboxed(&sock(&socket)),
+    );
+    let _ = agent.kill();
+    let _ = agent.wait();
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert!(result.stdout.contains("pc-i22-fixture"), "{result:?}");
+    let file = home.join("pc-i22-not-a-socket");
+    fs::write(&file, b"").unwrap();
+    let result = person_run(
+        home,
+        Profile::Person1,
+        "printf '%s' \"${SSH_AUTH_SOCK-unset}\"",
+        person.sandboxed(&sock(&file)),
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout, "unset");
+    println!("PC-I22: the fixture agent answered through the sandbox; a regular file was dropped");
+}
+/// PC-I29: with `sandbox-exec` unavailable, `!!` still runs and `!` is not
+/// started with `sandbox_unavailable` (setup reason 6).
+fn pc_i29_sandbox_exec_unavailable(home: &Path, person: &PersonHome) {
+    let job = person_job(
+        home,
+        Profile::PersonOutside1,
+        "printf ran > pc-i29-outside",
+        person.outside(&[]),
+        Some("no-sandbox-exec"),
+        None,
+    );
+    let result = settle(job, Duration::from_secs(10), false);
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert!(home.join("project/pc-i29-outside").exists());
+    let mut job = person_job(
+        home,
+        Profile::Person1,
+        "printf ran > pc-i29-person",
+        person.sandboxed(&[]),
+        Some("no-sandbox-exec"),
+        None,
+    );
+    pump_job(&mut job, "PC-I29 refusal", |_| false);
+    let result = job.result().unwrap();
+    assert_eq!(result.failure, Some(ExecCmdError::Unavailable));
+    assert_eq!(result.setup_reason, 6, "sandbox_unavailable");
+    assert!(!home.join("project/pc-i29-person").exists());
+    println!("PC-I29: !! ran without sandbox-exec; ! was refused with reason 6");
+}
+/// PC-U50 through the real guardian: each invalid frame is setup-failed
+/// reason 5 and no command runs.
+fn pc_u50_guardian_refuses_bad_frames(home: &Path, person: &PersonHome) {
+    let frame = |roles: &[u8], entries: &[(&str, &str)]| {
+        let mut body = vec![roles.len() as u8];
+        body.extend_from_slice(roles);
+        body.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        for (name, value) in entries {
+            body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            body.extend_from_slice(value.as_bytes());
+        }
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        frame
+    };
+    let home_text = home.to_str().unwrap();
+    let base = [
+        ("PATH", "/usr/bin:/bin"),
+        ("HOME", home_text),
+        ("TMPDIR", "/tmp"),
+    ];
+    let good = frame(&[1, 2, 4, 4], &base);
+    let mut trailing = good.clone();
+    trailing.push(b'x');
+    let mut other = base.to_vec();
+    other.push(("EDITOR", "vi"));
+    for (label, profile, bytes) in [
+        ("short", Profile::Person1, good[..good.len() - 3].to_vec()),
+        ("trailing", Profile::Person1, trailing),
+        (
+            "non-PC3 name",
+            Profile::Person1,
+            frame(&[1, 2, 4, 4], &other),
+        ),
+        (
+            "no HOME",
+            Profile::Person1,
+            frame(&[1, 2, 4, 4], &[base[0], base[2]]),
+        ),
+        (
+            "home not first",
+            Profile::Person1,
+            frame(&[2, 1, 4, 4], &base),
+        ),
+        (
+            "roots for !!",
+            Profile::PersonOutside1,
+            frame(&[1, 2], &base),
+        ),
+        (
+            "job marker name",
+            Profile::PersonOutside1,
+            frame(&[], &[("ASURA_JOB_1", "1")]),
+        ),
+        ("empty", Profile::PersonOutside1, Vec::new()),
+    ] {
+        let setup = match profile {
+            Profile::Person1 => person.sandboxed(&[]),
+            _ => person.outside(&[]),
+        };
+        let mut job = person_job(
+            home,
+            profile,
+            "printf ran > pc-u50-ran",
+            setup,
+            None,
+            Some(bytes),
+        );
+        pump_job(&mut job, label, |_| false);
+        let result = job.result().unwrap();
+        assert_eq!(result.setup_reason, 5, "{label}: {result:?}");
+        assert!(result.failure.is_some(), "{label}");
+        assert!(!home.join("project/pc-u50-ran").exists(), "{label}");
+    }
+    println!("PC-U50 (guardian): every invalid frame was setup-failed reason 5; nothing ran");
+}
+/// OD1 and EX5 for `!`: the job scratch is writable, so the sandbox
+/// marker attributes a `setsid` escapee, which is frozen and killed.
+fn p1_person_escapee_marker(home: &Path, person: &PersonHome) {
+    let project = home.join("project");
+    fs::write(
+        project.join("p1-escapee.pl"),
+        include_str!("fixtures/escapee.pl"),
+    )
+    .unwrap();
+    let result = person_run(
+        home,
+        Profile::Person1,
+        "/usr/bin/perl p1-escapee.pl setsid p1e; while [ ! -e p1e.pid ]; do /bin/sleep 0.05; done; exit 0",
+        person.sandboxed(&[]),
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.escapees, 1, "{result:?}");
+    let pid: i32 = fs::read_to_string(project.join("p1e.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!alive(pid), "the ! escapee was killed");
+    // The scratch is writable and starts empty (OD1); HOME stays the
+    // person's. The command names the path; it is not listed for it.
+    let id = asura_platform::random_id();
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    let scratch = home.join(format!(".asura/tmp/exec-cmd-{hex}"));
+    let command = format!(
+        "d='{}'; if [ -z \"$(/bin/ls -A \"$d\")\" ] && printf x > \"$d/probe\" && /bin/cat \"$d/probe\" >/dev/null; then printf scratch-ok; fi; printf '|%s' \"$HOME\"",
+        scratch.display()
+    );
+    let job = person_job_with_id(
+        home,
+        id,
+        Profile::Person1,
+        &command,
+        person.sandboxed(&[]),
+        None,
+        None,
+    );
+    let result = settle(job, Duration::from_secs(10), false);
+    assert!(
+        !scratch.exists(),
+        "the scratch is deleted when the job ends"
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout, format!("scratch-ok|{}", home.display()));
+    println!(
+        "OD1: the ! job scratch was writable and empty; the setsid escapee was killed (count 1)"
+    );
+}
+/// PC8: `T` stops a TERM-ignoring person group with KILL after the 2 s
+/// grace, for both person profiles.
+fn p1_person_grace(home: &Path, person: &PersonHome) {
+    for (profile, setup) in [
+        (Profile::Person1, person.sandboxed(&[])),
+        (Profile::PersonOutside1, person.outside(&[])),
+    ] {
+        let tag = profile.token();
+        let mut job = person_job(
+            home,
+            profile,
+            &format!("trap '' TERM; printf '%s' $$ > grace-{tag}; while :; do /bin/sleep 1; done"),
+            setup,
+            None,
+            None,
+        );
+        let pidfile = home.join(format!("project/grace-{tag}"));
+        pump_job(&mut job, "grace job started", |_| pidfile.exists());
+        let stopped = Instant::now();
+        job.stop(StopKind::Term);
+        let result = finish_stopped(job, "grace job settled");
+        let elapsed = stopped.elapsed();
+        assert_eq!(result.reason, Some(StopReason::Cancelled), "{tag}");
+        assert_eq!(result.signal, Some(9), "{tag}: KILL after the grace");
+        assert!(elapsed >= Duration::from_millis(1900), "{tag}: {elapsed:?}");
+        group_absent(&pidfile);
+        println!("PC8 {tag}: TERM ignored, KILL after {elapsed:?}");
+    }
+}
+/// Pump an outside job until the guardian settled.
+fn guardian_settled(job: &mut JobGuard, what: &str) -> asura_platform::exec_cmd::GuardianSettled {
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(settled) = job.guardian_settled() {
+            return settled;
+        }
+        assert!(Instant::now() < until, "{what}");
+        asura_platform::poll(&job.interests(), Duration::from_millis(20)).unwrap();
+        job.poll(Instant::now()).unwrap();
+    }
+}
+/// EC-I9 and EC-I10: a `!!` escapee that kept its environment and closed
+/// its output is found by the env-marker scan, counted (kind 6 count 1,
+/// kind 2 reason 14), not signalled and still running after settlement.
+/// One with a scrubbed environment and a new session is not attributable
+/// (EXD-1): the owned group still settles, with no count.
+fn ec_i9_ec_i10_outside_survivors(home: &Path, person: &PersonHome) {
+    let exe = std::env::current_exe().unwrap();
+    let project = home.join("project");
+    let command = format!(
+        "'{}' --survivor ec9 closed & while [ ! -e ec9.pid ]; do /bin/sleep 0.05; done; exit 0",
+        exe.display()
+    );
+    let mut job = person_job(
+        home,
+        Profile::PersonOutside1,
+        &command,
+        person.outside(&[]),
+        None,
+        None,
+    );
+    let settled = guardian_settled(&mut job, "EC-I9 guardian settled");
+    assert_eq!(settled.escapees, 1, "{settled:?}");
+    assert!(!settled.output_held, "reason 14: no capture pipe held");
+    assert_eq!(settled.exit, Exit::Exited(0));
+    let result = finish_stopped(job, "EC-I9 settled");
+    assert_eq!((result.exit_code, result.escapees), (Some(0), 1));
+    assert!(result.cleanup_confirmed);
+    let pid: i32 = fs::read_to_string(project.join("ec9.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(alive(pid), "EC-D1: the survivor is left running");
+    release_survivor(&project, "ec9");
+    println!("EC-I9: env-marked survivor counted (kind 6 = 1, reason 14) and left running");
+    let command = format!(
+        "/usr/bin/env -i '{}' --survivor ec10 closed & while [ ! -e ec10.pid ]; do /bin/sleep 0.05; done; exit 0",
+        exe.display()
+    );
+    let mut job = person_job(
+        home,
+        Profile::PersonOutside1,
+        &command,
+        person.outside(&[]),
+        None,
+        None,
+    );
+    let settled = guardian_settled(&mut job, "EC-I10 guardian settled");
+    assert_eq!(settled.escapees, 0, "scrubbed survivor is not attributable");
+    let result = finish_stopped(job, "EC-I10 settled");
+    assert_eq!((result.exit_code, result.escapees), (Some(0), 0));
+    let pid: i32 = fs::read_to_string(project.join("ec10.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(alive(pid), "never signalled");
+    release_survivor(&project, "ec10");
+    println!("EC-I10: env-scrubbed new-session survivor not attributed; the group settled");
+}
+/// OD2 and PQ3: a `!!` survivor holding the output keeps capture open
+/// after the guardian's kind 2 reason 15; the job settles at the
+/// survivor's EOF, or at `close_capture`, which leaves it running. An
+/// in-group background process is not stopped at shell exit.
+fn od2_outside_survivor_holds_output(home: &Path, person: &PersonHome) {
+    let exe = std::env::current_exe().unwrap();
+    let project = home.join("project");
+    for (tag, mode) in [("od2a", "hold"), ("od2b", "group")] {
+        let command = format!(
+            "'{}' --survivor {tag} {mode} & while [ ! -e {tag}.pid ]; do /bin/sleep 0.05; done; exit 0",
+            exe.display()
+        );
+        let mut job = person_job(
+            home,
+            Profile::PersonOutside1,
+            &command,
+            person.outside(&[]),
+            None,
+            None,
+        );
+        let settled = guardian_settled(&mut job, "OD2 guardian settled");
+        assert_eq!(settled.escapees, 1, "{tag}: {settled:?}");
+        assert!(settled.output_held, "{tag}: reason 15");
+        let pid: i32 = fs::read_to_string(project.join(format!("{tag}.pid")))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(alive(pid), "{tag}: PQ3, not stopped at shell exit");
+        // The survivor's line arrives after the guardian settled.
+        let line = format!("held {tag}\n");
+        pump_job(&mut job, "OD2 survivor output", |job| {
+            job.1.0.lock().unwrap().kept[0].ends_with(line.as_bytes())
+        });
+        assert!(!job.settled(), "{tag}: capture continues");
+        if mode == "hold" {
+            // The survivor ends: EOF settles the job with its output.
+            release_survivor(&project, tag);
+            let result = finish_stopped(job, "OD2 EOF settlement");
+            assert_eq!((result.exit_code, result.escapees), (Some(0), 1));
+        } else {
+            // A cancel closes capture; the survivor is not killed.
+            job.stop(StopKind::Term);
+            assert!(job.close_capture());
+            assert!(job.settled());
+            let result = job.result().unwrap();
+            assert_eq!((result.exit_code, result.escapees), (Some(0), 1));
+            job.take_cleanup()
+                .unwrap()
+                .run(
+                    Instant::now() + Duration::from_secs(2),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            assert!(alive(pid), "{tag}: EC-D1, left running after close_capture");
+            release_survivor(&project, tag);
+        }
+        println!("OD2 {tag}: kind 2 reason 15, capture continued after the shell exited");
+    }
+}
+/// PC-I38: a `!!` launch environment with `DYLD_INSERT_LIBRARIES` naming a
+/// fixture library. The guardian never loads it; the variable is given
+/// only to the `/bin/sh` spawn. A control run of the same unsigned test
+/// binary with the variable in its own environment loads it.
+fn pc_i38_dyld_launch_variable(home: &Path, person: &PersonHome) {
+    let markers = home.join("pc-i38");
+    fs::create_dir(&markers).unwrap();
+    let source = home.join("pc-i38.c");
+    fs::write(&source, include_str!("fixtures/dyld_marker.c")).unwrap();
+    let library = home.join("pc-i38.dylib");
+    let built = std::process::Command::new("/usr/bin/cc")
+        .args(["-dynamiclib", "-o"])
+        .arg(&library)
+        .arg(format!("-DMARKER_DIR=\"{}\"", markers.display()))
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(built.success(), "fixture library build");
+    let library_text = library.to_str().unwrap();
+    // Control: the variable in a process's own environment loads it.
+    let control = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--noop")
+        .env("DYLD_INSERT_LIBRARIES", library_text)
+        .spawn()
+        .unwrap();
+    let control_pid = control.id();
+    assert!(control.wait_with_output().unwrap().status.success());
+    assert!(
+        markers.join(format!("loaded.{control_pid}")).exists(),
+        "control run loaded the fixture"
+    );
+    let mut job = person_job(
+        home,
+        Profile::PersonOutside1,
+        "printf '%s' \"$PC_I38_SEEN\"",
+        person.outside(&[
+            ("DYLD_INSERT_LIBRARIES", library_text),
+            ("PC_I38_SEEN", "launch-env"),
+        ]),
+        None,
+        None,
+    );
+    let guardian = job.guardian_pid_for_test();
+    pump_job(&mut job, "PC-I38 settled", |_| false);
+    let result = job.result().unwrap();
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    let bytes = job.1.0.lock().unwrap();
+    assert_eq!(String::from_utf8_lossy(&bytes.kept[0]), "launch-env");
+    drop(bytes);
+    assert!(
+        !markers.join(format!("loaded.{guardian}")).exists(),
+        "the guardian loaded the launch environment's library"
+    );
+    let loaded: Vec<_> = fs::read_dir(&markers)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        loaded,
+        [format!("loaded.{control_pid}")],
+        "only the control loaded it"
+    );
+    if let Some(mut cleanup) = job.take_cleanup() {
+        cleanup
+            .run(
+                Instant::now() + Duration::from_secs(2),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+    }
+    println!("PC-I38: the guardian (pid {guardian}) never loaded the launch environment's library");
+}
+/// PC-I37: the PC-P1 probe steps under the person profile with the final
+/// (empty) `mach-lookup` list. Needs the network; opt in with
+/// `ASURA_TEST_NETWORK=1`.
+fn pc_i37_mach_probe_steps(home: &Path, person: &PersonHome) {
+    let cargo = std::process::Command::new("rustup")
+        .args(["which", "cargo"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8(o.stdout).unwrap().trim()));
+    let repo = home.join("project/pc-i37-repo");
+    fs::create_dir(&repo).unwrap();
+    for args in [
+        &["init", "-q", "."][..],
+        &[
+            "-c",
+            "user.email=f@x",
+            "-c",
+            "user.name=f",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let toolchain = cargo
+        .as_ref()
+        .and_then(|c| c.parent()?.parent().map(Path::to_path_buf));
+    let mut steps = vec![
+        ("git ls-remote", "/usr/bin/git ls-remote https://github.com/git/git HEAD".to_owned()),
+        ("git status", "/usr/bin/git -C pc-i37-repo status --short".into()),
+        ("curl", "/usr/bin/curl -sI https://example.com".into()),
+        ("xcrun", "/usr/bin/xcrun --find clang".into()),
+        ("git --version", "/usr/bin/git --version".into()),
+        (
+            "lookup",
+            "/usr/bin/perl -MSocket -e 'my ($e, @r) = Socket::getaddrinfo(\"example.com\", \"443\"); exit($e ? 1 : 0)'".into(),
+        ),
+    ];
+    if let Some(cargo) = &cargo {
+        steps.push((
+            "cargo search",
+            format!(
+                "CARGO_HOME=\"$TMPDIR/pc-i37-cargo\" '{}' search serde --limit 1",
+                cargo.display()
+            ),
+        ));
+    }
+    for (label, command) in steps {
+        // The toolchain is read and exec only, through the developer root.
+        let result = person_run(
+            home,
+            Profile::Person1,
+            &command,
+            person.sandboxed_with(toolchain.as_deref(), &[]),
+        );
+        assert_eq!(result.exit_code, Some(0), "PC-I37 {label}: {result:?}");
+        println!("PC-I37 {label}: passed");
     }
 }

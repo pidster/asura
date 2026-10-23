@@ -3,6 +3,7 @@ mod capture;
 mod cleanup;
 mod escapee;
 mod guardian;
+mod person;
 mod protocol;
 mod spawn;
 pub mod split;
@@ -18,11 +19,15 @@ pub use escapee::scan_for_test as escapee_scan_for_test;
 pub use guardian::run_guardian;
 #[cfg(feature = "test-support")]
 pub use guardian::run_guardian_for_test;
+pub use person::{
+    MAX_CACHES, MAX_ENTRIES, MAX_ENVIRONMENT_BYTES, MAX_FRAME_BYTES, MAX_NAME_BYTES, MAX_ROOTS,
+    PersonSetup, RootRole, Variables,
+};
 pub use protocol::Profile;
 use protocol::{
     KIND_ESCAPEE_REPORT, KIND_LEADER_EXITED, LEASE_KILL, LEASE_TERM, Notice, REASON_CANCEL,
-    REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED, REASON_ESCAPEE_UNTERMINATED, REASON_KILL,
-    REASON_LEASE_ENDED,
+    REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED, REASON_ESCAPEE_UNTERMINATED,
+    REASON_ESCAPEES_HOLD_OUTPUT, REASON_ESCAPEES_LEFT_RUNNING, REASON_KILL, REASON_LEASE_ENDED,
 };
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -105,7 +110,9 @@ pub enum UnconfirmedReason {
 /// `cleanup_confirmed` is true only when the guardian's settlement gate
 /// passed with no earlier `cleanup_unconfirmed` notice; a late settlement
 /// releases resources but never asserts that cleanup was clean.
-/// `escapees` counts the escapees the guardian terminated (notice kind 6).
+/// `escapees` is the notice kind 6 value: escapees the guardian terminated
+/// for `model-1` and `person-1`, survivors left running for
+/// `person-outside-1` (EC-D1).
 /// `setup_reason` is the guardian's kind 3 reason (5–9), or 0 when the
 /// terminal notice is not kind 3; `failure` folds reasons 5 and 6 into
 /// `Unavailable`, so a job maps reason 6 to `sandbox_unavailable` from here
@@ -145,7 +152,8 @@ pub const MAX_COMMAND_BYTES: usize = 8192;
 ///
 /// The command has no time bound: it ends on completion or cancel, and setup
 /// checks only cancellation. `profile` selects the guardian's sandbox and
-/// grace through its argv token.
+/// grace through its argv token. A person profile needs its
+/// [`PersonSetup`], passed to [`PreparedExecCmd::prepare_person`].
 pub struct ExecCmdRequest {
     pub job_id: [u8; 16],
     pub profile: Profile,
@@ -162,6 +170,7 @@ pub struct PreparedExecCmd {
     project: OwnedFd,
     cwd: OwnedFd,
     asura: OwnedFd,
+    person: Option<PersonSetup>,
     #[cfg(feature = "test-support")]
     omit_state_for_test: bool,
     #[cfg(feature = "test-support")]
@@ -170,6 +179,8 @@ pub struct PreparedExecCmd {
     guardian_fault_for_test: Option<String>,
     #[cfg(feature = "test-support")]
     profile_token_for_test: Option<String>,
+    #[cfg(feature = "test-support")]
+    frame_for_test: Option<Vec<u8>>,
     cleanup: Option<ExecCmdCleanup>,
 }
 fn check(cancel: &AtomicBool) -> Result<(), ExecCmdError> {
@@ -247,14 +258,45 @@ fn secret_environment(
         .collect()
 }
 impl PreparedExecCmd {
-    /// Blocking descriptor validation and scratch creation; retained setup worker only.
+    /// Blocking descriptor validation and scratch creation; retained setup
+    /// worker only. `model-1` only: a person profile without its setup is
+    /// `Invalid`.
     pub fn prepare(
         runtime: RuntimeDirectory,
         project: &ProjectIdentity,
         request: ExecCmdRequest,
         cancel: &AtomicBool,
     ) -> Result<Self, ExecCmdFailure> {
+        Self::prepare_inner(runtime, project, request, None, cancel)
+    }
+    /// [`Self::prepare`] for a person job: `person` must be the setup of
+    /// the request's profile (`person-1` or `person-outside-1`), otherwise
+    /// `Invalid`. Its root descriptors and environment reach the guardian
+    /// at spawn as FDs 12–19 and the FD 11 frame.
+    pub fn prepare_person(
+        runtime: RuntimeDirectory,
+        project: &ProjectIdentity,
+        request: ExecCmdRequest,
+        person: PersonSetup,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ExecCmdFailure> {
+        Self::prepare_inner(runtime, project, request, Some(person), cancel)
+    }
+    fn prepare_inner(
+        runtime: RuntimeDirectory,
+        project: &ProjectIdentity,
+        request: ExecCmdRequest,
+        person: Option<PersonSetup>,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ExecCmdFailure> {
         validate(&request)?;
+        if request.profile.person() != person.is_some()
+            || person
+                .as_ref()
+                .is_some_and(|setup| setup.profile() != request.profile)
+        {
+            return Err(ExecCmdError::Invalid.into());
+        }
         check(cancel)?;
         let original_project = project.process_location().to_owned();
         let boundary = project.boundary().clone();
@@ -290,6 +332,7 @@ impl PreparedExecCmd {
             project,
             cwd,
             asura,
+            person,
             #[cfg(feature = "test-support")]
             omit_state_for_test: false,
             #[cfg(feature = "test-support")]
@@ -298,6 +341,8 @@ impl PreparedExecCmd {
             guardian_fault_for_test: None,
             #[cfg(feature = "test-support")]
             profile_token_for_test: None,
+            #[cfg(feature = "test-support")]
+            frame_for_test: None,
             cleanup: Some(cleanup),
         };
         if let Err(reason) = check(cancel) {
@@ -335,9 +380,19 @@ impl PreparedExecCmd {
     pub fn profile_token_for_test(&mut self, token: &str) {
         self.profile_token_for_test = Some(token.into());
     }
+    /// Send these bytes on FD 11 in place of the setup's frame, to qualify
+    /// the guardian's frame checks (PC-U50); the roots are still mapped.
+    #[cfg(feature = "test-support")]
+    pub fn replace_frame_for_test(&mut self, frame: Vec<u8>) {
+        self.frame_for_test = Some(frame);
+    }
     /// After a successful spawn ownership always transfers to ExecCmdJob.
     /// The request's secret values are dropped (and zeroed) whether or not
-    /// the spawn succeeds.
+    /// the spawn succeeds. For a person job, this setup thread then writes
+    /// the FD 11 frame (nonblocking, paced polls, cancel checked between
+    /// them) and closes it; a cancel closes it early, which the guardian
+    /// reports as setup-failed reason 5. The person environment is dropped
+    /// and zeroed before return.
     /// `sink` receives the job's raw output on the reactor (J1).
     pub fn spawn(
         mut self,
@@ -348,6 +403,7 @@ impl PreparedExecCmd {
         let spawned = self.spawn_inner(executable, cancel, sink);
         self.request.secrets.clear();
         self.request.secret_command = None;
+        self.person = None;
         match spawned {
             Ok(job) => Ok(job),
             Err(reason) => Err(ExecCmdFailure {
@@ -397,6 +453,15 @@ impl PreparedExecCmd {
         let (err_read, err_write) = spawn::pipe(false)?;
         let null =
             open_at(libc::AT_FDCWD, c"/dev/null", libc::O_RDWR, 0).map_err(|_| ExecCmdError::Io)?;
+        // FD 11: the person environment descriptor, written after spawn.
+        let frame_pipe = match &self.person {
+            Some(_) => {
+                let (read, write) = spawn::pipe(true)?;
+                spawn::no_sigpipe(write.as_raw_fd())?;
+                Some((read, write))
+            }
+            None => None,
+        };
         #[allow(unused_mut)]
         let mut args = vec![
             executable.to_string_lossy().into_owned(),
@@ -414,7 +479,7 @@ impl PreparedExecCmd {
         if args.iter().map(|value| value.len() + 1).sum::<usize>() > 8704 {
             return Err(ExecCmdError::Invalid);
         }
-        let mappings: &[_] = &[
+        let mut mappings = vec![
             (null.as_raw_fd(), 0),
             (null.as_raw_fd(), 1),
             (null.as_raw_fd(), 2),
@@ -428,7 +493,15 @@ impl PreparedExecCmd {
             (self.asura.as_raw_fd(), 10),
         ];
         #[cfg(feature = "test-support")]
-        let mappings = &mappings[..mappings.len() - usize::from(self.omit_state_for_test)];
+        if self.omit_state_for_test {
+            mappings.pop();
+        }
+        if let (Some(setup), Some((read, _))) = (&self.person, &frame_pipe) {
+            mappings.push((read.as_raw_fd(), person::FRAME_FD));
+            for (index, fd) in setup.root_fds().enumerate() {
+                mappings.push((fd, person::FIRST_ROOT_FD + index as i32));
+            }
+        }
         let environment =
             secret_environment(&self.request.secrets, self.request.secret_command.as_ref());
         #[cfg(feature = "test-support")]
@@ -441,10 +514,23 @@ impl PreparedExecCmd {
         };
         let env: Vec<&[u8]> = environment.iter().map(|entry| entry.as_slice()).collect();
         check(cancel)?;
-        let pid = spawn::launch(executable, &args, &env, mappings, None, false)?;
+        let pid = spawn::launch(executable, &args, &env, &mappings, None, false)?;
         drop(env);
         drop(environment);
         // Everything after this point is infallible and transfers the live child.
+        if let (Some(setup), Some((read, write))) = (self.person.take(), frame_pipe) {
+            drop(read);
+            let frame = setup.frame();
+            #[cfg(feature = "test-support")]
+            let frame = match self.frame_for_test.take() {
+                Some(raw) => Zeroizing::new(raw),
+                None => frame,
+            };
+            drop(setup);
+            // Every end closes the write end; the guardian decides from
+            // what it read.
+            let _ = person::write_frame(write, &frame, cancel);
+        }
         Ok(ExecCmdJob {
             pid,
             reaped: false,
@@ -461,12 +547,13 @@ impl PreparedExecCmd {
             unconfirmed: None,
             escapees: 0,
             terminal: None,
-            out: Capture::new(out_read, Stream::Stdout),
-            err: Capture::new(err_read, Stream::Stderr),
+            out: Some(Capture::new(out_read, Stream::Stdout)),
+            err: Some(Capture::new(err_read, Stream::Stderr)),
             sink,
             stop: None,
             cleanup: self.cleanup.take(),
             job_id: self.request.job_id,
+            profile: self.request.profile,
             alternate: false,
             fault: false,
         })
@@ -501,15 +588,36 @@ pub struct ExecCmdJob {
     unconfirmed: Option<UnconfirmedReason>,
     escapees: u32,
     terminal: Option<Notice>,
-    out: Capture,
-    err: Capture,
+    /// Capture readers; `None` after [`ExecCmdJob::close_capture`].
+    out: Option<Capture>,
+    err: Option<Capture>,
     sink: Box<dyn OutputSink>,
     /// The strongest stop request so far.
     stop: Option<StopKind>,
     cleanup: Option<ExecCmdCleanup>,
     job_id: [u8; 16],
+    /// The guardian profile; it decides which kind 2 reasons may follow
+    /// kind 6.
+    profile: Profile,
     alternate: bool,
     fault: bool,
+}
+/// A capture stream is at EOF, or its reader was closed.
+fn ended(capture: &Option<Capture>) -> bool {
+    capture.as_ref().is_none_or(|c| c.eof)
+}
+/// The guardian's kind 2 settled notice. For `person-outside-1` it can
+/// arrive while survivors still hold the capture pipes (OD2), so capture
+/// and settlement may follow later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianSettled {
+    /// The leader's exit, as kind 5 reported it.
+    pub exit: Exit,
+    /// The kind 6 value (see [`ExecCmdResult::escapees`]).
+    pub escapees: u32,
+    /// Kind 2 reason 15: a `!!` survivor holds a capture pipe, so capture
+    /// continues; the conversation owner may release the lane (OD2).
+    pub output_held: bool,
 }
 impl ExecCmdJob {
     #[cfg(feature = "test-support")]
@@ -525,11 +633,16 @@ impl ExecCmdJob {
         let mut result = Vec::with_capacity(3);
         let room = self.sink.room();
         let stopping = self.stopping();
+        let stream =
+            |c: &Option<Capture>| c.as_ref().map(|c| (c.fd(), c.wants_read(room, stopping)));
         for (fd, wanted) in [
-            (self.status.as_raw_fd(), !self.status_eof),
-            (self.out.fd(), self.out.wants_read(room, stopping)),
-            (self.err.fd(), self.err.wants_read(room, stopping)),
-        ] {
+            Some((self.status.as_raw_fd(), !self.status_eof)),
+            stream(&self.out),
+            stream(&self.err),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if wanted {
                 result.push(PollInterest {
                     fd,
@@ -598,8 +711,9 @@ impl ExecCmdJob {
         self.alternate = !self.alternate;
         let stopping = self.stop.is_some() || self.fault;
         self.sink.flush();
-        first.drain(DRAIN_BUDGET, self.sink.as_mut(), stopping)?;
-        second.drain(DRAIN_BUDGET, self.sink.as_mut(), stopping)?;
+        for capture in [first, second].into_iter().flatten() {
+            capture.drain(DRAIN_BUDGET, self.sink.as_mut(), stopping)?;
+        }
         self.sink.flush();
         // No combined output stop (J1-Q2): the shared quota and pause apply.
         if !self.status_eof {
@@ -643,11 +757,14 @@ impl ExecCmdJob {
         }
         Ok(())
     }
-    /// Order rules (tool-job-controller.md, TJ-S3): kind 1 first, or kind 3
-    /// alone; at most one kind 5, after kind 1; at most one kind 4, after
-    /// kind 1 and before kinds 6 and 2, either side of kind 5; at most one
-    /// kind 6, after kind 5 and immediately before kind 2 with reason 12;
-    /// kind 2 last, after kind 5 and with its exit facts; at most five.
+    /// Order rules (tool-job-controller.md, TJ-S3; escapee-control.md):
+    /// kind 1 first, or kind 3 alone; at most one kind 5, after kind 1; at
+    /// most one kind 4, after kind 1 and before kinds 6 and 2, either side
+    /// of kind 5; at most one kind 6, after kind 5 and immediately before
+    /// kind 2; kind 2 last, after kind 5 and with its exit facts; at most
+    /// five. After kind 6, kind 2 carries reason 12 (`model-1`,
+    /// `person-1`) or reason 14 or 15 (`person-outside-1`); without kind 6
+    /// it carries none of them.
     fn accept(&mut self, notice: Notice) -> Result<(), ExecCmdError> {
         self.notices += 1;
         if self.notices > MAX_NOTICES || self.terminal.is_some() {
@@ -655,12 +772,27 @@ impl ExecCmdJob {
         }
         let after_report = self.last_kind == KIND_ESCAPEE_REPORT;
         let exit = (notice.exit_kind, notice.value);
+        let report_reason = match self.profile {
+            Profile::Model1 | Profile::Person1 => notice.reason == REASON_ESCAPEE_TERMINATED,
+            Profile::PersonOutside1 => matches!(
+                notice.reason,
+                REASON_ESCAPEES_LEFT_RUNNING | REASON_ESCAPEES_HOLD_OUTPUT
+            ),
+        };
+        let any_report_reason = matches!(
+            notice.reason,
+            REASON_ESCAPEE_TERMINATED | REASON_ESCAPEES_LEFT_RUNNING | REASON_ESCAPEES_HOLD_OUTPUT
+        );
         match notice.kind {
             1 if self.notices == 1 => self.spawned = true,
             3 if self.notices == 1 => self.terminal = Some(notice),
             KIND_LEADER_EXITED if self.spawned && self.leader.is_none() => self.leader = Some(exit),
             2 if self.leader == Some(exit)
-                && (notice.reason == REASON_ESCAPEE_TERMINATED) == after_report =>
+                && if after_report {
+                    report_reason
+                } else {
+                    !any_report_reason
+                } =>
             {
                 self.terminal = Some(notice)
             }
@@ -705,15 +837,48 @@ impl ExecCmdJob {
     pub fn cleanup_unconfirmed(&self) -> Option<UnconfirmedReason> {
         self.unconfirmed
     }
-    /// Escapees the guardian reported terminated (notice kind 6).
+    /// The notice kind 6 value: escapees terminated, or `!!` survivors
+    /// left running.
     pub fn escapees(&self) -> u32 {
         self.escapees
+    }
+    /// The guardian's kind 2 settled notice, once it arrived and the
+    /// guardian was reaped, before capture EOF. For a `!!` job with
+    /// `output_held` the job stays draining and capturing (OD2).
+    pub fn guardian_settled(&self) -> Option<GuardianSettled> {
+        let n = self.terminal.filter(|n| n.kind == 2)?;
+        if !self.reaped || self.fault {
+            return None;
+        }
+        Some(GuardianSettled {
+            exit: Exit::from_notice(&n)?,
+            escapees: self.escapees,
+            output_held: n.reason == REASON_ESCAPEES_HOLD_OUTPUT,
+        })
+    }
+    /// Close both capture read ends without waiting for EOF (OD2): a cancel
+    /// of a job whose guardian already settled, such as a `!!` job whose
+    /// survivors still hold its output. Allowed only after
+    /// [`Self::guardian_settled`]; returns whether it closed them. The sink
+    /// gets no `end`: the service seals the stored bytes as incomplete. A
+    /// survivor's next write gets EPIPE; it is never signalled (EC-D1).
+    pub fn close_capture(&mut self) -> bool {
+        if self.guardian_settled().is_none() {
+            return false;
+        }
+        self.out = None;
+        self.err = None;
+        true
+    }
+    /// Whether [`Self::close_capture`] closed the capture readers.
+    pub fn capture_closed(&self) -> bool {
+        self.out.is_none() && self.err.is_none()
     }
     pub fn settled(&self) -> bool {
         self.reaped
             && self.status_eof
-            && self.out.eof
-            && self.err.eof
+            && ended(&self.out)
+            && ended(&self.err)
             && self.terminal.is_some_and(|n| n.cleanup)
             && !self.fault
     }
@@ -790,8 +955,8 @@ impl ExecCmdJob {
             && self.exited
             && self.status_eof
             && !self.status_received
-            && self.out.eof
-            && self.err.eof
+            && ended(&self.out)
+            && ended(&self.err)
     }
 }
 

@@ -7,6 +7,11 @@
 //! The sweep freezes the attributed set to a fixpoint, then kills it. Every
 //! signal is sent only after the process's (pid, start time, pgid) tuple is
 //! re-read and matches. No call here waits on a process or adds a time limit.
+//!
+//! A `!!` job (`person-outside-1`) has no sandbox. Its descendants are
+//! attributed by the owned process group and by the job marker variable
+//! `ASURA_JOB_<jobhex>=1` in their `KERN_PROCARGS2` environment. They are
+//! counted after the shell exits and never signalled (EC-D1, PQ3).
 use super::ExecCmdError;
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -185,6 +190,125 @@ pub(super) fn sweep(
         Ok(Sweep::Clear)
     } else {
         Ok(Sweep::Remaining(after.members.len()))
+    }
+}
+
+/// The `!!` survivors found after the shell exited: live owned-group members
+/// and env-marked processes, never signalled (EC-D1).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct Survivors {
+    pub count: u32,
+    pub holders: usize,
+}
+impl Survivors {
+    /// The kind 2 reason: the lease reason with no survivor; otherwise 14,
+    /// or 15 when a survivor holds a capture pipe.
+    pub fn settled_reason(&self, lease_reason: u8) -> u8 {
+        if self.count == 0 {
+            lease_reason
+        } else if self.holders > 0 {
+            super::protocol::REASON_ESCAPEES_HOLD_OUTPUT
+        } else {
+            super::protocol::REASON_ESCAPEES_LEFT_RUNNING
+        }
+    }
+}
+/// The `!!` attribution: the owned process group and the job marker
+/// `ASURA_JOB_<jobhex>=1` in a process's `KERN_PROCARGS2` environment.
+pub(super) struct EnvMarker {
+    marker: Vec<u8>,
+    /// A `kern.argmax` buffer, allocated before the command spawns.
+    buffer: Vec<u8>,
+    /// The owned process group: the leader's PID.
+    group: i32,
+}
+impl EnvMarker {
+    /// Setup before spawn; a failure refuses the job (`sandbox_unavailable`).
+    pub fn new(marker: &str) -> Result<Self, ExecCmdError> {
+        let argmax =
+            usize::try_from(sysctl_int(c"kern.argmax")?).map_err(|_| ExecCmdError::Unavailable)?;
+        if argmax == 0 || argmax > MAX_ARGUMENT_BYTES {
+            return Err(ExecCmdError::Unavailable);
+        }
+        Ok(Self {
+            marker: marker.as_bytes().to_vec(),
+            buffer: vec![0; argmax],
+            group: 0,
+        })
+    }
+    /// Record the owned group once the leader exists.
+    pub fn set_group(&mut self, leader: i32) {
+        self.group = leader;
+    }
+    /// Whether `pid`'s `KERN_PROCARGS2` environment holds the marker. A
+    /// process whose record cannot be read (gone, or a platform binary
+    /// whose environment macOS 27 withholds from other processes) is not
+    /// attributable, as for an env-scrubbed escapee (EXD-1).
+    fn marked(&mut self, pid: i32) -> bool {
+        let mut size = self.buffer.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: the buffer holds `size` writable bytes; sysctl writes at
+        // most that many and reports the count in `size`.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                self.buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        result == 0
+            && size <= self.buffer.len()
+            && environment_holds(&self.buffer[..size], &self.marker)
+    }
+}
+/// The process table seen through the `!!` attribution: listing, identity,
+/// pipe holding and signals come from the real table; attribution is the
+/// owned group or the environment marker, never the sandbox marker.
+struct Outside<'a, P: Processes> {
+    table: &'a mut P,
+    env: &'a mut EnvMarker,
+}
+impl<P: Processes> Processes for Outside<'_, P> {
+    fn list(&mut self) -> Result<Vec<i32>, Unverifiable> {
+        self.table.list()
+    }
+    fn attributed(&mut self, pid: i32) -> Result<bool, Unverifiable> {
+        let group = self.env.group;
+        let in_group = self
+            .table
+            .identity(pid)?
+            .is_some_and(|found| group > 0 && i64::from(found.pgid) == i64::from(group));
+        Ok(in_group || self.env.marked(pid))
+    }
+    fn identity(&mut self, pid: i32) -> Result<Option<Identity>, Unverifiable> {
+        self.table.identity(pid)
+    }
+    fn holds_capture(&mut self, pid: i32) -> bool {
+        self.table.holds_capture(pid)
+    }
+    fn signal(&mut self, _pid: i32, _signal: i32) -> Result<bool, Unverifiable> {
+        // EC-D1: a `!!` survivor is never signalled.
+        Ok(false)
+    }
+}
+/// One scan for `!!` survivors after the shell exited: live owned-group
+/// members (PQ3) and env-marked processes, counted, never signalled.
+/// Best effort (EXD-1): a scan that cannot be verified reports none, so
+/// the job then settles on capture EOF or a cancel.
+pub(super) fn survivors(
+    table: &mut impl Processes,
+    env: &mut EnvMarker,
+    exclude: &[i32],
+) -> Survivors {
+    match scan(&mut Outside { table, env }, exclude) {
+        Ok(found) => Survivors {
+            count: u32::try_from(found.members.len()).unwrap_or(u32::MAX),
+            holders: found.holders,
+        },
+        Err(Unverifiable) => Survivors::default(),
     }
 }
 
@@ -525,6 +649,33 @@ impl Processes for Libproc {
     }
 }
 
+/// Largest accepted `kern.argmax`.
+const MAX_ARGUMENT_BYTES: usize = 16 << 20;
+/// Whether a `KERN_PROCARGS2` record's environment holds `entry` exactly:
+/// argc, the executable path and its NUL padding, argc strings, then the
+/// environment strings up to the first empty one.
+pub(super) fn environment_holds(record: &[u8], entry: &[u8]) -> bool {
+    let Some(argc) = record.get(..4) else {
+        return false;
+    };
+    let argc = i32::from_ne_bytes([argc[0], argc[1], argc[2], argc[3]]);
+    let Ok(argc) = usize::try_from(argc) else {
+        return false;
+    };
+    let mut rest = &record[4..];
+    let path = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+    rest = &rest[path..];
+    let padding = rest.iter().position(|b| *b != 0).unwrap_or(rest.len());
+    rest = &rest[padding..];
+    let mut strings = rest.split(|b| *b == 0);
+    for _ in 0..argc {
+        if strings.next().is_none() {
+            return false;
+        }
+    }
+    strings.take_while(|s| !s.is_empty()).any(|s| s == entry)
+}
+
 /// Test-support guardian faults (escapee-control.md, test-support faults).
 #[cfg(feature = "test-support")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -536,6 +687,8 @@ pub(super) enum Fault {
     Undyable,
     /// The first n scans are unverifiable (EC-D2).
     Unverifiable(u32),
+    /// `/usr/bin/sandbox-exec` is unavailable (PC-I29).
+    NoSandboxExec,
 }
 #[cfg(feature = "test-support")]
 impl Fault {
@@ -543,6 +696,7 @@ impl Fault {
         match text {
             "group-only" => Some(Self::GroupOnly),
             "undyable" => Some(Self::Undyable),
+            "no-sandbox-exec" => Some(Self::NoSandboxExec),
             _ => text
                 .strip_prefix("unverifiable:")
                 .and_then(|n| n.parse().ok())
