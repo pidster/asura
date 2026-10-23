@@ -133,6 +133,9 @@ directories named `.git` (except as listed below), `target`, `node_modules`,
 | `.envrc` | Any depth up to 8 |
 | `.cargo/config`, `.cargo/config.toml` | Any depth up to 8 |
 
+The depths above bound the walk. The model write denial covers the same
+patterns at any depth ([model write denial](#model-write-denial)).
+
 **Build and test list:**
 
 | Class | Patterns | Depth |
