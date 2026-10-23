@@ -83,3 +83,9 @@ name = "secret_store_fixture"
 path = "src/bin/secret_store_fixture.rs"
 required-features = ["test-support"]
 test = false
+
+[[test]]
+name = "person_command_flow"
+path = "tests/person_command_flow.rs"
+harness = false
+required-features = ["test-support"]

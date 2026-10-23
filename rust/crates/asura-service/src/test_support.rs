@@ -468,6 +468,8 @@ pub struct JobHarness {
     audit: Option<crate::audit::Worker>,
     audit_records: Vec<asura_storage::audit::Record>,
     events: Vec<String>,
+    /// The owner's control replies, oldest first.
+    replies: Vec<asura_control::pb::Envelope>,
     /// The longest single owner poll seen (reactor responsiveness).
     pub longest_poll: Duration,
 }
@@ -529,8 +531,28 @@ impl JobHarness {
     /// controller exists. With `audit`, a real audit worker records the
     /// job events (`audit.enabled` must be set in the home's config).
     pub fn start(runtime: &RuntimeDirectory, audit: bool) -> Result<Self, String> {
+        Self::start_with(runtime, audit, None)
+    }
+    /// [`Self::start`] whose controller drives `slots` instead of exec_cmd
+    /// slots: owner unit tests start no process.
+    #[cfg(test)]
+    pub(crate) fn start_scripted(
+        runtime: &RuntimeDirectory,
+        slots: crate::job_controller::SlotFactory,
+    ) -> Result<Self, String> {
+        Self::start_with(runtime, false, Some(slots))
+    }
+    fn start_with(
+        runtime: &RuntimeDirectory,
+        audit: bool,
+        #[allow(unused_variables)] slots: Option<crate::job_controller::SlotFactory>,
+    ) -> Result<Self, String> {
         let (reader, wake) = asura_platform::events::wake_pair().map_err(|e| e.to_string())?;
         let mut owner = crate::conversation::Owner::new(runtime.clone(), None);
+        #[cfg(test)]
+        if let Some(slots) = slots {
+            owner.set_test_slots(slots);
+        }
         let audit = if audit {
             let worker = crate::audit::Worker::start(
                 runtime.clone(),
@@ -553,15 +575,24 @@ impl JobHarness {
             audit,
             audit_records: Vec::new(),
             events: Vec::new(),
+            replies: Vec::new(),
             longest_poll: Duration::ZERO,
         };
-        harness.until(Duration::from_secs(60), |h| {
+        let started = harness.until(Duration::from_secs(60), |h| {
             h.owner
                 .fixture_replay()
                 .is_some_and(|r| r.binding.is_some())
                 && h.owner.fixture_jobs().is_some()
                 && h.owner.fixture_unavailable().is_none()
-        })?;
+        });
+        if let Err(error) = started {
+            let replay = harness.owner.fixture_replay().map(|r| r.binding.is_some());
+            let jobs = harness.owner.fixture_jobs().is_some();
+            let unavailable = harness.owner.fixture_unavailable();
+            return Err(format!(
+                "{error}: replay binding {replay:?}, controller {jobs}, unavailable {unavailable:?}"
+            ));
+        }
         Ok(harness)
     }
 
@@ -569,7 +600,8 @@ impl JobHarness {
     /// the wake for at most 20 ms (harness pacing only).
     pub fn step(&mut self) {
         let now = Instant::now();
-        let _ = self.owner.poll(now);
+        let replies = self.owner.poll(now);
+        self.replies.extend(replies);
         let spent = now.elapsed();
         self.longest_poll = self.longest_poll.max(spent);
         for event in self.owner.fixture_job_events() {
@@ -961,6 +993,35 @@ impl JobHarness {
         })
     }
 
+    /// Sends one control request to the owner; its reply, now or after
+    /// later steps, is taken with [`Self::reply`].
+    #[cfg(test)]
+    pub(crate) fn request(&mut self, request: asura_control::pb::Envelope) {
+        if let Some(reply) = self.owner.request(request, Instant::now()) {
+            self.replies.push(reply);
+        }
+    }
+    /// Steps until the reply to `counter` arrives.
+    #[cfg(test)]
+    pub(crate) fn reply(&mut self, counter: u64) -> Result<asura_control::pb::Envelope, String> {
+        let mut found = None;
+        self.until(Duration::from_secs(60), |h| {
+            if let Some(at) = h
+                .replies
+                .iter()
+                .position(|r| r.request_counter == Some(counter))
+            {
+                found = Some(h.replies.remove(at));
+            }
+            found.is_some()
+        })?;
+        Ok(found.expect("reply"))
+    }
+    /// The owner under test.
+    #[cfg(test)]
+    pub(crate) fn owner(&mut self) -> &mut crate::conversation::Owner {
+        &mut self.owner
+    }
     /// The controller events seen so far, as text, oldest first.
     pub fn events(&self) -> &[String] {
         &self.events
@@ -1007,4 +1068,23 @@ impl JobHarness {
     pub fn settled(&mut self) -> bool {
         self.owner.settled()
     }
+}
+
+// ------------------------------------------------------- secret store gate
+
+/// The gate an in-process service's secret store uses (SS-I8, SS-I9): set
+/// before the service starts, the owner builds its store over the gated
+/// port, so a test can hold a Keychain call or fail one call once. Every
+/// other call reaches the scratch keychain. `test-support` only.
+static SECRET_STORE_GATE: std::sync::Mutex<Option<crate::secret_store::Gate>> =
+    std::sync::Mutex::new(None);
+/// Sets (or clears) the gate for the next secret store this process starts.
+pub fn set_secret_store_gate(gate: Option<crate::secret_store::Gate>) {
+    *SECRET_STORE_GATE.lock().unwrap_or_else(|e| e.into_inner()) = gate;
+}
+pub(crate) fn secret_store_gate() -> Option<crate::secret_store::Gate> {
+    SECRET_STORE_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }

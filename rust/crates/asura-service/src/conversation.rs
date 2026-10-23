@@ -825,8 +825,13 @@ impl Owner {
         let notice_fault = runtime
             .scratch_home_for_test()
             .is_some_and(|home| home.join("job-notice-invalid").exists());
+        #[cfg(feature = "test-support")]
+        let hold_append = runtime
+            .scratch_home_for_test()
+            .is_some_and(|home| home.join("person-command-hold-append").exists());
 
-        Self {
+        #[allow(unused_mut)]
+        let mut owner = Self {
             audit_records: Arc::new(Vec::new()),
             create_recovery: None,
             audit_health: audit_tools::unavailable(),
@@ -871,7 +876,12 @@ impl Owner {
             fixture: None,
             #[cfg(feature = "test-support")]
             notice_fault,
+        };
+        #[cfg(feature = "test-support")]
+        {
+            owner.persons.hold_append = hold_append;
         }
+        owner
     }
     /// The queued input under preparation and its pre-acceptance step.
     fn preparing_step(&self) -> Option<(journal::Id, pb::ConversationWaitStep)> {

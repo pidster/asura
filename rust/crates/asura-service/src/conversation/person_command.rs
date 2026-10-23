@@ -43,9 +43,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 use zeroize::Zeroizing;
 
-/// Submits in flight at once: one secret store queue's worth (AE-03). A
-/// submit beyond it is `conversation_busy`.
-const SUBMITS: usize = secret_store::QUEUE_BOUND;
+/// Submits in flight at once (AE-03): twice the secret store queue, so a
+/// full store queue answers `secret_store_busy` first. A submit beyond it
+/// is `conversation_busy`.
+const SUBMITS: usize = 2 * secret_store::QUEUE_BOUND;
 /// Dropped inputs whose kind 31 waits to be read for the item decision.
 const CHECKS: usize = 16;
 /// The `!` PATH bounds (PC2).
@@ -335,6 +336,12 @@ pub(super) struct Persons {
     holds: VecDeque<Id>,
     /// The waiting reasons last published, by input (live display state).
     published: BTreeMap<Id, (i32, String)>,
+    /// Test-support seam (SS-I3): kind 31 appends are held for this run.
+    #[cfg(feature = "test-support")]
+    pub(super) hold_append: bool,
+    /// Owner unit tests: every delete the owner decided, in order.
+    #[cfg(test)]
+    deleted: Vec<Id>,
 }
 impl Default for Persons {
     fn default() -> Self {
@@ -354,6 +361,10 @@ impl Default for Persons {
             recovering: None,
             holds: VecDeque::new(),
             published: BTreeMap::new(),
+            #[cfg(feature = "test-support")]
+            hold_append: false,
+            #[cfg(test)]
+            deleted: Vec::new(),
         }
     }
 }
@@ -510,18 +521,32 @@ fn cut_display(display: &str) -> (String, bool) {
     while !display.is_char_boundary(cut) {
         cut -= 1;
     }
-    // A placeholder `$ASURA_SECRET_<digits>` that the cut would split ends
-    // the text before it.
+    // A placeholder `$ASURA_SECRET_<digits>` (or `${ASURA_SECRET_<digits>}`)
+    // that the cut would split ends the text before it.
     let bytes = display.as_bytes();
-    if let Some(start) = display[..cut].rfind("$ASURA_SECRET_") {
-        let digits = start + "$ASURA_SECRET_".len();
-        let end = digits
+    for (start, _) in display.match_indices("ASURA_SECRET_") {
+        let digits = start + "ASURA_SECRET_".len();
+        let mut end = digits
             + bytes[digits..]
                 .iter()
                 .take_while(|b| b.is_ascii_digit())
                 .count();
-        if end >= cut && end > digits {
-            cut = start;
+        let begin = match start.checked_sub(1).map(|i| bytes[i]) {
+            Some(b'$') => start - 1,
+            Some(b'{') if start >= 2 && bytes[start - 2] == b'$' => {
+                if bytes.get(end) == Some(&b'}') {
+                    end += 1;
+                }
+                start - 2
+            }
+            _ => continue,
+        };
+        if begin >= cut {
+            break;
+        }
+        if end > digits && begin < cut && cut < end {
+            cut = begin;
+            break;
         }
     }
     (display[..cut].to_owned(), true)
@@ -1051,6 +1076,12 @@ impl Owner {
         if self.pending.is_some() || self.closing || self.unavailable.is_some() {
             return false;
         }
+        // Test-support seam (SS-I3): appends are held for this run when
+        // the scratch home held `person-command-hold-append` at start.
+        #[cfg(feature = "test-support")]
+        if self.persons.hold_append {
+            return false;
+        }
         let Some(at) = self
             .persons
             .submits
@@ -1170,7 +1201,13 @@ impl Owner {
         let waiting = self.waiting_reasons();
         let mut entries = Vec::with_capacity(value.inputs.len());
         for v in value.inputs {
-            if v.status != InputStatus::Held {
+            // A dispatch hold whose decision waits for the ticket keeps the
+            // reason it noted.
+            let hold_pending = matches!(
+                self.persons.dispatches.get(&v.input.input),
+                Some(Dispatch::Holding)
+            ) || self.persons.holds.contains(&v.input.input);
+            if v.status != InputStatus::Held && !hold_pending {
                 self.hold_reasons.remove(&v.input.input);
             }
             let hold = (v.status == InputStatus::Held)
@@ -1719,6 +1756,8 @@ impl Owner {
     /// Sends `delete` for one input's item after its deciding record
     /// (ordering rule 5). A full worker queue leaves it for the next sweep.
     fn person_delete(&mut self, input: Id) {
+        #[cfg(test)]
+        self.persons.deleted.push(input);
         let Some(store) = &self.persons.store else {
             return;
         };
@@ -1895,7 +1934,19 @@ impl Owner {
             && let Some(state) = self.replay.as_deref()
             && state.binding.is_some()
         {
-            match Store::new(target.clone(), state.installation_id, self.wake.clone()) {
+            #[cfg(feature = "test-support")]
+            let started = match crate::test_support::secret_store_gate() {
+                Some(gate) => Store::gated(
+                    target.clone(),
+                    state.installation_id,
+                    self.wake.clone(),
+                    gate,
+                ),
+                None => Store::new(target.clone(), state.installation_id, self.wake.clone()),
+            };
+            #[cfg(not(feature = "test-support"))]
+            let started = Store::new(target.clone(), state.installation_id, self.wake.clone());
+            match started {
                 Ok(store) => self.persons.store = Some(store),
                 Err(_) => {
                     self.persons.store_failed = true;
@@ -2064,3 +2115,34 @@ impl Owner {
         self.persons.observation()
     }
 }
+
+#[cfg(test)]
+impl Owner {
+    /// Owner unit tests: stops the secret store worker and waits for it,
+    /// before the test deletes its scratch keychain (testing rule 2).
+    pub(crate) fn close_secret_store(&mut self) {
+        if let Some(store) = self.persons.store.take() {
+            let _ = store.close().join();
+        }
+    }
+    /// Owner unit tests: closes the journal writer and waits until its
+    /// worker settled, as a crash leaves the journal (no closure record is
+    /// written), so the next owner of the process can open its writer.
+    pub(crate) fn close_writer_for_test(&mut self) {
+        if let Some(writer) = &mut self.writer {
+            writer.close();
+            let end = Instant::now() + std::time::Duration::from_secs(60);
+            while !writer.settled() && Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+    /// Owner unit tests: the controller's slots come from `slots`.
+    pub(crate) fn set_test_slots(&mut self, slots: crate::job_controller::SlotFactory) {
+        self.jobs.set_slots(slots);
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+#[path = "person_command_tests.rs"]
+mod tests;
