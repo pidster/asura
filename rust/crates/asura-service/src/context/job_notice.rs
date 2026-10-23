@@ -35,6 +35,9 @@ pub(crate) const PERSON_LABEL: &str =
 pub(crate) const PERSON_OUTSIDE_LABEL: &str = "[The person ran a command, outside the sandbox, themselves. You did not run it.\nDo not run it again unless asked.]";
 pub(crate) const OVERFLOW_LINE: &str =
     "[More jobs settled since your last turn than are shown here. Use job list to see them.]";
+/// The live line for one job: its singular form (J5-E7).
+pub(crate) const LIVE_ONE_LINE: &str =
+    "[1 job in this conversation is still running or queued. Use job list to see it.]\n";
 
 /// One settlement of the `Prepare` notice inputs, with the records it names.
 #[derive(Clone, Copy, Debug)]
@@ -194,9 +197,7 @@ impl Notice {
         }
         match self.live {
             0 => {}
-            1 => text.push_str(
-                "[1 job in this conversation is still running or queued. Use job list to see them.]\n",
-            ),
+            1 => text.push_str(LIVE_ONE_LINE),
             count => text.push_str(&format!(
                 "[{count} jobs in this conversation are still running or queued. Use job list to see them.]\n"
             )),
@@ -246,9 +247,9 @@ fn entry(s: &Settlement<'_>) -> Result<Entry, NoticeError> {
     let capture = capture_suffix(facts);
     let handle = job_text::handle(&job);
     let full = format!(
-        "{label}\ncommand: {}\ndirectory: {}\nresult: {outcome}\noutput: stdout {} lines, {} bytes; stderr {} lines, {} bytes{capture}\njob: {handle}\n",
-        s.command,
-        s.directory,
+        "{label}\n{}{}result: {outcome}\noutput: stdout {} lines, {} bytes; stderr {} lines, {} bytes{capture}\njob: {handle}\n",
+        quoted("command", s.command),
+        quoted("directory", s.directory),
         facts.stdout.lines,
         facts.stdout.capture.stored_bytes,
         facts.stderr.lines,
@@ -267,6 +268,58 @@ fn entry(s: &Settlement<'_>) -> Result<Entry, NoticeError> {
         full,
         reference,
     })
+}
+
+/// The quoted value form of field `field` with stored value `value`
+/// (tool-job-controller.md, quoted value form; J5-E6, TJ-F6). Every line
+/// it writes ends in a newline and starts with `field: ` or the
+/// continuation prefix `  | `, so no stored text starts a notice line. An
+/// ordinary one-line value is unchanged.
+///
+/// 1. Each run of backslashes directly followed by `u{` or by a character
+///    of the escaped set is doubled.
+/// 2. Each character of the escaped set becomes `\u{H}`, `H` its code point
+///    in uppercase hexadecimal, at least 4 digits.
+/// 3. The result is split at each newline; the first line follows
+///    `field: `, each later line follows `  | `.
+pub(crate) fn quoted(field: &str, value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + field.len() + 2);
+    let mut run = 0usize;
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            run += 1;
+            continue;
+        }
+        let protect = escapes(c) || (c == 'u' && chars.peek() == Some(&'{'));
+        let backslashes = if protect { run * 2 } else { run };
+        escaped.extend(std::iter::repeat_n('\\', backslashes));
+        run = 0;
+        if escapes(c) {
+            escaped.push_str(&format!("\\u{{{:04X}}}", u32::from(c)));
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped.extend(std::iter::repeat_n('\\', run));
+    let mut out = String::with_capacity(escaped.len() + field.len() + 3);
+    for (index, line) in escaped.split('\n').enumerate() {
+        if index == 0 {
+            out.push_str(field);
+            out.push_str(": ");
+        } else {
+            out.push_str("  | ");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The escaped set `X` of the quoted value form: every general category Cc
+/// character except tab and newline, plus U+2028 and U+2029.
+fn escapes(c: char) -> bool {
+    (c.is_control() && c != '\t' && c != '\n') || c == '\u{2028}' || c == '\u{2029}'
 }
 
 /// `; capture <state text>` for a capture state other than `complete`.
