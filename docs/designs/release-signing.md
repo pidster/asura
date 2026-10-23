@@ -848,12 +848,18 @@ flowchart TD
   through `KERN_PROCARGS2` (process list and descriptor info are denied, these
   reads are not). A compromised helper can therefore see secrets that other
   long-running programs hold in their environment variables, for example API
-  tokens. The App Sandbox has no entitlement to deny this. Probe HS-P8 (SG2a)
-  tests whether a service-applied Seatbelt profile for the helper, with
-  `(deny process-info* (target others))` and the sysctl rule for
-  `kern.procargs2`, blocks these reads; if it does, the owner chooses between
-  that profile, the App Sandbox, or both. Until then the residual stands and
-  the person is advised to keep long-lived secrets out of the environment of
+  tokens. The App Sandbox has no entitlement to deny this. Probe HS-P8 (SG2a,
+  2026-10-23, macOS 27.0 26A428) found no Seatbelt rule that blocks a
+  same-user `KERN_PROCARGS2` read: `(deny process-info*)`, `(deny
+  sysctl-read)` blanket, by name and by the `kern.proc` prefix, and a
+  deny-default profile all leave it allowed; `(target others)` has no effect
+  in any rule; and the App Sandbox cannot be combined with a service-applied
+  Seatbelt profile (the helper traps in `_libsecinit_appsandbox`). The
+  residual therefore stands and the helper keeps the App Sandbox (SGQ7), which
+  confines files, sockets and the process list. Where a Seatbelt profile
+  limits process information, it is written `(deny process-info*)` with
+  `(allow process-info* (target self))`, never with `(target others)`. The
+  person is advised to keep long-lived secrets out of the environment of
   programs that stay running.
 - **Hub bundle.** The bundle holds tokenizer configuration data only. Its
   digest is pinned like the helper's, so a changed bundle fails before spawn.
@@ -947,6 +953,22 @@ evidence; the results and their design effect are:
 | HR-P2 | dyld removes `DYLD_*` from a hardened process's own environment | Resolved: a hardened `asura` cannot pass `DYLD_*` on to `!!` |
 | BN-P1 | MLX and Core AI reach the Hub fallback and crash without the bundle; no crash with it | Defect confirmed; fixed by BN1 for MLX and Core AI |
 
+SG2a reruns (2026-10-23): HS-P1 and HS-P6 pass with a sandboxed helper built
+with the embedded `Info.plist` and the inventory opening its asset root by full
+path; SG2's HS-P6 condition is met. The conversation-flow crash-recovery step
+was timing-sensitive with the slower-starting sandboxed helper (3 of 5 runs);
+its harness wait ends on the recorded event, not a deadline (SG-V5). Probes and
+end-to-end cases assert on helper behaviour, never on an outside
+`sandbox_check` answer, which reported readable model paths as denied. The
+helper's run copy for system, Ollama and inventory selections is a bare
+`run/model-<hex>` file whose name differs from `CFBundleExecutable`; every
+probe passed, so the name need not match.
+
+Core AI cache: with the embedded identity, repeated spawns share one cache,
+`~/Library/Caches/coreai-cache/<os build>/com.pidster.asura.model` (about
+2.1 GB per identity and OS build). Core AI owns that cache; Asura does not
+delete it, and the user documentation states its size and location.
+
 Test isolation (from HS-P6): home-relative exceptions anchor to the real
 account home, not `HOME` or the Asura home, so a sandboxed helper cannot read a
 harness home under `/private/tmp`. Tests of a sandboxed helper (SG-V5 and the
@@ -1025,8 +1047,8 @@ signing packet.
 | BN1 | Ready | — (BN-P1 confirmed the crash, 2026-10-23) |
 | SG1 | Not ready | BN1 delivered or closed; SG0 results for HS-P1 (embedded `Info.plist`) and HR-P2 |
 | SG0-K | Not ready | SG1 qualification bundle; the owner runs it (SGQ9) |
-| SG2a | Ready | SG0 ad hoc results recorded |
-| SG2 | Not ready | SG1 and SG2a, then HS-P6 passing ([SG-F2](#sg-f2-helper-sandbox-decision)) |
+| SG2a | Delivered (branch `sg2a`, 2026-10-23) | — |
+| SG2 | Not ready | SG1 (HS-P6 passed in SG2a) |
 | SG3 | Not ready | KC-P1 to KC-P4 results; then the secret store design revision that SG3 owns |
 | SG4 | Not ready | SG1, SG2 and NT-P1 |
 | SG5 | Not ready | SG2, SG3 and SG4 |
