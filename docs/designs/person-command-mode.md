@@ -1248,15 +1248,19 @@ as SL5 requires.
 The maximum payload is 22,570 bytes: 105 bytes of IDs, digest, generation and
 flags; 8,196 for the command; 8,196 for the display text; 1,028 for the cwd;
 4,100 for the search path; 634 for the client environment (1 + 8 × 66 + 105);
-8 for the order revision; and 302 for fields 14–22 (2 + 256 + 4 + 1 + 4 + 32 +
+8 for the order revision; and 303 for fields 14–22 (2 + 256 + 4 + 1 + 4 + 32 +
 1 + 1 + 2). The maximum frame is 22,754 bytes, below the 65,536-byte journal
-frame. PC-U20 tests both maxima.
+frame. These are decode upper bounds: fields 8 and 9 cannot both be full in a
+valid record, so the largest valid record is smaller. PC-U20 tests the bound
+and the reachable maxima (P2, 2026-10-23).
 
 A secret item exists exactly when field 14 is not 0, field 17 bit 1 is set or
 field 7 bit 1 is set. Replay does not check the Keychain; dispatch does.
 
 The request digest is SHA-256 over: the kind number 31 (u8), project ID,
-conversation ID, expected generation, queue flags, command, display command,
+conversation ID (the zero ID when field 7 bit 0 asks for a new conversation,
+because the service picks a fresh ID on each try and an exact retry must still
+match), expected generation, queue flags, command, display command,
 cwd, search path and client environment, each in its field encoding, in that
 order. An exact retry returns the original input ID; changed fields under the
 same request ID conflict. The secret values and the `!!` launch environment
@@ -1317,16 +1321,17 @@ the input ID, cut to 16 bytes. Payload IDs derive from the job ID with the one
 
 #### Replay rules for person commands
 
-P2 replaces J2 rule JR2 with these rules. Each broken rule is `Corrupt`.
+P2 replaces J2 rule JR2 with these rules (implemented 2026-10-23, branch `p2`). Each broken rule is `Corrupt`.
 
 | ID | Rule |
 | --- | --- |
 | PR1 | Kind 31 follows the kind 18 rules for request, input, conversation, generation and order revision, and its own field rules above |
-| PR2 | A person-origin kind 26 names a kind 31 input that is the lane head, not dropped and without an earlier kind 26 |
-| PR3 | The profile derived for a person-origin kind 26 matches field 7 bit 1: `person-outside-1` exactly when it is set |
+| PR2 | A person-origin kind 26 names a kind 31 input that is the lane head, not dropped and without an earlier kind 26, and no model turn dispatched from that lane is running. The service also refuses a person dispatch while any model turn of the conversation is active, including one started by a direct submit; replay checks only what the lane records. A person kind 26 moves the lane round-robin position (`last_dispatched_lane`) as any dispatch does |
+| PR3 | Kind 26 has no profile field, so the profile shows only at settlement: kind 28 reason 20 `outside_sandbox_off` or capture reason 7 requires a person job whose kind 31 has field 7 bit 1 set |
 | PR4 | A later dispatch from the same lane (a `TurnAccepted` or a person-origin kind 26) requires every earlier person input of that lane to have a kind 26 or a kind 13 Drop. It does not require their kind 28, because a released `!!` job (OD2) may still be live |
 | PR5 | Kind 13 Drop of a kind 31 input is accepted only before its kind 26 |
 | PR6 | A kind 31 without a kind 26 replays as `Held` under a later owner generation |
+| PR7 | The stored command text (field 8, or field 9 when field 17 bit 1 is set) passes the kind 14 placeholder check (TCR-D4), so P3-E rewrites with `rewrite_exec_cmd_call_with`, which refuses typed placeholders |
 
 Kinds 26–28 otherwise replay under the job controller's rules. At start the
 service writes kind 28 `interrupted` for a kind 26 without a settlement. It
@@ -1825,7 +1830,7 @@ cases cover the person path.
 | PC-U31 | Draft `make; rm -rf build`, then `echo "a⏎b"`, then `cmd \⏎ --flag`, then three lines | Two carets and one rule; one command; one command; three carets, two rules and `3 commands will run` |
 | PC-U29 | Environment with an unlisted name, a bad `LANG` value, a relative or 104-byte `SSH_AUTH_SOCK` | Unlisted name and bad values reject with `environment_invalid`; service-sourced names never come from the client |
 | PC-U20 | Kind 31 codec at every field bound and the 22,570-byte maximum payload (22,754-byte frame); each invalid field; person-origin job records | Exact round trip; each invalid form `Corrupt`; digest order; job ID vectors; no output or environment field |
-| PC-U21 | Replay PR1–PR6: person job intent without kind 31, for a dropped input, for a non-head input, with a mismatched profile; a later lane dispatch before an earlier person input's kind 26; a Drop after kind 26; a later dispatch after a kind 26 with no kind 28 | Each invalid order rejects the stream; the last is accepted (OD2) |
+| PC-U21 | Replay PR1–PR7: person job intent without kind 31, for a dropped input, for a non-head input, with a mismatched profile; a later lane dispatch before an earlier person input's kind 26; a Drop after kind 26; a later dispatch after a kind 26 with no kind 28 | Each invalid order rejects the stream; the last is accepted (OD2) |
 | PC-U22 | J5 person notice entry for each outcome, reason 20, survivors left running and each capture state (shared with J5T-06) | J5 labels exact; counts and handle present; no output text |
 | PC-U23 | Dispatch with controller `busy` for slot, then quota | Command stays queued at the head with each reason; retried on free |
 | PC-U24 | Guardian lease bytes `T`, `K`, EOF, unknown byte | TERM plus grace; KILL now; lease end; protocol fault |
@@ -2015,12 +2020,12 @@ reads or writes `~/.asura` or the login keychain.
 | SS1-K2 Keychain platform follow-up | `asura-platform/src/keychain.rs`; `asura-platform/src/keychain/tests.rs`; `asura-platform/src/bin/keychain_fixture.rs` | SS1-K | List bound of 257 with `Listing.truncated`; `scratch::fixture_main()` and `scratch::add_account` ([SS1-K2](secret-store.md#ss1-k2-platform-follow-up)); SS-K2-1 |
 | SS1-S Secret store worker | `asura-service/src/secret_store.rs` and `asura-service/src/secret_store/*.rs` (new); the `mod secret_store;` line of `asura-service/src/lib.rs`; `asura-service/src/bin/secret_store_fixture.rs` (new, test-support binary); the `[[bin]]` and `[[test]]` entries for them in `asura-service/Cargo.toml`; `asura-service/tests/secret_store_worker.rs` (new) | SS1-K2 | Queue, worker, `KeychainPort` and gated port, payload codec, binding, sweep, stranded and unrecognized counts, counts API; SS-U1, SS-U2, SS-U4 to SS-U8, SS-U10, SS-U11, SS-W1 to SS-W10 |
 | P1 Platform person profiles | `asura-platform/src/exec_cmd.rs`; `asura-platform/src/exec_cmd/{guardian,protocol,spawn,escapee,tests}.rs`; `asura-platform/src/exec_cmd/person.rs` (new: roots, developer directory, FD 11 frame); `asura-platform/tests/exec_cmd_process.rs`; `asura-platform/tests/fixtures/` (new fixtures) | J5 delivered | Tokens `person-1` and `person-outside-1`, FD 11 and FDs 12–19, person Seatbelt profile, job scratch write (OD1), `!!` gate, env-marker scan, kind 2 reasons 14 and 15, `ASURA_JOB_<jobhex>`, PC-P1 probe record (reported to D0); PC-U24, PC-U25, PC-U46, PC-U50 to PC-U52; PC-I2 to PC-I5, PC-I22, PC-I29, PC-I37, PC-I38 at the platform layer; EC-I9, EC-I10 |
-| P2 Storage records | `asura-storage/src/authority/**`; `asura-storage/tests/{authority_conversation,authority_replay,journal_writer,segmented_journal}.rs` | J5 delivered | Kind 31, PR1–PR6 replacing JR2, kind 28 capture reason 7 (reason 20 is already in the codec from J34-S), checkpoint and index entries for kind 31, `JobFacts` from kind 31; PC-U20, PC-U21, PC-U42 |
+| P2 Storage records | `asura-storage/src/authority/**`; `asura-storage/tests/{authority_conversation,authority_replay,journal_writer,segmented_journal}.rs` | J5 delivered | Kind 31, PR1–PR7 replacing JR2, the `QueuePersonCommand` writer command (the caller chooses the input and conversation IDs, because the secret store item binds them before the append), the `JobCommand` command source for listings, `JobFacts` and the notice, kind 28 capture reason 7 (reason 20 is already in the codec from J34-S), checkpoint and index entries for kind 31, `JobFacts` from kind 31; PC-U20, PC-U21, PC-U42 |
 | P2-G Configuration and audit schema | `asura-storage/src/config.rs`; `asura-storage/src/audit/{types,mod,tests}.rs` | J5 delivered | `personCommands.allowOutsideSandbox`; audit profiles `person-1` and `person-outside-1`; `outside_sandbox` fields; `person_command.queued` and `person_command.refused`; `Setting::for_config_key` entry; PC-U45, PC-U58 (unit) |
 | P3-C Control contract and client | `contracts/control/v1/control.proto`; `asura-control/src/{lib,wire,conversation,jobs}.rs`; `asura-client/src/lib.rs` | J5 delivered | Field 68, capability 8, `LaunchVariable`, queue entry fields 16–20, `QueueWaitReason`, `QueueRefusal`, reply fields 9–10, history field 5, `JobEntry` fields 28–29, `ServiceObservation` field 8; PC-U41, PC-U49, PC-U55 |
 | P3-K Controller | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | P2, P2-G | `Profile::Person1` and `PersonOutside1`, switch check at slot grant, reason 20, `ShellExited`, released `Draining`, `close_capture` on cancel; PC-U23, PC-U43 (controller part), PC-U53 |
 | P3-T Slot and capture workers | `asura-service/src/exec_cmd_worker.rs`; `asura-service/src/exec_cmd_worker/tests.rs`; `asura-service/src/capture_worker.rs`; `asura-service/tests/capture_worker.rs` | P1, P3-K | Person start with the FD 11 writer and root resolution, kind 2 reasons 14 and 15 to slot events, `SlotPort::close_capture`, capture reason 7; PC-I33 to PC-I35 at the worker layer |
-| P3-E Service integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (new `person_command.rs`); `asura-service/src/{lib,audit,config_worker,service_observer,test_support}.rs`; `asura-service/tests/person_command_flow.rs` (new) | SS1-S, P1, P2, P2-G, P3-C, P3-K, P3-T, SL7 | Submit validation, SL5 rewrite at submit, item put, get and delete, kind 31 append, dispatch with person grant, overlay and lane release, waiting reasons, refusals, audit emission, observer field 8; PC-U26, PC-U27, PC-U54, PC-U56, PC-U57; PC-I1 to PC-I39 except the TUI parts; SS-I1 to SS-I11; SDI-10; EC-I9, EC-I10 through the service |
+| P3-E Service integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (new `person_command.rs`); the `ReadRecord` kind list in `asura-storage/src/authority/writer/mod.rs` (add kind 31 if P3-E reads it); `asura-service/src/{lib,audit,config_worker,service_observer,test_support}.rs`; `asura-service/tests/person_command_flow.rs` (new) | SS1-S, P1, P2, P2-G, P3-C, P3-K, P3-T, SL7 | Submit validation, SL5 rewrite at submit, item put, get and delete, kind 31 append, dispatch with person grant, overlay and lane release, waiting reasons, refusals, audit emission, observer field 8; PC-U26, PC-U27, PC-U54, PC-U56, PC-U57; PC-I1 to PC-I39 except the TUI parts; SS-I1 to SS-I11; SDI-10; EC-I9, EC-I10 through the service |
 | P4 TUI | `asura-cli/src/tui/{ui,mod,config,jobs}.rs`; `asura-cli/src/tui/ui/*.rs`; `asura-cli/tests/tui_pty.py` (person journeys) | P3-C; P3-E for the PTY journeys | Three composer modes, splitter display, staging, refusal texts, Ctrl-C routing, log fold, released-job status, recall, `/help`, the `/status` secret store notices ([secret store operations](secret-store.md#operations-and-audit)); PC-U1 to PC-U19, PC-U28 to PC-U40, PC-U44, PC-U59; PC-E1 to PC-E20 with a fixture service until Q |
 | P5 Execution path guard | The [execution path guard packets](execution-path-guard.md#packets) EPG-S, EPG-W, EPG-P and EPG-T | P3-E, P4 | PCR18; PC-E21 |
 | Q Qualification | No code paths; evidence in this design | P1 to P5 | Every PC-E, SS-E, EC-E2 and EC-E4 case on the macOS 27 host; the CLI lifecycle gate; the PTY journeys; the threat model mapping; then capability 8 is advertised |
