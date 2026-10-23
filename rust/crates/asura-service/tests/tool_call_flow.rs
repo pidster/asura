@@ -716,6 +716,10 @@ fn exec_cmd_secret() -> Result<()> {
     assert!(delivered[0].contains("state: settled"), "{}", delivered[0]);
     assert!(delivered[0].contains("result: exit 0"), "{}", delivered[0]);
     assert!(!delivered[0].contains("GITHUB_TOKEN"), "no output text");
+    assert!(
+        !delivered[0].contains(&secret),
+        "the delivered result holds no secret"
+    );
     let progress = &event.tools[0];
     assert!(
         progress.job_id.is_some(),
