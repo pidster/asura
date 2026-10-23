@@ -2846,7 +2846,15 @@ def segmented_journal(fixture):
     assert code == 0, (raw, err)
     fixture.started = True
     # SJ-37: the CLI prints every page.
-    code, listed, err = fixture.command("project", "list")
+    # The owner opens the 200-project journal after `service start` returns;
+    # until then the CLI reports `conversation_busy` (service starting).
+    end = time.monotonic() + remaining(30)
+    while True:
+        code, listed, err = fixture.command("project", "list")
+        if code == 0 or b"conversation_busy" not in err:
+            break
+        assert time.monotonic() < end, (listed, err)
+        time.sleep(0.1)
     assert code == 0, (listed, err)
     lines = [line for line in listed.decode().splitlines() if re.match(r"^[0-9a-f]{32}  ", line)]
     assert len(lines) == 200, len(lines)
