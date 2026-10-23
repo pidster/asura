@@ -124,6 +124,61 @@ fn queue_submit_reply_matches(
         })
 }
 
+/// The service's answer to a person command submit
+/// (person-command-mode.md, control API additions).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandSubmit {
+    /// Queued: `accepted_input_id` names the kind 3 entry; the job ID derives
+    /// from it.
+    Accepted(pb::ConversationQueueReply),
+    /// A definite refusal: nothing was queued or stored. `status` is the
+    /// |OSStatus| of `secret_store_unavailable`. `sent` is false when this
+    /// client refused before sending, by the codec's own environment rule
+    /// ([`asura_control::person::environment_refusal`]), so an environment
+    /// that cannot fit one control frame still gets its refusal.
+    Refused {
+        refusal: pb::QueueRefusal,
+        status: Option<u32>,
+        sent: bool,
+    },
+}
+
+fn command_submit_reply(
+    request: &pb::ConversationQueueCommandSubmit,
+    reply: pb::ConversationQueueReply,
+) -> Option<CommandSubmit> {
+    if reply.request_id != request.request_id {
+        return None;
+    }
+    if let Some(refusal) = reply.refusal {
+        // The codec has checked the refusal reply's shape.
+        return Some(CommandSubmit::Refused {
+            refusal: pb::QueueRefusal::try_from(refusal).ok()?,
+            status: reply.refusal_status,
+            sent: true,
+        });
+    }
+    let outside = request.outside_sandbox == Some(true);
+    let accepted = reply.stale_order == Some(false)
+        && reply.order_revision.is_some()
+        && reply.full_text == Some(false)
+        && reply.accepted_input_id.is_some()
+        && reply
+            .entries
+            .iter()
+            .all(|entry| entry.project_id == request.project_id)
+        && reply.entries.iter().any(|entry| {
+            entry.input_id == reply.accepted_input_id
+                && entry.kind == Some(asura_control::person::ENTRY_KIND)
+                && entry.command_outside_sandbox == Some(outside)
+                && request
+                    .conversation_id
+                    .as_ref()
+                    .is_none_or(|id| entry.conversation_id.as_ref() == Some(id))
+        });
+    accepted.then_some(CommandSubmit::Accepted(reply))
+}
+
 fn queue_reorder_reply_matches(
     request: &pb::ConversationQueueReorder,
     reply: &pb::ConversationQueueReply,
@@ -144,6 +199,9 @@ pub struct ServiceUpdate {
     pub configured_model: Option<String>,
     /// The configured thinking level code (thinking-level.md).
     pub thinking_level: Option<i32>,
+    /// The secret store worker's counts, for `/status` detail
+    /// (secret-store.md, operations and audit).
+    pub secret_store: Option<pb::SecretStoreStatus>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -424,6 +482,7 @@ impl Client {
                     pending: value.pending.ok_or(Error::Protocol)?,
                     configured_model: value.configured_model,
                     thinking_level: value.thinking_level,
+                    secret_store: value.secret_store,
                 })
             }
             _ => Err(Error::Protocol),
@@ -670,6 +729,33 @@ impl Client {
                 if queue_submit_reply_matches(&expected, &reply) =>
             {
                 Ok(reply)
+            }
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Queues a person `!` or `!!` command (field 68). A submit whose
+    /// environment the codec refuses is answered locally and never sent.
+    /// Only `cancelled` or a lost connection ends the wait, as
+    /// `OutcomeUnconfirmed`; the caller retains its request ID for a retry.
+    pub fn queue_person_command(
+        &mut self,
+        request: pb::ConversationQueueCommandSubmit,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CommandSubmit> {
+        if let Some(refusal) = asura_control::person::environment_refusal(&request) {
+            return Ok(CommandSubmit::Refused {
+                refusal,
+                status: None,
+                sent: false,
+            });
+        }
+        let expected = request.clone();
+        match self.mutation(
+            pb::envelope::Body::ConversationQueueCommandSubmit(request),
+            cancelled,
+        )? {
+            pb::envelope::Body::ConversationQueueReply(reply) => {
+                command_submit_reply(&expected, reply).ok_or(Error::Protocol)
             }
             _ => Err(Error::Protocol),
         }
@@ -1616,6 +1702,162 @@ mod tests {
         vec![1, 2, 3, 4, 5, 7]
     }
 
+    fn person_submit(outside: bool) -> pb::ConversationQueueCommandSubmit {
+        pb::ConversationQueueCommandSubmit {
+            request_id: Some(vec![1; 16]),
+            project_id: Some(PROJECT.to_vec()),
+            conversation_id: Some(vec![3; 16]),
+            expected_generation: Some(1),
+            new_conversation: Some(false),
+            command: Some("make test".into()),
+            cwd: Some(".".into()),
+            search_path: (!outside).then(|| "/usr/bin:/bin".into()),
+            environment: Vec::new(),
+            outside_sandbox: outside.then_some(true),
+            launch_environment: if outside {
+                vec![pb::LaunchVariable {
+                    name: Some(b"HOME".to_vec()),
+                    value: Some(b"/Users/p".to_vec()),
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+    fn command_accept_answer(request: &pb::envelope::Body) -> pb::envelope::Body {
+        let pb::envelope::Body::ConversationQueueCommandSubmit(request) = request else {
+            unreachable!()
+        };
+        pb::envelope::Body::ConversationQueueReply(pb::ConversationQueueReply {
+            entries: vec![pb::ConversationQueueEntry {
+                input_id: Some(vec![4; 16]),
+                project_id: request.project_id.clone(),
+                conversation_id: request.conversation_id.clone(),
+                target_generation: request.expected_generation,
+                kind: Some(asura_control::person::ENTRY_KIND),
+                state: Some(1),
+                text: request.command.clone(),
+                sequence: Some(1),
+                new_conversation: Some(false),
+                order_position: Some(1),
+                command_cwd: request.cwd.clone(),
+                command_outside_sandbox: Some(request.outside_sandbox == Some(true)),
+                waiting_reason: Some(pb::QueueWaitReason::AgentSlots as i32),
+                waiting_text: Some("waiting: 2 of 2 jobs running for this agent".into()),
+                ..Default::default()
+            }],
+            request_id: request.request_id.clone(),
+            full_text: Some(false),
+            revision: Some(2),
+            pending: Some(false),
+            order_revision: Some(2),
+            stale_order: Some(false),
+            accepted_input_id: Some(vec![4; 16]),
+            ..Default::default()
+        })
+    }
+    fn command_refuse_answer(request: &pb::envelope::Body) -> pb::envelope::Body {
+        let pb::envelope::Body::ConversationQueueCommandSubmit(request) = request else {
+            unreachable!()
+        };
+        pb::envelope::Body::ConversationQueueReply(pb::ConversationQueueReply {
+            request_id: request.request_id.clone(),
+            full_text: Some(false),
+            refusal: Some(pb::QueueRefusal::SecretStoreUnavailable as i32),
+            refusal_status: Some(25_308),
+            ..Default::default()
+        })
+    }
+    fn command_foreign_answer(request: &pb::envelope::Body) -> pb::envelope::Body {
+        let pb::envelope::Body::ConversationQueueReply(mut reply) = command_accept_answer(request)
+        else {
+            unreachable!()
+        };
+        reply.request_id = Some(vec![0x99; 16]);
+        pb::envelope::Body::ConversationQueueReply(reply)
+    }
+    fn person_capabilities() -> Vec<i32> {
+        vec![1, 2, 3, 4, 5, 7, 8]
+    }
+    /// Field 68 through a real socket: acceptance, a typed refusal, a
+    /// reply for another request, and a local environment refusal.
+    #[test]
+    fn person_command_submit_round_trip() {
+        let fake = fake_service_with(Fake::Answer(command_accept_answer), person_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(client.supports(pb::Capability::PersonCommand));
+        let CommandSubmit::Accepted(reply) = client
+            .queue_person_command(person_submit(true), &|| false)
+            .unwrap()
+        else {
+            panic!("expected acceptance");
+        };
+        assert_eq!(reply.accepted_input_id.as_deref(), Some([4; 16].as_slice()));
+        assert_eq!(reply.entries[0].command_outside_sandbox, Some(true));
+        let fake = fake_service_with(Fake::Answer(command_accept_answer), person_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(matches!(
+            client.queue_person_command(person_submit(false), &|| false),
+            Ok(CommandSubmit::Accepted(_))
+        ));
+        let fake = fake_service_with(Fake::Answer(command_refuse_answer), person_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert_eq!(
+            client
+                .queue_person_command(person_submit(true), &|| false)
+                .unwrap(),
+            CommandSubmit::Refused {
+                refusal: pb::QueueRefusal::SecretStoreUnavailable,
+                status: Some(25_308),
+                sent: true,
+            }
+        );
+        let fake = fake_service_with(Fake::Answer(command_foreign_answer), person_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        assert!(matches!(
+            client.queue_person_command(person_submit(true), &|| false),
+            Err(Error::Protocol)
+        ));
+        // An environment too large for one frame is refused before sending:
+        // the fake closes on any request, so a sent submit would fail.
+        let fake = fake_service_with(Fake::Close, person_capabilities());
+        let mut client = Client::attach(&fake.runtime, "test/1", &|| false).unwrap();
+        let mut huge = person_submit(true);
+        huge.launch_environment = (0..2_000)
+            .map(|i| pb::LaunchVariable {
+                name: Some(format!("V{i}").into_bytes()),
+                value: Some(vec![b'x'; 40]),
+            })
+            .collect();
+        assert_eq!(
+            client.queue_person_command(huge, &|| false).unwrap(),
+            CommandSubmit::Refused {
+                refusal: pb::QueueRefusal::EnvironmentTooLarge,
+                status: None,
+                sent: false,
+            }
+        );
+    }
+    #[test]
+    fn person_command_reply_must_match_mode_and_kind() {
+        let request = person_submit(true);
+        let body = command_accept_answer(&pb::envelope::Body::ConversationQueueCommandSubmit(
+            request.clone(),
+        ));
+        let pb::envelope::Body::ConversationQueueReply(reply) = body else {
+            unreachable!()
+        };
+        assert!(command_submit_reply(&request, reply.clone()).is_some());
+        let mut message = reply.clone();
+        message.entries[0].kind = Some(1);
+        assert!(command_submit_reply(&request, message).is_none());
+        let mut sandboxed = reply.clone();
+        sandboxed.entries[0].command_outside_sandbox = Some(false);
+        assert!(command_submit_reply(&request, sandboxed).is_none());
+        let mut other = reply;
+        other.accepted_input_id = Some(vec![5; 16]);
+        assert!(command_submit_reply(&request, other).is_none());
+    }
     #[test]
     fn j4t01_capability_is_read_from_hello() {
         let fake = fake_service_with(Fake::Silent, jobs_capabilities());
