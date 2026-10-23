@@ -22,8 +22,31 @@ use std::time::Instant;
 #[cfg(feature = "test-support")]
 const KEPT_EVENTS: usize = 1024;
 
-/// What the start-time read returns: the limits and the execution setting.
-type Read = Result<(JobLimits, ExecutionSetting), ()>;
+/// What the start-time read returns: the limits, the execution setting,
+/// `personCommands.allowOutsideSandbox` and the secret store target.
+type Read = Result<Started, ()>;
+
+/// The start-time configuration (TJ-F5, PCM switch check, secret store
+/// target). `store` is `None` when this runtime has no Keychain target
+/// ([`super::person_command::store_target`]).
+pub(super) struct Started {
+    pub limits: JobLimits,
+    pub execution: ExecutionSetting,
+    pub outside: bool,
+    pub store: Option<asura_platform::keychain::Target>,
+}
+impl Started {
+    /// The defaults with no Keychain target, for tests.
+    #[cfg(test)]
+    pub(super) fn defaults() -> Self {
+        Self {
+            limits: JobLimits::default(),
+            execution: ExecutionSetting::default(),
+            outside: true,
+            store: None,
+        }
+    }
+}
 type ReadSlot = Arc<Mutex<Option<Read>>>;
 
 /// One read of `jobs.*` and `execution.*` on a retained worker thread
@@ -50,8 +73,17 @@ fn read_configuration(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Read {
         return Err(());
     }
     let limits = asura_storage::config::job_limits(runtime.clone(), cancel).map_err(|_| ())?;
-    let execution = asura_storage::config::execution_setting(runtime, cancel).map_err(|_| ())?;
-    Ok((limits, execution))
+    let execution =
+        asura_storage::config::execution_setting(runtime.clone(), cancel).map_err(|_| ())?;
+    let outside =
+        asura_storage::config::allow_outside_sandbox(runtime.clone(), cancel).map_err(|_| ())?;
+    let store = super::person_command::store_target(&runtime);
+    Ok(Started {
+        limits,
+        execution,
+        outside,
+        store,
+    })
 }
 
 pub(super) struct Jobs {
@@ -68,12 +100,15 @@ pub(super) struct Jobs {
     reads: u32,
     /// The execution setting the read returned, for the owner to take once.
     execution: Option<ExecutionSetting>,
+    /// The outside switch and secret store target the read returned, for
+    /// the owner to take once.
+    person: Option<(bool, Option<asura_platform::keychain::Target>)>,
     /// The limits read thread could not start or failed; logged once per
     /// run of failures.
     failing: bool,
     /// The unsettled jobs from the start-time replay, until the controller
-    /// takes them (J2-E5).
-    unsettled: Option<Vec<journal::UnsettledJob>>,
+    /// takes them (J2-E5), with the inputs whose kind 31 has field 7 bit 1.
+    unsettled: Option<(Vec<journal::UnsettledJob>, std::collections::BTreeSet<Id>)>,
     replay_seen: bool,
     /// The journal held normal records at the last poll.
     held: bool,
@@ -83,6 +118,14 @@ pub(super) struct Jobs {
     closing: Option<Instant>,
     /// Ended controller waits for the owner, oldest first.
     waits: Vec<WaitDone>,
+    /// Controller events for the owner since its last take (person
+    /// commands: settlement, `ShellExited`, withdrawal). The controller
+    /// coalesces state events per job, so at most one per unsettled job
+    /// and kind waits here.
+    owner_events: Vec<JobEvent>,
+    /// A scripted slot factory for owner unit tests (no process starts).
+    #[cfg(test)]
+    slots: Option<crate::job_controller::SlotFactory>,
     #[cfg(feature = "test-support")]
     events: std::collections::VecDeque<JobEvent>,
 }
@@ -102,6 +145,7 @@ impl Jobs {
             retry: None,
             reads: 0,
             execution: None,
+            person: None,
             failing: false,
             unsettled: None,
             replay_seen: false,
@@ -109,9 +153,17 @@ impl Jobs {
             unavailable: false,
             closing: None,
             waits: Vec::new(),
+            owner_events: Vec::new(),
+            #[cfg(test)]
+            slots: None,
             #[cfg(feature = "test-support")]
             events: std::collections::VecDeque::new(),
         }
+    }
+    /// Owner unit tests: the controller's slots come from `factory`.
+    #[cfg(test)]
+    pub(super) fn set_slots(&mut self, factory: crate::job_controller::SlotFactory) {
+        self.slots = Some(factory);
     }
 
     /// Starts one read of the job limits and the execution setting: at
@@ -173,9 +225,16 @@ impl Jobs {
     /// The start-time replay's unsettled jobs (the first replay of this
     /// run, after Open or the automatic initialization): each gets an
     /// explicit `interrupted` settlement before admission opens.
-    pub(super) fn replayed(&mut self, unsettled: Vec<journal::UnsettledJob>) {
+    /// `outside` holds the inputs whose kind 31 has field 7 bit 1, so an
+    /// interrupted `!!` job's `job.settled` carries `outside_sandbox`
+    /// (PCR25, `recover_profiles`).
+    pub(super) fn replayed(
+        &mut self,
+        unsettled: Vec<journal::UnsettledJob>,
+        outside: std::collections::BTreeSet<Id>,
+    ) {
         if !std::mem::replace(&mut self.replay_seen, true) {
-            self.unsettled = Some(unsettled);
+            self.unsettled = Some((unsettled, outside));
         }
     }
 
@@ -193,19 +252,27 @@ impl Jobs {
         if let Some(read) = &self.read {
             let taken = read.result.lock().unwrap_or_else(|e| e.into_inner()).take();
             match taken {
-                Some(Ok((limits, execution))) => {
+                Some(Ok(Started {
+                    limits,
+                    execution,
+                    outside,
+                    store,
+                })) => {
                     self.read = None;
                     self.retry = None;
                     if std::mem::replace(&mut self.failing, false) {
                         tracing::info!("job_limits_read");
                     }
                     payloads.set_model_reserved(limits.model_reserved_page_reads);
-                    let mut controller = JobController::new(
-                        limits,
-                        emitter.cloned(),
-                        runtime.clone(),
-                        crate::exec_cmd_worker::slot_factory(wake.cloned()),
-                    );
+                    #[cfg(test)]
+                    let slots = self
+                        .slots
+                        .take()
+                        .unwrap_or_else(|| crate::exec_cmd_worker::slot_factory(wake.cloned()));
+                    #[cfg(not(test))]
+                    let slots = crate::exec_cmd_worker::slot_factory(wake.cloned());
+                    let mut controller =
+                        JobController::new(limits, emitter.cloned(), runtime.clone(), slots);
                     if self.unavailable {
                         controller.journal_unavailable();
                     }
@@ -215,6 +282,7 @@ impl Jobs {
                     self.control = Some(JobControl::new(limits.client_viewers));
                     self.controller = Some(controller);
                     self.execution = Some(execution);
+                    self.person = Some((outside, store));
                 }
                 Some(Err(())) => {
                     self.read = None;
@@ -233,8 +301,8 @@ impl Jobs {
         let Some(controller) = &mut self.controller else {
             return;
         };
-        if let Some(unsettled) = self.unsettled.take() {
-            controller.recover(unsettled);
+        if let Some((unsettled, outside)) = self.unsettled.take() {
+            controller.recover_profiles(unsettled, &|input| outside.contains(&input));
         }
         controller.poll(now, payloads);
         controller.drain_waits(&mut self.waits);
@@ -246,6 +314,7 @@ impl Jobs {
                 break;
             }
         }
+        self.owner_events.extend(events.iter().copied());
         #[cfg(feature = "test-support")]
         for event in events {
             if self.events.len() == KEPT_EVENTS {
@@ -254,10 +323,21 @@ impl Jobs {
             self.events.push_back(event);
         }
     }
+    /// The controller events since the last call, oldest first.
+    pub(super) fn take_owner_events(&mut self) -> Vec<JobEvent> {
+        std::mem::take(&mut self.owner_events)
+    }
 
     /// The execution setting of the successful read, once.
     pub(super) fn take_execution(&mut self) -> Option<ExecutionSetting> {
         self.execution.take()
+    }
+    /// The outside switch and the secret store target of the successful
+    /// read, once.
+    pub(super) fn take_person(
+        &mut self,
+    ) -> Option<(bool, Option<asura_platform::keychain::Target>)> {
+        self.person.take()
     }
     /// Ended controller waits since the last call, oldest first.
     pub(super) fn take_waits(&mut self) -> Vec<WaitDone> {
@@ -414,7 +494,7 @@ mod tests {
             if counter.fetch_add(1, Ordering::AcqRel) < 2 {
                 Err(())
             } else {
-                Ok((JobLimits::default(), ExecutionSetting::default()))
+                Ok(Started::defaults())
             }
         }));
         let start = Instant::now();

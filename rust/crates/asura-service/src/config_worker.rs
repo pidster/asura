@@ -25,6 +25,8 @@ pub(crate) struct Worker {
     journal_quota: Option<u64>,
     /// The applied execution setting after a persisted `execution` set.
     execution: Option<asura_storage::config::ExecutionChange>,
+    /// `personCommands.allowOutsideSandbox` after a persisted set (PCR23).
+    allow_outside_sandbox: Option<bool>,
     completion: crate::completion::Completion,
 }
 impl Worker {
@@ -56,6 +58,7 @@ impl Worker {
             audit_event: None,
             journal_quota: None,
             execution: None,
+            allow_outside_sandbox: None,
             completion,
         })
     }
@@ -91,6 +94,12 @@ impl Worker {
     /// unconfirmed or failed set changes nothing in memory (ES-09).
     pub(crate) fn take_execution(&mut self) -> Option<asura_storage::config::ExecutionChange> {
         self.execution.take()
+    }
+    /// The effective `personCommands.allowOutsideSandbox` after a persisted
+    /// set of `personCommands` or its leaf: the owner applies it to the
+    /// next `!!` submit and slot grant (PCR23, switch check). Taken once.
+    pub(crate) fn take_allow_outside(&mut self) -> Option<bool> {
+        self.allow_outside_sandbox.take()
     }
     pub(crate) fn poll(&mut self) -> Option<pb::Envelope> {
         let done = self.task.as_ref().is_some_and(JoinHandle::is_finished);
@@ -133,6 +142,7 @@ impl Worker {
             if let Ok(reply) = result {
                 self.journal_quota = reply.journal_quota;
                 self.execution.clone_from(&reply.execution);
+                self.allow_outside_sandbox = reply.allow_outside_sandbox;
             }
         }
         if self.replied {
@@ -206,6 +216,7 @@ mod tests {
                 audit_event: None,
                 journal_quota: None,
                 execution: None,
+                allow_outside_sandbox: None,
                 completion: Default::default(),
             },
             send,
@@ -419,6 +430,7 @@ mod reactor_tests {
                         audit_event: None,
                         journal_quota: None,
                         execution: None,
+                        allow_outside_sandbox: None,
                         completion,
                     })
                 },

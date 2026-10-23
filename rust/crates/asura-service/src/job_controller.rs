@@ -613,6 +613,7 @@ impl JobController {
     /// Start-time recovery (J2-E5): one kind 28 `interrupted`, reason
     /// `restart`, for each unsettled job from replay, oldest first.
     /// Admission waits with `recovering` until every one commits.
+    #[cfg_attr(not(test), allow(dead_code))] // the owner passes the profiles
     pub(crate) fn recover(&mut self, unsettled: Vec<UnsettledJob>) {
         self.recover_profiles(unsettled, &|_| false);
     }

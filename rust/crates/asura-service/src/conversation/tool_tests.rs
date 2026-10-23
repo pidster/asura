@@ -123,6 +123,7 @@ impl Fixture {
                 jobs: Default::default(),
                 execution: Default::default(),
                 rules: Default::default(),
+                persons: Default::default(),
                 #[cfg(feature = "test-support")]
                 fixture: None,
                 #[cfg(feature = "test-support")]

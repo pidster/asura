@@ -39,6 +39,9 @@ pub(crate) struct Observer {
     refresh: bool,
     closing: bool,
     waiting: Vec<(pb::Envelope, Instant)>,
+    /// `ServiceObservation` field 8 from the secret store worker's facts;
+    /// absent until the store exists (secret-store.md, operations).
+    secret_store: Option<pb::SecretStoreStatus>,
 }
 impl Observer {
     pub fn new(runtime: RuntimeDirectory, wake: WakeSender, status: pb::InspectReply) -> Self {
@@ -57,6 +60,18 @@ impl Observer {
             refresh: true,
             closing: false,
             waiting: Vec::new(),
+            secret_store: None,
+        }
+    }
+    /// The secret store facts at this reactor step. A change moves the
+    /// revision, so a parked observation returns.
+    pub fn set_secret_store(&mut self, value: Option<pb::SecretStoreStatus>) {
+        if value != self.secret_store {
+            self.secret_store = value;
+            self.revision = self
+                .revision
+                .checked_add(1)
+                .expect("service revision exhausted");
         }
     }
     pub fn refresh(&mut self) {
@@ -78,7 +93,7 @@ impl Observer {
     }
     fn reply(&self, mut request: pb::Envelope, pending: bool) -> pb::Envelope {
         request.body = Some(Body::ServiceObservation(pb::ServiceObservation {
-            secret_store: None,
+            secret_store: self.secret_store.clone(),
             revision: Some(self.revision),
             pending: Some(pending),
             status: Some(self.status),

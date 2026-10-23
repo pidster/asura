@@ -7,6 +7,7 @@ mod jobs;
 mod memory_create;
 mod memory_tools;
 mod notice;
+mod person_command;
 mod response;
 use crate::model_owner::{ModelOwner, PackageIdentity};
 use crate::{job_control, job_text, sensors, tools};
@@ -124,6 +125,7 @@ pub(crate) fn handles(request: &pb::Envelope) -> bool {
                 | Body::ConversationObserve(_)
                 | Body::ConversationCancel(_)
                 | Body::ConversationQueueSubmit(_)
+                | Body::ConversationQueueCommandSubmit(_)
                 | Body::ConversationQueueReorder(_)
                 | Body::ConversationQueueList(_)
                 | Body::ConversationQueueDecision(_)
@@ -737,6 +739,14 @@ enum Job {
     CallResult,
     /// Journal work of the job control handler, by request key.
     Control(u64),
+    /// A person command's kind 31 append (P3-E).
+    PersonQueue(Box<person_command::Submit>),
+    /// The dispatch read of a person command's kind 31.
+    PersonRead(journal::Id),
+    /// The kind 31 read of a dropped person command (its item decision).
+    PersonCheck(journal::Id),
+    /// A dispatch hold of a person command (`secrets_lost` and others).
+    PersonHold(journal::Id),
     /// A worker-layer harness record or command (`test-support` only).
     #[cfg(feature = "test-support")]
     Fixture,
@@ -796,6 +806,9 @@ pub(crate) struct Owner {
     execution: Arc<std::sync::Mutex<Option<ExecutionSetting>>>,
     /// The secret rule set's warm thread (SD-S2).
     rules: crate::secret_rules::Warmer,
+    /// Person commands: submits, dispatch, the secret store and the `!!`
+    /// lane overlay (P3-E).
+    persons: person_command::Persons,
     /// The reply to the last harness record or command.
     #[cfg(feature = "test-support")]
     fixture: Option<writer::Result<writer::Reply>>,
@@ -853,6 +866,7 @@ impl Owner {
             jobs: jobs::Jobs::default(),
             execution: Default::default(),
             rules: Default::default(),
+            persons: Default::default(),
             #[cfg(feature = "test-support")]
             fixture: None,
             #[cfg(feature = "test-support")]
@@ -1482,6 +1496,13 @@ impl Owner {
             .chain(closing)
             .chain(self.payloads.next_deadline())
             .chain(self.jobs.next_deadline(now))
+            .chain(self.persons.next_deadline())
+            .chain(
+                (self.pending.is_none()
+                    && self.unavailable.is_none()
+                    && self.persons.has_journal_work())
+                .then_some(now),
+            )
             .chain(self.observations.iter().map(|(_, deadline)| *deadline))
             .min()
     }
@@ -1543,6 +1564,9 @@ impl Owner {
         }
     }
     pub(crate) fn request(&mut self, request: pb::Envelope, now: Instant) -> Option<pb::Envelope> {
+        if matches!(request.body, Some(Body::ConversationQueueCommandSubmit(_))) {
+            return self.person_submit(request);
+        }
         let original = request.clone();
         let result = self.request_inner(request, now);
         if let Some(pb::Envelope {
@@ -1789,19 +1813,33 @@ impl Owner {
                     Some(1) => journal::InputAction::Resume,
                     Some(4) => {
                         // Hold only the input under preparation; the hold
-                        // cancels its helper (waiting step display).
+                        // cancels its helper (waiting step display). A
+                        // person command under dispatch (its item read, a
+                        // Keychain wait or a waiter for a slot) leaves the
+                        // controller first.
                         let input = id(&value.input_id);
-                        if !self.active.as_ref().is_some_and(|active| {
-                            !active.accepted
-                                && active.queue_input == Some(input)
-                                && active.terminal.is_none()
-                        }) {
+                        let person = self.person_dispatching(input);
+                        if !person
+                            && !self.active.as_ref().is_some_and(|active| {
+                                !active.accepted
+                                    && active.queue_input == Some(input)
+                                    && active.terminal.is_none()
+                            })
+                        {
                             return Some(error(request, "input_not_preparing"));
+                        }
+                        if person {
+                            self.person_withdraw(input);
                         }
                         self.note_hold(input, "cancelled");
                         journal::InputAction::Hold
                     }
-                    _ => journal::InputAction::Drop,
+                    _ => {
+                        // A person command's waiter leaves the controller
+                        // before its Drop; a dispatched job is not affected.
+                        self.person_withdraw(id(&value.input_id));
+                        journal::InputAction::Drop
+                    }
                 };
                 return match self.submit(
                     writer::Command::InputDecision {
@@ -2242,6 +2280,16 @@ impl Owner {
                         self.jobs.identity_changed(project);
                     }
                 }
+                if matches!(
+                    job,
+                    Job::PersonQueue(_)
+                        | Job::PersonRead(_)
+                        | Job::PersonCheck(_)
+                        | Job::PersonHold(_)
+                ) {
+                    self.person_job_failed(job, cause);
+                    return;
+                }
                 match job {
                     Job::SensorLoad(project) | Job::SensorReconcile(project) => {
                         self.sensor_failed.insert(project);
@@ -2460,6 +2508,10 @@ impl Owner {
         };
         self.replay = value.replay.clone();
         match job {
+            Job::PersonQueue(submit) => self.person_queued(*submit, Ok(value)),
+            Job::PersonRead(input) => self.person_read(input, value, now),
+            Job::PersonCheck(input) => self.person_checked(input, value),
+            Job::PersonHold(input) => self.person_held(input),
             Job::Controller(job) => {
                 let sequence = self.replay.as_ref().map_or(0, |r| r.sequence);
                 self.jobs.record_done(job, Ok(sequence));
@@ -2927,70 +2979,11 @@ impl Owner {
                 {
                     Self::person_hold(active, id(&decision.input_id), now);
                 }
-                let request_id = match &request.body {
-                    Some(Body::ConversationQueueSubmit(v)) => v.request_id.clone(),
-                    Some(Body::ConversationQueueReorder(v)) => v.request_id.clone(),
-                    Some(Body::ConversationQueueDecision(v)) => v.request_id.clone(),
-                    _ => None,
-                };
                 let full_text = matches!(&request.body, Some(Body::ConversationQueueList(v)) if v.input_id.is_some());
-                let preparing = self.preparing_step();
-                let entries = value
-                    .inputs
-                    .into_iter()
-                    .map(|v| {
-                        // Exact decision replay returns current state. Preserve a
-                        // newer Hold reason if a resumed preparation failed again.
-                        if v.status != journal::InputStatus::Held {
-                            self.hold_reasons.remove(&v.input.input);
-                        }
-                        pb::ConversationQueueEntry {
-                            command_cwd: None,
-                            command_outside_sandbox: None,
-                            waiting_reason: None,
-                            waiting_text: None,
-                            command_filtered: None,
-                            input_id: Some(v.input.input.to_vec()),
-                            project_id: Some(v.input.project.to_vec()),
-                            conversation_id: Some(v.input.conversation.to_vec()),
-                            target_operation_id: v.target_operation.map(|id| id.to_vec()),
-                            target_generation: Some(v.target_generation),
-                            kind: Some(v.kind as u32),
-                            state: Some(v.status as u32),
-                            text: Some(v.input.prompt),
-                            sequence: Some(v.sequence),
-                            operation_id: v.operation.map(|(id, _)| id.to_vec()),
-                            generation: v.operation.map(|(_, generation)| generation),
-                            new_conversation: Some(v.input.new_conversation),
-                            order_position: Some(v.order_position),
-                            hold_reason: (v.status == journal::InputStatus::Held)
-                                .then(|| self.hold_reasons.get(&v.input.input).copied())
-                                .flatten()
-                                .map(str::to_owned),
-                            waiting_step: preparing
-                                .filter(|(input, _)| {
-                                    *input == v.input.input
-                                        && v.status == journal::InputStatus::Queued
-                                })
-                                .map(|(_, step)| step as i32),
-                        }
-                    })
-                    .collect();
-                self.out.push_back(reply(
-                    request,
-                    Body::ConversationQueueReply(pb::ConversationQueueReply {
-                        refusal: None,
-                        refusal_status: None,
-                        entries,
-                        request_id,
-                        full_text: Some(full_text),
-                        revision: self.replay.as_ref().map(|state| state.revision),
-                        pending: Some(false),
-                        order_revision: value.order_revision,
-                        stale_order: Some(value.stale_order),
-                        accepted_input_id: value.accepted_input_id.map(|id| id.to_vec()),
-                    }),
-                ));
+                // A durable Drop of a person command deletes its item; any
+                // queue action rechecks the lane's Keychain waits.
+                self.person_mutated(&request);
+                self.queue_reply(request, value, full_text);
             }
             Job::QueuePrepare(input) => {
                 self.hold_reasons.remove(&input);
@@ -3933,11 +3926,14 @@ impl Owner {
         self.capture_sensor_tool(now);
         self.capture_audit_tool();
         self.capture_inventory_tool();
+        self.poll_persons(now);
         // The ticket order (J2): the active turn's records, then the job
-        // closure records and kind 26, then new foreground commands.
+        // closure records and kind 26, then the person command reads,
+        // holds and appends, then new foreground commands.
         self.drive(now);
         self.drive_jobs();
         self.drive_job_control();
+        self.drive_persons();
         self.dispatch_foreground(now);
         self.capture_sensor_tool(now);
         self.capture_audit_tool();
@@ -3981,7 +3977,10 @@ impl Owner {
                     return;
                 }
                 // New turns wait while the journal holds normal records.
-                if let Some(input) = self.replay.as_ref().and_then(|r| r.ready_input())
+                if let Some(input) = self
+                    .replay
+                    .as_ref()
+                    .and_then(|r| r.ready_input_with(self.persons.released()))
                     && let Err(e) = self.submit(
                         writer::Command::PrepareInput { input },
                         Job::QueuePrepare(input),
@@ -5047,7 +5046,15 @@ impl Owner {
             && !matches!(self.pending, Some((_, Job::Open | Job::AutoInitialize)))
             && let Some(replay) = &self.replay
         {
-            self.jobs.replayed(replay.unsettled_jobs());
+            // Kind 31 field 7 bit 1 from replay gives an interrupted `!!`
+            // job's profile (recover_profiles, PCR25).
+            let outside = replay
+                .inputs
+                .iter()
+                .filter(|(_, q)| q.person.as_ref().is_some_and(|p| p.outside_sandbox))
+                .map(|(input, _)| *input)
+                .collect();
+            self.jobs.replayed(replay.unsettled_jobs(), outside);
         }
         self.jobs.hold(self.journal_held());
         if self.unavailable.is_some() {
@@ -5060,6 +5067,8 @@ impl Owner {
             self.audit_emitter.as_ref(),
             &mut self.payloads,
         );
+        let events = self.jobs.take_owner_events();
+        self.person_events(&events);
         // The start-time read built the controller: the execution setting
         // it read becomes the owner's value unless a persisted change set it
         // first; the controller's slot-grant check reads the result.

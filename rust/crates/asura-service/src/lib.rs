@@ -176,6 +176,11 @@ struct Dispatcher {
     epoch: [u8; 16],
     build: String,
     installation: pb::InspectInstallationReply,
+    /// Advertise capability 8 (`CAPABILITY_PERSON_COMMAND`). Field 68 is
+    /// served either way; the capability is listed only after P5 and Q
+    /// (OD3). A test-support build lists it when the scratch home holds
+    /// `person-command-capability`.
+    person_command: bool,
 }
 impl Dispatcher {
     fn status(&self, lifecycle: pb::Lifecycle) -> pb::InspectReply {
@@ -203,6 +208,7 @@ impl Dispatcher {
                 pb::InstallationState::Recovering,
                 pb::InstallationInspectionReason::InspectionPending,
             ),
+            person_command: false,
         })
     }
     fn error(
@@ -251,16 +257,21 @@ impl Dispatcher {
                 request_counter: None,
                 body: Some(Body::HelloReply(pb::HelloReply {
                     service_build: Some(self.build.clone()),
-                    capabilities: vec![
-                        pb::Capability::Inspect as i32,
-                        pb::Capability::Stop as i32,
-                        pb::Capability::InspectInstallation as i32,
-                        pb::Capability::Config as i32,
-                        pb::Capability::Conversation as i32,
-                        pb::Capability::Setup as i32,
+                    capabilities: [
+                        pb::Capability::Inspect,
+                        pb::Capability::Stop,
+                        pb::Capability::InspectInstallation,
+                        pb::Capability::Config,
+                        pb::Capability::Conversation,
+                        pb::Capability::Setup,
                         // J3 and J4 are enabled together (EN1).
-                        pb::Capability::Jobs as i32,
-                    ],
+                        pb::Capability::Jobs,
+                    ]
+                    .into_iter()
+                    // Capability 8 waits for P5 and Q (OD3).
+                    .chain(self.person_command.then_some(pb::Capability::PersonCommand))
+                    .map(|c| c as i32)
+                    .collect(),
                     max_frame_bytes: Some(asura_control::MAX_FRAME_BYTES as u32),
                 })),
             };
@@ -448,6 +459,13 @@ where
     G: FnMut(RuntimeDirectory, pb::Envelope) -> io::Result<config_worker::Worker>,
 {
     let mut dispatcher = Dispatcher::new(build)?;
+    // Test-support switch only: production never lists capability 8 here.
+    #[cfg(feature = "test-support")]
+    {
+        dispatcher.person_command = runtime
+            .scratch_home_for_test()
+            .is_some_and(|home| home.join("person-command-capability").exists());
+    }
     let mut guard = match runtime.acquire_owner() {
         Ok(guard) => guard,
         Err(error) => {
@@ -547,6 +565,7 @@ where
                     }
                 }
             }
+            service_observer.set_secret_store(conversations.secret_store_status());
             for reply in contexts
                 .poll(&attachments, now)
                 .into_iter()
@@ -647,6 +666,11 @@ where
                 // (EX11, ES-Q1).
                 if let Some(setting) = job.take_execution() {
                     conversations.set_execution(setting);
+                }
+                // A persisted `personCommands.allowOutsideSandbox` applies to
+                // the next `!!` submit and slot grant (PCR23).
+                if let Some(on) = job.take_allow_outside() {
+                    conversations.set_allow_outside(on);
                 }
                 if job.settled() {
                     config_job = None;
@@ -1159,6 +1183,9 @@ where
             }
             if let Some(setting) = job.take_execution() {
                 conversations.set_execution(setting);
+            }
+            if let Some(on) = job.take_allow_outside() {
+                conversations.set_allow_outside(on);
             }
             if job.settled() {
                 config_job = None;
