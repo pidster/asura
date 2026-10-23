@@ -50,6 +50,26 @@ private let mlxMetadata = #"{"max_position_embeddings":4096}"#
     #expect(ModelInventory.local(root: root.path, provider: "coreai").issues.first?.reason == "unsafe_asset")
 }
 
+@Test func inventoryOpensTheRootByFullPathAndRejectsAnyLinkOnIt() throws {
+    let root = try inventoryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    try metadataFile(root, "real/mlx/model/config.json", mlxMetadata)
+    // The full-path open reaches the asset root directly.
+    #expect(ModelInventory.local(root: root.appending(path: "real").path + "/", provider: "mlx").rows.map(\.selector) == ["mlx:model"])
+    // A link in an ancestor component, not only the last one, is rejected.
+    try FileManager.default.createSymbolicLink(at: root.appending(path: "alias"), withDestinationURL: root.appending(path: "real"))
+    let linked = ModelInventory.local(root: root.appending(path: "alias").path, provider: "mlx")
+    #expect(linked.rows.isEmpty)
+    #expect(linked.issues.map(\.reason) == ["unsafe_asset"])
+    // Dot components and a file where a directory belongs are rejected; a missing root is empty.
+    for path in [root.path + "/real/../real", root.path + "/./real"] {
+        #expect(ModelInventory.local(root: path, provider: "mlx").issues.map(\.reason) == ["unsafe_asset"])
+    }
+    try metadataFile(root, "file/mlx", "")
+    #expect(ModelInventory.local(root: root.appending(path: "file").path, provider: "mlx").issues.map(\.reason) == ["unsafe_asset"])
+    let missing = ModelInventory.local(root: root.appending(path: "missing").path, provider: "mlx")
+    #expect(missing.rows.isEmpty && missing.issues.isEmpty)
+}
+
 @Test func inventoryEnforcesRowsMetadataDepthAndEntryBounds() throws {
     let root = try inventoryRoot(); defer { try? FileManager.default.removeItem(at: root) }
     for index in 0..<22 { try metadataFile(root, "mlx/model\(index)/config.json", mlxMetadata) }

@@ -2002,6 +2002,7 @@ fn detail_lists_the_acknowledged_path_warnings_of_a_person_job() {
     );
     assert_eq!(h.env.journal.reads, ["JobFacts", "PathRecord"]);
     assert_eq!(reply.command.as_deref(), Some("cargo build"));
+    assert_eq!(reply.path_overflow, None, "no overflow, no field 7");
 
     // A model job: no `PathRecord` read, no warnings.
     let model_job = h.submit(model(2), C1, P1, "make");
@@ -2052,4 +2053,53 @@ fn detail_lists_the_acknowledged_path_warnings_of_a_person_job() {
     let reply = detail(h.send(1, inspect(job, Some(P1))));
     assert!(reply.error.is_some(), "{reply:?}");
     assert!(reply.path_warnings.is_empty() && reply.entry.is_none());
+}
+
+/// EPG-T2 (execution-path-guard.md, EPG-T record: "`JobDetail` gains
+/// `optional uint32 path_overflow = 7` from the kind 32 overflow count"):
+/// the detail carries the acknowledgement's overflow beside its 16 entries,
+/// so a restored log shows "⚠ and N more"; an entry the wire would refuse
+/// is counted there instead of listed; a model job has neither.
+#[test]
+fn detail_carries_the_acknowledgement_overflow_as_field_7() {
+    use journal::PathEntryKind as K;
+    let mut h = H::new(8);
+    let input = [7; 16];
+    let job = h.submit(person(7), C1, P1, "cargo build");
+    let paths: Vec<String> = (0..16).map(|i| format!("src/f{i}.rs")).collect();
+    let entries: Vec<_> = paths
+        .iter()
+        .map(|p| (K::ModelChanged, p.as_str()))
+        .collect();
+    h.env.journal.path_records.insert(
+        input,
+        journal::ExecutionPathRecord {
+            overflow: 5,
+            ..acknowledgement(P1, input, &entries)
+        },
+    );
+    let reply = detail(h.send(1, inspect(job, Some(P1))));
+    assert_eq!(reply.path_warnings.len(), 16);
+    assert_eq!(reply.path_overflow, Some(5));
+
+    // A stored entry the wire refuses (a NUL in the path) is counted.
+    let other = h.submit(person(8), C1, P1, "ls");
+    h.env.journal.path_records.insert(
+        [8; 16],
+        journal::ExecutionPathRecord {
+            overflow: 1,
+            ..acknowledgement(
+                P1,
+                [8; 16],
+                &[(K::ModelChanged, "build.rs"), (K::ModelChanged, "a\0b")],
+            )
+        },
+    );
+    let reply = detail(h.send(1, inspect(other, None)));
+    assert_eq!(reply.path_warnings.len(), 1);
+    assert_eq!(reply.path_overflow, Some(2));
+
+    let model_job = h.submit(model(2), C1, P1, "make");
+    let reply = detail(h.send(1, inspect(model_job, Some(P1))));
+    assert!(reply.path_warnings.is_empty() && reply.path_overflow.is_none());
 }

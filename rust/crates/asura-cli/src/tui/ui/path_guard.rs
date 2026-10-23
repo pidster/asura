@@ -349,6 +349,19 @@ impl App {
             None
         }
     }
+    /// Enter in queue focus on an entry held with `paths_changed` (EPG-T2):
+    /// the same Resume as Enter on its log entry.
+    pub(super) fn person_queue_resume(&mut self, input: [u8; 16]) {
+        self.send_path_decision(input, Step::Resume);
+    }
+    /// The focused queue entry is held with `paths_changed`.
+    pub(super) fn queue_focus_paths_held(&self) -> bool {
+        self.queue_focused_id.as_ref().is_some_and(|id| {
+            self.queue_entries
+                .iter()
+                .any(|e| e.input_id.as_ref() == Some(id) && paths_held(e))
+        })
+    }
     fn person_log_decidable(&self) -> Option<([u8; 16], &LogEntry)> {
         let entry = self.person.log.get(self.person_log_target()?)?;
         Some((entry.input?, entry))

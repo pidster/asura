@@ -643,6 +643,7 @@ fn job_inspect_and_detail_bounds() {
             .collect(),
         error: None,
         path_warnings: Vec::new(),
+        path_overflow: None,
     };
     // The largest detail fits one frame.
     assert!(reply_ok(Body::JobDetail(detail.clone())));
@@ -704,6 +705,28 @@ fn job_inspect_and_detail_bounds() {
     assert!(!reply_ok(Body::JobDetail(pb::JobDetail {
         error: Some(error::NOT_FOUND.into()),
         entry: Some(live_entry()),
+        ..Default::default()
+    })));
+    // EPG-T2: field 7 carries the kind 32 overflow count beside 16 warnings;
+    // it is never 0 and never on an error reply.
+    let warning = |kind, path: &str| pb::PathWarning {
+        kind: Some(kind),
+        path: Some(path.into()),
+    };
+    let mut d = detail.clone();
+    d.notes.clear();
+    d.path_warnings = vec![warning(1, &"p".repeat(1024)); 16];
+    d.path_overflow = Some(u32::MAX);
+    // `reply_ok` also encodes, decodes and compares the frame.
+    assert!(reply_ok(Body::JobDetail(d.clone())), "largest with field 7");
+    d.path_warnings.clear();
+    d.path_overflow = Some(2);
+    assert!(reply_ok(Body::JobDetail(d.clone())), "overflow alone");
+    d.path_overflow = Some(0);
+    assert!(!reply_ok(Body::JobDetail(d)), "zero overflow");
+    assert!(!reply_ok(Body::JobDetail(pb::JobDetail {
+        error: Some(error::NOT_FOUND.into()),
+        path_overflow: Some(1),
         ..Default::default()
     })));
 }

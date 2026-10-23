@@ -502,7 +502,8 @@ pub(super) struct LogEntry {
     /// The person's stop request: `Some(false)` stop, `Some(true)` kill.
     pub stop: Option<bool>,
     /// The path warnings shown before the command (queue entry fields 21
-    /// and 22, or `JobDetail.path_warnings` when restored).
+    /// and 22, or `JobDetail.path_warnings` and `path_overflow` (field 7)
+    /// when restored).
     pub path_warnings: Vec<pb::PathWarning>,
     pub path_overflow: u32,
     /// Held with `paths_changed`: Enter runs it, Esc drops it.
@@ -1253,10 +1254,11 @@ impl App {
         };
         // The queue's warnings came first when this client saw the entry;
         // a restored entry has only the job detail's.
-        if let Some(warnings) = update.path_warnings {
+        if let Some((warnings, overflow)) = update.path_warnings {
             let entry = &mut self.person.log[index];
             if entry.path_warnings.is_empty() && entry.path_overflow == 0 {
                 entry.path_warnings = warnings;
+                entry.path_overflow = overflow;
             }
         }
         match update.result {

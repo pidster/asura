@@ -1,6 +1,11 @@
 // swift-tools-version: 6.4
 import PackageDescription
 
+// Every helper build embeds Support/Info.plist in `__TEXT,__info_plist`
+// (release signing, HS-P1): an App-Sandboxed bare executable needs a bundle
+// identifier, and Core AI keys its compiled-model cache by it.
+let infoPlist = String(#filePath.dropLast("Package.swift".count)) + "Support/Info.plist"
+
 let package = Package(
     name: "AsuraModelHelper",
     platforms: [.macOS("27.0")],
@@ -21,7 +26,9 @@ let package = Package(
             .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
             .product(name: "Tokenizers", package: "swift-transformers")
         ]),
-        .executableTarget(name: "AsuraModelHelper", dependencies: ["HelperCore"]),
+        .executableTarget(name: "AsuraModelHelper", dependencies: ["HelperCore"],
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT",
+                                           "-Xlinker", "__info_plist", "-Xlinker", infoPlist])]),
         .testTarget(name: "HelperCoreTests", dependencies: ["HelperCore"])
     ]
 )

@@ -208,10 +208,11 @@ pub(super) struct FoldTarget {
 pub(super) struct FoldUpdate {
     pub job: [u8; 16],
     pub result: Result<pb::JobPage, Failure>,
-    /// The job's path warnings from one `JobInspect` at the fold's start
-    /// (`JobDetail.path_warnings`, execution-path-guard.md TUI); `None`
+    /// The job's path warnings and their overflow count from one
+    /// `JobInspect` at the fold's start (`JobDetail.path_warnings` and
+    /// `path_overflow`, execution-path-guard.md TUI and EPG-T2); `None`
     /// when the detail was not read or carried an error.
-    pub path_warnings: Option<Vec<pb::PathWarning>>,
+    pub path_warnings: Option<(Vec<pb::PathWarning>, u32)>,
 }
 
 #[derive(Default)]
@@ -1051,10 +1052,14 @@ pub(super) fn fold_loop(
     Ok(())
 }
 
-/// The path warnings of a fold's `JobDetail`: none when it carries an
-/// error (the job is not admitted yet, or is gone).
-pub(super) fn fold_detail_warnings(detail: pb::JobDetail) -> Option<Vec<pb::PathWarning>> {
-    detail.error.is_none().then_some(detail.path_warnings)
+/// The path warnings of a fold's `JobDetail` with the count not listed
+/// (field 7, 0 when absent): none when it carries an error (the job is not
+/// admitted yet, or is gone).
+pub(super) fn fold_detail_warnings(detail: pb::JobDetail) -> Option<(Vec<pb::PathWarning>, u32)> {
+    detail
+        .error
+        .is_none()
+        .then(|| (detail.path_warnings, detail.path_overflow.unwrap_or(0)))
 }
 
 /// The page ends before the stream's stored end by more than one page.
@@ -1422,10 +1427,21 @@ mod fold_tests {
             path_warnings: vec![warning.clone()],
             ..Default::default()
         };
-        assert_eq!(fold_detail_warnings(detail), Some(vec![warning]));
+        assert_eq!(
+            fold_detail_warnings(detail.clone()),
+            Some((vec![warning.clone()], 0))
+        );
+        // EPG-T2: field 7 travels with the list.
+        assert_eq!(
+            fold_detail_warnings(pb::JobDetail {
+                path_overflow: Some(4),
+                ..detail
+            }),
+            Some((vec![warning], 4))
+        );
         assert_eq!(
             fold_detail_warnings(pb::JobDetail::default()),
-            Some(Vec::new())
+            Some((Vec::new(), 0))
         );
         assert_eq!(
             fold_detail_warnings(pb::JobDetail {
