@@ -6051,18 +6051,26 @@ the binding point. Fidelity follows the prior turn:
 
 - A prior turn shown in full carries its notice at reference fidelity: each
   entry as its one-line reference form, then the overflow and live lines. The
-  block keeps the context label and the quoted value form.
+  block keeps the `<asura-context>` label and the header line; reference lines
+  carry no stored text, so no quoted values appear.
 - A prior turn shown as a reference, or omitted, carries no notice.
 - A notice with no entries and live count 0 adds nothing.
 
 Each rebuilt entry is a manifest segment of kind 5 at reference fidelity with
 the same source identity and digest as at its binding point; the summary is
-kind 6. Composer revision 3 marks this composition. A rebuilt notice is
+kind 6. They follow that turn's user history segment and precede its answer
+segment. Composer revision 3 marks this composition. A rebuilt notice is
 bounded by the same 8 entries per turn and counts toward the turn's history
 budget; when the history does not fit, the composer reduces the prior turn as
-for any history entry. Rebuilding reads at most 9 settlements per shown prior
-turn on the journal worker inside `Prepare`, with the prior turns' kind 21
-facts from the `T` entries; no history scan.
+for any history entry. Rebuilding reads at most 9 settlements per candidate
+prior turn (at most 1,024 turns) on the journal worker inside `Prepare`, with
+the prior turns' kind 21 facts from the `T` entries; no history scan. Because
+the lines are reference lines, the read returns only fixed-size reference
+facts per settlement (job ID, origin, outside flag, the kind 28 facts the line
+shows, the kind 28 header digest and settled sequence) and never reads a
+command source frame, so the reply is bounded by 1,024 × 9 × the fact size. If
+a prior turn's rebuilt inputs disagree with its kind 21 (S or live count), the
+owner fails the turn as `NoticeError::Range` under J5-E10.
 
 Tests: J5T-11 (unit) a prior full turn rebuilds its notice at reference
 fidelity with the stored S and live count, a reference turn carries none, and
