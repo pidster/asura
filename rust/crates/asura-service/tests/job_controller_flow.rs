@@ -624,6 +624,19 @@ fn shutdown_case() -> Result<()> {
     assert!(spent >= Duration::from_secs(2), "the 2 s bound: {spent:?}");
     drop(h);
     fs::write(directory.join("u.release"), b"")?;
+    // The fault left the fixture frozen, so the release file cannot end it:
+    // the test removes its own process after checking it is still the
+    // fixture (a reused PID would not run escapee.pl).
+    let pid: libc::pid_t = fs::read_to_string(directory.join("u.pid"))?
+        .trim()
+        .parse()?;
+    let command = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()?;
+    if String::from_utf8_lossy(&command.stdout).contains("escapee.pl setsid u") {
+        // SAFETY: a test-owned fixture process, identity checked above.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    }
     assert_eq!(home.unsettled()?, vec![held]);
     let mut h = home.harness(false)?;
     h.until(LONG, |_| {
