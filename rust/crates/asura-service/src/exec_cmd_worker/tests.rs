@@ -71,6 +71,7 @@ impl Home {
             secrets: Vec::new(),
             secret_command: None,
             capture: self.capture(job),
+            person: None,
         }
     }
 }

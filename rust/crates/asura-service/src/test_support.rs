@@ -5,10 +5,11 @@
 //! installs as kind 28's commit would (R2). [`JobHarness`] drives the real
 //! conversation owner and its job controller for J2.
 use crate::capture_worker;
-use crate::exec_cmd_worker::Worker;
+use crate::exec_cmd_worker::{PersonLaunch, Worker};
 use crate::job_controller::{SlotEvent, SlotPort, SlotStart};
 use crate::tools;
 use asura_platform::RuntimeDirectory;
+pub use asura_platform::exec_cmd::Profile;
 use asura_platform::exec_cmd::{Exit, StopKind};
 use asura_platform::secrets::{self, JobRedaction, SecretVariable};
 use asura_storage::authority::conversation::{
@@ -21,10 +22,52 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// One exec_cmd job for the harness: an already rewritten command and its
-/// secret variables (use `secrets::rewrite_exec_cmd_call`).
+/// secret variables (use `secrets::rewrite_exec_cmd_call`), its guardian
+/// profile and, for a person profile, its person setup.
 pub struct Job {
     pub command: String,
     pub secrets: Vec<SecretVariable>,
+    /// The guardian profile: `model-1` from [`Job::new`].
+    pub profile: Profile,
+    /// The person setup a person profile requires (person-command-mode.md,
+    /// environment sections); `None` for `model-1`.
+    pub person: Option<Person>,
+    /// A released `!!` job (kind 2 reason 15, OD2): the harness calls
+    /// `close_capture` this long after the release, as the controller does
+    /// for a person cancel of a released job (survivor rule 5). `None`
+    /// leaves capture open until the survivors close the pipes.
+    pub close_on_release: Option<Duration>,
+}
+impl Job {
+    /// A `model-1` job.
+    pub fn new(command: impl Into<String>, secrets: Vec<SecretVariable>) -> Self {
+        Self {
+            command: command.into(),
+            secrets,
+            profile: Profile::Model1,
+            person: None,
+            close_on_release: None,
+        }
+    }
+}
+/// A person job's setup for the harness: the service-side
+/// [`PersonLaunch`] in a public test form.
+pub enum Person {
+    /// `person-1`: the sanitized PATH and the PC3 client variables.
+    Sandboxed {
+        path: Vec<u8>,
+        client: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// `person-outside-1`: the launch environment.
+    Outside { launch: Vec<(Vec<u8>, Vec<u8>)> },
+}
+impl Person {
+    fn launch(self) -> PersonLaunch {
+        match self {
+            Self::Sandboxed { path, client } => PersonLaunch::Sandboxed { path, client },
+            Self::Outside { launch } => PersonLaunch::Outside { launch },
+        }
+    }
 }
 /// One capture worker on a real store with a test wake (J3T-22, TJ-Q10):
 /// the stored signal as the reactor sees it. `test-support` only.
@@ -114,6 +157,12 @@ pub struct Outcome {
     pub settled: Settled,
     /// The leader's exit, when a process ran.
     pub exit: Option<Exit>,
+    /// The guardian's escapee count (kind 2): for `person-outside-1`, the
+    /// survivors left running.
+    pub escapees: Option<u32>,
+    /// Kind 2 reason 15 arrived while capture was open: the job was
+    /// released (OD2).
+    pub released: bool,
     /// A cancel trigger reached the job: the harness's cancel or a capture
     /// fault.
     pub stopped: bool,
@@ -130,6 +179,9 @@ struct Running {
     leader_exited: bool,
     stopped: bool,
     exit: Option<Exit>,
+    escapees: Option<u32>,
+    released: Option<Instant>,
+    close_on_release: Option<Duration>,
     output: Option<Outcome>,
     capture: Option<capture_worker::Handle>,
     pages: Vec<Page>,
@@ -139,7 +191,9 @@ impl Running {
     /// leader's exit, a capture discard after it (TJ-S1).
     fn trigger(&mut self) {
         self.stopped = true;
-        if self.leader_exited {
+        if self.released.is_some() {
+            SlotPort::close_capture(&mut self.worker);
+        } else if self.leader_exited {
             SlotPort::discard_capture(&mut self.worker);
         } else {
             SlotPort::stop(&mut self.worker, StopKind::Term);
@@ -186,7 +240,7 @@ pub fn run_jobs(
             &mut worker,
             SlotStart {
                 job: job_id,
-                profile: crate::job_controller::Profile::Model1,
+                profile: job.profile,
                 runtime: runtime.clone(),
                 scope: tools::ExecutionScope {
                     project: [1; 16],
@@ -207,6 +261,7 @@ pub fn run_jobs(
                     wake: Some(wake.clone()),
                     gate_home: runtime.scratch_home_for_test().map(|p| p.to_path_buf()),
                 },
+                person: job.person.map(Person::launch),
             },
         )
         .map_err(|e| format!("start: {e:?}"))?;
@@ -218,6 +273,9 @@ pub fn run_jobs(
             leader_exited: false,
             stopped: false,
             exit: None,
+            escapees: None,
+            released: None,
+            close_on_release: job.close_on_release,
             output: None,
             capture: None,
             pages: Vec::new(),
@@ -241,6 +299,16 @@ pub fn run_jobs(
             }
         }
         for job in &mut running {
+            if job.output.is_none()
+                && !job.stopped
+                && job
+                    .released
+                    .zip(job.close_on_release)
+                    .is_some_and(|(at, after)| now >= at + after)
+            {
+                // A person cancel of a released `!!` job (survivor rule 5).
+                job.trigger();
+            }
             if job.output.is_none() && probe_pages {
                 let page = read_page(
                     store,
@@ -261,8 +329,22 @@ pub fn run_jobs(
                         job.leader_exited = true;
                         job.exit = Some(exit);
                     }
-                    SlotEvent::ProcessSettled { exit, .. } => {
+                    SlotEvent::ProcessSettled {
+                        exit,
+                        escapees,
+                        output_held,
+                        ..
+                    } => {
                         job.exit.get_or_insert(exit);
+                        job.escapees = Some(escapees);
+                        if output_held {
+                            job.released = Some(now);
+                            if job.stopped {
+                                // A trigger before the release closes
+                                // capture when it arrives (rule 5).
+                                SlotPort::close_capture(&mut job.worker);
+                            }
+                        }
                     }
                     // The controller's cancel triggers (TJ-S1): a capture
                     // fault, and a quota or space short while draining.
@@ -323,6 +405,8 @@ pub fn run_jobs(
                                 final_reservation: outcome.final_reservation,
                             },
                             exit: job.exit,
+                            escapees: job.escapees,
+                            released: job.released.is_some(),
                             stopped: job.stopped,
                             payloads: job.payloads,
                             live_pages: std::mem::take(&mut job.pages),
@@ -776,6 +860,7 @@ impl JobHarness {
             secret_command: None,
             duplicate_digest: digest.finalize().into(),
             stored_command: stored,
+            person: None,
         };
         let admission = self
             .owner

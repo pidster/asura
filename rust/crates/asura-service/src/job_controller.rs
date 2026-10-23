@@ -38,6 +38,7 @@ pub(crate) use views::JobView;
 pub(crate) use waits::{CLIENT_WAITS, TurnWaitEnd};
 pub(crate) use waits::{WaitDone, WaitEnding, WaitKey, WaitStart};
 
+use crate::exec_cmd_worker::PersonLaunch;
 use crate::{capture_worker, tools};
 use asura_platform::{
     PollInterest, RuntimeDirectory,
@@ -152,6 +153,12 @@ pub(crate) struct StartRequest {
     pub redaction: JobRedaction,
     pub duplicate_digest: [u8; 32],
     pub stored_command: String,
+    /// A person job's setup inputs (the sanitized PATH and PC3 variables
+    /// of `person-1`, or the launch environment of `person-outside-1`),
+    /// which the conversation owner builds at dispatch from kind 31 and the
+    /// secret store item. `None` for a model job. They move through the
+    /// queue and the held start into the slot unchanged.
+    pub person: Option<PersonLaunch>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -288,6 +295,7 @@ struct Body {
     secrets: Vec<SecretVariable>,
     secret_command: Option<SecretCommand>,
     redaction: JobRedaction,
+    person: Option<PersonLaunch>,
 }
 impl Body {
     fn from_start(start: SlotStart) -> Self {
@@ -299,6 +307,7 @@ impl Body {
             secrets,
             secret_command,
             capture,
+            person,
             ..
         } = start;
         Self {
@@ -309,6 +318,7 @@ impl Body {
             secrets,
             secret_command,
             redaction: capture.redaction,
+            person,
         }
     }
 }
@@ -707,6 +717,7 @@ impl JobController {
             redaction,
             duplicate_digest,
             stored_command,
+            person,
         } = request;
         let mut job = Job::new(
             id,
@@ -726,6 +737,7 @@ impl JobController {
             secrets,
             secret_command,
             redaction,
+            person,
         });
         if !origin.is_person() {
             // J2-E7: a model start is durable when it is queued; its kind 26
@@ -1848,6 +1860,7 @@ impl JobController {
                 wake: None,
                 gate_home,
             },
+            person: body.person,
         };
         let person_intent = job.origin.is_person() && job.intent != Intent::Committed;
         if person_intent {

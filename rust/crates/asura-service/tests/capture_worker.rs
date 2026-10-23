@@ -6,7 +6,7 @@
 use asura_platform::RuntimeDirectory;
 use asura_platform::exec_cmd::Exit;
 use asura_platform::secrets::{SecretVariable, rewrite_exec_cmd_call};
-use asura_service::test_support::{Job, Outcome, run_jobs};
+use asura_service::test_support::{Job, Outcome, Person, Profile, run_jobs};
 use asura_storage::authority::conversation::{CaptureReason, CaptureState, Id, LossReason};
 use asura_storage::payload::{
     MIB, Origin, PagePool, PageReply, PageRequest, PageState, PayloadStore, read_page,
@@ -70,7 +70,7 @@ impl Home {
     fn one(&self, command: &str) -> Result<Outcome> {
         let (command, secrets) = rewritten(command);
         Ok(self
-            .run(vec![Job { command, secrets }], false, None)?
+            .run(vec![Job::new(command, secrets)], false, None)?
             .remove(0))
     }
     fn object(&self, id: Id) -> Result<Vec<u8>> {
@@ -197,14 +197,7 @@ fn split_secret() -> Result<()> {
     let command = format!(
         "printf 'before\\n'; printf 'token: {a}'; sleep 0.4; printf '{b}'; sleep 0.4; printf '{c}\\n'; sleep 0.3; printf 'after\\n'"
     );
-    let outcomes = home.run(
-        vec![Job {
-            command,
-            secrets: Vec::new(),
-        }],
-        true,
-        None,
-    )?;
+    let outcomes = home.run(vec![Job::new(command, Vec::new())], true, None)?;
     let outcome = &outcomes[0];
     assert_eq!(outcome.settled.state, CaptureState::Complete);
     let mut live = 0;
@@ -320,10 +313,7 @@ fn concurrent() -> Result<()> {
             let (command, variables) = rewritten(&format!(
                 "i=0; while [ $i -lt 2000 ]; do printf 'line %d token: %s\\n' $i \"{secret}\"; i=$((i+1)); done; printf 'out %s\\n' \"{secret}\""
             ));
-            Job {
-                command,
-                secrets: variables,
-            }
+            Job::new(command, variables)
         })
         .collect();
     let outcomes = home.run(jobs, false, None)?;
@@ -372,15 +362,8 @@ fn gated_scanner() -> Result<()> {
     let runner = {
         let home = home.clone();
         std::thread::spawn(move || {
-            home.run(
-                vec![Job {
-                    command: FLOOD.into(),
-                    secrets: Vec::new(),
-                }],
-                false,
-                None,
-            )
-            .map_err(|e| e.to_string())
+            home.run(vec![Job::new(FLOOD, Vec::new())], false, None)
+                .map_err(|e| e.to_string())
         })
     };
     // The producer stalls: the pipe (64 KiB) and queue (512 KiB) fill.
@@ -450,10 +433,10 @@ fn partial_capture() -> Result<()> {
 
     fs::write(home.path.join("capture-throttle-scan"), b"60000")?;
     let outcomes = home.run(
-        vec![Job {
-            command: "while :; do printf '%04000d\\n' 1; done".into(),
-            secrets: Vec::new(),
-        }],
+        vec![Job::new(
+            "while :; do printf '%04000d\\n' 1; done",
+            Vec::new(),
+        )],
         false,
         Some(Duration::from_millis(800)),
     )?;
@@ -505,14 +488,7 @@ fn home_run_release(home: &Home, cancel: Duration) -> Result<Vec<Outcome>> {
         std::thread::sleep(cancel + Duration::from_secs(4));
         let _ = fs::remove_file(gate);
     });
-    let outcomes = home.run(
-        vec![Job {
-            command: FLOOD.into(),
-            secrets: Vec::new(),
-        }],
-        false,
-        Some(cancel),
-    );
+    let outcomes = home.run(vec![Job::new(FLOOD, Vec::new())], false, Some(cancel));
     releaser.join().unwrap();
     outcomes
 }
@@ -580,10 +556,10 @@ fn enospc_pause() -> Result<()> {
     );
     fs::write(&free, (16 * MIB).to_string())?;
     let outcomes = home.run(
-        vec![Job {
-            command: "/usr/bin/yes 0123456789 | /usr/bin/head -c 3000000".into(),
-            secrets: Vec::new(),
-        }],
+        vec![Job::new(
+            "/usr/bin/yes 0123456789 | /usr/bin/head -c 3000000",
+            Vec::new(),
+        )],
         false,
         Some(Duration::from_millis(1500)),
     )?;
@@ -602,23 +578,9 @@ fn quota_expiry() -> Result<()> {
     home.store.set_effective_quota(64 * MIB, u64::MAX / 2);
     let size = 40 * 1_000_000;
     let command = format!("/usr/bin/yes 0123456789 | /usr/bin/head -c {size}");
-    let first = home.run(
-        vec![Job {
-            command: command.clone(),
-            secrets: Vec::new(),
-        }],
-        false,
-        None,
-    )?;
+    let first = home.run(vec![Job::new(command.clone(), Vec::new())], false, None)?;
     wait_installed(&home, &first[0])?;
-    let second = home.run(
-        vec![Job {
-            command,
-            secrets: Vec::new(),
-        }],
-        false,
-        None,
-    )?;
+    let second = home.run(vec![Job::new(command, Vec::new())], false, None)?;
     assert_eq!(second[0].settled.stdout.stored_bytes, size);
     assert_eq!(second[0].settled.state, CaptureState::Complete);
     let page = read_page(
@@ -650,14 +612,7 @@ fn quota_expiry() -> Result<()> {
 /// answers `busy` after the 2 s step while its worker stays held.
 fn pages() -> Result<()> {
     let home = Home::new("pages")?;
-    let outcomes = home.run(
-        vec![Job {
-            command: FLOOD.into(),
-            secrets: Vec::new(),
-        }],
-        true,
-        None,
-    )?;
+    let outcomes = home.run(vec![Job::new(FLOOD, Vec::new())], true, None)?;
     let outcome = &outcomes[0];
     let mut live = 0;
     for page in &outcome.live_pages {
@@ -855,10 +810,7 @@ fn disk_image() -> Result<()> {
     // 3. Cancel while paused.
     fill(&filler, 22 * MIB, &home.store)?;
     let outcomes = home.run(
-        vec![Job {
-            command: command.into(),
-            secrets: Vec::new(),
-        }],
+        vec![Job::new(command, Vec::new())],
         false,
         Some(Duration::from_millis(2500)),
     )?;
@@ -936,10 +888,174 @@ fn stored_signal() -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------ `!!` survivors
+
+/// The PC-I33 and PC-I34 writer (person-command-mode.md, PC-I33; macOS has
+/// no `setsid` command). It is this test binary, not `/usr/bin/perl`:
+/// macOS 27 withholds a platform binary's `KERN_PROCARGS2` environment from
+/// other processes, so the guardian's env-marker scan cannot attribute a
+/// new-session platform binary (EXD-1 residual). The shell starts it in the
+/// background and exits 0 once it recorded its pid; it calls `setsid`,
+/// keeps stdout and writes. `hold` prints `tick 0` to `tick 4` one second
+/// apart and ends; `forever` writes until a write fails, records `EPIPE`
+/// and ends. It lives at most 60 s and never signals anything. Rust
+/// ignores SIGPIPE, so a write to a closed pipe returns EPIPE.
+fn survivor(dir: &Path, mode: &str) {
+    use std::io::Write;
+    // SAFETY: the test-owned child leaves its session; nothing else changes.
+    unsafe {
+        libc::setsid();
+    }
+    let record = |name: &str, text: &str| {
+        let tmp = dir.join(format!("{name}.tmp"));
+        let _ = fs::write(&tmp, text);
+        let _ = fs::rename(&tmp, dir.join(name));
+    };
+    record("survivor.pid", &std::process::id().to_string());
+    let end = Instant::now() + Duration::from_secs(60);
+    let limit = if mode == "hold" { 5 } else { u32::MAX };
+    let mut out = std::io::stdout();
+    for i in 0..limit {
+        if let Err(error) = out
+            .write_all(format!("tick {i}\n").as_bytes())
+            .and_then(|()| out.flush())
+        {
+            let text = if error.raw_os_error() == Some(libc::EPIPE) {
+                "EPIPE".to_string()
+            } else {
+                format!("error {error}")
+            };
+            record("epipe", &text);
+            return;
+        }
+        if Instant::now() >= end {
+            break;
+        }
+        std::thread::sleep(if mode == "hold" {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(50)
+        });
+    }
+    record("done", "ended");
+}
+
+/// A `!!` job of the survivor writer with a fixture launch environment
+/// (scratch HOME, no account variable).
+fn survivor_job(home: &Home, mode: &str) -> Result<(Job, PathBuf)> {
+    let marks = home.path.join(format!("marks-{mode}"));
+    fs::create_dir(&marks)?;
+    let exe = std::env::current_exe()?;
+    let mut job = Job::new(
+        format!(
+            "'{exe}' --survivor '{marks}' {mode} & while [ ! -e '{marks}/survivor.pid' ]; do /bin/sleep 0.05; done; exit 0",
+            exe = exe.display(),
+            marks = marks.display()
+        ),
+        Vec::new(),
+    );
+    job.profile = Profile::PersonOutside1;
+    job.person = Some(Person::Outside {
+        launch: vec![
+            (b"PATH".to_vec(), b"/usr/bin:/bin".to_vec()),
+            (
+                b"HOME".to_vec(),
+                home.path.as_os_str().as_encoded_bytes().to_vec(),
+            ),
+        ],
+    });
+    Ok((job, marks))
+}
+fn wait_mark(path: &Path) -> Result<String> {
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = fs::read_to_string(path) {
+            return Ok(text);
+        }
+        if Instant::now() >= end {
+            return Err(format!("no {}", path.display()).into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 checks for the process only.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// PC-I33 (worker layer, real guardian): the `!!` shell exits 0 at once
+/// while its new-session survivor keeps stdout. The guardian reports one
+/// survivor and reason 15, so the job is released with capture open; all
+/// five `tick` lines are retained and capture settles `complete` on the
+/// survivor's EOF. The survivor was never signalled.
+fn survivor_released() -> Result<()> {
+    let home = Home::new("pci33")?;
+    let (job, marks) = survivor_job(&home, "hold")?;
+    let outcome = home.run(vec![job], false, None)?.remove(0);
+    assert_eq!(outcome.exit, Some(Exit::Exited(0)));
+    assert!(outcome.released, "kind 2 reason 15 released the job");
+    assert_eq!(outcome.escapees, Some(1), "one survivor left running");
+    assert!(!outcome.stopped);
+    assert_eq!(outcome.settled.state, CaptureState::Complete);
+    assert_eq!(outcome.settled.reason, CaptureReason::None);
+    let expected = b"tick 0\ntick 1\ntick 2\ntick 3\ntick 4\n";
+    assert_eq!(outcome.settled.stdout.stored_bytes, expected.len() as u64);
+    assert_eq!(outcome.settled.lines[0], 5);
+    wait_installed(&home, &outcome)?;
+    assert_eq!(home.object(outcome.payloads[0])?, expected);
+    check_digests(&home, &outcome)?;
+    assert_eq!(wait_mark(&marks.join("done"))?, "ended", "never signalled");
+    println!(
+        "PASS PC-I33 worker layer: released with 1 survivor, five tick lines retained, capture complete on EOF, survivor never signalled"
+    );
+    Ok(())
+}
+
+/// PC-I34 (worker layer, real guardian): a survivor writing forever; the
+/// person cancel of the released job closes capture. Capture seals
+/// `incomplete` with reason 7; the survivor is not signalled and its next
+/// write fails with EPIPE, which it records.
+fn survivor_closed() -> Result<()> {
+    let home = Home::new("pci34")?;
+    let (mut job, marks) = survivor_job(&home, "forever")?;
+    job.close_on_release = Some(Duration::from_millis(600));
+    let outcome = home.run(vec![job], false, None)?.remove(0);
+    assert_eq!(outcome.exit, Some(Exit::Exited(0)));
+    assert!(outcome.released && outcome.stopped);
+    assert_eq!(outcome.escapees, Some(1));
+    assert_eq!(outcome.settled.state, CaptureState::Incomplete);
+    assert_eq!(outcome.settled.reason, CaptureReason::ClosedAfterCancel);
+    assert!(outcome.settled.stdout.stored_bytes > 0);
+    assert!(outcome.settled.stdout.digest.is_some());
+    let pid: i32 = wait_mark(&marks.join("survivor.pid"))?.trim().parse()?;
+    assert_eq!(
+        wait_mark(&marks.join("epipe"))?,
+        "EPIPE",
+        "the survivor outlived the close and its next write got EPIPE"
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        if Instant::now() >= end {
+            return Err("survivor did not end after EPIPE".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    println!(
+        "PASS PC-I34 worker layer: close_capture sealed incomplete reason 7, the survivor was not signalled and recorded EPIPE"
+    );
+    Ok(())
+}
+
 type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let [_, flag, dir, mode] = args.as_slice()
+        && flag == "--survivor"
+    {
+        survivor(Path::new(dir), mode);
+        return;
+    }
     if let [_, flag, id, profile, command] = args.as_slice()
         && flag == "--asura-exec-cmd-guardian"
     {
@@ -950,7 +1066,7 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 15] = [
+    let cases: [Case; 17] = [
         ("full", full_capture),
         ("split", split_secret),
         ("klb", key_long_binary),
@@ -966,6 +1082,8 @@ fn main() {
         ("pages", pages),
         ("disk", disk_image),
         ("stored", stored_signal),
+        ("pci33", survivor_released),
+        ("pci34", survivor_closed),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

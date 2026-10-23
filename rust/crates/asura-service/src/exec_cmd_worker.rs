@@ -46,7 +46,6 @@ const CLEANUP_BOUND: Duration = Duration::from_millis(2500);
 /// resolves them on its setup thread with [`PersonSetup`]; the values reach
 /// the guardian only in the FD 11 frame. No `Debug`, and every byte is
 /// zeroed on drop: a launch environment commonly holds tokens.
-#[cfg_attr(not(test), allow(dead_code))] // P3-E builds it at dispatch
 pub(crate) enum PersonLaunch {
     /// `person-1` (`!`): the service-sanitized PATH (PC2) and the PC3
     /// client variables (locale names and `SSH_AUTH_SOCK`). HOME, USER,
@@ -720,11 +719,12 @@ fn setup_ended(stage: Stage, failure: Failure, scope: &tools::ExecutionScope) ->
 }
 
 impl Worker {
-    /// `SlotPort::start` for a `model-1` job: [`Self::start_job_with`]
-    /// with no person setup. A person profile is `Invalid` here, because
-    /// it needs its [`PersonLaunch`].
-    pub(crate) fn start_job(&mut self, start: SlotStart) -> Result<(), SlotStartError> {
-        self.start_job_with(start, None)
+    /// `SlotPort::start`: [`Self::start_job_with`] with the start's own
+    /// person setup ([`SlotStart::person`]). A person profile without its
+    /// [`PersonLaunch`] is `Invalid`.
+    pub(crate) fn start_job(&mut self, mut start: SlotStart) -> Result<(), SlotStartError> {
+        let person = start.person.take();
+        self.start_job_with(start, person)
     }
     /// `SlotPort::start`: the controller granted a slot and 1 MiB for this
     /// job. Starts the capture worker, then setup on the slot's setup
@@ -751,6 +751,7 @@ impl Worker {
             secrets,
             secret_command,
             mut capture,
+            person: _,
         } = start;
         let person_matches = match &person {
             None => !profile.person(),

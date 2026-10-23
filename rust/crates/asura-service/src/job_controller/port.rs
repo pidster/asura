@@ -4,6 +4,7 @@
 //! in-memory work: no file, journal or process wait, and at most one
 //! nonblocking 1-byte lease write (AE-01).
 use super::Origin;
+use crate::exec_cmd_worker::PersonLaunch;
 use crate::{capture_worker, tools};
 use asura_platform::{
     PollInterest, RuntimeDirectory,
@@ -47,6 +48,10 @@ pub(crate) struct SlotStart {
     pub secrets: Vec<SecretVariable>,
     pub secret_command: Option<SecretCommand>,
     pub capture: capture_worker::Start,
+    /// A person job's setup inputs, required for and matching a person
+    /// profile, absent for `model-1` (`exec_cmd_worker::start_job` passes
+    /// them to `start_job_with`).
+    pub person: Option<PersonLaunch>,
 }
 
 /// Why a slot refused a start. The job settles `not_started` with no

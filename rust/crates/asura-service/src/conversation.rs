@@ -475,6 +475,7 @@ fn submit_exec(
         redaction,
         duplicate_digest: tool.digest,
         stored_command: stored_command.clone(),
+        person: None,
     };
     match controller.submit(request, now) {
         Admission::Accepted { job } | Admission::Existing { job } => {

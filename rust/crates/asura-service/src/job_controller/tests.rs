@@ -108,6 +108,7 @@ impl Harness {
             redaction: JobRedaction::new(asura_platform::secrets::detection().expect("rules"), &[]),
             duplicate_digest: [digest; 32],
             stored_command: "printf secret-command-text".into(),
+            person: None,
         }
     }
     fn submit(&mut self, origin: Origin, agent: AgentKey, project: Id) -> Admission {

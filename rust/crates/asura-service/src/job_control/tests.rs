@@ -628,6 +628,7 @@ impl H {
             ),
             duplicate_digest: [1; 32],
             stored_command: command.into(),
+            person: None,
         };
         let job = origin.job_id();
         self.env
