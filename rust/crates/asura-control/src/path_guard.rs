@@ -117,9 +117,7 @@ pub(crate) fn valid(body: &Body) -> bool {
                     Some(false) | None => request_path(&v.path),
                 }
         }
-        Body::PathGuardRevoke(v) => {
-            id(&v.request_id) && id(&v.project_id) && request_path(&v.path)
-        }
+        Body::PathGuardRevoke(v) => id(&v.request_id) && id(&v.project_id) && request_path(&v.path),
         Body::PathGuardReply(v) => match v.error.as_deref() {
             Some(token) => {
                 error::ALL.contains(&token)
@@ -131,8 +129,7 @@ pub(crate) fn valid(body: &Body) -> bool {
                 warnings_valid(&v.pending, v.overflow)
                     && v.approved.len() <= MAX_APPROVED_PATHS
                     && v.approved.iter().all(|p| path_form_valid(p))
-                    && v
-                        .approved
+                    && v.approved
                         .windows(2)
                         .all(|w| w[0].as_bytes() < w[1].as_bytes())
             }
@@ -248,7 +245,10 @@ mod tests {
         })));
         assert!(!reply(approve(Some(".envrc"), None)));
         // Revoke: a path, always.
-        assert!(round_trips(revoke(Some(".git/config")), Direction::ClientToServer));
+        assert!(round_trips(
+            revoke(Some(".git/config")),
+            Direction::ClientToServer
+        ));
         assert!(round_trips(revoke(Some(&long)), Direction::ClientToServer));
         assert!(!request(revoke(None)));
         assert!(!request(revoke(Some(""))));
@@ -283,7 +283,10 @@ mod tests {
             listed(sixteen.clone(), Some(7), approved.clone()),
             Direction::ServerToClient
         ));
-        assert!(round_trips(listed(Vec::new(), None, Vec::new()), Direction::ServerToClient));
+        assert!(round_trips(
+            listed(Vec::new(), None, Vec::new()),
+            Direction::ServerToClient
+        ));
         assert!(!request(listed(Vec::new(), None, Vec::new())));
         // A cut list keeps its count; a zero count is not sent.
         assert!(reply(listed(sixteen[..3].to_vec(), Some(13), Vec::new())));
@@ -293,18 +296,28 @@ mod tests {
         seventeen.push(warning(1, "x"));
         assert!(!reply(listed(seventeen.clone(), None, Vec::new())));
         assert!(encode_frame(&envelope(listed(seventeen, None, Vec::new()))).is_err());
-        let mut many: Vec<String> = (0..=MAX_APPROVED_PATHS).map(|i| format!("{i:04}")).collect();
+        let mut many: Vec<String> = (0..=MAX_APPROVED_PATHS)
+            .map(|i| format!("{i:04}"))
+            .collect();
         assert!(!reply(listed(Vec::new(), None, many.clone())));
         assert!(encode_frame(&envelope(listed(Vec::new(), None, many.clone()))).is_err());
         // Approved paths are valid, unique and in byte order.
         many.truncate(2);
         many.reverse();
         assert!(!reply(listed(Vec::new(), None, many)));
-        assert!(!reply(listed(Vec::new(), None, vec!["a".into(), "a".into()])));
+        assert!(!reply(listed(
+            Vec::new(),
+            None,
+            vec!["a".into(), "a".into()]
+        )));
         assert!(!reply(listed(Vec::new(), None, vec!["/a".into()])));
         // Each kind 1-5; 0 and 6 are not warnings; each path valid.
         for kind in 1..=MAX_WARNING_KIND {
-            assert!(reply(listed(vec![warning(kind, "build.rs")], None, Vec::new())));
+            assert!(reply(listed(
+                vec![warning(kind, "build.rs")],
+                None,
+                Vec::new()
+            )));
         }
         for bad in [
             warning(0, "build.rs"),
@@ -321,7 +334,10 @@ mod tests {
                 path: None,
             },
         ] {
-            assert!(!reply(listed(vec![bad.clone()], None, Vec::new())), "{bad:?}");
+            assert!(
+                !reply(listed(vec![bad.clone()], None, Vec::new())),
+                "{bad:?}"
+            );
         }
         // Each error token alone; nothing else beside it.
         for token in error::ALL {
@@ -407,7 +423,10 @@ mod tests {
             path_overflow: Some(3),
             ..command_entry()
         };
-        assert!(round_trips(entries(entry.clone()), Direction::ServerToClient));
+        assert!(round_trips(
+            entries(entry.clone()),
+            Direction::ServerToClient
+        ));
         // Held with `paths_changed` and its warnings.
         assert!(reply(entries(pb::ConversationQueueEntry {
             state: Some(2),
@@ -470,7 +489,10 @@ mod tests {
             })
         };
         assert!(reply(detail(Vec::new(), Some("not_found"))));
-        assert!(!reply(detail(vec![warning(1, "build.rs")], Some("not_found"))));
+        assert!(!reply(detail(
+            vec![warning(1, "build.rs")],
+            Some("not_found")
+        )));
         let sixteen = vec![warning(2, ".envrc"); MAX_PATH_WARNINGS];
         assert!(
             encode_frame(&envelope(detail(

@@ -24,7 +24,10 @@ impl Scratch {
             "/private/tmp/as-pg-{:x}",
             u128::from_ne_bytes(asura_platform::random_id())
         ));
-        std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
         std::fs::create_dir(path.join("project")).unwrap();
         Self(path)
     }
@@ -228,7 +231,11 @@ fn epg_u1_walk_bounds() {
     let cancelled = walk::walk(&root, List::Implicit, &AtomicBool::new(true));
     assert_eq!(cancelled, Err(walk::WalkError::Cancelled));
     assert_eq!(
-        walk::walk(&root.join("absent"), List::Implicit, &AtomicBool::new(false)),
+        walk::walk(
+            &root.join("absent"),
+            List::Implicit,
+            &AtomicBool::new(false)
+        ),
         Err(walk::WalkError::Unavailable)
     );
 }
@@ -430,7 +437,10 @@ fn epg_u4_warning_computation() {
         ),
     ] {
         let all = check::all(&view, &facts);
-        assert_eq!(all.last(), Some(&warning(K::Overflow, check::OVERFLOW_PATH)));
+        assert_eq!(
+            all.last(),
+            Some(&warning(K::Overflow, check::OVERFLOW_PATH))
+        );
     }
     // An overflow-only change holds nothing: no kind 1, through 0.
     let only = PathGuardView {
@@ -443,7 +453,12 @@ fn epg_u4_warning_computation() {
     let many = PathGuardView {
         changes: vec![change(
             5,
-            &(0..20).map(|i| format!("t{i:02}")).collect::<Vec<_>>().iter().map(String::as_str).collect::<Vec<_>>(),
+            &(0..20)
+                .map(|i| format!("t{i:02}"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             0,
         )],
         ..Default::default()
@@ -469,7 +484,10 @@ fn digest_states() {
         use sha2::Digest;
         sha2::Sha256::digest(b"export A=1\n").into()
     };
-    assert_eq!(walk::digest(&root, ".envrc", &no), FileState::Digest(expected));
+    assert_eq!(
+        walk::digest(&root, ".envrc", &no),
+        FileState::Digest(expected)
+    );
     symlink("/etc/hosts", root.join(".gitmodules")).unwrap();
     let FileState::Digest(link) = walk::digest(&root, ".gitmodules", &no) else {
         panic!("link digest");
@@ -482,14 +500,26 @@ fn digest_states() {
         walk::digest(&root, ".gitattributes", &no),
         FileState::Unreadable
     );
-    s.file(".git/hooks/big", &vec![b'x'; lists::MAX_HASHED_BYTES as usize + 1]);
-    assert_eq!(walk::digest(&root, ".git/hooks/big", &no), FileState::TooLarge);
-    s.file(".git/hooks/edge", &vec![b'x'; lists::MAX_HASHED_BYTES as usize]);
+    s.file(
+        ".git/hooks/big",
+        &vec![b'x'; lists::MAX_HASHED_BYTES as usize + 1],
+    );
+    assert_eq!(
+        walk::digest(&root, ".git/hooks/big", &no),
+        FileState::TooLarge
+    );
+    s.file(
+        ".git/hooks/edge",
+        &vec![b'x'; lists::MAX_HASHED_BYTES as usize],
+    );
     assert!(matches!(
         walk::digest(&root, ".git/hooks/edge", &no),
         FileState::Digest(_)
     ));
-    assert_eq!(walk::digest(&root, ".git/hooks/none", &no), FileState::Missing);
+    assert_eq!(
+        walk::digest(&root, ".git/hooks/none", &no),
+        FileState::Missing
+    );
     std::fs::create_dir(s.0.join("outside")).unwrap();
     std::fs::write(s.0.join("outside/.envrc"), b"x").unwrap();
     symlink(s.0.join("outside"), root.join("linked")).unwrap();
@@ -572,7 +602,9 @@ fn worker_check_admission_and_cancel() {
         inode: root.inode + 1,
         ..root.clone()
     };
-    let ticket = guard.submit(moved, Work::Check { approved: vec![] }).unwrap();
+    let ticket = guard
+        .submit(moved, Work::Check { approved: vec![] })
+        .unwrap();
     assert_eq!(wait(&ticket), Reply::Unavailable);
     // A stalled filesystem (the gate): eight admitted, the ninth busy.
     std::fs::write(&gate, b"").unwrap();

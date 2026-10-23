@@ -72,12 +72,7 @@ const BUILD_SUFFIXES: [&str; 2] = [".mk", ".cmake"];
 const TEST_CONFIG_PREFIXES: [&str; 2] = ["jest.config.", "vitest.config."];
 /// Test code by name.
 const TEST_SUFFIXES: [&str; 6] = [
-    "_test.go",
-    "_test.py",
-    ".test.js",
-    ".test.ts",
-    ".spec.js",
-    ".spec.ts",
+    "_test.go", "_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts",
 ];
 const TEST_PREFIXES: [&str; 1] = ["test_"];
 /// Test directories: every file under one, up to [`BUILD_DEPTH`] levels.
@@ -109,9 +104,9 @@ fn named_build_or_test(name: &str) -> bool {
         || TEST_SUFFIXES
             .iter()
             .any(|s| name.len() > s.len() && name.ends_with(s))
-        || TEST_PREFIXES.iter().any(|p| {
-            name.len() > p.len() + 3 && name.starts_with(p) && name.ends_with(".py")
-        })
+        || TEST_PREFIXES
+            .iter()
+            .any(|p| name.len() > p.len() + 3 && name.starts_with(p) && name.ends_with(".py"))
 }
 
 /// Whether `path` names a file in the build and test list.

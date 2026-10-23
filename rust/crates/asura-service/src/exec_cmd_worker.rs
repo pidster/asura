@@ -560,14 +560,16 @@ impl Slot {
             SlotPhase::Cleanup(work) if work.thread.is_finished() => match work.thread.join() {
                 Ok(mut cleaned) if cleaned.result.is_ok() => {
                     if let Some(change) = cleaned.change.take() {
-                        self.events.push_back(SlotEvent::PathsChanged(Box::new(change)));
+                        self.events
+                            .push_back(SlotEvent::PathsChanged(Box::new(change)));
                     }
                     self.scratch_cleaned = true;
                     self.scratch = Some(SlotEvent::ScratchCleaned);
                 }
                 Ok(mut cleaned) => {
                     if let Some(change) = cleaned.change.take() {
-                        self.events.push_back(SlotEvent::PathsChanged(Box::new(change)));
+                        self.events
+                            .push_back(SlotEvent::PathsChanged(Box::new(change)));
                     }
                     // Failure or L3 passed: token and slot held until restart.
                     self.scratch = Some(SlotEvent::ScratchRetained);

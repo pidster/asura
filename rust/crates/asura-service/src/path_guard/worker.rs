@@ -12,9 +12,9 @@ use super::lists::List;
 use super::walk::{self, FileState, WalkError};
 use asura_platform::events::WakeSender;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
-use std::sync::Arc;
 use std::thread::JoinHandle;
 
 /// Outstanding requests, the running one included (AE-03).
@@ -203,9 +203,10 @@ fn run(root: &Root, work: &Work, cancel: &AtomicBool) -> Reply {
     }
     let path = Path::new(&root.path);
     match work {
-        Work::Digest { path: relative } => {
-            Reply::Digest(walk::digest(path, relative, cancel), super::display(relative))
-        }
+        Work::Digest { path: relative } => Reply::Digest(
+            walk::digest(path, relative, cancel),
+            super::display(relative),
+        ),
         Work::Check { approved } => match walk::walk(path, List::Implicit, cancel) {
             Err(WalkError::Cancelled) => Reply::Cancelled,
             Err(WalkError::Unavailable) => Reply::Unavailable,

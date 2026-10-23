@@ -1205,11 +1205,7 @@ impl JobController {
                     let PathRecord::Queued(change) = &job.path_record else {
                         return None;
                     };
-                    journal::Record::ExecutionPath(Box::new(model_changed(
-                        job.project,
-                        id,
-                        change,
-                    )))
+                    journal::Record::ExecutionPath(Box::new(model_changed(job.project, id, change)))
                 }
                 Kind::Intent => return None,
             };
@@ -1399,8 +1395,7 @@ impl JobController {
         if job.committed.is_none() || job.abandoned {
             return;
         }
-        if let PathRecord::Ready(change) =
-            std::mem::replace(&mut job.path_record, PathRecord::None)
+        if let PathRecord::Ready(change) = std::mem::replace(&mut job.path_record, PathRecord::None)
         {
             job.path_record = PathRecord::Queued(change);
             self.closures.push_back((id, Kind::PathChange));

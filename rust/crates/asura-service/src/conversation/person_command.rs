@@ -1370,8 +1370,7 @@ impl Owner {
                 } else {
                     v.status
                 };
-                let paths =
-                    guard::entry_fields(self.paths.shown(&v.input.input), &mut budget);
+                let paths = guard::entry_fields(self.paths.shown(&v.input.input), &mut budget);
                 entries.push(queue_entry(
                     &v,
                     person,

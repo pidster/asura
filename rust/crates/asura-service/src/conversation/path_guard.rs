@@ -19,9 +19,9 @@
 use super::person_command::Dispatch;
 use super::{Body, Job, Owner, reply};
 use crate::path_guard::check::{self, Facts, Warnings};
+use crate::path_guard::lists;
 use crate::path_guard::walk::FileState;
 use crate::path_guard::worker::{Guard, Polled, Refused, Reply, Root, Ticket, Work};
-use crate::path_guard::lists;
 use crate::secret_store::Secrets;
 use asura_control::path_guard::{MAX_PATH_WARNINGS, error as token, path_form_valid};
 use asura_control::pb;
@@ -46,6 +46,8 @@ const CONTROL_BOUND: usize = 4;
 /// warnings of 1,024 bytes the reply would pass one frame, so the listed
 /// warnings stop here and the rest are counted in `path_overflow`.
 pub(super) const QUEUE_WARNING_BYTES: usize = 24 * 1024;
+/// Recent entries whose shown warnings stay in memory.
+const SHOWN: usize = 64;
 /// Encoded approved-path bytes in one `PathGuardReply`.
 const APPROVED_BYTES: usize = 40 * 1024;
 
@@ -111,8 +113,10 @@ pub(super) struct Paths {
     /// Inputs whose acknowledgement committed (or was found): their start
     /// proceeds.
     acknowledged: std::collections::BTreeSet<Id>,
-    /// The warnings shown on each live person entry.
-    shown: BTreeMap<Id, Warnings>,
+    /// The warnings shown on recent person entries, oldest first, at most
+    /// [`SHOWN`]: a listed entry keeps them after it ran; the restored log
+    /// reads the kind 32 acknowledgement.
+    shown: VecDeque<(Id, Warnings)>,
     /// A `!!` entry held with `paths_changed`: the newest `model_changed`
     /// sequence its warnings showed. Resume admits it when no newer one
     /// appeared.
@@ -126,9 +130,16 @@ impl Paths {
     pub(super) fn acknowledged(&self, input: &Id) -> bool {
         self.acknowledged.contains(input)
     }
-    /// The warnings of a live entry.
+    /// The warnings shown on an entry.
     pub(super) fn shown(&self, input: &Id) -> Option<&Warnings> {
-        self.shown.get(input)
+        self.shown.iter().find(|(i, _)| i == input).map(|(_, w)| w)
+    }
+    fn show(&mut self, input: Id, warnings: Warnings) {
+        self.shown.retain(|(i, _)| *i != input);
+        if self.shown.len() == SHOWN {
+            self.shown.pop_front();
+        }
+        self.shown.push_back((input, warnings));
     }
 }
 
@@ -279,14 +290,14 @@ impl Owner {
                 let root = self.guard_root(record.project);
                 let approved = view.approvals.iter().map(|a| a.path.clone()).collect();
                 match (root, self.path_guard()) {
-                    (Some(root), Some(guard)) if guard.has_room() => match guard
-                        .submit(root, Work::Check { approved })
-                    {
-                        Ok(ticket) => GuardStep::Checking(view, ticket),
-                        // A full queue: the entry waits with `path_check`
-                        // until the worker accepts; never refused.
-                        Err(Refused::Busy | Refused::Stopped) => GuardStep::Check(view),
-                    },
+                    (Some(root), Some(guard)) if guard.has_room() => {
+                        match guard.submit(root, Work::Check { approved }) {
+                            Ok(ticket) => GuardStep::Checking(view, ticket),
+                            // A full queue: the entry waits with `path_check`
+                            // until the worker accepts; never refused.
+                            Err(Refused::Busy | Refused::Stopped) => GuardStep::Check(view),
+                        }
+                    }
                     // Not resident, or no worker: the check waits.
                     _ => GuardStep::Check(view),
                 }
@@ -330,12 +341,12 @@ impl Owner {
             && shown.is_none_or(|shown| through > shown)
         {
             self.paths.held_through.insert(input, through);
-            self.paths.shown.insert(input, warnings);
+            self.paths.show(input, warnings);
             drop(values);
             return self.command_hold(input, PATHS_CHANGED);
         }
         let ack = check::acknowledgement(record.project, input, view, &warnings);
-        self.paths.shown.insert(input, warnings);
+        self.paths.show(input, warnings);
         Dispatch::Guard(record, values, GuardStep::Ack(Box::new(ack)))
     }
 
@@ -347,13 +358,18 @@ impl Owner {
             return false;
         }
         let held = self.journal_held();
-        let next = self.persons.dispatches.iter().find_map(|(input, d)| match d {
-            Dispatch::Guard(_, _, GuardStep::Record | GuardStep::View) => Some(*input),
-            Dispatch::Guard(_, _, GuardStep::Ack(_)) if !held => Some(*input),
-            _ => None,
-        });
+        let next = self
+            .persons
+            .dispatches
+            .iter()
+            .find_map(|(input, d)| match d {
+                Dispatch::Guard(_, _, GuardStep::Record | GuardStep::View) => Some(*input),
+                Dispatch::Guard(_, _, GuardStep::Ack(_)) if !held => Some(*input),
+                _ => None,
+            });
         if let Some(input) = next {
-            let Some(Dispatch::Guard(record, values, step)) = self.persons.dispatches.remove(&input)
+            let Some(Dispatch::Guard(record, values, step)) =
+                self.persons.dispatches.remove(&input)
             else {
                 return false;
             };
@@ -418,9 +434,7 @@ impl Owner {
                 Some((_, ack)) if ack.action == PathAction::Acknowledged => {
                     // A re-dispatch (after a restart, or a later Resume):
                     // the acknowledgement stands.
-                    self.paths
-                        .shown
-                        .insert(input, Warnings::from_record(&ack));
+                    self.paths.show(input, Warnings::from_record(&ack));
                     self.paths.acknowledged.insert(input);
                     Dispatch::Admit(record, values)
                 }
@@ -447,7 +461,10 @@ impl Owner {
                 Dispatch::Guard(record, values, GuardStep::Record)
             }
             (_, Err(cause)) => {
-                tracing::info!(class = super::storage_error(cause), "path_check_read_failed");
+                tracing::info!(
+                    class = super::storage_error(cause),
+                    "path_check_read_failed"
+                );
                 // The dispatch starts again on the next pass.
                 return;
             }
@@ -483,7 +500,9 @@ impl Owner {
                 Some(InputStatus::Queued | InputStatus::Held | InputStatus::Running)
             )
         };
-        self.paths.shown.retain(|input, _| live(input));
+        self.paths
+            .shown
+            .retain(|(input, _)| state.input_status(*input) != Some(InputStatus::Dropped));
         self.paths.acknowledged.retain(|input| live(input));
         self.paths.held_through.retain(|input, _| {
             matches!(
@@ -710,9 +729,12 @@ impl Owner {
             match &control.step {
                 Step::Work(view) => {
                     let work = match (&control.op, control.listing) {
-                        (Op::Approve { path: Some(path), .. }, false) => Work::Digest {
-                            path: path.clone(),
-                        },
+                        (
+                            Op::Approve {
+                                path: Some(path), ..
+                            },
+                            false,
+                        ) => Work::Digest { path: path.clone() },
                         _ => Work::Check {
                             approved: view.approvals.iter().map(|a| a.path.clone()).collect(),
                         },
@@ -729,7 +751,8 @@ impl Owner {
                     let control = &mut self.paths.controls[index];
                     match submitted {
                         Ok(ticket) => {
-                            let Step::Work(view) = std::mem::replace(&mut control.step, Step::Flight)
+                            let Step::Work(view) =
+                                std::mem::replace(&mut control.step, Step::Flight)
                             else {
                                 unreachable!("work");
                             };
@@ -788,7 +811,13 @@ impl Owner {
         }
         let project = control.project;
         match (&control.op, worked) {
-            (Op::Approve { reference, path: Some(_) }, Reply::Digest(state, shown)) => {
+            (
+                Op::Approve {
+                    reference,
+                    path: Some(_),
+                },
+                Reply::Digest(state, shown),
+            ) => {
                 let reference = *reference;
                 let record = match (state, shown) {
                     (FileState::Digest(digest), Some(shown)) => {
@@ -803,7 +832,13 @@ impl Owner {
                 };
                 self.paths.controls[index].step = Step::Append(VecDeque::from([record]));
             }
-            (Op::Approve { reference, path: None }, Reply::Checked(facts)) => {
+            (
+                Op::Approve {
+                    reference,
+                    path: None,
+                },
+                Reply::Checked(facts),
+            ) => {
                 let reference = *reference;
                 let mut records = VecDeque::new();
                 let mut room = view.as_ref().clone();
@@ -816,11 +851,12 @@ impl Owner {
                     }
                     room.approval_records += 1;
                     if !room.approvals.iter().any(|a| a.path == path) {
-                        room.approvals.push(asura_storage::authority::conversation::PathApproval {
-                            path: path.clone(),
-                            digest,
-                            frame: Default::default(),
-                        });
+                        room.approvals
+                            .push(asura_storage::authority::conversation::PathApproval {
+                                path: path.clone(),
+                                digest,
+                                frame: Default::default(),
+                            });
                     }
                     records.push_back(approval(
                         PathAction::Approved,
