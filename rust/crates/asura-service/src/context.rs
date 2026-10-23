@@ -138,12 +138,20 @@ fn reference_texts(turn: &Candidate) -> (String, String) {
 /// turn's own input placed them (notices in later turns). Only the prompt
 /// when the notice is empty.
 fn full_user_text(turn: &Candidate) -> String {
-    let notice = turn.notice.text(turn.notice.entries.len());
-    format!("{}{}", context_block(&[], 0, &notice), turn.prompt)
+    format!("{}{}", prior_block(turn), turn.prompt)
+}
+/// A prior turn's rebuilt notice in its context label; empty when the
+/// notice is empty.
+fn prior_block(turn: &Candidate) -> String {
+    context_block(&[], 0, &turn.notice.text(turn.notice.entries.len()))
 }
 fn turn_len(turn: &Candidate, fidelity: Fidelity) -> u64 {
     match fidelity {
-        Fidelity::Full => entry_len(&full_user_text(turn)) + entry_len(&turn.answer),
+        Fidelity::Full => {
+            // The length of `full_user_text` without copying the prompt.
+            let user = prior_block(turn).len() + turn.prompt.len();
+            field_len(2 + field_len(user as u64)) + entry_len(&turn.answer)
+        }
         Fidelity::Reference => {
             let (user, model) = reference_texts(turn);
             entry_len(&user) + entry_len(&model)
