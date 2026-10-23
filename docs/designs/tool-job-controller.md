@@ -2905,7 +2905,7 @@ pub(crate) enum SlotEvent {
     CleanupUnconfirmed(UnconfirmedReason),           // kind 4, or guardian lost
     CapturePaused(capture_worker::PauseReason), CaptureResumed, CaptureFault(CaptureReason),
     ProcessSettled { exit: Exit, cleanup: JobCleanup, escapees: u32, elapsed_ms: u64,
-        output_held: bool }, // kind 2; output_held for reason 15 (P3-T), always false in J2
+        output_held: bool }, // kind 2; output_held for reason 15 (`person-outside-1`, P3-T)
     CaptureSettled(Box<CaptureOutcome>),             // sealed report, or L3 unconfirmed
     ScratchCleaned, ScratchRetained,
     IdentityChanged,                                 // pre-spawn recheck mismatch
@@ -3033,7 +3033,7 @@ job-mode mappings from guardian and capture facts to slot events:
 | Guardian lost or protocol fault before kind 1 | `SetupFailed(ProtocolFault)` once; capture `not_started`. Since [J2-A2](#j2-a2-platform-follow-up): when `take_cleanup` returns the token, the slot deletes the scratch and reports `ScratchCleaned`; while `ExecCmdJob::release_pending()` is true it keeps polling; otherwise it reports `ScratchRetained` |
 | Guardian setup failure (kind 3) | `guardian_setup_reason` maps `ExecCmdResult.setup_reason` (since J2-A2): 5 `spawn_failed` to 15, 6 `sandbox_unavailable` to 14, 7 `denied` to 13 `project_changed`, 8 to 17 `protocol_fault`, any other value to 18 `setup_failed` |
 | Scratch cleanup | Runs on the slot's cleanup thread with its own 2.5 s bound, separate from the capture L3 bound; an expired bound or a failure gives `ScratchRetained` |
-| `close_capture` | A no-op until P3-T |
+| `close_capture` | Closes the platform capture read ends and the capture worker's producer; no lease byte, no signal; idempotent; a call before reason 15 applies when reason 15 arrives. The seal is `incomplete` with reason 7 unless a fault or pause-cancel reason came first: a quota, `ENOSPC` or capture-fault trigger records its own capture reason; the controller maps 7 to 5 for outcome `cancelled` (P3-T, 2026-10-23) |
 | `ProcessSettled.output_held` | Always `false` in J2; P3-T sets it for kind 2 reason 15 |
 
 ##### TJ-Q4: J2 start, stop and settlement
