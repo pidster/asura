@@ -3055,6 +3055,46 @@ impl Replay {
             live: u32::try_from(live).map_err(|_| ReplayError::Limit)?,
         })
     }
+    /// The notice inputs of a prior turn of `conversation`, rebuilt for a
+    /// later turn's history (tool-job-controller.md, notices in later
+    /// turns). `generation` is the prior turn's; `through` and `live` are
+    /// its kind 21 `notice_through` and `notice_live` (S and the live
+    /// count, J5-E8). P is the `notice_through` of the conversation's `T`
+    /// entry one generation earlier (0 for the first turn), the same P the
+    /// binding point used. The settlements are the same `(P, S]` read, at
+    /// most [`MAX_NOTICE_SETTLEMENTS`]: no history scan and no recount. A
+    /// missing earlier `T` entry, P above S or a live count above the
+    /// unsettled-job bound is `Corrupt`.
+    pub fn prior_notice(
+        &self,
+        conversation: Id,
+        generation: u64,
+        through: u64,
+        live: u32,
+        index: &mut dyn Index,
+    ) -> Result<JobNotice> {
+        let after = match generation.checked_sub(1) {
+            None | Some(0) => 0,
+            Some(previous) => {
+                match self.entry(&Key::new(Tag::Turn, conversation, previous), index)? {
+                    Some(Entry::Turn { notice_through, .. }) => notice_through,
+                    _ => return Err(ReplayError::Corrupt),
+                }
+            }
+        };
+        require(after <= through && live as usize <= MAX_UNSETTLED_JOBS)?;
+        let settlements = self
+            .settlement_calls(conversation, after, through, MAX_NOTICE_SETTLEMENTS, index)?
+            .into_iter()
+            .map(|(listing, command)| NoticeSettlement { listing, command })
+            .collect();
+        Ok(JobNotice {
+            after,
+            through,
+            settlements,
+            live,
+        })
+    }
     /// Projects and conversations named by the active operation or an
     /// unresolved input never leave memory.
     fn pinned(&self) -> (BTreeSet<Id>, BTreeSet<Id>) {

@@ -1750,6 +1750,91 @@ fn j5t_02_notice_read_is_exactly_once_and_cursor_survives_restart() {
     );
 }
 
+/// J5T-11 (storage part, notices in later turns): a prior turn's notice
+/// inputs are rebuilt from records only, with P from the earlier `T` entry
+/// and S and the live count from the turn's kind 21: the same settlements
+/// as the binding-point read, before and after a restart from index runs.
+/// A cursor below P, a live count above 64 or a missing earlier `T` entry
+/// is `Corrupt`.
+#[test]
+fn j5t_11_prior_notice_rebuilds_the_binding_range() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (conversation, op1, gen1) = h.start(project, None);
+    let jobs: Vec<Id> = (1..=4).map(|n| h.job(op1, gen1, n)).collect();
+    h.append(exited(jobs[0])).unwrap();
+    h.finish(conversation, op1, gen1, 0);
+    h.append(exited(jobs[1])).unwrap();
+    // Turn 2's binding read: P = 0 (turn 1's cursor), S now, live 2.
+    let bound = {
+        let (state, mut store) = h.journal.store();
+        state.job_notice(conversation, 0, &mut store).unwrap()
+    };
+    assert_eq!(notice_jobs(&bound), [(jobs[1], 2), (jobs[0], 1)]);
+    assert_eq!(bound.live, 2);
+    let (_, op2, gen2) = h.start_with(project, Some(conversation), bound.through, bound.live);
+    h.finish(conversation, op2, gen2, 0);
+    // Turn 3's binding read: P = turn 2's S.
+    h.append(exited(jobs[2])).unwrap();
+    let bound3 = {
+        let (state, mut store) = h.journal.store();
+        state
+            .job_notice(conversation, bound.through, &mut store)
+            .unwrap()
+    };
+    assert_eq!(notice_jobs(&bound3), [(jobs[2], 3)]);
+    let (_, op3, gen3) = h.start_with(project, Some(conversation), bound3.through, bound3.live);
+    h.finish(conversation, op3, gen3, 0);
+    // A settlement after turn 3's S changes neither rebuilt notice.
+    h.append(exited(jobs[3])).unwrap();
+    let check = |state: &Replay, store: &mut dyn Index| {
+        let first = state.prior_notice(conversation, gen1, 0, 0, store).unwrap();
+        assert_eq!((first.after, first.through, first.live), (0, 0, 0));
+        assert!(first.settlements.is_empty());
+        let second = state
+            .prior_notice(conversation, gen2, bound.through, bound.live, store)
+            .unwrap();
+        assert_eq!(second, bound, "turn 2 rebuilt as bound");
+        let third = state
+            .prior_notice(conversation, gen3, bound3.through, bound3.live, store)
+            .unwrap();
+        assert_eq!(third, bound3, "turn 3 rebuilt as bound");
+        // S below P, a live count above the bound, no earlier `T` entry.
+        assert_eq!(
+            state.prior_notice(conversation, gen3, bound.through - 1, 0, store),
+            Err(ReplayError::Corrupt)
+        );
+        assert_eq!(
+            state.prior_notice(conversation, gen2, bound.through, 65, store),
+            Err(ReplayError::Corrupt)
+        );
+        assert_eq!(
+            state.prior_notice(conversation, gen3 + 2, bound3.through, 0, store),
+            Err(ReplayError::Corrupt)
+        );
+    };
+    {
+        let (state, mut store) = h.journal.store();
+        check(&state, &mut store);
+    }
+    // After a restart with the `T` entries in index runs.
+    let (other, op4, gen4) = h.start(project, None);
+    let text = "z".repeat(61_440);
+    for n in 0..300u64 {
+        h.segment(op4, gen4, n * 61_440, &text).unwrap();
+    }
+    h.finish(other, op4, gen4, 300 * 61_440);
+    let mut reopened = open(h.files(), true).unwrap();
+    let (state, mut store) = reopened.store();
+    assert!(
+        state
+            .delta_tag(Tag::Turn)
+            .iter()
+            .all(|(key, _)| key.id != conversation)
+    );
+    check(&state, &mut store);
+}
+
 /// An index that counts the frames read through it (J5T-10).
 struct CountingIndex<'a> {
     inner: &'a mut dyn Index,

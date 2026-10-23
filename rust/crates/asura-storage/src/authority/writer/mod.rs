@@ -264,6 +264,13 @@ pub struct Prepared {
     /// records `notice.through` as `notice_through`. A new conversation
     /// has P = 0, no settlements and no live jobs.
     pub notice: JobNotice,
+    /// The notice inputs of the first [`MAX_COMPOSED_PRIOR`] `history`
+    /// turns, in the same order, for their notices in this turn's history
+    /// (tool-job-controller.md, notices in later turns): P from the earlier
+    /// `T` entry, S and the live count from the turn's kind 21.
+    ///
+    /// [`MAX_COMPOSED_PRIOR`]: crate::authority::conversation::MAX_COMPOSED_PRIOR
+    pub history_notices: Vec<JobNotice>,
 }
 /// One project as a page lists it.
 #[derive(Clone, Debug)]
