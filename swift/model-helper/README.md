@@ -13,13 +13,23 @@ Before a standard SwiftPM build, the root build owner must:
    `public static let schemaDigest: [UInt8]`, each exactly 32 bytes.
 4. Build with standard `swift build --package-path swift/model-helper`; run
    model-free tests with `swift test --package-path swift/model-helper`.
+   Every build embeds `Support/Info.plist` in the `__TEXT,__info_plist`
+   section (`-sectcreate`, set in `Package.swift`): `CFBundleIdentifier`
+   `com.pidster.asura.model`, `CFBundleExecutable` `asura-model`. The
+   linker's ad hoc signature takes that identifier and binds the plist. An
+   App-Sandboxed bare helper cannot start without it, and Core AI keys its
+   compiled-model cache by it, so every copy shares one cache
+   ([HS-P1](../../docs/designs/release-signing.md#sg0-results-ad-hoc-part-2026-10-23)).
+   A change to the plist relinks the helper (checked 2026-10-23); a relink
+   of unchanged inputs gives the same digest.
 5. Assemble helper/binary/manifest identities according to the D2 contract.
    Place `asura-model`, `mlx.metallib` and `swift-transformers_Hub.bundle`
    (from the same SwiftPM build directory) beside the service executable,
    and beside the test binaries for native journeys. Do not ship the other
    SwiftPM resource bundles; no code reads them.
 6. Write `.build/model-tools/package-identity.txt` as five lowercase hex
-   SHA-256 lines: build ID, `model.proto`, `asura-model`, `mlx.metallib` and
+   SHA-256 lines (the helper digest covers the embedded plist and the
+   signature, so hash the linked executable as built): build ID, `model.proto`, `asura-model`, `mlx.metallib` and
    the Hub bundle digest. Write the same values to `model-package.json`, with
    the bundle as `hub_bundle_sha256`. Compute the bundle digest in the bundle
    root ([encoding](../../docs/designs/release-signing.md#hub-bundle-digest-encoding)):

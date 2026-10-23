@@ -201,18 +201,23 @@ enum ModelInventory {
                 catch { note(reason(error)) }
             }
         }
-        // Open each absolute path component without following links, then stay descriptor-relative.
-        var fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard fd >= 0 else { return Result(issues: [issue(provider, "provider_unavailable")]) }
+        // Open the provider directory by its full path. `O_NOFOLLOW_ANY` rejects a
+        // link in any component, as the earlier walk from `/` did, but needs no
+        // read access to the ancestors: the helper App Sandbox grants only the
+        // asset subtree (release signing, HS-P6). Below it, stay descriptor-relative.
+        guard !root.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) else {
+            return Result(issues: [issue(provider, "unsafe_asset")])
+        }
+        let path = (root.hasSuffix("/") ? root : root + "/") + provider
+        let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
+        guard fd >= 0 else {
+            if errno == ENOENT { return result }
+            return Result(issues: [issue(provider, "unsafe_asset")])
+        }
         defer { Darwin.close(fd) }
-        for component in root.split(separator: "/").map(String.init) + [provider] {
-            guard component != ".", component != ".." else { return Result(issues: [issue(provider, "unsafe_asset")]) }
-            let next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            guard next >= 0 else {
-                if errno == ENOENT { return result }
-                return Result(issues: [issue(provider, "unsafe_asset")])
-            }
-            Darwin.close(fd); fd = next
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else {
+            return Result(issues: [issue(provider, "unsafe_asset")])
         }
         do { try scan(fd, "", 0) } catch { note(reason(error)) }
         result.rows.sort { $0.selector < $1.selector }
