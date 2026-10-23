@@ -348,10 +348,17 @@ const BLOCKER: &str = "while [ ! -e release ]; do /bin/sleep 0.1; done";
 /// and kind 28 exit 0 with stdout `hi\n`, one line, and the digest of the
 /// stream. An exact retry of the request ID returns the same input and
 /// queues nothing; a changed retry conflicts. The audit log records
-/// `person_command.queued` with no command text.
+/// `person_command.queued` with no command text. The service lists
+/// capability 8 with no test seam (Q passed; OD3).
 fn basic() -> Result<()> {
     let mut env = Env::new("pc-basic")?;
     env.start_audited()?;
+    assert!(
+        env.fixture
+            .attach()?
+            .supports(pb::Capability::PersonCommand),
+        "CAPABILITY_PERSON_COMMAND (OD3, after Q)"
+    );
     let (project, _) = env.project("project")?;
     let submit = request(project, None, "echo hi", None);
     let (input, _) = queued(&env, &submit)?;
