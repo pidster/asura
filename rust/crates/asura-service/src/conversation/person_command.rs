@@ -2269,14 +2269,9 @@ impl Owner {
     /// Owner unit tests: closes the journal writer and waits until its
     /// worker settled, as a crash leaves the journal (no closure record is
     /// written), so the next owner of the process can open its writer.
+    #[cfg(feature = "test-support")]
     pub(crate) fn close_writer_for_test(&mut self) {
-        if let Some(writer) = &mut self.writer {
-            writer.close();
-            let end = Instant::now() + std::time::Duration::from_secs(60);
-            while !writer.settled() && Instant::now() < end {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
+        self.fixture_writer_join();
     }
     /// Owner unit tests: the controller's slots come from `slots`.
     pub(crate) fn set_test_slots(&mut self, slots: crate::job_controller::SlotFactory) {

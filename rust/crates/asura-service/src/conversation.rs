@@ -5189,6 +5189,15 @@ impl Owner {
             writer.close();
         }
     }
+    /// Closes the journal writer and waits for its worker thread to exit,
+    /// as a crash leaves the journal (no closure record), so the next owner
+    /// of the process gets the writer claim.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_writer_join(&mut self) {
+        if let Some(writer) = &mut self.writer {
+            writer.close_and_join();
+        }
+    }
 }
 
 #[cfg(test)]

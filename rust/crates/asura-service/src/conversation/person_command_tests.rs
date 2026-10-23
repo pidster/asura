@@ -31,13 +31,12 @@ struct Slot {
     job: Option<Id>,
 }
 impl Drop for H {
+    /// The store's worker and the writer stop first; then the scratch
+    /// guard deletes the scratch keychain and the home (testing rule 2).
     fn drop(&mut self) {
         if let Some(mut h) = self.h.take() {
             h.owner().close_secret_store();
             h.owner().close_writer_for_test();
-        }
-        if let Some(target) = self.keychain.take() {
-            let _ = asura_platform::keychain::scratch::delete(&target);
         }
     }
 }
@@ -130,20 +129,30 @@ fn submit_body(project: Id, conversation: Option<(Id, u64)>, command: &str, outs
     })
 }
 
-/// The scratch home, removed last.
-struct Dir(std::path::PathBuf);
-impl Drop for Dir {
+/// The scratch home and its scratch keychain, if any. It exists from the
+/// moment the home directory does, so a start that fails part way (a
+/// panic before the harness exists) still deletes the scratch keychain
+/// and removes the home. Only the scratch keychain under the home is
+/// deleted; the search list and the login keychain are never touched.
+struct Scratch {
+    path: std::path::PathBuf,
+    /// Deleted before the home is removed.
+    keychain: Option<asura_platform::keychain::Target>,
+}
+impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(target) = self.keychain.take() {
+            let _ = asura_platform::keychain::scratch::delete(&target);
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 struct H {
     h: Option<JobHarness>,
     log: Slots,
-    /// The scratch keychain of a `!!` case; deleted after the store's
-    /// worker stopped (testing rule 2).
-    keychain: Option<asura_platform::keychain::Target>,
-    path: Dir,
+    /// The home and the scratch keychain of a `!!` case; dropped after
+    /// [`H`]'s own drop stopped the store's worker (testing rule 2).
+    scratch: Scratch,
     runtime: asura_platform::RuntimeDirectory,
     counter: u64,
     _serial: std::sync::MutexGuard<'static, ()>,
@@ -157,6 +166,11 @@ impl H {
         Self::start(true)
     }
     fn start(keychain: bool) -> Self {
+        Self::start_checked(keychain, |_| {})
+    }
+    /// [`Self::start`] that calls `before_harness` with the home just
+    /// before the harness starts (a failure seam for the cleanup test).
+    fn start_checked(keychain: bool, before_harness: impl FnOnce(&std::path::Path)) -> Self {
         let serial = crate::TEST_WRITER.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::path::PathBuf::from(format!(
             "/private/tmp/asura-pcu-{:x}",
@@ -166,29 +180,36 @@ impl H {
             .mode(0o700)
             .create(&path)
             .unwrap();
+        // The cleanup guard comes before anything else that can fail.
+        let mut scratch = Scratch {
+            path,
+            keychain: None,
+        };
+        let path = scratch.path.clone();
         let runtime = asura_platform::RuntimeDirectory::scratch(&path, true).unwrap();
-        let keychain = keychain.then(|| {
+        if keychain {
             let file = path.join("scratch.keychain");
             let password: String = asura_platform::random_id()
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect();
-            let target = asura_platform::keychain::scratch::create(&file, &password)
-                .expect("scratch keychain");
+            scratch.keychain = Some(
+                asura_platform::keychain::scratch::create(&file, &password)
+                    .expect("scratch keychain"),
+            );
             std::fs::write(
                 path.join("secret-store-keychain"),
                 format!("{}\n{password}\n", file.display()),
             )
             .unwrap();
-            target
-        });
+        }
+        before_harness(&path);
         let log = Slots::default();
         let h = JobHarness::start_scripted(&runtime, factory(log.clone())).expect("harness");
         Self {
             h: Some(h),
             log,
-            keychain,
-            path: Dir(path),
+            scratch,
             runtime,
             counter: 0,
             _serial: serial,
@@ -210,7 +231,7 @@ impl H {
         self.counter = 0;
     }
     fn project(&mut self) -> Id {
-        let location = self.path.0.join("project");
+        let location = self.scratch.path.join("project");
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&location)
@@ -987,4 +1008,23 @@ fn p3e2_new_conversation_waits_for_the_pending_one() {
     }
     assert_eq!(h.j().owner().persons.items, items, "no item was put");
     assert_eq!(h.accepted(body), input, "the exact retry");
+}
+
+/// P3-E3: a start that fails after the scratch keychain exists, before the
+/// harness does, still deletes the scratch keychain and removes the home:
+/// no `scratch.keychain` is left under `/private/tmp/asura-pcu-*`.
+#[test]
+fn a_failed_start_removes_the_scratch_keychain_and_home() {
+    let mut seen = None;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        H::start_checked(true, |home| {
+            assert!(home.join("scratch.keychain").exists());
+            seen = Some(home.to_owned());
+            panic!("injected start failure");
+        })
+    }));
+    assert!(failed.is_err());
+    let home = seen.expect("the seam ran");
+    assert!(!home.join("scratch.keychain").exists());
+    assert!(!home.exists());
 }

@@ -865,6 +865,17 @@ impl WriterHandle {
         }
         self.handle.is_none()
     }
+    /// Test support: closes the writer and blocks until its worker thread
+    /// exited, which releases the process-wide writer claim, so the next
+    /// writer of the process starts. Only test threads call it, never a
+    /// reactor; the wait ends when the worker finishes its queued commands.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn close_and_join(&mut self) {
+        self.close();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 /// The journal worker loop: queued commands in order; between commands, run
 /// compaction steps, and while normal records are held, recheck free space

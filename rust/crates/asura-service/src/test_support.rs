@@ -567,7 +567,6 @@ impl JobHarness {
             None
         };
         owner.register(wake);
-        owner.open();
         let mut harness = Self {
             owner,
             reader,
@@ -578,13 +577,32 @@ impl JobHarness {
             replies: Vec::new(),
             longest_poll: Duration::ZERO,
         };
-        let started = harness.until(Duration::from_secs(60), |h| {
-            h.owner
-                .fixture_replay()
-                .is_some_and(|r| r.binding.is_some())
-                && h.owner.fixture_jobs().is_some()
-                && h.owner.fixture_unavailable().is_none()
-        });
+        // As the service does (its installation inspection waits for the
+        // audit bootstrap, and the owner opens after the inspection), the
+        // owner opens only after the audit bootstrap settled: the bootstrap
+        // creates `.asura/logs`, which changes `.asura` under the writer's
+        // authority scan (`authority_repair_required`). The bootstrap's
+        // settlement wakes the harness.
+        harness
+            .until(Duration::from_secs(60), |h| {
+                h.audit.as_ref().is_none_or(|a| a.bootstrap_settled())
+            })
+            .map_err(|e| format!("{e}: audit bootstrap"))?;
+        harness.owner.open();
+        // Ready, or a final failure: the owner never clears `unavailable`.
+        let started = harness
+            .until(Duration::from_secs(60), |h| {
+                h.owner.fixture_unavailable().is_some()
+                    || (h
+                        .owner
+                        .fixture_replay()
+                        .is_some_and(|r| r.binding.is_some())
+                        && h.owner.fixture_jobs().is_some())
+            })
+            .and_then(|()| match harness.owner.fixture_unavailable() {
+                Some(_) => Err("owner unavailable".to_string()),
+                None => Ok(()),
+            });
         if let Err(error) = started {
             let replay = harness.owner.fixture_replay().map(|r| r.binding.is_some());
             let jobs = harness.owner.fixture_jobs().is_some();
@@ -1070,6 +1088,16 @@ impl JobHarness {
     }
 }
 
+impl Drop for JobHarness {
+    /// The writer's worker exits before the drop returns, so the next
+    /// harness of the process gets the process-wide writer claim
+    /// (`storage_unavailable` otherwise). The journal is left as a crash
+    /// leaves it.
+    fn drop(&mut self) {
+        self.owner.fixture_writer_join();
+    }
+}
+
 // ------------------------------------------------------- secret store gate
 
 /// The gate an in-process service's secret store uses (SS-I8, SS-I9): set
@@ -1087,4 +1115,71 @@ pub(crate) fn secret_store_gate() -> Option<crate::secret_store::Gate> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::AtomicBool;
+
+    /// A private scratch home, removed after the harness that uses it.
+    struct Home(std::path::PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn home(audit: bool) -> (Home, RuntimeDirectory) {
+        let path = std::path::PathBuf::from(format!(
+            "/private/tmp/asura-jh-{:x}",
+            u128::from_ne_bytes(asura_platform::random_id())
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let home = Home(path);
+        let runtime = RuntimeDirectory::scratch(&home.0, true).unwrap();
+        if audit {
+            asura_storage::config::execute(
+                runtime.clone(),
+                "audit.enabled",
+                Some("true"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        }
+        (home, runtime)
+    }
+
+    /// Harness start race (P3-E3): with the audit worker, the harness
+    /// opens the owner only after the audit bootstrap settled, as the
+    /// service does, so the bootstrap's first `logs` directory cannot
+    /// change `.asura` under the writer's authority scan
+    /// (`authority_repair_required`). Each fresh home starts.
+    #[test]
+    fn audited_harness_opens_the_owner_after_the_audit_bootstrap() {
+        let _serial = crate::TEST_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        for round in 0..12 {
+            let (_home, runtime) = home(true);
+            let h =
+                JobHarness::start(&runtime, true).unwrap_or_else(|e| panic!("round {round}: {e}"));
+            drop(h);
+        }
+    }
+
+    /// Harness start race (P3-E3): a dropped harness's writer releases the
+    /// process-wide writer claim before the drop returns, so the next
+    /// harness's owner gets a writer (`storage_unavailable` otherwise).
+    #[test]
+    fn a_harness_starts_right_after_the_previous_one_dropped() {
+        let _serial = crate::TEST_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        for round in 0..6 {
+            let (_home, runtime) = home(false);
+            let h =
+                JobHarness::start(&runtime, false).unwrap_or_else(|e| panic!("round {round}: {e}"));
+            drop(h);
+        }
+    }
 }
