@@ -14,9 +14,15 @@ Implementation state, 2026-10-22: packet J34-G is merged on `main` (`09eaa67`,
 Reason 19 in the journal codec is implemented by J34-S on the J3 integration
 branch, not merged. On the same branch J34-K implements the controller's
 revocation scope and the check at slot grant, J3-R the refusal reason and
-J4-T the TUI. The owner's state, revocation wiring and audit emission and the
-64 KiB configuration file bound are not implemented; they land with J34-E on
-the J3 integration branch ([code packets](#code-packets)).
+J4-T the TUI. J34-E implements the owner's state, the per-call grant, the
+revocation wiring, one `execution.changed` per changed entry and the 64 KiB
+configuration file bound on the same branch (2026-10-23,
+[J3 and J4 evidence](tool-job-controller.md#j3-and-j4-evidence)): ES-02
+(file bound), ES-04, ES-05, ES-07, ES-10, ES-11 and ES-12 pass at the
+integration layer and J34E-14 through the TUI. In ES-10 the starting call
+reports the revoked job as settled with status 1, as the J3 yield window
+rules state (the window continues until kind 28 commits), not with status
+`cancelled`.
 
 ## Owner decision
 
