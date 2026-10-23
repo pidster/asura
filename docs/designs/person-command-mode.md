@@ -986,7 +986,37 @@ enum QueueRefusal {
   `secret_store_denied` and `secret_rules_changed` for kind 3 entries. Each is
   a current-owner diagnostic, as today.
 - `ConversationHistoryEntry` gains `optional bytes person_command_input_id = 5`.
-  The restored log reads the job's state and fold through the job API.
+  The restored log reads the job's state and fold through the job API. A
+  person entry has the input ID, `accepted_frame` (its kind 31 frame), and
+  `generation` (the generation it was queued against, 0 before the first
+  turn, at most the reply's), and has no `operation_id` or `kind`. A history
+  reply may carry generation 0 only when every entry is a person entry: a
+  conversation that so far holds only person commands.
+
+Codec rules (P3-C, 2026-10-23):
+
+- A kind 3 queue entry carries `target_generation` and no
+  `target_operation_id`, and has no `operation_id` or `generation` in any
+  state, because a person command runs as a job, not an operation. It requires
+  `command_cwd` and `command_outside_sandbox`; `waiting_step` is not allowed;
+  `command_filtered` appears only as true; `waiting_text` is 1–128 bytes with no
+  control characters.
+- A refusal reply has `full_text = false`, and `pending` and `stale_order` are
+  not true. `refusal_status` is present and nonzero exactly when the refusal is
+  `secret_store_unavailable`.
+- `JobEntry` fields 28 `left_running` and 29 `shell_exited` appear only on a
+  person job with `outside_sandbox = true`: `left_running` only in `DRAINING` or
+  `SETTLED`, `shell_exited` only as true and only in `DRAINING`.
+- `SecretStoreStatus` fields are optional; stranded IDs are distinct, valid and
+  no more than `stranded_count` (at most 16 listed, counts at most 257).
+- One owner checks the environment form: `asura_control::person::environment_refusal`
+  (size first: more than 1,024 entries or 40,960 bytes is
+  `environment_too_large`; any other form fault is `environment_invalid`). The
+  client applies it before sending and answers a refused environment locally,
+  so an environment too large for one frame still gets its refusal; the service
+  applies the same function at submit. The wire limit of `launch_environment`
+  is the frame bound (32,768 entries), so a count above 1,024 is a refusal, not
+  a wire fault.
 
 TUI texts for refusals:
 

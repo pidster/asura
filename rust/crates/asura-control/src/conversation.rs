@@ -219,7 +219,12 @@ pub(super) fn valid(body: &Body) -> bool {
                     v.generation.is_none() && v.entries.is_empty() && v.has_more == Some(false)
                 } else {
                     id(&v.conversation_id)
-                        && v.generation.is_some_and(|n| n > 0)
+                        // Generation 0: a conversation that holds only person
+                        // commands, queued before its first turn.
+                        && v.generation.is_some_and(|n| {
+                            n > 0
+                                || v.entries.iter().all(|e| e.person_command_input_id.is_some())
+                        })
                         && v.entries.len() <= 8
                         && (v.has_more == Some(false) || !v.entries.is_empty())
                         && v.entries.iter().all(|e| {
@@ -2283,6 +2288,22 @@ mod tests {
                 ..command.clone()
             }
         ]))));
+        // A conversation with only person commands has generation 0; a turn
+        // entry needs a generation above 0.
+        let only_commands = |entries| pb::ConversationHistoryReply {
+            generation: Some(0),
+            ..reply(entries)
+        };
+        let first = pb::ConversationHistoryEntry {
+            generation: Some(0),
+            ..command.clone()
+        };
+        assert!(valid(&Body::ConversationHistoryReply(only_commands(vec![
+            first.clone()
+        ]))));
+        assert!(!valid(&Body::ConversationHistoryReply(only_commands(
+            vec![turn.clone(), first]
+        ))));
         for (name, changed) in [
             (
                 "operation",
