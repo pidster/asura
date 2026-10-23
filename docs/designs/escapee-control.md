@@ -190,6 +190,15 @@ accepted residual under EXD-1: a `!!` command "works like your terminal", where 
 deliberately detached, re-`exec`ed background process likewise outlives the shell.
 The design states this residual rather than hiding it (PT13).
 
+The marker is also invisible for platform binaries: on macOS 27,
+`KERN_PROCARGS2` returns no environment for them (`/bin/sh`, `/bin/sleep`,
+`/usr/bin/perl`), while unsigned binaries are readable (P1, 2026-10-23). A `!!`
+escapee that left the group and runs a platform binary is therefore not
+counted, which widens the same EXD-1 residual; EC-I9 uses an unsigned fixture.
+If the `!!` survivor scan itself cannot be verified, the guardian counts no
+survivors and the job settles on EOF or cancel: nothing is signalled either
+way, so only the reported count is affected.
+
 The guardian does not kill the surviving `!!` descendants it finds. It records
 their count as an escapee fact and leaves them running, as the person's terminal
 would. This is [EC-D1](#decisions-under-existing-owner-rules), decided under the

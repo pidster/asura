@@ -116,7 +116,7 @@ two owner decisions: a `!` command is a tool job, and the
 | PCR7 | For a `!` command the Seatbelt sandbox stays, and network access is allowed. Amended on 2026-10-19 (PC13): a `!!` command runs with no sandbox under PCR21. |
 | PCR8 | The command receives the person's PATH and HOME, not the model's fixed PATH and scratch HOME. Reads are allowed across the person's home, including `~/.ssh`. |
 | PCR9 | The working directory is the TUI launch directory when it is inside the selected project; otherwise it is the project root. Each command runs in its own shell; `!cd` does not persist. |
-| PCR10 | Writes are allowed only to the project, `$TMPDIR` and the fixed cache list `~/.cargo`, `~/.rustup`, `~/.cache`, `~/Library/Caches`, `~/.npm`. Shell configuration files, `~/.ssh` and other dotfiles remain read-only. Amended on 2026-10-22 (OD1): the command may also write its own empty Asura-private job scratch directory, so the escapee marker works for `!` as for model jobs. HOME and `$TMPDIR` stay the person's. The directory is deleted when the job ends. |
+| PCR10 | Writes are allowed only to the project, `$TMPDIR` and the fixed cache list `~/.cargo`, `~/.rustup`, `~/.cache`, `~/Library/Caches`, `~/.npm`. Shell configuration files, `~/.ssh` and other dotfiles remain read-only. Amended on 2026-10-22 (OD1): the command may also write its own empty Asura-private job scratch directory, so the escapee marker works for `!` as for model jobs. HOME and `$TMPDIR` stay the person's. The directory is deleted when the job ends. The command reaches it only by its path: no variable names it, and a `!` command cannot list `~/.asura/tmp`. |
 | PCR11 | A person command has no timeout. Ctrl-C while it runs sends TERM to its process group, then KILL after a grace period of 2 s (PC8). A second Ctrl-C kills at once. `/cancel` also stops it. With nothing running, Ctrl-C keeps its current quit behavior. |
 | PCR12 | A person command queues behind a running model turn in the existing managed input queue. It runs when its turn comes, so the model never sees the workspace change mid-turn. |
 | PCR13 | On the next turn the model receives a notice: command, directory, exit status, line and byte counts, and the job handle. The context composer chooses how much output that request shows ([model view](tool-output-views.md#required-behavior)). The wording says the person ran it, not the model. |
@@ -715,10 +715,10 @@ and client paths never enter the profile.
 | --- | --- |
 | Base | `(version 1) (deny default)` |
 | Process | `process-fork`; `process-exec` and `file-map-executable` under every read root |
-| Reads | Model roots; the fixed system roots `/Library`, `/Applications`, `/opt/homebrew`, `/usr/local` and `/private/etc`; the literals `/var/db/xcode_select_link` and `/private/var/db/xcode_select_link`; the home, `$TMPDIR`, developer directory and cache root descriptors; the existing `/`, `/private/var/select/sh` and `/dev` literals |
+| Reads | Model roots; the fixed system roots `/Library`, `/Applications`, `/opt/homebrew`, `/usr/local` and `/private/etc`; the literals `/var/db/xcode_select_link`, `/private/var/db/xcode_select_link` and `/private/var/select/developer_dir` (xcode-select on macOS 27 reads it); metadata of the literals `/var`, `/etc` and `/tmp` (without `/etc` Git fails on `/etc/gitconfig` and curl exits 77; without `/var` xcode-select fails, PC-P1); the home, `$TMPDIR`, developer directory and cache root descriptors; the existing `/`, `/private/var/select/sh` and `/dev` literals |
 | Writes | Project; `$TMPDIR`; each cache-list directory that exists; the job's own private scratch directory (FD 9, OD1); `/dev/null` |
 | Network | `(allow network*)`, then a deny for the Asura control socket (PX3) |
-| Services | `sysctl-read`; the `mach-lookup` list fixed by probe [PC-P1](#pc-p1-mach-service-probe) |
+| Services | `sysctl-read`; no `mach-lookup` (probe [PC-P1](#pc-p1-mach-service-probe) found an empty list) |
 | Excluded | Writes to home outside the cache list, `~/.ssh` and dotfiles; reads, writes and connections under `~/.asura` (PX3), except the job's own scratch directory, which the profile re-allows by its exact descriptor path, as the model profile does |
 
 The fixed system roots are literals compiled into the guardian, like the model
@@ -789,11 +789,27 @@ observed denials; the design does not invent it.
    (Keychain, the PC1 accepted cost), `com.apple.pasteboard.1`, any
    `com.apple.xpc.launchd.*` domain service, and any service that can start
    an unsandboxed process on the caller's behalf.
-6. Re-run steps 2 and 3 with the final list: every step passes and no denial
-   remains except for excluded names.
+6. Re-run steps 2 and 3 with the final list: every step passes. Remaining
+   denials that no step needed are recorded here, not allowed (amended
+   2026-10-23: rule 4 forbids adding a name no step needs).
 
 The guardian embeds the final list as fixed literals. A change to it needs a
 new probe record here.
+
+**Probe record (P1, 2026-10-23).** macOS 27.0 (26A428). Person profile with
+`(deny mach-lookup)` and no allow; scratch HOME with copies of `.gitconfig` and
+`.config/git`; scratch `CARGO_HOME` with `config.toml`; a fixture ssh-agent with
+one fixture key; `~/.rustup` added as a read root so the toolchain Cargo runs.
+Every step of rule 2 passed with no `mach-lookup` allowed. **Final allow list:
+empty.** Residual denials, from launchd "denied lookup" lines (the Sandbox
+sender logged none), needed by no step and none excluded:
+`com.apple.bsd.dirhelper` (Git, xcrun), `com.apple.logd`,
+`com.apple.system.notification_center`,
+`com.apple.system.opendirectoryd.libinfo` and `.membership`,
+`com.apple.SystemConfiguration.configd` (Cargo, curl, git-remote-http),
+`com.apple.CoreServices.coreservicesd` and
+`com.apple.DiskArbitration.diskarbitrationd` (Cargo). The probe also found
+the read literals added to the Reads row above.
 
 ### Authority and grant
 
@@ -1377,14 +1393,14 @@ No new process type or supervisor is added.
 
 | Change | Detail |
 | --- | --- |
-| Profile selection | `ExecCmdRequest::profile` and the guardian argv profile token exist from J2 with `model-1` only ([guardian contract additions](tool-job-controller.md#guardian-contract-additions)). P1 adds `Person(PersonSetup)` and `PersonOutside(PersonSetup)`, with tokens `person-1` and `person-outside-1`. Validated descriptors still authorize the entrypoint. |
+| Profile selection | `ExecCmdRequest::profile` and the guardian argv profile token exist from J2 with `model-1` only ([guardian contract additions](tool-job-controller.md#guardian-contract-additions)). P1 adds the unit variants `Profile::Person1` and `Profile::PersonOutside1` (`Profile` stays `Copy`), with tokens `person-1` and `person-outside-1`, and `PreparedExecCmd::prepare_person(runtime, project, request, PersonSetup, cancel)`; `PersonSetup::sandboxed` (blocking, on the setup thread) or `PersonSetup::outside` builds the setup, and a setup that does not match the profile is `Invalid`. Validated descriptors still authorize the entrypoint. |
 | No-deadline mode | Done in J1: the guardian has no deadline argument or mode (owner, 2026-10-17). It keeps its 100 ms lease poll. Every other existing check stays for all profiles. |
 | Stop control | Delivered by J2 for every profile: `T` starts TERM and the profile's grace timer; `K` sends KILL at once. EOF still means service loss. At most 2 bytes are written, below `PIPE_BUF`. |
 | Grace | Selected by the profile token: `person-1` and `person-outside-1` 2 s (PC8); `model-1` keeps 500 ms. |
 | Notice reasons | Delivered by J2 for every profile: kind 2 reason 2 `cancel` for a `T` stop and 11 `kill` for `K`. P1 adds kind 2 reasons 14 `escapees_left_running` and 15 `escapees_hold_output`, valid only for `person-outside-1` ([escapee control](escapee-control.md#guardian-status-notice-extensions)). The controller, not the guardian, records `person_stop` or `person_kill`. |
 | Person environment descriptor | FD 11 for both person profiles; see below. The guardian's own environment still accepts only `ASURA_SECRET_*` entries |
 | Child environment | Person: the FD 11 entries (sanitized PATH, account HOME, `TMPDIR`, `USER`, `LOGNAME`, `TERM=dumb`, `GIT_TERMINAL_PROMPT=0`, PC3 variables), then EX4 secret variables. Outside: the FD 11 entries (the launch environment as sent), then `ASURA_JOB_<jobhex>=1`, then EX4 secret variables. Model: unchanged |
-| Root descriptors | Person: FDs 12–19 for the variable roots of the [person profile](#person-seatbelt-profile), in the order the FD 11 root table lists; validated like FDs 7–9. Outside: none |
+| Root descriptors | Person: FDs 12–19 for the variable roots of the [person profile](#person-seatbelt-profile), in the order the FD 11 root table lists; validated like FDs 7–9 (directory, opened with no-follow), with effective-UID ownership required for roles 1, 2 and 4 only, because the developer directory (role 3) may be root-owned. A failed check is setup reason 7 `denied`. Outside: none |
 | Job scratch | FD 9, as for every profile. `person-1` grants it for writing (OD1) and uses it as the escapee marker; `person-outside-1` does not use it |
 | Outside spawn | For `PersonOutside` the guardian spawns `/bin/sh -c COMMAND` without `sandbox-exec` and compiles no profile. Lease, process group, descriptor closing, stop bytes, grace and reaping are the person profile's |
 | Outside settlement | The `!!` gate: leader reaped; no group stop at shell exit (PQ3, decided under PC13); then the owned-group and env-marker scan, kind 6 and kind 2 reason 14 or 15; no wait for capture EOF (OD2). A cancel before shell exit still sends TERM, then KILL after 2 s |
@@ -1885,7 +1901,7 @@ cases cover the person path.
 | PC-U21 | Replay PR1–PR7: person job intent without kind 31, for a dropped input, for a non-head input, with a mismatched profile; a later lane dispatch before an earlier person input's kind 26; a Drop after kind 26; a later dispatch after a kind 26 with no kind 28 | Each invalid order rejects the stream; the last is accepted (OD2) |
 | PC-U22 | J5 person notice entry for each outcome, reason 20, survivors left running and each capture state (shared with J5T-06) | J5 labels exact; counts and handle present; no output text |
 | PC-U23 | Dispatch with controller `busy` for slot, then quota | Command stays queued at the head with each reason; retried on free |
-| PC-U24 | Guardian lease bytes `T`, `K`, EOF, unknown byte | TERM plus grace; KILL now; lease end; protocol fault |
+| PC-U24 | Guardian lease bytes `T`, `K`, EOF, unknown byte | TERM plus grace; KILL now; lease end; an unknown byte is handled as EOF (reason 4), as in the J2 contract |
 | PC-U25 | Person profile generation from fixture roots | Write rules only for project, TMPDIR and existing caches; network rule present; no command text in profile |
 | PC-U26 | Lane with a running person job, then a queued message | The message waits until settlement |
 | PC-U28 | Running job; fixture observer delivers 1000 replies at once, then none | At most one observe in flight per job; the fold shows the last end page; no timer drives redraws |
@@ -1959,8 +1975,8 @@ cases cover the person path.
 | PC-I35 | Same survivor; service killed while the job drains | Next start writes `interrupted`; the survivor is not signalled by the restarted service |
 | PC-I40 | `!!sh -c 'nohup sh -c "for i in 1 2 3 4 5; do echo n \$i; sleep 1; done" &'` (stays in the shell's group, no new session); then the same command with `!` (PQ3) | `!!`: the shell exits; kind 6 count 1 and kind 2 reason 15; the background process is never signalled, all five lines are captured, the lane advances at shell exit, and the job settles on EOF with escapees 1. `!`: the group is stopped at shell exit; at most the first line is captured; the job settles without survivors |
 | PC-I36 | `!` command starts the new-session escapee fixture that writes to `$TMPDIR` (OD1, EC-E2 integration) | The escapee is attributed through the job scratch marker, frozen and killed; the job settles with `cleanup_confirmed`; a write to the job scratch from the command succeeds; the scratch is deleted after settlement |
-| PC-I37 | PC-P1 mach probe steps with the final list | Each step passes; no denial except excluded names |
-| PC-I38 | `!!` launch environment holding `DYLD_INSERT_LIBRARIES` naming a fixture library that writes a marker file when loaded | The `/bin/sh` child sees the variable; the guardian process never loads the library (no marker from the guardian PID) |
+| PC-I37 | PC-P1 mach probe steps with the final list (network steps run with `ASURA_TEST_NETWORK=1`) | Each step passes; remaining denials are recorded, not asserted |
+| PC-I38 | `!!` launch environment holding `DYLD_INSERT_LIBRARIES` naming a fixture library that writes a marker file when loaded | An ordinary launch variable reaches the `/bin/sh` child; the guardian process never loads the library (no marker from the guardian PID); a control run of an unsigned fixture binary does load it. SIP removes `DYLD_*` for protected binaries such as `/bin/sh`, so the child cannot see that variable |
 | PC-I39 | Model exec_cmd job and `!` job in one project; `/execution project off` (ES-08) | The model job stops with `execution_off`; the `!` job continues and settles normally |
 
 ### End to end
