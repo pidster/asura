@@ -24,7 +24,7 @@ pub(crate) struct Worker {
     audit_event: Option<asura_storage::audit::Event>,
     journal_quota: Option<u64>,
     /// The applied execution setting after a persisted `execution` set.
-    execution: Option<asura_storage::config::ExecutionSetting>,
+    execution: Option<asura_storage::config::ExecutionChange>,
     completion: crate::completion::Completion,
 }
 impl Worker {
@@ -89,7 +89,7 @@ impl Worker {
     /// The execution setting after a persisted set of an `execution` key
     /// (EX11): the owner applies it, revokes and audits. Taken once. An
     /// unconfirmed or failed set changes nothing in memory (ES-09).
-    pub(crate) fn take_execution(&mut self) -> Option<asura_storage::config::ExecutionSetting> {
+    pub(crate) fn take_execution(&mut self) -> Option<asura_storage::config::ExecutionChange> {
         self.execution.take()
     }
     pub(crate) fn poll(&mut self) -> Option<pb::Envelope> {

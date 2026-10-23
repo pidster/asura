@@ -789,9 +789,6 @@ pub(crate) struct Owner {
     /// The person's execution setting (EX11): `None` until the start-time
     /// read. The one copy; the controller's slot-grant check reads it.
     execution: Arc<std::sync::Mutex<Option<ExecutionSetting>>>,
-    /// A persisted change that arrived before the start-time read: it
-    /// applies once the persisted value is known (newest wins).
-    execution_pending: Option<ExecutionSetting>,
     /// The secret rule set's warm thread (SD-S2).
     rules: crate::secret_rules::Warmer,
     /// The reply to the last harness record or command.
@@ -841,7 +838,6 @@ impl Owner {
             journal_status: None,
             jobs: jobs::Jobs::default(),
             execution: Default::default(),
-            execution_pending: None,
             rules: Default::default(),
             #[cfg(feature = "test-support")]
             fixture: None,
@@ -4676,36 +4672,34 @@ impl Owner {
     /// revocation with `execution_off`; the values are replaced; one
     /// `execution.changed` event per changed entry; the job revision
     /// moves so a parked `JobList` returns.
-    pub(crate) fn set_execution(&mut self, setting: ExecutionSetting) {
-        if let Some(change) = self.apply_execution(setting) {
-            self.emit_execution(change);
-        }
+    pub(crate) fn set_execution(&mut self, change: asura_storage::config::ExecutionChange) {
+        let change = self.apply_execution(change);
+        self.emit_execution(change);
     }
-    /// The start-time read's persisted value (TJ-F5): it becomes the
-    /// owner's value, and a change that arrived before it is applied now,
-    /// compared against this persisted value.
-    fn execution_read(&mut self, persisted: ExecutionSetting) -> Option<execution::Change> {
+    /// The start-time read's persisted value (TJ-F5) becomes the owner's
+    /// value, unless a persisted change already set it: that change is newer
+    /// than or equal to what the read saw.
+    fn execution_read(&mut self, persisted: ExecutionSetting) {
         self.execution
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert(persisted);
-        let pending = self.execution_pending.take()?;
-        self.apply_execution(pending)
     }
     /// Revokes, replaces and bumps the revision for a persisted change;
     /// returns the change whose events are due. Before the start-time read
-    /// the persisted value is unknown, so the change waits for it: no event
-    /// is computed against defaults.
-    fn apply_execution(&mut self, setting: ExecutionSetting) -> Option<execution::Change> {
-        let Some(old) = self
+    /// the owner has no value, so the change compares against the file's
+    /// setting before the write, never against defaults (ES-Q1).
+    fn apply_execution(
+        &mut self,
+        persisted: asura_storage::config::ExecutionChange,
+    ) -> execution::Change {
+        let setting = persisted.current;
+        let old = self
             .execution
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        else {
-            self.execution_pending = Some(setting);
-            return None;
-        };
+            .get_or_insert(persisted.previous)
+            .clone();
         let registered: Vec<journal::Id> = self
             .replay
             .as_ref()
@@ -4728,7 +4722,7 @@ impl Owner {
         if let Some(controller) = self.jobs.controller() {
             controller.bump_revision();
         }
-        Some(change)
+        change
     }
     fn emit_execution(&self, change: execution::Change) {
         if let Some(emitter) = &self.audit_emitter {
@@ -5012,13 +5006,10 @@ impl Owner {
             &mut self.payloads,
         );
         // The start-time read built the controller: the execution setting
-        // it read becomes the owner's value, and a persisted change that
-        // arrived before it applies against it; the controller's
-        // slot-grant check reads the result.
+        // it read becomes the owner's value unless a persisted change set it
+        // first; the controller's slot-grant check reads the result.
         if let Some(setting) = self.jobs.take_execution() {
-            if let Some(change) = self.execution_read(setting) {
-                self.emit_execution(change);
-            }
+            self.execution_read(setting);
             let execution = self.execution.clone();
             if let Some(controller) = self.jobs.controller() {
                 controller.set_execution(Box::new(move |project| {

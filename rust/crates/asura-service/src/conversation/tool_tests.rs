@@ -121,7 +121,6 @@ impl Fixture {
                 dispatching_foreground: false,
                 jobs: Default::default(),
                 execution: Default::default(),
-                execution_pending: None,
                 rules: Default::default(),
                 #[cfg(feature = "test-support")]
                 fixture: None,
@@ -2289,10 +2288,11 @@ fn tl15_refused_thinking_segment_cancels_and_keeps_the_journaled_prefix() {
 }
 
 /// ES-Q1 with the start-time read (TJ-F5): a persisted change that arrives
-/// before the read computes no event against defaults; once the persisted
-/// value is read, the change compares against it.
+/// before the read compares against the file's setting before the write,
+/// never against defaults, and the later read does not replace it.
 #[test]
 fn execution_change_before_the_start_time_read_compares_against_the_persisted_value() {
+    use asura_storage::config::ExecutionChange;
     let on = ExecutionSetting::default();
     assert!(on.enabled);
     let off = ExecutionSetting {
@@ -2300,34 +2300,41 @@ fn execution_change_before_the_start_time_read_compares_against_the_persisted_va
         projects: Default::default(),
     };
     let current = |f: &Fixture| f.owner.execution.lock().unwrap().clone();
+    let change = |previous: &ExecutionSetting, current: &ExecutionSetting| ExecutionChange {
+        previous: previous.clone(),
+        current: current.clone(),
+    };
 
-    // The file already held `off` when the service started.
+    // The file held `off` and a set of `off` arrives first: no event,
+    // although the default is `on`.
     let mut fixture = Fixture::new();
-    assert_eq!(fixture.owner.apply_execution(off.clone()), None);
-    assert_eq!(current(&fixture), None, "nothing applied before the read");
-    let change = fixture.owner.execution_read(off.clone()).unwrap();
+    assert_eq!(current(&fixture), None);
+    let events = fixture.owner.apply_execution(change(&off, &off));
     assert_eq!(
-        change,
+        events,
         execution::Change::default(),
         "no event for no change"
     );
     assert_eq!(current(&fixture), Some(off.clone()));
+    // The read saw the same file: it keeps the owner's value.
+    fixture.owner.execution_read(off.clone());
+    assert_eq!(current(&fixture), Some(off.clone()));
 
-    // The file held `on`: one global event, and the newest change wins.
+    // The file held `on` and `off` arrives before the read: one global
+    // event, and a read that saw the old file does not undo it.
     let mut fixture = Fixture::new();
-    fixture.owner.set_execution(on.clone());
-    fixture.owner.set_execution(off.clone());
-    let change = fixture.owner.execution_read(on.clone()).unwrap();
-    assert_eq!(change.events.len(), 1);
+    let events = fixture.owner.apply_execution(change(&on, &off));
+    assert_eq!(events.events.len(), 1);
+    fixture.owner.execution_read(on.clone());
     assert_eq!(current(&fixture), Some(off.clone()));
 
     // After the read a change compares against the owner's value.
-    let change = fixture.owner.apply_execution(on.clone()).unwrap();
-    assert_eq!(change.events.len(), 1);
+    let events = fixture.owner.apply_execution(change(&off, &on));
+    assert_eq!(events.events.len(), 1);
     assert_eq!(current(&fixture), Some(on.clone()));
 
-    // A read with no earlier change applies nothing.
+    // A read with no earlier change sets the value and emits nothing.
     let mut fixture = Fixture::new();
-    assert_eq!(fixture.owner.execution_read(on.clone()), None);
+    fixture.owner.execution_read(on.clone());
     assert_eq!(current(&fixture), Some(on));
 }

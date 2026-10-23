@@ -917,9 +917,18 @@ pub struct Reply {
     /// The new effective `journal.quotaBytes` after a persisted set of
     /// `journal` or `journal.quotaBytes`, which applies at once; else `None`.
     pub journal_quota: Option<u64>,
-    /// The new effective execution setting after a persisted set of any
-    /// `execution` key, which applies at once (EX11); else `None`.
-    pub execution: Option<ExecutionSetting>,
+    /// The effective execution setting before and after a persisted set of
+    /// any `execution` key, which applies at once (EX11); else `None`.
+    pub execution: Option<ExecutionChange>,
+}
+
+/// A persisted execution change: the file's effective setting before the
+/// write and after it. The owner compares against `previous` when it has
+/// not yet read the setting (ES-Q1), so an early change is still audited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionChange {
+    pub previous: ExecutionSetting,
+    pub current: ExecutionSetting,
 }
 
 pub fn execute(
@@ -967,6 +976,7 @@ pub fn execute(
     let mut journal_quota = None;
     let mut execution = None;
     if let Some(value) = value {
+        let previous = config.execution.setting();
         config.set(key, value)?;
         let serialized = yaml(&config)?;
         snapshot
@@ -976,7 +986,10 @@ pub fn execute(
             journal_quota = Some(config.journal.quota_bytes);
         }
         if key == "execution" || key.starts_with("execution.") {
-            execution = Some(config.execution.setting());
+            execution = Some(ExecutionChange {
+                previous,
+                current: config.execution.setting(),
+            });
         }
     } else if cancel.load(Ordering::Acquire) {
         return Err("config_cancelled");
@@ -2342,7 +2355,10 @@ mod tests {
             Ok(Reply {
                 value_yaml: "off\n".into(),
                 journal_quota: None,
-                execution: Some(off.clone())
+                execution: Some(ExecutionChange {
+                    previous: ExecutionSetting::default(),
+                    current: off.clone(),
+                })
             })
         );
         let file = root.0.join(".asura/config.yaml");
@@ -2351,11 +2367,15 @@ mod tests {
         )));
         assert_eq!(execution_setting(runtime.clone(), &cancel), Ok(off.clone()));
         let reply = call("execution.enabled", Some("false")).unwrap();
+        let disabled = ExecutionSetting {
+            enabled: false,
+            ..off.clone()
+        };
         assert_eq!(
             reply.execution,
-            Some(ExecutionSetting {
-                enabled: false,
-                ..off.clone()
+            Some(ExecutionChange {
+                previous: off.clone(),
+                current: disabled.clone(),
             })
         );
         let reply = call(
@@ -2365,16 +2385,23 @@ mod tests {
             )),
         )
         .unwrap();
+        let project_b = ExecutionSetting {
+            enabled: true,
+            projects: BTreeMap::from([(id(PROJECT_B), true)]),
+        };
         assert_eq!(
             reply.execution,
-            Some(ExecutionSetting {
-                enabled: true,
-                projects: BTreeMap::from([(id(PROJECT_B), true)]),
+            Some(ExecutionChange {
+                previous: disabled,
+                current: project_b.clone(),
             })
         );
         assert_eq!(
             call("execution.projects", Some("{}")).unwrap().execution,
-            Some(ExecutionSetting::default())
+            Some(ExecutionChange {
+                previous: project_b,
+                current: ExecutionSetting::default(),
+            })
         );
         assert!(
             !std::fs::read_to_string(&file)
