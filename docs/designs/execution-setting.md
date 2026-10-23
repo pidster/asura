@@ -282,8 +282,9 @@ sequenceDiagram
     U->>W: ConfigSet execution.projects.ID = off
     W->>W: Validate, write and sync the file
     alt Persisted
-        W-->>R: Persisted
-        R->>O: execution_changed(enabled, overrides)
+        W-->>R: Persisted, with the file's setting before and after the write
+        R->>O: execution_changed(previous, current)
+        O->>O: Old value: owner's value, or previous before the start-time read
         O->>O: Projects turned off: {ID}
         O->>K: revoke(ID, model origin, execution_off)
         K->>G: T on each live model job
@@ -297,6 +298,14 @@ sequenceDiagram
     end
     Note over O,K: Later exec_cmd calls in ID get kind 14 denied, execution_off
 ```
+
+The configuration worker reads the file's effective setting before it applies
+the set, and returns both values with the persisted reply. The owner compares
+`current` against its own value. Before the start-time read (TJ-F5) the owner
+has no value, so it takes `previous` as the old value: a change made while the
+service starts is audited against what the file held, never against defaults.
+The start-time read then keeps the owner's value, because the persisted change
+is at least as new as the file the read saw.
 
 ### ES-F1: decision for one model exec_cmd call
 

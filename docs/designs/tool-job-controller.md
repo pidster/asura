@@ -4403,14 +4403,12 @@ pub(crate) struct JobView { pub job: Id, pub origin: Origin, pub agent: AgentKey
     pub project: Id, pub sequence: Option<u64>, // kind 26 frame sequence once committed
     pub intent_ms: u64, pub snapshot: JobSnapshot, // the kind 29 state block
     pub text: Option<String>, pub cancel: Option<JobReason>, pub outcome: Option<Outcome> }
-pub(crate) struct Outlived { pub count: u32, pub jobs: Vec<Id> } // at most 8 IDs (EX12)
 impl JobController {
     pub fn revision(&self) -> u64;
     pub fn bump_revision(&mut self);
     pub fn view(&self, job: Id, now: Instant) -> Option<JobView>;
     pub fn live_views(&self, scope: Option<JobScope>, now: Instant) -> Vec<JobView>;
     pub fn live_count(&self, scope: Option<JobScope>) -> u32;
-    pub fn outlived(&self, operation: Id) -> Outlived;
 }
 // job_controller/waits.rs
 pub(crate) enum WaitKey { Agent(AgentKey), Client(u64) }
@@ -5494,7 +5492,12 @@ Deviations found by the packet and settled (2026-10-23):
 - The outlived count of a terminal read after a service restart was absent,
   because the owner kept it in memory for the last 64 terminals. This breaks
   the derivation rule above and the restore rule of the EX12 notice. Packet
-  J34-E2 derives it from the records at each terminal read (J4T-08).
+  J34-E2 derives it from the records at each terminal read: the journal
+  worker's `ReadResponse` returns `Reply.outlived: Option<OutlivedJobs>` from
+  `Replay::outlived_jobs` (at most 8 IDs, `MAX_OUTLIVED_JOB_IDS`), and the
+  controller keeps no copy. J4T-08's unit layer is in storage
+  (`authority_conversation.rs`); its integration case `outlived` in
+  `job_control_flow.rs` reads the count again after a restart.
 - With no job controller (the controller failed to start or is stopping),
   every J4 request gets `unavailable`, including lists of settled jobs. This
   is the intended rule: settled-job reads need the controller's view of
