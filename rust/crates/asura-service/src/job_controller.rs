@@ -1908,17 +1908,21 @@ fn started_event(job: &Job) -> Event {
         job: job.id,
         origin: job.origin.audit(),
         agent: job.agent.agent,
-        // P3-K derives the person profiles from `Profile`; until then a
-        // person job is a `!` job.
+        // P3-K sets the person profiles at admission; until then a person
+        // job admitted with `Model1` is a `!` job.
         profile: match (job.profile, &job.origin) {
             (Profile::Model1, Origin::Model { .. }) => record::JobProfile::Model1,
-            (Profile::Model1, Origin::Person { .. }) => record::JobProfile::Person1,
+            (Profile::Model1 | Profile::Person1, Origin::Person { .. }) => {
+                record::JobProfile::Person1
+            }
+            (Profile::PersonOutside1, _) => record::JobProfile::PersonOutside1,
+            (Profile::Person1, Origin::Model { .. }) => record::JobProfile::Person1,
         },
         operation,
         generation,
         ordinal,
         input,
-        outside_sandbox: false,
+        outside_sandbox: job.profile == Profile::PersonOutside1,
     }
 }
 
