@@ -1,6 +1,7 @@
 //! Serialized, pollable journal ownership. All filesystem work stays on its worker.
 use super::conversation::*;
 pub use super::journal::{HoldReason, JournalStatus};
+use asura_platform::pacing::Fibonacci;
 use asura_platform::{ProjectIdentity, RuntimeDirectory};
 use std::sync::{
     Arc,
@@ -799,13 +800,6 @@ impl WriterHandle {
         self.handle.is_none()
     }
 }
-/// Longest gap between free-space rechecks while held (owner, 2026-10-19).
-const RECHECK_CAP_SECS: u64 = 60;
-/// The next recheck gaps: each the sum of the two before, at most
-/// `RECHECK_CAP_SECS`.
-fn next_pacing((a, b): (u64, u64)) -> (u64, u64) {
-    (b, a.saturating_add(b).min(RECHECK_CAP_SECS))
-}
 /// The journal worker loop: queued commands in order; between commands, run
 /// compaction steps, and while normal records are held, recheck free space
 /// after 1, 1, 2, 3, 5, 8 seconds and so on, at most 60 seconds apart. The
@@ -817,8 +811,7 @@ fn run_worker(
     notify: impl Fn(),
 ) {
     use std::sync::mpsc::RecvTimeoutError;
-    use std::time::Duration;
-    let mut pacing = (1u64, 1u64);
+    let mut pacing = Fibonacci::new();
     state.publish_status();
     while !stop.load(Ordering::Acquire) {
         let job = match receiver.try_recv() {
@@ -832,11 +825,13 @@ fn run_worker(
                     continue;
                 }
                 if state.held() {
-                    match receiver.recv_timeout(Duration::from_secs(pacing.0)) {
+                    // The sequence advances only when the gap elapses.
+                    let mut advanced = pacing;
+                    match receiver.recv_timeout(advanced.next_delay()) {
                         Ok(job) => Some(job),
                         Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => {
-                            pacing = next_pacing(pacing);
+                            pacing = advanced;
                             state.recheck();
                             if state.publish_status() {
                                 notify();
@@ -858,7 +853,7 @@ fn run_worker(
         let result = state.execute(job.command);
         let changed = state.publish_status();
         if !state.held() {
-            pacing = (1, 1);
+            pacing.reset();
         }
         let _ = job.reply.try_send(result);
         drop(job.settlement);
@@ -901,11 +896,10 @@ mod tests {
     /// SJ-14: the held recheck gaps grow as 1, 1, 2, 3, 5 ... and stop at 60 s.
     #[test]
     fn held_recheck_pacing_is_capped() {
-        let mut pacing = (1, 1);
+        let mut pacing = Fibonacci::new();
         let mut gaps = Vec::new();
         for _ in 0..14 {
-            gaps.push(pacing.0);
-            pacing = next_pacing(pacing);
+            gaps.push(pacing.next_delay().as_secs());
         }
         assert_eq!(gaps, [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 60, 60, 60, 60]);
     }

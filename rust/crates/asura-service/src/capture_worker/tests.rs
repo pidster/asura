@@ -102,29 +102,36 @@ fn waiting_bytes_merge_per_stream_up_to_one_chunk() {
 /// J1T-09 unit: the retry delays are 1, 1, 2, 3, 5, 8, 13 s, at most 60 s.
 #[test]
 fn j1t_09_backoff_is_fibonacci_capped_at_a_minute() {
-    let mut backoff = Backoff::START;
+    let mut backoff = Fibonacci::new();
     let mut seen = Vec::new();
     for _ in 0..8 {
-        seen.push(backoff.delay().as_secs());
-        backoff = backoff.next();
+        seen.push(backoff.next_delay().as_secs());
     }
     assert_eq!(seen, [1, 1, 2, 3, 5, 8, 13, 21]);
-    let mut capped = Backoff::START;
+    let mut capped = Fibonacci::new();
     let mut gaps = Vec::new();
     for _ in 0..12 {
-        gaps.push(capped.delay().as_secs());
-        capped = capped.next();
+        gaps.push(capped.next_delay().as_secs());
     }
     assert_eq!(gaps, [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 60, 60]);
-    let mut far = Backoff::START;
+    let mut far = Fibonacci::new();
     for _ in 0..200 {
-        far = far.next();
+        far.next_delay();
     }
     assert_eq!(
-        far.delay().as_secs(),
+        far.next_delay().as_secs(),
         60,
         "stays at the cap; never ends work"
     );
+}
+
+/// The backoff after `n` delays.
+fn advanced(n: usize) -> Fibonacci {
+    let mut backoff = Fibonacci::new();
+    for _ in 0..n {
+        backoff.next_delay();
+    }
+    backoff
 }
 
 /// J1T-09 unit: a space event retries at once and restarts the sequence; a
@@ -133,7 +140,8 @@ fn j1t_09_backoff_is_fibonacci_capped_at_a_minute() {
 fn j1t_09_space_event_retries_at_once_and_restarts() {
     let shared = shared();
     let mut seen = 0;
-    let mut backoff = Backoff(5, 8);
+    // Four delays in: the next delay is 5 s.
+    let mut backoff = advanced(4);
     let notifier = {
         let shared = shared.clone();
         std::thread::spawn(move || {
@@ -144,12 +152,12 @@ fn j1t_09_space_event_retries_at_once_and_restarts() {
     let started = Instant::now();
     assert_eq!(wait_retry(&shared, &mut seen, &mut backoff), Wake::Space);
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert_eq!(backoff, Backoff::START);
+    assert_eq!(backoff, Fibonacci::new());
     notifier.join().unwrap();
     let started = Instant::now();
     assert_eq!(wait_retry(&shared, &mut seen, &mut backoff), Wake::Timer);
     assert!(started.elapsed() >= Duration::from_millis(990));
-    assert_eq!(backoff, Backoff(1, 2));
+    assert_eq!(backoff, advanced(1));
     shared.set(|c| c.cancel = true);
     assert_eq!(wait_retry(&shared, &mut seen, &mut backoff), Wake::Cancel);
     shared.set(|c| c.abandon = true);
