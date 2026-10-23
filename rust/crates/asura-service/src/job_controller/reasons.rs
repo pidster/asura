@@ -65,16 +65,19 @@ pub(crate) struct Counts {
     pub service_limit: usize,
     pub service_awaiting_cleanup: usize,
     pub pending_installs: usize,
+    /// Released `!!` jobs (OD2) among the live ones: shell exited, output
+    /// still open. Shown in the slot texts only, never in kind 29.
+    pub agent_released: usize,
+    pub service_released: usize,
 }
 
 /// The brief text of a blocking reason with its live values.
 pub(crate) fn block_text(reason: BlockReason, counts: &Counts) -> String {
-    let cleanup = |n: usize| {
-        if n == 0 {
-            String::new()
-        } else {
-            format!(" ({n} awaiting cleanup)")
-        }
+    let cleanup = |n: usize, released: usize| match (n, released) {
+        (0, 0) => String::new(),
+        (n, 0) => format!(" ({n} awaiting cleanup)"),
+        (0, r) => format!(" ({r} shell exited, output open)"),
+        (n, r) => format!(" ({n} awaiting cleanup; {r} shell exited, output open)"),
     };
     match reason {
         BlockReason::Recovering => "waiting: recovering jobs after restart".into(),
@@ -85,13 +88,13 @@ pub(crate) fn block_text(reason: BlockReason, counts: &Counts) -> String {
             "waiting: {} of {} jobs running for this agent{}",
             counts.agent_live,
             counts.agent_limit,
-            cleanup(counts.agent_awaiting_cleanup)
+            cleanup(counts.agent_awaiting_cleanup, counts.agent_released)
         ),
         BlockReason::ServiceSlots => format!(
             "waiting: {} of {} jobs running{}",
             counts.service_live,
             counts.service_limit,
-            cleanup(counts.service_awaiting_cleanup)
+            cleanup(counts.service_awaiting_cleanup, counts.service_released)
         ),
         BlockReason::PendingInstalls => format!(
             "waiting: {} finished jobs still saving output",

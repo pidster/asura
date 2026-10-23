@@ -97,7 +97,10 @@ impl Harness {
                 inode: 2,
                 boundary: self.runtime.state_boundary(),
             },
-            profile: Profile::Model1,
+            profile: match origin {
+                Origin::Model { .. } => Profile::Model1,
+                Origin::Person { .. } => Profile::Person1,
+            },
             command: "printf secret-command-text".into(),
             cwd: ".".into(),
             secrets: Vec::new(),
@@ -1588,3 +1591,594 @@ fn service_cancel_and_reactor_hooks() {
 
 // J3 and J4 controller extensions (J34-K).
 mod j34;
+
+/// Person command packet P3-K (person-command-mode.md): the person
+/// profiles at admission, the `!!` switch check at slot grant (reason 20),
+/// `ShellExited` and the released `Draining` state (OD2, PQ3), and
+/// `close_capture` on cancel. PC-U23, the controller part of PC-U43 and
+/// PC-U53.
+mod person {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn outside_request(h: &Harness, n: u8, agent: AgentKey) -> StartRequest {
+        let mut request = h.request(person(n), agent, P1, 1);
+        request.profile = Profile::PersonOutside1;
+        request
+    }
+    /// Submits a `!!` job; returns its ID.
+    fn submit_outside(h: &mut Harness, n: u8, agent: AgentKey) -> Id {
+        let request = outside_request(h, n, agent);
+        let Admission::Accepted { job } = h.ctl.submit(request, h.now) else {
+            panic!("`!!` start refused");
+        };
+        job
+    }
+    /// A switch the test flips: the configuration owner's current value.
+    fn switch(h: &mut Harness, on: bool) -> Rc<Cell<bool>> {
+        let value = Rc::new(Cell::new(on));
+        let read = value.clone();
+        h.ctl.set_outside_switch(Box::new(move || read.get()));
+        value
+    }
+    fn events(h: &mut Harness) -> Vec<JobEvent> {
+        let mut out = Vec::new();
+        h.ctl.drain_events(&mut out);
+        out
+    }
+    fn shell_exits(events: &[JobEvent]) -> Vec<(Id, Exit, u32)> {
+        events
+            .iter()
+            .filter_map(|e| match *e {
+                JobEvent::ShellExited(job, exit, survivors) => Some((job, exit, survivors)),
+                _ => None,
+            })
+            .collect()
+    }
+    /// Kind 5, kind 6 with `survivors`, then kind 2 (reason 15 when
+    /// `held`, else reason 14), as the `!!` slot reports them.
+    fn shell_exit(exit: Exit, survivors: u32, held: bool) -> Vec<SlotEvent> {
+        vec![
+            SlotEvent::Spawned,
+            SlotEvent::LeaderExited(exit),
+            SlotEvent::ProcessSettled {
+                exit,
+                cleanup: JobCleanup::Confirmed,
+                escapees: survivors,
+                elapsed_ms: 42,
+                output_held: held,
+            },
+        ]
+    }
+    fn closed_capture() -> Box<CaptureOutcome> {
+        let mut c = capture(CaptureState::Incomplete, 30, 5);
+        c.reason = CaptureReason::ClosedAfterCancel;
+        c
+    }
+    fn closes(h: &Harness) -> Vec<Id> {
+        h.slots.borrow().closes.clone()
+    }
+    fn discards(h: &Harness) -> Vec<Id> {
+        h.slots.borrow().discards.clone()
+    }
+    /// Every audit event is valid, and those of `job` carry the `!!` flag.
+    fn assert_outside_audit(h: &Harness, job: Id) {
+        for event in h.audit.0.borrow().iter() {
+            event.validate().expect("valid audit event");
+            let (id, outside) = match event {
+                Event::JobQueued {
+                    job,
+                    outside_sandbox,
+                    ..
+                }
+                | Event::JobStarted {
+                    job,
+                    outside_sandbox,
+                    ..
+                }
+                | Event::JobCancelRequested {
+                    job,
+                    outside_sandbox,
+                    ..
+                }
+                | Event::JobSettled {
+                    job,
+                    outside_sandbox,
+                    ..
+                } => (*job, *outside_sandbox),
+                _ => continue,
+            };
+            assert_eq!(outside, id == job, "outside_sandbox of {id:?}");
+        }
+    }
+
+    /// The profile is fixed at admission and paired with the origin:
+    /// `model-1` for a model start, `person-1` or `person-outside-1` for a
+    /// person start; any other pairing is a conflict and admits nothing.
+    #[test]
+    fn profile_is_paired_with_origin_at_admission() {
+        let mut h = Harness::new(limits(4, 2, 8));
+        let mut request = h.request(person(1), conversation(1), P1, 1);
+        request.profile = Profile::Model1;
+        assert_eq!(h.ctl.submit(request, h.now), Admission::Conflict);
+        let mut request = h.request(model(2), conversation(2), P1, 1);
+        request.profile = Profile::Person1;
+        assert_eq!(h.ctl.submit(request, h.now), Admission::Conflict);
+        let mut request = h.request(model(3), conversation(3), P1, 1);
+        request.profile = Profile::PersonOutside1;
+        assert_eq!(h.ctl.submit(request, h.now), Admission::Conflict);
+        assert!(h.ctl.status(person(1).job_id()).is_none());
+        // `!` and `!!` starts are admitted with their own profiles, and the
+        // started event names them.
+        let bang = h.submit(person(4), conversation(4), P1);
+        let Admission::Accepted { job: bang } = bang else {
+            panic!("`!` accepted");
+        };
+        let outside = submit_outside(&mut h, 5, conversation(5));
+        h.commit();
+        h.script(bang, [SlotEvent::Spawned]);
+        h.script(outside, [SlotEvent::Spawned]);
+        let audit = h.audit.0.borrow();
+        let profiles: Vec<_> = audit
+            .iter()
+            .filter_map(|e| match e {
+                Event::JobStarted {
+                    job,
+                    profile,
+                    outside_sandbox,
+                    ..
+                } => Some((*job, *profile, *outside_sandbox)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            profiles,
+            [
+                (bang, record::JobProfile::Person1, false),
+                (outside, record::JobProfile::PersonOutside1, true)
+            ]
+        );
+        for event in audit.iter() {
+            event.validate().expect("valid audit event");
+        }
+    }
+
+    /// PC-U23: a person command at the head of its agent queue, blocked
+    /// for a slot and then by the quota, stays queued with each reason and
+    /// its brief text, writes no record, and starts when space frees.
+    #[test]
+    fn pc_u23_person_waiter_blocked_by_slot_then_quota() {
+        let mut h = Harness::new(limits(1, 1, 8));
+        let running = h.model(1, conversation(1), P1);
+        let job = submit_outside(&mut h, 5, conversation(1));
+        assert!(h.commit().is_empty(), "a waiter writes no record");
+        assert_eq!(h.state(job), Some(JobState::Queued));
+        assert_eq!(h.reason(job), Some(BlockReason::AgentSlots));
+        assert_eq!(
+            h.text(job).as_deref(),
+            Some("waiting: 1 of 1 jobs running for this agent")
+        );
+        let queued = |events: Vec<JobEvent>| -> Vec<BlockReason> {
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    JobEvent::Queued(id, reason) if id == job => Some(reason),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(queued(events(&mut h)), [BlockReason::AgentSlots]);
+        // The slot frees; now the 1 MiB reservation is short.
+        h.payloads.short = Some(Short::Quota);
+        h.finish(running, 0);
+        assert_eq!(h.state(job), Some(JobState::Queued));
+        assert_eq!(h.reason(job), Some(BlockReason::Quota));
+        assert_eq!(h.text(job).as_deref(), Some("waiting: output quota full"));
+        assert!(!h.payloads.admitted.contains(&job));
+        // Each reason reaches the owner as a `Queued` event.
+        assert_eq!(queued(events(&mut h)), [BlockReason::Quota]);
+        // Space frees: retried on the space epoch, no timer.
+        h.payloads.short = None;
+        h.payloads.epoch += 1;
+        let records = h.commit();
+        assert_eq!(kinds(&records), [26]);
+        assert_eq!(h.started(), [running, job]);
+        assert_eq!(h.state(job), Some(JobState::Starting));
+        assert_eq!(
+            h.audit_kinds()
+                .iter()
+                .filter(|k| **k == "job.queued")
+                .count(),
+            1
+        );
+        assert_outside_audit(&h, job);
+    }
+
+    /// PC-U43 (controller part): the switch on at submit and off at slot
+    /// grant: kind 26 then kind 28 `not_started` reason 20, no setup, the
+    /// slot and reservation released, and `job.settled` with the flag.
+    #[test]
+    fn pc_u43_switch_off_at_slot_grant() {
+        let mut h = Harness::new(limits(1, 1, 8));
+        let allow = switch(&mut h, true);
+        let running = h.model(1, conversation(1), P1);
+        let job = submit_outside(&mut h, 5, conversation(1));
+        let behind = h.model(2, conversation(1), P1);
+        h.poll();
+        assert_eq!(h.reason(job), Some(BlockReason::AgentSlots));
+        allow.set(false);
+        h.finish(running, 0);
+        let records = h.commit();
+        assert_eq!(kinds(&records), [26, 28]);
+        let Record::JobIntent(intent) = &records[0] else {
+            panic!("kind 26");
+        };
+        assert_eq!(intent.origin, JobOrigin::Person { input: [5; 16] });
+        let s = settled(&records)[0];
+        assert_eq!(
+            (s.job, s.outcome, s.reason, s.capture_state, s.escapees),
+            (
+                job,
+                Outcome::NotStarted,
+                JobReason::OutsideSandboxOff,
+                JobCaptureState::NotStarted,
+                0
+            )
+        );
+        assert!(cancels(&records).is_empty(), "reason 20 is not a cancel");
+        // No setup: the slot never started; the reservation returned after
+        // kind 28 committed, and the slot went to the next head.
+        assert!(!h.started().contains(&job));
+        assert!(h.payloads.released.iter().any(|(id, _)| *id == job));
+        assert_eq!(h.state(job), Some(JobState::Recorded));
+        assert_eq!(h.started(), [running, behind], "slot released");
+        assert!(
+            events(&mut h).contains(&JobEvent::Settled(job, Outcome::NotStarted)),
+            "the owner deletes the secret item on this settlement"
+        );
+        let audit = h.audit.0.borrow();
+        assert!(
+            !audit
+                .iter()
+                .any(|e| matches!(e, Event::JobStarted { job: id, .. } if *id == job))
+        );
+        let settled_event = audit
+            .iter()
+            .find(|e| matches!(e, Event::JobSettled { job: id, .. } if *id == job))
+            .expect("job.settled");
+        let Event::JobSettled {
+            reason,
+            outside_sandbox,
+            ..
+        } = settled_event
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (*reason, *outside_sandbox),
+            (record::JobReason::OutsideSandboxOff, true)
+        );
+        drop(audit);
+        assert_outside_audit(&h, job);
+    }
+
+    /// PC-U43 (controller part): the switch governs `!!` only, and only at
+    /// slot grant: a `!` job starts while it is off, and turning it off
+    /// after a `!!` spawn leaves that job running.
+    #[test]
+    fn pc_u43_switch_off_after_spawn_and_for_bang() {
+        let mut h = Harness::new(limits(4, 2, 8));
+        let allow = switch(&mut h, true);
+        let outside = submit_outside(&mut h, 5, conversation(1));
+        h.commit();
+        h.script(outside, [SlotEvent::Spawned]);
+        assert_eq!(h.state(outside), Some(JobState::Running));
+        allow.set(false);
+        h.poll();
+        assert_eq!(h.state(outside), Some(JobState::Running));
+        assert!(h.stops().is_empty(), "a running `!!` job is not stopped");
+        let Admission::Accepted { job: bang } = h.submit(person(6), conversation(2), P1) else {
+            panic!("accepted");
+        };
+        h.commit();
+        assert_eq!(h.started(), [outside, bang], "`!` ignores the switch");
+        let records = h.finish(outside, 0);
+        let s = settled(&records)[0];
+        assert_eq!((s.outcome, s.reason), (Outcome::Exited, JobReason::None));
+    }
+
+    /// PC-U53: a `!!` slot reports kind 5, kind 6 count 2 and kind 2
+    /// reason 15, then capture EOF. `ShellExited` once; the job stays
+    /// `Draining` with its slot held and named in a blocked start's text;
+    /// EOF settles `exited` with capture `complete` and escapees 2.
+    #[test]
+    fn pc_u53_survivor_holds_output_then_eof() {
+        let mut h = Harness::new(limits(1, 1, 8));
+        let job = submit_outside(&mut h, 5, conversation(1));
+        h.commit();
+        events(&mut h);
+        h.script(job, shell_exit(Exit::Exited(0), 2, true));
+        let drained = events(&mut h);
+        assert_eq!(shell_exits(&drained), [(job, Exit::Exited(0), 2)]);
+        assert!(!drained.iter().any(|e| matches!(e, JobEvent::Settled(..))));
+        assert_eq!(h.state(job), Some(JobState::Draining));
+        assert!(h.stops().is_empty(), "PQ3, EC-D1: nothing is signalled");
+        let v = h.ctl.view(job, h.now).expect("view");
+        assert_eq!(
+            (v.profile, v.shell_exited, v.left_running),
+            (Profile::PersonOutside1, true, Some(2))
+        );
+        assert_eq!(h.ctl.live_count(None), 1);
+        // The slot stays held: a later start waits and names it.
+        let next = h.model(2, conversation(1), P1);
+        assert_eq!(h.reason(next), Some(BlockReason::AgentSlots));
+        assert_eq!(
+            h.text(next).as_deref(),
+            Some("waiting: 1 of 1 jobs running for this agent (1 shell exited, output open)")
+        );
+        // More slot polls: no second `ShellExited`.
+        h.poll();
+        assert!(shell_exits(&events(&mut h)).is_empty());
+        // Survivor EOF: the capture seals complete.
+        h.script(
+            job,
+            [SlotEvent::CaptureSettled(capture(
+                CaptureState::Complete,
+                40,
+                5,
+            ))],
+        );
+        let records = h.commit();
+        let s = settled(&records)[0];
+        assert_eq!(
+            (
+                s.outcome,
+                s.reason,
+                s.exit_value,
+                s.capture_state,
+                s.capture_reason,
+                s.escapees,
+                s.cleanup
+            ),
+            (
+                Outcome::Exited,
+                JobReason::None,
+                0,
+                JobCaptureState::Complete,
+                CaptureReason::None,
+                2,
+                JobCleanup::Confirmed
+            )
+        );
+        assert!(cancels(&records).is_empty());
+        let v = h.ctl.view(job, h.now).expect("view");
+        assert_eq!((v.shell_exited, v.left_running), (false, Some(2)));
+        h.script(job, [SlotEvent::ScratchCleaned]);
+        h.idle(job);
+        assert_eq!(h.started(), [job, next], "slot released at settlement");
+        assert_outside_audit(&h, job);
+        let audit = h.audit.0.borrow();
+        assert!(audit.iter().any(|e| matches!(
+            e,
+            Event::JobSettled { job: id, escapees: 2, outside_sandbox: true, .. } if *id == job
+        )));
+    }
+
+    /// PC-U53: a person cancel of a released `!!` job writes kind 27,
+    /// calls `close_capture` (no lease byte, no discard), and settles
+    /// `exited` with the trigger's reason, capture `incomplete` reason 7.
+    /// A kill after the stop writes nothing more.
+    #[test]
+    fn pc_u53_person_cancel_closes_capture() {
+        let mut h = Harness::new(limits(4, 2, 8));
+        let job = submit_outside(&mut h, 5, conversation(1));
+        h.commit();
+        h.script(job, shell_exit(Exit::Exited(3), 2, true));
+        assert_eq!(shell_exits(&events(&mut h)).len(), 1);
+        assert_eq!(
+            h.ctl
+                .cancel(job, Requester::Person, JobReason::PersonStop, false),
+            CancelReply::Accepted(JobState::Draining)
+        );
+        assert_eq!(closes(&h), [job]);
+        assert!(discards(&h).is_empty());
+        assert!(h.stops().is_empty(), "the guardian has exited");
+        assert_eq!(
+            h.ctl
+                .cancel(job, Requester::Person, JobReason::PersonKill, true),
+            CancelReply::Accepted(JobState::Draining)
+        );
+        assert_eq!(closes(&h), [job], "closed once");
+        assert!(h.stops().is_empty());
+        let records = h.commit();
+        let c = cancels(&records);
+        assert_eq!(
+            (c.len(), c[0].requester, c[0].reason, c[0].kill),
+            (1, JobRequester::Person, JobReason::PersonStop, false)
+        );
+        h.script(job, [SlotEvent::CaptureSettled(closed_capture())]);
+        let records = h.commit();
+        let s = settled(&records)[0];
+        assert_eq!(
+            (
+                s.outcome,
+                s.reason,
+                s.exit_value,
+                s.capture_state,
+                s.capture_reason,
+                s.escapees
+            ),
+            (
+                Outcome::Exited,
+                JobReason::PersonKill,
+                3,
+                JobCaptureState::Incomplete,
+                CaptureReason::ClosedAfterCancel,
+                2
+            )
+        );
+        assert!(shell_exits(&events(&mut h)).is_empty());
+        assert_outside_audit(&h, job);
+    }
+
+    /// PC-U53: kind 2 reason 14 (no survivor holds output) emits no
+    /// `ShellExited`; the job finalizes and settles on EOF as any job.
+    #[test]
+    fn pc_u53_reason_14_never_releases() {
+        let mut h = Harness::new(limits(4, 2, 8));
+        let job = submit_outside(&mut h, 5, conversation(1));
+        h.commit();
+        h.script(job, shell_exit(Exit::Exited(0), 2, false));
+        assert!(shell_exits(&events(&mut h)).is_empty());
+        assert_eq!(h.state(job), Some(JobState::Finalizing));
+        let v = h.ctl.view(job, h.now).expect("view");
+        assert_eq!((v.shell_exited, v.left_running), (false, None));
+        h.script(
+            job,
+            [SlotEvent::CaptureSettled(capture(
+                CaptureState::Complete,
+                4,
+                1,
+            ))],
+        );
+        let records = h.commit();
+        let s = settled(&records)[0];
+        assert_eq!(
+            (s.outcome, s.escapees, s.capture_state),
+            (Outcome::Exited, 2, JobCaptureState::Complete)
+        );
+        assert!(shell_exits(&events(&mut h)).is_empty());
+    }
+
+    /// Reason 15 releases only a `!!` job whose capture is still open: a
+    /// `!` job never gets `ShellExited` (its slot never reports a held
+    /// output, and the controller ignores one), and a capture that sealed
+    /// before kind 2 settles at once.
+    #[test]
+    fn shell_exited_only_for_open_outside_capture() {
+        let mut h = Harness::new(limits(4, 2, 8));
+        let Admission::Accepted { job: bang } = h.submit(person(4), conversation(1), P1) else {
+            panic!("accepted");
+        };
+        let outside = submit_outside(&mut h, 5, conversation(2));
+        h.commit();
+        h.script(bang, shell_exit(Exit::Exited(0), 0, true));
+        assert_eq!(h.state(bang), Some(JobState::Finalizing));
+        let mut early = shell_exit(Exit::Exited(0), 1, true);
+        early.insert(
+            2,
+            SlotEvent::CaptureSettled(capture(CaptureState::Complete, 4, 1)),
+        );
+        h.script(outside, early);
+        assert!(shell_exits(&events(&mut h)).is_empty());
+        assert_eq!(h.state(outside), Some(JobState::Recording));
+    }
+
+    /// A trigger before the guardian's kind 2 (in `Draining` after kind 5):
+    /// capture discards, and the reason 15 that follows closes it, so the
+    /// survivors cannot hold the job open. It settles `exited` with the
+    /// trigger's reason and capture reason 7.
+    #[test]
+    fn trigger_between_shell_exit_and_reason_15_closes_capture() {
+        let mut h = Harness::new(limits(4, 2, 8));
+        let job = submit_outside(&mut h, 5, conversation(1));
+        h.commit();
+        h.script(
+            job,
+            [SlotEvent::Spawned, SlotEvent::LeaderExited(Exit::Exited(0))],
+        );
+        assert_eq!(h.state(job), Some(JobState::Draining));
+        h.ctl
+            .cancel(job, Requester::Person, JobReason::PersonStop, false);
+        assert_eq!(discards(&h), [job]);
+        h.script(
+            job,
+            [SlotEvent::ProcessSettled {
+                exit: Exit::Exited(0),
+                cleanup: JobCleanup::Confirmed,
+                escapees: 1,
+                elapsed_ms: 9,
+                output_held: true,
+            }],
+        );
+        assert_eq!(shell_exits(&events(&mut h)).len(), 1);
+        assert_eq!(closes(&h), [job]);
+        h.script(job, [SlotEvent::CaptureSettled(closed_capture())]);
+        let records = h.commit();
+        let s = settled(&records)[0];
+        assert_eq!(
+            (s.outcome, s.reason, s.capture_reason),
+            (
+                Outcome::Exited,
+                JobReason::PersonStop,
+                CaptureReason::ClosedAfterCancel
+            )
+        );
+    }
+
+    /// A stop before the shell exits settles `cancelled`; when survivors
+    /// then hold the output, the capture closes and kind 28 records reason
+    /// 5 `discarded_after_cancel`, because replay allows reason 7 only
+    /// with `exited` or `signalled`. A `!` job whose slot reported reason
+    /// 7 records reason 5 too (PR3: reason 7 needs `person-outside-1`).
+    #[test]
+    fn capture_reason_7_only_where_replay_allows_it() {
+        let mut h = Harness::new(limits(4, 2, 8));
+        let outside = submit_outside(&mut h, 5, conversation(1));
+        let Admission::Accepted { job: bang } = h.submit(person(6), conversation(2), P1) else {
+            panic!("accepted");
+        };
+        h.commit();
+        h.script(outside, [SlotEvent::Spawned]);
+        h.ctl
+            .cancel(outside, Requester::Person, JobReason::PersonStop, false);
+        assert_eq!(h.stops(), [(outside, StopKind::Term)]);
+        let mut events_ = shell_exit(Exit::Signalled(15), 1, true);
+        events_.remove(0);
+        h.script(outside, events_);
+        assert_eq!(closes(&h), [outside]);
+        h.script(outside, [SlotEvent::CaptureSettled(closed_capture())]);
+        h.script(bang, settle_events(Exit::Exited(0), 0).into_iter().take(3));
+        h.ctl
+            .cancel(bang, Requester::Person, JobReason::PersonStop, false);
+        h.script(bang, [SlotEvent::CaptureSettled(closed_capture())]);
+        let records = h.commit();
+        let by_job = |id: Id| {
+            settled(&records)
+                .into_iter()
+                .find(|s| s.job == id)
+                .unwrap()
+                .clone()
+        };
+        let o = by_job(outside);
+        assert_eq!(
+            (o.outcome, o.reason, o.capture_reason),
+            (
+                Outcome::Cancelled,
+                JobReason::PersonStop,
+                CaptureReason::DiscardedAfterCancel
+            )
+        );
+        let b = by_job(bang);
+        assert_eq!(b.capture_reason, CaptureReason::DiscardedAfterCancel);
+    }
+
+    /// Recovery: an interrupted `!!` job's `job.settled` carries the flag,
+    /// from the input's kind 31 (`recover_profiles`).
+    #[test]
+    fn recovered_outside_job_audit_carries_the_flag() {
+        let mut h = Harness::unrecovered(limits(4, 2, 8));
+        let mut u = unsettled(1, 10, false);
+        u.origin = JobOrigin::Person { input: [1; 16] };
+        u.job = journal::job_id(&u.origin);
+        let mut bang = unsettled(2, 20, false);
+        bang.origin = JobOrigin::Person { input: [2; 16] };
+        bang.job = journal::job_id(&bang.origin);
+        h.ctl
+            .recover_profiles(vec![u.clone(), bang.clone()], &|input| input == [1; 16]);
+        let records = h.commit();
+        assert_eq!(kinds(&records), [28, 28]);
+        assert_outside_audit(&h, u.job);
+    }
+}

@@ -238,9 +238,11 @@ pub(crate) enum JobEvent {
     Started(Id),
     State(Id, JobState),
     Settled(Id, Outcome),
-    /// P3-K: a `!!` job's kind 2 reason 15; survivors still hold output
-    /// (OD2). Never emitted in J2.
-    #[allow(dead_code)] // P3-K emits it
+    /// A `!!` job's kind 2 reason 15 while its capture is open: the shell
+    /// exited and survivors still hold its output (OD2). The job stays
+    /// `Draining` with its slot held; the conversation owner advances the
+    /// lane. Emitted at most once per job, never for reason 14 or another
+    /// profile. Fields: the leader's exit and the survivors left running.
     ShellExited(Id, Exit, u32),
 }
 
@@ -386,6 +388,12 @@ struct Job {
     /// The `JobEntry.command` excerpt, built once at admission with
     /// storage's `command_excerpt` (the one owner).
     excerpt: String,
+    /// A `!!` job's kind 2 reason 15 arrived while capture was open: the
+    /// job drains with its lane released (OD2). The guardian has exited, so
+    /// a later trigger writes no lease byte.
+    released: bool,
+    /// `SlotPort::close_capture` was called (at most once).
+    capture_closed: bool,
 }
 impl Job {
     fn new(
@@ -438,7 +446,13 @@ impl Job {
             intent_ms: 0,
             stored: [0; 2],
             excerpt: String::new(),
+            released: false,
+            capture_closed: false,
         }
+    }
+    /// Profile `person-outside-1`: a `!!` job (PCR25 audit flag).
+    fn outside(&self) -> bool {
+        self.profile == Profile::PersonOutside1
     }
 }
 
@@ -455,6 +469,7 @@ struct Retired {
     /// a journal read; `None` for a restart settlement.
     settled: Option<Box<JobSettled>>,
     excerpt: String,
+    profile: Profile,
 }
 
 /// The shared [`Fibonacci`] pacing (PACE-1: 1, 1, 2, 3, 5, 8 s and so on,
@@ -524,6 +539,10 @@ pub(crate) struct JobController {
     /// The EX11 effective value of a project, checked at slot grant for a
     /// model-origin head. Absent: execution is on.
     execution: Option<Box<dyn Fn(Id) -> bool>>,
+    /// The owner's current `personCommands.allowOutsideSandbox`, read when
+    /// a `!!` job's slot is granted, before `SlotPort::start` (PCM switch
+    /// check). Absent: the default, `true`.
+    outside_switch: Option<Box<dyn Fn() -> bool>>,
 }
 
 impl JobController {
@@ -575,6 +594,7 @@ impl JobController {
             waits: BTreeMap::new(),
             done: VecDeque::new(),
             execution: None,
+            outside_switch: None,
         }
     }
 
@@ -583,7 +603,18 @@ impl JobController {
     /// Start-time recovery (J2-E5): one kind 28 `interrupted`, reason
     /// `restart`, for each unsettled job from replay, oldest first.
     /// Admission waits with `recovering` until every one commits.
-    pub(crate) fn recover(&mut self, mut unsettled: Vec<UnsettledJob>) {
+    pub(crate) fn recover(&mut self, unsettled: Vec<UnsettledJob>) {
+        self.recover_profiles(unsettled, &|_| false);
+    }
+    /// [`Self::recover`] with each person job's profile: `outside` answers
+    /// kind 31 field 7 bit 1 for an input ID (replay's
+    /// `inputs[&input].person.outside_sandbox`), so the interrupted
+    /// `job.settled` of a `!!` job carries `outside_sandbox` (PCR25).
+    pub(crate) fn recover_profiles(
+        &mut self,
+        mut unsettled: Vec<UnsettledJob>,
+        outside: &dyn Fn(Id) -> bool,
+    ) {
         if self.recover_called {
             return;
         }
@@ -608,6 +639,11 @@ impl JobController {
             job.intent_ms = u.time;
             job.recovered = true;
             job.reason = JobReason::Restart;
+            job.profile = match u.origin {
+                JobOrigin::Model { .. } => Profile::Model1,
+                JobOrigin::Person { input } if outside(input) => Profile::PersonOutside1,
+                JobOrigin::Person { .. } => Profile::Person1,
+            };
             job.settled = Some(Box::new(JobSettled::interrupted(u.job, now)));
             self.closures.push_back((u.job, Kind::Settled));
             self.jobs.insert(u.job, job);
@@ -644,6 +680,19 @@ impl JobController {
         // Replay accepts agent 0 only until a subagent design assigns
         // numbers (JR3); a model start of another agent could never commit.
         if request.agent.agent != 0 || request.scope.project == [0; 16] {
+            return Admission::Conflict;
+        }
+        // The profile is fixed at admission: `model-1` for a model start;
+        // for a person start `person-1` or `person-outside-1`, which the
+        // owner takes from kind 31 field 7 bit 1, never from a later
+        // request (person grant). Any other pairing names no runnable job.
+        let profile_matches = match request.origin {
+            Origin::Model { .. } => request.profile == Profile::Model1,
+            Origin::Person { .. } => {
+                matches!(request.profile, Profile::Person1 | Profile::PersonOutside1)
+            }
+        };
+        if !profile_matches {
             return Admission::Conflict;
         }
         let StartRequest {
@@ -852,6 +901,12 @@ impl JobController {
                     send_stop(job, StopKind::Kill);
                 }
             }
+            JobState::Draining if job.released => {
+                // A released `!!` job (OD2): the guardian has exited, so no
+                // lease byte; the slot closes the capture read ends and the
+                // survivors are not signalled (EC-D1).
+                close_capture(job);
+            }
             JobState::Draining | JobState::Finalizing => {
                 if let Some(slot) = job.slot.as_mut() {
                     slot.discard_capture();
@@ -950,6 +1005,10 @@ impl JobController {
                 }
                 _ => {
                     job.abandoned = true;
+                    if job.released {
+                        // No guardian to stop: the survivors' pipes close.
+                        close_capture(job);
+                    }
                     send_stop(job, StopKind::Term);
                     if job.slot.is_none() {
                         // Interrupted or not_started records that will not
@@ -994,6 +1053,18 @@ impl JobController {
     }
     fn execution_on(&self, project: Id) -> bool {
         self.execution.as_ref().is_none_or(|check| check(project))
+    }
+    /// The owner's current `personCommands.allowOutsideSandbox`, read when
+    /// a `!!` job's slot is granted. The configuration owner keeps the one
+    /// copy; the closure reads it and never blocks. A change never stops a
+    /// running `!!` job.
+    #[cfg_attr(not(test), allow(dead_code))] // P3-E wires the configuration owner
+    pub(crate) fn set_outside_switch(&mut self, check: Box<dyn Fn() -> bool>) {
+        self.outside_switch = Some(check);
+        self.dirty = true;
+    }
+    fn outside_on(&self) -> bool {
+        self.outside_switch.as_ref().is_none_or(|check| check())
     }
 
     // ----- Reactor -----
@@ -1144,7 +1215,7 @@ impl JobController {
                         requester: reasons::audit_requester(t.requester),
                         reason: reasons::audit_reason(t.reason),
                         kill: t.kill,
-                        outside_sandbox: false,
+                        outside_sandbox: job.outside(),
                     };
                     self.audit(event);
                 }
@@ -1242,7 +1313,7 @@ impl JobController {
             stderr_bytes: settled.stderr.capture.stored_bytes,
             elapsed_ms: settled.elapsed_ms,
             pause_count: settled.pause_count,
-            outside_sandbox: false,
+            outside_sandbox: job.outside(),
         };
         let recovered = job.recovered;
         self.audit(event);
@@ -1322,6 +1393,7 @@ impl JobController {
                 .map_or(Outcome::Interrupted, |s| s.outcome),
             settled: job.settled.filter(|_| !job.recovered),
             excerpt: job.excerpt,
+            profile: job.profile,
         });
     }
 
@@ -1439,7 +1511,7 @@ impl JobController {
                 cleanup,
                 escapees,
                 elapsed_ms,
-                output_held: _,
+                output_held,
             } => {
                 job.exit.get_or_insert(exit);
                 job.process = Some(Process {
@@ -1448,10 +1520,27 @@ impl JobController {
                     escapees,
                     elapsed_ms,
                 });
-                if !matches!(
+                let live = !matches!(
                     job.state,
                     JobState::Recording | JobState::Recorded | JobState::Withdrawn
-                ) {
+                );
+                // OD2: a `!!` kind 2 reason 15 while capture is open
+                // releases the lane; the job keeps draining with its slot.
+                let release =
+                    live && output_held && job.outside() && !job.released && job.capture.is_none();
+                if release {
+                    job.released = true;
+                    if job.cancel.is_some() {
+                        // A trigger came before the guardian's kind 2: the
+                        // survivors would keep a discarding capture open, so
+                        // the read ends close now.
+                        close_capture(job);
+                    }
+                    self.set_state(id, JobState::Draining);
+                    self.event(JobEvent::ShellExited(id, exit, escapees));
+                    return;
+                }
+                if live {
                     self.set_state(id, JobState::Finalizing);
                 }
                 self.finish(id, payloads);
@@ -1546,11 +1635,14 @@ impl JobController {
         };
         for job in self.jobs.values().filter(|j| j.holds_slot) {
             let cleanup = job.state == JobState::CleanupUnconfirmed;
+            let released = job.released && job.state == JobState::Draining;
             c.service_live += 1;
             c.service_awaiting_cleanup += usize::from(cleanup);
+            c.service_released += usize::from(released);
             if job.agent == agent {
                 c.agent_live += 1;
                 c.agent_awaiting_cleanup += usize::from(cleanup);
+                c.agent_released += usize::from(released);
             }
         }
         c
@@ -1708,7 +1800,7 @@ impl JobController {
                     origin: job.origin.audit(),
                     agent: job.agent.agent,
                     reason: reason.audit(),
-                    outside_sandbox: false,
+                    outside_sandbox: job.outside(),
                 }
             });
             if let Some(event) = audit {
@@ -1772,6 +1864,17 @@ impl JobController {
     }
 
     fn start_slot(&mut self, id: Id, start: SlotStart) {
+        let outside = self.jobs.get(&id).is_some_and(Job::outside);
+        if outside && !self.outside_on() {
+            // The `!!` switch at slot grant: kind 26 is committed; no setup
+            // starts. Kind 28 `not_started` reason 20 and the slot and
+            // reservation return (switch check).
+            drop(start);
+            tracing::info!("job_outside_sandbox_off_at_grant");
+            self.settle_without_process(id, Some(JobReason::OutsideSandboxOff));
+            self.dirty = true;
+            return;
+        }
         let mut slot = (self.slots)();
         let result = slot.start(start);
         let Some(job) = self.jobs.get_mut(&id) else {
@@ -1908,21 +2011,28 @@ fn started_event(job: &Job) -> Event {
         job: job.id,
         origin: job.origin.audit(),
         agent: job.agent.agent,
-        // P3-K sets the person profiles at admission; until then a person
-        // job admitted with `Model1` is a `!` job.
-        profile: match (job.profile, &job.origin) {
-            (Profile::Model1, Origin::Model { .. }) => record::JobProfile::Model1,
-            (Profile::Model1 | Profile::Person1, Origin::Person { .. }) => {
-                record::JobProfile::Person1
-            }
-            (Profile::PersonOutside1, _) => record::JobProfile::PersonOutside1,
-            (Profile::Person1, Origin::Model { .. }) => record::JobProfile::Person1,
+        // Admission pairs the profile with the origin.
+        profile: match job.profile {
+            Profile::Model1 => record::JobProfile::Model1,
+            Profile::Person1 => record::JobProfile::Person1,
+            Profile::PersonOutside1 => record::JobProfile::PersonOutside1,
         },
         operation,
         generation,
         ordinal,
         input,
-        outside_sandbox: job.profile == Profile::PersonOutside1,
+        outside_sandbox: job.outside(),
+    }
+}
+
+/// Closes a released `!!` job's capture read ends once
+/// (`SlotPort::close_capture`); the capture seals `incomplete` with reason 7.
+fn close_capture(job: &mut Job) {
+    if std::mem::replace(&mut job.capture_closed, true) {
+        return;
+    }
+    if let Some(slot) = job.slot.as_mut() {
+        slot.close_capture();
     }
 }
 
@@ -1986,7 +2096,7 @@ fn process_settlement(job: &Job, process: &Process, capture: CaptureOutcome) -> 
         capture_reason: if unconfirmed {
             CaptureReason::SettlementUnconfirmed
         } else {
-            capture.reason
+            settled_capture_reason(job, outcome, capture.reason)
         },
         stdout: strip(capture.stdout),
         stderr: strip(capture.stderr),
@@ -1997,6 +2107,26 @@ fn process_settlement(job: &Job, process: &Process, capture: CaptureOutcome) -> 
         paused_ms: capture.paused_ms,
         final_reservation: capture.final_reservation,
         settled_time: wall_ms(),
+    }
+}
+
+/// Capture reason 7 `closed_after_cancel` only where replay allows it
+/// (PR3 and the kind 28 rules): a `!!` job whose capture this controller
+/// closed after a trigger, settling `exited` or `signalled`. A trigger
+/// before the shell exited settles `cancelled`, so the closed capture
+/// records reason 5 `discarded_after_cancel`, as any cancelled capture.
+fn settled_capture_reason(job: &Job, outcome: Outcome, reason: CaptureReason) -> CaptureReason {
+    if reason != CaptureReason::ClosedAfterCancel {
+        return reason;
+    }
+    let closed = job.outside()
+        && job.capture_closed
+        && job.cancel.is_some()
+        && matches!(outcome, Outcome::Exited | Outcome::Signalled);
+    if closed {
+        reason
+    } else {
+        CaptureReason::DiscardedAfterCancel
     }
 }
 
