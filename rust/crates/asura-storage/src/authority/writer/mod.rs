@@ -167,6 +167,19 @@ pub enum Command {
         through: u64,
         limit: usize,
     },
+    /// The execution path guard state of a registered project (P5): its
+    /// newest acknowledgement, the newest pending kind 32 `model_changed`
+    /// records with their paths (at most 64; older ones counted) and its
+    /// current approvals with their paths (at most 256).
+    PathGuard {
+        project: Id,
+    },
+    /// The kind 32 record of one reference (a job, input or request ID),
+    /// or none: the acknowledgement of a person input, or the record of an
+    /// approval request (AE-05).
+    PathRecord {
+        reference: Id,
+    },
     /// Usage, quota and hold state; also rechecks free space.
     JournalStatus,
     /// A successful `journal.quotaBytes` set applies at once.
@@ -314,6 +327,11 @@ pub struct Reply {
     pub before_found: bool,
     /// `JobFacts`: `None` for an ID of no job.
     pub job_records: Option<Box<JobRecords>>,
+    /// `PathGuard`: the project's guard state.
+    pub path_guard: Option<Box<PathGuardView>>,
+    /// `PathRecord`: the reference's kind 32 and its frame; also the
+    /// committed record of a kind 32 `Append`.
+    pub path_record: Option<(Locator, Box<ExecutionPathRecord>)>,
     pub status: Option<JournalStatus>,
     pub inputs: Vec<InputView>,
     pub queued: Option<QueuedPreparation>,

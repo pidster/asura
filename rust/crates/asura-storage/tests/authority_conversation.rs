@@ -5025,3 +5025,583 @@ fn pc_u21_listing_and_job_facts_read_the_kind_31_source() {
     assert_eq!(notice.settlements[0].listing.job, person_job(41));
     assert!(matches!(&notice.settlements[0].command, JobCommand::Person(p) if p.input == id(41)));
 }
+
+// ----- P5 kind 32 execution paths (execution-path-guard.md, EPG-U3). -----
+
+fn path_entries(kind: PathEntryKind, paths: &[&str]) -> Vec<PathEntry> {
+    paths
+        .iter()
+        .map(|path| PathEntry {
+            kind,
+            path: (*path).into(),
+        })
+        .collect()
+}
+fn path_record(
+    action: PathAction,
+    project: Id,
+    reference: Id,
+    through: u64,
+    entries: Vec<PathEntry>,
+    digest: Hash,
+) -> Record {
+    Record::ExecutionPath(Box::new(ExecutionPathRecord {
+        action,
+        project,
+        reference,
+        through,
+        entries,
+        overflow: 0,
+        digest,
+    }))
+}
+/// Kind 32 `model_changed` of job `job` in project 6.
+fn changed(job: Id, paths: &[&str]) -> Record {
+    path_record(
+        PathAction::ModelChanged,
+        id(6),
+        job,
+        0,
+        path_entries(PathEntryKind::ModelChanged, paths),
+        [0; 32],
+    )
+}
+/// Kind 32 `acknowledged` of input `input` in project 6.
+fn acknowledged(input: u64, through: u64, warnings: &[(PathEntryKind, &str)]) -> Record {
+    path_record(
+        PathAction::Acknowledged,
+        id(6),
+        id(input),
+        through,
+        warnings
+            .iter()
+            .map(|(kind, path)| PathEntry {
+                kind: *kind,
+                path: (*path).into(),
+            })
+            .collect(),
+        [0; 32],
+    )
+}
+fn approved(request: u64, path: &str, digest: u8) -> Record {
+    path_record(
+        PathAction::Approved,
+        id(6),
+        id(request),
+        0,
+        path_entries(PathEntryKind::Approval, &[path]),
+        [digest; 32],
+    )
+}
+fn revoked(request: u64, path: &str) -> Record {
+    path_record(
+        PathAction::Revoked,
+        id(6),
+        id(request),
+        0,
+        path_entries(PathEntryKind::Approval, &[path]),
+        [0; 32],
+    )
+}
+/// A second registered project, ID 66.
+fn other_project() -> Record {
+    Record::ProjectRegistered(ProjectRegistered {
+        request: id(65),
+        digest: request_digest(Request::Register { location: "/other" }).unwrap(),
+        project: id(66),
+        location: "/other".into(),
+        device: 1,
+        inode: 3,
+        registry_revision: 1,
+        visibility: 1,
+    })
+}
+/// A record moved to project 66.
+fn in_other(record: Record) -> Record {
+    let Record::ExecutionPath(mut p) = record else {
+        unreachable!()
+    };
+    p.project = id(66);
+    Record::ExecutionPath(p)
+}
+fn guard(journal: &Journal) -> PathGuardView {
+    let state = inspect(&journal.bytes).unwrap();
+    let mut index = MemoryIndex {
+        segments: std::collections::BTreeMap::from([(1, &journal.bytes[..])]),
+    };
+    state.path_guard(id(6), &mut index).unwrap()
+}
+fn reference_record(journal: &Journal, reference: Id) -> Option<ExecutionPathRecord> {
+    let state = inspect(&journal.bytes).unwrap();
+    let mut index = MemoryIndex {
+        segments: std::collections::BTreeMap::from([(1, &journal.bytes[..])]),
+    };
+    state
+        .path_record(reference, &mut index)
+        .unwrap()
+        .map(|(frame, p)| {
+            assert!(frame.sequence > 0);
+            p
+        })
+}
+/// A model job at `ordinal` of the started operation, settled.
+fn settled_model_job(ordinal: u32) -> [Record; 4] {
+    [
+        run_exec(ordinal),
+        r26(ordinal),
+        r29(ordinal, 1),
+        r28(ordinal),
+    ]
+}
+
+/// EPG-U3 (unit): replay derives the pending model changes, the newest
+/// acknowledgement and the approvals of a project from kind 32 alone;
+/// each record emits its index entries; a kind 32 from the next owner
+/// generation is independent of the old active operation.
+#[test]
+fn epg_u3_replay_derives_changes_acknowledgements_and_approvals() {
+    let mut j = started_with(settled_model_job(1));
+    j.append(r31(pcq(40, 41, 43, true, 1, false)));
+    assert_eq!(guard(&j), PathGuardView::default());
+    j.append(changed(job(1), &["build.rs", "package.json"]));
+    let first = j.sequence;
+    let view = guard(&j);
+    assert_eq!(view.acknowledged, None);
+    assert_eq!(view.changes.len(), 1);
+    assert_eq!(view.changes[0].frame.sequence, first);
+    assert_eq!(view.changes[0].job, job(1));
+    assert_eq!(view.changes[0].paths, vec!["build.rs", "package.json"]);
+    assert_eq!((view.omitted_changes, view.through()), (0, first));
+    assert_eq!(
+        reference_record(&j, job(1)).unwrap().action,
+        PathAction::ModelChanged
+    );
+    // The acknowledgement covers the change: kind 1 warnings appear once.
+    j.append(acknowledged(
+        41,
+        first,
+        &[
+            (PathEntryKind::ModelChanged, "build.rs"),
+            (PathEntryKind::ModelChanged, "package.json"),
+            (PathEntryKind::NotApproved, ".git/hooks/pre-commit"),
+        ],
+    ));
+    let acked = j.sequence;
+    let view = guard(&j);
+    let ack = view.acknowledged.unwrap();
+    assert_eq!(
+        (ack.frame.sequence, ack.input, ack.through),
+        (acked, id(41), first)
+    );
+    assert!(view.changes.is_empty());
+    assert_eq!((view.omitted_changes, view.through()), (0, first));
+    let record = reference_record(&j, id(41)).unwrap();
+    assert_eq!(record.entries.len(), 3);
+    assert_eq!(record.entries[2].kind, PathEntryKind::NotApproved);
+    // A later model change is pending again.
+    for record in settled_model_job(2) {
+        j.append(record);
+    }
+    j.append(changed(job(2), &["Cargo.toml"]));
+    let second = j.sequence;
+    let view = guard(&j);
+    assert_eq!(view.changes.len(), 1);
+    assert_eq!(view.changes[0].paths, vec!["Cargo.toml"]);
+    assert_eq!(view.through(), second);
+    // Approvals: latest record per path wins; a revocation removes it.
+    j.append(approved(70, ".envrc", 1));
+    j.append(approved(71, ".git/hooks/pre-commit", 2));
+    j.append(approved(72, ".envrc", 3));
+    j.append(revoked(73, ".git/hooks/pre-commit"));
+    j.append(approved(74, ".cargo/config.toml", 4));
+    let view = guard(&j);
+    assert_eq!(
+        view.approvals
+            .iter()
+            .map(|a| (a.path.as_str(), a.digest[0]))
+            .collect::<Vec<_>>(),
+        vec![(".cargo/config.toml", 4), (".envrc", 3)]
+    );
+    assert_eq!(view.approval_records, 5);
+    assert_eq!(view.changes.len(), 1, "approvals do not clear changes");
+    assert_eq!(
+        reference_record(&j, id(73)).unwrap().action,
+        PathAction::Revoked
+    );
+    assert_eq!(reference_record(&j, id(99)), None);
+    // Index entries: B per change, F per acknowledgement, Q per approval
+    // or revocation, Z per record.
+    let state = inspect(&j.bytes).unwrap();
+    let entries = state.delta_entries();
+    let count = |tag: Tag| entries.iter().filter(|(key, _)| key.tag == tag).count();
+    assert_eq!(
+        (
+            count(Tag::PathChange),
+            count(Tag::PathAck),
+            count(Tag::PathApproval),
+            count(Tag::PathReference)
+        ),
+        (2, 1, 5, 8)
+    );
+    let entry = state
+        .entry(
+            &Key::new(Tag::PathChange, id(6), second),
+            &mut MemoryIndex {
+                segments: Default::default(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(entry, Some(Entry::PathChange { number: 2, .. })));
+    // The next owner generation: the operation is from the old one, and
+    // kind 32 is still accepted.
+    j.append(r31(pcq(44, 45, 43, false, 2, false)));
+    j.append(Record::OwnerGeneration);
+    j.append(approved(75, ".gitmodules", 5));
+    j.append(acknowledged(45, second, &[]));
+    let view = guard(&j);
+    assert_eq!(view.approvals.len(), 3);
+    assert!(view.changes.is_empty());
+    assert_eq!(view.acknowledged.unwrap().through, second);
+}
+
+/// EPG-U3 (unit): an acknowledgement may cover fewer changes than are
+/// pending (a change committed after the check), and a guard read keeps
+/// the newest 64 pending changes and counts the older ones.
+#[test]
+fn epg_u3_pending_changes_are_bounded_and_partly_covered() {
+    let mut j = Journal::started();
+    j.append(r31(pcq(40, 41, 43, true, 1, false)));
+    let mut sequences = Vec::new();
+    for ordinal in 1..=70u32 {
+        for record in settled_model_job(ordinal) {
+            j.append(record);
+        }
+        j.append(changed(job(ordinal), &[&format!("tests/t{ordinal}.rs")]));
+        sequences.push(j.sequence);
+    }
+    let view = guard(&j);
+    assert_eq!(view.changes.len(), MAX_PENDING_PATH_CHANGES);
+    assert_eq!(view.omitted_changes, 6);
+    assert_eq!(view.changes[0].paths, vec!["tests/t7.rs"]);
+    assert_eq!(view.changes[63].paths, vec!["tests/t70.rs"]);
+    assert_eq!(view.through(), sequences[69]);
+    // Cover through the 10th change only.
+    j.append(acknowledged(41, sequences[9], &[]));
+    let view = guard(&j);
+    assert_eq!(view.changes.len(), 60);
+    assert_eq!(view.omitted_changes, 0);
+    assert_eq!(view.changes[0].paths, vec!["tests/t11.rs"]);
+    // A new input acknowledges with the same `through`: nothing new covered.
+    let mut k = Journal::started();
+    k.append(r31(pcq(40, 41, 43, true, 1, false)));
+    k.append(r31(pcq(44, 45, 43, false, 2, false)));
+    for record in settled_model_job(1) {
+        k.append(record);
+    }
+    k.append(changed(job(1), &["build.rs"]));
+    let change = k.sequence;
+    k.append(acknowledged(41, 0, &[]));
+    assert_eq!(guard(&k).changes.len(), 1);
+    k.append(acknowledged(
+        45,
+        change,
+        &[(PathEntryKind::ModelChanged, "build.rs")],
+    ));
+    assert!(guard(&k).changes.is_empty());
+}
+
+/// EPG-U3 (unit): each replay rule rejects its broken twin as `Corrupt`.
+#[test]
+fn epg_u3_replay_rules_reject_each_invalid_record() {
+    let settled = || started_with(settled_model_job(1));
+    let with = |mut j: Journal, records: Vec<Record>| {
+        for record in records {
+            j.append(record);
+        }
+        j
+    };
+    // A registered project.
+    expect_rule(
+        "unregistered project",
+        with(settled(), vec![approved(70, ".envrc", 1)]),
+        with(settled(), vec![in_other(approved(70, ".envrc", 1))]),
+    );
+    // One record per reference (AE-05).
+    expect_rule(
+        "second record of a request",
+        with(
+            settled(),
+            vec![approved(70, ".envrc", 1), approved(71, ".envrc", 2)],
+        ),
+        with(
+            settled(),
+            vec![approved(70, ".envrc", 1), approved(70, ".envrc", 2)],
+        ),
+    );
+    expect_rule(
+        "second model_changed of a job",
+        with(settled(), vec![changed(job(1), &["build.rs"])]),
+        with(
+            settled(),
+            vec![
+                changed(job(1), &["build.rs"]),
+                changed(job(1), &["Cargo.toml"]),
+            ],
+        ),
+    );
+    // Action 1: a settled model-origin job of the project.
+    expect_rule(
+        "model_changed of an unknown job",
+        with(settled(), vec![changed(job(1), &["build.rs"])]),
+        with(settled(), vec![changed(id(99), &["build.rs"])]),
+    );
+    expect_rule(
+        "model_changed of an unsettled job",
+        with(settled(), vec![changed(job(1), &["build.rs"])]),
+        started_with([
+            run_exec(1),
+            r26(1),
+            r29(1, 1),
+            changed(job(1), &["build.rs"]),
+        ]),
+    );
+    expect_rule(
+        "model_changed of a person job",
+        with(settled(), vec![changed(job(1), &["build.rs"])]),
+        base_with([
+            r31(pcq(40, 41, 43, true, 1, false)),
+            r26p(41),
+            r28p(41),
+            changed(person_job(41), &["build.rs"]),
+        ]),
+    );
+    expect_rule(
+        "model_changed in another project",
+        with(
+            settled(),
+            vec![other_project(), changed(job(1), &["build.rs"])],
+        ),
+        with(
+            settled(),
+            vec![other_project(), in_other(changed(job(1), &["build.rs"]))],
+        ),
+    );
+    // Action 2: an undispatched, undropped kind 31 input of the project.
+    let queued_person = || with(settled(), vec![r31(pcq(40, 41, 43, true, 1, false))]);
+    expect_rule(
+        "acknowledgement of an unknown input",
+        with(queued_person(), vec![acknowledged(41, 0, &[])]),
+        with(queued_person(), vec![acknowledged(99, 0, &[])]),
+    );
+    expect_rule(
+        "acknowledgement of a kind 18 input",
+        with(queued_person(), vec![acknowledged(41, 0, &[])]),
+        with(
+            settled(),
+            vec![
+                Record::InputQueued(queued(40, 41, 42, 43, true, 1)),
+                acknowledged(41, 0, &[]),
+            ],
+        ),
+    );
+    expect_rule(
+        "acknowledgement after the kind 26",
+        with(queued_person(), vec![acknowledged(41, 0, &[]), r26p(41)]),
+        with(queued_person(), vec![r26p(41), acknowledged(41, 0, &[])]),
+    );
+    expect_rule(
+        "acknowledgement of a dropped input",
+        with(
+            queued_person(),
+            vec![
+                decision(50, 41, InputAction::Hold),
+                acknowledged(41, 0, &[]),
+            ],
+        ),
+        with(
+            queued_person(),
+            vec![
+                decision(50, 41, InputAction::Hold),
+                decision(51, 41, InputAction::Drop),
+                acknowledged(41, 0, &[]),
+            ],
+        ),
+    );
+    expect_rule(
+        "acknowledgement in another project",
+        with(
+            queued_person(),
+            vec![other_project(), acknowledged(41, 0, &[])],
+        ),
+        with(
+            queued_person(),
+            vec![other_project(), in_other(acknowledged(41, 0, &[]))],
+        ),
+    );
+    expect_rule(
+        "second acknowledgement of an input",
+        with(
+            queued_person(),
+            vec![
+                r31(pcq(44, 45, 43, false, 2, false)),
+                acknowledged(41, 0, &[]),
+                acknowledged(45, 0, &[]),
+            ],
+        ),
+        with(
+            queued_person(),
+            vec![
+                r31(pcq(44, 45, 43, false, 2, false)),
+                acknowledged(41, 0, &[]),
+                acknowledged(41, 0, &[]),
+            ],
+        ),
+    );
+    // Field 4: 0, the previous `through`, or a later change of the project.
+    let changed_person = || with(queued_person(), vec![changed(job(1), &["build.rs"])]);
+    let change = changed_person().sequence;
+    expect_rule(
+        "through names no change",
+        with(changed_person(), vec![acknowledged(41, change, &[])]),
+        with(changed_person(), vec![acknowledged(41, change - 1, &[])]),
+    );
+    expect_rule(
+        "through names a later sequence",
+        with(changed_person(), vec![acknowledged(41, change, &[])]),
+        with(changed_person(), vec![acknowledged(41, change + 1, &[])]),
+    );
+    let two_inputs = || {
+        with(
+            changed_person(),
+            vec![
+                r31(pcq(44, 45, 43, false, 2, false)),
+                acknowledged(41, change, &[]),
+            ],
+        )
+    };
+    expect_rule(
+        "through goes back",
+        with(two_inputs(), vec![acknowledged(45, change, &[])]),
+        with(two_inputs(), vec![acknowledged(45, 0, &[])]),
+    );
+    let other_change = || {
+        with(
+            queued_person(),
+            vec![
+                other_project(),
+                Record::ExecutionPath(Box::new(ExecutionPathRecord {
+                    action: PathAction::Approved,
+                    project: id(66),
+                    reference: id(80),
+                    through: 0,
+                    entries: path_entries(PathEntryKind::Approval, &[".envrc"]),
+                    overflow: 0,
+                    digest: [1; 32],
+                })),
+            ],
+        )
+    };
+    let approval_sequence = other_change().sequence;
+    expect_rule(
+        "through names a record that is not a change",
+        with(other_change(), vec![acknowledged(41, 0, &[])]),
+        with(
+            other_change(),
+            vec![acknowledged(41, approval_sequence, &[])],
+        ),
+    );
+    // Action 4: an approved path.
+    expect_rule(
+        "revocation of an unapproved path",
+        with(
+            settled(),
+            vec![approved(70, ".envrc", 1), revoked(71, ".envrc")],
+        ),
+        with(
+            settled(),
+            vec![approved(70, ".envrc", 1), revoked(71, ".gitmodules")],
+        ),
+    );
+    expect_rule(
+        "second revocation",
+        with(
+            settled(),
+            vec![
+                approved(70, ".envrc", 1),
+                revoked(71, ".envrc"),
+                approved(72, ".envrc", 1),
+            ],
+        ),
+        with(
+            settled(),
+            vec![
+                approved(70, ".envrc", 1),
+                revoked(71, ".envrc"),
+                revoked(72, ".envrc"),
+            ],
+        ),
+    );
+    expect_rule(
+        "approval in another project is not this project's",
+        with(
+            settled(),
+            vec![
+                other_project(),
+                approved(70, ".envrc", 1),
+                revoked(71, ".envrc"),
+            ],
+        ),
+        with(
+            settled(),
+            vec![
+                other_project(),
+                in_other(approved(70, ".envrc", 1)),
+                revoked(71, ".envrc"),
+            ],
+        ),
+    );
+    // A field rule the record alone determines is Corrupt at decode.
+    let mut broken = with(settled(), vec![approved(70, ".envrc", 1)]);
+    tamper_last(&mut broken, |payload| payload[0] = 4);
+    assert_eq!(inspect(&broken.bytes).unwrap_err(), ReplayError::Corrupt);
+}
+
+/// EPG-U3 (unit): at most 256 approved paths per project and 4,096
+/// approval records; the next is `Limit`. Re-approving an approved path at
+/// the bound is accepted.
+#[test]
+fn epg_u3_approval_bounds_are_limit() {
+    let mut j = Journal::base();
+    for n in 0..MAX_PATH_APPROVALS as u64 {
+        j.append(approved(1000 + n, &format!(".git/hooks/h{n}"), 1));
+    }
+    let bound = j.bytes.clone();
+    j.append(approved(2000, ".git/hooks/h0", 2));
+    assert_eq!(guard(&j).approvals.len(), MAX_PATH_APPROVALS);
+    let mut over = Journal {
+        bytes: bound,
+        sequence: j.sequence - 1,
+        owner: 1,
+        digest: [0; 32],
+    };
+    over.digest = inspect(&over.bytes).unwrap().last_digest;
+    over.append(approved(2000, ".envrc", 2));
+    assert_eq!(inspect(&over.bytes).unwrap_err(), ReplayError::Limit);
+    // Approval records: revoke and re-approve one path up to the bound.
+    let mut j = Journal::base();
+    j.append(approved(1, ".envrc", 1));
+    let mut request = 2;
+    while request <= MAX_PATH_APPROVAL_RECORDS as u64 {
+        j.append(if request % 2 == 0 {
+            revoked(request, ".envrc")
+        } else {
+            approved(request, ".envrc", 1)
+        });
+        request += 1;
+    }
+    let view = guard(&j);
+    assert_eq!(view.approval_records, MAX_PATH_APPROVAL_RECORDS);
+    assert!(!view.has_room(PathAction::Approved, ".envrc"));
+    j.append(approved(request, ".envrc", 1));
+    assert_eq!(inspect(&j.bytes).unwrap_err(), ReplayError::Limit);
+}
