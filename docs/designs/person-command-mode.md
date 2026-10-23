@@ -2158,7 +2158,11 @@ journeys follow P3-E. Choices made in P4 and accepted:
   and reads again when the queue shows the command started.
 - **Refusal notices.** A refusal shows its whole text in the header notice,
   wrapped to the terminal width; it is never cut to half the width (P4-E
-  finding: at 80 to 120 columns the cut text lost the configuration key).
+  finding: at 80 to 120 columns the cut text lost the configuration key). A
+  notice that fits in half the width stays beside the header; a wider one wraps
+  on rows below the header, and the band, the lifecycle lines, the history and
+  the overlay move down. It takes at most `max(2, height / 3)` rows so the
+  composer keeps its place; a longer notice ends in `…` (P4-F).
 - **Draining exit.** A released `!!` entry shows the shell's exit:
   `↳ shell exited 0 · 1 background process writing`. The controller keeps the
   kind 5 exit in `JobView` while draining, and `JobEntry` carries `exit_kind`
