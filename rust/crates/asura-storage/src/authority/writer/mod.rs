@@ -93,6 +93,14 @@ pub enum Command {
     QueuePersonCommand {
         command: Box<PersonCommandQueued>,
     },
+    /// The recorded outcome of one request ID, or none: the live state
+    /// first, then the request index, so a request older than the replay
+    /// checkpoint is found too. Read only (secret store ordering rule 6:
+    /// a person command retry finds its kind 31 before any Keychain put,
+    /// P3-E2).
+    RequestOutcome {
+        request: Id,
+    },
     ReorderInput {
         request: Id,
         input: Id,
@@ -338,6 +346,8 @@ pub struct Reply {
     pub order_revision: Option<u64>,
     pub stale_order: bool,
     pub accepted_input_id: Option<Id>,
+    /// `RequestOutcome`: the request's recorded outcome, or none.
+    pub request_outcome: Option<RequestResult>,
     pub project_name: Option<String>,
     pub project_name_revision: Option<u64>,
     pub project_name_changed: Option<bool>,
@@ -677,7 +687,11 @@ impl WriterClient {
             {
                 return Err(Error::Invalid);
             }
-            Command::Initialize { request } if *request == [0; 16] => return Err(Error::Invalid),
+            Command::Initialize { request } | Command::RequestOutcome { request }
+                if *request == [0; 16] =>
+            {
+                return Err(Error::Invalid);
+            }
             Command::Register { request, location }
                 if *request == [0; 16] || location.len() > 4096 =>
             {

@@ -1298,6 +1298,13 @@ impl State {
                 };
                 return self.project_queue_reply(project, Some(input));
             }
+            Command::RequestOutcome { request } => {
+                self.state()?;
+                let outcome = self.read(|state, store| state.outcome(request, store))?;
+                let mut reply = self.reply();
+                reply.request_outcome = outcome;
+                return Ok(reply);
+            }
             Command::QueuePersonCommand { mut command } => {
                 let digest = request_digest(Request::QueuePersonCommand(command.request()))
                     .map_err(|_| Error::Invalid)?;
@@ -1496,10 +1503,18 @@ impl State {
             }
             Command::PrepareInput { input } => {
                 let state = self.state()?.clone();
-                if state.ready_input() != Some(input) {
+                // Replay's dispatch rule (PR2, PR4) with no active turn, not
+                // the lane head of `ready_input`: earlier person inputs of
+                // the lane need only their kind 26, so a message behind a
+                // released `!!` job dispatches. The released set is an
+                // owner overlay; the writer needs none of it (P3-E2).
+                let q = state.inputs.get(&input).ok_or(Error::Conflict)?.clone();
+                if state.active_operation.is_some()
+                    || q.kind == InputKind::Person
+                    || !state.input_ready(input)
+                {
                     return Err(Error::Conflict);
                 }
-                let q = state.inputs.get(&input).ok_or(Error::Invalid)?.clone();
                 let generation = state
                     .conversations
                     .get(&q.conversation)
