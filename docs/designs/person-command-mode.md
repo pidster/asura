@@ -2200,6 +2200,89 @@ Texts the earlier sections did not give word for word:
 | Exit confirmation | "N commands are queued or running; they stop when the service stops." |
 | Accepted | "Command queued", or "Command " followed by the entry's `waiting_text` |
 
+### Q qualification evidence
+
+Run on 2026-10-23 (packet Q, branch `q-qual` at `b4eb122`). Host: Mac16,6
+(Apple M4 Max), macOS 27.0 (26A428), Rust 1.98.0, Python 3.15.0, real
+`sandbox-exec`, Git, curl and Cargo. Every run used an isolated Asura home, a
+scratch HOME and a scratch keychain named through the `secret-store-keychain`
+seam. `security list-keychains -d user` showed only the login keychain before
+and after the runs; no `escapee.pl` process remained. The host was shared
+with other work (load average about 12).
+
+Commands, from the repository root with
+`ASURA_PROTOC=.build/dev-tools/protoc`:
+
+- Build: `cargo test --workspace --all-features --locked --no-run`.
+- Each selector twice in a row:
+  `python3 rust/crates/asura-cli/tests/tui_pty.py target/debug/deps/lifecycle-HASH SELECTOR`.
+- Gate: `cargo test -p asura-cli --all-features --locked --test lifecycle`.
+- Workspace: `cargo test --workspace --all-features --locked --no-fail-fast`.
+
+End-to-end results. "Runs" counts the passing runs; the selector runs were
+two in a row, and the gate ran each selector once more.
+
+| Case | Selector or method | Runs | Result |
+| --- | --- | --- | --- |
+| PC-E1, PC-E6, PC-E7, PC-E10, PC-E12 | `--person-commands` | 2 + gate | Pass |
+| PC-E2, PC-E3, PC-E11, PC-E13 to PC-E16 | `--person-outside` | 2 + gate | Pass |
+| PC-E4, PC-E5, PC-E17, PC-E18, PC-E19 | `--person-model` | 2 + gate | Pass; no PENDING line (`PENDING_P3E2` is false) |
+| PC-E8, PC-E9, PC-E20 | `--person-restart` | 2 + gate | Pass |
+| SS-E1, SS-E2 | `--person-secrets` | 2 + gate | Pass |
+| EPG-E1 to EPG-E4, PC-E21 | `--path-guard` | 2 + gate | Pass; the journey runs `cat build.rs`, because its PATH has no Cargo |
+| PC-E21 with `!cargo build` | By hand, PTY driver outside the tree | 2 | Pass: the warning row comes first, then the output; Cargo built the fixture crate (a toolchain clone in the fixture account's `.rustup`) |
+| EC-E2 | PC-E20 | 2 + gate | Pass |
+| EC-E4 | PC-E18 (survivor, lane release), PC-E17 (notice label), PC-U45 (audit flag) | 2 + gate | Pass |
+| SDE-03 | By hand, PTY driver outside the tree | 2 | Pass: double-quoted, single-quoted and `!!` bearer tokens reached a loopback fixture; log headers, `/jobs` and the viewer show `$ASURA_SECRET_1`; the single-quoted run is journaled as `eval "$ASURA_SECRET_COMMAND"`; no file in the scratch home holds a token; no Keychain item remains |
+| CLI lifecycle gate | `--test lifecycle` | 1 of 2 | Run 1 failed in `--segmented-journal` (`service stop` hit the fixture CLI deadline); that selector then passed 3 times alone, and run 2 of the gate passed |
+| Workspace | `--workspace --no-fail-fast` | 1 failure | `person_command_flow` `basic` (PC-I1) failed once; it then passed 3 times alone |
+
+The workspace failure is a test race, not a product fault. `basic` reads the
+audit log just after the changed retry's `request_conflict` reply. The
+service appends `person_command.refused` asynchronously; the retained home
+held it as sequence 6, written 2 ms after the job settled. Proposed fix, in
+the P3-E test: wait for the event, as `wait_for` does for records, before the
+assertion. The SDE-03 driver also showed that the `Pending local` queue row
+shows the typed command, token included, until the service receipt. This
+follows the [secret detection trust boundaries](secret-detection.md): the
+draft and the outbox hold the raw command. From the settled entry on, after a
+full redraw, the TUI drew no token.
+
+Threat model mapping, with the test that ran for each row:
+
+| Threat case | Covered by (file, case) | Gap |
+| --- | --- | --- |
+| PX-V1 | `asura-platform/tests/exec_cmd_process.rs` PC-I2, PC-I3; `asura-service/tests/person_command_flow.rs` `profile` (PC-I2 to PC-I5, PC-I36) | None |
+| PX-V2, PX-V9, PX-V11 | `exec_cmd_process.rs` EPG-I1; `asura-service/tests/path_guard_flow.rs` `model_change`, `approval`; `--path-guard` (EPG-E1 to EPG-E4); PC-E21 by hand | None |
+| PX-V3 | `exec_cmd_process.rs` PC-I4 (`~/.asura` read denied), PC-I5 (socket denied); `person_command_flow.rs` `outside_profile` (PC-I30 contrast); `--state-isolation` | None |
+| PX-V4 | `person_command_tests.rs` `path_sanitizer` (PC-U19) | No automated case plants an `ls` (PC-I1 does not). Run by hand twice: client PATH `.::bin:…`, a planted `ls` in the project; `!ls` ran `/bin/ls` and the planted file did not run |
+| PX-V5, PX-V17 | `tui/ui/person.rs` message-mode `!!ls` tests (PC-U37); `asura-control/src/conversation.rs` (PC-U55); `asura-control/tests/jobs.rs` and `asura-client` (J4T-01) | None |
+| PX-V6, PX-V15 | `person_command_flow.rs` `secrets` (PC-I28, SS-I1); SDE-03 by hand | None |
+| PX-V7 | `person_command_flow.rs` `stall` (PC-I18); `--person-restart` (PC-E9) | None |
+| PX-V8, PX-V16 | `asura-storage/src/audit/tests.rs` PC-U45, PC-U58 | None |
+| PX-V10 | Not selected | No case, by design |
+| PX-V12 | `person_command_flow.rs` `secrets` (whole-command form); SDE-03 by hand | PC-U48 has no test labelled with its ID; `secrets` and SDE-03 cover its single-quoted and in-command token forms, not the 17-token and `sh -c "…"` forms |
+| PX-V13 | `person_command_flow.rs` `outside_profile` (PC-I23, PC-I30); `--person-outside` (PC-E13, PC-E14) | None |
+| PX-V14 | `job_controller/tests.rs` (PC-U43); `person_command_flow.rs` `refusals` (PC-I31); `--person-outside` (PC-E15) | None |
+| PX-V18, PX-V19 | `person_command_flow.rs` `restart` (PC-I32, SS-I2), `lost` (SS-I6), `locked`, `orphan`; `secret_store/tests.rs` (SS-U2); `--person-secrets` | None |
+| EC-I9, EC-I10, EC-I13, EC-E2, EC-E4 | `exec_cmd_process.rs` EC-I9, EC-I10; `person_command_flow.rs` `survivors` (PC-I33, PC-I34, PC-I40); `--person-restart` (PC-E20); `--person-model` (PC-E18) | EC-I13 has no platform-layer test labelled with its ID; PC-I40 covers it through the service |
+| ES-08 | `person_command_flow.rs` `model` (PC-I39) | None |
+| J5T-06 (end to end) | `--person-model` (PC-E5, PC-E17, PC-E18) | None |
+
+Residuals named by this design:
+
+| Residual | Record or test | Status |
+| --- | --- | --- |
+| PC-P1 remaining mach-lookup denials | PC-I37 records them; P1 probe record above | Recorded, not asserted, as designed |
+| EXD-1 exposure: `!!` reaches Asura state | PC-I30 confirms it | Accepted (EXD-1) |
+| EXD-1: a `!!` survivor that scrubs its environment and leaves the group is not attributed (PT13) | No test; the lane waits for capture EOF and person cancel ends it (PC-I34) | Accepted (EXD-1) |
+| A new-session survivor that runs a platform binary is not attributed ([escapee residual](escapee-control.md)) | PC-E18 uses an in-group writer for this reason | Accepted |
+| SS-T8 copies of values inside the Security framework | No test possible | Accepted (EXD-3) |
+
+Gaps that remain: PC-U48 and EC-I13 have no tests labelled with their IDs, and
+PX-V4's planted `ls` has no automated case. The design does not mark these
+cases end to end, so their by-hand coverage above does not close the gap.
+
 ### Packet split
 
 Selected plan (2026-10-22). Each code packet owns its paths alone while it
