@@ -3790,6 +3790,7 @@ def execution_setting_journey(fixture, source):
         harness.command(first, "/jobs", handle[:8])
         first.until(b"execution_off", plain=True, limit=20)
         first.send(b"\x1b")
+        first.idle(0.2)
         # ES-04: the next exec_cmd is refused; nothing runs.
         harness.script[:] = [("exec_cmd", {"command": "printf ran > refused.txt"}), "REFUSED-DONE"]
         first.send(b"Try again.\r")
