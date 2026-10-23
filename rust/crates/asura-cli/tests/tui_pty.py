@@ -1270,8 +1270,14 @@ def managed_queue_reorder(fixture):
         trial.send(b"[")
         trial.until(b"Queue order updated", offset, plain=True, limit=12,
                     reject="Queue order changed")
-        screen = trial.screen.text()
-        assert screen.index("queue-reorder-second") < screen.index("queue-reorder-first"), screen
+        # The notice can arrive a frame before the reordered rows.
+        end = time.monotonic() + remaining(8)
+        while True:
+            screen = trial.screen.text()
+            if screen.index("queue-reorder-second") < screen.index("queue-reorder-first"):
+                break
+            assert time.monotonic() < end, screen
+            trial.read(0.025)
         trial.send(b"\x1b")
         trial.until("↑↓ recall".encode(), plain=True, limit=5)
         trial.send(b"/quit\r")
