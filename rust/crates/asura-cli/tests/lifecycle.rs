@@ -442,6 +442,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--job-viewer"),
         Some("--job-retention"),
         Some("--execution-setting"),
+        Some("--job-notices"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);

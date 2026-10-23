@@ -1775,6 +1775,10 @@ impl Index for CountingIndex<'_> {
         self.frames += 1;
         self.inner.frame_owner(locator)
     }
+    fn frame_command(&mut self, locator: &Locator) -> Result<(Hash, Record), ReplayError> {
+        self.frames += 1;
+        self.inner.frame_command(locator)
+    }
 }
 
 /// J5T-10 (unit, J5-E9): the notice read goes through the shared job
@@ -1816,6 +1820,29 @@ fn j5t_10_notice_read_reads_four_frames_per_settlement() {
                 .all(|s| s.listing.cancel.is_some())
         );
         assert_eq!(counting.frames, 36);
+        // Each listing carries its kind 28 header digest, read with the
+        // frame: SHA-256 of the kind and the payload bytes, with no second
+        // read for it (the 36 frames above).
+        for settlement in &notice.settlements {
+            let settled = settlement.listing.settled.clone().unwrap();
+            let frame = encode_frame(
+                &FrameContext {
+                    installation_id: [7; 16],
+                    transition_id: [8; 16],
+                    sequence: 9,
+                    prior_digest: [0; 32],
+                    expected_revision: 0,
+                    owner_generation: 1,
+                },
+                &Record::JobSettled(settled),
+            )
+            .unwrap();
+            let mut expected = sha2::Sha256::new();
+            expected.update(28u16.to_be_bytes());
+            expected.update(&frame[144..frame.len() - 40]);
+            let expected: Hash = expected.finalize().into();
+            assert_eq!(settlement.listing.settled_digest, Some(expected));
+        }
     };
     let through = h.state().sequence;
     count(&mut h, 0, through);

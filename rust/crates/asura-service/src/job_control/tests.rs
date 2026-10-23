@@ -215,6 +215,7 @@ impl Journal {
                             cancel_frame: Locator::NONE,
                             settled: None,
                             settled_frame: Locator::NONE,
+                            settled_digest: None,
                             command: Locator::NONE,
                             excerpt: journal::command_excerpt(&command),
                             retention: Default::default(),

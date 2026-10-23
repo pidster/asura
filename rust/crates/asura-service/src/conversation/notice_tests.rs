@@ -6,7 +6,7 @@ use crate::context::{Budget, compose_turn};
 use asura_platform::RuntimeDirectory;
 use asura_storage::authority::conversation::{
     ArgumentForm, CaptureReason, CaptureStream, JobCaptureState, JobCleanup, JobIntent, JobListing,
-    JobOrigin, JobOutcome, JobReason, JobStream, Locator, NoticeSettlement, ToolCall,
+    JobOrigin, JobOutcome, JobReason, JobSettled, JobStream, Locator, NoticeSettlement, ToolCall,
     ToolCallSource, ToolDecision, ToolOperation,
 };
 use sha2::{Digest, Sha256};
@@ -118,6 +118,7 @@ fn settlement(n: u64, sequence: u64, arguments: &str) -> NoticeSettlement {
                 sequence,
                 ..Locator::NONE
             },
+            settled_digest: Some(payload_digest(&settled(&intent, n as u32))),
             command: Locator::NONE,
             excerpt: String::new(),
             retention: Default::default(),
@@ -153,6 +154,18 @@ fn payload_digest(settled: &JobSettled) -> Hash {
     h.update(28u16.to_be_bytes());
     h.update(&frame[144..frame.len() - 40]);
     h.finalize().into()
+}
+
+/// A settlement read without its kind 28 header digest is `Job` (J5-E10):
+/// the owner never derives the digest itself.
+#[test]
+fn a_settlement_without_its_header_digest_is_a_job_error() {
+    let mut missing = settlement(1, 20, &arguments("cargo test", None));
+    missing.listing.settled_digest = None;
+    assert_eq!(
+        build(CONVERSATION, &inputs(vec![missing], 0)).err(),
+        Some(NoticeError::Job)
+    );
 }
 
 /// The owner reads command and cwd from the kind 14 and orders entries by

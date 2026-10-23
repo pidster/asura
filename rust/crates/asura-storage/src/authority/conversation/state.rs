@@ -55,6 +55,9 @@ pub trait Index {
     /// The verified record at a locator with the owner generation of its
     /// frame header (J2: kind 26 at checkpoint load).
     fn frame_owner(&mut self, locator: &Locator) -> Result<(u64, Record)>;
+    /// The verified record at a locator with the command digest of its
+    /// frame header (J5: the notice entry's source digest).
+    fn frame_command(&mut self, locator: &Locator) -> Result<(Hash, Record)>;
 }
 
 /// The last activity a frame recorded, for sensors (not checkpointed).
@@ -2497,11 +2500,11 @@ impl Replay {
                 _ => return Err(ReplayError::Corrupt),
             }
         };
-        let settled = if settled_frame.is_none() {
-            None
+        let (settled, settled_digest) = if settled_frame.is_none() {
+            (None, None)
         } else {
-            match index.frame(&settled_frame)? {
-                Record::JobSettled(s) if s.job == job => Some(s),
+            match index.frame_command(&settled_frame)? {
+                (digest, Record::JobSettled(s)) if s.job == job => (Some(s), Some(digest)),
                 _ => return Err(ReplayError::Corrupt),
             }
         };
@@ -2529,6 +2532,7 @@ impl Replay {
             cancel_frame,
             settled,
             settled_frame,
+            settled_digest,
             command,
             excerpt,
             retention: self.job_retention_summary(job, index)?,
@@ -3115,6 +3119,9 @@ impl Index for MemoryIndex<'_> {
     fn frame_owner(&mut self, locator: &Locator) -> Result<(u64, Record)> {
         let (context, record, _) = authority::verified_frame(self.bytes(locator)?, locator)?;
         Ok((context.owner_generation, record))
+    }
+    fn frame_command(&mut self, locator: &Locator) -> Result<(Hash, Record)> {
+        authority::verified_command(self.bytes(locator)?, locator)
     }
 }
 

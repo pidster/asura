@@ -2146,6 +2146,10 @@ pub struct JobListing {
     pub settled: Option<Box<JobSettled>>,
     /// `Locator::NONE` while unsettled.
     pub settled_frame: Locator,
+    /// The command digest of the kind 28 frame header, read with it: the
+    /// job notice entry's source digest (J5 manifest). `None` while
+    /// unsettled.
+    pub settled_digest: Option<Hash>,
     /// The command source: the model call's kind 14 (a person job's kind
     /// 31 after P2). Command, cwd and excerpt are read from it.
     pub command: Locator,

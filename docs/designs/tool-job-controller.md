@@ -6053,7 +6053,7 @@ has neither kind. The composer revision is 2 from this change
 
 | Item | Rule or limit |
 | --- | --- |
-| AE-01, AE-02 | The settlement read and frame reads run on the journal worker inside `Prepare`; rendering is pure on the reactor. Each `NoticeSettlement` carries `settled_digest`, the command digest copied from its kind 28 frame header during the read; the service never re-encodes a record to find it (one source) |
+| AE-01, AE-02 | The settlement read and frame reads run on the journal worker inside `Prepare`; rendering is pure on the reactor. Each settlement's `JobListing` carries `settled_digest`, the command digest taken from its kind 28 frame header by the same frame read (`Index::frame_command`); the service never re-encodes a record to find it (one source) |
 | AE-03 | At most 9 settlements read through the shared job listing read (J5-E9), each with its kind 26, kind 27 when present, kind 28 and command source frames: at most 36 frames, at most 627,732 bytes with kind 14 sources (9 × (225 + 203 + 4,270 + 65,050)). Index reads: one `U` range of 9 entries, and per job its `W` entry and at most 65 `E` entries for the retention summary. The kind 27 read stays because the notice and `job list` share one listing read; a notice-only copy would be a second implementation for 9 frames of 203 bytes |
 | AE-04 | No time bound; `Prepare` ends on its reply, cancel or fence |
 | Entries | 8 per notice; one overflow line; one live line |
