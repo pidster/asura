@@ -429,8 +429,11 @@ pub(super) struct Worker {
     /// Test hook run inside `poll_request` between its two reads of the
     /// request thread, to pin an interleaving without timing.
     #[cfg(test)]
-    between_reads: Option<Box<dyn FnMut(&JoinHandle<()>)>>,
+    between_reads: Option<BetweenReads>,
 }
+/// See `Worker::between_reads`.
+#[cfg(test)]
+type BetweenReads = Box<dyn FnMut(&JoinHandle<()>)>;
 impl Worker {
     pub fn set_notice(&mut self, notice: Notice) {
         self.notice = notice;
