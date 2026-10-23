@@ -74,9 +74,10 @@ pub(crate) fn scan(
             }
             oneofs.push(oneof);
         }
-        // Repeated messages and bytes have one element per key; repeated
-        // scalars are one packed segment or unpacked keys, never both.
-        if field.repeated && !matches!(field.kind, Kind::Message(_) | Kind::Bytes) {
+        // Repeated messages, bytes and strings have one element per key;
+        // repeated scalars are one packed segment or unpacked keys, never
+        // both.
+        if field.repeated && !matches!(field.kind, Kind::Message(_) | Kind::Bytes | Kind::String) {
             let mode = if wire == 2 { 2 } else { 1 };
             if repeated_mode[index] != 0 && (repeated_mode[index] != mode || mode == 2) {
                 return Err(ProtocolError::MalformedWire);
@@ -107,7 +108,7 @@ pub(crate) fn scan(
                     }
                     scan(value, child, depth + 1, tables)?;
                 }
-                Kind::Bytes if field.repeated => {
+                Kind::Bytes | Kind::String if field.repeated => {
                     counts[index] += 1;
                     if counts[index] > field.repeated_limit {
                         return Err(ProtocolError::MalformedWire);
@@ -130,7 +131,7 @@ pub(crate) fn scan(
         }
         if counts[index] > 16
             && field.repeated
-            && !matches!(field.kind, Kind::Message(_) | Kind::Bytes)
+            && !matches!(field.kind, Kind::Message(_) | Kind::Bytes | Kind::String)
         {
             return Err(ProtocolError::MalformedWire);
         }

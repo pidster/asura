@@ -642,6 +642,7 @@ fn job_inspect_and_detail_bounds() {
             .map(|i| note(1 + i % 2, &"n".repeat(jobs::MAX_JOB_NOTE_BYTES)))
             .collect(),
         error: None,
+        path_warnings: Vec::new(),
     };
     // The largest detail fits one frame.
     assert!(reply_ok(Body::JobDetail(detail.clone())));

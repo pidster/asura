@@ -66,6 +66,12 @@ message Envelope {
     // Person command mode (person-command-mode.md, control API additions).
     // Replied to with ConversationQueueReply.
     ConversationQueueCommandSubmit conversation_queue_command_submit = 68;
+    // Execution path guard (execution-path-guard.md, control messages).
+    // List, Approve and Revoke are replied to with PathGuardReply.
+    PathGuardList path_guard_list = 69;
+    PathGuardReply path_guard_reply = 70;
+    PathGuardApprove path_guard_approve = 71;
+    PathGuardRevoke path_guard_revoke = 72;
   }
   // Removed operations: direct ConversationSubmit (22) and its reply (23), and
   // the target-bearing ConversationEnqueue (35). Conversation input uses the queue.
@@ -452,6 +458,10 @@ message ConversationQueueEntry {
   optional QueueWaitReason waiting_reason = 18; // live, Queued only; never journaled
   optional string waiting_text = 19;            // brief text with live numbers, at most 128 bytes
   optional bool command_filtered = 20;          // display-only copy of a whole-command input
+  // Execution path guard (kind 3 only): the warnings shown before the
+  // command, at most 16, and the count of warnings not listed.
+  repeated PathWarning path_warnings = 21;
+  optional uint32 path_overflow = 22;
 }
 enum QueueWaitReason {
   QUEUE_WAIT_REASON_UNSPECIFIED = 0;
@@ -470,7 +480,7 @@ enum QueueWaitReason {
   QUEUE_WAIT_REASON_KEYCHAIN_UNAVAILABLE = 12;// "waiting: Keychain unavailable"
   QUEUE_WAIT_REASON_KEYCHAIN_BUSY = 13;       // "waiting: Keychain requests queued"
   QUEUE_WAIT_REASON_HELD_HEAD = 14;           // "waiting: an earlier input is held"
-  // 15 PATH_CHECK and entry fields 21-22 are added by P5 (execution-path-guard.md).
+  QUEUE_WAIT_REASON_PATH_CHECK = 15;          // "waiting: path check" (execution-path-guard.md)
 }
 message ConversationQueueReply {
   repeated ConversationQueueEntry entries = 1;
@@ -483,6 +493,31 @@ message ConversationQueueReply {
   optional bytes accepted_input_id = 8; // new Submit receipt within the bounded projection
   optional QueueRefusal refusal = 9;     // a definite refusal; nothing was queued or stored
   optional uint32 refusal_status = 10;   // with SECRET_STORE_UNAVAILABLE: |OSStatus|
+}
+// Execution path guard (execution-path-guard.md, control messages), part of
+// capability 8. Paths are project-relative and display-redacted.
+message PathGuardList { optional bytes project_id = 1; }
+// `all` takes no `path`: every implicit-execution file shown as not approved
+// or changed since approval.
+message PathGuardApprove {
+  optional bytes request_id = 1;
+  optional bytes project_id = 2;
+  optional string path = 3;
+  optional bool all = 4;
+}
+message PathGuardRevoke {
+  optional bytes request_id = 1;
+  optional bytes project_id = 2;
+  optional string path = 3;
+}
+// kind: 1 model_changed, 2 not_approved, 3 changed_since_approval,
+// 4 too_large, 5 overflow.
+message PathWarning { optional uint32 kind = 1; optional string path = 2; }
+message PathGuardReply {
+  repeated PathWarning pending = 1;   // what the next person command would show, at most 16
+  optional uint32 overflow = 2;       // pending warnings not listed
+  repeated string approved = 3;       // at most 256 approved paths, in byte order
+  optional string error = 4;          // not_found, path_invalid, too_large, not_implicit, limit, busy, unavailable
 }
 enum QueueRefusal {
   QUEUE_REFUSAL_UNSPECIFIED = 0;
@@ -717,6 +752,7 @@ message JobDetail {
   optional string cwd = 3;
   repeated JobNote notes = 4;           // at most 16, oldest first
   optional string error = 5;
+  repeated PathWarning path_warnings = 6; // person jobs: from the kind 32 acknowledgement, at most 16
 }
 message JobNote { optional uint32 author = 1; optional uint64 unix_ms = 2; optional string text = 3; }
 message JobRead {

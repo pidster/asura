@@ -1696,6 +1696,7 @@ mod tests {
                 text: Some("model note".into()),
             }],
             error: None,
+            path_warnings: Vec::new(),
         })
     }
     fn jobs_capabilities() -> Vec<i32> {

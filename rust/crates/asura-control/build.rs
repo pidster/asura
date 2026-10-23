@@ -133,8 +133,14 @@ fn tables(
                 _ => return Err("unsupported descriptor field type".into()),
             };
             let repeated = field.label() == Label::Repeated;
-            // Repeated bytes are IDs, one length-delimited element each.
-            if repeated && !matches!(field.r#type(), Type::Enum | Type::Message | Type::Bytes) {
+            // Repeated bytes are IDs and repeated strings are names, one
+            // length-delimited element each.
+            if repeated
+                && !matches!(
+                    field.r#type(),
+                    Type::Enum | Type::Message | Type::Bytes | Type::String
+                )
+            {
                 return Err("unsupported repeated field".into());
             }
             let repeated_limit = match (name.as_str(), field.name()) {
@@ -157,6 +163,11 @@ fn tables(
                 (".asura.control.v1.ConversationQueueCommandSubmit", "launch_environment") => {
                     32_768
                 }
+                // Execution path guard: 16 listed warnings, 256 approvals.
+                (".asura.control.v1.PathGuardReply", "pending") => 16,
+                (".asura.control.v1.PathGuardReply", "approved") => 256,
+                (".asura.control.v1.ConversationQueueEntry", "path_warnings") => 16,
+                (".asura.control.v1.JobDetail", "path_warnings") => 16,
                 // Two entries per shown turn; the context composer bounds segments.
                 (".asura.model.v1.ModelInput", "history") => 2048,
                 _ => 32,
