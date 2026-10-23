@@ -2096,7 +2096,7 @@ impl State {
                 source: HistorySource::Person { input },
             });
         }
-        entries.sort_by(|a, b| b.accepted_frame.cmp(&a.accepted_frame));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.accepted_frame));
         if entries
             .windows(2)
             .any(|pair| pair[0].accepted_frame == pair[1].accepted_frame)
