@@ -9,8 +9,9 @@
 //! records with P from the previous kind 21 and S and the live count from
 //! the turn's kind 21), J5T-05 (small window: reference lines), J5T-07
 //! (raw-byte sweep of model input), J5T-08 (forged lines only on `  | `
-//! lines) and J5T-09 (inconsistent notice inputs fail the turn as a repair
-//! case and keep the input).
+//! lines), J5T-12 (`later`: notices in later turns, model jobs) and
+//! J5T-09 (inconsistent notice inputs fail the turn as a repair case and
+//! keep the input).
 #[path = "support/job_fixture.rs"]
 mod job_fixture;
 #[path = "support/queue_submit.rs"]
@@ -655,6 +656,119 @@ fn restart() -> Result<()> {
     );
     Ok(())
 }
+/// The reference line of a model job that exited 0 with complete capture
+/// (tool-job-controller.md, fidelity), from its kind 28.
+fn oracle_reference(job: [u8; 16], facts: &JobSettled) -> String {
+    assert_eq!(
+        (facts.outcome, facts.reason),
+        (JobOutcome::Exited, JobReason::None)
+    );
+    assert_eq!(facts.exit_value, 0);
+    format!(
+        "[job {}: you, exit 0; stdout {} bytes; stderr {} bytes]\n",
+        hex(&job),
+        facts.stdout.capture.stored_bytes,
+        facts.stderr.capture.stored_bytes
+    )
+}
+/// The history user entry that ends with `prompt`, exactly one.
+fn history_entry(chat: &Value, prompt: &str) -> Result<String> {
+    let mut all = messages(chat);
+    all.pop();
+    let found: Vec<String> = all
+        .into_iter()
+        .filter(|(role, text)| role == "user" && text.ends_with(prompt))
+        .map(|(_, text)| text)
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        _ => Err(format!("{} history entries end with {prompt:?}", found.len()).into()),
+    }
+}
+
+/// J5T-12 (integration, model jobs; tool-job-controller.md "Notices in
+/// later turns"): a turn's notice with one model job entry and one live
+/// job is rebuilt in later turns' history at reference fidelity with the
+/// stored S and live count, though the live job has since settled; the
+/// turn after it shows its own full entry and, later, its rebuilt
+/// reference without a live line. Checked before and after a crash and
+/// restart, with each input digest bound in its kind 21.
+fn later() -> Result<()> {
+    let (mut fixture, model, project) = setup("later")?;
+    let quick = "printf quick";
+    let slow = "sleep 4; printf slow";
+    model.script(&[
+        call("exec_cmd", json!({"command": quick})),
+        call("exec_cmd", json!({"command": slow, "yield_seconds": 0})),
+        Step::Final,
+    ]);
+    let first = fixture.submit(project, "Two jobs.")?;
+    fixture.finish(first, Duration::from_secs(60))?;
+    let (quick_job, slow_job) = (job_of(first, 1, 1), job_of(first, 1, 2));
+    let (_, quick_facts) = wait_settled(&fixture, quick_job)?;
+    let second = fixture.follow(project, first, "Status?")?;
+    fixture.finish(second, Duration::from_secs(60))?;
+    let (_, second_turn) = accepted(&fixture, second)?;
+    assert_eq!(second_turn.composition.notice_live, 1, "slow live at S");
+    let (_, slow_facts) = wait_settled(&fixture, slow_job)?;
+    // The second turn's notice as later turns carry it: the stored live
+    // count 1 though the slow job has settled.
+    let rebuilt_second = format!(
+        "<asura-context>\n{HEADER}\n{}{LIVE_ONE}\n</asura-context>\n\nStatus?",
+        oracle_reference(quick_job, &quick_facts)
+    );
+    let rebuilt_third = format!(
+        "<asura-context>\n{HEADER}\n{}</asura-context>\n\nAnd the other?",
+        oracle_reference(slow_job, &slow_facts)
+    );
+    // The third turn: its own notice holds the slow job's full entry; its
+    // history holds the second turn's rebuilt notice.
+    let before = model.chat_count();
+    let third = fixture.follow(project, second, "And the other?")?;
+    let event = fixture.finish(third, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    let chat = first_chat(&model, before);
+    assert_eq!(
+        user_text(&chat),
+        format!(
+            "<asura-context>\n{HEADER}\n{}</asura-context>\n\nAnd the other?",
+            oracle_entry(slow, ".", slow_job, &slow_facts)
+        )
+    );
+    assert_eq!(history_entry(&chat, "Status?")?, rebuilt_second, "J5T-12");
+    assert_eq!(history_entry(&chat, "Two jobs.")?, "Two jobs.");
+    let (_, third_turn) = accepted(&fixture, third)?;
+    assert_eq!(input_digest(&chat)?, third_turn.input_digest);
+    assert_eq!(third_turn.composition.composer_revision, 3);
+    // Crash and restart; the fourth turn rebuilds both notices from the
+    // journal and has none of its own.
+    fixture.crash()?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    let before = model.chat_count();
+    model.script(&[Step::Final]);
+    let fourth = fixture.follow(project, third, "After restart?")?;
+    let event = fixture.finish(fourth, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    let chat = first_chat(&model, before);
+    assert_eq!(user_text(&chat), "After restart?");
+    assert_eq!(
+        history_entry(&chat, "Status?")?,
+        rebuilt_second,
+        "after restart"
+    );
+    assert_eq!(history_entry(&chat, "And the other?")?, rebuilt_third);
+    let (_, fourth_turn) = accepted(&fixture, fourth)?;
+    assert_eq!(input_digest(&chat)?, fourth_turn.input_digest);
+    let sent = serde_json::to_string(&chat)?;
+    for absent in ["command: printf quick", "command: sleep 4", MODEL_LABEL] {
+        assert!(!sent.contains(absent), "{absent} in {sent}");
+    }
+    println!(
+        "PASS J5T-12 integration (model jobs): later turns before and after a crash held each earlier input with its notice rebuilt at reference fidelity, with the stored live count, digests bound"
+    );
+    Ok(())
+}
 /// J5T-05 (integration): with a window too small for the full entry, the
 /// model gets the entry's reference line and the turn completes.
 fn small_window() -> Result<()> {
@@ -809,10 +923,11 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
         ("idle", idle),
         ("race", race),
         ("restart", restart),
+        ("later", later),
         ("window", small_window),
         ("invalid", invalid),
     ];

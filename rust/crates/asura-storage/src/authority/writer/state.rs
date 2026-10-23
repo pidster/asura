@@ -1889,6 +1889,7 @@ impl State {
                 let config = self.config()?;
                 let mut history = Vec::new();
                 let mut omitted = 0;
+                let mut history_notices = Vec::new();
                 let notice = if let Some(id) = conversation {
                     let found = self
                         .read(|state, store| state.find_conversation(id, store))?
@@ -1897,6 +1898,22 @@ impl State {
                         return Err(Error::Conflict);
                     }
                     (history, omitted) = self.history(id)?;
+                    // Each prior turn the composer can show carries the
+                    // notice it had (notices in later turns): at most 9
+                    // settlements per turn, P from the earlier `T` entry,
+                    // S and the live count from its kind 21.
+                    for (prior, _) in history.iter().take(MAX_COMPOSED_PRIOR) {
+                        let composition = &prior.composition;
+                        history_notices.push(self.read(|state, store| {
+                            state.prior_notice(
+                                id,
+                                prior.generation,
+                                composition.notice_through,
+                                composition.notice_live,
+                                store,
+                            )
+                        })?);
+                    }
                     // The notice read: P from the previous kind 21, S the
                     // last committed sequence, on this worker (J5 AE-01).
                     let after = found.latest.map_or(0, |turn| turn.notice_through);
@@ -1921,6 +1938,7 @@ impl State {
                     history,
                     omitted,
                     notice,
+                    history_notices,
                 });
                 return Ok(reply);
             }

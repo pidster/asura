@@ -6,6 +6,7 @@ fn turn(generation: u64, size: usize) -> Candidate {
         generation,
         prompt: format!("question {generation} {}", "q".repeat(size)),
         answer: format!("answer {generation} {}", "a".repeat(size)),
+        notice: Notice::none([0; 16], 0),
     }
 }
 fn budget(window_tokens: u32) -> Budget {

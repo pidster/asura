@@ -44,6 +44,8 @@ fn candidates(history: &[(journal::TurnAccepted, journal::TurnTerminal)]) -> Vec
             generation: accepted.generation,
             prompt: accepted.prompt.clone(),
             answer: terminal.text.clone(),
+            // No jobs in these conversations: every rebuilt notice is empty.
+            notice: Notice::none(accepted.conversation, accepted.composition.notice_through),
         })
         .collect()
 }

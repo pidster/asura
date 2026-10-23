@@ -6,8 +6,10 @@
 //! (AE-01); this runs on the reactor over at most
 //! [`journal::MAX_NOTICE_SETTLEMENTS`] settlements, each re-encoding one
 //! kind 28 of at most a few KiB and parsing one kind 14 argument object.
-use crate::context::{Notice, NoticeError, NoticeInputs, Settlement};
-use asura_storage::authority::conversation::{self as journal, Hash, Id, JobNotice};
+use crate::context::{Candidate, Notice, NoticeError, NoticeInputs, Settlement};
+use asura_storage::authority::conversation::{
+    self as journal, Hash, Id, JobNotice, PriorNotice, TurnAccepted, TurnTerminal,
+};
 
 /// The stored command, cwd, kind 28 command digest and `!!` flag of one
 /// settlement.
@@ -80,6 +82,70 @@ pub(super) fn build(conversation: Id, inputs: &JobNotice) -> Result<Notice, Noti
         })
         .collect();
     Notice::build(&NoticeInputs {
+        conversation,
+        previous: inputs.after,
+        through: inputs.through,
+        settlements: &settlements,
+        live: inputs.live,
+    })
+}
+
+/// The composer's candidates from the `Prepare` history (newest first),
+/// each with the notice it had when it ran (tool-job-controller.md,
+/// notices in later turns; CCR15). `notices` holds the notice inputs of
+/// the first `history` turns in the same order (`Prepared.history_notices`);
+/// a turn past them is beyond the shown-turn bound and gets no notice.
+/// Each notice is built from the writer's reference facts by the same
+/// selection and checks as the turn's own notice, so a `NoticeError` is
+/// the same journal repair case (J5-E10).
+pub(super) fn candidates(
+    conversation: Id,
+    history: Vec<(TurnAccepted, TurnTerminal)>,
+    notices: &[PriorNotice],
+) -> Result<Vec<Candidate>, NoticeError> {
+    let mut out = Vec::with_capacity(history.len());
+    for (index, (prior, terminal)) in history.into_iter().enumerate() {
+        let notice = match notices.get(index) {
+            Some(inputs) => {
+                // The inputs are the turn's own kind 21 facts.
+                if inputs.through != prior.composition.notice_through
+                    || inputs.live != prior.composition.notice_live
+                {
+                    return Err(NoticeError::Range);
+                }
+                prior_notice(conversation, inputs)?
+            }
+            None => Notice::none(conversation, prior.composition.notice_through),
+        };
+        out.push(Candidate {
+            operation: prior.operation,
+            generation: prior.generation,
+            prompt: prior.prompt,
+            answer: terminal.text,
+            notice,
+        });
+    }
+    Ok(out)
+}
+
+/// A prior turn's reference-only notice from its fixed-size facts.
+fn prior_notice(conversation: Id, inputs: &PriorNotice) -> Result<Notice, NoticeError> {
+    let mut settlements = Vec::with_capacity(inputs.settlements.len());
+    for settlement in &inputs.settlements {
+        if settlement.settled.job != settlement.job {
+            return Err(NoticeError::Job);
+        }
+        settlements.push(Settlement {
+            sequence: settlement.sequence,
+            digest: settlement.digest,
+            intent: &settlement.intent,
+            settled: &settlement.settled,
+            outside_sandbox: settlement.outside_sandbox,
+            command: "",
+            directory: "",
+        });
+    }
+    Notice::reference_only(&NoticeInputs {
         conversation,
         previous: inputs.after,
         through: inputs.through,

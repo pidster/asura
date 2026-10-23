@@ -2172,16 +2172,16 @@ impl Owner {
         drop(inputs);
         // The composer runs when the model reports its window (context-composer.md).
         let prepared_omitted = prepared.omitted;
-        let candidates = prepared
-            .history
-            .into_iter()
-            .map(|(prior, terminal)| crate::context::Candidate {
-                operation: prior.operation,
-                generation: prior.generation,
-                prompt: prior.prompt,
-                answer: terminal.text,
-            })
-            .collect();
+        // Each prior turn carries the notice it had (notices in later turns).
+        let candidates = notice::candidates(
+            queued.conversation,
+            prepared.history,
+            &prepared.history_notices,
+        )
+        .map_err(|error| {
+            tracing::warn!(variant = ?error, "job_notice_invalid");
+            "authority_repair_required"
+        })?;
         let tools_enabled =
             ENABLE_PROJECT_TOOLS && crate::model::project_tools_allowed(&prepared.model);
         let turn = journal::TurnAccepted {
