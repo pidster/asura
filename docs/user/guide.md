@@ -339,6 +339,12 @@ You can also type `/config set model SELECTOR`. The selectors are:
 Asura does not download missing model files. Ollama must run on this computer;
 by default Asura uses `http://127.0.0.1:11434`.
 
+The first time a Core AI model starts, macOS compiles it and keeps the result
+in `~/Library/Caches/coreai-cache/<macOS build>/com.pidster.asura.model`. This
+cache can use about 2 GB or more for each macOS build. Later starts reuse it.
+macOS owns the cache, and Asura does not delete it; you can delete the folder
+to free space, and the next start compiles the model again.
+
 ### Thinking level
 
 Some models can think before they answer. The thinking level sets how much:
