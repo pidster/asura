@@ -3859,7 +3859,7 @@ An out-of-range integer is 9 `out_of_range`; a wrong JSON type is 8 `wrong_type`
 | Code | Command | Behavior | Ends on |
 | --- | --- | --- | --- |
 | 11 | `list` | Up to 8 jobs of the turn's conversation, any origin, newest first by kind 26 sequence, from before `before` when given. Each entry: handle, origin, command excerpt, state or outcome, bytes per stream and unread bytes | The journal worker's reply |
-| 12 | `status` | One job's [state block](#model-result-text) | At once for a live job; the journal reply for a settled one |
+| 12 | `status` | One job's [state block](#model-result-text) | The journal's `JobFacts` reply (as for codes 13–16: it supplies the conversation scope, origin, stored command, SL7 flag and retention counts), then at once for a live job; for a settled one the same reply carries kind 28 |
 | 13 | `read` | One text page of at most `limit` source bytes from `offset`, under the page contract; moves the turn cursor to the page's end | The page reply; turn cancel discards it |
 | 14 | `wait` | Returns at once if the job is settled. Otherwise waits for kind 28, for either stream's stored bytes to pass their values at the call, or for `seconds` | Those events, or turn cancel |
 | 15 | `cancel` | Requests cancellation of a model-origin job with requester model, reason 1 `model_cancel`; returns the state after the request. It never claims that the process stopped | At once |
@@ -3872,7 +3872,9 @@ job exists elsewhere. `cancel` of a person-origin job gives `not_permitted`
 (PC10). Each command needs the turn's `read_authorized` grant and runs the tool
 executor's existing project identity recheck first; a mismatch revokes the
 project's jobs with `identity_changed` (J2-E10) and the call gets `not_found`.
-`cancel` and `note` are allowed while execution is off (ES-E3). A `job` call
+`cancel` and `note` are allowed while execution is off (ES-E3). Codes 12–16
+first read the job's `JobFacts` from the journal worker; the scope check and
+`not_found` use that reply, so no job fact is kept twice in service memory. A `job` call
 for a remote destination is `denied`, as exec_cmd, memory and audit calls
 are: job state and output never go to a remote destination (recorded
 2026-10-22 from the J3-R report).
@@ -5482,8 +5484,30 @@ APFS image with a file deleted outside Asura), J34E-13 through the TUI,
 J34E-15, J3T-18 and J4T-12 (typing and Inspect within 100 ms under 8
 followers or a 16-job flood), J2T-18 and J2T-19 measurements, SDI-13 through
 a gated warm thread, J34E-02 and J34E-12 on a native model, and EX10's 5
-runs per provider. The outlived count of a terminal read after a service
-restart is absent: the owner keeps it in memory for the last 64 terminals.
+runs per provider.
+
+Deviations found by the packet and settled (2026-10-23):
+
+- The outlived count of a terminal read after a service restart was absent,
+  because the owner kept it in memory for the last 64 terminals. This breaks
+  the derivation rule above and the restore rule of the EX12 notice. Packet
+  J34-E2 derives it from the records at each terminal read (J4T-08).
+- With no job controller (the controller failed to start or is stopping),
+  every J4 request gets `unavailable`, including lists of settled jobs. This
+  is the intended rule: settled-job reads need the controller's view of
+  retention and live state, and a partial list would misstate them.
+- TJ-F5's integration case cannot use an invalid `config.yaml`, because that
+  also blocks turn preparation. The case uses a `test-support` gate file read
+  only in `test-support` builds.
+- `JobView.excerpt` needs `StartRequest.stored_command` and retired jobs keep
+  their kind 28 (`settled_facts`) in `job_controller*`, beyond the J34-E row's
+  `port.rs`. The change is accepted under the J34-E row.
+- The audit codec (`asura-control/src/audit_query.rs`) accepted tool codes
+  1–10 only and now accepts 1–16, so the control contract's audit range follows
+  [the audit job values](#audit-of-job-tool-calls).
+- `ToolProgress.exit_code` is absent for job-mode `exec_cmd` calls: a value
+  from controller memory differed after a restart, and a tool-record view does
+  not read kind 28. The viewer and `job status` show the exit.
 
 ## J3 and J4 code packets
 
