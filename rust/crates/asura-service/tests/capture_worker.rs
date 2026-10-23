@@ -872,6 +872,67 @@ fn disk_image() -> Result<()> {
     Ok(())
 }
 
+/// J3T-22 (TJ-Q10, integration): a real flood of 64 chunks through a
+/// capture worker on a real store with a test wake, read as the reactor
+/// reads it (clear the signal, then read `Ledger::stored`, then wait for a
+/// wake). After the last append a wake arrives and the stored bytes equal
+/// the bytes written: no stored advance is lost.
+fn stored_signal() -> Result<()> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    const CHUNKS: usize = 64;
+    const CHUNK: usize = 4096;
+    let home = Home::new("stored")?;
+    let (reader, wake) = asura_platform::events::wake_pair()?;
+    // SAFETY: `reader` owns the descriptor and outlives this borrow.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(reader.as_raw_fd()) };
+    let mut wakes = std::os::unix::net::UnixStream::from(borrowed.try_clone_to_owned()?);
+    let mut take_wake = || {
+        let mut bytes = [0u8; 64];
+        matches!(wakes.read(&mut bytes), Ok(n) if n > 0)
+    };
+    let (_, mut probe) =
+        asura_service::test_support::StoredProbe::start(home.store.clone(), home.installation, wake)?;
+    let mut line = vec![b'a'; CHUNK - 1];
+    line.push(b'\n');
+    let expected = (CHUNKS * CHUNK) as u64;
+    let end = Instant::now() + Duration::from_secs(60);
+    let mut sent = 0;
+    while sent < CHUNKS {
+        if probe.room(CHUNK) {
+            probe.append_stdout(&line);
+            sent += 1;
+        } else {
+            take_wake();
+            probe.turn();
+            if Instant::now() >= end {
+                return Err("no room".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    // Every chunk is accepted: the reactor now waits only for a wake.
+    let mut seen = probe.turn();
+    let mut woken = 0;
+    while seen < expected {
+        if Instant::now() >= end {
+            return Err(format!("stored {seen} of {expected} with no further wake").into());
+        }
+        if take_wake() {
+            woken += 1;
+            seen = probe.turn();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(seen, expected, "Ledger::stored equals the bytes written");
+    probe.finish();
+    println!(
+        "PASS J3T-22 flood of {CHUNKS} chunks: {woken} wake(s) after the last append, Ledger::stored {seen} equals the bytes written"
+    );
+    Ok(())
+}
+
 type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
@@ -886,7 +947,7 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 14] = [
+    let cases: [Case; 15] = [
         ("full", full_capture),
         ("split", split_secret),
         ("klb", key_long_binary),
@@ -901,6 +962,7 @@ fn main() {
         ("quota", quota_expiry),
         ("pages", pages),
         ("disk", disk_image),
+        ("stored", stored_signal),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

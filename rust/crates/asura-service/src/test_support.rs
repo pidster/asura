@@ -26,6 +26,70 @@ pub struct Job {
     pub command: String,
     pub secrets: Vec<SecretVariable>,
 }
+/// One capture worker on a real store with a test wake (J3T-22, TJ-Q10):
+/// the stored signal as the reactor sees it. `test-support` only.
+pub struct StoredProbe {
+    handle: capture_worker::Handle,
+    sink: Box<dyn asura_platform::exec_cmd::OutputSink>,
+    store: Arc<PayloadStore>,
+}
+impl StoredProbe {
+    /// Admits a job of 1 MiB on `store` and starts its capture worker with
+    /// `wake` as the reactor wake. Returns the job ID.
+    pub fn start(
+        store: Arc<PayloadStore>,
+        installation: Id,
+        wake: asura_platform::events::WakeSender,
+    ) -> Result<(Id, Self), String> {
+        let job = asura_platform::random_id();
+        let victims = store
+            .admit(installation, job, asura_platform::random_id())
+            .map_err(|e| format!("admit: {e:?}"))?;
+        let rules = secrets::detection().map_err(|_| "rule set".to_string())?;
+        let handle = capture_worker::start(capture_worker::Start {
+            store: store.clone(),
+            job,
+            victims,
+            redaction: JobRedaction::new(rules, &[]),
+            wake: Some(wake),
+            gate_home: None,
+        })
+        .map_err(|e| e.to_string())?;
+        let sink = handle.output_sink();
+        Ok((job, Self {
+            handle,
+            sink,
+            store,
+        }))
+    }
+    /// Room for one more stdout chunk of `bytes` (after a flush).
+    pub fn room(&self, bytes: usize) -> bool {
+        self.handle.sink.flush();
+        self.sink.room() >= bytes
+    }
+    pub fn append_stdout(&mut self, bytes: &[u8]) {
+        self.sink
+            .accept(asura_platform::secrets::Stream::Stdout, bytes);
+    }
+    /// One reactor turn: the slot's clear of the stored signal, then the
+    /// ledger read (`Ledger::stored`), as the controller's poll orders them.
+    pub fn turn(&mut self) -> u64 {
+        self.handle.sink.flush();
+        self.handle.take_stored();
+        let _ = self.handle.drain();
+        self.store
+            .stored(self.handle.job)
+            .map_or(0, |[stdout, _]| stdout)
+    }
+    /// Ends both streams, seals and abandons the worker.
+    pub fn finish(mut self) {
+        self.sink.end(asura_platform::secrets::Stream::Stdout);
+        self.sink.end(asura_platform::secrets::Stream::Stderr);
+        self.handle.sink.close();
+        self.handle.abandon();
+    }
+}
+
 /// The capture facts a job settled with, as kind 28 records them.
 #[derive(Clone, Debug)]
 pub struct Settled {
