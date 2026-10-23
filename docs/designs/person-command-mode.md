@@ -2138,9 +2138,9 @@ Implemented 2026-10-23 (branch `p3-e`). Rules settled from its report:
   ([escapee residual](escapee-control.md)); fixtures use the test binary.
 - **Seams.** Test-support builds read scratch-home files:
   `secret-store-keychain` (scratch keychain path and password; without it a
-  test runtime has no store, so no test can reach the login keychain),
-  `person-command-capability` (advertise capability 8 in that test only) and
-  `person-command-hold-append`.
+  test runtime has no store, so no test can reach the login keychain) and
+  `person-command-hold-append`. The `person-command-capability` seam was
+  removed when Q passed and capability 8 became always advertised.
 
 ### P4 TUI record
 

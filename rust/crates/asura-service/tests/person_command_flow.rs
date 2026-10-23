@@ -395,7 +395,15 @@ fn basic() -> Result<()> {
         Err(error) => assert!(error.to_string().contains("request_conflict"), "{error}"),
         Ok(other) => return Err(format!("changed retry accepted: {other:?}").into()),
     }
-    let audit = audit_text(env.home())?;
+    // The audit worker writes the refusal after the reply; wait for it.
+    let end = Instant::now() + Duration::from_secs(20);
+    let audit = loop {
+        let audit = audit_text(env.home())?;
+        if audit.contains("person_command.refused") || Instant::now() >= end {
+            break audit;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert!(audit.contains("person_command.queued"), "{audit}");
     assert!(audit.contains("person_command.refused"), "{audit}");
     assert!(!audit.contains("echo hi"), "no command text in audit");
