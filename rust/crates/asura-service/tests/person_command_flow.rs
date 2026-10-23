@@ -17,7 +17,9 @@
 //! EC-I10), `interrupt` (PC-I10, PC-I26, PC-I35), `gate` (SS-I8, SS-I9,
 //! in-process service), `full` (SS-I10), `profile` (PC-I2 to PC-I5,
 //! PC-I14, PC-I29, PC-I36), `observer` (field 8), `long` (PC-I9, PC-I25),
-//! `released_turn` (PC-I33 message part, PC-I21).
+//! `released_turn` (PC-I33 message part, PC-I21), `quota` (PC-I20),
+//! `printing` (SDI-10 first half); `notice_later` (PC-I13 later-turn
+//! part) runs only when named (blocked, reported).
 #[path = "support/job_fixture.rs"]
 mod job_fixture;
 #[path = "support/queue_submit.rs"]
@@ -1455,7 +1457,9 @@ fn model() -> Result<()> {
             "PC-I12, PC-I27: runs after the terminal commit"
         );
     }
-    // PC-I13: the next turn's input holds both person entries.
+    // PC-I13 (next-turn part): the notice entries of both person commands
+    // are in the next turn's input, once each. The later-turn part is the
+    // `notice_later` case.
     model.script(&[Step::Final]);
     let next = env
         .fixture
@@ -1463,15 +1467,15 @@ fn model() -> Result<()> {
         .map_err(|e| format!("second turn: {e}"))?;
     env.fixture.finish(next, Duration::from_secs(60))?;
     let chat = model.chats().last().cloned().ok_or("chat")?;
-    assert!(
-        chat.contains("The person ran a command themselves"),
-        "{chat}"
-    );
-    assert!(
-        chat.contains("The person ran a command, outside the sandbox, themselves"),
-        "{chat}"
-    );
-    assert!(chat.contains("command: echo sandboxed"), "{chat}");
+    let entries = [
+        "The person ran a command themselves",
+        "The person ran a command, outside the sandbox, themselves",
+        "command: echo sandboxed",
+        "command: echo outside",
+    ];
+    for entry in entries {
+        assert_eq!(chat.matches(entry).count(), 1, "{entry}: {chat}");
+    }
     // PC-I39: execution off stops the model job; the `!` job runs on.
     model.script(&[
         call(
@@ -2252,6 +2256,257 @@ fn sandbox() -> Result<()> {
     Ok(())
 }
 
+/// PC-I20: the retention quota (64 MiB) is held full by a pinned person
+/// job's output beside an older unpinned one. A `!` command flooding
+/// stdout makes the payload owner expire the unpinned output first, then
+/// pauses its capture (`CapturePaused`, the writer blocks on the pipe, so
+/// no byte is dropped); a person cancel ends it.
+fn quota() -> Result<()> {
+    let mut env = Env::new("pc-quota")?;
+    env.start()?;
+    let reply = env.fixture.config("retention.quotaBytes", "67108864")?;
+    assert!(reply.error.is_none(), "{reply:?}");
+    env.fixture.stop()?;
+    env.start()?;
+    let (project, _) = env.project("project")?;
+    let run = |command: &str| -> Result<[u8; 16]> {
+        let (input, _) = queued(&env, &request(project, None, command, None))?;
+        let s = wait_settled(&env, input, Duration::from_secs(120))?;
+        assert_eq!(s.outcome, JobOutcome::Exited, "{s:?}");
+        assert_eq!(s.capture_state, JobCaptureState::Complete, "{s:?}");
+        Ok(input)
+    };
+    let old = run("/usr/bin/yes old | /usr/bin/head -c 12582912")?;
+    let kept = run("/usr/bin/yes kept | /usr/bin/head -c 41943040")?;
+    let installation = env.installation()?;
+    let object = |input: [u8; 16]| {
+        let [payload, _] = asura_storage::payload::job_payloads(installation, job_of(input));
+        env.home()
+            .join(".asura/payloads/objects")
+            .join(job_fixture::hex(&payload))
+    };
+    wait_for(Duration::from_secs(20), "outputs installed", || {
+        object(old).exists() && object(kept).exists()
+    })?;
+    let pinned = env.fixture.attach()?.retain_job(
+        pb::JobRetain {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            job_id: Some(job_of(kept).to_vec()),
+            expected_project_id: Some(project.to_vec()),
+            action: Some(pb::JobRetainAction::Pin as i32),
+            note: None,
+            confirmed: None,
+        },
+        &|| false,
+    )?;
+    assert_eq!(pinned.changed, Some(true), "{pinned:?}");
+    let (flood, _) = queued(
+        &env,
+        &request(project, None, "/usr/bin/yes 0123456789", None),
+    )?;
+    let job = job_of(flood);
+    wait_for(Duration::from_secs(120), "CapturePaused", || {
+        env.fixture
+            .attach()
+            .and_then(|mut c| Ok(c.inspect_job(job, None, &|| false)?))
+            .is_ok_and(|d| {
+                d.entry
+                    .is_some_and(|e| e.state == Some(pb::JobState::CapturePaused as i32))
+            })
+    })?;
+    assert!(!object(old).exists(), "the unpinned output expired first");
+    assert!(object(kept).exists(), "the pinned output is kept");
+    // Paused, the pipes are not read: the count holds while the writer
+    // blocks, so nothing is read and dropped.
+    let paused = || -> Result<(Option<i32>, Option<u64>)> {
+        let entry = env
+            .fixture
+            .attach()?
+            .inspect_job(job, None, &|| false)?
+            .entry
+            .ok_or("entry")?;
+        Ok((entry.state, entry.stdout_bytes))
+    };
+    let before = paused()?;
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(paused()?, before, "no read while paused");
+    let reply = env.fixture.attach()?.cancel_job(
+        pb::JobCancel {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            job_id: Some(job.to_vec()),
+            expected_project_id: Some(project.to_vec()),
+            kill: None,
+        },
+        &|| false,
+    )?;
+    assert_eq!(reply.requested, Some(true), "{reply:?}");
+    let s = wait_settled(&env, flood, Duration::from_secs(60))?;
+    assert_eq!(
+        (s.outcome, s.reason),
+        (JobOutcome::Cancelled, JobReason::PersonStop),
+        "{s:?}"
+    );
+    assert!(s.pause_count >= 1, "{s:?}");
+    println!(
+        "PASS PC-I20: pinned output held the quota; the unpinned output expired, then the flood paused its capture; cancel ended it"
+    );
+    Ok(())
+}
+
+/// SDI-10 (first half): the service is killed while a `!` command prints a
+/// fixture secret. The unverified prefix the capture staged holds redacted
+/// bytes only; after the restart the job is `interrupted`, its stdout page
+/// reads `unverified_prefix` with placeholders, and no file of the home,
+/// payloads included, holds the value.
+fn printing() -> Result<()> {
+    let mut env = Env::new("pc-print")?;
+    env.start()?;
+    let (project, directory) = env.project("project")?;
+    let secret = token("gH9");
+    std::fs::write(directory.join("key.txt"), format!("key {secret}"))?;
+    let (input, _) = queued(
+        &env,
+        &request(project, None, "/usr/bin/yes \"$(/bin/cat key.txt)\"", None),
+    )?;
+    let job = job_of(input);
+    wait_for(Duration::from_secs(60), "output staged", || {
+        env.fixture
+            .attach()
+            .and_then(|mut c| Ok(c.inspect_job(job, None, &|| false)?))
+            .is_ok_and(|d| {
+                d.entry
+                    .and_then(|e| e.stdout_bytes)
+                    .is_some_and(|n| n > 1024 * 1024)
+            })
+    })?;
+    env.fixture.crash()?;
+    let installation = env.installation()?;
+    let [payload, _] = asura_storage::payload::job_payloads(installation, job);
+    let staged = env
+        .home()
+        .join(".asura/payloads/staging")
+        .join(job_fixture::hex(&payload));
+    let prefix = std::fs::read(&staged)?;
+    assert!(!prefix.is_empty(), "a staged prefix");
+    let text = String::from_utf8_lossy(&prefix);
+    assert!(text.contains("key $ASURA_SECRET_1"), "redacted lines");
+    assert!(!text.contains(&secret), "no value in the prefix");
+    let unredacted = |root: &Path| -> Result<Vec<PathBuf>> {
+        Ok(walk(root)?
+            .into_iter()
+            .filter(|p| {
+                std::fs::read(p)
+                    .is_ok_and(|b| b.windows(secret.len()).any(|w| w == secret.as_bytes()))
+            })
+            .collect())
+    };
+    assert_eq!(
+        unredacted(&env.home().join(".asura"))?,
+        Vec::<PathBuf>::new()
+    );
+    env.start()?;
+    let s = wait_settled(&env, input, Duration::from_secs(30))?;
+    assert_eq!(s.outcome, JobOutcome::Interrupted, "{s:?}");
+    let page = env.fixture.attach()?.read_job(
+        pb::JobRead {
+            job_id: Some(job.to_vec()),
+            project_id: Some(project.to_vec()),
+            stream: Some(pb::JobStream::Stdout as i32),
+            offset: Some(0),
+            limit: None,
+            at_end: None,
+        },
+        &|| false,
+    )?;
+    let page = page.pages.first().ok_or("a stdout page")?;
+    assert_eq!(
+        page.state,
+        Some(pb::JobPageState::UnverifiedPrefix as i32),
+        "{:?}",
+        page.state
+    );
+    let shown = page.text.as_deref().unwrap_or_default();
+    assert!(shown.starts_with("key $ASURA_SECRET_1"), "{shown:.80}");
+    assert!(!shown.contains(&secret));
+    assert_eq!(
+        unredacted(&env.home().join(".asura"))?,
+        Vec::<PathBuf>::new()
+    );
+    println!(
+        "PASS SDI-10 (first half): killed while printing a secret; the unverified prefix holds redacted bytes only"
+    );
+    Ok(())
+}
+
+/// PC-I13 (later-turn part, blocked outside P3-E2): after a `!` and a
+/// `!!` command settled and the next turn carried their notice entries,
+/// the service restarts and a later turn runs. Its input must hold the
+/// same entries again, recomposed from the journal (context composer
+/// CCR15), once each with the same text. Today the later turn's history
+/// holds the earlier person message without the notice, so this case is
+/// not in the default run (reported).
+fn notice_later() -> Result<()> {
+    let model = Model::start()?;
+    let mut env = Env::new("pc-later")?;
+    env.start()?;
+    let (project, _) = env.project("project")?;
+    env.fixture.model(&model.endpoint)?;
+    model.script(&[Step::Final]);
+    let first = env
+        .fixture
+        .submit(project, "Hello.")
+        .map_err(|e| format!("first turn: {e}"))?;
+    let (conversation, generation) = turn_of(&env, first)?;
+    let environment = launch(&env, &[]);
+    let (sandboxed, _) = queued(
+        &env,
+        &at_generation(
+            request(project, Some(conversation), "echo sandboxed", None),
+            generation,
+        ),
+    )?;
+    let (outside_input, _) = queued(
+        &env,
+        &at_generation(
+            outside(project, Some(conversation), "echo outside", &environment),
+            generation,
+        ),
+    )?;
+    for input in [sandboxed, outside_input] {
+        wait_settled(&env, input, Duration::from_secs(60))?;
+    }
+    model.script(&[Step::Final]);
+    let next = env
+        .fixture
+        .follow(project, first, "What did I run?")
+        .map_err(|e| format!("second turn: {e}"))?;
+    env.fixture.finish(next, Duration::from_secs(60))?;
+    let chat = model.chats().last().cloned().ok_or("chat")?;
+    let entries = [
+        "The person ran a command themselves",
+        "The person ran a command, outside the sandbox, themselves",
+        "command: echo sandboxed",
+        "command: echo outside",
+    ];
+    for entry in entries {
+        assert_eq!(chat.matches(entry).count(), 1, "{entry}: {chat}");
+    }
+    env.fixture.stop()?;
+    env.start()?;
+    model.script(&[Step::Final]);
+    let later = env
+        .fixture
+        .follow(project, next, "And now?")
+        .map_err(|e| format!("later turn: {e}"))?;
+    env.fixture.finish(later, Duration::from_secs(60))?;
+    let chat = model.chats().last().cloned().ok_or("later chat")?;
+    for entry in entries {
+        assert_eq!(chat.matches(entry).count(), 1, "{entry}: {chat}");
+    }
+    println!("PASS PC-I13 (later turn): the notice entries recomposed after a restart");
+    Ok(())
+}
+
 type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
@@ -2324,7 +2579,19 @@ fn main() {
         ("gate", gate),
         ("sandbox", sandbox),
         ("released_turn", released_turn),
+        ("quota", quota),
+        ("printing", printing),
     ];
+    // Blocked outside P3-E2 (reported): run only when named.
+    let blocked: Vec<Case> = vec![("notice_later", notice_later)];
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .chain(
+            blocked
+                .into_iter()
+                .filter(|(name, _)| selected.contains(name)),
+        )
+        .collect();
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {
             continue;
