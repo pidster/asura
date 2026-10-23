@@ -58,8 +58,13 @@ fn main() {
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        Self::tagged("as-sh-p-")
+    }
+    /// A fixture home named `TAG<pid>-<random>`; the tag may hold regex
+    /// metacharacters (EPG-I1).
+    fn tagged(tag: &str) -> Self {
         let name = format!(
-            "as-sh-p-{}-{}",
+            "{tag}{}-{}",
             std::process::id(),
             asura_platform::random_id()
                 .iter()
@@ -276,6 +281,7 @@ fn qualification() {
     secret_environment_refusals(&f.0);
     secret_variables(&f.0);
     person_profiles(&f.0);
+    epg_i1_model_implicit_path_denial();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -2206,4 +2212,282 @@ fn pc_i37_mach_probe_steps(home: &Path, person: &PersonHome) {
         assert_eq!(result.exit_code, Some(0), "PC-I37 {label}: {result:?}");
         println!("PC-I37 {label}: passed");
     }
+}
+/// EPG-I1 (PX-V2 part): a real `model-1` job under `sandbox-exec` cannot
+/// write the implicit-execution paths of its project, at the root, nested
+/// at any depth (8, 9 and 20 directories are tried; the deny has no depth
+/// bound), in another letter case or under the firmlinked spelling; writes elsewhere in the project, including elsewhere under
+/// `.git`, succeed. The project path holds regex metacharacters, so the
+/// nested rule only matches when the path is escaped. `person-1` and
+/// `person-outside-1` keep write access to the same paths (PX1).
+fn epg_i1_model_implicit_path_denial() {
+    let f = Fixture::tagged("as-e.+(a)[b]{c}$^|*?\\");
+    let project = f.0.join("project");
+    let nested8 = "1/2/3/4/5/6/7/8";
+    let nested9 = "1/2/3/4/5/6/7/8/9";
+    let nested20 = "1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/18/19/20";
+    for dir in [
+        ".git/hooks",
+        "sub/.git/hooks",
+        ".cargo",
+        "sub/.cargo",
+        &format!("{nested8}/.git/hooks"),
+        &format!("{nested9}/.git/hooks"),
+        &format!("{nested20}/.git/hooks"),
+    ] {
+        fs::create_dir_all(project.join(dir)).unwrap();
+    }
+    fs::write(project.join(".git/config"), b"[core]\n").unwrap();
+    fs::write(project.join(".git/hooks/existing"), b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        project.join(".git/hooks/existing"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(project.join(".envrc"), b"fixture\n").unwrap();
+    let firmlinked = Path::new("/System/Volumes/Data").join(project.strip_prefix("/").unwrap());
+    assert!(firmlinked.join(".envrc").exists());
+    // Each step prints `NAME=0` when it succeeded, or `NAME=1:` and its error.
+    let step = |name: &str, command: &str| {
+        format!(
+            "if out=$( {{ {command}; }} 2>&1 ); then echo '{name}=0'; else echo \"{name}=1:$out\"; fi; "
+        )
+    };
+    let denied = [
+        ("hook", step("hook", "printf x > .git/hooks/pre-commit")),
+        (
+            "nested-hook",
+            step("nested-hook", "printf x > sub/.git/hooks/x"),
+        ),
+        ("git-config", step("git-config", "printf x >> .git/config")),
+        ("envrc", step("envrc", "printf x > .envrc")),
+        (
+            "gitattributes",
+            step("gitattributes", "printf x > .gitattributes"),
+        ),
+        ("gitmodules", step("gitmodules", "printf x > .gitmodules")),
+        (
+            "cargo-config",
+            step("cargo-config", "printf x > .cargo/config"),
+        ),
+        (
+            "cargo-config-toml",
+            step("cargo-config-toml", "printf x > .cargo/config.toml"),
+        ),
+        (
+            "nested-git-config",
+            step("nested-git-config", "printf x > sub/.git/config"),
+        ),
+        (
+            "nested-envrc",
+            step("nested-envrc", "printf x > sub/.envrc"),
+        ),
+        (
+            "nested-gitattributes",
+            step("nested-gitattributes", "printf x > sub/.gitattributes"),
+        ),
+        (
+            "nested-gitmodules",
+            step("nested-gitmodules", "printf x > sub/.gitmodules"),
+        ),
+        (
+            "nested-cargo-config",
+            step("nested-cargo-config", "printf x > sub/.cargo/config.toml"),
+        ),
+        (
+            "depth8-hook",
+            step("depth8-hook", &format!("printf x > {nested8}/.git/hooks/x")),
+        ),
+        (
+            "depth8-envrc",
+            step("depth8-envrc", &format!("printf x > {nested8}/.envrc")),
+        ),
+        // Past the walk's bound of 8: the deny has no depth bound.
+        (
+            "depth9-hook",
+            step("depth9-hook", &format!("printf x > {nested9}/.git/hooks/x")),
+        ),
+        (
+            "depth9-envrc",
+            step("depth9-envrc", &format!("printf x > {nested9}/.envrc")),
+        ),
+        (
+            "depth20-hook",
+            step(
+                "depth20-hook",
+                &format!("printf x > {nested20}/.git/hooks/x"),
+            ),
+        ),
+        (
+            "depth20-envrc",
+            step("depth20-envrc", &format!("printf x > {nested20}/.envrc")),
+        ),
+        ("hook-dir", step("hook-dir", "/bin/mkdir .git/hooks/new")),
+        (
+            "hook-chmod",
+            step("hook-chmod", "/bin/chmod 700 .git/hooks/existing"),
+        ),
+        (
+            "hook-unlink",
+            step("hook-unlink", "/bin/rm -f .git/hooks/existing"),
+        ),
+        (
+            "hooks-rename",
+            step("hooks-rename", "/bin/mv .git/hooks .git/hooks-old"),
+        ),
+        (
+            "config-rename",
+            step(
+                "config-rename",
+                "printf x > .git/config.lock && /bin/mv .git/config.lock .git/config",
+            ),
+        ),
+        (
+            "config-unlink",
+            step("config-unlink", "/bin/rm -f .git/config"),
+        ),
+        ("case-envrc", step("case-envrc", "printf x > .ENVRC")),
+        (
+            "case-hook",
+            step("case-hook", "printf x > .GIT/Hooks/upper"),
+        ),
+        (
+            "firmlink-envrc",
+            step(
+                "firmlink-envrc",
+                &format!("printf x > '{}/.envrc'", firmlinked.display()),
+            ),
+        ),
+    ];
+    let allowed = [
+        ("plain", step("plain", "printf x > plain")),
+        ("git-other", step("git-other", "printf x > .git/HEAD")),
+        (
+            "nested-git-other",
+            step("nested-git-other", "printf x > sub/.git/description"),
+        ),
+        (
+            "hooks-outside-git",
+            step(
+                "hooks-outside-git",
+                "/bin/mkdir -p hooks && printf x > hooks/pre-commit",
+            ),
+        ),
+        (
+            "envrc-example",
+            step("envrc-example", "printf x > .envrc.example"),
+        ),
+        (
+            "cargo-other",
+            step("cargo-other", "printf x > .cargo/credentials-note"),
+        ),
+        (
+            "config-lock",
+            step("config-lock", "printf x > .git/config.lock2"),
+        ),
+    ];
+    let script: String = denied
+        .iter()
+        .chain(allowed.iter())
+        .map(|(_, s)| s.as_str())
+        .collect();
+    let result = run(
+        &f.0,
+        &format!("{script}exit 0"),
+        Duration::from_secs(20),
+        false,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    let lines: Vec<&str> = result.stdout.lines().collect();
+    let line = |name: &str| {
+        lines
+            .iter()
+            .find(|l| l.starts_with(&format!("{name}=")))
+            .copied()
+            .unwrap_or_else(|| panic!("{name} missing: {result:?}"))
+    };
+    for (name, _) in &denied {
+        let l = line(name);
+        assert!(
+            l.starts_with(&format!("{name}=1:")) && l.contains("Operation not permitted"),
+            "{name} was not denied by the OS: {l}"
+        );
+    }
+    for (name, _) in &allowed {
+        assert_eq!(line(name), format!("{name}=0"), "{result:?}");
+    }
+    assert_eq!(fs::read(project.join(".git/config")).unwrap(), b"[core]\n");
+    assert_eq!(fs::read(project.join(".envrc")).unwrap(), b"fixture\n");
+    assert_eq!(
+        fs::read(project.join(".git/hooks/existing")).unwrap(),
+        b"#!/bin/sh\n"
+    );
+    assert_eq!(
+        fs::metadata(project.join(".git/hooks/existing"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let names = |dir: &Path| -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names(&project.join(".git/hooks")), ["existing"]);
+    assert!(names(&project.join("sub/.git/hooks")).is_empty());
+    for path in [
+        ".gitattributes",
+        ".gitmodules",
+        ".cargo/config",
+        ".cargo/config.toml",
+        "sub/.git/config",
+        "sub/.envrc",
+        "sub/.cargo/config.toml",
+        ".git/hooks-old",
+    ] {
+        assert!(!project.join(path).exists(), "{path}");
+    }
+    for nested in [nested8, nested9, nested20] {
+        assert!(
+            !project.join(format!("{nested}/.envrc")).exists(),
+            "{nested}"
+        );
+        assert!(
+            names(&project.join(format!("{nested}/.git/hooks"))).is_empty(),
+            "{nested}"
+        );
+    }
+    println!(
+        "EPG-I1: {} implicit-execution writes denied by the OS (root, nested, depths 8, 9 and 20, case, firmlink); {} other project writes succeeded",
+        denied.len(),
+        allowed.len()
+    );
+    // PX1: the person profiles keep write access to the same paths.
+    let person = PersonHome::new(&f.0);
+    let command = "printf p > .git/hooks/pre-commit && printf p > sub/.git/hooks/x && printf '[p]\\n' >> .git/config && printf p > .envrc && printf p > sub/.cargo/config.toml";
+    for (label, setup, profile) in [
+        ("person-1", person.sandboxed(&[]), Profile::Person1),
+        (
+            "person-outside-1",
+            person.outside(&[]),
+            Profile::PersonOutside1,
+        ),
+    ] {
+        let result = person_run(&f.0, profile, command, setup);
+        assert_eq!(result.exit_code, Some(0), "{label}: {result:?}");
+    }
+    assert_eq!(
+        fs::read(project.join(".git/hooks/pre-commit")).unwrap(),
+        b"p"
+    );
+    assert_eq!(
+        fs::read(project.join(".git/config")).unwrap(),
+        b"[core]\n[p]\n[p]\n"
+    );
+    println!("EPG-I1: person-1 and person-outside-1 wrote the same implicit-execution paths");
 }
