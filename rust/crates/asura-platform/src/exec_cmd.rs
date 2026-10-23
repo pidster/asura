@@ -21,7 +21,7 @@ pub use guardian::run_guardian;
 pub use guardian::run_guardian_for_test;
 pub use person::{
     MAX_CACHES, MAX_ENTRIES, MAX_ENVIRONMENT_BYTES, MAX_FRAME_BYTES, MAX_NAME_BYTES, MAX_ROOTS,
-    PersonSetup, RootRole,
+    PersonSetup, RootRole, Variables,
 };
 pub use protocol::Profile;
 use protocol::{

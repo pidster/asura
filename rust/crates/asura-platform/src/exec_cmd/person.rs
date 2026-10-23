@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use zeroize::Zeroizing;
 
+/// Environment variables as (name, value) byte pairs.
+pub type Variables = [(Vec<u8>, Vec<u8>)];
 /// Most root descriptors (FDs 12–19).
 pub const MAX_ROOTS: usize = 8;
 /// Most cache-list roots (PCR10).
@@ -164,7 +166,7 @@ impl PersonSetup {
     /// `Invalid`; a cancel with `Cancelled`.
     pub fn sandboxed(
         path: &[u8],
-        client: &[(Vec<u8>, Vec<u8>)],
+        client: &Variables,
         cancel: &AtomicBool,
     ) -> Result<Self, ExecCmdError> {
         let (user, home) = account()?;
@@ -193,7 +195,7 @@ impl PersonSetup {
         tmpdir: &Path,
         developer: Option<&Path>,
         path: &[u8],
-        client: &[(Vec<u8>, Vec<u8>)],
+        client: &Variables,
     ) -> Result<Self, ExecCmdError> {
         Self::resolve(
             Account {
@@ -213,7 +215,7 @@ impl PersonSetup {
     fn resolve(
         account: Account,
         path: &[u8],
-        client: &[(Vec<u8>, Vec<u8>)],
+        client: &Variables,
         cancel: &AtomicBool,
     ) -> Result<Self, ExecCmdError> {
         check_path(path)?;
@@ -269,7 +271,7 @@ impl PersonSetup {
     /// with no `=` and no NUL, each value without NUL, at most 1,024
     /// entries and 40,960 bytes, no duplicate and no `ASURA_SECRET_` or
     /// `ASURA_JOB_` name. Anything else is `Invalid`.
-    pub fn outside(launch: &[(Vec<u8>, Vec<u8>)]) -> Result<Self, ExecCmdError> {
+    pub fn outside(launch: &Variables) -> Result<Self, ExecCmdError> {
         let entries: Vec<Entry> = launch
             .iter()
             .map(|(name, value)| Entry::new(name, value))
@@ -501,9 +503,7 @@ pub(super) fn check_path(path: &[u8]) -> Result<(), ExecCmdError> {
 }
 /// The PC3 client variables: locale names with short plain values and
 /// `SSH_AUTH_SOCK` with an absolute path; no name twice.
-pub(super) fn check_client(
-    client: &[(Vec<u8>, Vec<u8>)],
-) -> Result<&[(Vec<u8>, Vec<u8>)], ExecCmdError> {
+pub(super) fn check_client(client: &Variables) -> Result<&Variables, ExecCmdError> {
     let mut seen: Vec<&[u8]> = Vec::new();
     for (name, value) in client {
         if seen.contains(&name.as_slice()) {
