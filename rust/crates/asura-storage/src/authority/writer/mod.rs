@@ -84,6 +84,15 @@ pub enum Command {
         new_conversation: bool,
         prompt: String,
     },
+    /// Kind 31 (P2): queue one person command. The caller fills every
+    /// field except the digest and the order revision, which the writer
+    /// computes; it chooses the input ID, and for a new conversation the
+    /// conversation ID, because the secret store item binds both before
+    /// the append. An exact retry of `request` returns the original input;
+    /// changed fields under the same request are `Conflict`.
+    QueuePersonCommand {
+        command: Box<PersonCommandQueued>,
+    },
     ReorderInput {
         request: Id,
         input: Id,
@@ -671,6 +680,12 @@ impl WriterClient {
             {
                 return Err(Error::Invalid);
             }
+            Command::QueuePersonCommand { command }
+                if command.request == [0; 16]
+                    || request_digest(Request::QueuePersonCommand(command.request())).is_err() =>
+            {
+                return Err(Error::Invalid);
+            }
             Command::Prepare { prompt, .. } if prompt.is_empty() || prompt.len() > MAX_PROMPT => {
                 return Err(Error::Invalid);
             }
@@ -724,6 +739,7 @@ impl WriterClient {
                 | Command::Register { .. }
                 | Command::RenameProject { .. }
                 | Command::QueueInput { .. }
+                | Command::QueuePersonCommand { .. }
                 | Command::ReorderInput { .. }
                 | Command::InputDecision { .. }
                 | Command::PromoteInput { .. }

@@ -2903,3 +2903,220 @@ fn j5t_02_real_writer_prepare_returns_notice_inputs_and_checks_the_cursor() {
     );
     close(&mut writer);
 }
+
+/// A kind 31 command for the writer: the caller's fields, with the digest
+/// and order revision left for the writer.
+fn p2_command(
+    request: u8,
+    input: u8,
+    project: Id,
+    lane: Id,
+    new: bool,
+    outside: bool,
+) -> PersonCommandQueued {
+    PersonCommandQueued {
+        request: [request; 16],
+        digest: [0; 32],
+        input: [input; 16],
+        project,
+        conversation: lane,
+        expected_generation: 0,
+        new_conversation: new,
+        outside_sandbox: outside,
+        command: format!("ls {request}"),
+        display_command: String::new(),
+        cwd: ".".into(),
+        search_path: if outside { "" } else { "/bin" }.into(),
+        environment: vec![],
+        order_revision: 0,
+        number_kinds: vec![],
+        unnumbered: 0,
+        command_cut: false,
+        whole_command: false,
+        rule_set_revision: 1,
+        rule_set_digest: [7; 32],
+        fallback: None,
+    }
+}
+fn p2_queue(writer: &mut WriterHandle, command: PersonCommandQueued) -> Result<Reply> {
+    wait(&mut writer.try_submit(Command::QueuePersonCommand {
+        command: Box::new(command),
+    })?)
+}
+/// P2 (integration): the real writer queues kind 31 with caller-chosen
+/// input and conversation IDs, answers an exact retry with the original
+/// input and a changed retry with `Conflict`, lists person entries with
+/// their kind 31, appends the person job's kinds 26 and 28, answers
+/// `JobFacts` and `Jobs` from kind 31, and reopens with the undispatched
+/// command held (PR6).
+#[test]
+fn p2_real_writer_queues_kind_31_and_reads_person_jobs() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, _) = j1_initialize(&scratch, &mut writer);
+    let lane = [60; 16];
+    let first = p2_command(61, 62, project, lane, true, true);
+    let reply = p2_queue(&mut writer, first.clone()).unwrap();
+    assert_eq!(reply.accepted_input_id, Some([62; 16]));
+    assert_eq!(reply.inputs.len(), 1);
+    let view = &reply.inputs[0];
+    assert_eq!(view.kind, InputKind::Person);
+    assert_eq!(view.status, InputStatus::Queued);
+    assert_eq!(view.input.conversation, lane);
+    assert!(view.input.prompt.is_empty());
+    let stored = view.person.as_deref().unwrap();
+    assert!(stored.outside_sandbox && stored.order_revision == 1);
+    assert_eq!(
+        stored.digest,
+        request_digest(Request::QueuePersonCommand(first.request())).unwrap()
+    );
+    drop(reply);
+    // An exact retry with another chosen input returns the original.
+    let retry = p2_queue(
+        &mut writer,
+        PersonCommandQueued {
+            input: [63; 16],
+            ..first.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(retry.accepted_input_id, Some([62; 16]));
+    assert_eq!(retry.order_revision, Some(1));
+    drop(retry);
+    // Changed fields under the same request conflict.
+    let changed = PersonCommandQueued {
+        command: "ls other".into(),
+        ..first.clone()
+    };
+    assert!(matches!(
+        p2_queue(&mut writer, changed),
+        Err(Error::Conflict)
+    ));
+    // Invalid fields are refused before the writer: `!!` with a PATH.
+    let invalid = PersonCommandQueued {
+        request: [64; 16],
+        search_path: "/bin".into(),
+        ..first.clone()
+    };
+    assert!(matches!(
+        writer.try_submit(Command::QueuePersonCommand {
+            command: Box::new(invalid),
+        }),
+        Err(Error::Invalid)
+    ));
+    // A second `!` command in the lane, and an unknown lane.
+    let second = p2_command(65, 66, project, lane, false, false);
+    let reply = p2_queue(&mut writer, second).unwrap();
+    assert_eq!(reply.inputs.len(), 2);
+    assert_eq!(reply.order_revision, Some(2));
+    let state = reply.replay.clone().unwrap();
+    assert_eq!(state.order_revision, 2);
+    let mut revision = state.revision;
+    drop((reply, state));
+    assert!(matches!(
+        p2_queue(
+            &mut writer,
+            p2_command(67, 68, project, [69; 16], false, false)
+        ),
+        Err(Error::Conflict)
+    ));
+    // Dispatch and settle the first command's job.
+    let job = job_id(&JobOrigin::Person { input: [62; 16] });
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::JobIntent(JobIntent {
+            origin: JobOrigin::Person { input: [62; 16] },
+            agent: 0,
+            time: 1_760_000_000_000,
+        }),
+    )
+    .unwrap();
+    let facts = wait(&mut writer.try_submit(Command::JobFacts { job }).unwrap())
+        .unwrap()
+        .job_records
+        .unwrap();
+    assert!(facts.listing.settled.is_none());
+    assert_eq!(facts.listing.excerpt, "ls 61");
+    assert!(facts.command.outside_sandbox());
+    assert_eq!(facts.command.person().unwrap().input, [62; 16]);
+    let settled = JobSettled {
+        job,
+        outcome: JobOutcome::Exited,
+        reason: JobReason::None,
+        exit_kind: 1,
+        exit_value: 0,
+        cleanup: JobCleanup::Confirmed,
+        unconfirmed_reason: 0,
+        escapees: 1,
+        elapsed_ms: 5,
+        capture_state: JobCaptureState::Complete,
+        capture_reason: CaptureReason::None,
+        stdout: JobStream {
+            capture: CaptureStream {
+                digest: Some([1; 32]),
+                eof: true,
+                ..CaptureStream::default()
+            },
+            lines: 0,
+        },
+        stderr: JobStream {
+            capture: CaptureStream {
+                digest: Some([2; 32]),
+                eof: true,
+                ..CaptureStream::default()
+            },
+            lines: 0,
+        },
+        distinct_numbers: 0,
+        numbers: vec![],
+        pause_count: 0,
+        first_pause_ms: 0,
+        paused_ms: 0,
+        final_reservation: INITIAL_RESERVATION,
+        settled_time: 1_760_000_000_001,
+    };
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::JobSettled(Box::new(settled.clone())),
+    )
+    .unwrap();
+    let listed = wait(
+        &mut writer
+            .try_submit(Command::Jobs {
+                scope: JobScope::Conversation(lane),
+                before: None,
+                limit: 9,
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .jobs;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].settled.as_deref(), Some(&settled));
+    let inputs = wait(
+        &mut writer
+            .try_submit(Command::Inputs {
+                project,
+                input: Some([62; 16]),
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .inputs;
+    assert!(inputs.iter().all(|v| v.person.is_some()));
+    close(&mut writer);
+    let durable = journal_replay(&scratch);
+    assert_eq!(durable.input_status([62; 16]), Some(InputStatus::Complete));
+    assert_eq!(durable.input_status([66; 16]), Some(InputStatus::Queued));
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let reopened = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    assert_eq!(reopened.input_status([66; 16]), Some(InputStatus::Held));
+    drop(reopened);
+    close(&mut writer);
+}

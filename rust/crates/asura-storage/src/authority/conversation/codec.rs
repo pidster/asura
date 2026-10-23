@@ -5926,7 +5926,7 @@ mod tests {
         let raw = raw31(&both);
         assert_eq!(raw.len(), MAX_PERSON_COMMAND_PAYLOAD);
         assert_eq!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD, 22_754);
-        assert!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD <= MAX_FRAME);
+        const { assert!(HEADER + TRAILER + MAX_PERSON_COMMAND_PAYLOAD <= MAX_FRAME) };
         assert_eq!(decode_record(31, &raw), Err(ReplayError::Corrupt));
         let mut over = raw;
         over.push(0);

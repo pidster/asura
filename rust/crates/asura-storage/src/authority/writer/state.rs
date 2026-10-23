@@ -1285,6 +1285,56 @@ impl State {
                 };
                 return self.project_queue_reply(project, Some(input));
             }
+            Command::QueuePersonCommand { mut command } => {
+                let digest = request_digest(Request::QueuePersonCommand(command.request()))
+                    .map_err(|_| Error::Invalid)?;
+                if let Some(prior) =
+                    self.read(|state, store| state.outcome(command.request, store))?
+                {
+                    return match prior.result {
+                        Outcome::QueueInput {
+                            input,
+                            order_revision,
+                            ..
+                        } if prior.digest == digest && prior.kind == 31 => {
+                            let project = self.input_project(input)?;
+                            let mut reply = self.project_queue_reply(project, Some(input))?;
+                            reply.order_revision = Some(order_revision);
+                            Ok(reply)
+                        }
+                        _ => Err(Error::Conflict),
+                    };
+                }
+                let project = command.project;
+                self.find_project(project)?;
+                if !command.new_conversation {
+                    let found = self.read(|state, store| {
+                        state.find_conversation(command.conversation, store)
+                    })?;
+                    if !found.is_some_and(|c| {
+                        c.project == project && command.expected_generation <= c.generation
+                    }) {
+                        return Err(Error::Conflict);
+                    }
+                }
+                let held = self.project(project)?;
+                held.validate().map_err(|_| Error::StaleProject)?;
+                command.digest = digest;
+                command.order_revision = self
+                    .state()?
+                    .order_revision
+                    .checked_add(1)
+                    .ok_or(Error::Limit)?;
+                command.validate().map_err(|_| Error::Invalid)?;
+                let request = command.request;
+                self.append(Record::PersonCommandQueued(command))?;
+                held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
+                let input = match self.state()?.requests.get(&request).map(|r| &r.result) {
+                    Some(Outcome::QueueInput { input, .. }) => *input,
+                    _ => return Err(Error::RepairRequired),
+                };
+                return self.project_queue_reply(project, Some(input));
+            }
             Command::ReorderInput {
                 request,
                 input,
