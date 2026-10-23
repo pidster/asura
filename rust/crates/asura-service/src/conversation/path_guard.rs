@@ -217,6 +217,7 @@ fn error_reply(request: pb::Envelope, error: &str) -> pb::Envelope {
             overflow: None,
             approved: Vec::new(),
             error: Some(error.to_owned()),
+            approved_omitted: None,
         }),
     )
 }
@@ -885,19 +886,69 @@ fn list_reply(view: &PathGuardView, facts: &Facts) -> pb::PathGuardReply {
     let warnings = Warnings::from_all(check::all(view, facts));
     let mut budget = usize::MAX;
     let (pending, overflow) = entry_fields(Some(&warnings), &mut budget);
-    let mut approved = Vec::new();
-    let mut bytes = 0;
-    for a in &view.approvals {
-        bytes += a.path.len() + 4;
-        if bytes > APPROVED_BYTES {
-            break;
-        }
-        approved.push(a.path.clone());
-    }
+    let (approved, approved_omitted) = approved_fields(view.approvals.iter().map(|a| &a.path));
     pb::PathGuardReply {
         pending,
         overflow,
         approved,
         error: None,
+        approved_omitted,
+    }
+}
+
+/// `PathGuardReply` fields 3 and 5: the approved paths, in the view's byte
+/// order, until their encoded bytes would pass `APPROVED_BYTES`; the rest
+/// are counted, never listed out of order (EPG-W record, frame bounds).
+fn approved_fields<'a>(
+    paths: impl ExactSizeIterator<Item = &'a String>,
+) -> (Vec<String>, Option<u32>) {
+    let total = paths.len();
+    let mut approved = Vec::new();
+    let mut bytes = 0;
+    for path in paths {
+        bytes += path.len() + 4;
+        if bytes > APPROVED_BYTES {
+            break;
+        }
+        approved.push(path.clone());
+    }
+    let omitted = total - approved.len();
+    (approved, (omitted > 0).then_some(omitted as u32))
+}
+
+/// `approved_omitted` (field 5): the approved list stops at 40 KiB and
+/// counts the rest; each listed path is whole and in the view's order.
+#[cfg(test)]
+mod approved_tests {
+    use super::{APPROVED_BYTES, approved_fields};
+    use asura_control::path_guard::{MAX_APPROVED_PATHS, MAX_GUARD_PATH_BYTES};
+
+    #[test]
+    fn approved_list_counts_what_passes_40_kib() {
+        // Nothing to cut: no count.
+        let few: Vec<String> = (0..3).map(|i| format!("a{i}/.envrc")).collect();
+        assert_eq!(approved_fields(few.iter()), (few.clone(), None));
+        assert_eq!(approved_fields([].iter()), (Vec::new(), None));
+        // 256 paths of 1,024 bytes: 39 fit in 40 KiB, 217 are counted.
+        let long: Vec<String> = (0..MAX_APPROVED_PATHS)
+            .map(|i| format!("{i:04}/{}", "p".repeat(MAX_GUARD_PATH_BYTES - 5)))
+            .collect();
+        let (listed, omitted) = approved_fields(long.iter());
+        let fit = APPROVED_BYTES / (MAX_GUARD_PATH_BYTES + 4);
+        assert_eq!(listed.len(), fit);
+        assert_eq!(listed[..], long[..fit], "a prefix in order");
+        assert_eq!(omitted, Some((MAX_APPROVED_PATHS - fit) as u32));
+        assert!(asura_control::path_guard::approved_omitted_valid(
+            listed.len(),
+            omitted
+        ));
+        // Exactly at the bound: listed whole.
+        let exact: Vec<String> = (0..4)
+            .map(|i| format!("{i}{}", "q".repeat(APPROVED_BYTES / 4 - 5)))
+            .collect();
+        assert_eq!(approved_fields(exact.iter()), (exact.clone(), None));
+        let mut over = exact.clone();
+        over.push("x".into());
+        assert_eq!(approved_fields(over.iter()), (exact, Some(1)));
     }
 }

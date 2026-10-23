@@ -192,6 +192,10 @@ struct Journal {
     reads: Vec<&'static str>,
     /// Person jobs whose kind 31 has field 7 bit 1 (`!!`).
     outside: BTreeSet<Id>,
+    /// Kind 32 by reference (`PathRecord`).
+    path_records: BTreeMap<Id, journal::ExecutionPathRecord>,
+    /// `PathRecord` reads answer `Unavailable`.
+    path_unavailable: bool,
 }
 /// A kind 31 for a person job's command source (the journal fixture holds
 /// records as stored; validity is the codec's).
@@ -337,6 +341,16 @@ impl Journal {
                         error: None,
                     });
                 }
+            }
+            JournalWork::Read(writer::Command::PathRecord { reference }) => {
+                self.reads.push("PathRecord");
+                if self.path_unavailable {
+                    return Err(writer::Error::Unavailable);
+                }
+                reply.path_record = self
+                    .path_records
+                    .get(&reference)
+                    .map(|r| (Locator::NONE, Box::new(r.clone())));
             }
             JournalWork::Append(Record::JobRetention(r)) => {
                 if self.held {
@@ -1915,4 +1929,127 @@ fn outside_entry_fields_follow_the_view_then_kind_28() {
         (Some(1), Some(4)),
         "kind 28"
     );
+}
+
+// ----- EPG-T: `JobDetail.path_warnings` -----
+
+fn acknowledgement(
+    project: Id,
+    input: Id,
+    entries: &[(journal::PathEntryKind, &str)],
+) -> journal::ExecutionPathRecord {
+    journal::ExecutionPathRecord {
+        action: journal::PathAction::Acknowledged,
+        project,
+        reference: input,
+        through: 3,
+        entries: entries
+            .iter()
+            .map(|(kind, path)| journal::PathEntry {
+                kind: *kind,
+                path: (*path).into(),
+            })
+            .collect(),
+        overflow: 0,
+        digest: [0; 32],
+    }
+}
+
+/// EPG-T (execution-path-guard.md, TUI: "The restored log reads the
+/// warnings from `JobDetail.path_warnings`"): a person job's detail lists
+/// the entries of its input's kind 32 acknowledgement, read with one
+/// `PathRecord` after the facts and the registry; a model job never reads
+/// it; a person job with no acknowledgement, or one of another project or
+/// action, lists none; a failed read answers with the journal's error.
+#[test]
+fn detail_lists_the_acknowledged_path_warnings_of_a_person_job() {
+    use journal::PathEntryKind as K;
+    let mut h = H::new(8);
+    let input = [7; 16];
+    let job = h.submit(person(7), C1, P1, "cargo build");
+    h.env.journal.path_records.insert(
+        input,
+        acknowledgement(
+            P1,
+            input,
+            &[
+                (K::ModelChanged, "build.rs"),
+                (K::ModelChanged, "package.json"),
+                (K::NotApproved, ".git/hooks/pre-commit"),
+                (K::ChangedSinceApproval, ".envrc"),
+                (K::TooLarge, ".git/config"),
+                (K::Overflow, "."),
+            ],
+        ),
+    );
+    h.env.journal.reads.clear();
+    let reply = detail(h.send(1, inspect(job, Some(P1))));
+    let listed: Vec<_> = reply
+        .path_warnings
+        .iter()
+        .map(|w| (w.kind.unwrap(), w.path.as_deref().unwrap()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (1, "build.rs"),
+            (1, "package.json"),
+            (2, ".git/hooks/pre-commit"),
+            (3, ".envrc"),
+            (4, ".git/config"),
+            (5, "."),
+        ]
+    );
+    assert_eq!(h.env.journal.reads, ["JobFacts", "PathRecord"]);
+    assert_eq!(reply.command.as_deref(), Some("cargo build"));
+
+    // A model job: no `PathRecord` read, no warnings.
+    let model_job = h.submit(model(2), C1, P1, "make");
+    h.env.journal.reads.clear();
+    let reply = detail(h.send(1, inspect(model_job, Some(P1))));
+    assert!(reply.path_warnings.is_empty());
+    assert_eq!(h.env.journal.reads, ["JobFacts"]);
+
+    // No record, a record of another project, or not an acknowledgement.
+    let bare = h.submit(person(8), C1, P1, "ls");
+    assert!(
+        detail(h.send(1, inspect(bare, None)))
+            .path_warnings
+            .is_empty()
+    );
+    let other = h.submit(person(9), C1, P1, "ls -l");
+    h.env.journal.path_records.insert(
+        [9; 16],
+        acknowledgement(P2, [9; 16], &[(K::ModelChanged, "build.rs")]),
+    );
+    assert!(
+        detail(h.send(1, inspect(other, None)))
+            .path_warnings
+            .is_empty()
+    );
+    let approved = h.submit(person(10), C1, P1, "pwd");
+    h.env.journal.path_records.insert(
+        [10; 16],
+        journal::ExecutionPathRecord {
+            action: journal::PathAction::Approved,
+            entries: vec![journal::PathEntry {
+                kind: K::Approval,
+                path: ".envrc".into(),
+            }],
+            through: 0,
+            digest: [1; 32],
+            ..acknowledgement(P1, [10; 16], &[])
+        },
+    );
+    assert!(
+        detail(h.send(1, inspect(approved, None)))
+            .path_warnings
+            .is_empty()
+    );
+
+    // The read fails: the journal's error, not a detail without warnings.
+    h.env.journal.path_unavailable = true;
+    let reply = detail(h.send(1, inspect(job, Some(P1))));
+    assert!(reply.error.is_some(), "{reply:?}");
+    assert!(reply.path_warnings.is_empty() && reply.entry.is_none());
 }

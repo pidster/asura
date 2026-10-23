@@ -518,6 +518,7 @@ message PathGuardReply {
   optional uint32 overflow = 2;       // pending warnings not listed
   repeated string approved = 3;       // at most 256 approved paths, in byte order
   optional string error = 4;          // not_found, path_invalid, too_large, not_implicit, limit, busy, unavailable
+  optional uint32 approved_omitted = 5; // approved paths not listed because the list reached 40 KiB
 }
 enum QueueRefusal {
   QUEUE_REFUSAL_UNSPECIFIED = 0;

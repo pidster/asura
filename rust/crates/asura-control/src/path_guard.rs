@@ -90,6 +90,14 @@ pub fn warnings_valid(warnings: &[pb::PathWarning], overflow: Option<u32>) -> bo
         && overflow.is_none_or(|n| n > 0)
 }
 
+/// `PathGuardReply.approved_omitted`: the approved paths the service did
+/// not list because the list reached its byte bound. Absent when every path
+/// is listed; never zero; the listed and omitted paths together are at most
+/// 256, the approvals of one project.
+pub fn approved_omitted_valid(listed: usize, omitted: Option<u32>) -> bool {
+    omitted.is_none_or(|n| n > 0 && listed.saturating_add(n as usize) <= MAX_APPROVED_PATHS)
+}
+
 pub(crate) fn handles(body: &Body) -> bool {
     matches!(
         body,
@@ -124,10 +132,12 @@ pub(crate) fn valid(body: &Body) -> bool {
                     && v.pending.is_empty()
                     && v.overflow.is_none()
                     && v.approved.is_empty()
+                    && v.approved_omitted.is_none()
             }
             None => {
                 warnings_valid(&v.pending, v.overflow)
                     && v.approved.len() <= MAX_APPROVED_PATHS
+                    && approved_omitted_valid(v.approved.len(), v.approved_omitted)
                     && v.approved.iter().all(|p| path_form_valid(p))
                     && v.approved
                         .windows(2)
@@ -198,6 +208,7 @@ mod tests {
             overflow,
             approved,
             error: None,
+            approved_omitted: None,
         })
     }
 
@@ -370,6 +381,43 @@ mod tests {
             error: Some("denied".into()),
             ..Default::default()
         })));
+    }
+
+    /// `approved_omitted` (field 5): a nonzero count beside a cut list,
+    /// listed and omitted together at most 256, never beside an error.
+    #[test]
+    fn epg_u6_approved_omitted() {
+        let with = |approved: Vec<String>, omitted: Option<u32>| {
+            Body::PathGuardReply(pb::PathGuardReply {
+                approved,
+                approved_omitted: omitted,
+                ..Default::default()
+            })
+        };
+        let forty: Vec<String> = (0..40).map(|i| format!("a/{i:04}/.envrc")).collect();
+        assert!(round_trips(
+            with(forty.clone(), Some(216)),
+            Direction::ServerToClient
+        ));
+        assert!(round_trips(
+            with(forty.clone(), None),
+            Direction::ServerToClient
+        ));
+        assert!(reply(with(Vec::new(), Some(256))));
+        assert!(!reply(with(forty.clone(), Some(0))), "zero is not sent");
+        assert!(
+            !reply(with(forty.clone(), Some(217))),
+            "more than 256 in all"
+        );
+        assert!(!reply(with(Vec::new(), Some(257))));
+        assert!(!reply(Body::PathGuardReply(pb::PathGuardReply {
+            error: Some(error::LIMIT.into()),
+            approved_omitted: Some(1),
+            ..Default::default()
+        })));
+        assert!(approved_omitted_valid(256, None));
+        assert!(!approved_omitted_valid(256, Some(1)));
+        assert!(approved_omitted_valid(255, Some(1)));
     }
 
     /// The largest reply that the service sends fits one frame: 16

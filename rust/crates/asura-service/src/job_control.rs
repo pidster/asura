@@ -1002,11 +1002,29 @@ struct InspectWork {
     job: Id,
     fence: Option<Id>,
     facts: Option<Facts>,
+    /// `JobDetail.path_warnings`: a person job's warnings from its input's
+    /// kind 32 acknowledgement; `None` until read (a model job has none).
+    warnings: Option<Vec<pb::PathWarning>>,
+    /// The `PathRecord` read is in flight.
+    path_read: bool,
 }
 impl InspectWork {
     fn step(&mut self, s: &mut Step, input: Input) -> Next {
         match input {
             Input::Start => return Next::Read(writer::Command::JobFacts { job: self.job }),
+            Input::Journal(result) if self.path_read => {
+                self.path_read = false;
+                match *result {
+                    Ok(reply) => {
+                        let project = self.facts.as_ref().map(Facts::project);
+                        self.warnings = Some(detail_path_warnings(
+                            reply.path_record.as_ref().map(|(_, r)| r.as_ref()),
+                            project,
+                        ));
+                    }
+                    Err(e) => return s.journal_error(e),
+                }
+            }
             Input::Journal(result) => match facts_of(result) {
                 Ok(Some(facts)) => self.facts = Some(facts),
                 Ok(None) => return s.error(wire::error::NOT_FOUND),
@@ -1024,6 +1042,17 @@ impl InspectWork {
             Registry::No => return s.error(wire::error::NOT_FOUND),
             Registry::Read(p) => return Next::Read(project_read(p)),
             Registry::Yes => {}
+        }
+        // A person job's warnings: one bounded `PathRecord` read of its
+        // input's kind 32 on the journal worker (at most 16 entries).
+        if self.warnings.is_none() {
+            match facts.origin() {
+                JobOrigin::Person { input } => {
+                    self.path_read = true;
+                    return Next::Read(writer::Command::PathRecord { reference: input });
+                }
+                JobOrigin::Model { .. } => self.warnings = Some(Vec::new()),
+            }
         }
         let view = s.view(self.job);
         let records = &facts.records;
@@ -1044,9 +1073,36 @@ impl InspectWork {
             cwd,
             notes,
             error: None,
-            path_warnings: Vec::new(),
+            path_warnings: self.warnings.take().unwrap_or_default(),
         })))
     }
+}
+
+/// `JobDetail.path_warnings` from a person input's kind 32: the entries of
+/// its `acknowledged` record in the job's project, as stored (display-
+/// redacted, at most 16). Any other record, or none (the command ran
+/// before the guard, or was never checked), gives no warnings. The record
+/// keeps no listing overflow field in `JobDetail`; the entries alone are
+/// returned.
+fn detail_path_warnings(
+    record: Option<&journal::ExecutionPathRecord>,
+    project: Option<Id>,
+) -> Vec<pb::PathWarning> {
+    let Some(record) = record
+        .filter(|r| r.action == journal::PathAction::Acknowledged && Some(r.project) == project)
+    else {
+        return Vec::new();
+    };
+    record
+        .entries
+        .iter()
+        .map(|e| pb::PathWarning {
+            kind: Some(e.kind as u32),
+            path: Some(e.path.clone()),
+        })
+        .filter(asura_control::path_guard::warning_valid)
+        .take(asura_control::path_guard::MAX_PATH_WARNINGS)
+        .collect()
 }
 
 /// `JobDetail.notes`: person notes (author 1) with their kind 30 text and
@@ -1796,6 +1852,8 @@ impl JobControl {
                 job: id(&v.job_id),
                 fence: optional_id(&v.project_id),
                 facts: None,
+                warnings: None,
+                path_read: false,
             }),
             Body::JobRead(v) => Work::View(ViewWork::read(v)),
             Body::JobObserve(v) => Work::View(ViewWork::observe(v)),
