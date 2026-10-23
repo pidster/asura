@@ -9,7 +9,9 @@ pub use audit_io::{AuditArchive, AuditDirectory, AuditFile, audit_archive_name};
 mod model_process;
 pub mod pacing;
 pub mod payload_io;
-pub use model_process::{HUB_BUNDLE_NAME, ModelProcess, PackageResources, bundle_digest};
+pub use model_process::{
+    HUB_BUNDLE_NAME, ModelProcess, PackageResources, bundle_digest, package_resource_directory,
+};
 pub mod git_observer;
 mod project_identity;
 pub use journal_io::gate::Point as JournalPoint;

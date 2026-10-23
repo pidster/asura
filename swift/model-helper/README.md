@@ -39,6 +39,16 @@ Before a standard SwiftPM build, the root build owner must:
      xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1
    ```
 
+`tools/release/asura-bundle` performs steps 1 to 6 for a signed or ad hoc
+`Asura.app` ([SG1 package script](../../docs/designs/release-signing.md#sg1-package-script)).
+It signs the Hub bundle and then the helper before it hashes them, and leaves
+the development package layout in `<out>/package/`. In `Asura.app` the helper
+is `Contents/MacOS/asura-model`, beside `asura`, and `mlx.metallib` and the
+Hub bundle are in `Contents/Resources`. The service reads them from
+`Contents/Resources` only when the helper is in `<name>.app/Contents/MacOS/`;
+in every other layout it reads them beside the helper
+([resource directory](../../docs/designs/release-signing.md#resource-directory-inside-the-bundle)).
+
 The service copies the Hub bundle beside the helper copy for MLX and Core AI
 selections. `Hub` reads it through `Bundle.module` when a tokenizer
 configuration has no `tokenizer_class`; without it the helper stops in

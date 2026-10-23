@@ -1,0 +1,226 @@
+#!/bin/sh
+# Checks for the SG1 package script (release-signing.md#validation).
+#
+#   test-asura-bundle --static         SG-V1 and SG-V3 unit checks of the tracked
+#                                      files; SG-V3 refusal checks of the script
+#   test-asura-bundle --bundle APP     SG-V1 and SG-V2 checks of an assembled
+#                                      ad hoc Asura.app (from asura-bundle --ad-hoc)
+#
+# --static needs ASURA_PROTOC and ASURA_PROTOC_GEN_SWIFT for the refusal cases
+# that pass the generator preflight. No case signs with an identity, reads a
+# keychain or builds the bundle.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
+release=$root/tools/release
+passed=0
+failed=0
+pass() { passed=$((passed + 1)); printf 'PASS %s\n' "$*"; }
+bad() { failed=$((failed + 1)); printf 'FAIL %s\n' "$*"; }
+check() { label=$1; shift; if "$@"; then pass "$label"; else bad "$label"; fi; }
+sorted_keys() { plutil -convert json -o - "$1" | /usr/bin/python3 -I -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin))))'; }
+value() { /usr/libexec/PlistBuddy -c "Print :$1" "$2" 2>/dev/null; }
+
+static_checks() {
+    # SG-V1 unit: every tracked property list parses and lists only allowed keys.
+    for plist in "$release/Info.plist.in" "$release"/entitlements/*.plist; do
+        check "parses: ${plist#"$root"/}" plutil -lint -s "$plist"
+    done
+    count=$(find "$release/entitlements" -type f | wc -l | tr -d ' ')
+    check 'six entitlement files' [ "$count" = 6 ]
+    restricted='com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups'
+    expect() { check "keys of $1: ${2:-none}" [ "$(sorted_keys "$release/entitlements/$1")" = "$2" ]; }
+    expect asura.release.plist "$restricted"
+    expect asura.development.plist "com.apple.application-identifier com.apple.developer.team-identifier com.apple.security.get-task-allow keychain-access-groups"
+    expect asura.ad-hoc.plist ''
+    expect asura-model.release.plist ''
+    expect asura-model.ad-hoc.plist ''
+    expect asura-model.development.plist 'com.apple.security.get-task-allow'
+    for kind in release development; do
+        file=$release/entitlements/asura.$kind.plist
+        check "$kind application identifier" [ "$(value com.apple.application-identifier "$file")" = '@TEAM_ID@.com.pidster.asura' ]
+        check "$kind team identifier" [ "$(value com.apple.developer.team-identifier "$file")" = '@TEAM_ID@' ]
+        check "$kind access group is the only group" [ "$(value keychain-access-groups "$file" | sed 's/^ *//' | tr '\n' ' ')" = 'Array { @TEAM_ID@.com.pidster.asura } ' ]
+    done
+    for file in asura.development.plist asura-model.development.plist; do
+        check "$file get-task-allow is true" [ "$(value com.apple.security.get-task-allow "$release/entitlements/$file")" = true ]
+    done
+    # RS2: no false Boolean and no exception entitlement in any file.
+    check 'no false Boolean entitlement' sh -c '! grep -l "<false/>" "$1"/entitlements/*.plist' sh "$release"
+    check 'no Hardened Runtime exception entitlement' sh -c '! grep -l "com.apple.security.cs\." "$1"/entitlements/*.plist' sh "$release"
+    info=$release/Info.plist.in
+    check 'Info.plist keys' [ "$(sorted_keys "$info")" = 'CFBundleDevelopmentRegion CFBundleExecutable CFBundleIdentifier CFBundleInfoDictionaryVersion CFBundleName CFBundlePackageType CFBundleShortVersionString CFBundleVersion LSMinimumSystemVersion LSUIElement' ]
+    check 'Info.plist bundle identifier' [ "$(value CFBundleIdentifier "$info")" = com.pidster.asura ]
+    check 'Info.plist executable' [ "$(value CFBundleExecutable "$info")" = asura ]
+    check 'Info.plist LSUIElement' [ "$(value LSUIElement "$info")" = true ]
+    check 'Info.plist minimum system' [ "$(value LSMinimumSystemVersion "$info")" = 27.0 ]
+    check 'Info.plist version placeholder' [ "$(value CFBundleVersion "$info")" = '@VERSION@' ]
+
+    # SG-V3 unit: no signing material is tracked.
+    check 'no tracked key, certificate bundle or profile file' sh -c \
+        '[ -z "$(git -C "$1" ls-files -- "*.p12" "*.p8" "*.provisionprofile" "*.mobileprovision")" ]' sh "$root"
+    check 'no tracked PEM private key' sh -c \
+        '! git -C "$1" grep -lE -e "-----BEGIN [A-Z ]*PRIVATE KEY-----" -- .' sh "$root"
+    check 'no tracked file names a team ID in place of the placeholder' sh -c \
+        '! git -C "$1" grep -lE "[A-Z0-9]{10}\.com\.pidster\.asura" -- tools' sh "$root"
+
+    # SG-V3 integration: the script refuses before building or signing.
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/asura-bundle-test.XXXXXXXX")
+    script=$release/asura-bundle
+    refuses() {
+        label=$1 expected=$2; shift 2
+        rm -rf "$scratch/out"
+        set +e
+        message=$(unset ASURA_SIGN_IDENTITY ASURA_TEAM_ID ASURA_PROFILE ASURA_NOTARY_PROFILE; "$@" 2>&1 >/dev/null)
+        status=$?
+        set -e
+        if [ "$status" -eq 1 ] && printf '%s' "$message" | grep -Fq -- "$expected" && [ ! -e "$scratch/out" ]; then
+            pass "refuses: $label"
+        else
+            bad "refuses: $label (status $status: $message)"
+        fi
+    }
+    out=$scratch/out
+    : > "$scratch/profile"
+    refuses 'no mode' 'choose --ad-hoc' "$script" --out "$out"
+    refuses 'two modes' 'exactly one' "$script" --ad-hoc --release --out "$out"
+    refuses 'no output directory' '--out DIR is required' "$script" --ad-hoc
+    for input in --identity --team-id --profile --notary-profile; do
+        refuses "ad hoc with $input" 'takes no identity' "$script" --ad-hoc --out "$out" "$input" x
+    done
+    refuses 'release without identity' 'signing identity name' \
+        "$script" --release --out "$out" --team-id ABCDE12345 --profile "$scratch/profile" --notary-profile n
+    refuses 'release without team ID' 'team ID' \
+        "$script" --release --out "$out" --identity 'Developer ID Application: T' --profile "$scratch/profile" --notary-profile n
+    refuses 'release without profile' 'provisioning profile path' \
+        "$script" --release --out "$out" --identity 'Developer ID Application: T' --team-id ABCDE12345 --notary-profile n
+    refuses 'release without notary profile' 'notarytool keychain profile name' \
+        "$script" --release --out "$out" --identity 'Developer ID Application: T' --team-id ABCDE12345 --profile "$scratch/profile"
+    refuses 'development without identity' 'signing identity name' \
+        "$script" --development --out "$out" --team-id ABCDE12345 --profile "$scratch/profile"
+    refuses 'development with a notary profile' 'only --release notarises' \
+        "$script" --development --out "$out" --identity 'Apple Development: T' --team-id ABCDE12345 --profile "$scratch/profile" --notary-profile n
+    refuses 'malformed team ID' 'ten upper-case' \
+        "$script" --development --out "$out" --identity 'Apple Development: T' --team-id abc --profile "$scratch/profile"
+    refuses 'ad hoc identity name in a signed mode' 'needs a named identity' \
+        "$script" --development --out "$out" --identity - --team-id ABCDE12345 --profile "$scratch/profile"
+    refuses 'missing profile file' 'regular file' \
+        "$script" --development --out "$out" --identity 'Apple Development: T' --team-id ABCDE12345 --profile "$scratch/none"
+    refuses 'relative generator' 'absolute path' \
+        env ASURA_PROTOC=protoc ASURA_PROTOC_GEN_SWIFT=/x "$script" --ad-hoc --out "$out"
+    mkdir "$out.exists"
+    if [ -n "${ASURA_PROTOC:-}" ] && [ -n "${ASURA_PROTOC_GEN_SWIFT:-}" ]; then
+        refuses 'existing output directory' 'must not exist' "$script" --ad-hoc --out "$out.exists"
+        refuses 'wrong generator version' 'is not protoc-gen-swift' \
+            env ASURA_PROTOC_GEN_SWIFT="$ASURA_PROTOC" "$script" --ad-hoc --out "$out"
+        # Profile checks run against a scratch copy of the script tree, whose
+        # missing sources stop it at the generate step if the profile passes.
+        tree=$scratch/tree
+        mkdir -p "$tree/tools/release" "$tree/tools/protobuf" "$tree/rust/crates/asura-cli"
+        cp -R "$release/." "$tree/tools/release/"
+        cp "$root/tools/protobuf/lock.json" "$tree/tools/protobuf/"
+        cp "$root/rust/crates/asura-cli/Cargo.toml" "$tree/rust/crates/asura-cli/"
+        git -C "$tree" init -q
+        git -C "$tree" add -A
+        git -C "$tree" -c user.name=t -c user.email=t@example.invalid commit -qm tree
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout "$scratch/key.pem" -out "$scratch/cert.pem" \
+            -days 1 -subj /CN=asura-bundle-test >/dev/null 2>&1
+        profile_for() { # team application-group expiry get-task-allow -> CMS profile path
+            cat > "$scratch/p.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>ExpirationDate</key><date>$3</date>
+<key>TeamIdentifier</key><array><string>$1</string></array>
+<key>Entitlements</key><dict>
+<key>com.apple.application-identifier</key><string>$1.com.pidster.asura</string>
+<key>keychain-access-groups</key><array><string>$2</string></array>
+<key>com.apple.security.get-task-allow</key><$4/>
+</dict></dict></plist>
+EOF
+            openssl smime -sign -in "$scratch/p.plist" -signer "$scratch/cert.pem" -inkey "$scratch/key.pem" \
+                -outform DER -nodetach -binary -out "$scratch/$5.provisionprofile"
+            printf '%s' "$scratch/$5.provisionprofile"
+        }
+        dev() { "$tree/tools/release/asura-bundle" --development --out "$out" \
+            --identity 'Apple Development: T' --team-id ABCDE12345 --profile "$1"; }
+        refuses 'expired profile' 'profile expired' dev "$(profile_for ABCDE12345 ABCDE12345.com.pidster.asura 2020-01-01T00:00:00Z true expired)"
+        refuses 'profile for another team' 'another team' dev "$(profile_for ZZZZZ12345 ZZZZZ12345.com.pidster.asura 2099-01-01T00:00:00Z true team)"
+        refuses 'profile without the access group' 'keychain access group' dev "$(profile_for ABCDE12345 ABCDE12345.com.other 2099-01-01T00:00:00Z true group)"
+        refuses 'development profile without get-task-allow' 'must allow get-task-allow' dev "$(profile_for ABCDE12345 'ABCDE12345.*' 2099-01-01T00:00:00Z false gta)"
+        refuses 'unsigned file as profile' 'cannot decode' dev "$scratch/profile"
+        good=$(profile_for ABCDE12345 'ABCDE12345.*' 2099-01-01T00:00:00Z true good)
+        rm -rf "$out"
+        set +e
+        message=$(unset ASURA_SIGN_IDENTITY; dev "$good" 2>&1 >/dev/null)
+        set -e
+        check 'a valid profile passes preflight (stops at generate in the scratch tree)' \
+            sh -c 'printf "%s" "$1" | grep -Fq "asura-bundle: generate:"' sh "$message"
+        rm -rf "$out"
+        : > "$tree/untracked"
+        refuses 'release from an unclean tree' 'clean working tree' "$tree/tools/release/asura-bundle" --release --out "$out" \
+            --identity 'Developer ID Application: T' --team-id ABCDE12345 --profile "$good" --notary-profile n
+    else
+        bad 'generator refusal and profile cases need ASURA_PROTOC and ASURA_PROTOC_GEN_SWIFT'
+    fi
+    rm -rf "$scratch"
+}
+
+bundle_checks() {
+    app=$1
+    contents=$app/Contents
+    check 'deep strict verification' codesign --verify --deep --strict "$app"
+    for path in Info.plist MacOS/asura MacOS/asura-model Resources/mlx.metallib Resources/model-package.json \
+        Resources/swift-transformers_Hub.bundle/Contents/Info.plist _CodeSignature/CodeResources; do
+        check "layout: Contents/$path" [ -e "$contents/$path" ]
+    done
+    check 'no profile in an ad hoc bundle' [ ! -e "$contents/embedded.provisionprofile" ]
+    check 'no other top-level entry' [ "$(ls "$contents" | LC_ALL=C sort | tr '\n' ' ')" = 'Info.plist MacOS Resources _CodeSignature ' ]
+    check 'at most 64 files' [ "$(find "$app" -type f | wc -l | tr -d ' ')" -le 64 ]
+    check 'bundle identifier' [ "$(value CFBundleIdentifier "$contents/Info.plist")" = com.pidster.asura ]
+    check 'bundle executable' [ "$(value CFBundleExecutable "$contents/Info.plist")" = asura ]
+    check 'bundle version' [ "$(value CFBundleVersion "$contents/Info.plist")" = "$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/rust/crates/asura-cli/Cargo.toml" | head -n 1)" ]
+    info=$(codesign -d --verbose=2 "$contents/MacOS/asura-model" 2>&1)
+    check 'helper identifier' sh -c 'printf "%s\n" "$1" | grep -qx "Identifier=com.pidster.asura.model"' sh "$info"
+    check 'helper embedded Info.plist bound' sh -c 'printf "%s\n" "$1" | grep -Eq "^Info.plist entries=[1-9]"' sh "$info"
+    check 'helper embedded CFBundleIdentifier' sh -c \
+        'launchctl plist __TEXT,__info_plist "$1" | grep -Fq "\"CFBundleIdentifier\" = \"com.pidster.asura.model\""' \
+        sh "$contents/MacOS/asura-model"
+    for binary in asura asura-model; do
+        info=$(codesign -d --verbose=2 "$contents/MacOS/$binary" 2>&1)
+        check "$binary Hardened Runtime" sh -c 'printf "%s\n" "$1" | grep -Eq "^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime"' sh "$info"
+        check "$binary ad hoc signature, no team" sh -c 'printf "%s\n" "$1" | grep -qx "Signature=adhoc" && printf "%s\n" "$1" | grep -qx "TeamIdentifier=not set"' sh "$info"
+        # SG-V1 integration: the signed entitlements equal the tracked list.
+        actual=$(codesign -d --entitlements - --xml "$contents/MacOS/$binary" 2>/dev/null || :)
+        [ -n "$actual" ] || actual='<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict/></plist>'
+        check "$binary entitlements equal $binary.ad-hoc.plist" sh -c \
+            '[ "$(printf "%s" "$1" | plutil -p -)" = "$(plutil -p "$2")" ]' sh "$actual" "$release/entitlements/$binary.ad-hoc.plist"
+        check "$binary has no get-task-allow" sh -c '! printf "%s" "$1" | grep -q get-task-allow' sh "$actual"
+    done
+    check 'app identifier' sh -c 'codesign -d --verbose=2 "$1" 2>&1 | grep -qx "Identifier=com.pidster.asura"' sh "$app"
+    check 'Hub bundle signed ad hoc' sh -c 'codesign -d --verbose=2 "$1" 2>&1 | grep -qx "Signature=adhoc"' sh "$contents/Resources/swift-transformers_Hub.bundle"
+    # SG-V2 integration: digests inside the bundle equal the package identity.
+    manifest=$contents/Resources/model-package.json
+    field() { plutil -extract "$1" raw -o - "$manifest"; }
+    hub=$(cd "$contents/Resources/swift-transformers_Hub.bundle" && find . -type f | sed 's|^\./||' | LC_ALL=C sort |
+        tr '\n' '\0' | xargs -0 shasum -a 256 | shasum -a 256 | cut -d ' ' -f 1)
+    check 'manifest format 0.1' [ "$(field format)" = 0.1 ]
+    check 'helper digest equals model-package.json' [ "$(shasum -a 256 "$contents/MacOS/asura-model" | cut -d ' ' -f 1)" = "$(field helper_sha256)" ]
+    check 'metallib digest equals model-package.json' [ "$(shasum -a 256 "$contents/Resources/mlx.metallib" | cut -d ' ' -f 1)" = "$(field metallib_sha256)" ]
+    check 'Hub bundle digest equals model-package.json' [ "$hub" = "$(field hub_bundle_sha256)" ]
+    check 'schema digest equals model.proto' [ "$(shasum -a 256 "$root/contracts/model/v1/model.proto" | cut -d ' ' -f 1)" = "$(field schema_sha256)" ]
+    identity=$root/.build/model-tools/package-identity.txt
+    check 'package-identity.txt equals model-package.json' [ "$(cat "$identity")" = \
+        "$(printf '%s\n' "$(field build_id)" "$(field schema_sha256)" "$(field helper_sha256)" "$(field metallib_sha256)" "$(field hub_bundle_sha256)")" ]
+    check 'asura binary embeds the helper and Hub bundle digests' /usr/bin/python3 -I -c \
+        'import sys; data = open(sys.argv[1], "rb").read(); sys.exit(0 if all(bytes.fromhex(h) in data for h in sys.argv[2:]) else 1)' \
+        "$contents/MacOS/asura" "$(field helper_sha256)" "$(field hub_bundle_sha256)" "$(field build_id)"
+}
+
+case "${1:-}" in
+    --static) [ "$#" -eq 1 ] || { echo "$0 --static" >&2; exit 2; }; static_checks ;;
+    --bundle) [ "$#" -eq 2 ] && [ -d "$2" ] || { echo "$0 --bundle PATH/Asura.app" >&2; exit 2; }; bundle_checks "$2" ;;
+    *) sed -n '2,11p' "$0" >&2; exit 2 ;;
+esac
+printf '%s passed, %s failed\n' "$passed" "$failed"
+[ "$failed" -eq 0 ]

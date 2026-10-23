@@ -10,7 +10,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::{ffi::OsStrExt, fs::MetadataExt, net::UnixStream},
     },
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -22,6 +22,26 @@ const HUB_BUNDLE_DIRECTORIES: usize = 16;
 const HUB_BUNDLE_DEPTH: usize = 4;
 const HUB_BUNDLE_FILE_BYTES: u64 = 1024 * 1024;
 const HUB_BUNDLE_TOTAL_BYTES: u64 = 1024 * 1024;
+
+/// The one directory that holds `mlx.metallib` and the Hub bundle for
+/// `helper` (release signing, SG1). Inside `<name>.app/Contents/MacOS/` it is
+/// `<name>.app/Contents/Resources`; for any other layout (development package,
+/// test binaries) it is the helper's own directory. Only the path is
+/// inspected: there is no search and no second location.
+pub fn package_resource_directory(helper: &Path) -> PathBuf {
+    let directory = helper.parent().unwrap_or(Path::new(""));
+    let contents = directory
+        .parent()
+        .filter(|_| directory.file_name() == Some("MacOS".as_ref()));
+    let bundle = contents
+        .filter(|contents| contents.file_name() == Some("Contents".as_ref()))
+        .and_then(Path::parent)
+        .filter(|bundle| bundle.extension() == Some("app".as_ref()));
+    match (contents, bundle) {
+        (Some(contents), Some(_)) => contents.join("Resources"),
+        _ => directory.to_path_buf(),
+    }
+}
 
 /// Package resources copied beside the helper. An absent digest copies nothing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -553,8 +573,8 @@ impl ModelProcess {
     }
 
     /// MLX requires `mlx.metallib`; MLX and Core AI require the Hub bundle.
-    /// Each resource is the package sibling of `helper`, copied beside the
-    /// helper copy in one private package directory.
+    /// Each resource is read from [`package_resource_directory`] of `helper`
+    /// and copied beside the helper copy in one private package directory.
     pub fn spawn_with_resources(
         runtime: &RuntimeDirectory,
         helper: &Path,
@@ -598,11 +618,12 @@ impl ModelProcess {
             128 * 1024 * 1024,
             &check,
         )?;
+        let resource_directory = package_resource_directory(helper);
         let resource = if let Some(digest) = resources.metallib {
             Some(verified_copy(
                 pinned.directory.try_clone()?,
                 CString::new("mlx.metallib").unwrap(),
-                &helper.with_file_name("mlx.metallib"),
+                &resource_directory.join("mlx.metallib"),
                 digest,
                 uid,
                 false,
@@ -615,7 +636,7 @@ impl ModelProcess {
         let bundle = if let Some(digest) = resources.hub_bundle {
             Some(copy_bundle(
                 &pinned.directory,
-                &helper.with_file_name(HUB_BUNDLE_NAME),
+                &resource_directory.join(HUB_BUNDLE_NAME),
                 digest,
                 uid,
                 &check,
@@ -1140,6 +1161,159 @@ mod tests {
         );
         owned.0.take();
         assert_eq!(fixture.copies(), 0);
+    }
+
+    #[test]
+    fn package_resource_directory_is_contents_resources_only_inside_an_app_bundle() {
+        // SG-V9 unit: one resource directory per layout, decided by the path.
+        for (helper, expected) in [
+            (
+                "/opt/homebrew/Cellar/asura/0.1.0/libexec/Asura.app/Contents/MacOS/asura-model",
+                "/opt/homebrew/Cellar/asura/0.1.0/libexec/Asura.app/Contents/Resources",
+            ),
+            (
+                "/private/tmp/out/Asura.app/Contents/MacOS/asura-model",
+                "/private/tmp/out/Asura.app/Contents/Resources",
+            ),
+            (
+                "/Applications/Other.app/Contents/MacOS/asura-model",
+                "/Applications/Other.app/Contents/Resources",
+            ),
+            // Development package and test binaries: beside the helper.
+            ("/repo/target/debug/asura-model", "/repo/target/debug"),
+            (
+                "/repo/.build/current-package/asura-model",
+                "/repo/.build/current-package",
+            ),
+            // Not a bundle: a `MacOS` directory outside `Contents`, a
+            // `Contents` directory outside an `.app`, or a lower-case name.
+            ("/x/Asura.app/MacOS/asura-model", "/x/Asura.app/MacOS"),
+            (
+                "/x/Asura/Contents/MacOS/asura-model",
+                "/x/Asura/Contents/MacOS",
+            ),
+            (
+                "/x/Asura.app/contents/MacOS/asura-model",
+                "/x/Asura.app/contents/MacOS",
+            ),
+            (
+                "/x/Asura.app/Contents/macos/asura-model",
+                "/x/Asura.app/Contents/macos",
+            ),
+            (
+                "/x/Asura.apps/Contents/MacOS/asura-model",
+                "/x/Asura.apps/Contents/MacOS",
+            ),
+            ("/Contents/MacOS/asura-model", "/Contents/MacOS"),
+            ("asura-model", ""),
+        ] {
+            assert_eq!(
+                package_resource_directory(Path::new(helper)),
+                PathBuf::from(expected),
+                "{helper}"
+            );
+        }
+    }
+
+    /// An `Asura.app` layout under the fixture root: the fixture helper is
+    /// copied to `Contents/MacOS/asura-model`; returns (helper, Resources).
+    fn app_layout(fixture: &Fixture) -> (PathBuf, PathBuf) {
+        let contents = fixture.root.join("Asura.app/Contents");
+        let resources = contents.join("Resources");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::create_dir(&resources).unwrap();
+        let helper = contents.join("MacOS/asura-model");
+        std::fs::copy(&fixture.helper, &helper).unwrap();
+        (helper, resources)
+    }
+
+    #[test]
+    fn app_bundle_resources_are_read_from_contents_resources() {
+        // SG-V9 integration: the copy step finds `Resources/mlx.metallib` and
+        // the Hub bundle; decoys beside the helper inside the bundle are ignored.
+        let fixture = Fixture::new(
+            b"#!/bin/sh\n/bin/cat \"${0%/*}/mlx.metallib\" \"${0%/*}/swift-transformers_Hub.bundle/Contents/Resources/a.json\"\n",
+        );
+        let (helper, resources) = app_layout(&fixture);
+        let metal_bytes = b"bundle-metal;";
+        std::fs::write(resources.join("mlx.metallib"), metal_bytes).unwrap();
+        std::fs::write(helper.with_file_name("mlx.metallib"), b"decoy-metal;").unwrap();
+        let digest = write_bundle(
+            &fixture,
+            &[],
+            &[
+                ("Contents/Info.plist", b"plist"),
+                ("Contents/Resources/a.json", b"bundle-hub"),
+            ],
+        );
+        std::fs::rename(
+            fixture.helper.with_file_name(HUB_BUNDLE_NAME),
+            resources.join(HUB_BUNDLE_NAME),
+        )
+        .unwrap();
+        write_bundle(
+            &fixture,
+            &[],
+            &[
+                ("Contents/Info.plist", b"plist"),
+                ("Contents/Resources/a.json", b"decoy-hub"),
+            ],
+        );
+        std::fs::rename(
+            fixture.helper.with_file_name(HUB_BUNDLE_NAME),
+            helper.with_file_name(HUB_BUNDLE_NAME),
+        )
+        .unwrap();
+        let child = ModelProcess::spawn_with_resources(
+            &fixture.runtime,
+            &helper,
+            fixture.digest,
+            PackageResources {
+                metallib: Some(Sha256::digest(metal_bytes).into()),
+                hub_bundle: Some(digest),
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let mut owned = OwnedTestChild(Some(child));
+        assert_eq!(fixture.copies(), 1);
+        while !owned.0.as_mut().unwrap().try_reap().unwrap() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        owned.0.as_mut().unwrap().poll_diagnostics().unwrap();
+        assert_eq!(
+            owned.0.as_ref().unwrap().diagnostic_tail,
+            b"bundle-metal;bundle-hub"
+        );
+        owned.0.take();
+        assert_eq!(fixture.copies(), 0);
+    }
+
+    #[test]
+    fn app_bundle_without_contents_resources_never_spawns() {
+        // SG-V9 integration: resources only beside the helper inside a bundle
+        // are absent; preparation fails before spawn and leaves no copy.
+        let fixture = Fixture::new(b"#!/bin/sh\nexit 0\n");
+        let (helper, _resources) = app_layout(&fixture);
+        let metal_bytes = b"beside-only";
+        std::fs::write(helper.with_file_name("mlx.metallib"), metal_bytes).unwrap();
+        let digest = write_bundle(&fixture, &[], &[("Contents/Info.plist", b"plist")]);
+        std::fs::rename(
+            fixture.helper.with_file_name(HUB_BUNDLE_NAME),
+            helper.with_file_name(HUB_BUNDLE_NAME),
+        )
+        .unwrap();
+        for resources in [metal(Sha256::digest(metal_bytes).into()), hub(digest)] {
+            let result = ModelProcess::spawn_with_resources(
+                &fixture.runtime,
+                &helper,
+                fixture.digest,
+                resources,
+                &AtomicBool::new(false),
+            );
+            assert!(result.is_err(), "{resources:?} must not spawn");
+            assert_eq!(fixture.copies(), 0);
+        }
     }
 
     #[test]

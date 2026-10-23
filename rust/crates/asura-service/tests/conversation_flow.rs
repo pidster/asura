@@ -2030,6 +2030,135 @@ fn native_mlx() -> Result<()> {
     result.map_err(|error| format!("native-mlx {stage}: {error}").into())
 }
 
+/// SG-V9 end to end (release signing, SG1): the service runs from an
+/// `Asura.app` layout built from an assembled bundle (`ASURA_TEST_BUNDLE`,
+/// from `tools/release/asura-bundle`). It must find the signed helper beside
+/// itself in `Contents/MacOS` and `mlx.metallib` and the Hub bundle in
+/// `Contents/Resources`. This test binary stands in for `asura`, which uses
+/// the account home; it must be built after the bundle so that it embeds the
+/// same package identity.
+fn bundle_mlx() -> Result<()> {
+    let mut stage = "inputs";
+    let mut fixture = Fixture::new()?;
+    let result = (|| -> Result<()> {
+        let bundle = PathBuf::from(
+            std::env::var_os("ASURA_TEST_BUNDLE").ok_or("ASURA_TEST_BUNDLE is required")?,
+        )
+        .canonicalize()?;
+        let source = PathBuf::from(
+            std::env::var_os("ASURA_TEST_MLX_ASSET").ok_or("ASURA_TEST_MLX_ASSET is required")?,
+        )
+        .canonicalize()?;
+        stage = "bundle layout";
+        let packaged = bundle.join("Contents");
+        let contents = fixture.home.join("Asura.app/Contents");
+        fs::create_dir_all(contents.join("MacOS"))?;
+        fs::create_dir(contents.join("Resources"))?;
+        let executable = contents.join("MacOS/conversation_flow");
+        fs::copy(std::env::current_exe()?, &executable)?;
+        fs::copy(
+            packaged.join("MacOS/asura-model"),
+            contents.join("MacOS/asura-model"),
+        )?;
+        fs::copy(
+            packaged.join("Resources/mlx.metallib"),
+            contents.join("Resources/mlx.metallib"),
+        )?;
+        let hub = format!("Resources/{}", asura_platform::HUB_BUNDLE_NAME);
+        copy_assets(
+            &packaged.join(&hub),
+            &contents.join(&hub),
+            0,
+            &mut 0,
+            &mut 0,
+        )?;
+        fixture.executable = executable;
+        stage = "service startup";
+        fixture.start()?;
+        stage = "installation ready";
+        wait_ready(&fixture, None)?;
+        stage = "asset copy";
+        let assets = fixture.home.join(".asura/data/models/mlx/native-fixture");
+        copy_assets(&source, &assets, 0, &mut 0, &mut 0)?;
+        stage = "installation ready";
+        wait_ready(&fixture, None)?;
+        let directory = fixture.home.join("bundle-project");
+        fs::create_dir(&directory)?;
+        stage = "project registration";
+        let project = checked_id(
+            fixture
+                .attach()?
+                .register_project(
+                    pb::ProjectRegister {
+                        request_id: Some(asura_platform::random_id().to_vec()),
+                        location: Some(directory.to_str().ok_or("invalid fixture path")?.into()),
+                    },
+                    &|| false,
+                )?
+                .project_id,
+        )?;
+        stage = "model configuration";
+        let configured = fixture
+            .attach()?
+            .config("model", Some("mlx:native-fixture"), &|| false)?;
+        assert!(
+            configured.error.is_none(),
+            "configuration failed: {configured:?}"
+        );
+        stage = "native submit";
+        let accepted = provider_submit(&fixture, project, None, 0, "Name one tree.")?;
+        let operation = checked_id(accepted.operation_id)?;
+        stage = "bundle resource proof";
+        let run = fixture.home.join(".asura/run");
+        let copied = fs::read_dir(&run)?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.join("mlx.metallib").is_file())
+            .ok_or("native helper did not retain its private Metal resource")?;
+        assert_eq!(
+            fs::read(copied.join("asura-model"))?,
+            fs::read(packaged.join("MacOS/asura-model"))?,
+            "the helper copy must be the bundle's signed helper"
+        );
+        assert_eq!(
+            fs::read(copied.join("mlx.metallib"))?,
+            fs::read(packaged.join("Resources/mlx.metallib"))?,
+            "mlx.metallib must come from Contents/Resources"
+        );
+        assert_eq!(
+            bundle_files(&copied.join(asura_platform::HUB_BUNDLE_NAME))?,
+            bundle_files(&packaged.join(&hub))?,
+            "the Hub bundle must come from Contents/Resources"
+        );
+        stage = "native completion";
+        let terminal = observe(&fixture, operation)?;
+        assert_eq!(
+            terminal.kind,
+            Some(3),
+            "MLX completion failed: {terminal:?}"
+        );
+        assert!(!terminal.text.as_deref().unwrap_or_default().is_empty());
+        stage = "service shutdown";
+        fixture.stop()?;
+        assert!(
+            !fs::read_dir(&run)?
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("model-")),
+            "owned model copies leaked after shutdown"
+        );
+        println!(
+            "PASS bundle MLX: service in Asura.app/Contents/MacOS used the bundle helper and Contents/Resources resources, completed and cleaned up"
+        );
+        Ok(())
+    })();
+    result.map_err(|error| {
+        // The fixture deletes its home on drop; keep the service log tail.
+        let log = fs::read_to_string(fixture.home.join("service.log")).unwrap_or_default();
+        let tail = &log[log.len().saturating_sub(4096)..];
+        format!("bundle-mlx {stage}: {error}\nservice log tail:\n{tail}").into()
+    })
+}
+
 fn native_ollama() -> Result<()> {
     let mut stage = "model selection";
     let result = (|| -> Result<()> {
@@ -2560,6 +2689,8 @@ fn main() {
         native_ollama_thinking()
     } else if args.iter().any(|a| a == "--native-ollama") {
         native_ollama()
+    } else if args.iter().any(|a| a == "--bundle-mlx") {
+        bundle_mlx()
     } else if args.iter().any(|a| a == "--native-mlx") {
         native_mlx()
     } else if args.iter().any(|a| a == "--native-coreai-tools") {

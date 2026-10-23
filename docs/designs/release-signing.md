@@ -9,6 +9,8 @@ Status: selected design, 2026-10-23. The owner answered the nine signing
 questions SGQ1–SGQ9 on 2026-10-23 ([owner decisions](#owner-decisions)). No
 code, test, signature, notarisation or Keychain call was made to write this
 design. Protocol numbering stays `0.1`; journal format stays `1`.
+Packet SG1 delivered the package script and the bundle resource lookup on
+2026-10-23 ([SG1 delivery](#sg1-delivery)); it signed ad hoc only.
 
 What is fixed:
 
@@ -303,17 +305,19 @@ Selected (SGQ9).
 | Apple Development key (development bundles, SGQ3) | The owner's login keychain | As above |
 | Notary credential | `notarytool store-credentials` profile (App Store Connect API key, Developer role). The operator deletes the `.p8` file after storing it | In environment files, scripts, logs or arguments |
 | Provisioning profiles | Downloaded by the operator into an ignored path (`.build/signing/`). They are not secret, but they hold the team's certificate and are not tracked | Tracked in git |
-| Team ID | Read by the release script from the signing certificate at run time. Rust code does not embed it: `SecItem` calls omit `kSecAttrAccessGroup`, so the default group is the first group in the entitlement | Hard-coded in source |
+| Team ID | Given to the package script by the operator (argument or environment) at run time. The script checks it against the profile and against the signed result (`codesign -dv` `TeamIdentifier`), so it never reads the keychain to find it. Rust code does not embed it: `SecItem` calls omit `kSecAttrAccessGroup`, so the default group is the first group in the entitlement | Hard-coded in source or written to a tracked file |
 
 Tracked files: entitlement property lists for each executable and build kind,
-the `Info.plist` template, and the release script. None contains a secret.
-The release script takes the signing identity name and the notary profile
-name as arguments. It refuses to run when the working tree is unclean or when
-either name is absent. Tests do not run the release script. A dry-run mode
-(release-distribution HD10) runs every step except `codesign` with a real
-identity, `notarytool` and `stapler`. The dry run signs ad hoc, so it never
-touches a certificate. CI may run the dry run; it never holds an identity or
-a notary profile (RS10).
+the `Info.plist` template, and the package script
+([SG1 package script](#sg1-package-script)). None contains a secret. The
+script takes the signing identity name, the team ID, the profile path and the
+notary profile name from the operator. It stores none of them in a tracked
+file and prints no secret. It refuses a release when the working tree is
+unclean or when any of the four inputs is absent. Its ad hoc mode is the dry
+run (release-distribution HD10): it runs every step except `codesign` with a
+real identity, `notarytool` and `stapler`. The dry run signs ad hoc, so it
+never touches a certificate or a keychain. CI may run the dry run; it never
+holds an identity or a notary profile (RS10).
 
 ### Development builds compared with release builds
 
@@ -335,6 +339,190 @@ development build and a release build on one Mac therefore share items
 (SGQ4). The sweep and the binding digest already handle items from another
 installation. Probe KC-P1 must show whether Apple Development and Developer ID
 signatures from one team both satisfy the group.
+
+### SG1 package script
+
+Selected design (packet SG1, engineering, 2026-10-23). The script
+`tools/release/asura-bundle` builds, signs and checks `Asura.app`. It is an
+operator tool. No Asura runtime component calls it, and no `cargo test` runs
+it. `tools/release/README.md` gives the operator commands.
+
+#### Modes and inputs
+
+| Mode | Signing identity | Required inputs | Entitlement files | Profile | Timestamp | After signing |
+| --- | --- | --- | --- | --- | --- | --- |
+| `--ad-hoc` (dry run, HD10) | `-` (ad hoc) | `--out` only. An identity, team, profile or notary argument is refused | `*.ad-hoc.plist` | None | None | Archive, marked unstapled |
+| `--development` (SGQ3) | Apple Development | Identity name, team ID, development profile | `*.development.plist` | Copied in | None | None |
+| `--release` | Developer ID Application | Identity name, team ID, Developer ID profile, notary keychain profile name; clean working tree | `*.release.plist` | Copied in | Secure timestamp | Notarise, staple, archive |
+
+Each identity input comes from an argument (`--identity`, `--team-id`,
+`--profile`, `--notary-profile`) or from the environment (`ASURA_SIGN_IDENTITY`,
+`ASURA_TEAM_ID`, `ASURA_PROFILE`, `ASURA_NOTARY_PROFILE`). An argument wins.
+The ad hoc mode reads none of the environment inputs. Every mode needs a new
+output directory (`--out`, which must not exist) and the verified generators
+`ASURA_PROTOC` (`protoc` 36.2) and `ASURA_PROTOC_GEN_SWIFT`
+(`protoc-gen-swift` 1.38.1), checked against `tools/protobuf/lock.json`. The
+team ID must be ten upper-case letters or digits.
+
+The profile is decoded with `/usr/bin/openssl smime -verify -noverify`, which
+reads no keychain. The script refuses a profile that has expired, whose
+`TeamIdentifier` does not hold the team ID, whose
+`com.apple.application-identifier` is not `<TeamID>.com.pidster.asura`, or
+whose `keychain-access-groups` lacks `<TeamID>.com.pidster.asura` (or
+`<TeamID>.*`). No step calls `security`.
+
+#### Entitlement files
+
+Tracked in `tools/release/entitlements/`. `@TEAM_ID@` is replaced with the
+team ID at signing time, in the output directory only.
+
+| File | Keys |
+| --- | --- |
+| `asura.release.plist` | `keychain-access-groups` [`@TEAM_ID@.com.pidster.asura`], `com.apple.application-identifier` `@TEAM_ID@.com.pidster.asura`, `com.apple.developer.team-identifier` `@TEAM_ID@` |
+| `asura.development.plist` | The release keys and `com.apple.security.get-task-allow` `true` |
+| `asura.ad-hoc.plist` | None |
+| `asura-model.release.plist`, `asura-model.ad-hoc.plist` | None. Packet SG2 adds the App Sandbox keys (SGQ7) |
+| `asura-model.development.plist` | `com.apple.security.get-task-allow` `true`. SG2 adds the App Sandbox keys |
+
+The ad hoc files omit the profile-authorised keys because the kernel kills an
+ad hoc process that claims them: an ad hoc, hardened test binary that claimed
+`keychain-access-groups` and `com.apple.application-identifier` exited with
+`SIGKILL` (status 137) at launch (observed, 2026-10-23, macOS 27.0). The dry
+run therefore proves the bundle layout, the signing order, the Hardened
+Runtime and the digests. It does not prove the restricted entitlements; KC-P1
+and NT-P1 do.
+
+#### Steps and checks
+
+The steps run one at a time. Each check that fails stops the script with
+`asura-bundle: <step>: <reason>` and a non-zero status, and nothing after it
+runs. A failed run leaves its output directory for inspection and never writes
+the archive. A new run needs a new output directory.
+
+1. **Preflight.** macOS 27 on Apple silicon; mode inputs present and valid;
+   generator versions; profile checks; release mode needs a clean tree.
+2. **Generate.** A new random 32-byte build ID; `schema_digest` is the SHA-256
+   of `contracts/model/v1/model.proto`. Write `BuildIdentity.swift` and
+   `model.pb.swift` into the ignored `Sources/HelperCore/Generated/`.
+3. **Build the helper.** `swift build -c release --product asura-model`.
+   The products are `asura-model`, `swift-transformers_Hub.bundle` and
+   `mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib`, staged as
+   `mlx.metallib`.
+4. **Stage and check limits.** Helper at most 128 MiB, `mlx.metallib` at most
+   64 MiB, Hub bundle within the BN1 limits, no symbolic link anywhere.
+5. **Sign inside-out (D-S3).** The Hub bundle first, then `asura-model` with
+   identifier `com.pidster.asura.model` and the Hardened Runtime. Check:
+   `codesign --verify --strict` passes for both; the helper's identifier is
+   `com.pidster.asura.model`, its flags hold `runtime`, its embedded
+   `Info.plist` is bound, and the signed helper's `--version` reports the
+   build ID and schema digest from step 2 (step 2 also checks that each
+   generated array holds 32 bytes).
+6. **Hash.** SHA-256 of the signed helper and `mlx.metallib`, and the Hub
+   bundle digest ([encoding](#hub-bundle-digest-encoding)). Write the five
+   lines of `.build/model-tools/package-identity.txt` and the staged
+   `model-package.json` (`format` `0.1`).
+7. **Build the service.** `cargo build --release --locked -p asura-cli`.
+   `asura-service/build.rs` embeds the digests from step 6.
+8. **Assemble** `Asura.app` ([bundle layout](#bundle-layout)) from the template
+   `tools/release/Info.plist.in` (version from `asura-cli`), the staged files
+   and, for a signed mode, the profile. Check: at most 64 files; the copied
+   helper, `mlx.metallib` and Hub bundle digests equal step 6.
+9. **Sign the bundle.** `codesign` on `Asura.app` with the `asura` entitlements,
+   without `--deep`, so nested code is not signed again. Check:
+   `codesign --verify --deep --strict` passes; the entitlements of `asura` and
+   `asura-model` (`codesign -d --entitlements`) equal the expected files; both
+   carry `runtime`; the bundle identifier is `com.pidster.asura`; in a signed
+   mode both carry the team ID and the profile allows every signed
+   entitlement; the digests inside the bundle still equal step 6 (SG-V2).
+10. **Notarise (release only).** Zip with `ditto -c -k --keepParent`, then
+    `xcrun notarytool submit --keychain-profile <name> --wait`. A result other
+    than `Accepted` downloads the log with `notarytool log`, stops and publishes
+    nothing. Then `xcrun stapler staple` with paced retries
+    ([failure handling](#failure-handling)), `stapler validate`,
+    `spctl --assess --type execute`, and the step 9 digest check again.
+11. **Archive.** `asura-<version>-macos-arm64.tar.gz` holding `Asura.app` and
+    `LICENSE`, with its SHA-256 beside it. The ad hoc archive is named
+    `…-adhoc-unstapled.tar.gz` so that it cannot be mistaken for a release.
+    The release promotion and the formula stay with SG4.
+
+The script also leaves the signed helper, `mlx.metallib`, the Hub bundle and
+`model-package.json` in `<out>/package/`, the development package layout
+(resources beside the helper). Steps 2 and 6 rewrite the generated Swift
+sources and `.build/model-tools/package-identity.txt`, as the manual package
+step does. Later Cargo builds therefore embed this package's identity, and
+native tests use `<out>/package/` beside the test binaries.
+
+Time: no step has a time bound (RS8). `notarytool --wait` ends with the
+service's reply or an operator cancel (Ctrl-C). Stapling retries end with
+success or an operator cancel.
+
+#### SG-F4: package script checks
+
+Selected design. Arrows show the next step; labelled arrows show a check
+result. Every "Stop" leaves no archive.
+
+```mermaid
+flowchart TD
+    In["Mode and inputs"] --> Pre{"Host, inputs, generators, profile and clean tree valid for the mode?"}
+    Pre -->|No| S0["Stop: refused, nothing built"]
+    Pre -->|Yes| Gen["Generate build ID, BuildIdentity.swift and model.pb.swift"]
+    Gen --> SB["swift build -c release"]
+    SB --> Lim{"Helper, metallib and Hub bundle within limits, no symlink?"}
+    Lim -->|No| S1["Stop: limits"]
+    Lim -->|Yes| Sig["Sign Hub bundle, then asura-model"]
+    Sig --> HV{"Strict verify, identifier, runtime and bound Info.plist?"}
+    HV -->|No| S2["Stop: helper signature"]
+    HV -->|Yes| Hash["Hash signed files into package-identity.txt and model-package.json"]
+    Hash --> CB["cargo build --release: build.rs embeds digests"]
+    CB --> Asm["Assemble Asura.app"]
+    Asm --> D1{"Copies equal recorded digests, at most 64 files?"}
+    D1 -->|No| S3["Stop: assembly"]
+    D1 -->|Yes| SA["Sign Asura.app without --deep"]
+    SA --> AV{"Deep strict verify, entitlements, runtime, team and digests unchanged?"}
+    AV -->|No| S4["Stop: bundle signature"]
+    AV -->|"Yes, ad hoc or development"| Out["Bundle ready; ad hoc also writes the unstapled archive"]
+    AV -->|"Yes, release"| Nt["notarytool submit --wait"]
+    Nt -->|"Not Accepted"| S5["Stop: notary log saved"]
+    Nt -->|Accepted| St["Staple with paced retries, validate, assess"]
+    St --> D2{"Digests unchanged after stapling?"}
+    D2 -->|No| S6["Stop: identity broken"]
+    D2 -->|Yes| Tar["Release archive and its SHA-256"]
+```
+
+#### Resource directory inside the bundle
+
+Selected (engineering, packet SG1). The helper stays beside the canonical
+service executable, so `model_owner` is unchanged. The platform owner
+(`asura_platform::package_resource_directory`) derives the one source
+directory for `mlx.metallib` and the Hub bundle from the helper path. It
+inspects only the path; there is no search and no second location.
+
+| Helper path | Resource directory |
+| --- | --- |
+| `<name>.app/Contents/MacOS/asura-model` | `<name>.app/Contents/Resources` |
+| Any other path (development package, test binaries) | The helper's directory |
+
+A bundle layout with resources beside the helper and none in `Resources`
+fails before spawn, like any missing resource. The copied run layout does not
+change: the copy step still places both resources beside the helper copy.
+
+#### SG-F5: resource directory resolution
+
+Selected design. Arrows show the next test on the helper path; labels show
+the result.
+
+```mermaid
+flowchart TD
+    H["Canonical helper path, beside the service executable"] --> M{"Parent directory named MacOS?"}
+    M -->|No| Side["Resources beside the helper"]
+    M -->|Yes| C{"Its parent named Contents?"}
+    C -->|No| Side
+    C -->|Yes| A{"Its parent has the extension app?"}
+    A -->|No| Side
+    A -->|Yes| R["Resources in Contents/Resources"]
+    Side --> Copy["Verified copy beside the helper copy (SG-F3)"]
+    R --> Copy
+```
 
 ## Service App Sandbox: no
 
@@ -632,8 +820,10 @@ HS-P3 runs MLX generation in a hardened, and then a sandboxed, helper.
 Lookup order after the bundle change: MLX first tries `mlx.metallib` beside the
 running executable. The running executable is the copy in
 `~/.asura/run/model-<hex>/`, and the copy step already places `mlx.metallib`
-there. The source path changes from beside `asura-model` to
-`Contents/Resources/mlx.metallib`. The copied layout does not change.
+there. In a bundle, the source path changes from beside `asura-model` to
+`Contents/Resources/mlx.metallib`
+([resource directory](#resource-directory-inside-the-bundle)). The copied
+layout does not change.
 
 ### SwiftPM resource bundles
 
@@ -1045,13 +1235,54 @@ signing packet.
 | --- | --- | --- |
 | SG0 | Ready | BN-P1 done; SB, HS and HR probes remain |
 | BN1 | Ready | — (BN-P1 confirmed the crash, 2026-10-23) |
-| SG1 | Not ready | BN1 delivered or closed; SG0 results for HS-P1 (embedded `Info.plist`) and HR-P2 |
-| SG0-K | Not ready | SG1 qualification bundle; the owner runs it (SGQ9) |
+| SG1 | Delivered (branch `sg1`, 2026-10-23) | — ([delivery](#sg1-delivery)) |
+| SG0-K | Not ready | A qualification-bundle variant of the package script (entitlements naming the test group `<TeamID>.com.pidster.asura.test`, and its profile); then the owner runs it (SGQ9) |
 | SG2a | Delivered (branch `sg2a`, 2026-10-23) | — |
-| SG2 | Not ready | SG1 (HS-P6 passed in SG2a) |
+| SG2 | Ready | — (SG1 delivered; HS-P6 passed in SG2a) |
 | SG3 | Not ready | KC-P1 to KC-P4 results; then the secret store design revision that SG3 owns |
-| SG4 | Not ready | SG1, SG2 and NT-P1 |
+| SG4 | Not ready | SG2 and NT-P1 |
 | SG5 | Not ready | SG2, SG3 and SG4 |
+
+### SG1 delivery
+
+Delivered 2026-10-23 on branch `sg1`, ad hoc signing only. No named identity,
+`notarytool`, `stapler` or `security` call was made; `security list-keychains
+-d user` listed only the login keychain before and after.
+
+- `tools/release/`: `asura-bundle`, `test-asura-bundle`, `Info.plist.in`, six
+  entitlement files, and `README.md` with the operator commands.
+- `asura_platform::package_resource_directory` and its use in
+  `ModelProcess::spawn_with_resources`
+  ([resource directory](#resource-directory-inside-the-bundle)).
+  `model_owner` keeps the helper beside the canonical executable; only its
+  comment changed.
+- `conversation_flow --bundle-mlx`: an opt-in journey that runs the service
+  from an `Asura.app` layout built from an assembled bundle
+  (`ASURA_TEST_BUNDLE`) with an MLX model (`ASURA_TEST_MLX_ASSET`).
+
+| Case | Layer | Evidence |
+| --- | --- | --- |
+| SG-V1 | Unit | `test-asura-bundle --static`: every tracked list parses; each lists only its allowed keys; no false Boolean and no `cs.` exception key; `Info.plist` template keys and values |
+| SG-V1 | Integration | `test-asura-bundle --bundle`: `codesign -d --entitlements` of `asura` and `asura-model` equals `*.ad-hoc.plist`; both carry `runtime`; identifiers, bound helper `Info.plist`, layout, file count |
+| SG-V2 | Integration | The script checks the digests after assembly and after bundle signing (and after stapling in a release); `test-asura-bundle --bundle` re-hashes the helper, `mlx.metallib` and Hub bundle against `model-package.json` and `package-identity.txt`, and finds the digests in `asura` |
+| SG-V3 | Unit | `test-asura-bundle --static`: no tracked `*.p12`, `*.p8`, `*.provisionprofile` or `*.mobileprovision`, no PEM private key, no literal team-scoped identifier under `tools/` |
+| SG-V3 | Integration | `test-asura-bundle --static`: 25 refusal cases (missing or mixed modes and inputs, ad hoc identity inputs, malformed team ID, generators, existing output, expired, foreign-team, groupless or wrong-`get-task-allow` profiles, unsigned profile, unclean tree), each without an output directory; a valid scratch profile passes preflight. `--bundle` checks that every signature in the dry run is `adhoc` with no team |
+| SG-V9 | Unit | `package_resource_directory_is_contents_resources_only_inside_an_app_bundle` |
+| SG-V9 | Integration | `app_bundle_resources_are_read_from_contents_resources` (decoys beside the helper ignored), `app_bundle_without_contents_resources_never_spawns` |
+| SG-V9 | End to end | `conversation_flow --bundle-mlx` with the ad hoc bundle and `mlx-community/Qwen3-1.7B-4bit`: the run copy is the bundle's signed helper, `mlx.metallib` and the Hub bundle come from `Contents/Resources`, MLX generation completes, no copy remains after shutdown |
+
+Found during delivery: the first dry run generated empty `BuildIdentity`
+arrays, and the helper then failed at Hello (`helper_protocol`). The script now
+checks that each generated array holds 32 bytes and that the signed helper's
+`--version` reports the generated build ID and schema digest.
+
+Proof limits: the restricted entitlements, the profile checks against a real
+Apple profile, development and release signing, notarisation and stapling are
+not run (KC-P1, KC-P2, NT-P1, owner only). The SG-V9 end-to-end case runs a
+relocated test binary in place of `asura`, because `asura` uses the account
+home; the installed-keg case stays with SG4 and SG5. The script does not yet
+build the qualification bundle that SG0-K needs. Native tests that use the
+development package need `<out>/package/` beside the test binaries.
 
 ## Design verification
 
@@ -1074,5 +1305,12 @@ were rendered with the local Mermaid CLI and inspected.
 Updated 2026-10-23 by packet BN1: probe BN-P1 ran (result above), BN1 code and
 tests landed, and the revised SG-F3 diagram was rendered with the local
 Mermaid CLI and inspected. The other probes and packets remain as stated.
+
+Updated 2026-10-23 by packet SG1: the [package script](#sg1-package-script),
+the [resource directory](#resource-directory-inside-the-bundle) rule and the
+[delivery record](#sg1-delivery). Team ID input changed from "read from the
+certificate" to an operator input checked against the profile and the
+signature, so the script reads no keychain. Diagrams SG-F4 and SG-F5 were
+rendered with Mermaid CLI 12.0.0 and inspected.
 
 Return to the [design index](README.md).

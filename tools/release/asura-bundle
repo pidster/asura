@@ -1,0 +1,371 @@
+#!/bin/sh
+# Build, sign and check Asura.app (release signing design, packet SG1:
+# docs/designs/release-signing.md#sg1-package-script).
+#
+#   asura-bundle --ad-hoc      --out DIR [--swift-scratch DIR]
+#   asura-bundle --development --out DIR [--swift-scratch DIR]
+#                [--identity NAME] [--team-id ID] [--profile PATH]
+#   asura-bundle --release     --out DIR [--swift-scratch DIR]
+#                [--identity NAME] [--team-id ID] [--profile PATH]
+#                [--notary-profile NAME]
+#
+# Signed modes read missing identity inputs from ASURA_SIGN_IDENTITY,
+# ASURA_TEAM_ID, ASURA_PROFILE and ASURA_NOTARY_PROFILE. The ad hoc mode (the
+# dry run) reads none of them and refuses identity arguments. Every mode needs
+# ASURA_PROTOC and ASURA_PROTOC_GEN_SWIFT (absolute, versions from
+# tools/protobuf/lock.json). Nothing here stores an input in a tracked file,
+# calls `security`, or has a time bound.
+set -eu
+umask 022
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+export PATH
+
+step=arguments
+fail() { printf 'asura-bundle: %s: %s\n' "$step" "$*" >&2; exit 1; }
+note() { printf 'asura-bundle: %s\n' "$*"; }
+trap 'printf "asura-bundle: %s: cancelled by the operator\n" "$step" >&2; exit 130' INT TERM
+
+mode= out= scratch= arg_identity= arg_team= arg_profile= arg_notary= identity_args=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --ad-hoc|--development|--release)
+            [ -z "$mode" ] || fail 'exactly one of --ad-hoc, --development or --release'
+            mode=${1#--} ;;
+        --out|--swift-scratch|--identity|--team-id|--profile|--notary-profile)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail "$1 needs a value"
+            case "$1" in
+                --out) out=$2 ;;
+                --swift-scratch) scratch=$2 ;;
+                --identity) arg_identity=$2; identity_args=1 ;;
+                --team-id) arg_team=$2; identity_args=1 ;;
+                --profile) arg_profile=$2; identity_args=1 ;;
+                --notary-profile) arg_notary=$2; identity_args=1 ;;
+            esac
+            shift ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+    shift
+done
+[ -n "$mode" ] || fail 'choose --ad-hoc, --development or --release'
+[ -n "$out" ] || fail '--out DIR is required'
+
+identity= team= profile= notary=
+case "$mode" in
+    ad-hoc)
+        [ "$identity_args" -eq 0 ] || fail 'the ad hoc dry run takes no identity, team, profile or notary input' ;;
+    development|release)
+        identity=${arg_identity:-${ASURA_SIGN_IDENTITY:-}}
+        team=${arg_team:-${ASURA_TEAM_ID:-}}
+        profile=${arg_profile:-${ASURA_PROFILE:-}}
+        [ -n "$identity" ] || fail "$mode needs the signing identity name (--identity or ASURA_SIGN_IDENTITY)"
+        [ -n "$team" ] || fail "$mode needs the team ID (--team-id or ASURA_TEAM_ID)"
+        [ -n "$profile" ] || fail "$mode needs the provisioning profile path (--profile or ASURA_PROFILE)"
+        if [ "$mode" = release ]; then
+            notary=${arg_notary:-${ASURA_NOTARY_PROFILE:-}}
+            [ -n "$notary" ] || fail 'release needs the notarytool keychain profile name (--notary-profile or ASURA_NOTARY_PROFILE)'
+        elif [ -n "$arg_notary" ]; then
+            fail 'only --release notarises; remove --notary-profile'
+        fi
+        printf '%s\n' "$team" | grep -Eqx '[A-Z0-9]{10}' || fail 'the team ID must be ten upper-case letters or digits'
+        case "$identity" in -) fail 'a signed mode needs a named identity; use --ad-hoc for ad hoc signing' ;; esac
+        [ -f "$profile" ] && [ ! -L "$profile" ] || fail 'the profile must be a regular file' ;;
+esac
+
+# --- 1. Preflight -----------------------------------------------------------
+step=preflight
+root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P) || fail 'cannot find the repository root'
+[ "$(uname -s)" = Darwin ] || fail 'macOS is required'
+[ "$(uname -m)" = arm64 ] || fail 'Apple silicon is required'
+[ "$(sw_vers -productVersion | cut -d . -f 1)" = 27 ] || fail 'macOS 27 is required'
+lock=$root/tools/protobuf/lock.json
+for tool in ASURA_PROTOC ASURA_PROTOC_GEN_SWIFT; do
+    eval "value=\${$tool:-}"
+    case "$value" in /*) ;; *) fail "$tool must be an absolute path to the verified generator" ;; esac
+    [ -f "$value" ] && [ -x "$value" ] || fail "$tool must be an executable file"
+done
+want=$(plutil -extract protoc.expected_tool_version raw -o - "$lock") || fail 'cannot read the protoc lock'
+[ "$("$ASURA_PROTOC" --version)" = "libprotoc $want" ] || fail "ASURA_PROTOC is not protoc $want"
+want=$(plutil -extract swift_protobuf.expected_tool_version raw -o - "$lock") || fail 'cannot read the swift-protobuf lock'
+[ "$("$ASURA_PROTOC_GEN_SWIFT" --version)" = "protoc-gen-swift $want" ] || fail "ASURA_PROTOC_GEN_SWIFT is not protoc-gen-swift $want"
+if [ "$mode" = release ]; then
+    [ -z "$(git -C "$root" status --porcelain)" ] || fail 'release needs a clean working tree'
+fi
+case "$out" in /*) ;; *) out=$(pwd -P)/$out ;; esac
+[ ! -e "$out" ] && [ ! -L "$out" ] || fail "the output directory must not exist: $out"
+[ -d "$(dirname -- "$out")" ] || fail 'the parent of the output directory must exist'
+scratch=${scratch:-$root/.build/release-helper}
+case "$scratch" in /*) ;; *) scratch=$(pwd -P)/$scratch ;; esac
+version=$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' "$root/rust/crates/asura-cli/Cargo.toml" | head -n 1)
+[ -n "$version" ] || fail 'cannot read the asura-cli version'
+
+pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$2" 2>/dev/null; }
+if [ "$mode" != ad-hoc ]; then
+    # Decode the CMS envelope without a keychain; the signer is not trusted here.
+    decoded=$(mktemp -d "${TMPDIR:-/tmp}/asura-bundle-profile.XXXXXXXX") || fail 'no temporary directory'
+    trap 'rm -rf "$decoded"' EXIT
+    openssl smime -verify -noverify -inform DER -in "$profile" -out "$decoded/profile.plist" 2>/dev/null ||
+        fail 'cannot decode the provisioning profile'
+    expires=$(plutil -extract ExpirationDate raw -o - "$decoded/profile.plist") || fail 'the profile has no expiry date'
+    [ "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \< "$expires" ] || fail "the profile expired at $expires"
+    plutil -extract TeamIdentifier json -o - "$decoded/profile.plist" | grep -Fq "\"$team\"" ||
+        fail 'the profile is for another team'
+    [ "$(pb Entitlements:com.apple.application-identifier "$decoded/profile.plist")" = "$team.com.pidster.asura" ] ||
+        fail "the profile application identifier is not $team.com.pidster.asura"
+    pb Entitlements:keychain-access-groups "$decoded/profile.plist" |
+        sed 's/^ *//' | grep -Fqx -e "$team.com.pidster.asura" -e "$team.*" ||
+        fail "the profile does not allow the keychain access group $team.com.pidster.asura"
+    gta=$(pb Entitlements:com.apple.security.get-task-allow "$decoded/profile.plist" || :)
+    if [ "$mode" = development ]; then
+        [ "$gta" = true ] || fail 'a development profile must allow get-task-allow'
+    else
+        [ "$gta" != true ] || fail 'a Developer ID profile must not allow get-task-allow'
+    fi
+fi
+
+mkdir -m 700 "$out" || fail "cannot create $out"
+work=$out/work
+pkg=$out/package
+app=$out/Asura.app
+mkdir "$work" "$pkg"
+
+entitlements=$root/tools/release/entitlements
+asura_entitlements=$work/asura.entitlements
+helper_entitlements=$work/asura-model.entitlements
+sed "s/@TEAM_ID@/$team/g" "$entitlements/asura.$mode.plist" > "$asura_entitlements"
+sed "s/@TEAM_ID@/$team/g" "$entitlements/asura-model.$mode.plist" > "$helper_entitlements"
+for plist in "$asura_entitlements" "$helper_entitlements"; do
+    plutil -lint -s "$plist" || fail "invalid entitlements $plist"
+    ! grep -q '@TEAM_ID@' "$plist" || fail 'an entitlement placeholder is left'
+done
+
+sha() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+# Hub bundle digest: SHA-256 of the sorted `shasum` lines of every regular
+# file (release-signing.md#hub-bundle-digest-encoding).
+tree_sha() {
+    (cd "$1" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | tr '\n' '\0' |
+        xargs -0 shasum -a 256 | shasum -a 256 | cut -d ' ' -f 1)
+}
+size() { stat -f %z "$1"; }
+# BN1 limits: 16 files, 16 directories, depth 4, 1 MiB per file and in total,
+# regular files and directories only, no control character or backslash.
+check_tree() {
+    [ -d "$1" ] && [ ! -L "$1" ] || fail "$2 is not a directory"
+    [ -z "$(find "$1" ! -type f ! -type d)" ] || fail "$2 holds a link or special file"
+    [ -z "$(find "$1" -mindepth 5)" ] || fail "$2 is deeper than 4"
+    [ -z "$(find "$1" -name '*[[:cntrl:]\\]*')" ] || fail "$2 holds an invalid name"
+    files=$(find "$1" -type f | wc -l | tr -d ' ')
+    dirs=$(find "$1" -mindepth 1 -type d | wc -l | tr -d ' ')
+    [ "$files" -ge 1 ] && [ "$files" -le 16 ] || fail "$2 holds $files files (1 to 16 allowed)"
+    [ "$dirs" -le 16 ] || fail "$2 holds $dirs directories (16 allowed)"
+    sizes=$(find "$1" -type f -exec stat -f %z {} + |
+        awk '$1 > 1048576 { big = 1 } { total += $1 } END { print big + 0, total + 0 }')
+    [ "${sizes% *}" = 0 ] || fail "$2 holds a file over 1 MiB"
+    [ "${sizes#* }" -le 1048576 ] || fail "$2 is over 1 MiB"
+}
+copy() { ditto --norsrc --noextattr --noqtn "$1" "$2"; }
+sign() {
+    case "$mode" in
+        ad-hoc) codesign --force --sign - --timestamp=none "$@" ;;
+        development) codesign --force --sign "$identity" --timestamp=none "$@" ;;
+        release) codesign --force --sign "$identity" --timestamp "$@" ;;
+    esac
+}
+details() { codesign -d --verbose=2 "$1" 2>&1; }
+field() { details "$1" | sed -n "s/^$2=//p" | head -n 1; }
+require_runtime() {
+    details "$1" | grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' ||
+        fail "$1 lacks the Hardened Runtime flag"
+}
+require_signer() {
+    if [ "$mode" = ad-hoc ]; then
+        [ "$(field "$1" Signature)" = adhoc ] || fail "$1 is not ad hoc signed"
+        [ "$(field "$1" TeamIdentifier)" = 'not set' ] || fail "$1 carries a team identifier"
+    else
+        [ "$(field "$1" TeamIdentifier)" = "$team" ] || fail "$1 is not signed for team $team"
+    fi
+}
+# Compare the signed entitlements with the expected file, keys sorted.
+require_entitlements() {
+    codesign -d --entitlements - --xml "$1" > "$work/actual.plist" 2>/dev/null || :
+    if [ ! -s "$work/actual.plist" ]; then
+        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<plist version="1.0"><dict/></plist>' > "$work/actual.plist"
+    fi
+    [ "$(plutil -p "$work/actual.plist")" = "$(plutil -p "$2")" ] ||
+        fail "$1 entitlements differ from $(basename "$2")"
+}
+
+note "mode $mode, output $out"
+[ "$mode" = ad-hoc ] || note "identity \"$identity\", team $team"
+
+# --- 2. Generate ------------------------------------------------------------
+step=generate
+generated=$root/swift/model-helper/Sources/HelperCore/Generated
+mkdir -p "$generated" "$work/generated"
+build_id=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+schema=$(sha "$root/contracts/model/v1/model.proto")
+[ "${#build_id}" -eq 64 ] || fail 'cannot draw a build ID'
+bytes() { printf '%s\n' "$1" | awk '{ for (i = 1; i < length($0); i += 2) printf "%s%d", (i > 1 ? ", " : ""), index("0123456789abcdef", substr($0, i, 1)) * 16 - 17 + index("0123456789abcdef", substr($0, i + 1, 1)) }'; }
+{
+    printf 'public enum BuildIdentity {\n'
+    printf ' public static let buildID: [UInt8] = [%s]\n' "$(bytes "$build_id")"
+    printf ' public static let schemaDigest: [UInt8] = [%s]\n' "$(bytes "$schema")"
+    printf '}\n'
+} > "$work/generated/BuildIdentity.swift"
+for digest in "$build_id" "$schema"; do
+    n=$(bytes "$digest" | awk -F ', ' '{ print NF }')
+    [ "$n" = 32 ] || fail "BuildIdentity.swift would hold $n bytes, not 32"
+done
+"$ASURA_PROTOC" --plugin=protoc-gen-swift="$ASURA_PROTOC_GEN_SWIFT" \
+    --swift_opt=Visibility=Public --swift_out="$work/generated" \
+    -I "$root/contracts/model/v1" "$root/contracts/model/v1/model.proto" || fail 'protoc failed'
+[ -f "$work/generated/model.pb.swift" ] || fail 'protoc wrote no model.pb.swift'
+for name in BuildIdentity.swift model.pb.swift; do
+    mv -f "$work/generated/$name" "$generated/$name"
+done
+
+# --- 3. Build the helper ----------------------------------------------------
+step='helper build'
+swift build -c release --package-path "$root/swift/model-helper" --scratch-path "$scratch" \
+    --product asura-model || fail 'swift build failed'
+bin=$(swift build -c release --package-path "$root/swift/model-helper" --scratch-path "$scratch" \
+    --show-bin-path) || fail 'cannot find the Swift products'
+
+# --- 4. Stage and check limits ----------------------------------------------
+step=stage
+for source in "$bin/asura-model" "$bin/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"; do
+    [ -f "$source" ] && [ ! -L "$source" ] || fail "missing product $source"
+done
+copy "$bin/asura-model" "$pkg/asura-model"
+copy "$bin/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib" "$pkg/mlx.metallib"
+check_tree "$bin/swift-transformers_Hub.bundle" 'the built Hub bundle'
+copy "$bin/swift-transformers_Hub.bundle" "$pkg/swift-transformers_Hub.bundle"
+[ "$(size "$pkg/mlx.metallib")" -le 67108864 ] || fail 'mlx.metallib is over 64 MiB'
+
+# --- 5. Sign inside-out (D-S3) ----------------------------------------------
+step='helper signature'
+sign "$pkg/swift-transformers_Hub.bundle" || fail 'cannot sign the Hub bundle'
+sign --identifier com.pidster.asura.model --options runtime \
+    --entitlements "$helper_entitlements" "$pkg/asura-model" || fail 'cannot sign asura-model'
+codesign --verify --strict --deep "$pkg/swift-transformers_Hub.bundle" || fail 'the Hub bundle does not verify'
+codesign --verify --strict "$pkg/asura-model" || fail 'asura-model does not verify'
+[ "$(field "$pkg/asura-model" Identifier)" = com.pidster.asura.model ] || fail 'asura-model has the wrong identifier'
+require_runtime "$pkg/asura-model"
+details "$pkg/asura-model" | grep -Eq '^Info.plist entries=[1-9]' || fail 'asura-model has no bound Info.plist'
+require_signer "$pkg/asura-model"
+require_signer "$pkg/swift-transformers_Hub.bundle"
+# The signed helper reports the identity generated in step 2.
+case "$("$pkg/asura-model" --version)" in *" build=$build_id schema=$schema") ;; *) false ;; esac ||
+    fail 'the signed helper does not report the generated build ID and schema digest'
+check_tree "$pkg/swift-transformers_Hub.bundle" 'the signed Hub bundle'
+[ "$(size "$pkg/asura-model")" -le 134217728 ] || fail 'asura-model is over 128 MiB'
+
+# --- 6. Hash the signed files -----------------------------------------------
+step=hash
+helper_sha=$(sha "$pkg/asura-model")
+metallib_sha=$(sha "$pkg/mlx.metallib")
+hub_sha=$(tree_sha "$pkg/swift-transformers_Hub.bundle")
+identity_file=$root/.build/model-tools/package-identity.txt
+mkdir -p "$(dirname -- "$identity_file")"
+printf '%s\n' "$build_id" "$schema" "$helper_sha" "$metallib_sha" "$hub_sha" > "$work/package-identity.txt"
+mv -f "$work/package-identity.txt" "$identity_file"
+printf '{"build_id": "%s", "schema_sha256": "%s", "format": "0.1", "helper_sha256": "%s", "metallib_sha256": "%s", "hub_bundle_sha256": "%s"}\n' \
+    "$build_id" "$schema" "$helper_sha" "$metallib_sha" "$hub_sha" > "$pkg/model-package.json"
+# Every later check compares against these recorded values.
+require_digests() {
+    [ "$(sha "$1/asura-model")" = "$helper_sha" ] || fail "$2: asura-model digest changed"
+    [ "$(sha "$3/mlx.metallib")" = "$metallib_sha" ] || fail "$2: mlx.metallib digest changed"
+    [ "$(tree_sha "$3/swift-transformers_Hub.bundle")" = "$hub_sha" ] || fail "$2: Hub bundle digest changed"
+}
+
+# --- 7. Build the service ---------------------------------------------------
+step='service build'
+CARGO_TARGET_DIR=$root/target cargo build --manifest-path "$root/Cargo.toml" --release --locked -p asura-cli ||
+    fail 'cargo build failed'
+[ "$(cat "$identity_file")" = "$(printf '%s\n' "$build_id" "$schema" "$helper_sha" "$metallib_sha" "$hub_sha")" ] ||
+    fail 'package-identity.txt changed during the build'
+
+# --- 8. Assemble Asura.app --------------------------------------------------
+step=assembly
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+sed "s/@VERSION@/$version/g" "$root/tools/release/Info.plist.in" > "$app/Contents/Info.plist"
+plutil -lint -s "$app/Contents/Info.plist" || fail 'invalid Info.plist'
+copy "$root/target/release/asura" "$app/Contents/MacOS/asura"
+copy "$pkg/asura-model" "$app/Contents/MacOS/asura-model"
+copy "$pkg/mlx.metallib" "$app/Contents/Resources/mlx.metallib"
+copy "$pkg/model-package.json" "$app/Contents/Resources/model-package.json"
+copy "$pkg/swift-transformers_Hub.bundle" "$app/Contents/Resources/swift-transformers_Hub.bundle"
+[ "$mode" = ad-hoc ] || copy "$profile" "$app/Contents/embedded.provisionprofile"
+require_digests "$app/Contents/MacOS" 'assembled copy' "$app/Contents/Resources"
+count=$(find "$app" -type f | wc -l | tr -d ' ')
+[ "$count" -le 64 ] || fail "Asura.app holds $count files (64 allowed)"
+
+# --- 9. Sign the bundle, without --deep -------------------------------------
+step='bundle signature'
+sign --options runtime --entitlements "$asura_entitlements" "$app" || fail 'cannot sign Asura.app'
+verify_bundle() {
+    codesign --verify --deep --strict --verbose=2 "$app" || fail 'Asura.app does not verify'
+    [ "$(field "$app" Identifier)" = com.pidster.asura ] || fail 'Asura.app has the wrong identifier'
+    for binary in "$app/Contents/MacOS/asura" "$app/Contents/MacOS/asura-model"; do
+        require_runtime "$binary"
+        require_signer "$binary"
+    done
+    require_signer "$app/Contents/Resources/swift-transformers_Hub.bundle"
+    require_entitlements "$app/Contents/MacOS/asura" "$asura_entitlements"
+    require_entitlements "$app/Contents/MacOS/asura-model" "$helper_entitlements"
+    [ "$mode" = ad-hoc ] || cmp -s "$profile" "$app/Contents/embedded.provisionprofile" ||
+        fail 'the embedded profile differs from the input profile'
+    require_digests "$app/Contents/MacOS" "$1" "$app/Contents/Resources"
+    count=$(find "$app" -type f | wc -l | tr -d ' ')
+    [ "$count" -le 64 ] || fail "Asura.app holds $count files (64 allowed)"
+}
+verify_bundle 'after bundle signing'
+[ "$mode" = ad-hoc ] || details "$app" | grep '^Authority=' | sed 's/^/asura-bundle: /'
+
+# --- 10. Notarise and staple (release only) ---------------------------------
+if [ "$mode" = release ]; then
+    step=notarisation
+    ditto -c -k --keepParent "$app" "$work/Asura.zip" || fail 'cannot zip Asura.app'
+    note 'submitting to the notary service; this waits for its reply (Ctrl-C cancels)'
+    xcrun notarytool submit "$work/Asura.zip" --keychain-profile "$notary" --wait \
+        --output-format plist > "$out/notary-submit.plist" || :
+    submission=$(plutil -extract id raw -o - "$out/notary-submit.plist" 2>/dev/null || :)
+    status=$(plutil -extract status raw -o - "$out/notary-submit.plist" 2>/dev/null || :)
+    note "notary submission ${submission:-unknown}: ${status:-no status}"
+    if [ "$status" != Accepted ]; then
+        [ -z "$submission" ] || xcrun notarytool log "$submission" --keychain-profile "$notary" "$out/notary-log.json" || :
+        fail "not accepted (${status:-no reply}); see $out/notary-log.json; query later with: xcrun notarytool info ${submission:-<id>} --keychain-profile <name>"
+    fi
+    step=stapling
+    delay=1
+    until xcrun stapler staple "$app"; do
+        note "ticket not stapled; retry in ${delay}s (Ctrl-C cancels)"
+        sleep "$delay"
+        delay=$((delay * 2)); [ "$delay" -le 60 ] || delay=60
+    done
+    xcrun stapler validate "$app" || fail 'stapler validate failed'
+    spctl --assess --type execute --verbose=2 "$app" || fail 'Gatekeeper assessment failed'
+    verify_bundle 'after stapling'
+fi
+
+# --- 11. Archive ------------------------------------------------------------
+step=archive
+if [ "$mode" = development ]; then
+    archive=
+else
+    archive=asura-$version-macos-arm64.tar.gz
+    [ "$mode" = release ] || archive=asura-$version-macos-arm64-adhoc-unstapled.tar.gz
+    COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$out/$archive" -C "$out" Asura.app -C "$root" LICENSE ||
+        fail 'cannot write the archive'
+    (cd "$out" && shasum -a 256 "$archive" > "$archive.sha256")
+fi
+rm -rf "$work"
+step=done
+note "Asura.app: $app"
+note "development package: $pkg"
+[ -z "$archive" ] || note "archive: $out/$archive"
+note "build_id $build_id"
+note "helper $helper_sha"
+note "metallib $metallib_sha"
+note "hub_bundle $hub_sha"
+note "package identity written to $identity_file"

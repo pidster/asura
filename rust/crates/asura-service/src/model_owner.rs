@@ -261,6 +261,9 @@ impl ModelOwner {
             .name("asura-model-prepare".into())
             .spawn(move || {
                 let _completion = signal.guard();
+                // The helper is beside the canonical service executable, also
+                // in `Asura.app/Contents/MacOS/`; the platform owner derives
+                // the resource directory from this path (release signing, SG1).
                 let executable = std::env::current_exe()?.canonicalize()?;
                 let helper = executable
                     .parent()
