@@ -289,6 +289,9 @@ pub enum Step {
     Call(String, Value),
     /// The final answer.
     Final,
+    /// On receipt, create this file (a journal gate file of the service
+    /// home), then reply with the inner step. A test-harness hold.
+    Create(PathBuf, Box<Step>),
 }
 pub fn call(name: &str, arguments: Value) -> Step {
     Step::Call(name.into(), arguments)
@@ -436,7 +439,11 @@ fn serve(
     let chat: Value = serde_json::from_slice(body).unwrap_or_default();
     let handle = last_handle(&chat).unwrap_or_default();
     log.lock().unwrap().push(chat);
-    let step = steps.lock().unwrap().pop_front().unwrap_or(Step::Final);
+    let mut step = steps.lock().unwrap().pop_front().unwrap_or(Step::Final);
+    while let Step::Create(path, then) = step {
+        let _ = std::fs::write(path, b"");
+        step = *then;
+    }
     socket.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
     )?;
@@ -445,7 +452,7 @@ fn serve(
             "message": {"role": "assistant", "content": "", "tool_calls": [
                 {"function": {"name": name, "arguments": substitute(&arguments, &handle)}}]},
             "done": true, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}),
-        Step::Final => json!({
+        Step::Final | Step::Create(..) => json!({
             "message": {"role": "assistant", "content": "COMPLETE"},
             "done": true, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3}),
     };

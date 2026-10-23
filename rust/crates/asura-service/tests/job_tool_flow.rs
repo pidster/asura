@@ -411,6 +411,73 @@ fn identity() -> Result<()> {
     Ok(())
 }
 
+/// J3T-21 (integration, TJ-S1): a turn cancelled before its job's kind 26
+/// commits. Appends are held when the model proposes the call, the turn is
+/// cancelled, then the hold ends: kind 14, then kind 26, then kind 29 with
+/// status 6 before the terminal; kinds 27 and 28 after kind 26; replay
+/// accepts the journal (JR13) and the command never ran.
+fn cancel_before_intent() -> Result<()> {
+    let (fixture, model, project, directory) = setup("j21", &[])?;
+    let hold = fixture.home.join("journal-hold-appends");
+    model.script(&[
+        Step::Create(
+            hold.clone(),
+            Box::new(call("exec_cmd", json!({"command": "sleep 1; printf ran > j21.txt"}))),
+        ),
+        Step::Final,
+    ]);
+    let operation = fixture.submit(project, "Cancel before the intent.")?;
+    wait_for(Duration::from_secs(20), "the hold", || hold.exists())?;
+    std::thread::sleep(Duration::from_millis(300));
+    // The cancel's own kind 7 waits behind the hold: send it from a thread.
+    let runtime = fixture.runtime()?;
+    let cancel = std::thread::spawn(move || {
+        let never: asura_client::Cancel = std::sync::Arc::new(|| false);
+        asura_client::Client::attach(&runtime, job_fixture::BUILD, &*never)
+            .and_then(|mut client| client.cancel_conversation(operation, 1, &|| false))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::remove_file(&hold)?;
+    cancel.join().map_err(|_| "cancel thread")??;
+    let event = fixture.finish(operation, Duration::from_secs(30))?;
+    assert_eq!(event.kind, Some(5), "cancelled: {event:?}");
+    let job = job_of(operation, 1, 1);
+    wait_settled(&fixture, job, Duration::from_secs(20))?;
+    let records = fixture.records()?;
+    let position = |test: &dyn Fn(&Record) -> bool| records.iter().position(|r| test(r));
+    let intent14 = position(&|r| matches!(r, Record::ToolCall(c) if c.operation == operation))
+        .ok_or("kind 14")?;
+    let intent26 = position(&|r| matches!(r, Record::JobIntent(i) if journal::job_id(&i.origin) == job))
+        .ok_or("kind 26")?;
+    let result29 = position(&|r| matches!(r, Record::JobResult(r) if r.operation == operation))
+        .ok_or("kind 29")?;
+    let terminal = position(&|r| matches!(r, Record::TurnTerminal(t) if t.operation == operation))
+        .ok_or("terminal")?;
+    let cancel27 = position(&|r| matches!(r, Record::JobCancelRequested(c) if c.job == job))
+        .ok_or("kind 27")?;
+    let settle28 = position(&|r| matches!(r, Record::JobSettled(s) if s.job == job))
+        .ok_or("kind 28")?;
+    assert!(intent14 < intent26 && intent26 < result29 && result29 < terminal);
+    assert!(intent26 < cancel27 && cancel27 < settle28, "JR8: 27 and 28 after 26");
+    let Record::JobResult(result) = &records[result29] else {
+        unreachable!()
+    };
+    assert_eq!(result.status, 6, "{result:?}");
+    let Record::JobSettled(settled) = &records[settle28] else {
+        unreachable!()
+    };
+    assert_eq!(settled.reason, JobReason::TurnEnded);
+    // Replay of the whole journal accepts the order (JR13).
+    fixture.journal()?;
+    assert!(!directory.join("j21.txt").exists(), "the command never ran");
+    println!(
+        "PASS J3T-21 integration: a turn cancelled before its kind 26 committed recorded kind 14, kind 26, kind 29 status 6 before the terminal, kinds 27 and 28 after kind 26; replay accepted it; nothing ran"
+    );
+    Ok(())
+}
+
 type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
@@ -434,11 +501,12 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 4] = [
+    let cases: [Case; 5] = [
         ("reads", reads_and_waits),
         ("queue", queue_and_cancel),
         ("execution", execution_setting),
         ("identity", identity),
+        ("j21", cancel_before_intent),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {
