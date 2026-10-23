@@ -664,6 +664,12 @@ these fields only in `/status` detail; they are not in the top pane. When
 When `unrecognized_count` is above 0, it shows "N Keychain items under
 Asura's service name were not written by Asura."
 
+`/status` is a local TUI command (added by P4, 2026-10-23). It opens the text
+panel titled "Service status" and makes no service request: it shows the
+header facts of the last `ServiceObservation`, then "N Keychain items" (a
+count of 257 reads "more than 256"), "sweep pending" when set, the last
+unavailable `OSStatus` when it is not 0, and the two notices above.
+
 ## Validation
 
 Every test uses a scratch keychain file created in the test's scratch runtime
