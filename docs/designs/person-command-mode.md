@@ -124,7 +124,7 @@ two owner decisions: a `!` command is a tool job, and the
 | PCR15 | The log shows the output folded, with the darker amber stripe. It shows the last lines and offers a key to see the rest. The job viewer pages through all retained output. |
 | PCR16 | `!` commands share the prompt recall history. Recalling one restores command mode. Help `?` entries are not recorded. |
 | PCR17 | Protocol stays `0.1`; journal format stays `1`. Schemas may evolve under [numbering authority](../engineering.md#wire-protocol-change-authority). |
-| PCR18 | Before a person command runs, the TUI warns when the model changed build or test paths since the person's last command (PX1, owner 2026-10-14). Asura also re-checks the recorded digest of each approved implicit-execution file before relying on it, and warns again when it changed (PX1, EX1, owner 2026-10-15). Amended on 2026-10-22 (OD3): the [execution path guard](execution-path-guard.md) design is canonical for the warning, the path lists, approvals and their storage; it is delivered as packet P5. P4 TUI code may merge before P5, but capability 8 is not advertised until P5 passes. |
+| PCR18 | Before a person command runs, the TUI warns when the model changed build or test paths since the person's last command (PX1, owner 2026-10-14). Asura also re-checks the recorded digest of each approved implicit-execution file before relying on it, and warns again when it changed (PX1, EX1, owner 2026-10-15). Amended on 2026-10-23 (owner, "Hold only for !!"): a `!!` command with a build or test path change waits until the person confirms it; a `!` command warns and runs. Amended on 2026-10-22 (OD3): the [execution path guard](execution-path-guard.md) design is canonical for the warning, the path lists, approvals and their storage; it is delivered as packet P5. P4 TUI code may merge before P5, but capability 8 is not advertised until P5 passes. |
 | PCR19 | Secrets in output are detected at capture and replaced with placeholders before storage; the journal, retained streams, viewer and model see placeholders. Secrets only. A secret in the command becomes a per-execution variable such as `$ASURA_SECRET_1`, passed in the environment for that one execution and then dropped; the log keeps only its name. Amended on 2026-10-20 (PC14): a person command is never refused for a secret. A form the rewrite cannot handle safely runs through the whole-command variable: the raw command goes to the secret store, and the journal holds `eval "$ASURA_SECRET_COMMAND"` and a display-only filtered copy (PX6, EX4, SO5). Mechanism: [secret detection](secret-detection.md#whole-command-variable), slice SL5. |
 
 Required behavior (owner, 2026-10-19, PC13) for `!!`. PCR1–PCR19 apply to `!!`
@@ -998,7 +998,10 @@ enum QueueRefusal {
   an `Error` token, such as `stale_generation`, `conversation_busy` (16
   unresolved inputs), `request_conflict` and `Draining`, keeps that form for
   both submits; the refusal field holds only the person-command reasons above.
-- Hold reasons. The existing `hold_reason` string gains `secrets_lost`,
+- Hold reasons. The existing `hold_reason` string gains `paths_changed` (a
+  `!!` command held for confirmation of a build or test path change, owner
+  2026-10-23, [execution path guard](execution-path-guard.md#warning-at-person-dispatch)),
+  `secrets_lost`,
   `secret_store_denied` and `secret_rules_changed` for kind 3 entries. Each is
   a current-owner diagnostic, as today.
 - `ConversationHistoryEntry` gains `optional bytes person_command_input_id = 5`.

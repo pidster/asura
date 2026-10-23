@@ -52,7 +52,7 @@ redaction).
 | EPG-R2 | A person approves an implicit-execution file's current content. Asura records the file's digest with the approval. | PX1, EX1 |
 | EPG-R3 | Before a person command runs, Asura re-checks the digest of each approved implicit-execution file in the project and warns when it changed, or when a file exists that is not approved. | PX1, EX1, PCR18 |
 | EPG-R4 | Before a person command runs, the person is warned of each build or test path that a model job changed since the person's last command in that project. | PX1, PCR18 |
-| EPG-R5 | A warning never blocks, delays for confirmation, or changes the command. The command runs after the warning is shown. | PX5, person command non-goals |
+| EPG-R5 | A warning never changes the command. A `!` command runs after its warnings are shown. A `!!` command with a `model_changed` warning is held until the person confirms it (Enter runs it, Esc drops it); its other warnings do not hold it. | Owner, 2026-10-23 ("Hold only for !!"); PX5 |
 | EPG-R6 | Warnings, approvals and detected changes hold path names only, display-redacted; never file content. | EX4 |
 
 ## Terms
@@ -228,7 +228,21 @@ The owner appends kind 32 `acknowledged` with the warnings (at most 16, plus an
 overflow count) and the sequence of the last `model_changed` record it covers.
 It then admits the job. The warning list reaches the TUI on the queue entry
 before the job's spawned state, so the log entry shows it above the output.
-The command runs whether or not warnings exist (EPG-R5). Kind 2–4 warnings
+A `!` command runs whether or not warnings exist (EPG-R5).
+
+**`!!` hold (owner, 2026-10-23).** When a `!!` command's check returns at
+least one `model_changed` warning, the owner does not append the
+acknowledgement and does not admit the job. It holds the entry with hold reason
+`paths_changed` and the warnings on the queue entry. The person sees the
+warnings in the log entry and confirms with Enter on that entry (or `/queue
+resume`), or drops it with Esc (or `/queue drop`). On Resume the owner checks
+again: if no `model_changed` warning appeared after the warnings it showed, it
+appends kind 32 `acknowledged` and admits the job; if a newer one appeared, it
+holds again with the new list. The hold has no time bound and ends only by the
+person's Resume or Drop, a revocation, shutdown or restart (a held input stays
+held after restart, PR6). Warnings of kinds 2 to 5 never hold: every Git
+repository has `.git/config`, so holding on `not_approved` would hold every
+`!!` command until its approval. Kind 2–4 warnings
 repeat before each command until the person approves or revokes; kind 1
 warnings appear once.
 
@@ -249,6 +263,12 @@ sequenceDiagram
     Note over O: Entry waits with path_check
     W->>W: Walk implicit list, hash files at most 1 MiB, compare approvals
     W-->>O: Warnings: model_changed, not_approved, changed_since_approval
+    alt !! command with a model_changed warning
+        O-->>T: Entry held, paths_changed, warnings shown
+        T->>O: Person confirms (Enter or /queue resume)
+        O->>W: check again
+        W-->>O: No newer model_changed warning
+    end
     O->>J: Kind 32 acknowledged (warnings, through sequence)
     J-->>O: Committed
     O-->>T: Queue entry with path warnings
@@ -434,6 +454,7 @@ gets `not_implicit`.
 | EPG-I4 | Restart between a model change and the person command | The warning still appears |
 | EPG-I5 | Stalled filesystem fixture during a check | The entry waits with `path_check`; TUI, cancel and other lanes respond within 100 ms |
 | EPG-I6 | 1,100 test files | `overflow` warning; the first 1,024 still compared |
+| EPG-I7 | Real model job edits `Makefile`; then a `!!` command; Resume; then a `!!` command with only a `not_approved` warning | The first is held `paths_changed` with no kind 32 and no kind 26; Resume appends kind 32 and runs it; a model change made while it was held holds it again with the new list; Drop drops it with no kind 26; restart keeps it held; the last runs without a hold |
 
 ### End to end
 
@@ -442,6 +463,7 @@ gets `not_implicit`.
 | EPG-E1 | PTY: scripted model edits `build.rs`; type `!cargo build` (PC-E21) | Warning line above the output; the command runs |
 | EPG-E2 | PTY: `!git commit` with an approved hook, then the hook changed by `!` | First run no warning; second run `changed since you approved it` |
 | EPG-E3 | PTY: `/paths`, `/paths approve all`, `/paths revoke` | List and replies match |
+| EPG-E4 | PTY: scripted model edits `Makefile`; type `!!make`; Enter on the held entry; repeat and press Esc | The entry shows the warning and "Held: confirm to run (paths changed)"; Enter runs it; Esc drops it and nothing runs; the same change with `!make` runs at once |
 
 Environments: the macOS 27 host with `sandbox-exec`, scratch Asura home,
 scratch HOME and a scratch project.
