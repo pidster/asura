@@ -9,11 +9,13 @@
 use crate::context::{Notice, NoticeError, NoticeInputs, Settlement};
 use asura_storage::authority::conversation::{self as journal, Hash, Id, JobNotice};
 
-/// The stored command, cwd and kind 28 command digest of one settlement.
+/// The stored command, cwd, kind 28 command digest and `!!` flag of one
+/// settlement.
 struct Source {
     command: String,
     directory: String,
     digest: Hash,
+    outside_sandbox: bool,
 }
 
 /// The notice of a turn of `conversation` from its `Prepare` notice
@@ -33,15 +35,32 @@ pub(super) fn build(conversation: Id, inputs: &JobNotice) -> Result<Notice, Noti
             .as_ref()
             .and(listing.settled_digest)
             .ok_or(NoticeError::Job)?;
-        // The command source is the model call's kind 14 (a person job's
-        // kind 31 after P2): its stored command and cwd (J5-E5).
-        let call = settlement.command.model().ok_or(NoticeError::Command)?;
-        let command = journal::exec_cmd_command(call).ok_or(NoticeError::Command)?;
-        let directory = crate::job_control::exec_cmd_cwd(call).ok_or(NoticeError::Command)?;
+        // The command source is the model call's kind 14 or the person
+        // input's kind 31: its stored command and cwd (J5-E5). A person
+        // command's text is the rewrite, or the display-only copy of a
+        // whole-command input; never a secret value.
+        let (command, directory) = match &settlement.command {
+            journal::JobCommand::Model(call) => (
+                journal::exec_cmd_command(call).ok_or(NoticeError::Command)?,
+                crate::job_control::exec_cmd_cwd(call).ok_or(NoticeError::Command)?,
+            ),
+            journal::JobCommand::Person(person) => {
+                (person.command_text().to_owned(), person.cwd.clone())
+            }
+        };
+        // The origin and the source agree: replay keeps a person intent on
+        // its kind 31 (PR2), so a mismatch is inconsistent input.
+        if matches!(listing.intent.origin, journal::JobOrigin::Person { .. })
+            != settlement.command.person().is_some()
+        {
+            return Err(NoticeError::Command);
+        }
         sources.push(Source {
             command,
             directory,
             digest,
+            // Kind 31 field 7 bit 1 (PCR24); always false for kind 14.
+            outside_sandbox: settlement.command.outside_sandbox(),
         });
     }
     let settlements: Vec<Settlement<'_>> = inputs
@@ -54,9 +73,7 @@ pub(super) fn build(conversation: Id, inputs: &JobNotice) -> Result<Notice, Noti
                 digest: source.digest,
                 intent: &settlement.listing.intent,
                 settled: settlement.listing.settled.as_deref()?,
-                // Kind 14 sources are model jobs; kind 31 field 7 bit 1
-                // marks a `!!` person job once P2 records it.
-                outside_sandbox: false,
+                outside_sandbox: source.outside_sandbox,
                 command: &source.command,
                 directory: &source.directory,
             })

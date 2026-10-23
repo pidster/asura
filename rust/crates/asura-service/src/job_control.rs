@@ -25,15 +25,15 @@
 //! pool's queue of 8 (`busy`); 64 remembered retain outcomes.
 
 use crate::job_controller::{
-    CancelReply, JobController, JobReason, JobView, Requester, WaitDone, WaitEnding, WaitKey,
-    WaitStart,
+    CancelReply, JobController, JobReason, JobView, Profile, Requester, WaitDone, WaitEnding,
+    WaitKey, WaitStart,
 };
 use asura_control::{jobs as wire, pb};
 use asura_platform::secrets::json::{self, Value};
 use asura_platform::secrets::{self, RuleSet, SelfCheckError};
 use asura_storage::authority::conversation::{
-    self as journal, Id, JobBlockReason, JobOrigin, JobPauseReason, JobRecords, JobRetention,
-    JobRunState, JobScope, OutputStream, RetentionAction, RetentionAuthor, ToolCall,
+    self as journal, Id, JobBlockReason, JobCommand, JobOrigin, JobPauseReason, JobRecords,
+    JobRetention, JobRunState, JobScope, OutputStream, RetentionAction, RetentionAuthor, ToolCall,
 };
 use asura_storage::authority::writer;
 use asura_storage::payload::{self, Page, PagePool, PageReply, PageRequest, PageState, Ticket};
@@ -472,7 +472,35 @@ fn origin_fields(entry: &mut pb::JobEntry, origin: &JobOrigin) {
 }
 
 fn entry_from_facts(facts: &Facts, view: Option<&JobView>) -> pb::JobEntry {
-    entry_from_listing(&facts.records.listing, view)
+    let mut entry = entry_from_listing(&facts.records.listing, view);
+    // The command source decides the profile of a settled person job the
+    // controller no longer remembers: kind 31 field 7 bit 1 (PCR25).
+    if facts.records.command.outside_sandbox() && entry.outside_sandbox.is_none() {
+        let settled = facts.records.listing.settled.as_deref();
+        outside_fields(&mut entry, None, settled);
+    }
+    entry
+}
+
+/// `JobEntry.outside_sandbox` and OD2 fields 28 and 29 of a `!!` job
+/// (profile `person-outside-1`): `left_running` from the controller's view
+/// while `draining`, or from kind 28 field 8 once settled; `shell_exited`
+/// only while a released job drains. Absent for every other profile.
+fn outside_fields(
+    entry: &mut pb::JobEntry,
+    view: Option<&JobView>,
+    settled: Option<&journal::JobSettled>,
+) {
+    entry.outside_sandbox = Some(true);
+    let state = entry.state;
+    if state == Some(pb::JobState::Settled as i32) {
+        entry.left_running = settled
+            .map(|s| s.escapees)
+            .or_else(|| view.and_then(|v| v.left_running));
+    } else if state == Some(pb::JobState::Draining as i32) {
+        entry.left_running = view.and_then(|v| v.left_running);
+        entry.shell_exited = view.is_some_and(|v| v.shell_exited).then_some(true);
+    }
 }
 
 /// One job's entry: settled facts from kind 28 once it committed; live
@@ -521,6 +549,9 @@ fn entry_from_listing(listing: &journal::JobListing, view: Option<&JobView>) -> 
             entry.stderr_bytes = Some(0);
         }
     }
+    if view.is_some_and(|v| v.profile == Profile::PersonOutside1) {
+        outside_fields(&mut entry, view, listing.settled.as_deref());
+    }
     entry
 }
 
@@ -545,6 +576,9 @@ fn entry_from_view(view: &JobView) -> Option<pb::JobEntry> {
     };
     origin_fields(&mut entry, &view.origin.journal());
     apply_view(&mut entry, view);
+    if view.profile == Profile::PersonOutside1 {
+        outside_fields(&mut entry, Some(view), None);
+    }
     Some(entry)
 }
 
@@ -992,7 +1026,10 @@ impl InspectWork {
             .ctx
             .projects
             .location(facts.project())
-            .zip(records.command.model().and_then(exec_cmd_cwd))
+            .zip(match &records.command {
+                JobCommand::Model(call) => exec_cmd_cwd(call),
+                JobCommand::Person(command) => Some(command.cwd.clone()),
+            })
             .and_then(|(location, cwd)| absolute_cwd(&location, &cwd));
         let notes = detail_notes(records);
         Next::Reply(Box::new(Body::JobDetail(pb::JobDetail {

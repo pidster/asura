@@ -190,6 +190,39 @@ struct Journal {
     held: bool,
     appended: Vec<JobRetention>,
     reads: Vec<&'static str>,
+    /// Person jobs whose kind 31 has field 7 bit 1 (`!!`).
+    outside: BTreeSet<Id>,
+}
+/// A kind 31 for a person job's command source (the journal fixture holds
+/// records as stored; validity is the codec's).
+fn person_command(input: Id, command: &str, outside: bool) -> journal::PersonCommandQueued {
+    journal::PersonCommandQueued {
+        request: [0xa1; 16],
+        digest: [0; 32],
+        input,
+        project: P1,
+        conversation: C1,
+        expected_generation: 0,
+        new_conversation: true,
+        outside_sandbox: outside,
+        command: command.into(),
+        display_command: String::new(),
+        cwd: "tools/bin".into(),
+        search_path: if outside {
+            String::new()
+        } else {
+            "/usr/bin:/bin".into()
+        },
+        environment: Vec::new(),
+        order_revision: 1,
+        number_kinds: Vec::new(),
+        unnumbered: 0,
+        command_cut: false,
+        whole_command: false,
+        rule_set_revision: 1,
+        rule_set_digest: [1; 32],
+        fallback: None,
+    }
 }
 impl Journal {
     fn commit(&mut self, job: Id, record: &Record) -> u64 {
@@ -220,9 +253,14 @@ impl Journal {
                             excerpt: journal::command_excerpt(&command),
                             retention: Default::default(),
                         },
-                        command: asura_storage::authority::conversation::JobCommand::Model(
-                            Box::new(call(&command)),
-                        ),
+                        command: match intent.origin {
+                            JobOrigin::Model { .. } => {
+                                journal::JobCommand::Model(Box::new(call(&command)))
+                            }
+                            JobOrigin::Person { input } => journal::JobCommand::Person(Box::new(
+                                person_command(input, &command, self.outside.contains(&job)),
+                            )),
+                        },
                         retention: Vec::new(),
                         model_notes: Vec::new(),
                     },
@@ -601,6 +639,23 @@ impl H {
     }
 
     fn submit(&mut self, origin: Origin, conversation: Id, project: Id, command: &str) -> Id {
+        let profile = match origin {
+            Origin::Model { .. } => Profile::Model1,
+            Origin::Person { .. } => Profile::Person1,
+        };
+        self.submit_as(origin, conversation, project, command, profile)
+    }
+    fn submit_as(
+        &mut self,
+        origin: Origin,
+        conversation: Id,
+        project: Id,
+        command: &str,
+        profile: Profile,
+    ) -> Id {
+        if profile == Profile::PersonOutside1 {
+            self.env.journal.outside.insert(origin.job_id());
+        }
         let request = StartRequest {
             origin,
             agent: AgentKey {
@@ -614,10 +669,7 @@ impl H {
                 inode: 2,
                 boundary: self.env.runtime.state_boundary(),
             },
-            profile: match origin {
-                Origin::Model { .. } => Profile::Model1,
-                Origin::Person { .. } => Profile::Person1,
-            },
+            profile,
             command: command.into(),
             cwd: "src".into(),
             secrets: Vec::new(),
@@ -1770,4 +1822,85 @@ fn j4t_13_detail_lists_person_and_model_notes() {
     );
     assert_eq!(reply.notes[1].unix_ms, Some(1234));
     assert_eq!(reply.entry.and_then(|e| e.notes), Some(3));
+}
+
+// ----- P3-E: `!!` entry fields -----
+
+/// P3-E (person-command-mode.md, control API additions and OD2): a `!!`
+/// job's `JobEntry` carries `outside_sandbox`, and while it drains released
+/// (kind 2 reason 15) `shell_exited` and `left_running` from the
+/// controller's view; once settled, `left_running` comes from kind 28 and
+/// `shell_exited` is gone. A `!` job carries none of them. `JobDetail.cwd`
+/// of a person job is its kind 31 cwd. Every reply passes the codec.
+#[test]
+fn outside_entry_fields_follow_the_view_then_kind_28() {
+    let mut h = H::new(4);
+    let outside = h.submit_as(person(7), C1, P1, "brew upgrade", Profile::PersonOutside1);
+    let sandboxed = h.submit(person(8), C2, P1, "make check");
+    h.script(sandboxed, [SlotEvent::Spawned]);
+    let exit = Exit::Exited(0);
+    h.script(
+        outside,
+        [
+            SlotEvent::Spawned,
+            SlotEvent::LeaderExited(exit),
+            SlotEvent::ProcessSettled {
+                exit,
+                cleanup: JobCleanup::Confirmed,
+                escapees: 2,
+                elapsed_ms: 10,
+                output_held: true,
+            },
+        ],
+    );
+    let entry = detail(h.send(1, inspect(outside, Some(P1)))).entry.unwrap();
+    assert_eq!(entry.state, Some(pb::JobState::Draining as i32));
+    assert_eq!(entry.outside_sandbox, Some(true));
+    assert_eq!(entry.shell_exited, Some(true));
+    assert_eq!(entry.left_running, Some(2));
+    let reply = detail(h.send(1, inspect(sandboxed, Some(P1))));
+    assert_eq!(
+        reply.cwd.as_deref(),
+        Some("/private/tmp/project/tools/bin"),
+        "a person job's cwd is its kind 31 cwd"
+    );
+    let entry = reply.entry.unwrap();
+    assert_eq!(entry.outside_sandbox, None);
+    assert_eq!((entry.shell_exited, entry.left_running), (None, None));
+    let live = listing(h.send(1, Body::JobList(list(1, Some(P1), None))));
+    let row = live
+        .entries
+        .iter()
+        .find(|e| e.job_id.as_deref() == Some(&outside[..]))
+        .unwrap();
+    assert_eq!(
+        (row.outside_sandbox, row.shell_exited, row.left_running),
+        (Some(true), Some(true), Some(2))
+    );
+    h.script(
+        outside,
+        [
+            SlotEvent::CaptureSettled(Box::new(CaptureOutcome {
+                state: CaptureState::Complete,
+                reason: CaptureReason::None,
+                stdout: JobStream::default(),
+                stderr: JobStream::default(),
+                distinct_numbers: 0,
+                numbers: Vec::new(),
+                pause_count: 0,
+                first_pause_ms: 0,
+                paused_ms: 0,
+                final_reservation: 1024 * 1024,
+                capture: None,
+            })),
+            SlotEvent::ScratchCleaned,
+        ],
+    );
+    h.env.slots.borrow_mut().idle.insert(outside);
+    h.settle();
+    let entry = detail(h.send(1, inspect(outside, Some(P1)))).entry.unwrap();
+    assert_eq!(entry.state, Some(pb::JobState::Settled as i32));
+    assert_eq!(entry.outside_sandbox, Some(true));
+    assert_eq!(entry.shell_exited, None);
+    assert_eq!(entry.left_running, Some(2), "kind 28 field 8: survivors");
 }

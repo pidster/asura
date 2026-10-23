@@ -343,3 +343,97 @@ fn j5t_09_notice_error_fails_the_turn_as_a_repair_case() {
         Some("model_package_unavailable")
     );
 }
+
+/// A person job of input `n`, `!!` when `outside`, settled at `sequence`;
+/// its command source is its kind 31.
+fn person_settlement(n: u8, sequence: u64, outside: bool, whole: bool) -> NoticeSettlement {
+    let mut model = settlement(1, sequence, &arguments("unused", None));
+    let intent = JobIntent {
+        origin: JobOrigin::Person { input: [n; 16] },
+        agent: 0,
+        time: 1_700_000_000_000,
+    };
+    let settled = settled(&intent, 0);
+    model.listing.job = journal::job_id(&intent.origin);
+    model.listing.intent = intent;
+    model.listing.settled_digest = Some(payload_digest(&settled));
+    model.listing.settled = Some(Box::new(settled));
+    model.command = journal::JobCommand::Person(Box::new(journal::PersonCommandQueued {
+        request: [0xa1; 16],
+        digest: [0; 32],
+        input: [n; 16],
+        project: [0xa0; 16],
+        conversation: CONVERSATION,
+        expected_generation: 0,
+        new_conversation: true,
+        outside_sandbox: outside,
+        command: if whole {
+            journal::WHOLE_COMMAND.into()
+        } else {
+            "git status".into()
+        },
+        display_command: if whole {
+            "curl -u 'admin:$ASURA_SECRET_1' x".into()
+        } else {
+            String::new()
+        },
+        cwd: "crates/cli".into(),
+        search_path: if outside {
+            String::new()
+        } else {
+            "/usr/bin:/bin".into()
+        },
+        environment: Vec::new(),
+        order_revision: 1,
+        number_kinds: Vec::new(),
+        unnumbered: 0,
+        command_cut: false,
+        whole_command: whole,
+        rule_set_revision: 1,
+        rule_set_digest: [1; 32],
+        fallback: None,
+    }));
+    model
+}
+
+/// P3-E: a person job's entry reads its kind 31: the command as recorded
+/// (the display-only copy of a whole-command input), the kind 31 cwd, the
+/// person label, and the `, outside the sandbox,` label for field 7 bit 1
+/// (PCR13, PCR24). A person intent whose source is a kind 14, or a model
+/// intent whose source is a kind 31, is inconsistent input.
+#[test]
+fn person_sources_give_person_entries() {
+    let sandboxed = person_settlement(5, 20, false, false);
+    let outside = person_settlement(6, 30, true, true);
+    let notice = build(CONVERSATION, &inputs(vec![outside, sandboxed], 0)).unwrap();
+    let first = &notice.entries[0].full;
+    assert!(
+        first.contains("[The person ran a command themselves. You did not run it."),
+        "{first}"
+    );
+    assert!(
+        first.contains("command: git status\ndirectory: crates/cli\n"),
+        "{first}"
+    );
+    let second = &notice.entries[1].full;
+    assert!(
+        second.contains("[The person ran a command, outside the sandbox, themselves."),
+        "{second}"
+    );
+    assert!(
+        second.contains("command: curl -u 'admin:$ASURA_SECRET_1' x\n"),
+        "{second}"
+    );
+    let mut crossed = person_settlement(7, 20, false, false);
+    crossed.command = settlement(1, 20, &arguments("ls", None)).command;
+    assert_eq!(
+        build(CONVERSATION, &inputs(vec![crossed], 0)).err(),
+        Some(NoticeError::Command)
+    );
+    let mut crossed = settlement(1, 20, &arguments("ls", None));
+    crossed.command = person_settlement(7, 20, false, false).command;
+    assert_eq!(
+        build(CONVERSATION, &inputs(vec![crossed], 0)).err(),
+        Some(NoticeError::Command)
+    );
+}
