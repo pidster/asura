@@ -537,11 +537,72 @@ fn secrets() -> Result<()> {
             .any(|r| matches!(r, Record::JobIntent(_) | Record::PersonCommandQueued(_))),
         "nothing runs again"
     );
-    job_fixture::sweep(env.home(), &needles)?;
-    let audit = audit_text(env.home())?;
+    // Secret store audit (P3-E2): the start-time sweeps; per item one put,
+    // one dispatch read and one delete; the retry's read finds no item
+    // and puts nothing. Input IDs, reply codes and counts only.
+    let count = |audit: &str, kind: &str, input: Option<[u8; 16]>, reply: &str| {
+        audit
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|e| {
+                e["kind"] == kind
+                    && e["details"]["reply"] == reply
+                    && input.is_none_or(|i| e["details"]["input"] == job_fixture::hex(&i))
+            })
+            .count()
+    };
+    let mut audit = String::new();
+    wait_for(Duration::from_secs(20), "secret store audit", || {
+        audit = audit_text(env.home()).unwrap_or_default();
+        [one, two, three]
+            .iter()
+            .all(|i| count(&audit, "secret_store.delete", Some(*i), "deleted") == 1)
+            && count(&audit, "secret_store.get", Some(three), "missing") == 1
+    })?;
     assert!(audit.contains("\"secret_item\":true"), "{audit}");
+    // One start-time sweep per service start (`start_audited` starts twice).
+    assert_eq!(
+        count(&audit, "secret_store.sweep", None, "swept"),
+        2,
+        "{audit}"
+    );
+    for input in [one, two, three] {
+        assert_eq!(count(&audit, "secret_store.put", Some(input), "stored"), 1);
+        assert_eq!(count(&audit, "secret_store.get", Some(input), "read"), 1);
+    }
+    assert_eq!(
+        audit.matches("\"kind\":\"secret_store.put\"").count(),
+        3,
+        "the retry put nothing: {audit}"
+    );
+    for line in audit.lines().filter(|l| l.contains("secret_store.")) {
+        let e: serde_json::Value = serde_json::from_str(line)?;
+        let mut names: Vec<&str> = e["details"]
+            .as_object()
+            .ok_or("details")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.retain(|n| {
+            ![
+                "input",
+                "reply",
+                "status",
+                "kept",
+                "deleted",
+                "failed",
+                "stranded",
+                "unrecognized",
+                "truncated",
+                "listings",
+            ]
+            .contains(n)
+        });
+        assert!(names.is_empty(), "only IDs, codes and counts: {line}");
+    }
+    job_fixture::sweep(env.home(), &needles)?;
     println!(
-        "PASS SS-I1 PC-I28 SS-I11: items before kind 31, real values ran, placeholders kept, items deleted, retry ran nothing"
+        "PASS SS-I1 PC-I28 SS-I11: items before kind 31, real values ran, placeholders kept, items deleted, retry ran nothing; secret store audit events"
     );
     Ok(())
 }

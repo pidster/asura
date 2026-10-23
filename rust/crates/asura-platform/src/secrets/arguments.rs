@@ -435,8 +435,10 @@ impl Emit<'_, '_> {
 }
 
 /// Cuts a command at 8,192 bytes on a character boundary, never inside a
-/// placeholder. Returns whether it cut.
-fn cut_command(text: &mut String, placeholders: &[Range<usize>]) -> bool {
+/// placeholder (`placeholders` from [`placeholder_ranges`]). Returns
+/// whether it cut. The one cut of a refused command, a whole-command
+/// display text and kind 31's display copy.
+pub fn cut_command(text: &mut String, placeholders: &[Range<usize>]) -> bool {
     if text.len() <= MAX_REFUSED_COMMAND_BYTES {
         return false;
     }
@@ -451,7 +453,7 @@ fn cut_command(text: &mut String, placeholders: &[Range<usize>]) -> bool {
     true
 }
 /// Byte ranges of the `$ASURA_SECRET_<n>` and `${ASURA_SECRET_<n>` tokens.
-fn placeholder_ranges(text: &str) -> Vec<Range<usize>> {
+pub fn placeholder_ranges(text: &str) -> Vec<Range<usize>> {
     let bytes = text.as_bytes();
     tokens(text)
         .into_iter()

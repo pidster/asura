@@ -13,7 +13,7 @@ mod stream;
 pub use arguments::{
     ArgumentForm, ArgumentsInput, ExecCmdCommand, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_NUMBERS,
     MAX_NAME_BYTES, MAX_STORED_NAME_BYTES, NotRetained, PlaceholderTokens, RedactedArguments,
-    WITHHELD_TEXT, placeholder_tokens, redact_arguments,
+    WITHHELD_TEXT, cut_command, placeholder_ranges, placeholder_tokens, redact_arguments,
 };
 pub use rewrite::{
     MAX_REWRITTEN_COMMAND_BYTES, MAX_WHOLE_COMMAND_NUMBERS, Plan, Refusal, RefusalCode, Rewrite,
