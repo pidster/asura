@@ -113,6 +113,23 @@ use sha2::Sha256;
 
 // ----- Harness -----
 
+/// A `!` (or `!!`) submit body with a fresh request ID.
+fn submit_body(project: Id, conversation: Option<(Id, u64)>, command: &str, outside: bool) -> Body {
+    Body::ConversationQueueCommandSubmit(pb::ConversationQueueCommandSubmit {
+        request_id: Some(asura_platform::random_id().to_vec()),
+        project_id: Some(project.to_vec()),
+        conversation_id: conversation.map(|(c, _)| c.to_vec()),
+        expected_generation: Some(conversation.map_or(0, |(_, g)| g)),
+        new_conversation: Some(conversation.is_none()),
+        command: Some(command.into()),
+        cwd: Some(".".into()),
+        search_path: (!outside).then(|| "/usr/bin:/bin".into()),
+        environment: Vec::new(),
+        outside_sandbox: outside.then_some(true),
+        launch_environment: Vec::new(),
+    })
+}
+
 /// The scratch home, removed last.
 struct Dir(std::path::PathBuf);
 impl Drop for Dir {
@@ -123,6 +140,8 @@ impl Drop for Dir {
 struct H {
     h: Option<JobHarness>,
     log: Slots,
+    /// The harness runs the real audit worker.
+    audit: bool,
     /// The scratch keychain of a `!!` case; deleted after the store's
     /// worker stopped (testing rule 2).
     keychain: Option<asura_platform::keychain::Target>,
@@ -133,13 +152,17 @@ struct H {
 }
 impl H {
     fn new() -> Self {
-        Self::start(false)
+        Self::start(false, false)
     }
     /// A home with a scratch keychain for the secret store.
     fn with_keychain() -> Self {
-        Self::start(true)
+        Self::start(true, false)
     }
-    fn start(keychain: bool) -> Self {
+    /// [`Self::with_keychain`] with the real audit worker.
+    fn audited() -> Self {
+        Self::start(true, true)
+    }
+    fn start(keychain: bool, audit: bool) -> Self {
         let serial = crate::TEST_WRITER.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::path::PathBuf::from(format!(
             "/private/tmp/asura-pcu-{:x}",
@@ -165,11 +188,22 @@ impl H {
             .unwrap();
             target
         });
+        if audit {
+            // The audit log is a start-time setting, written first.
+            asura_storage::config::execute(
+                runtime.clone(),
+                "audit.enabled",
+                Some("true"),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .expect("audit.enabled");
+        }
         let log = Slots::default();
-        let h = JobHarness::start_scripted(&runtime, factory(log.clone())).expect("harness");
+        let h = JobHarness::start_scripted(&runtime, factory(log.clone()), audit).expect("harness");
         Self {
             h: Some(h),
             log,
+            audit,
             keychain,
             path: Dir(path),
             runtime,
@@ -187,8 +221,10 @@ impl H {
             old.owner().close_writer_for_test();
         }
         let log = Slots::default();
-        self.h =
-            Some(JobHarness::start_scripted(&self.runtime, factory(log.clone())).expect("harness"));
+        self.h = Some(
+            JobHarness::start_scripted(&self.runtime, factory(log.clone()), self.audit)
+                .expect("harness"),
+        );
         self.log = log;
         self.counter = 0;
     }
@@ -227,21 +263,12 @@ impl H {
         command: &str,
         outside: bool,
     ) -> Id {
-        let reply = self.send(Body::ConversationQueueCommandSubmit(
-            pb::ConversationQueueCommandSubmit {
-                request_id: Some(asura_platform::random_id().to_vec()),
-                project_id: Some(project.to_vec()),
-                conversation_id: conversation.map(|(c, _)| c.to_vec()),
-                expected_generation: Some(conversation.map_or(0, |(_, g)| g)),
-                new_conversation: Some(conversation.is_none()),
-                command: Some(command.into()),
-                cwd: Some(".".into()),
-                search_path: (!outside).then(|| "/usr/bin:/bin".into()),
-                environment: Vec::new(),
-                outside_sandbox: outside.then_some(true),
-                launch_environment: Vec::new(),
-            },
-        ));
+        let body = submit_body(project, conversation, command, outside);
+        self.accepted(body)
+    }
+    /// Sends a submit that must be accepted; returns its input.
+    fn accepted(&mut self, body: Body) -> Id {
+        let reply = self.send(body);
         match reply.body {
             Some(Body::ConversationQueueReply(value)) => value
                 .accepted_input_id
@@ -889,4 +916,129 @@ fn pc_u54_message_turn_after_release() {
         Some("model_package_unavailable"),
         "{entry:?}"
     );
+}
+
+/// Secret store ordering rule 6 (P3-E2): an exact `!!` retry whose kind 31
+/// is older than the replay checkpoint, after its job settled and its item
+/// was deleted, finds its request in the journal before any Keychain call:
+/// it gets the original input, reads the (missing) item once, and writes
+/// and deletes no item. The audit holds one `secret_store.put` for it.
+#[test]
+fn p3e2_exact_retry_after_the_checkpoint_writes_no_item() {
+    let mut h = H::audited();
+    let project = h.project();
+    let body = submit_body(project, None, "brew upgrade", true);
+    let input = h.accepted(body.clone());
+    let job = h.run(input);
+    h.settle(job, false, 0);
+    h.wait("the item delete", |h| {
+        h.j().owner().persons.deleted.contains(&input) && h.j().owner().persons.deletes.is_empty()
+    });
+    let Body::ConversationQueueCommandSubmit(submit) = &body else {
+        unreachable!()
+    };
+    let request: Id = submit.request_id.clone().unwrap().try_into().unwrap();
+    // Rolls: the request leaves the replay state for an index run.
+    let turn = h.j().begin_turn(project).expect("turn");
+    let text = "y".repeat(journal::MAX_TEXT);
+    for k in 0..160u64 {
+        h.j()
+            .append(
+                journal::Record::ResponseText(journal::ResponseText {
+                    operation: turn.operation,
+                    generation: turn.generation,
+                    offset: k * journal::MAX_TEXT as u64,
+                    text: text.clone(),
+                }),
+                None,
+            )
+            .expect("response text");
+    }
+    h.j().end_turn(&turn).expect("end turn");
+    {
+        let replay = h.j().owner().replay.clone().unwrap();
+        assert!(
+            replay.base > 0 && !replay.requests.contains_key(&request),
+            "the kind 31 is older than the checkpoint"
+        );
+    }
+    let deleted = h.j().owner().persons.deleted.len();
+    let items = h.j().owner().persons.items.clone();
+    // The exact retry.
+    assert_eq!(h.accepted(body), input, "the original input");
+    h.wait("the retry's read is audited", |h| {
+        h.j().audit_events().iter().any(|e| {
+            matches!(e, Event::SecretStoreGet { input: i, reply: StoreReply::Missing, .. } if *i == input)
+        })
+    });
+    h.steps(10);
+    let owner = h.j().owner();
+    assert_eq!(owner.persons.deleted.len(), deleted, "no item to delete");
+    assert_eq!(owner.persons.items, items, "no item stored");
+    let events = h.j().audit_events();
+    let puts: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, Event::SecretStorePut { .. }))
+        .collect();
+    assert_eq!(puts.len(), 1, "{puts:?}");
+    assert!(matches!(
+        puts[0],
+        Event::SecretStorePut { input: i, reply: StoreReply::Stored, status: None } if *i == input
+    ));
+    for (what, found) in [
+        (
+            "dispatch read",
+            events.iter().any(|e| {
+                matches!(e, Event::SecretStoreGet { input: i, reply: StoreReply::Read, .. } if *i == input)
+            }),
+        ),
+        (
+            "delete",
+            events.iter().any(|e| {
+                matches!(e, Event::SecretStoreDelete { input: i, reply: StoreReply::Deleted, .. } if *i == input)
+            }),
+        ),
+        (
+            "sweep",
+            events.iter().any(|e| {
+                matches!(e, Event::SecretStoreSweep { reply: StoreReply::Swept, .. })
+            }),
+        ),
+    ] {
+        assert!(found, "{what}: {events:?}");
+    }
+}
+
+/// P3-E2 queue rule: a project holds one pending new conversation at a
+/// time (PR1). While a person command waits (Held after a restart) in a
+/// generation-0 conversation, a new-conversation submit is refused
+/// `conversation_busy` before any Keychain call, for `!` and `!!`; an
+/// exact retry of the waiting command still returns its input.
+#[test]
+fn p3e2_new_conversation_waits_for_the_pending_one() {
+    let mut h = H::with_keychain();
+    let project = h.project();
+    let body = submit_body(project, None, "make check", false);
+    let input = h.accepted(body.clone());
+    // Restart before its kind 26: the command is Held at generation 0.
+    h.restart();
+    h.wait("replay", |h| {
+        h.j()
+            .owner()
+            .replay
+            .as_ref()
+            .is_some_and(|r| r.input_status(input) == Some(InputStatus::Held))
+    });
+    let items = h.j().owner().persons.items.clone();
+    for outside in [false, true] {
+        let reply = h.send(submit_body(project, None, "ls", outside));
+        match reply.body {
+            Some(Body::Error(e)) => {
+                assert_eq!(e.message.as_deref(), Some("conversation_busy"), "{e:?}")
+            }
+            other => panic!("not refused conversation_busy: {other:?}"),
+        }
+    }
+    assert_eq!(h.j().owner().persons.items, items, "no item was put");
+    assert_eq!(h.accepted(body), input, "the exact retry");
 }
