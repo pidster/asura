@@ -383,13 +383,27 @@ pub struct HistoryPage {
     pub has_more: bool,
     pub entries: Vec<HistoryEntry>,
 }
-#[derive(Clone, Debug)]
+/// One history entry: a turn or a dispatched person command, ordered by
+/// accepted sequence.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryEntry {
-    pub operation: Id,
+    /// A turn's generation, or the generation a person command was queued
+    /// against (its kind 31 expected generation, 0 before the first turn).
     pub generation: u64,
-    /// The accepted frame's sequence (SJ-D14).
+    /// The accepted frame's sequence (SJ-D14): a turn's `TurnAccepted`, or a
+    /// person command's kind 26.
     pub accepted_frame: u64,
-    pub terminal: Option<TerminalKind>,
+    pub source: HistorySource,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistorySource {
+    /// A turn; `terminal` is none while it is active.
+    Turn {
+        operation: Id,
+        terminal: Option<TerminalKind>,
+    },
+    /// A dispatched person command (`p` entry, P3-E3).
+    Person { input: Id },
 }
 #[derive(Debug)]
 pub struct InputView {
@@ -850,6 +864,17 @@ impl WriterHandle {
             let _ = self.handle.take().expect("finished").join();
         }
         self.handle.is_none()
+    }
+    /// Test support: closes the writer and blocks until its worker thread
+    /// exited, which releases the process-wide writer claim, so the next
+    /// writer of the process starts. Only test threads call it, never a
+    /// reactor; the wait ends when the worker finishes its queued commands.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn close_and_join(&mut self) {
+        self.close();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 /// The journal worker loop: queued commands in order; between commands, run

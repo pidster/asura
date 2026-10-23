@@ -18,7 +18,8 @@
 //! in-process service), `full` (SS-I10), `profile` (PC-I2 to PC-I5,
 //! PC-I14, PC-I29, PC-I36), `observer` (field 8), `long` (PC-I9, PC-I25),
 //! `released_turn` (PC-I33 message part, PC-I21), `quota` (PC-I20),
-//! `printing` (SDI-10 first half); `notice_later` (PC-I13 later-turn
+//! `printing` (SDI-10 first half), `history` (P3-E3, PC-E8 service
+//! part); `notice_later` (PC-I13 later-turn
 //! part) runs only when named (blocked, reported).
 #[path = "support/job_fixture.rs"]
 mod job_fixture;
@@ -1387,6 +1388,106 @@ fn position(records: &[Record], f: impl Fn(&Record) -> bool) -> Option<usize> {
     records.iter().position(f)
 }
 
+/// The kind 26 sequence of a dispatched person input.
+fn dispatched_at(env: &Env, input: [u8; 16]) -> Result<u64> {
+    let (_, replay) = env.fixture.journal()?;
+    Ok(replay
+        .inputs
+        .get(&input)
+        .and_then(|q| q.person)
+        .and_then(|p| p.job)
+        .ok_or("person input with its kind 26")?
+        .sequence)
+}
+
+/// P3-E3 (owner and integration, PC-E8 service part): a conversation that
+/// holds only person commands restores from the history read. With no
+/// conversation named, the read selects it and replies generation 0; each
+/// dispatched command is an entry with `person_command_input_id`, its kind
+/// 26 sequence as `accepted_frame` and its queued generation, and no
+/// operation or kind, newest first. A command held by a restart and
+/// dropped before it ran is not listed. Pages by `before_accepted_frame` are bounded by `limit`; the
+/// same pages answer after a restart.
+fn history() -> Result<()> {
+    let mut env = Env::new("pc-history")?;
+    env.start()?;
+    let (project, _) = env.project("project")?;
+    let (first, conversation) = queued(&env, &request(project, None, "echo one", None))?;
+    wait_settled(&env, first, Duration::from_secs(60))?;
+    let (blocker, _) = queued(&env, &request(project, Some(conversation), BLOCKER, None))?;
+    wait_for(Duration::from_secs(30), "blocker running", || {
+        intent_committed(&env, blocker).unwrap_or(false)
+    })?;
+    let (dropped, _) = queued(
+        &env,
+        &request(project, Some(conversation), "echo never", None),
+    )?;
+    // A restart holds the queued command (PR6); the person drops it.
+    env.fixture.stop()?;
+    env.start()?;
+    wait_for(Duration::from_secs(30), "held after restart", || {
+        entry(&env, project, dropped).is_ok_and(|e| e.state == Some(2))
+    })?;
+    decide(&env, dropped, DROP).map_err(|e| format!("drop: {e}"))?;
+    wait_settled(&env, blocker, Duration::from_secs(60))?;
+    assert!(
+        !intent_committed(&env, dropped)?,
+        "the dropped command never ran"
+    );
+    let expected = [
+        (blocker, dispatched_at(&env, blocker)?),
+        (first, dispatched_at(&env, first)?),
+    ];
+    let check = |env: &Env| -> Result<()> {
+        let reply = env
+            .fixture
+            .attach()?
+            .conversation_history(project, None, None, 8)?;
+        assert_eq!(reply.conversation_id.as_deref(), Some(&conversation[..]));
+        assert_eq!(reply.generation, Some(0), "{reply:?}");
+        assert_eq!(reply.has_more, Some(false));
+        let shape: Vec<_> = reply
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.person_command_input_id.clone(),
+                    e.accepted_frame,
+                    e.generation,
+                    e.operation_id.is_none() && e.kind.is_none(),
+                )
+            })
+            .collect();
+        let want: Vec<_> = expected
+            .iter()
+            .map(|(input, at)| (Some(input.to_vec()), Some(*at), Some(0), true))
+            .collect();
+        assert_eq!(shape, want, "{reply:?}");
+        // One entry per page, by the kind 26 cursor.
+        let mut client = env.fixture.attach()?;
+        let page = client.conversation_history(project, Some(conversation), None, 1)?;
+        assert_eq!(page.entries, reply.entries[..1]);
+        assert_eq!(page.has_more, Some(true));
+        let page = client.conversation_history(
+            project,
+            Some(conversation),
+            page.entries[0].accepted_frame,
+            1,
+        )?;
+        assert_eq!(page.entries, reply.entries[1..]);
+        assert_eq!(page.has_more, Some(false));
+        Ok(())
+    };
+    check(&env)?;
+    env.fixture.stop()?;
+    env.start()?;
+    check(&env)?;
+    println!(
+        "PASS P3-E3 history: a person-only conversation restores with generation 0, its dispatched commands newest first, the dropped one absent, across a restart"
+    );
+    Ok(())
+}
+
 /// PC-I12, PC-I27, PC-I13 and PC-I39 with a scripted model: a `!` and a
 /// `!!` command submitted while a model turn runs wait with
 /// `waiting: model turn running` and run after the turn's terminal record;
@@ -2593,6 +2694,7 @@ fn main() {
         ("released_turn", released_turn),
         ("quota", quota),
         ("printing", printing),
+        ("history", history),
     ];
     // Blocked outside P3-E2 (reported): run only when named.
     let blocked: Vec<Case> = vec![("notice_later", notice_later)];

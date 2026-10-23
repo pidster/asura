@@ -8,8 +8,8 @@ need a service that lists CAPABILITY_JOBS; they run after packet J34-E.
 The person journeys (--person-*) need packets P3-E and P4 and a test-support
 service: each uses a scratch home whose seams name a scratch keychain, the
 `!` account directories and capability 8 (person-command-mode.md, PC-E1 to
-PC-E20; secret-store.md, SS-E1 and SS-E2). Checks that need P3-E2 print
-PENDING until PENDING_P3E2 is False.
+PC-E20; secret-store.md, SS-E1 and SS-E2). The P3-E2 and P3-E3 checks
+(PC-E8, PC-E18, PC-E19) run unconditionally (PENDING_P3E2 is False).
 This verifies process and tty state, not native terminal visual correctness.
 """
 import codecs
@@ -4356,9 +4356,9 @@ def person_outside_journey(fixture, source):
 
 # P3-E2 (person-command-mode.md, "P3-E service record") lets a message behind
 # a released `!!` job dispatch, and fills history field 5 so a relaunched TUI
-# restores person entries. Until it merges, the checks that need it report
-# PENDING instead of failing; the P3-E2 integration sets this to False.
-PENDING_P3E2 = True
+# restores person entries (P3-E3 adds the person history index). Both have
+# merged, so these checks fail instead of reporting PENDING.
+PENDING_P3E2 = False
 # A draining `!!` job's entry carries the shell's kind 5 exit (P4-F), so
 # `↳ shell exited 0 · …` shows the 0.
 PENDING_DRAINING_EXIT = False

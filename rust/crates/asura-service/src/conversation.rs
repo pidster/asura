@@ -2734,18 +2734,35 @@ impl Owner {
                             entries: page
                                 .entries
                                 .into_iter()
-                                .map(|entry| pb::ConversationHistoryEntry {
-                                    person_command_input_id: None,
-                                    operation_id: Some(entry.operation.to_vec()),
-                                    generation: Some(entry.generation),
-                                    accepted_frame: Some(entry.accepted_frame),
-                                    kind: Some(match entry.terminal {
-                                        None => 1,
-                                        Some(journal::TerminalKind::Complete) => 3,
-                                        Some(journal::TerminalKind::Failed) => 4,
-                                        Some(journal::TerminalKind::Cancelled) => 5,
-                                        Some(journal::TerminalKind::Interrupted) => 6,
-                                    }),
+                                .map(|entry| match entry.source {
+                                    writer::HistorySource::Turn {
+                                        operation,
+                                        terminal,
+                                    } => pb::ConversationHistoryEntry {
+                                        person_command_input_id: None,
+                                        operation_id: Some(operation.to_vec()),
+                                        generation: Some(entry.generation),
+                                        accepted_frame: Some(entry.accepted_frame),
+                                        kind: Some(match terminal {
+                                            None => 1,
+                                            Some(journal::TerminalKind::Complete) => 3,
+                                            Some(journal::TerminalKind::Failed) => 4,
+                                            Some(journal::TerminalKind::Cancelled) => 5,
+                                            Some(journal::TerminalKind::Interrupted) => 6,
+                                        }),
+                                    },
+                                    // A person command: its kind 31 input,
+                                    // its kind 26 and the generation it was
+                                    // queued against (field 5).
+                                    writer::HistorySource::Person { input } => {
+                                        pb::ConversationHistoryEntry {
+                                            person_command_input_id: Some(input.to_vec()),
+                                            operation_id: None,
+                                            generation: Some(entry.generation),
+                                            accepted_frame: Some(entry.accepted_frame),
+                                            kind: None,
+                                        }
+                                    }
                                 })
                                 .collect(),
                         }),
@@ -5170,6 +5187,15 @@ impl Owner {
     pub(crate) fn fixture_writer_close(&self) {
         if let Some(writer) = &self.writer {
             writer.close();
+        }
+    }
+    /// Closes the journal writer and waits for its worker thread to exit,
+    /// as a crash leaves the journal (no closure record), so the next owner
+    /// of the process gets the writer claim.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_writer_join(&mut self) {
+        if let Some(writer) = &mut self.writer {
+            writer.close_and_join();
         }
     }
 }

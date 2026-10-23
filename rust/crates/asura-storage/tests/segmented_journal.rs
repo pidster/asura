@@ -581,7 +581,10 @@ fn sj28_two_hundred_large_tool_calls_span_segment_files() {
         .unwrap()
         .history
         .unwrap();
-        seen.extend(page.entries.iter().map(|e| e.operation));
+        seen.extend(page.entries.iter().map(|e| match e.source {
+            HistorySource::Turn { operation, .. } => operation,
+            HistorySource::Person { .. } => panic!("no person commands"),
+        }));
         if !page.has_more {
             break;
         }
@@ -2127,5 +2130,254 @@ fn p3e2_request_outcome_finds_kind_31_older_than_the_checkpoint() {
             .try_submit(Command::RequestOutcome { request: [0; 16] }),
         Err(Error::Invalid)
     ));
+    close(&mut session.writer);
+}
+
+/// A kind 31 `!` command through the writer; returns its input.
+fn p3e3_queue(session: &Session, project: Id, conversation: Id, generation: u64) -> Id {
+    let command = PersonCommandQueued {
+        request: random_id(),
+        digest: [0; 32],
+        input: random_id(),
+        project,
+        conversation,
+        expected_generation: generation,
+        new_conversation: generation == 0 && conversation_is_new(session, conversation),
+        outside_sandbox: false,
+        command: "ls".into(),
+        display_command: String::new(),
+        cwd: ".".into(),
+        search_path: "/bin".into(),
+        environment: vec![],
+        order_revision: 0,
+        number_kinds: vec![],
+        unnumbered: 0,
+        command_cut: false,
+        whole_command: false,
+        rule_set_revision: 1,
+        rule_set_digest: [7; 32],
+        fallback: None,
+    };
+    let input = command.input;
+    let reply = run(
+        &session.writer,
+        Command::QueuePersonCommand {
+            command: Box::new(command),
+        },
+    )
+    .unwrap();
+    assert_eq!(reply.accepted_input_id, Some(input));
+    input
+}
+fn conversation_is_new(session: &Session, conversation: Id) -> bool {
+    !state(&session.writer)
+        .conversations
+        .contains_key(&conversation)
+}
+/// Dispatches a queued person input (its kind 26); returns the sequence.
+fn p3e3_dispatch(session: &Session, input: Id) -> u64 {
+    session
+        .append(Record::JobIntent(JobIntent {
+            origin: JobOrigin::Person { input },
+            agent: 0,
+            time: 1_760_000_000_000,
+        }))
+        .unwrap();
+    state(&session.writer).sequence
+}
+fn p3e3_page(
+    session: &Session,
+    project: Id,
+    conversation: Option<Id>,
+    before: Option<u64>,
+    limit: usize,
+) -> HistoryPage {
+    run(
+        &session.writer,
+        Command::History {
+            project,
+            conversation,
+            before_accepted_frame: before,
+            limit,
+        },
+    )
+    .unwrap()
+    .history
+    .unwrap()
+}
+/// Every page of a conversation's history, newest first, by `limit`.
+fn p3e3_all(session: &Session, project: Id, conversation: Id, limit: usize) -> Vec<HistoryEntry> {
+    let mut all = Vec::new();
+    let mut before = None;
+    loop {
+        let page = p3e3_page(session, project, Some(conversation), before, limit);
+        assert!(page.entries.len() <= limit);
+        all.extend(page.entries.iter().cloned());
+        if !page.has_more {
+            break;
+        }
+        before = page.entries.last().map(|e| e.accepted_frame);
+    }
+    all
+}
+
+/// P3-E3 (writer integration): the history read merges `T` turns, the
+/// active turn and `p` person commands newest accepted sequence first, at
+/// most `limit` per page, with a cursor on either kind of entry. A person
+/// entry carries its kind 26 sequence and its kind 31 expected generation;
+/// a command dropped before it ran is not listed. A read with no
+/// conversation named selects a conversation that holds only person
+/// commands (generation 0) when its command is the newest activity. The
+/// pages are equal before and after rolls move the entries into index runs
+/// and after a restart from the checkpoint.
+#[test]
+fn p3e3_history_merges_turns_and_person_commands_across_rolls_and_restart() {
+    let _guard = WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut session = Session::start(&scratch);
+    let project = session.register(&scratch, 1);
+    // A conversation with one turn; its later turns and commands follow.
+    let (lane, op1, gen1) = session.start_turn(project, None);
+    session.finish(op1, gen1, 0, "one");
+    // A person-only conversation: `a` runs, `b` is dropped before it ran.
+    let solo = random_id();
+    let a = p3e3_queue(&session, project, solo, 0);
+    let a_at = p3e3_dispatch(&session, a);
+    session
+        .append(j2_exited(job_id(&JobOrigin::Person { input: a })))
+        .unwrap();
+    let b = p3e3_queue(&session, project, solo, 0);
+    for action in [InputAction::Hold, InputAction::Drop] {
+        run(
+            &session.writer,
+            Command::InputDecision {
+                request: random_id(),
+                input: b,
+                action,
+            },
+        )
+        .unwrap();
+    }
+    // No conversation named: the person-only conversation is newer, and
+    // replies generation 0.
+    let solo_page = |session: &Session| {
+        let page = p3e3_page(session, project, Some(solo), None, 8);
+        assert_eq!(page.generation, Some(0));
+        assert_eq!(
+            page.entries,
+            vec![HistoryEntry {
+                generation: 0,
+                accepted_frame: a_at,
+                source: HistorySource::Person { input: a },
+            }]
+        );
+        assert!(!page.has_more);
+        page
+    };
+    let page = p3e3_page(&session, project, None, None, 8);
+    assert_eq!(page.conversation, Some(solo));
+    assert_eq!(page.entries, solo_page(&session).entries);
+    // In the lane: `c` queued against generation 1, a turn, rolls, `d`
+    // queued against generation 2 and left running, and an active turn.
+    let c = p3e3_queue(&session, project, lane, gen1);
+    let c_at = p3e3_dispatch(&session, c);
+    session
+        .append(j2_exited(job_id(&JobOrigin::Person { input: c })))
+        .unwrap();
+    let (_, op2, gen2) = session.start_turn(project, Some(lane));
+    // Rolls: response text moves `a`, `c` and the turns into index runs.
+    let text = "y".repeat(MAX_TEXT);
+    for k in 0..160u64 {
+        session
+            .append(Record::ResponseText(ResponseText {
+                operation: op2,
+                generation: gen2,
+                offset: k * MAX_TEXT as u64,
+                text: text.clone(),
+            }))
+            .unwrap();
+    }
+    session.finish(op2, gen2, 160 * MAX_TEXT as u64, "");
+    let current = state(&session.writer);
+    assert!(
+        current.base > c_at,
+        "the kind 26 of c is before the checkpoint"
+    );
+    drop(current);
+    let d = p3e3_queue(&session, project, lane, gen2);
+    let d_at = p3e3_dispatch(&session, d);
+    let (_, op3, gen3) = session.start_turn(project, Some(lane));
+    let op3_at = state(&session.writer).operations[&op3]
+        .accepted_frame
+        .sequence;
+    let check = |session: &Session, op3_terminal: Option<TerminalKind>| {
+        let all = p3e3_all(session, project, lane, 2);
+        let shape: Vec<_> = all
+            .iter()
+            .map(|e| match e.source {
+                HistorySource::Turn {
+                    operation,
+                    terminal,
+                } => (Some(operation), None, e.generation, terminal),
+                HistorySource::Person { input } => (None, Some(input), e.generation, None),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (Some(op3), None, gen3, op3_terminal),
+                (None, Some(d), gen2, None),
+                (Some(op2), None, gen2, Some(TerminalKind::Complete)),
+                (None, Some(c), gen1, None),
+                (Some(op1), None, gen1, Some(TerminalKind::Complete)),
+            ]
+        );
+        assert_eq!(
+            [0, 1, 3].map(|n| all[n].accepted_frame),
+            [op3_at, d_at, c_at]
+        );
+        // A cursor on a person entry pages by accepted sequence: the turn
+        // of generation 2, accepted before d, follows d.
+        let below_d = p3e3_page(session, project, Some(lane), Some(d_at), 1);
+        assert_eq!(below_d.entries, vec![all[2].clone()]);
+        assert!(below_d.has_more);
+        let below_c = p3e3_page(session, project, Some(lane), Some(c_at), 8);
+        assert_eq!(below_c.entries, all[4..].to_vec());
+        assert!(!below_c.has_more);
+        let below_first = p3e3_page(session, project, Some(lane), Some(all[4].accepted_frame), 8);
+        assert!(below_first.entries.is_empty() && !below_first.has_more);
+        // A cursor that is no entry of this conversation is invalid: a
+        // person command of another conversation, and a sequence of no
+        // entry.
+        for bad in [a_at, a_at + 1] {
+            let reply = run(
+                &session.writer,
+                Command::History {
+                    project,
+                    conversation: Some(lane),
+                    before_accepted_frame: Some(bad),
+                    limit: 8,
+                },
+            );
+            assert!(matches!(reply, Err(Error::Invalid)), "{bad}");
+        }
+        // No conversation named: the lane now holds the newest turn.
+        let latest = p3e3_page(session, project, None, None, 8);
+        assert_eq!(latest.conversation, Some(lane));
+        assert_eq!(latest.generation, Some(gen3));
+        assert_eq!(latest.entries, all);
+        // The person-only conversation keeps its page; the dropped `b` is
+        // listed nowhere.
+        solo_page(session);
+    };
+    // The active turn comes from the live state.
+    check(&session, None);
+    session.finish(op3, gen3, 0, "three");
+    check(&session, Some(TerminalKind::Complete));
+    // Restart: the checkpoint and the tail answer the same pages.
+    close(&mut session.writer);
+    let mut session = Session::start(&scratch);
+    assert!(state(&session.writer).base > c_at);
+    check(&session, Some(TerminalKind::Complete));
     close(&mut session.writer);
 }
