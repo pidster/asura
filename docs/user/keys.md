@@ -70,6 +70,8 @@ and keeps the draft.
 | Ctrl+J | Start a new line in the command |
 | Ctrl+C | Stop the running command; press again to kill it |
 | Enter or Space | In the conversation log, open the job viewer at the end of the command's output |
+| Enter on a held command | In the conversation log, run a `!!` command that waits with "Held: confirm to run (paths changed)" |
+| Escape on a held command | In the conversation log, drop a held `!!` command, or a command that waits for its path check; it does not run |
 
 ## Help mode keys
 

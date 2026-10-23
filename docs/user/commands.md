@@ -151,6 +151,19 @@ The setting changes `execution.enabled` and `execution.projects.ID` in
 `~/.asura/config.yaml`. If Asura cannot confirm the change, it shows
 "Execution setting outcome unconfirmed; read it again with /execution".
 
+## Execution path commands
+
+| Command | Action |
+| --- | --- |
+| `/paths` | Show the path warnings for the next command in the selected project and the approved paths; `/paths approve` and `/paths revoke` change the approvals |
+
+| Form | Action |
+| --- | --- |
+| `/paths` | List the warnings that the next command shows and the approved paths |
+| `/paths approve PATH` | Approve the current content of an implicit-execution file, such as `.git/hooks/pre-commit`; PATH is relative to the project folder |
+| `/paths approve all` | Approve every implicit-execution file that the list shows as not approved or changed |
+| `/paths revoke PATH` | Remove the approval of PATH |
+
 ## Job limits
 
 The `jobs` settings limit how many command jobs the service runs and queues.
