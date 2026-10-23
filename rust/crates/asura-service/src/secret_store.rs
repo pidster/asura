@@ -39,7 +39,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 /// Requests outstanding at once, queued or running (AE-03).
 pub const QUEUE_BOUND: usize = 16;
@@ -49,8 +48,6 @@ pub const ITEM_LIMIT: u32 = 256;
 pub const COUNT_TRUNCATED: u32 = asura_platform::keychain::LIST_BOUND as u32;
 /// Stranded input IDs the observation carries; the count keeps the total.
 pub const OBSERVED_STRANDED: usize = 16;
-/// Longest gap of the locked or unavailable recheck at dispatch.
-pub const RECHECK_MAX: Duration = Duration::from_secs(60);
 
 /// Why a Keychain request did not succeed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,34 +403,12 @@ fn open_target(target: &Target) -> Result<Keychain, asura_platform::keychain::Fa
 }
 
 /// The paced recheck of a command waiting at dispatch with
-/// `keychain_locked` or `keychain_unavailable`: 1, 1, 2, 3, 5, 8 s and so
-/// on, at most [`RECHECK_MAX`] apart. Pacing only; it ends nothing. The
+/// `keychain_locked` or `keychain_unavailable`: the shared
+/// [`Fibonacci`](asura_platform::pacing::Fibonacci) pacing, 1, 1, 2, 3, 5,
+/// 8 s and so on, at most 60 s apart. Pacing only; it ends nothing. The
 /// owner also rechecks at once on the person's next action in that
 /// conversation, and resets the pacing when the command leaves the wait.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Recheck {
-    previous: Duration,
-    current: Duration,
-}
-
-impl Default for Recheck {
-    fn default() -> Self {
-        Self {
-            previous: Duration::ZERO,
-            current: Duration::from_secs(1),
-        }
-    }
-}
-
-impl Recheck {
-    /// The delay before the next recheck; advances the pacing.
-    pub fn next_delay(&mut self) -> Duration {
-        let delay = self.current;
-        self.current = (self.previous + self.current).min(RECHECK_MAX);
-        self.previous = delay;
-        delay
-    }
-}
+pub type Recheck = asura_platform::pacing::Fibonacci;
 
 #[cfg(test)]
 mod tests;
