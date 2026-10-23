@@ -877,7 +877,7 @@ impl App {
                 let row = self.local_outbox.remove(index);
                 self.notice = queue_input_notice(entry);
                 if let Some(input) = entry.input_id.as_deref().filter(|_| command) {
-                    self.command_accepted(row.request_id, input);
+                    self.command_accepted(row.request_id, input, entry.text.as_deref());
                     self.person.rows.retain(|r| r.request_id != row.request_id);
                 }
                 // Ctrl+S: promote the accepted row only while its exact
