@@ -250,6 +250,15 @@ Every segment has a kind, a role, a source identity, a source digest, a byte
 range and a fidelity level. Segments are ordered by CCR9: instructions, then
 history, then the context block, then the current prompt.
 
+Segment kinds in the manifest encoding: 1 instructions, 2 history, 3 context
+block, 4 prompt, and, from composer revision 2 (J5), 5 `job_notice` and 6
+`job_notice_summary`. The notice segments follow the context block segment and
+precede the prompt: one `job_notice` segment per notice entry in increasing
+kind 28 sequence, then one `job_notice_summary` segment. A turn without a
+notice block has neither kind. The job controller's
+[notice text](tool-job-controller.md#notice-text) defines their sources and
+digests.
+
 | Fidelity | Content | Example |
 | --- | --- | --- |
 | Full | The whole source text | A prior turn's prompt and answer |
@@ -752,6 +761,10 @@ normal redispatch rules apply.
   rechecks current authority (retention page contract).
 - **Person commands.** Person notice wording states that the person ran the
   command (PCR13).
+- **Stored text in notices.** Commands and directories enter the notice in the
+  [quoted value form](tool-job-controller.md#quoted-value-form), so stored text
+  never starts a line of the context block and cannot forge a label or the
+  block's end (J5-E6).
 - **Egress.** Remote destinations stay restricted today (`conversation.rs:1814`).
   The manifest records the destination. A remote egress view needs the egress
   policy design before the composer serves it.
@@ -862,7 +875,9 @@ decisions, except item 8, which the owner selected.
    `omitted_turns` (u32), `manifest_digest`, `composer_revision` (u32), the N1
    budget inputs `window_tokens`, `output_reservation`, `overhead_tokens` and
    `bytes_per_token_milli` (u32 each), and, from J5, `notice_through` (u64), the
-   [notice cursor](tool-job-controller.md#binding-point). Its `prior_operations`
+   [notice cursor](tool-job-controller.md#binding-point), and `notice_live`
+   (u32), the live job count at that cursor. Like the N1 budget inputs, these
+   let a turn with a notice be recomposed exactly from journal sources. Its `prior_operations`
    lists the shown prior turns (full or reference), at most 1,024, in generation
    order. Replay requires the shown operations to be completed turns of the
    conversation in increasing generation, and the shown count plus
@@ -871,7 +886,8 @@ decisions, except item 8, which the owner selected.
    `context` module: format byte, composer revision, budget fields, then each
    segment (kind, role, fidelity, source identity, source digest, byte length,
    content digest), then each omission range. The composer revision versions the
-   encoding.
+   encoding. Revision 1 is CC1; revision 2 (J5) adds the job notice in the
+   context block and its segment kinds 5 and 6.
 8. **Input stall bound (owner, 2026-10-15).** The helper's existing 5-second
    input-phase bound restarts after each accepted chunk. It ends only a transfer
    that makes no progress, as a wind-down bound on a stalled peer; a large input
