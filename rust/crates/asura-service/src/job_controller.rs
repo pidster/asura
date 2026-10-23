@@ -1144,6 +1144,7 @@ impl JobController {
                         requester: reasons::audit_requester(t.requester),
                         reason: reasons::audit_reason(t.reason),
                         kill: t.kill,
+                        outside_sandbox: false,
                     };
                     self.audit(event);
                 }
@@ -1241,6 +1242,7 @@ impl JobController {
             stderr_bytes: settled.stderr.capture.stored_bytes,
             elapsed_ms: settled.elapsed_ms,
             pause_count: settled.pause_count,
+            outside_sandbox: false,
         };
         let recovered = job.recovered;
         self.audit(event);
@@ -1706,6 +1708,7 @@ impl JobController {
                     origin: job.origin.audit(),
                     agent: job.agent.agent,
                     reason: reason.audit(),
+                    outside_sandbox: false,
                 }
             });
             if let Some(event) = audit {
@@ -1905,13 +1908,17 @@ fn started_event(job: &Job) -> Event {
         job: job.id,
         origin: job.origin.audit(),
         agent: job.agent.agent,
-        profile: match job.profile {
-            Profile::Model1 => record::JobProfile::Model1,
+        // P3-K derives the person profiles from `Profile`; until then a
+        // person job is a `!` job.
+        profile: match (job.profile, &job.origin) {
+            (Profile::Model1, Origin::Model { .. }) => record::JobProfile::Model1,
+            (Profile::Model1, Origin::Person { .. }) => record::JobProfile::Person1,
         },
         operation,
         generation,
         ordinal,
         input,
+        outside_sandbox: false,
     }
 }
 

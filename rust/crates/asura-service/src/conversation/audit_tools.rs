@@ -177,7 +177,9 @@ pub(super) fn read(
                 | Event::ConfigChanged { .. }
                 | Event::ServiceStopping { .. }
                 | Event::JournalGap { .. }
-                | Event::ExecutionChanged { .. } => continue,
+                | Event::ExecutionChanged { .. }
+                | Event::PersonCommandQueued { .. }
+                | Event::PersonCommandRefused { .. } => continue,
             }
             let Ok(line) = std::str::from_utf8(&bytes) else {
                 continue;
@@ -524,6 +526,7 @@ mod tests {
                     stderr_bytes: 0,
                     elapsed_ms: 2,
                     pause_count: 0,
+                    outside_sandbox: false,
                 },
             ),
             at(
@@ -535,6 +538,7 @@ mod tests {
                     requester: JobRequester::Service,
                     reason: JobReason::ExecutionOff,
                     kill: false,
+                    outside_sandbox: false,
                 },
             ),
             at(
@@ -550,6 +554,7 @@ mod tests {
                     generation: Some(7),
                     ordinal: Some(8),
                     input: None,
+                    outside_sandbox: false,
                 },
             ),
             at(
@@ -561,6 +566,7 @@ mod tests {
                     origin: JobOrigin::Model,
                     agent: 0,
                     reason: JobBlockReason::AgentSlots,
+                    outside_sandbox: false,
                 },
             ),
         ];

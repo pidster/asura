@@ -41,6 +41,12 @@ struct Config {
     jobs: Jobs,
     #[serde(default, skip_serializing_if = "Execution::is_default")]
     execution: Execution,
+    #[serde(
+        default,
+        rename = "personCommands",
+        skip_serializing_if = "PersonCommands::is_default"
+    )]
+    person_commands: PersonCommands,
     /// The model thinking level (thinking-level.md); absent is `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
@@ -316,6 +322,27 @@ impl ExecutionSetting {
     /// default (ES-R1, ES-R2).
     pub fn effective(&self, project: &[u8; 16]) -> bool {
         self.project_override(project).unwrap_or(self.enabled)
+    }
+}
+/// Person command settings (person-command-mode.md, PCR23). Written only
+/// away from its default.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersonCommands {
+    /// `personCommands.allowOutsideSandbox`: `false` refuses `!!` commands.
+    #[serde(default = "enabled", rename = "allowOutsideSandbox")]
+    allow_outside_sandbox: bool,
+}
+impl Default for PersonCommands {
+    fn default() -> Self {
+        Self {
+            allow_outside_sandbox: enabled(),
+        }
+    }
+}
+impl PersonCommands {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -639,6 +666,10 @@ impl Config {
             "execution" => yaml(&self.execution),
             "execution.enabled" => yaml(&self.execution.enabled),
             "execution.projects" => yaml(&self.execution.projects),
+            "personCommands" => yaml(&self.person_commands),
+            "personCommands.allowOutsideSandbox" => {
+                yaml(&self.person_commands.allow_outside_sandbox)
+            }
             "thinking" => yaml(&THINKING_LEVELS[usize::from(self.thinking())]),
             _ => Err("config_unknown_key"),
         }
@@ -791,6 +822,25 @@ impl Config {
                 self.execution.projects =
                     serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
             }
+            "personCommands" => {
+                // The whole mapping: its one field present, no other field.
+                let Value::Mapping(ref fields) = value else {
+                    return Err("config_invalid_value");
+                };
+                if fields.len() != 1
+                    || !fields.contains_key(Value::String("allowOutsideSandbox".into()))
+                {
+                    return Err("config_invalid_value");
+                }
+                self.person_commands =
+                    serde_yaml_ng::from_value(value).map_err(|_| "config_invalid_value")?;
+            }
+            "personCommands.allowOutsideSandbox" => {
+                let Value::Bool(allow) = value else {
+                    return Err("config_invalid_value");
+                };
+                self.person_commands.allow_outside_sandbox = allow;
+            }
             "thinking" => {
                 let Value::String(level) = value else {
                     return Err("config_invalid_value");
@@ -920,6 +970,10 @@ pub struct Reply {
     /// The effective execution setting before and after a persisted set of
     /// any `execution` key, which applies at once (EX11); else `None`.
     pub execution: Option<ExecutionChange>,
+    /// The effective `personCommands.allowOutsideSandbox` after a persisted
+    /// set of `personCommands` or its leaf, which applies to the next `!!`
+    /// submit and slot grant (PCR23); else `None`.
+    pub allow_outside_sandbox: Option<bool>,
 }
 
 /// A persisted execution change: the file's effective setting before the
@@ -963,6 +1017,8 @@ pub fn execute(
                 | "execution"
                 | "execution.enabled"
                 | "execution.projects"
+                | "personCommands"
+                | "personCommands.allowOutsideSandbox"
                 | "thinking"
         )
         && !key.starts_with(EXECUTION_PROJECTS_PREFIX)
@@ -975,6 +1031,7 @@ pub fn execute(
     let mut config = Config::read(&snapshot.bytes)?;
     let mut journal_quota = None;
     let mut execution = None;
+    let mut allow_outside_sandbox = None;
     if let Some(value) = value {
         let previous = config.execution.setting();
         config.set(key, value)?;
@@ -991,6 +1048,9 @@ pub fn execute(
                 current: config.execution.setting(),
             });
         }
+        if matches!(key, "personCommands" | "personCommands.allowOutsideSandbox") {
+            allow_outside_sandbox = Some(config.person_commands.allow_outside_sandbox);
+        }
     } else if cancel.load(Ordering::Acquire) {
         return Err("config_cancelled");
     }
@@ -998,6 +1058,7 @@ pub fn execute(
         value_yaml: config.get(key)?,
         journal_quota,
         execution,
+        allow_outside_sandbox,
     })
 }
 
@@ -1036,6 +1097,19 @@ pub fn execution_setting(
 ) -> Result<ExecutionSetting> {
     let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
     Ok(Config::read(&snapshot.bytes)?.execution.setting())
+}
+
+/// The effective `personCommands.allowOutsideSandbox` (PCR23), read once at
+/// service start with the rest of the configuration; later changes arrive in
+/// `Reply::allow_outside_sandbox`. The read runs on the caller's worker with
+/// the bounded read pipeline and has no time bound; it ends on completion, an
+/// error or cancel. An invalid file is an error: the service never runs with a
+/// guessed value.
+pub fn allow_outside_sandbox(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Result<bool> {
+    let snapshot = PrivateFileSnapshot::read(runtime, "config.yaml", cancel).map_err(file_error)?;
+    Ok(Config::read(&snapshot.bytes)?
+        .person_commands
+        .allow_outside_sandbox)
 }
 
 /// Startup-only typed audit settings from the canonical validated YAML snapshot.
@@ -1676,7 +1750,8 @@ mod tests {
             Ok(Reply {
                 value_yaml: "4294967296\n".into(),
                 journal_quota: None,
-                execution: None
+                execution: None,
+                allow_outside_sandbox: None
             })
         );
         let file = root.0.join(".asura/config.yaml");
@@ -1692,7 +1767,8 @@ mod tests {
             Ok(Reply {
                 value_yaml: "67108864\n".into(),
                 journal_quota: Some(JOURNAL_MIN_QUOTA),
-                execution: None
+                execution: None,
+                allow_outside_sandbox: None
             })
         );
         assert!(
@@ -1709,7 +1785,8 @@ mod tests {
             Ok(Reply {
                 value_yaml: "quotaBytes: 1099511627776\n".into(),
                 journal_quota: Some(JOURNAL_MAX_QUOTA),
-                execution: None
+                execution: None,
+                allow_outside_sandbox: None
             })
         );
         assert_eq!(
@@ -1995,7 +2072,8 @@ mod tests {
             Ok(Reply {
                 value_yaml: "2\n".into(),
                 journal_quota: None,
-                execution: None
+                execution: None,
+                allow_outside_sandbox: None
             })
         );
         assert!(
@@ -2343,7 +2421,8 @@ mod tests {
             Ok(Reply {
                 value_yaml: "inherit\n".into(),
                 journal_quota: None,
-                execution: None
+                execution: None,
+                allow_outside_sandbox: None
             })
         );
         let off = ExecutionSetting {
@@ -2358,7 +2437,8 @@ mod tests {
                 execution: Some(ExecutionChange {
                     previous: ExecutionSetting::default(),
                     current: off.clone(),
-                })
+                }),
+                allow_outside_sandbox: None
             })
         );
         let file = root.0.join(".asura/config.yaml");
@@ -2538,5 +2618,163 @@ mod tests {
             execution_setting(runtime, &cancel).unwrap().projects.len(),
             EXECUTION_MAX_PROJECTS
         );
+    }
+    /// PCR23 (P2-G): `personCommands.allowOutsideSandbox` defaults to `true`,
+    /// takes only a boolean, is written only away from its default, and
+    /// `set personCommands` takes the whole mapping.
+    #[test]
+    fn pcr23_person_commands_key_get_set_and_validation() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.get("personCommands.allowOutsideSandbox").unwrap(),
+            "true\n"
+        );
+        assert_eq!(
+            config.get("personCommands").unwrap(),
+            "allowOutsideSandbox: true\n"
+        );
+        assert!(!yaml(&config).unwrap().contains("personCommands"));
+        config
+            .set("personCommands.allowOutsideSandbox", "false")
+            .unwrap();
+        assert!(!config.person_commands.allow_outside_sandbox);
+        let written = yaml(&config).unwrap();
+        assert!(
+            written.contains("personCommands:\n  allowOutsideSandbox: false\n"),
+            "{written}"
+        );
+        let again = Config::read(written.as_bytes()).unwrap();
+        assert!(!again.person_commands.allow_outside_sandbox);
+        assert!(
+            config
+                .get("")
+                .unwrap()
+                .contains("personCommands:\n  allowOutsideSandbox: false\n")
+        );
+        config
+            .set("personCommands", "{allowOutsideSandbox: true}")
+            .unwrap();
+        assert!(config.person_commands.allow_outside_sandbox);
+        assert!(!yaml(&config).unwrap().contains("personCommands"));
+        for (key, value) in [
+            ("personCommands.allowOutsideSandbox", "'true'"),
+            ("personCommands.allowOutsideSandbox", "1"),
+            ("personCommands.allowOutsideSandbox", "on"),
+            ("personCommands.allowOutsideSandbox", "[on]"),
+            ("personCommands", "true"),
+            ("personCommands", "{}"),
+            ("personCommands", "{allowOutsideSandbox: 1}"),
+            ("personCommands", "{allowOutsideSandbox: true, other: true}"),
+        ] {
+            assert_eq!(
+                config.set(key, value),
+                Err("config_invalid_value"),
+                "{key}: {value}"
+            );
+        }
+        assert!(config.person_commands.allow_outside_sandbox);
+        assert_eq!(
+            config.get("personCommands.other"),
+            Err("config_unknown_key")
+        );
+        for text in [
+            "personCommands: {allowOutsideSandbox: maybe}\n",
+            "personCommands: {other: true}\n",
+            "personCommands: true\n",
+        ] {
+            assert!(Config::read(text.as_bytes()).is_err(), "{text}");
+        }
+        // An absent field in the file is the default.
+        assert!(
+            Config::read(b"personCommands: {}\n")
+                .unwrap()
+                .person_commands
+                .allow_outside_sandbox
+        );
+    }
+    /// PCR23 (P2-G): a persisted set reports the effective switch, the
+    /// startup read sees it, other keys report none, and an invalid file
+    /// fails the read rather than guessing.
+    #[test]
+    fn pcr23_person_commands_execute_and_startup_read() {
+        use std::os::unix::fs::DirBuilderExt;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Scratch(
+            format!(
+                "/private/tmp/asura-person-{:x}",
+                u128::from_ne_bytes(asura_platform::random_id())
+            )
+            .into(),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root.0)
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&root.0, true).unwrap();
+        let cancel = AtomicBool::new(false);
+        let call = |key: &str, value: Option<&str>| execute(runtime.clone(), key, value, &cancel);
+        assert_eq!(allow_outside_sandbox(runtime.clone(), &cancel), Ok(true));
+        assert_eq!(
+            call("personCommands.allowOutsideSandbox", None),
+            Ok(Reply {
+                value_yaml: "true\n".into(),
+                journal_quota: None,
+                execution: None,
+                allow_outside_sandbox: None
+            })
+        );
+        assert_eq!(
+            call("personCommands.allowOutsideSandbox", Some("false")),
+            Ok(Reply {
+                value_yaml: "false\n".into(),
+                journal_quota: None,
+                execution: None,
+                allow_outside_sandbox: Some(false)
+            })
+        );
+        let file = root.0.join(".asura/config.yaml");
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("personCommands:\n  allowOutsideSandbox: false\n")
+        );
+        assert_eq!(allow_outside_sandbox(runtime.clone(), &cancel), Ok(false));
+        assert_eq!(
+            call("personCommands", Some("{allowOutsideSandbox: true}"))
+                .unwrap()
+                .allow_outside_sandbox,
+            Some(true)
+        );
+        assert!(
+            !std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("personCommands")
+        );
+        assert_eq!(
+            call("audit.keepFiles", Some("6"))
+                .unwrap()
+                .allow_outside_sandbox,
+            None
+        );
+        // A rejected set leaves the file unchanged.
+        let before = std::fs::read(&file).unwrap();
+        assert!(call("personCommands.allowOutsideSandbox", Some("no")).is_err());
+        assert_eq!(
+            call("personCommands.other", Some("true")),
+            Err("config_unknown_key")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        std::fs::write(&file, b"personCommands: {allowOutsideSandbox: 1}\n").unwrap();
+        assert_eq!(
+            allow_outside_sandbox(runtime.clone(), &cancel),
+            Err("config_invalid_schema")
+        );
+        let cancelled = AtomicBool::new(true);
+        assert!(allow_outside_sandbox(runtime, &cancelled).is_err());
     }
 }

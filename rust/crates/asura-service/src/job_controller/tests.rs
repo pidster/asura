@@ -1432,6 +1432,7 @@ fn j2t_20_audit_events() {
             origin: record::JobOrigin::Model,
             agent: 0,
             reason: record::JobBlockReason::ServiceSlots,
+            outside_sandbox: false,
         }
     );
     let started = audit
@@ -1451,6 +1452,7 @@ fn j2t_20_audit_events() {
             generation: Some(1),
             ordinal: Some(1),
             input: None,
+            outside_sandbox: false,
         }
     );
     assert!(audit.contains(&Event::JobCancelRequested {
@@ -1460,6 +1462,7 @@ fn j2t_20_audit_events() {
         requester: record::JobRequester::Client,
         reason: record::JobReason::ClientCancel,
         kill: false,
+        outside_sandbox: false,
     }));
     let Some(Event::JobSettled {
         outcome,

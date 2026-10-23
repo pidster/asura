@@ -383,6 +383,7 @@ fn queued() -> Event {
         origin: JobOrigin::Model,
         agent: 0,
         reason: JobBlockReason::AgentSlots,
+        outside_sandbox: false,
     }
 }
 fn started_model() -> Event {
@@ -397,6 +398,7 @@ fn started_model() -> Event {
         generation: Some(2),
         ordinal: Some(1),
         input: None,
+        outside_sandbox: false,
     }
 }
 fn cancel_requested(requester: JobRequester, reason: JobReason, kill: bool) -> Event {
@@ -407,6 +409,7 @@ fn cancel_requested(requester: JobRequester, reason: JobReason, kill: bool) -> E
         requester,
         reason,
         kill,
+        outside_sandbox: false,
     }
 }
 fn settled_exited() -> Event {
@@ -426,6 +429,7 @@ fn settled_exited() -> Event {
         stderr_bytes: 0,
         elapsed_ms: 40,
         pause_count: 0,
+        outside_sandbox: false,
     }
 }
 /// Replace fields of a `job.settled` event.
@@ -445,11 +449,12 @@ fn j2t_20_job_events_names_fields_and_round_trip() {
         job: [5; 16],
         origin: JobOrigin::Person,
         agent: 0,
-        profile: JobProfile::Model1,
+        profile: JobProfile::Person1,
         operation: None,
         generation: None,
         ordinal: None,
         input: Some([7; 16]),
+        outside_sandbox: false,
     };
     let cases: [(Event, &str, &[&str]); 5] = [
         (
@@ -1204,17 +1209,33 @@ fn j34g_reasons_19_and_20_follow_the_reason_table() {
     }
     let text = String::from_utf8(job_record(cancelled(off)).encode().unwrap()).unwrap();
     assert!(text.contains("\"reason\":\"execution_off\""), "{text}");
-    not_started(outside).validate().unwrap();
-    let text = String::from_utf8(job_record(not_started(outside)).encode().unwrap()).unwrap();
+    // Reason 20 settles a `!!` job alone (PCR23).
+    let outside_job = |mut event: Event| {
+        if let Event::JobSettled {
+            outside_sandbox, ..
+        } = &mut event
+        {
+            *outside_sandbox = true;
+        }
+        event
+    };
+    outside_job(not_started(outside)).validate().unwrap();
+    assert_eq!(not_started(outside).validate(), Err(Error::Invalid));
+    let text = String::from_utf8(
+        job_record(outside_job(not_started(outside)))
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
     assert!(
         text.contains("\"reason\":\"outside_sandbox_off\""),
         "{text}"
     );
     for event in [
-        exited(outside),
-        signalled(outside),
-        cancelled(outside),
-        interrupted(outside),
+        outside_job(exited(outside)),
+        outside_job(signalled(outside)),
+        outside_job(cancelled(outside)),
+        outside_job(interrupted(outside)),
         interrupted(off),
     ] {
         assert_eq!(event.validate(), Err(Error::Invalid), "{event:?}");
@@ -1388,6 +1409,519 @@ fn es_02_execution_setting_names_match_config_keys() {
         "execution.projects.abababababababababababababababab.x",
         "execution.other",
         "executionx",
+    ] {
+        assert_eq!(Setting::for_config_key(key), None, "{key}");
+    }
+}
+
+/// The four job events of one `!!` job: queued, started with the outside
+/// profile, cancelled by the person, and settled with survivors counted.
+fn outside_job_events() -> [Event; 4] {
+    let mut events = [
+        queued(),
+        Event::JobStarted {
+            project: [3; 16],
+            conversation: [4; 16],
+            job: [5; 16],
+            origin: JobOrigin::Person,
+            agent: 0,
+            profile: JobProfile::PersonOutside1,
+            operation: None,
+            generation: None,
+            ordinal: None,
+            input: Some([7; 16]),
+            outside_sandbox: true,
+        },
+        cancel_requested(JobRequester::Person, JobReason::PersonStop, false),
+        settled(|e| {
+            if let Event::JobSettled {
+                outcome, reason, ..
+            } = e
+            {
+                *outcome = JobOutcome::Cancelled;
+                *reason = JobReason::PersonStop;
+            }
+        }),
+    ];
+    for event in &mut events {
+        match event {
+            Event::JobQueued {
+                origin,
+                outside_sandbox,
+                ..
+            } => {
+                *origin = JobOrigin::Person;
+                *outside_sandbox = true;
+            }
+            Event::JobCancelRequested {
+                outside_sandbox, ..
+            }
+            | Event::JobSettled {
+                outside_sandbox, ..
+            } => *outside_sandbox = true,
+            _ => {}
+        }
+    }
+    events
+}
+/// Field values no audit record may hold: a command, a cwd, PATH, an
+/// environment name and value, and output.
+const PERSON_TEXT: [&str; 6] = [
+    "ls -la /secret",
+    "/Users/person/project",
+    "/usr/bin:/bin",
+    "API_TOKEN",
+    "hunter2",
+    "total 0",
+];
+
+/// PC-U45 (PCR25): the audit events of a `!!` job's queue, start, cancel and
+/// settlement, and of a refused `!!` submit, each carry `outside_sandbox:
+/// true` and the outside profile; none carries command, cwd, environment or
+/// output. A `!` job and a model job carry no flag, and the flag never
+/// decodes as `false`, on a model job, or with a profile it does not match.
+#[test]
+fn pc_u45_outside_sandbox_job_events_carry_the_flag_and_no_text() {
+    let refused = Event::PersonCommandRefused {
+        project: [3; 16],
+        request: [8; 16],
+        outside_sandbox: true,
+        reason: PersonCommandRefusal::OutsideSandboxOff,
+    };
+    let events = outside_job_events();
+    let kinds = [
+        "job.queued",
+        "job.started",
+        "job.cancel_requested",
+        "job.settled",
+        "person_command.refused",
+    ];
+    for (event, kind) in events.iter().cloned().chain([refused]).zip(kinds) {
+        event.validate().unwrap();
+        assert_eq!(event.project(), Some([3; 16]), "{kind}");
+        let value = job_record(event);
+        let bytes = value.encode().unwrap();
+        assert_eq!(Record::decode(&bytes).unwrap(), value, "{kind}");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["kind"], kind);
+        assert_eq!(json["details"]["outside_sandbox"], true, "{kind}");
+        let text = String::from_utf8(bytes).unwrap();
+        for part in PERSON_TEXT {
+            assert!(!text.contains(part), "{part} in {text}");
+        }
+        for field in ["command", "cwd", "env", "environment", "path", "output"] {
+            assert!(!text.contains(&format!("\"{field}\"")), "{field} in {text}");
+        }
+    }
+    let started = String::from_utf8(job_record(events[1].clone()).encode().unwrap()).unwrap();
+    assert!(
+        started.contains("\"profile\":\"person-outside-1\""),
+        "{started}"
+    );
+    assert!(started.contains("\"origin\":\"person\""), "{started}");
+    // A `!` job and a model job write no flag.
+    let person = Event::JobStarted {
+        project: [3; 16],
+        conversation: [4; 16],
+        job: [5; 16],
+        origin: JobOrigin::Person,
+        agent: 0,
+        profile: JobProfile::Person1,
+        operation: None,
+        generation: None,
+        ordinal: None,
+        input: Some([7; 16]),
+        outside_sandbox: false,
+    };
+    for event in [
+        person.clone(),
+        started_model(),
+        queued(),
+        settled_exited(),
+        cancel_requested(JobRequester::Person, JobReason::PersonKill, true),
+    ] {
+        let text = String::from_utf8(job_record(event).encode().unwrap()).unwrap();
+        assert!(!text.contains("outside_sandbox"), "{text}");
+    }
+    let text = String::from_utf8(job_record(person.clone()).encode().unwrap()).unwrap();
+    assert!(text.contains("\"profile\":\"person-1\""), "{text}");
+    // The flag is written only when true; an explicit false is malformed.
+    let anchor = "\"input\":\"07070707070707070707070707070707\"";
+    for broken in [
+        text.replacen(anchor, &format!("{anchor},\"outside_sandbox\":false"), 1),
+        text.replacen(anchor, &format!("{anchor},\"outside_sandbox\":null"), 1),
+        // `person-1` with the flag, and `person-outside-1` without it.
+        text.replacen(anchor, &format!("{anchor},\"outside_sandbox\":true"), 1),
+        text.replace("person-1", "person-outside-1"),
+        // A model job is never outside the sandbox.
+        String::from_utf8(job_record(started_model()).encode().unwrap())
+            .unwrap()
+            .replacen("\"ordinal\":1", "\"ordinal\":1,\"outside_sandbox\":true", 1),
+        String::from_utf8(job_record(queued()).encode().unwrap())
+            .unwrap()
+            .replacen("\"agent\":0", "\"agent\":0,\"outside_sandbox\":true", 1),
+        // The profile follows the origin.
+        String::from_utf8(job_record(started_model()).encode().unwrap())
+            .unwrap()
+            .replace("model-1", "person-outside-1"),
+        text.replace("person-1", "model-1"),
+    ] {
+        assert_ne!(broken, text);
+        assert_eq!(
+            Record::decode(broken.as_bytes()),
+            Err(Error::MalformedRecord),
+            "{broken}"
+        );
+    }
+    // Text fields never decode on the `!!` events.
+    for event in outside_job_events() {
+        let text = String::from_utf8(job_record(event).encode().unwrap()).unwrap();
+        let anchor = "\"outside_sandbox\":true";
+        for field in ["command", "cwd", "env", "path", "output"] {
+            let broken = text.replacen(anchor, &format!("{anchor},\"{field}\":\"x\""), 1);
+            assert_ne!(broken, text);
+            assert_eq!(
+                Record::decode(broken.as_bytes()),
+                Err(Error::MalformedRecord),
+                "{broken}"
+            );
+        }
+    }
+}
+
+/// PC-U58: `person_command.queued` and `person_command.refused` for `!` and
+/// `!!` have their names and exact field sets, round-trip, name their
+/// project, carry `outside_sandbox` true for `!!` alone, and hold no command,
+/// cwd, PATH, environment or value.
+#[test]
+fn pc_u58_person_command_queued_and_refused_events() {
+    let queued_event = |outside_sandbox, secret_item| Event::PersonCommandQueued {
+        project: [3; 16],
+        conversation: [4; 16],
+        input: [7; 16],
+        request: [8; 16],
+        outside_sandbox,
+        secret_item,
+    };
+    let refused_event = |outside_sandbox, reason| Event::PersonCommandRefused {
+        project: [3; 16],
+        request: [8; 16],
+        outside_sandbox,
+        reason,
+    };
+    let queued_fields: &[&str] = &[
+        "project",
+        "conversation",
+        "input",
+        "request",
+        "outside_sandbox",
+        "secret_item",
+    ];
+    let refused_fields: &[&str] = &["project", "request", "outside_sandbox", "reason"];
+    let cases = [
+        (
+            queued_event(false, false),
+            "person_command.queued",
+            queued_fields,
+            false,
+        ),
+        (
+            queued_event(false, true),
+            "person_command.queued",
+            queued_fields,
+            false,
+        ),
+        (
+            queued_event(true, false),
+            "person_command.queued",
+            queued_fields,
+            true,
+        ),
+        (
+            queued_event(true, true),
+            "person_command.queued",
+            queued_fields,
+            true,
+        ),
+        (
+            refused_event(false, PersonCommandRefusal::SecretInCwd),
+            "person_command.refused",
+            refused_fields,
+            false,
+        ),
+        (
+            refused_event(true, PersonCommandRefusal::OutsideSandboxOff),
+            "person_command.refused",
+            refused_fields,
+            true,
+        ),
+        (
+            refused_event(true, PersonCommandRefusal::EnvironmentTooLarge),
+            "person_command.refused",
+            refused_fields,
+            true,
+        ),
+    ];
+    for (event, kind, fields, outside) in cases {
+        event.validate().unwrap();
+        assert_eq!(event.project(), Some([3; 16]), "{kind}");
+        let value = job_record(event);
+        let bytes = value.encode().unwrap();
+        assert_eq!(Record::decode(&bytes).unwrap(), value, "{kind}");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["kind"], kind);
+        let details = json["details"].as_object().unwrap();
+        let mut names: Vec<&str> = details.keys().map(String::as_str).collect();
+        let mut expected = fields.to_vec();
+        names.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(names, expected, "{kind}");
+        assert_eq!(details["outside_sandbox"], outside, "{kind}");
+        let text = String::from_utf8(bytes).unwrap();
+        for part in PERSON_TEXT {
+            assert!(!text.contains(part), "{part} in {text}");
+        }
+        // The closed schema rejects text fields, nulls and duplicates.
+        let anchor = format!("\"outside_sandbox\":{outside}");
+        for field in ["command", "cwd", "path", "env", "value", "output"] {
+            let broken = text.replacen(&anchor, &format!("{anchor},\"{field}\":\"x\""), 1);
+            assert_ne!(broken, text);
+            assert_eq!(
+                Record::decode(broken.as_bytes()),
+                Err(Error::MalformedRecord),
+                "{broken}"
+            );
+        }
+        for broken in [
+            text.replacen(&anchor, &format!("{anchor},{anchor}"), 1),
+            text.replace(&anchor, "\"outside_sandbox\":null"),
+            text.replace(
+                "\"request\":\"08080808080808080808080808080808\"",
+                "\"request\":\"00000000000000000000000000000000\"",
+            ),
+        ] {
+            assert_ne!(broken, text);
+            assert_eq!(
+                Record::decode(broken.as_bytes()),
+                Err(Error::MalformedRecord),
+                "{broken}"
+            );
+        }
+    }
+    let text = String::from_utf8(job_record(queued_event(true, true)).encode().unwrap()).unwrap();
+    assert!(text.contains("\"secret_item\":true"), "{text}");
+    let text = String::from_utf8(
+        job_record(refused_event(true, PersonCommandRefusal::OutsideSandboxOff))
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("\"reason\":\"outside_sandbox_off\""),
+        "{text}"
+    );
+    // Every field is present: none may be omitted.
+    for (text, field) in [
+        (
+            String::from_utf8(job_record(queued_event(false, false)).encode().unwrap()).unwrap(),
+            ",\"secret_item\":false",
+        ),
+        (
+            String::from_utf8(job_record(queued_event(false, false)).encode().unwrap()).unwrap(),
+            ",\"outside_sandbox\":false",
+        ),
+    ] {
+        assert_eq!(
+            Record::decode(text.replacen(field, "", 1).as_bytes()),
+            Err(Error::MalformedRecord),
+            "{text}"
+        );
+    }
+    // The switch refuses `!!` submits alone.
+    assert_eq!(
+        refused_event(false, PersonCommandRefusal::OutsideSandboxOff).validate(),
+        Err(Error::Invalid)
+    );
+    // Zero identifiers are invalid.
+    for event in [
+        Event::PersonCommandQueued {
+            project: [0; 16],
+            conversation: [4; 16],
+            input: [7; 16],
+            request: [8; 16],
+            outside_sandbox: false,
+            secret_item: false,
+        },
+        Event::PersonCommandQueued {
+            project: [3; 16],
+            conversation: [0; 16],
+            input: [7; 16],
+            request: [8; 16],
+            outside_sandbox: false,
+            secret_item: false,
+        },
+        Event::PersonCommandQueued {
+            project: [3; 16],
+            conversation: [4; 16],
+            input: [0; 16],
+            request: [8; 16],
+            outside_sandbox: false,
+            secret_item: false,
+        },
+        Event::PersonCommandQueued {
+            project: [3; 16],
+            conversation: [4; 16],
+            input: [7; 16],
+            request: [0; 16],
+            outside_sandbox: false,
+            secret_item: false,
+        },
+        Event::PersonCommandRefused {
+            project: [0; 16],
+            request: [8; 16],
+            outside_sandbox: false,
+            reason: PersonCommandRefusal::PathInvalid,
+        },
+        Event::PersonCommandRefused {
+            project: [3; 16],
+            request: [0; 16],
+            outside_sandbox: false,
+            reason: PersonCommandRefusal::PathInvalid,
+        },
+    ] {
+        assert_eq!(event.validate(), Err(Error::Invalid), "{event:?}");
+    }
+    // Every `QueueRefusal` name and queue submit token, and nothing else.
+    let names = [
+        (
+            "outside_sandbox_off",
+            PersonCommandRefusal::OutsideSandboxOff,
+        ),
+        (
+            "environment_invalid",
+            PersonCommandRefusal::EnvironmentInvalid,
+        ),
+        (
+            "environment_too_large",
+            PersonCommandRefusal::EnvironmentTooLarge,
+        ),
+        ("path_invalid", PersonCommandRefusal::PathInvalid),
+        ("cwd_invalid", PersonCommandRefusal::CwdInvalid),
+        (
+            "secret_store_locked",
+            PersonCommandRefusal::SecretStoreLocked,
+        ),
+        (
+            "secret_store_denied",
+            PersonCommandRefusal::SecretStoreDenied,
+        ),
+        (
+            "secret_store_unavailable",
+            PersonCommandRefusal::SecretStoreUnavailable,
+        ),
+        ("secret_store_full", PersonCommandRefusal::SecretStoreFull),
+        ("secret_store_busy", PersonCommandRefusal::SecretStoreBusy),
+        ("secret_in_cwd", PersonCommandRefusal::SecretInCwd),
+        (
+            "placeholder_not_available",
+            PersonCommandRefusal::PlaceholderNotAvailable,
+        ),
+        (
+            "secret_detection_unavailable",
+            PersonCommandRefusal::SecretDetectionUnavailable,
+        ),
+        ("stale_generation", PersonCommandRefusal::StaleGeneration),
+        ("conversation_busy", PersonCommandRefusal::ConversationBusy),
+        ("request_conflict", PersonCommandRefusal::RequestConflict),
+        ("service_draining", PersonCommandRefusal::ServiceDraining),
+        ("project_unknown", PersonCommandRefusal::ProjectUnknown),
+        ("project_stale", PersonCommandRefusal::ProjectStale),
+        (
+            "project_overlaps_asura_state",
+            PersonCommandRefusal::ProjectOverlapsAsuraState,
+        ),
+        (
+            "installation_not_initialized",
+            PersonCommandRefusal::InstallationNotInitialized,
+        ),
+        (
+            "authority_repair_required",
+            PersonCommandRefusal::AuthorityRepairRequired,
+        ),
+        (
+            "outcome_unconfirmed",
+            PersonCommandRefusal::OutcomeUnconfirmed,
+        ),
+        (
+            "capacity_exhausted",
+            PersonCommandRefusal::CapacityExhausted,
+        ),
+        ("cancelled", PersonCommandRefusal::Cancelled),
+        ("invalid_request", PersonCommandRefusal::InvalidRequest),
+        (
+            "storage_unavailable",
+            PersonCommandRefusal::StorageUnavailable,
+        ),
+        ("journal_quota", PersonCommandRefusal::JournalQuota),
+        ("journal_disk_space", PersonCommandRefusal::JournalDiskSpace),
+    ];
+    for (name, reason) in names {
+        assert_eq!(
+            PersonCommandRefusal::from_name(name),
+            Some(reason),
+            "{name}"
+        );
+        assert_eq!(
+            serde_json::to_string(&reason).unwrap(),
+            format!("\"{name}\"")
+        );
+    }
+    for name in [
+        "",
+        "secret_store",
+        "OUTSIDE_SANDBOX_OFF",
+        "ls -la",
+        "unspecified",
+    ] {
+        assert_eq!(PersonCommandRefusal::from_name(name), None, "{name}");
+    }
+    let text = String::from_utf8(
+        job_record(refused_event(false, PersonCommandRefusal::PathInvalid))
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        Record::decode(text.replace("path_invalid", "ls -la").as_bytes()),
+        Err(Error::MalformedRecord)
+    );
+}
+
+/// PCR23 (P2-G): the `personCommands` settings carry their configuration
+/// key names, and `for_config_key` maps the mapping and its leaf.
+#[test]
+fn pcr23_person_commands_setting_names_match_config_keys() {
+    for (name, setting) in [
+        ("personCommands", Setting::PersonCommands),
+        (
+            "personCommands.allowOutsideSandbox",
+            Setting::PersonCommandsAllowOutsideSandbox,
+        ),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&setting).unwrap(),
+            format!("\"{name}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<Setting>(&format!("\"{name}\"")).unwrap(),
+            setting
+        );
+        assert_eq!(Setting::for_config_key(name), Some(setting));
+    }
+    for key in [
+        "personCommands.other",
+        "personCommands.allowOutsideSandbox.x",
+        "personcommands",
     ] {
         assert_eq!(Setting::for_config_key(key), None, "{key}");
     }

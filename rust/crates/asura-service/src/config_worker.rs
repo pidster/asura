@@ -167,6 +167,7 @@ mod tests {
                 value_yaml: "true\n".into(),
                 journal_quota: None,
                 execution: None,
+                allow_outside_sandbox: None,
             }),
         )
     }
@@ -239,6 +240,7 @@ mod tests {
                     value_yaml: "67108864\n".into(),
                     journal_quota: Some(67_108_864),
                     execution: None,
+                    allow_outside_sandbox: None,
                 }),
             );
             assert_eq!(worker.take_journal_quota(), None);
@@ -267,6 +269,7 @@ mod tests {
                 value_yaml: "4294967296\n".into(),
                 journal_quota: None,
                 execution: None,
+                allow_outside_sandbox: None,
             }),
         );
         settle(&mut worker, release);
@@ -299,6 +302,7 @@ mod tests {
                     value_yaml: "2\n".into(),
                     journal_quota: None,
                     execution: None,
+                    allow_outside_sandbox: None,
                 }),
             );
             settle(&mut worker, release);
@@ -402,6 +406,7 @@ mod reactor_tests {
                             value_yaml: "true\n".into(),
                             journal_quota: None,
                             execution: None,
+                            allow_outside_sandbox: None,
                         })
                     });
                     admitted_tx.send(()).unwrap();

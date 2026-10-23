@@ -193,6 +193,11 @@ pub enum Setting {
     /// project of a leaf set is in `execution.changed`, not in the setting.
     #[serde(rename = "execution.projects")]
     ExecutionProjects,
+    /// The whole `personCommands` mapping (person-command-mode.md, PCR23).
+    #[serde(rename = "personCommands")]
+    PersonCommands,
+    #[serde(rename = "personCommands.allowOutsideSandbox")]
+    PersonCommandsAllowOutsideSandbox,
 }
 impl Setting {
     /// The setting that a successful `ConfigSet` of `key` reports in
@@ -217,6 +222,8 @@ impl Setting {
             "execution" => Self::Execution,
             "execution.enabled" => Self::ExecutionEnabled,
             "execution.projects" => Self::ExecutionProjects,
+            "personCommands" => Self::PersonCommands,
+            "personCommands.allowOutsideSandbox" => Self::PersonCommandsAllowOutsideSandbox,
             // The leaf form: only a valid project ID names a key.
             leaf => match leaf.strip_prefix("execution.projects.") {
                 Some(project) if id::parse(project).is_ok() => Self::ExecutionProjects,
@@ -247,11 +254,61 @@ pub enum JobBlockReason {
     Quota,
     DiskSpace,
 }
-/// The guardian profile token of a job. P1 adds the person profiles.
+/// The guardian profile token of a job (person-command-mode.md, profiles).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobProfile {
     #[serde(rename = "model-1")]
     Model1,
+    /// The sandboxed person profile of a `!` command.
+    #[serde(rename = "person-1")]
+    Person1,
+    /// The unsandboxed person profile of a `!!` command.
+    #[serde(rename = "person-outside-1")]
+    PersonOutside1,
+}
+/// Why a person command submit was refused (person-command-mode.md, audit):
+/// a `QueueRefusal` name, or the `Error` token of a submit the codec accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonCommandRefusal {
+    // `QueueRefusal` values 1-13.
+    OutsideSandboxOff,
+    EnvironmentInvalid,
+    EnvironmentTooLarge,
+    PathInvalid,
+    CwdInvalid,
+    SecretStoreLocked,
+    SecretStoreDenied,
+    SecretStoreUnavailable,
+    SecretStoreFull,
+    SecretStoreBusy,
+    SecretInCwd,
+    PlaceholderNotAvailable,
+    SecretDetectionUnavailable,
+    // Queue submit `Error` tokens.
+    StaleGeneration,
+    ConversationBusy,
+    RequestConflict,
+    ServiceDraining,
+    ProjectUnknown,
+    ProjectStale,
+    ProjectOverlapsAsuraState,
+    InstallationNotInitialized,
+    AuthorityRepairRequired,
+    OutcomeUnconfirmed,
+    CapacityExhausted,
+    Cancelled,
+    InvalidRequest,
+    StorageUnavailable,
+    JournalQuota,
+    JournalDiskSpace,
+}
+impl PersonCommandRefusal {
+    /// The refusal named by a `QueueRefusal` or `Error` token name; `None`
+    /// for a name outside the closed set.
+    pub fn from_name(name: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
+    }
 }
 /// The requester of a job cancel (kind 27 field 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +527,13 @@ pub enum Event {
         origin: JobOrigin,
         agent: u32,
         reason: JobBlockReason,
+        /// Present, and `true`, for a `!!` job alone (PCR25).
+        #[serde(
+            default,
+            skip_serializing_if = "is_false",
+            deserialize_with = "present_true"
+        )]
+        outside_sandbox: bool,
     },
     /// The guardian's spawned notice arrived. A model job carries
     /// `operation`, `generation` and `ordinal`; a person job carries `input`.
@@ -500,6 +564,13 @@ pub enum Event {
         ordinal: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none", with = "optional_id")]
         input: Option<Id>,
+        /// Present, and `true`, for a `!!` job alone (PCR25).
+        #[serde(
+            default,
+            skip_serializing_if = "is_false",
+            deserialize_with = "present_true"
+        )]
+        outside_sandbox: bool,
     },
     /// Kind 27 committed.
     #[serde(rename = "job.cancel_requested")]
@@ -513,6 +584,13 @@ pub enum Event {
         requester: JobRequester,
         reason: JobReason,
         kill: bool,
+        /// Present, and `true`, for a `!!` job alone (PCR25).
+        #[serde(
+            default,
+            skip_serializing_if = "is_false",
+            deserialize_with = "present_true"
+        )]
+        outside_sandbox: bool,
     },
     /// Kind 28 committed. `escapees` is a count only (escapee control).
     #[serde(rename = "job.settled")]
@@ -535,6 +613,13 @@ pub enum Event {
         stderr_bytes: u64,
         elapsed_ms: u64,
         pause_count: u32,
+        /// Present, and `true`, for a `!!` job alone (PCR25).
+        #[serde(
+            default,
+            skip_serializing_if = "is_false",
+            deserialize_with = "present_true"
+        )]
+        outside_sandbox: bool,
     },
     /// The owner applied a persisted execution change (EX11). `project` is
     /// present for project scope alone; `revoked_projects` counts the
@@ -548,6 +633,33 @@ pub enum Event {
         from: ExecutionValue,
         to: ExecutionValue,
         revoked_projects: u32,
+    },
+    /// Kind 31 committed: a person command was queued. `secret_item` is
+    /// true when a Keychain item exists for it. Never holds the command,
+    /// cwd, PATH, environment, a secret value or output.
+    #[serde(rename = "person_command.queued")]
+    PersonCommandQueued {
+        #[serde(with = "id")]
+        project: Id,
+        #[serde(with = "id")]
+        conversation: Id,
+        #[serde(with = "id")]
+        input: Id,
+        #[serde(with = "id")]
+        request: Id,
+        outside_sandbox: bool,
+        secret_item: bool,
+    },
+    /// A person command submit got a `QueueRefusal`, or an `Error` token
+    /// after the codec accepted it. Nothing was queued.
+    #[serde(rename = "person_command.refused")]
+    PersonCommandRefused {
+        #[serde(with = "id")]
+        project: Id,
+        #[serde(with = "id")]
+        request: Id,
+        outside_sandbox: bool,
+        reason: PersonCommandRefusal,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -571,7 +683,9 @@ impl Event {
             | Self::JobQueued { project, .. }
             | Self::JobStarted { project, .. }
             | Self::JobCancelRequested { project, .. }
-            | Self::JobSettled { project, .. } => Some(*project),
+            | Self::JobSettled { project, .. }
+            | Self::PersonCommandQueued { project, .. }
+            | Self::PersonCommandRefused { project, .. } => Some(*project),
             _ => None,
         }
     }
@@ -632,8 +746,16 @@ impl Event {
                 project,
                 conversation,
                 job,
+                origin,
+                outside_sandbox,
                 ..
-            } => nonzero(project) && nonzero(conversation) && nonzero(job),
+            } => {
+                nonzero(project)
+                    && nonzero(conversation)
+                    && nonzero(job)
+                    // Only a person can run a command outside the sandbox.
+                    && (!*outside_sandbox || *origin == JobOrigin::Person)
+            }
             Self::JobStarted {
                 project,
                 conversation,
@@ -643,11 +765,21 @@ impl Event {
                 generation,
                 ordinal,
                 input,
+                profile,
+                outside_sandbox,
                 ..
             } => {
                 nonzero(project)
                     && nonzero(conversation)
                     && nonzero(job)
+                    // The profile follows the origin and the `!!` flag (PR3).
+                    && *profile
+                        == match (origin, outside_sandbox) {
+                            (JobOrigin::Model, false) => JobProfile::Model1,
+                            (JobOrigin::Person, false) => JobProfile::Person1,
+                            (JobOrigin::Person, true) => JobProfile::PersonOutside1,
+                            (JobOrigin::Model, true) => return Err(Error::Invalid),
+                        }
                     && match origin {
                         JobOrigin::Model => {
                             operation.as_ref().is_some_and(nonzero)
@@ -673,6 +805,7 @@ impl Event {
                 requester,
                 reason,
                 kill,
+                ..
             } => {
                 nonzero(project)
                     && nonzero(conversation)
@@ -685,8 +818,17 @@ impl Event {
                 project,
                 conversation,
                 job,
+                reason,
+                outside_sandbox,
                 ..
-            } => nonzero(project) && nonzero(conversation) && nonzero(job) && self.settled_facts(),
+            } => {
+                nonzero(project)
+                    && nonzero(conversation)
+                    && nonzero(job)
+                    // Reason 20 settles a `!!` job alone (PCR23).
+                    && (*reason != JobReason::OutsideSandboxOff || *outside_sandbox)
+                    && self.settled_facts()
+            }
             Self::ExecutionChanged {
                 scope,
                 project,
@@ -710,6 +852,24 @@ impl Event {
                         && (*revoked_projects == 0 || *to != ExecutionValue::On)
                 }
             },
+            Self::PersonCommandQueued {
+                project,
+                conversation,
+                input,
+                request,
+                ..
+            } => nonzero(project) && nonzero(conversation) && nonzero(input) && nonzero(request),
+            Self::PersonCommandRefused {
+                project,
+                request,
+                outside_sandbox,
+                reason,
+            } => {
+                nonzero(project)
+                    && nonzero(request)
+                    // The switch refuses `!!` submits alone (PCR23).
+                    && (*reason != PersonCommandRefusal::OutsideSandboxOff || *outside_sandbox)
+            }
         };
         if valid { Ok(()) } else { Err(Error::Invalid) }
     }
@@ -883,6 +1043,18 @@ mod optional_id {
 
 fn present_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     u64::deserialize(d).map(Some)
+}
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+/// A flag written only when set: a present value must be `true`, so each
+/// record has one encoding.
+fn present_true<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    if bool::deserialize(d)? {
+        Ok(true)
+    } else {
+        Err(serde::de::Error::custom("absent when false"))
+    }
 }
 fn present_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
     u32::deserialize(d).map(Some)
