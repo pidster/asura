@@ -1003,9 +1003,17 @@ enum QueueRefusal {
   a current-owner diagnostic, as today.
 - `ConversationHistoryEntry` gains `optional bytes person_command_input_id = 5`.
   The restored log reads the job's state and fold through the job API. A
-  person entry has the input ID, `accepted_frame` (its kind 31 frame), and
+  person entry has the input ID, `accepted_frame` (its kind 26 frame, the
+  dispatch, as a turn's accepted frame is its `TurnAccepted`), and
   `generation` (the generation it was queued against, 0 before the first
-  turn, at most the reply's), and has no `operation_id` or `kind`. A history
+  turn, at most the reply's), and has no `operation_id` or `kind`. A command
+  dropped before it ran is not listed, as for a dropped message. The writer's
+  history read merges `T` turn entries with `p` person entries (index tag `p`,
+  [segmented journal](segmented-journal.md)) and the live state's dispatched
+  person inputs, newest accepted sequence first, at most 8, with the
+  `before_accepted_frame` cursor compared by accepted sequence, so a page is
+  bounded work. A history read with no conversation named may select a
+  conversation that so far holds only person commands (P3-E3). A history
   reply may carry generation 0 only when every entry is a person entry: a
   conversation that so far holds only person commands.
 

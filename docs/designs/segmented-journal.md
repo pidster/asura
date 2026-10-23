@@ -561,6 +561,7 @@ stateDiagram-v2
 | `Y` job | Zero ID, kind 26 sequence | Job ID, project ID (J4 designed) | With `W` |
 | `U` conversation settlement | Conversation ID, kind 28 sequence | Job ID (J4 designed, read by J5 notices) | With `W` |
 | `E` job retention | Job ID, kind 30 sequence | Action, author, kind 30 locator (J4 designed) | Roll after the kind 30 |
+| `p` conversation person command | Conversation ID, kind 26 sequence | Input ID, job ID, kind 31 expected generation, kind 31 locator (person commands, P3-E3). The byte is lowercase because every uppercase letter is in use | Roll after the person kind 26 |
 
 `G` covers installation, graph, task, operation, input and dispatch-request
 IDs; `J` and `V` cover project and conversation IDs for the generated-ID check. The newest entry under a prefix
