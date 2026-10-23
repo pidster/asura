@@ -581,6 +581,54 @@ pub(super) fn state_rules(asura: &str, scratch: &str) -> Result<String, ExecCmdE
         tmp = quote(&format!("{asura}/tmp"))?,
     ))
 }
+/// The implicit-execution hook directory (PX1 list, execution-path-guard.md
+/// "Path lists"): the directory and every file under it.
+const IMPLICIT_HOOKS: &str = ".git/hooks";
+/// The implicit-execution files of the same list.
+const IMPLICIT_FILES: [&str; 6] = [
+    ".git/config",
+    ".gitattributes",
+    ".gitmodules",
+    ".envrc",
+    ".cargo/config",
+    ".cargo/config.toml",
+];
+/// Directories between the project and a nested implicit-execution path:
+/// 1 to 8 (execution-path-guard.md "Path lists").
+const IMPLICIT_NESTED_DEPTH: usize = 8;
+/// The `model-1` deny rules for the implicit-execution paths of `project`
+/// (EPG-R1). They follow the write allow rules, so they win. Root forms use
+/// `subpath` and `literal` filters; nested forms, 1 to 8 directories below
+/// the project, use one `regex` filter in which the project path and the
+/// listed names are escaped by [`crate::git_observer::regex_escaped`].
+/// Seatbelt's regex dialect does not honour `{m,n}` (such a filter never
+/// matches; macOS 27 probe, 2026-10-23), so the depth bound is one required
+/// directory group followed by seven nested optional groups.
+fn implicit_deny_rules(project: &str) -> Result<String, ExecCmdError> {
+    let escape = |s: &str| crate::git_observer::regex_escaped(s).map_err(|_| ExecCmdError::Denied);
+    let project = project.trim_end_matches('/');
+    let mut filters = format!(
+        " (subpath {})",
+        quote(&format!("{project}/{IMPLICIT_HOOKS}"))?
+    );
+    let mut forms = vec![format!("{}(/.*)?", escape(IMPLICIT_HOOKS)?)];
+    for file in IMPLICIT_FILES {
+        filters.push_str(&format!(
+            " (literal {})",
+            quote(&format!("{project}/{file}"))?
+        ));
+        forms.push(escape(file)?);
+    }
+    let directory = "[^/]+/";
+    let nested = format!(
+        "{directory}{}{}",
+        format!("({directory}").repeat(IMPLICIT_NESTED_DEPTH - 1),
+        ")?".repeat(IMPLICIT_NESTED_DEPTH - 1)
+    );
+    let regex = format!("^{}/{nested}({})$", escape(project)?, forms.join("|"));
+    filters.push_str(&format!(" (regex {})", quote(&regex)?));
+    Ok(format!("(deny file-write*{filters})"))
+}
 fn seatbelt(project: &str, scratch: &str, asura: &str) -> Result<String, ExecCmdError> {
     let roots = [
         "/bin",
@@ -599,8 +647,9 @@ fn seatbelt(project: &str, scratch: &str, asura: &str) -> Result<String, ExecCmd
     }
     let metadata = ancestor_literals(&roots)?;
     let state = state_rules(asura, scratch)?;
+    let deny = implicit_deny_rules(project)?;
     Ok(format!(
-        "(version 1)(deny default)(allow file-read* file-test-existence (literal \"/\"))(allow file-read* (literal \"/private/var/select/sh\"))(allow file-read-metadata (literal \"/private\") (literal \"/private/var\") (literal \"/private/var/select\"))(allow process-fork)(allow process-exec file-map-executable file-read*{filters})(allow file-read-metadata{metadata})(allow file-write* (subpath {}) (subpath {}))(allow sysctl-read)(allow file-read* file-write* (literal \"/dev/null\"))(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\")){state}",
+        "(version 1)(deny default)(allow file-read* file-test-existence (literal \"/\"))(allow file-read* (literal \"/private/var/select/sh\"))(allow file-read-metadata (literal \"/private\") (literal \"/private/var\") (literal \"/private/var/select\"))(allow process-fork)(allow process-exec file-map-executable file-read*{filters})(allow file-read-metadata{metadata})(allow file-write* (subpath {}) (subpath {}))(allow sysctl-read)(allow file-read* file-write* (literal \"/dev/null\"))(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\")){state}{deny}",
         quote(project)?,
         quote(scratch)?
     ))
@@ -1048,6 +1097,50 @@ mod tests {
         assert!(text.ends_with(")"));
         let quoted = seatbelt("/p", "/h/.as\"ura/tmp/s", "/h/.as\"ura").unwrap();
         assert!(quoted.contains("(subpath \"/h/.as\\\"ura\")"));
+    }
+    /// EPG-U5: the `model-1` profile ends with the implicit-execution deny
+    /// rules for a project path holding every regex metacharacter and a
+    /// Seatbelt string quote; the path is escaped in the regex and quoted in
+    /// every filter, and the rules follow the project write allow.
+    #[test]
+    fn epg_u5_model_profile_denies_implicit_paths_with_escaped_project() {
+        let project = r#"/w/p.a+b(c)[d]{e}$f^g|h*i?j\k"l"#;
+        let text = seatbelt(project, "/h/.asura/tmp/exec-cmd-1", "/h/.asura").unwrap();
+        let q = r#"/w/p.a+b(c)[d]{e}$f^g|h*i?j\\k\"l"#;
+        let rx = r#"/w/p\\.a\\+b\\(c\\)\\[d\\]\\{e\\}\\$f\\^g\\|h\\*i\\?j\\\\k\"l"#;
+        let dir = "[^/]+/";
+        let nested = format!("{dir}{}{}", format!("({dir}").repeat(7), ")?".repeat(7));
+        let expected = format!(
+            concat!(
+                "(deny file-write* (subpath \"{q}/.git/hooks\")",
+                " (literal \"{q}/.git/config\") (literal \"{q}/.gitattributes\")",
+                " (literal \"{q}/.gitmodules\") (literal \"{q}/.envrc\")",
+                " (literal \"{q}/.cargo/config\") (literal \"{q}/.cargo/config.toml\")",
+                " (regex \"^{rx}/{nested}(\\\\.git/hooks(/.*)?|\\\\.git/config|\\\\.gitattributes",
+                "|\\\\.gitmodules|\\\\.envrc|\\\\.cargo/config|\\\\.cargo/config\\\\.toml)$\"))"
+            ),
+            q = q,
+            rx = rx,
+            nested = nested
+        );
+        assert!(text.ends_with(&expected), "{text}");
+        assert_eq!(text.matches("(deny file-write*").count(), 1);
+        let allow = text
+            .find(&format!("(allow file-write* (subpath \"{q}\")"))
+            .expect("project write allow");
+        let state = text
+            .find("(deny file-read* file-write*")
+            .expect("state rules");
+        assert!(allow < state && state < text.len() - expected.len());
+        // A trailing slash on the project does not double the separator.
+        let trailing = implicit_deny_rules("/w/p/").unwrap();
+        assert!(trailing.starts_with("(deny file-write* (subpath \"/w/p/.git/hooks\")"));
+        assert!(trailing.contains("(regex \"^/w/p/[^/]+/"));
+        // A control character in the project refuses the profile.
+        assert_eq!(
+            seatbelt("/w/p\nq", "/h/.asura/tmp/s", "/h/.asura"),
+            Err(ExecCmdError::Denied)
+        );
     }
     fn numbers(entries: &[&[u8]]) -> Result<Vec<u8>, ExecCmdError> {
         secret_environment(entries.iter().copied()).map(|accepted| {

@@ -132,6 +132,29 @@ pub(crate) fn quoted(value: &str) -> Result<String, &'static str> {
     ))
 }
 
+/// `value` with every POSIX extended regular expression metacharacter
+/// (`\ . ^ $ | ? * + ( ) [ ] { }`) escaped by a backslash, so that a path
+/// matches only itself inside a Seatbelt `regex` filter
+/// (execution-path-guard.md, model write denial). Control characters are
+/// refused, as by [`quoted`]. The result is regex text; it still goes
+/// through [`quoted`] to become a Seatbelt string literal.
+pub(crate) fn regex_escaped(value: &str) -> Result<String, &'static str> {
+    if value.chars().any(char::is_control) {
+        return Err("git_path_invalid");
+    }
+    let mut escaped = String::with_capacity(value.len() * 2);
+    for c in value.chars() {
+        if matches!(
+            c,
+            '\\' | '.' | '^' | '$' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    Ok(escaped)
+}
+
 /// Collect one Git snapshot. Collection has no time bound (owner, 2026-10-16):
 /// it ends on completion, `cancelled`, or supersession by a newer change
 /// (`superseded` returns true, reported as `git_changed_during_observation`).
@@ -726,6 +749,19 @@ mod tests {
         assert!(parse_status(b"# branch.head main\0unexpected\0").is_err());
         assert!(parse_status(b"# branch.head main\x00\x32 rename\0").is_err());
         assert!(parse_status(b"# branch.head main\x00\x32 rename\0old\0").is_ok());
+    }
+    /// EPG-U5 (helper half): every POSIX ERE metacharacter is escaped once,
+    /// other characters pass through, and control characters are refused.
+    #[test]
+    fn regex_escaped_escapes_every_metacharacter() {
+        assert_eq!(
+            regex_escaped(r"/p.a+b(c)[d]{e}$f^g|h*i?j\k").unwrap(),
+            r"/p\.a\+b\(c\)\[d\]\{e\}\$f\^g\|h\*i\?j\\k"
+        );
+        assert_eq!(regex_escaped("/a b/\"c'-#~é").unwrap(), "/a b/\"c'-#~é");
+        assert_eq!(regex_escaped(""), Ok(String::new()));
+        assert_eq!(regex_escaped("/p\nq"), Err("git_path_invalid"));
+        assert_eq!(regex_escaped("/p\0q"), Err("git_path_invalid"));
     }
 }
 
