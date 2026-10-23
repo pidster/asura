@@ -161,6 +161,10 @@ pub(super) struct JobCall {
     refresh: Option<(Ending, JobSnapshot)>,
     result: Option<JobResult>,
     text: Option<String>,
+    /// Code 10: the job's kind 26 sequence, latched once seen committed.
+    /// The controller forgets a settled job after 64 newer ones retire, so
+    /// the kind 29 hold (JR13) must not depend on it still holding the job.
+    intent: Option<u64>,
 }
 
 fn wall_ms() -> u64 {
@@ -251,6 +255,7 @@ impl JobCall {
             refresh: None,
             result: None,
             text: None,
+            intent: None,
         }
     }
 
@@ -319,6 +324,23 @@ impl JobCall {
     /// The next action when the ticket is free, and its in-flight step.
     /// Code 10's kind 29 waits until the job's kind 26 committed (JR13).
     pub(super) fn action(&mut self, jobs: Option<&JobController>) -> Option<Action> {
+        self.step_action(Self::intent_of(jobs, self.job))
+    }
+    /// The job's kind 26 sequence as the controller now shows it.
+    fn intent_of(jobs: Option<&JobController>, job: Id) -> Option<u64> {
+        jobs.and_then(|j| j.view(job, Instant::now()))
+            .and_then(|v| v.sequence)
+    }
+    /// Latches the kind 26 sequence the first time it is seen committed.
+    fn latch_intent(&mut self, seen: Option<u64>) {
+        if self.intent.is_none() {
+            self.intent = seen;
+        }
+    }
+    /// [`Self::action`] with the controller's current view of the job's
+    /// kind 26 sequence.
+    fn step_action(&mut self, seen: Option<u64>) -> Option<Action> {
+        self.latch_intent(seen);
         match std::mem::replace(&mut self.step, Step::Done) {
             Step::Recheck => {
                 self.step = Step::Rechecking;
@@ -333,10 +355,8 @@ impl JobCall {
                 Some(Action::Note(record))
             }
             Step::Result => {
-                let intent_committed = self.code != ToolOperation::ExecCmd
-                    || jobs
-                        .and_then(|j| j.view(self.job, Instant::now()))
-                        .is_some_and(|v| v.sequence.is_some());
+                let intent_committed =
+                    self.code != ToolOperation::ExecCmd || self.intent.is_some();
                 let Some(result) = self.result.clone().filter(|_| intent_committed) else {
                     self.step = Step::Result;
                     return None;
@@ -378,6 +398,10 @@ impl JobCall {
 
     /// Runs every transition whose input arrived. In-memory work only.
     pub(super) fn advance(&mut self, env: &mut Env) {
+        if self.code == ToolOperation::ExecCmd {
+            let seen = Self::intent_of(env.jobs.as_deref(), self.job);
+            self.latch_intent(seen);
+        }
         match self.step {
             Step::Start => self.start(env),
             Step::Rechecking => {
@@ -488,6 +512,8 @@ impl JobCall {
         if records.listing.conversation != env.conversation || records.listing.job != self.job {
             return self.outcome(env, O::NotFound);
         }
+        // A job read from the journal has its kind 26 committed.
+        self.latch_intent(Some(records.listing.intent_frame.sequence));
         let known = Known {
             origin: records.listing.intent.origin,
             sequence: records.listing.intent_frame.sequence,
@@ -970,10 +996,9 @@ impl JobCall {
     /// The rendered view of this call's job.
     fn shown(&self, env: Option<&Env>) -> Option<Shown> {
         if self.code == ToolOperation::ExecCmd {
-            let sequence = env
-                .and_then(|e| e.jobs.as_deref())
-                .and_then(|j| j.view(self.job, Instant::now()))
-                .and_then(|v| v.sequence)
+            let sequence = self
+                .intent
+                .or_else(|| Self::intent_of(env.and_then(|e| e.jobs.as_deref()), self.job))
                 .unwrap_or(0);
             return Some(Shown {
                 job: self.job,
@@ -1039,5 +1064,59 @@ impl JobCall {
         self.result = Some(result);
         self.text = Some(text);
         self.step = Step::Result;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delivery(job: Id) -> JobCall {
+        let agent = AgentKey {
+            conversation: [3; 16],
+            agent: 0,
+        };
+        let mut call = JobCall::exec(1, job, agent, 0, "true".into(), false);
+        call.result = Some(JobResult {
+            operation: [1; 16],
+            generation: 1,
+            ordinal: 1,
+            status: O::Ok.status(),
+            outcome: O::Ok,
+            job: [0; 16],
+            body: JobResultBody::State(settled_snapshot()),
+        });
+        call.text = Some("settled".into());
+        call.step = Step::Result;
+        call
+    }
+
+    /// JR13 (code 10): kind 29 waits for the job's kind 26; once seen
+    /// committed, the call keeps that fact, so a controller that later
+    /// forgets the settled job (64-entry retired list) cannot hold it.
+    #[test]
+    fn code_10_kind_29_waits_for_kind_26_and_keeps_it_after_eviction() {
+        let mut call = delivery([7; 16]);
+        assert!(call.step_action(None).is_none(), "no kind 26 yet: held");
+        assert!(call.next_is_append());
+        assert!(matches!(
+            call.step_action(Some(40)),
+            Some(Action::Result(journal::Record::JobResult(_)))
+        ));
+        // The journal refused the append at its quota; meanwhile the
+        // controller forgot the job. The retry still appends.
+        call.append_refused();
+        assert!(matches!(
+            call.step_action(None),
+            Some(Action::Result(journal::Record::JobResult(_)))
+        ));
+        assert_eq!(call.shown(None).map(|s| s.sequence), Some(40));
+
+        // Seen in an earlier step only, then evicted before the result.
+        let mut call = delivery([8; 16]);
+        call.step = Step::Parked;
+        assert!(call.step_action(Some(41)).is_none());
+        call.step = Step::Result;
+        assert!(call.step_action(None).is_some());
     }
 }
