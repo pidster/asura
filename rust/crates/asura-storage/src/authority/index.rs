@@ -19,12 +19,17 @@ pub const ENTRY_BYTES: usize = KEY_BYTES + VALUE_BYTES;
 pub enum Tag {
     /// Project activity: project, accepted sequence.
     Activity = b'A',
+    /// Model change of a project's build and test paths: project, kind 32
+    /// action 1 sequence (P5).
+    PathChange = b'B',
     /// Tool call: operation, ordinal.
     Call = b'C',
     /// Project identity: device and inode, 0.
     Identity = b'D',
     /// Job retention: job ID, kind 30 sequence (J4).
     Retention = b'E',
+    /// Path warning acknowledgement: project, kind 32 action 2 sequence (P5).
+    PathAck = b'F',
     /// Generated ID: installation, graph, task, operation, input or dispatch request.
     Generated = b'G',
     /// Thinking piece: operation, start offset (thinking-level.md).
@@ -45,6 +50,9 @@ pub enum Tag {
     Operation = b'O',
     /// Response piece: operation, start offset.
     Piece = b'P',
+    /// Path approval or revocation: project, kind 32 action 3 or 4
+    /// sequence (P5).
+    PathApproval = b'Q',
     /// Request outcome.
     Request = b'R',
     /// Sealed segment file: first sequence.
@@ -62,13 +70,17 @@ pub enum Tag {
     Payload = b'X',
     /// Every job: the zero ID, kind 26 sequence (J4).
     AllJobs = b'Y',
+    /// One kind 32 per reference: job, input or request ID, 0 (P5, AE-05).
+    PathReference = b'Z',
 }
 impl Tag {
-    pub const ALL: [Tag; 22] = [
+    pub const ALL: [Tag; 26] = [
         Tag::Activity,
+        Tag::PathChange,
         Tag::Call,
         Tag::Identity,
         Tag::Retention,
+        Tag::PathAck,
         Tag::Generated,
         Tag::Thinking,
         Tag::Input,
@@ -79,6 +91,7 @@ impl Tag {
         Tag::Name,
         Tag::Operation,
         Tag::Piece,
+        Tag::PathApproval,
         Tag::Request,
         Tag::Segment,
         Tag::Turn,
@@ -87,6 +100,7 @@ impl Tag {
         Tag::Job,
         Tag::Payload,
         Tag::AllJobs,
+        Tag::PathReference,
     ];
     pub fn from_byte(byte: u8) -> Option<Self> {
         Self::ALL.into_iter().find(|tag| *tag as u8 == byte)
@@ -255,6 +269,36 @@ pub enum Entry {
         author: u8,
         frame: Locator,
     },
+    /// `B`: one kind 32 `model_changed` of a project, keyed by its
+    /// sequence. `number` counts the project's `model_changed` records.
+    PathChange {
+        job: Id,
+        number: u64,
+        frame: Locator,
+    },
+    /// `F`: one kind 32 `acknowledged` of a project, keyed by its sequence.
+    /// `covered` is the `number` of the change at `through`, or 0.
+    PathAck {
+        input: Id,
+        through: u64,
+        covered: u64,
+        frame: Locator,
+    },
+    /// `Q`: one kind 32 `approved` or `revoked` of a project, keyed by its
+    /// sequence. `path_key` is the SHA-256 path key; `digest` is zero for
+    /// a revocation.
+    PathApproval {
+        action: u8,
+        path_key: Hash,
+        digest: Hash,
+        frame: Locator,
+    },
+    /// `Z`: the kind 32 of one reference.
+    PathReference {
+        action: u8,
+        project: Id,
+        frame: Locator,
+    },
     Segment {
         last: u64,
         bytes: u64,
@@ -382,6 +426,10 @@ impl Entry {
             Self::AllJobs { .. } => Tag::AllJobs,
             Self::Settlement { .. } => Tag::Settlement,
             Self::Retention { .. } => Tag::Retention,
+            Self::PathChange { .. } => Tag::PathChange,
+            Self::PathAck { .. } => Tag::PathAck,
+            Self::PathApproval { .. } => Tag::PathApproval,
+            Self::PathReference { .. } => Tag::PathReference,
             Self::Segment { .. } => Tag::Segment,
             Self::Project { .. } => Tag::Project,
             Self::Name { .. } => Tag::Name,
@@ -494,6 +542,42 @@ impl Entry {
                 frame,
             } => {
                 out.put(&[*action, *author]);
+                out.locator(frame);
+            }
+            Self::PathChange { job, number, frame } => {
+                out.put(job);
+                out.u64(*number);
+                out.locator(frame);
+            }
+            Self::PathAck {
+                input,
+                through,
+                covered,
+                frame,
+            } => {
+                out.put(input);
+                out.u64(*through);
+                out.u64(*covered);
+                out.locator(frame);
+            }
+            Self::PathApproval {
+                action,
+                path_key,
+                digest,
+                frame,
+            } => {
+                out.put(&[*action]);
+                out.put(path_key);
+                out.put(digest);
+                out.locator(frame);
+            }
+            Self::PathReference {
+                action,
+                project,
+                frame,
+            } => {
+                out.put(&[*action]);
+                out.put(project);
                 out.locator(frame);
             }
             Self::Segment {
@@ -621,6 +705,28 @@ impl Entry {
                 author: r.byte(),
                 frame: r.locator(),
             },
+            Tag::PathChange => Self::PathChange {
+                job: r.id(),
+                number: r.u64(),
+                frame: r.locator(),
+            },
+            Tag::PathAck => Self::PathAck {
+                input: r.id(),
+                through: r.u64(),
+                covered: r.u64(),
+                frame: r.locator(),
+            },
+            Tag::PathApproval => Self::PathApproval {
+                action: r.byte(),
+                path_key: r.hash(),
+                digest: r.hash(),
+                frame: r.locator(),
+            },
+            Tag::PathReference => Self::PathReference {
+                action: r.byte(),
+                project: r.id(),
+                frame: r.locator(),
+            },
             Tag::Segment => Self::Segment {
                 last: r.u64(),
                 bytes: r.u64(),
@@ -667,21 +773,25 @@ mod tests {
     fn keys_order_as_their_encoding_and_reject_padding() {
         let keys = [
             Key::new(Tag::Activity, [9; 16], 7),
+            Key::new(Tag::PathChange, [0; 16], 0),
             Key::new(Tag::Call, [1; 16], 1),
             Key::new(Tag::Call, [1; 16], 2),
             Key::new(Tag::Call, [2; 16], 0),
             Key::new(Tag::Identity, [0; 16], 0),
             Key::new(Tag::Retention, [0; 16], 0),
+            Key::new(Tag::PathAck, [0; 16], 0),
             Key::new(Tag::ProjectConversation, [0; 16], 0),
             Key::new(Tag::ConversationJob, [0; 16], 0),
             Key::new(Tag::ProjectJob, [0; 16], 0),
             Key::new(Tag::Name, [0; 16], 0),
+            Key::new(Tag::PathApproval, [0xff; 16], u64::MAX),
             Key::new(Tag::Turn, [0; 16], 0),
             Key::new(Tag::Settlement, [0; 16], 0),
             Key::new(Tag::Conversation, [0xff; 16], 0),
             Key::new(Tag::Job, [0; 16], 0),
             Key::new(Tag::Payload, [0; 16], 0),
             Key::new(Tag::AllJobs, [0; 16], 0),
+            Key::new(Tag::PathReference, [0; 16], 0),
         ];
         // Tag::ALL is in byte order with no gaps in the encoding check.
         for pair in Tag::ALL.windows(2) {
@@ -698,9 +808,11 @@ mod tests {
         let mut bad = keys[0].encode();
         bad[31] = 1;
         assert_eq!(Key::decode(&bad), Err(ReplayError::Corrupt));
-        let mut bad = keys[0].encode();
-        bad[0] = b'Z';
-        assert_eq!(Key::decode(&bad), Err(ReplayError::Corrupt));
+        for unknown in [0, b'@', b'[', b'a'] {
+            let mut bad = keys[0].encode();
+            bad[0] = unknown;
+            assert_eq!(Key::decode(&bad), Err(ReplayError::Corrupt), "{unknown}");
+        }
     }
     #[test]
     fn every_value_round_trips_within_96_bytes() {
@@ -778,6 +890,28 @@ mod tests {
                 action: 4,
                 author: 2,
                 frame: locator(21),
+            },
+            Entry::PathChange {
+                job: [17; 16],
+                number: u64::MAX,
+                frame: locator(22),
+            },
+            Entry::PathAck {
+                input: [18; 16],
+                through: u64::MAX,
+                covered: u64::MAX,
+                frame: locator(23),
+            },
+            Entry::PathApproval {
+                action: 3,
+                path_key: [0xff; 32],
+                digest: [0xfe; 32],
+                frame: locator(24),
+            },
+            Entry::PathReference {
+                action: 4,
+                project: [19; 16],
+                frame: locator(25),
             },
             Entry::Segment {
                 last: 32_768,

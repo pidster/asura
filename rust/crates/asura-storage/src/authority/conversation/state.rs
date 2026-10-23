@@ -303,7 +303,7 @@ impl Replay {
         self.delta_charge += GENERATED_CHARGE;
         Ok(())
     }
-    fn emit(&mut self, key: Key, entry: Entry) -> Result<()> {
+    pub(super) fn emit(&mut self, key: Key, entry: Entry) -> Result<()> {
         require(self.delta.entries.insert(key, entry.encode()).is_none())?;
         self.delta_charge += ENTRY_CHARGE;
         Ok(())
@@ -1103,7 +1103,7 @@ impl Replay {
             entry.activity = sequence;
         }
     }
-    fn record_activity(&mut self, project: Id, conversation: Option<Id>, sequence: u64) {
+    pub(super) fn record_activity(&mut self, project: Id, conversation: Option<Id>, sequence: u64) {
         self.touch(project, conversation, sequence);
         let (operation, generation, settled) = conversation
             .and_then(|c| self.conversations.get(&c))
@@ -1165,15 +1165,16 @@ impl Replay {
                 // Job closure records are independent of the operation
                 // (JR8); JR6 and JR7 decide them. A person's kind 30 is
                 // independent of the operation too; a model note needs an
-                // operation of this owner generation.
-                let person_retention = matches!(
+                // operation of this owner generation. Kind 32 is independent
+                // of the operation (execution-path-guard.md).
+                let independent = matches!(
                     &record,
                     Record::JobRetention(p)
                         if matches!(p.author, RetentionAuthor::Person { .. })
-                );
+                ) || matches!(&record, Record::ExecutionPath(_));
                 require(
                     reconciliation
-                        || person_retention
+                        || independent
                         || matches!(
                             record,
                             Record::OwnerGeneration
@@ -1437,6 +1438,7 @@ impl Replay {
                 self.active_activity(sequence);
             }
             Record::JobRetention(p) => self.job_retention(*p, frame, index)?,
+            Record::ExecutionPath(p) => self.execution_path(*p, frame, index)?,
             Record::ToolResult(p) => {
                 self.tool_result(p, frame)?;
                 self.active_activity(sequence);
