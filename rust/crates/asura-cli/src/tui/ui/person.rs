@@ -626,11 +626,15 @@ pub(super) fn footer(entry: &LogEntry) -> Option<String> {
         _ => None,
     };
     if entry.released() {
-        let exit = exit.map(|e| e.replace("exit ", "")).unwrap_or_default();
+        // The shell's status, when the entry carries it while draining.
+        let shell = exit.map_or_else(
+            || "shell exited".to_owned(),
+            |e| format!("shell exited {}", e.replace("exit ", "")),
+        );
         return Some(if left > 0 {
-            format!("↳ shell exited {exit} · {} writing", processes(left))
+            format!("↳ {shell} · {} writing", processes(left))
         } else {
-            format!("↳ shell exited {exit} · output still open")
+            format!("↳ {shell} · output still open")
         });
     }
     if !entry.settled() {
@@ -1076,8 +1080,15 @@ impl App {
         true
     }
     /// The receipt of a staged command: the log entry learns its input and
-    /// job, derived from the input ID.
-    pub(super) fn command_accepted(&mut self, request: [u8; 16], input: &[u8]) {
+    /// job, derived from the input ID, and shows the command as the service
+    /// stored it (`stored`, the accepted entry's text): a secret in the typed
+    /// text is then shown only as its placeholder (PCR19).
+    pub(super) fn command_accepted(
+        &mut self,
+        request: [u8; 16],
+        input: &[u8],
+        stored: Option<&str>,
+    ) {
         let Ok(input) = <[u8; 16]>::try_from(input) else {
             return;
         };
@@ -1090,6 +1101,9 @@ impl App {
             entry.request_id = None;
             entry.input = Some(input);
             entry.job = Some(job_of(input));
+            if let Some(text) = stored.filter(|t| !t.is_empty()) {
+                entry.command = Some(text.to_owned());
+            }
         }
     }
     /// A submit whose outcome is unknown keeps its entry, marked.
@@ -1547,7 +1561,9 @@ impl App {
         } else if cursor_row >= *scroll + height {
             *scroll = cursor_row + 1 - height;
         }
-        *scroll = (*scroll).min(rows.len().saturating_sub(1));
+        // A view that grew, or a draft that shrank, shows as many rows as
+        // fit: a scroll kept from an earlier draft never leaves rows blank.
+        *scroll = (*scroll).min(rows.len().saturating_sub(height));
         let scroll = *scroll;
         let gutter_x = area.x.saturating_sub(2);
         for (offset, row) in rows.iter().skip(scroll).take(height).enumerate() {
@@ -2074,7 +2090,11 @@ mod tests {
             let mut app = app();
             app.person.log.push(entry.clone());
             render(&mut app, 80, 30);
-            app.history_focus = true;
+            // Shift+Up reaches a log that holds commands alone (no
+            // transcript entry).
+            assert!(app.transcript.is_empty());
+            chord(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+            assert!(app.history_focus, "Shift+Up enters a log of commands alone");
             press(&mut app, key);
             let request = app.take_job_request().expect("read");
             assert_eq!(
@@ -2326,6 +2346,24 @@ mod tests {
         typed(&mut app, "echo 'open");
         render(&mut app, 80, 24);
         assert!(app.hints().contains(" · not split · "));
+    }
+    #[test]
+    fn pc_u31_view_scroll_from_a_longer_draft_leaves_no_blank_rows() {
+        // A long draft scrolls the view to its last rows; the next, shorter
+        // draft shows from its first row (PC-E12 found the stale scroll).
+        let mut app = app();
+        press(&mut app, KeyCode::Char('!'));
+        typed(&mut app, "a; b; c; d; e; f; g; h");
+        render(&mut app, 80, 24);
+        assert!(app.person.scroll > 0);
+        press(&mut app, KeyCode::Enter);
+        render(&mut app, 80, 24);
+        paste(&mut app, "!one\ntwo\nthree");
+        let buffer = render(&mut app, 80, 24);
+        let y = marker_row(&buffer, "!", COMMAND_BOX);
+        let gutter: Vec<&str> = (y..y + 5).map(|r| buffer[(1, r)].symbol()).collect();
+        assert_eq!(gutter, ["!", "─", "›", "─", "›"]);
+        assert_eq!(app.person.scroll, 0);
     }
     #[test]
     fn pc_u32_to_u35_outside_mode_steps() {
@@ -2605,6 +2643,14 @@ mod tests {
             footer(&released).unwrap(),
             "↳ shell exited 0 · output still open"
         );
+        // A draining entry without the shell's status (PC-E18 found the
+        // double space).
+        let job = released.entry.as_mut().unwrap();
+        (job.exit_kind, job.exit_value, job.left_running) = (None, None, Some(1));
+        assert_eq!(
+            footer(&released).unwrap(),
+            "↳ shell exited · 1 background process writing"
+        );
     }
     #[test]
     fn refusals_return_the_command_to_the_editor_in_its_mode() {
@@ -2636,10 +2682,15 @@ mod tests {
     }
     #[test]
     fn acceptance_derives_the_job_id_from_the_input() {
+        // The service stores the rewritten command: after the receipt the
+        // log header shows the placeholder, not the typed token (PCR19).
+        const TYPED: &str = "curl -H \"Authorization: Bearer abcdefghijklmnopqrstuvwx0123\" x";
+        const STORED: &str = "curl -H \"Authorization: Bearer ${ASURA_SECRET_1}\" x";
         let mut app = app();
         press(&mut app, KeyCode::Char('!'));
-        typed(&mut app, "ls");
+        typed(&mut app, TYPED);
         press(&mut app, KeyCode::Enter);
+        assert_eq!(header(&app.person.log[0]), format!("! {TYPED}"));
         let request = staged_command(&mut app);
         app.queue_request_scope = app.queue_identity_scope();
         let input = vec![9; 16];
@@ -2657,7 +2708,7 @@ mod tests {
                     target_generation: Some(1),
                     command_cwd: Some("src/ui".into()),
                     command_outside_sandbox: Some(false),
-                    text: Some("ls".into()),
+                    text: Some(STORED.into()),
                     waiting_reason: Some(10),
                     waiting_text: Some("waiting: model turn running".into()),
                     sequence: Some(1),
@@ -2676,12 +2727,15 @@ mod tests {
         let entry = &app.person.log[0];
         assert_eq!(entry.input, Some([9; 16]));
         assert_eq!(entry.job, Some(job_of([9; 16])));
+        assert_eq!(header(entry), format!("! {STORED}"));
         assert_eq!(
             app.person_folds().first().map(|t| t.job),
             Some(job_of([9; 16]))
         );
-        let buffer = render(&mut app, 80, 24);
-        assert!(text_of(&buffer).contains(">> ! ls · waiting: model turn running"));
+        let buffer = render(&mut app, 160, 24);
+        let text = text_of(&buffer);
+        assert!(text.contains(&format!(">> ! {STORED} · waiting: model turn running")));
+        assert!(!text.contains("abcdefghij"), "the typed token is not shown");
     }
     #[test]
     fn refusal_texts_follow_the_design_table() {

@@ -139,9 +139,11 @@ impl App {
         self.focus = Focus::Queue(ids.len() - 1);
         true
     }
-    /// Focus the conversation log at its latest row. False without a transcript.
+    /// Focus the conversation log at its latest row. False when the log
+    /// shows nothing: no transcript and no person command entry (a
+    /// conversation of commands alone still has a log, PC11).
     fn enter_log(&mut self) -> bool {
-        if self.transcript.is_empty() {
+        if self.transcript.is_empty() && self.person.log.is_empty() {
             return false;
         }
         self.focus = Focus::Editor;
