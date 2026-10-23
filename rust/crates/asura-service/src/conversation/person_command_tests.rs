@@ -456,8 +456,7 @@ fn pc_u54_shell_exited_releases_the_lane_until_restart() {
         "the job stays live"
     );
     // The owner's lane is released: it dispatches the message, which waited
-    // until now (state 1 above). The journal writer's `PrepareInput` then
-    // refuses it; see `pc_u54_message_turn_after_release` (blocked).
+    // until now (state 1 above); see `pc_u54_message_turn_after_release`.
     h.wait("the message dispatch", |h| {
         h.entry(project, message).state != Some(1)
     });
@@ -853,12 +852,11 @@ fn display_cut_keeps_placeholders_whole() {
     assert!(cut.ends_with(' '));
 }
 
-/// PC-U54, message part (blocked outside P3-E, reported): after
-/// `ShellExited` the message's preparation is not refused by the lane. The
-/// journal writer's `PrepareInput` checks `ready_input()` without the
-/// released overlay and answers `request_conflict`, so the input is held.
+/// PC-U54, message part (P3-E2): after `ShellExited` the message's
+/// preparation is not refused: the journal writer's `PrepareInput` takes
+/// an input that replay's `input_ready` accepts (the `!!` job's kind 26
+/// is enough), so the message is not held `request_conflict`.
 #[test]
-#[ignore = "blocked: writer PrepareInput ignores the released !! overlay (P3-E report)"]
 fn pc_u54_message_turn_after_release() {
     let mut h = H::with_keychain();
     let project = h.project();
@@ -884,9 +882,11 @@ fn pc_u54_message_turn_after_release() {
         h.entry(project, message).state != Some(1)
     });
     let entry = h.entry(project, message);
-    assert_ne!(
+    // The writer prepared the turn; the harness has no model package, so
+    // the turn's admission holds it there, past the preparation.
+    assert_eq!(
         entry.hold_reason.as_deref(),
-        Some("request_conflict"),
+        Some("model_package_unavailable"),
         "{entry:?}"
     );
 }

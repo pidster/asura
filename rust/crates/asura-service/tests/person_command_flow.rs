@@ -16,7 +16,8 @@
 //! (PC-I7, PC-I8, PC-I24), `survivors` (PC-I33, PC-I34, PC-I40, EC-I9,
 //! EC-I10), `interrupt` (PC-I10, PC-I26, PC-I35), `gate` (SS-I8, SS-I9,
 //! in-process service), `full` (SS-I10), `profile` (PC-I2 to PC-I5,
-//! PC-I14, PC-I29, PC-I36), `observer` (field 8), `long` (PC-I9, PC-I25).
+//! PC-I14, PC-I29, PC-I36), `observer` (field 8), `long` (PC-I9, PC-I25),
+//! `released_turn` (PC-I33 message part, PC-I21).
 #[path = "support/job_fixture.rs"]
 mod job_fixture;
 #[path = "support/queue_submit.rs"]
@@ -2008,12 +2009,14 @@ fn gate() -> Result<()> {
     Ok(())
 }
 
-/// PC-I21 (blocked, see the P3-E report): a model turn after a released
-/// `!!` job; the model lists, inspects, reads and waits on it, and its
-/// cancel is `not_permitted` while the job keeps running. The message's
-/// turn after the release is refused by the journal writer's
-/// `PrepareInput`, which checks `ready_input()` without the released
-/// overlay; this case is not in the default run until storage takes it.
+/// PC-I33 (message part) and PC-I21 with a scripted model. A `!!` job's
+/// shell exits at once while its new-session survivor prints five ticks
+/// one second apart; a message queued behind it starts its turn while the
+/// job is `Draining` (the journal writer's `PrepareInput` takes it on
+/// replay's `input_ready`, P3-E2), and the job then settles `exited` 0
+/// with all five ticks. Then a model turn after a released `!!` job lists,
+/// inspects, reads and waits on it, and its cancel is `not_permitted`
+/// while the job keeps running.
 fn released_turn() -> Result<()> {
     let model = Model::start()?;
     let mut env = Env::new("pc-reltu")?;
@@ -2021,18 +2024,83 @@ fn released_turn() -> Result<()> {
     let (project, _) = env.project("project")?;
     env.fixture.model(&model.endpoint)?;
     model.script(&[Step::Final]);
-    let next = env
+    let first = env
         .fixture
         .submit(project, "Hello.")
         .map_err(|e| format!("first turn: {e}"))?;
-    let (conversation, _) = turn_of(&env, next)?;
+    let (conversation, generation) = turn_of(&env, first)?;
     let environment = launch(&env, &[]);
-    // PC-I21: a released `!!` job; the model lists, inspects and reads it;
-    // its cancel is not permitted and the job keeps running.
     let exe = std::env::current_exe()?;
     let marks = env.home().join("marks");
     std::fs::create_dir(&marks)?;
+    // PC-I33: the message's turn starts while the `!!` job drains.
+    let hold = format!(
+        "'{exe}' --survivor '{marks}/h' hold & while [ ! -e '{marks}/h.pid' ]; do /bin/sleep 0.05; done; exit 0",
+        exe = exe.display(),
+        marks = marks.display()
+    );
+    let (draining, _) = queued(
+        &env,
+        &at_generation(
+            outside(project, Some(conversation), &hold, &environment),
+            generation,
+        ),
+    )?;
+    model.script(&[Step::Final]);
+    let attach = || env.fixture.attach();
+    let reply = queue_submit::queue_call(
+        &attach,
+        queue_submit::queue_request(
+            project,
+            Some(conversation.to_vec()),
+            generation,
+            "While it drains.",
+        ),
+    )?;
+    let message = id(reply.accepted_input_id)?;
+    let next = id(queue_submit::dispatched(&attach, project, message)
+        .map_err(|e| format!("the message behind the !! job: {e}"))?
+        .operation_id)?;
+    env.fixture.finish(next, Duration::from_secs(60))?;
+    let held_job = job_of(draining);
+    let done = wait_settled(&env, draining, Duration::from_secs(60))?;
+    let all = records(&env)?;
+    let accepted_at = position(
+        &all,
+        |r| matches!(r, Record::TurnAccepted(t) if t.operation == next),
+    )
+    .ok_or("the message's kind 21")?;
+    let intent_at = position(
+        &all,
+        |r| matches!(r, Record::JobIntent(i) if journal::job_id(&i.origin) == held_job),
+    )
+    .ok_or("kind 26")?;
+    let settled_at = position(
+        &all,
+        |r| matches!(r, Record::JobSettled(s) if s.job == held_job),
+    )
+    .ok_or("kind 28")?;
+    assert!(
+        intent_at < accepted_at && accepted_at < settled_at,
+        "PC-I33: the message's turn started while the !! job drained"
+    );
+    assert_eq!(
+        (done.outcome, done.exit_value, done.escapees),
+        (JobOutcome::Exited, 0, 1)
+    );
+    assert_eq!(done.capture_state, JobCaptureState::Complete);
+    assert_eq!(
+        stdout(&env, draining)?,
+        b"tick 0\ntick 1\ntick 2\ntick 3\ntick 4\n"
+    );
+    assert_eq!(
+        read_mark(&marks.join("h.done"))?,
+        "ended",
+        "never signalled"
+    );
     let (_, generation) = turn_of(&env, next)?;
+    // PC-I21: a released `!!` job; the model lists, inspects and reads it;
+    // its cancel is not permitted and the job keeps running.
     let forever = format!(
         "'{exe}' --survivor '{marks}/f' forever & while [ ! -e '{marks}/f.pid' ]; do /bin/sleep 0.05; done; exit 0",
         exe = exe.display(),
@@ -2094,7 +2162,9 @@ fn released_turn() -> Result<()> {
     )?;
     assert_eq!(reply.requested, Some(true));
     wait_settled(&env, released, Duration::from_secs(30))?;
-    println!("PASS PC-I21: model job commands on a released person job; cancel not permitted");
+    println!(
+        "PASS PC-I33 PC-I21: a message's turn started while the !! job drained; model job commands on a released person job; cancel not permitted"
+    );
     Ok(())
 }
 
@@ -2192,17 +2262,8 @@ fn main() {
         ("volume", volume),
         ("gate", gate),
         ("sandbox", sandbox),
+        ("released_turn", released_turn),
     ];
-    // Blocked outside P3-E (reported): run only when named.
-    let blocked: Vec<Case> = vec![("released_turn", released_turn)];
-    let cases: Vec<Case> = cases
-        .into_iter()
-        .chain(
-            blocked
-                .into_iter()
-                .filter(|(name, _)| selected.contains(name)),
-        )
-        .collect();
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {
             continue;
