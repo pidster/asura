@@ -1365,9 +1365,10 @@ impl Owner {
             return;
         }
         for input in state.ready_person_inputs(&self.persons.released) {
-            if !self.persons.dispatches.contains_key(&input) {
-                self.persons.dispatches.insert(input, Dispatch::Reading);
-            }
+            self.persons
+                .dispatches
+                .entry(input)
+                .or_insert(Dispatch::Reading);
         }
         // Advance the item reads, the paced rechecks and the starts.
         let inputs: Vec<Id> = self.persons.dispatches.keys().copied().collect();

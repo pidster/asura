@@ -362,7 +362,7 @@ fn basic() -> Result<()> {
     assert_eq!(stdout(&env, input)?, b"hi\n");
     // Record order: kind 31, then kind 26 with person origin, then kind 28.
     let all = records(&env)?;
-    let position = |f: &dyn Fn(&Record) -> bool| all.iter().position(|r| f(r));
+    let position = |f: &dyn Fn(&Record) -> bool| all.iter().position(f);
     let q = position(&|r| matches!(r, Record::PersonCommandQueued(p) if p.input == input))
         .ok_or("kind 31")?;
     let i =
@@ -1323,13 +1323,11 @@ fn position(records: &[Record], f: impl Fn(&Record) -> bool) -> Option<usize> {
     records.iter().position(f)
 }
 
-/// PC-I12, PC-I27, PC-I13, PC-I21 and PC-I39 with a scripted model: a `!`
-/// and a `!!` command submitted while a model turn runs wait with
+/// PC-I12, PC-I27, PC-I13 and PC-I39 with a scripted model: a `!` and a
+/// `!!` command submitted while a model turn runs wait with
 /// `waiting: model turn running` and run after the turn's terminal record;
 /// the next turn's input holds both person entries (the `!!` one with the
-/// outside label). A released `!!` job is listed, inspected and read by the
-/// model, whose cancel is `not_permitted` while the job keeps running.
-/// Turning execution off for the project stops a model job with
+/// outside label). Turning execution off for the project stops a model job with
 /// `execution_off` while a `!` job of the project runs on and settles.
 fn model() -> Result<()> {
     let model = Model::start()?;
@@ -1467,7 +1465,7 @@ fn model() -> Result<()> {
     );
     assert_eq!(stdout(&env, person)?, b"person done\n");
     println!(
-        "PASS PC-I12 PC-I27 PC-I13 PC-I21 PC-I39: waited for the turn, notice entries, model job commands on a person job, execution off spared the person job"
+        "PASS PC-I12 PC-I27 PC-I13 PC-I39: waited for the turn, notice entries, execution off spared the person job"
     );
     Ok(())
 }
@@ -1806,16 +1804,24 @@ fn volume() -> Result<()> {
     let mut env = Env::new("pc-volume")?;
     env.start()?;
     let (project, _) = env.project("project")?;
-    let command = "/usr/bin/yes stdout-line | /usr/bin/head -c 52428800; /usr/bin/yes stderr-line | /usr/bin/head -c 52428800 >&2";
+    // The output words are built by the shell, so the stored command text
+    // never holds them: `volume-out1` and `volume-err1`, 12 bytes a line.
+    let command = "/usr/bin/yes \"$(printf 'vol%s' ume-out1)\" 2>/dev/null | /usr/bin/head -c 52428800; /usr/bin/yes \"$(printf 'vol%s' ume-err1)\" 2>/dev/null | /usr/bin/head -c 52428800 >&2";
     let (input, _) = queued(&env, &request(project, None, command, None))?;
     let s = wait_settled(&env, input, Duration::from_secs(300))?;
     assert_eq!((s.outcome, s.exit_value), (JobOutcome::Exited, 0), "{s:?}");
-    assert_eq!(s.stdout.capture.stored_bytes, 52_428_800);
-    assert_eq!(s.stderr.capture.stored_bytes, 52_428_800);
+    for stream in [&s.stdout.capture, &s.stderr.capture] {
+        assert_eq!(stream.stored_bytes, 52_428_800, "{stream:?}");
+        assert_eq!(stream.observed_bytes, 52_428_800);
+        assert!(stream.eof && stream.digest.is_some());
+    }
     assert_eq!(s.stdout.lines, 52_428_800 / 12);
     assert_eq!(s.stderr.lines, 52_428_800 / 12);
     let (bytes, _) = env.fixture.journal()?;
-    assert!(!holds(&bytes, b"stdout-line"), "no output in the journal");
+    assert!(
+        !holds(&bytes, b"volume-out1") && !holds(&bytes, b"volume-err1"),
+        "no output in the journal"
+    );
     println!("PASS PC-I19: 100 MiB retained whole with exact counts; no output in the journal");
     Ok(())
 }
