@@ -23,8 +23,11 @@ pub(crate) trait SlotPort {
     fn start(&mut self, start: SlotStart) -> Result<(), SlotStartError>;
     fn stop(&mut self, kind: StopKind); // Term or Kill; idempotent; never blocks
     fn discard_capture(&mut self); // cancel trigger in Draining: capture discards
-    #[allow(dead_code)] // P3-T calls it
-    fn close_capture(&mut self); // P3-T: cancel after a `!!` kind 2 reason 15: close the read ends, seal with reason 7
+    /// A trigger on a released `!!` job (after kind 2 reason 15, OD2): close
+    /// the capture read ends and seal the stored bytes `incomplete` with
+    /// capture reason 7. Called at most once; writes no lease byte and
+    /// signals nothing. P3-T implements it in the exec_cmd slot.
+    fn close_capture(&mut self);
     fn interests(&self, out: &mut Vec<PollInterest>);
     fn next_deadline(&self, now: Instant) -> Option<Instant>;
     fn poll(&mut self, now: Instant, out: &mut Vec<SlotEvent>); // at most 8 events
@@ -78,9 +81,10 @@ pub(crate) enum SlotEvent {
         cleanup: JobCleanup,
         escapees: u32,
         elapsed_ms: u64,
-        #[allow(dead_code)] // P3-T reads it
+        /// `person-outside-1` kind 2 reason 15: a survivor holds a
+        /// capture pipe (OD2); the slot maps it from the notice (P3-T).
         output_held: bool,
-    }, // kind 2; output_held for reason 15 (P3-T)
+    }, // kind 2
     CaptureSettled(Box<CaptureOutcome>), // sealed report, or L3 unconfirmed
     ScratchCleaned,
     ScratchRetained,

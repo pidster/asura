@@ -35,6 +35,16 @@ pub(crate) struct JobView {
     /// `command_excerpt`); empty for a recovered job, whose excerpt comes
     /// from a journal read.
     pub excerpt: String,
+    /// The job's profile, fixed at admission (`JobEntry.outside_sandbox`
+    /// for `person-outside-1`).
+    pub profile: Profile,
+    /// A released `!!` job (OD2): the shell exited and survivors hold its
+    /// output; true only in state `draining` (`JobEntry.shell_exited`).
+    pub shell_exited: bool,
+    /// A `!!` job's survivors left running, once its kind 2 arrived
+    /// (`draining`) or from kind 28 (`settled`); `None` before, and for
+    /// every other profile (`JobEntry.left_running`).
+    pub left_running: Option<u32>,
 }
 impl JobView {
     /// Kind 28 committed: the settled facts are in the journal.
@@ -86,6 +96,13 @@ impl JobController {
             cancel: None,
             outcome: Some(r.outcome),
             excerpt: r.excerpt.clone(),
+            profile: r.profile,
+            shell_exited: false,
+            left_running: r
+                .settled
+                .as_ref()
+                .filter(|_| r.profile == Profile::PersonOutside1)
+                .map(|s| s.escapees),
         })
     }
 
@@ -172,6 +189,17 @@ impl JobController {
             cancel: j.cancel.map(|t| t.reason),
             outcome: j.settled.as_ref().map(|s| s.outcome),
             excerpt: j.excerpt.clone(),
+            profile: j.profile,
+            shell_exited: j.released && state == JobRunState::Draining,
+            left_running: if !j.outside() {
+                None
+            } else if state == JobRunState::Settled {
+                j.settled.as_ref().map(|s| s.escapees)
+            } else if state == JobRunState::Draining {
+                j.process.as_ref().map(|p| p.escapees)
+            } else {
+                None
+            },
         }
     }
 

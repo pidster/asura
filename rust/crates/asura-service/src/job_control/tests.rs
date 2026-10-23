@@ -614,7 +614,10 @@ impl H {
                 inode: 2,
                 boundary: self.env.runtime.state_boundary(),
             },
-            profile: Profile::Model1,
+            profile: match origin {
+                Origin::Model { .. } => Profile::Model1,
+                Origin::Person { .. } => Profile::Person1,
+            },
             command: command.into(),
             cwd: "src".into(),
             secrets: Vec::new(),
