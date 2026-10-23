@@ -179,6 +179,8 @@ pub struct PreparedExecCmd {
     guardian_fault_for_test: Option<String>,
     #[cfg(feature = "test-support")]
     profile_token_for_test: Option<String>,
+    #[cfg(feature = "test-support")]
+    frame_for_test: Option<Vec<u8>>,
     cleanup: Option<ExecCmdCleanup>,
 }
 fn check(cancel: &AtomicBool) -> Result<(), ExecCmdError> {
@@ -339,6 +341,8 @@ impl PreparedExecCmd {
             guardian_fault_for_test: None,
             #[cfg(feature = "test-support")]
             profile_token_for_test: None,
+            #[cfg(feature = "test-support")]
+            frame_for_test: None,
             cleanup: Some(cleanup),
         };
         if let Err(reason) = check(cancel) {
@@ -375,6 +379,12 @@ impl PreparedExecCmd {
     #[cfg(feature = "test-support")]
     pub fn profile_token_for_test(&mut self, token: &str) {
         self.profile_token_for_test = Some(token.into());
+    }
+    /// Send these bytes on FD 11 in place of the setup's frame, to qualify
+    /// the guardian's frame checks (PC-U50); the roots are still mapped.
+    #[cfg(feature = "test-support")]
+    pub fn replace_frame_for_test(&mut self, frame: Vec<u8>) {
+        self.frame_for_test = Some(frame);
     }
     /// After a successful spawn ownership always transfers to ExecCmdJob.
     /// The request's secret values are dropped (and zeroed) whether or not
@@ -511,6 +521,11 @@ impl PreparedExecCmd {
         if let (Some(setup), Some((read, write))) = (self.person.take(), frame_pipe) {
             drop(read);
             let frame = setup.frame();
+            #[cfg(feature = "test-support")]
+            let frame = match self.frame_for_test.take() {
+                Some(raw) => Zeroizing::new(raw),
+                None => frame,
+            };
             drop(setup);
             // Every end closes the write end; the guardian decides from
             // what it read.
