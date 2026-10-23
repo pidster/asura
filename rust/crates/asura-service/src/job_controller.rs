@@ -284,6 +284,25 @@ enum Kind {
     Intent,
     Cancel,
     Settled,
+    /// Kind 32 `model_changed`, after the job's kind 28 (P5).
+    PathChange,
+}
+
+/// Where a model job's kind 32 `model_changed` record is
+/// (execution-path-guard.md, model change detection).
+enum PathRecord {
+    None,
+    /// The slot reported the change set; kind 28 has not committed.
+    Ready(Box<crate::path_guard::ModelChange>),
+    /// In the outbox or in flight.
+    Queued(Box<crate::path_guard::ModelChange>),
+    Committed,
+}
+impl PathRecord {
+    /// The record still has to commit before the job may retire.
+    fn pending(&self) -> bool {
+        matches!(self, Self::Ready(_) | Self::Queued(_))
+    }
 }
 
 /// The request facts that wait in the queue until the slot starts.
@@ -404,6 +423,8 @@ struct Job {
     released: bool,
     /// `SlotPort::close_capture` was called (at most once).
     capture_closed: bool,
+    /// A model job's kind 32 `model_changed` (P5).
+    path_record: PathRecord,
 }
 impl Job {
     fn new(
@@ -458,6 +479,7 @@ impl Job {
             excerpt: String::new(),
             released: false,
             capture_closed: false,
+            path_record: PathRecord::None,
         }
     }
     /// Profile `person-outside-1`: a `!!` job (PCR25 audit flag).
@@ -1156,10 +1178,14 @@ impl JobController {
         if self.in_flight.is_some() || self.journal_down {
             return None;
         }
-        let ready = self.closures.iter().position(|(id, _)| {
+        // Kind 32 is a normal record: it waits while the journal holds
+        // normal records (`journal_held`), as kind 26 does.
+        let held = self.journal_held;
+        let ready = self.closures.iter().position(|(id, kind)| {
             self.jobs
                 .get(id)
                 .is_some_and(|j| j.intent == Intent::Committed)
+                && (*kind != Kind::PathChange || !held)
         });
         if let Some(index) = ready {
             let (id, kind) = self.closures.remove(index)?;
@@ -1175,6 +1201,12 @@ impl JobController {
                     })
                 }
                 Kind::Settled => journal::Record::JobSettled(job.settled.clone()?),
+                Kind::PathChange => {
+                    let PathRecord::Queued(change) = &job.path_record else {
+                        return None;
+                    };
+                    journal::Record::ExecutionPath(Box::new(model_changed(job.project, id, change)))
+                }
                 Kind::Intent => return None,
             };
             self.in_flight = Some((id, kind));
@@ -1234,6 +1266,21 @@ impl JobController {
                 }
             }
             (Kind::Settled, Ok(sequence)) => self.settlement_committed(id, sequence),
+            (Kind::PathChange, Ok(_)) => {
+                if let Some(job) = self.jobs.get_mut(&id) {
+                    job.path_record = PathRecord::Committed;
+                }
+                self.dirty = true;
+            }
+            // Held at the journal quota or disk floor: it waits at the head
+            // of the outbox until the hold ends.
+            (
+                Kind::PathChange,
+                Err(writer::Error::JournalQuota | writer::Error::JournalDiskSpace),
+            ) => {
+                self.journal_held = true;
+                self.closures.push_front((id, Kind::PathChange));
+            }
             (_, Err(_)) => self.journal_unavailable(),
         }
     }
@@ -1330,12 +1377,29 @@ impl JobController {
         };
         let recovered = job.recovered;
         self.audit(event);
+        self.queue_path_record(id);
         self.event(JobEvent::Settled(id, outcome));
         if recovered {
             self.retire(id);
             self.check_recovered();
         }
         self.dirty = true;
+    }
+
+    /// A model job's change set joins the outbox once its kind 28 has
+    /// committed (the replay rule: action 1 names a settled job).
+    fn queue_path_record(&mut self, id: Id) {
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return;
+        };
+        if job.committed.is_none() || job.abandoned {
+            return;
+        }
+        if let PathRecord::Ready(change) = std::mem::replace(&mut job.path_record, PathRecord::None)
+        {
+            job.path_record = PathRecord::Queued(change);
+            self.closures.push_back((id, Kind::PathChange));
+        }
     }
 
     /// After kind 28 commits: the payload owner settles the ledger and the
@@ -1366,7 +1430,9 @@ impl JobController {
         let mut done = Vec::new();
         for job in self.jobs.values_mut() {
             let finished = (job.state == JobState::Recorded || job.abandoned) && job.delivered;
-            if !finished || job.scratch_retained {
+            // A model job's kind 32 commits before the job retires.
+            let recording = !job.abandoned && job.path_record.pending();
+            if !finished || job.scratch_retained || recording {
                 continue;
             }
             if job.slot.as_ref().is_none_or(|s| s.idle()) {
@@ -1564,6 +1630,12 @@ impl JobController {
             }
             SlotEvent::ScratchCleaned => {}
             SlotEvent::ScratchRetained => job.scratch_retained = true,
+            SlotEvent::PathsChanged(change) => {
+                if matches!(job.path_record, PathRecord::None) && !job.origin.is_person() {
+                    job.path_record = PathRecord::Ready(change);
+                    self.queue_path_record(id);
+                }
+            }
         }
     }
 
@@ -1985,6 +2057,31 @@ impl JobController {
                 .values()
                 .filter_map(|j| j.slot.as_ref())
                 .all(|s| s.idle())
+    }
+}
+
+/// Kind 32 `model_changed` of a settled model job (execution-path-guard.md,
+/// kind 32): its changed build and test paths and the count not listed.
+fn model_changed(
+    project: Id,
+    job: Id,
+    change: &crate::path_guard::ModelChange,
+) -> journal::ExecutionPathRecord {
+    journal::ExecutionPathRecord {
+        action: journal::PathAction::ModelChanged,
+        project,
+        reference: job,
+        through: 0,
+        entries: change
+            .paths
+            .iter()
+            .map(|path| journal::PathEntry {
+                kind: journal::PathEntryKind::ModelChanged,
+                path: path.clone(),
+            })
+            .collect(),
+        overflow: change.overflow,
+        digest: [0; 32],
     }
 }
 

@@ -89,3 +89,9 @@ name = "person_command_flow"
 path = "tests/person_command_flow.rs"
 harness = false
 required-features = ["test-support"]
+
+[[test]]
+name = "path_guard_flow"
+path = "tests/path_guard_flow.rs"
+harness = false
+required-features = ["test-support"]

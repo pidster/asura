@@ -618,6 +618,7 @@ fn ts4_viewer_streams_scroll_pages_follow_and_detail() {
                 },
             ],
             error: None,
+            path_warnings: Vec::new(),
         }),
     );
     let screen = render(&mut app, 100, 24);

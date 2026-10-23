@@ -1044,6 +1044,7 @@ impl InspectWork {
             cwd,
             notes,
             error: None,
+            path_warnings: Vec::new(),
         })))
     }
 }

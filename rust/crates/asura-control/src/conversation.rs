@@ -559,7 +559,7 @@ pub mod person {
     /// names one is `environment_invalid`.
     pub const RESERVED_PREFIXES: [&[u8]; 2] = [b"ASURA_SECRET_", b"ASURA_JOB_"];
     /// The highest `QueueWaitReason` value in this protocol revision.
-    pub const MAX_WAIT_REASON: i32 = 14;
+    pub const MAX_WAIT_REASON: i32 = 15;
     /// The highest `QueueRefusal` value.
     pub const MAX_REFUSAL: i32 = 13;
     /// Command entry kind in `ConversationQueueEntry.kind`.
@@ -681,7 +681,9 @@ pub mod person {
                 && e.command_outside_sandbox.is_none()
                 && e.waiting_reason.is_none()
                 && e.waiting_text.is_none()
-                && e.command_filtered.is_none();
+                && e.command_filtered.is_none()
+                && e.path_warnings.is_empty()
+                && e.path_overflow.is_none();
         }
         e.command_cwd
             .as_ref()
@@ -702,6 +704,8 @@ pub mod person {
             }
             // Set only, and only true, as ToolProgress.command_filtered.
             && e.command_filtered.is_none_or(|filtered| filtered)
+            // Fields 21-22: the path warnings shown before the command.
+            && crate::path_guard::warnings_valid(&e.path_warnings, e.path_overflow)
     }
 
     /// A refusal reply carries the request ID and the refusal, and nothing

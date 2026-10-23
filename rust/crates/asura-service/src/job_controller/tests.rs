@@ -2194,3 +2194,68 @@ mod person {
         assert_outside_audit(&h, u.job);
     }
 }
+
+// ----- Execution path guard (P5): kind 32 `model_changed` -----
+
+fn change(paths: &[&str], overflow: u32) -> SlotEvent {
+    SlotEvent::PathsChanged(Box::new(crate::path_guard::ModelChange {
+        paths: paths.iter().map(|p| p.to_string()).collect(),
+        overflow,
+    }))
+}
+
+/// A model job's change set is appended as kind 32 `model_changed` after
+/// its kind 28, held at the journal quota until the hold ends, and the job
+/// retires only after it commits. A person job's change set is ignored.
+#[test]
+fn epg_model_change_follows_kind_28_and_waits_at_the_quota() {
+    let mut h = Harness::new(limits(4, 2, 8));
+    let job = h.model(1, conversation(1), P1);
+    let mut events = settle_events(Exit::Exited(0), 0);
+    // The slot may report the change before its capture settles.
+    events.insert(3, change(&["build.rs", "package.json"], 2));
+    h.script(job, events);
+    let (id, record) = h.ctl.next_record().expect("kind 28");
+    assert_eq!((id, record.kind()), (job, 28), "kind 28 first");
+    h.ctl.record_done(id, Ok(10));
+    h.poll();
+    let (id, record) = h.ctl.next_record().expect("kind 32");
+    assert_encodes(&record);
+    let Record::ExecutionPath(path) = &record else {
+        panic!("kind 32: {record:?}");
+    };
+    assert_eq!(path.action, journal::PathAction::ModelChanged);
+    assert_eq!((path.project, path.reference, path.overflow), (P1, job, 2));
+    assert_eq!(
+        path.entries
+            .iter()
+            .map(|e| (e.kind, e.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (journal::PathEntryKind::ModelChanged, "build.rs"),
+            (journal::PathEntryKind::ModelChanged, "package.json"),
+        ]
+    );
+    // Held at the quota: it waits; the job stays until it commits.
+    h.ctl.record_done(id, Err(writer::Error::JournalQuota));
+    h.poll();
+    assert!(h.ctl.next_record().is_none(), "held while the quota holds");
+    h.script(job, [SlotEvent::ScratchCleaned]);
+    h.idle(job);
+    assert!(h.ctl.jobs.contains_key(&job), "not retired before kind 32");
+    h.ctl.journal_hold_ended();
+    assert_eq!(kinds(&h.commit()), [32]);
+    h.poll();
+    assert!(!h.ctl.jobs.contains_key(&job), "retired after kind 32");
+    // A change reported after kind 28 committed joins the outbox then.
+    let later = h.model(2, conversation(1), P1);
+    h.script(later, settle_events(Exit::Exited(0), 0));
+    assert_eq!(kinds(&h.commit()), [28]);
+    h.script(later, [change(&[], 1), SlotEvent::ScratchCleaned]);
+    assert_eq!(kinds(&h.commit()), [32]);
+    // No change set, no kind 32.
+    let quiet = h.model(3, conversation(1), P1);
+    h.script(quiet, settle_events(Exit::Exited(0), 0));
+    h.script(quiet, [SlotEvent::ScratchCleaned]);
+    assert_eq!(kinds(&h.commit()), [28]);
+}

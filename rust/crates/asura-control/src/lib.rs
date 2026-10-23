@@ -3,6 +3,7 @@ use prost::Message;
 use std::fmt;
 mod audit_query;
 pub mod jobs;
+pub mod path_guard;
 mod sensor_query;
 pub mod thinking;
 
@@ -301,7 +302,8 @@ pub fn validate_semantics(
             | Body::ConversationQueueDecision(_)
             | Body::ObserveContext(_)
             | Body::ObserveService(_)
-    ) || jobs::is_request(body);
+    ) || jobs::is_request(body)
+        || path_guard::is_request(body);
     if request != (direction == Direction::ClientToServer) {
         return Err(ProtocolError::WrongDirection);
     }
@@ -484,6 +486,7 @@ pub fn validate_semantics(
         },
         body if conversation::handles(body) => conversation::valid(body),
         body if jobs::handles(body) => jobs::valid(body),
+        body if path_guard::handles(body) => path_guard::valid(body),
         Body::Stop(v) => v.expected_epoch == envelope.service_epoch,
         Body::Error(v) => {
             v.code
