@@ -59,12 +59,14 @@ fn held(command: Command) -> (Worker, std::sync::mpsc::Sender<()>) {
     let (release, hold) = std::sync::mpsc::channel::<()>();
     let sent = request(command);
     let reply = sent.clone();
+    let slot: Arc<std::sync::Mutex<Option<Finished>>> = Arc::default();
+    let stored = slot.clone();
     let handle = std::thread::spawn(move || {
         hold.recv().unwrap();
-        Finished {
+        *stored.lock().unwrap() = Some(Finished {
             request: reply,
             result: Ok(Reply::List(pb::JobListReply::default())),
-        }
+        });
     });
     let mut worker = Worker::default();
     worker.request = Some(RequestJob {
@@ -72,6 +74,7 @@ fn held(command: Command) -> (Worker, std::sync::mpsc::Sender<()>) {
         cancel: Arc::new(Cancellation::default()),
         request: sent,
         reported: false,
+        reply: slot,
     });
     (worker, release)
 }
@@ -554,4 +557,49 @@ fn j4t_11_requests_carry_the_designed_fields() {
     assert_eq!(Retain::Note("x".into()).action(), pb::JobRetainAction::Note);
     assert_eq!(Retain::Delete.action(), pb::JobRetainAction::Delete);
     assert_eq!(Stream::Stdout.other(), Stream::Stderr);
+}
+
+/// J34-E (J4T-11): the request slot's reply is read from its slot, stored
+/// before the thread's settlement notice. The three slots share one router
+/// source, so the notice can be consumed before the thread exits: the reply
+/// is still reported at once, and the slot clears once the thread exits.
+#[test]
+fn j4t_11_reply_stored_before_the_thread_exits_is_reported() {
+    let (release, hold) = std::sync::mpsc::channel::<()>();
+    let sent = request(read());
+    let reply = sent.clone();
+    let slot: Arc<std::sync::Mutex<Option<Finished>>> = Arc::default();
+    let stored = slot.clone();
+    let (ready_tx, ready) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        *stored.lock().unwrap() = Some(Finished {
+            request: reply,
+            result: Ok(Reply::List(pb::JobListReply::default())),
+        });
+        ready_tx.send(()).unwrap();
+        hold.recv().unwrap();
+    });
+    let mut worker = Worker::default();
+    worker.request = Some(RequestJob {
+        handle,
+        cancel: Arc::new(Cancellation::default()),
+        request: sent,
+        reported: false,
+        reply: slot,
+    });
+    ready.recv().unwrap();
+    let finished = worker
+        .poll_request()
+        .expect("reported before the thread exits");
+    assert!(matches!(finished.result, Ok(Reply::List(_))));
+    assert!(
+        worker.request_busy(),
+        "the slot stays busy until the thread exits"
+    );
+    assert!(worker.poll_request().is_none(), "reported once");
+    release.send(()).unwrap();
+    while worker.request_busy() {
+        assert!(worker.poll_request().is_none());
+        std::thread::yield_now();
+    }
 }

@@ -373,10 +373,14 @@ fn send(
 }
 
 struct RequestJob {
-    handle: JoinHandle<Finished>,
+    handle: JoinHandle<()>,
     cancel: Arc<Cancellation>,
     request: Request,
     reported: bool,
+    /// The reply, stored before the thread's settlement notice. The slot
+    /// threads share one router source, so a notice can be consumed before
+    /// the thread has exited: the reply is read from here, not from join.
+    reply: Arc<Mutex<Option<Finished>>>,
 }
 struct StatusJob {
     scope: Scope,
@@ -447,6 +451,8 @@ impl Worker {
         let token = cancel.clone();
         let notice = self.notice.clone();
         let sent = request.clone();
+        let reply: Arc<Mutex<Option<Finished>>> = Arc::default();
+        let slot = reply.clone();
         let handle = std::thread::Builder::new()
             .name("asura-job-request".into())
             .spawn(move || {
@@ -459,9 +465,12 @@ impl Worker {
                 if let Ok(mut socket) = token.socket.lock() {
                     socket.take();
                 }
-                Finished {
-                    request: sent,
-                    result,
+                // Stored before `_settlement` drops and notifies.
+                if let Ok(mut slot) = slot.lock() {
+                    *slot = Some(Finished {
+                        request: sent,
+                        result,
+                    });
                 }
             })
             .map_err(|_| "Cannot start job request; draft retained")?;
@@ -470,6 +479,7 @@ impl Worker {
             cancel,
             request,
             reported: false,
+            reply,
         });
         Ok(())
     }
@@ -478,16 +488,34 @@ impl Worker {
     /// until the thread settles, and a late reply is discarded.
     pub fn poll_request(&mut self) -> Option<Finished> {
         let job = self.request.as_mut()?;
-        if job.handle.is_finished() {
+        // The reply is read from its slot, stored before the thread's
+        // settlement notice: the slot threads share one router source, so
+        // a notice can be consumed before the thread has exited.
+        let stored = job.reply.lock().ok().and_then(|mut slot| slot.take());
+        let exited = job.handle.is_finished();
+        let reported = job.reported;
+        job.reported |= stored.is_some();
+        if exited {
             let job = self.request.take().unwrap();
             let request = job.request.clone();
-            let finished = job.handle.join().unwrap_or(Finished {
-                request,
-                result: Err(Failure::Unavailable("job request failed".into())),
-            });
-            return (!job.reported).then_some(finished);
+            let panicked = job.handle.join().is_err();
+            return match stored {
+                Some(finished) if !reported => Some(finished),
+                None if !reported && panicked => Some(Finished {
+                    request,
+                    result: Err(Failure::Unavailable("job request failed".into())),
+                }),
+                _ => None,
+            };
         }
-        if !job.reported && job.cancel.stopped() {
+        if stored.is_some() || reported {
+            // The slot clears once the thread has exited: look again.
+            self.notice.ready();
+        }
+        if let Some(finished) = stored {
+            return (!reported).then_some(finished);
+        }
+        if !reported && job.cancel.stopped() {
             job.reported = true;
             return Some(Finished {
                 request: job.request.clone(),

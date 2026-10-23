@@ -182,6 +182,8 @@ class Trial:
             if reject and reject in self.screen.text():
                 notice = next(line.strip() for line in self.screen.text().splitlines() if reject in line)
                 raise AssertionError(f"terminal failure while waiting for {text!r}: {notice[:256]}")
+            if time.monotonic() >= end and os.environ.get("ASURA_TUI_SCREEN"):
+                print(self.screen.text(), file=sys.stderr)
             assert time.monotonic() < end, (text, bytes(self.output[-2500:]))
             if refresh and time.monotonic() >= next_refresh:
                 width = 82 if self.size[0] != 82 else 80
@@ -367,6 +369,9 @@ class Fixture:
         if self.uncertain_start:
             self.wait_absent(stable=1)
         assert not self.uncertain_start, "detached startup outcome remains uncertain"
+        if os.environ.get("ASURA_TUI_KEEP"):
+            print(f"TUI fixture retained: {self.root}", file=sys.stderr)
+            return
         shutil.rmtree(self.root)
 
 
@@ -1809,7 +1814,14 @@ def exec_cmd_capture(fixture, source):
     single-quoted token runs from the whole-command variable), J1T-21 (typing
     during a stalled capture), J1T-22 (restart and inspect the call) and
     J1T-08 (a visible busy result). The stalled-capture step needs a
-    test-support build of the fixture binary."""
+    test-support build of the fixture binary.
+
+    J3 (J34-E port): every exec_cmd call runs as a job and its result is the
+    handle delivery, which holds no output text (PC12); the model reads the
+    output with `job read`. A call step is an exec_cmd argument mapping or a
+    (tool, arguments) pair; "{job}" in an argument names the job of the last
+    handle delivery. J1T-08's retired `exec_cmd_busy: quota` is now a start
+    that waits queued with its reason (AQ1, J3T-07)."""
     import threading
 
     shutil.copyfile(source.parent / "asura-model", fixture.root / "asura-model")
@@ -1823,6 +1835,7 @@ def exec_cmd_capture(fixture, source):
              f"\"{second}\"; i=$((i+1)); done; printf flood-done")
     script = [
         {"command": "cat .env", "cwd": "."},
+        ("job", {"command": "read", "job": "{job}", "stream": "stdout"}),
         {"command": f"printf '%s' \"{second}\" > out.txt; printf rewritten-ok", "cwd": "."},
         {"command": flood, "cwd": "."},
         None,
@@ -1869,17 +1882,27 @@ def exec_cmd_capture(fixture, source):
                                     "model_info": {"fixture.context_length": 16384}}
                     elif request.startswith(b"POST /api/chat "):
                         chat = json.loads(body[:length])
+                        handle = ""
                         for message in chat["messages"]:
                             if message.get("role") == "tool":
-                                tool_messages.append(message.get("content", ""))
+                                content = message.get("content", "")
+                                tool_messages.append(content)
+                                for line in content.splitlines():
+                                    if line.startswith("job: "):
+                                        handle = line[5:]
                         step = script.pop(0) if script else None
+                        name = "exec_cmd"
+                        if isinstance(step, tuple):
+                            name, step = step
+                            step = {k: (v.replace("{job}", handle) if isinstance(v, str) else v)
+                                    for k, v in step.items()}
                         peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
                         if step is None or isinstance(step, str):
                             reply = {"message": {"role": "assistant", "content": step or "COMPLETE"},
                                      "done": True, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3}
                         else:
                             reply = {"message": {"role": "assistant", "content": "",
-                                                 "tool_calls": [{"function": {"name": "exec_cmd", "arguments": step}}]},
+                                                 "tool_calls": [{"function": {"name": name, "arguments": step}}]},
                                      "done": True, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}
                         peer.sendall(json.dumps(reply).encode() + b"\n")
                         continue
@@ -1910,8 +1933,9 @@ def exec_cmd_capture(fixture, source):
         trial.send(b"Run the capture fixture.\r")
         # J1T-25 (fixture part): the activity shows the rewritten command.
         trial.until(b"${ASURA_SECRET_1}", plain=True, limit=30, reject="Incomplete response")
-        # J1T-26: typing stays within 100 ms during the secret flood.
-        trial.until(b"line ", plain=True, limit=30)
+        # J1T-26: typing stays within 100 ms during the secret flood (the
+        # activity names the flood command; its output is not shown, PC12).
+        trial.until(b"$i -lt 3000", plain=True, limit=30)
         flood_typing = max(typed_within_100ms(trial, ch) for ch in [b"a", b"b", b"c"])
         trial.until(b"COMPLETE", plain=True, limit=60, reject="Incomplete response")
         trial.idle(0.2)
@@ -1919,12 +1943,18 @@ def exec_cmd_capture(fixture, source):
         assert first not in screen and second not in screen, "raw secret on screen"
         assert (project / "out.txt").read_text() == second, "the rewritten command used the value"
         (project / "out.txt").unlink()
-        # J1T-24: the model saw placeholders, never values.
-        assert any("GITHUB_TOKEN=$ASURA_SECRET_1" in m for m in tool_messages), tool_messages
+        # J1T-24: the model saw placeholders, never values: handle
+        # deliveries hold no output, and its `job read` page holds the
+        # placeholder.
+        assert any(m.startswith("job: ") and "state: " in m for m in tool_messages), tool_messages
+        assert any("GITHUB_TOKEN=$ASURA_SECRET_1" in m and "[stdout text follows." in m
+                   for m in tool_messages), tool_messages
         assert all(first not in m and second not in m for m in tool_messages)
         trial.send(b"\x1b[17~\r")  # F6 response history; Enter expands the activity.
         trial.until("▾ Activity".encode(), plain=True)
-        trial.until(b"$ASURA_SECRET_1", plain=True)
+        # The activity shows the rewrite; a job result has no output
+        # preview (PC12).
+        trial.until(b"${ASURA_SECRET_1}", plain=True)
         trial.send(b"\x1b")
         trial.idle(0.1)
         trial.send(b"\x7f" * 3)  # Clear the typed draft.
@@ -1933,7 +1963,9 @@ def exec_cmd_capture(fixture, source):
         # shows the filtered command; no record holds the token (final sweep).
         third = "ghp_" + "Kd5" * 12
         digest = hashlib.sha256(third.encode()).hexdigest()
-        script[:0] = [{"command": f"printf %s '{third}' | shasum -a 256", "cwd": "."}, "DIGEST-DONE"]
+        script[:0] = [{"command": f"printf %s '{third}' | shasum -a 256", "cwd": "."},
+                      ("job", {"command": "read", "job": "{job}", "stream": "stdout"}),
+                      "DIGEST-DONE"]
         offset = len(trial.output)
         trial.send(b"Digest the fixture token.\r")
         trial.until(b"DIGEST-DONE", offset, plain=True, limit=60, reject="Incomplete response")
@@ -1975,7 +2007,7 @@ def exec_cmd_capture(fixture, source):
         trial.send(b"\x1b[A" * 4)  # Select the oldest response.
         trial.idle(0.2)
         trial.send(b"\r")
-        trial.until(b"$ASURA_SECRET_1", plain=True, limit=10)
+        trial.until(b"${ASURA_SECRET_1}", plain=True, limit=10)
         screen = trial.screen.text()
         assert first not in screen and second not in screen, "raw secret after restart"
         trial.send(b"\x1b")
@@ -1983,9 +2015,10 @@ def exec_cmd_capture(fixture, source):
         trial.send(b"\x01/quit\r")
         trial.finish()
         fixture.wait_absent(stable=0.2)
-        # J1T-08: a quota too small for one reservation is a visible busy.
-        # Free space at the 16 MiB reserve: the quota is only what is retained,
-        # under 1 MiB here even with every earlier call expired.
+        # J1T-08 (J3T-07 form): a quota too small for one reservation is a
+        # visible wait. Free space at the 16 MiB reserve: the quota is only
+        # what is retained, under 1 MiB here even with every earlier call
+        # expired; the start waits queued with its reason and never runs.
         (home / "payload-free-bytes").write_text(str(16 * 1024 * 1024))
         trial = fixture.launch()
         trial.resize(140, 45)
@@ -1997,14 +2030,21 @@ def exec_cmd_capture(fixture, source):
         offset = len(trial.output)
         trial.send(b"Busy please.\r")
         end = time.monotonic() + 30
-        while not any("exec_cmd_busy: quota" in m for m in tool_messages):
+        while not any("state: queued (waiting: " in m for m in tool_messages):
             assert time.monotonic() < end, ((project / "busy.txt").exists(), [m[:300] for m in tool_messages[-2:]], sorted(p.name for p in (home / ".asura").iterdir()))
             trial.read(0.05)
         trial.until(b"COMPLETE", offset, plain=True, limit=30, reject="Incomplete response")
         assert not (project / "busy.txt").exists()
-        assert any("exec_cmd_busy: quota" in m for m in tool_messages), tool_messages[-3:]
+        assert any("state: queued (waiting: " in m for m in tool_messages), tool_messages[-3:]
         (home / "payload-free-bytes").unlink()
+        # The queued job is still live: the exit confirmation counts it
+        # (J4 TUI exit confirmation); shutdown settles it not_started.
+        offset = len(trial.output)
         trial.send(b"\x01/quit\r")
+        trial.until(b"still running in all projects", offset, plain=True, refresh=True)
+        trial.send(b"\t")
+        trial.until(b"[Discard and exit]", offset, plain=True, refresh=True)
+        trial.send(b"\r")
         trial.finish()
         fixture.wait_absent(stable=0.2)
         (project / ".env").unlink()
@@ -2017,7 +2057,7 @@ def exec_cmd_capture(fixture, source):
         print(f"PASS J1T-24/25/26/21/22/08 SDE-06 TUI: placeholders shown, rewrite shown and run, "
               "single-quoted token run from a secret variable (digest matched, filtered command shown), "
               f"typing {flood_typing*1000:.0f} ms during a flood and {stall_typing*1000:.0f} ms during a "
-              "stalled capture, restart inspection, visible busy, raw-byte sweep clean")
+              "stalled capture, restart inspection, visible queued wait, raw-byte sweep clean")
     finally:
         if trial is not None:
             trial.close()
@@ -2085,9 +2125,14 @@ def tool_call_records(fixture, source):
                     elif request.startswith(b"POST /api/chat "):
                         chat = json.loads(body[:length])
                         chats.append(chat)
+                        handle = ""
                         for message in chat["messages"]:
                             if message.get("role") == "tool":
-                                tool_messages.append(message.get("content", ""))
+                                content = message.get("content", "")
+                                tool_messages.append(content)
+                                for line in content.splitlines():
+                                    if line.startswith("job: "):
+                                        handle = line[5:]
                         step = script.pop(0) if script else None
                         peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
                         if step is None:
@@ -2095,6 +2140,9 @@ def tool_call_records(fixture, source):
                                      "done": True, "done_reason": "stop", "prompt_eval_count": 48, "eval_count": 3}
                         else:
                             name, arguments = step
+                            # "{job}" names the job of the last handle delivery.
+                            arguments = {k: (v.replace("{job}", handle) if isinstance(v, str) else v)
+                                         for k, v in arguments.items()}
                             reply = {"message": {"role": "assistant", "content": "",
                                                  "tool_calls": [{"function": {"name": name, "arguments": arguments}}]},
                                      "done": True, "done_reason": "stop", "prompt_eval_count": 32, "eval_count": 2}
@@ -2169,16 +2217,18 @@ def tool_call_records(fixture, source):
         trial.send(b"\x1b")
         trial.idle(0.1)
         print("PASS TCR-E01 TUI: rejected call shown as project + invalid_arguments: missing_field, then the valid result")
-        # TCR-E02: a secret in the command; only placeholders are shown.
-        script[:] = [("exec_cmd", {"command": f"printf '%s' \"{secret}\" > out.txt; cat .env"}), None]
+        # TCR-E02: a secret in the command; only placeholders are shown. The
+        # call runs as a job (J3): the model reads its output with job read.
+        script[:] = [("exec_cmd", {"command": f"printf '%s' \"{secret}\" > out.txt; cat .env"}),
+                     ("job", {"command": "read", "job": "{job}", "stream": "stdout"}), None]
         trial.send(b"Run E02.\r")
-        wait_chats(trial, 5)
+        wait_chats(trial, 6)
         expand_latest(trial, "Run E02.")
         trial.until(b"ASURA_SECRET_1", plain=True, limit=10)
         trial.idle(0.2)
         screen = trial.screen.text()
         assert secret not in screen, "raw secret on screen"
-        assert "GITHUB_TOKEN=$ASURA_SECRET_1" in screen, screen
+        assert any("GITHUB_TOKEN=$ASURA_SECRET_1" in m for m in tool_messages), tool_messages
         assert (project / "out.txt").read_text() == secret, "the rewritten command used the value"
         (project / "out.txt").unlink()
         assert all(secret not in m for m in tool_messages)
@@ -3397,6 +3447,9 @@ def jobs_journey(fixture, source):
         trial.idle(0.1)
         # J34E-05: /job cancel stops a running job; the viewer shows the result.
         harness.command(trial, f"/job cancel {first}", "Stopping job " + first[:8])
+        # The viewer shows the entry its page read returns: open it once the
+        # job has settled (TERM, then kind 28).
+        trial.idle(2.0)
         harness.command(trial, f"/job {first}", "Job " + first[:8])
         trial.until(b"client_cancel", plain=True, limit=20)
         trial.send(b"\x1b")
@@ -3426,12 +3479,17 @@ def jobs_journey(fixture, source):
         harness.script[:] = [("exec_cmd", {"command": "sleep 58", "yield_seconds": 1}), JobsHarness.HOLD]
         offset = len(trial.output)
         trial.send(b"Keep me after the handle.\r")
+        # The handle arrives with the held request, so the turn is live.
         kept = harness.wait_handles(trial, before + 1)[-1]
-        harness.wait_chats(trial, len(harness.chats) + 1)
         trial.send(b"/cancel\r")
         trial.until("kept running after this turn".encode(), offset, plain=True, limit=20)
         harness.release.set()
-        harness.command(trial, f"/job {kept}", "Job " + kept[:8] + " · running")
+        # Two earlier jobs still hold this agent's slots, so the kept job may
+        # still wait queued; either way it was not cancelled (TJ-03).
+        harness.command(trial, f"/job {kept}", "Job " + kept[:8] + " · ")
+        trial.idle(0.3)
+        header = trial.screen.text()
+        assert ("Job " + kept[:8] + " · running") in header or ("Job " + kept[:8] + " · queued") in header, header
         trial.send(b"\x1b")
         trial.idle(0.1)
         # J34E-09: another project's jobs in /jobs all; cancel asks first.
@@ -3442,15 +3500,17 @@ def jobs_journey(fixture, source):
         harness.select(trial, other)
         harness.command(trial, "/jobs", "No jobs")
         trial.send(b"\x1b")
+        trial.idle(0.2)
         harness.command(trial, "/jobs all", "Jobs · all projects")
-        trial.until(b"[alpha]", plain=True, limit=10)
+        # Project names are capitalized from the directory (project naming).
+        trial.until(b"[Alpha]", plain=True, limit=10)
         # The newest row is the kept job of project alpha.
         trial.send(b"c")
-        trial.until(f"Cancel job {kept[:8]} in project alpha? (y/n)".encode(), plain=True, limit=10)
+        trial.until(f"Cancel job {kept[:8]} in project Alpha? (y/n)".encode(), plain=True, limit=10)
         trial.send(b"n")
         trial.until(b"Nothing sent", plain=True, limit=10)
         trial.send(b"c")
-        trial.until(b"in project alpha? (y/n)", plain=True, limit=10)
+        trial.until(b"in project Alpha? (y/n)", plain=True, limit=10)
         trial.send(b"y")
         trial.until(("Stopping job " + kept[:8]).encode(), plain=True, limit=20)
         trial.send(b"\x1b")
@@ -3461,9 +3521,12 @@ def jobs_journey(fixture, source):
         trial.send(b"One more before new.\r")
         trial.until(b"STARTED-NEW", plain=True, limit=40)
         survivor = harness.handles()[-1]
+        # /new waits until the finished turn has settled in the client.
+        trial.idle(1.0)
         harness.command(trial, "/new", "New conversation ready")
         harness.command(trial, "/jobs", survivor[:8])
         trial.send(b"\x1b")
+        trial.idle(0.2)
         # An attached TUI exits without a prompt; the backend keeps the jobs.
         trial.send(b"\x01/quit\r")
         trial.finish()
@@ -3473,6 +3536,7 @@ def jobs_journey(fixture, source):
         harness.command(trial, "/jobs", survivor[:8])
         trial.until(b"running", plain=True, limit=10)
         trial.send(b"\x1b")
+        trial.idle(0.2)
         trial.send(b"\x01/quit\r")
         trial.finish()
         fixture.stop()
@@ -3558,6 +3622,7 @@ def job_viewer_journey(fixture, source):
         trial.send(b"\x1b")
         trial.until(b"responses", plain=True, limit=10)
         trial.send(b"\x1b")
+        trial.idle(0.2)
         trial.send(b"\x01/quit\r")
         trial.finish()
         fixture.wait_absent(stable=0.2)
@@ -3597,9 +3662,11 @@ def job_viewer_journey(fixture, source):
         harness.command(trial, "/jobs", crashed[:8])
         trial.until(b"interrupted", plain=True, limit=10)
         trial.send(b"\x1b")
+        trial.idle(0.2)
         harness.command(trial, f"/job {crashed}", "unverified prefix")
         trial.until(b"crash 0", plain=True, limit=10)
         trial.send(b"\x1b")
+        trial.idle(0.2)
         trial.send(b"\x01/quit\r")
         trial.finish()
         print("PASS J34E-04/11 TUI: growing output, Tab positions, follow to settlement, "
@@ -3643,17 +3710,24 @@ def job_retention_journey(fixture, source):
         trial.until(b"pinned", plain=True, limit=10)
         trial.until("✎2".encode(), plain=True, limit=10)
         trial.send(b"\x1b")
+        trial.idle(0.2)
+        offset = len(trial.output)
         harness.command(trial, f"/job {handle[:6]}", f"Job {short}")
-        trial.until(b"kept output", plain=True, limit=10)
+        # The list row's command also says "kept output": wait for the page.
+        trial.until(b"complete", offset, plain=True, limit=10)
+        trial.until(b"kept output", offset, plain=True, limit=10)
+        trial.idle(0.2)
         trial.send(b"i")
         trial.until(b"Notes: 2", plain=True, limit=10)
         trial.until(b"model \xc2\xb7", plain=True, limit=10)
         trial.until(b"model says rerun", plain=True, limit=10)
         trial.until(b"you \xc2\xb7", plain=True, limit=10)
         trial.until(b"person says flaky", plain=True, limit=10)
+        # Two separate Escapes: the detail panel, then the viewer.
         trial.send(b"\x1b")
+        trial.idle(0.2)
         trial.send(b"\x1b")
-        trial.idle(0.1)
+        trial.idle(0.2)
         # Delete asks first; n keeps the output, y deletes it.
         trial.send(f"/job delete {handle}\r".encode())
         trial.until(f"Delete the output of job {short}? Its summary and notes stay. (y/n)".encode(),
@@ -3668,7 +3742,10 @@ def job_retention_journey(fixture, source):
         harness.command(trial, f"/job {handle}", "Output deleted; i shows the summary and notes")
         trial.send(b"i")
         trial.until(b"person says flaky", plain=True, limit=10)
-        trial.send(b"\x1b\x1b")
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
         trial.send(b"\x01/quit\r")
         trial.finish()
         fixture.wait_absent(stable=0.2)
@@ -3703,8 +3780,9 @@ def execution_setting_journey(fixture, source):
         second.resize(160, 48)
         harness.select(second, project)
         second.until(b"jobs 1", plain=True, limit=10)
+        # The header cuts the long notice at the terminal width.
         harness.command(first, "/execution project off",
-                        "running model jobs in this project are being stopped · /jobs")
+                        "execution off for Exec: running model jobs in this project")
         first.until(b"exec off", plain=True, limit=20)
         # ES-12: the second TUI's parked status list returns with the change.
         second.until(b"exec off", plain=True, limit=20)
