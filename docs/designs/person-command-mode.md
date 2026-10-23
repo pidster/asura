@@ -2013,16 +2013,16 @@ cases cover the person path.
 | PC-E8 | Relaunch after commands | History shows settled command entries with their folds |
 | PC-E9 | TUI-launched backend; quit with a running and a queued command | Exit confirmation counts both and says they will stop; after relaunch the running one is cancelled with `shutdown` |
 | PC-E10 | `/jobs` after a command | The person job is listed with `!` and opens in the viewer |
-| PC-E12 | Paste a three-line command containing U+202E | Three carets and two rules; a red block where U+202E is; hint counts commands and hidden characters; the command runs with the original bytes |
+| PC-E12 | Paste a three-line command containing U+202E | The `!` marker on the first row, two carets and two rules (P4 command view); a red block where U+202E is; hint counts commands and hidden characters; the command runs with the original bytes |
 | PC-E11 | `!yes \| head -c 50000000` | The fold keeps showing the newest lines while running; TUI input stays responsive |
-| PC-E13 | Type `!`, `!`, then `touch "$OUTSIDE_FIXTURE/made"`, Enter, with the fixture directory outside every person-profile root | Box turns `#D27068` with marker `!!`; the log shows `!! touch …`, then the warning line before output; the file exists; exit 0 |
+| PC-E13 | Type `!`, `!`, then `touch <outside fixture path>/made` (the literal path: a `!` command gets only the PC3 variables, so a variable would be empty in PC-E14), Enter, with the fixture directory outside every person-profile root | Box turns `#D27068` with marker `!!`; the log shows `!! touch …`, then the warning line before output; the file exists; exit 0 |
 | PC-E14 | Same command after one Backspace at position 0 | Amber command mode; the `!` run reports `Operation not permitted`; the file does not exist |
 | PC-E15 | `personCommands.allowOutsideSandbox` false; type `!!ls`, Enter | The refusal message names the key and suggests `!`; draft and outside mode kept |
 | PC-E16 | `!!sleep 600`; Ctrl-C; then `!!sleep 600`; Ctrl-C twice | Stopped by you; killed by you; TUI still running |
 | PC-E17 | `!!` command, then a message to a deterministic model fixture | Fixture receives the notice entry with `, outside the sandbox,` before the prompt |
-| PC-E18 | `!!` runs the PC-I33 writer fixture printing `bg 1` to `bg 5`, then a message to a deterministic model fixture (EC-E4) | The log shows `↳ shell exited 0 · 1 background process writing`; the message's turn runs at once; the fold later shows `bg 5`; the entry then reads `↳ exit 0 · 1 background process left running`; the next turn's notice has the entry |
+| PC-E18 | `!!` runs an in-group background writer printing `bg 1` to `bg 5` (PQ3; a new-session Perl survivor is a platform binary and is not attributed, so its count would be 0), then a message to a deterministic model fixture (EC-E4) | The log shows `↳ shell exited 0 · 1 background process writing`; the message's turn runs at once; the fold later shows `bg 5`; the entry then reads `↳ exit 0 · 1 background process left running`; the next turn's notice has the entry |
 | PC-E19 | Same with an endless survivor; Ctrl-C after the turn ends | The released job settles with `output capture stopped by you`; the TUI stays responsive |
-| PC-E20 | `!` command that starts the new-session escapee fixture (EC-E2) | `/jobs` shows the job settled with cleanup confirmed and an escapee count; the escapee is gone |
+| PC-E20 | `!` command that starts the new-session escapee fixture (EC-E2) | `/jobs` shows the job settled `exit 0`, not `cleanup unconfirmed` (`JobEntry` carries no cleanup state or escapee count); the escapee wrote its beat and PID files, its PID is gone, and no process remains |
 | PC-E21 | Model edits `build.rs`, then `!cargo build` (P5, PX-V9) | The log entry shows the path warning before output; the command runs |
 
 Required environments: macOS 27 host with `sandbox-exec`, real Git, curl and
