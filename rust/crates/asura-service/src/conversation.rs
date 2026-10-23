@@ -4456,10 +4456,6 @@ impl Owner {
                 let rendered =
                     tools::not_run_result(tool.decision, tool.fault, tool.reason, tool.refusal);
                 let job = self.progress_job(operation, index as u32 + 1, tool);
-                let exit_code = job
-                    .and_then(|job| self.jobs.controller_ref()?.settled_facts(job))
-                    .filter(|s| s.exit_kind == 1)
-                    .and_then(|s| i32::try_from(s.exit_value).ok());
                 pb::ToolProgress {
                     ordinal: Some(index as u32 + 1),
                     // J4T-09: the job an exec_cmd or job call names.
@@ -4504,9 +4500,11 @@ impl Owner {
                         .map(|(_, text)| prefix(&text, 128))
                         .or_else(|| tool.preview.clone()),
                     truncated: tool.truncated,
-                    // Kind 28 holds the exit facts, while the controller
-                    // remembers the job.
-                    exit_code,
+                    // The exit facts are the job's kind 28, which a view of
+                    // tool records does not read; a value from memory would
+                    // differ after a restart, so none is shown (the job
+                    // viewer and `job status` show them).
+                    exit_code: None,
                 }
             })
             .collect()

@@ -1,6 +1,10 @@
 //! Native exec_cmd qualification uses only an owned scratch project and runtime.
 //! Cases EQ-1 to EQ-4 and their failure classes are defined in
 //! `docs/designs/exec-cmd-tool.md` (per-model exec_cmd qualification, EX10).
+//! J3 reruns them on the job path (J34E-17): the call's result is its kind
+//! 29 (a handle, a state and counts, no output text, PC12); the model reads
+//! the output with `job read`; the output evidence is the job's kind 28 and
+//! its pages, read through the control API.
 use super::*;
 use asura_storage::authority::conversation as journal;
 use std::io::Read;
@@ -52,11 +56,12 @@ fn excerpt(text: &str) -> String {
     format!("{:?}", text.chars().take(160).collect::<String>())
 }
 
-/// Every tool call of `operation`, each with its decoded kind 14 record and result.
+/// Every tool call of `operation`, each with its decoded kind 14 record and
+/// its kind 29 (job-mode calls; kind 15 calls have none here).
 fn recorded(
     fixture: &Fixture,
     operation: [u8; 16],
-) -> Result<Vec<(journal::ToolCall, Option<journal::ToolResult>)>> {
+) -> Result<Vec<(journal::ToolCall, Option<journal::JobResult>)>> {
     let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
     let replay = journal::replay(&bytes, &std::sync::atomic::AtomicBool::new(false))
         .map_err(|error| format!("exec_cmd replay: {error:?}"))?;
@@ -79,12 +84,11 @@ fn recorded(
             return Err("tool intent variant".into());
         };
         let result = match tool.result_frame {
-            Some(frame) => {
-                let journal::Record::ToolResult(result) = decode(frame)? else {
-                    return Err("tool result variant".into());
-                };
-                Some(result)
-            }
+            Some(frame) => match decode(frame)? {
+                journal::Record::JobResult(result) => Some(*result),
+                journal::Record::ToolResult(_) => None,
+                _ => return Err("tool result variant".into()),
+            },
             None => None,
         };
         calls.push((*intent, result));
@@ -93,26 +97,31 @@ fn recorded(
 }
 
 /// The single exact exec_cmd call of a case, or the model/service failure.
+/// `job` calls (codes 11-16) are allowed beside it: the model reads the
+/// output with `job read`.
 fn exact_call(
-    calls: Vec<(journal::ToolCall, Option<journal::ToolResult>)>,
+    calls: Vec<(journal::ToolCall, Option<journal::JobResult>)>,
     command: &str,
-) -> std::result::Result<journal::ToolResult, Failure> {
+) -> std::result::Result<journal::JobResult, Failure> {
     ensure(!calls.is_empty(), Class::Model, "no tool call")?;
     for (intent, _) in &calls {
         ensure(
-            intent.tool_operation == Some(journal::ToolOperation::ExecCmd),
+            intent.tool_operation.is_some_and(|code| code.job_result()),
             Class::Model,
             format!("called another tool: {}", excerpt(&intent.name)),
         )?;
     }
-    ensure(
-        calls.len() == 1,
-        Class::Model,
-        format!("{} exec_cmd calls, one required", calls.len()),
-    )?;
-    let (intent, result) = calls
+    let mut exec: Vec<_> = calls
         .into_iter()
-        .next()
+        .filter(|(intent, _)| intent.tool_operation == Some(journal::ToolOperation::ExecCmd))
+        .collect();
+    ensure(
+        exec.len() == 1,
+        Class::Model,
+        format!("{} exec_cmd calls, one required", exec.len()),
+    )?;
+    let (intent, result) = exec
+        .pop()
         .ok_or_else(|| fail(Class::Harness, "call list changed during classification"))?;
     let arguments: serde_json::Value = serde_json::from_str(&intent.arguments)
         .map_err(|_| fail(Class::Model, "arguments are not JSON"))?;
@@ -132,13 +141,69 @@ fn exact_call(
         Class::Service,
         format!("exact call decision {:?}", intent.decision),
     )?;
-    let result = result.ok_or_else(|| fail(Class::Service, "durable result absent"))?;
-    ensure(
-        result.text.len() <= 16384 && result.next_offset.is_none(),
-        Class::Service,
-        "result exceeds 16 KiB or has a continuation",
-    )?;
-    Ok(result)
+    result.ok_or_else(|| fail(Class::Service, "durable result absent"))
+}
+
+/// The job of an exec_cmd call (its derived ID) and its kind 28.
+fn settled_job(
+    fixture: &Fixture,
+    result: &journal::JobResult,
+) -> std::result::Result<journal::JobSettled, Failure> {
+    let job = journal::exec_cmd_job_id(result.operation, result.generation, result.ordinal);
+    let bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)
+        .map_err(|error| fail(Class::Harness, error.to_string()))?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(
+            bytes[offset + 12..offset + 16]
+                .try_into()
+                .map_err(|_| fail(Class::Harness, "frame length"))?,
+        ) as usize;
+        let frame = &bytes[offset..offset + length];
+        if let Ok(journal::Record::JobSettled(settled)) = journal::decode_record(
+            u16::from_be_bytes([frame[10], frame[11]]),
+            &frame[144..frame.len() - 40],
+        ) && settled.job == job
+        {
+            return Ok(*settled);
+        }
+        offset += length;
+    }
+    Err(fail(Class::Service, "the job has no kind 28"))
+}
+
+/// The stdout and stderr text of a settled job's pages, read through the
+/// control API (the service must run).
+fn job_output(
+    fixture: &Fixture,
+    result: &journal::JobResult,
+) -> std::result::Result<(String, String), Failure> {
+    let job = journal::exec_cmd_job_id(result.operation, result.generation, result.ordinal);
+    let read = |stream: pb::JobStream| -> std::result::Result<String, Failure> {
+        let page = fixture
+            .attach()
+            .and_then(|mut client| {
+                Ok(client.read_job(
+                    pb::JobRead {
+                        job_id: Some(job.to_vec()),
+                        project_id: None,
+                        stream: Some(stream as i32),
+                        offset: Some(0),
+                        limit: Some(8192),
+                        at_end: None,
+                    },
+                    &|| false,
+                )?)
+            })
+            .map_err(|error| fail(Class::Service, format!("job read: {error}")))?;
+        ensure(page.error.is_none(), Class::Service, "job read refused")?;
+        Ok(page
+            .pages
+            .first()
+            .and_then(|p| p.text.clone())
+            .unwrap_or_default())
+    };
+    Ok((read(pb::JobStream::Stdout)?, read(pb::JobStream::Stderr)?))
 }
 
 /// A model-class call failure in a turn that failed (neither completed nor
@@ -262,7 +327,7 @@ struct Retry {
     project: [u8; 16],
     operation: [u8; 16],
     event: pb::ConversationEvent,
-    result: journal::ToolResult,
+    result: journal::JobResult,
 }
 
 /// EQ-1: one exact call, its scratch proof, exact output and one effect.
@@ -277,7 +342,7 @@ fn proof_call(
         None,
         0,
         &format!(
-            "Call exec_cmd exactly once with command `{COMMAND}` and cwd `.`. Then reply only with the proof token returned on stdout. Do not use other tools or repeat the command."
+            "Call exec_cmd exactly once with command `{COMMAND}` and cwd `.`. Its result gives a job handle and no output; read the stdout with the job tool (command read, that job handle, stream stdout). Then reply only with the proof token printed on stdout. Do not repeat the command."
         ),
     );
     let observed = (|| -> Result<_> {
@@ -307,9 +372,12 @@ fn proof_call(
     // A retry inside the same service lifetime returns the same input.
     let live_retry = managed_submit_call(fixture, request.clone())
         .map(|retry| retry.accepted_input_id == receipt.accepted_input_id);
-    let stopped = fixture.stop();
     let calls = recorded(fixture, operation)?;
-    let result = exact_call(calls, COMMAND).map_err(|f| unexplained(fixture, &event, f))?;
+    let result = exact_call(calls, COMMAND).map_err(|f| unexplained(fixture, &event, f));
+    // The output evidence is read while the service runs.
+    let output = result.as_ref().ok().map(|r| job_output(fixture, r));
+    let stopped = fixture.stop();
+    let result = result?;
     terminal(fixture, &event, 3)?;
     stopped.map_err(|error| fail(Class::Service, format!("stop: {error}")))?;
     ensure(
@@ -335,17 +403,19 @@ fn proof_call(
         Class::Service,
         format!("result status {}", result.status),
     )?;
+    let (stdout, stderr) = output.ok_or_else(|| fail(Class::Harness, "no output read"))??;
     ensure(
-        result.text.contains(proof) && result.text.contains("stderr-proof"),
+        stdout.contains(proof) && stderr.contains("stderr-proof"),
         Class::Service,
         "durable stdout/stderr evidence missing",
     )?;
-    ensure(!result.truncated, Class::Service, "result truncated")?;
+    let settled = settled_job(fixture, &result)?;
     ensure(
-        result.text.starts_with("failure=None exit_code=0 signal=none reason=none truncated=false cleanup_confirmed=true capture=complete\nstdout:\n")
-            && result.text.contains("\nstderr:\nstderr-proof"),
+        (settled.exit_kind, settled.exit_value) == (1, 0)
+            && settled.cleanup == journal::JobCleanup::Confirmed
+            && settled.capture_state == journal::JobCaptureState::Complete,
         Class::Service,
-        "result envelope differs",
+        "kind 28 differs: exit 0, cleanup confirmed, capture complete",
     )?;
     ensure(
         live_retry.unwrap_or(false),
@@ -417,7 +487,7 @@ fn retry_restart(fixture: &mut Fixture, directory: &Path, retry: Retry) -> Case 
         reason: format!("replayed call: {}", failure.reason),
     })?;
     ensure(
-        replayed.text == retry.result.text,
+        replayed == retry.result,
         Class::Service,
         "replayed durable result differs",
     )
@@ -489,9 +559,24 @@ fn interrupted(
             }
         },
     };
-    let stopped = fixture.stop();
     let calls = recorded(fixture, operation)?;
-    let result = exact_call(calls, &command).map_err(|f| unexplained(fixture, &event, f))?;
+    let result = exact_call(calls, &command).map_err(|f| unexplained(fixture, &event, f));
+    // The job settles at the turn's cancel (turn_ended) or at completion;
+    // its output is read while the service runs.
+    let (settled, output) = match &result {
+        Ok(result) => {
+            let mut settled = settled_job(fixture, result);
+            let end = Instant::now() + Duration::from_secs(30);
+            while settled.is_err() && Instant::now() < end {
+                thread::sleep(Duration::from_millis(50));
+                settled = settled_job(fixture, result);
+            }
+            (Some(settled), Some(job_output(fixture, result)))
+        }
+        Err(_) => (None, None),
+    };
+    let stopped = fixture.stop();
+    let result = result?;
     terminal(fixture, &event, if cancel { 5 } else { 3 })?;
     stopped.map_err(|error| fail(Class::Service, format!("stop: {error}")))?;
     ensure(
@@ -499,17 +584,21 @@ fn interrupted(
         Class::Service,
         format!("result status {}", result.status),
     )?;
+    let settled = settled.ok_or_else(|| fail(Class::Harness, "no kind 28 read"))??;
     ensure(
-        result.text.contains(if cancel {
-            "reason=cancelled"
-        } else {
-            "reason=none"
-        }) && result.text.contains("cleanup_confirmed=true"),
+        settled.reason
+            == if cancel {
+                journal::JobReason::TurnEnded
+            } else {
+                journal::JobReason::None
+            }
+            && settled.cleanup == journal::JobCleanup::Confirmed,
         Class::Service,
-        "result reason or cleanup differs",
+        "kind 28 reason or cleanup differs",
     )?;
+    let (stdout, _) = output.ok_or_else(|| fail(Class::Harness, "no output read"))??;
     ensure(
-        result.text.contains("partial-output"),
+        stdout.contains("partial-output"),
         Class::Service,
         "partial command output must survive completion and cancel",
     )?;
