@@ -249,6 +249,7 @@ fn pending_projection() -> Arc<journal::Replay> {
             owner_generation: 1,
             input_digest: [7; 32],
             accepted_frame: journal::Locator::NONE,
+            notice_through: 0,
             helper: Some([8; 16]),
             cancel: None,
             terminal: None,

@@ -1260,6 +1260,7 @@ fn install_recorded_memory_cancel(fixture: &mut Fixture) {
             owner_generation: 1,
             input_digest: active.turn.input_digest,
             accepted_frame: journal::Locator::NONE,
+            notice_through: 0,
             helper: None,
             cancel: active.cancel,
             terminal: None,

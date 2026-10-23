@@ -78,6 +78,8 @@ pub(crate) struct Composed {
     pub manifest_digest: Hash,
     /// `notice_through` for kind 21: the notice cursor `S` (J5-E2).
     pub notice_through: u64,
+    /// `notice_live` for kind 21: the live count at `S` (J5-E8).
+    pub notice_live: u32,
     /// Notice entries at reference fidelity, oldest first (J5T-05).
     pub notice_reduced: u32,
 }
@@ -91,6 +93,8 @@ impl Composed {
             output_reservation: budget.output_reservation,
             overhead_tokens: budget.overhead_tokens,
             bytes_per_token_milli: budget.bytes_per_token_milli,
+            notice_through: self.notice_through,
+            notice_live: self.notice_live,
         }
     }
 }
@@ -305,6 +309,7 @@ pub(crate) fn compose_turn(
                 omitted: omitted.len() as u32 + unlisted,
                 manifest_digest,
                 notice_through: notice.through,
+                notice_live: notice.live,
                 notice_reduced: reduced as u32,
             });
         }

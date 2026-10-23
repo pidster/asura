@@ -5213,6 +5213,7 @@ mod observation_tests {
                 owner_generation: 1,
                 input_digest: [9; 32],
                 accepted_frame: journal::Locator::NONE,
+                notice_through: 0,
                 helper: None,
                 cancel: None,
                 terminal: Some(journal::Terminal {
