@@ -56,6 +56,12 @@ harness = false
 required-features = ["test-support"]
 
 [[test]]
+name = "job_control_flow"
+path = "tests/job_control_flow.rs"
+harness = false
+required-features = ["test-support"]
+
+[[test]]
 name = "job_controller_flow"
 path = "tests/job_controller_flow.rs"
 harness = false
