@@ -34,6 +34,20 @@ owner's half of the store (put at submit, get at dispatch, delete on
 settlement, the replay live set, audit emission and the observer field) is
 packet P3-E and is not implemented.
 
+Revision of 2026-10-23, for release signing: the owner answered the signing
+questions SGQ1–SGQ9 ([release signing](release-signing.md#owner-decisions)).
+The storage that follows the login keychain (KQ1, EXD-3) is now resolved as
+[team Keychain store](release-signing.md#team-keychain-store): the team
+data-protection Keychain with the access group `<TeamID>.com.pidster.asura`.
+KQ2 is revised by SGQ4: any build that the team signs with the access group
+may read and delete items, so stranded items go away. The switch is clean,
+with no migration code (SGQ5), and only the signed qualification run writes
+items, under a separate test access group (SGQ6). The Secure Enclave item
+stays open for later study (SGQ8). Packet SG3 implements the team Keychain store. **Until
+SG3 lands, the file-based login keychain store described below remains the
+implemented state.** Text that SG3 replaces is marked "SG3 replaces" with a
+link to the governing section.
+
 ## Scope
 
 The secret store holds values that must not enter any Asura record but must
@@ -84,7 +98,7 @@ its job's later output deletion.
 | SSR3 | The item is deleted when its command's job settles (kind 28 committed), when its input is dropped (kind 13 Drop committed), when its kind 31 append is rejected, or when dispatch finds it mismatched. A startup sweep deletes items the journal does not reference as live. |
 | SSR4 | When the Keychain is locked, unavailable or denies access, the person sees why. Asura never falls back to writing values to disk, and never shows a Keychain prompt. |
 | SSR5 | No Keychain call runs on the reactor, a control handler or a render path. No Keychain wait has a time bound; each ends by a reply, a cancel of the waiting request, or shutdown. |
-| SSR6 | Tests never read, write or delete items in the login keychain; they use a scratch keychain file. No test or probe calls `SecItemAdd` unless the status pre-check of its scratch keychain returned 0 in the same worker step ([testing rules](#testing-rules)). |
+| SSR6 | Tests never read, write or delete items in the login keychain; they use a scratch keychain file. No test or probe calls `SecItemAdd` unless the status pre-check of its scratch keychain returned 0 in the same worker step ([testing rules](#testing-rules)). SG3 adds (SGQ6): only the signed qualification run writes data-protection items, under the test access group, and it leaves that group empty ([test isolation](release-signing.md#test-isolation-without-the-login-keychain)). |
 
 ## Terms
 
@@ -204,6 +218,13 @@ The service and account attributes bind an item to one installation and one
 input. The payload binds it again by digest, so an item copied under another
 name is rejected.
 
+SG3 replaces the Keychain, Synchronizable, Access control and Accessibility
+class rows with the
+[the team Keychain store item contract](release-signing.md#item-contract-changes):
+the data-protection keychain, the Asura access group,
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and read and delete by any
+team-signed build with the group (SGQ4). The other rows are unchanged.
+
 ### Payload
 
 Selected format. All integers are big-endian. The codec rejects unknown
@@ -274,6 +295,12 @@ Selected (engineering, 2026-10-22, SS1-K gap 5).
 ### Stranded and unrecognized items
 
 Selected (engineering, 2026-10-22, SS1-K gaps 1 and 4).
+
+SG3 replaces the stranded-item part of this section (SGQ4). Under the team Keychain store
+every team-signed build can delete every Asura item, so stranded items go
+away; the stranded fields and the `/status` stranded notice are removed
+([what SG3 removes](release-signing.md#what-sg3-removes)). The
+unrecognized-item rule stays.
 
 A **stranded item** is an orphan whose delete returned `denied`
 (-25244, or -25293 or -25308 with the keychain unlocked). Probe SS-P3 showed
@@ -403,6 +430,11 @@ at worker start with `SecKeychainCopyDefault` and pre-checked the same way.
 The worker never passes a keychain reference to an item call without a
 pre-check that returned 0 in that step.
 
+SG3 replaces the production part of this rule: the data-protection keychain
+has one target per user, so production makes no pre-check. The pre-check
+stays for the test-only scratch backend
+([what SG3 removes](release-signing.md#what-sg3-removes)).
+
 Residual (test-only): a scratch keychain deleted between the pre-check and the
 add is a check-then-add race. Production does not delete its target, so the
 race needs a test that deletes its own keychain while the worker runs. The
@@ -469,6 +501,11 @@ answers `busy` before the request reaches the worker.
 Selected (engineering, 2026-10-22), replacing the table that probe SS-P2
 disproved. The worker reads the `OSStatus` of each item call after a
 successful pre-check.
+
+SG3 replaces this table with the
+[the team Keychain store status mapping](release-signing.md#status-mapping), which adds
+`errSecMissingEntitlement` (-34018) as `unavailable/not_signed`. Probe KC-P4
+must confirm it first.
 
 | Security status | Reply |
 | --- | --- |
@@ -573,6 +610,14 @@ the queue entry's waiting reason.
 | Service binary rebuilt or replaced | The default ACL no longer trusts it for reads: `denied` ([KQ2](#owner-decisions)). Deletes still succeed while the executable file name stays `asura` (probe SS-P3), so Drop and the sweep remove the old items. A renamed binary leaves stranded items |
 | Target keychain missing or deleted | Pre-check non-zero: `unavailable`; no item call; never a write to another keychain |
 
+SG3 replaces these rows: "Keychain locked at submit" (new text for the
+data-protection keychain before first unlock), "Access denied at submit" and
+"Denied at dispatch" (only a missing entitlement, `not_signed`), "Delete
+denied" (no stranded item), "Another same-UID binary deletes the item" (only a
+team-signed build with the group can), "Service binary rebuilt or replaced"
+(no `denied`, SGQ4) and "Target keychain missing or deleted" (production has
+one target). See [release signing failure handling](release-signing.md#failure-handling).
+
 A command with no detected secret, a `!` command with no secret, and a model
 call never touch the Keychain. A `!!` command always has a launch environment,
 so every `!!` command needs the Keychain.
@@ -634,7 +679,9 @@ at rest in the Keychain.
 ## Operations and audit
 
 - No configuration key. The production target is the default (login)
-  keychain.
+  keychain. SG3 replaces it with the data-protection keychain and removes
+  `SecretStoreStatus` fields 4 and 6, which stay reserved
+  ([what SG3 removes](release-signing.md#what-sg3-removes)).
 - Audit events `secret_store.put`, `secret_store.get`, `secret_store.delete`
   and `secret_store.sweep` carry the input ID, the reply code, the status code
   for `unavailable` and counts. They never carry a value, name, digest or
@@ -696,6 +743,11 @@ Required for every test, probe and fixture (SSR6, 2026-10-22):
    It never calls add on a missing keychain, because probe finding (d) shows
    that such an add writes to the default keychain.
 4. The scratch target is selectable only through the test-support seam below.
+
+These rules stay after SG3. SG3 adds an unsigned negative case against the
+data-protection keychain (every call returns -34018, no change is made) and
+the signed qualification run under the test access group (SGQ6); see
+[test isolation](release-signing.md#test-isolation-without-the-login-keychain).
 
 ### Test-support seam
 
@@ -857,9 +909,11 @@ read or written.
 
 ### SS-P: delivery order
 
-Selected plan, revised 2026-10-22 (third revision adds PACE-1). Arrows mean
+Selected plan, revised 2026-10-22 (third revision adds PACE-1) and 2026-10-23
+(adds SG3). Arrows mean
 "is a prerequisite of". SS1 does not depend on the job packets; SL5 needs both. The packet names match the
-[person command packet split](person-command-mode.md#packet-split).
+[person command packet split](person-command-mode.md#packet-split). SG3 and
+its prerequisites are owned by the [release signing packet order](release-signing.md#sg-p-packet-order).
 
 ```mermaid
 flowchart TD
@@ -876,6 +930,10 @@ flowchart TD
     SSS --> SL5
     SL7["SL7: whole-command variable"] --> SL5
     SL5 --> E2E["SS-E1, SS-E2 with person command qualification Q"]
+    SSS --> SG3["SG3 team Keychain store: data-protection Keychain (release signing)"]
+    SGK["SG1 and KC-P1 to KC-P4 (release signing)"] --> SG3
+    SG3 --> E2E2["SS-I and SL5 cases on the signed qualification bundle"]
+    SL5 --> E2E2
 ```
 
 ## Decisions and alternatives
@@ -886,7 +944,10 @@ values. Engineering choices in this design:
 - **Rust owner, not the Swift helper.** See [ownership](#ownership).
 - **File-based login keychain now.** The data-protection keychain needs a
   code-signed binary with a keychain access group entitlement. Asura's signing
-  is not selected until I9, and development builds are unsigned.
+  is not selected until I9, and development builds are unsigned. SG3 replaces
+  this choice (owner, 2026-10-23): the
+  [release signing design](release-signing.md#team-keychain-store) selects
+  the team Keychain store, the team data-protection Keychain, with a clean switch (SGQ5).
 - **One item per input.** Deletion and the sweep act on one item per command.
   Rejected: one item per value, which multiplies calls and partial states.
 - **Read only at dispatch.** One read path for the first run and after a
@@ -919,7 +980,8 @@ values. Engineering choices in this design:
   `/secrets purge` command. The running binary is the one that was denied,
   and Drop already deletes the items of live inputs. Revisit at I9, when the
   data-protection keychain and an access group bind items to a signed
-  identity (KQ1).
+  identity (KQ1). Revisited 2026-10-23: under the team Keychain store (SGQ4) stranded items
+  go away, and SG3 removes this rule.
 - **Unrecognized items are counted, never deleted** (2026-10-22). Rejected: a
   platform delete by raw account, which would let the service delete items
   it did not write.
@@ -1029,7 +1091,7 @@ timeout; the type needs no peek method.
 | 3 The fixture binary is in `asura-platform` | A thin `secret_store_fixture` binary in `asura-service` over the shared `fixture_main()` ([fixture binary](#fixture-binary)) |
 | 4 Unrecognized accounts have no delete call | Counted and reported, never deleted ([stranded and unrecognized items](#stranded-and-unrecognized-items)) |
 | 5 `list` and `get` memory | List at most 257 results; the codec rejects data over 55,413 bytes ([bounds](#item-count-and-memory-bounds)) |
-| 6 Copies inside the Security framework | Residual [SS-T8](execution-threat-model.md#secret-store-at-rest), owner-accepted (EXD-3, 2026-10-22); Secure Enclave replacement after release signing (I9) |
+| 6 Copies inside the Security framework | Residual [SS-T8](execution-threat-model.md#secret-store-at-rest), owner-accepted (EXD-3, 2026-10-22); Secure Enclave replacement after release signing (I9). Revised 2026-10-23 (SGQ8): the team Keychain store does not remove these copies; the Secure Enclave item stays open for later study ([release signing](release-signing.md#secure-enclave-open-item)) |
 | 7 Probe facts | Recorded in [probe results](#probe-results-2026-10-22) |
 
 ## Readiness audit resolution (2026-10-22)
@@ -1056,6 +1118,19 @@ Answered by the owner on 2026-10-20. No owner question remains open.
 | KQ1 | Use the file-based login keychain now. When release signing is chosen (I9), move to the data-protection keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and an Asura access group. |
 | KQ2 | Only the binary that wrote an item may read it: the default ACL. The owner accepts that a rebuilt development binary may get `secret_store_denied` for items written before the rebuild; such commands are entered again. |
 | KQ3 | Approved: `security-framework` 3.7.0, with `security-framework-sys` and `core-foundation`, as dependencies of `asura-platform`, minimal features. The implementer verifies the version against crates.io and records the lockfile diff for review. |
+
+Answered by the owner on 2026-10-23 in the
+[release signing design](release-signing.md#owner-decisions). They take effect
+when packet SG3 lands; until then KQ1 and KQ2 above describe the implemented
+store.
+
+| ID | Decision (owner, 2026-10-23) |
+| --- | --- |
+| KQ1 follow-up (EXD-3) | Resolved: after release signing the store is the team Keychain store: the team data-protection Keychain with the access group `<TeamID>.com.pidster.asura` and `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (SGQ2, SGQ8). |
+| KQ2 revised (SGQ4) | Any build that the team signs with the access group may read and delete items. Stranded items go away. |
+| SGQ5 | Clean switch. No migration code. Leftover login keychain items are deleted by hand once. |
+| SGQ6 | Only the signed qualification run writes items, under a separate test access group, and it must leave that group empty. |
+| SGQ8 | The Secure Enclave design item stays open for later study. |
 
 ## Design verification
 
@@ -1087,5 +1162,11 @@ the merged code at commit `1a5991a` (`asura-service/src/secret_store.rs`,
 `secret_store/*.rs`, `tests/secret_store.rs`, `Cargo.toml`). SS-F1 and SS-P
 changed and were rendered with Mermaid CLI and inspected. No code or test was run by the
 design writer.
+
+Recorded on 2026-10-23: revised for the owner's signing answers SGQ1–SGQ9 and
+the [release signing design](release-signing.md). Implemented-state text is
+kept; the parts that SG3 replaces are marked. SS-P changed (SG3 nodes) and was
+rendered with Mermaid CLI 12.0.0 and inspected. No Keychain call, code or test
+was run.
 
 Return to the [design index](README.md).

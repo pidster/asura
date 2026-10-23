@@ -4,7 +4,9 @@ Status: proposed D7/I9 distribution design. [ADR-0008](../decisions/0008-homebre
 selects the existing `pidster/homebrew-tap` and prebuilt GitHub release pattern.
 The exact Asura archive layout, signing/notarization procedure, formula update
 automation and service handover remain open. No release is implemented or
-qualified. Upgrade, handover and migration sections are deferred until the first
+qualified. The [release signing design](release-signing.md) (2026-10-23) now
+owns the signing, Hardened Runtime, notarisation and `Asura.app` layout
+contract. Upgrade, handover and migration sections are deferred until the first
 release (owner, 2026-10-17). Before that release, no compatibility with older
 builds or data is required. Live build-mismatch detection stays in force: a
 control protocol mismatch reports `incompatible_protocol`, and the service checks
