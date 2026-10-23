@@ -1011,12 +1011,19 @@ enum QueueRefusal {
   `generation` (the generation it was queued against, 0 before the first
   turn, at most the reply's), and has no `operation_id` or `kind`. A command
   dropped before it ran is not listed, as for a dropped message. The writer's
-  history read merges `T` turn entries with `p` person entries (index tag `p`,
-  [segmented journal](segmented-journal.md)) and the live state's dispatched
-  person inputs, newest accepted sequence first, at most 8, with the
-  `before_accepted_frame` cursor compared by accepted sequence, so a page is
-  bounded work. A history read with no conversation named may select a
-  conversation that so far holds only person commands (P3-E3). A history
+  history read merges the active turn, `T` turn entries and `p` person entries
+  (index tag `p`, [segmented journal](segmented-journal.md), from the delta and
+  the runs; a `p` entry is written at the kind 26, so the delta already holds
+  recent dispatches), newest accepted sequence first, at most 8. The
+  `before_accepted_frame` cursor must name an `A` turn of this conversation or
+  a `p` entry at exactly that sequence, otherwise the read is `invalid`; turns
+  below it are found by a binary search over `T` (at most 64 lookups), so a page
+  is bounded work. With no conversation named, the read returns the project's
+  latest-turn conversation, except that the project's newest conversation (its
+  last `K` entry) is returned when it is at generation 0 and its newest `p`
+  entry is later than the latest turn. An older person-only conversation behind
+  a newer generation-0 conversation is not selected; finding it would need a
+  project-keyed person index (P3-E3). A history
   reply may carry generation 0 only when every entry is a person entry: a
   conversation that so far holds only person commands.
 
