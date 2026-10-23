@@ -6067,8 +6067,10 @@ prior turn (at most 1,024 turns) on the journal worker inside `Prepare`, with
 the prior turns' kind 21 facts from the `T` entries; no history scan. Because
 the lines are reference lines, the read returns only fixed-size reference
 facts per settlement (job ID, origin, outside flag, the kind 28 facts the line
-shows, the kind 28 header digest and settled sequence) and never reads a
-command source frame, so the reply is bounded by 1,024 × 9 × the fact size. If
+shows, the kind 28 header digest and settled sequence). It reads no kind 14;
+for a person job it reads the kind 31 only to take its outside flag (field 7
+bit 1, which no other record or index carries) and drops the record at once.
+The reply is bounded by 1,024 × 9 × the fact size (`MAX_PRIOR_NOTICE_BYTES`). If
 a prior turn's rebuilt inputs disagree with its kind 21 (S or live count), the
 owner fails the turn as `NoticeError::Range` under J5-E10.
 
