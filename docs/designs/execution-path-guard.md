@@ -370,6 +370,7 @@ message PathGuardReply {
   optional uint32 overflow = 2;
   repeated string approved = 3;       // at most 256 approved paths
   optional string error = 4;          // not_found, path_invalid, too_large, not_implicit, limit, busy, unavailable
+  optional uint32 approved_omitted = 5; // approved paths not listed because the list reached 40 KiB
 }
 // ConversationQueueEntry (kind 3): repeated PathWarning path_warnings = 21; optional uint32 path_overflow = 22;
 // QueueWaitReason: QUEUE_WAIT_REASON_PATH_CHECK = 15;
@@ -392,12 +393,43 @@ gets `not_implicit`.
   send the requests; the reply refreshes the list.
 - The restored log reads the warnings from `JobDetail.path_warnings`.
 
+### EPG-W record
+
+Implemented 2026-10-23 (branch `epg-w`). Rules settled from its report:
+
+- **Frame bounds.** `PathGuardReply.approved` lists approved paths in byte
+  order until 40 KiB, and counts the rest in `approved_omitted`. A queue reply
+  holds at most 24 KiB of path warnings; the rest are counted in
+  `path_overflow`, so a list can be shorter than 16 when an overflow is present.
+- **`approve all` references.** Each kind 32 approval of an `approve all`
+  request has reference SHA-256("asura.path-approve-all\0" ‖ request ‖ path)
+  truncated to 16 bytes, so an exact retry finds every record.
+- **Snapshots.** The slot setup thread takes the first snapshot just before a
+  `model-1` spawn and the cleanup thread the second after the settled notice;
+  the controller queues kind 32 `model_changed` after kind 28 commits and does
+  not retire the job until it commits.
+- **Held `!!` after a restart.** The warnings shown are owner memory, so after
+  a restart the first Resume shows the warnings again and holds; the second
+  Resume runs the command. The person has not seen the warnings since the
+  restart, so this is intended.
+- **Acknowledgement at the quota.** When the acknowledgement waits at the
+  journal quota, the owner reads the view again after the hold ends and checks
+  again; the acknowledgement may then list more than was first shown.
+- **Symlinks and special files.** An approval of a symlink covers the link
+  itself (the digest is of the target name); FIFOs and other non-regular files
+  count as unreadable.
+- **Walk residual.** The walk is path-based (std only) and narrows the rename
+  race with a directory identity check before and after each listing; closing
+  it needs an `openat` walk in `asura-platform` (recorded residual).
+- **Dropping a checking entry.** The writer drops only held inputs; the TUI
+  sends Hold, then Drop, for an entry waiting with `path_check`.
+
 ## Failure handling
 
 | Case | Result |
 | --- | --- |
 | Walk or snapshot exceeds a bound | `overflow` warning; known paths still compared |
-| Snapshot fails on a model job (I/O error) | No `model_changed` record; the next person command gets an `overflow` warning naming the job's project |
+| Snapshot fails on a model job (I/O error), or a spawned job has no cleanup snapshot | A `model_changed` record with no entries and overflow 1, so the `overflow` warning survives a restart (EPG-W) |
 | File unreadable at approval or check | `changed_since_approval` (cannot verify); approval refused with `unavailable` |
 | Path guard worker queue full | The entry waits with `path_check` until the worker accepts; never refused |
 | Filesystem stalls during the check | The entry waits; the person can Hold or Drop it; other lanes continue |
