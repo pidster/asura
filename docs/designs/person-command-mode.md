@@ -2283,6 +2283,13 @@ Gaps that remain: PC-U48 and EC-I13 have no tests labelled with their IDs, and
 PX-V4's planted `ls` has no automated case. The design does not mark these
 cases end to end, so their by-hand coverage above does not close the gap.
 
+Capability 8 (OD3). Every required case passed, so the service now lists
+`CAPABILITY_PERSON_COMMAND` in each Hello reply. The test-support seam
+`person-command-capability` named in the [P3-E record](#p3-e-service-record)
+is removed; PC-I1 asserts the capability with no seam. After the change,
+each person selector passed twice more, the lifecycle gate passed once, and
+the workspace run passed with no failure.
+
 ### Packet split
 
 Selected plan (2026-10-22). Each code packet owns its paths alone while it
