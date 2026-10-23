@@ -627,14 +627,17 @@ resource absence/hash mismatch fails before spawn, failures remove owned copies,
 system preparation requires no resource, and unknown replacement entries survive
 cleanup. Root must run relocated native MLX inference to prove Metal loading.
 
-Defect BN-P1 (found by reading the code, 2026-10-23; probe not yet run):
+Defect BN-P1 (found by reading the code and confirmed by probe, 2026-10-23):
 `swift-transformers` `Hub` reads `Bundle.module` when a model's tokenizer
 configuration has no `tokenizer_class` and the model has a `model_type`. The
 copied helper has no `swift-transformers_Hub.bundle` beside it, so the
 generated accessor calls `fatalError` and the helper exits. The service
 contains the exit as a helper failure, but the model cannot run. Fix packet
 BN1 ships the bundle, pins its digest as `hub_bundle_sha256` and copies it
-beside the helper with the rules above. The
+beside the helper with the rules above, for MLX and Core AI selections. The
+bundle copy adds a directory walk with its own limits (16 files, 16
+directories, depth 4, 1 MiB per file and in total) on the same preparation
+worker. The
 [release signing design](release-signing.md#bn1-hub-resource-bundle-defect)
 owns the defect record, limits, flow SG-F3 and validation SG-V10.
 

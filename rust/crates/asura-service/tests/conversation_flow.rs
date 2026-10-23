@@ -35,6 +35,8 @@ const BUILD: &str = "asura/conversation-test";
 struct Fixture {
     home: PathBuf,
     child: Option<Child>,
+    /// The service executable; a relocated package copy when a journey sets it.
+    executable: PathBuf,
 }
 impl Fixture {
     fn new() -> Result<Self> {
@@ -48,7 +50,11 @@ impl Fixture {
         ));
         fs::create_dir(&home)?;
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
-        Ok(Self { home, child: None })
+        Ok(Self {
+            home,
+            child: None,
+            executable: std::env::current_exe()?,
+        })
     }
     fn runtime(&self) -> Result<RuntimeDirectory> {
         Ok(RuntimeDirectory::scratch(&self.home, true)?)
@@ -60,7 +66,7 @@ impl Fixture {
             .append(true)
             .open(self.home.join("service.log"))?;
         self.child = Some(
-            Command::new(std::env::current_exe()?)
+            Command::new(&self.executable)
                 .arg("--conversation-child")
                 .arg(&self.home)
                 .stdin(Stdio::null())
@@ -1754,6 +1760,27 @@ fn provider_submit(
     submit(fixture, project, conversation, generation, prompt)
 }
 
+/// Relative path and bytes of every file in a small resource bundle, sorted.
+fn bundle_files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push((path.strip_prefix(root)?.to_path_buf(), fs::read(&path)?));
+            }
+            if files.len() + pending.len() > 64 {
+                return Err("bundle fixture entry limit".into());
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 fn copy_assets(
     source: &Path,
     target: &Path,
@@ -1877,6 +1904,21 @@ fn native_mlx() -> Result<()> {
             fs::read(packaged)?,
             "native helper resource must match assembled package"
         );
+        stage = "private Hub bundle proof";
+        let copied = fs::read_dir(fixture.home.join(".asura/run"))?
+            .flatten()
+            .map(|entry| entry.path().join(asura_platform::HUB_BUNDLE_NAME))
+            .find(|path| path.is_dir())
+            .ok_or("native helper did not retain its private Hub bundle")?;
+        let packaged = std::env::current_exe()?
+            .parent()
+            .ok_or("test binary parent")?
+            .join(asura_platform::HUB_BUNDLE_NAME);
+        assert_eq!(
+            bundle_files(&copied)?,
+            bundle_files(&packaged)?,
+            "native helper Hub bundle must match assembled package"
+        );
         stage = "native completion";
         let terminal = observe(&fixture, operation)?;
         assert_eq!(
@@ -1920,8 +1962,68 @@ fn native_mlx() -> Result<()> {
                 .any(|entry| entry.file_name().to_string_lossy().starts_with("model-")),
             "owned model copies leaked after shutdown"
         );
+        // SG-V10: a relocated package whose Hub bundle does not match the
+        // embedded `hub_bundle_sha256`, or lacks it, never spawns the helper.
+        stage = "relocated package";
+        let built = std::env::current_exe()?
+            .parent()
+            .ok_or("test binary parent")?
+            .to_path_buf();
+        let package = fixture.home.join("package");
+        fs::create_dir(&package)?;
+        let relocated = package.join("conversation_flow");
+        fs::copy(std::env::current_exe()?, &relocated)?;
+        for name in ["asura-model", "mlx.metallib"] {
+            fs::copy(built.join(name), package.join(name))?;
+        }
+        let bundle = package.join(asura_platform::HUB_BUNDLE_NAME);
+        copy_assets(
+            &built.join(asura_platform::HUB_BUNDLE_NAME),
+            &bundle,
+            0,
+            &mut 0,
+            &mut 0,
+        )?;
+        let plist = bundle.join("Contents/Info.plist");
+        let mut tampered = fs::read(&plist)?;
+        tampered.push(b'\n');
+        fs::write(&plist, tampered)?;
+        fixture.executable = relocated;
+        for (case, class) in [
+            ("tampered", "preparation_unsafe"),
+            ("absent", "preparation_absent"),
+        ] {
+            if case == "absent" {
+                fs::remove_dir_all(&bundle)?;
+            }
+            stage = "relocated service startup";
+            fixture.start()?;
+            wait_ready(&fixture, None)?;
+            stage = "relocated submit";
+            let outcome = match provider_submit(&fixture, project, None, 0, "Hello") {
+                Err(error) => error.to_string(),
+                Ok(accepted) => format!(
+                    "{:?}",
+                    observe(&fixture, checked_id(accepted.operation_id)?)?
+                ),
+            };
+            assert!(
+                outcome.contains("model_helper_unavailable"),
+                "{case} Hub bundle must fail before spawn: {outcome}"
+            );
+            stage = "relocated shutdown";
+            fixture.stop()?;
+            assert!(
+                !fs::read_dir(fixture.home.join(".asura/run"))?
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with("model-")),
+                "{case} Hub bundle left a model copy"
+            );
+            let log = fs::read_to_string(fixture.home.join("service.log"))?;
+            assert!(log.contains(class), "{case} Hub bundle must log {class}");
+        }
         println!(
-            "PASS native MLX missing-asset rejection, copied Metal resource, completion, cancellation and cleanup"
+            "PASS native MLX missing-asset rejection, copied Metal resource and Hub bundle, completion, cancellation, cleanup, and relocated tampered or absent Hub bundle refused before spawn"
         );
         Ok(())
     })();

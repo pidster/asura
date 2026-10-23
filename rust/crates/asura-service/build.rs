@@ -6,10 +6,12 @@ fn main() {
     println!("cargo:rerun-if-changed={}", identity.display());
     let source = match fs::read_to_string(&identity) {
         Ok(text) => {
+            // Lines: build ID, schema, helper, then optional `mlx.metallib`
+            // and `hub_bundle_sha256` (BN1). The bundle needs the metallib line.
             let fields: Vec<_> = text.lines().collect();
             assert!(
-                (3..=4).contains(&fields.len()),
-                "model package identity must have three or four hashes"
+                (3..=5).contains(&fields.len()),
+                "model package identity must have three to five hashes"
             );
             let mut arrays = Vec::new();
             for field in fields {
@@ -23,15 +25,19 @@ fn main() {
                     .collect();
                 arrays.push(format!("{:?}", bytes));
             }
+            let optional = |index: usize| {
+                arrays
+                    .get(index)
+                    .map(|hash| format!("Some({hash})"))
+                    .unwrap_or_else(|| "None".into())
+            };
             format!(
-                "const MODEL_PACKAGE: Option<model_owner::PackageIdentity> = Some(model_owner::PackageIdentity {{ build_id: {}, schema_digest: {}, helper_digest: {}, metallib_digest: {} }});",
+                "const MODEL_PACKAGE: Option<model_owner::PackageIdentity> = Some(model_owner::PackageIdentity {{ build_id: {}, schema_digest: {}, helper_digest: {}, metallib_digest: {}, hub_bundle_digest: {} }});",
                 arrays[0],
                 arrays[1],
                 arrays[2],
-                arrays
-                    .get(3)
-                    .map(|hash| format!("Some({hash})"))
-                    .unwrap_or_else(|| "None".into())
+                optional(3),
+                optional(4)
             )
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

@@ -14,6 +14,26 @@ Before a standard SwiftPM build, the root build owner must:
 4. Build with standard `swift build --package-path swift/model-helper`; run
    model-free tests with `swift test --package-path swift/model-helper`.
 5. Assemble helper/binary/manifest identities according to the D2 contract.
+   Place `asura-model`, `mlx.metallib` and `swift-transformers_Hub.bundle`
+   (from the same SwiftPM build directory) beside the service executable,
+   and beside the test binaries for native journeys. Do not ship the other
+   SwiftPM resource bundles; no code reads them.
+6. Write `.build/model-tools/package-identity.txt` as five lowercase hex
+   SHA-256 lines: build ID, `model.proto`, `asura-model`, `mlx.metallib` and
+   the Hub bundle digest. Write the same values to `model-package.json`, with
+   the bundle as `hub_bundle_sha256`. Compute the bundle digest in the bundle
+   root ([encoding](../../docs/designs/release-signing.md#hub-bundle-digest-encoding)):
+
+   ```sh
+   find . -type f | sed 's|^\./||' | LC_ALL=C sort | tr '\n' '\0' |
+     xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1
+   ```
+
+The service copies the Hub bundle beside the helper copy for MLX and Core AI
+selections. `Hub` reads it through `Bundle.module` when a tokenizer
+configuration has no `tokenizer_class`; without it the helper stops in
+`fatalError` (defect BN-P1). The bundle is limited to 16 files, 16
+directories, depth 4 and 1 MiB.
 
 Generated source and identities are ignored. Missing inputs fail compilation;
 there is no unverified fallback or user-path helper lookup. The dependency is the
