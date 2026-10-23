@@ -366,7 +366,7 @@ Each must be designed before its code. None is selected by this document.
 | Job-outlived-turn notice. Designed 2026-10-22 in [J4](tool-job-controller.md#j4-tui) | EX12 | Client job packet J4 |
 | Destination grant by data class and project | EX13, EX7 | Remote providers |
 | Provider credentials in Keychain, with the D1 credential review. A sandboxed helper cannot claim a keychain access group; see the [helper App Sandbox](release-signing.md#what-the-helper-needs) | EX14, EX8, EX7 | Remote providers |
-| Release signing, Hardened Runtime, Keychain option C and the helper App Sandbox. Designed 2026-10-23: [release signing](release-signing.md) | I9, EXD-3, SGQ1–SGQ9 | Release qualification; secret store packet SG3 |
+| Release signing, Hardened Runtime, team Keychain store and the helper App Sandbox. Designed 2026-10-23: [release signing](release-signing.md) | I9, EXD-3, SGQ1–SGQ9 | Release qualification; secret store packet SG3 |
 | Spend ceilings and cost confirmation | EX15 | Remote providers |
 | Note deletion and review mark | EX6 | Memory note changes |
 | Approval flow with digest re-check, build-path list and change detection. Designed 2026-10-22: [execution path guard](execution-path-guard.md) | EX1, PX1, OD3 | Person command packet P5; capability 8 waits for it (OD3) |
@@ -748,7 +748,7 @@ submit until settlement or Drop. Model call values stay in memory.
 | SS-T4 | An item is replayed into another command | Service and account attributes name the installation and input; the payload binding digest covers project, conversation, input and request digest. | None found. |
 | SS-T5 | A Keychain prompt blocks the service | User interaction is disabled for the service process; a would-be prompt fails. | None found. |
 | SS-T6 | A `!!` command reads the item | It runs as the person with no sandbox (EXD-1). | Accepted under EXD-1. |
-| SS-T8 | Copies of values inside the Security framework outlive Asura's zeroizing | Asura passes values in zeroizing buffers and zeroizes its own copies after spawn. `security-framework` 3.7.0 copies a read result out of a `CFData` that is then released without zeroizing; securityd receives and holds values in its own process. | Values can remain in freed memory of the service process and of securityd until it is reused. Asura cannot clear it. Residual, accepted by the owner on 2026-10-22 (EXD-3); it is inherent in the Keychain store that EXD-2 selected. A same-UID reader of process memory is the same principal under D1. Planned replacement: a Secure Enclave key design once release builds are signed (I9). Revised 2026-10-23 (owner, SGQ8): after release signing the store is option C, the team data-protection Keychain ([release signing](release-signing.md#keychain-option-c)), which does not remove these copies; the Secure Enclave item stays open for later study. |
+| SS-T8 | Copies of values inside the Security framework outlive Asura's zeroizing | Asura passes values in zeroizing buffers and zeroizes its own copies after spawn. `security-framework` 3.7.0 copies a read result out of a `CFData` that is then released without zeroizing; securityd receives and holds values in its own process. | Values can remain in freed memory of the service process and of securityd until it is reused. Asura cannot clear it. Residual, accepted by the owner on 2026-10-22 (EXD-3); it is inherent in the Keychain store that EXD-2 selected. A same-UID reader of process memory is the same principal under D1. Planned replacement: a Secure Enclave key design once release builds are signed (I9). Revised 2026-10-23 (owner, SGQ8): after release signing the store is the team Keychain store: the team data-protection Keychain ([release signing](release-signing.md#team-keychain-store)), which does not remove these copies; the Secure Enclave item stays open for later study. |
 | SS-T9 | A same-UID process writes items under Asura's service attribute | The store never reads or deletes an [unrecognized item](secret-store.md#stranded-and-unrecognized-items); a list returns at most 257 results; the item count includes such items and `/status` reports them. | Such items can fill the 256-item limit, so submits that need the Keychain are refused with `secret_store_full`, and one list can hold 257 large attribute sets in memory. Denial of service only. Accepted under D1. |
 
 **EXD-2 — Durable secret store in the Keychain (owner, 2026-10-20).** The
@@ -815,9 +815,9 @@ usable key reaches securityd. That design is a follow-up and needs signed
 builds with Keychain entitlements.
 
 EXD-3 update (owner, 2026-10-23): the storage after release signing is
-resolved as option C, the team data-protection Keychain with the access group
+resolved as the team Keychain store: the team data-protection Keychain with the access group
 `<TeamID>.com.pidster.asura`
-([release signing](release-signing.md#keychain-option-c)). Any build that the
+([release signing](release-signing.md#team-keychain-store)). Any build that the
 team signs with the group may read and delete items (SGQ4, KQ2 revised); this
 is residual [SG-T1](release-signing.md#security). The Secure Enclave design
 item stays open for later study (SGQ8). SS-T8 stays accepted. Until packet SG3

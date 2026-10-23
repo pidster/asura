@@ -1,4 +1,9 @@
-# Release signing, Keychain option C and helper sandbox (I9)
+# Release signing, team Keychain store and helper sandbox (I9)
+
+Naming note: EXD-3 named its Secure Enclave replacement "option C". That item
+stays open for later study (SGQ8). The secret store's move to the team
+data-protection Keychain is called the **team Keychain store** here; it is a
+separate step and does not close EXD-3 option C.
 
 Status: selected design, 2026-10-23. The owner answered the nine signing
 questions SGQ1–SGQ9 on 2026-10-23 ([owner decisions](#owner-decisions)). No
@@ -9,7 +14,7 @@ What is fixed:
 
 - the bundle layout, bundle IDs and access group (SGQ1, SGQ2);
 - signing of development bundles (SGQ3) and release bundles;
-- Keychain option C: the secret store moves to the team data-protection
+- team Keychain store: the secret store moves to the team data-protection
   Keychain with the Asura access group, with a clean switch (SGQ4–SGQ6);
 - the helper App Sandbox rule (SGQ7) and the owner-only signing operator
   (SGQ9);
@@ -40,7 +45,7 @@ In scope:
 - Whether the Rust service runs in the App Sandbox (selected: no, D-S1).
 - Whether the Swift model helper runs in the App Sandbox (selected: yes if
   probes HS-P1 to HS-P7 pass, SGQ7).
-- Keychain option C: the data-protection keychain with a keychain access
+- team Keychain store: the data-protection keychain with a keychain access
   group. This covers the switch from the login keychain, stranded items and
   test isolation.
 - The effect of the Hardened Runtime on `DYLD_*` (PC-I38), on `mlx.metallib`
@@ -95,7 +100,7 @@ Required behavior.
 | RS1 | Each release must contain signed executables that the macOS notary service accepts. Notarisation requires the Hardened Runtime. | [Apple: Hardened Runtime](https://developer.apple.com/documentation/security/hardened-runtime) ("To upload a macOS app to be notarized, you must enable the Hardened Runtime capability"); ADR-0008; release-distribution HD1, HD9 |
 | RS2 | An executable must claim only the entitlements that it needs. A false Boolean entitlement must be omitted. | Apple Hardened Runtime page |
 | RS3 | Signing keys and notary credentials must never be in the repository, in test inputs, or in any file that a test reads. No test signs with a real identity. | AGENTS.md (credentials stay out of tracked files) |
-| RS4 | A queued person command's values must stay in the macOS Keychain. Under option C the store uses the data-protection keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and the Asura access group. | KQ1, SO6, EXD-2, SGQ4 |
+| RS4 | A queued person command's values must stay in the macOS Keychain. The team Keychain store uses the data-protection keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and the Asura access group. | KQ1, SO6, EXD-2, SGQ4 |
 | RS5 | Tests must never read, write or delete items in the person's keychains. Only the signed qualification run writes data-protection items, under a separate test access group, and it must leave that group empty. | SSR6, SGQ6 |
 | RS6 | `!!` commands must run with no sandbox. `!` and model jobs must run under per-job `sandbox-exec` profiles. The escapee scan must keep working. | EXD-1, PCR21, EX5 |
 | RS7 | No backward compatibility with unreleased builds or data. | Owner, 2026-10-17; SGQ5 |
@@ -113,7 +118,7 @@ Required behavior.
 | App-like bundle | A directory `Asura.app/Contents/{Info.plist, MacOS/, Resources/, embedded.provisionprofile}`. It holds a command-line executable so that a profile can be embedded |
 | Data-protection keychain | The per-user keychain that `SecItem` calls reach with `kSecUseDataProtectionKeychain = true`. Its access control is keychain access groups ([TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)) |
 | Asura access group | `<TeamID>.com.pidster.asura` (SGQ2). The test access group is `<TeamID>.com.pidster.asura.test` (SGQ6) |
-| Keychain option C | The secret store on the data-protection keychain with the Asura access group, replacing the file-based login keychain (SGQ4, SGQ8) |
+| Team Keychain store | The secret store on the data-protection keychain with the Asura access group, replacing the file-based login keychain (SGQ4, SGQ8) |
 | Qualification bundle | A test `Asura.app` that the owner signs with the test access group, used only by the signed qualification run (SGQ6) |
 
 ## Owner decisions
@@ -123,14 +128,14 @@ the packets below.
 
 | ID | Question | Decision (owner, 2026-10-23) |
 | --- | --- | --- |
-| SGQ1 | Can the released `asura` command live in `Asura.app/Contents/MacOS/asura`, with Homebrew linking `bin/asura` to it? Option C needs a provisioning profile, and a profile needs an app-like bundle. | Yes, `Asura.app`; Homebrew links `bin/asura`. |
+| SGQ1 | Can the released `asura` command live in `Asura.app/Contents/MacOS/asura`, with Homebrew linking `bin/asura` to it? The team Keychain store needs a provisioning profile, and a profile needs an app-like bundle. | Yes, `Asura.app`; Homebrew links `bin/asura`. |
 | SGQ2 | Which bundle IDs? | `com.pidster.asura` and `com.pidster.asura.model`; access group `<TeamID>.com.pidster.asura`. |
 | SGQ3 | Sign the assembled development bundle with the Apple Development identity and a development profile? | Yes. Development `Asura.app` bundles are signed with the Apple Development identity and a development profile. Cargo test binaries stay unsigned. |
-| SGQ4 | KQ2 says that only the build that wrote an item can read it. Under option C, any build that the team signs with the access group can read and delete the item. Accept? | Yes. Any build signed by the team with the access group may read and delete items (KQ2 revised). Stranded items go away. |
+| SGQ4 | KQ2 says that only the build that wrote an item can read it. In the team Keychain store, any build that the team signs with the access group can read and delete the item. Accept? | Yes. Any build signed by the team with the access group may read and delete items (KQ2 revised). Stranded items go away. |
 | SGQ5 | Old items named "Asura queued command secrets" stay in the login keychain on development Macs. Accept a one-time manual clean-up, with no Asura code that reads or deletes them? | Clean switch. No migration code. The leftovers are deleted by hand once. |
 | SGQ6 | Can the signed qualification run (not `cargo test`) write and delete items under a separate test access group? | Yes. Only the signed qualification run writes items, under a separate test access group, and it must leave that group empty. |
 | SGQ7 | Must the Swift model helper run in the App Sandbox? | The helper App Sandbox is a release requirement if probes HS-P1 to HS-P7 pass. Otherwise the helper ships unsandboxed, with the gap recorded. |
-| SGQ8 | EXD-3 planned a Secure Enclave replacement for SS-T8. Close it? | Keep the Secure Enclave design item open for later study. Option C for now is the team data-protection Keychain. |
+| SGQ8 | EXD-3 planned a Secure Enclave replacement for SS-T8. Close it? | Keep the Secure Enclave design item open for later study. The team Keychain store for now is the team data-protection Keychain. |
 | SGQ9 | Who signs and notarises? | Only the owner, on the owner's Mac, for the first release. No CI secrets. |
 
 The draft of this design recommended closing the Secure Enclave item (SGQ8).
@@ -151,7 +156,7 @@ Selected (engineering), consistent with the owner decisions:
 - **D-S4. Notarise a zip of `Asura.app`, staple `Asura.app`, then build the
   release archive.** A ticket cannot be stapled to a bare executable or to a
   zip ([notarisation facts](#signing-order-and-build-identity)).
-- **D-S5. Option C replaces the file-keychain production path in one change
+- **D-S5. The team Keychain store replaces the file-keychain production path in one change
   (SG3).** No legacy reader (RS7, SGQ5).
 - **D-S6. BN1 ships the Hub resource bundle and copies it beside the
   helper.** See [BN1](#bn1-hub-resource-bundle-defect).
@@ -424,7 +429,7 @@ flowchart TD
     NT -->|Accepted| Done["Release requirement met"]
 ```
 
-## Keychain option C
+## Team Keychain store
 
 Selected (SGQ4, SGQ5, SGQ6, SGQ8). Packet SG3 implements it. Until SG3 lands,
 the [secret store](secret-store.md) keeps the file-based login keychain.
@@ -463,7 +468,7 @@ Selected, replacing rows of the
 [secret store item contract](secret-store.md#keychain-item-contract) when SG3
 lands:
 
-| Property | Option C |
+| Property | Team Keychain store |
 | --- | --- |
 | Keychain | Data-protection keychain: `kSecUseDataProtectionKeychain = true` on every add, query and delete. Production no longer uses `kSecUseKeychain` or `SecKeychainCopyDefault` |
 | Access group | Omitted in calls. The default group is the first `keychain-access-groups` entry, `<TeamID>.com.pidster.asura` ([Apple: sharing access](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps)) |
@@ -513,7 +518,7 @@ Selected; probe KC-P4 must confirm each code before SG3 is ready.
 | `errSecMissingEntitlement` (-34018) | `unavailable`, reason `not_signed`: "This Asura build is not signed for the Keychain." No retry |
 | `errSecNotAvailable` (-25291) or any other code | `unavailable` with the code, as today |
 
-#### SG-S1: secret store availability under option C
+#### SG-S1: secret store availability under the team Keychain store
 
 Selected design. Arrows are observed call results on the secret store
 worker. `NotSigned` is terminal for the process: no recheck can add an
@@ -571,7 +576,7 @@ delete never touches a production item.
 ### Secure Enclave: open item
 
 Open decision (owner, 2026-10-23, SGQ8): the Secure Enclave design item from
-EXD-3 stays open for later study. Option C does not depend on it. These notes
+EXD-3 stays open for later study. The team Keychain store does not depend on it. These notes
 are input to that study; they select nothing.
 
 - The Secure Enclave holds only NIST P-256 keys. It signs and does key
@@ -583,7 +588,7 @@ are input to that study; they select nothing.
   in-process copy described by SS-T8 therefore stays. The securityd copy would
   move to an enclave key-agreement call; this detail is **unverified**.
 - The enclave key reference itself lives in the data-protection keychain under
-  the same access group. A Secure Enclave design therefore needs option C
+  the same access group. A Secure Enclave design therefore needs the team Keychain store
   first.
 - Under D1, a same-user reader of process memory is the same principal. SS-T8
   stays an accepted residual (EXD-3) until the study decides otherwise.
@@ -739,7 +744,7 @@ flowchart TD
   design makes no new boundary claim.
 - **Stronger defence in depth.** In a signed build, the Hardened Runtime
   refuses `DYLD_*` injection, and with no `get-task-allow` it refuses a
-  debugger attaching to `asura`. With option C, a same-user program that lacks
+  debugger attaching to `asura`. With the team Keychain store, a same-user program that lacks
   the team-signed group cannot read or delete Asura items. SS-T1 and SS-T3
   improve: a binary named `asura` can no longer delete items by name. SS-T6
   (`!!` runs as the person) and SS-T8 are unchanged.
@@ -833,7 +838,7 @@ requires:
 | SG-V3 | RS3, RS10 | A check that no tracked file matches `*.p12`, `*.p8`, `*.provisionprofile` or contains `BEGIN PRIVATE KEY` | The release script refuses without identity arguments; the dry run calls no real identity | — | — |
 | SG-V4 | D-S1, RS6 | — | SB-P1, SB-P2 and SB-P3 recorded | Existing EC and PC suites pass on the signed qualification bundle, including the `KERN_PROCARGS2` environment-marker scan | macOS 27 |
 | SG-V5 | SGQ7 | — | HS-P1 to HS-P7 | Native system, MLX, Core AI and Ollama journeys with the sandboxed helper | macOS 27, real models |
-| SG-V6 | RS4, option C | KC-U1 every dictionary sets the data-protection flag; KC-U2 status mapping including -34018; KC-U3 no stranded fields; SS-U7 extended | Unsigned negative case (-34018, no change); scratch file backend cases unchanged | Signed qualification: SS-I and SL5 cases with the test group; the store ends empty | Qualification Mac (SGQ6) |
+| SG-V6 | RS4, the team Keychain store | KC-U1 every dictionary sets the data-protection flag; KC-U2 status mapping including -34018; KC-U3 no stranded fields; SS-U7 extended | Unsigned negative case (-34018, no change); scratch file backend cases unchanged | Signed qualification: SS-I and SL5 cases with the test group; the store ends empty | Qualification Mac (SGQ6) |
 | SG-V7 | RS5 | Test-support seam: production cannot select `Scratch` | After each run, the test group lists empty; no test runs a login keychain search | — | — |
 | SG-V8 | PC-I38 | — | PC-I38 unsigned (existing) | PC-I38-S signed; HR-P2 recorded | macOS 27 |
 | SG-V9 | Bundle lookup | Resource path resolution from `Contents/MacOS` | Copy step finds `Resources/mlx.metallib` and the Hub bundle | `--native-mlx` from the installed keg | Clean host |
@@ -858,7 +863,7 @@ flowchart TD
     SG1 --> SG0K
     SG0K["SG0-K owner probes KC-P1 to KC-P4"] --> SG3
     SG2["SG2 helper App Sandbox, or EX-H1 if an HS probe fails"] --> SG5
-    SG3["SG3 secret store option C"] --> SG5
+    SG3["SG3 secret store on the team Keychain"] --> SG5
     SG1 --> SG4["SG4 notarise, staple, formula (NT-P1)"]
     SG2 --> SG4
     SG4 --> SG5["SG5 I9 qualification on the signed artifact"]

@@ -37,13 +37,13 @@ packet P3-E and is not implemented.
 Revision of 2026-10-23, for release signing: the owner answered the signing
 questions SGQ1–SGQ9 ([release signing](release-signing.md#owner-decisions)).
 The storage that follows the login keychain (KQ1, EXD-3) is now resolved as
-[Keychain option C](release-signing.md#keychain-option-c): the team
+[team Keychain store](release-signing.md#team-keychain-store): the team
 data-protection Keychain with the access group `<TeamID>.com.pidster.asura`.
 KQ2 is revised by SGQ4: any build that the team signs with the access group
 may read and delete items, so stranded items go away. The switch is clean,
 with no migration code (SGQ5), and only the signed qualification run writes
 items, under a separate test access group (SGQ6). The Secure Enclave item
-stays open for later study (SGQ8). Packet SG3 implements option C. **Until
+stays open for later study (SGQ8). Packet SG3 implements the team Keychain store. **Until
 SG3 lands, the file-based login keychain store described below remains the
 implemented state.** Text that SG3 replaces is marked "SG3 replaces" with a
 link to the governing section.
@@ -220,7 +220,7 @@ name is rejected.
 
 SG3 replaces the Keychain, Synchronizable, Access control and Accessibility
 class rows with the
-[option C item contract](release-signing.md#item-contract-changes):
+[the team Keychain store item contract](release-signing.md#item-contract-changes):
 the data-protection keychain, the Asura access group,
 `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and read and delete by any
 team-signed build with the group (SGQ4). The other rows are unchanged.
@@ -296,7 +296,7 @@ Selected (engineering, 2026-10-22, SS1-K gap 5).
 
 Selected (engineering, 2026-10-22, SS1-K gaps 1 and 4).
 
-SG3 replaces the stranded-item part of this section (SGQ4). Under option C
+SG3 replaces the stranded-item part of this section (SGQ4). Under the team Keychain store
 every team-signed build can delete every Asura item, so stranded items go
 away; the stranded fields and the `/status` stranded notice are removed
 ([what SG3 removes](release-signing.md#what-sg3-removes)). The
@@ -503,7 +503,7 @@ disproved. The worker reads the `OSStatus` of each item call after a
 successful pre-check.
 
 SG3 replaces this table with the
-[option C status mapping](release-signing.md#status-mapping), which adds
+[the team Keychain store status mapping](release-signing.md#status-mapping), which adds
 `errSecMissingEntitlement` (-34018) as `unavailable/not_signed`. Probe KC-P4
 must confirm it first.
 
@@ -930,7 +930,7 @@ flowchart TD
     SSS --> SL5
     SL7["SL7: whole-command variable"] --> SL5
     SL5 --> E2E["SS-E1, SS-E2 with person command qualification Q"]
-    SSS --> SG3["SG3 option C: data-protection Keychain (release signing)"]
+    SSS --> SG3["SG3 team Keychain store: data-protection Keychain (release signing)"]
     SGK["SG1 and KC-P1 to KC-P4 (release signing)"] --> SG3
     SG3 --> E2E2["SS-I and SL5 cases on the signed qualification bundle"]
     SL5 --> E2E2
@@ -946,8 +946,8 @@ values. Engineering choices in this design:
   code-signed binary with a keychain access group entitlement. Asura's signing
   is not selected until I9, and development builds are unsigned. SG3 replaces
   this choice (owner, 2026-10-23): the
-  [release signing design](release-signing.md#keychain-option-c) selects
-  option C, the team data-protection Keychain, with a clean switch (SGQ5).
+  [release signing design](release-signing.md#team-keychain-store) selects
+  the team Keychain store, the team data-protection Keychain, with a clean switch (SGQ5).
 - **One item per input.** Deletion and the sweep act on one item per command.
   Rejected: one item per value, which multiplies calls and partial states.
 - **Read only at dispatch.** One read path for the first run and after a
@@ -980,7 +980,7 @@ values. Engineering choices in this design:
   `/secrets purge` command. The running binary is the one that was denied,
   and Drop already deletes the items of live inputs. Revisit at I9, when the
   data-protection keychain and an access group bind items to a signed
-  identity (KQ1). Revisited 2026-10-23: under option C (SGQ4) stranded items
+  identity (KQ1). Revisited 2026-10-23: under the team Keychain store (SGQ4) stranded items
   go away, and SG3 removes this rule.
 - **Unrecognized items are counted, never deleted** (2026-10-22). Rejected: a
   platform delete by raw account, which would let the service delete items
@@ -1091,7 +1091,7 @@ timeout; the type needs no peek method.
 | 3 The fixture binary is in `asura-platform` | A thin `secret_store_fixture` binary in `asura-service` over the shared `fixture_main()` ([fixture binary](#fixture-binary)) |
 | 4 Unrecognized accounts have no delete call | Counted and reported, never deleted ([stranded and unrecognized items](#stranded-and-unrecognized-items)) |
 | 5 `list` and `get` memory | List at most 257 results; the codec rejects data over 55,413 bytes ([bounds](#item-count-and-memory-bounds)) |
-| 6 Copies inside the Security framework | Residual [SS-T8](execution-threat-model.md#secret-store-at-rest), owner-accepted (EXD-3, 2026-10-22); Secure Enclave replacement after release signing (I9). Revised 2026-10-23 (SGQ8): option C does not remove these copies; the Secure Enclave item stays open for later study ([release signing](release-signing.md#secure-enclave-open-item)) |
+| 6 Copies inside the Security framework | Residual [SS-T8](execution-threat-model.md#secret-store-at-rest), owner-accepted (EXD-3, 2026-10-22); Secure Enclave replacement after release signing (I9). Revised 2026-10-23 (SGQ8): the team Keychain store does not remove these copies; the Secure Enclave item stays open for later study ([release signing](release-signing.md#secure-enclave-open-item)) |
 | 7 Probe facts | Recorded in [probe results](#probe-results-2026-10-22) |
 
 ## Readiness audit resolution (2026-10-22)
@@ -1126,7 +1126,7 @@ store.
 
 | ID | Decision (owner, 2026-10-23) |
 | --- | --- |
-| KQ1 follow-up (EXD-3) | Resolved: after release signing the store is option C, the team data-protection Keychain with the access group `<TeamID>.com.pidster.asura` and `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (SGQ2, SGQ8). |
+| KQ1 follow-up (EXD-3) | Resolved: after release signing the store is the team Keychain store: the team data-protection Keychain with the access group `<TeamID>.com.pidster.asura` and `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (SGQ2, SGQ8). |
 | KQ2 revised (SGQ4) | Any build that the team signs with the access group may read and delete items. Stranded items go away. |
 | SGQ5 | Clean switch. No migration code. Leftover login keychain items are deleted by hand once. |
 | SGQ6 | Only the signed qualification run writes items, under a separate test access group, and it must leave that group empty. |
