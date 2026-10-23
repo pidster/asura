@@ -1602,7 +1602,15 @@ impl Owner {
             return Dispatch::Ready(record);
         };
         match controller.submit(request, now) {
-            Admission::Accepted { job } | Admission::Existing { job } => Dispatch::Submitted(job),
+            Admission::Accepted { job } | Admission::Existing { job } => {
+                // The controller grants slots in its own poll, which ran
+                // earlier in this reactor step: wake the reactor so the
+                // start is evaluated now, not at the next unrelated wake.
+                if let Some(wake) = &self.wake {
+                    let _ = wake.notify();
+                }
+                Dispatch::Submitted(job)
+            }
             // A known-size queue bound: the command stays at the lane head
             // and dispatch tries again on the next wake (AQ1). The values
             // moved into the refused request and were dropped; the next
@@ -2047,34 +2055,6 @@ impl Owner {
     /// check reads, then kind 31 appends.
     pub(super) fn drive_persons(&mut self) -> bool {
         self.drive_person_journal() || self.drive_submits()
-    }
-}
-
-/// Test seams for the person path.
-#[cfg(test)]
-impl Persons {
-    pub(super) fn dispatch_names(&self) -> Vec<(Id, &'static str)> {
-        self.dispatches
-            .iter()
-            .map(|(input, d)| {
-                (
-                    *input,
-                    match d {
-                        Dispatch::Reading => "reading",
-                        Dispatch::Ready(_) => "ready",
-                        Dispatch::Getting(..) => "getting",
-                        Dispatch::Waiting(_, KeychainWait::Locked, _) => "keychain_locked",
-                        Dispatch::Waiting(_, KeychainWait::Unavailable, _) => {
-                            "keychain_unavailable"
-                        }
-                        Dispatch::Waiting(_, KeychainWait::Busy, _) => "keychain_busy",
-                        Dispatch::Admit(..) => "admit",
-                        Dispatch::Submitted(_) => "submitted",
-                        Dispatch::Holding => "holding",
-                    },
-                )
-            })
-            .collect()
     }
 }
 

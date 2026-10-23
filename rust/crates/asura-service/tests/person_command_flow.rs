@@ -204,7 +204,13 @@ fn send(env: &Env, request: &pb::ConversationQueueCommandSubmit) -> Result<Comma
 }
 /// Sends a submit that must be accepted; returns (input, conversation).
 fn queued(env: &Env, request: &pb::ConversationQueueCommandSubmit) -> Result<([u8; 16], [u8; 16])> {
-    match send(env, request)? {
+    let sent = send(env, request).map_err(|e| {
+        format!(
+            "{e} (command {:?}, generation {:?})",
+            request.command, request.expected_generation
+        )
+    })?;
+    match sent {
         CommandSubmit::Accepted(reply) => {
             let input = id(reply.accepted_input_id.clone())?;
             let entry = reply
@@ -1072,6 +1078,28 @@ fn survivors() -> Result<()> {
     );
     Ok(())
 }
+fn stderr_of(env: &Env, input: [u8; 16]) -> Result<Vec<u8>> {
+    let installation = env.installation()?;
+    let [_, payload] = asura_storage::payload::job_payloads(installation, job_of(input));
+    let path = env
+        .home()
+        .join(".asura/payloads/objects")
+        .join(job_fixture::hex(&payload));
+    wait_for(Duration::from_secs(20), "stderr installed", || {
+        path.exists()
+    })?;
+    Ok(std::fs::read(path)?)
+}
+fn input_of_last(env: &Env) -> Result<[u8; 16]> {
+    records(env)?
+        .iter()
+        .rev()
+        .find_map(|r| match r {
+            Record::PersonCommandQueued(p) => Some(p.input),
+            _ => None,
+        })
+        .ok_or_else(|| "no kind 31".into())
+}
 fn read_mark(path: &Path) -> Result<String> {
     let mut text = None;
     wait_for(Duration::from_secs(30), "mark", || {
@@ -1316,7 +1344,10 @@ fn model() -> Result<()> {
         ),
         Step::Final,
     ]);
-    let operation = env.fixture.submit(project, "Wait for it.")?;
+    let operation = env
+        .fixture
+        .submit(project, "Wait for it.")
+        .map_err(|e| format!("first turn: {e}"))?;
     let (conversation, generation) = turn_of(&env, operation)?;
     let environment = launch(&env, &[]);
     let (sandboxed, _) = queued(
@@ -1366,7 +1397,10 @@ fn model() -> Result<()> {
     }
     // PC-I13: the next turn's input holds both person entries.
     model.script(&[Step::Final]);
-    let next = env.fixture.follow(project, operation, "What did I run?")?;
+    let next = env
+        .fixture
+        .follow(project, operation, "What did I run?")
+        .map_err(|e| format!("second turn: {e}"))?;
     env.fixture.finish(next, Duration::from_secs(60))?;
     let chat = model.chats().last().cloned().ok_or("chat")?;
     assert!(
@@ -1378,70 +1412,6 @@ fn model() -> Result<()> {
         "{chat}"
     );
     assert!(chat.contains("command: echo sandboxed"), "{chat}");
-    // PC-I21: a released `!!` job; the model lists, inspects and reads it;
-    // its cancel is not permitted and the job keeps running.
-    let exe = std::env::current_exe()?;
-    let marks = env.home().join("marks");
-    std::fs::create_dir(&marks)?;
-    let (_, generation) = turn_of(&env, next)?;
-    let forever = format!(
-        "'{exe}' --survivor '{marks}/f' forever & while [ ! -e '{marks}/f.pid' ]; do /bin/sleep 0.05; done; exit 0",
-        exe = exe.display(),
-        marks = marks.display()
-    );
-    let (released, _) = queued(
-        &env,
-        &at_generation(
-            outside(project, Some(conversation), &forever, &environment),
-            generation,
-        ),
-    )?;
-    let job = job_of(released);
-    wait_for(Duration::from_secs(30), "released", || {
-        entry(&env, project, released).is_ok_and(|e| e.state == Some(4))
-    })?;
-    let handle = job_fixture::hex(&job);
-    model.script(&[
-        call("job", serde_json::json!({"command": "list"})),
-        call(
-            "job",
-            serde_json::json!({"command": "status", "job": handle}),
-        ),
-        call(
-            "job",
-            serde_json::json!({"command": "read", "job": handle, "stream": "stdout"}),
-        ),
-        call(
-            "job",
-            serde_json::json!({"command": "wait", "job": handle, "seconds": 1}),
-        ),
-        call(
-            "job",
-            serde_json::json!({"command": "cancel", "job": handle}),
-        ),
-        Step::Final,
-    ]);
-    let third = env.fixture.follow(project, next, "Look at my job.")?;
-    env.fixture.finish(third, Duration::from_secs(60))?;
-    let chat = model.chats().last().cloned().ok_or("chat")?;
-    assert!(
-        chat.contains(&handle),
-        "list and status name the job: {chat}"
-    );
-    assert!(chat.contains("tick"), "read returns the output: {chat}");
-    assert!(chat.contains("not_permitted"), "{chat}");
-    assert!(settled(&env, released)?.is_none(), "the job keeps running");
-    let reply = env.fixture.attach()?.cancel_job(
-        pb::JobCancel {
-            request_id: Some(asura_platform::random_id().to_vec()),
-            job_id: Some(job.to_vec()),
-            expected_project_id: Some(project.to_vec()),
-            kill: None,
-        },
-        &|| false,
-    )?;
-    assert_eq!(reply.requested, Some(true));
-    wait_settled(&env, released, Duration::from_secs(30))?;
     // PC-I39: execution off stops the model job; the `!` job runs on.
     model.script(&[
         call(
@@ -1450,7 +1420,10 @@ fn model() -> Result<()> {
         ),
         Step::Final,
     ]);
-    let fourth = env.fixture.follow(project, third, "Start a long job.")?;
+    let fourth = env
+        .fixture
+        .follow(project, next, "Start a long job.")
+        .map_err(|e| format!("fourth turn: {e}"))?;
     env.fixture.finish(fourth, Duration::from_secs(60))?;
     let model_job = records(&env)?
         .into_iter()
@@ -1509,7 +1482,8 @@ fn interrupt() -> Result<()> {
     env.start()?;
     let (project, directory) = env.project("project")?;
     let environment = launch(&env, &[]);
-    let marks = env.home().join("marks");
+    // The project is writable by `!` and `!!` alike.
+    let marks = directory.join("marks");
     std::fs::create_dir(&marks)?;
     let sleeper = |name: &str| {
         format!(
@@ -1651,31 +1625,33 @@ fn profile() -> Result<()> {
     assert!(!directory.join("real/ran").exists(), "nothing runs");
     // PC-I36: a new-session escapee writing to `$TMPDIR` is attributed,
     // frozen and killed; cleanup confirmed.
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../asura-platform/tests/fixtures/escapee.pl");
+    // The fixture is copied into the project, a read root of `!`.
+    let fixture = directory.join("escapee.pl");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../asura-platform/tests/fixtures/escapee.pl"),
+        &fixture,
+    )?;
     let (s, _) = run(&format!(
         "/usr/bin/perl '{}' single \"$TMPDIR/escapee\"; /bin/sleep 0.5",
         fixture.display()
     ))?;
-    assert!(s.escapees >= 1, "PC-I36: {s:?}");
+    assert!(
+        s.escapees >= 1,
+        "PC-I36: {s:?} {}",
+        String::from_utf8_lossy(&stderr_of(&env, input_of_last(&env)?)?)
+    );
     assert_eq!(s.cleanup, journal::JobCleanup::Confirmed);
-    // PC-I15 and PC-I29: `sandbox-exec` unavailable (test seam).
+    // PC-I29: with `sandbox-exec` unavailable (test seam), `!!` runs.
     write_private(
         &env.home().join("exec-cmd-guardian-fault"),
         "no-sandbox-exec\n",
     )?;
-    let (s, _) = run("echo sandboxed")?;
-    assert_eq!(
-        (s.outcome, s.reason),
-        (JobOutcome::NotStarted, JobReason::SandboxUnavailable),
-        "PC-I15"
-    );
     let environment = launch(&env, &[]);
     let (input, _) = queued(&env, &outside(project, None, "echo outside", &environment))?;
     let s = wait_settled(&env, input, Duration::from_secs(60))?;
     assert_eq!((s.outcome, s.exit_value), (JobOutcome::Exited, 0), "PC-I29");
     std::fs::remove_file(env.home().join("exec-cmd-guardian-fault"))?;
-    println!("PASS PC-I2 PC-I3 PC-I4 PC-I5 PC-I14 PC-I15 PC-I29 PC-I36 through the service");
+    println!("PASS PC-I2 PC-I3 PC-I4 PC-I5 PC-I14 PC-I29 (!! part) PC-I36 through the service");
     Ok(())
 }
 
@@ -1844,6 +1820,301 @@ fn volume() -> Result<()> {
     Ok(())
 }
 
+/// The service in this test process, so the secret store's gate (a
+/// test-support seam set before start) can hold a Keychain call or fail one
+/// call once (SS-I8, SS-I9).
+struct InProcess {
+    thread: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
+}
+impl InProcess {
+    fn start(env: &Env, gate: Option<asura_service::secret_store::Gate>) -> Result<Self> {
+        asura_service::test_support::set_secret_store_gate(gate);
+        let runtime = env.fixture.runtime()?;
+        let thread = std::thread::spawn(move || {
+            asura_service::run(runtime, job_fixture::BUILD, None).map_err(|e| e.to_string())
+        });
+        let service = Self {
+            thread: Some(thread),
+        };
+        env.fixture.wait_ready()?;
+        Ok(service)
+    }
+    fn stop(mut self, env: &Env) -> Result<()> {
+        env.fixture.attach()?.stop()?;
+        if let Some(thread) = self.thread.take() {
+            thread.join().map_err(|_| "service panicked")??;
+        }
+        asura_service::test_support::set_secret_store_gate(None);
+        Ok(())
+    }
+}
+
+/// SS-I8 and SS-I9 (in-process service): with the secret store worker held
+/// inside a Keychain call, status and the queue stay responsive, a
+/// secret-free command runs, a cancel and a Drop take effect, and once the
+/// store's 16 requests are outstanding a further `!!` submit gets
+/// `secret_store_busy`; released, the held submits complete. A Drop whose
+/// item delete fails once is durable, and the next start's sweep deletes
+/// the item. (Drop takes a held input; a restart holds the queued ones.)
+fn gate() -> Result<()> {
+    use asura_service::secret_store::{Call, Gate};
+    let env = Env::new("pc-gate")?;
+    let gate = Gate::default();
+    let log = std::fs::File::create(env.home().join("service.log"))?;
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(std::sync::Mutex::new(log))
+        .try_init();
+    let service = InProcess::start(&env, Some(gate.clone()))?;
+    let (project, _) = env.project("project")?;
+    let (other, other_directory) = env.project("other")?;
+    let (third_project, _) = env.project("third")?;
+    let environment = launch(&env, &[]);
+    let (first, conversation) = queued(&env, &request(project, None, BLOCKER, None))?;
+    wait_for(Duration::from_secs(30), "blocker running", || {
+        intent_committed(&env, first).unwrap_or(false)
+    })?;
+    let (behind, _) = queued(
+        &env,
+        &request(project, Some(conversation), "echo behind", None),
+    )?;
+    let (dropped, _) = queued(
+        &env,
+        &outside(project, Some(conversation), "echo dropped", &environment),
+    )?;
+    // A restart holds the queued inputs.
+    service.stop(&env)?;
+    let service = InProcess::start(&env, Some(gate.clone()))?;
+    for input in [behind, dropped] {
+        wait_for(Duration::from_secs(30), "held after restart", || {
+            entry(&env, project, input).is_ok_and(|e| e.state == Some(2))
+        })?;
+    }
+    // SS-I9 first (16 unresolved inputs at most across all projects): the
+    // Drop's delete fails once; the item stays for the next sweep.
+    gate.fail_once(Call::Delete);
+    decide(&env, dropped, DROP).map_err(|e| format!("drop dropped: {e}"))?;
+    assert_eq!(
+        entry(&env, project, dropped)?.state,
+        Some(6),
+        "Drop durable"
+    );
+    wait_for(Duration::from_secs(10), "the failed delete", || {
+        gate.calls().contains(&Call::Delete)
+    })?;
+    assert_eq!(
+        env.items()?,
+        vec![dropped],
+        "the failed delete kept the item"
+    );
+    let (blocker, lane) = queued(&env, &request(other, None, BLOCKER, None))?;
+    wait_for(Duration::from_secs(30), "blocker running", || {
+        intent_committed(&env, blocker).unwrap_or(false)
+    })?;
+    gate.hold();
+    let runtime = env.fixture.runtime()?;
+    let held: Vec<_> = (0..16)
+        .map(|n| {
+            // In the blocker's lane: a project holds one pending new
+            // conversation at a time (kind 18 rule, PR1).
+            let submit = outside(other, Some(lane), &format!("echo held {n}"), &environment);
+            let runtime = runtime.clone();
+            std::thread::spawn(move || -> std::result::Result<bool, String> {
+                let cancel: asura_client::Cancel = std::sync::Arc::new(|| false);
+                let mut client =
+                    asura_client::Client::attach(&runtime, job_fixture::BUILD, &*cancel)
+                        .map_err(|e| e.to_string())?;
+                match client.queue_person_command(submit, &|| false) {
+                    Ok(CommandSubmit::Accepted(_)) => Ok(true),
+                    Ok(other) => Err(format!("{other:?}")),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+        })
+        .collect();
+    gate.wait_blocked();
+    // The worker is held: everything else stays responsive.
+    for _ in 0..5 {
+        job_fixture::within_100ms("inspect", || Ok(env.fixture.attach()?.inspect()?))?;
+        job_fixture::within_100ms("queue list", || {
+            Ok(env.fixture.attach()?.conversation_queue(project, None)?)
+        })?;
+    }
+    let (free, _) = queued(&env, &request(third_project, None, "echo free", None))?;
+    assert_eq!(
+        wait_settled(&env, free, Duration::from_secs(60))?.outcome,
+        JobOutcome::Exited,
+        "a secret-free command runs"
+    );
+    decide(&env, behind, DROP).map_err(|e| format!("drop behind: {e}"))?;
+    assert_eq!(entry(&env, project, behind)?.state, Some(6), "Drop durable");
+    let reply = env.fixture.attach()?.cancel_job(
+        pb::JobCancel {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            job_id: Some(job_of(blocker).to_vec()),
+            expected_project_id: Some(other.to_vec()),
+            kill: None,
+        },
+        &|| false,
+    )?;
+    assert_eq!(reply.requested, Some(true));
+    assert_eq!(
+        wait_settled(&env, blocker, Duration::from_secs(30))?.outcome,
+        JobOutcome::Cancelled
+    );
+    // 16 requests are outstanding: the next submit with values is busy.
+    let probe = outside(other, Some(lane), "echo busy", &environment);
+    assert_eq!(refused(&env, &probe)?, pb::QueueRefusal::SecretStoreBusy);
+    gate.release();
+    for thread in held {
+        assert!(
+            thread
+                .join()
+                .map_err(|_| "submit thread")?
+                .map_err(|e| format!("held submit: {e}"))?
+        );
+    }
+    if let Err(error) = wait_for(Duration::from_secs(180), "held commands ran", || {
+        env.items().is_ok_and(|items| items == vec![dropped])
+    }) {
+        let states: Vec<_> = env
+            .fixture
+            .attach()?
+            .conversation_queue(other, None)?
+            .entries
+            .iter()
+            .map(|e| (e.state, e.hold_reason.clone(), e.waiting_text.clone()))
+            .collect();
+        return Err(format!("{error}: items {:?}, queue {states:?}", env.items()?.len()).into());
+    }
+    std::fs::write(other_directory.join("release"), b"")?;
+    service.stop(&env)?;
+    let service = InProcess::start(&env, None)?;
+    wait_for(Duration::from_secs(30), "swept", || {
+        env.items().is_ok_and(|items| items.is_empty())
+    })?;
+    service.stop(&env)?;
+    println!(
+        "PASS SS-I8 SS-I9: a held worker left control, cancel, Drop and secret-free commands responsive, a full store queue refused busy; a failed delete was swept at the next start"
+    );
+    Ok(())
+}
+
+/// PC-I21 (blocked, see the P3-E report): a model turn after a released
+/// `!!` job; the model lists, inspects, reads and waits on it, and its
+/// cancel is `not_permitted` while the job keeps running. The message's
+/// turn after the release is refused by the journal writer's
+/// `PrepareInput`, which checks `ready_input()` without the released
+/// overlay; this case is not in the default run until storage takes it.
+fn released_turn() -> Result<()> {
+    let model = Model::start()?;
+    let mut env = Env::new("pc-reltu")?;
+    env.start()?;
+    let (project, _) = env.project("project")?;
+    env.fixture.model(&model.endpoint)?;
+    model.script(&[Step::Final]);
+    let next = env
+        .fixture
+        .submit(project, "Hello.")
+        .map_err(|e| format!("first turn: {e}"))?;
+    let (conversation, _) = turn_of(&env, next)?;
+    let environment = launch(&env, &[]);
+    // PC-I21: a released `!!` job; the model lists, inspects and reads it;
+    // its cancel is not permitted and the job keeps running.
+    let exe = std::env::current_exe()?;
+    let marks = env.home().join("marks");
+    std::fs::create_dir(&marks)?;
+    let (_, generation) = turn_of(&env, next)?;
+    let forever = format!(
+        "'{exe}' --survivor '{marks}/f' forever & while [ ! -e '{marks}/f.pid' ]; do /bin/sleep 0.05; done; exit 0",
+        exe = exe.display(),
+        marks = marks.display()
+    );
+    let (released, _) = queued(
+        &env,
+        &at_generation(
+            outside(project, Some(conversation), &forever, &environment),
+            generation,
+        ),
+    )?;
+    let job = job_of(released);
+    wait_for(Duration::from_secs(30), "released", || {
+        entry(&env, project, released).is_ok_and(|e| e.state == Some(4))
+    })?;
+    let handle = job_fixture::hex(&job);
+    model.script(&[
+        call("job", serde_json::json!({"command": "list"})),
+        call(
+            "job",
+            serde_json::json!({"command": "status", "job": handle}),
+        ),
+        call(
+            "job",
+            serde_json::json!({"command": "read", "job": handle, "stream": "stdout"}),
+        ),
+        call(
+            "job",
+            serde_json::json!({"command": "wait", "job": handle, "seconds": 1}),
+        ),
+        call(
+            "job",
+            serde_json::json!({"command": "cancel", "job": handle}),
+        ),
+        Step::Final,
+    ]);
+    let third = env
+        .fixture
+        .follow(project, next, "Look at my job.")
+        .map_err(|e| format!("turn after the release: {e}"))?;
+    env.fixture.finish(third, Duration::from_secs(60))?;
+    let chat = model.chats().last().cloned().ok_or("chat")?;
+    assert!(
+        chat.contains(&handle),
+        "list and status name the job: {chat}"
+    );
+    assert!(chat.contains("tick"), "read returns the output: {chat}");
+    assert!(chat.contains("not_permitted"), "{chat}");
+    assert!(settled(&env, released)?.is_none(), "the job keeps running");
+    let reply = env.fixture.attach()?.cancel_job(
+        pb::JobCancel {
+            request_id: Some(asura_platform::random_id().to_vec()),
+            job_id: Some(job.to_vec()),
+            expected_project_id: Some(project.to_vec()),
+            kill: None,
+        },
+        &|| false,
+    )?;
+    assert_eq!(reply.requested, Some(true));
+    wait_settled(&env, released, Duration::from_secs(30))?;
+    println!("PASS PC-I21: model job commands on a released person job; cancel not permitted");
+    Ok(())
+}
+
+/// PC-I15 and PC-I29 (`!` part): with `sandbox-exec` unavailable (test
+/// seam) a `!` command is not started with `sandbox_unavailable`; nothing
+/// runs.
+fn sandbox() -> Result<()> {
+    let mut env = Env::new("pc-sbx")?;
+    env.start()?;
+    let (project, directory) = env.project("project")?;
+    write_private(
+        &env.home().join("exec-cmd-guardian-fault"),
+        "no-sandbox-exec\n",
+    )?;
+    let (input, _) = queued(&env, &request(project, None, "touch ran", None))?;
+    let s = wait_settled(&env, input, Duration::from_secs(60))?;
+    assert!(!directory.join("ran").exists(), "nothing ran");
+    assert_eq!(
+        (s.outcome, s.reason),
+        (JobOutcome::NotStarted, JobReason::SandboxUnavailable),
+        "PC-I15"
+    );
+    println!("PASS PC-I15: ! not started with sandbox_unavailable");
+    Ok(())
+}
+
 type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
@@ -1855,10 +2126,32 @@ fn main() {
             job, profile, command,
         ));
     }
+    if let [_, flag, job, profile, command, fault] = args.as_slice()
+        && flag == "--asura-exec-cmd-guardian"
+    {
+        std::process::exit(asura_platform::exec_cmd::run_guardian_for_test(
+            job, profile, command, fault,
+        ));
+    }
+    if args.get(1).map(String::as_str) == Some("--asura-exec-cmd-guardian") {
+        std::process::exit(2);
+    }
     if let [_, flag, base, mode] = args.as_slice()
         && flag == "--survivor"
     {
         survivor_main(base, mode);
+        return;
+    }
+    if let [_, flag, home] = args.as_slice()
+        && flag == "--dump-journal"
+    {
+        let bytes = asura_storage::authority::fixture::journal_bytes(Path::new(home)).unwrap();
+        for record in job_fixture::records(&bytes).unwrap() {
+            println!(
+                "{}",
+                format!("{record:?}").chars().take(400).collect::<String>()
+            );
+        }
         return;
     }
     if args.get(1).map(String::as_str) == Some(CHILD) {
@@ -1891,7 +2184,19 @@ fn main() {
         ("long", long),
         ("stall", stall),
         ("volume", volume),
+        ("gate", gate),
+        ("sandbox", sandbox),
     ];
+    // Blocked outside P3-E (reported): run only when named.
+    let blocked: Vec<Case> = vec![("released_turn", released_turn)];
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .chain(
+            blocked
+                .into_iter()
+                .filter(|(name, _)| selected.contains(name)),
+        )
+        .collect();
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {
             continue;

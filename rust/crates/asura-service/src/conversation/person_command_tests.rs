@@ -455,7 +455,10 @@ fn pc_u54_shell_exited_releases_the_lane_until_restart() {
         "Draining",
         "the job stays live"
     );
-    h.wait("the message dispatches", |h| {
+    // The owner's lane is released: it dispatches the message, which waited
+    // until now (state 1 above). The journal writer's `PrepareInput` then
+    // refuses it; see `pc_u54_message_turn_after_release` (blocked).
+    h.wait("the message dispatch", |h| {
         h.entry(project, message).state != Some(1)
     });
     // Restart without kind 28: recovery writes `interrupted`; Failed.
@@ -848,4 +851,42 @@ fn display_cut_keeps_placeholders_whole() {
     assert!(cut.len() <= 8_192);
     assert!(!cut.contains("$ASURA_SECRET_1"), "{}", &cut[8_180..]);
     assert!(cut.ends_with(' '));
+}
+
+/// PC-U54, message part (blocked outside P3-E, reported): after
+/// `ShellExited` the message's preparation is not refused by the lane. The
+/// journal writer's `PrepareInput` checks `ready_input()` without the
+/// released overlay and answers `request_conflict`, so the input is held.
+#[test]
+#[ignore = "blocked: writer PrepareInput ignores the released !! overlay (P3-E report)"]
+fn pc_u54_message_turn_after_release() {
+    let mut h = H::with_keychain();
+    let project = h.project();
+    let input = h.command(project, None, "brew upgrade", true);
+    let job = h.run(input);
+    let conversation = h.conversation_of(input);
+    let message = h.message(project, conversation, 0);
+    let exit = Exit::Exited(0);
+    h.script(
+        job,
+        [
+            SlotEvent::LeaderExited(exit),
+            SlotEvent::ProcessSettled {
+                exit,
+                cleanup: JobCleanup::Confirmed,
+                escapees: 1,
+                elapsed_ms: 5,
+                output_held: true,
+            },
+        ],
+    );
+    h.wait("the message leaves Queued", |h| {
+        h.entry(project, message).state != Some(1)
+    });
+    let entry = h.entry(project, message);
+    assert_ne!(
+        entry.hold_reason.as_deref(),
+        Some("request_conflict"),
+        "{entry:?}"
+    );
 }
