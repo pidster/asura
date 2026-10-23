@@ -426,6 +426,10 @@ pub(super) struct Worker {
     unsupported: Option<String>,
     /// The last follow session whose thread ended.
     follow_done: Option<u64>,
+    /// Test hook run inside `poll_request` between its two reads of the
+    /// request thread, to pin an interleaving without timing.
+    #[cfg(test)]
+    between_reads: Option<Box<dyn FnMut(&JoinHandle<()>)>>,
 }
 impl Worker {
     pub fn set_notice(&mut self, notice: Notice) {
@@ -490,9 +494,15 @@ impl Worker {
         let job = self.request.as_mut()?;
         // The reply is read from its slot, stored before the thread's
         // settlement notice: the slot threads share one router source, so
-        // a notice can be consumed before the thread has exited.
-        let stored = job.reply.lock().ok().and_then(|mut slot| slot.take());
+        // a notice can be consumed before the thread has exited. The exit
+        // is checked first: a thread seen exited has stored its reply, so
+        // the slot read after it cannot miss one before the slot is freed.
         let exited = job.handle.is_finished();
+        #[cfg(test)]
+        if let Some(hook) = self.between_reads.as_mut() {
+            hook(&job.handle);
+        }
+        let stored = job.reply.lock().ok().and_then(|mut slot| slot.take());
         let reported = job.reported;
         job.reported |= stored.is_some();
         if exited {

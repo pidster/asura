@@ -126,6 +126,29 @@ fn j4t_11_request_slot_holds_one_request_and_cancel_reports_at_once() {
 }
 
 #[test]
+fn j4t_11_reply_stored_between_the_slot_read_and_the_exit_check_is_returned() {
+    // The thread stores its reply and exits between the worker's two reads
+    // of the request thread: the reply must still be returned once.
+    let (mut worker, release) = held(read());
+    let mut release = Some(release);
+    worker.between_reads = Some(Box::new(move |handle: &JoinHandle<()>| {
+        if let Some(release) = release.take() {
+            release.send(()).unwrap();
+            wait(handle);
+        }
+    }));
+    let got = worker.poll_request();
+    let got = match got {
+        Some(got) => got,
+        None => worker.poll_request().expect("stored reply returned"),
+    };
+    assert_eq!(got.request.command, read());
+    assert!(matches!(got.result, Ok(Reply::List(_))));
+    assert!(worker.poll_request().is_none(), "returned once");
+    assert!(!worker.request_busy());
+}
+
+#[test]
 fn j4t_11_cancellation_disconnects_a_pending_transport() {
     use std::io::Read;
     let (client, mut peer) = UnixStream::pair().unwrap();
