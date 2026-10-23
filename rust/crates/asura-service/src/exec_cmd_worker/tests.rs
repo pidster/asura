@@ -740,3 +740,606 @@ fn factory_slots_follow_the_port_event_order() {
         assert!(matches!(events[0], SlotEvent::SetupFailed(JobReason::None)));
     }
 }
+
+// ------------------------------------------------------------ person jobs
+//
+// P3-T worker layer (person-command-mode.md, outside survivors and lane
+// release). The unit test binary is not a guardian, so these cases run a
+// scripted guardian peer through the test-support replacement hook: it
+// reads the FD 11 frame and checks FDs 12 onwards, then speaks the status
+// notice protocol of a person profile (kinds 1, 5, 6 and 2) while a real
+// survivor process holds the stdout pipe. The slot, capture worker, payload
+// store, pipes and survivor are real. The real guardian's kind 6 and
+// reason 14 and 15 decisions are qualified by P1 at the platform layer
+// (`exec_cmd_process.rs`, EC-I9, OD2).
+
+/// The scripted guardian peer. Argv is the guardian's: flag, job hex,
+/// profile token, command; the command is `MODE DIR`. It never signals
+/// any process. Survivors keep only FD 5, ignore SIGPIPE, record their pid
+/// and how they ended, and live at most 30 s.
+const PERSON_GUARDIAN: &str = r#"#!/usr/bin/perl
+use strict; use warnings; use POSIX ();
+my (undef, $hex, $profile, $command) = @ARGV;
+my ($mode, $dir) = split(/ /, $command, 2);
+$SIG{PIPE} = 'IGNORE';
+sub record { my ($name, $text) = @_; open(my $f, '>', "$dir/$name.tmp") or POSIX::_exit(3); print $f $text; close $f; rename("$dir/$name.tmp", "$dir/$name") or POSIX::_exit(3); }
+$SIG{__DIE__} = sub { record('guardian.err', $_[0]); POSIX::_exit(2); };
+my $id = pack('H32', $hex);
+open(my $frame, '<&=', 11) or die "fd 11: $!";
+binmode $frame;
+my $bytes = '';
+while (1) { my $n = sysread($frame, my $buf, 65536); die "frame read: $!" unless defined $n; last if $n == 0; $bytes .= $buf; }
+close $frame;
+my $off = 0;
+my $len = unpack('N', substr($bytes, $off, 4)); $off += 4;
+my $roots = unpack('C', substr($bytes, $off, 1)); $off += 1;
+my @roles = unpack('C*', substr($bytes, $off, $roots)); $off += $roots;
+my $count = unpack('n', substr($bytes, $off, 2)); $off += 2;
+my @names;
+for (1 .. $count) {
+  my $n = unpack('n', substr($bytes, $off, 2)); $off += 2;
+  push @names, substr($bytes, $off, $n); $off += $n;
+  my $v = unpack('N', substr($bytes, $off, 4)); $off += 4 + $v;
+}
+my @kinds = map { -d "/dev/fd/" . (12 + $_) ? 'dir' : 'other' } 0 .. $#roles;
+record('frame', join("\n", 'length ' . ($len == length($bytes) - 4 && $off == length($bytes) ? 'ok' : 'bad'),
+  "profile $profile", "roles @roles", "roots @kinds", @names) . "\n");
+open(my $status, '>&=', 4) or die "fd 4: $!";
+sub notice {
+  my ($kind, $reason, $exit_kind, $cleanup, $value) = @_;
+  my $b = 'ASSH' . pack('CCCC', $kind, $reason, $exit_kind, $cleanup) . $id . pack('N', $value) . "\0\0\0\0";
+  syswrite($status, $b) == 32 or die "notice: $!";
+}
+notice(1, 0, 0, 0, 0);
+if ($mode eq 'none') { notice(5, 0, 1, 0, 0); notice(2, 0, 1, 1, 0); POSIX::_exit(0); }
+my $pid = fork(); die "fork" unless defined $pid;
+if ($pid == 0) {
+  POSIX::setsid();
+  POSIX::close($_) for (3, 4, 6, 7, 8, 9, 10);
+  open(my $out, '>&=', 5) or POSIX::_exit(4);
+  $out->autoflush(1);
+  record('survivor.pid', $$);
+  my $end = time + 30;
+  if ($mode eq 'left') { close $out; POSIX::close(5); select(undef, undef, undef, 0.3); record('done', 'left'); POSIX::_exit(0); }
+  my $limit = $mode eq 'hold' ? 5 : 1_000_000;
+  for my $i (0 .. $limit - 1) {
+    my $n = syswrite($out, "tick $i\n");
+    if (!defined $n) { record('epipe', $!{EPIPE} ? 'EPIPE' : "errno $!"); POSIX::_exit(0); }
+    last if time > $end || -e "$dir/release";
+    select(undef, undef, undef, $mode eq 'hold' ? 0.2 : 0.05);
+  }
+  record('done', 'ended');
+  POSIX::_exit(0);
+}
+POSIX::close(5); POSIX::close(6);
+my $wait = time + 10;
+select(undef, undef, undef, 0.01) until -e "$dir/survivor.pid" || time > $wait;
+die "no survivor" unless -e "$dir/survivor.pid";
+notice(5, 0, 1, 0, 0);
+select(undef, undef, undef, 0.5) if $mode eq 'late';
+notice(6, 0, 0, 0, 1);
+notice(2, $mode eq 'left' ? 14 : 15, 1, 1, 0);
+POSIX::_exit(0);
+"#;
+
+/// A home whose guardian is the scripted peer, with a marks directory.
+fn person_home() -> (Home, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = Home::new(64 * MIB);
+    let script = home.path.join("person-guardian");
+    std::fs::write(&script, PERSON_GUARDIAN).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        home.path.join("exec-cmd-guardian-executable"),
+        script.to_str().unwrap(),
+    )
+    .unwrap();
+    let marks = home.path.join("marks");
+    std::fs::create_dir(&marks).unwrap();
+    (home, marks)
+}
+fn launch_outside() -> PersonLaunch {
+    PersonLaunch::Outside {
+        launch: vec![
+            (b"PATH".to_vec(), b"/usr/bin:/bin".to_vec()),
+            (b"FIXTURE_TOKEN".to_vec(), b"launch-value".to_vec()),
+        ],
+    }
+}
+fn person_start(home: &Home, profile: Profile, mode: &str, marks: &std::path::Path) -> SlotStart {
+    let mut start = home.start(asura_platform::random_id(), home.scope());
+    start.profile = profile;
+    start.command = format!("{mode} {}", marks.display());
+    start
+}
+/// Polls until `done` holds for the events so far (30 s test guard).
+fn poll_until(
+    worker: &mut Worker,
+    events: &mut Vec<SlotEvent>,
+    done: impl Fn(&[SlotEvent]) -> bool,
+) {
+    let end = Instant::now() + Duration::from_secs(30);
+    while !done(events) {
+        worker.poll_job(Instant::now(), events);
+        assert!(Instant::now() < end, "slot events: {:?}", names(events));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+fn released(events: &[SlotEvent]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            SlotEvent::ProcessSettled {
+                output_held: true,
+                ..
+            }
+        )
+    })
+}
+fn wait_file(path: &std::path::Path) -> String {
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text;
+        }
+        assert!(Instant::now() < end, "no {}", path.display());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+fn survivor(marks: &std::path::Path) -> i32 {
+    wait_file(&marks.join("survivor.pid"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+fn stored_stdout(worker: &Worker) -> u64 {
+    let slot = worker.slot.as_ref().unwrap();
+    slot.capture.as_ref().unwrap().sink.counts().0[0]
+}
+
+/// The person start checks its inputs before any thread starts: a person
+/// profile needs its `PersonLaunch`, of the same profile, and `model-1`
+/// takes none. The launch values are zeroed when dropped.
+#[test]
+fn person_start_requires_matching_person_inputs() {
+    let home = Home::new(64 * MIB);
+    let person = |profile| {
+        let mut start = home.start(asura_platform::random_id(), home.scope());
+        start.profile = profile;
+        start
+    };
+    let sandboxed = || PersonLaunch::Sandboxed {
+        path: b"/usr/bin:/bin".to_vec(),
+        client: Vec::new(),
+    };
+    let mut worker = Worker::default();
+    for (start, launch) in [
+        (person(Profile::Person1), None),
+        (person(Profile::PersonOutside1), None),
+        (person(Profile::Person1), Some(launch_outside())),
+        (person(Profile::PersonOutside1), Some(sandboxed())),
+        (person(Profile::Model1), Some(sandboxed())),
+    ] {
+        assert_eq!(
+            worker.start_job_with(start, launch).err(),
+            Some(SlotStartError::Invalid)
+        );
+        assert!(worker.idle());
+    }
+    assert_eq!(
+        SlotPort::start(&mut worker, person(Profile::PersonOutside1)).err(),
+        Some(SlotStartError::Invalid),
+        "the port start has no person inputs yet"
+    );
+    assert_eq!(launch_outside().profile(), Profile::PersonOutside1);
+    assert_eq!(sandboxed().profile(), Profile::Person1);
+}
+
+/// Person setup failures settle `not_started` before any spawn: a missing
+/// home is `sandbox_unavailable` (role 1 is required), and an input that
+/// fails the platform's form check is `setup_failed`.
+#[cfg(feature = "test-support")]
+#[test]
+fn person_setup_failures_map_to_not_started_reasons() {
+    let (home, marks) = person_home();
+    std::fs::write(
+        home.path.join("exec-cmd-person-account"),
+        format!(
+            "{}\n{}\n",
+            home.path.join("missing-home").display(),
+            home.path.display()
+        ),
+    )
+    .unwrap();
+    let mut worker = Worker::default();
+    let launch = PersonLaunch::Sandboxed {
+        path: b"/usr/bin:/bin".to_vec(),
+        client: Vec::new(),
+    };
+    worker
+        .start_job_with(
+            person_start(&home, Profile::Person1, "none", &marks),
+            Some(launch),
+        )
+        .unwrap();
+    let events = poll_until_idle(&mut worker);
+    assert_eq!(
+        names(&events),
+        ["setup_failed", "capture_settled", "scratch_cleaned"]
+    );
+    assert!(matches!(
+        events[0],
+        SlotEvent::SetupFailed(JobReason::SandboxUnavailable)
+    ));
+    let bad = PersonLaunch::Outside {
+        launch: vec![(b"BAD=NAME".to_vec(), b"x".to_vec())],
+    };
+    worker
+        .start_job_with(
+            person_start(&home, Profile::PersonOutside1, "none", &marks),
+            Some(bad),
+        )
+        .unwrap();
+    let events = poll_until_idle(&mut worker);
+    assert!(matches!(
+        events[0],
+        SlotEvent::SetupFailed(JobReason::SetupFailed)
+    ));
+    assert!(!marks.join("frame").exists(), "no guardian ran");
+}
+
+/// Person start with root resolution and the FD 11 writer: a `!` job's
+/// setup resolves the fixture home and `$TMPDIR` into root descriptors 12
+/// and 13 (roles 1 and 2) and the setup thread writes the frame, which the
+/// guardian peer reads whole: the PC2 and PC3 names in order, and the
+/// client locale. A `!!` job's frame carries the launch names and no
+/// roots. Both then settle as ordinary jobs.
+#[cfg(feature = "test-support")]
+#[test]
+fn person_start_sends_the_frame_and_root_descriptors() {
+    let (home, marks) = person_home();
+    let account = home.path.join("account");
+    let tmpdir = home.path.join("account-tmp");
+    std::fs::create_dir(&account).unwrap();
+    std::fs::create_dir(&tmpdir).unwrap();
+    std::fs::write(
+        home.path.join("exec-cmd-person-account"),
+        format!("{}\n{}\n", account.display(), tmpdir.display()),
+    )
+    .unwrap();
+    let mut worker = Worker::default();
+    let launch = PersonLaunch::Sandboxed {
+        path: b"/usr/bin:/bin".to_vec(),
+        client: vec![(b"LANG".to_vec(), b"en_GB.UTF-8".to_vec())],
+    };
+    worker
+        .start_job_with(
+            person_start(&home, Profile::Person1, "none", &marks),
+            Some(launch),
+        )
+        .unwrap();
+    let mut events = poll_until_idle(&mut worker);
+    assert_port_order(&events);
+    assert_eq!(
+        names(&events),
+        [
+            "spawned",
+            "leader_exited",
+            "process_settled",
+            "capture_settled",
+            "scratch_cleaned"
+        ]
+    );
+    let frame = wait_file(&marks.join("frame"));
+    assert_eq!(
+        frame,
+        "length ok\nprofile person-1\nroles 1 2\nroots dir dir\nPATH\nHOME\nTMPDIR\nUSER\nLOGNAME\nTERM\nGIT_TERMINAL_PROMPT\nLANG\n"
+    );
+    let outcome = capture_outcome(events.get_mut(3));
+    assert_eq!(outcome.state, CaptureState::Complete);
+    outcome.capture.take().unwrap().abandon();
+
+    std::fs::remove_file(marks.join("frame")).unwrap();
+    worker
+        .start_job_with(
+            person_start(&home, Profile::PersonOutside1, "none", &marks),
+            Some(launch_outside()),
+        )
+        .unwrap();
+    let mut events = poll_until_idle(&mut worker);
+    assert_port_order(&events);
+    assert_eq!(
+        wait_file(&marks.join("frame")),
+        "length ok\nprofile person-outside-1\nroles \nroots \nPATH\nFIXTURE_TOKEN\n"
+    );
+    capture_outcome(events.get_mut(3))
+        .capture
+        .take()
+        .unwrap()
+        .abandon();
+}
+
+/// Kind 2 reason 14: the `!!` survivor holds no capture pipe, so the job
+/// settles as usual with the survivor count; `output_held` is false and
+/// the survivor is left running, never signalled (EC-D1).
+#[cfg(feature = "test-support")]
+#[test]
+fn reason_14_settles_with_survivors_left_running() {
+    let (home, marks) = person_home();
+    let mut worker = Worker::default();
+    worker
+        .start_job_with(
+            person_start(&home, Profile::PersonOutside1, "left", &marks),
+            Some(launch_outside()),
+        )
+        .unwrap();
+    let mut events = poll_until_idle(&mut worker);
+    assert_port_order(&events);
+    let settled: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SlotEvent::ProcessSettled {
+                exit,
+                escapees,
+                output_held,
+                ..
+            } => Some((*exit, *escapees, *output_held)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(settled, [(Exit::Exited(0), 1, false)]);
+    let outcome = capture_outcome(events.iter_mut().find(|e| name(e) == "capture_settled"));
+    assert_eq!(outcome.state, CaptureState::Complete);
+    outcome.capture.take().unwrap().abandon();
+    assert_eq!(wait_file(&marks.join("done")), "left", "ended by itself");
+}
+
+/// PC-I33 worker layer: a `!!` survivor in a new session keeps stdout and
+/// prints `tick 0` to `tick 4` after the shell exited. Kind 6 count 1 and
+/// kind 2 reason 15 give `ProcessSettled { output_held: true }` while
+/// capture is open and the slot stays held; the survivor's later lines are
+/// retained; its EOF then settles capture `complete` with all five lines,
+/// and the scratch is cleaned. The survivor was never signalled.
+#[cfg(feature = "test-support")]
+#[test]
+fn pc_i33_survivor_output_is_captured_after_release() {
+    use sha2::{Digest, Sha256};
+    let (home, marks) = person_home();
+    let mut worker = Worker::default();
+    worker
+        .start_job_with(
+            person_start(&home, Profile::PersonOutside1, "hold", &marks),
+            Some(launch_outside()),
+        )
+        .unwrap();
+    let mut events = Vec::new();
+    poll_until(&mut worker, &mut events, released);
+    assert_eq!(
+        names(&events),
+        ["spawned", "leader_exited", "process_settled"]
+    );
+    assert!(matches!(
+        events[2],
+        SlotEvent::ProcessSettled {
+            exit: Exit::Exited(0),
+            escapees: 1,
+            output_held: true,
+            cleanup: JobCleanup::Confirmed,
+            ..
+        }
+    ));
+    assert!(!worker.idle(), "the slot stays held while capture is open");
+    let pid = survivor(&marks);
+    assert!(alive(pid), "PQ3: not stopped at shell exit");
+    let mut rest = poll_until_idle(&mut worker);
+    events.append(&mut rest);
+    assert_port_order(&events);
+    assert_eq!(
+        names(&events),
+        [
+            "spawned",
+            "leader_exited",
+            "process_settled",
+            "capture_settled",
+            "scratch_cleaned"
+        ]
+    );
+    let expected = b"tick 0\ntick 1\ntick 2\ntick 3\ntick 4\n";
+    let outcome = capture_outcome(events.get_mut(3));
+    assert_eq!(outcome.state, CaptureState::Complete);
+    assert_eq!(outcome.reason, CaptureReason::None);
+    assert_eq!(outcome.stdout.lines, 5);
+    assert_eq!(outcome.stdout.capture.stored_bytes, expected.len() as u64);
+    let digest: [u8; 32] = Sha256::digest(expected).into();
+    assert_eq!(outcome.stdout.capture.digest, Some(digest));
+    outcome.capture.take().unwrap().abandon();
+    assert_eq!(wait_file(&marks.join("done")), "ended", "never signalled");
+    let end = Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(Instant::now() < end, "survivor did not end by itself");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(scratch_left(&home).is_empty(), "scratch deleted");
+}
+/// PC-I34 worker layer: a survivor that writes forever; the controller's
+/// trigger on the released job calls `close_capture`. Capture seals
+/// `incomplete` with reason 7 `closed_after_cancel` and a digest of the
+/// stored bytes; the scratch is cleaned and the slot released. The survivor
+/// is still alive after the close, never signalled, and its next write
+/// fails with EPIPE, which it records.
+#[cfg(feature = "test-support")]
+#[test]
+fn pc_i34_close_capture_seals_reason_7_and_leaves_the_survivor() {
+    let (home, marks) = person_home();
+    let mut worker = Worker::default();
+    worker
+        .start_job_with(
+            person_start(&home, Profile::PersonOutside1, "forever", &marks),
+            Some(launch_outside()),
+        )
+        .unwrap();
+    let mut events = Vec::new();
+    poll_until(&mut worker, &mut events, released);
+    let pid = survivor(&marks);
+    let end = Instant::now() + Duration::from_secs(30);
+    while stored_stdout(&worker) < 28 {
+        worker.poll_job(Instant::now(), &mut events);
+        assert!(Instant::now() < end, "no survivor output");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        names(&events),
+        ["spawned", "leader_exited", "process_settled"]
+    );
+    SlotPort::close_capture(&mut worker);
+    SlotPort::close_capture(&mut worker);
+    assert!(alive(pid), "EC-D1: close_capture signals nothing");
+    let mut rest = poll_until_idle(&mut worker);
+    events.append(&mut rest);
+    assert_port_order(&events);
+    assert_eq!(
+        names(&events),
+        [
+            "spawned",
+            "leader_exited",
+            "process_settled",
+            "capture_settled",
+            "scratch_cleaned"
+        ]
+    );
+    let outcome = capture_outcome(events.get_mut(3));
+    assert_eq!(outcome.state, CaptureState::Incomplete);
+    assert_eq!(outcome.reason, CaptureReason::ClosedAfterCancel);
+    assert!(outcome.stdout.capture.stored_bytes >= 28);
+    assert!(outcome.stdout.capture.digest.is_some());
+    assert!(!outcome.stdout.capture.eof, "closed before EOF");
+    outcome.capture.take().unwrap().abandon();
+    assert_eq!(wait_file(&marks.join("epipe")), "EPIPE");
+    assert!(scratch_left(&home).is_empty(), "scratch deleted");
+    SlotPort::close_capture(&mut worker);
+    assert!(worker.idle());
+}
+
+/// Step 5 of the survivor rules: a trigger that arrives after kind 5 but
+/// before the reason 15 notice closes capture when that notice arrives.
+#[cfg(feature = "test-support")]
+#[test]
+fn close_capture_before_reason_15_applies_at_release() {
+    let (home, marks) = person_home();
+    let mut worker = Worker::default();
+    worker
+        .start_job_with(
+            person_start(&home, Profile::PersonOutside1, "late", &marks),
+            Some(launch_outside()),
+        )
+        .unwrap();
+    let mut events = Vec::new();
+    poll_until(&mut worker, &mut events, |e| {
+        e.iter().any(|e| matches!(e, SlotEvent::LeaderExited(_)))
+    });
+    assert!(!released(&events), "the peer waits 0.5 s before kind 6");
+    SlotPort::close_capture(&mut worker);
+    let pid = survivor(&marks);
+    let mut rest = poll_until_idle(&mut worker);
+    events.append(&mut rest);
+    assert_port_order(&events);
+    assert!(released(&events));
+    let outcome = capture_outcome(events.iter_mut().find(|e| name(e) == "capture_settled"));
+    assert_eq!(outcome.state, CaptureState::Incomplete);
+    assert_eq!(outcome.reason, CaptureReason::ClosedAfterCancel);
+    outcome.capture.take().unwrap().abandon();
+    assert_eq!(wait_file(&marks.join("epipe")), "EPIPE");
+    let end = Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(Instant::now() < end, "survivor did not end by itself");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// PC-I35 worker layer: the service ends while a released job drains. The
+/// slot and its capture worker are dropped with no settlement (restart
+/// recovery writes `interrupted`; P3-E). Dropping signals nothing: the
+/// survivor is alive afterwards and its next write fails with EPIPE.
+#[cfg(feature = "test-support")]
+#[test]
+fn pc_i35_service_end_while_released_does_not_signal_the_survivor() {
+    let (home, marks) = person_home();
+    let mut worker = Worker::default();
+    worker
+        .start_job_with(
+            person_start(&home, Profile::PersonOutside1, "forever", &marks),
+            Some(launch_outside()),
+        )
+        .unwrap();
+    let mut events = Vec::new();
+    poll_until(&mut worker, &mut events, released);
+    let pid = survivor(&marks);
+    drop(worker);
+    assert!(alive(pid), "the survivor is not signalled");
+    assert_eq!(wait_file(&marks.join("epipe")), "EPIPE");
+    std::fs::write(marks.join("release"), b"").unwrap();
+}
+
+/// Capture reason 7 at the capture worker: closed read ends end the
+/// producer without EOF; the seal is `incomplete`, reason 7, with digests,
+/// also when no byte arrived (a process ran, so never `not_started`). A
+/// fault names its own cause first.
+#[test]
+fn capture_seals_reason_7_after_close_output() {
+    let home = Home::new(64 * MIB);
+    for bytes in [&b""[..], b"tick 0\n"] {
+        let job = asura_platform::random_id();
+        let mut handle = capture_worker::start(home.capture(job)).unwrap();
+        handle.leader_exited();
+        let mut sink = handle.output_sink();
+        if !bytes.is_empty() {
+            sink.accept(asura_platform::secrets::Stream::Stdout, bytes);
+        }
+        handle.close_output();
+        handle.sink.flush();
+        handle.sink.close();
+        let end = Instant::now() + Duration::from_secs(30);
+        let report = loop {
+            if let Some(report) = handle.drain().into_iter().find_map(|m| match m {
+                Message::Sealed(report) => Some(report),
+                _ => None,
+            }) {
+                break report;
+            }
+            assert!(Instant::now() < end, "no sealed report");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(report.state, CaptureState::Incomplete);
+        assert_eq!(report.reason, CaptureReason::ClosedAfterCancel);
+        assert_eq!(report.streams[0].stored, bytes.len() as u64);
+        assert!(report.streams.iter().all(|s| s.digest.is_some() && !s.eof));
+        handle.abandon();
+    }
+    // Both pipes at EOF before the close took effect: complete.
+    let job = asura_platform::random_id();
+    let mut handle = capture_worker::start(home.capture(job)).unwrap();
+    let mut sink = handle.output_sink();
+    sink.end(asura_platform::secrets::Stream::Stdout);
+    sink.end(asura_platform::secrets::Stream::Stderr);
+    handle.close_output();
+    let end = Instant::now() + Duration::from_secs(30);
+    let report = loop {
+        if let Some(report) = handle.drain().into_iter().find_map(|m| match m {
+            Message::Sealed(report) => Some(report),
+            _ => None,
+        }) {
+            break report;
+        }
+        assert!(Instant::now() < end, "no sealed report");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(
+        (report.state, report.reason),
+        (CaptureState::Complete, CaptureReason::None)
+    );
+    handle.abandon();
+}

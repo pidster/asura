@@ -185,6 +185,10 @@ struct Control {
     /// J2: a cancel trigger in `Draining`; later chunks are discarded and
     /// counted.
     drop_output: bool,
+    /// OD2: the slot closed the capture read ends of a released `!!` job
+    /// (`SlotPort::close_capture`). The producer ends without EOF; the
+    /// seal is `incomplete` with reason 7 `closed_after_cancel`.
+    closed: bool,
     space: u64,
 }
 /// State shared by the reactor side and the worker.
@@ -426,6 +430,14 @@ impl Handle {
             c.cancel = true;
             c.drop_output = true;
         });
+    }
+    /// OD2: the slot closed the job's capture read ends after a trigger on
+    /// a released `!!` job. The reactor still moves the bytes it already
+    /// read, then ends the producer; the worker stages them and seals
+    /// `incomplete` with reason 7 `closed_after_cancel`, also when no byte
+    /// ever arrived (a process ran, so it is never `not_started`).
+    pub(crate) fn close_output(&self) {
+        self.shared.set(|c| c.closed = true);
     }
     /// Clears the stored signal (TJ-Q10) and returns whether one was
     /// outstanding. The slot calls it at the start of every step, before the
@@ -995,7 +1007,8 @@ impl Worker {
         {
             self.fault(CaptureReason::StorageFault);
         }
-        let not_started = !self.received && self.disconnected;
+        let closed = self.shared.control().closed;
+        let not_started = !self.received && self.disconnected && !closed;
         let sealed = self.capture.take().map(Capture::seal);
         if not_started {
             // No process ran: the staging files are removed now; recovery
@@ -1034,6 +1047,10 @@ impl Worker {
             (CaptureState::Incomplete, reason)
         } else if let Some(reason) = self.cancelled_while_paused {
             (CaptureState::Incomplete, reason.reason())
+        } else if closed && !(self.eof[0] && self.eof[1]) {
+            // OD2: the read ends were closed before EOF; a fault or a
+            // pause cancel above names its own cause first.
+            (CaptureState::Incomplete, CaptureReason::ClosedAfterCancel)
         } else if self.discarded.iter().any(|d| *d > 0) {
             (
                 CaptureState::Incomplete,
