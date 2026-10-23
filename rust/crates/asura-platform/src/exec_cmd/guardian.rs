@@ -1,10 +1,10 @@
-use super::escapee::{self, FREEZE_ROUND_LIMIT, Gate, GateFacts, Libproc, Sweep, Tally};
+use super::escapee::{self, EnvMarker, FREEZE_ROUND_LIMIT, Gate, GateFacts, Libproc, Sweep, Tally};
 use super::protocol::{
     KIND_ESCAPEE_REPORT, KIND_LEADER_EXITED, LEASE_KILL, LEASE_TERM, Notice, Profile,
     REASON_CANCEL, REASON_CLEANUP_FAILED, REASON_ESCAPEE_TERMINATED, REASON_ESCAPEE_UNTERMINATED,
     REASON_KILL, REASON_LEASE_ENDED,
 };
-use super::{ExecCmdError, MAX_COMMAND_BYTES, spawn};
+use super::{ExecCmdError, MAX_COMMAND_BYTES, person, spawn};
 use crate::runtime::{open_at, stat_fd};
 use crate::secrets::rewrite::{MAX_SECRET_VARIABLES, SECRET_COMMAND_NAME, WHOLE_COMMAND};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -173,6 +173,79 @@ fn preamble(names: impl IntoIterator<Item = SecretName>) -> String {
         text.push_str("unset __asura_t; ");
     }
     text
+}
+
+/// The `!!` job marker, `ASURA_JOB_<jobhex>=1`, with the 32 lowercase hex
+/// digits of the job ID (escapee-control.md, the `!!` unsandboxed job).
+fn job_marker(jobhex: &str) -> String {
+    format!("ASURA_JOB_{jobhex}=1")
+}
+/// The path names an executable regular file (`access(X_OK)`).
+fn executable(path: &str) -> bool {
+    let Ok(path) = std::ffi::CString::new(path) else {
+        return false;
+    };
+    // SAFETY: a NUL-terminated path; access only reads metadata.
+    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+}
+/// What the guardian spawns: executable, argv and envp. Environment entries
+/// are copies in zeroizing memory.
+struct CommandLine {
+    executable: &'static str,
+    args: Vec<String>,
+    env: Vec<Zeroizing<Vec<u8>>>,
+}
+/// The command line for each profile (PC-U46). `model-1`: `sandbox-exec -p
+/// PROFILE /bin/sh -c SCRIPT` with the fixed model environment; `person-1`:
+/// the same with the person profile and the FD 11 entries; `person-outside-1`:
+/// `/bin/sh -c SCRIPT` with no `sandbox-exec`, the FD 11 entries, then the
+/// job marker. The secret variables come last in every case. The FD 11
+/// entries apply only here, never to the guardian's own environment.
+#[allow(clippy::too_many_arguments)]
+fn command_line(
+    profile: Profile,
+    sandbox_exec: &'static str,
+    sandbox: Option<String>,
+    script: String,
+    scratch: &str,
+    marker: &str,
+    frame: &[Zeroizing<Vec<u8>>],
+    secrets: &[SecretEntry],
+) -> CommandLine {
+    let owned = |entry: &[u8]| Zeroizing::new(entry.to_vec());
+    let mut env: Vec<Zeroizing<Vec<u8>>> = match profile {
+        Profile::Model1 => [
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
+            "LC_ALL=C".into(),
+            "LANG=C".into(),
+            format!("HOME={scratch}"),
+            format!("TMPDIR={scratch}"),
+        ]
+        .iter()
+        .map(|entry| owned(entry.as_bytes()))
+        .collect(),
+        Profile::Person1 | Profile::PersonOutside1 => frame.iter().map(|e| owned(e)).collect(),
+    };
+    if profile == Profile::PersonOutside1 {
+        env.push(owned(marker.as_bytes()));
+    }
+    env.extend(secrets.iter().map(|secret| owned(&secret.entry)));
+    let shell = ["/bin/sh".to_owned(), "-c".into(), script];
+    match sandbox {
+        Some(sandbox) => CommandLine {
+            executable: sandbox_exec,
+            args: [sandbox_exec.to_owned(), "-p".into(), sandbox]
+                .into_iter()
+                .chain(shell)
+                .collect(),
+            env,
+        },
+        None => CommandLine {
+            executable: "/bin/sh",
+            args: shell.into(),
+            env,
+        },
+    }
 }
 
 // Child ownership loss is irreversible. A later PID observation cannot restore
@@ -360,6 +433,14 @@ impl Faults {
     fn apply(&self, table: &mut Libproc) {
         table.fault = self.0;
     }
+    /// `no-sandbox-exec` names a path that does not exist (PC-I29).
+    fn sandbox_exec(&self) -> &'static str {
+        if self.0 == escapee::Fault::NoSandboxExec {
+            "/usr/bin/sandbox-exec-absent-for-test"
+        } else {
+            SANDBOX_EXEC
+        }
+    }
 }
 #[cfg(not(feature = "test-support"))]
 impl Faults {
@@ -367,7 +448,11 @@ impl Faults {
         false
     }
     fn apply(&self, _table: &mut Libproc) {}
+    fn sandbox_exec(&self) -> &'static str {
+        SANDBOX_EXEC
+    }
 }
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 fn parse_id(s: &str) -> Result<[u8; 16], ExecCmdError> {
     if s.len() != 32
         || !s
@@ -385,7 +470,10 @@ fn parse_id(s: &str) -> Result<[u8; 16], ExecCmdError> {
     }
     Ok(id)
 }
-fn descriptors() -> Result<Vec<OwnedFd>, ExecCmdError> {
+/// FDs 3–10 for every profile; FD 11 is the person environment descriptor
+/// for the person tokens and must be absent for `model-1`, as must the
+/// root descriptors FDs 12–19.
+fn descriptors(profile: Profile) -> Result<(Vec<OwnedFd>, Option<OwnedFd>), ExecCmdError> {
     for fd in 3..=10 {
         let st = stat_fd(fd).map_err(|_| ExecCmdError::Denied)?;
         // SAFETY: inspect access mode before assuming descriptor ownership.
@@ -413,12 +501,33 @@ fn descriptors() -> Result<Vec<OwnedFd>, ExecCmdError> {
             return Err(ExecCmdError::Denied);
         }
     }
+    let frame = if profile.person() {
+        let fd = person::FRAME_FD;
+        let st = stat_fd(fd).map_err(|_| ExecCmdError::Denied)?;
+        // SAFETY: inspect access mode before assuming descriptor ownership.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0
+            || flags & libc::O_ACCMODE != libc::O_RDONLY
+            || st.st_mode & libc::S_IFMT != libc::S_IFIFO
+            || st.st_uid != unsafe { libc::geteuid() }
+        {
+            return Err(ExecCmdError::Denied);
+        }
+        // SAFETY: this private invocation exclusively receives FD 11.
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    } else {
+        person::absent(person::FRAME_FD..=person::FIRST_ROOT_FD + person::MAX_ROOTS as i32 - 1)?;
+        None
+    };
     // SAFETY: this private invocation exclusively receives the validated FDs.
-    Ok((3..=10)
-        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-        .collect())
+    Ok((
+        (3..=10)
+            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+            .collect(),
+        frame,
+    ))
 }
-fn pinned_path(fd: i32) -> Result<String, ExecCmdError> {
+pub(super) fn pinned_path(fd: i32) -> Result<String, ExecCmdError> {
     let path = spawn::path(fd)?;
     let (device, inode) =
         crate::project_identity::pinned_identity(&path).map_err(|_| ExecCmdError::Denied)?;
@@ -429,7 +538,7 @@ fn pinned_path(fd: i32) -> Result<String, ExecCmdError> {
     Ok(path)
 }
 /// `path` is `root` or lies beneath it.
-fn within(path: &str, root: &str) -> bool {
+pub(super) fn within(path: &str, root: &str) -> bool {
     path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/')))
 }
 /// A path check inside the guardian. Storage's identity check is the authority.
@@ -442,8 +551,37 @@ fn separate_from_state(project: &str, scratch: &str, asura: &str) -> Result<(), 
     }
     Ok(())
 }
+/// A Seatbelt string literal, from the existing quoting helper.
+pub(super) fn quote(s: &str) -> Result<String, ExecCmdError> {
+    crate::git_observer::quoted(s).map_err(|_| ExecCmdError::Denied)
+}
+/// ` (literal P)` for every proper ancestor of every root, so path lookups
+/// can stat their way down to each root.
+pub(super) fn ancestor_literals(roots: &[&str]) -> Result<String, ExecCmdError> {
+    let mut ancestors = std::collections::BTreeSet::new();
+    for root in roots {
+        let mut p = Path::new(root).parent();
+        while let Some(parent) = p {
+            ancestors.insert(parent.to_string_lossy().into_owned());
+            p = parent.parent();
+        }
+    }
+    let mut metadata = String::new();
+    for p in ancestors {
+        metadata.push_str(&format!(" (literal {})", quote(&p)?));
+    }
+    Ok(metadata)
+}
+/// The last matching rule wins: deny the Asura home, then re-allow scratch.
+pub(super) fn state_rules(asura: &str, scratch: &str) -> Result<String, ExecCmdError> {
+    Ok(format!(
+        "(deny file-read* file-write* process-exec file-map-executable (subpath {asura}))(allow process-exec file-map-executable file-read* (subpath {scratch}))(allow file-write* (subpath {scratch}))(allow file-read-metadata (literal {asura}) (literal {tmp}))",
+        asura = quote(asura)?,
+        scratch = quote(scratch)?,
+        tmp = quote(&format!("{asura}/tmp"))?,
+    ))
+}
 fn seatbelt(project: &str, scratch: &str, asura: &str) -> Result<String, ExecCmdError> {
-    let quote = |s: &str| crate::git_observer::quoted(s).map_err(|_| ExecCmdError::Denied);
     let roots = [
         "/bin",
         "/usr/bin",
@@ -456,26 +594,11 @@ fn seatbelt(project: &str, scratch: &str, asura: &str) -> Result<String, ExecCmd
         scratch,
     ];
     let mut filters = String::new();
-    let mut ancestors = std::collections::BTreeSet::new();
     for root in roots {
         filters.push_str(&format!(" (subpath {})", quote(root)?));
-        let mut p = Path::new(root).parent();
-        while let Some(parent) = p {
-            ancestors.insert(parent.to_string_lossy().into_owned());
-            p = parent.parent();
-        }
     }
-    let mut metadata = String::new();
-    for p in ancestors {
-        metadata.push_str(&format!(" (literal {})", quote(&p)?));
-    }
-    // The last matching rule wins: deny the Asura home, then re-allow scratch.
-    let state = format!(
-        "(deny file-read* file-write* process-exec file-map-executable (subpath {asura}))(allow process-exec file-map-executable file-read* (subpath {scratch}))(allow file-write* (subpath {scratch}))(allow file-read-metadata (literal {asura}) (literal {tmp}))",
-        asura = quote(asura)?,
-        scratch = quote(scratch)?,
-        tmp = quote(&format!("{asura}/tmp"))?,
-    );
+    let metadata = ancestor_literals(&roots)?;
+    let state = state_rules(asura, scratch)?;
     Ok(format!(
         "(version 1)(deny default)(allow file-read* file-test-existence (literal \"/\"))(allow file-read* (literal \"/private/var/select/sh\"))(allow file-read-metadata (literal \"/private\") (literal \"/private/var\") (literal \"/private/var/select\"))(allow process-fork)(allow process-exec file-map-executable file-read*{filters})(allow file-read-metadata{metadata})(allow file-write* (subpath {}) (subpath {}))(allow sysctl-read)(allow file-read* file-write* (literal \"/dev/null\"))(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\")){state}",
         quote(project)?,
@@ -504,13 +627,22 @@ fn guardian(
         return Err(ExecCmdError::Invalid);
     }
     let first_sample = spawn::monotonic_ns()?;
-    let descriptors = descriptors()?;
+    let (descriptors, mut frame_fd) = descriptors(profile)?;
     // SAFETY: guardian is a single-purpose fresh child, before spawning command.
     unsafe {
         libc::umask(0o077);
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
     let setup = (|| {
+        // FD 11 before any other setup step; it is closed once read.
+        let frame = match frame_fd.take() {
+            Some(fd) => {
+                let bytes = person::read_frame(fd.as_raw_fd(), 3, &mut || read_lease(3).is_some())?;
+                drop(fd);
+                Some(person::parse_frame(&bytes, profile)?)
+            }
+            None => None,
+        };
         let secrets = own_secret_environment()?;
         // The whole-command variable runs only the fixed `eval` text.
         if secrets.iter().any(|s| s.name == SecretName::Command) && command != WHOLE_COMMAND {
@@ -524,13 +656,33 @@ fn guardian(
             return Err(ExecCmdError::Denied);
         }
         separate_from_state(&project, &scratch, &asura)?;
-        let sandbox = match profile {
-            Profile::Model1 => seatbelt(&project, &scratch, &asura)?,
+        let roots = match &frame {
+            Some(frame) => person::root_paths(&frame.roles)?,
+            None => Vec::new(),
         };
+        let sandbox = match profile {
+            Profile::Model1 => Some(seatbelt(&project, &scratch, &asura)?),
+            Profile::Person1 => Some(person::seatbelt(&person::PersonPaths::from_roots(
+                &roots, &project, &scratch, &asura,
+            )?)?),
+            Profile::PersonOutside1 => None,
+        };
+        // A sandboxed profile never runs without `sandbox-exec`; only the
+        // outside profile does not need it (PC-I29).
+        let sandbox_exec = faults.sandbox_exec();
+        if sandbox.is_some() && !executable(sandbox_exec) {
+            return Err(ExecCmdError::Unavailable);
+        }
         // EX5: marker, decoy, PID buffer and capture pipe handles exist
-        // before the command does; a failure refuses the job.
+        // before the command does; a failure refuses the job. A `!!` job
+        // attributes by its owned group and its environment marker.
+        let marker = job_marker(jobhex);
         let mut table = Libproc::new(&scratch, &asura, escapee::capture_handles([5, 6])?)?;
         faults.apply(&mut table);
+        let env_marker = match profile {
+            Profile::PersonOutside1 => Some(EnvMarker::new(&marker)?),
+            Profile::Model1 | Profile::Person1 => None,
+        };
         // Any lease input before the command exists refuses the job.
         if read_lease(3).is_some() {
             return Err(ExecCmdError::Cancelled);
@@ -546,37 +698,30 @@ fn guardian(
         if script.len() > MAX_COMMAND_BYTES + PREAMBLE_LIMIT {
             return Err(ExecCmdError::Invalid);
         }
-        let args = vec![
-            "/usr/bin/sandbox-exec".into(),
-            "-p".into(),
+        let line = command_line(
+            profile,
+            sandbox_exec,
             sandbox,
-            "/bin/sh".into(),
-            "-c".into(),
             script,
-        ];
-        let fixed = [
-            "PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
-            "LC_ALL=C".into(),
-            "LANG=C".into(),
-            format!("HOME={scratch}"),
-            format!("TMPDIR={scratch}"),
-        ];
-        let env: Vec<&[u8]> = fixed
-            .iter()
-            .map(|entry| entry.as_bytes())
-            .chain(secrets.iter().map(|secret| secret.entry.as_slice()))
-            .collect();
+            &scratch,
+            &marker,
+            frame
+                .as_ref()
+                .map_or(&[][..], |frame| frame.entries.as_slice()),
+            &secrets,
+        );
+        let env: Vec<&[u8]> = line.env.iter().map(|entry| entry.as_slice()).collect();
         spawn::launch(
-            Path::new("/usr/bin/sandbox-exec"),
-            &args,
+            Path::new(line.executable),
+            &line.args,
             &env,
             &[(null.as_raw_fd(), 0), (5, 1), (6, 2)],
             Some(8),
             true,
         )
-        .map(|pid| (pid, table))
+        .map(|pid| (pid, table, env_marker))
     })();
-    let (pid, mut table) = match setup {
+    let (pid, mut table, mut env_marker) = match setup {
         Ok(spawned) => spawned,
         Err(error) => {
             notice(
@@ -626,6 +771,10 @@ fn guardian(
     // SAFETY: getpid has no preconditions.
     let exclude = [unsafe { libc::getpid() }, pid];
     let mut tally = Tally::new(table.limit());
+    if let Some(env) = env_marker.as_mut() {
+        env.set_group(pid);
+    }
+    let outside = profile == Profile::PersonOutside1;
     let mut last_sweep: Option<Result<Sweep, escapee::Unverifiable>> = None;
     loop {
         let (now, clock_fault) = safety.sample_clock(spawn::monotonic_ns());
@@ -688,7 +837,10 @@ fn guardian(
                 None => break,
             }
         }
-        if exited || !report_ok {
+        // PQ3: a `!!` shell exit with no stop signals nothing; the leader
+        // is reaped and its survivors are counted at once.
+        let shell_exit = outside && exited && !stop.stopped && report_ok;
+        if (exited && !shell_exit) || !report_ok {
             signal = signal.max(stop.unprompted());
         }
         if stop.stopped && stopping.is_none() {
@@ -714,6 +866,7 @@ fn guardian(
             }
             Signal::None => {}
         }
+        let mut ready = shell_exit && safety.fence_valid;
         if let Some(start) = stopping {
             if safety.kill_due(
                 clock_fault,
@@ -729,81 +882,99 @@ fn guardian(
                 killed = true;
             }
             if safety.fence_valid && exited && group_only_leader(pid).unwrap_or(false) {
-                // EX5 settlement gate: the leader stays unreaped, as the
-                // group fence, until no attributed descendant remains.
+                ready = true;
+            }
+        }
+        if ready {
+            // EX5 settlement gate: the leader stays unreaped, as the group
+            // fence, until no attributed descendant remains. The `!!` gate
+            // needs only the leader: its survivors are counted after the
+            // reap and never signalled (EC-D1, OD2).
+            let gate = if outside {
+                Gate::Settled
+            } else {
                 let swept = if faults.group_only() {
                     Ok(Sweep::Clear)
                 } else {
                     escapee::sweep(&mut table, &exclude, &mut tally, FREEZE_ROUND_LIMIT)
                 };
                 last_sweep = Some(swept);
-                match escapee::gate(GateFacts {
+                escapee::gate(GateFacts {
                     leader_exited: true,
                     group_empty: true,
                     sweep: swept.ok(),
-                }) {
-                    Gate::Settled => {
-                        let mut status = 0;
-                        // SAFETY: our zombie leader is reaped only after all
-                        // group and escapee signals end.
-                        let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-                        if reaped == pid {
+                })
+            };
+            match gate {
+                Gate::Settled => {
+                    let mut status = 0;
+                    // SAFETY: our zombie leader is reaped only after all
+                    // group and escapee signals end.
+                    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    if reaped == pid {
+                        let (escapees, reason) = if let Some(env) = env_marker.as_mut() {
+                            let found = escapee::survivors(&mut table, env, &exclude);
+                            (found.count, found.settled_reason(stop.reason))
+                        } else {
                             let escapees = tally.count();
-                            // Kind 2 repeats the kind 5 exit facts.
-                            if let (true, Some((exit_kind, value))) = (report_ok, leader) {
-                                if escapees > 0 {
-                                    notice(
-                                        4,
-                                        Notice {
-                                            kind: KIND_ESCAPEE_REPORT,
-                                            reason: 0,
-                                            exit_kind: 0,
-                                            cleanup: false,
-                                            value: escapees,
-                                        },
-                                        id,
-                                    )?;
-                                }
+                            (escapees, stop.settled_reason(escapees))
+                        };
+                        // Kind 2 repeats the kind 5 exit facts.
+                        if let (true, Some((exit_kind, value))) = (report_ok, leader) {
+                            if escapees > 0 {
                                 notice(
                                     4,
                                     Notice {
-                                        kind: 2,
-                                        reason: stop.settled_reason(escapees),
-                                        exit_kind,
-                                        cleanup: true,
-                                        value,
+                                        kind: KIND_ESCAPEE_REPORT,
+                                        reason: 0,
+                                        exit_kind: 0,
+                                        cleanup: false,
+                                        value: escapees,
                                     },
                                     id,
                                 )?;
                             }
-                            return if report_ok {
-                                Ok(())
-                            } else {
-                                Err(ExecCmdError::Protocol)
-                            };
+                            notice(
+                                4,
+                                Notice {
+                                    kind: 2,
+                                    reason,
+                                    exit_kind,
+                                    cleanup: true,
+                                    value,
+                                },
+                                id,
+                            )?;
                         }
+                        return if report_ok {
+                            Ok(())
+                        } else {
+                            Err(ExecCmdError::Protocol)
+                        };
                     }
-                    // EC-D2: an unverifiable scan is reported at once.
-                    Gate::Unverifiable if !reported_unknown => {
-                        if report_ok {
-                            report_ok =
-                                notice(4, unconfirmed(REASON_ESCAPEE_UNTERMINATED), id).is_ok();
-                        }
-                        reported_unknown = true;
+                }
+                // EC-D2: an unverifiable scan is reported at once.
+                Gate::Unverifiable if !reported_unknown => {
+                    if report_ok {
+                        report_ok = notice(4, unconfirmed(REASON_ESCAPEE_UNTERMINATED), id).is_ok();
                     }
-                    Gate::Unverifiable | Gate::Wait => {}
+                    reported_unknown = true;
                 }
+                Gate::Unverifiable | Gate::Wait => {}
             }
-            if now.saturating_sub(start) >= 2_500_000_000 && !reported_unknown {
-                let reason = match last_sweep {
-                    Some(Ok(Sweep::Remaining(_)) | Err(_)) => REASON_ESCAPEE_UNTERMINATED,
-                    _ => REASON_CLEANUP_FAILED,
-                };
-                if report_ok {
-                    report_ok = notice(4, unconfirmed(reason), id).is_ok();
-                }
-                reported_unknown = true;
+        }
+        if let Some(start) = stopping
+            && now.saturating_sub(start) >= 2_500_000_000
+            && !reported_unknown
+        {
+            let reason = match last_sweep {
+                Some(Ok(Sweep::Remaining(_)) | Err(_)) => REASON_ESCAPEE_UNTERMINATED,
+                _ => REASON_CLEANUP_FAILED,
+            };
+            if report_ok {
+                report_ok = notice(4, unconfirmed(reason), id).is_ok();
             }
+            reported_unknown = true;
         }
         // One paced polling wait of at most 100 ms. FD 3 is watched until
         // its EOF, so `K` after a stop wakes the loop and a hung-up lease
@@ -1233,6 +1404,152 @@ mod tests {
         assert_eq!(Signal::Term.max(Signal::Kill), Signal::Kill);
         assert_eq!(Signal::None.max(Signal::Term), Signal::Term);
     }
+    /// PC-U24: the person profiles' lease bytes. `T` starts TERM and the
+    /// 2 s grace (PC8), `K` kills at once, EOF ends the lease and stops the
+    /// group, and an unknown byte is handled as EOF (the J2 lease rule: a
+    /// lease fault). The grace is the profile's, not the model's 500 ms.
+    #[test]
+    fn pc_u24_person_lease_bytes_and_grace() {
+        for profile in [Profile::Person1, Profile::PersonOutside1] {
+            let grace = profile.grace_ns();
+            assert_eq!(grace, 2_000_000_000, "{profile:?}");
+            let safety = CleanupSafety::new(0);
+            // T: TERM now, KILL only once the 2 s grace has passed.
+            let mut s = StopState::new();
+            assert_eq!(s.lease(lease_input(1, b'T', false).unwrap()), Signal::Term);
+            assert_eq!(s.reason, REASON_CANCEL);
+            assert!(!safety.kill_due(false, 500_000_000, false, grace));
+            assert!(!safety.kill_due(false, 1_999_999_999, false, grace));
+            assert!(safety.kill_due(false, 2_000_000_000, false, grace));
+            // K: KILL now, reason 11.
+            assert_eq!(s.lease(lease_input(1, b'K', false).unwrap()), Signal::Kill);
+            assert_eq!(s.reason, REASON_KILL);
+            // EOF: lease end, TERM, reason 4.
+            let mut s = StopState::new();
+            assert_eq!(s.lease(lease_input(0, 0, false).unwrap()), Signal::Term);
+            assert_eq!((s.reason, s.lease_open), (REASON_LEASE_ENDED, false));
+            // An unknown byte is a lease fault, handled as EOF.
+            let mut s = StopState::new();
+            assert_eq!(lease_input(1, b'x', false), Some(LeaseInput::End));
+            assert_eq!(s.lease(LeaseInput::End), Signal::Term);
+            assert_eq!(s.reason, REASON_LEASE_ENDED);
+        }
+    }
+    fn secret(entry: &[u8], number: u8) -> SecretEntry {
+        SecretEntry {
+            name: SecretName::Numbered(number),
+            entry: Zeroizing::new(entry.to_vec()),
+        }
+    }
+    /// PC-U46: `PersonOutside` runs `/bin/sh -c COMMAND` with no
+    /// `sandbox-exec` and no profile; envp is the FD 11 launch environment,
+    /// then `ASURA_JOB_<jobhex>=1`, then the secret variables, and the
+    /// preamble is present when secret variables exist. The guardian's own
+    /// environment check refuses a launch entry, so none can reach it.
+    #[test]
+    fn pc_u46_outside_command_line() {
+        let jobhex = "00112233445566778899aabbccddeeff";
+        let marker = job_marker(jobhex);
+        assert_eq!(marker, format!("ASURA_JOB_{jobhex}=1"));
+        let frame = [
+            Zeroizing::new(b"PATH=/opt/x/bin:/usr/bin".to_vec()),
+            Zeroizing::new(b"DYLD_INSERT_LIBRARIES=/tmp/x.dylib".to_vec()),
+            Zeroizing::new(b"HOME=/Users/p".to_vec()),
+        ];
+        let secrets = [secret(b"ASURA_SECRET_1=hunter2", 1)];
+        let script = format!(
+            "{}echo \"$ASURA_SECRET_1\"",
+            preamble(secrets.iter().map(|s| s.name))
+        );
+        let line = command_line(
+            Profile::PersonOutside1,
+            SANDBOX_EXEC,
+            None,
+            script.clone(),
+            "/h/.asura/tmp/exec-cmd-1",
+            &marker,
+            &frame,
+            &secrets,
+        );
+        assert_eq!(line.executable, "/bin/sh");
+        assert_eq!(
+            line.args,
+            vec!["/bin/sh".to_owned(), "-c".into(), script.clone()]
+        );
+        assert!(
+            line.args
+                .iter()
+                .all(|a| !a.contains("sandbox-exec") && !a.contains("(version 1)"))
+        );
+        assert!(script.starts_with("__asura_t=$ASURA_SECRET_1; unset ASURA_SECRET_1;"));
+        let env: Vec<&[u8]> = line.env.iter().map(|e| e.as_slice()).collect();
+        assert_eq!(
+            env,
+            vec![
+                &b"PATH=/opt/x/bin:/usr/bin"[..],
+                b"DYLD_INSERT_LIBRARIES=/tmp/x.dylib",
+                b"HOME=/Users/p",
+                marker.as_bytes(),
+                b"ASURA_SECRET_1=hunter2",
+            ]
+        );
+        // Without secrets: no preamble, the marker is last.
+        let line = command_line(
+            Profile::PersonOutside1,
+            SANDBOX_EXEC,
+            None,
+            format!("{}true", preamble([])),
+            "/s",
+            &marker,
+            &frame,
+            &[],
+        );
+        assert_eq!(line.args[2], "true");
+        assert_eq!(line.env.last().unwrap().as_slice(), marker.as_bytes());
+        // The guardian never adopts a launch entry: its own environment
+        // check refuses every non-secret name.
+        for entry in frame.iter() {
+            assert!(secret_environment([entry.as_slice()]).is_err());
+        }
+        // `person-1` keeps `sandbox-exec`, its FD 11 entries and no marker;
+        // `model-1` keeps its fixed environment.
+        let line = command_line(
+            Profile::Person1,
+            SANDBOX_EXEC,
+            Some("(version 1)".into()),
+            "true".into(),
+            "/s",
+            &marker,
+            &frame,
+            &[],
+        );
+        assert_eq!(line.executable, SANDBOX_EXEC);
+        assert_eq!(&line.args[..3], &[SANDBOX_EXEC, "-p", "(version 1)"]);
+        assert_eq!(&line.args[3..], &["/bin/sh", "-c", "true"]);
+        assert_eq!(line.env.len(), 3);
+        assert!(line.env.iter().all(|e| !e.starts_with(b"ASURA_JOB_")));
+        let line = command_line(
+            Profile::Model1,
+            SANDBOX_EXEC,
+            Some("(version 1)".into()),
+            "true".into(),
+            "/s",
+            &marker,
+            &frame,
+            &[],
+        );
+        let env: Vec<&[u8]> = line.env.iter().map(|e| e.as_slice()).collect();
+        assert_eq!(
+            env,
+            vec![
+                &b"PATH=/usr/bin:/bin:/usr/sbin:/sbin"[..],
+                b"LC_ALL=C",
+                b"LANG=C",
+                b"HOME=/s",
+                b"TMPDIR=/s",
+            ]
+        );
+    }
     /// J2T-06 unit: kind 5 facts from `waitid`.
     #[test]
     fn j2t_06_leader_exit_facts() {
@@ -1294,7 +1611,10 @@ mod tests {
         assert_eq!(body.matches("kind: 3,").count(), 1);
         let launch = at("spawn::launch(", 0);
         // The launch is the setup's last fallible step.
-        let matched = at("let (pid, mut table) = match setup {", launch);
+        let matched = at(
+            "let (pid, mut table, mut env_marker) = match setup {",
+            launch,
+        );
         assert_no_exit("after the launch in setup", &body[launch..matched]);
         // The setup failure arm sends kind 3 only and spawns nothing.
         let ok_arm = at("Ok(spawned) => spawned,", matched);
