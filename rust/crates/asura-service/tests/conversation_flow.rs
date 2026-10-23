@@ -1397,8 +1397,10 @@ fn crash_recovery(
         "Write a long numbered list of 100 different trees, with a description of each tree. Continue until the list is complete.",
     )?;
     let operation = checked_id(accepted.operation_id)?;
-    let deadline = Instant::now() + Duration::from_secs(30);
     let mut client = fixture.attach()?;
+    // The wait ends on the recorded event, started or terminal, not on a
+    // deadline: a sandboxed helper starts more slowly (release-signing.md,
+    // SG2a reruns, SG-V5). The poll is paced.
     loop {
         let event = client.observe_conversation(operation, 0, 0)?;
         if event.kind == Some(2) {
@@ -1406,9 +1408,6 @@ fn crash_recovery(
         }
         if matches!(event.kind, Some(3..=6)) {
             return Err("operation completed before crash boundary; no crash proof".into());
-        }
-        if Instant::now() >= deadline {
-            return Err("no started snapshot before crash deadline".into());
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -2030,14 +2029,21 @@ fn native_mlx() -> Result<()> {
     result.map_err(|error| format!("native-mlx {stage}: {error}").into())
 }
 
-/// SG-V9 end to end (release signing, SG1): the service runs from an
-/// `Asura.app` layout built from an assembled bundle (`ASURA_TEST_BUNDLE`,
-/// from `tools/release/asura-bundle`). It must find the signed helper beside
-/// itself in `Contents/MacOS` and `mlx.metallib` and the Hub bundle in
-/// `Contents/Resources`. This test binary stands in for `asura`, which uses
-/// the account home; it must be built after the bundle so that it embeds the
-/// same package identity.
-fn bundle_mlx() -> Result<()> {
+/// SG-V5 and SG-V9 end to end (release signing, SG1 and SG2). The service runs
+/// from an `Asura.app` layout built from the SG-V5 test variant of an assembled
+/// ad hoc bundle (`ASURA_TEST_BUNDLE`, prepared by
+/// `tools/release/test-asura-bundle --sandbox`). The variant's helper claims
+/// the shipped App Sandbox list plus a test-only read-only exception for the
+/// harness homes. The service must find that helper beside itself in
+/// `Contents/MacOS` and `mlx.metallib` and the Hub bundle in
+/// `Contents/Resources`. Every helper this journey starts must be in the App
+/// Sandbox (`sandbox_check(pid, NULL, 0) == 1`, a process answer, never a path
+/// answer). The system provider always runs; MLX runs when
+/// `ASURA_TEST_MLX_ASSET` names a model directory, Ollama when
+/// `ASURA_TEST_OLLAMA_MODEL` names a model of a running local Ollama. This
+/// test binary stands in for `asura`, which uses the account home; it must be
+/// built after the variant so that it embeds the variant's package identity.
+fn bundle_sandbox() -> Result<()> {
     let mut stage = "inputs";
     let mut fixture = Fixture::new()?;
     let result = (|| -> Result<()> {
@@ -2045,10 +2051,16 @@ fn bundle_mlx() -> Result<()> {
             std::env::var_os("ASURA_TEST_BUNDLE").ok_or("ASURA_TEST_BUNDLE is required")?,
         )
         .canonicalize()?;
-        let source = PathBuf::from(
-            std::env::var_os("ASURA_TEST_MLX_ASSET").ok_or("ASURA_TEST_MLX_ASSET is required")?,
-        )
-        .canonicalize()?;
+        let mlx = std::env::var_os("ASURA_TEST_MLX_ASSET")
+            .filter(|value| !value.is_empty())
+            .map(|value| PathBuf::from(value).canonicalize())
+            .transpose()?;
+        let ollama = std::env::var("ASURA_TEST_OLLAMA_MODEL")
+            .ok()
+            .filter(|name| !name.is_empty());
+        if let Some(name) = &ollama {
+            assert!(!name.chars().any(char::is_whitespace));
+        }
         stage = "bundle layout";
         let packaged = bundle.join("Contents");
         let contents = fixture.home.join("Asura.app/Contents");
@@ -2076,13 +2088,10 @@ fn bundle_mlx() -> Result<()> {
         stage = "service startup";
         fixture.start()?;
         stage = "installation ready";
-        wait_ready(&fixture, None)?;
-        stage = "asset copy";
-        let assets = fixture.home.join(".asura/data/models/mlx/native-fixture");
-        copy_assets(&source, &assets, 0, &mut 0, &mut 0)?;
-        stage = "installation ready";
-        wait_ready(&fixture, None)?;
-        let directory = fixture.home.join("bundle-project");
+        let installation = wait_ready(&fixture, None)?
+            .installation_id
+            .map(|id| id.to_vec());
+        let directory = fixture.home.join("sandbox-project");
         fs::create_dir(&directory)?;
         stage = "project registration";
         let project = checked_id(
@@ -2097,57 +2106,168 @@ fn bundle_mlx() -> Result<()> {
                 )?
                 .project_id,
         )?;
-        stage = "model configuration";
-        let configured = fixture
-            .attach()?
-            .config("model", Some("mlx:native-fixture"), &|| false)?;
+
+        // HS-P6: the sandboxed helper lists a metadata-only MLX asset under
+        // `.asura/data/models`, reached through the read-only exception.
+        stage = "inventory";
+        let listed = fixture
+            .home
+            .join(".asura/data/models/mlx/inventory-fixture");
+        // Private modes, as the authority scan on the crash-recovery restart
+        // requires for every directory under `.asura`.
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&listed)?;
+        }
+        fs::write(
+            listed.join("config.json"),
+            r#"{"model_type":"fixture","max_position_embeddings":4096}"#,
+        )?;
+        wait_ready(&fixture, installation.clone())?;
+        let inventory = loop {
+            let reply = fixture.attach()?.models(&|| false)?;
+            if reply.error.as_deref() == Some("models_busy") {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            break reply;
+        };
+        assert_eq!(inventory.error, None, "inventory failed: {inventory:?}");
         assert!(
-            configured.error.is_none(),
-            "configuration failed: {configured:?}"
+            inventory
+                .models
+                .iter()
+                .any(|row| row.selector.as_deref() == Some("system"))
         );
-        stage = "native submit";
-        let accepted = provider_submit(&fixture, project, None, 0, "Name one tree.")?;
-        let operation = checked_id(accepted.operation_id)?;
-        stage = "bundle resource proof";
-        let run = fixture.home.join(".asura/run");
-        let copied = fs::read_dir(&run)?
-            .flatten()
-            .map(|entry| entry.path())
-            .find(|path| path.join("mlx.metallib").is_file())
-            .ok_or("native helper did not retain its private Metal resource")?;
-        assert_eq!(
-            fs::read(copied.join("asura-model"))?,
-            fs::read(packaged.join("MacOS/asura-model"))?,
-            "the helper copy must be the bundle's signed helper"
+        assert!(
+            inventory.models.iter().any(|row| row.selector.as_deref()
+                == Some("mlx:inventory-fixture")
+                && row.status == Some(2)),
+            "the sandboxed inventory did not list the MLX asset: {:?}",
+            inventory.models
         );
-        assert_eq!(
-            fs::read(copied.join("mlx.metallib"))?,
-            fs::read(packaged.join("Resources/mlx.metallib"))?,
-            "mlx.metallib must come from Contents/Resources"
+        assert!(
+            !inventory
+                .issues
+                .iter()
+                .any(|issue| issue.provider.as_deref() == Some("mlx")),
+            "the sandboxed inventory reported an MLX issue: {:?}",
+            inventory.issues
         );
-        assert_eq!(
-            bundle_files(&copied.join(asura_platform::HUB_BUNDLE_NAME))?,
-            bundle_files(&packaged.join(&hub))?,
-            "the Hub bundle must come from Contents/Resources"
+        println!(
+            "PASS sandboxed inventory listed the MLX asset through the read-only models exception"
         );
-        stage = "native completion";
-        let terminal = observe(&fixture, operation)?;
+
+        // HS-P1 and HS-P2: start, container, FD 3 and Foundation Models.
+        stage = "system provider";
+        select(&fixture, "system")?;
+        let terminal = sandboxed_turn(
+            &fixture,
+            project,
+            "Write a numbered list of five trees, one short sentence each.",
+            |_| Ok(()),
+        )?;
         assert_eq!(
             terminal.kind,
             Some(3),
-            "MLX completion failed: {terminal:?}"
+            "system completion failed: {terminal:?}"
         );
         assert!(!terminal.text.as_deref().unwrap_or_default().is_empty());
+        println!("PASS sandboxed helper completed a system provider turn over FD 3");
+
+        // HS-P3 and HS-P6: MLX with the bundle's Metal library and Hub bundle,
+        // reading the asset under `.asura/data/models`.
+        if let Some(source) = &mlx {
+            stage = "MLX asset copy";
+            let assets = fixture.home.join(".asura/data/models/mlx/native-fixture");
+            copy_assets(source, &assets, 0, &mut 0, &mut 0)?;
+            wait_ready(&fixture, installation.clone())?;
+            stage = "MLX provider";
+            select(&fixture, "mlx:native-fixture")?;
+            let terminal = sandboxed_turn(&fixture, project, "Name one tree.", |copied| {
+                assert_eq!(
+                    fs::read(copied.join("asura-model"))?,
+                    fs::read(packaged.join("MacOS/asura-model"))?,
+                    "the helper copy must be the bundle's signed helper"
+                );
+                assert_eq!(
+                    fs::read(copied.join("mlx.metallib"))?,
+                    fs::read(packaged.join("Resources/mlx.metallib"))?,
+                    "mlx.metallib must come from Contents/Resources"
+                );
+                assert_eq!(
+                    bundle_files(&copied.join(asura_platform::HUB_BUNDLE_NAME))?,
+                    bundle_files(&packaged.join(&hub))?,
+                    "the Hub bundle must come from Contents/Resources"
+                );
+                Ok(())
+            })?;
+            assert_eq!(
+                terminal.kind,
+                Some(3),
+                "MLX completion failed: {terminal:?}"
+            );
+            assert!(!terminal.text.as_deref().unwrap_or_default().is_empty());
+            println!(
+                "PASS sandboxed helper completed an MLX turn with Contents/Resources mlx.metallib and Hub bundle"
+            );
+        } else {
+            println!("SKIP sandboxed MLX turn: ASURA_TEST_MLX_ASSET is not set");
+        }
+
+        // HS-P5: Ollama on loopback through `network.client`.
+        if let Some(name) = &ollama {
+            stage = "Ollama provider";
+            let reply = fixture.attach()?.config(
+                "providers.ollama.endpoint",
+                Some("http://127.0.0.1:11434"),
+                &|| false,
+            )?;
+            assert!(reply.error.is_none(), "configuration failed: {reply:?}");
+            select(&fixture, &format!("ollama:{name}"))?;
+            let terminal = sandboxed_turn(
+                &fixture,
+                project,
+                "Say hello in one short sentence.",
+                |_| Ok(()),
+            )?;
+            assert_eq!(
+                terminal.kind,
+                Some(3),
+                "Ollama completion failed: {terminal:?}"
+            );
+            assert!(!terminal.text.as_deref().unwrap_or_default().is_empty());
+            println!("PASS sandboxed helper completed an Ollama ({name}) turn on loopback");
+        } else {
+            println!("SKIP sandboxed Ollama turn: ASURA_TEST_OLLAMA_MODEL is not set");
+        }
+
         stage = "service shutdown";
         fixture.stop()?;
+        let run = fixture.home.join(".asura/run");
         assert!(
             !fs::read_dir(&run)?
                 .flatten()
                 .any(|entry| entry.file_name().to_string_lossy().starts_with("model-")),
             "owned model copies leaked after shutdown"
         );
+        println!("PASS sandboxed helper copies removed at clean shutdown");
+
+        // HS-P1: a sandboxed helper sees service EOF and exits; recovery
+        // starts no helper. A killed service leaves its run copy, so this
+        // step follows the clean-shutdown check.
+        stage = "crash recovery";
+        fixture.start()?;
+        wait_ready(&fixture, installation.clone())?;
+        select(&fixture, "system")?;
+        crash_recovery(&mut fixture, project, installation.clone())?;
+        stage = "final shutdown";
+        fixture.stop()?;
         println!(
-            "PASS bundle MLX: service in Asura.app/Contents/MacOS used the bundle helper and Contents/Resources resources, completed and cleaned up"
+            "PASS bundle sandbox: service in Asura.app/Contents/MacOS ran only sandboxed helpers"
         );
         Ok(())
     })();
@@ -2155,8 +2275,59 @@ fn bundle_mlx() -> Result<()> {
         // The fixture deletes its home on drop; keep the service log tail.
         let log = fs::read_to_string(fixture.home.join("service.log")).unwrap_or_default();
         let tail = &log[log.len().saturating_sub(4096)..];
-        format!("bundle-mlx {stage}: {error}\nservice log tail:\n{tail}").into()
+        format!("bundle-sandbox {stage}: {error}\nservice log tail:\n{tail}").into()
     })
+}
+
+fn select(fixture: &Fixture, model: &str) -> Result<()> {
+    let reply = fixture.attach()?.config("model", Some(model), &|| false)?;
+    if reply.error.is_some() {
+        return Err(format!("model selection {model} failed: {reply:?}").into());
+    }
+    Ok(())
+}
+
+/// Submits one turn and observes it to its terminal event. While the turn
+/// runs, the one direct helper must be witnessed in the App Sandbox; `copied`
+/// then receives its run copy directory. The wait ends on the terminal event.
+fn sandboxed_turn(
+    fixture: &Fixture,
+    project: [u8; 16],
+    prompt: &str,
+    copied: impl Fn(&Path) -> Result<()>,
+) -> Result<pb::ConversationEvent> {
+    unsafe extern "C" {
+        /// `int sandbox_check(pid_t, const char *operation, int type, ...)`;
+        /// a null operation asks only whether the process is sandboxed.
+        fn sandbox_check(pid: libc::pid_t, operation: *const libc::c_char, kind: i32, ...) -> i32;
+    }
+    let accepted = provider_submit(fixture, project, None, 0, prompt)?;
+    let mut observer = Observer::new(checked_id(accepted.operation_id)?);
+    let mut witnessed = false;
+    loop {
+        if !witnessed && let Ok(helper) = helper_witness(fixture) {
+            let pid = libc::pid_t::try_from(helper.pid)?;
+            // SAFETY: a null operation with type 0 reads no further arguments.
+            match unsafe { sandbox_check(pid, std::ptr::null(), 0) } {
+                1 => {
+                    let path = Path::new(&helper.command);
+                    copied(path.parent().ok_or("helper path has no parent")?)?;
+                    witnessed = true;
+                }
+                0 if same_helper(&fixture.home, &helper)? => {
+                    return Err(format!("helper {pid} is not in the App Sandbox").into());
+                }
+                // The helper exited or was replaced; look again.
+                _ => {}
+            }
+        }
+        if let Some(event) = observer.step(fixture)? {
+            if !witnessed {
+                return Err("the turn ended before its helper was witnessed".into());
+            }
+            return Ok(event);
+        }
+    }
 }
 
 fn native_ollama() -> Result<()> {
@@ -2689,8 +2860,8 @@ fn main() {
         native_ollama_thinking()
     } else if args.iter().any(|a| a == "--native-ollama") {
         native_ollama()
-    } else if args.iter().any(|a| a == "--bundle-mlx") {
-        bundle_mlx()
+    } else if args.iter().any(|a| a == "--bundle-sandbox") {
+        bundle_sandbox()
     } else if args.iter().any(|a| a == "--native-mlx") {
         native_mlx()
     } else if args.iter().any(|a| a == "--native-coreai-tools") {

@@ -254,9 +254,16 @@ require_runtime "$pkg/asura-model"
 details "$pkg/asura-model" | grep -Eq '^Info.plist entries=[1-9]' || fail 'asura-model has no bound Info.plist'
 require_signer "$pkg/asura-model"
 require_signer "$pkg/swift-transformers_Hub.bundle"
-# The signed helper reports the identity generated in step 2.
-case "$("$pkg/asura-model" --version)" in *" build=$build_id schema=$schema") ;; *) false ;; esac ||
+# The signed helper's code reports the identity generated in step 2. The
+# signed helper claims the App Sandbox (SG2), and starting it would create its
+# container under the product identifier on this Mac, so the check runs an ad
+# hoc copy without entitlements: the same code with its signature replaced.
+copy "$pkg/asura-model" "$work/asura-model-version"
+codesign --force --sign - --timestamp=none "$work/asura-model-version" 2>/dev/null ||
+    fail 'cannot sign the version-check copy'
+case "$("$work/asura-model-version" --version)" in *" build=$build_id schema=$schema") ;; *) false ;; esac ||
     fail 'the signed helper does not report the generated build ID and schema digest'
+rm -f "$work/asura-model-version"
 check_tree "$pkg/swift-transformers_Hub.bundle" 'the signed Hub bundle'
 [ "$(size "$pkg/asura-model")" -le 134217728 ] || fail 'asura-model is over 128 MiB'
 

@@ -10,7 +10,9 @@ questions SGQ1–SGQ9 on 2026-10-23 ([owner decisions](#owner-decisions)). No
 code, test, signature, notarisation or Keychain call was made to write this
 design. Protocol numbering stays `0.1`; journal format stays `1`.
 Packet SG1 delivered the package script and the bundle resource lookup on
-2026-10-23 ([SG1 delivery](#sg1-delivery)); it signed ad hoc only.
+2026-10-23 ([SG1 delivery](#sg1-delivery)); it signed ad hoc only. Packet SG2
+delivered the helper App Sandbox entitlements and the SG-V5 checks on
+2026-10-23 ([SG2 delivery](#sg2-delivery)), also ad hoc only.
 
 What is fixed:
 
@@ -381,8 +383,13 @@ team ID at signing time, in the output directory only.
 | `asura.release.plist` | `keychain-access-groups` [`@TEAM_ID@.com.pidster.asura`], `com.apple.application-identifier` `@TEAM_ID@.com.pidster.asura`, `com.apple.developer.team-identifier` `@TEAM_ID@` |
 | `asura.development.plist` | The release keys and `com.apple.security.get-task-allow` `true` |
 | `asura.ad-hoc.plist` | None |
-| `asura-model.release.plist`, `asura-model.ad-hoc.plist` | None. Packet SG2 adds the App Sandbox keys (SGQ7) |
-| `asura-model.development.plist` | `com.apple.security.get-task-allow` `true`. SG2 adds the App Sandbox keys |
+| `asura-model.release.plist`, `asura-model.ad-hoc.plist` | `com.apple.security.app-sandbox` `true`, `com.apple.security.network.client` `true`, `com.apple.security.temporary-exception.files.home-relative-path.read-only` [`/.asura/data/models/`, `/.asura/run/`] (SG2, SGQ7) |
+| `asura-model.development.plist` | The release helper keys and `com.apple.security.get-task-allow` `true` |
+
+The ad hoc helper list equals the release list: these keys need no profile,
+so an ad hoc helper can claim them, and the dry run signs the helper that a
+release would ship. No tracked list carries an absolute-path exception; the
+SG-V5 test variant adds one at test time ([SG2 delivery](#sg2-delivery)).
 
 The ad hoc files omit the profile-authorised keys because the kernel kills an
 ad hoc process that claims them: an ad hoc, hardened test binary that claimed
@@ -414,9 +421,12 @@ the archive. A new run needs a new output directory.
    identifier `com.pidster.asura.model` and the Hardened Runtime. Check:
    `codesign --verify --strict` passes for both; the helper's identifier is
    `com.pidster.asura.model`, its flags hold `runtime`, its embedded
-   `Info.plist` is bound, and the signed helper's `--version` reports the
-   build ID and schema digest from step 2 (step 2 also checks that each
-   generated array holds 32 bytes).
+   `Info.plist` is bound, and the signed helper's code reports the build ID
+   and schema digest from step 2 through `--version` (step 2 also checks that
+   each generated array holds 32 bytes). The check runs an ad hoc copy with
+   no entitlements: the signed helper claims the App Sandbox, and starting it
+   would create its container under `com.pidster.asura.model` on the
+   packaging Mac. The copy has the same code; only its signature differs.
 6. **Hash.** SHA-256 of the signed helper and `mlx.metallib`, and the Hub
    bundle digest ([encoding](#hub-bundle-digest-encoding)). Write the five
    lines of `.build/model-tools/package-identity.txt` and the staged
@@ -1029,10 +1039,10 @@ flowchart TD
   controls that account can sign as Asura. Notarisation keeps an audit trail,
   and Apple can revoke tickets
   ([Notarizing macOS software](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)).
-- **Helper sandbox.** If SG2 ships, it limits a compromised helper to reading
-  models, its run directory and the Hub bundle, using the network, and writing
-  its container. If an HS probe fails, residual EX-H1 records the unconfined
-  helper.
+- **Helper sandbox.** SG2 ships it (2026-10-23): it limits a compromised
+  helper to reading models, its run directory and the Hub bundle, using the
+  network, and writing its container. EX-H1 is not recorded. If NT-P1 rejects
+  the sandboxed helper, SG-F2 ships it unsandboxed and EX-H1 is recorded.
 - **New residual SG-T3 (HS-P7).** The App Sandbox does not stop the helper
   reading the arguments and environment of other processes of the same user
   through `KERN_PROCARGS2` (process list and descriptor info are denied, these
@@ -1238,10 +1248,10 @@ signing packet.
 | SG1 | Delivered (branch `sg1`, 2026-10-23) | — ([delivery](#sg1-delivery)) |
 | SG0-K | Not ready | A qualification-bundle variant of the package script (entitlements naming the test group `<TeamID>.com.pidster.asura.test`, and its profile); then the owner runs it (SGQ9) |
 | SG2a | Delivered (branch `sg2a`, 2026-10-23) | — |
-| SG2 | Ready | — (SG1 delivered; HS-P6 passed in SG2a) |
+| SG2 | Delivered (branch `sg2`, 2026-10-23) | — ([delivery](#sg2-delivery)) |
 | SG3 | Not ready | KC-P1 to KC-P4 results; then the secret store design revision that SG3 owns |
-| SG4 | Not ready | SG2 and NT-P1 |
-| SG5 | Not ready | SG2, SG3 and SG4 |
+| SG4 | Not ready | NT-P1 |
+| SG5 | Not ready | SG3 and SG4 |
 
 ### SG1 delivery
 
@@ -1284,6 +1294,105 @@ home; the installed-keg case stays with SG4 and SG5. The script does not yet
 build the qualification bundle that SG0-K needs. Native tests that use the
 development package need `<out>/package/` beside the test binaries.
 
+### SG2 delivery
+
+Delivered 2026-10-23 on branch `sg2`, ad hoc signing only (`codesign -s -`).
+No named identity, `notarytool`, `stapler` or Keychain call was made;
+`security list-keychains -d user` listed only the login keychain before and
+after. SGQ7 is decided for release: HS-P1 to HS-P7 passed (SG0, SG2a and the
+SG-V5 run below), so the helper ships with the App Sandbox and EX-H1 is not
+recorded. NT-P1 still decides whether the notary service accepts the
+temporary exceptions ([SG-F2](#sg-f2-helper-sandbox-decision)).
+
+- `tools/release/entitlements/asura-model.{release,development,ad-hoc}.plist`:
+  the App Sandbox keys of the [entitlement table](#entitlement-files). The
+  embedded `Info.plist` identity (`com.pidster.asura.model`) is unchanged.
+- `tools/release/asura-bundle`: step 5 checks `--version` on an ad hoc copy
+  without entitlements, so that packaging never starts the sandboxed helper
+  and creates no container under the product identifier. No other step
+  changed; step 9 already compares the helper's entitlements with its list.
+- `tools/release/test-asura-bundle`: `--static` checks the helper keys and
+  that no tracked list carries an absolute-path or writable exception;
+  `--sandbox APP` runs SG-V5 ([SG-F6](#sg-f6-sg-v5-checks)). The SG1 team-ID
+  check no longer matches the script's own fixture strings.
+- `tools/release/sandbox-probe.c`: the HS-P7 negative fixture.
+- `conversation_flow --bundle-sandbox` replaces `--bundle-mlx`. The shipped
+  helper reads only the account home's `~/.asura`, so a sandboxed bundle
+  helper cannot run in a test home; SG-V9's end-to-end checks now run inside
+  this journey with the test variant. The crash-recovery step's wait for the
+  started event has no deadline; it ends on the started or a terminal event
+  (paced poll).
+
+Test isolation (selected, engineering): `--sandbox` re-signs a copy of the
+bundle's helper as a test-only variant. It claims the bundle helper's list
+plus `com.apple.security.temporary-exception.files.absolute-path.read-only`
+[`/private/tmp/`], the parent of every harness home (the home name is random,
+and an exception names a directory, not a prefix). Its signing identifier and
+its embedded `CFBundleIdentifier` are the probe identifier
+`com.pidster.asura.probe.model` (the section is rewritten at the same size),
+so tests never create a container or Core AI cache under
+`com.pidster.asura.model`. The variant's digest goes into
+`package-identity.txt` for the journey build only; the script restores the
+file afterwards. At the end it removes the probe container's `Data`
+directory and lists what remains.
+
+#### SG-F6: SG-V5 checks
+
+Selected design. Arrows show the next step; labelled arrows show a check
+result. A failed check is recorded and the next step runs, except where a
+step cannot produce its input.
+
+```mermaid
+flowchart TD
+    B["Ad hoc Asura.app from asura-bundle --ad-hoc"] --> E{"Bundle helper claims exactly asura-model.ad-hoc.plist?"}
+    E -->|"No: record FAIL"| T
+    E -->|Yes| T["Test list: shipped list plus absolute-path read-only /private/tmp/"]
+    T --> V["Variant: copy bundle, embedded Info.plist set to com.pidster.asura.probe.model, re-sign ad hoc with runtime and the test list"]
+    V -->|"Copy or signing fails"| Stop["Stop the remaining steps: record FAIL"]
+    V --> VC{"Identifier, bound Info.plist, runtime, entitlements and build ID verified?"}
+    VC -->|"No: record FAIL"| N
+    VC -->|Yes| N["HS-P7 fixture: same identifier and test list; control without entitlements"]
+    N -->|"Build or signing fails"| Stop
+    N --> NC{"Sandboxed: ssh read, home write and tmp write denied; tmp read and container write allowed; control allowed?"}
+    NC -->|"No: record FAIL"| I
+    NC -->|Yes| I["Write variant digest to package-identity.txt; build conversation_flow"]
+    I -->|"Build fails"| Stop
+    I --> J["--bundle-sandbox: service runs from the variant Asura.app layout in a scratch home"]
+    J --> W{"Each turn's helper witnessed with sandbox_check pid NULL equal 1 before the terminal event?"}
+    W -->|"No: journey fails, record FAIL"| R
+    W -->|Yes| P["Inventory, system turn, MLX if asset set, Ollama if running, clean shutdown, crash and recovery"]
+    P --> R["Always: restore package-identity.txt; remove work tree and probe container Data; list what remains"]
+    Stop --> R
+    R --> X{"Any FAIL?"}
+    X -->|Yes| Bad["Exit 1"]
+    X -->|No| Good["Exit 0; SKIP lines name providers not run"]
+```
+
+| Case | Layer | Evidence (2026-10-23, macOS 27.0, ad hoc bundle `sg2-1`) |
+| --- | --- | --- |
+| SG-V1 (SG2 keys) | Unit | `test-asura-bundle --static`: 71 passed. Helper lists hold exactly the App Sandbox, `network.client` and the two home-relative read-only paths (development adds `get-task-allow`); no absolute-path, writable or `inherit` key; `asura` lists claim no App Sandbox |
+| SG-V1 | Integration | `test-asura-bundle --bundle`: 34 passed; the ad hoc helper's signed entitlements equal `asura-model.ad-hoc.plist` |
+| SG-V5, HS-P7 | Integration | `--sandbox`: the fixture with the helper's identifier and list is sandboxed; listing `~/.ssh` and opening `~/.ssh/known_hosts` are denied; creating a file in the account home and in `/private/tmp/` is denied; reading `/private/tmp/` and writing in the container are allowed. The unsandboxed control lists and opens `~/.ssh` and writes `/private/tmp/` |
+| SG-V5, HS-P1, HS-P6 | End to end | `--bundle-sandbox`: every helper is witnessed sandboxed; the inventory lists a metadata-only MLX asset with no MLX issue; at a clean shutdown no run copy remains; after a service kill the sandboxed helper exits on EOF and recovery starts no helper |
+| SG-V5, HS-P2 | End to end | A system provider turn completes over FD 3 |
+| SG-V5, HS-P3, SG-V9 | End to end | `mlx-community/Qwen3-1.7B-4bit` completes; the run copy is the variant helper, and `mlx.metallib` and the Hub bundle come from `Contents/Resources` |
+| SG-V5, HS-P5 | End to end | An Ollama turn (`granite4.1:8b`, a local Ollama already running) completes on loopback |
+
+Found during delivery: a test directory created under `.asura` with mode
+0755 made the restart's authority scan report `unsafe_authority`; the journey
+creates its fixture directories with mode 0700. A killed service leaves its
+helper run copy, so the leak check runs at a clean shutdown before the crash
+step.
+
+Proof limits: no Core AI asset was run sandboxed in SG-V5 (HS-P4 passed in
+SG0; it would create a Core AI cache of about 2 GB for the probe identity).
+The control-socket connect and `/bin/sh` child cases of HS-P7 are not repeated
+here (SG0 recorded them). Development and release signatures, the profile and
+notarisation of the sandboxed helper remain with SG0-K, NT-P1 and SG4. The
+`<out>/package/` helper now claims the App Sandbox with the product
+identifier, so native tests beside it would read only the account home;
+native tests use an unsandboxed development helper or the SG-V5 variant.
+
 ## Design verification
 
 Recorded on 2026-10-23. Written from the draft of the same day and the owner's
@@ -1312,5 +1421,11 @@ the [resource directory](#resource-directory-inside-the-bundle) rule and the
 certificate" to an operator input checked against the profile and the
 signature, so the script reads no keychain. Diagrams SG-F4 and SG-F5 were
 rendered with Mermaid CLI 12.0.0 and inspected.
+
+Updated 2026-10-23 by packet SG2: the helper
+[entitlement files](#entitlement-files), the step 5 version check, the
+[helper sandbox](#security) bullet, [readiness](#packet-readiness) and the
+[delivery record](#sg2-delivery). Diagram SG-F6 was rendered with the local
+Mermaid CLI and inspected.
 
 Return to the [design index](README.md).

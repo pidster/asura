@@ -366,7 +366,7 @@ Each must be designed before its code. None is selected by this document.
 | Job-outlived-turn notice. Designed 2026-10-22 in [J4](tool-job-controller.md#j4-tui) | EX12 | Client job packet J4 |
 | Destination grant by data class and project | EX13, EX7 | Remote providers |
 | Provider credentials in Keychain, with the D1 credential review. A sandboxed helper cannot claim a keychain access group; see the [helper App Sandbox](release-signing.md#what-the-helper-needs) | EX14, EX8, EX7 | Remote providers |
-| Release signing, Hardened Runtime, team Keychain store and the helper App Sandbox. Designed 2026-10-23: [release signing](release-signing.md) | I9, EXD-3, SGQ1–SGQ9 | Release qualification; secret store packet SG3 |
+| Release signing, Hardened Runtime, team Keychain store and the helper App Sandbox. Designed 2026-10-23: [release signing](release-signing.md). The helper App Sandbox entitlements were delivered by packet SG2 on 2026-10-23 ([SG2 delivery](release-signing.md#sg2-delivery)) | I9, EXD-3, SGQ1–SGQ9 | Release qualification; secret store packet SG3; notarisation of the sandboxed helper (NT-P1) |
 | Spend ceilings and cost confirmation | EX15 | Remote providers |
 | Note deletion and review mark | EX6 | Memory note changes |
 | Approval flow with digest re-check, build-path list and change detection. Designed 2026-10-22: [execution path guard](execution-path-guard.md) | EX1, PX1, OD3 | Person command packet P5; capability 8 waits for it (OD3) |
@@ -828,6 +828,18 @@ HS-P1 to HS-P7 pass; otherwise the helper ships unsandboxed and residual EX-H1
 "helper unconfined" is recorded here (SGQ7). In a signed build the Hardened
 Runtime also stops `DYLD_*` injection into the guardian (PC-I38-S).
 
+Helper App Sandbox update (packet SG2, 2026-10-23): HS-P1 to HS-P7 passed, and
+every helper entitlement list (development, release and the ad hoc dry run)
+claims the App Sandbox, `network.client` and read-only access to
+`~/.asura/data/models/` and `~/.asura/run/`
+([SG2 delivery](release-signing.md#sg2-delivery)). Residual EX-H1 is therefore
+not recorded. A compromised helper cannot read `~/.ssh`, write outside its
+container, or connect to the control socket. Residual
+[SG-T3](release-signing.md#security) stays (PT-H1): the App Sandbox does not
+stop `KERN_PROCARGS2` reads of other same-user processes. If NT-P1 rejects the
+sandboxed helper, SG-F2 ships it unsandboxed and EX-H1 is recorded here
+instead.
+
 Recorded on 2026-10-22 (second revision): SS-T3 updated and SS-T8 and SS-T9
 added from the SS1-K report and probe SS-P3 of the
 [secret store](secret-store.md#probe-results-2026-10-22). No diagram changed.
@@ -837,5 +849,9 @@ Recorded on 2026-10-23: SS-T8, the follow-up design table and EXD-3 updated
 for the owner's signing answers and the
 [release signing design](release-signing.md). No diagram changed. No code or
 test was run.
+
+Recorded on 2026-10-23 (packet SG2): the release signing row of the
+follow-up design table and the helper App Sandbox update under EXD-3. EX-H1 is
+not recorded; PT-H1 and SG-T3 are unchanged. No diagram changed.
 
 Return to the [design index](README.md).

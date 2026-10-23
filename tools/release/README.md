@@ -9,7 +9,8 @@ profile.
 | File | Purpose |
 | --- | --- |
 | `asura-bundle` | The package script: `--ad-hoc` (dry run), `--development` or `--release` |
-| `test-asura-bundle` | Checks: `--static` (tracked files and refusals), `--bundle APP` (an ad hoc bundle) |
+| `test-asura-bundle` | Checks: `--static` (tracked files and refusals), `--bundle APP` (an ad hoc bundle), `--sandbox APP` (the helper App Sandbox with an ad hoc bundle, SG-V5) |
+| `sandbox-probe.c` | The SG-V5 negative fixture that `--sandbox` builds and signs with the helper's sandbox list |
 | `Info.plist.in` | `Asura.app/Contents/Info.plist`; `@VERSION@` is the `asura-cli` version |
 | `entitlements/*.plist` | One list for each executable and mode; `@TEAM_ID@` is replaced at signing time |
 
@@ -91,21 +92,46 @@ The script also rewrites the ignored generated Swift sources and
 package's identity. To run native tests against it, place the files from
 `package/` beside the test binaries (helper README, step 5).
 
-## End-to-end check of the bundle layout
+## Helper App Sandbox and end-to-end check of the bundle layout
 
-After an ad hoc run, rebuild the test binary so that it embeds the same
-package identity, then run the journey with a local MLX model directory:
+Every `asura-model` list claims the App Sandbox, `network.client` and
+read-only access to `~/.asura/data/models/` and `~/.asura/run/` of the account
+home (SG2). Tests never use that home, so the bundle's own helper cannot read a
+test home. `--sandbox` therefore re-signs a copy of the bundle's helper as a
+test-only variant: the shipped list plus a read-only exception for
+`/private/tmp/`, under the probe identifier `com.pidster.asura.probe.model`.
+No tracked list carries that exception. It then:
+
+1. runs `sandbox-probe` with the same identifier and list: `~/.ssh` reads,
+   writes to the account home and to `/private/tmp/` are denied; reads of
+   `/private/tmp/` and writes in the container are allowed; an unsandboxed
+   control can do each of them;
+2. writes the variant's digest to `.build/model-tools/package-identity.txt`,
+   builds `conversation_flow` and runs `--bundle-sandbox`: the service runs
+   from the variant's `Asura.app` layout, every helper must be sandboxed, and
+   the inventory, a system turn, an MLX turn (when `ASURA_TEST_MLX_ASSET` is
+   set) and an Ollama turn (when a local Ollama already serves
+   `ASURA_TEST_OLLAMA_MODEL`, default `granite4.1:8b`) complete, then a
+   service crash and recovery;
+3. restores the package identity file, removes its work directory and the
+   `Data` directory of the probe container, and lists what the container
+   keeps.
 
 ```sh
-ASURA_TEST_BUNDLE=.build/bundles/dry-run-1/Asura.app \
 ASURA_TEST_MLX_ASSET=<path to an MLX model directory> \
-cargo test -p asura-service --test conversation_flow -- --bundle-mlx
+tools/release/test-asura-bundle --sandbox .build/bundles/dry-run-1/Asura.app
 ```
+
+The script never starts the bundle's own helper: the package script checks
+`--version` on an unsandboxed ad hoc copy, so that packaging creates no
+container under `com.pidster.asura.model`.
 
 ## What the dry run does not prove
 
 - The restricted entitlements (`keychain-access-groups`, application and team
   identifiers). An ad hoc process that claims them is killed at launch, so the
   ad hoc lists omit them. Probes KC-P1 and KC-P2 need a signed bundle.
-- Notarisation and stapling (probe NT-P1, packet SG4).
-- The helper App Sandbox. Packet SG2 adds its entitlements.
+- Notarisation and stapling (probe NT-P1, packet SG4), including whether the
+  notary service accepts the helper's temporary exceptions.
+- The helper App Sandbox under a real signature. The ad hoc helper claims the
+  same list, and `--sandbox` proves it with a test variant.
