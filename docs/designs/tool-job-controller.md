@@ -5086,8 +5086,10 @@ for live-only rows.
   discarded (WB1).
 - **Cancel.** `JobCancel` on a model-origin job calls `cancel` with requester
   client, reason 3 `client_cancel`. On a person-origin job it uses requester
-  person, reason 4 `person_stop`, or 5 `person_kill` with `kill`. A settled job
-  replies `requested: false`. A repeated request is idempotent (J2).
+  person, reason 4 `person_stop`, or 5 `person_kill` with `kill`. A job settled
+  before the request replies `requested: false`; a request that the controller
+  accepts replies `true`, even when the job then settles at once (a queued
+  start). A repeated request is idempotent (J2).
 - **Retain.** The handler validates, redacts a person note, appends kind 30 and
   replies after the commit. A held journal makes the request wait for room; the
   person's cancel ends the wait with `outcome_unconfirmed` (J1-0 client rule).
@@ -5138,8 +5140,9 @@ branch). These choices settle details that the rules above leave open:
   most 3 times. Then it replies `requested: true` with the live entry.
 - **Writer busy.** A journal writer `Busy` gives `unavailable` for
   `JobCancel` and `JobRetain`.
-- **Live list without the journal.** Entries come from memory, with an empty
-  `command` and no retention fields.
+- **Live list without the journal.** Entries come from memory, with the
+  command excerpt that `JobView.excerpt` holds (built at admission from the
+  stored, redacted command) and no retention fields.
 - **Pages without a read.** For an `expired`, `missing`, `corrupt` or
   `deleted` page, the reply holds the kind 28 totals and an empty page. A
   stale cursor gives an empty page at the total. An unspawned job gives an

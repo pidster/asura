@@ -1049,6 +1049,7 @@ stateDiagram-v2
     NotStarted --> Warming: Owner spawns asura-secret-rules at start
     NotStarted --> NotStarted: Spawn fails, log secret_rules_warm_unavailable
     NotStarted --> Warming: A turn start or person note needs the set, spawn retried
+    Warming --> NotStarted: Thread ends without a result (compile panic), owner sees it finished
     NotStarted --> Ready: A worker thread compiled the set first
     Warming --> Ready: Compile and self-check pass, thread wakes the reactor
     Warming --> Failed: Self-check fails, thread wakes the reactor
@@ -1057,6 +1058,10 @@ stateDiagram-v2
     note right of Warming
         Reactor users wait: turn starts and person notes.
         They end on Ready, Failed, cancel, detach or shutdown.
+    end note
+    note left of NotStarted
+        A need respawns when no thread runs: none was spawned,
+        or the last one has finished without a result.
     end note
     note right of Failed
         Fail closed: no tool text kept, starts refused,
