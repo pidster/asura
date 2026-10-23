@@ -42,6 +42,7 @@ use crate::{capture_worker, tools};
 use asura_platform::{
     PollInterest, RuntimeDirectory,
     exec_cmd::{Exit, StopKind, UnconfirmedReason},
+    pacing::Fibonacci,
     secrets::{JobRedaction, SecretCommand, SecretVariable},
 };
 use asura_storage::audit::{self as record, Event};
@@ -67,9 +68,6 @@ pub(crate) const PENDING_INSTALLS: usize = crate::payload_owner::PENDING_INSTALL
 /// Settled jobs whose identity the controller remembers after it releases
 /// them, so a duplicate start still returns the existing job.
 const RETIRED: usize = MAX_UNSETTLED;
-/// The paced delays: 1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart
-/// (owner pattern of 2026-10-19). Pacing only; it ends nothing.
-const PACING_MAX: Duration = Duration::from_secs(60);
 
 /// An agent: (conversation ID, agent number). Agent 0 is the main agent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -459,32 +457,27 @@ struct Retired {
     excerpt: String,
 }
 
-/// Fibonacci pacing: the step and the next time. The controller's
-/// `disk_space` recheck uses it, and the owner's start-time limits read
-/// retry (TJ-F5) reuses it until PACE-1 replaces it with the shared helper.
+/// The shared [`Fibonacci`] pacing (PACE-1: 1, 1, 2, 3, 5, 8 s and so on,
+/// at most 60 s apart; it ends nothing) and the time of the next step. The
+/// controller's `disk_space` recheck uses it, and the owner's start-time
+/// limits read retry (TJ-F5) reuses it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Pacing {
     at: Instant,
-    previous: Duration,
-    current: Duration,
+    delays: Fibonacci,
 }
 impl Pacing {
-    /// The first step: `now` plus 1 s.
+    /// The first step: `now` plus the first delay.
     pub(crate) fn start(now: Instant) -> Self {
-        let first = Duration::from_secs(1);
+        let mut delays = Fibonacci::new();
         Self {
-            at: now + first,
-            previous: Duration::ZERO,
-            current: first,
+            at: now + delays.next_delay(),
+            delays,
         }
     }
-    /// The next step from `now`: 1, 1, 2, 3, 5, 8 s and so on, at most
-    /// 60 s.
+    /// The next step: `now` plus the next delay.
     pub(crate) fn advance(&mut self, now: Instant) {
-        let next = (self.previous + self.current).min(PACING_MAX);
-        self.previous = self.current;
-        self.current = next;
-        self.at = now + next;
+        self.at = now + self.delays.next_delay();
     }
     /// When the paced step is due.
     pub(crate) fn at(&self) -> Instant {
