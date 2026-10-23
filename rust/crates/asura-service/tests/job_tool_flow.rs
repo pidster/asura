@@ -466,7 +466,7 @@ fn identity() -> Result<()> {
     model.script(&[
         call(
             "exec_cmd",
-            json!({"command": "sleep 60", "yield_seconds": 0}),
+            json!({"command": "printf x > started.txt; sleep 60", "yield_seconds": 0}),
         ),
         // Replace the project directory while the turn runs, then call
         // `job status`: the recheck sees another inode.
@@ -480,10 +480,10 @@ fn identity() -> Result<()> {
     // Hold the second model reply until the directory is replaced.
     let operation = fixture.submit(project, "Identity.")?;
     let job = job_of(operation, 1, 1);
+    // The job has spawned (a replacement before the spawn is the slot's
+    // pre-spawn recheck instead: `not_started`, `project_changed`).
     wait_for(Duration::from_secs(20), "the first job runs", || {
-        fixture
-            .records()
-            .is_ok_and(|r| r.iter().any(|r| matches!(r, Record::JobIntent(_))))
+        directory.join("started.txt").exists()
     })?;
     let moved = directory.with_file_name("project-old");
     std::fs::rename(&directory, &moved)?;
