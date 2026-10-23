@@ -10,6 +10,7 @@
 //! logs or the model.
 use asura_platform::events::WakeSender;
 use asura_platform::exec_cmd::{OutputSink, READ_BUFFER};
+use asura_platform::pacing::Fibonacci;
 use asura_platform::secrets::{
     JobRedaction, JobSummary, LossSpan, NumberOrigin, Redacted, Stream, StreamStats,
 };
@@ -539,26 +540,15 @@ enum Wake {
     Space,
     Timer,
 }
-/// The paused-capture retry backoff (owner, 2026-10-15): delays of 1, 1, 2,
-/// 3, 5, 8 s and so on, each the sum of the two before, at most 60 s apart
-/// (owner, 2026-10-19). It is pacing only: it never ends or refuses work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Backoff(u64, u64);
-impl Backoff {
-    const START: Self = Self(1, 1);
-    const CAP_SECS: u64 = 60;
-    fn delay(self) -> Duration {
-        Duration::from_secs(self.0)
-    }
-    fn next(self) -> Self {
-        Self(self.1, self.0.saturating_add(self.1).min(Self::CAP_SECS))
-    }
-}
 /// Waits for the next retry: abandonment, a cancel trigger, the leader's
 /// exit, a space event (retry at once; the sequence restarts) or the
-/// backoff delay.
-fn wait_retry(shared: &Shared, space_seen: &mut u64, backoff: &mut Backoff) -> Wake {
-    let end = Instant::now() + backoff.delay();
+/// backoff delay. The paused-capture retry backoff (owner, 2026-10-15) is
+/// the shared [`Fibonacci`] pacing: 1, 1, 2, 3, 5, 8 s and so on, at most
+/// 60 s apart. It is pacing only: it never ends or refuses work. The
+/// sequence advances only when the delay elapses.
+fn wait_retry(shared: &Shared, space_seen: &mut u64, backoff: &mut Fibonacci) -> Wake {
+    let mut advanced = *backoff;
+    let end = Instant::now() + advanced.next_delay();
     let mut control = shared.control();
     loop {
         if control.abandon {
@@ -572,12 +562,12 @@ fn wait_retry(shared: &Shared, space_seen: &mut u64, backoff: &mut Backoff) -> W
         }
         if control.space != *space_seen {
             *space_seen = control.space;
-            *backoff = Backoff::START;
+            backoff.reset();
             return Wake::Space;
         }
         let now = Instant::now();
         if now >= end {
-            *backoff = backoff.next();
+            *backoff = advanced;
             return Wake::Timer;
         }
         control = shared
@@ -623,7 +613,7 @@ struct Worker {
     pause_count: u32,
     first_pause_ms: u64,
     paused_ms: u64,
-    delays: Backoff,
+    delays: Fibonacci,
     space_seen: u64,
     disconnected: bool,
 }
@@ -659,7 +649,7 @@ impl Worker {
             pause_count: 0,
             first_pause_ms: 0,
             paused_ms: 0,
-            delays: Backoff::START,
+            delays: Fibonacci::new(),
             space_seen: 0,
             disconnected: false,
         }
@@ -702,7 +692,7 @@ impl Worker {
                     self.first_pause_ms = self.started.elapsed().as_millis() as u64;
                 }
                 self.space_seen = self.shared.control().space;
-                self.delays = Backoff::START;
+                self.delays.reset();
                 self.pause = Some((reason, Instant::now()));
                 self.send(Message::Paused(reason));
             }
