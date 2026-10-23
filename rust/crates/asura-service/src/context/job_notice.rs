@@ -157,6 +157,20 @@ impl Notice {
         })
     }
 
+    /// A prior turn's notice for a later turn's history, which shows it at
+    /// reference fidelity only (tool-job-controller.md, notices in later
+    /// turns): the same selection and checks as [`Notice::build`], from
+    /// settlements whose `command` and `directory` are empty because the
+    /// writer returns no command source. Each entry's `full` text is empty;
+    /// only `text(entries.len())` and the reference segments are used.
+    pub(crate) fn reference_only(inputs: &NoticeInputs<'_>) -> Result<Self, NoticeError> {
+        let mut notice = Self::build(inputs)?;
+        for entry in &mut notice.entries {
+            entry.full = String::new();
+        }
+        Ok(notice)
+    }
+
     /// No settled entry and no live job: no block (rule 4).
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.live == 0 && !self.overflow

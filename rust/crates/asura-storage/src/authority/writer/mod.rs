@@ -266,11 +266,14 @@ pub struct Prepared {
     pub notice: JobNotice,
     /// The notice inputs of the first [`MAX_COMPOSED_PRIOR`] `history`
     /// turns, in the same order, for their notices in this turn's history
-    /// (tool-job-controller.md, notices in later turns): P from the earlier
-    /// `T` entry, S and the live count from the turn's kind 21.
+    /// at reference fidelity (tool-job-controller.md, notices in later
+    /// turns): P from the earlier `T` entry, S and the live count from the
+    /// turn's kind 21, and fixed-size reference facts per settlement. The
+    /// settlement facts total at most [`MAX_PRIOR_NOTICE_BYTES`].
     ///
     /// [`MAX_COMPOSED_PRIOR`]: crate::authority::conversation::MAX_COMPOSED_PRIOR
-    pub history_notices: Vec<JobNotice>,
+    /// [`MAX_PRIOR_NOTICE_BYTES`]: crate::authority::conversation::MAX_PRIOR_NOTICE_BYTES
+    pub history_notices: Vec<PriorNotice>,
 }
 /// One project as a page lists it.
 #[derive(Clone, Debug)]

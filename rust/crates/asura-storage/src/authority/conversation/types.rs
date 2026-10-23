@@ -2394,6 +2394,43 @@ pub struct NoticeSettlement {
     /// The model call's kind 14 or the person input's kind 31.
     pub command: JobCommand,
 }
+/// One settlement of a prior turn's notice, as a later turn's history
+/// shows it: reference fidelity only (tool-job-controller.md, notices in
+/// later turns). Fixed size: the kind 26, the kind 28 with `numbers`
+/// emptied (the reference line never shows them, so nothing is on the
+/// heap), the kind 28 header's command digest, the kind 28 sequence and,
+/// for a person job, kind 31 field 7 bit 1. No command source record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PriorSettlement {
+    pub job: Id,
+    /// The job's kind 26.
+    pub intent: JobIntent,
+    /// The job's kind 28, `numbers` empty.
+    pub settled: JobSettled,
+    /// The command digest of the kind 28 frame header.
+    pub digest: Hash,
+    /// The kind 28 frame sequence.
+    pub sequence: u64,
+    /// Kind 31 field 7 bit 1 for a person job (`!!`); false for a model job.
+    pub outside_sandbox: bool,
+}
+/// The notice inputs of a prior turn: its range `(after, through]`, at
+/// most [`MAX_NOTICE_SETTLEMENTS`] settlements newest first, and the live
+/// count its kind 21 recorded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PriorNotice {
+    pub after: u64,
+    pub through: u64,
+    pub settlements: Vec<PriorSettlement>,
+    pub live: u32,
+}
+/// The fixed size of one [`PriorSettlement`] in memory.
+pub const PRIOR_SETTLEMENT_BYTES: usize = std::mem::size_of::<PriorSettlement>();
+/// The bound on the settlement facts of a whole `Prepared.history_notices`
+/// reply: [`MAX_COMPOSED_PRIOR`] turns × [`MAX_NOTICE_SETTLEMENTS`] ×
+/// [`PRIOR_SETTLEMENT_BYTES`].
+pub const MAX_PRIOR_NOTICE_BYTES: usize =
+    MAX_COMPOSED_PRIOR * MAX_NOTICE_SETTLEMENTS * PRIOR_SETTLEMENT_BYTES;
 /// The command source record of a job: the model call's kind 14 or the
 /// person input's kind 31 (P2). It holds the stored command and cwd.
 #[derive(Clone, Debug, PartialEq, Eq)]

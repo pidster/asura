@@ -6,8 +6,8 @@ use crate::context::{Budget, compose_turn};
 use asura_platform::RuntimeDirectory;
 use asura_storage::authority::conversation::{
     ArgumentForm, CaptureReason, CaptureStream, JobCaptureState, JobCleanup, JobIntent, JobListing,
-    JobOrigin, JobOutcome, JobReason, JobSettled, JobStream, Locator, NoticeSettlement, ToolCall,
-    ToolCallSource, ToolDecision, ToolOperation,
+    JobOrigin, JobOutcome, JobReason, JobSettled, JobStream, Locator, NoticeSettlement,
+    PriorNotice, PriorSettlement, ToolCall, ToolCallSource, ToolDecision, ToolOperation,
 };
 use sha2::{Digest, Sha256};
 
@@ -290,6 +290,27 @@ fn j5t_09_each_notice_error_from_crafted_inputs() {
     assert!(build(CONVERSATION, &inputs(vec![limit], 0)).is_ok());
 }
 
+/// The writer's reference facts for a binding-point read (the prior
+/// notice read returns these, with no command source).
+fn prior_inputs(notice: &JobNotice) -> PriorNotice {
+    PriorNotice {
+        after: notice.after,
+        through: notice.through,
+        live: notice.live,
+        settlements: notice
+            .settlements
+            .iter()
+            .map(|s| PriorSettlement {
+                job: s.listing.job,
+                intent: s.listing.intent,
+                settled: *s.listing.settled.clone().unwrap(),
+                digest: s.listing.settled_digest.unwrap(),
+                sequence: s.listing.settled_frame.sequence,
+                outside_sandbox: s.command.outside_sandbox(),
+            })
+            .collect(),
+    }
+}
 /// One completed prior turn of generation `generation` whose kind 21
 /// recorded `notice_through` = `through` and `notice_live` = `live`.
 fn prior(
@@ -349,8 +370,8 @@ fn j5t_11_prior_turns_carry_their_rebuilt_notice() {
     // Newest first, as `Prepare` returns them.
     let history = vec![prior(3, 40, 1), prior(2, 4, 0), prior(1, 0, 0)];
     let notices = vec![
-        inputs(vec![entry()], 1),
-        JobNotice {
+        prior_inputs(&inputs(vec![entry()], 1)),
+        PriorNotice {
             after: 0,
             through: 4,
             settlements: Vec::new(),
@@ -364,13 +385,40 @@ fn j5t_11_prior_turns_carry_their_rebuilt_notice() {
     );
     assert_eq!(shown[0].prompt, "question 3");
     assert_eq!(shown[0].answer, "answer 3");
-    let expected = build(CONVERSATION, &inputs(vec![entry()], 1)).unwrap();
-    assert_eq!(shown[0].notice, expected);
-    assert_eq!((shown[0].notice.through, shown[0].notice.live), (40, 1));
-    assert_eq!(shown[0].notice.entries.len(), 1);
+    // The reference facts give the same entry identity, digest and
+    // reference line as the binding-point notice; no full text is kept.
+    let bound = build(CONVERSATION, &inputs(vec![entry()], 1)).unwrap();
+    let rebuilt = &shown[0].notice;
+    assert_eq!(
+        (rebuilt.through, rebuilt.live, rebuilt.overflow),
+        (40, 1, false)
+    );
+    assert_eq!(rebuilt.entries.len(), 1);
+    let (got, want) = (&rebuilt.entries[0], &bound.entries[0]);
+    assert_eq!(
+        (got.job, got.sequence, got.digest, &got.reference),
+        (want.job, want.sequence, want.digest, &want.reference)
+    );
+    assert!(got.full.is_empty());
+    assert_eq!(rebuilt.text(1), bound.text(1));
+    assert_eq!(rebuilt.summary_digest(), bound.summary_digest());
     assert!(shown[1].notice.is_empty());
     assert_eq!(shown[1].notice.through, 4);
     assert!(shown[2].notice.is_empty(), "past the inputs: no notice");
+    // A `!!` person job's reference line names the sandbox.
+    let mut outside = notices.clone();
+    outside[0].settlements[0] =
+        prior_inputs(&inputs(vec![person_settlement(7, 20, true, false)], 1))
+            .settlements
+            .remove(0);
+    let shown_outside = candidates(CONVERSATION, history.clone(), &outside).unwrap();
+    assert!(
+        shown_outside[0].notice.entries[0]
+            .reference
+            .contains(": the person, outside the sandbox, exit "),
+        "{:?}",
+        shown_outside[0].notice.entries[0]
+    );
     // The inputs must be the turn's own S and live count.
     for (through, live) in [(41, 1), (40, 2)] {
         let mut wrong = notices.clone();
@@ -383,7 +431,7 @@ fn j5t_11_prior_turns_carry_their_rebuilt_notice() {
     }
     // A damaged settlement of a prior turn is the same repair case.
     let mut damaged = notices.clone();
-    damaged[0].settlements[0].listing.conversation = [0xc1; 16];
+    damaged[0].settlements[0].settled.job = [0; 16];
     assert_eq!(
         candidates(CONVERSATION, history, &damaged).err(),
         Some(NoticeError::Job)
@@ -433,8 +481,11 @@ fn j5t_09_notice_error_fails_the_turn_as_a_repair_case() {
     };
     // A prior turn's notice inputs that disagree with its records fail the
     // same way (notices in later turns, J5-E10).
-    let mut damaged = inputs(vec![settlement(1, 20, &arguments("true", None))], 0);
-    damaged.settlements[0].listing.conversation = [0xc1; 16];
+    let mut damaged = prior_inputs(&inputs(
+        vec![settlement(1, 20, &arguments("true", None))],
+        0,
+    ));
+    damaged.settlements[0].settled.job = [0; 16];
     let mut with_prior = prepared(inputs(Vec::new(), 0));
     with_prior.history = vec![prior(1, 40, 0)];
     with_prior.history_notices = vec![damaged];

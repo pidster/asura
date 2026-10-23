@@ -1750,12 +1750,33 @@ fn j5t_02_notice_read_is_exactly_once_and_cursor_survives_restart() {
     );
 }
 
+/// The reference facts of a binding-point read: what a prior notice
+/// rebuilds for each settlement.
+fn reference_facts(notice: &JobNotice) -> Vec<PriorSettlement> {
+    notice
+        .settlements
+        .iter()
+        .map(|s| {
+            let mut settled = *s.listing.settled.clone().unwrap();
+            settled.numbers = Vec::new();
+            PriorSettlement {
+                job: s.listing.job,
+                intent: s.listing.intent,
+                settled,
+                digest: s.listing.settled_digest.unwrap(),
+                sequence: s.listing.settled_frame.sequence,
+                outside_sandbox: s.command.outside_sandbox(),
+            }
+        })
+        .collect()
+}
+
 /// J5T-11 (storage part, notices in later turns): a prior turn's notice
 /// inputs are rebuilt from records only, with P from the earlier `T` entry
-/// and S and the live count from the turn's kind 21: the same settlements
-/// as the binding-point read, before and after a restart from index runs.
-/// A cursor below P, a live count above 64 or a missing earlier `T` entry
-/// is `Corrupt`.
+/// and S and the live count from the turn's kind 21: the reference facts
+/// of the same settlements as the binding-point read, before and after a
+/// restart from index runs. A cursor below P, a live count above 64 or a
+/// missing earlier `T` entry is `Corrupt`.
 #[test]
 fn j5t_11_prior_notice_rebuilds_the_binding_range() {
     let mut h = Harness::new();
@@ -1791,14 +1812,21 @@ fn j5t_11_prior_notice_rebuilds_the_binding_range() {
         let first = state.prior_notice(conversation, gen1, 0, 0, store).unwrap();
         assert_eq!((first.after, first.through, first.live), (0, 0, 0));
         assert!(first.settlements.is_empty());
-        let second = state
-            .prior_notice(conversation, gen2, bound.through, bound.live, store)
-            .unwrap();
-        assert_eq!(second, bound, "turn 2 rebuilt as bound");
-        let third = state
-            .prior_notice(conversation, gen3, bound3.through, bound3.live, store)
-            .unwrap();
-        assert_eq!(third, bound3, "turn 3 rebuilt as bound");
+        for (generation, notice) in [(gen2, &bound), (gen3, &bound3)] {
+            let prior = state
+                .prior_notice(conversation, generation, notice.through, notice.live, store)
+                .unwrap();
+            assert_eq!(
+                (prior.after, prior.through, prior.live),
+                (notice.after, notice.through, notice.live),
+                "turn {generation}"
+            );
+            assert_eq!(
+                prior.settlements,
+                reference_facts(notice),
+                "turn {generation}"
+            );
+        }
         // S below P, a live count above the bound, no earlier `T` entry.
         assert_eq!(
             state.prior_notice(conversation, gen3, bound.through - 1, 0, store),
@@ -1833,6 +1861,135 @@ fn j5t_11_prior_notice_rebuilds_the_binding_range() {
             .all(|(key, _)| key.id != conversation)
     );
     check(&state, &mut store);
+}
+
+/// An index that records the kind of every frame read through it.
+struct KindIndex<'a> {
+    inner: &'a mut dyn Index,
+    kinds: Vec<u16>,
+}
+impl Index for KindIndex<'_> {
+    fn get(&mut self, key: &Key) -> Result<Option<Value>, ReplayError> {
+        self.inner.get(key)
+    }
+    fn range(
+        &mut self,
+        lo: &Key,
+        hi: &Key,
+        descending: bool,
+        limit: usize,
+    ) -> Result<Vec<(Key, Value)>, ReplayError> {
+        self.inner.range(lo, hi, descending, limit)
+    }
+    fn frame(&mut self, locator: &Locator) -> Result<Record, ReplayError> {
+        let record = self.inner.frame(locator)?;
+        self.kinds.push(record.kind());
+        Ok(record)
+    }
+    fn frame_owner(&mut self, locator: &Locator) -> Result<(u64, Record), ReplayError> {
+        let found = self.inner.frame_owner(locator)?;
+        self.kinds.push(found.1.kind());
+        Ok(found)
+    }
+    fn frame_command(&mut self, locator: &Locator) -> Result<(Hash, Record), ReplayError> {
+        let found = self.inner.frame_command(locator)?;
+        self.kinds.push(found.1.kind());
+        Ok(found)
+    }
+}
+
+/// J5T-11 (storage part, owner option A): a prior-notice read keeps
+/// fixed-size reference facts only. A model job's read touches its kind 26
+/// and kind 28 and no kind 14 (nor its kind 27); a person job's touches
+/// its kind 26, kind 28 and its kind 31 once, for the outside flag. The
+/// whole `history_notices` reply is bounded by `MAX_PRIOR_NOTICE_BYTES` =
+/// 1,024 turns × 9 settlements × `PRIOR_SETTLEMENT_BYTES`.
+#[test]
+fn j5t_11_prior_notice_reads_no_command_source_and_is_bounded() {
+    // The constant, as stated in the report (64-bit targets).
+    assert_eq!(
+        PRIOR_SETTLEMENT_BYTES,
+        std::mem::size_of::<PriorSettlement>()
+    );
+    assert_eq!(PRIOR_SETTLEMENT_BYTES, 536);
+    assert_eq!(
+        MAX_PRIOR_NOTICE_BYTES,
+        MAX_COMPOSED_PRIOR * MAX_NOTICE_SETTLEMENTS * PRIOR_SETTLEMENT_BYTES
+    );
+    assert_eq!(MAX_PRIOR_NOTICE_BYTES, 4_939_776);
+    let mut h = Harness::new();
+    let project = h.register(1);
+    // Model jobs with a kind 27 each: more than 9 settle.
+    let (conversation, op, generation) = h.start(project, None);
+    let jobs: Vec<Id> = (1..=10).map(|n| h.job(op, generation, n)).collect();
+    for job in &jobs {
+        h.append(cancel(*job, JobReason::ModelCancel)).unwrap();
+        h.append(exited(*job)).unwrap();
+    }
+    h.finish(conversation, op, generation, 0);
+    let through = h.state().sequence;
+    {
+        let (state, mut store) = h.journal.store();
+        let mut kinds = KindIndex {
+            inner: &mut store,
+            kinds: Vec::new(),
+        };
+        let prior = state
+            .prior_notice(conversation, 1, through, 0, &mut kinds)
+            .unwrap();
+        assert_eq!(prior.settlements.len(), MAX_NOTICE_SETTLEMENTS);
+        assert_eq!(kinds.kinds, [26, 28].repeat(MAX_NOTICE_SETTLEMENTS));
+        assert!(prior.settlements.iter().all(|s| !s.outside_sandbox));
+        // No heap beyond the settlement vector: `numbers` is empty.
+        assert!(
+            prior
+                .settlements
+                .iter()
+                .all(|s| s.settled.numbers.capacity() == 0)
+        );
+        let bytes = prior.settlements.len() * PRIOR_SETTLEMENT_BYTES;
+        assert!(bytes * MAX_COMPOSED_PRIOR <= MAX_PRIOR_NOTICE_BYTES);
+    }
+    // Person jobs: a `!` and a `!!`.
+    let lane = h.fresh();
+    let (first, a) = person31(&mut h, project, lane, true, false);
+    h.append(first).unwrap();
+    let (second, b) = person31(&mut h, project, lane, false, true);
+    h.append(second).unwrap();
+    for input in [a, b] {
+        h.append(person_intent(input)).unwrap();
+        h.append(exited(job_id(&JobOrigin::Person { input })))
+            .unwrap();
+    }
+    let through = h.state().sequence;
+    let (state, mut store) = h.journal.store();
+    let mut kinds = KindIndex {
+        inner: &mut store,
+        kinds: Vec::new(),
+    };
+    let prior = state.prior_notice(lane, 1, through, 0, &mut kinds).unwrap();
+    // Newest first: the `!!` job, then the `!` job.
+    assert_eq!(
+        prior
+            .settlements
+            .iter()
+            .map(|s| (s.job, s.outside_sandbox))
+            .collect::<Vec<_>>(),
+        [
+            (job_id(&JobOrigin::Person { input: b }), true),
+            (job_id(&JobOrigin::Person { input: a }), false),
+        ]
+    );
+    assert_eq!(kinds.kinds, [26, 28, 31, 26, 28, 31]);
+    // The binding-point read is unchanged: it still returns the kind 31.
+    let notice = state.job_notice(lane, 0, &mut store).unwrap();
+    assert!(
+        notice
+            .settlements
+            .iter()
+            .all(|s| s.command.person().is_some())
+    );
+    assert_eq!(prior.settlements, reference_facts(&notice));
 }
 
 /// An index that counts the frames read through it (J5T-10).

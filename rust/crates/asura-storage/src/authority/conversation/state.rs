@@ -3056,15 +3056,19 @@ impl Replay {
         })
     }
     /// The notice inputs of a prior turn of `conversation`, rebuilt for a
-    /// later turn's history (tool-job-controller.md, notices in later
-    /// turns). `generation` is the prior turn's; `through` and `live` are
-    /// its kind 21 `notice_through` and `notice_live` (S and the live
-    /// count, J5-E8). P is the `notice_through` of the conversation's `T`
-    /// entry one generation earlier (0 for the first turn), the same P the
-    /// binding point used. The settlements are the same `(P, S]` read, at
-    /// most [`MAX_NOTICE_SETTLEMENTS`]: no history scan and no recount. A
-    /// missing earlier `T` entry, P above S or a live count above the
-    /// unsettled-job bound is `Corrupt`.
+    /// later turn's history at reference fidelity (tool-job-controller.md,
+    /// notices in later turns). `generation` is the prior turn's; `through`
+    /// and `live` are its kind 21 `notice_through` and `notice_live` (S and
+    /// the live count, J5-E8). P is the `notice_through` of the
+    /// conversation's `T` entry one generation earlier (0 for the first
+    /// turn), the same P the binding point used. The settlements are the
+    /// same `(P, S]` `U` range, at most [`MAX_NOTICE_SETTLEMENTS`], newest
+    /// first, as fixed-size reference facts: per job its `W` entry, kind 26
+    /// and kind 28 frames, and for a person job its kind 31 frame, kept only
+    /// for the outside flag. No kind 14 is read. No history scan and no
+    /// recount. A missing earlier `T` entry, P above S, a live count above
+    /// the unsettled-job bound or a settlement that disagrees with its
+    /// records is `Corrupt`.
     pub fn prior_notice(
         &self,
         conversation: Id,
@@ -3072,7 +3076,7 @@ impl Replay {
         through: u64,
         live: u32,
         index: &mut dyn Index,
-    ) -> Result<JobNotice> {
+    ) -> Result<PriorNotice> {
         let after = match generation.checked_sub(1) {
             None | Some(0) => 0,
             Some(previous) => {
@@ -3083,16 +3087,76 @@ impl Replay {
             }
         };
         require(after <= through && live as usize <= MAX_UNSETTLED_JOBS)?;
-        let settlements = self
-            .settlement_calls(conversation, after, through, MAX_NOTICE_SETTLEMENTS, index)?
-            .into_iter()
-            .map(|(listing, command)| NoticeSettlement { listing, command })
-            .collect();
-        Ok(JobNotice {
+        let found = if after == through {
+            Vec::new()
+        } else {
+            self.range(
+                &Key::new(Tag::Settlement, conversation, after + 1),
+                &Key::new(Tag::Settlement, conversation, through.saturating_add(1)),
+                true,
+                MAX_NOTICE_SETTLEMENTS,
+                index,
+            )?
+        };
+        let mut settlements = Vec::with_capacity(found.len());
+        for (key, value) in found {
+            let Entry::Settlement { job } = Entry::decode(Tag::Settlement, &value)? else {
+                return Err(ReplayError::Corrupt);
+            };
+            settlements.push(self.prior_settlement(conversation, job, key.disc, index)?);
+        }
+        Ok(PriorNotice {
             after,
             through,
             settlements,
             live,
+        })
+    }
+    /// The reference facts of one settled job of `conversation` whose kind
+    /// 28 is at `sequence`.
+    fn prior_settlement(
+        &self,
+        conversation: Id,
+        job: Id,
+        sequence: u64,
+        index: &mut dyn Index,
+    ) -> Result<PriorSettlement> {
+        let Some(JobState::Settled(state)) = self.job_state(job, index)? else {
+            return Err(ReplayError::Corrupt);
+        };
+        require(state.conversation == conversation && state.settled.sequence == sequence)?;
+        let Record::JobIntent(intent) = index.frame(&state.intent)? else {
+            return Err(ReplayError::Corrupt);
+        };
+        require(job_id(&intent.origin) == job)?;
+        let (digest, mut settled) = match index.frame_command(&state.settled)? {
+            (digest, Record::JobSettled(settled)) if settled.job == job => (digest, *settled),
+            _ => return Err(ReplayError::Corrupt),
+        };
+        settled.numbers = Vec::new();
+        // A person job's kind 31, read for its outside flag only and
+        // dropped at once (owner decision, option A).
+        let outside_sandbox = match intent.origin {
+            JobOrigin::Model { .. } => false,
+            JobOrigin::Person { input } => {
+                let frame = self.input_frame(input, index)?;
+                match index.frame(&frame)? {
+                    Record::PersonCommandQueued(person)
+                        if person.input == input && person.conversation == conversation =>
+                    {
+                        person.outside_sandbox
+                    }
+                    _ => return Err(ReplayError::Corrupt),
+                }
+            }
+        };
+        Ok(PriorSettlement {
+            job,
+            intent,
+            settled,
+            digest,
+            sequence,
+            outside_sandbox,
         })
     }
     /// Projects and conversations named by the active operation or an
