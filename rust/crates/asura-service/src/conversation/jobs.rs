@@ -40,6 +40,15 @@ struct LimitsRead {
 pub(super) type Reader = Arc<dyn Fn(RuntimeDirectory, &AtomicBool) -> Read + Send + Sync>;
 
 fn read_configuration(runtime: RuntimeDirectory, cancel: &AtomicBool) -> Read {
+    // Test-support gate (TJ-F5 integration): the read fails while
+    // `HOME/job-limits-fail` exists in a scratch home.
+    #[cfg(feature = "test-support")]
+    if runtime
+        .scratch_home_for_test()
+        .is_some_and(|home| home.join("job-limits-fail").exists())
+    {
+        return Err(());
+    }
     let limits = asura_storage::config::job_limits(runtime.clone(), cancel).map_err(|_| ())?;
     let execution = asura_storage::config::execution_setting(runtime, cancel).map_err(|_| ())?;
     Ok((limits, execution))

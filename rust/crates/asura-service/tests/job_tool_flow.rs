@@ -580,6 +580,70 @@ fn cancel_before_intent() -> Result<()> {
     Ok(())
 }
 
+/// TJ-F5 (integration): the start-time limits read fails at start (a
+/// test-support gate file), so no controller exists; an exec_cmd call
+/// waits before its decision and the journal's unsettled job stays
+/// unsettled; once the gate is gone the paced retry reads the limits, the
+/// call runs and the earlier job settles `interrupted`.
+fn limits_retry() -> Result<()> {
+    let (mut fixture, model, project, directory) = setup("limits", &[])?;
+    model.script(&[
+        call(
+            "exec_cmd",
+            json!({"command": "sleep 60", "yield_seconds": 0}),
+        ),
+        Step::Final,
+    ]);
+    let first = fixture.submit(project, "Leave a live job.")?;
+    fixture.finish(first, Duration::from_secs(60))?;
+    let earlier = job_of(first, 1, 1);
+    fixture.crash()?;
+    let gate = fixture.home.join("job-limits-fail");
+    std::fs::write(&gate, b"")?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    model.script(&[
+        call("exec_cmd", json!({"command": "printf ran > f5.txt"})),
+        Step::Final,
+    ]);
+    let waiting = fixture.submit(project, "Run once the limits are read.")?;
+    // The call waits before its decision: no kind 14 yet, nothing ran, and
+    // the earlier job is still unsettled (no controller wrote kind 28).
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        calls(&fixture, waiting)?.is_empty(),
+        "no decision while waiting"
+    );
+    assert!(!directory.join("f5.txt").exists());
+    assert!(
+        settled(&fixture, earlier)?.is_none(),
+        "unsettled until the read"
+    );
+    std::fs::remove_file(&gate)?;
+    let event = fixture.finish(waiting, Duration::from_secs(90))?;
+    assert_eq!(event.kind, Some(3), "{event:?}");
+    wait_for(Duration::from_secs(20), "the call ran", || {
+        directory.join("f5.txt").exists()
+    })?;
+    let facts = wait_settled(&fixture, earlier, Duration::from_secs(20))?;
+    assert_eq!(facts.outcome, JobOutcome::Interrupted);
+    let log = std::fs::read_to_string(fixture.home.join("service.log"))?;
+    assert!(
+        log.contains("job_limits_unavailable"),
+        "logged once per run"
+    );
+    assert_eq!(
+        log.matches("job_limits_unavailable").count(),
+        1,
+        "once per run of failures"
+    );
+    assert!(log.contains("job_limits_read"));
+    println!(
+        "PASS TJ-F5 integration: a failed limits read held the exec_cmd call before its decision and kept the journal's job unsettled; the paced retry built the controller, the call ran and the earlier job settled interrupted"
+    );
+    Ok(())
+}
+
 type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
@@ -603,12 +667,13 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
         ("reads", reads_and_waits),
         ("queue", queue_and_cancel),
         ("execution", execution_setting),
         ("identity", identity),
         ("j21", cancel_before_intent),
+        ("limits", limits_retry),
     ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {

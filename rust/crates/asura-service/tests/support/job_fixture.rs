@@ -108,6 +108,13 @@ impl Fixture {
         self.child.take();
         Err("service failed clean shutdown; killed and reaped".into())
     }
+    /// A crash: SIGKILL, no drain.
+    pub fn crash(&mut self) -> Result<()> {
+        let mut child = self.child.take().ok_or("no service")?;
+        child.kill()?;
+        child.wait()?;
+        Ok(())
+    }
     pub fn journal(&self) -> Result<(Vec<u8>, journal::Replay)> {
         let bytes = asura_storage::authority::fixture::journal_bytes(&self.home)?;
         let replay = journal::replay(&bytes, &AtomicBool::new(false))
@@ -357,10 +364,7 @@ impl Model {
     /// Every `tool` message content of the last request, in order.
     pub fn tool_messages(&self) -> Vec<String> {
         let requests = self.requests.lock().unwrap();
-        requests
-            .last()
-            .map(tool_messages)
-            .unwrap_or_default()
+        requests.last().map(tool_messages).unwrap_or_default()
     }
 }
 impl Drop for Model {
