@@ -9,10 +9,18 @@
 //! reports `ProcessSettled { output_held: true }` while capture continues;
 //! `close_capture` then closes the read ends and capture seals with reason
 //! 7 (OD2).
+//!
+//! Model jobs (execution-path-guard.md, model change detection): the setup
+//! thread takes a build and test snapshot of the project just before spawn,
+//! and the cleanup thread another after the settled notice; the slot
+//! reports their difference as `SlotEvent::PathsChanged` before its scratch
+//! event. A model job whose slot has no cleanup thread after spawn reports
+//! an unknown change (overflow 1).
 use crate::{
     capture_worker::{self, Message, PauseReason, Report},
     completion::Completion,
     job_controller::{CaptureOutcome, SlotEvent, SlotFactory, SlotPort, SlotStart, SlotStartError},
+    path_guard::{self, ModelChange, Snapshot},
     tools::{self, ExecutionError},
 };
 use asura_platform::{
@@ -114,6 +122,13 @@ impl From<ExecCmdFailure> for Failure {
 struct Cleaned {
     token: Option<ExecCmdCleanup>,
     result: Result<(), ExecCmdError>,
+    /// A model job's change set from its two snapshots.
+    change: Option<ModelChange>,
+}
+/// A model job's project and its snapshot from before spawn.
+struct Watch {
+    root: String,
+    before: Snapshot,
 }
 /// One exec_cmd slot: at most one job.
 #[derive(Default)]
@@ -151,7 +166,7 @@ struct SetupEnded {
     cleanup: Option<ExecCmdCleanup>,
 }
 enum SlotPhase {
-    Setup(ThreadWork<Result<ExecCmdJob, SetupEnded>>),
+    Setup(ThreadWork<Result<(ExecCmdJob, Option<Watch>), SetupEnded>>),
     Running(ExecCmdJob),
     Cleanup(ThreadWork<Cleaned>),
     /// Scratch cleaned, or none was created: only capture may remain.
@@ -200,6 +215,11 @@ pub(crate) struct Slot {
     /// `CaptureSettled` so the controller sees the port's event order.
     scratch: Option<SlotEvent>,
     events: VecDeque<SlotEvent>,
+    /// A model job's snapshot before spawn, until the cleanup thread takes
+    /// the second one.
+    watch: Option<Watch>,
+    /// The cleanup thread took the watch: its join reports the change.
+    watch_sent: bool,
 }
 impl Slot {
     fn new(phase: SlotPhase, capture: Option<capture_worker::Handle>) -> Self {
@@ -218,6 +238,19 @@ impl Slot {
             close_requested: false,
             scratch: None,
             events: VecDeque::new(),
+            watch: None,
+            watch_sent: false,
+        }
+    }
+    /// A model job that spawned and whose second snapshot cannot be taken
+    /// (no cleanup thread): its change is unknown (overflow 1).
+    fn paths_unknown(&mut self) {
+        if self.watch.take().is_some() && self.spawned_at.is_some() {
+            self.events
+                .push_back(SlotEvent::PathsChanged(Box::new(ModelChange {
+                    paths: Vec::new(),
+                    overflow: 1,
+                })));
         }
     }
     fn trigger(&mut self, now: Instant) {
@@ -281,20 +314,43 @@ impl Slot {
         let deadline = now + CLEANUP_BOUND;
         let shared = Arc::new(std::sync::Mutex::new(Some(token)));
         let handoff = shared.clone();
+        // A model job that spawned: the second snapshot, after the settled
+        // notice, then the scratch cleanup with its L3 bound from then.
+        let watch = self.watch.take().filter(|_| self.spawned_at.is_some());
+        let watched = watch.is_some();
+        self.watch_sent = watched;
         self.phase = match spawn("asura-job-cleanup", wake, move |cancel| {
             let mut token = handoff
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take()
                 .expect("exclusive cleanup transfer");
+            let (change, deadline) = match watch {
+                Some(watch) => {
+                    let after = path_guard::snapshot(&watch.root, cancel);
+                    let change = path_guard::model_change(&watch.before, &after);
+                    (change, Instant::now() + CLEANUP_BOUND)
+                }
+                None => (None, deadline),
+            };
             let result = token.run(deadline, cancel);
             Cleaned {
                 token: Some(token),
                 result,
+                change,
             }
         }) {
             Ok(work) => SlotPhase::Cleanup(work),
             Err(_) => {
+                // No thread took the second snapshot.
+                self.watch_sent = false;
+                if watched {
+                    self.events
+                        .push_back(SlotEvent::PathsChanged(Box::new(ModelChange {
+                            paths: Vec::new(),
+                            overflow: 1,
+                        })));
+                }
                 self.scratch = Some(SlotEvent::ScratchRetained);
                 SlotPhase::Held {
                     // Spawn failed: no thread holds the lock.
@@ -315,6 +371,7 @@ impl Slot {
     fn lost(&mut self, mut job: ExecCmdJob, now: Instant, wake: Option<&WakeSender>) {
         job.close_lease();
         if self.spawned_at.is_some() {
+            self.paths_unknown();
             if !self.unconfirmed {
                 self.unconfirmed = true;
                 self.events.push_back(SlotEvent::CleanupUnconfirmed(
@@ -424,6 +481,7 @@ impl Slot {
         match job.take_cleanup() {
             Some(token) => self.cleanup(token, now, wake),
             None => {
+                self.paths_unknown();
                 self.scratch = Some(SlotEvent::ScratchRetained);
                 self.phase = SlotPhase::Held {
                     _cleanup: None,
@@ -465,7 +523,8 @@ impl Slot {
         let phase = std::mem::replace(&mut self.phase, SlotPhase::Done);
         match phase {
             SlotPhase::Setup(work) if work.thread.is_finished() => match work.thread.join() {
-                Ok(Ok(mut job)) => {
+                Ok(Ok((mut job, watch))) => {
+                    self.watch = watch;
                     // A cancel before spawn: the late returned job is stopped now.
                     if let Some(kind) = self.stop {
                         job.stop(kind);
@@ -499,11 +558,17 @@ impl Slot {
             },
             SlotPhase::Running(job) => self.running(job, now, wake),
             SlotPhase::Cleanup(work) if work.thread.is_finished() => match work.thread.join() {
-                Ok(cleaned) if cleaned.result.is_ok() => {
+                Ok(mut cleaned) if cleaned.result.is_ok() => {
+                    if let Some(change) = cleaned.change.take() {
+                        self.events.push_back(SlotEvent::PathsChanged(Box::new(change)));
+                    }
                     self.scratch_cleaned = true;
                     self.scratch = Some(SlotEvent::ScratchCleaned);
                 }
-                Ok(cleaned) => {
+                Ok(mut cleaned) => {
+                    if let Some(change) = cleaned.change.take() {
+                        self.events.push_back(SlotEvent::PathsChanged(Box::new(change)));
+                    }
                     // Failure or L3 passed: token and slot held until restart.
                     self.scratch = Some(SlotEvent::ScratchRetained);
                     self.phase = SlotPhase::Held {
@@ -512,6 +577,14 @@ impl Slot {
                     };
                 }
                 Err(_) => {
+                    // A cleanup panic: the second snapshot is unknown.
+                    if self.watch_sent {
+                        self.events
+                            .push_back(SlotEvent::PathsChanged(Box::new(ModelChange {
+                                paths: Vec::new(),
+                                overflow: 1,
+                            })));
+                    }
                     self.scratch = Some(SlotEvent::ScratchRetained);
                     self.phase = SlotPhase::Held {
                         _cleanup: None,
@@ -946,7 +1019,9 @@ enum Stage {
 /// the person setup (account database, `confstr`, `readlink` and root
 /// descriptors for `person-1`; the form check for `person-outside-1`),
 /// descriptor validation and scratch creation, then the guardian spawn,
-/// after which this thread writes the FD 11 frame of a person job.
+/// after which this thread writes the FD 11 frame of a person job. A
+/// `model-1` job takes its build and test snapshot just before the spawn
+/// (execution-path-guard.md, model change detection).
 /// Setup checks only cancellation (J1-Q4); it has no deadline.
 fn setup(
     runtime: RuntimeDirectory,
@@ -955,7 +1030,8 @@ fn setup(
     person: Option<PersonLaunch>,
     sink: Box<dyn asura_platform::exec_cmd::OutputSink>,
     cancel: &AtomicBool,
-) -> Result<ExecCmdJob, (Stage, Failure)> {
+) -> Result<(ExecCmdJob, Option<Watch>), (Stage, Failure)> {
+    let model = request.profile == Profile::Model1;
     let failed = |stage, error| {
         (
             stage,
@@ -998,8 +1074,13 @@ fn setup(
     if let Some(fault) = fault {
         prepared.guardian_fault_for_test(&fault);
     }
+    let watch = model.then(|| Watch {
+        root: scope.path.clone(),
+        before: path_guard::snapshot(&scope.path, cancel),
+    });
     prepared
         .spawn(&executable, cancel, sink)
+        .map(|job| (job, watch))
         .map_err(|f| (Stage::Spawn, Failure::from(f)))
 }
 

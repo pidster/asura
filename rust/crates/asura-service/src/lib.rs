@@ -11,6 +11,7 @@ mod exec_cmd_worker;
 mod job_control;
 mod job_controller;
 mod job_text;
+mod path_guard;
 mod payload_owner;
 mod secret_rules;
 pub mod secret_store;

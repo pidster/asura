@@ -72,7 +72,10 @@ pub(crate) enum SlotStartError {
 /// `LeaderExited`, at most one `CleanupUnconfirmed`, and `ProcessSettled`;
 /// then exactly one `CaptureSettled`; then `ScratchCleaned` or
 /// `ScratchRetained`. Pause events may come at any point before
-/// `CaptureSettled`.
+/// `CaptureSettled`. A `model-1` job that spawned also reports at most one
+/// `PathsChanged` after `ProcessSettled` and before its scratch event
+/// (execution-path-guard.md, model change detection); it may come before
+/// or after `CaptureSettled`.
 pub(crate) enum SlotEvent {
     Spawned,                               // kind 1
     SetupFailed(JobReason),                // codes 12-18; no process
@@ -94,6 +97,8 @@ pub(crate) enum SlotEvent {
     ScratchCleaned,
     ScratchRetained,
     IdentityChanged, // pre-spawn recheck mismatch
+    /// The build and test paths a model job changed (kind 32 action 1).
+    PathsChanged(Box<crate::path_guard::ModelChange>),
 }
 
 /// The capture facts of one settled job, as kind 28 records them, and the
