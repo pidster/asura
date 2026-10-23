@@ -1910,6 +1910,7 @@ mod person {
             (v.profile, v.shell_exited, v.left_running),
             (Profile::PersonOutside1, true, Some(2))
         );
+        assert_eq!(v.shell_exit, Some((1, 0)), "the kind 5 exit is kept");
         assert_eq!(h.ctl.live_count(None), 1);
         // The slot stays held: a later start waits and names it.
         let next = h.model(2, conversation(1), P1);
@@ -1955,6 +1956,7 @@ mod person {
         assert!(cancels(&records).is_empty());
         let v = h.ctl.view(job, h.now).expect("view");
         assert_eq!((v.shell_exited, v.left_running), (false, Some(2)));
+        assert_eq!(v.shell_exit, None, "settled: the exit is kind 28's");
         h.script(job, [SlotEvent::ScratchCleaned]);
         h.idle(job);
         assert_eq!(h.started(), [job, next], "slot released at settlement");
@@ -1977,6 +1979,8 @@ mod person {
         h.commit();
         h.script(job, shell_exit(Exit::Exited(3), 2, true));
         assert_eq!(shell_exits(&events(&mut h)).len(), 1);
+        let v = h.ctl.view(job, h.now).expect("view");
+        assert_eq!((v.shell_exited, v.shell_exit), (true, Some((1, 3))));
         assert_eq!(
             h.ctl
                 .cancel(job, Requester::Person, JobReason::PersonStop, false),
@@ -2035,6 +2039,7 @@ mod person {
         assert_eq!(h.state(job), Some(JobState::Finalizing));
         let v = h.ctl.view(job, h.now).expect("view");
         assert_eq!((v.shell_exited, v.left_running), (false, None));
+        assert_eq!(v.shell_exit, None, "not released");
         h.script(
             job,
             [SlotEvent::CaptureSettled(capture(
@@ -2090,6 +2095,12 @@ mod person {
             [SlotEvent::Spawned, SlotEvent::LeaderExited(Exit::Exited(0))],
         );
         assert_eq!(h.state(job), Some(JobState::Draining));
+        let v = h.ctl.view(job, h.now).expect("view");
+        assert_eq!(
+            (v.shell_exited, v.shell_exit),
+            (false, None),
+            "draining before release: no shell exit shown"
+        );
         h.ctl
             .cancel(job, Requester::Person, JobReason::PersonStop, false);
         assert_eq!(discards(&h), [job]);

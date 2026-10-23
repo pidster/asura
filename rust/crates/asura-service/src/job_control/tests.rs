@@ -1838,7 +1838,7 @@ fn outside_entry_fields_follow_the_view_then_kind_28() {
     let outside = h.submit_as(person(7), C1, P1, "brew upgrade", Profile::PersonOutside1);
     let sandboxed = h.submit(person(8), C2, P1, "make check");
     h.script(sandboxed, [SlotEvent::Spawned]);
-    let exit = Exit::Exited(0);
+    let exit = Exit::Exited(4);
     h.script(
         outside,
         [
@@ -1858,6 +1858,11 @@ fn outside_entry_fields_follow_the_view_then_kind_28() {
     assert_eq!(entry.outside_sandbox, Some(true));
     assert_eq!(entry.shell_exited, Some(true));
     assert_eq!(entry.left_running, Some(2));
+    assert_eq!(
+        (entry.exit_kind, entry.exit_value),
+        (Some(1), Some(4)),
+        "the shell's kind 5 exit while the released job drains"
+    );
     let reply = detail(h.send(1, inspect(sandboxed, Some(P1))));
     assert_eq!(
         reply.cwd.as_deref(),
@@ -1867,6 +1872,7 @@ fn outside_entry_fields_follow_the_view_then_kind_28() {
     let entry = reply.entry.unwrap();
     assert_eq!(entry.outside_sandbox, None);
     assert_eq!((entry.shell_exited, entry.left_running), (None, None));
+    assert_eq!((entry.exit_kind, entry.exit_value), (None, None));
     let live = listing(h.send(1, Body::JobList(list(1, Some(P1), None))));
     let row = live
         .entries
@@ -1877,6 +1883,7 @@ fn outside_entry_fields_follow_the_view_then_kind_28() {
         (row.outside_sandbox, row.shell_exited, row.left_running),
         (Some(true), Some(true), Some(2))
     );
+    assert_eq!((row.exit_kind, row.exit_value), (Some(1), Some(4)));
     h.script(
         outside,
         [
@@ -1903,4 +1910,9 @@ fn outside_entry_fields_follow_the_view_then_kind_28() {
     assert_eq!(entry.outside_sandbox, Some(true));
     assert_eq!(entry.shell_exited, None);
     assert_eq!(entry.left_running, Some(2), "kind 28 field 8: survivors");
+    assert_eq!(
+        (entry.exit_kind, entry.exit_value),
+        (Some(1), Some(4)),
+        "kind 28"
+    );
 }

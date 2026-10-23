@@ -485,7 +485,7 @@ fn entry_from_facts(facts: &Facts, view: Option<&JobView>) -> pb::JobEntry {
 /// `JobEntry.outside_sandbox` and OD2 fields 28 and 29 of a `!!` job
 /// (profile `person-outside-1`): `left_running` from the controller's view
 /// while `draining`, or from kind 28 field 8 once settled; `shell_exited`
-/// only while a released job drains. Absent for every other profile.
+/// and the shell's exit (fields 12 and 13) only while a released job drains. Absent for every other profile.
 fn outside_fields(
     entry: &mut pb::JobEntry,
     view: Option<&JobView>,
@@ -500,6 +500,12 @@ fn outside_fields(
     } else if state == Some(pb::JobState::Draining as i32) {
         entry.left_running = view.and_then(|v| v.left_running);
         entry.shell_exited = view.is_some_and(|v| v.shell_exited).then_some(true);
+        // The shell's kind 5 exit while the released job drains
+        // (tool-job-controller.md `JobEntry` fields 12 and 13).
+        if let Some((kind, value)) = view.filter(|v| v.shell_exited).and_then(|v| v.shell_exit) {
+            entry.exit_kind = Some(u32::from(kind));
+            entry.exit_value = Some(value);
+        }
     }
 }
 

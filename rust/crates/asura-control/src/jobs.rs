@@ -291,6 +291,13 @@ pub(crate) fn entry(v: &pb::JobEntry) -> bool {
         (4, None) => true,
         (_, reason) => reason.is_none(),
     };
+    // The shell's kind 5 exit of a released `!!` job (DRAINING with
+    // `shell_exited`); every other unsettled job has no exit.
+    let draining_exit = state == pb::JobState::Draining as i32
+        && person
+        && v.outside_sandbox == Some(true)
+        && v.shell_exited == Some(true)
+        && matches!(v.exit_kind, Some(1 | 2));
     let exit = match (v.exit_kind, v.exit_value) {
         (None, None) => true,
         (Some(0), Some(0)) => true,
@@ -327,7 +334,7 @@ pub(crate) fn entry(v: &pb::JobEntry) -> bool {
                 && v.capture_state.is_some_and(|n| (1..=5).contains(&n))
         } else {
             v.outcome.is_none()
-                && v.exit_kind.is_none()
+                && (v.exit_kind.is_none() || draining_exit)
                 && v.capture_state.is_none()
                 && v.stdout_lines.is_none()
                 && v.stderr_lines.is_none()
@@ -403,7 +410,9 @@ mod tests {
         }
     }
     /// `JobEntry` fields 28 and 29 (OD2): only a person `!!` job; survivors
-    /// in DRAINING or SETTLED; `shell_exited` only true and only DRAINING.
+    /// in DRAINING or SETTLED; `shell_exited` only true and only DRAINING;
+    /// the shell's exit (fields 12 and 13) in DRAINING only with
+    /// `shell_exited`.
     #[test]
     fn released_outside_job_fields() {
         use pb::JobState::{Draining, Running, Settled};
@@ -422,7 +431,63 @@ mod tests {
             shell_exited: None,
             ..draining.clone()
         }));
+        // The shell's exit while the released job drains.
+        let exited = pb::JobEntry {
+            exit_kind: Some(1),
+            exit_value: Some(0),
+            ..draining.clone()
+        };
+        assert!(entry(&exited));
+        assert!(entry(&pb::JobEntry {
+            exit_kind: Some(2),
+            exit_value: Some(15),
+            ..draining.clone()
+        }));
         for (name, changed) in [
+            (
+                "exit without shell_exited",
+                pb::JobEntry {
+                    shell_exited: None,
+                    ..exited.clone()
+                },
+            ),
+            (
+                "exit while running",
+                pb::JobEntry {
+                    exit_kind: Some(1),
+                    exit_value: Some(0),
+                    ..outside_entry(Running)
+                },
+            ),
+            (
+                "exit in a sandboxed person job",
+                pb::JobEntry {
+                    outside_sandbox: Some(false),
+                    ..exited.clone()
+                },
+            ),
+            (
+                "exit kind 0 while draining",
+                pb::JobEntry {
+                    exit_kind: Some(0),
+                    exit_value: Some(0),
+                    ..draining.clone()
+                },
+            ),
+            (
+                "exit kind without value",
+                pb::JobEntry {
+                    exit_value: None,
+                    ..exited.clone()
+                },
+            ),
+            (
+                "exit value out of range",
+                pb::JobEntry {
+                    exit_value: Some(256),
+                    ..exited.clone()
+                },
+            ),
             (
                 "model origin",
                 pb::JobEntry {

@@ -41,6 +41,10 @@ pub(crate) struct JobView {
     /// A released `!!` job (OD2): the shell exited and survivors hold its
     /// output; true only in state `draining` (`JobEntry.shell_exited`).
     pub shell_exited: bool,
+    /// The shell's kind 5 exit (`exit_kind`, `exit_value`) while a released
+    /// `!!` job drains: `Some` exactly when `shell_exited` is true. The
+    /// settled exit comes from kind 28 (`JobEntry` fields 12 and 13).
+    pub shell_exit: Option<(u8, u32)>,
     /// A `!!` job's survivors left running, once its kind 2 arrived
     /// (`draining`) or from kind 28 (`settled`); `None` before, and for
     /// every other profile (`JobEntry.left_running`).
@@ -98,6 +102,7 @@ impl JobController {
             excerpt: r.excerpt.clone(),
             profile: r.profile,
             shell_exited: false,
+            shell_exit: None,
             left_running: r
                 .settled
                 .as_ref()
@@ -177,6 +182,7 @@ impl JobController {
             }
             _ => None,
         };
+        let shell_exited = j.released && state == JobRunState::Draining;
         JobView {
             job: j.id,
             origin: j.origin,
@@ -190,7 +196,8 @@ impl JobController {
             outcome: j.settled.as_ref().map(|s| s.outcome),
             excerpt: j.excerpt.clone(),
             profile: j.profile,
-            shell_exited: j.released && state == JobRunState::Draining,
+            shell_exited,
+            shell_exit: j.exit.filter(|_| shell_exited).map(exit_facts),
             left_running: if !j.outside() {
                 None
             } else if state == JobRunState::Settled {
