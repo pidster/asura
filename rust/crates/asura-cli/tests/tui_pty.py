@@ -6,8 +6,8 @@ The job journeys (--jobs, --job-viewer, --job-retention, --execution-setting)
 need a service that lists CAPABILITY_JOBS; they run after packet J34-E.
 --job-notices needs the J5 job notice; it runs after packet J5-E.
 The person journeys (--person-*) need packets P3-E and P4 and a test-support
-service: each uses a scratch home whose seams name a scratch keychain, the
-`!` account directories and capability 8 (person-command-mode.md, PC-E1 to
+service: each uses a scratch home whose seams name a scratch keychain and the
+`!` account directories (person-command-mode.md, PC-E1 to
 PC-E20; secret-store.md, SS-E1 and SS-E2). The P3-E2 and P3-E3 checks
 (PC-E8, PC-E18, PC-E19) run unconditionally (PENDING_P3E2 is False).
 This verifies process and tty state, not native terminal visual correctness.
@@ -3952,7 +3952,6 @@ class PersonHarness(JobsHarness):
       root with `security create-keychain` (never the login keychain; the
       search list and the default keychain are never changed, and the
       harness checks the search list is unchanged at close);
-    - `person-command-capability`: the service advertises capability 8;
     - `exec-cmd-person-account`: the `!` command's account home and
       `$TMPDIR` are fixture directories.
 
@@ -3983,7 +3982,6 @@ class PersonHarness(JobsHarness):
             assert keychain_search_list() == self.search_list, "create-keychain changed the search list"
             write_private(home / "secret-store-keychain", f"{self.keychain}\n{password}\n")
             write_private(home / "exec-cmd-person-account", f"{self.account}\n{self.tmpdir}\n")
-            write_private(home / "person-command-capability", "")
             fixture.env = {
                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                 "HOME": str(self.account),
