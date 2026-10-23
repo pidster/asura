@@ -443,6 +443,11 @@ fn terminal_regressions() -> Result<()> {
         Some("--job-retention"),
         Some("--execution-setting"),
         Some("--job-notices"),
+        Some("--person-commands"),
+        Some("--person-outside"),
+        Some("--person-model"),
+        Some("--person-restart"),
+        Some("--person-secrets"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);

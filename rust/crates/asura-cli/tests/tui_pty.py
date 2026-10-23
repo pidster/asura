@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices]
+Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets]
 The job journeys (--jobs, --job-viewer, --job-retention, --execution-setting)
 need a service that lists CAPABILITY_JOBS; they run after packet J34-E.
 --job-notices needs the J5 job notice; it runs after packet J5-E.
+The person journeys (--person-*) need packets P3-E and P4 and a test-support
+service: each uses a scratch home whose seams name a scratch keychain, the
+`!` account directories and capability 8 (person-command-mode.md, PC-E1 to
+PC-E20; secret-store.md, SS-E1 and SS-E2). Checks that need P3-E2 print
+PENDING until PENDING_P3E2 is False.
 This verifies process and tty state, not native terminal visual correctness.
 """
 import codecs
@@ -139,7 +144,7 @@ class Screen:
 
 
 class Trial:
-    def __init__(self, binary, cwd=None):
+    def __init__(self, binary, cwd=None, env=None):
         self.master, self.slave = pty.openpty()
         self.output = bytearray()
         self.screen = Screen()
@@ -154,7 +159,7 @@ class Trial:
             [sys.executable, "-c", SUPERVISOR, str(binary)],
             stdin=self.slave, stdout=self.slave, stderr=self.slave,
             close_fds=True, preexec_fn=controlling_terminal, cwd=cwd or binary.parent,
-            env={**os.environ, "TERM": "xterm-256color"},
+            env={**(os.environ if env is None else env), "TERM": "xterm-256color"},
         )
         try:
             self.until(b"__ASURA_TEST_PID__")
@@ -268,6 +273,9 @@ class Fixture:
         self.started = False
         self.uncertain_start = False
         self.active_trials = []
+        # A journey may give the CLI and the TUI a scratch environment (the
+        # person journeys: scratch HOME and TMPDIR); None inherits.
+        self.env = None
 
     def command(self, *args):
         self.counter += 1
@@ -275,7 +283,7 @@ class Fixture:
         err = self.root / f"command-{self.counter}.err"
         with out.open("wb") as stdout, err.open("wb") as stderr:
             child = subprocess.Popen([str(self.binary), *args], cwd=self.root,
-                stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, env=self.env,
             )
             try:
                 end = time.monotonic() + remaining()
@@ -296,7 +304,7 @@ class Fixture:
         # authenticated CLI status proves a current service after the launch.
         self.started = True
         self.uncertain_start = True
-        trial = Trial(self.binary, cwd=cwd)
+        trial = Trial(self.binary, cwd=cwd, env=self.env)
         self.active_trials.append(trial)
         try:
             trial.until(b"Connected (", plain=True, refresh=True)
@@ -3896,6 +3904,893 @@ def job_notices_journey(fixture, source):
             trial.close()
         harness.close()
 
+def keychain_search_list():
+    """The person's keychain search list (read-only)."""
+    result = subprocess.run(["/usr/bin/security", "list-keychains", "-d", "user"],
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    assert result.returncode == 0, result
+    return result.stdout
+
+
+def write_private(path, text):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as file:
+        file.write(text)
+
+
+# Composer and stripe colours as the TUI writes them (person-command-mode.md,
+# PCR5, PCR22, PCR26), as 24-bit SGR parameters.
+AMBER_BOX = b"48;2;232;181;119"
+OUTSIDE_BOX_BG = b"48;2;210;112;104"
+AMBER_STRIPE = b"48;2;116;90;60"
+OUTSIDE_STRIPE = b"48;2;105;56;52"
+HIDDEN_RED = b"38;2;179;38;30"
+PERSON_LABEL = "[The person ran a command themselves. You did not run it."
+OUTSIDE_LABEL = "[The person ran a command, outside the sandbox, themselves. You did not run it."
+
+
+class PersonHarness(JobsHarness):
+    """Shared fixture for the person command journeys (person-command-mode.md,
+    end to end PC-E1 to PC-E20): the real TUI and service with a scripted
+    loopback model, in a scratch home whose test-support seams name
+
+    - `secret-store-keychain`: a scratch keychain created under the fixture
+      root with `security create-keychain` (never the login keychain; the
+      search list and the default keychain are never changed, and the
+      harness checks the search list is unchanged at close);
+    - `person-command-capability`: the service advertises capability 8;
+    - `exec-cmd-person-account`: the `!` command's account home and
+      `$TMPDIR` are fixture directories.
+
+    The CLI, the TUI and every service it launches get a scratch
+    environment: HOME and TMPDIR are the fixture account directories, so a
+    `!!` command's launch environment names no real directory of the person.
+    """
+
+    def __init__(self, fixture, source):
+        super().__init__(fixture, source)
+        try:
+            root = fixture.root
+            home = root / "home"
+            self.search_list = keychain_search_list()
+            self.account = root / "account"
+            self.tmpdir = root / "account-tmp"
+            # Outside every person-profile root (PC-E13, PC-E14).
+            self.outside = root / "outside"
+            for directory in (self.account, self.tmpdir, self.outside):
+                directory.mkdir(mode=0o700)
+            self.keychain = root / "scratch.keychain"
+            password = os.urandom(16).hex()
+            created = subprocess.run(
+                ["/usr/bin/security", "create-keychain", "-p", password, str(self.keychain)],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+            assert created.returncode == 0, created
+            assert self.keychain.is_file(), sorted(p.name for p in root.iterdir())
+            assert keychain_search_list() == self.search_list, "create-keychain changed the search list"
+            write_private(home / "secret-store-keychain", f"{self.keychain}\n{password}\n")
+            write_private(home / "exec-cmd-person-account", f"{self.account}\n{self.tmpdir}\n")
+            write_private(home / "person-command-capability", "")
+            fixture.env = {
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": str(self.account),
+                "TMPDIR": str(self.tmpdir) + "/",
+                "LANG": "en_US.UTF-8",
+                "USER": os.environ.get("USER", "fixture"),
+                "LOGNAME": os.environ.get("LOGNAME", "fixture"),
+                "SHELL": "/bin/sh",
+                "OUTSIDE_FIXTURE": str(self.outside),
+            }
+        except BaseException:
+            JobsHarness.close(self)
+            raise
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            assert keychain_search_list() == self.search_list, "the keychain search list changed"
+
+    def add_project(self, project):
+        """Registers `project` through the CLI; the installation may still be
+        initializing (`conversation_busy`), so this retries that only."""
+        end = time.monotonic() + remaining(20)
+        while True:
+            code, out, err = self.fixture.command("project", "add", str(project))
+            if code == 0:
+                return
+            assert b"conversation_busy" in err and time.monotonic() < end, (out, err)
+            time.sleep(0.1)
+
+    def configure_model(self, trial):
+        for key, value in [("providers.ollama.endpoint", self.endpoint), ("model", "ollama:fixture")]:
+            trial.send(f"/config set {key} {value}\r".encode())
+            trial.until(f"Saved {key}".encode(), plain=True)
+            trial.send(b"\x1b")
+            trial.idle(0.1)
+
+    def enable(self, trial):
+        """Waits until the TUI knows the service lists capability 8: a
+        command-mode Enter without it keeps the draft with a notice."""
+        trial.until(b"Connected (", plain=True, limit=10)
+
+    def run(self, trial, text, mode="!", expect=None, limit=30):
+        """Types a command in `!` or `!!` mode and presses Enter; waits for
+        the accepted notice, or `expect`."""
+        offset = len(trial.output)
+        trial.send(mode.encode())
+        trial.send(text.encode())
+        trial.idle(0.1)
+        trial.send(b"\r")
+        trial.until((expect or "Command ").encode(), offset, plain=True, limit=limit,
+                    reject="Commands are not enabled")
+        return offset
+
+    def footer(self, trial, header, prefix="↳ exit 0", limit=30):
+        """Waits until the newest log entry whose stripe starts with `header`
+        shows a line containing `prefix` below it; returns that line."""
+        end = time.monotonic() + remaining(limit)
+        while True:
+            rows = [row.strip() for row in trial.screen.text().splitlines()]
+            starts = [i for i, row in enumerate(rows) if row.startswith(header)]
+            if starts:
+                below = rows[starts[-1] + 1:]
+                # The entry ends at the next blank row.
+                below = below[:below.index("")] if "" in below else below
+                found = [row for row in below if prefix in row]
+                if found:
+                    return found[0]
+            if time.monotonic() >= end and os.environ.get("ASURA_TUI_SCREEN"):
+                print(trial.screen.text(), file=sys.stderr)
+            assert time.monotonic() < end, ("entry footer", header, prefix)
+            trial.read(0.025)
+            assert trial.process.poll() is None, trial.screen.text()
+
+    def job_row(self, trial, command, limit=10):
+        """The open /jobs list's row of the person job whose command starts
+        with `command` (`HANDLE !  COMMAND · STATE · …`)."""
+        pattern = re.compile(r"^[0-9a-f]{8} !{1,2} +" + re.escape(command))
+        end = time.monotonic() + remaining(limit)
+        while True:
+            rows = [row.strip() for row in trial.screen.text().splitlines()]
+            found = [row for row in rows if pattern.match(row)]
+            if found:
+                return found[0]
+            assert time.monotonic() < end, ("job row", command, trial.screen.text())
+            trial.read(0.025)
+
+    def chat_user(self, index=-1):
+        users = [m for m in self.chats[index]["messages"] if m.get("role") == "user"]
+        return users[-1]["content"] if users else ""
+
+
+def quit_tui(trial):
+    trial.send(b"\x01/quit\r")
+    trial.finish()
+
+
+def person_commands_journey(fixture, source):
+    """--person-commands: PC-E1 (a `!pwd` in a project subdirectory runs
+    there: amber stripe, exit 0), PC-E6 (Up restores command mode with the
+    text), PC-E10 (/jobs lists the person job with `!` and opens it in the
+    viewer), PC-E7 (long output: Enter on the log entry opens the viewer at
+    the end of stdout; Home reaches byte 0; Tab reaches stderr; Escape
+    returns to the log) and PC-E12 (a pasted three-line command with U+202E:
+    marker, carets and rules, a red block, the hint counts; it runs with the
+    original bytes). Runnable after P3-E and P4."""
+    harness = PersonHarness(fixture, source)
+    project = harness.project("persona")
+    sub = project / "src" / "ui"
+    sub.mkdir(parents=True, mode=0o700)
+    trial = None
+    try:
+        fixture.start()
+        harness.add_project(project)
+        trial = fixture.launch(cwd=sub)
+        trial.resize(120, 40)
+        trial.until(b"Persona", plain=True, limit=10)
+        # PC-E1: the box turns amber in command mode; the run is in src/ui.
+        offset = len(trial.output)
+        trial.send(b"!")
+        trial.until("↵ run in src/ui".encode(), offset, plain=True, limit=10)
+        assert AMBER_BOX in trial.output[offset:], "amber command box"
+        trial.send(b"pwd\r")
+        trial.until(b"! pwd", offset, plain=True, limit=10, reject="Commands are not enabled")
+        line = harness.footer(trial, "! pwd")
+        assert "src/ui" in line, line
+        assert str(sub.resolve()) in trial.screen.text() or str(sub) in trial.screen.text(), trial.screen.text()
+        assert AMBER_STRIPE in trial.output[offset:], "amber stripe"
+        # PC-E6: Up restores command mode with the text.
+        offset = len(trial.output)
+        trial.send(b"\x1b[A")
+        trial.until("↵ run in src/ui".encode(), offset, plain=True, limit=10)
+        assert any(row.lstrip().startswith("! pwd") or row.lstrip().startswith("!pwd")
+                   for row in trial.screen.text().splitlines()), trial.screen.text()
+        # Clear the recalled draft: select all is not needed; Backspace x3
+        # and once more at position 0 leaves command mode.
+        trial.send(b"\x7f\x7f\x7f\x7f")
+        trial.idle(0.2)
+        assert "↵ run in" not in trial.screen.text(), trial.screen.text()
+        # PC-E10: /jobs lists the person job with `!` and opens it.
+        harness.command(trial, "/jobs", "Jobs · this project")
+        trial.until(b"! pwd", plain=True, limit=10)
+        offset = len(trial.output)
+        trial.send(b"\r")
+        trial.until(b"stdout", offset, plain=True, limit=10)
+        trial.until(str(sub).encode(), offset, plain=True, limit=10)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        # PC-E7: long output on both streams.
+        command = ("i=0; while [ $i -lt 400 ]; do echo out $i; i=$((i+1)); done; "
+                   "echo err first >&2; echo err last >&2")
+        harness.run(trial, command)
+        harness.footer(trial, "! i=0; while")
+        trial.until(b"err last", plain=True, limit=10)
+        # Log focus (Shift+Up; the queue is empty), then Enter opens the
+        # viewer at stdout's end.
+        trial.idle(0.5)
+        offset = len(trial.output)
+        trial.send(b"\x1b[1;2A")
+        trial.idle(0.2)
+        trial.send(b"\r")
+        trial.until(b"stdout", offset, plain=True, limit=10)
+        trial.until(b"out 399", offset, plain=True, limit=10)
+        offset = len(trial.output)
+        trial.send(b"\x1b[H")  # Home: byte 0.
+        trial.until(b"out 0", offset, plain=True, limit=10)
+        offset = len(trial.output)
+        trial.send(b"\t")
+        trial.until(b"stderr", offset, plain=True, limit=10)
+        trial.until(b"err first", offset, plain=True, limit=10)
+        trial.send(b"\x1b")
+        trial.idle(0.3)
+        assert "out 0" not in trial.screen.text(), "Escape returned to the log"
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        # PC-E12: a pasted three-line command with U+202E.
+        rlo = "‮"
+        pasted = f"!echo one\necho '{rlo}' > rlo.out\necho three"
+        offset = len(trial.output)
+        trial.send(b"\x1b[200~" + pasted.encode() + b"\x1b[201~")
+        trial.until(b"3 commands will run", offset, plain=True, limit=10)
+        trial.until(b"1 hidden character", offset, plain=True, limit=10)
+        screen = trial.screen.text()
+        rows = screen.splitlines()
+        assert any("█" in row and "rlo.out" in row for row in rows), screen
+        assert HIDDEN_RED in trial.output[offset:], "red hidden mark"
+        composer = [row for row in rows if "echo" in row]
+        assert len(composer) >= 3, screen
+        carets = sum(1 for row in rows if row.lstrip().startswith("› echo"))
+        markers = sum(1 for row in rows if row.lstrip().startswith("! echo one"))
+        rules = sum(1 for row in rows if "────" in row and not row.strip("─ ").strip())
+        assert (markers, carets) == (1, 2), (markers, carets, screen)
+        assert rules >= 2, screen
+        trial.send(b"\r")
+        line = harness.footer(trial, "! echo one (+2 lines)")
+        assert "2 lines" in line, line
+        assert (sub / "rlo.out").read_bytes() == (rlo + "\n").encode(), (sub / "rlo.out").read_bytes()
+        quit_tui(trial)
+        trial = None
+        fixture.stop()
+        print("PASS PC-E1/E6/E7/E10/E12 TUI: !pwd in a subdirectory with the amber box and stripe, "
+              "recall restores command mode, /jobs lists ! and opens the viewer, the viewer from the "
+              "log at stdout's end with Home and Tab, the pasted split with a hidden mark runs the "
+              "original bytes")
+    finally:
+        if trial is not None:
+            trial.close()
+        harness.close()
+
+
+def person_outside_journey(fixture, source):
+    """--person-outside: PC-E2 (launched outside the project, `!pwd` prints
+    the project root), PC-E13 (`!!` box, marker, stripe, warning before
+    output; the file outside every person root is made), PC-E14 (one
+    Backspace at position 0 returns to `!`; the same command is refused by
+    the sandbox), PC-E15 (allowOutsideSandbox false: the refusal names the
+    key; draft and outside mode kept), PC-E3 and PC-E16 (Ctrl-C stops, a
+    second Ctrl-C kills, the TUI keeps running, for `!` and `!!`) and PC-E11
+    (a 50 MB flood: the fold shows the newest lines while running; typing
+    stays responsive). Runnable after P3-E and P4."""
+    harness = PersonHarness(fixture, source)
+    project = harness.project("outsider")
+    trial = None
+    try:
+        fixture.start()
+        harness.add_project(project)
+        # PC-E2: launched in the fixture root, outside the project.
+        trial = fixture.launch()
+        trial.resize(120, 40)
+        harness.select(trial, project)
+        harness.run(trial, "pwd", expect="↵ run in Outsider")
+        line = harness.footer(trial, "! pwd")
+        assert "Outsider" in line, line
+        rows = [row.strip() for row in trial.screen.text().splitlines()]
+        assert str(project) in rows, trial.screen.text()
+
+        # PC-E13: `!`, `!`, the command, Enter.
+        made = harness.outside / "made"
+        offset = len(trial.output)
+        trial.send(b"!")
+        trial.send(b"!")
+        trial.send(f'touch "{made}"'.encode())
+        trial.until("↵ run OUTSIDE the sandbox in Outsider".encode(), offset, plain=True, limit=10)
+        trial.until(f'touch "{made}"'.encode(), offset, plain=True, limit=10)
+        assert OUTSIDE_BOX_BG in trial.output[offset:], "outside box colour"
+        # The `!!` marker fills the two gutter cells.
+        assert any(row.startswith("!!touch") for row in
+                   (r.strip() for r in trial.screen.text().splitlines())), trial.screen.text()
+        offset = len(trial.output)
+        trial.send(b"\r")
+        header = f'!! touch "{made}"'
+        line = harness.footer(trial, header)
+        rows = [row.strip() for row in trial.screen.text().splitlines()]
+        at = max(i for i, row in enumerate(rows) if row.startswith(header))
+        assert rows[at + 1] == "running OUTSIDE the sandbox, as you typed it: it may write anywhere you can", rows[at:at + 4]
+        assert OUTSIDE_STRIPE in trial.output[offset:], "outside stripe"
+        assert made.exists(), "the !! command made the file"
+
+        # PC-E14: the same command after one Backspace at position 0.
+        refused = harness.outside / "made14"
+        offset = len(trial.output)
+        trial.send(b"!!")
+        trial.send(f'touch "{refused}"'.encode())
+        trial.until("↵ run OUTSIDE".encode(), offset, plain=True, limit=10)
+        trial.until(f'touch "{refused}"'.encode(), offset, plain=True, limit=10)
+        trial.send(b"\x1b[H")  # Home: position 0.
+        trial.idle(0.1)
+        offset = len(trial.output)
+        trial.send(b"\x7f")
+        trial.until("↵ run in Outsider".encode(), offset, plain=True, limit=10)
+        assert AMBER_BOX in trial.output[offset:], "amber command box"
+        trial.send(b"\r")
+        header = f'! touch "{refused}"'
+        line = harness.footer(trial, header, "↳ exit 1")
+        trial.until(b"Operation not permitted", plain=True, limit=10)
+        assert not refused.exists(), "the sandbox kept the file from being made"
+
+        # PC-E15: allowOutsideSandbox false.
+        harness.command(trial, "/config set personCommands.allowOutsideSandbox false",
+                        "Saved personCommands.allowOutsideSandbox")
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        # The header notice is cut to half the terminal width: widen it so
+        # the whole refusal shows.
+        trial.resize(300, 40)
+        trial.idle(0.2)
+        offset = len(trial.output)
+        trial.send(b"!!ls\r")
+        trial.until(b"Running outside the sandbox is turned off (personCommands.allowOutsideSandbox is false). "
+                    b"Type it after a single ! to run it in the sandbox.", offset, plain=True, limit=20)
+        trial.until("↵ run OUTSIDE the sandbox".encode(), offset, plain=True, limit=10)
+        rows = [row.strip() for row in trial.screen.text().splitlines()]
+        assert "!!ls" in rows, trial.screen.text()
+        # Leave the draft: two Backspaces, then two at position 0.
+        trial.send(b"\x7f\x7f\x7f\x7f")
+        trial.idle(0.2)
+        assert "↵ run" not in trial.screen.text(), trial.screen.text()
+        trial.resize(120, 40)
+        harness.command(trial, "/config set personCommands.allowOutsideSandbox true",
+                        "Saved personCommands.allowOutsideSandbox")
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+
+        # PC-E3 and PC-E16: Ctrl-C stops; a second Ctrl-C kills.
+        for mode in ("!", "!!"):
+            outside = " OUTSIDE the sandbox" if mode == "!!" else ""
+            harness.run(trial, "sleep 600", mode=mode)
+            trial.until(f"running{outside} sleep 600".encode(), plain=True, limit=20)
+            # The job itself runs (a stop before its start is `not started`).
+            harness.footer(trial, f"{mode} sleep 600", "↳ running")
+            trial.send(b"\x03")
+            line = harness.footer(trial, f"{mode} sleep 600", "↳ stopped by you")
+            assert "signal 15" in line, line
+            assert trial.process.poll() is None, "Ctrl-C did not quit"
+            # A program that ignores TERM: the stop waits for KILL.
+            stubborn = "exec /usr/bin/perl -e '$SIG{TERM}=q(IGNORE); sleep 600'"
+            harness.run(trial, stubborn, mode=mode)
+            trial.until(f"running{outside} exec".encode(), plain=True, limit=20)
+            harness.footer(trial, f"{mode} {stubborn}", "↳ running")
+            # Perl sets its TERM disposition after it starts.
+            trial.idle(1.0)
+            trial.send(b"\x03")
+            trial.until("stopping · Ctrl-C again kills".encode(), plain=True, limit=10)
+            # The job is still stopping: a second Ctrl-C now cannot quit.
+            harness.footer(trial, f"{mode} {stubborn}", "↳ stopping")
+            trial.send(b"\x03")
+            line = harness.footer(trial, f"{mode} {stubborn}", "↳ killed by you")
+            assert "signal 9" in line, line
+            trial.idle(0.3)
+            assert trial.process.poll() is None, "Ctrl-C did not quit"
+
+        # PC-E11: a flood; the fold shows the newest lines while running.
+        harness.run(trial, "yes | head -c 50000000")
+        header = "! yes | head -c 50000000"
+        live_fold = False
+        end = time.monotonic() + remaining(40)
+        while True:
+            rows = [row.strip() for row in trial.screen.text().splitlines()]
+            starts = [i for i, row in enumerate(rows) if row.startswith(header)]
+            below = rows[starts[-1] + 1:] if starts else []
+            below = below[:below.index("")] if "" in below else below
+            if any(row.startswith("↳ exit") for row in below):
+                break
+            if (not live_fold and any(row.startswith("▸ ") for row in below) and below.count("y") >= 8
+                    and any(row.startswith("↳ running") or row.startswith("↳ paused") for row in below)):
+                live_fold = True
+                # Typing echoes while the flood runs.
+                offset = len(trial.output)
+                started = time.monotonic()
+                trial.send(b"responsive")
+                trial.until(b"responsive", offset, plain=True, limit=5)
+                elapsed = time.monotonic() - started
+                assert elapsed < 0.5, f"typing echo took {elapsed:.3f}s during the flood"
+            assert time.monotonic() < end, ("flood did not settle", trial.screen.text())
+            trial.read(0.025)
+        assert live_fold, "the fold never showed live output"
+        line = harness.footer(trial, header)
+        # 25,000,000 stdout lines; `yes` may add a stderr line, see the
+        # SIGPIPE note in the P4-E report.
+        lines = int(re.search(r"· (\d+) lines ·", line).group(1))
+        assert lines >= 25000000, (line, trial.screen.text())
+        trial.send(b"\x7f" * len("responsive"))
+        trial.idle(0.2)
+        quit_tui(trial)
+        trial = None
+        fixture.stop()
+        print("PASS PC-E2/E3/E11/E13/E14/E15/E16 TUI: !pwd outside the project runs at its root; "
+              "!! box, stripe and warning, file made; Backspace to ! and the sandbox refuses; the "
+              "allowOutsideSandbox refusal keeps the draft; Ctrl-C stops and a second kills for ! "
+              "and !!; a 50 MB flood folds live while typing stays responsive")
+    finally:
+        if trial is not None:
+            trial.close()
+        harness.close()
+
+
+# P3-E2 (person-command-mode.md, "P3-E service record") lets a message behind
+# a released `!!` job dispatch, and fills history field 5 so a relaunched TUI
+# restores person entries. Until it merges, the checks that need it report
+# PENDING instead of failing; the P3-E2 integration sets this to False.
+PENDING_P3E2 = True
+# The service gives a draining `!!` job's entry no shell exit status (exit
+# kind and value come only from kind 28), so `↳ shell exited 0 · …` cannot
+# show the 0 (reported with P4-E). The fix sets this to False.
+PENDING_DRAINING_EXIT = True
+
+
+def pending_or_fail(condition, case, message, pending=None, owner="P3-E2"):
+    if condition:
+        return True
+    if PENDING_P3E2 if pending is None else pending:
+        print(f"PENDING {case} (needs {owner}): {message}")
+        return False
+    raise AssertionError(f"{case}: {message}")
+
+
+def resume_held(trial, text):
+    """Resumes the held input whose row shows `text` (`/queue resume ID`)."""
+    offset = len(trial.output)
+    trial.send(b"/queue\r")
+    trial.until(text.encode(), offset, plain=True, limit=10)
+    trial.until(b"Input queue", offset, plain=True, limit=10)
+    trial.idle(0.5)
+    # The overlay lists `ID · State`, then the input's text.
+    rows = trial.screen.text().splitlines()
+    found = None
+    for above, row in zip(rows, rows[1:]):
+        held = re.search(r"([0-9a-f]{32}) · Held", above)
+        if held and row.strip() == text:
+            found = held
+    assert found, trial.screen.text()
+    trial.send(b"\x1b")
+    trial.idle(0.2)
+    offset = len(trial.output)
+    # A trailing space closes the ID completion list, so Enter sends.
+    trial.send(f"/queue resume {found.group(1)} ".encode())
+    trial.idle(0.3)
+    trial.send(b"\r")
+    trial.until(f"{found.group(1)} · Queued".encode(), offset, plain=True, limit=10)
+    trial.send(b"\x1b")
+    trial.idle(0.2)
+
+
+def person_model_journey(fixture, source):
+    """--person-model: PC-E4 (a command typed during a model turn queues as
+    `! git status` and runs after the turn), PC-E5 and PC-E17 (the next
+    turn's input holds the person notice entry before the prompt, with
+    `, outside the sandbox,` for `!!`), PC-E18 (a `!!` writer left in the
+    shell's group: `↳ shell exited 0 · 1 background process writing`, the
+    message behind it runs at once, the fold later shows `bg 5`, then
+    `↳ exit 0 · … 1 background process left running`, and the next notice has
+    the entry) and PC-E19 (an endless survivor: Ctrl-C after the turn ends
+    settles the released job with `output capture stopped by you`; the TUI
+    stays responsive). Runnable after P3-E and P4; the message-behind-a-
+    released-job checks need P3-E2."""
+    harness = PersonHarness(fixture, source)
+    project = harness.project("modelled")
+    stop_file = harness.tmpdir / "endless.stop"
+    trial = None
+    try:
+        fixture.start()
+        trial = fixture.launch()
+        harness.configure(trial, project)
+        # PC-E4: a command typed while a model turn runs.
+        harness.script[:] = [JobsHarness.HOLD]
+        trial.send(b"Hold this turn.\r")
+        harness.wait_chats(trial, 1)
+        harness.run(trial, "git status", expect="Command")
+        trial.until(b"! git status", plain=True, limit=10)
+        trial.idle(1.0)
+        rows = [row.strip() for row in trial.screen.text().splitlines()]
+        assert any(">>" in row and "! git status" in row for row in rows), trial.screen.text()
+        assert not any(row.startswith("↳ exit") for row in rows), "the command waited for the turn"
+        harness.release.set()
+        trial.until(b"RELEASED", plain=True, limit=20, reject="Incomplete response")
+        harness.footer(trial, "! git status", "↳ exit")
+
+        # PC-E5: a command, then a message.
+        harness.run(trial, "echo e5-marker")
+        harness.footer(trial, "! echo e5-marker")
+        harness.script[:] = ["E5-SEEN"]
+        trial.send(b"What did I run for E5?\r")
+        trial.until(b"E5-SEEN", plain=True, limit=30, reject="Incomplete response")
+        text = harness.chat_user()
+        assert PERSON_LABEL in text and "command: echo e5-marker" in text, text
+        assert text.index(PERSON_LABEL) < text.index("What did I run for E5?"), text
+        assert OUTSIDE_LABEL not in text, text
+
+        # PC-E17: the same with `!!`.
+        harness.run(trial, "echo e17-marker", mode="!!")
+        harness.footer(trial, "!! echo e17-marker")
+        harness.script[:] = ["E17-SEEN"]
+        trial.send(b"What did I run for E17?\r")
+        trial.until(b"E17-SEEN", plain=True, limit=30, reject="Incomplete response")
+        text = harness.chat_user()
+        assert OUTSIDE_LABEL in text and "command: echo e17-marker" in text, text
+        assert text.index(OUTSIDE_LABEL) < text.index("What did I run for E17?"), text
+
+        # PC-E18: an in-group writer outlives the shell (PQ3, OD2).
+        writer = ("/usr/bin/perl -e '$|=1; for my $i (1..5) { sleep 1; print qq(bg $i\\n) }' & exit 0")
+        header = f"!! {writer}"
+        harness.run(trial, writer, mode="!!")
+        line = harness.footer(trial, header, "↳ shell exited")
+        if not pending_or_fail(line == "↳ shell exited 0 · 1 background process writing", "PC-E18",
+                               f"the released entry reads {line!r}", PENDING_DRAINING_EXIT,
+                               "the shell's exit status on a draining JobEntry"):
+            assert line == "↳ shell exited · 1 background process writing", line
+        harness.script[:] = ["E18-AFTER"]
+        trial.send(b"Run behind the writer.\r")
+        end = time.monotonic() + remaining(15)
+        while "E18-AFTER" not in trial.screen.text() and time.monotonic() < end:
+            trial.read(0.05)
+        rows = [row.strip() for row in trial.screen.text().splitlines()]
+        ran_at_once = "E18-AFTER" in trial.screen.text() and "bg 5" not in rows
+        ran = pending_or_fail(ran_at_once, "PC-E18",
+                              "the message behind a released !! job did not run while the job drained")
+        trial.until(b"bg 5", plain=True, limit=20)
+        line = harness.footer(trial, header, "↳ exit 0")
+        assert line.endswith("1 background process left running"), line
+        if not ran and "Held (request conflict) · Run behind the writer." in trial.screen.text():
+            # Without P3-E2 the message is held; Resume runs it.
+            resume_held(trial, "Run behind the writer.")
+        trial.until(b"E18-AFTER", plain=True, limit=30, reject="Incomplete response")
+        # The next turn's notice holds the settled entry.
+        harness.script[:] = ["E18-NOTICE"]
+        trial.send(b"And now?\r")
+        trial.until(b"E18-NOTICE", plain=True, limit=30, reject="Incomplete response")
+        notices = "\n".join(m.get("content", "") for chat in harness.chats[-2:]
+                            for m in chat["messages"] if m.get("role") == "user")
+        assert OUTSIDE_LABEL in notices and "bg $i" in notices, notices
+
+        # PC-E19: an endless survivor; Ctrl-C after the turn ends.
+        endless = (f"/usr/bin/perl -e '$|=1; while (! -e q({stop_file}) && print qq(tick\\n)) "
+                   "{ sleep 1 }' & exit 0")
+        header = f"!! {endless}"
+        harness.run(trial, endless, mode="!!")
+        harness.footer(trial, header, "1 background process writing")
+        harness.script[:] = ["E19-TURN"]
+        trial.send(b"A turn while it writes.\r")
+        end = time.monotonic() + remaining(15)
+        while "E19-TURN" not in trial.screen.text() and time.monotonic() < end:
+            trial.read(0.05)
+        turn_ran = pending_or_fail("E19-TURN" in trial.screen.text(), "PC-E19",
+                                   "the message behind an endless released !! job did not run")
+        if turn_ran:
+            # The turn has ended: Ctrl-C targets the released job.
+            trial.idle(0.5)
+            trial.until("/job cancel".encode(), plain=True, limit=10)
+        offset = len(trial.output)
+        trial.send(b"\x03")
+        line = harness.footer(trial, header, "↳ exit 0", limit=20)
+        assert "output capture stopped by you" in line and "1 background process left running" in line, line
+        assert trial.process.poll() is None, "Ctrl-C did not quit"
+        if not turn_ran:
+            # Without P3-E2 the message is held; Resume runs it.
+            trial.until(b"Held (request conflict) \xc2\xb7 A turn while it writes.", plain=True, limit=10)
+            resume_held(trial, "A turn while it writes.")
+            trial.until(b"E19-TURN", plain=True, limit=30, reject="Incomplete response")
+        # The TUI stays responsive.
+        offset = len(trial.output)
+        started = time.monotonic()
+        trial.send(b"still here")
+        trial.until(b"still here", offset, plain=True, limit=5)
+        assert time.monotonic() - started < 0.5
+        trial.send(b"\x7f" * len("still here"))
+        trial.idle(0.2)
+        quit_tui(trial)
+        trial = None
+        fixture.stop()
+        print("PASS PC-E4/E5/E17/E18/E19 TUI (any PENDING line above names a part still waiting): "
+              "a command typed during a turn queues and runs after it; "
+              "the next turn's notice holds the person entry (outside label for !!); the in-group "
+              "writer releases the lane, is never signalled and settles with a survivor; Ctrl-C "
+              "closes an endless survivor's capture")
+    finally:
+        try:
+            stop_file.touch()
+        except OSError:
+            pass
+        if trial is not None:
+            trial.close()
+        harness.close()
+
+
+def quit_owned(trial, fixture):
+    """Ctrl+Q from a TUI that launched its backend: confirms the exit when it
+    asks about live commands or jobs, then waits for the backend to stop."""
+    trial.send(b"\x11")
+    end = time.monotonic() + remaining(10)
+    while trial.process.poll() is None:
+        if "stop when the service stops" in trial.screen.text() or "stops when the service stops" in trial.screen.text():
+            trial.send(b"\t\r")  # Select exit and confirm.
+            break
+        assert time.monotonic() < end, trial.screen.text()
+        trial.read(0.025)
+    trial.finish()
+    fixture.wait_absent(stable=0.2)
+
+
+def person_restart_journey(fixture, source):
+    """--person-restart: PC-E20 (a `!` command's new-session escapee is
+    frozen and killed: the job settles with exit 0, not `cleanup
+    unconfirmed`, and the escapee is gone), PC-E9 (a TUI-launched backend:
+    the exit confirmation counts a running and a queued command and says
+    they stop; after relaunch the running one is cancelled with `shutdown`)
+    and PC-E8 (the relaunched TUI shows the settled command entries with
+    their folds; needs P3-E2's history field 5). Runnable after P3-E and
+    P4."""
+    harness = PersonHarness(fixture, source)
+    project = harness.project("restarted")
+    escapee = project / "escapee.pl"
+    shutil.copyfile(Path(__file__).resolve().parents[2] / "asura-platform/tests/fixtures/escapee.pl", escapee)
+    tag = harness.tmpdir / "escapee"
+    trial = None
+    try:
+        trial = fixture.launch()
+        trial.resize(120, 40)
+        trial.send(("/project add " + str(project) + "\r").encode())
+        trial.until(b"Project ", plain=True)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        # PC-E8 seed: a settled command with output.
+        harness.run(trial, "echo e8-restored")
+        harness.footer(trial, "! echo e8-restored")
+
+        # PC-E20: the escapee fixture (a fork, `setsid`, a beat file in
+        # `$TMPDIR`) under `!`.
+        command = f"/usr/bin/perl '{escapee}' single \"$TMPDIR/escapee\"; /bin/sleep 0.5"
+        harness.run(trial, command)
+        line = harness.footer(trial, f"! {command}", "↳ exit", limit=40)
+        assert line.startswith("↳ exit 0"), line
+        harness.command(trial, "/jobs", "Jobs · this project")
+        row = harness.job_row(trial, "/usr/bin/perl")
+        assert "· exit 0 ·" in row and "cleanup unconfirmed" not in row, row
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        # The escapee ran (it left the group and beat in `$TMPDIR`) ...
+        beat = Path(str(tag) + ".beat")
+        pid_file = Path(str(tag) + ".pid")
+        assert beat.exists() and pid_file.exists(), sorted(p.name for p in harness.tmpdir.iterdir())
+        # ... and is gone: no beat grows, its PID is free.
+        before = beat.stat().st_size
+        trial.idle(0.6)
+        assert beat.stat().st_size == before, "the escapee still writes"
+        pid = int(pid_file.read_text())
+        try:
+            os.kill(pid, 0)
+            raise AssertionError(f"escapee {pid} is alive")
+        except ProcessLookupError:
+            pass
+        listing = subprocess.run(["/bin/ps", "-axo", "command"], capture_output=True, timeout=10).stdout.decode()
+        assert str(escapee) not in listing, "an escapee process remains"
+
+        # PC-E9: a running and a queued command at exit.
+        harness.run(trial, "sleep 600")
+        harness.footer(trial, "! sleep 600", "↳ running")
+        harness.run(trial, "sleep 601")
+        trial.until(b"! sleep 601", plain=True, limit=10)
+        offset = len(trial.output)
+        trial.send(b"\x11")  # Ctrl+Q
+        trial.until(b"2 commands are queued or running; they stop when the service stops.",
+                    offset, plain=True, limit=10)
+        trial.send(b"\t\r")  # Select exit and confirm.
+        trial.finish()
+        fixture.wait_absent(stable=0.2)
+        trial = fixture.launch()
+        trial.resize(120, 40)
+        harness.select(trial, project)
+        trial.idle(1.0)
+        # PC-E8: the restored history shows the settled entries and folds.
+        rows = [row.strip() for row in trial.screen.text().splitlines()]
+        restored = ("! echo e8-restored" in rows and "e8-restored" in rows
+                    and any(row.startswith("↳ exit 0") for row in rows))
+        pending_or_fail(restored, "PC-E8", "the relaunched TUI shows no restored command entries")
+        harness.command(trial, "/jobs", "Jobs · this project")
+        row = harness.job_row(trial, "sleep 600")
+        assert "· cancelled ·" in row and "· shutdown ·" in row, row
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        quit_owned(trial, fixture)
+        trial = None
+        print("PASS PC-E9/E20 TUI (PC-E8 above if PENDING): the escapee of a ! command is gone and "
+              "its job settled; the launched backend's exit counts 2 commands; after relaunch the "
+              "running one is cancelled with shutdown")
+    finally:
+        if trial is not None:
+            trial.close()
+        harness.close()
+
+
+def keychain_items(path):
+    """The service names of the generic items in the scratch keychain at
+    `path` (read-only; attributes only, never secret data)."""
+    result = subprocess.run(["/usr/bin/security", "dump-keychain", str(path)],
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    assert result.returncode == 0, result
+    return re.findall(rb'"svce"<blob>="([^"]*)"', result.stdout)
+
+
+def person_secrets_journey(fixture, source):
+    """--person-secrets: SS-E1 (secret-store.md, end to end: with a model
+    turn running, a `!!` command reading a launch environment token and a `!`
+    command carrying a bearer token queue behind it; the service restarts;
+    after Resume both run with the real values: the loopback fixture gets
+    the token, the digest matches, the relaunched log shows no token, and no
+    Keychain item remains after settlement) and SS-E2 (with the scratch
+    keychain locked, a `!!` submit shows the locked message and keeps the
+    draft; after unlocking, Enter runs it). Runnable after P3-E and P4."""
+    import hashlib
+    import threading
+    harness = PersonHarness(fixture, source)
+    project = harness.project("secretive")
+    env_token = "fixture-env-" + os.urandom(12).hex()
+    bearer = "fx" + os.urandom(16).hex()
+    fixture.env["FIXTURE_TOKEN"] = env_token
+    received = []
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    listener.settimeout(0.1)
+    port = listener.getsockname()[1]
+    stopped = threading.Event()
+
+    def serve():
+        while not stopped.is_set():
+            try:
+                peer, _ = listener.accept()
+            except socket.timeout:
+                continue
+            with peer:
+                peer.settimeout(5)
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = peer.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                received.append(data)
+                peer.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nSS-OK\n")
+
+    server = threading.Thread(target=serve, name="asura-ss-e1-fixture")
+    server.start()
+    trial = None
+    try:
+        fixture.start()
+        trial = fixture.launch()
+        harness.configure(trial, project)
+        # SS-E2 first: a locked scratch keychain refuses the `!!` submit.
+        locked = subprocess.run(["/usr/bin/security", "lock-keychain", str(harness.keychain)],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        assert locked.returncode == 0, locked
+        trial.resize(300, 40)
+        trial.idle(0.2)
+        offset = len(trial.output)
+        trial.send(b"!!echo unlocked-run\r")
+        trial.until(b"The login keychain is locked. Unlock it, then press Enter again.", offset,
+                    plain=True, limit=20)
+        trial.until("↵ run OUTSIDE the sandbox".encode(), offset, plain=True, limit=10)
+        rows = [row.strip() for row in trial.screen.text().splitlines()]
+        assert "!!echo unlocked-run" in rows, trial.screen.text()
+        unlocked = subprocess.run(["/usr/bin/security", "unlock-keychain", "-p",
+                                   (fixture.root / "home/secret-store-keychain").read_text().splitlines()[1],
+                                   str(harness.keychain)],
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        assert unlocked.returncode == 0, unlocked
+        trial.send(b"\r")
+        harness.footer(trial, "!! echo unlocked-run")
+        trial.resize(160, 48)
+
+        # SS-E1: both commands queue behind a running model turn.
+        harness.script[:] = [JobsHarness.HOLD]
+        trial.send(b"Hold for the secrets.\r")
+        harness.wait_chats(trial, 1)
+        digest_command = 'printf %s "$FIXTURE_TOKEN" | shasum -a 256'
+        curl_command = f"curl -s -H 'Authorization: Bearer {bearer}' http://127.0.0.1:{port}/ss-e1"
+        harness.run(trial, digest_command, mode="!!")
+        harness.run(trial, curl_command)
+        trial.idle(0.5)
+        assert not received, "a queued command ran during the turn"
+        # Each queued command holds one Keychain item before it runs.
+        items = [i for i in keychain_items(harness.keychain) if i.startswith(b"asura.secret-store")]
+        assert len(items) == 2, items
+        # The service restarts with both queued.
+        trial.send(b"\x01/quit\r")
+        trial.finish()
+        fixture.active_trials.remove(trial)
+        trial = None
+        harness.release.set()
+        fixture.stop()
+        fixture.start()
+        trial = fixture.launch()
+        restarted = len(trial.output)
+        trial.resize(160, 48)
+        harness.select(trial, project)
+        trial.idle(1.0)
+        # Resume each held input (a queued one runs at its turn anyway).
+        for text in (digest_command, curl_command, "Hold for the secrets."):
+            trial.send(b"/queue\r")
+            trial.until(b"Input queue", plain=True, limit=10)
+            trial.idle(0.5)
+            held = "\n".join(trial.screen.text().splitlines())
+            trial.send(b"\x1b")
+            trial.idle(0.2)
+            if "· Held" in held:
+                rows = held.splitlines()
+                for above, row in zip(rows, rows[1:]):
+                    if re.search(r"[0-9a-f]{32} · Held", above) and row.strip().startswith(text[:24]):
+                        resume_held(trial, row.strip())
+                        break
+        harness.footer(trial, "!! printf %s", limit=40)
+        end = time.monotonic() + remaining(30)
+        while not received:
+            assert time.monotonic() < end, ("the loopback fixture got no request", trial.screen.text())
+            trial.read(0.05)
+        assert f"Authorization: Bearer {bearer}".encode() in received[0], received[0]
+        trial.until(hashlib.sha256(env_token.encode()).hexdigest().encode(), plain=True, limit=20)
+        trial.until(b"SS-OK", plain=True, limit=20)
+        # The relaunched log shows placeholders, never the token.
+        assert bearer.encode() not in bytes(trial.output[restarted:]), "the token reached the relaunched log"
+        assert env_token.encode() not in bytes(trial.output[restarted:]), "the env token reached the log"
+        trial.idle(1.0)
+        items = keychain_items(harness.keychain)
+        assert not [i for i in items if i.startswith(b"asura.secret-store")], items
+        quit_tui(trial)
+        trial = None
+        fixture.stop()
+        print("PASS SS-E1/E2 TUI: a locked scratch keychain refuses and keeps the draft, then runs "
+              "after unlock; queued !! and ! commands with secrets survive a restart, run with the "
+              "real values after Resume, the log shows no token, and no item remains")
+    finally:
+        stopped.set()
+        server.join(timeout=3)
+        listener.close()
+        if trial is not None:
+            trial.close()
+        harness.close()
+
+
 def main():
     global DEADLINE
     assert len(sys.argv) in (2, 3), __doc__
@@ -3923,7 +4818,12 @@ def main():
     job_modes = {"--jobs": jobs_journey, "--job-viewer": job_viewer_journey,
                  "--job-retention": job_retention_journey,
                  "--execution-setting": execution_setting_journey,
-                 "--job-notices": job_notices_journey}
+                 "--job-notices": job_notices_journey,
+                 "--person-commands": person_commands_journey,
+                 "--person-outside": person_outside_journey,
+                 "--person-model": person_model_journey,
+                 "--person-restart": person_restart_journey,
+                 "--person-secrets": person_secrets_journey}
     job_mode = job_modes.get(sys.argv[2]) if len(sys.argv) == 3 else None
     assert len(sys.argv) == 2 or job_mode or thinking or segmented or restore or records or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
     if native:
