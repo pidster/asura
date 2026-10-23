@@ -2407,18 +2407,30 @@ fn printing() -> Result<()> {
     env.start()?;
     let s = wait_settled(&env, input, Duration::from_secs(30))?;
     assert_eq!(s.outcome, JobOutcome::Interrupted, "{s:?}");
-    let page = env.fixture.attach()?.read_job(
-        pb::JobRead {
-            job_id: Some(job.to_vec()),
-            project_id: Some(project.to_vec()),
-            stream: Some(pb::JobStream::Stdout as i32),
-            offset: Some(0),
-            limit: None,
-            at_end: None,
-        },
-        &|| false,
-    )?;
-    let page = page.pages.first().ok_or("a stdout page")?;
+    // Payload recovery after the restart is derived; read until it answers.
+    let read = || -> Result<pb::JobPage> {
+        Ok(env.fixture.attach()?.read_job(
+            pb::JobRead {
+                job_id: Some(job.to_vec()),
+                project_id: Some(project.to_vec()),
+                stream: Some(pb::JobStream::Stdout as i32),
+                offset: Some(0),
+                limit: None,
+                at_end: None,
+            },
+            &|| false,
+        )?)
+    };
+    let mut last = None;
+    wait_for(Duration::from_secs(30), "a stdout page", || {
+        let reply = read().ok();
+        let found = reply.as_ref().is_some_and(|r| !r.pages.is_empty());
+        last = reply;
+        found
+    })
+    .map_err(|e| format!("{e}: {last:?}"))?;
+    let reply = last.ok_or("reply")?;
+    let page = reply.pages.first().ok_or("a stdout page")?;
     assert_eq!(
         page.state,
         Some(pb::JobPageState::UnverifiedPrefix as i32),

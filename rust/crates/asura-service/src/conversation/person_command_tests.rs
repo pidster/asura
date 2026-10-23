@@ -140,8 +140,6 @@ impl Drop for Dir {
 struct H {
     h: Option<JobHarness>,
     log: Slots,
-    /// The harness runs the real audit worker.
-    audit: bool,
     /// The scratch keychain of a `!!` case; deleted after the store's
     /// worker stopped (testing rule 2).
     keychain: Option<asura_platform::keychain::Target>,
@@ -152,17 +150,13 @@ struct H {
 }
 impl H {
     fn new() -> Self {
-        Self::start(false, false)
+        Self::start(false)
     }
     /// A home with a scratch keychain for the secret store.
     fn with_keychain() -> Self {
-        Self::start(true, false)
+        Self::start(true)
     }
-    /// [`Self::with_keychain`] with the real audit worker.
-    fn audited() -> Self {
-        Self::start(true, true)
-    }
-    fn start(keychain: bool, audit: bool) -> Self {
+    fn start(keychain: bool) -> Self {
         let serial = crate::TEST_WRITER.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::path::PathBuf::from(format!(
             "/private/tmp/asura-pcu-{:x}",
@@ -188,22 +182,11 @@ impl H {
             .unwrap();
             target
         });
-        if audit {
-            // The audit log is a start-time setting, written first.
-            asura_storage::config::execute(
-                runtime.clone(),
-                "audit.enabled",
-                Some("true"),
-                &std::sync::atomic::AtomicBool::new(false),
-            )
-            .expect("audit.enabled");
-        }
         let log = Slots::default();
-        let h = JobHarness::start_scripted(&runtime, factory(log.clone()), audit).expect("harness");
+        let h = JobHarness::start_scripted(&runtime, factory(log.clone())).expect("harness");
         Self {
             h: Some(h),
             log,
-            audit,
             keychain,
             path: Dir(path),
             runtime,
@@ -221,10 +204,8 @@ impl H {
             old.owner().close_writer_for_test();
         }
         let log = Slots::default();
-        self.h = Some(
-            JobHarness::start_scripted(&self.runtime, factory(log.clone()), self.audit)
-                .expect("harness"),
-        );
+        self.h =
+            Some(JobHarness::start_scripted(&self.runtime, factory(log.clone())).expect("harness"));
         self.log = log;
         self.counter = 0;
     }
@@ -921,14 +902,15 @@ fn pc_u54_message_turn_after_release() {
 /// Secret store ordering rule 6 (P3-E2): an exact `!!` retry whose kind 31
 /// is older than the replay checkpoint, after its job settled and its item
 /// was deleted, finds its request in the journal before any Keychain call:
-/// it gets the original input, reads the (missing) item once, and writes
-/// and deletes no item. The audit holds one `secret_store.put` for it.
+/// it gets the original input and stores and deletes no item. (The audit
+/// events of the same path are checked through the service, `secrets`.)
 #[test]
 fn p3e2_exact_retry_after_the_checkpoint_writes_no_item() {
-    let mut h = H::audited();
+    let mut h = H::with_keychain();
     let project = h.project();
     let body = submit_body(project, None, "brew upgrade", true);
     let input = h.accepted(body.clone());
+    assert!(h.j().owner().persons.items.contains(&input), "its item");
     let job = h.run(input);
     h.settle(job, false, 0);
     h.wait("the item delete", |h| {
@@ -962,51 +944,15 @@ fn p3e2_exact_retry_after_the_checkpoint_writes_no_item() {
             "the kind 31 is older than the checkpoint"
         );
     }
-    let deleted = h.j().owner().persons.deleted.len();
+    let deleted = h.j().owner().persons.deleted.clone();
     let items = h.j().owner().persons.items.clone();
-    // The exact retry.
+    // The exact retry: a fresh put would add an item for a new input and
+    // delete it when the writer answered with the original.
     assert_eq!(h.accepted(body), input, "the original input");
-    h.wait("the retry's read is audited", |h| {
-        h.j().audit_events().iter().any(|e| {
-            matches!(e, Event::SecretStoreGet { input: i, reply: StoreReply::Missing, .. } if *i == input)
-        })
-    });
-    h.steps(10);
+    h.steps(20);
     let owner = h.j().owner();
-    assert_eq!(owner.persons.deleted.len(), deleted, "no item to delete");
+    assert_eq!(owner.persons.deleted, deleted, "no item to delete");
     assert_eq!(owner.persons.items, items, "no item stored");
-    let events = h.j().audit_events();
-    let puts: Vec<_> = events
-        .iter()
-        .filter(|e| matches!(e, Event::SecretStorePut { .. }))
-        .collect();
-    assert_eq!(puts.len(), 1, "{puts:?}");
-    assert!(matches!(
-        puts[0],
-        Event::SecretStorePut { input: i, reply: StoreReply::Stored, status: None } if *i == input
-    ));
-    for (what, found) in [
-        (
-            "dispatch read",
-            events.iter().any(|e| {
-                matches!(e, Event::SecretStoreGet { input: i, reply: StoreReply::Read, .. } if *i == input)
-            }),
-        ),
-        (
-            "delete",
-            events.iter().any(|e| {
-                matches!(e, Event::SecretStoreDelete { input: i, reply: StoreReply::Deleted, .. } if *i == input)
-            }),
-        ),
-        (
-            "sweep",
-            events.iter().any(|e| {
-                matches!(e, Event::SecretStoreSweep { reply: StoreReply::Swept, .. })
-            }),
-        ),
-    ] {
-        assert!(found, "{what}: {events:?}");
-    }
 }
 
 /// P3-E2 queue rule: a project holds one pending new conversation at a

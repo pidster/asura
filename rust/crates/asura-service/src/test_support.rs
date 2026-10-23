@@ -534,15 +534,13 @@ impl JobHarness {
         Self::start_with(runtime, audit, None)
     }
     /// [`Self::start`] whose controller drives `slots` instead of exec_cmd
-    /// slots: owner unit tests start no process. `audit` starts the real
-    /// audit worker, so [`Self::audit_events`] holds the owner's events.
+    /// slots: owner unit tests start no process.
     #[cfg(test)]
     pub(crate) fn start_scripted(
         runtime: &RuntimeDirectory,
         slots: crate::job_controller::SlotFactory,
-        audit: bool,
     ) -> Result<Self, String> {
-        Self::start_with(runtime, audit, Some(slots))
+        Self::start_with(runtime, false, Some(slots))
     }
     fn start_with(
         runtime: &RuntimeDirectory,
