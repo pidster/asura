@@ -4255,14 +4255,12 @@ def person_outside_journey(fixture, source):
                         "Saved personCommands.allowOutsideSandbox")
         trial.send(b"\x1b")
         trial.idle(0.2)
-        # The header notice is cut to half the terminal width: widen it so
-        # the whole refusal shows.
-        trial.resize(300, 40)
-        trial.idle(0.2)
+        # The header notice shows the whole refusal, wrapped to the
+        # terminal width (P4 TUI record, refusal notices).
         offset = len(trial.output)
         trial.send(b"!!ls\r")
-        trial.until(b"Running outside the sandbox is turned off (personCommands.allowOutsideSandbox is false). "
-                    b"Type it after a single ! to run it in the sandbox.", offset, plain=True, limit=20)
+        notice_until(trial, "Running outside the sandbox is turned off (personCommands.allowOutsideSandbox is false). "
+                     "Type it after a single ! to run it in the sandbox.", offset, limit=20)
         trial.until("↵ run OUTSIDE the sandbox".encode(), offset, plain=True, limit=10)
         rows = [row.strip() for row in trial.screen.text().splitlines()]
         assert "!!ls" in rows, trial.screen.text()
@@ -4270,7 +4268,6 @@ def person_outside_journey(fixture, source):
         trial.send(b"\x7f\x7f\x7f\x7f")
         trial.idle(0.2)
         assert "↵ run" not in trial.screen.text(), trial.screen.text()
-        trial.resize(120, 40)
         harness.command(trial, "/config set personCommands.allowOutsideSandbox true",
                         "Saved personCommands.allowOutsideSandbox")
         trial.send(b"\x1b")
@@ -4330,10 +4327,12 @@ def person_outside_journey(fixture, source):
             trial.read(0.025)
         assert live_fold, "the fold never showed live output"
         line = harness.footer(trial, header)
-        # 25,000,000 stdout lines; `yes` may add a stderr line, see the
-        # SIGPIPE note in the P4-E report.
+        # 25,000,000 stdout lines and no stderr: the command starts with
+        # SIGPIPE at its default action, so `yes` ends quietly when `head`
+        # closes the pipe (exec-cmd-tool.md, P4-E finding).
         lines = int(re.search(r"· (\d+) lines ·", line).group(1))
-        assert lines >= 25000000, (line, trial.screen.text())
+        assert lines == 25000000, (line, trial.screen.text())
+        assert "Broken pipe" not in trial.screen.text(), trial.screen.text()
         trial.send(b"\x7f" * len("responsive"))
         trial.idle(0.2)
         quit_tui(trial)
@@ -4354,10 +4353,21 @@ def person_outside_journey(fixture, source):
 # restores person entries. Until it merges, the checks that need it report
 # PENDING instead of failing; the P3-E2 integration sets this to False.
 PENDING_P3E2 = True
-# The service gives a draining `!!` job's entry no shell exit status (exit
-# kind and value come only from kind 28), so `↳ shell exited 0 · …` cannot
-# show the 0 (reported with P4-E). The fix sets this to False.
-PENDING_DRAINING_EXIT = True
+# A draining `!!` job's entry carries the shell's kind 5 exit (P4-F), so
+# `↳ shell exited 0 · …` shows the 0.
+PENDING_DRAINING_EXIT = False
+
+
+def notice_until(trial, text, offset=0, limit=8):
+    """Waits until the screen shows `text` whole, allowing it to wrap over
+    rows (a header notice wider than half the terminal wraps to its width)."""
+    end = time.monotonic() + remaining(limit)
+    while True:
+        joined = " ".join(row.strip() for row in trial.screen.text().splitlines())
+        if text in joined and len(trial.output) > offset:
+            return
+        assert time.monotonic() < end, (text, trial.screen.text())
+        trial.read(0.025)
 
 
 def pending_or_fail(condition, case, message, pending=None, owner="P3-E2"):
@@ -4704,12 +4714,10 @@ def person_secrets_journey(fixture, source):
         locked = subprocess.run(["/usr/bin/security", "lock-keychain", str(harness.keychain)],
                                 stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
         assert locked.returncode == 0, locked
-        trial.resize(300, 40)
-        trial.idle(0.2)
         offset = len(trial.output)
         trial.send(b"!!echo unlocked-run\r")
-        trial.until(b"The login keychain is locked. Unlock it, then press Enter again.", offset,
-                    plain=True, limit=20)
+        notice_until(trial, "The login keychain is locked. Unlock it, then press Enter again.", offset,
+                     limit=20)
         trial.until("↵ run OUTSIDE the sandbox".encode(), offset, plain=True, limit=10)
         rows = [row.strip() for row in trial.screen.text().splitlines()]
         assert "!!echo unlocked-run" in rows, trial.screen.text()

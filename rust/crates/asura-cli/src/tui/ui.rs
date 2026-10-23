@@ -2504,10 +2504,24 @@ impl App {
             &self.notice
         };
         let notice = literal(notice, 1024);
+        // Rows the header notice adds below the header row: a notice wider
+        // than half the terminal is shown whole, wrapped to the terminal
+        // width, never cut (a refusal names its configuration key).
+        let mut notice_rows = 0;
         if notice.is_empty() {
             line(frame, area, 0, &header, panel);
+        } else if unicode_display_width::width(&notice) > u64::from(area.width / 2) {
+            line(frame, area, 0, &header, panel);
+            let rows = notice_lines(&notice, area.width, area.height);
+            notice_rows = rows.len() as u16;
+            frame.render_widget(
+                Paragraph::new("").style(panel),
+                Rect::new(full_area.x, full_area.y + 1, full_area.width, notice_rows),
+            );
+            for (row, text) in (1..).zip(&rows) {
+                line(frame, area, row, text, panel);
+            }
         } else {
-            let notice = shorten(&notice, usize::from(area.width / 2));
             let notice_width = unicode_display_width::width(&notice) as u16;
             let header_area = Rect::new(
                 area.x,
@@ -2527,35 +2541,47 @@ impl App {
         line(
             frame,
             full_area,
-            1,
+            1 + notice_rows,
             &"▀".repeat(full_area.width as usize),
             Style::default().fg(Color::Rgb(55, 66, 76)),
         );
         line(
             frame,
             area,
-            2,
+            2 + notice_rows,
             &format!("Lifecycle {}", self.view.lifecycle),
             muted,
         );
         line(
             frame,
             area,
-            3,
+            3 + notice_rows,
             &format!("Installation {}", self.view.installation),
             muted,
         );
         if area.height >= 12 {
-            line(frame, area, 4, &literal(self.view.reason, 128), muted);
+            line(
+                frame,
+                area,
+                4 + notice_rows,
+                &literal(self.view.reason, 128),
+                muted,
+            );
             if let Some(epoch) = &self.view.epoch {
-                line(frame, area, 5, &format!("Epoch {epoch}"), muted);
+                line(
+                    frame,
+                    area,
+                    5 + notice_rows,
+                    &format!("Epoch {epoch}"),
+                    muted,
+                );
             }
         }
         if self.view.connection == "unavailable" && area.height >= 12 {
             line(
                 frame,
                 area,
-                6,
+                6 + notice_rows,
                 if self.view.reason == "incompatible_protocol" {
                     "Existing backend incompatible · restart it with the current build"
                 } else {
@@ -2595,9 +2621,9 @@ impl App {
         if !self.transcript.is_empty() || !self.person.log.is_empty() {
             let history_area = Rect::new(
                 full_area.x,
-                area.y + 2,
+                area.y + 2 + notice_rows,
                 full_area.width,
-                editor_y.saturating_sub(area.y + 4 + strips + tray_height),
+                editor_y.saturating_sub(area.y + 4 + notice_rows + strips + tray_height),
             );
             self.response_page = usize::from(history_area.height).max(1);
             self.history_page = usize::from(history_area.height).max(1);
@@ -2834,9 +2860,9 @@ impl App {
         }
         let overlay_area = Rect::new(
             full_area.x,
-            full_area.y + 2,
+            full_area.y + 2 + notice_rows,
             full_area.width,
-            editor_y.saturating_sub(full_area.y + 2 + strips + tray_height),
+            editor_y.saturating_sub(full_area.y + 2 + notice_rows + strips + tray_height),
         );
         self.settle_job_viewer(overlay_area.height);
         self.draw_jobs(frame, overlay_area, panel);
@@ -3308,6 +3334,20 @@ fn tools_table(width: usize) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// The rows of a header notice too wide to share the header row: the whole
+/// text wrapped to `width` cells. At most a third of the terminal height
+/// (at least 2 rows) is used, so the composer keeps its place; only a
+/// notice longer than that ends in `…`.
+fn notice_lines(notice: &str, width: u16, height: u16) -> Vec<String> {
+    let mut rows = wrap_cells(notice, usize::from(width));
+    let cap = usize::from(height / 3).max(2);
+    if rows.len() > cap {
+        let rest = rows.split_off(cap - 1).join(" ");
+        rows.push(shorten(&rest, usize::from(width)));
+    }
+    rows
 }
 
 /// Wrap text to `limit` display cells, splitting words that are longer.
@@ -4177,17 +4217,60 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let buffer = terminal.backend().buffer();
-        let top: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
+        let row = |buffer: &ratatui::buffer::Buffer, y| -> String {
+            (0..40).map(|x| buffer[(x, y)].symbol()).collect()
+        };
+        let top = row(buffer, 0);
         assert!(top.starts_with(" Asura"), "{top}");
-        assert!(top.contains('界'), "{top}");
-        assert!(!top.contains('\u{1b}') && !top.contains('\n'));
+        // Wider than half the terminal: wrapped below the header row, at
+        // most a third of the height, the last row ending in `…`.
+        let notice: Vec<String> = (1..5).map(|y| row(buffer, y)).collect();
+        assert!(notice[0].contains('界'), "{notice:?}");
+        assert!(notice[3].trim_end().ends_with('…'), "{notice:?}");
+        assert!(row(buffer, 5).contains('▀'), "{}", row(buffer, 5));
+        for text in &notice {
+            assert!(!text.contains('\u{1b}') && !text.contains('\n'));
+        }
         app.notice.clear();
         terminal.draw(|frame| app.draw(frame)).unwrap();
-        let top: String = (0..40)
-            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
-            .collect();
-        assert!(!top.contains('界'));
-        assert!(top.contains("Asura"));
+        let buffer = terminal.backend().buffer();
+        assert!(!row(buffer, 1).contains('界'));
+        assert!(row(buffer, 0).contains("Asura"));
+        assert!(row(buffer, 1).contains('▀'), "{}", row(buffer, 1));
+    }
+    /// P4 TUI record, refusal notices (P4-E finding): at 80 columns a
+    /// refusal shows its whole text, wrapped to the terminal width below
+    /// the header, never cut to half the width; the draft is kept.
+    #[test]
+    fn refusal_notice_shows_whole_text_wrapped_at_80_columns() {
+        use asura_control::pb::QueueRefusal;
+        for refusal in [
+            QueueRefusal::OutsideSandboxOff,
+            QueueRefusal::EnvironmentTooLarge,
+            QueueRefusal::SecretStoreLocked,
+        ] {
+            let text = person::refusal_text(refusal, None, false);
+            let mut app = App::new();
+            app.insert("!!ls");
+            app.notice = text.clone();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |y| -> String { (0..80).map(|x| buffer[(x, y)].symbol()).collect() };
+            assert!(row(0).starts_with(" Asura"), "{}", row(0));
+            let band = (1..24).find(|y| row(*y).contains('▀')).unwrap();
+            let shown: Vec<String> = (0..band).map(|y| row(y).trim().to_owned()).collect();
+            let joined = if unicode_display_width::width(&text) > 40 {
+                assert!(band > 1, "{text}: wrapped below the header");
+                shown[1..].join(" ")
+            } else {
+                assert_eq!(band, 1, "{text}: fits beside the header");
+                shown[0].clone()
+            };
+            assert!(joined.contains(&text), "{text}: {shown:?}");
+            assert!(!joined.contains('…'), "{shown:?}");
+            assert_eq!(app.draft(), "!!ls");
+        }
     }
     fn input_cells(app: &mut App) -> Vec<(u16, u16, String, Style)> {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
