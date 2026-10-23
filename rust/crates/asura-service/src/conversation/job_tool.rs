@@ -599,7 +599,7 @@ impl JobCall {
     fn live_snapshot(&self, env: &mut Env) -> Option<JobSnapshot> {
         let view = env.jobs.as_deref()?.view(self.job, env.now)?;
         if view.settled() {
-            return Some(settled_snapshot()).filter(|_| self.settled_known(env));
+            return self.settled_known(env).then(settled_snapshot);
         }
         Some(view.snapshot)
     }

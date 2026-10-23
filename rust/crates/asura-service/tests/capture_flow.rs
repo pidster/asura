@@ -890,7 +890,7 @@ fn no_output_stop() -> Result<()> {
         finish(&fixture, operation, Duration::from_secs(600))?.kind,
         Some(3)
     );
-    let calls = vec![settled_call(&fixture, operation, Duration::from_secs(600))?];
+    let calls = [settled_call(&fixture, operation, Duration::from_secs(600))?];
     let settled = calls[0].settled.as_ref().ok_or("kind 28")?;
     assert_eq!(settled.capture_state, JobCaptureState::Complete);
     assert_eq!(settled.stdout.capture.stored_bytes, size);
@@ -936,7 +936,7 @@ fn overload() -> Result<()> {
         );
         // The cancel ended the yield window: kind 29 status 6 before the
         // terminal; the job settles at the L3 bound after it (TJ-04).
-        let calls = vec![settled_call(&fixture, operation, Duration::from_secs(20))?];
+        let calls = [settled_call(&fixture, operation, Duration::from_secs(20))?];
         let settled_after = cancel_started.elapsed();
         assert_eq!(calls[0].result.as_ref().map(|r| r.status), Some(6));
         let settled = calls[0].settled.as_ref().ok_or("kind 28")?;

@@ -726,13 +726,13 @@ enum Job {
     /// One job record from the controller's outbox (kinds 26 to 28).
     Controller(journal::Id),
     /// A journal read of the active job-mode call (`Jobs`, `JobFacts`).
-    JobRead,
+    CallRead,
     /// The active `job note` call's kind 30.
-    JobNote,
+    CallNote,
     /// The active job-mode call's kind 29.
-    JobResult,
+    CallResult,
     /// Journal work of the job control handler, by request key.
-    JobControl(u64),
+    Control(u64),
     /// A worker-layer harness record or command (`test-support` only).
     #[cfg(feature = "test-support")]
     Fixture,
@@ -2241,14 +2241,14 @@ impl Owner {
                     }
                     Job::Open => self.unavailable = Some(message),
                     // A failed read of a job-mode call: `unavailable`.
-                    Job::JobRead => {
+                    Job::CallRead => {
                         if let Some(job) = self.job_call() {
                             job.journal_done(Err(cause));
                         }
                     }
                     // Kinds 29 and 30 are normal records: at the journal
                     // quota they wait and the turn shows the paused step.
-                    Job::JobNote | Job::JobResult
+                    Job::CallNote | Job::CallResult
                         if matches!(
                             cause,
                             writer::Error::JournalQuota | writer::Error::JournalDiskSpace
@@ -2264,7 +2264,7 @@ impl Owner {
                         }
                         self.publish_step(now);
                     }
-                    Job::JobControl(key) => {
+                    Job::Control(key) => {
                         with_control(
                             &mut self.jobs,
                             &self.payloads,
@@ -2437,12 +2437,12 @@ impl Owner {
                 let sequence = self.replay.as_ref().map_or(0, |r| r.sequence);
                 self.jobs.record_done(job, Ok(sequence));
             }
-            Job::JobRead => {
+            Job::CallRead => {
                 if let Some(job) = self.job_call() {
                     job.journal_done(Ok(value));
                 }
             }
-            Job::JobNote => {
+            Job::CallNote => {
                 // A kind 30 changes the job's retention state (revision).
                 if let Some(controller) = self.jobs.controller() {
                     controller.bump_revision();
@@ -2451,8 +2451,8 @@ impl Owner {
                     job.note_done(Ok(()));
                 }
             }
-            Job::JobResult => self.job_result_committed(now),
-            Job::JobControl(key) => {
+            Job::CallResult => self.job_result_committed(now),
+            Job::Control(key) => {
                 with_control(
                     &mut self.jobs,
                     &self.payloads,
@@ -4227,7 +4227,7 @@ impl Owner {
                         }
                     }
                     Some(job_tool::Action::Read(command)) => {
-                        if let Err(e) = self.submit(command, Job::JobRead)
+                        if let Err(e) = self.submit(command, Job::CallRead)
                             && let Some(job) = self
                                 .active
                                 .as_mut()
@@ -4238,12 +4238,12 @@ impl Owner {
                         }
                     }
                     Some(job_tool::Action::Note(record)) => {
-                        if let Err(e) = self.append(record, Job::JobNote, None) {
+                        if let Err(e) = self.append(record, Job::CallNote, None) {
                             self.unavailable = Some(storage_error(e));
                         }
                     }
                     Some(job_tool::Action::Result(record)) => {
-                        if let Err(e) = self.append(record, Job::JobResult, None) {
+                        if let Err(e) = self.append(record, Job::CallResult, None) {
                             self.unavailable = Some(storage_error(e));
                         }
                     }
@@ -4940,9 +4940,9 @@ impl Owner {
             return false;
         };
         let submitted = match work {
-            job_control::JournalWork::Read(command) => self.submit(command, Job::JobControl(key)),
+            job_control::JournalWork::Read(command) => self.submit(command, Job::Control(key)),
             job_control::JournalWork::Append(record) => {
-                self.append(record, Job::JobControl(key), None)
+                self.append(record, Job::Control(key), None)
             }
         };
         if let Err(e) = submitted {
