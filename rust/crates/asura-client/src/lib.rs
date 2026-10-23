@@ -1766,6 +1766,7 @@ mod tests {
             }],
             error: None,
             path_warnings: Vec::new(),
+            path_overflow: None,
         })
     }
     fn jobs_capabilities() -> Vec<i32> {

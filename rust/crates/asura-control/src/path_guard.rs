@@ -534,6 +534,7 @@ mod tests {
                 notes: Vec::new(),
                 error: error.map(str::to_owned),
                 path_warnings: warnings,
+                path_overflow: None,
             })
         };
         assert!(reply(detail(Vec::new(), Some("not_found"))));

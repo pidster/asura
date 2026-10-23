@@ -1002,9 +1002,10 @@ struct InspectWork {
     job: Id,
     fence: Option<Id>,
     facts: Option<Facts>,
-    /// `JobDetail.path_warnings`: a person job's warnings from its input's
-    /// kind 32 acknowledgement; `None` until read (a model job has none).
-    warnings: Option<Vec<pb::PathWarning>>,
+    /// `JobDetail.path_warnings` and `path_overflow`: a person job's
+    /// warnings from its input's kind 32 acknowledgement; `None` until read
+    /// (a model job has none).
+    warnings: Option<DetailWarnings>,
     /// The `PathRecord` read is in flight.
     path_read: bool,
 }
@@ -1051,7 +1052,7 @@ impl InspectWork {
                     self.path_read = true;
                     return Next::Read(writer::Command::PathRecord { reference: input });
                 }
-                JobOrigin::Model { .. } => self.warnings = Some(Vec::new()),
+                JobOrigin::Model { .. } => self.warnings = Some(DetailWarnings::default()),
             }
         }
         let view = s.view(self.job);
@@ -1067,33 +1068,43 @@ impl InspectWork {
             })
             .and_then(|(location, cwd)| absolute_cwd(&location, &cwd));
         let notes = detail_notes(records);
+        let warnings = self.warnings.take().unwrap_or_default();
         Next::Reply(Box::new(Body::JobDetail(pb::JobDetail {
             entry: Some(entry_from_facts(facts, view.as_ref())),
             command: Some(cut(&command, wire::MAX_JOB_COMMAND_BYTES).replace('\0', " ")),
             cwd,
             notes,
             error: None,
-            path_warnings: self.warnings.take().unwrap_or_default(),
+            path_warnings: warnings.listed,
+            path_overflow: warnings.overflow,
         })))
     }
 }
 
+/// `JobDetail.path_warnings` and `path_overflow` of one person job.
+#[derive(Debug, Default, PartialEq)]
+struct DetailWarnings {
+    listed: Vec<pb::PathWarning>,
+    /// Field 7: absent when every entry is listed, never 0.
+    overflow: Option<u32>,
+}
+
 /// `JobDetail.path_warnings` from a person input's kind 32: the entries of
 /// its `acknowledged` record in the job's project, as stored (display-
-/// redacted, at most 16). Any other record, or none (the command ran
-/// before the guard, or was never checked), gives no warnings. The record
-/// keeps no listing overflow field in `JobDetail`; the entries alone are
-/// returned.
+/// redacted, at most 16). `path_overflow` is the record's overflow count
+/// (field 7), plus any stored entry the wire would refuse, so a restored
+/// log can show "⚠ and N more" (EPG-T2). Any other record, or none (the
+/// command ran before the guard, or was never checked), gives no warnings.
 fn detail_path_warnings(
     record: Option<&journal::ExecutionPathRecord>,
     project: Option<Id>,
-) -> Vec<pb::PathWarning> {
+) -> DetailWarnings {
     let Some(record) = record
         .filter(|r| r.action == journal::PathAction::Acknowledged && Some(r.project) == project)
     else {
-        return Vec::new();
+        return DetailWarnings::default();
     };
-    record
+    let listed: Vec<_> = record
         .entries
         .iter()
         .map(|e| pb::PathWarning {
@@ -1102,7 +1113,12 @@ fn detail_path_warnings(
         })
         .filter(asura_control::path_guard::warning_valid)
         .take(asura_control::path_guard::MAX_PATH_WARNINGS)
-        .collect()
+        .collect();
+    let dropped = u32::try_from(record.entries.len() - listed.len()).unwrap_or(u32::MAX);
+    DetailWarnings {
+        listed,
+        overflow: Some(record.overflow.saturating_add(dropped)).filter(|n| *n > 0),
+    }
 }
 
 /// `JobDetail.notes`: person notes (author 1) with their kind 30 text and

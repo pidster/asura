@@ -754,6 +754,7 @@ message JobDetail {
   repeated JobNote notes = 4;           // at most 16, oldest first
   optional string error = 5;
   repeated PathWarning path_warnings = 6; // person jobs: from the kind 32 acknowledgement, at most 16
+  optional uint32 path_overflow = 7;      // the acknowledgement's entries not listed; absent when none, never 0
 }
 message JobNote { optional uint32 author = 1; optional uint64 unix_ms = 2; optional string text = 3; }
 message JobRead {

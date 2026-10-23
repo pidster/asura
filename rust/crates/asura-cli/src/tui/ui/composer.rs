@@ -529,6 +529,15 @@ impl App {
                             self.notice = "Selected input is no longer queued".into();
                             return true;
                         };
+                        // EPG-T2: Enter on a `!!` entry held with
+                        // `paths_changed` confirms it, as Enter on its log
+                        // entry does (the owner checks the paths again).
+                        if super::path_guard::paths_held(&entry)
+                            && let Ok(input) = <[u8; 16]>::try_from(ids[selected].as_slice())
+                        {
+                            self.person_queue_resume(input);
+                            return true;
+                        }
                         let active = self.conversation_busy
                             && self.conversation_cancellable
                             && self.active_operation.is_some()
@@ -655,7 +664,12 @@ impl App {
             }
             Focus::Queue(_) if self.queue_busy => "Queue request pending · Esc input".into(),
             Focus::Queue(_) => format!(
-                "↑↓ select · [ move up · ] move down · ↵ send now{history_above} · Esc input"
+                "↑↓ select · [ move up · ] move down · {}{history_above} · Esc input",
+                if self.queue_focus_paths_held() {
+                    "↵ run the held command"
+                } else {
+                    "↵ send now"
+                }
             ),
         }
     }

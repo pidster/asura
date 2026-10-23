@@ -135,6 +135,7 @@ pub(crate) fn valid(body: &Body) -> bool {
                     && v.cwd.is_none()
                     && v.notes.is_empty()
                     && v.path_warnings.is_empty()
+                    && v.path_overflow.is_none()
             } else {
                 v.entry.as_ref().is_some_and(entry)
                     && v.command
@@ -149,8 +150,7 @@ pub(crate) fn valid(body: &Body) -> bool {
                             && n.unix_ms.is_some()
                             && n.text.as_deref().is_some_and(note_text_valid)
                     })
-                    && v.path_warnings.len() <= crate::path_guard::MAX_PATH_WARNINGS
-                    && v.path_warnings.iter().all(crate::path_guard::warning_valid)
+                    && crate::path_guard::warnings_valid(&v.path_warnings, v.path_overflow)
             }
         }
         Body::JobRead(v) => {

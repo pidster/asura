@@ -382,6 +382,55 @@ fn enter_and_esc_on_an_ordinary_entry_keep_their_meaning() {
     assert!(app.queue_request.is_none());
 }
 
+/// EPG-T2 (execution-path-guard.md, EPG-T record: "In queue focus Enter on
+/// a `paths_changed` entry also resumes it"): Enter on the focused held
+/// entry sends Resume (action 1) for that input and keeps the draft; the
+/// hint names the action; another held entry keeps its `/queue resume`
+/// notice.
+#[test]
+fn enter_in_queue_focus_resumes_a_paths_changed_entry() {
+    let mut app = app();
+    let other = pb::ConversationQueueEntry {
+        hold_reason: Some("secrets_lost".into()),
+        ..queued(5, true, 2)
+    };
+    app.queue_entries = vec![
+        other,
+        held(4, vec![warning(kind::MODEL_CHANGED, "Makefile")]),
+    ];
+    app.person_queue_seen();
+    render(&mut app);
+    app.insert("draft text");
+    app.handle(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+    assert_eq!(app.focus, Focus::Queue(1), "the held entry is last");
+    assert!(
+        app.hints().contains("↵ run the held command"),
+        "{}",
+        app.hints()
+    );
+    press(&mut app, KeyCode::Enter);
+    let decision = take_decision(&mut app);
+    assert_eq!(decision.action, Some(1), "Resume");
+    assert_eq!(decision.input_id.as_deref(), Some(&[4; 16][..]));
+    assert_eq!(app.notice, "Confirming the held command");
+    reply_to(&mut app, decision, Ok(()));
+    assert!(
+        !app.person
+            .log
+            .iter()
+            .any(|e| e.input == Some([4; 16]) && e.paths_held)
+    );
+    assert_eq!(app.draft(), "draft text", "a key decision keeps the draft");
+
+    // The other held entry: no decision, the existing notice.
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.focus, Focus::Queue(0));
+    assert!(app.hints().contains("↵ send now"), "{}", app.hints());
+    press(&mut app, KeyCode::Enter);
+    assert!(app.queue_request.is_none());
+    assert_eq!(app.notice, "Held input needs /queue resume ID");
+}
+
 #[test]
 fn a_busy_queue_sends_no_decision() {
     let mut app = in_log(vec![held(4, Vec::new())]);
@@ -430,21 +479,55 @@ fn a_restored_entry_reads_its_warnings_from_the_job_detail() {
     app.person_folded(FoldUpdate {
         job,
         result: Ok(pb::JobPage::default()),
-        path_warnings: Some(detail.clone()),
+        path_warnings: Some((detail.clone(), 0)),
     });
     assert_eq!(app.person.log[0].path_warnings, detail);
     assert!(
         texts(&app.person.log[0]).contains(&"⚠ changed since you approved it: .envrc".to_owned())
     );
+    assert!(!texts(&app.person.log[0]).iter().any(|t| t.contains("more")));
     // The queue's list, seen first, is kept.
     let queue = vec![warning(kind::MODEL_CHANGED, "build.rs")];
     app.person.log[0].path_warnings = queue.clone();
     app.person_folded(FoldUpdate {
         job,
         result: Ok(pb::JobPage::default()),
-        path_warnings: Some(detail),
+        path_warnings: Some((detail, 3)),
     });
     assert_eq!(app.person.log[0].path_warnings, queue);
+    assert_eq!(app.person.log[0].path_overflow, 0);
+}
+
+/// EPG-T2: a restored log shows the detail's overflow count (field 7) as
+/// "⚠ and N more" below its warnings, and an overflow alone still shows.
+#[test]
+fn a_restored_entry_shows_the_detail_overflow() {
+    let mut restored = app();
+    restored.person_restored(vec![(0, [9; 16])]);
+    let job = restored.person.log[0].job.unwrap();
+    let detail = vec![warning(kind::MODEL_CHANGED, "build.rs")];
+    restored.person_folded(FoldUpdate {
+        job,
+        result: Ok(pb::JobPage::default()),
+        path_warnings: Some((detail, 7)),
+    });
+    assert_eq!(restored.person.log[0].path_overflow, 7);
+    let lines = texts(&restored.person.log[0]);
+    let at = |text: &str| lines.iter().position(|l| l == text);
+    let warning_line =
+        at("⚠ changed by the model since your last command: build.rs").expect("warning");
+    let more = at("⚠ and 7 more").expect("overflow line");
+    assert!(warning_line < more, "{lines:#?}");
+
+    let mut app = app();
+    app.person_restored(vec![(0, [9; 16])]);
+    let job = app.person.log[0].job.unwrap();
+    app.person_folded(FoldUpdate {
+        job,
+        result: Ok(pb::JobPage::default()),
+        path_warnings: Some((Vec::new(), 2)),
+    });
+    assert!(texts(&app.person.log[0]).contains(&"⚠ and 2 more".to_owned()));
 }
 
 // ----- `/paths` -----
