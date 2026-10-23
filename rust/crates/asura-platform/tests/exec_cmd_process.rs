@@ -281,6 +281,7 @@ fn qualification() {
     secret_environment_refusals(&f.0);
     secret_variables(&f.0);
     person_profiles(&f.0);
+    sigpipe_default(&f.0);
     epg_i1_model_implicit_path_denial();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -1511,6 +1512,38 @@ fn person_run(home: &Path, profile: Profile, command: &str, setup: PersonSetup) 
         Duration::from_secs(20),
         false,
     )
+}
+/// The command's SIGPIPE probe: a closed pipe ends `yes` quietly, and the
+/// command sees SIGPIPE at its default action with no blocked signals.
+const SIGPIPE_PROBE: &str = "yes | head -c 10; /usr/bin/perl -MPOSIX -e '$o = POSIX::SigSet->new; sigprocmask(SIG_BLOCK, POSIX::SigSet->new, $o); print join(\",\", grep { $o->ismember($_) } 1..31), \"|\", defined $SIG{PIPE} ? $SIG{PIPE} : \"DEFAULT\"'";
+fn assert_sigpipe_default(label: &str, result: &Outcome) {
+    assert_eq!(result.exit_code, Some(0), "{label}: {result:?}");
+    assert_eq!(result.stderr, "", "{label}: {result:?}");
+    assert_eq!(
+        result.stdout, "y\ny\ny\ny\ny\n|DEFAULT",
+        "{label}: {result:?}"
+    );
+}
+/// exec_cmd SIGPIPE default (P4-E finding): the guardian ignores SIGPIPE
+/// for itself, but `yes | head -c 10` writes nothing to stderr and exits 0
+/// in every profile, because the command starts with SIGPIPE at its default
+/// action and an empty signal mask.
+fn sigpipe_default(home: &Path) {
+    let result = run(home, SIGPIPE_PROBE, Duration::from_secs(10), false);
+    assert_sigpipe_default("model-1", &result);
+    let person = PersonHome::new(home);
+    let result = person_run(home, Profile::Person1, SIGPIPE_PROBE, person.sandboxed(&[]));
+    assert_sigpipe_default("person-1", &result);
+    let result = person_run(
+        home,
+        Profile::PersonOutside1,
+        SIGPIPE_PROBE,
+        person.outside(&[]),
+    );
+    assert_sigpipe_default("person-outside-1", &result);
+    println!(
+        "SIGPIPE default: yes | head ended quietly for model-1, person-1 and person-outside-1"
+    );
 }
 fn person_profiles(home: &Path) {
     let person = PersonHome::new(home);

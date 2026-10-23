@@ -158,15 +158,29 @@ pub(super) fn launch(
     let mut raw = unsafe { std::mem::zeroed() };
     ok(unsafe { libc::posix_spawnattr_init(&mut raw) })?;
     let mut attrs = SpawnAttributes(raw);
+    // The command (`group`) starts with SIGPIPE at its default action and an
+    // empty signal mask, for every profile: the guardian ignores SIGPIPE for
+    // itself, and an ignored disposition would otherwise be inherited, so a
+    // command in a closed pipe would print "Broken pipe" instead of ending
+    // quietly as in a terminal.
     let flags = libc::POSIX_SPAWN_CLOEXEC_DEFAULT
         | if group {
-            libc::POSIX_SPAWN_SETPGROUP
+            libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_SETSIGDEF | libc::POSIX_SPAWN_SETSIGMASK
         } else {
             0
         };
     ok(unsafe { libc::posix_spawnattr_setflags(&mut attrs.0, flags as i16) })?;
     if group {
         ok(unsafe { libc::posix_spawnattr_setpgroup(&mut attrs.0, 0) })?;
+        // SAFETY: both sets are complete local values initialized by their
+        // native constructors before use; attrs is initialized.
+        let mut default: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigemptyset(&mut default) };
+        ok(unsafe { libc::sigaddset(&mut default, libc::SIGPIPE) })?;
+        ok(unsafe { libc::posix_spawnattr_setsigdefault(&mut attrs.0, &default) })?;
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigemptyset(&mut mask) };
+        ok(unsafe { libc::posix_spawnattr_setsigmask(&mut attrs.0, &mask) })?;
     }
     let mut pid = 0;
     // SAFETY: strings and terminated pointer arrays remain alive, actions/attrs
