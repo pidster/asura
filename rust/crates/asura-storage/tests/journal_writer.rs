@@ -3120,3 +3120,247 @@ fn p2_real_writer_queues_kind_31_and_reads_person_jobs() {
     drop(reopened);
     close(&mut writer);
 }
+
+// ---------------------------------------------------------- P5 kind 32
+// execution-path-guard.md, EPG-U3 (integration support): kind 32 through
+// the real writer on real files, the guard reads and the restart.
+
+fn p5_record(
+    action: PathAction,
+    project: Id,
+    reference: Id,
+    through: u64,
+    entries: &[(PathEntryKind, &str)],
+    digest: Hash,
+) -> Record {
+    Record::ExecutionPath(Box::new(ExecutionPathRecord {
+        action,
+        project,
+        reference,
+        through,
+        entries: entries
+            .iter()
+            .map(|(kind, path)| PathEntry {
+                kind: *kind,
+                path: (*path).into(),
+            })
+            .collect(),
+        overflow: 0,
+        digest,
+    }))
+}
+fn p5_append(writer: &mut WriterHandle, revision: u64, record: Record) -> Result<Reply> {
+    wait(&mut writer.try_submit(Command::Append {
+        expected_revision: revision,
+        record,
+        admission: None,
+    })?)
+}
+fn p5_guard(writer: &mut WriterHandle, project: Id) -> Result<PathGuardView> {
+    Ok(
+        *wait(&mut writer.try_submit(Command::PathGuard { project })?)?
+            .path_guard
+            .unwrap(),
+    )
+}
+/// EPG-U3 (integration support): the real writer appends a model change,
+/// an acknowledgement, approvals and a revocation; an exact retry of a
+/// reference returns the committed record without writing, a different
+/// record under it is `Conflict`, a replay rule violation is `Invalid`
+/// with nothing written; `PathGuard` and `PathRecord` read the state, and
+/// a reopened writer reads the same state.
+#[test]
+fn epg_u3_real_writer_appends_kind_32_reads_guard_state_and_reopens() {
+    use PathAction::*;
+    use PathEntryKind as K;
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    let state = j1_admit_and_start(&mut writer, project, configuration_digest);
+    let mut revision = state.revision;
+    drop(state);
+    let job = j2_job(1);
+    for record in [
+        Record::ToolCall(Box::new(j1_call(1, ToolDecision::Run))),
+        Record::JobIntent(j2_intent(1)),
+        j2_handle(1),
+        Record::JobSettled(Box::new(j2_settled(1))),
+    ] {
+        submit(&mut writer, &mut revision, record).unwrap();
+    }
+    let reply = p2_queue(
+        &mut writer,
+        p2_command(61, 62, project, [60; 16], true, false),
+    )
+    .unwrap();
+    revision = reply.replay.as_ref().unwrap().revision;
+    drop(reply);
+    assert_eq!(
+        p5_guard(&mut writer, project).unwrap(),
+        PathGuardView::default()
+    );
+    // The model change of the settled job.
+    let change = p5_record(
+        ModelChanged,
+        project,
+        job,
+        0,
+        &[
+            (K::ModelChanged, "build.rs"),
+            (K::ModelChanged, "package.json"),
+        ],
+        [0; 32],
+    );
+    let reply = p5_append(&mut writer, revision, change.clone()).unwrap();
+    let (frame, committed) = reply.path_record.clone().unwrap();
+    assert_eq!(Record::ExecutionPath(committed), change);
+    let through = frame.sequence;
+    revision = reply.replay.as_ref().unwrap().revision;
+    drop(reply);
+    // An exact retry, even at a stale revision, writes nothing.
+    let before = segment_bytes(&scratch);
+    let retry = p5_append(&mut writer, revision - 1, change.clone()).unwrap();
+    assert_eq!(retry.path_record.as_ref().unwrap().0, frame);
+    drop(retry);
+    let other = p5_record(
+        ModelChanged,
+        project,
+        job,
+        0,
+        &[(K::ModelChanged, "x")],
+        [0; 32],
+    );
+    assert!(matches!(
+        p5_append(&mut writer, revision, other),
+        Err(Error::Conflict)
+    ));
+    // A replay rule violation: a model change of an unknown job.
+    let unknown = p5_record(ModelChanged, project, [99; 16], 0, &[], [0; 32]);
+    assert!(matches!(
+        p5_append(&mut writer, revision, unknown),
+        Err(Error::Invalid)
+    ));
+    // A field rule violation is refused before the worker.
+    let field = p5_record(
+        Approved,
+        project,
+        [70; 16],
+        0,
+        &[(K::Approval, ".envrc")],
+        [0; 32],
+    );
+    assert!(matches!(
+        writer.try_submit(Command::Append {
+            expected_revision: revision,
+            record: field,
+            admission: None,
+        }),
+        Err(Error::Invalid)
+    ));
+    assert_eq!(segment_bytes(&scratch), before);
+    let view = p5_guard(&mut writer, project).unwrap();
+    assert_eq!(view.changes.len(), 1);
+    assert_eq!(view.changes[0].paths, vec!["build.rs", "package.json"]);
+    assert_eq!(view.through(), through);
+    // The acknowledgement of the person input, then approvals.
+    for record in [
+        p5_record(
+            Acknowledged,
+            project,
+            [62; 16],
+            through,
+            &[
+                (K::ModelChanged, "build.rs"),
+                (K::ModelChanged, "package.json"),
+                (K::NotApproved, ".git/hooks/pre-commit"),
+            ],
+            [0; 32],
+        ),
+        p5_record(
+            Approved,
+            project,
+            [70; 16],
+            0,
+            &[(K::Approval, ".envrc")],
+            [1; 32],
+        ),
+        p5_record(
+            Approved,
+            project,
+            [71; 16],
+            0,
+            &[(K::Approval, ".git/hooks/pre-commit")],
+            [2; 32],
+        ),
+        p5_record(
+            Revoked,
+            project,
+            [72; 16],
+            0,
+            &[(K::Approval, ".envrc")],
+            [0; 32],
+        ),
+    ] {
+        submit(&mut writer, &mut revision, record).unwrap();
+    }
+    let before = segment_bytes(&scratch);
+    let again = p5_record(
+        Revoked,
+        project,
+        [73; 16],
+        0,
+        &[(K::Approval, ".envrc")],
+        [0; 32],
+    );
+    assert!(matches!(
+        p5_append(&mut writer, revision, again),
+        Err(Error::Invalid)
+    ));
+    assert_eq!(segment_bytes(&scratch), before);
+    let view = p5_guard(&mut writer, project).unwrap();
+    assert!(view.changes.is_empty());
+    assert_eq!(view.acknowledged.unwrap().input, [62; 16]);
+    assert_eq!(
+        view.approvals
+            .iter()
+            .map(|a| (a.path.as_str(), a.digest))
+            .collect::<Vec<_>>(),
+        vec![(".git/hooks/pre-commit", [2; 32])]
+    );
+    assert_eq!(view.approval_records, 3);
+    let acknowledged = wait(
+        &mut writer
+            .try_submit(Command::PathRecord {
+                reference: [62; 16],
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .path_record
+    .unwrap();
+    assert_eq!(acknowledged.1.entries.len(), 3);
+    assert!(
+        wait(
+            &mut writer
+                .try_submit(Command::PathRecord {
+                    reference: [99; 16],
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .path_record
+        .is_none()
+    );
+    // An unregistered project has no guard state.
+    assert!(matches!(
+        p5_guard(&mut writer, [98; 16]),
+        Err(Error::Invalid)
+    ));
+    close(&mut writer);
+    // Reopen: the same state from the records.
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    wait(&mut writer.try_submit(Command::Open).unwrap()).unwrap();
+    assert_eq!(p5_guard(&mut writer, project).unwrap(), view);
+    close(&mut writer);
+}
