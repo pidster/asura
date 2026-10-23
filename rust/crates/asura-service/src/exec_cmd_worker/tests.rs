@@ -95,6 +95,7 @@ fn name(event: &SlotEvent) -> &'static str {
         SlotEvent::ScratchCleaned => "scratch_cleaned",
         SlotEvent::ScratchRetained => "scratch_retained",
         SlotEvent::IdentityChanged => "identity_changed",
+        SlotEvent::PathsChanged(_) => "paths_changed",
     }
 }
 fn names(events: &[SlotEvent]) -> Vec<&'static str> {

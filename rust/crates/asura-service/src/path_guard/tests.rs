@@ -563,7 +563,10 @@ fn worker_check_admission_and_cancel() {
             },
         )
         .unwrap();
-    assert!(matches!(wait(&ticket), Reply::Digest(FileState::Digest(_))));
+    assert!(matches!(
+        wait(&ticket),
+        Reply::Digest(FileState::Digest(_), Some(shown)) if shown == ".envrc"
+    ));
     // A replaced project directory is not read.
     let moved = Root {
         inode: root.inode + 1,

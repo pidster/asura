@@ -14,7 +14,7 @@ use asura_platform::events::WakeSender;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 /// Outstanding requests, the running one included (AE-03).
@@ -43,7 +43,9 @@ pub(crate) enum Work {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reply {
     Checked(Facts),
-    Digest(FileState),
+    /// The file's state and its display-redacted record path (`None`
+    /// when it cannot be recorded).
+    Digest(FileState, Option<String>),
     /// The project is not the registered directory, or cannot be read.
     Unavailable,
     Cancelled,
@@ -112,7 +114,6 @@ impl Guard {
         let (sender, receiver) = mpsc::sync_channel::<Job>(QUEUE_BOUND);
         let outstanding = Arc::new(AtomicUsize::new(0));
         let count = outstanding.clone();
-        let wake = Arc::new(Mutex::new(wake));
         let thread = std::thread::Builder::new()
             .name("asura-path-guard".into())
             .spawn(move || {
@@ -121,7 +122,7 @@ impl Guard {
                     let reply = run(&job.root, &job.work, &job.cancel);
                     let _ = job.reply.try_send(reply);
                     count.fetch_sub(1, Ordering::AcqRel);
-                    if let Some(wake) = wake.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                    if let Some(wake) = &wake {
                         let _ = wake.notify();
                     }
                 }
@@ -202,7 +203,9 @@ fn run(root: &Root, work: &Work, cancel: &AtomicBool) -> Reply {
     }
     let path = Path::new(&root.path);
     match work {
-        Work::Digest { path: relative } => Reply::Digest(walk::digest(path, relative, cancel)),
+        Work::Digest { path: relative } => {
+            Reply::Digest(walk::digest(path, relative, cancel), super::display(relative))
+        }
         Work::Check { approved } => match walk::walk(path, List::Implicit, cancel) {
             Err(WalkError::Cancelled) => Reply::Cancelled,
             Err(WalkError::Unavailable) => Reply::Unavailable,

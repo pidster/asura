@@ -7,6 +7,7 @@ mod jobs;
 mod memory_create;
 mod memory_tools;
 mod notice;
+mod path_guard;
 mod person_command;
 mod response;
 use crate::model_owner::{ModelOwner, PackageIdentity};
@@ -129,6 +130,9 @@ pub(crate) fn handles(request: &pb::Envelope) -> bool {
                 | Body::ConversationQueueReorder(_)
                 | Body::ConversationQueueList(_)
                 | Body::ConversationQueueDecision(_)
+                | Body::PathGuardList(_)
+                | Body::PathGuardApprove(_)
+                | Body::PathGuardRevoke(_)
         )
     ) || request.body.as_ref().is_some_and(job_control::handles)
 }
@@ -750,6 +754,10 @@ enum Job {
     PersonCheck(journal::Id),
     /// A dispatch hold of a person command (`secrets_lost` and others).
     PersonHold(journal::Id),
+    /// A person dispatch's path guard read or acknowledgement (P5).
+    PathDispatch(journal::Id),
+    /// A `/paths` request's read or append, by request key (P5).
+    PathControl(u64),
     /// A worker-layer harness record or command (`test-support` only).
     #[cfg(feature = "test-support")]
     Fixture,
@@ -812,6 +820,9 @@ pub(crate) struct Owner {
     /// Person commands: submits, dispatch, the secret store and the `!!`
     /// lane overlay (P3-E).
     persons: person_command::Persons,
+    /// The execution path guard: dispatch checks, `/paths` requests and
+    /// the worker (P5).
+    paths: path_guard::Paths,
     /// The reply to the last harness record or command.
     #[cfg(feature = "test-support")]
     fixture: Option<writer::Result<writer::Reply>>,
@@ -875,6 +886,7 @@ impl Owner {
             execution: Default::default(),
             rules: Default::default(),
             persons: Default::default(),
+            paths: Default::default(),
             #[cfg(feature = "test-support")]
             fixture: None,
             #[cfg(feature = "test-support")]
@@ -1608,6 +1620,12 @@ impl Owner {
         if request.body.as_ref().is_some_and(job_control::handles) {
             return self.job_request(request, now);
         }
+        if matches!(
+            request.body,
+            Some(Body::PathGuardList(_) | Body::PathGuardApprove(_) | Body::PathGuardRevoke(_))
+        ) {
+            return self.path_request(request);
+        }
         if let Some(Body::AuditRead(query)) = request.body.as_ref() {
             let project = id(&query.project_id);
             let error = (!self.project_known(project)).then_some("project_unknown");
@@ -2272,6 +2290,30 @@ impl Owner {
         Ok(())
     }
     fn job_done(&mut self, job: Job, result: writer::Result<writer::Reply>, now: Instant) {
+        // The path guard's journal work keeps its own outcome handling.
+        let job = match job {
+            Job::PathDispatch(input) => {
+                if let Ok(value) = &result {
+                    self.replay = value.replay.clone();
+                }
+                return self.path_dispatch_done(input, result, now);
+            }
+            Job::PathControl(key) => {
+                if let Ok(value) = &result {
+                    self.replay = value.replay.clone();
+                }
+                if let Err(
+                    cause @ (writer::Error::OutcomeUnconfirmed
+                    | writer::Error::RepairRequired
+                    | writer::Error::Unavailable),
+                ) = &result
+                {
+                    self.unavailable = Some(storage_error(*cause));
+                }
+                return self.path_control_done(key, result);
+            }
+            job => job,
+        };
         let value = match result {
             Ok(value) => value,
             Err(cause) => {
@@ -2522,6 +2564,8 @@ impl Owner {
         };
         self.replay = value.replay.clone();
         match job {
+            // Handled before the result is taken.
+            Job::PathDispatch(_) | Job::PathControl(_) => {}
             Job::PersonQueue(submit) => self.person_queued(*submit, Ok(value)),
             Job::PersonLookup(submit) => self.person_looked_up(*submit, value),
             Job::PersonRead(input) => self.person_read(input, value, now),
@@ -4709,6 +4753,7 @@ impl Owner {
     }
     pub(crate) fn shutdown(&mut self) {
         self.closing = true;
+        self.close_path_guard();
         self.payloads.shutdown(Instant::now());
         self.jobs.close(Instant::now());
         // Parked and pending job requests answer `Draining` (AE-06).

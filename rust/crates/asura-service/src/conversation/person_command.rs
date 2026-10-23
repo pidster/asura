@@ -16,6 +16,7 @@
 //! writer worker, the setup on the slot's setup thread. No wait has a time
 //! bound: a submit ends by its reply, a dispatch read by its reply; a
 //! locked Keychain is rechecked on the shared pacing, which ends nothing.
+use super::path_guard::{self as guard, GuardStep};
 use super::{Body, Job, Owner, error, id, reply, storage_error};
 use crate::exec_cmd_worker::PersonLaunch;
 use crate::job_controller::{
@@ -332,7 +333,7 @@ pub(super) enum KeychainWait {
 
 /// Where one dispatched person command is, until its kind 26 commits (or
 /// it is held).
-enum Dispatch {
+pub(super) enum Dispatch {
     /// The kind 31 read is queued for, or holds, the journal ticket.
     Reading,
     /// The kind 31 is read; the item read or the controller submit follows.
@@ -346,6 +347,10 @@ enum Dispatch {
     /// queues (AQ1), and is tried again on the next wake. The values stay
     /// in this dispatch only, zeroed on drop.
     Admit(Box<PersonCommandQueued>, Option<Box<Secrets>>),
+    /// The path check (P5) between the item read and the admission: the
+    /// entry waits with `path_check`. The values stay here, zeroed on
+    /// drop.
+    Guard(Box<PersonCommandQueued>, Option<Box<Secrets>>, GuardStep),
     /// The controller holds the start: a waiter, then a job.
     Submitted(Id),
     /// A hold decision is queued for the journal ticket, or a kind 31 read
@@ -375,7 +380,7 @@ pub(super) struct Persons {
     /// with the controller's slot-grant check.
     switch: Arc<AtomicU8>,
     submits: Vec<Submit>,
-    dispatches: BTreeMap<Id, Dispatch>,
+    pub(super) dispatches: BTreeMap<Id, Dispatch>,
     /// Inputs of released `!!` jobs (OD2), in memory only.
     released: BTreeSet<Id>,
     /// Inputs known to have an item: stored here, or read at dispatch.
@@ -672,6 +677,7 @@ pub(super) fn queue_entry(
     state: InputStatus,
     hold_reason: Option<&str>,
     waiting: Option<&(i32, String)>,
+    paths: (Vec<pb::PathWarning>, Option<u32>),
 ) -> pb::ConversationQueueEntry {
     let mut text = person.command_text().to_owned();
     if !full && text.len() > 256 {
@@ -688,8 +694,8 @@ pub(super) fn queue_entry(
         waiting_reason: waiting.map(|(reason, _)| *reason),
         waiting_text: waiting.map(|(_, text)| text.clone()),
         command_filtered: person.whole_command.then_some(true),
-        path_warnings: Vec::new(),
-        path_overflow: None,
+        path_warnings: paths.0,
+        path_overflow: paths.1,
         input_id: Some(view.input.input.to_vec()),
         project_id: Some(view.input.project.to_vec()),
         conversation_id: Some(view.input.conversation.to_vec()),
@@ -1339,6 +1345,7 @@ impl Owner {
         };
         let preparing = self.preparing_step();
         let waiting = self.waiting_reasons();
+        let mut budget = guard::QUEUE_WARNING_BYTES;
         let mut entries = Vec::with_capacity(value.inputs.len());
         for v in value.inputs {
             // A dispatch hold whose decision waits for the ticket keeps the
@@ -1363,6 +1370,8 @@ impl Owner {
                 } else {
                     v.status
                 };
+                let paths =
+                    guard::entry_fields(self.paths.shown(&v.input.input), &mut budget);
                 entries.push(queue_entry(
                     &v,
                     person,
@@ -1370,6 +1379,7 @@ impl Owner {
                     state,
                     hold,
                     waiting.get(&v.input.input),
+                    paths,
                 ));
                 continue;
             }
@@ -1456,6 +1466,7 @@ impl Owner {
                     && state.input_status(q.request) == Some(InputStatus::Held)
             });
             let reason = match self.persons.dispatches.get(input) {
+                Some(Dispatch::Guard(_, _, step)) => Some(self.guard_waiting(step)),
                 Some(Dispatch::Waiting(_, wait, _)) => {
                     let (code, text) = keychain_text(*wait);
                     Some((code, text.to_owned()))
@@ -1519,7 +1530,7 @@ impl Owner {
         }
     }
 
-    fn advance_dispatch(&mut self, input: Id, now: Instant) {
+    pub(super) fn advance_dispatch(&mut self, input: Id, now: Instant) {
         let Some(dispatch) = self.persons.dispatches.remove(&input) else {
             return;
         };
@@ -1541,6 +1552,7 @@ impl Owner {
                 }
             },
             Dispatch::Admit(record, values) => self.person_start(record, values.map(|v| *v), now),
+            Dispatch::Guard(record, values, step) => self.advance_guard(record, values, step),
             Dispatch::Waiting(record, wait, pacing) => {
                 let due = now >= pacing.at()
                     || (wait == KeychainWait::Busy
@@ -1643,6 +1655,11 @@ impl Owner {
         };
         if self.jobs.controller_ref().is_none() {
             return Dispatch::Admit(record, values.map(Box::new));
+        }
+        // P5: the path check before the job admission (EPG-Q1).
+        if !self.paths.acknowledged(&record.input) {
+            let step = GuardStep::Record;
+            return self.advance_guard(record, values.map(Box::new), step);
         }
         let values = values.unwrap_or_default();
         // The numbered values, or the whole-command value, re-planned.
@@ -1772,7 +1789,7 @@ impl Owner {
     }
 
     /// Queues a hold decision for a dispatch the owner cannot run.
-    fn command_hold(&mut self, input: Id, reason: &'static str) -> Dispatch {
+    pub(super) fn command_hold(&mut self, input: Id, reason: &'static str) -> Dispatch {
         self.note_hold(input, reason);
         if !self.persons.holds.contains(&input) {
             self.persons.holds.push_back(input);
@@ -1984,7 +2001,12 @@ impl Owner {
         }
         if matches!(
             self.persons.dispatches.get(&input),
-            Some(Dispatch::Submitted(_) | Dispatch::Waiting(..) | Dispatch::Ready(_))
+            Some(
+                Dispatch::Submitted(_)
+                    | Dispatch::Waiting(..)
+                    | Dispatch::Ready(_)
+                    | Dispatch::Guard(..)
+            )
         ) {
             self.persons.dispatches.remove(&input);
         }
@@ -2197,6 +2219,7 @@ impl Owner {
     /// The owner's person step: store and sweep, submits, dispatches,
     /// released inputs that settled, and the published waiting reasons.
     pub(super) fn poll_persons(&mut self, now: Instant) {
+        self.poll_paths();
         self.poll_store();
         self.poll_submits();
         self.drive_person_dispatch(now);
@@ -2219,7 +2242,7 @@ impl Owner {
     /// records and before new foreground commands: holds, kind 31 reads,
     /// check reads, then kind 31 appends.
     pub(super) fn drive_persons(&mut self) -> bool {
-        self.drive_person_journal() || self.drive_submits()
+        self.drive_person_journal() || self.drive_path_journal() || self.drive_submits()
     }
 }
 
