@@ -1786,6 +1786,28 @@ A refused `!!` submit is the `person_command.refused` event with
 `outside_sandbox: true`. No event contains command text, cwd, PATH,
 environment, a secret value or output.
 
+Schema rules (P2-G, 2026-10-23):
+
+- `outside_sandbox` on the job events and the two person events is written
+  only when true; an explicit `false` or `null` is malformed, so each record
+  has one encoding. `job.queued` with the flag requires origin `person`;
+  `job.started` uses profile `model-1` for a model job, `person-1` for a person
+  job without the flag and `person-outside-1` exactly when it is set;
+  `job.settled` with reason 20 requires the flag.
+- `reason` of `person_command.refused` is a closed set, `PersonCommandRefusal`:
+  the 13 `QueueRefusal` names and the submit error tokens `stale_generation`,
+  `conversation_busy`, `request_conflict`, `service_draining`,
+  `project_unknown`, `project_stale`, `project_overlaps_asura_state`,
+  `installation_not_initialized`, `authority_repair_required`,
+  `outcome_unconfirmed`, `capacity_exhausted`, `cancelled`, `invalid_request`,
+  `storage_unavailable`, `journal_quota` and `journal_disk_space`. P3-E maps its
+  submit outcomes to this enum with an exhaustive match, so every refusal has a
+  name; a new submit error needs a new member, never a fallback.
+- The project audit read (`AuditRead`, `/audit`) does not show the two
+  `person_command.*` events. It shows the person job's `job.*` events (entry
+  kinds 4–7) as for a model job; the person events stay in the audit log file
+  for review there.
+
 ## Validation
 
 Detailed acceptance cases. Each row names its initial state, trigger and
