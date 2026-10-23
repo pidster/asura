@@ -737,10 +737,10 @@ fn v8_capture_incomplete_quota() {
 command: yes | head -c 9999999999
 directory: .
 result: exit 0; then stopped: output quota full while finishing
-output: stdout 4 lines, 112 bytes; stderr 0 lines, 0 bytes; capture incomplete: quota
+output: stdout 4 lines, 112 bytes; stderr 0 lines, 0 bytes; capture incomplete: output quota full
 job: f544df88ca0a5d84840521101e9ea00e
 "#,
-        "ebd3f829805b5e360377062c287593e4bd68530a0bb0faa0dfee693bc636d0f5",
+        "cec843bed5258b041523bafd92343d1c5d6d724873fdbf256e8cda7f89555ef0",
     );
 }
 
