@@ -1,6 +1,6 @@
 //! One model operation: bounded preparation, private protocol, and exact-child settlement.
 use asura_control::model::{self, Direction, ModelCodec, pb};
-use asura_platform::{ModelProcess, RuntimeDirectory};
+use asura_platform::{ModelProcess, PackageResources, RuntimeDirectory};
 use pb::envelope::Body;
 use std::{
     collections::VecDeque,
@@ -18,6 +18,8 @@ pub(crate) struct PackageIdentity {
     pub schema_digest: [u8; 32],
     pub helper_digest: [u8; 32],
     pub metallib_digest: Option<[u8; 32]>,
+    /// `hub_bundle_sha256` (BN1): the Hub resource bundle beside the helper.
+    pub hub_bundle_digest: Option<[u8; 32]>,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Selection {
@@ -25,6 +27,34 @@ pub(crate) struct Selection {
     pub asset_root: Option<String>,
     pub endpoint: Option<String>,
     pub model_capabilities: Option<u32>,
+}
+/// Package resources the selected provider needs beside the helper copy.
+/// MLX needs `mlx.metallib`; MLX and Core AI load Hub tokenizers, which read
+/// the Hub resource bundle (BN1). A missing identity fails before spawn.
+fn package_resources(identity: &PackageIdentity, model: &str) -> io::Result<PackageResources> {
+    let mlx = model.starts_with("mlx:");
+    let hub = mlx || model.starts_with("coreai:");
+    let missing = |what| io::Error::new(io::ErrorKind::NotFound, what);
+    Ok(PackageResources {
+        metallib: if mlx {
+            Some(
+                identity
+                    .metallib_digest
+                    .ok_or_else(|| missing("MLX resource identity unavailable"))?,
+            )
+        } else {
+            None
+        },
+        hub_bundle: if hub {
+            Some(
+                identity
+                    .hub_bundle_digest
+                    .ok_or_else(|| missing("Hub bundle identity unavailable"))?,
+            )
+        } else {
+            None
+        },
+    })
 }
 #[derive(Debug)]
 pub(crate) enum ModelEvent {
@@ -222,13 +252,7 @@ impl ModelOwner {
         selection: Selection,
         inventory_only: bool,
     ) -> io::Result<Self> {
-        let resource_digest = if selection.model.starts_with("mlx:") {
-            Some(identity.metallib_digest.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "MLX resource identity unavailable")
-            })?)
-        } else {
-            None
-        };
+        let resources = package_resources(&identity, &selection.model)?;
         let cancelled = Arc::new(AtomicBool::new(false));
         let token = cancelled.clone();
         let completion = crate::completion::Completion::default();
@@ -242,11 +266,11 @@ impl ModelOwner {
                     .parent()
                     .ok_or(asura_platform::Error::Unavailable)?
                     .join("asura-model");
-                ModelProcess::spawn_with_resource(
+                ModelProcess::spawn_with_resources(
                     &runtime,
                     &helper,
                     identity.helper_digest,
-                    resource_digest,
+                    resources,
                     &token,
                 )
             })?;
@@ -1054,6 +1078,76 @@ impl ModelOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hub_bundle_is_required_for_mlx_and_coreai_only() {
+        let full = PackageIdentity {
+            build_id: [1; 32],
+            schema_digest: [2; 32],
+            helper_digest: [3; 32],
+            metallib_digest: Some([4; 32]),
+            hub_bundle_digest: Some([5; 32]),
+        };
+        let resources = |identity: &PackageIdentity, model: &str| {
+            package_resources(identity, model).map_err(|error| error.kind())
+        };
+        assert_eq!(
+            resources(&full, "mlx:fixture"),
+            Ok(PackageResources {
+                metallib: Some([4; 32]),
+                hub_bundle: Some([5; 32]),
+            })
+        );
+        assert_eq!(
+            resources(&full, "coreai:fixture"),
+            Ok(PackageResources {
+                metallib: None,
+                hub_bundle: Some([5; 32]),
+            })
+        );
+        for model in ["system", "ollama:fixture"] {
+            assert_eq!(resources(&full, model), Ok(PackageResources::default()));
+        }
+        let without_bundle = PackageIdentity {
+            hub_bundle_digest: None,
+            ..full
+        };
+        for model in ["mlx:fixture", "coreai:fixture"] {
+            assert_eq!(
+                resources(&without_bundle, model),
+                Err(io::ErrorKind::NotFound)
+            );
+        }
+        assert_eq!(
+            resources(&without_bundle, "system"),
+            Ok(PackageResources::default())
+        );
+        // An unavailable identity fails at owner creation, before a worker or spawn.
+        let root = std::path::PathBuf::from(format!(
+            "/private/tmp/asura-hub-owner-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let runtime = RuntimeDirectory::scratch(&root, true).unwrap();
+        let created = ModelOwner::new(
+            runtime,
+            without_bundle,
+            Selection {
+                model: "coreai:fixture".into(),
+                asset_root: None,
+                endpoint: None,
+                model_capabilities: None,
+            },
+        );
+        assert!(created.is_err());
+        let copies = std::fs::read_dir(root.join(".asura/run"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(copies, 0);
+    }
     fn owner_with_capacity(tokens: u32) -> ModelOwner {
         let mut owner = owner(Phase::Available);
         owner.effective_context = Some(tokens);
@@ -1092,6 +1186,7 @@ mod tests {
                 schema_digest: [2; 32],
                 helper_digest: [3; 32],
                 metallib_digest: None,
+                hub_bundle_digest: None,
             },
             selection: Selection {
                 model: "system".into(),

@@ -647,8 +647,10 @@ there. The source path changes from beside `asura-model` to
 
 ## BN1: Hub resource bundle defect
 
-Status: defect found by reading the code, 2026-10-23. Probe BN-P1 must confirm
-it before BN1's code. Fix (D-S6) selected (engineering). Owned with the
+Status: defect confirmed by probe BN-P1, 2026-10-23
+([result](#bn-p1-result)). Fix (D-S6) selected (engineering) and delivered
+for development packages ([delivery](#bn1-delivery)); release placement in
+`Contents/Resources` and bundle signing remain with SG1. Owned with the
 [model provider packaging](model-provider-integration.md#verified-metal-resource-packaging).
 
 **Defect.** `Hub.tokenizerConfig` calls `fallbackTokenizerConfig(for:)` when
@@ -669,33 +671,110 @@ control stays usable, but the model cannot run.
 1. Package assembly takes `swift-transformers_Hub.bundle` from the release
    SwiftPM build and places it at
    `Asura.app/Contents/Resources/swift-transformers_Hub.bundle`. A
-   development package places it in `.build/current-package/`.
+   development package places it beside `asura-model`, as it places
+   `mlx.metallib`. Until SG1 moves the resource source path, the copy step
+   reads the bundle beside `asura-model`.
 2. The release script signs the Hub bundle before the helper (D-S3). It then
    records the bundle digest in `package-identity.txt` and
    `model-package.json` as `hub_bundle_sha256`. The digest is the SHA-256 of
    the sorted list of (relative path, file SHA-256) pairs of every regular
-   file in the bundle. `asura-service/build.rs` embeds it as it embeds the
-   `metallib` digest.
+   file in the bundle ([encoding](#hub-bundle-digest-encoding)). It is the
+   fifth line of `package-identity.txt`, after the `metallib` digest.
+   `asura-service/build.rs` embeds it as it embeds the `metallib` digest.
 3. The preparation worker copies the bundle beside the helper copy, as
    `~/.asura/run/model-<hex>/swift-transformers_Hub.bundle/`, for every MLX
-   selection, and for any other provider that BN-P1 shows reaching
-   `Hub.tokenizerConfig`. It uses the existing copy rules: regular files only,
+   and every Core AI selection (BN-P1 shows both reach `Hub.tokenizerConfig`).
+   It uses the existing copy rules: regular files only,
    owned by the service account, not group or world writable, no symlinks,
    64 KiB chunks under the preparation cancellation flag, each copied inode
-   re-read and hashed. A digest mismatch or a missing bundle makes the provider
-   unavailable before spawn.
-4. Limits: at most 16 files, depth 4, each file at most 1 MiB, and the bundle
-   at most 1 MiB in total. The current bundle has 7 files in 44 KiB. A bundle
-   over a limit fails package assembly.
+   re-read and hashed. Source directories follow the same owner and mode
+   rules and are opened without following links. A digest mismatch or a
+   missing bundle makes the provider unavailable before spawn. System and
+   Ollama selections do not copy the bundle.
+4. Limits: at most 16 files and 16 directories, depth 4, each file at most
+   1 MiB, and the bundle at most 1 MiB in total. A file at depth 4 has a
+   relative path of four components. Empty files are allowed: the ad hoc
+   signed bundle holds an empty `Contents/_CodeSignature/CodeSignature`. Each
+   name is UTF-8 with no control character and no backslash, so the
+   `shasum` form below stays exact. The current bundle has 7 files and
+   3 directories in 44 KiB. A bundle over a limit fails package assembly and
+   fails preparation.
 5. Cleanup removes only the copied names whose device and inode match the
-   retained descriptors, then the matching empty directories, as for
-   `mlx.metallib`.
+   retained descriptors, then the matching empty directories, deepest first,
+   as for `mlx.metallib`. Unknown entries survive, and so do their
+   directories.
+
+#### Hub bundle digest encoding
+
+Selected (engineering). For each regular file, the relative path joins the
+names below the bundle root with `/` (for example
+`Contents/Resources/gpt2_tokenizer_config.json`). Sort the files by the bytes
+of that path. For each file, write one line: the 64 lowercase hex digits of the
+file SHA-256, two spaces, the relative path and a line feed. The digest is the
+SHA-256 of these lines. The bytes equal the output of `shasum -a 256` over the
+sorted relative paths, run in the bundle root, so the development package step
+can compute the same value with standard tools. The platform owner computes it
+in Rust during the copy; a unit test pins both forms to one known vector.
+
+#### BN-P1 result
+
+Run 2026-10-23 on macOS 27.0 (26A428), Apple Swift 6.4
+(swiftlang-6.4.0.34.1), development helper build, no signing.
+
+- Fixture: `mlx-community/Falcon-H1-Tiny-Tool-Calling-90M-bf16` copied to a
+  scratch directory (`model_type` `falcon_h1`), with `tokenizer_class` removed
+  from `tokenizer_config.json`. Run through `conversation_flow --native-mlx`
+  with a scratch home, so the service copied the helper into
+  `<home>/.asura/run/model-<hex>/` without the Hub bundle.
+- Without the bundle: the submit failed with `model_helper_failed`. The crash
+  report shows `EXC_BREAKPOINT` (`SIGTRAP`) in the `NSBundle.module`
+  initializer, called from `LanguageModelConfigurationFromHub.fallbackTokenizerConfig(for:)`,
+  `tokenizerConfig`, `AutoTokenizer.from(modelFolder:)` and the MLX tokenizer
+  loader.
+- Control: the same model with `tokenizer_class` kept completed the journey.
+- With the bundle beside the copied helper (after BN1), the same
+  `falcon_h1` fixture no longer crashes. `Hub` guesses the class
+  `Falcon_H1Tokenizer`, which `swift-transformers` does not know, so the
+  helper reports the provider unavailable (`model_unavailable`). This is the
+  library's selection rule, not a crash.
+- A second fixture completes the journey: a synthetic one-layer `llama`
+  model (64 hidden units, zero attention and MLP weights, greedy output of one
+  token then EOS) with the Falcon-H1 tokenizer files and no
+  `tokenizer_class`. `Hub` guesses `LlamaTokenizer`. Before BN1 the same
+  fixture fails with `model_helper_failed`; after BN1 it completes.
+- Providers: MLX reaches `Hub.tokenizerConfig` (proved above). Core AI reaches
+  it by code reading: `CoreAILanguageModels` `LanguageBundle.loadTokenizer()`
+  calls `AutoTokenizer.from(modelFolder:)` on the embedded `tokenizer/`
+  directory. No Core AI asset was run. System and Ollama do not load a Hub
+  tokenizer.
 
 Rejected alternative: **reject such models.** MLX asset validation would
 refuse a model whose tokenizer configuration lacks `tokenizer_class` when
 `model_type` is set. It refuses valid models that Hub supports through its
 fallback and its capitalised-name guess, and it copies Hub's selection logic
 into Asura, where it can drift from the library.
+
+#### BN1 delivery
+
+Delivered 2026-10-23 on branch `bn1`:
+
+- `asura-platform` `ModelProcess::spawn_with_resources` takes
+  `PackageResources` (`metallib`, `hub_bundle`). The bundle copy walks the
+  source by directory descriptor, applies the limits above, copies each file
+  with the existing verified-copy routine (empty files allowed), computes the
+  digest, and re-checks every retained name before spawn. Cleanup is owned by
+  the retained descriptors.
+- `asura-service` `build.rs` reads an optional fifth identity line;
+  `PackageIdentity.hub_bundle_digest` holds it. `model_owner` requires it for
+  `mlx:` and `coreai:` selections and fails owner creation without it.
+- The development package step is documented in
+  `swift/model-helper/README.md`. No tracked script assembles the package; the
+  root build owner runs the step.
+
+Proof limits: no Core AI asset was run; no release bundle, signing or
+`Contents/Resources` lookup exists yet (SG1). The service-level stalled-copy
+responsiveness case in AE-07 has no test seam yet; cancellation during the
+copy is proved at the platform unit level.
 
 ### SG-F3: Hub bundle preparation
 
@@ -706,16 +785,21 @@ flow; it does not replace it.
 
 ```mermaid
 flowchart TD
-    Sel["MLX selected, package hashes admitted"] --> Has{"hub_bundle_sha256 in package identity?"}
-    Has -->|No| Fail["Provider unavailable before spawn"]
-    Has -->|Yes| Walk["List bundle files: at most 16, depth 4, 1 MiB"]
-    Walk --> Lim{"Within limits, regular files, no symlinks?"}
-    Lim -->|No| Fail
-    Lim -->|Yes| Copy["Copy into model-hex beside helper and mlx.metallib"]
-    Copy --> Dig{"Re-hashed digest matches and not cancelled?"}
-    Dig -->|No| Clean["Remove only matching owned copies"]
+    Sel["MLX or Core AI selected, package hashes admitted"] --> Has{"hub_bundle_sha256 in package identity?"}
+    Has -->|"No: owner creation fails"| Fail["Provider unavailable before spawn"]
+    Has -->|Yes| Prep["Preparation worker: copy helper, and mlx.metallib for MLX, into model-hex"]
+    Prep --> Walk["Walk next bundle entry by directory descriptor"]
+    Walk --> Lim{"Within 16 files, 16 directories, depth 4, 1 MiB; regular file or directory; owner and mode valid; no symlink; name valid; not cancelled?"}
+    Lim -->|No| Clean["Remove only matching owned copies, deepest first"]
+    Lim -->|Yes| Copy["Copy entry in 64 KiB chunks; re-read and hash the copy"]
+    Copy --> More{"More entries?"}
+    More -->|Yes| Walk
+    More -->|No| Dig{"Digest of sorted path and hash lines matches?"}
+    Dig -->|No| Clean
     Clean --> Fail
-    Dig -->|Yes| Spawn["Spawn copied helper"]
+    Dig -->|Yes| Names{"Every retained name still the copied inode?"}
+    Names -->|No| Clean
+    Names -->|Yes| Spawn["Spawn copied helper"]
     Spawn --> Load["Hub finds the bundle beside the executable"]
 ```
 
@@ -773,7 +857,7 @@ flowchart TD
 | Payload | 55,413 bytes | Secret store (unchanged) |
 | Helper executable | 128 MiB | Model packaging (unchanged) |
 | `mlx.metallib` | 64 MiB | Model packaging (unchanged) |
-| Hub bundle | 16 files, depth 4, 1 MiB each, 1 MiB total | BN1 |
+| Hub bundle | 16 files, 16 directories, depth 4, 1 MiB each, 1 MiB total | BN1 |
 | `Asura.app` | At most 64 files (selected; the current count is under 20) | SG1 release script |
 | Notarisation | One submission at a time; at most 75 per day (Apple) | Release operator |
 | Stapling retries | Paced 1, 2, 4, 8 … s, at most 60 s apart, no count limit | Release script |
@@ -842,7 +926,7 @@ requires:
 | SG-V7 | RS5 | Test-support seam: production cannot select `Scratch` | After each run, the test group lists empty; no test runs a login keychain search | — | — |
 | SG-V8 | PC-I38 | — | PC-I38 unsigned (existing) | PC-I38-S signed; HR-P2 recorded | macOS 27 |
 | SG-V9 | Bundle lookup | Resource path resolution from `Contents/MacOS` | Copy step finds `Resources/mlx.metallib` and the Hub bundle | `--native-mlx` from the installed keg | Clean host |
-| SG-V10 | BN1 | Digest over sorted (path, SHA-256) pairs; limit checks (17 files, depth 5, 1 MiB + 1 byte rejected); symlink rejected | Copy into a scratch run root; mismatch and absence fail before spawn; cleanup leaves unknown entries; cancel during copy cleans owned copies | `conversation_flow --native-mlx` with a fixture model that has `model_type` and no `tokenizer_class` completes | macOS 27, real MLX model |
+| SG-V10 | BN1 | Digest over sorted (path, SHA-256) pairs, pinned to the `shasum` form; limit checks (17 files, 17 directories, depth 5, 1 MiB + 1 byte file, 1 MiB + 1 byte total rejected; the limits themselves accepted); empty file accepted; symlink, group-writable and control-character names rejected | Copy into a scratch run root and read by the copied helper; mismatch and absence fail before spawn; Core AI copies, system does not; cleanup leaves unknown entries; cancel during copy cleans owned copies; the service reports an MLX selection unavailable before spawn when the package bundle does not match its embedded digest | `conversation_flow --native-mlx` with a fixture model that has `model_type` and no `tokenizer_class` completes | macOS 27, real MLX model (BN-P1 fixture) |
 
 ## Delivery
 
@@ -889,8 +973,8 @@ signing packet.
 
 | Packet | Ready? | Missing before code |
 | --- | --- | --- |
-| SG0 | Ready | — |
-| BN1 | Not ready | BN-P1 result. If BN-P1 shows no crash, BN1 is closed with the result recorded |
+| SG0 | Ready | BN-P1 done; SB, HS and HR probes remain |
+| BN1 | Ready | — (BN-P1 confirmed the crash, 2026-10-23) |
 | SG1 | Not ready | BN1 delivered or closed; SG0 results for HS-P1 (embedded `Info.plist`) and HR-P2 |
 | SG0-K | Not ready | SG1 qualification bundle; the owner runs it (SGQ9) |
 | SG2 | Not ready | HS-P1 to HS-P7 results ([SG-F2](#sg-f2-helper-sandbox-decision)) |
@@ -915,5 +999,9 @@ inspection used `otool -L` on build outputs, and reads of the
 Not done: no `codesign`, `notarytool`, `stapler`, `security` or Keychain call;
 no probe; no code or test. Diagrams SG-O1, SG-F1, SG-F2, SG-S1, SG-F3 and SG-P
 were rendered with the local Mermaid CLI and inspected.
+
+Updated 2026-10-23 by packet BN1: probe BN-P1 ran (result above), BN1 code and
+tests landed, and the revised SG-F3 diagram was rendered with the local
+Mermaid CLI and inspected. The other probes and packets remain as stated.
 
 Return to the [design index](README.md).
