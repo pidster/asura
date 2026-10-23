@@ -9,8 +9,10 @@ mod job_notice;
 pub(crate) use job_notice::{Notice, NoticeError, NoticeInputs, Settlement};
 
 /// Versions the composition rules and the manifest encoding. Revision 2
-/// adds the J5 job notice and its segments.
-pub(crate) const COMPOSER_REVISION: u32 = 2;
+/// adds the J5 job notice and its segments; revision 3 adds each prior
+/// turn's notice, rebuilt at reference fidelity inside its history entry
+/// (tool-job-controller.md, notices in later turns).
+pub(crate) const COMPOSER_REVISION: u32 = 3;
 /// Calibration before enough measurements: one token per byte (D2).
 const FALLBACK_MILLI: u32 = 1000;
 /// Upper bound on the learned bytes per token.
@@ -27,6 +29,10 @@ pub(crate) struct Candidate {
     pub generation: u64,
     pub prompt: String,
     pub answer: String,
+    /// The notice this turn had when it ran, rebuilt from the records
+    /// (CCR15): shown at reference fidelity inside the turn's user entry
+    /// when the turn is shown in full; nothing when it is a reference.
+    pub notice: Notice,
 }
 
 /// `R = ⌊E ÷ 4⌋`: room the composer leaves for the answer (D3 refinement,
@@ -127,9 +133,17 @@ fn reference_texts(turn: &Candidate) -> (String, String) {
         ),
     )
 }
+/// The user entry of a turn shown in full: its notice at reference
+/// fidelity in the labelled context block, then the person's text, as the
+/// turn's own input placed them (notices in later turns). Only the prompt
+/// when the notice is empty.
+fn full_user_text(turn: &Candidate) -> String {
+    let notice = turn.notice.text(turn.notice.entries.len());
+    format!("{}{}", context_block(&[], 0, &notice), turn.prompt)
+}
 fn turn_len(turn: &Candidate, fidelity: Fidelity) -> u64 {
     match fidelity {
-        Fidelity::Full => entry_len(&turn.prompt) + entry_len(&turn.answer),
+        Fidelity::Full => entry_len(&full_user_text(turn)) + entry_len(&turn.answer),
         Fidelity::Reference => {
             let (user, model) = reference_texts(turn);
             entry_len(&user) + entry_len(&model)
@@ -285,17 +299,17 @@ pub(crate) fn compose_turn(
         let input = build(instructions, &block, prompt, shown, &fidelity);
         let bytes = model::encode_input(&input).map_err(|_| Error::Invalid)?;
         if bytes.len() as u64 <= limit {
-            let manifest_digest = manifest(
-                &budget,
+            let manifest_digest = manifest(&Parts {
+                budget: &budget,
                 instructions,
-                &block,
+                block: &block,
                 prompt,
                 shown,
-                &fidelity,
+                fidelity: &fidelity,
                 omitted,
                 notice,
                 reduced,
-            );
+            });
             let mut shown_ids: Vec<(u64, Id)> =
                 shown.iter().map(|t| (t.generation, t.operation)).collect();
             shown_ids.sort();
@@ -340,7 +354,7 @@ fn build(
     let mut history = Vec::with_capacity(shown.len() * 2);
     for (turn, fidelity) in shown.iter().zip(fidelity).rev() {
         let (user, model) = match fidelity {
-            Fidelity::Full => (turn.prompt.clone(), turn.answer.clone()),
+            Fidelity::Full => (full_user_text(turn), turn.answer.clone()),
             Fidelity::Reference => reference_texts(turn),
         };
         history.push(pb::HistoryTurn {
@@ -358,31 +372,45 @@ fn build(
         prompt: Some(format!("{block}{prompt}")),
     }
 }
-/// SHA-256 over the deterministic manifest encoding (context-composer.md, item 7).
-#[allow(clippy::too_many_arguments)] // One input per manifest part, in encoding order.
-fn manifest(
-    budget: &Budget,
-    instructions: &str,
-    block: &str,
-    prompt: &str,
-    shown: &[&Candidate],
-    fidelity: &[Fidelity],
-    omitted: &[&Candidate],
-    notice: &Notice,
+/// The parts of one composed request that the manifest binds, in
+/// encoding order.
+struct Parts<'a> {
+    budget: &'a Budget,
+    instructions: &'a str,
+    block: &'a str,
+    prompt: &'a str,
+    /// Shown turns, newest first, with their fidelity.
+    shown: &'a [&'a Candidate],
+    fidelity: &'a [Fidelity],
+    omitted: &'a [&'a Candidate],
+    notice: &'a Notice,
+    /// The current notice's entries at reference fidelity, oldest first.
     reduced: usize,
-) -> Hash {
+}
+/// SHA-256 over the deterministic manifest encoding (context-composer.md, item 7).
+fn manifest(parts: &Parts<'_>) -> Hash {
     let mut h = Sha256::new();
-    h.update([1u8]);
-    h.update(COMPOSER_REVISION.to_be_bytes());
+    manifest_encode(COMPOSER_REVISION, parts, &mut |bytes| h.update(bytes));
+    h.finalize().into()
+}
+/// The manifest encoding under composer revision `revision`: format byte,
+/// revision, budget fields, then each segment in input order, then the
+/// omitted range. A prior turn shown in full has its rebuilt notice
+/// segments (kind 5 at reference fidelity, then kind 6) after its user
+/// entry's segment and before its answer's (revision 3).
+fn manifest_encode(revision: u32, parts: &Parts<'_>, out: &mut dyn FnMut(&[u8])) {
+    out(&[1u8]);
+    out(&revision.to_be_bytes());
+    let budget = parts.budget;
     for value in [
         budget.window_tokens,
         budget.output_reservation,
         budget.overhead_tokens,
         budget.bytes_per_token_milli,
     ] {
-        h.update(value.to_be_bytes());
+        out(&value.to_be_bytes());
     }
-    let segment = |h: &mut Sha256,
+    let segment = |out: &mut dyn FnMut(&[u8]),
                    kind: u8,
                    role: u8,
                    fidelity: u8,
@@ -390,24 +418,24 @@ fn manifest(
                    source_text: &str,
                    shown: &str| {
         let digest: Hash = Sha256::digest(source_text.as_bytes()).into();
-        h.update(segment_bytes(kind, role, fidelity, source, digest, shown));
+        out(&segment_bytes(kind, role, fidelity, source, digest, shown));
     };
     segment(
-        &mut h,
+        out,
         INSTRUCTIONS,
         0,
         Fidelity::Full as u8,
         [0; 16],
-        instructions,
-        instructions,
+        parts.instructions,
+        parts.instructions,
     );
-    for (turn, fidelity) in shown.iter().zip(fidelity).rev() {
+    for (turn, fidelity) in parts.shown.iter().zip(parts.fidelity).rev() {
         let (user, model) = match fidelity {
-            Fidelity::Full => (turn.prompt.clone(), turn.answer.clone()),
+            Fidelity::Full => (full_user_text(turn), turn.answer.clone()),
             Fidelity::Reference => reference_texts(turn),
         };
         segment(
-            &mut h,
+            out,
             HISTORY,
             1,
             *fidelity as u8,
@@ -415,8 +443,14 @@ fn manifest(
             &turn.prompt,
             &user,
         );
+        // The rebuilt notice: every entry at reference fidelity, with the
+        // source identity and digest of its binding point; none for a
+        // reference turn.
+        if *fidelity == Fidelity::Full {
+            out(&notice_segments(&turn.notice, turn.notice.entries.len()));
+        }
         segment(
-            &mut h,
+            out,
             HISTORY,
             2,
             *fidelity as u8,
@@ -426,35 +460,35 @@ fn manifest(
         );
     }
     segment(
-        &mut h,
+        out,
         BLOCK,
         1,
         Fidelity::Full as u8,
         [0; 16],
-        block,
-        block,
+        parts.block,
+        parts.block,
     );
-    h.update(notice_segments(notice, reduced));
+    out(&notice_segments(parts.notice, parts.reduced));
     segment(
-        &mut h,
+        out,
         PROMPT,
         1,
         Fidelity::Full as u8,
         [0; 16],
-        prompt,
-        prompt,
+        parts.prompt,
+        parts.prompt,
     );
-    let mut range: Vec<(u64, Id)> = omitted
+    let mut range: Vec<(u64, Id)> = parts
+        .omitted
         .iter()
         .map(|t| (t.generation, t.operation))
         .collect();
     range.sort();
-    h.update((range.len() as u32).to_be_bytes());
+    out(&(range.len() as u32).to_be_bytes());
     if let (Some(first), Some(last)) = (range.first(), range.last()) {
-        h.update(first.1);
-        h.update(last.1);
+        out(&first.1);
+        out(&last.1);
     }
-    h.finalize().into()
 }
 
 const INSTRUCTIONS: u8 = 1;

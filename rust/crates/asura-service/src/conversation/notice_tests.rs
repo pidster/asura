@@ -290,6 +290,106 @@ fn j5t_09_each_notice_error_from_crafted_inputs() {
     assert!(build(CONVERSATION, &inputs(vec![limit], 0)).is_ok());
 }
 
+/// One completed prior turn of generation `generation` whose kind 21
+/// recorded `notice_through` = `through` and `notice_live` = `live`.
+fn prior(
+    generation: u64,
+    through: u64,
+    live: u32,
+) -> (journal::TurnAccepted, journal::TurnTerminal) {
+    let operation = [generation as u8; 16];
+    (
+        journal::TurnAccepted {
+            request: [0x21; 16],
+            digest: [0; 32],
+            project: [0xa0; 16],
+            original_conversation: Some(CONVERSATION),
+            expected_generation: generation - 1,
+            conversation: CONVERSATION,
+            generation,
+            task: [0x22; 16],
+            operation,
+            model: "system".into(),
+            configuration_digest: [0; 32],
+            instructions_digest: [0; 32],
+            input_digest: [0; 32],
+            prior_operations: Vec::new(),
+            prompt: format!("question {generation}"),
+            event_cursor: 1,
+            composition: journal::Composition {
+                notice_through: through,
+                notice_live: live,
+                ..journal::Composition::default()
+            },
+            thinking_level: 0,
+            thinking_request: 0,
+        },
+        journal::TurnTerminal {
+            operation,
+            generation,
+            kind: journal::TerminalKind::Complete,
+            cause: journal::Cause::None,
+            final_cursor: 2,
+            usage_known: false,
+            output_tokens: 0,
+            text_offset: 0,
+            text: format!("answer {generation}"),
+        },
+    )
+}
+
+/// J5T-11 (unit, owner part): each prior turn becomes a candidate with
+/// the notice it had, built from its `Prepare` notice inputs by the same
+/// rule as the turn's own notice; a turn past the inputs (beyond the
+/// shown-turn bound) gets none; inputs that disagree with the turn's own
+/// kind 21 facts are a `NoticeError`.
+#[test]
+fn j5t_11_prior_turns_carry_their_rebuilt_notice() {
+    let entry = || settlement(1, 20, &arguments("cargo test", None));
+    // Newest first, as `Prepare` returns them.
+    let history = vec![prior(3, 40, 1), prior(2, 4, 0), prior(1, 0, 0)];
+    let notices = vec![
+        inputs(vec![entry()], 1),
+        JobNotice {
+            after: 0,
+            through: 4,
+            settlements: Vec::new(),
+            live: 0,
+        },
+    ];
+    let shown = candidates(CONVERSATION, history.clone(), &notices).unwrap();
+    assert_eq!(
+        shown.iter().map(|c| c.generation).collect::<Vec<_>>(),
+        [3, 2, 1]
+    );
+    assert_eq!(shown[0].prompt, "question 3");
+    assert_eq!(shown[0].answer, "answer 3");
+    let expected = build(CONVERSATION, &inputs(vec![entry()], 1)).unwrap();
+    assert_eq!(shown[0].notice, expected);
+    assert_eq!((shown[0].notice.through, shown[0].notice.live), (40, 1));
+    assert_eq!(shown[0].notice.entries.len(), 1);
+    assert!(shown[1].notice.is_empty());
+    assert_eq!(shown[1].notice.through, 4);
+    assert!(shown[2].notice.is_empty(), "past the inputs: no notice");
+    // The inputs must be the turn's own S and live count.
+    for (through, live) in [(41, 1), (40, 2)] {
+        let mut wrong = notices.clone();
+        wrong[0].through = through;
+        wrong[0].live = live;
+        assert_eq!(
+            candidates(CONVERSATION, history.clone(), &wrong).err(),
+            Some(NoticeError::Range)
+        );
+    }
+    // A damaged settlement of a prior turn is the same repair case.
+    let mut damaged = notices.clone();
+    damaged[0].settlements[0].listing.conversation = [0xc1; 16];
+    assert_eq!(
+        candidates(CONVERSATION, history, &damaged).err(),
+        Some(NoticeError::Job)
+    );
+}
+
 /// J5T-09 (unit, J5-E10): a `NoticeError` fails the preparation with
 /// `authority_repair_required` before the helper starts; consistent inputs
 /// pass the notice step (and then stop at the missing model package).
@@ -329,7 +429,20 @@ fn j5t_09_notice_error_fails_the_turn_as_a_repair_case() {
         history: Vec::new(),
         omitted: 0,
         notice,
+        history_notices: Vec::new(),
     };
+    // A prior turn's notice inputs that disagree with its records fail the
+    // same way (notices in later turns, J5-E10).
+    let mut damaged = inputs(vec![settlement(1, 20, &arguments("true", None))], 0);
+    damaged.settlements[0].listing.conversation = [0xc1; 16];
+    let mut with_prior = prepared(inputs(Vec::new(), 0));
+    with_prior.history = vec![prior(1, 40, 0)];
+    with_prior.history_notices = vec![damaged];
+    assert_eq!(
+        owner.prepared(queued(), with_prior).err(),
+        Some("authority_repair_required")
+    );
+    assert!(owner.active.is_none(), "no turn starts; no kind 21");
     let mut bad = inputs(vec![settlement(1, 20, &arguments("true", None))], 0);
     bad.after = 41;
     assert_eq!(
