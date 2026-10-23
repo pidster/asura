@@ -80,6 +80,7 @@ impl App {
         self.queue_entries.clear();
         self.queue_observed.clear();
         self.transcript.clear();
+        self.person.log.clear();
         self.rendered_responses.clear();
         self.activity.clear();
         self.response_selection = None;
@@ -89,17 +90,22 @@ impl App {
         true
     }
     fn recall(&mut self, previous: bool) -> bool {
+        // Entries and the saved draft keep their mode (PCR16).
         let recalled = if previous {
-            self.history.previous(&self.editor.text())
+            let current = super::person::recall_entry(self.mode, &self.editor.text());
+            self.history.previous(&current)
         } else {
             self.history.next()
         };
-        if let Some(text) = recalled {
+        if let Some(entry) = recalled {
+            let (mode, text) = super::person::recalled(&entry);
             let _ = self
                 .editor
                 .key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-            if let Err(error) = self.editor.insert(&text) {
+            if let Err(error) = self.editor.insert(text) {
                 self.notice = error.to_string();
+            } else {
+                self.mode = mode;
             }
             true
         } else {
@@ -481,7 +487,15 @@ impl App {
                             .position(|item| item.request_id.as_slice() == ids[selected].as_slice())
                         {
                             if self.local_outbox[index].state == LocalInputState::Rejected {
-                                if self.editor.is_empty() {
+                                if self.editor.is_empty()
+                                    && self.mode == super::person::Mode::Message
+                                    && self.person_restore_rejected(index)
+                                {
+                                    // A command returns in its mode.
+                                    self.focus = Focus::Editor;
+                                    self.queue_focused_id = None;
+                                    self.notice = "Rejected input restored to editor".into();
+                                } else if self.editor.is_empty() {
                                     let text = self.local_outbox[index].text.clone();
                                     if let Err(error) = self.editor.insert(&text) {
                                         self.notice = error.to_string();
@@ -563,6 +577,14 @@ impl App {
         if let Some(hint) = self.help_hint() {
             return hint;
         }
+        if self.focus == Focus::Editor
+            && self.response_selection.is_none()
+            && !self.history_focus
+            && self.picker.is_none()
+            && let Some(hint) = self.person_hint()
+        {
+            return hint;
+        }
         if let Some(selected) = self.response_selection {
             let job = self.jobs.supported != Some(false)
                 && self
@@ -604,6 +626,16 @@ impl App {
         } else {
             " · ⇧↑ history"
         };
+        // A running person job's status replaces the editor hint (PCR11).
+        if self.focus == Focus::Editor
+            && let Some(status) = self.person_status(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64),
+            )
+        {
+            return status;
+        }
         match self.focus {
             Focus::Editor => format!(
                 "{} · {newline_chord} newline · ↑↓ recall{above} · ⇧↓ status",
@@ -778,7 +810,11 @@ impl App {
                         } else {
                             String::new()
                         },
-                        literal(entry.text.as_deref().unwrap_or_default(), 256)
+                        if super::person::command_entry(entry) {
+                            super::person::queue_text(entry)
+                        } else {
+                            literal(entry.text.as_deref().unwrap_or_default(), 256)
+                        }
                     ),
                 ))
             })
@@ -790,9 +826,14 @@ impl App {
                 LocalInputState::Unconfirmed => "Unconfirmed",
                 LocalInputState::Rejected => "Rejected local",
             };
+            let marker = match self.row_mode(item) {
+                super::person::Mode::Message => "",
+                super::person::Mode::Command => "! ",
+                super::person::Mode::Outside => "!! ",
+            };
             (
                 item.request_id.to_vec(),
-                format!(">> {label} · {}", literal(&item.text, 256)),
+                format!(">> {label} · {marker}{}", literal(&item.text, 256)),
             )
         }));
         if rows.is_empty() {

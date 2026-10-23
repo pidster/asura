@@ -216,6 +216,9 @@ pub(crate) fn run(
                 if let Some(update) = job_worker.poll_follow() {
                     dirty |= app.jobs_followed(update);
                 }
+                for update in job_worker.poll_folds() {
+                    dirty |= app.person_folded(update);
+                }
             }
             if has(Source::Context)
                 && let Some(update) = context_worker.poll()
@@ -354,6 +357,12 @@ pub(crate) fn run(
             // Spawn failures retry on the next cycle; the views stay usable.
             let _ = job_worker.synchronize_status(resolve, app.job_status_scope(), now);
             let _ = job_worker.synchronize_follow(resolve, app.job_follow());
+            // Person command folds: one observe in flight per job (PC6).
+            let _ = job_worker.synchronize_folds(resolve, app.person_folds());
+            app.set_person_service(
+                job_worker.person_command(app.service_epoch()),
+                worker.secret_store(),
+            );
             output.borrow_mut().pump()?;
             if dirty && !output.borrow().pending() {
                 screen.draw(|frame| app.draw(frame))?;

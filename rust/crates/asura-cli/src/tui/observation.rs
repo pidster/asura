@@ -92,6 +92,9 @@ pub(super) struct Worker {
     shared: Arc<Shared>,
     handle: Option<JoinHandle<()>>,
     lease: Mutex<Option<asura_platform::ServiceLease>>,
+    /// `ServiceObservation.secret_store` of the last successful observation
+    /// (secret-store.md, operations and audit); `/status` reads it.
+    secret_store: Arc<Mutex<Option<asura_control::pb::SecretStoreStatus>>>,
 }
 impl Worker {
     pub(super) fn start(
@@ -106,7 +109,9 @@ impl Worker {
         let mut revision = None;
         let mut owned_epoch = None;
         let mut spawned = false;
-        let worker = Self::start_notified(
+        let secret_store: Arc<Mutex<Option<asura_control::pb::SecretStoreStatus>>> = Arc::default();
+        let observed = secret_store.clone();
+        let mut worker = Self::start_notified(
             move |stop| {
                 if client.is_none() {
                     let attached = attach(resolve, log_resolve, &mut attempted, stop, &lifetime)?;
@@ -121,6 +126,7 @@ impl Worker {
                             owned_epoch = Some(update.snapshot.service_epoch);
                             spawned = false;
                         }
+                        *observed.lock().unwrap_or_else(|e| e.into_inner()) = update.secret_store;
                         let details = super::ui::ServiceDetails {
                             owned: owned_epoch == Some(update.snapshot.service_epoch),
                             uptime_ms: update.uptime_ms,
@@ -140,6 +146,7 @@ impl Worker {
             false,
         )?;
         *worker.lease.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
+        worker.secret_store = secret_store;
         Ok(worker)
     }
     #[cfg(test)]
@@ -217,7 +224,13 @@ impl Worker {
             shared,
             handle: Some(handle),
             lease: Mutex::new(None),
+            secret_store: Arc::default(),
         })
+    }
+    /// The secret store status of the last successful observation. The
+    /// lock is held only for a copy; contention reports nothing this cycle.
+    pub(super) fn secret_store(&self) -> Option<asura_control::pb::SecretStoreStatus> {
+        self.secret_store.try_lock().ok()?.clone()
     }
     pub fn running(&self) -> bool {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
@@ -421,6 +434,7 @@ mod tests {
             shared: shared.clone(),
             handle: None,
             lease: Mutex::new(None),
+            secret_store: Arc::default(),
         };
         let guard = shared.latest.lock().unwrap();
         let (send, receive) = std::sync::mpsc::sync_channel(1);

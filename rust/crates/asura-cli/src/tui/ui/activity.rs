@@ -270,6 +270,7 @@ impl App {
             self.rendered_responses.remove(0);
             self.activity.remove(0);
             self.response_selection = self.response_selection.map(|n| n.saturating_sub(1));
+            self.person_transcript_shifted();
         }
         self.transcript.push((prompt, String::new()));
         self.rendered_responses.push(Default::default());
@@ -474,6 +475,11 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.history_focus = false,
+            // Enter or Space opens a person entry's job at the end of
+            // stdout; the fold never expands inline (PC11).
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.person_open_from_log();
+            }
             KeyCode::Up => self.history_scroll = self.history_scroll.saturating_sub(1),
             KeyCode::Down => {
                 self.history_scroll = self

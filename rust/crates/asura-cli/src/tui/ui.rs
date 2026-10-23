@@ -6,11 +6,13 @@ mod help_mode;
 mod job_view;
 mod markdown;
 mod paging;
+mod person;
 mod thinking;
 use super::editor::{CommandHeader, Editor, MAX_DRAFT_BYTES};
 use composer::{Focus, Picker, selection_style};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use help_mode::{HELP_INDIGO, HelpMode};
+use person::Mode;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -107,7 +109,7 @@ const GAUGE_AMBER: Color = Color::Rgb(0xF2, 0xB9, 0x50);
 /// The TUI commands: completion, help and dispatch. `/jobs`, `/job` and
 /// `/execution` (tool-job-controller.md, J4 TUI; execution-setting.md)
 /// take arguments and dispatch before the no-argument check.
-const LOCAL_COMMANDS: [&str; 18] = [
+const LOCAL_COMMANDS: [&str; 19] = [
     "/help",
     "/quit",
     "/exit",
@@ -126,6 +128,7 @@ const LOCAL_COMMANDS: [&str; 18] = [
     "/jobs",
     "/job",
     "/execution",
+    "/status",
 ];
 
 enum Overlay {
@@ -262,6 +265,10 @@ pub struct App {
     jobs: job_view::Jobs,
     /// A pending `/execution` configuration request.
     execution: Option<execution::Execution>,
+    /// The composer mode: message, `!` or `!!` (person-command-mode.md).
+    mode: Mode,
+    /// Person command state: launch environment, split cache and log.
+    person: person::Person,
 }
 impl App {
     pub fn new() -> Self {
@@ -367,6 +374,11 @@ impl App {
             thinking_support: None,
             jobs: job_view::Jobs::default(),
             execution: None,
+            mode: Mode::Message,
+            person: person::Person {
+                launch: person::Launch::from_process(),
+                ..Default::default()
+            },
         }
     }
     pub(super) fn take_queue_request(
@@ -387,15 +399,21 @@ impl App {
                 item.state = LocalInputState::Rejected;
                 self.notice = "Local input project changed; text retained".into();
             } else {
-                let request =
-                    super::queue::Request::Submit(asura_control::pb::ConversationQueueSubmit {
-                        request_id: Some(item.request_id.to_vec()),
-                        project_id: Some(item.project.to_vec()),
-                        conversation_id: self.conversation_id.clone(),
-                        expected_generation: Some(self.conversation_generation),
-                        new_conversation: Some(self.conversation_id.is_none()),
-                        prompt: Some(item.text.clone()),
-                    });
+                let item = &self.local_outbox[index];
+                let request = match self.command_row(item.request_id) {
+                    Some(row) => super::queue::Request::Command(self.command_request(item, row)),
+                    None => {
+                        super::queue::Request::Submit(asura_control::pb::ConversationQueueSubmit {
+                            request_id: Some(item.request_id.to_vec()),
+                            project_id: Some(item.project.to_vec()),
+                            conversation_id: self.conversation_id.clone(),
+                            expected_generation: Some(self.conversation_generation),
+                            new_conversation: Some(self.conversation_id.is_none()),
+                            prompt: Some(item.text.clone()),
+                        })
+                    }
+                };
+                let item = &mut self.local_outbox[index];
                 item.state = LocalInputState::Sending;
                 self.queue_retained = Some(request.clone());
                 self.queue_busy = true;
@@ -460,6 +478,7 @@ impl App {
             let entries = self.queue_projection.entries();
             self.track_queue_eligibility(&entries, true, false);
             self.queue_entries = entries;
+            self.person_queue_seen();
             self.observe_queued();
         }
         changed
@@ -640,7 +659,9 @@ impl App {
     pub(super) fn queue_finished(&mut self, update: super::queue::Update) {
         if matches!(
             &update.request,
-            super::queue::Request::Submit(_) | super::queue::Request::Reorder(_)
+            super::queue::Request::Submit(_)
+                | super::queue::Request::Command(_)
+                | super::queue::Request::Reorder(_)
         ) {
             self.managed_queue_finished(update);
             return;
@@ -771,9 +792,11 @@ impl App {
     fn managed_queue_finished(&mut self, update: super::queue::Update) {
         let request_id = match &update.request {
             super::queue::Request::Submit(request) => request.request_id.as_deref(),
+            super::queue::Request::Command(request) => request.request_id.as_deref(),
             super::queue::Request::Reorder(request) => request.request_id.as_deref(),
             _ => None,
         };
+        let command = matches!(&update.request, super::queue::Request::Command(_));
         let local = request_id.and_then(|id| {
             self.local_outbox
                 .iter()
@@ -784,6 +807,8 @@ impl App {
                 self.queue_busy = false;
                 if let Some(index) = local {
                     self.local_outbox[index].state = LocalInputState::Unconfirmed;
+                    let request = self.local_outbox[index].request_id;
+                    self.command_unconfirmed(request);
                 }
                 self.notice = "Queue scope changed; exact request outcome unconfirmed".into();
             }
@@ -794,13 +819,22 @@ impl App {
         }
         let reply = match update.outcome {
             Err(error) => {
+                let unconfirmed = !update.done || error.contains("unconfirmed");
                 if let Some(index) = local {
-                    self.local_outbox[index].state =
-                        if !update.done || error.contains("unconfirmed") {
-                            LocalInputState::Unconfirmed
-                        } else {
-                            LocalInputState::Rejected
-                        };
+                    self.local_outbox[index].state = if unconfirmed {
+                        LocalInputState::Unconfirmed
+                    } else {
+                        LocalInputState::Rejected
+                    };
+                    let request = self.local_outbox[index].request_id;
+                    if unconfirmed {
+                        self.command_unconfirmed(request);
+                    } else if command {
+                        // A definite rejection returns the command to the
+                        // editor in its mode, as a refusal does.
+                        self.person.log.retain(|e| e.request_id != Some(request));
+                        self.person_restore_rejected(index);
+                    }
                 }
                 if update.done && !error.contains("unconfirmed") {
                     self.queue_retained = None;
@@ -812,6 +846,13 @@ impl App {
             Ok(_) => return,
         };
         self.queue_retained = None;
+        if reply.refusal.is_some() {
+            // A typed person command refusal: nothing was queued or stored.
+            if let Some(index) = local {
+                self.command_refused(index, &reply);
+            }
+            return;
+        }
         self.queue_order_revision = reply.order_revision;
         self.queue_projection.advance_revision(reply.revision);
         if reply.stale_order == Some(true) {
@@ -835,6 +876,10 @@ impl App {
                 self.restoration_ready = true;
                 let row = self.local_outbox.remove(index);
                 self.notice = queue_input_notice(entry);
+                if let Some(input) = entry.input_id.as_deref().filter(|_| command) {
+                    self.command_accepted(row.request_id, input);
+                    self.person.rows.retain(|r| r.request_id != row.request_id);
+                }
                 // Ctrl+S: promote the accepted row only while its exact
                 // target is still the acknowledged active turn.
                 if let (Some((operation, generation)), Some(input)) =
@@ -865,6 +910,7 @@ impl App {
             .collect();
         let entries = self.queue_entries.clone();
         self.track_queue_eligibility(&entries, true, true);
+        self.person_queue_seen();
         self.observe_queued();
     }
     fn observe_queued(&mut self) {
@@ -1126,6 +1172,7 @@ impl App {
                 self.restoration_ready = false;
                 self.pending_restored_operation = None;
                 self.transcript.clear();
+                self.person.log.clear();
                 self.rendered_responses.clear();
                 self.activity.clear();
                 self.model_context = None;
@@ -1158,6 +1205,7 @@ impl App {
             self.restoration_ready = false;
             self.pending_restored_operation = None;
             self.transcript.clear();
+            self.person.log.clear();
             self.rendered_responses.clear();
             self.activity.clear();
             self.model_context = None;
@@ -1173,7 +1221,10 @@ impl App {
             && self.new_conversation_intent != Some(restore.project)
         {
             match restore.result {
-                Ok(restored) => self.apply_restoration(restored),
+                Ok(restored) => {
+                    self.apply_restoration(restored);
+                    self.person_restored(restore.persons);
+                }
                 Err(error) => {
                     self.restoration_ready = false;
                     self.notice = format!(
@@ -1269,6 +1320,7 @@ impl App {
         self.conversation_id = restored.conversation_id;
         self.conversation_generation = restored.generation;
         self.transcript.clear();
+        self.person.log.clear();
         self.rendered_responses.clear();
         self.activity.clear();
         self.response_selection = None;
@@ -1656,7 +1708,11 @@ impl App {
                 if self.capture.is_some() {
                     self.capture(&text);
                 } else if !self.help_entry_paste(&text) {
-                    self.insert(&text);
+                    // Leading `!` at position 0 steps the mode (PCR2, PCR20).
+                    let rest = self.person_paste(&text);
+                    if !rest.is_empty() {
+                        self.insert(rest);
+                    }
                 }
             }
             return false;
@@ -1693,6 +1749,14 @@ impl App {
                 .collect();
             match key.code {
                 KeyCode::Esc => return false,
+                // With the command list open, `!` is text and never switches
+                // the mode (PCR1, PC-U4): it closes the list.
+                KeyCode::Char('!')
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    self.insert("!");
+                    return false;
+                }
                 KeyCode::Down | KeyCode::Right => {
                     selected = Some(selected.map_or(0, |i| (i + 1) % names.len()))
                 }
@@ -1782,6 +1846,7 @@ impl App {
                             .is_some_and(|capture| !capture.invalid)
                         {
                             let text = self.capture.as_ref().unwrap().text.clone();
+                            let text = self.person_paste(&text).to_owned();
                             match self.editor.insert(&text) {
                                 Ok(()) => {
                                     self.history.reset_navigation();
@@ -1827,6 +1892,9 @@ impl App {
         }
         if key.modifiers == KeyModifiers::CONTROL {
             match key.code {
+                // Ctrl-C stops the selected conversation's person job before
+                // it quits anything (PCR11, PCM-F2).
+                KeyCode::Char('c') if self.person_stop(true) => return false,
                 KeyCode::Char('q' | 'c') => {
                     if self.editor.is_empty()
                         && self.local_outbox.is_empty()
@@ -1835,6 +1903,15 @@ impl App {
                         return true;
                     }
                     self.overlay = Some(Overlay::Exit(false));
+                    return false;
+                }
+                // A command cannot steer; Ctrl+T queues it as Enter does.
+                KeyCode::Char('s') if self.mode.command() => {
+                    self.notice = "A command cannot steer; Enter queues it".into();
+                    return false;
+                }
+                KeyCode::Char('t') if self.mode.command() => {
+                    self.submit_command();
                     return false;
                 }
                 KeyCode::Char('s' | 't') => {
@@ -1852,7 +1929,14 @@ impl App {
                     self.overlay = Some(Overlay::Exit(false));
                     return false;
                 }
-                KeyCode::Char('j') => return false,
+                // Ctrl+J inserts a newline in a command; `/bin/sh -c` runs
+                // every line.
+                KeyCode::Char('j') => {
+                    if self.mode.command() && self.focus == Focus::Editor {
+                        self.insert("\n");
+                    }
+                    return false;
+                }
                 KeyCode::Char('v') => {
                     self.notice.clear();
                     self.capture = Some(Capture {
@@ -1870,11 +1954,19 @@ impl App {
         if self.history_key(key) {
             return false;
         }
+        if self.person_key(key) {
+            return false;
+        }
         if self.composer_key(key) {
             return false;
         }
         match key.code {
-            KeyCode::Tab if key.modifiers.is_empty() && self.editor.command_header().is_some() => {
+            // No slash-command completion in command and outside mode.
+            KeyCode::Tab
+                if key.modifiers.is_empty()
+                    && !self.mode.command()
+                    && self.editor.command_header().is_some() =>
+            {
                 let header = self.editor.command_header().unwrap();
                 let names: Vec<_> = LOCAL_COMMANDS
                     .iter()
@@ -1928,6 +2020,12 @@ impl App {
     /// whose draft is the `/cancel` command; Esc keeps the person's draft.
     /// Returns false when nothing is cancellable.
     fn cancel_current(&mut self, clear: bool) -> bool {
+        // `/cancel` (not Escape) stops the selected conversation's person
+        // job when no model turn is active there (PCM-F2); it never kills.
+        if clear && self.person_stop(false) {
+            self.editor = Editor::new();
+            return true;
+        }
         if self.cancel_job_wait(clear) {
             // A job wait has no time bound; /cancel and Escape stop it.
         } else if self.audit_draft.is_some() {
@@ -2001,6 +2099,11 @@ impl App {
     }
     fn submit(&mut self) -> bool {
         self.last_area = super::help::Area::Box;
+        if self.mode.command() {
+            // `/` and `?` are shell text here: Enter stages a command.
+            self.submit_command();
+            return false;
+        }
         let draft = self.editor.text();
         self.history.record(&draft);
         if !draft.starts_with('/') {
@@ -2034,6 +2137,7 @@ impl App {
                     self.active_operation = None;
                     self.model_context = None;
                     self.transcript.clear();
+                    self.person.log.clear();
                     self.rendered_responses.clear();
                     self.activity.clear();
                     self.response_selection = None;
@@ -2287,6 +2391,17 @@ impl App {
             self.execution_command(draft);
             return false;
         }
+        if name == "/status" {
+            if draft.split_whitespace().count() != 1 {
+                self.notice = "Use /status without arguments; draft retained".into();
+            } else {
+                self.editor = Editor::new();
+                self.notice.clear();
+                self.result_title = "Service status";
+                self.config_result = Some(self.status_text());
+            }
+            return false;
+        }
         if draft.split_whitespace().next() == Some("/config") {
             if self.config_draft.is_some() {
                 self.notice = "Configuration request busy; draft retained".into();
@@ -2450,11 +2565,14 @@ impl App {
             );
         }
         let strips = u16::from(area.width >= 60 && area.height >= 16);
-        let rows = self
-            .editor
-            .visual_rows(area.width.saturating_sub(2))
-            .clamp(1, if area.width >= 60 { 6 } else { 3 })
-            .min(area.height.saturating_sub(7 + 2 * strips).max(1));
+        self.person_refresh_split();
+        let rows = if self.mode.command() && !self.help_active() {
+            self.person_rows(area.width.saturating_sub(2))
+        } else {
+            self.editor.visual_rows(area.width.saturating_sub(2))
+        }
+        .clamp(1, if area.width >= 60 { 6 } else { 3 })
+        .min(area.height.saturating_sub(7 + 2 * strips).max(1));
         let picker_height = self.picker_height(area.height);
         let editor_y = area
             .bottom()
@@ -2474,7 +2592,7 @@ impl App {
         } else {
             self.draw_queue(frame, full_area, tray_bottom, panel)
         };
-        if !self.transcript.is_empty() {
+        if !self.transcript.is_empty() || !self.person.log.is_empty() {
             let history_area = Rect::new(
                 full_area.x,
                 area.y + 2,
@@ -2483,13 +2601,20 @@ impl App {
             );
             self.response_page = usize::from(history_area.height).max(1);
             self.history_page = usize::from(history_area.height).max(1);
-            self.response_scroll_max = render_history(
+            let persons: Vec<(usize, Vec<(String, Style)>)> = self
+                .person
+                .log
+                .iter()
+                .map(|entry| (entry.after, person::entry_rows(entry, text)))
+                .collect();
+            (self.response_scroll_max, self.person.drawn) = render_history(
                 frame,
                 history_area,
                 History {
                     transcript: &self.transcript,
                     rendered_responses: &self.rendered_responses,
                     activity: &self.activity,
+                    persons: &persons,
                 },
                 self.response_selection
                     .map(|index| (index, self.response_scroll)),
@@ -2509,8 +2634,9 @@ impl App {
         let tint = if self.help_active() {
             HELP_INDIGO
         } else {
-            INPUT_TINT
+            self.mode.tint().unwrap_or(INPUT_TINT)
         };
+        let command_view = self.mode.command() && !self.help_active();
         if strips > 0 {
             let top_separator = if self.overlay.is_some() || tray_height > 0 {
                 "█"
@@ -2531,8 +2657,8 @@ impl App {
             .fg(INPUT_TEXT)
             .bg(tint)
             .add_modifier(Modifier::BOLD);
-        // Command highlighting never applies to a help query.
-        if self.help_active() {
+        // Command highlighting never applies to a help query or a command.
+        if self.help_active() || command_view {
             self.editor.set_highlight(None);
         } else {
             let draft = self.editor.text();
@@ -2547,13 +2673,20 @@ impl App {
             && self.response_selection.is_none()
             && !self.history_focus
             && self.picker.is_none();
-        self.editor.render(
-            Rect::new(area.x + 2, editor_y, area.width - 2, rows),
-            frame.buffer_mut(),
-            input,
-            focused,
-        );
-        if self.editor.first_row_visible() {
+        let text_area = Rect::new(area.x + 2, editor_y, area.width - 2, rows);
+        if command_view {
+            // The editor keeps its row state through a render bounded to
+            // the composer area; the command view draws what is shown.
+            let mut scratch =
+                ratatui::buffer::Buffer::empty(Rect::new(0, 0, text_area.width, text_area.height));
+            self.editor
+                .render(*scratch.area(), &mut scratch, input, focused);
+            self.draw_command_view(frame, text_area, focused);
+        } else {
+            self.editor
+                .render(text_area, frame.buffer_mut(), input, focused);
+        }
+        if !command_view && self.editor.first_row_visible() {
             frame.render_widget(
                 Paragraph::new(if self.help_active() { "?" } else { "›" })
                     .style(input.fg(INPUT_GLOW)),
@@ -2693,7 +2826,10 @@ impl App {
             &self.hints(),
             Style::default().fg(Color::Rgb(145, 145, 145)),
         );
-        if focused && let Some(cursor) = self.editor.cursor() {
+        if focused
+            && !command_view
+            && let Some(cursor) = self.editor.cursor()
+        {
             frame.set_cursor_position(cursor);
         }
         let overlay_area = Rect::new(
@@ -3240,6 +3376,9 @@ pub(super) fn queue_wait_label(
     }
 }
 fn queue_input_notice(entry: &asura_control::pb::ConversationQueueEntry) -> String {
+    if person::command_entry(entry) {
+        return person::queue_notice(entry);
+    }
     if let Some(step) = queue_wait_label(entry) {
         return format!("Input waiting: {}; Esc holds it", step.to_lowercase());
     }
@@ -3276,6 +3415,9 @@ struct History<'a> {
     transcript: &'a [(String, String)],
     rendered_responses: &'a [Text<'static>],
     activity: &'a [activity::Activity],
+    /// Person command entries: the transcript entries before each, and its
+    /// styled rows (person-command-mode.md, person view).
+    persons: &'a [(usize, Vec<(String, Style)>)],
 }
 
 fn render_history(
@@ -3286,7 +3428,7 @@ fn render_history(
     full_scroll: Option<usize>,
     strips: u16,
     styles: (Style, Style),
-) -> usize {
+) -> (usize, Vec<(usize, usize)>) {
     let (text, band) = styles;
     struct Block {
         paragraph: Paragraph<'static>,
@@ -3294,8 +3436,49 @@ fn render_history(
         inset: u16,
         style: Style,
         marker: Option<&'static str>,
+        /// The log index of a person entry's first block.
+        person: Option<usize>,
     }
     let mut blocks = Vec::new();
+    // Person entries follow the transcript entry they were staged after;
+    // a selected response shows only itself.
+    let push_persons = |blocks: &mut Vec<Block>, after: usize| {
+        if selection.is_some() {
+            return;
+        }
+        for (log, (_, rows)) in history
+            .persons
+            .iter()
+            .enumerate()
+            .filter(|(_, (position, _))| *position == after)
+        {
+            for (row, (content, style)) in rows.iter().enumerate() {
+                let inset = 1;
+                let width = area.width.saturating_sub(inset + 1);
+                let paragraph = Paragraph::new(Text::raw(content.clone()))
+                    .style(*style)
+                    .wrap(Wrap { trim: false });
+                let height = paragraph.line_count(width).max(1);
+                blocks.push(Block {
+                    paragraph,
+                    height,
+                    inset,
+                    style: *style,
+                    marker: None,
+                    person: (row == 0).then_some(log),
+                });
+            }
+            blocks.push(Block {
+                paragraph: Paragraph::new(""),
+                height: 1,
+                inset: 0,
+                style: text,
+                marker: None,
+                person: None,
+            });
+        }
+    };
+    push_persons(&mut blocks, 0);
     for (index, (prompt, response)) in history.transcript.iter().enumerate() {
         if selection.is_some_and(|(selected, _)| selected != index) {
             continue;
@@ -3386,8 +3569,18 @@ fn render_history(
                 inset,
                 style,
                 marker,
+                person: None,
             });
         }
+        push_persons(&mut blocks, index + 1);
+    }
+    let mut top = 0;
+    let mut drawn = Vec::new();
+    for block in &blocks {
+        if let Some(log) = block.person {
+            drawn.push((log, top));
+        }
+        top += block.height;
     }
     let total: usize = blocks.iter().map(|block| block.height).sum();
     let max_scroll = total.saturating_sub(area.height as usize);
@@ -3429,7 +3622,7 @@ fn render_history(
         y += height;
         skip = 0;
     }
-    max_scroll
+    (max_scroll, drawn)
 }
 
 /// Measured input share of the model's context, when the basis is measured.
@@ -4137,6 +4330,7 @@ mod tests {
         ));
         app.conversation_finished(super::super::conversation::Update {
             restore: Some(super::super::conversation::RestoreUpdate {
+                persons: Vec::new(),
                 project,
                 epoch,
                 result: Ok(super::super::conversation::Restored {

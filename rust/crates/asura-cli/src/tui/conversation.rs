@@ -25,11 +25,71 @@ pub(super) struct Restored {
     pub generation: u64,
     pub turns: Vec<RestoredTurn>,
 }
+/// Restored person entries: the turns before each and its input ID.
+type RestoredPersons = Vec<(usize, [u8; 16])>;
+/// One validated history entry, as listed (newest first).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HistoryItem {
+    Turn {
+        operation: [u8; 16],
+        generation: u64,
+    },
+    Person([u8; 16]),
+}
+/// Validates a history reply's entries without reading anything else. A
+/// person entry has its input ID, the frame and a generation of at most the
+/// reply's, and no operation or kind; generation 0 is allowed only when
+/// every entry is a person entry (control API additions).
+fn history_items(history: &pb::ConversationHistoryReply) -> Result<Vec<HistoryItem>, String> {
+    let generation = history.generation.unwrap_or(0);
+    if history.entries.len() > 8 {
+        return Err("Invalid restored conversation history".into());
+    }
+    let mut previous_frame = u64::MAX;
+    let mut items = Vec::with_capacity(history.entries.len());
+    for entry in &history.entries {
+        let frame = entry.accepted_frame.ok_or("Missing history cursor")?;
+        if frame >= previous_frame {
+            return Err("Conversation history is not ordered".into());
+        }
+        previous_frame = frame;
+        if let Some(input) = entry.person_command_input_id.as_deref() {
+            let input: [u8; 16] = input.try_into().map_err(|_| "Invalid history input")?;
+            if entry.operation_id.is_some()
+                || entry.kind.is_some()
+                || entry.generation.is_none_or(|g| g > generation)
+            {
+                return Err("Invalid person history entry".into());
+            }
+            items.push(HistoryItem::Person(input));
+            continue;
+        }
+        let operation: [u8; 16] = entry
+            .operation_id
+            .as_deref()
+            .ok_or("Missing history operation")?
+            .try_into()
+            .map_err(|_| "Invalid history operation")?;
+        let turn_generation = entry.generation.ok_or("Missing history generation")?;
+        if turn_generation == 0 || turn_generation > generation {
+            return Err("Invalid history generation".into());
+        }
+        items.push(HistoryItem::Turn {
+            operation,
+            generation: turn_generation,
+        });
+    }
+    Ok(items)
+}
 #[derive(Clone)]
 pub(super) struct RestoreUpdate {
     pub project: [u8; 16],
     pub epoch: [u8; 16],
     pub result: Result<Restored, String>,
+    /// Person command entries (history field 5) of a restored history,
+    /// oldest first: the number of turns before each and its input ID. The
+    /// log reads each job through the job API.
+    pub persons: Vec<(usize, [u8; 16])>,
 }
 #[derive(Clone, Default)]
 pub(super) struct Update {
@@ -60,7 +120,7 @@ fn restore(
     project: [u8; 16],
     epoch: [u8; 16],
     stopped: &AtomicBool,
-) -> Result<Restored, String> {
+) -> Result<(Restored, RestoredPersons), String> {
     if client.service_epoch() != epoch {
         return Err("Service changed during conversation restoration".into());
     }
@@ -69,46 +129,43 @@ fn restore(
     let history = client
         .conversation_history(project, None, None, 8)
         .map_err(|e| e.to_string())?;
-    let conversation_id = history.conversation_id;
+    let conversation_id = history.conversation_id.clone();
     let generation = history.generation.unwrap_or(0);
     if history.entries.is_empty() {
         if conversation_id.is_some() || generation != 0 {
             return Err("Invalid empty conversation history".into());
         }
-        return Ok(Restored {
-            conversation_id: None,
-            generation: 0,
-            turns: Vec::new(),
-        });
+        return Ok((
+            Restored {
+                conversation_id: None,
+                generation: 0,
+                turns: Vec::new(),
+            },
+            Vec::new(),
+        ));
     }
     let conversation = conversation_id
         .as_ref()
         .filter(|id| id.len() == 16)
         .ok_or("Invalid restored conversation identity")?;
-    if generation == 0 || history.entries.len() > 8 {
-        return Err("Invalid restored conversation history".into());
-    }
-    let mut previous_frame = u64::MAX;
-    let mut turns = Vec::with_capacity(history.entries.len());
-    for entry in history.entries {
+    let items = history_items(&history)?;
+    let mut turns = Vec::with_capacity(items.len());
+    // (turns listed after it, input), newest first.
+    let mut persons = Vec::new();
+    for item in items {
         if stopped.load(Ordering::Acquire) {
             return Err("Conversation restoration stopped".into());
         }
-        let frame = entry.accepted_frame.ok_or("Missing history cursor")?;
-        if frame >= previous_frame {
-            return Err("Conversation history is not ordered".into());
-        }
-        previous_frame = frame;
-        let operation: [u8; 16] = entry
-            .operation_id
-            .as_deref()
-            .ok_or("Missing history operation")?
-            .try_into()
-            .map_err(|_| "Invalid history operation")?;
-        let turn_generation = entry.generation.ok_or("Missing history generation")?;
-        if turn_generation == 0 || turn_generation > generation {
-            return Err("Invalid history generation".into());
-        }
+        let (operation, turn_generation) = match item {
+            HistoryItem::Person(input) => {
+                persons.push((turns.len(), input));
+                continue;
+            }
+            HistoryItem::Turn {
+                operation,
+                generation,
+            } => (operation, generation),
+        };
         let prompt = client
             .read_conversation_prompt(project, operation)
             .map_err(|e| e.to_string())?;
@@ -135,11 +192,20 @@ fn restore(
         });
     }
     turns.reverse();
-    Ok(Restored {
-        conversation_id,
-        generation,
-        turns,
-    })
+    let count = turns.len();
+    let persons = persons
+        .into_iter()
+        .rev()
+        .map(|(newer, input)| (count - newer, input))
+        .collect();
+    Ok((
+        Restored {
+            conversation_id,
+            generation,
+            turns,
+        },
+        persons,
+    ))
 }
 // Each transport call remains bounded by Client. Turn age does not terminate
 // subscription; the existing owner keeps the worker slot until it settles.
@@ -251,9 +317,18 @@ impl Worker {
                     let mut client = attach().map_err(|e| e.to_string())?;
                     let (operation, generation) = match request {
                         Request::Restore { project, epoch } => {
-                            let result = restore(&mut client, project, epoch, &stopped);
+                            let (result, persons) =
+                                match restore(&mut client, project, epoch, &stopped) {
+                                    Ok((restored, persons)) => (Ok(restored), persons),
+                                    Err(error) => (Err(error), Vec::new()),
+                                };
                             publish(Update {
-                                restore: Some(RestoreUpdate { project, epoch, result }),
+                                restore: Some(RestoreUpdate {
+                                    project,
+                                    epoch,
+                                    result,
+                                    persons,
+                                }),
                                 done: true,
                                 ..Default::default()
                             });
@@ -348,7 +423,12 @@ impl Worker {
                 if let Err(message) = run() {
                     if let Some((project, epoch)) = restore_scope {
                         publish(Update {
-                            restore: Some(RestoreUpdate { project, epoch, result: Err(message) }),
+                            restore: Some(RestoreUpdate {
+                                project,
+                                epoch,
+                                result: Err(message),
+                                persons: Vec::new(),
+                            }),
                             done: true,
                             ..Default::default()
                         });
@@ -417,6 +497,79 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn person_entry(frame: u64, input: u8, generation: u64) -> pb::ConversationHistoryEntry {
+        pb::ConversationHistoryEntry {
+            accepted_frame: Some(frame),
+            generation: Some(generation),
+            person_command_input_id: Some(vec![input; 16]),
+            ..Default::default()
+        }
+    }
+    fn turn_entry(frame: u64, operation: u8, generation: u64) -> pb::ConversationHistoryEntry {
+        pb::ConversationHistoryEntry {
+            operation_id: Some(vec![operation; 16]),
+            generation: Some(generation),
+            accepted_frame: Some(frame),
+            kind: Some(3),
+            ..Default::default()
+        }
+    }
+    /// History field 5: person entries are listed in order with turns; a
+    /// conversation of only person entries may have generation 0; a person
+    /// entry with an operation, a kind or a later generation is invalid.
+    #[test]
+    fn restored_history_lists_person_entries_with_turns() {
+        let reply = |generation, entries| pb::ConversationHistoryReply {
+            conversation_id: Some(vec![9; 16]),
+            generation: Some(generation),
+            entries,
+            ..Default::default()
+        };
+        let items = history_items(&reply(
+            2,
+            vec![
+                person_entry(50, 3, 2),
+                turn_entry(40, 2, 2),
+                person_entry(30, 1, 1),
+                turn_entry(20, 1, 1),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(
+            items,
+            [
+                HistoryItem::Person([3; 16]),
+                HistoryItem::Turn {
+                    operation: [2; 16],
+                    generation: 2
+                },
+                HistoryItem::Person([1; 16]),
+                HistoryItem::Turn {
+                    operation: [1; 16],
+                    generation: 1
+                },
+            ]
+        );
+        assert_eq!(
+            history_items(&reply(0, vec![person_entry(9, 4, 0)])).unwrap(),
+            [HistoryItem::Person([4; 16])]
+        );
+        assert!(history_items(&reply(0, vec![turn_entry(9, 4, 0)])).is_err());
+        let mut with_operation = person_entry(9, 4, 0);
+        with_operation.operation_id = Some(vec![1; 16]);
+        assert!(history_items(&reply(1, vec![with_operation])).is_err());
+        let mut with_kind = person_entry(9, 4, 0);
+        with_kind.kind = Some(3);
+        assert!(history_items(&reply(1, vec![with_kind])).is_err());
+        assert!(history_items(&reply(1, vec![person_entry(9, 4, 2)])).is_err());
+        let mut short = person_entry(9, 4, 0);
+        short.person_command_input_id = Some(vec![1; 15]);
+        assert!(history_items(&reply(1, vec![short])).is_err());
+        // Order still holds across kinds.
+        assert!(
+            history_items(&reply(1, vec![person_entry(5, 1, 1), turn_entry(6, 1, 1)])).is_err()
+        );
+    }
 
     #[test]
     fn pending_subscription_delivers_terminal_and_preserves_cursor() {

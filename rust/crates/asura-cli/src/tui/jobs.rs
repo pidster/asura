@@ -9,6 +9,7 @@
 //! | Status | Parked `JobList` scope project, `live_only`, `after_revision` |
 //! | Observe | `JobObserve` for the open viewer in follow mode |
 //! | Request | One `JobList` page, `JobInspect`, `JobRead`, `JobCancel` or `JobRetain` |
+//! | Fold | Per person job in the log, at most 4: `JobRead` of each stream's end, then one `JobObserve` with `at_end` in flight (person-command-mode.md PC6) |
 //!
 //! Every wait has no time bound (owner, 2026-10-16): it ends on the reply,
 //! the person's `/cancel` or Escape, a scope change, exit or a lost
@@ -38,6 +39,9 @@ pub(super) const MIN_PREFIX_DIGITS: usize = 6;
 pub(super) const MAX_CHOOSER: usize = 9;
 /// Entries per list page; the service's bound.
 pub(super) const LIST_PAGE: u32 = limits::MAX_JOB_LIST_ENTRIES;
+/// Person command folds kept at once: the controller's service live-job
+/// limit (AQ1), so every live person job can have one.
+pub(super) const MAX_FOLDS: usize = 4;
 /// Pacing before a failed status attachment is tried again. It ends no wait.
 const STATUS_RETRY: Duration = Duration::from_secs(1);
 
@@ -189,6 +193,20 @@ pub(super) struct Follow {
 #[derive(Debug)]
 pub(super) struct FollowUpdate {
     pub session: u64,
+    pub result: Result<pb::JobPage, Failure>,
+}
+
+/// One person job whose log fold the worker keeps current.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FoldTarget {
+    pub epoch: String,
+    pub job: [u8; 16],
+    pub project: Option<[u8; 16]>,
+}
+/// The newest fold reply of a job: both streams' end pages and the entry.
+#[derive(Debug)]
+pub(super) struct FoldUpdate {
+    pub job: [u8; 16],
     pub result: Result<pb::JobPage, Failure>,
 }
 
@@ -388,6 +406,12 @@ struct StatusJob {
     latest: Arc<Mutex<Option<StatusUpdate>>>,
     handle: JoinHandle<()>,
 }
+struct FoldJob {
+    target: FoldTarget,
+    cancel: Arc<Cancellation>,
+    latest: Arc<Mutex<Option<FoldUpdate>>>,
+    handle: JoinHandle<()>,
+}
 struct FollowJob {
     follow: Follow,
     cancel: Arc<Cancellation>,
@@ -420,6 +444,10 @@ pub(super) struct Worker {
     request: Option<RequestJob>,
     status: Option<StatusJob>,
     follow: Option<FollowJob>,
+    folds: Vec<FoldJob>,
+    /// The epoch and whether its service lists capability 8, from the
+    /// status slot's attachment.
+    person_command: Arc<Mutex<Option<(String, bool)>>>,
     status_retry: Option<Instant>,
     /// The epoch whose service did not list `CAPABILITY_JOBS`; the status
     /// slot does not attach again for it.
@@ -440,7 +468,16 @@ impl Worker {
     }
     /// Whether any slot thread still runs or holds an unread reply.
     pub fn running(&self) -> bool {
-        self.request.is_some() || self.status.is_some() || self.follow.is_some()
+        self.request.is_some()
+            || self.status.is_some()
+            || self.follow.is_some()
+            || !self.folds.is_empty()
+    }
+    /// Whether the service of `epoch` lists capability 8 (person commands),
+    /// once the status slot has attached to it.
+    pub fn person_command(&self, epoch: Option<&str>) -> Option<bool> {
+        let known = self.person_command.try_lock().ok()?.clone()?;
+        (Some(known.0.as_str()) == epoch).then_some(known.1)
     }
     /// The request slot stays occupied until its thread settles.
     pub fn request_busy(&self) -> bool {
@@ -590,6 +627,7 @@ impl Worker {
         let mailbox = latest.clone();
         let notice = self.notice.clone();
         let worker_scope = scope.clone();
+        let capability = self.person_command.clone();
         let handle = std::thread::Builder::new()
             .name("asura-job-status".into())
             .spawn(move || {
@@ -605,6 +643,11 @@ impl Worker {
                 };
                 let run = || -> Result<(), Failure> {
                     let mut client = attach(resolve, &worker_scope.epoch, &token)?;
+                    // Capability 8 (OD3), as this epoch's attachment lists it.
+                    *capability.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+                        worker_scope.epoch.clone(),
+                        client.supports(pb::Capability::PersonCommand),
+                    ));
                     let cancelled = || token.stopped();
                     let mut revision = None;
                     while !token.stopped() {
@@ -787,8 +830,122 @@ impl Worker {
         (!job.cancel.stopped()).then_some(value)
     }
 
+    /// Keeps one fold per target, at most `MAX_FOLDS`: an unwanted fold's
+    /// wait is cancelled, and a settled thread is retired once its last
+    /// reply has been taken. Each reply replaces the unread one, so a flood
+    /// leaves only the newest end pages; the next observe starts only after
+    /// the previous reply, one in flight per job.
+    pub fn synchronize_folds(
+        &mut self,
+        resolve: Resolver,
+        targets: Vec<FoldTarget>,
+    ) -> io::Result<()> {
+        let mut index = 0;
+        while index < self.folds.len() {
+            let job = &self.folds[index];
+            if !targets.contains(&job.target) {
+                job.cancel.cancel();
+            }
+            if job.handle.is_finished() && !pending(&job.latest) {
+                let job = self.folds.remove(index);
+                let _ = job.handle.join();
+                self.notice.settled();
+                continue;
+            }
+            index += 1;
+        }
+        for target in targets.into_iter().take(MAX_FOLDS) {
+            if self.folds.len() >= MAX_FOLDS {
+                break;
+            }
+            if self.folds.iter().any(|f| f.target == target) {
+                continue;
+            }
+            let cancel = Arc::new(Cancellation::default());
+            let token = cancel.clone();
+            let latest = Arc::new(Mutex::new(None));
+            let mailbox = latest.clone();
+            let notice = self.notice.clone();
+            let wanted = target.clone();
+            let handle = std::thread::Builder::new()
+                .name("asura-job-fold".into())
+                .spawn(move || {
+                    let _settlement = notice.guard();
+                    let publish = |result| {
+                        if !token.stopped() {
+                            *mailbox.lock().unwrap_or_else(|e| e.into_inner()) = Some(FoldUpdate {
+                                job: wanted.job,
+                                result,
+                            });
+                            notice.ready();
+                        }
+                    };
+                    let run = || -> Result<(), Failure> {
+                        let mut client = attach(resolve, &wanted.epoch, &token)?;
+                        let client = std::cell::RefCell::new(&mut client);
+                        let cancelled = || token.stopped();
+                        fold_loop(
+                            &cancelled,
+                            |stream| {
+                                client
+                                    .borrow_mut()
+                                    .read_job(
+                                        read_request(wanted.job, wanted.project, stream, None),
+                                        &cancelled,
+                                    )
+                                    .map_err(failure)
+                            },
+                            |state| {
+                                client
+                                    .borrow_mut()
+                                    .observe_job(
+                                        pb::JobObserve {
+                                            job_id: Some(wanted.job.to_vec()),
+                                            project_id: wanted.project.map(|p| p.to_vec()),
+                                            stream: None,
+                                            offset: None,
+                                            at_end: Some(true),
+                                            after_state: state,
+                                        },
+                                        &cancelled,
+                                    )
+                                    .map_err(failure)
+                            },
+                            |page| publish(Ok(page)),
+                        )
+                    };
+                    match run() {
+                        Ok(()) | Err(Failure::Cancelled) => {}
+                        Err(_) if token.stopped() => {}
+                        Err(error) => publish(Err(error)),
+                    }
+                    if let Ok(mut socket) = token.socket.lock() {
+                        socket.take();
+                    }
+                })?;
+            self.folds.push(FoldJob {
+                target,
+                cancel,
+                latest,
+                handle,
+            });
+        }
+        Ok(())
+    }
+    /// The newest unread reply of each fold.
+    pub fn poll_folds(&mut self) -> Vec<FoldUpdate> {
+        self.folds
+            .iter()
+            .filter(|f| !f.cancel.stopped())
+            .filter_map(|f| take(&f.latest, &self.notice))
+            .collect()
+    }
+
     pub fn cancel(&self) {
         self.cancel_request();
+        for fold in &self.folds {
+            fold.cancel.cancel();
+        }
         for cancel in [
             self.status.as_ref().map(|j| &j.cancel),
             self.follow.as_ref().map(|j| &j.cancel),
@@ -817,6 +974,8 @@ impl Drop for Worker {
                     .as_ref()
                     .is_none_or(|j| j.handle.is_finished())
         };
+        let finished =
+            |worker: &Self| finished(worker) && worker.folds.iter().all(|f| f.handle.is_finished());
         let end = Instant::now() + Duration::from_millis(100);
         while !finished(self) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(2));
@@ -830,7 +989,51 @@ impl Drop for Worker {
         if let Some(job) = self.follow.take().filter(|j| j.handle.is_finished()) {
             let _ = job.handle.join();
         }
+        for job in std::mem::take(&mut self.folds) {
+            if job.handle.is_finished() {
+                let _ = job.handle.join();
+            }
+        }
     }
+}
+
+/// The log fold of one person job (PC6): one `JobRead` at the end of each
+/// stream, then `JobObserve` with `at_end` and no stream, one at a time,
+/// parked on the last state seen. There is no refresh timer: the observe
+/// returns on new output, a state change or settlement. Ends when the job
+/// settles, a reply carries an error, a call fails, or `stopped`.
+pub(super) fn fold_loop(
+    stopped: &dyn Fn() -> bool,
+    mut read: impl FnMut(Stream) -> Result<pb::JobPage, Failure>,
+    mut observe: impl FnMut(Option<i32>) -> Result<pb::JobPage, Failure>,
+    mut publish: impl FnMut(pb::JobPage),
+) -> Result<(), Failure> {
+    let settled = |state: Option<i32>| state == Some(pb::JobState::Settled as i32);
+    let mut first = pb::JobPage::default();
+    for stream in [Stream::Stdout, Stream::Stderr] {
+        if stopped() {
+            return Ok(());
+        }
+        let page = read(stream)?;
+        if page.error.is_some() {
+            publish(page);
+            return Ok(());
+        }
+        first.entry = page.entry.or(first.entry);
+        first.pages.extend(page.pages);
+    }
+    let mut state = first.entry.as_ref().and_then(|e| e.state);
+    publish(first);
+    while !settled(state) && !stopped() {
+        let page = observe(state)?;
+        if page.error.is_some() {
+            publish(page);
+            return Ok(());
+        }
+        state = page.entry.as_ref().and_then(|e| e.state).or(state);
+        publish(page);
+    }
+    Ok(())
 }
 
 /// The page ends before the stream's stored end by more than one page.
@@ -1125,3 +1328,106 @@ fn literal(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+    use std::cell::Cell;
+    fn page(state: pb::JobState, text: &str) -> pb::JobPage {
+        pb::JobPage {
+            entry: Some(pb::JobEntry {
+                state: Some(state as i32),
+                ..Default::default()
+            }),
+            pages: vec![
+                pb::JobStreamPage {
+                    stream: Some(pb::JobStream::Stdout as i32),
+                    text: Some(text.into()),
+                    ..Default::default()
+                },
+                pb::JobStreamPage {
+                    stream: Some(pb::JobStream::Stderr as i32),
+                    text: Some(String::new()),
+                    ..Default::default()
+                },
+            ],
+            error: None,
+        }
+    }
+    /// PC-U28: a fixture observer answers 1000 replies at once, then none.
+    /// One observe is in flight at a time, each reply replaces the unread
+    /// one, so the reader sees the last end page; nothing but a reply drives
+    /// the next request.
+    #[test]
+    fn pc_u28_one_observe_in_flight_and_the_newest_page_wins() {
+        let in_flight = Cell::new(0);
+        let most = Cell::new(0);
+        let calls = Cell::new(0);
+        let mailbox: Mutex<Option<pb::JobPage>> = Mutex::new(None);
+        let published = Cell::new(0);
+        let stopped = || calls.get() >= 1000;
+        let result = fold_loop(
+            &stopped,
+            |_| Ok(page(pb::JobState::Running, "start\n")),
+            |state| {
+                in_flight.set(in_flight.get() + 1);
+                most.set(most.get().max(in_flight.get()));
+                assert_eq!(state, Some(pb::JobState::Running as i32));
+                calls.set(calls.get() + 1);
+                let reply = page(pb::JobState::Running, &format!("line {}\n", calls.get()));
+                in_flight.set(in_flight.get() - 1);
+                Ok(reply)
+            },
+            |page| {
+                published.set(published.get() + 1);
+                *mailbox.lock().unwrap() = Some(page);
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(most.get(), 1);
+        assert_eq!(calls.get(), 1000);
+        // One read reply, then 1000 observe replies; the reader sees one.
+        assert_eq!(published.get(), 1001);
+        let last = mailbox.lock().unwrap().take().unwrap();
+        assert_eq!(last.pages[0].text.as_deref(), Some("line 1000\n"));
+        assert!(mailbox.lock().unwrap().is_none());
+    }
+    /// A settled job's end pages end the fold without an observe; an error
+    /// page is published and ends it too.
+    #[test]
+    fn fold_ends_on_settlement_or_error_without_observing() {
+        let observed = Cell::new(false);
+        let pages = std::cell::RefCell::new(Vec::new());
+        fold_loop(
+            &|| false,
+            |stream| {
+                let mut p = page(pb::JobState::Settled, "done\n");
+                p.pages.retain(|s| s.stream == Some(stream.code()));
+                Ok(p)
+            },
+            |_| {
+                observed.set(true);
+                Err(Failure::Cancelled)
+            },
+            |p| pages.borrow_mut().push(p),
+        )
+        .unwrap();
+        assert!(!observed.get());
+        let pages = pages.into_inner();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].pages.len(), 2);
+        let errors = std::cell::RefCell::new(Vec::new());
+        fold_loop(
+            &|| false,
+            |_| {
+                Ok(pb::JobPage {
+                    error: Some(limits::error::NOT_FOUND.into()),
+                    ..Default::default()
+                })
+            },
+            |_| unreachable!(),
+            |p| errors.borrow_mut().push(p),
+        )
+        .unwrap();
+        assert_eq!(errors.into_inner().len(), 1);
+    }
+}

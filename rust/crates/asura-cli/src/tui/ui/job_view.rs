@@ -225,6 +225,14 @@ impl App {
         self.queue_scope()
     }
     pub(in super::super) fn take_job_request(&mut self) -> Option<Request> {
+        // A person stop or kill that found the slot busy goes next.
+        if self.jobs.outgoing.is_none()
+            && self.jobs.pending.is_none()
+            && let Some(command) = self.person.deferred.take()
+            && !self.job_send(command.clone(), None, false)
+        {
+            self.person.deferred = Some(command);
+        }
         let request = self.jobs.outgoing.take()?;
         self.jobs.pending = Some(request.clone());
         Some(request)
@@ -250,6 +258,7 @@ impl App {
     /// A new service epoch: capability and counts are unknown again, and
     /// every view of the old service closes. Jobs are unaffected (PC5).
     pub(super) fn jobs_service_changed(&mut self) {
+        self.person.supported = None;
         let pending = self.jobs.pending.take();
         self.jobs = Jobs {
             pending,
@@ -318,7 +327,7 @@ impl App {
 
     /// Queues one request-slot command. A second while the slot is busy
     /// shows `job request pending`; the draft is kept.
-    fn job_send(&mut self, command: Command, draft: Option<String>, loud: bool) -> bool {
+    pub(super) fn job_send(&mut self, command: Command, draft: Option<String>, loud: bool) -> bool {
         if self.jobs.supported == Some(false) {
             self.notice = UNSUPPORTED.into();
             return false;
@@ -474,6 +483,13 @@ impl App {
             Some(_) => self.job_act(job, Action::Retain(Retain::Note(note.unwrap())), draft),
         }
     }
+    /// The viewer at the end of stdout, for a person entry in the log (PC11).
+    pub(super) fn open_viewer_at_end(&mut self, job: [u8; 16], fence: Option<[u8; 16]>) {
+        self.open_viewer_from(job, fence, Origin::History, None, None);
+        if let Some(viewer) = self.jobs.viewer.as_mut().filter(|v| v.job == job) {
+            viewer.land = Land::Bottom;
+        }
+    }
     fn open_viewer(
         &mut self,
         job: [u8; 16],
@@ -481,11 +497,21 @@ impl App {
         origin: Origin,
         draft: Option<String>,
     ) {
+        self.open_viewer_from(job, fence, origin, draft, Some(0));
+    }
+    fn open_viewer_from(
+        &mut self,
+        job: [u8; 16],
+        fence: Option<[u8; 16]>,
+        origin: Origin,
+        draft: Option<String>,
+        offset: Option<u64>,
+    ) {
         let command = Command::Read {
             job,
             project: fence,
             stream: Stream::Stdout,
-            offset: Some(0),
+            offset,
         };
         if self.job_send(command.clone(), draft, true) {
             let mut viewer = Viewer::new(job, fence, origin);
@@ -823,6 +849,7 @@ impl App {
     }
     fn job_entry_changed(&mut self, entry: &pb::JobEntry) {
         self.jobs.remember(entry);
+        self.person_entry_changed(entry);
         let id = worker::entry_id(entry);
         if let Some(list) = self.jobs.list.as_mut() {
             for row in &mut list.entries {
@@ -900,7 +927,9 @@ impl App {
                     viewer.phase = Phase::Failed(text);
                 }
             }
-            Command::Cancel { .. } => {
+            Command::Cancel { job, kill, .. } => {
+                // A stop that did not reach the service can be repeated.
+                self.person_stop_unconfirmed(*job, *kill);
                 self.notice = if failure == Failure::Unconfirmed {
                     "Cancel outcome unconfirmed; repeating /job cancel is safe".into()
                 } else {
@@ -1330,10 +1359,14 @@ impl App {
     /// A TUI-launched backend with live jobs asks before exit.
     pub(super) fn jobs_exit_line(&self) -> Option<String> {
         let owned = self.view.service.as_ref().is_some_and(|s| s.owned);
-        if !owned || self.jobs.supported != Some(true) {
-            return None;
+        let jobs = (owned && self.jobs.supported == Some(true))
+            .then(|| worker::exit_line(self.jobs.live_in_service))
+            .flatten();
+        // Queued and running commands stop with a TUI-launched backend (PC5).
+        match (jobs, self.person_exit_line()) {
+            (Some(jobs), Some(commands)) => Some(format!("{jobs}\n{commands}")),
+            (jobs, commands) => jobs.or(commands),
         }
-        worker::exit_line(self.jobs.live_in_service)
     }
     fn row(&self, entry: &pb::JobEntry, all: bool, width: usize, now: u64) -> String {
         let id = worker::entry_id(entry)

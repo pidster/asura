@@ -49,6 +49,8 @@ impl App {
             && self.response_selection.is_none()
             && !self.history_focus
             && self.focus == Focus::Editor
+            // In command and outside mode `?` is shell text.
+            && !self.mode.command()
             && self.editor.at_start()
     }
 
