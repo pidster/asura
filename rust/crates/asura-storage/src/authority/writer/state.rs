@@ -633,8 +633,26 @@ impl State {
     fn input_view(&mut self, input: Id, full: bool) -> Result<InputView> {
         let state = self.state()?.clone();
         let entry = state.inputs.get(&input).ok_or(Error::Invalid)?;
-        let Record::InputQueued(mut value) = self.record(entry.frame)? else {
-            return Err(Error::RepairRequired);
+        let (mut value, person) = match self.record(entry.frame)? {
+            Record::InputQueued(value) if entry.person.is_none() => (value, None),
+            // A person command: the lane facts of its kind 31, with no
+            // prompt or dispatch request; the command is in `person`.
+            Record::PersonCommandQueued(p) if entry.person.is_some() => (
+                InputQueued {
+                    request: p.request,
+                    digest: p.digest,
+                    input: p.input,
+                    dispatch_request: [0; 16],
+                    project: p.project,
+                    conversation: p.conversation,
+                    expected_generation: p.expected_generation,
+                    new_conversation: p.new_conversation,
+                    prompt: String::new(),
+                    order_revision: p.order_revision,
+                },
+                Some(p),
+            ),
+            _ => return Err(Error::RepairRequired),
         };
         // The record retains the enqueue digest and prompt. Scheduling fields
         // change only through a durable promotion record.
@@ -647,6 +665,7 @@ impl State {
         }
         Ok(InputView {
             input: value,
+            person,
             kind: entry.kind,
             target_operation: (entry.kind == InputKind::Steer).then_some(entry.target_operation),
             target_generation: entry.target_generation,
@@ -714,6 +733,7 @@ impl State {
         };
         match self.record(queued)? {
             Record::InputQueued(value) => Ok(value.project),
+            Record::PersonCommandQueued(value) => Ok(value.project),
             _ => Err(Error::RepairRequired),
         }
     }
@@ -1258,6 +1278,56 @@ impl State {
                     prompt,
                     order_revision: revision,
                 }))?;
+                held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
+                let input = match self.state()?.requests.get(&request).map(|r| &r.result) {
+                    Some(Outcome::QueueInput { input, .. }) => *input,
+                    _ => return Err(Error::RepairRequired),
+                };
+                return self.project_queue_reply(project, Some(input));
+            }
+            Command::QueuePersonCommand { mut command } => {
+                let digest = request_digest(Request::QueuePersonCommand(command.request()))
+                    .map_err(|_| Error::Invalid)?;
+                if let Some(prior) =
+                    self.read(|state, store| state.outcome(command.request, store))?
+                {
+                    return match prior.result {
+                        Outcome::QueueInput {
+                            input,
+                            order_revision,
+                            ..
+                        } if prior.digest == digest && prior.kind == 31 => {
+                            let project = self.input_project(input)?;
+                            let mut reply = self.project_queue_reply(project, Some(input))?;
+                            reply.order_revision = Some(order_revision);
+                            Ok(reply)
+                        }
+                        _ => Err(Error::Conflict),
+                    };
+                }
+                let project = command.project;
+                self.find_project(project)?;
+                if !command.new_conversation {
+                    let found = self.read(|state, store| {
+                        state.find_conversation(command.conversation, store)
+                    })?;
+                    if !found.is_some_and(|c| {
+                        c.project == project && command.expected_generation <= c.generation
+                    }) {
+                        return Err(Error::Conflict);
+                    }
+                }
+                let held = self.project(project)?;
+                held.validate().map_err(|_| Error::StaleProject)?;
+                command.digest = digest;
+                command.order_revision = self
+                    .state()?
+                    .order_revision
+                    .checked_add(1)
+                    .ok_or(Error::Limit)?;
+                command.validate().map_err(|_| Error::Invalid)?;
+                let request = command.request;
+                self.append(Record::PersonCommandQueued(command))?;
                 held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
                 let input = match self.state()?.requests.get(&request).map(|r| &r.result) {
                     Some(Outcome::QueueInput { input, .. }) => *input,
@@ -2003,7 +2073,8 @@ impl State {
     }
 }
 /// The `PayloadFacts` job form: `call` is the job ID, `operation` the model
-/// origin's operation, `intent_sequence` the kind 26 sequence, `settled`
+/// origin's operation or the person origin's input (the payload owner
+/// reference), `intent_sequence` the kind 26 sequence, `settled`
 /// the kind 28 capture facts and the pin and delete state. An unsettled job
 /// is `active`.
 fn job_fact(
@@ -2015,9 +2086,9 @@ fn job_fact(
     settled: Option<Settlement>,
     retention: JobRetentionSummary,
 ) -> Result<PayloadFact> {
-    // Person origin replays only after P2.
-    let JobOrigin::Model { operation, .. } = origin else {
-        return Err(Error::RepairRequired);
+    let operation = match origin {
+        JobOrigin::Model { operation, .. } => operation,
+        JobOrigin::Person { input } => input,
     };
     Ok(PayloadFact {
         payload,

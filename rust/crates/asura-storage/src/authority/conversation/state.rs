@@ -77,6 +77,21 @@ pub(crate) struct Delta {
     pub(crate) entries: BTreeMap<Key, Value>,
 }
 
+/// The lane facts shared by kinds 18 and 31.
+struct Enqueued {
+    request: Id,
+    digest: Hash,
+    input: Id,
+    /// Kind 18 only; a person input dispatches through its kind 26.
+    dispatch_request: Option<Id>,
+    project: Id,
+    conversation: Id,
+    expected_generation: u64,
+    new_conversation: bool,
+    order_revision: u64,
+    person: Option<PersonInput>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Replay {
     pub installation_id: Id,
@@ -612,6 +627,11 @@ impl Replay {
                 conversation: p.conversation,
                 order_revision: p.order_revision,
             },
+            Record::PersonCommandQueued(p) => Outcome::QueueInput {
+                input: p.input,
+                conversation: p.conversation,
+                order_revision: p.order_revision,
+            },
             Record::InputReordered(p) => Outcome::ReorderInput {
                 input: p.input,
                 order_revision: p.order_revision,
@@ -864,6 +884,18 @@ impl Replay {
     }
     pub fn input_status(&self, id: Id) -> Option<InputStatus> {
         let input = self.inputs.get(&id)?;
+        // A person input runs from its kind 26 until its kind 28; the kind
+        // 28 outcome settles it (person-command-mode.md, queue states).
+        if let Some(person) = &input.person {
+            match (person.job, person.outcome) {
+                (_, Some(JobOutcome::Exited | JobOutcome::Signalled)) => {
+                    return Some(InputStatus::Complete);
+                }
+                (_, Some(_)) => return Some(InputStatus::Failed),
+                (Some(_), None) => return Some(InputStatus::Running),
+                (None, None) => {}
+            }
+        }
         if input.dispatched.is_some() {
             return Some(match input.dispatched_terminal {
                 None => InputStatus::Running,
@@ -908,7 +940,22 @@ impl Replay {
             Some(InputStatus::Queued | InputStatus::Held | InputStatus::Running)
         )
     }
+    /// Whether a dispatch of the input is accepted by replay: a `Queued`
+    /// lane head (PR2). An earlier `Queued` or `Held` input of the lane
+    /// blocks it, and so does a running model turn of the lane. A running
+    /// person job does not, because a released `!!` job may still be live
+    /// (PR4, OD2); the service holds the lane until settlement otherwise.
     pub fn input_ready(&self, id: Id) -> bool {
+        self.lane_ready(id, None)
+    }
+    /// The service's dispatch condition: [`Self::input_ready`], and no
+    /// earlier person job of the lane is running unless `released` holds
+    /// its input (a `!!` job released by `ShellExited`, OD2, in memory
+    /// only).
+    pub fn input_ready_with(&self, id: Id, released: &BTreeSet<Id>) -> bool {
+        self.lane_ready(id, Some(released))
+    }
+    fn lane_ready(&self, id: Id, released: Option<&BTreeSet<Id>>) -> bool {
         let Some(input) = self.inputs.get(&id) else {
             return false;
         };
@@ -921,16 +968,36 @@ impl Replay {
         !self.inputs.values().any(|prior| {
             prior.conversation == input.conversation
                 && prior.request != id
-                && self.unresolved(prior.request)
-                && prior.order_position < input.order_position
+                && match self.input_status(prior.request) {
+                    Some(InputStatus::Queued | InputStatus::Held) => {
+                        prior.order_position < input.order_position
+                    }
+                    Some(InputStatus::Running) => match released {
+                        _ if prior.person.is_none() => true,
+                        None => false,
+                        Some(released) => !released.contains(&prior.request),
+                    },
+                    _ => false,
+                }
         })
     }
+    /// The next message input to start a turn, or `None` while a turn is
+    /// active. A person command at a lane head blocks its lane here; it is
+    /// dispatched through [`Self::ready_person_inputs`].
     pub fn ready_input(&self) -> Option<Id> {
+        self.ready_input_with(&BTreeSet::new())
+    }
+    /// [`Self::ready_input`] with the inputs of released `!!` jobs (OD2).
+    pub fn ready_input_with(&self, released: &BTreeSet<Id>) -> Option<Id> {
         if self.active_operation.is_some() {
             return None;
         }
         let mut lanes: BTreeMap<Id, (&QueuedInput, u64)> = BTreeMap::new();
-        for input in self.inputs.values().filter(|q| self.input_ready(q.request)) {
+        for input in self
+            .inputs
+            .values()
+            .filter(|q| q.kind != InputKind::Person && self.input_ready_with(q.request, released))
+        {
             let lane_sequence = self
                 .inputs
                 .values()
@@ -958,6 +1025,34 @@ impl Replay {
         });
         let pick = position.map_or(0, |index| (index + 1) % lanes.len());
         lanes.get(pick).map(|(input, _)| input.request)
+    }
+    /// The person commands that the service may dispatch now, oldest lane
+    /// first: each is a `Queued` lane head under
+    /// [`Self::input_ready_with`], and its conversation has no active turn.
+    /// At most one per lane, so at most [`MAX_INPUTS`].
+    pub fn ready_person_inputs(&self, released: &BTreeSet<Id>) -> Vec<Id> {
+        let busy = self.active().map(|(_, op)| op.conversation);
+        let mut ready: Vec<(u64, Id)> = self
+            .inputs
+            .values()
+            .filter(|q| {
+                q.kind == InputKind::Person
+                    && busy != Some(q.conversation)
+                    && self.input_ready_with(q.request, released)
+            })
+            .map(|q| {
+                let lane = self
+                    .inputs
+                    .values()
+                    .filter(|other| other.conversation == q.conversation)
+                    .map(|other| other.sequence)
+                    .min()
+                    .unwrap_or(q.sequence);
+                (lane, q.request)
+            })
+            .collect();
+        ready.sort_unstable();
+        ready.into_iter().map(|(_, id)| id).collect()
     }
     pub fn steering_input(&self, operation: Id) -> Option<Id> {
         self.inputs
@@ -1112,8 +1207,13 @@ impl Replay {
             Record::OwnerGeneration => {
                 require(generation == next(self.owner_generation)?)?;
                 self.owner_generation = generation;
+                // MQ07R, PR6: an undispatched input is held under the new
+                // owner; a person input is dispatched by its kind 26.
                 for input in self.inputs.values_mut() {
-                    if input.dispatched.is_none() && !input.dropped {
+                    if input.dispatched.is_none()
+                        && !input.dropped
+                        && input.person.is_none_or(|p| p.job.is_none())
+                    {
                         input.held = true;
                         input.resumed = false;
                     }
@@ -1227,6 +1327,9 @@ impl Replay {
                 self.record_activity(p.project, None, sequence);
             }
             Record::InputQueued(p) => self.enqueue(p, generation, kind, frame, index)?,
+            Record::PersonCommandQueued(p) => {
+                self.enqueue_person(*p, generation, kind, frame, index)?
+            }
             Record::InputReordered(p) => self.reorder_input(p, kind, frame, index)?,
             Record::InputPromoted(p) => {
                 require(
@@ -1839,14 +1942,7 @@ impl Replay {
         frame: Locator,
         index: &mut dyn Index,
     ) -> Result<()> {
-        require(self.binding.is_some() && self.load_project(p.project, index)?)?;
-        require(
-            p.input != [0; 16]
-                && p.input != p.request
-                && p.input != p.dispatch_request
-                && p.dispatch_request != p.request,
-        )?;
-        require(p.order_revision == next(self.order_revision)?)?;
+        require(p.input != p.dispatch_request && p.dispatch_request != p.request)?;
         let original = if p.new_conversation {
             None
         } else {
@@ -1862,6 +1958,73 @@ impl Replay {
                     prompt: &p.prompt,
                 })?,
         )?;
+        self.enqueue_entry(
+            Enqueued {
+                request: p.request,
+                digest: p.digest,
+                input: p.input,
+                dispatch_request: Some(p.dispatch_request),
+                project: p.project,
+                conversation: p.conversation,
+                expected_generation: p.expected_generation,
+                new_conversation: p.new_conversation,
+                order_revision: p.order_revision,
+                person: None,
+            },
+            owner,
+            kind,
+            frame,
+            index,
+        )
+    }
+    /// Kind 31 under PR1: the kind 18 rules for request, input,
+    /// conversation, generation and order revision, after the record's own
+    /// field rules. A person input has no dispatch request; its dispatch is
+    /// its job's kind 26.
+    fn enqueue_person(
+        &mut self,
+        p: PersonCommandQueued,
+        owner: u64,
+        kind: u16,
+        frame: Locator,
+        index: &mut dyn Index,
+    ) -> Result<()> {
+        p.validate()?;
+        self.enqueue_entry(
+            Enqueued {
+                request: p.request,
+                digest: p.digest,
+                input: p.input,
+                dispatch_request: None,
+                project: p.project,
+                conversation: p.conversation,
+                expected_generation: p.expected_generation,
+                new_conversation: p.new_conversation,
+                order_revision: p.order_revision,
+                person: Some(PersonInput {
+                    outside_sandbox: p.outside_sandbox,
+                    job: None,
+                    outcome: None,
+                }),
+            },
+            owner,
+            kind,
+            frame,
+            index,
+        )
+    }
+    /// The lane entry of a kind 18 or kind 31, after its digest check.
+    fn enqueue_entry(
+        &mut self,
+        p: Enqueued,
+        owner: u64,
+        kind: u16,
+        frame: Locator,
+        index: &mut dyn Index,
+    ) -> Result<()> {
+        require(self.binding.is_some() && self.load_project(p.project, index)?)?;
+        require(p.input != [0; 16] && p.input != p.request)?;
+        require(p.order_revision == next(self.order_revision)?)?;
         if p.new_conversation {
             require(p.expected_generation == 0)?;
             self.fresh(p.conversation, index)?;
@@ -1893,16 +2056,21 @@ impl Replay {
         {
             return Err(ReplayError::Limit);
         }
-        require(
-            !self.inputs.contains_key(&p.input)
-                && self
-                    .get(&Key::new(Tag::Request, p.dispatch_request, 0), index)?
+        require(!self.inputs.contains_key(&p.input))?;
+        if let Some(dispatch) = p.dispatch_request {
+            require(
+                self.get(&Key::new(Tag::Request, dispatch, 0), index)?
                     .is_none(),
-        )?;
+            )?;
+        }
         self.fresh(p.input, index)?;
-        self.fresh(p.dispatch_request, index)?;
+        if let Some(dispatch) = p.dispatch_request {
+            self.fresh(dispatch, index)?;
+        }
         self.generate(p.input, Generated::Input, frame)?;
-        self.generate(p.dispatch_request, Generated::Dispatch, frame)?;
+        if let Some(dispatch) = p.dispatch_request {
+            self.generate(dispatch, Generated::Dispatch, frame)?;
+        }
         if p.new_conversation {
             self.create_conversation(p.conversation, p.project, frame)?;
         }
@@ -1931,12 +2099,16 @@ impl Replay {
             p.input,
             QueuedInput {
                 request: p.input,
-                dispatch_request: p.dispatch_request,
+                dispatch_request: p.dispatch_request.unwrap_or([0; 16]),
                 project: p.project,
                 conversation: p.conversation,
                 target_operation: [0; 16],
                 target_generation: p.expected_generation,
-                kind: InputKind::Queue,
+                kind: if p.person.is_some() {
+                    InputKind::Person
+                } else {
+                    InputKind::Queue
+                },
                 frame,
                 sequence: frame.sequence,
                 owner_generation: owner,
@@ -1949,6 +2121,7 @@ impl Replay {
                 dispatched_terminal: None,
                 target_terminal: None,
                 settled: None,
+                person: p.person,
             },
         );
         self.order_revision = p.order_revision;
@@ -2169,22 +2342,30 @@ impl Replay {
         frame: Locator,
         index: &mut dyn Index,
     ) -> Result<UnsettledJob> {
-        // JR2: person origin waits for kind PCQ (P2).
-        let JobOrigin::Model { operation, .. } = p.origin else {
-            return Err(ReplayError::Corrupt);
-        };
-        let conversation = match self.operations.get(&operation) {
-            Some(op) => op.conversation,
-            None => {
-                self.operation_facts(operation, index)?
+        let (conversation, project) = match p.origin {
+            JobOrigin::Model { operation, .. } => {
+                let conversation = match self.operations.get(&operation) {
+                    Some(op) => op.conversation,
+                    None => {
+                        self.operation_facts(operation, index)?
+                            .ok_or(ReplayError::Corrupt)?
+                            .conversation
+                    }
+                };
+                let project = self
+                    .find_conversation(conversation, index)?
                     .ok_or(ReplayError::Corrupt)?
-                    .conversation
+                    .project;
+                (conversation, project)
+            }
+            // PR2: the input's kind 31 names both. An unsettled person job's
+            // input is unresolved, so it is in the live state.
+            JobOrigin::Person { input } => {
+                let q = self.inputs.get(&input).ok_or(ReplayError::Corrupt)?;
+                require(q.person.is_some())?;
+                (q.conversation, q.project)
             }
         };
-        let project = self
-            .find_conversation(conversation, index)?
-            .ok_or(ReplayError::Corrupt)?
-            .project;
         let job = job_id(&p.origin);
         Ok(UnsettledJob {
             job,
@@ -2199,7 +2380,7 @@ impl Replay {
             payloads: job_payload_ids(self.installation_id, job),
         })
     }
-    /// Kind 26 under JR1 to JR5 and JR9.
+    /// Kind 26 under JR1 to JR5 and JR9, and PR2 to PR4 for person origin.
     fn job_intent(
         &mut self,
         p: JobIntent,
@@ -2208,13 +2389,15 @@ impl Replay {
         index: &mut dyn Index,
     ) -> Result<()> {
         p.validate()?;
-        let JobOrigin::Model {
-            operation,
-            generation,
-            ordinal,
-        } = p.origin
-        else {
-            return Err(ReplayError::Corrupt);
+        let (operation, generation, ordinal) = match p.origin {
+            JobOrigin::Model {
+                operation,
+                generation,
+                ordinal,
+            } => (operation, generation, ordinal),
+            JobOrigin::Person { input } => {
+                return self.person_job_intent(p, input, owner, frame, index);
+            }
         };
         // JR1: the active operation's last kind 14, a `run` exec_cmd with no
         // kind 29 or 26, in a nonterminal operation of this generation.
@@ -2252,6 +2435,56 @@ impl Replay {
         self.active_activity(frame.sequence);
         Ok(())
     }
+    /// A person-origin kind 26 (PR2 to PR4): it names a kind 31 input that
+    /// is a `Queued` lane head, not dropped and without an earlier kind 26.
+    /// The profile derives from the input's outside flag (PR3). The order
+    /// revision advances on dispatch.
+    fn person_job_intent(
+        &mut self,
+        p: JobIntent,
+        input: Id,
+        owner: u64,
+        frame: Locator,
+        index: &mut dyn Index,
+    ) -> Result<()> {
+        let q = self.inputs.get(&input).ok_or(ReplayError::Corrupt)?;
+        let person = q.person.ok_or(ReplayError::Corrupt)?;
+        require(person.job.is_none() && !q.dropped && self.input_ready(input))?;
+        let job = self.derive_job(&p, owner, frame, index)?;
+        // JR5.
+        require(
+            !self.jobs.contains_key(&job.job)
+                && self.get(&Key::new(Tag::Job, job.job, 0), index)?.is_none(),
+        )?;
+        // JR9.
+        if self.jobs.len() >= MAX_UNSETTLED_JOBS {
+            return Err(ReplayError::Limit);
+        }
+        let (project, conversation) = (job.project, job.conversation);
+        self.jobs.insert(job.job, job);
+        let q = self.inputs.get_mut(&input).ok_or(ReplayError::Corrupt)?;
+        if let Some(person) = q.person.as_mut() {
+            person.job = Some(frame);
+        }
+        self.order_revision = next(self.order_revision)?;
+        self.last_dispatched_lane = Some(conversation);
+        self.record_activity(project, Some(conversation), frame.sequence);
+        Ok(())
+    }
+    /// The outside flag of a person job's input (PR3); `None` for a model
+    /// job. An unsettled person job's input is in the live state.
+    fn person_outside(&self, job: &UnsettledJob) -> Result<Option<bool>> {
+        match job.origin {
+            JobOrigin::Model { .. } => Ok(None),
+            JobOrigin::Person { input } => Ok(Some(
+                self.inputs
+                    .get(&input)
+                    .and_then(|q| q.person)
+                    .ok_or(ReplayError::Corrupt)?
+                    .outside_sandbox,
+            )),
+        }
+    }
     /// Kind 27 under JR6 and JR8.
     fn job_cancel(&mut self, p: JobCancelRequested, owner: u64, frame: Locator) -> Result<()> {
         p.validate()?;
@@ -2278,13 +2511,23 @@ impl Replay {
         } else {
             owner == job.owner_generation
         })?;
-        // Reason 20 is the `!!` switch of a person job (profile
-        // `person-outside-1`); a model job never records it.
+        // PR3: reason 20 is the `!!` switch at slot grant and capture
+        // reason 7 a cancel after a `!!` shell exited; both need profile
+        // `person-outside-1`, derived from kind 31 field 7 bit 1.
+        let outside = self.person_outside(job)? == Some(true);
         require(
-            p.reason != JobReason::OutsideSandboxOff
-                || matches!(job.origin, JobOrigin::Person { .. }),
+            outside
+                || (p.reason != JobReason::OutsideSandboxOff
+                    && p.capture_reason != CaptureReason::ClosedAfterCancel),
         )?;
         let job = self.jobs.remove(&p.job).ok_or(ReplayError::Corrupt)?;
+        if let JobOrigin::Person { input } = job.origin {
+            let q = self.inputs.get_mut(&input).ok_or(ReplayError::Corrupt)?;
+            let person = q.person.as_mut().ok_or(ReplayError::Corrupt)?;
+            require(person.job == Some(job.intent) && person.outcome.is_none())?;
+            person.outcome = Some(p.outcome);
+            self.settle_input(input, frame.sequence)?;
+        }
         let cancel = job.cancel.map_or(Locator::NONE, |c| c.frame);
         self.emit(
             Key::new(Tag::Job, job.job, 0),
@@ -2355,6 +2598,15 @@ impl Replay {
         };
         p.validate()?;
         let mut job = self.derive_job(&p, owner, intent, index)?;
+        // A person job's input names this kind 26 (PR2).
+        if let JobOrigin::Person { input } = p.origin {
+            require(
+                self.inputs
+                    .get(&input)
+                    .and_then(|q| q.person)
+                    .is_some_and(|person| person.job == Some(intent) && person.outcome.is_none()),
+            )?;
+        }
         if !cancel.is_none() {
             let (cancel_owner, Record::JobCancelRequested(c)) = index.frame_owner(&cancel)? else {
                 return Err(ReplayError::Corrupt);
@@ -2472,7 +2724,7 @@ impl Replay {
         &self,
         job: Id,
         index: &mut dyn Index,
-    ) -> Result<Option<(JobListing, Box<ToolCall>)>> {
+    ) -> Result<Option<(JobListing, JobCommand)>> {
         let (conversation, intent_frame, cancel_frame, settled_frame) =
             match self.job_state(job, index)? {
                 None => return Ok(None),
@@ -2508,18 +2760,32 @@ impl Replay {
                 _ => return Err(ReplayError::Corrupt),
             }
         };
-        // The command source: the model call's kind 14. A person job's
-        // kind 31 arrives with P2; replay rejects person origin until then.
-        let command = match intent.origin {
+        // The command source: the model call's kind 14, or the person
+        // input's kind 31. One frame read either way.
+        let (command, source) = match intent.origin {
             JobOrigin::Model {
                 operation, ordinal, ..
-            } => self.call_frame(operation, ordinal, index)?,
-            JobOrigin::Person { .. } => return Err(ReplayError::Corrupt),
+            } => {
+                let command = self.call_frame(operation, ordinal, index)?;
+                let Record::ToolCall(call) = index.frame(&command)? else {
+                    return Err(ReplayError::Corrupt);
+                };
+                (command, JobCommand::Model(call))
+            }
+            JobOrigin::Person { input } => {
+                let command = self.input_frame(input, index)?;
+                match index.frame(&command)? {
+                    Record::PersonCommandQueued(p)
+                        if p.input == input && p.conversation == conversation =>
+                    {
+                        (command, JobCommand::Person(p))
+                    }
+                    _ => return Err(ReplayError::Corrupt),
+                }
+            }
         };
-        let Record::ToolCall(call) = index.frame(&command)? else {
-            return Err(ReplayError::Corrupt);
-        };
-        let excerpt = exec_cmd_command(&call)
+        let excerpt = source
+            .command()
             .map(|text| command_excerpt(&text))
             .unwrap_or_default();
         let listing = JobListing {
@@ -2537,7 +2803,18 @@ impl Replay {
             excerpt,
             retention: self.job_retention_summary(job, index)?,
         };
-        Ok(Some((listing, call)))
+        Ok(Some((listing, source)))
+    }
+    /// The enqueue frame of an input: the live state's entry, or the
+    /// `queued` locator of its `I` entry once settled.
+    fn input_frame(&self, input: Id, index: &mut dyn Index) -> Result<Locator> {
+        if let Some(q) = self.inputs.get(&input) {
+            return Ok(q.frame);
+        }
+        match self.entry(&Key::new(Tag::Input, input, 0), index)? {
+            Some(Entry::Input { queued, .. }) => Ok(queued),
+            _ => Err(ReplayError::Corrupt),
+        }
     }
     /// Whether a job of the scope has its kind 26 at exactly `sequence`, in
     /// the live state, the delta or the runs: the `Jobs` cursor check
@@ -2621,8 +2898,8 @@ impl Replay {
         }
         Ok(out)
     }
-    /// One job's listing, its kind 14 and its kind 30 records in order (at
-    /// most 64).
+    /// One job's listing, its kind 14 or kind 31 and its kind 30 records in
+    /// order (at most 64).
     pub fn job_records(&self, job: Id, index: &mut dyn Index) -> Result<Option<JobRecords>> {
         let Some((listing, command)) = self.job_listing_call(job, index)? else {
             return Ok(None);
@@ -2717,7 +2994,7 @@ impl Replay {
         through: u64,
         limit: usize,
         index: &mut dyn Index,
-    ) -> Result<Vec<(JobListing, Box<ToolCall>)>> {
+    ) -> Result<Vec<(JobListing, JobCommand)>> {
         if after >= through {
             return Ok(Vec::new());
         }

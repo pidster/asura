@@ -84,6 +84,15 @@ pub enum Command {
         new_conversation: bool,
         prompt: String,
     },
+    /// Kind 31 (P2): queue one person command. The caller fills every
+    /// field except the digest and the order revision, which the writer
+    /// computes; it chooses the input ID, and for a new conversation the
+    /// conversation ID, because the secret store item binds both before
+    /// the append. An exact retry of `request` returns the original input;
+    /// changed fields under the same request are `Conflict`.
+    QueuePersonCommand {
+        command: Box<PersonCommandQueued>,
+    },
     ReorderInput {
         request: Id,
         input: Id,
@@ -145,8 +154,8 @@ pub enum Command {
         before: Option<u64>,
         limit: usize,
     },
-    /// One job's records, its kind 14, its kind 30 records and its model
-    /// note texts (J4).
+    /// One job's records, its kind 14 or kind 31, its kind 30 records and
+    /// its model note texts (J4).
     JobFacts {
         job: Id,
     },
@@ -261,7 +270,7 @@ pub struct PayloadFact {
     pub payload: Id,
     /// The job ID.
     pub call: Id,
-    /// The model origin's operation.
+    /// The model origin's operation, or the person origin's input.
     pub operation: Id,
     pub payloads: [Id; 2],
     /// The kind 26 sequence.
@@ -356,8 +365,12 @@ pub struct HistoryEntry {
 }
 #[derive(Debug)]
 pub struct InputView {
-    /// The durable kind 18 record; the prompt is a bounded excerpt unless full.
+    /// The durable kind 18 record; the prompt is a bounded excerpt unless
+    /// full. For a person command, the lane fields of its kind 31 with an
+    /// empty prompt and a zero dispatch request.
     pub input: InputQueued,
+    /// The kind 31 of a person command (`kind` is `Person`).
+    pub person: Option<Box<PersonCommandQueued>>,
     /// Queue, or Steer after a durable promotion.
     pub kind: InputKind,
     /// The promotion target; present only for Steer.
@@ -667,6 +680,12 @@ impl WriterClient {
             {
                 return Err(Error::Invalid);
             }
+            Command::QueuePersonCommand { command }
+                if command.request == [0; 16]
+                    || request_digest(Request::QueuePersonCommand(command.request())).is_err() =>
+            {
+                return Err(Error::Invalid);
+            }
             Command::Prepare { prompt, .. } if prompt.is_empty() || prompt.len() > MAX_PROMPT => {
                 return Err(Error::Invalid);
             }
@@ -720,6 +739,7 @@ impl WriterClient {
                 | Command::Register { .. }
                 | Command::RenameProject { .. }
                 | Command::QueueInput { .. }
+                | Command::QueuePersonCommand { .. }
                 | Command::ReorderInput { .. }
                 | Command::InputDecision { .. }
                 | Command::PromoteInput { .. }

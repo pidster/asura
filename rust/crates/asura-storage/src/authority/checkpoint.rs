@@ -238,6 +238,15 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
             w.byte(cause as u8);
         }
         option_u64(&mut w, q.settled);
+        // A person input (kind 3): its kind 26 and kind 28 outcome. The
+        // outside flag is rebuilt from its kind 31 frame.
+        if let Some(person) = &q.person {
+            require(q.kind == InputKind::Person)?;
+            option_locator(&mut w, person.job.as_ref());
+            w.byte(person.outcome.map_or(0, |o| o as u8));
+        } else {
+            require(q.kind != InputKind::Person)?;
+        }
     }
     w.u64(state.order_revision);
     w.optional(state.last_dispatched_lane);
@@ -255,6 +264,39 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
     w.bytes(COMMIT);
     require(w.0.len() <= MAX_CHECKPOINT)?;
     Ok(w.0)
+}
+
+/// A checkpoint's person input: its stored job facts, and the outside flag
+/// rebuilt from its kind 31 frame, which must name the same input, project
+/// and conversation.
+fn person_input(
+    mut input: QueuedInput,
+    r: &mut Reader<'_>,
+    index: &mut dyn Index,
+) -> Result<QueuedInput> {
+    let job = read_option_locator(r)?;
+    let outcome = match r.byte()? {
+        0 => None,
+        code => Some(JobOutcome::from_code(code).ok_or(ReplayError::Corrupt)?),
+    };
+    let Record::PersonCommandQueued(p) = index.frame(&input.frame)? else {
+        return Err(ReplayError::Corrupt);
+    };
+    require(
+        p.input == input.request
+            && p.project == input.project
+            && p.conversation == input.conversation
+            && input.dispatch_request == [0; 16]
+            && input.dispatched.is_none()
+            && input.promoted.is_none()
+            && (job.is_some() || outcome.is_none()),
+    )?;
+    input.person = Some(PersonInput {
+        outside_sandbox: p.outside_sandbox,
+        job,
+        outcome,
+    });
+    Ok(input)
 }
 
 /// Decodes and checks a checkpoint's bytes. `frames` rebuilds the active
@@ -515,6 +557,7 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
             kind: match r.byte()? {
                 1 => InputKind::Queue,
                 2 => InputKind::Steer,
+                3 => InputKind::Person,
                 _ => return Err(ReplayError::Corrupt),
             },
             frame: read_locator(&mut r)?,
@@ -543,6 +586,12 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
                 None
             },
             settled: read_option_u64(&mut r)?,
+            person: None,
+        };
+        let input = if input.kind == InputKind::Person {
+            person_input(input, &mut r, index)?
+        } else {
+            input
         };
         require(state.inputs.last_key_value().is_none_or(|(k, _)| *k < id))?;
         state.inputs.insert(id, input);

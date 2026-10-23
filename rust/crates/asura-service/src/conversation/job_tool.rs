@@ -516,8 +516,8 @@ impl JobCall {
         let known = Known {
             origin: records.listing.intent.origin,
             sequence: records.listing.intent_frame.sequence,
-            command: journal::exec_cmd_command(&records.command).unwrap_or_default(),
-            whole_command: records.command.whole_command,
+            command: records.command.command().unwrap_or_default(),
+            whole_command: records.command.whole_command(),
             settled: records.listing.settled.clone(),
             retention: records.listing.retention,
         };

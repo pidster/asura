@@ -1594,9 +1594,10 @@ fn notice_jobs(notice: &JobNotice) -> Vec<(Id, u32)> {
             let JobOrigin::Model { ordinal, .. } = s.listing.intent.origin else {
                 panic!("model origin")
             };
-            assert_eq!(s.command.ordinal, ordinal);
+            let call = s.command.model().expect("model command");
+            assert_eq!(call.ordinal, ordinal);
             assert!(s.listing.settled.is_some());
-            (s.listing.job, s.command.ordinal)
+            (s.listing.job, call.ordinal)
         })
         .collect()
 }
@@ -1862,4 +1863,170 @@ fn j5t_10_notice_read_reads_four_frames_per_settlement() {
     );
     let through = h.state().sequence;
     count(&mut h, 0, through);
+}
+
+/// A kind 31 `!` command (`!!` with `outside`) in the harness journal.
+fn person31(
+    h: &mut Harness,
+    project: Id,
+    conversation: Id,
+    new_conversation: bool,
+    outside: bool,
+) -> (Record, Id) {
+    let request = h.fresh();
+    let input = h.fresh();
+    let mut p = PersonCommandQueued {
+        request,
+        digest: [0; 32],
+        input,
+        project,
+        conversation,
+        expected_generation: 0,
+        new_conversation,
+        outside_sandbox: outside,
+        command: "cargo test".into(),
+        display_command: String::new(),
+        cwd: "crates".into(),
+        search_path: if outside { "" } else { "/usr/bin" }.into(),
+        environment: vec![],
+        order_revision: h.state().order_revision + 1,
+        number_kinds: vec![],
+        unnumbered: 0,
+        command_cut: false,
+        whole_command: false,
+        rule_set_revision: 1,
+        rule_set_digest: [9; 32],
+        fallback: None,
+    };
+    p.digest = request_digest(Request::QueuePersonCommand(p.request())).unwrap();
+    (Record::PersonCommandQueued(Box::new(p)), input)
+}
+fn person_intent(input: Id) -> Record {
+    Record::JobIntent(JobIntent {
+        origin: JobOrigin::Person { input },
+        agent: 0,
+        time: 1_760_000_000_000,
+    })
+}
+
+/// P2 (unit): kind 31 inputs and person jobs through the real append path,
+/// rolls and a checkpoint. The checkpoint lists each person input with its
+/// kind 31 locator and rebuilds the outside flag from that frame; a
+/// settled input's `I` entry and its job's `W`, `L` and `U` entries reach
+/// the runs; the reopened state equals a genesis replay.
+#[test]
+fn p2_kind_31_checkpoint_and_index_entries() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let lane = h.fresh();
+    let (first, a) = person31(&mut h, project, lane, true, false);
+    h.append(first).unwrap();
+    let (second, b) = person31(&mut h, project, lane, false, true);
+    h.append(second).unwrap();
+    h.append(person_intent(a)).unwrap();
+    let job_a = job_id(&JobOrigin::Person { input: a });
+    let job_b = job_id(&JobOrigin::Person { input: b });
+    h.append(exited(job_a)).unwrap();
+    h.append(person_intent(b)).unwrap();
+    let (third, c) = person31(&mut h, project, lane, false, false);
+    h.append(third).unwrap();
+    // A restart: `c` is held (PR6); `b` keeps running until `interrupted`.
+    h.append(Record::OwnerGeneration).unwrap();
+    assert_eq!(h.state().input_status(a), Some(InputStatus::Complete));
+    assert_eq!(h.state().input_status(b), Some(InputStatus::Running));
+    assert_eq!(h.state().input_status(c), Some(InputStatus::Held));
+    // Force rolls in another project.
+    let other = h.register(2);
+    let (_, operation, generation) = h.start(other, None);
+    for n in 0..150u64 {
+        h.segment(operation, generation, n * 61_440, &"p".repeat(61_440))
+            .unwrap();
+    }
+    assert!(!h.journal.runs().is_empty());
+    let files = h.files();
+    let replayed = genesis(&files);
+    assert_eq!(canonical(&replayed), canonical(h.state()));
+    let mut reopened = open(files.clone(), false).unwrap();
+    assert_eq!(canonical(reopened.state()), canonical(&replayed));
+    {
+        let (state, mut store) = reopened.store();
+        assert!(state.base > 0);
+        assert_eq!(state.input_status(b), Some(InputStatus::Running));
+        assert_eq!(state.input_status(c), Some(InputStatus::Held));
+        let person = state.inputs[&b].person.unwrap();
+        assert!(person.outside_sandbox);
+        assert_eq!(person.job, Some(unsettled(&state)[0].intent));
+        assert_eq!(unsettled(&state)[0].job, job_b);
+        // The settled job and input are answered from the runs.
+        assert!(state.delta_tag(Tag::Job).is_empty());
+        let Some(Entry::Input { status, queued, .. }) = state
+            .entry(&Key::new(Tag::Input, a, 0), &mut store)
+            .unwrap()
+        else {
+            panic!("I entry of the settled person input");
+        };
+        assert_eq!(status, input_status_code(InputStatus::Complete));
+        let records = state.job_records(job_a, &mut store).unwrap().unwrap();
+        assert_eq!(records.listing.command, queued);
+        assert_eq!(records.listing.excerpt, "cargo test");
+        assert_eq!(records.command.person().unwrap().cwd, "crates");
+        // Once the settled input leaves the live state, its `I` entry names
+        // the kind 31.
+        let mut evicted: Replay = (*state).clone();
+        evicted.inputs.remove(&a);
+        let again = evicted.job_records(job_a, &mut store).unwrap().unwrap();
+        assert_eq!(again.listing, records.listing);
+        assert_eq!(again.command, records.command);
+        assert!(matches!(
+            state.job_state(job_a, &mut store).unwrap(),
+            Some(JobState::Settled(SettledJob { origin: 2, .. }))
+        ));
+        let listed = state
+            .jobs(JobScope::Conversation(lane), None, 9, &mut store)
+            .unwrap();
+        assert_eq!(
+            listed.iter().map(|l| l.job).collect::<Vec<_>>(),
+            vec![job_b, job_a]
+        );
+        let notice = state.job_notice(lane, 0, &mut store).unwrap();
+        assert_eq!((notice.settlements.len(), notice.live), (1, 1));
+        assert!(notice.settlements[0].command.person().is_some());
+        // The request outcome of a kind 31 decodes from its frame.
+        let (Record::PersonCommandQueued(p), _) = (store.frame(&queued).unwrap(), ()) else {
+            panic!("kind 31");
+        };
+        assert_eq!(
+            state
+                .outcome(p.request, &mut store)
+                .unwrap()
+                .map(|r| r.result),
+            Some(Outcome::QueueInput {
+                input: a,
+                conversation: lane,
+                order_revision: 1,
+            })
+        );
+    }
+    // A checkpoint whose person input names a frame that is not its kind
+    // 31 is corrupt.
+    let mut damaged: Replay = (**reopened.state()).clone();
+    damaged.clear_delta();
+    let wrong = damaged.inputs[&b].frame;
+    damaged.inputs.get_mut(&c).unwrap().frame = wrong;
+    let census = checkpoint::Census {
+        segments: 0,
+        holding: 0,
+        bytes: 0,
+    };
+    let bytes = checkpoint::encode(&damaged, &census, &[]).unwrap();
+    let (_, mut store) = reopened.store();
+    assert_eq!(
+        checkpoint::decode(&bytes, &mut store).unwrap_err(),
+        ReplayError::Corrupt
+    );
+    // The restart settles the running `!!` job `interrupted`.
+    let mut writer = open(files, true).unwrap();
+    let transition = id(0xfeed);
+    writer.append(interrupted(job_b), transition).unwrap();
+    assert_eq!(writer.state().input_status(b), Some(InputStatus::Failed));
 }

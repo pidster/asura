@@ -568,6 +568,7 @@ fn capture_reason_text(reason: CaptureReason) -> &'static str {
         CaptureReason::DetectorFault => "secret detection failed",
         CaptureReason::DiscardedAfterCancel => "output after the cancel was discarded",
         CaptureReason::SettlementUnconfirmed => "capture settlement not confirmed",
+        CaptureReason::ClosedAfterCancel => "output capture stopped after the shell exited",
     }
 }
 

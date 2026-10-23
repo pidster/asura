@@ -4026,7 +4026,10 @@ fn j4t_03_listing_entries_and_reads_over_live_state_and_delta() {
     assert!(jobs(JobScope::Project(id(99)), None, 9, &mut index).is_empty());
     // `JobFacts`: the kind 14 and the kind 30 records in order.
     let records = state.job_records(job(1), &mut index).unwrap().unwrap();
-    assert_eq!(records.command.tool_operation, Some(ToolOperation::ExecCmd));
+    assert_eq!(
+        records.command.model().and_then(|c| c.tool_operation),
+        Some(ToolOperation::ExecCmd)
+    );
     assert_eq!(
         records
             .retention
@@ -4451,4 +4454,574 @@ fn j5t_03_notice_live_replay_bound() {
             assert_eq!(result.unwrap_err(), ReplayError::Corrupt, "{live}");
         }
     }
+}
+
+// ----- P2 kind 31 person commands: PR1 to PR6 (person-command-mode.md). -----
+
+/// A kind 31 `!` command (or `!!` with `outside`) in conversation
+/// `conversation` of project 6; a new conversation with `new_conversation`.
+fn pcq(
+    request: u64,
+    input: u64,
+    conversation: u64,
+    new_conversation: bool,
+    revision: u64,
+    outside: bool,
+) -> PersonCommandQueued {
+    let mut p = PersonCommandQueued {
+        request: id(request),
+        digest: [0; 32],
+        input: id(input),
+        project: id(6),
+        conversation: id(conversation),
+        expected_generation: 0,
+        new_conversation,
+        outside_sandbox: outside,
+        command: format!("echo person {request}\nsecond line"),
+        display_command: String::new(),
+        cwd: ".".into(),
+        search_path: if outside {
+            String::new()
+        } else {
+            "/usr/bin:/bin".into()
+        },
+        environment: if outside {
+            vec![]
+        } else {
+            vec![(ClientVariable::LcAll, "C".into())]
+        },
+        order_revision: revision,
+        number_kinds: vec![],
+        unnumbered: 0,
+        command_cut: false,
+        whole_command: false,
+        rule_set_revision: 1,
+        rule_set_digest: RULE_SET_DIGEST,
+        fallback: None,
+    };
+    p.digest = request_digest(Request::QueuePersonCommand(p.request())).unwrap();
+    p
+}
+fn r31(p: PersonCommandQueued) -> Record {
+    Record::PersonCommandQueued(Box::new(p))
+}
+fn person_job(input: u64) -> Id {
+    job_id(&JobOrigin::Person { input: id(input) })
+}
+fn r26p(input: u64) -> Record {
+    r26_for(JobOrigin::Person { input: id(input) })
+}
+fn r28p(input: u64) -> Record {
+    r28_for(person_job(input))
+}
+/// A `!!` settlement after a cancel closed the capture (OD2).
+fn closed28(input: u64) -> Record {
+    let mut s = settled28(person_job(input));
+    s.reason = JobReason::PersonStop;
+    s.capture_state = JobCaptureState::Incomplete;
+    s.capture_reason = CaptureReason::ClosedAfterCancel;
+    s.escapees = 1;
+    s.stdout.capture.eof = false;
+    Record::JobSettled(Box::new(s))
+}
+/// A not-started settlement with reason 20 `outside_sandbox_off`.
+fn switch_off28(input: u64) -> Record {
+    Record::JobSettled(Box::new(JobSettled {
+        outcome: JobOutcome::NotStarted,
+        reason: JobReason::OutsideSandboxOff,
+        exit_kind: 0,
+        exit_value: 0,
+        cleanup: JobCleanup::None,
+        elapsed_ms: 0,
+        capture_state: JobCaptureState::NotStarted,
+        stdout: JobStream::default(),
+        stderr: JobStream::default(),
+        final_reservation: 0,
+        ..settled28(person_job(input))
+    }))
+}
+/// The kind 21 that dispatches the kind 18 `q` in its existing lane.
+fn dispatch_turn(q: &InputQueued, generation: u64) -> Record {
+    let mut t = turn();
+    t.request = q.dispatch_request;
+    t.original_conversation = Some(q.conversation);
+    t.expected_generation = generation - 1;
+    t.conversation = q.conversation;
+    t.generation = generation;
+    t.prompt = q.prompt.clone();
+    t.task = id(900 + generation);
+    t.operation = id(910 + generation);
+    t.digest = request_digest(Request::Submit {
+        project: q.project,
+        conversation: Some(q.conversation),
+        expected_generation: t.expected_generation,
+        prompt: &t.prompt,
+    })
+    .unwrap();
+    Record::TurnAccepted(Box::new(t))
+}
+fn base_with(records: impl IntoIterator<Item = Record>) -> Journal {
+    let mut j = Journal::base();
+    for record in records {
+        j.append(record);
+    }
+    j
+}
+
+/// PC-U21: a person command queues, dispatches through its kind 26 and
+/// settles through its kind 28; replay derives the input states, the job
+/// facts and the request outcome.
+#[test]
+fn pc_u21_person_command_queues_dispatches_and_settles() {
+    let first = pcq(40, 41, 43, true, 1, false);
+    let journal = base_with([r31(first.clone())]);
+    let state = inspect(&journal.bytes).unwrap();
+    let q = &state.inputs[&id(41)];
+    assert_eq!(q.kind, InputKind::Person);
+    assert_eq!(q.dispatch_request, [0; 16]);
+    assert_eq!(
+        q.person,
+        Some(PersonInput {
+            outside_sandbox: false,
+            job: None,
+            outcome: None,
+        })
+    );
+    assert_eq!(state.conversations[&id(43)].generation, 0);
+    assert_eq!(state.input_status(id(41)), Some(InputStatus::Queued));
+    assert_eq!(state.order_revision, 1);
+    assert_eq!(
+        state.requests[&id(40)].result,
+        Outcome::QueueInput {
+            input: id(41),
+            conversation: id(43),
+            order_revision: 1,
+        }
+    );
+    assert_eq!(state.requests[&id(40)].kind, 31);
+    // A person head is dispatched as a job, never as a turn.
+    assert_eq!(state.ready_input(), None);
+    assert_eq!(state.ready_person_inputs(&Default::default()), vec![id(41)]);
+    assert!(state.input_ready(id(41)));
+
+    let journal = base_with([r31(first.clone()), r26p(41)]);
+    let state = inspect(&journal.bytes).unwrap();
+    assert_eq!(state.input_status(id(41)), Some(InputStatus::Running));
+    assert_eq!(state.order_revision, 2, "dispatch advances the order");
+    assert_eq!(state.last_dispatched_lane, Some(id(43)));
+    let jobs = state.unsettled_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job, person_job(41));
+    assert_eq!(jobs[0].origin, JobOrigin::Person { input: id(41) });
+    assert_eq!((jobs[0].conversation, jobs[0].project), (id(43), id(6)));
+    assert_eq!(jobs[0].payloads, job_payload_ids(id(1), person_job(41)));
+    assert_eq!(
+        state.inputs[&id(41)].person.unwrap().job,
+        Some(jobs[0].intent)
+    );
+    assert!(state.ready_person_inputs(&Default::default()).is_empty());
+
+    for (settlement, status) in [
+        (r28p(41), InputStatus::Complete),
+        (
+            Record::JobSettled(Box::new(JobSettled::interrupted(person_job(41), 5))),
+            InputStatus::Failed,
+        ),
+    ] {
+        let interrupted =
+            matches!(&settlement, Record::JobSettled(s) if s.outcome == JobOutcome::Interrupted);
+        let mut journal = base_with([r31(first.clone()), r26p(41)]);
+        if interrupted {
+            journal.append(Record::OwnerGeneration);
+        }
+        journal.append(settlement);
+        let state = inspect(&journal.bytes).unwrap();
+        assert_eq!(state.input_status(id(41)), Some(status));
+        assert!(state.jobs.is_empty());
+        let entry = state
+            .delta_entries()
+            .into_iter()
+            .find(|(k, _)| k.tag == Tag::Input && k.id == id(41))
+            .map(|(_, v)| Entry::decode(Tag::Input, &v).unwrap());
+        let Some(Entry::Input {
+            status: code,
+            queued,
+            ..
+        }) = entry
+        else {
+            panic!("settled input entry");
+        };
+        assert_eq!(code, input_status_code(status));
+        assert_eq!(queued, state.inputs[&id(41)].frame);
+        let job = state.job_state(
+            person_job(41),
+            &mut MemoryIndex {
+                segments: std::collections::BTreeMap::from([(1, &journal.bytes[..])]),
+            },
+        );
+        assert!(matches!(
+            job,
+            Ok(Some(JobState::Settled(SettledJob { origin: 2, .. })))
+        ));
+    }
+    // A `!!` command in an existing lane derives the outside flag.
+    let outside = pcq(44, 45, 43, false, 2, true);
+    let journal = base_with([r31(first), r31(outside)]);
+    let state = inspect(&journal.bytes).unwrap();
+    assert!(state.inputs[&id(45)].person.unwrap().outside_sandbox);
+    assert_eq!(state.inputs[&id(45)].order_position, 2);
+}
+
+/// PC-U21: each invalid order rejects the stream; a later dispatch after a
+/// person job's kind 26 without its kind 28 is accepted (PR4, OD2).
+#[test]
+fn pc_u21_replay_rules_pr1_to_pr6() {
+    let head = pcq(40, 41, 43, true, 1, false);
+    let second = pcq(44, 45, 43, false, 2, false);
+    let message = queued(46, 47, 48, 43, false, 2);
+    // PR2: a person-origin kind 26 needs a kind 31 input.
+    expect_rule(
+        "PR2 kind 26 without kind 31",
+        base_with([r31(head.clone()), r26p(41)]),
+        base_with([r31(head.clone()), r26p(99)]),
+    );
+    expect_rule(
+        "PR2 kind 26 for a kind 18 input",
+        base_with([r31(head.clone()), r26p(41)]),
+        base_with([
+            Record::InputQueued(queued(40, 41, 42, 43, true, 1)),
+            r26p(41),
+        ]),
+    );
+    // PR2: not dropped.
+    expect_rule(
+        "PR2 dropped input",
+        base_with([
+            r31(head.clone()),
+            decision(50, 41, InputAction::Hold),
+            decision(51, 41, InputAction::Resume),
+            r26p(41),
+        ]),
+        base_with([
+            r31(head.clone()),
+            decision(50, 41, InputAction::Hold),
+            decision(51, 41, InputAction::Drop),
+            r26p(41),
+        ]),
+    );
+    // PR2: the lane head, and not held.
+    expect_rule(
+        "PR2 non-head input",
+        base_with([r31(head.clone()), r31(second.clone()), r26p(41)]),
+        base_with([r31(head.clone()), r31(second.clone()), r26p(45)]),
+    );
+    expect_rule(
+        "PR2 held input",
+        base_with([r31(head.clone()), r26p(41)]),
+        base_with([
+            r31(head.clone()),
+            decision(50, 41, InputAction::Hold),
+            r26p(41),
+        ]),
+    );
+    // PR2, JR5: no earlier kind 26.
+    expect_rule(
+        "PR2 second kind 26",
+        base_with([r31(head.clone()), r26p(41), r28p(41)]),
+        base_with([r31(head.clone()), r26p(41), r26p(41)]),
+    );
+    expect_rule(
+        "PR2 kind 26 after settlement",
+        base_with([r31(head.clone()), r26p(41), r28p(41)]),
+        base_with([r31(head.clone()), r26p(41), r28p(41), r26p(41)]),
+    );
+    // PR4: a later dispatch of the lane needs every earlier person input
+    // to have a kind 26 or a Drop.
+    expect_rule(
+        "PR4 turn before the person head's kind 26",
+        base_with([
+            r31(head.clone()),
+            Record::InputQueued(message.clone()),
+            r26p(41),
+            dispatch_turn(&message, 1),
+        ]),
+        base_with([
+            r31(head.clone()),
+            Record::InputQueued(message.clone()),
+            dispatch_turn(&message, 1),
+        ]),
+    );
+    expect_rule(
+        "PR4 person dispatch before the head's kind 26",
+        base_with([r31(head.clone()), r31(second.clone()), r26p(41), r26p(45)]),
+        base_with([r31(head.clone()), r31(second.clone()), r26p(45), r26p(41)]),
+    );
+    expect_rule(
+        "PR4 a dropped head releases the lane",
+        base_with([
+            r31(head.clone()),
+            r31(second.clone()),
+            decision(50, 41, InputAction::Hold),
+            decision(51, 41, InputAction::Drop),
+            r26p(45),
+        ]),
+        base_with([
+            r31(head.clone()),
+            r31(second.clone()),
+            decision(50, 41, InputAction::Hold),
+            r26p(45),
+        ]),
+    );
+    // PR4 accepts a later dispatch after a kind 26 with no kind 28: a
+    // released `!!` job may still be live (OD2).
+    let live = base_with([
+        r31(head.clone()),
+        r31(second.clone()),
+        Record::InputQueued(queued(46, 47, 48, 43, false, 3)),
+        r26p(41),
+        r26p(45),
+        dispatch_turn(&queued(46, 47, 48, 43, false, 3), 1),
+    ]);
+    let state = inspect(&live.bytes).unwrap();
+    assert_eq!(state.unsettled_jobs().len(), 2);
+    assert_eq!(state.input_status(id(41)), Some(InputStatus::Running));
+    assert_eq!(state.input_status(id(47)), Some(InputStatus::Running));
+    // PR4: a running model turn of the lane blocks a person dispatch.
+    expect_rule(
+        "PR4 person dispatch during the lane's turn",
+        base_with([
+            Record::InputQueued(queued(40, 41, 42, 43, true, 1)),
+            r31(pcq(44, 45, 43, false, 2, false)),
+            dispatch_turn(&queued(40, 41, 42, 43, true, 1), 1),
+        ]),
+        base_with([
+            Record::InputQueued(queued(40, 41, 42, 43, true, 1)),
+            r31(pcq(44, 45, 43, false, 2, false)),
+            dispatch_turn(&queued(40, 41, 42, 43, true, 1), 1),
+            r26p(45),
+        ]),
+    );
+    // PR5: Drop (and every decision) only before the kind 26.
+    for action in [InputAction::Drop, InputAction::Hold, InputAction::Resume] {
+        expect_rule(
+            "PR5 decision after kind 26",
+            base_with([r31(head.clone()), r26p(41)]),
+            base_with([r31(head.clone()), r26p(41), decision(50, 41, action)]),
+        );
+    }
+    // A person input never steers.
+    let mut promoted = Journal::started();
+    promoted.append(r31(pcq(40, 41, 8, false, 1, false)));
+    let state = inspect(&promoted.bytes).unwrap();
+    assert!(!state.can_promote_input(id(41), id(10), 1));
+    // PR6: undispatched after a restart is held; Resume makes it eligible.
+    let restarted = base_with([r31(head.clone()), Record::OwnerGeneration]);
+    let state = inspect(&restarted.bytes).unwrap();
+    assert_eq!(state.input_status(id(41)), Some(InputStatus::Held));
+    assert!(state.ready_person_inputs(&Default::default()).is_empty());
+    expect_rule(
+        "PR6 held after restart",
+        base_with([
+            r31(head.clone()),
+            Record::OwnerGeneration,
+            decision(50, 41, InputAction::Resume),
+            r26p(41),
+        ]),
+        base_with([r31(head.clone()), Record::OwnerGeneration, r26p(41)]),
+    );
+    // A dispatched person input stays running across a restart until its
+    // `interrupted` kind 28; a same-generation settlement is refused (JR7).
+    let journal = base_with([r31(head.clone()), r26p(41), Record::OwnerGeneration]);
+    let state = inspect(&journal.bytes).unwrap();
+    assert_eq!(state.input_status(id(41)), Some(InputStatus::Running));
+    expect_rule(
+        "JR7 person settlement after restart",
+        base_with([
+            r31(head.clone()),
+            r26p(41),
+            Record::OwnerGeneration,
+            Record::JobSettled(Box::new(JobSettled::interrupted(person_job(41), 1))),
+        ]),
+        base_with([
+            r31(head.clone()),
+            r26p(41),
+            Record::OwnerGeneration,
+            r28p(41),
+        ]),
+    );
+    // PR1: the kind 18 rules for request, input, conversation, generation
+    // and order revision.
+    let mut gap = pcq(40, 41, 43, true, 2, false);
+    gap.order_revision = 2;
+    let mut stale = pcq(44, 45, 43, false, 2, false);
+    stale.expected_generation = 1;
+    stale.digest = request_digest(Request::QueuePersonCommand(stale.request())).unwrap();
+    let mut unknown = pcq(44, 45, 77, false, 2, false);
+    unknown.digest = request_digest(Request::QueuePersonCommand(unknown.request())).unwrap();
+    let reused_request = pcq(40, 45, 43, false, 2, false);
+    let reused_input = pcq(44, 41, 43, false, 2, false);
+    let reused_conversation = pcq(44, 45, 43, true, 2, false);
+    for (name, broken) in [
+        ("PR1 order revision gap", gap),
+        ("PR1 generation above the conversation", stale),
+        ("PR1 unknown conversation", unknown),
+        ("PR1 reused request", reused_request),
+        ("PR1 reused input", reused_input),
+        ("PR1 reused conversation ID", reused_conversation),
+    ] {
+        expect_rule(
+            name,
+            base_with([r31(head.clone()), r31(second.clone())]),
+            base_with([r31(head.clone()), r31(broken)]),
+        );
+    }
+    // Person commands count toward the 16 unresolved inputs.
+    let mut full = Journal::base();
+    full.append(r31(pcq(100, 101, 43, true, 1, false)));
+    for n in 1..MAX_INPUTS as u64 {
+        full.append(r31(pcq(100 + 2 * n, 101 + 2 * n, 43, false, n + 1, false)));
+    }
+    assert!(inspect(&full.bytes).is_ok());
+    full.append(r31(pcq(200, 201, 43, false, MAX_INPUTS as u64 + 1, false)));
+    assert_eq!(inspect(&full.bytes).unwrap_err(), ReplayError::Limit);
+}
+
+/// PC-U42 and PR3: the profile derives from kind 31 field 7 bit 1. Reason 20
+/// and capture reason 7 need `person-outside-1`; a `!` job or a model job
+/// recording either rejects the stream.
+#[test]
+fn pc_u42_profile_follows_the_outside_flag() {
+    let plain = pcq(40, 41, 43, true, 1, false);
+    let outside = pcq(40, 41, 43, true, 1, true);
+    expect_rule(
+        "PR3 reason 20 on a person-1 job",
+        base_with([r31(outside.clone()), r26p(41), switch_off28(41)]),
+        base_with([r31(plain.clone()), r26p(41), switch_off28(41)]),
+    );
+    expect_rule(
+        "PR3 capture reason 7 on a person-1 job",
+        base_with([
+            r31(outside.clone()),
+            r26p(41),
+            r27_for(person_job(41), JobReason::PersonStop),
+            closed28(41),
+        ]),
+        base_with([
+            r31(plain.clone()),
+            r26p(41),
+            r27_for(person_job(41), JobReason::PersonStop),
+            closed28(41),
+        ]),
+    );
+    let state = inspect(&base_with([r31(outside), r26p(41), switch_off28(41)]).bytes).unwrap();
+    assert_eq!(state.input_status(id(41)), Some(InputStatus::Failed));
+    // A model job never records capture reason 7.
+    let mut model = settled28(job(1));
+    model.reason = JobReason::ModelCancel;
+    model.capture_state = JobCaptureState::Incomplete;
+    model.capture_reason = CaptureReason::ClosedAfterCancel;
+    model.stdout.capture.eof = false;
+    expect_rule(
+        "PR3 capture reason 7 on a model job",
+        started_with(with(live_job(), [r28(1)])),
+        started_with(with(live_job(), [Record::JobSettled(Box::new(model))])),
+    );
+}
+
+/// The service's lane rule: a running person job blocks its lane until it
+/// settles, unless the service released its `!!` job (OD2); replay accepts
+/// either (PR4).
+#[test]
+fn pc_u21_lane_readiness_and_released_jobs() {
+    let journal = base_with([
+        r31(pcq(40, 41, 43, true, 1, true)),
+        Record::InputQueued(queued(46, 47, 48, 43, false, 2)),
+        r31(pcq(49, 50, 43, false, 3, false)),
+        r26p(41),
+    ]);
+    let state = inspect(&journal.bytes).unwrap();
+    let none = std::collections::BTreeSet::new();
+    let released = std::collections::BTreeSet::from([id(41)]);
+    assert!(state.input_ready(id(47)), "replay accepts the dispatch");
+    assert!(!state.input_ready_with(id(47), &none));
+    assert_eq!(state.ready_input(), None);
+    assert!(state.input_ready_with(id(47), &released));
+    assert_eq!(state.ready_input_with(&released), Some(id(47)));
+    // The later person command waits behind the message.
+    assert!(!state.input_ready_with(id(50), &released));
+    assert!(state.ready_person_inputs(&released).is_empty());
+    // After the settlement the lane advances without the overlay.
+    let mut settled = journal;
+    settled.append(r28p(41));
+    let state = inspect(&settled.bytes).unwrap();
+    assert_eq!(state.ready_input(), Some(id(47)));
+    // While a model turn of the lane runs, no person head is ready.
+    settled.append(dispatch_turn(&queued(46, 47, 48, 43, false, 2), 1));
+    let state = inspect(&settled.bytes).unwrap();
+    assert!(state.ready_person_inputs(&none).is_empty());
+}
+
+/// Listings, `JobFacts` and the notice read a person job's command from
+/// its kind 31: the stored command, or the display text of a whole-command
+/// input; the excerpt is its first line.
+#[test]
+fn pc_u21_listing_and_job_facts_read_the_kind_31_source() {
+    let mut whole = pcq(44, 45, 43, false, 2, true);
+    whole.command = WHOLE_COMMAND.into();
+    whole.display_command = "deploy $ASURA_SECRET_1".into();
+    whole.number_kinds = vec![SecretKind::GithubToken];
+    whole.whole_command = true;
+    whole.fallback = Some(ExecCmdRefusal {
+        code: RefusalCode::SecretInHeredoc,
+        kind: None,
+        word: None,
+    });
+    whole.digest = request_digest(Request::QueuePersonCommand(whole.request())).unwrap();
+    let journal = base_with([
+        r31(pcq(40, 41, 43, true, 1, false)),
+        r31(whole.clone()),
+        r26p(41),
+        r28p(41),
+        r26p(45),
+    ]);
+    let state = inspect(&journal.bytes).unwrap();
+    let mut index = MemoryIndex {
+        segments: std::collections::BTreeMap::from([(1, &journal.bytes[..])]),
+    };
+    let settled = state
+        .job_records(person_job(41), &mut index)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.listing.command, state.inputs[&id(41)].frame);
+    assert_eq!(settled.listing.excerpt, "echo person 40…");
+    let JobCommand::Person(command) = &settled.command else {
+        panic!("person source");
+    };
+    assert_eq!((command.input, command.cwd.as_str()), (id(41), "."));
+    assert_eq!(
+        settled.command.command().as_deref(),
+        Some("echo person 40\nsecond line")
+    );
+    assert!(!settled.command.outside_sandbox() && settled.command.model().is_none());
+    assert!(settled.listing.settled.is_some());
+    let live = state
+        .job_records(person_job(45), &mut index)
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.listing.excerpt, "deploy $ASURA_SECRET_1");
+    assert!(live.command.outside_sandbox() && live.command.whole_command());
+    assert_eq!(live.command.person().unwrap().command, WHOLE_COMMAND);
+    let listed = state
+        .jobs(JobScope::Conversation(id(43)), None, 9, &mut index)
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|l| l.job).collect::<Vec<_>>(),
+        vec![person_job(45), person_job(41)]
+    );
+    assert!(listed.iter().all(|l| l.intent.origin.code() == 2));
+    let notice = state.job_notice(id(43), 0, &mut index).unwrap();
+    assert_eq!(notice.live, 1);
+    assert_eq!(notice.settlements.len(), 1);
+    assert_eq!(notice.settlements[0].listing.job, person_job(41));
+    assert!(matches!(&notice.settlements[0].command, JobCommand::Person(p) if p.input == id(41)));
 }

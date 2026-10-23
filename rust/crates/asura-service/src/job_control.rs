@@ -987,12 +987,12 @@ impl InspectWork {
         }
         let view = s.view(self.job);
         let records = &facts.records;
-        let command = journal::exec_cmd_command(&records.command).unwrap_or_default();
+        let command = records.command.command().unwrap_or_default();
         let cwd = s
             .ctx
             .projects
             .location(facts.project())
-            .zip(exec_cmd_cwd(&records.command))
+            .zip(records.command.model().and_then(exec_cmd_cwd))
             .and_then(|(location, cwd)| absolute_cwd(&location, &cwd));
         let notes = detail_notes(records);
         Next::Reply(Box::new(Body::JobDetail(pb::JobDetail {
