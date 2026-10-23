@@ -6038,6 +6038,38 @@ has neither kind. The composer revision is 2 from this change
   exact only at the sequence where the writer took it (J5-E8). The text uses no
   wall-clock time and no payload state, so it is stable across restarts.
 
+### Notices in later turns
+
+Selected (engineering, 2026-10-23, from P3-E2's PC-I13 finding; CCR15: "each
+later turn recomposes the entry from the journal"). A prior turn shown in a
+later turn's history carries the notice it had when it ran, so the model's
+history matches what it saw. The composer rebuilds it from records only: P is
+the previous kind 21's `notice_through` in the conversation (0 for the first),
+S and the live count are that turn's own kind 21 `notice_through` and
+`notice_live` (J5-E8), and the settlements are the same `(P, S]` read as at
+the binding point. Fidelity follows the prior turn:
+
+- A prior turn shown in full carries its notice at reference fidelity: each
+  entry as its one-line reference form, then the overflow and live lines. The
+  block keeps the context label and the quoted value form.
+- A prior turn shown as a reference, or omitted, carries no notice.
+- A notice with no entries and live count 0 adds nothing.
+
+Each rebuilt entry is a manifest segment of kind 5 at reference fidelity with
+the same source identity and digest as at its binding point; the summary is
+kind 6. Composer revision 3 marks this composition. A rebuilt notice is
+bounded by the same 8 entries per turn and counts toward the turn's history
+budget; when the history does not fit, the composer reduces the prior turn as
+for any history entry. Rebuilding reads at most 9 settlements per shown prior
+turn on the journal worker inside `Prepare`, with the prior turns' kind 21
+facts from the `T` entries; no history scan.
+
+Tests: J5T-11 (unit) a prior full turn rebuilds its notice at reference
+fidelity with the stored S and live count, a reference turn carries none, and
+revision 3 changes the manifest digest; J5T-12 (integration, PC-I13 later
+turn) a later turn's history holds both earlier inputs with their notices,
+before and after a restart.
+
 ### J5 failure handling
 
 | Case | Result |
