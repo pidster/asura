@@ -174,7 +174,7 @@ Selected mechanism.
 | Executable | Release signature | Hardened Runtime | Entitlements | Why |
 | --- | --- | --- | --- | --- |
 | `Asura.app` / `Contents/MacOS/asura` (CLI, TUI, service, guardian) | Developer ID Application, secure timestamp | Yes | `keychain-access-groups: [<TeamID>.com.pidster.asura]`, plus `com.apple.application-identifier` and `com.apple.developer.team-identifier` as the profile requires. Nothing else. | The secret store needs the access group (RS4). The process needs no JIT, no `DYLD_*`, no unsigned libraries and no debugger rights. The guardian calls `sandbox_check`, `proc_listpids`, `proc_pidinfo` and `sysctl(KERN_PROCARGS2)` on same-user processes; these need no entitlement (the escapee control probes ran unsigned). |
-| `Asura.app/Contents/MacOS/asura-model` | Developer ID Application, secure timestamp, identifier `com.pidster.asura.model` | Yes | If the HS probes pass (SGQ7): `com.apple.security.app-sandbox`, `com.apple.security.network.client`, and `com.apple.security.temporary-exception.files.home-relative-path.read-only` for `/.asura/data/models/` and `/.asura/run/`. If an HS probe fails: none. | See [helper App Sandbox](#helper-app-sandbox). An embedded `Info.plist` (`-sectcreate __TEXT __info_plist`) may be needed for a sandboxed bare executable (probe HS-P1). |
+| `Asura.app/Contents/MacOS/asura-model` | Developer ID Application, secure timestamp, identifier `com.pidster.asura.model` | Yes | If the HS probes pass (SGQ7): `com.apple.security.app-sandbox`, `com.apple.security.network.client`, and `com.apple.security.temporary-exception.files.home-relative-path.read-only` for `/.asura/data/models/` and `/.asura/run/`. If an HS probe fails: none. | See [helper App Sandbox](#helper-app-sandbox). An embedded `Info.plist` (`-sectcreate __TEXT __info_plist`, `CFBundleIdentifier` equal to the signing identifier) is required: without it a sandboxed bare executable traps at start in `_libsecinit_appsandbox` (HS-P1). It also gives the helper a stable identity in every build, so Core AI reuses one compiled-model cache instead of one per copy. |
 | `Asura.app/Contents/Resources/mlx.metallib` | Not code. Sealed by the bundle's `CodeResources` | — | — | Metal loads it as data. The service still checks its SHA-256 (RS9). |
 | `Asura.app/Contents/Resources/model-package.json` | Sealed by the bundle | — | — | Manifest |
 | `Asura.app/Contents/Resources/swift-transformers_Hub.bundle` | Nested bundle, signed before the helper and the outer bundle (BN1) | — | — | `Bundle.module` calls `fatalError` when it is absent ([BN1](#bn1-hub-resource-bundle-defect)) |
@@ -382,7 +382,7 @@ apps. A custom Seatbelt profile would have to list them and keep them current.
 
 | Need | Under the App Sandbox | Entitlement or mechanism | Probe |
 | --- | --- | --- | --- |
-| Start as a bare executable spawned by an unsandboxed parent | The helper is not a child of a sandboxed app, so it must not claim `inherit`. It sets up its own sandbox and container, keyed by its signing identifier. Apple does not document whether a bare executable without an app bundle can do this. | `app-sandbox`; an embedded `Info.plist` if needed | HS-P1 |
+| Start as a bare executable spawned by an unsandboxed parent | The helper is not a child of a sandboxed app, so it must not claim `inherit`. It sets up its own sandbox and container, keyed by its signing identifier. Apple does not document whether a bare executable without an app bundle can do this. | `app-sandbox`; an embedded `Info.plist` (required, HS-P1) | HS-P1 |
 | Private channel on FD 3, diagnostics on FD 1/2 | The parent passes the descriptors before exec. The sandbox checks access when a file is opened, so inherited descriptors should keep working. | None | HS-P1 |
 | Read its own executable, `mlx.metallib` and the Hub bundle in `~/.asura/run/model-<hex>/` | Outside the container | `temporary-exception.files.home-relative-path.read-only: /.asura/run/` | HS-P3 |
 | Read assets in `~/.asura/data/models/{coreai,mlx}/` | Outside the container | `temporary-exception.files.home-relative-path.read-only: /.asura/data/models/` | HS-P6 |
@@ -912,6 +912,41 @@ requires:
 | KC-P3 | Data-protection availability over SSH, and before first unlock | SSH session to the qualification Mac | Records the status codes | Owner |
 | KC-P4 | Status code inventory; no prompt on any call | Qualification bundle | [Status mapping](#status-mapping) confirmed or corrected | Owner |
 | NT-P1 | Notarise a zip of `Asura.app` with a sandboxed helper that claims temporary exceptions; staple; tar round trip; Homebrew install | Real release dry run to a private tap branch | Accepted; `stapler validate` passes after extraction; `codesign --verify --strict` passes in the keg; quarantine state recorded | Owner |
+
+### SG0 results (ad hoc part, 2026-10-23)
+
+Run on the macOS 27 host with ad hoc signing only, scratch homes, probe-only
+bundle IDs (`com.pidster.asura.probe.*`) and no Keychain call. The full record
+with commands, entitlement plists and output is kept with the session
+evidence; the results and their design effect are:
+
+| Probe | Result | Effect |
+| --- | --- | --- |
+| SB-P1 | `sandbox-exec` inside the App Sandbox: `sandbox_apply: Operation not permitted`, exit 71 | Confirms D-S1: the service is not App-Sandboxed (EC-V-NEST verified) |
+| SB-P2 | Inside the App Sandbox, `proc_listpids` and file-descriptor info are denied; bsdinfo, pidpath, `sandbox_check` and `KERN_PROCARGS2` (with environment) are allowed | EX5 escapee control would lose its process list inside the App Sandbox; recorded in D-S1 |
+| SB-P3 | A `/bin/sh` child of a sandboxed process is sandboxed; a dynamic sandbox extension (the mechanism behind bookmarks) is inherited by the child | Corrects the forum claim; D-S1 unchanged (`!!` still cannot run outside the sandbox) |
+| HS-P1 | A sandboxed bare helper starts from an unsandboxed parent, gets its container and FD 3, with no prompt, only with an embedded `Info.plist` | Embedded `Info.plist` required (SG1) |
+| HS-P2, HS-P4 | System provider and Core AI match the unsandboxed helper | Pass |
+| HS-P3 | MLX with the metallib works hardened and sandboxed; no `allow-jit` | Pass |
+| HS-P5 | Ollama works with `network.client`; without it `model_unavailable` | Pass |
+| HS-P6 | Read-only exceptions work, but the `--models` inventory fails: it opens `/` and walks each component with `openat`, and `private` and `Users` are denied | Fix in packet SG2: the inventory opens the asset root by its full path (or the service passes a directory descriptor); rerun HS-P6 before SGQ7 is decided for release |
+| HS-P7 | `~/.ssh` reads, writes and unix-socket connects are denied; children stay sandboxed; EX5 qualification passes with a sandboxed stand-in alive | Pass. Limit: the helper sandbox does not stop `KERN_PROCARGS2` reads of other same-user processes' arguments and environment (recorded under security, EX-H1) |
+| HR-P1 | A hardened guardian loads no `DYLD_INSERT_LIBRARIES` library; the unsigned control does | Pass at the dyld level; PC-I38-S runs with SG1 |
+| HR-P2 | dyld removes `DYLD_*` from a hardened process's own environment | Resolved: a hardened `asura` cannot pass `DYLD_*` on to `!!` |
+| BN-P1 | MLX and Core AI reach the Hub fallback and crash without the bundle; no crash with it | Defect confirmed; fixed by BN1 for MLX and Core AI |
+
+Test isolation (from HS-P6): home-relative exceptions anchor to the real
+account home, not `HOME` or the Asura home, so a sandboxed helper cannot read a
+harness home under `/private/tmp`. Tests of a sandboxed helper (SG-V5 and the
+HS end-to-end cases) sign a test variant with an absolute-path read-only
+exception for the harness home; release entitlements never carry it.
+
+Core AI cache (observed): Core AI keys its compiled-model cache by process
+identity. Unsigned helper copies with a new name per spawn each created a 2 to
+15 GB cache under `~/Library/Caches/coreai-cache/`, never reused (about 340 GB
+had collected; the owner approved deleting them on 2026-10-23). The embedded
+`Info.plist` identity (HS-P1) is the fix; packet SG2a delivers it for
+development builds before SG1.
 
 ## Validation
 
