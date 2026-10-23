@@ -1155,8 +1155,23 @@ on. Selected mechanism:
    (a trigger after the leader exited). The survivor is not killed; its next
    write to the closed pipe gets EPIPE or `SIGPIPE`. The TUI and the job
    viewer say so: `output capture stopped; 1 background process left running`.
+   Every trigger in this state closes capture, not only these three: a quota,
+   `ENOSPC` or capture-fault trigger also calls `close_capture` once, because
+   discarding would leave the job open while survivors write (P3-K,
+   2026-10-23). A trigger that arrives after kind 5 but before the reason 15
+   notice closes capture when that notice arrives.
+5a. **Stop before shell exit, then reason 15.** A person stop written while
+   the shell still ran ends with outcome `cancelled`. If the guardian then
+   reports reason 15, the controller closes capture as in step 5 so the
+   survivors cannot hold the job open, and records capture reason 5
+   `discarded_after_cancel`: capture reason 7 is valid only with outcome
+   `exited` or `signalled` (P2 codec and PR3).
 6. **Restart.** Pipes are lost with the service. Start-time recovery writes
-   kind 28 `interrupted`, as for any unsettled job.
+   kind 28 `interrupted`, as for any unsettled job. The owner calls the
+   controller's `recover_profiles(unsettled, outside)`, where `outside(input)`
+   reads field 7 bit 1 of the input's kind 31 from replay, so an interrupted
+   `!!` job's `job.settled` carries `outside_sandbox: true`; the flag has one
+   source, the kind 31 record.
 7. **Without an attributed holder.** A survivor that scrubbed its environment
    and left the group (the EXD-1 residual) is not attributed, so the guardian
    sends no reason 15. The lane then waits for capture EOF, as for any job.
@@ -2093,7 +2108,7 @@ reads or writes `~/.asura` or the login keychain.
 | P3-C Control contract and client | `contracts/control/v1/control.proto`; `asura-control/src/{lib,wire,conversation,jobs}.rs`; `asura-client/src/lib.rs` | J5 delivered | Field 68, capability 8, `LaunchVariable`, queue entry fields 16–20, `QueueWaitReason`, `QueueRefusal`, reply fields 9–10, history field 5, `JobEntry` fields 28–29, `ServiceObservation` field 8; PC-U41, PC-U49, PC-U55 |
 | P3-K Controller | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | P2, P2-G | `Profile::Person1` and `PersonOutside1`, switch check at slot grant, reason 20, `ShellExited`, released `Draining`, `close_capture` on cancel; PC-U23, PC-U43 (controller part), PC-U53 |
 | P3-T Slot and capture workers | `asura-service/src/exec_cmd_worker.rs`; `asura-service/src/exec_cmd_worker/tests.rs`; `asura-service/src/capture_worker.rs`; `asura-service/tests/capture_worker.rs` | P1, P3-K | Person start with the FD 11 writer and root resolution, kind 2 reasons 14 and 15 to slot events, `SlotPort::close_capture`, capture reason 7; PC-I33 to PC-I35 at the worker layer |
-| P3-E Service integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (new `person_command.rs`); the `ReadRecord` kind list in `asura-storage/src/authority/writer/mod.rs` (add kind 31 if P3-E reads it); `asura-service/src/{lib,audit,config_worker,service_observer,test_support}.rs`; `asura-service/tests/person_command_flow.rs` (new) | SS1-S, P1, P2, P2-G, P3-C, P3-K, P3-T, SL7 | Submit validation, SL5 rewrite at submit, item put, get and delete, kind 31 append, dispatch with person grant, overlay and lane release, waiting reasons, refusals, audit emission, observer field 8; PC-U26, PC-U27, PC-U54, PC-U56, PC-U57; PC-I1 to PC-I39 except the TUI parts; SS-I1 to SS-I11; SDI-10; EC-I9, EC-I10 through the service |
+| P3-E Service integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (new `person_command.rs`); `asura-service/src/job_control.rs` and `job_control/tests.rs` (`JobEntry` fields 28 and 29 and `outside_sandbox` from the new `JobView` fields `profile`, `shell_exited` and `left_running`); the `ReadRecord` kind list in `asura-storage/src/authority/writer/mod.rs` (add kind 31 if P3-E reads it); `asura-service/src/{lib,audit,config_worker,service_observer,test_support}.rs`; `asura-service/tests/person_command_flow.rs` (new) | SS1-S, P1, P2, P2-G, P3-C, P3-K, P3-T, SL7 | Submit validation, SL5 rewrite at submit, item put, get and delete, kind 31 append, dispatch with person grant, overlay and lane release, waiting reasons, refusals, audit emission, observer field 8; PC-U26, PC-U27, PC-U54, PC-U56, PC-U57; PC-I1 to PC-I39 except the TUI parts; SS-I1 to SS-I11; SDI-10; EC-I9, EC-I10 through the service |
 | P4 TUI | `asura-cli/src/tui/{ui,mod,config,jobs,queue,observation,conversation,editor}.rs` (`editor.rs`: read-only cursor and selection byte accessors for the command view; `queue.rs`: the serial queue sender's `Request::Command`; `observation.rs`: `ServiceObservation` field 8 to the status details; `conversation.rs`: person entries restored from history field 5); `asura-cli/src/tui/ui/*.rs`; `asura-cli/tests/tui_pty.py` (person journeys) | P3-C; P3-E for the PTY journeys | Three composer modes, splitter display, staging, refusal texts, Ctrl-C routing, log fold, released-job status, recall, `/help`, the `/status` secret store notices ([secret store operations](secret-store.md#operations-and-audit)); PC-U1 to PC-U19, PC-U28 to PC-U40, PC-U44, PC-U59; PC-E1 to PC-E20 with a fixture service until Q |
 | P5 Execution path guard | The [execution path guard packets](execution-path-guard.md#packets) EPG-S, EPG-W, EPG-P and EPG-T | P3-E, P4 | PCR18; PC-E21 |
 | Q Qualification | No code paths; evidence in this design | P1 to P5 | Every PC-E, SS-E, EC-E2 and EC-E4 case on the macOS 27 host; the CLI lifecycle gate; the PTY journeys; the threat model mapping; then capability 8 is advertised |
