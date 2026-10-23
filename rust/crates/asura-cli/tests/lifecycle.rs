@@ -448,6 +448,7 @@ fn terminal_regressions() -> Result<()> {
         Some("--person-model"),
         Some("--person-restart"),
         Some("--person-secrets"),
+        Some("--path-guard"),
     ] {
         let mut command = Command::new("python3");
         command.arg(&script).arg(std::env::current_exe()?);

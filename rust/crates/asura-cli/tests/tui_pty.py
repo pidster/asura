@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production TUI journeys using only an isolated CLI fixture executable.
 
-Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets]
+Usage: python3 tui_pty.py target/debug/deps/lifecycle-HASH [--conversation|--setup|--queue-reorder|--state-isolation|--help-mode|--waiting-steps|--queue-steer|--thinking|--jobs|--job-viewer|--job-retention|--execution-setting|--job-notices|--person-commands|--person-outside|--person-model|--person-restart|--person-secrets|--path-guard]
 The job journeys (--jobs, --job-viewer, --job-retention, --execution-setting)
 need a service that lists CAPABILITY_JOBS; they run after packet J34-E.
 --job-notices needs the J5 job notice; it runs after packet J5-E.
@@ -4805,6 +4805,220 @@ def person_secrets_journey(fixture, source):
         harness.close()
 
 
+def entry_rows(trial, header, wanted, limit=30):
+    """Waits until the newest log entry whose stripe starts with `header`
+    shows a row containing `wanted`; returns that entry's rows (stripe
+    first, to the next blank row)."""
+    end = time.monotonic() + remaining(limit)
+    while True:
+        rows = [row.strip() for row in trial.screen.text().splitlines()]
+        starts = [i for i, row in enumerate(rows) if row.startswith(header)]
+        if starts:
+            below = rows[starts[-1]:]
+            below = below[:below.index("")] if "" in below else below
+            if any(wanted in row for row in below):
+                return below
+        if time.monotonic() >= end and os.environ.get("ASURA_TUI_SCREEN"):
+            print(trial.screen.text(), file=sys.stderr)
+        assert time.monotonic() < end, ("entry rows", header, wanted, trial.screen.text())
+        trial.read(0.025)
+        assert trial.process.poll() is None, trial.screen.text()
+
+
+def paths_panel(trial, wanted=None, limit=20):
+    """Sends `/paths` until its panel shows `wanted` (a model change is
+    recorded after its job settles); returns the panel's joined text and
+    closes it."""
+    end = time.monotonic() + remaining(limit)
+    while True:
+        offset = len(trial.output)
+        trial.send(b"/paths\r")
+        trial.until(b"Approved paths", offset, plain=True, limit=10, reject="Commands are not enabled")
+        trial.idle(0.2)
+        joined = " ".join(row.strip() for row in trial.screen.text().splitlines())
+        trial.send(b"\x1b")
+        trial.idle(0.1)
+        if wanted is None or wanted in joined:
+            return joined
+        assert time.monotonic() < end, ("/paths", wanted, joined)
+        trial.idle(0.3)
+
+
+def paths_reply(trial, command, notice, wanted=()):
+    """Sends a `/paths` request and waits for its notice; returns the
+    refreshed panel text after checking it shows each of `wanted`."""
+    offset = len(trial.output)
+    trial.send(command.encode() + b"\r")
+    notice_until(trial, notice, offset, limit=15)
+    trial.idle(0.2)
+    joined = " ".join(row.strip() for row in trial.screen.text().splitlines())
+    for text in wanted:
+        assert text in joined, (command, text, joined)
+    trial.send(b"\x1b")
+    trial.idle(0.1)
+    return joined
+
+
+def model_edit(harness, trial, command, answer, path):
+    """A scripted model turn whose exec_cmd job edits a build file; waits
+    until `/paths` lists the model change (the kind 32 after the job)."""
+    harness.script[:] = [("exec_cmd", {"command": command}), answer]
+    trial.send(f"Edit {path}.\r".encode())
+    trial.until(answer.encode(), plain=True, limit=40, reject="Incomplete response")
+    paths_panel(trial, f"changed by the model since your last command: {path}")
+
+
+def log_focus(trial):
+    """Shift+Up twice: the queue (it holds the entry), then the log."""
+    trial.send(b"\x1b[1;2A")
+    trial.idle(0.2)
+    if "scroll history" not in trial.screen.text():
+        trial.send(b"\x1b[1;2A")
+        trial.idle(0.2)
+    assert "scroll history" in trial.screen.text(), trial.screen.text()
+
+
+def path_guard_journey(fixture, source):
+    """--path-guard (execution-path-guard.md, end to end): EPG-E3 (`/paths`
+    lists the not approved files; `/paths approve all`, `/paths revoke` and
+    `/paths approve PATH` reply with the refreshed list; an error keeps the
+    draft), EPG-E2 (`!git commit` with an approved hook runs without a
+    warning; after a `!` command changes the hook the next commit shows
+    `changed since you approved it`), EPG-E1 and PC-E21 (the scripted model
+    edits `build.rs`; the next `!` command shows the warning line above its
+    output and runs; it runs `cat build.rs` because the fixture PATH has no
+    Cargo) and EPG-E4 (the model edits `Makefile`; `!!make` is held with
+    the warning and "Held: confirm to run (paths changed)"; Enter in the log
+    runs it; after another edit Esc drops it and nothing runs; the same
+    change with `!make` runs at once with the warning). Runnable after
+    EPG-W and EPG-T."""
+    harness = PersonHarness(fixture, source)
+    project = harness.project("guarded")
+    git_env = {"PATH": "/usr/bin:/bin", "HOME": str(harness.account), "GIT_CONFIG_NOSYSTEM": "1"}
+    # An empty template: the only implicit-execution files are .git/config
+    # and the hook written here.
+    made = subprocess.run(["/usr/bin/git", "init", "-q", "--template=", str(project)],
+                          stdin=subprocess.DEVNULL, capture_output=True, timeout=30, env=git_env)
+    assert made.returncode == 0, made
+    hooks = project / ".git" / "hooks"
+    hooks.mkdir(mode=0o700, exist_ok=True)
+    (hooks / "pre-commit").write_text("#!/bin/sh\necho hook-ran\n")
+    (hooks / "pre-commit").chmod(0o700)
+    commit = "git -c user.name=Fixture -c user.email=fixture@example.invalid commit -q --allow-empty -m"
+    trial = None
+    try:
+        fixture.start()
+        trial = fixture.launch()
+        harness.configure(trial, project)
+        harness.enable(trial)
+
+        # EPG-E3: the list, approve all, revoke, approve one, an error.
+        listed = paths_panel(trial)
+        assert "⚠ not approved: .git/config, .git/hooks/pre-commit · /paths approve" in listed, listed
+        assert "No approved paths" in listed, listed
+        paths_reply(trial, "/paths approve all", "Approved every implicit-execution file shown",
+                    ["No path warnings", "Approved paths .git/config .git/hooks/pre-commit"])
+        paths_reply(trial, "/paths revoke .git/config", "Revoked .git/config",
+                    ["⚠ not approved: .git/config · /paths approve", "Approved paths .git/hooks/pre-commit"])
+        paths_reply(trial, "/paths approve .git/config", "Approved .git/config",
+                    ["No path warnings", "Approved paths .git/config .git/hooks/pre-commit"])
+        offset = len(trial.output)
+        trial.send(b"/paths revoke .envrc\r")
+        notice_until(trial, "Not approved: .envrc; draft retained", offset, limit=15)
+        rows = [row.strip() for row in trial.screen.text().splitlines()]
+        assert any(row.endswith("/paths revoke .envrc") for row in rows), trial.screen.text()
+        trial.send(b"\x01\x7f")  # Ctrl+A, Backspace: clear the kept draft.
+        trial.idle(0.2)
+
+        # EPG-E2: an approved hook runs without a warning; changed, it warns.
+        harness.run(trial, f"{commit} one")
+        rows = entry_rows(trial, f"! {commit} one", "↳ exit 0")
+        assert "hook-ran" in rows, rows
+        assert not any(row.startswith("⚠") for row in rows), rows
+        harness.run(trial, "printf 'echo hook-changed\\n' >> .git/hooks/pre-commit")
+        harness.footer(trial, "! printf 'echo hook-changed")
+        harness.run(trial, f"{commit} two")
+        rows = entry_rows(trial, f"! {commit} two", "↳ exit 0")
+        warning = "⚠ changed since you approved it: .git/hooks/pre-commit"
+        assert warning in rows and "hook-changed" in rows, rows
+        assert rows.index(warning) < rows.index("hook-ran"), rows
+        paths_reply(trial, "/paths approve .git/hooks/pre-commit", "Approved .git/hooks/pre-commit",
+                    ["No path warnings"])
+
+        # EPG-E1 (PC-E21): the model edits build.rs; the next `!` command
+        # shows the warning above its output and runs.
+        model_edit(harness, trial, "printf 'fn main() {}\\n' > build.rs", "EDITED-BUILD", "build.rs")
+        harness.run(trial, "cat build.rs")
+        rows = entry_rows(trial, "! cat build.rs", "↳ exit 0")
+        warning = "⚠ changed by the model since your last command: build.rs"
+        assert rows[1] == warning and "fn main() {}" in rows, rows
+        assert rows.index(warning) < rows.index("fn main() {}"), rows
+        # Kind 1 appears once: the next command shows none.
+        harness.run(trial, "echo clean")
+        rows = entry_rows(trial, "! echo clean", "↳ exit 0")
+        assert not any(row.startswith("⚠") for row in rows), rows
+
+        # EPG-E4: `!!make` after a model change is held; Enter runs it.
+        model_edit(harness, trial, "printf 'all:\\n\\t@echo made-once\\n' > Makefile", "EDITED-MAKE",
+                   "Makefile")
+        offset = len(trial.output)
+        harness.run(trial, "make", mode="!!", expect="Held: confirm to run (paths changed)")
+        rows = entry_rows(trial, "!! make", "Held: confirm to run (paths changed)")
+        assert "⚠ changed by the model since your last command: Makefile" in rows, rows
+        assert not any(row.startswith("↳ exit") for row in rows), rows
+        assert b"made-once" not in bytes(trial.output[offset:]), "the held command ran"
+        log_focus(trial)
+        assert "↵ run the held command · Esc drop it" in trial.screen.text(), trial.screen.text()
+        offset = len(trial.output)
+        trial.send(b"\r")
+        notice_until(trial, "Command confirmed; Asura checks its paths again, then runs it", offset)
+        # Once the entry is no longer held, Esc leaves the log (whose view
+        # stays where it was while focused).
+        end = time.monotonic() + remaining(10)
+        while "↵ run the held command" in trial.screen.text():
+            assert time.monotonic() < end, trial.screen.text()
+            trial.read(0.025)
+        trial.send(b"\x1b")
+        trial.idle(0.2)
+        assert "scroll history" not in trial.screen.text(), trial.screen.text()
+        rows = entry_rows(trial, "!! make", "↳ exit 0")
+        assert "made-once" in rows and "Held: confirm to run (paths changed)" not in rows, rows
+
+        # Again, then Esc drops it and nothing runs.
+        model_edit(harness, trial, "printf 'all:\\n\\t@echo made-twice\\n' > Makefile", "EDITED-AGAIN",
+                   "Makefile")
+        offset = len(trial.output)
+        harness.run(trial, "make", mode="!!", expect="Held: confirm to run (paths changed)")
+        entry_rows(trial, "!! make", "Held: confirm to run (paths changed)")
+        log_focus(trial)
+        trial.send(b"\x1b")
+        rows = entry_rows(trial, "!! make", "↳ dropped; it did not run")
+        assert "Held: confirm to run (paths changed)" not in rows, rows
+        assert "scroll history" in trial.screen.text(), "Esc dropped the entry; the log keeps focus"
+        trial.send(b"\x1b")
+        trial.idle(1.0)
+        assert "scroll history" not in trial.screen.text(), trial.screen.text()
+        assert b"made-twice" not in bytes(trial.output[offset:]), "the dropped command ran"
+        assert "made-twice" not in trial.screen.text(), trial.screen.text()
+
+        # The same change with `!make` runs at once, with the warning.
+        harness.run(trial, "make")
+        rows = entry_rows(trial, "! make", "↳ exit 0")
+        assert "⚠ changed by the model since your last command: Makefile" in rows, rows
+        assert "made-twice" in rows, rows
+        quit_tui(trial)
+        trial = None
+        fixture.stop()
+        print("PASS EPG-E1/E2/E3/E4 TUI: /paths lists, approves and revokes with refreshed replies; an "
+              "approved hook runs without a warning and warns once changed; a model change to build.rs "
+              "shows its warning above the next command's output; a held !!make runs on Enter and is "
+              "dropped on Esc; the same change with !make runs at once")
+    finally:
+        if trial is not None:
+            trial.close()
+        harness.close()
+
+
 def main():
     global DEADLINE
     assert len(sys.argv) in (2, 3), __doc__
@@ -4837,7 +5051,8 @@ def main():
                  "--person-outside": person_outside_journey,
                  "--person-model": person_model_journey,
                  "--person-restart": person_restart_journey,
-                 "--person-secrets": person_secrets_journey}
+                 "--person-secrets": person_secrets_journey,
+                 "--path-guard": path_guard_journey}
     job_mode = job_modes.get(sys.argv[2]) if len(sys.argv) == 3 else None
     assert len(sys.argv) == 2 or job_mode or thinking or segmented or restore or records or steer or steps or waits_client or helpmode or native or setup or models or composer or queue_history or queue_reorder or long or activity or multipass or isolation or long_turns or waits or capture, __doc__
     if native:
