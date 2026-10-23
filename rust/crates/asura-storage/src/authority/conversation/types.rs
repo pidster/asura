@@ -350,6 +350,9 @@ pub enum Record {
     JobResult(Box<JobResult>),
     /// Kind 30 (J4): one pin, unpin, delete or note of a job.
     JobRetention(Box<JobRetention>),
+    /// Kind 32 (P5): a model change, acknowledgement, approval or
+    /// revocation of execution paths (execution-path-guard.md).
+    ExecutionPath(Box<super::ExecutionPathRecord>),
 }
 impl Record {
     pub fn kind(&self) -> u16 {
@@ -378,6 +381,7 @@ impl Record {
             Self::JobSettled(_) => 28,
             Self::JobResult(_) => 29,
             Self::JobRetention(_) => 30,
+            Self::ExecutionPath(_) => 32,
         }
     }
 }

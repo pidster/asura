@@ -2030,3 +2030,161 @@ fn p2_kind_31_checkpoint_and_index_entries() {
     writer.append(interrupted(job_b), transition).unwrap();
     assert_eq!(writer.state().input_status(b), Some(InputStatus::Failed));
 }
+
+// ----- P5 kind 32 (execution-path-guard.md, EPG-U3). -----
+
+fn path32(
+    action: PathAction,
+    project: Id,
+    reference: Id,
+    through: u64,
+    entries: &[(PathEntryKind, &str)],
+    digest: Hash,
+) -> Record {
+    Record::ExecutionPath(Box::new(ExecutionPathRecord {
+        action,
+        project,
+        reference,
+        through,
+        entries: entries
+            .iter()
+            .map(|(kind, path)| PathEntry {
+                kind: *kind,
+                path: (*path).into(),
+            })
+            .collect(),
+        overflow: 0,
+        digest,
+    }))
+}
+/// EPG-U3 (unit, segmented journal): kind 32 entries move to index runs
+/// at a roll; the guard read merges runs and delta; a reopened checkpoint
+/// plus tail equals the genesis replay and reads the same guard state.
+#[test]
+fn epg_u3_kind_32_entries_survive_rolls_and_checkpoints() {
+    use PathAction::*;
+    use PathEntryKind as K;
+    // A normal record: held at the quota like kind 26, never a closure.
+    assert!(!is_closure(&path32(
+        ModelChanged,
+        id(1),
+        id(2),
+        0,
+        &[],
+        [0; 32]
+    )));
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (conversation, operation, generation) = h.start(project, None);
+    let first = h.job(operation, generation, 1);
+    h.append(exited(first)).unwrap();
+    h.append(path32(
+        ModelChanged,
+        project,
+        first,
+        0,
+        &[(K::ModelChanged, "build.rs")],
+        [0; 32],
+    ))
+    .unwrap();
+    let first_change = h.state().sequence;
+    h.append(path32(
+        Approved,
+        project,
+        id(900),
+        0,
+        &[(K::Approval, ".envrc")],
+        [1; 32],
+    ))
+    .unwrap();
+    h.finish(conversation, operation, generation, 0);
+    // Force rolls: the entries above move to an index run.
+    let (_, op2, gen2) = h.start(project, Some(conversation));
+    let text = "z".repeat(61_440);
+    for n in 0..150u64 {
+        h.segment(op2, gen2, n * 61_440, &text).unwrap();
+    }
+    assert!(!h.journal.runs().is_empty());
+    let second = h.job(op2, gen2, 1);
+    h.append(exited(second)).unwrap();
+    h.append(path32(
+        ModelChanged,
+        project,
+        second,
+        0,
+        &[(K::ModelChanged, "Cargo.toml")],
+        [0; 32],
+    ))
+    .unwrap();
+    let second_change = h.state().sequence;
+    let lane = h.fresh();
+    let (record, input) = person31(&mut h, project, lane, true, false);
+    h.append(record).unwrap();
+    h.append(path32(
+        Acknowledged,
+        project,
+        input,
+        first_change,
+        &[(K::ModelChanged, "build.rs")],
+        [0; 32],
+    ))
+    .unwrap();
+    h.append(path32(
+        Approved,
+        project,
+        id(904),
+        0,
+        &[(K::Approval, ".git/hooks/pre-commit")],
+        [2; 32],
+    ))
+    .unwrap();
+    // A revocation of the approval held in the run.
+    h.append(path32(
+        Revoked,
+        project,
+        id(905),
+        0,
+        &[(K::Approval, ".envrc")],
+        [0; 32],
+    ))
+    .unwrap();
+    let check = |state: &Replay, store: &mut dyn Index| {
+        let view = state.path_guard(project, store).unwrap();
+        assert_eq!(view.acknowledged.unwrap().through, first_change);
+        assert_eq!(view.changes.len(), 1);
+        assert_eq!(view.changes[0].frame.sequence, second_change);
+        assert_eq!(view.changes[0].paths, vec!["Cargo.toml"]);
+        assert_eq!(view.omitted_changes, 0);
+        assert_eq!(view.approvals.len(), 1);
+        assert_eq!(view.approvals[0].path, ".git/hooks/pre-commit");
+        assert_eq!(view.approval_records, 3);
+        assert!(state.path_record(first, store).unwrap().is_some());
+        view
+    };
+    let live = {
+        let (state, mut store) = h.journal.store();
+        // The first change and approval are in a run; the rest in the delta.
+        assert_eq!(state.delta_tag(Tag::PathChange).len(), 1);
+        assert_eq!(state.delta_tag(Tag::PathApproval).len(), 2);
+        check(&state, &mut store)
+    };
+    // More rolls: everything moves to runs and the checkpoint.
+    for n in 150..300u64 {
+        h.segment(op2, gen2, n * 61_440, &text).unwrap();
+    }
+    let files = h.files();
+    let mut reopened = open(files.clone(), false).unwrap();
+    assert!(reopened.state().base > second_change);
+    let replayed = genesis(&files);
+    assert_eq!(canonical(reopened.state()), canonical(&replayed));
+    {
+        let (state, mut store) = reopened.store();
+        assert!(state.delta_tag(Tag::PathReference).is_empty());
+        assert_eq!(check(&state, &mut store), live);
+    }
+    let segments = segments(&files);
+    let mut index = MemoryIndex {
+        segments: segments.iter().map(|(f, b)| (*f, b.as_slice())).collect(),
+    };
+    assert_eq!(check(&replayed, &mut index), live);
+}

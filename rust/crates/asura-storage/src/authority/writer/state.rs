@@ -1160,6 +1160,19 @@ impl State {
                 reply.before_found = before_found;
                 return Ok(reply);
             }
+            Command::PathGuard { project } => {
+                self.find_project(project)?;
+                let view = self.read(|state, store| state.path_guard(project, store))?;
+                let mut reply = self.reply();
+                reply.path_guard = Some(Box::new(view));
+                return Ok(reply);
+            }
+            Command::PathRecord { reference } => {
+                let found = self.read(|state, store| state.path_record(reference, store))?;
+                let mut reply = self.reply();
+                reply.path_record = found.map(|(frame, p)| (frame, Box::new(p)));
+                return Ok(reply);
+            }
             Command::JobFacts { job } => {
                 let records = self.read(|state, store| state.job_records(job, store))?;
                 let mut reply = self.reply();
@@ -1901,6 +1914,23 @@ impl State {
                 record,
                 admission,
             } => {
+                // Kind 32 is idempotent by reference (AE-05): an exact
+                // retry returns the committed record whatever the revision;
+                // a different record under the same reference is
+                // `Conflict`.
+                if let Record::ExecutionPath(path) = &record {
+                    let reference = path.reference;
+                    if let Some((frame, prior)) =
+                        self.read(|state, store| state.path_record(reference, store))?
+                    {
+                        if prior != **path {
+                            return Err(Error::Conflict);
+                        }
+                        let mut reply = self.reply();
+                        reply.path_record = Some((frame, Box::new(prior)));
+                        return Ok(reply);
+                    }
+                }
                 if self.state()?.revision != expected_revision {
                     return Err(Error::Conflict);
                 }
@@ -1926,9 +1956,21 @@ impl State {
                         return Err(Error::Limit);
                     }
                 }
+                let path_reference = match &record {
+                    Record::ExecutionPath(path) => Some(path.reference),
+                    _ => None,
+                };
                 self.append(record)?;
                 if let Some(held) = held {
                     held.validate().map_err(|_| Error::OutcomeUnconfirmed)?;
+                }
+                if let Some(reference) = path_reference {
+                    let committed = self
+                        .read(|state, store| state.path_record(reference, store))?
+                        .ok_or(Error::RepairRequired)?;
+                    let mut reply = self.reply();
+                    reply.path_record = Some((committed.0, Box::new(committed.1)));
+                    return Ok(reply);
                 }
             }
         }

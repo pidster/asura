@@ -1982,6 +1982,7 @@ fn payload(record: &Record) -> Result<Vec<u8>> {
             p.validate()?;
             job_retention_fields(&mut w, p);
         }
+        Record::ExecutionPath(p) => super::execution_path::write_execution_path(&mut w, p)?,
         Record::ResponseText(p) | Record::ThinkingText(p) => {
             require(!p.text.is_empty() || p.offset > 0)?;
             w.bytes(&p.operation);
@@ -2269,6 +2270,12 @@ pub fn decode_record(kind: u16, payload: &[u8]) -> Result<Record> {
         31 => {
             require(payload.len() <= MAX_PERSON_COMMAND_PAYLOAD)?;
             Record::PersonCommandQueued(Box::new(read_person_command(&mut r)?))
+        }
+        32 => {
+            require(payload.len() <= super::execution_path::MAX_EXECUTION_PATH_PAYLOAD)?;
+            Record::ExecutionPath(Box::new(super::execution_path::read_execution_path(
+                &mut r,
+            )?))
         }
 
         _ => return Err(ReplayError::UnsupportedFormat),
