@@ -790,6 +790,9 @@ pub(crate) struct Owner {
     /// The person's execution setting (EX11): `None` until the start-time
     /// read. The one copy; the controller's slot-grant check reads it.
     execution: Arc<std::sync::Mutex<Option<ExecutionSetting>>>,
+    /// A persisted change that arrived before the start-time read: it
+    /// applies once the persisted value is known (newest wins).
+    execution_pending: Option<ExecutionSetting>,
     /// The secret rule set's warm thread (SD-S2).
     rules: crate::secret_rules::Warmer,
     /// The outlived model jobs of recent terminals (EX12), newest last.
@@ -841,6 +844,7 @@ impl Owner {
             journal_status: None,
             jobs: jobs::Jobs::default(),
             execution: Default::default(),
+            execution_pending: None,
             rules: Default::default(),
             outlived: VecDeque::new(),
             #[cfg(feature = "test-support")]
@@ -4697,12 +4701,35 @@ impl Owner {
     /// `execution.changed` event per changed entry; the job revision
     /// moves so a parked `JobList` returns.
     pub(crate) fn set_execution(&mut self, setting: ExecutionSetting) {
-        let old = self
+        if let Some(change) = self.apply_execution(setting) {
+            self.emit_execution(change);
+        }
+    }
+    /// The start-time read's persisted value (TJ-F5): it becomes the
+    /// owner's value, and a change that arrived before it is applied now,
+    /// compared against this persisted value.
+    fn execution_read(&mut self, persisted: ExecutionSetting) -> Option<execution::Change> {
+        self.execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(persisted);
+        let pending = self.execution_pending.take()?;
+        self.apply_execution(pending)
+    }
+    /// Revokes, replaces and bumps the revision for a persisted change;
+    /// returns the change whose events are due. Before the start-time read
+    /// the persisted value is unknown, so the change waits for it: no event
+    /// is computed against defaults.
+    fn apply_execution(&mut self, setting: ExecutionSetting) -> Option<execution::Change> {
+        let Some(old) = self
             .execution
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
-            .unwrap_or_default();
+        else {
+            self.execution_pending = Some(setting);
+            return None;
+        };
         let registered: Vec<journal::Id> = self
             .replay
             .as_ref()
@@ -4722,13 +4749,16 @@ impl Owner {
             }
         }
         *self.execution.lock().unwrap_or_else(|e| e.into_inner()) = Some(setting);
+        if let Some(controller) = self.jobs.controller() {
+            controller.bump_revision();
+        }
+        Some(change)
+    }
+    fn emit_execution(&self, change: execution::Change) {
         if let Some(emitter) = &self.audit_emitter {
             for event in change.events {
                 let _ = emitter.try_emit(event);
             }
-        }
-        if let Some(controller) = self.jobs.controller() {
-            controller.bump_revision();
         }
     }
     /// The active turn's job-mode call.
@@ -5006,13 +5036,13 @@ impl Owner {
             &mut self.payloads,
         );
         // The start-time read built the controller: the execution setting
-        // it read becomes the owner's value, unless a persisted change
-        // already arrived; the controller's slot-grant check reads it.
+        // it read becomes the owner's value, and a persisted change that
+        // arrived before it applies against it; the controller's
+        // slot-grant check reads the result.
         if let Some(setting) = self.jobs.take_execution() {
-            self.execution
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_or_insert(setting);
+            if let Some(change) = self.execution_read(setting) {
+                self.emit_execution(change);
+            }
             let execution = self.execution.clone();
             if let Some(controller) = self.jobs.controller() {
                 controller.set_execution(Box::new(move |project| {
