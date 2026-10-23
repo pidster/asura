@@ -1466,7 +1466,11 @@ impl CancelWork {
             },
             None => return s.error(wire::error::UNAVAILABLE),
         };
-        let requested = entry.state != Some(pb::JobState::Settled as i32);
+        // `requested` reports the cancel that this request made: an accepted
+        // trigger is `true` even when the job settled at once (a queued
+        // start settles `not_started` in the same step); `false` only for a
+        // job that had settled before, whose entry is then SETTLED.
+        let requested = !settled_reply || entry.state != Some(pb::JobState::Settled as i32);
         let request_id = match s.body {
             Body::JobCancel(v) => v.request_id.clone(),
             _ => None,

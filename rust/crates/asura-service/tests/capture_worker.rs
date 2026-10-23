@@ -891,8 +891,11 @@ fn stored_signal() -> Result<()> {
         let mut bytes = [0u8; 64];
         matches!(wakes.read(&mut bytes), Ok(n) if n > 0)
     };
-    let (_, mut probe) =
-        asura_service::test_support::StoredProbe::start(home.store.clone(), home.installation, wake)?;
+    let (_, mut probe) = asura_service::test_support::StoredProbe::start(
+        home.store.clone(),
+        home.installation,
+        wake,
+    )?;
     let mut line = vec![b'a'; CHUNK - 1];
     line.push(b'\n');
     let expected = (CHUNKS * CHUNK) as u64;

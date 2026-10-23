@@ -159,14 +159,18 @@ impl Fixture {
         records(&bytes)
     }
     pub fn submit(&self, project: [u8; 16], prompt: &str) -> Result<[u8; 16]> {
-        let accepted = super::queue_submit::submit_queued(&|| self.attach(), project, None, 0, prompt)?;
+        let accepted =
+            super::queue_submit::submit_queued(&|| self.attach(), project, None, 0, prompt)?;
         id(accepted.operation_id)
     }
     /// The next turn of the conversation that `previous` belongs to (job
     /// commands reach only the jobs of their own conversation, TJ-12).
     pub fn follow(&self, project: [u8; 16], previous: [u8; 16], prompt: &str) -> Result<[u8; 16]> {
         let (_, replay) = self.journal()?;
-        let op = replay.operations.get(&previous).ok_or("previous operation")?;
+        let op = replay
+            .operations
+            .get(&previous)
+            .ok_or("previous operation")?;
         let accepted = super::queue_submit::submit_queued(
             &|| self.attach(),
             project,
@@ -262,10 +266,16 @@ pub fn sweep(root: &Path, needles: &[&[u8]]) -> Result<()> {
         if meta.is_dir() {
             sweep(&path, needles)?;
         } else if meta.is_file() {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             // The project's own files and the payload objects are the
             // output's home; the sweep covers every other file.
-            if path.components().any(|c| c.as_os_str() == "payloads" || c.as_os_str() == "project") {
+            if path
+                .components()
+                .any(|c| c.as_os_str() == "payloads" || c.as_os_str() == "project")
+            {
                 continue;
             }
             let bytes = std::fs::read(&path)?;
@@ -349,7 +359,7 @@ impl Model {
         let requests = self.requests.lock().unwrap();
         requests
             .last()
-            .map(|last| tool_messages(last))
+            .map(tool_messages)
             .unwrap_or_default()
     }
 }

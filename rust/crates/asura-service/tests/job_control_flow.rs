@@ -2,10 +2,10 @@
 //! control socket, with real guardians and a scripted loopback model
 //! (tool-job-controller.md, J4 validation, integration layer). Cases:
 //! J4T-04, J4T-05, J4T-06, J4T-07, J4T-09, J4T-13 and ES-12.
-#[path = "support/queue_submit.rs"]
-mod queue_submit;
 #[path = "support/job_fixture.rs"]
 mod job_fixture;
+#[path = "support/queue_submit.rs"]
+mod queue_submit;
 
 use asura_control::pb;
 use asura_storage::authority::conversation::{self as journal, JobReason, JobRequester, Record};
@@ -61,12 +61,22 @@ fn follow_and_cancel() -> Result<()> {
     assert_eq!(event.outlived_jobs, Some(1), "{event:?}");
     assert_eq!(event.outlived_job_ids, vec![job.to_vec()]);
     let mut client = fixture.attach()?;
-    assert!(client.supports(pb::Capability::Jobs), "CAPABILITY_JOBS (EN1)");
+    assert!(
+        client.supports(pb::Capability::Jobs),
+        "CAPABILITY_JOBS (EN1)"
+    );
     let reply = client.jobs(list(project), &never)?;
     assert_eq!(reply.entries.len(), 1, "{reply:?}");
     let entry = &reply.entries[0];
     assert_eq!(job_id(entry)?, job);
-    assert!(entry.command.as_deref().unwrap_or("").starts_with("printf 'first"), "{entry:?}");
+    assert!(
+        entry
+            .command
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("printf 'first"),
+        "{entry:?}"
+    );
     assert_eq!(reply.live_in_scope, Some(1));
     assert_eq!(reply.execution_enabled, Some(true));
     let revision = reply.revision.ok_or("revision")?;
@@ -107,7 +117,11 @@ fn follow_and_cancel() -> Result<()> {
     )?;
     let waited = started.elapsed();
     assert!(
-        observed.pages[0].text.as_deref().unwrap_or("").contains("second"),
+        observed.pages[0]
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains("second"),
         "{observed:?}"
     );
     // J4T-07: a wrong expected project is refused before any effect.
@@ -151,15 +165,16 @@ fn follow_and_cancel() -> Result<()> {
     assert!(parked.revision.unwrap_or(0) != revision, "{parked:?}");
     // J4T-05: one kind 27 from the client; the job settles cancelled.
     wait_for(Duration::from_secs(20), "kind 28", || {
-        fixture
-            .records()
-            .is_ok_and(|r| r.iter().any(|r| matches!(r, Record::JobSettled(s) if s.job == job)))
+        fixture.records().is_ok_and(|r| {
+            r.iter()
+                .any(|r| matches!(r, Record::JobSettled(s) if s.job == job))
+        })
     })?;
     let records = fixture.records()?;
     let cancels: Vec<_> = records
         .iter()
         .filter_map(|r| match r {
-            Record::JobCancelRequested(c) if c.job == job => Some(c.clone()),
+            Record::JobCancelRequested(c) if c.job == job => Some(*c),
             _ => None,
         })
         .collect();
@@ -167,6 +182,34 @@ fn follow_and_cancel() -> Result<()> {
     assert_eq!(
         (cancels[0].requester, cancels[0].reason),
         (JobRequester::Client, JobReason::ClientCancel)
+    );
+    // The settled job's pages and detail still read (the viewer's
+    // requests after a cancel).
+    let page = client.read_job(
+        pb::JobRead {
+            job_id: Some(job.to_vec()),
+            project_id: None,
+            stream: Some(pb::JobStream::Stdout as i32),
+            offset: None,
+            limit: Some(8192),
+            at_end: Some(true),
+        },
+        &never,
+    )?;
+    assert!(page.error.is_none(), "{page:?}");
+    assert!(
+        page.pages[0]
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains("second"),
+        "{page:?}"
+    );
+    let detail = client.inspect_job(job, None, &never)?;
+    assert_eq!(
+        detail.entry.as_ref().and_then(|e| e.reason),
+        Some(JobReason::ClientCancel as u32),
+        "{detail:?}"
     );
     fixture.stop()?;
     println!(
@@ -188,7 +231,10 @@ fn retention() -> Result<()> {
     fixture.model(&model.endpoint)?;
     model.script(&[
         call("exec_cmd", json!({"command": "printf 'kept output\\n'"})),
-        call("job", json!({"command": "note", "job": "{job}", "text": "model says hi"})),
+        call(
+            "job",
+            json!({"command": "note", "job": "{job}", "text": "model says hi"}),
+        ),
         Step::Final,
     ]);
     let operation = fixture.submit(project, "Note it.")?;
@@ -215,7 +261,11 @@ fn retention() -> Result<()> {
     let pinned = retain(&mut client, pb::JobRetainAction::Pin, None)?;
     assert_eq!(pinned.changed, Some(true), "{pinned:?}");
     let again = retain(&mut client, pb::JobRetainAction::Pin, None)?;
-    assert_eq!(again.changed, Some(false), "an unchanged pin writes nothing");
+    assert_eq!(
+        again.changed,
+        Some(false),
+        "an unchanged pin writes nothing"
+    );
     let unpinned = retain(&mut client, pb::JobRetainAction::Unpin, None)?;
     assert_eq!(unpinned.changed, Some(true));
     let token = ["ghp_", &"Np8".repeat(12)].concat();
@@ -229,10 +279,17 @@ fn retention() -> Result<()> {
         .map(|n| (n.author, n.text.clone().unwrap_or_default()))
         .collect();
     assert_eq!(notes.len(), 2, "{notes:?}");
-    assert_eq!(notes[0], (Some(2), "model says hi".to_owned()), "the model note first");
+    assert_eq!(
+        notes[0],
+        (Some(2), "model says hi".to_owned()),
+        "the model note first"
+    );
     assert_eq!(notes[1].0, Some(1));
     assert!(notes[1].1.contains("$ASURA_SECRET_0"), "{:?}", notes[1]);
-    assert!(notes[1].1.contains("$ASURA_SECRET_3"), "a typed placeholder stays");
+    assert!(
+        notes[1].1.contains("$ASURA_SECRET_3"),
+        "a typed placeholder stays"
+    );
     assert!(!notes[1].1.contains(&token));
     // Delete: the summary and notes stay; pages report `deleted`.
     let deleted = retain(&mut client, pb::JobRetainAction::Delete, None)?;
@@ -243,7 +300,9 @@ fn retention() -> Result<()> {
         .home
         .join(".asura/payloads/objects")
         .join(job_fixture::hex(&stdout));
-    wait_for(Duration::from_secs(10), "the payload deletion", || !object.exists())?;
+    wait_for(Duration::from_secs(10), "the payload deletion", || {
+        !object.exists()
+    })?;
     let page = client.read_job(
         pb::JobRead {
             job_id: Some(job.to_vec()),
@@ -255,7 +314,11 @@ fn retention() -> Result<()> {
         },
         &never,
     )?;
-    assert_eq!(page.pages[0].state, Some(pb::JobPageState::Deleted as i32), "{page:?}");
+    assert_eq!(
+        page.pages[0].state,
+        Some(pb::JobPageState::Deleted as i32),
+        "{page:?}"
+    );
     let detail = client.inspect_job(job, None, &never)?;
     assert_eq!(detail.notes.len(), 2, "notes stay after delete");
     let kinds: Vec<_> = fixture
@@ -269,7 +332,10 @@ fn retention() -> Result<()> {
     use journal::RetentionAction as A;
     assert_eq!(kinds, vec![A::Note, A::Pin, A::Unpin, A::Note, A::Delete]);
     let journal_bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
-    assert!(!job_fixture::holds(&journal_bytes, token.as_bytes()), "no secret in kind 30");
+    assert!(
+        !job_fixture::holds(&journal_bytes, token.as_bytes()),
+        "no secret in kind 30"
+    );
     fixture.stop()?;
     println!(
         "PASS J4T-06/13 integration: pin, unchanged pin, unpin, a redacted person note with a typed placeholder kept, the model note, both notes in JobInspect by author, delete removed the files and pages report deleted, the notes stay"

@@ -4,10 +4,10 @@
 //! scratch homes (tool-job-controller.md, J3 validation, integration
 //! layer). Cases: J3T-04 to J3T-14, J3T-17, J3T-20, ES-04, ES-05, ES-07,
 //! ES-10, ES-11 and the identity detectors through real turns.
-#[path = "support/queue_submit.rs"]
-mod queue_submit;
 #[path = "support/job_fixture.rs"]
 mod job_fixture;
+#[path = "support/queue_submit.rs"]
+mod queue_submit;
 
 use asura_storage::authority::conversation::{
     self as journal, JobOutcome, JobReason, JobResultOutcome, Record, ToolDecision,
@@ -41,7 +41,10 @@ fn setup(label: &str, config: &[(&str, &str)]) -> Result<(Fixture, Model, [u8; 1
 }
 
 /// The kind 14 and kind 29 records of one operation, in order.
-fn calls(fixture: &Fixture, operation: [u8; 16]) -> Result<Vec<(journal::ToolCall, Option<journal::JobResult>)>> {
+fn calls(
+    fixture: &Fixture,
+    operation: [u8; 16],
+) -> Result<Vec<(journal::ToolCall, Option<journal::JobResult>)>> {
     let records = fixture.records()?;
     let mut out: Vec<(journal::ToolCall, Option<journal::JobResult>)> = Vec::new();
     for record in records {
@@ -93,15 +96,24 @@ fn reads_and_waits() -> Result<()> {
             "exec_cmd",
             json!({"command": "printf 'OUT%sPUT-%s\\nline2\\n' X 7f3a; printf 'warn' >&2"}),
         ),
-        call("job", json!({"command": "read", "job": "{job}", "stream": "stdout"})),
-        call("job", json!({"command": "read", "job": "{job}", "stream": "stderr"})),
+        call(
+            "job",
+            json!({"command": "read", "job": "{job}", "stream": "stdout"}),
+        ),
+        call(
+            "job",
+            json!({"command": "read", "job": "{job}", "stream": "stderr"}),
+        ),
         call(
             "exec_cmd",
             json!({"command": "sleep 1; printf tick; sleep 2; printf tock", "yield_seconds": 0}),
         ),
         call("job", json!({"command": "wait", "job": "{job}"})),
         call("job", json!({"command": "status", "job": "{job}"})),
-        call("job", json!({"command": "note", "job": "{job}", "text": "watch this job"})),
+        call(
+            "job",
+            json!({"command": "note", "job": "{job}", "text": "watch this job"}),
+        ),
         call("job", json!({"command": "list"})),
         Step::Final,
     ]);
@@ -113,11 +125,26 @@ fn reads_and_waits() -> Result<()> {
     // J3T-04: settled inside the window; no output text in the delivery.
     assert!(messages[0].starts_with("job: "), "{}", messages[0]);
     assert!(messages[0].contains("state: settled") && messages[0].contains("result: exit 0"));
-    assert!(!messages[0].contains(marker), "PC12: no output text in the delivery");
+    assert!(
+        !messages[0].contains(marker),
+        "PC12: no output text in the delivery"
+    );
     // J3T-08: pages of both streams from 0; the delivered text is the output.
-    assert!(messages[1].contains("stream: stdout") && messages[1].contains(marker), "{}", messages[1]);
-    assert!(messages[1].contains("next offset: end of stream"), "{}", messages[1]);
-    assert!(messages[2].contains("stream: stderr") && messages[2].contains("warn"), "{}", messages[2]);
+    assert!(
+        messages[1].contains("stream: stdout") && messages[1].contains(marker),
+        "{}",
+        messages[1]
+    );
+    assert!(
+        messages[1].contains("next offset: end of stream"),
+        "{}",
+        messages[1]
+    );
+    assert!(
+        messages[2].contains("stream: stderr") && messages[2].contains("warn"),
+        "{}",
+        messages[2]
+    );
     // J3T-04 (`yield_seconds` 0): handle delivery as soon as it spawned.
     assert!(
         messages[3].contains("state: running") || messages[3].contains("state: starting"),
@@ -126,15 +153,28 @@ fn reads_and_waits() -> Result<()> {
     );
     // J3T-09 and J3T-22: the wait ends on new output with no other event.
     assert!(
-        messages[4].contains("wait ended: new output") || messages[4].contains("wait ended: settled"),
+        messages[4].contains("wait ended: new output")
+            || messages[4].contains("wait ended: settled"),
         "{}",
         messages[4]
     );
-    assert!(messages[5].contains("command: sleep 1; printf tick"), "{}", messages[5]);
+    assert!(
+        messages[5].contains("command: sleep 1; printf tick"),
+        "{}",
+        messages[5]
+    );
     // J3T-13: the note is recorded on the job.
-    assert!(messages[6].starts_with("note: recorded on job "), "{}", messages[6]);
+    assert!(
+        messages[6].starts_with("note: recorded on job "),
+        "{}",
+        messages[6]
+    );
     // J3T-11: the list shows both jobs, newest first.
-    assert!(messages[7].starts_with("jobs: 2 shown, newest first"), "{}", messages[7]);
+    assert!(
+        messages[7].starts_with("jobs: 2 shown, newest first"),
+        "{}",
+        messages[7]
+    );
     let rows: Vec<&str> = messages[7].lines().skip(1).collect();
     assert!(rows[0].contains("sleep 1; printf tick"), "{rows:?}");
     assert!(rows[1].contains("printf 'OUT%sPUT"), "{rows:?}");
@@ -146,8 +186,17 @@ fn reads_and_waits() -> Result<()> {
     use ToolOperation as T;
     assert_eq!(
         codes,
-        [T::ExecCmd, T::JobRead, T::JobRead, T::ExecCmd, T::JobWait, T::JobStatus, T::JobNote, T::JobList]
-            .map(Some)
+        [
+            T::ExecCmd,
+            T::JobRead,
+            T::JobRead,
+            T::ExecCmd,
+            T::JobWait,
+            T::JobStatus,
+            T::JobNote,
+            T::JobList
+        ]
+        .map(Some)
     );
     for (call, result) in &recorded {
         assert_eq!(call.decision, ToolDecision::Run);
@@ -172,14 +221,30 @@ fn reads_and_waits() -> Result<()> {
     let mut fixture = fixture;
     fixture.stop()?;
     let audit = audit_text(&fixture.home)?;
-    for name in ["job_read", "job_wait", "job_status", "job_note", "job_list", "exec_cmd"] {
-        assert!(audit.contains(&format!("\"tool\":\"{name}\"")), "{name} not audited");
+    for name in [
+        "job_read",
+        "job_wait",
+        "job_status",
+        "job_note",
+        "job_list",
+        "exec_cmd",
+    ] {
+        assert!(
+            audit.contains(&format!("\"tool\":\"{name}\"")),
+            "{name} not audited"
+        );
     }
     // J3T-17 and J3T-20: no output text in the journal or the audit log.
     let journal_bytes = asura_storage::authority::fixture::journal_bytes(&fixture.home)?;
-    assert!(!holds(&journal_bytes, marker.as_bytes()), "J3T-17: output in the journal");
+    assert!(
+        !holds(&journal_bytes, marker.as_bytes()),
+        "J3T-17: output in the journal"
+    );
     assert!(!holds(audit.as_bytes(), marker.as_bytes()));
-    assert!(!holds(audit.as_bytes(), b"watch this job"), "no note text in the audit");
+    assert!(
+        !holds(audit.as_bytes(), b"watch this job"),
+        "no note text in the audit"
+    );
     sweep(&fixture.home, &[marker.as_bytes()])?;
     drop(directory);
     println!(
@@ -237,9 +302,18 @@ fn queue_and_cancel() -> Result<()> {
     model.script(&[
         call("exec_cmd", sleeper.clone()),
         call("exec_cmd", sleeper.clone()),
-        call("exec_cmd", json!({"command": "printf third > third.txt", "yield_seconds": 0})),
-        call("exec_cmd", json!({"command": "printf fourth > fourth.txt", "yield_seconds": 0})),
-        call("job", json!({"command": "status", "job": "0123456789abcdef0123456789abcdef"})),
+        call(
+            "exec_cmd",
+            json!({"command": "printf third > third.txt", "yield_seconds": 0}),
+        ),
+        call(
+            "exec_cmd",
+            json!({"command": "printf fourth > fourth.txt", "yield_seconds": 0}),
+        ),
+        call(
+            "job",
+            json!({"command": "status", "job": "0123456789abcdef0123456789abcdef"}),
+        ),
         Step::Final,
     ]);
     let operation = fixture.submit(project, "Queue.")?;
@@ -308,7 +382,10 @@ fn execution_setting() -> Result<()> {
     let (fixture, model, project, directory) = setup("exec", &[])?;
     let key = format!("execution.projects.{}", job_fixture::hex(&project));
     model.script(&[
-        call("exec_cmd", json!({"command": "sleep 60", "yield_seconds": 30})),
+        call(
+            "exec_cmd",
+            json!({"command": "sleep 60", "yield_seconds": 30}),
+        ),
         Step::Final,
     ]);
     let operation = fixture.submit(project, "Long.")?;
@@ -327,8 +404,16 @@ fn execution_setting() -> Result<()> {
     let event = fixture.finish(operation, Duration::from_secs(40))?;
     assert_eq!(event.kind, Some(3), "{event:?}");
     let messages = model.tool_messages();
-    assert!(messages[0].contains("state: settled"), "ES-10: {}", messages[0]);
-    assert!(messages[0].contains("the person turned execution off"), "{}", messages[0]);
+    assert!(
+        messages[0].contains("state: settled"),
+        "ES-10: {}",
+        messages[0]
+    );
+    assert!(
+        messages[0].contains("the person turned execution off"),
+        "{}",
+        messages[0]
+    );
     // ES-04: refused, nothing reaches the controller.
     model.script(&[
         call("exec_cmd", json!({"command": "printf ran > refused.txt"})),
@@ -379,10 +464,16 @@ fn execution_setting() -> Result<()> {
 fn identity() -> Result<()> {
     let (fixture, model, project, directory) = setup("identity", &[])?;
     model.script(&[
-        call("exec_cmd", json!({"command": "sleep 60", "yield_seconds": 0})),
+        call(
+            "exec_cmd",
+            json!({"command": "sleep 60", "yield_seconds": 0}),
+        ),
         // Replace the project directory while the turn runs, then call
         // `job status`: the recheck sees another inode.
-        call("exec_cmd", json!({"command": "sleep 1", "yield_seconds": 0})),
+        call(
+            "exec_cmd",
+            json!({"command": "sleep 1", "yield_seconds": 0}),
+        ),
         call("job", json!({"command": "status", "job": "{job}"})),
         Step::Final,
     ]);
@@ -399,7 +490,11 @@ fn identity() -> Result<()> {
     std::fs::create_dir(&directory)?;
     let event = fixture.finish(operation, Duration::from_secs(60))?;
     let facts = wait_settled(&fixture, job, Duration::from_secs(20))?;
-    assert_eq!(facts.reason, JobReason::IdentityChanged, "{facts:?} {event:?}");
+    assert_eq!(
+        facts.reason,
+        JobReason::IdentityChanged,
+        "{facts:?} {event:?}"
+    );
     let messages = model.tool_messages();
     assert!(
         messages.iter().any(|m| m.contains("job_not_found")),
@@ -422,7 +517,10 @@ fn cancel_before_intent() -> Result<()> {
     model.script(&[
         Step::Create(
             hold.clone(),
-            Box::new(call("exec_cmd", json!({"command": "sleep 1; printf ran > j21.txt"}))),
+            Box::new(call(
+                "exec_cmd",
+                json!({"command": "sleep 1; printf ran > j21.txt"}),
+            )),
         ),
         Step::Final,
     ]);
@@ -446,21 +544,25 @@ fn cancel_before_intent() -> Result<()> {
     let job = job_of(operation, 1, 1);
     wait_settled(&fixture, job, Duration::from_secs(20))?;
     let records = fixture.records()?;
-    let position = |test: &dyn Fn(&Record) -> bool| records.iter().position(|r| test(r));
+    let position = |test: &dyn Fn(&Record) -> bool| records.iter().position(test);
     let intent14 = position(&|r| matches!(r, Record::ToolCall(c) if c.operation == operation))
         .ok_or("kind 14")?;
-    let intent26 = position(&|r| matches!(r, Record::JobIntent(i) if journal::job_id(&i.origin) == job))
-        .ok_or("kind 26")?;
+    let intent26 =
+        position(&|r| matches!(r, Record::JobIntent(i) if journal::job_id(&i.origin) == job))
+            .ok_or("kind 26")?;
     let result29 = position(&|r| matches!(r, Record::JobResult(r) if r.operation == operation))
         .ok_or("kind 29")?;
     let terminal = position(&|r| matches!(r, Record::TurnTerminal(t) if t.operation == operation))
         .ok_or("terminal")?;
     let cancel27 = position(&|r| matches!(r, Record::JobCancelRequested(c) if c.job == job))
         .ok_or("kind 27")?;
-    let settle28 = position(&|r| matches!(r, Record::JobSettled(s) if s.job == job))
-        .ok_or("kind 28")?;
+    let settle28 =
+        position(&|r| matches!(r, Record::JobSettled(s) if s.job == job)).ok_or("kind 28")?;
     assert!(intent14 < intent26 && intent26 < result29 && result29 < terminal);
-    assert!(intent26 < cancel27 && cancel27 < settle28, "JR8: 27 and 28 after 26");
+    assert!(
+        intent26 < cancel27 && cancel27 < settle28,
+        "JR8: 27 and 28 after 26"
+    );
     let Record::JobResult(result) = &records[result29] else {
         unreachable!()
     };

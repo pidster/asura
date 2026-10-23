@@ -1077,6 +1077,22 @@ fn j4t_05_person_job_stop_and_kill() {
     );
 }
 
+/// J4T-05 (J34-E): a queued model start settles `not_started` in the same
+/// step as its cancel; the reply still reports `requested: true`, because
+/// this request made the cancel.
+#[test]
+fn j4t_05_cancel_of_a_queued_start_is_requested() {
+    let mut h = H::new(8);
+    let _a = h.running(1, C1, P1);
+    let _b = h.running(2, C1, P1);
+    let queued = h.submit(model(3), C1, P1, "sleep 61");
+    let reply = cancelled(h.send(1, cancel(1, queued, P1, false)));
+    assert_eq!(reply.error, None, "{reply:?}");
+    assert_eq!(reply.requested, Some(true), "{reply:?}");
+    let c = h.kind_27(queued).expect("kind 27");
+    assert_eq!(c.reason, JobReason::ClientCancel);
+}
+
 /// J4T-05: a settled job replies `requested: false` with its settled
 /// entry, from the controller's memory or from the journal alone.
 #[test]

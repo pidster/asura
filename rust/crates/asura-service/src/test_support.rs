@@ -56,11 +56,14 @@ impl StoredProbe {
         })
         .map_err(|e| e.to_string())?;
         let sink = handle.output_sink();
-        Ok((job, Self {
-            handle,
-            sink,
-            store,
-        }))
+        Ok((
+            job,
+            Self {
+                handle,
+                sink,
+                store,
+            },
+        ))
     }
     /// Room for one more stdout chunk of `bytes` (after a flush).
     pub fn room(&self, bytes: usize) -> bool {
