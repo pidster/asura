@@ -33,9 +33,7 @@ pub(crate) use port::{
     SlotStart, SlotStartError,
 };
 pub(crate) use reasons::{BlockReason, BusyReason, Counts, MAX_UNSETTLED, block_text};
-#[cfg(test)]
-pub(crate) use views::MAX_OUTLIVED_IDS;
-pub(crate) use views::{JobView, Outlived};
+pub(crate) use views::JobView;
 #[cfg(test)]
 pub(crate) use waits::{CLIENT_WAITS, TurnWaitEnd};
 pub(crate) use waits::{WaitDone, WaitEnding, WaitKey, WaitStart};

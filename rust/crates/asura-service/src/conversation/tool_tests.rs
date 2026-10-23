@@ -123,7 +123,6 @@ impl Fixture {
                 execution: Default::default(),
                 execution_pending: None,
                 rules: Default::default(),
-                outlived: VecDeque::new(),
                 #[cfg(feature = "test-support")]
                 fixture: None,
             },

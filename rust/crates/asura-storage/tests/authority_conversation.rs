@@ -4049,6 +4049,52 @@ fn j4t_03_listing_entries_and_reads_over_live_state_and_delta() {
     assert_eq!(settlements(settled_sequence, u64::MAX - 1, &mut index), 0);
     assert_eq!(settlements(0, settled_sequence - 1, &mut index), 0);
 }
+/// J4T-08 (unit): the outlived jobs of a terminal operation are derived
+/// from its records: each kind 26 before the terminal frame with no kind
+/// 28 before it, a kind 28 after the terminal still counting; oldest kind
+/// 26 first, at most 8 IDs with the whole count.
+#[test]
+fn j4t_08_outlived_jobs_derived_from_the_records_at_the_terminal() {
+    let [accepted, started] = second_turn();
+    let mut records = Vec::new();
+    for ordinal in 1..=10 {
+        records.extend(job_call(ordinal));
+    }
+    records.push(r28(1)); // settled before the terminal
+    records.push(complete());
+    records.extend([accepted, started]);
+    records.push(r28(2)); // settled after the terminal: still outlived
+    let journal = started_with(records);
+    let state = inspect(&journal.bytes).unwrap();
+    let mut index = MemoryIndex {
+        segments: std::collections::BTreeMap::from([(1, &journal.bytes[..])]),
+    };
+    let op = &state.operations[&id(10)];
+    let terminal = op.terminal.as_ref().unwrap().frame.sequence;
+    let outlived = state
+        .outlived_jobs(&op.tools, terminal, &mut index)
+        .unwrap();
+    assert_eq!(outlived.count, 9);
+    assert_eq!(
+        outlived.jobs,
+        (2..=MAX_OUTLIVED_JOB_IDS as u32 + 1)
+            .map(job)
+            .collect::<Vec<_>>()
+    );
+    // At a terminal just before job 1's kind 28, all ten counted.
+    let Some(JobState::Settled(first)) = state.job_state(job(1), &mut index).unwrap() else {
+        panic!("job 1 settled");
+    };
+    let earlier = state
+        .outlived_jobs(&op.tools, first.settled.sequence - 1, &mut index)
+        .unwrap();
+    assert_eq!(earlier.count, 10);
+    // An operation with no job calls has none.
+    let none = state
+        .outlived_jobs(&state.operations[&id(43)].tools, u64::MAX, &mut index)
+        .unwrap();
+    assert_eq!(none, OutlivedJobs::default());
+}
 /// The lowercase handle of a job (J3-E8).
 fn handle(job: Id) -> String {
     job.iter().map(|b| format!("{b:02x}")).collect()

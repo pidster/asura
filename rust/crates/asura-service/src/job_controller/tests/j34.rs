@@ -1,6 +1,6 @@
 //! Unit tests of the J3 and J4 controller extensions with the fixture slot
-//! and payload port: the unit parts of J3T-04 to J3T-10, J4T-04, J4T-08
-//! and ES-05 (tool-job-controller.md, J3 and J4 validation;
+//! and payload port: the unit parts of J3T-04 to J3T-10, J4T-04 and ES-05
+//! (tool-job-controller.md, J3 and J4 validation;
 //! execution-setting.md, validation). No test starts a thread, a process
 //! or a timer; time moves only through the harness clock.
 use super::*;
@@ -647,43 +647,6 @@ fn j4t_04_list_revision_detach_bound_and_shutdown() {
         waits(&mut h),
         [agent_done(conversation(1), job, WaitEnding::Settled)]
     );
-}
-
-// ----- J4T-08: outlived count -----
-
-/// J4T-08 (controller part): the operation's model jobs with a committed
-/// kind 26 and no committed kind 28, oldest first, at most 8 IDs with the
-/// whole count; settled jobs, other operations and a kind 26 not yet
-/// committed are not counted.
-#[test]
-fn j4t_08_outlived_jobs_of_an_operation() {
-    let mut h = Harness::new(limits(16, 16, 16));
-    let operation = [0x40; 16];
-    let origin = |ordinal: u32| Origin::Model {
-        operation,
-        generation: 1,
-        ordinal,
-    };
-    let mut jobs = Vec::new();
-    for ordinal in 1..=10 {
-        let request = h.request(origin(ordinal), conversation(1), P1, 1);
-        let Admission::Accepted { job } = h.ctl.submit(request, h.now) else {
-            panic!("accepted");
-        };
-        h.commit();
-        jobs.push(job);
-    }
-    h.model(0x41, conversation(1), P1); // another operation
-    // The first job settles before the terminal.
-    h.script(jobs[0], settle_events(Exit::Exited(0), 0));
-    h.commit();
-    // The eleventh call's kind 26 is not yet committed.
-    let request = h.request(origin(11), conversation(1), P1, 1);
-    h.ctl.submit(request, h.now);
-    let outlived = h.ctl.outlived(operation);
-    assert_eq!(outlived.count, 9);
-    assert_eq!(outlived.jobs, jobs[1..=MAX_OUTLIVED_IDS]);
-    assert_eq!(h.ctl.outlived([0x77; 16]), Outlived::default());
 }
 
 // ----- J4 listings: live views, counts and revision -----

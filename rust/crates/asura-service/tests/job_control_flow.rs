@@ -1,7 +1,7 @@
 //! The J4 control requests through the real service and client over the
 //! control socket, with real guardians and a scripted loopback model
 //! (tool-job-controller.md, J4 validation, integration layer). Cases:
-//! J4T-04, J4T-05, J4T-06, J4T-07, J4T-09, J4T-13 and ES-12.
+//! J4T-04, J4T-05, J4T-06, J4T-07, J4T-08, J4T-09, J4T-13 and ES-12.
 #[path = "support/job_fixture.rs"]
 mod job_fixture;
 #[path = "support/queue_submit.rs"]
@@ -343,6 +343,76 @@ fn retention() -> Result<()> {
     Ok(())
 }
 
+/// J4T-08 (EX12): a turn cancelled with two live jobs carries
+/// `outlived_jobs` 2 and both IDs, oldest first; after a service restart,
+/// when both jobs have settled after the terminal, the terminal read still
+/// derives 2 from the records.
+fn outlived() -> Result<()> {
+    let model = Model::start()?;
+    let mut fixture = Fixture::new("outlived", CHILD)?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    let (project, _) = fixture.project("project")?;
+    fixture.model(&model.endpoint)?;
+    let long = json!({"command": "sleep 600", "yield_seconds": 0});
+    model.script(&[
+        call("exec_cmd", long.clone()),
+        call("exec_cmd", long),
+        // Only events end this wait: the turn cancel ends it.
+        call("job", json!({"command": "wait", "job": "{job}"})),
+        Step::Final,
+    ]);
+    let operation = fixture.submit(project, "Start two jobs and wait.")?;
+    wait_for(Duration::from_secs(60), "the job wait call", || {
+        fixture.records().is_ok_and(|records| {
+            records
+                .iter()
+                .filter(|r| matches!(r, Record::ToolCall(c) if c.operation == operation))
+                .count()
+                == 3
+        })
+    })?;
+    fixture
+        .attach()?
+        .cancel_conversation(operation, 1, &never)?;
+    let event = fixture.finish(operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(5), "cancelled: {event:?}");
+    let jobs: Vec<Vec<u8>> = event.tools[..2]
+        .iter()
+        .map(|t| t.job_id.clone().ok_or("job_id"))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(event.outlived_jobs, Some(2), "{event:?}");
+    assert_eq!(event.outlived_job_ids, jobs);
+    // Both jobs are still live: no kind 28 yet.
+    assert!(!fixture
+        .records()?
+        .iter()
+        .any(|r| matches!(r, Record::JobSettled(_))));
+    // The restart settles both after the terminal; the read derives the
+    // same count from the records.
+    fixture.stop()?;
+    fixture.start()?;
+    fixture.wait_ready()?;
+    wait_for(Duration::from_secs(60), "both kind 28 after the terminal", || {
+        fixture.records().is_ok_and(|records| {
+            records
+                .iter()
+                .filter(|r| matches!(r, Record::JobSettled(s) if jobs.contains(&s.job.to_vec())))
+                .count()
+                == 2
+        })
+    })?;
+    let event = fixture.finish(operation, Duration::from_secs(60))?;
+    assert_eq!(event.kind, Some(5), "{event:?}");
+    assert_eq!(event.outlived_jobs, Some(2), "after restart: {event:?}");
+    assert_eq!(event.outlived_job_ids, jobs);
+    fixture.stop()?;
+    println!(
+        "PASS J4T-08 integration: a turn cancelled with two live jobs gives outlived_jobs 2 with both IDs, and the same after a service restart"
+    );
+    Ok(())
+}
+
 type Case = (&'static str, fn() -> Result<()>);
 
 fn main() {
@@ -366,7 +436,11 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let cases: [Case; 2] = [("follow", follow_and_cancel), ("retain", retention)];
+    let cases: [Case; 3] = [
+        ("follow", follow_and_cancel),
+        ("retain", retention),
+        ("outlived", outlived),
+    ];
     for (name, case) in cases {
         if !selected.is_empty() && !selected.contains(&name) {
             continue;

@@ -1538,8 +1538,12 @@ impl State {
                 record.text_offset = start;
                 record.text = text;
                 let tools = self.tools(operation)?;
+                let terminal = terminal_frame.sequence;
+                let outlived =
+                    self.read(|state, store| state.outlived_jobs(&tools, terminal, store))?;
                 let mut reply = self.reply();
                 reply.response_bytes = Some(length);
+                reply.outlived = Some(outlived);
                 reply.record = Some(Record::TurnTerminal(record));
                 reply.tools = Some(tools);
                 reply.thinking = Some(ThinkingWindow {

@@ -1,16 +1,14 @@
 //! Job views (tool-job-controller.md, J3 kind 29 and J4 listings): the
 //! state block of one job, the live jobs of a scope with their kind 26
-//! sequence, the live counts, the job revision and the outlived-turn
-//! derivation (EX12). Every function is bounded in-memory work on the
+//! sequence, the live counts and the job revision. The outlived-turn count
+//! (EX12) is derived from the journal records at each terminal read, not
+//! here. Every function is bounded in-memory work on the
 //! reactor (AE-01): at most the 64 unsettled jobs and the 64 remembered
 //! settled jobs.
 //!
 //! The conversation owner and the job control handler are the callers.
 use super::*;
 use journal::{JobBlockReason, JobListEntry, JobRunState, JobScope, JobSnapshot};
-
-/// `ConversationEvent.outlived_job_ids` holds at most 8 IDs.
-pub(crate) const MAX_OUTLIVED_IDS: usize = 8;
 
 /// What the controller knows of one job, in the kind 29 vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,15 +52,6 @@ impl JobView {
             stderr_bytes: self.snapshot.stderr_bytes,
         }
     }
-}
-
-/// The model-origin jobs of one operation whose kind 26 committed and
-/// whose kind 28 has not: the EX12 count at the turn terminal.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Outlived {
-    pub count: u32,
-    /// At most `MAX_OUTLIVED_IDS`, oldest kind 26 first.
-    pub jobs: Vec<Id>,
 }
 
 impl JobController {
@@ -139,33 +128,6 @@ impl JobController {
             .filter(|j| live(j) && in_scope(j, scope))
             .count();
         u32::try_from(n).unwrap_or(u32::MAX)
-    }
-
-    /// EX12: the model-origin jobs of `operation` with a committed kind 26
-    /// and no committed kind 28, at the moment the owner builds the turn
-    /// terminal. The owner's ticket is serialized, so every record the
-    /// controller counts as committed precedes the terminal frame.
-    pub(crate) fn outlived(&self, operation: Id) -> Outlived {
-        let mut jobs: Vec<(u64, Id)> = self
-            .jobs
-            .values()
-            .filter(|j| {
-                matches!(j.origin, Origin::Model { operation: o, .. } if o == operation)
-                    && j.intent == Intent::Committed
-                    && j.state != JobState::Recorded
-                    && !j.recovered
-            })
-            .map(|j| (j.sequence.unwrap_or(u64::MAX), j.id))
-            .collect();
-        jobs.sort_unstable();
-        Outlived {
-            count: u32::try_from(jobs.len()).unwrap_or(u32::MAX),
-            jobs: jobs
-                .into_iter()
-                .take(MAX_OUTLIVED_IDS)
-                .map(|(_, id)| id)
-                .collect(),
-        }
     }
 
     fn job_view(&self, j: &Job, now: Instant) -> JobView {

@@ -2391,6 +2391,41 @@ impl Replay {
             None => None,
         })
     }
+    /// The model jobs of a terminal operation that outlived its turn
+    /// (EX12), from its tool calls (`tools`) and the terminal frame's
+    /// sequence: each `run` exec_cmd call's kind 26 before the terminal
+    /// with no kind 28 before it. One state or index lookup per call, so at
+    /// most `MAX_TOOL_CALL_ORDINAL`.
+    pub fn outlived_jobs(
+        &self,
+        tools: &[ToolRecord],
+        terminal: u64,
+        index: &mut dyn Index,
+    ) -> Result<OutlivedJobs> {
+        let mut found: Vec<(u64, Id)> = Vec::new();
+        for exec in tools.iter().filter_map(|tool| tool.exec_cmd.as_deref()) {
+            let Some(intent) = exec.job_intent.filter(|i| i.sequence < terminal) else {
+                continue;
+            };
+            let outlived = match self.job_state(exec.job, index)? {
+                Some(JobState::Unsettled(_)) => true,
+                Some(JobState::Settled(job)) => job.settled.sequence > terminal,
+                None => return Err(ReplayError::Corrupt),
+            };
+            if outlived {
+                found.push((intent.sequence, exec.job));
+            }
+        }
+        found.sort_unstable();
+        Ok(OutlivedJobs {
+            count: u32::try_from(found.len()).map_err(|_| ReplayError::Limit)?,
+            jobs: found
+                .into_iter()
+                .take(MAX_OUTLIVED_JOB_IDS)
+                .map(|(_, job)| job)
+                .collect(),
+        })
+    }
     // ----- J4 job listings: `L`, `M`, `Y`, `U` and `E` reads. -----
 
     /// The kind 14 locator of a model call: the in-memory operation's call,

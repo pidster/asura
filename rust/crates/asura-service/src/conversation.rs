@@ -183,11 +183,13 @@ fn wait_step(active: &Active) -> Option<pb::ConversationWaitStep> {
 fn terminal_event(
     turn: &journal::TurnTerminal,
     text_bytes: u64,
-    outlived: Option<&crate::job_controller::Outlived>,
+    outlived: Option<&journal::OutlivedJobs>,
 ) -> pb::ConversationEvent {
+    let outlived = outlived.filter(|o| o.count > 0);
     pb::ConversationEvent {
         // The model jobs of the operation that outlived its turn (EX12):
-        // kind 26 committed and no kind 28 before the terminal frame.
+        // kind 26 committed and no kind 28 before the terminal frame,
+        // derived from the records at this read.
         outlived_jobs: outlived.map(|o| o.count),
         outlived_job_ids: outlived
             .map(|o| o.jobs.iter().map(|id| id.to_vec()).collect())
@@ -338,9 +340,6 @@ fn tool_wire_result(value: &journal::ToolResult) -> mp::ToolResult {
         truncated: Some(value.truncated),
     }
 }
-
-/// Terminal outlived counts kept for later reads (EX12).
-const OUTLIVED_KEPT: usize = 64;
 
 /// The owner's project registry and execution setting, as the job control
 /// handler reads them: in-memory lookups only.
@@ -795,8 +794,6 @@ pub(crate) struct Owner {
     execution_pending: Option<ExecutionSetting>,
     /// The secret rule set's warm thread (SD-S2).
     rules: crate::secret_rules::Warmer,
-    /// The outlived model jobs of recent terminals (EX12), newest last.
-    outlived: VecDeque<(journal::Id, crate::job_controller::Outlived)>,
     /// The reply to the last harness record or command.
     #[cfg(feature = "test-support")]
     fixture: Option<writer::Result<writer::Reply>>,
@@ -846,7 +843,6 @@ impl Owner {
             execution: Default::default(),
             execution_pending: None,
             rules: Default::default(),
-            outlived: VecDeque::new(),
             #[cfg(feature = "test-support")]
             fixture: None,
         }
@@ -2869,21 +2865,6 @@ impl Owner {
             }
             Job::Finish => {
                 let mut active = self.active.take().expect("finished operation");
-                // EX12: the operation's model jobs whose kind 26 committed
-                // and kind 28 did not, before this terminal frame (the
-                // ticket is serialized, so the controller's committed state
-                // is the journal's order).
-                if let Some(outlived) = self
-                    .jobs
-                    .controller_ref()
-                    .map(|c| c.outlived(active.turn.operation))
-                    .filter(|o| o.count > 0)
-                {
-                    if self.outlived.len() == OUTLIVED_KEPT {
-                        self.outlived.pop_front();
-                    }
-                    self.outlived.push_back((active.turn.operation, outlived));
-                }
                 // Unverified prefixes of an ended operation become expirable.
                 if let Some(store) = self.payloads.store() {
                     store.operation_ended(active.turn.operation);
@@ -3076,15 +3057,10 @@ impl Owner {
             Job::Read(request) => {
                 self.out.push_back(match value.record {
                     Some(journal::Record::TurnTerminal(terminal)) => {
-                        let outlived = self
-                            .outlived
-                            .iter()
-                            .find(|(id, _)| *id == terminal.operation)
-                            .map(|(_, outlived)| outlived.clone());
                         let mut event = terminal_event(
                             &terminal,
                             value.response_bytes.unwrap_or(0),
-                            outlived.as_ref(),
+                            value.outlived.as_ref(),
                         );
                         if let Some(thinking) = value.thinking {
                             event.thinking_level = Some(i32::from(thinking.level));

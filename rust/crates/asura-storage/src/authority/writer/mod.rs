@@ -311,6 +311,9 @@ pub struct Reply {
     pub stale_project_name_revision: bool,
     /// The whole response length for `ReadResponse`.
     pub response_bytes: Option<u64>,
+    /// `ReadResponse`: the operation's jobs that outlived its turn (EX12),
+    /// derived from the records at this read.
+    pub outlived: Option<OutlivedJobs>,
     /// The turn's thinking level, request and one thinking window, for
     /// `ReadResponse`.
     pub thinking: Option<ThinkingWindow>,

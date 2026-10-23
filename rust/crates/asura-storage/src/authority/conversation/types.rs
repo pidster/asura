@@ -1562,6 +1562,17 @@ pub struct SettledJob {
     pub cancel: Locator,
     pub settled: Locator,
 }
+/// Job IDs per terminal event in `outlived_job_ids` (EX12).
+pub const MAX_OUTLIVED_JOB_IDS: usize = 8;
+/// The model jobs of a terminal operation that outlived its turn (EX12):
+/// its kind 26 records with no kind 28 before the terminal frame. Derived
+/// from the records at each terminal read, never stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutlivedJobs {
+    pub count: u32,
+    /// At most [`MAX_OUTLIVED_JOB_IDS`], oldest kind 26 first.
+    pub jobs: Vec<Id>,
+}
 /// What replay knows of one job ID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobState {
