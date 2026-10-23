@@ -843,6 +843,18 @@ flowchart TD
   models, its run directory and the Hub bundle, using the network, and writing
   its container. If an HS probe fails, residual EX-H1 records the unconfined
   helper.
+- **New residual SG-T3 (HS-P7).** The App Sandbox does not stop the helper
+  reading the arguments and environment of other processes of the same user
+  through `KERN_PROCARGS2` (process list and descriptor info are denied, these
+  reads are not). A compromised helper can therefore see secrets that other
+  long-running programs hold in their environment variables, for example API
+  tokens. The App Sandbox has no entitlement to deny this. Probe HS-P8 (SG2a)
+  tests whether a service-applied Seatbelt profile for the helper, with
+  `(deny process-info* (target others))` and the sysctl rule for
+  `kern.procargs2`, blocks these reads; if it does, the owner chooses between
+  that profile, the App Sandbox, or both. Until then the residual stands and
+  the person is advised to keep long-lived secrets out of the environment of
+  programs that stay running.
 - **Hub bundle.** The bundle holds tokenizer configuration data only. Its
   digest is pinned like the helper's, so a changed bundle fails before spawn.
 - **Data handling.** No signing material enters Asura records, tests or logs.
@@ -994,7 +1006,7 @@ flowchart TD
 | BN1 | `asura-platform/src/model_process.rs` (bundle copy, limits, cleanup), `asura-service/build.rs` and `asura-service/src/model_owner.rs` (`hub_bundle_sha256`), `model-package.json` producer, `swift/model-helper/README.md` (package step), model provider integration design | BN-P1 | SG-V10 |
 | SG1 | `tools/release/` (new script, `Info.plist` template, entitlement plists), `asura-service/src/model_owner.rs` (resource path), `asura-platform/src/model_process.rs` (resource source path), `swift/model-helper/README.md` | SGQ1–SGQ3, BN1 | SG-V1 to SG-V3, SG-V9 |
 | SG0-K | Owner's Mac; results recorded in this design | SG1 (a signed qualification bundle) | KC-P1 to KC-P4 results |
-| SG2a | `swift/model-helper` build: embed `Info.plist` (`CFBundleIdentifier` `com.pidster.asura.model`) in every helper build; the model inventory opens the asset root by its full path instead of walking from `/` | SG0 ad hoc results | HS-P1 and HS-P6 rerun with an ad hoc sandboxed helper; one Core AI cache for repeated spawns (two spawns create one cache directory) |
+| SG2a | HS-P8 probe (Seatbelt `process-info*` and `kern.procargs2` denial for the helper); `swift/model-helper` build: embed `Info.plist` (`CFBundleIdentifier` `com.pidster.asura.model`) in every helper build; the model inventory opens the asset root by its full path instead of walking from `/` | SG0 ad hoc results | HS-P1 and HS-P6 rerun with an ad hoc sandboxed helper; one Core AI cache for repeated spawns (two spawns create one cache directory) |
 | SG2 | Helper entitlement plist; threat model rows | SG1, SG2a | SG-V5, or EX-H1 recorded |
 | SG3 | `asura-platform/src/keychain*`, `asura-service/src/secret_store*`, `ServiceObservation` field 8 schema (fields 4 and 6 reserved), TUI `/status` text, secret store design | SG0-K, SGQ4–SGQ6 | SG-V6, SG-V7 |
 | SG4 | `tools/release/`, `pidster/homebrew-tap` formula | SG1, SG2, NT-P1 | HD1, HD5, HD9, HD10, HD12, HD13 |
