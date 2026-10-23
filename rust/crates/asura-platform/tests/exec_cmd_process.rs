@@ -2215,8 +2215,8 @@ fn pc_i37_mach_probe_steps(home: &Path, person: &PersonHome) {
 }
 /// EPG-I1 (PX-V2 part): a real `model-1` job under `sandbox-exec` cannot
 /// write the implicit-execution paths of its project, at the root, nested
-/// up to 8 directories, in another letter case or under the firmlinked
-/// spelling; writes elsewhere in the project, including elsewhere under
+/// at any depth (8, 9 and 20 directories are tried; the deny has no depth
+/// bound), in another letter case or under the firmlinked spelling; writes elsewhere in the project, including elsewhere under
 /// `.git`, succeed. The project path holds regex metacharacters, so the
 /// nested rule only matches when the path is escaped. `person-1` and
 /// `person-outside-1` keep write access to the same paths (PX1).
@@ -2225,6 +2225,7 @@ fn epg_i1_model_implicit_path_denial() {
     let project = f.0.join("project");
     let nested8 = "1/2/3/4/5/6/7/8";
     let nested9 = "1/2/3/4/5/6/7/8/9";
+    let nested20 = "1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/18/19/20";
     for dir in [
         ".git/hooks",
         "sub/.git/hooks",
@@ -2232,6 +2233,7 @@ fn epg_i1_model_implicit_path_denial() {
         "sub/.cargo",
         &format!("{nested8}/.git/hooks"),
         &format!("{nested9}/.git/hooks"),
+        &format!("{nested20}/.git/hooks"),
     ] {
         fs::create_dir_all(project.join(dir)).unwrap();
     }
@@ -2300,6 +2302,26 @@ fn epg_i1_model_implicit_path_denial() {
             "depth8-envrc",
             step("depth8-envrc", &format!("printf x > {nested8}/.envrc")),
         ),
+        // Past the walk's bound of 8: the deny has no depth bound.
+        (
+            "depth9-hook",
+            step("depth9-hook", &format!("printf x > {nested9}/.git/hooks/x")),
+        ),
+        (
+            "depth9-envrc",
+            step("depth9-envrc", &format!("printf x > {nested9}/.envrc")),
+        ),
+        (
+            "depth20-hook",
+            step(
+                "depth20-hook",
+                &format!("printf x > {nested20}/.git/hooks/x"),
+            ),
+        ),
+        (
+            "depth20-envrc",
+            step("depth20-envrc", &format!("printf x > {nested20}/.envrc")),
+        ),
         ("hook-dir", step("hook-dir", "/bin/mkdir .git/hooks/new")),
         (
             "hook-chmod",
@@ -2362,15 +2384,6 @@ fn epg_i1_model_implicit_path_denial() {
         (
             "config-lock",
             step("config-lock", "printf x > .git/config.lock2"),
-        ),
-        // Past the designed depth bound of 8 nested directories.
-        (
-            "depth9-hook",
-            step("depth9-hook", &format!("printf x > {nested9}/.git/hooks/x")),
-        ),
-        (
-            "depth9-envrc",
-            step("depth9-envrc", &format!("printf x > {nested9}/.envrc")),
         ),
     ];
     let script: String = denied
@@ -2435,14 +2448,22 @@ fn epg_i1_model_implicit_path_denial() {
         "sub/.git/config",
         "sub/.envrc",
         "sub/.cargo/config.toml",
-        "1/2/3/4/5/6/7/8/.envrc",
         ".git/hooks-old",
     ] {
         assert!(!project.join(path).exists(), "{path}");
     }
-    assert!(project.join(format!("{nested9}/.envrc")).exists());
+    for nested in [nested8, nested9, nested20] {
+        assert!(
+            !project.join(format!("{nested}/.envrc")).exists(),
+            "{nested}"
+        );
+        assert!(
+            names(&project.join(format!("{nested}/.git/hooks"))).is_empty(),
+            "{nested}"
+        );
+    }
     println!(
-        "EPG-I1: {} implicit-execution writes denied by the OS (root, nested, depth 8, case, firmlink); {} other project writes succeeded",
+        "EPG-I1: {} implicit-execution writes denied by the OS (root, nested, depths 8, 9 and 20, case, firmlink); {} other project writes succeeded",
         denied.len(),
         allowed.len()
     );
