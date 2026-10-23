@@ -133,6 +133,9 @@ directories named `.git` (except as listed below), `target`, `node_modules`,
 | `.envrc` | Any depth up to 8 |
 | `.cargo/config`, `.cargo/config.toml` | Any depth up to 8 |
 
+The depths above bound the walk. The model write denial covers the same
+patterns at any depth ([model write denial](#model-write-denial)).
+
 **Build and test list:**
 
 | Class | Patterns | Depth |
@@ -160,6 +163,24 @@ every regex metacharacter. A model command that writes such a path gets
 `Operation not permitted`. Cost (PX1): model Git operations that write
 `.git/config`, such as `git config` or `git remote add`, fail; the model asks
 the person, who runs them with `!`.
+
+Implementation notes (EPG-P, 2026-10-23, probed on macOS 27):
+
+- The nested `regex` filter has no depth bound (`([^/]+/)+`): a deny rule
+  costs nothing more at any depth. The walk keeps its bound of 8, because
+  that bound limits the walk's cost. Seatbelt ignores `{m,n}` repetition, so
+  a regex never uses it.
+- On a case-insensitive APFS volume Seatbelt matches these filters in any
+  letter case (`.ENVRC`, `.GIT/Hooks` are denied); the
+  `/System/Volumes/Data` firmlink spelling is denied too.
+- **Directory moves.** Seatbelt checks only the old and new path of a moved
+  item, not the files inside it. A model can build `d/.envrc` in its job
+  scratch and move `d` into the project, or rename `.git` and move in a
+  prepared `.git` with its own `hooks/`. The deny rule is therefore a first
+  layer; the [check before each person command](#warning-at-person-dispatch) (EPG-R3) is
+  the backstop: it finds such a file and warns `not_approved`. Denying writes
+  to the `.git` and `.cargo` directories themselves is rejected: it would
+  block a model's `git init` and still not stop the first route.
 
 The person profile and the outside profile keep write access: the person
 applies a change the model asked for with a `!` command or an editor. That is
@@ -356,6 +377,9 @@ gets `not_implicit`.
   approved; it reveals nothing beyond equality.
 - The guard is a warning, not a boundary: a person command still runs changed
   code. The threat model's PT2 residual stands.
+- The model deny rule is a first layer only: a directory moved into the project
+  carries implicit files past it ([directory moves](#model-write-denial)). The
+  dispatch check is the backstop for that case.
 
 ## Validation
 
