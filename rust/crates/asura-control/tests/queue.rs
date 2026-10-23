@@ -11,6 +11,11 @@ fn envelope(body: Body) -> pb::Envelope {
 #[test]
 fn queue_projection_requires_bounded_text_and_truthful_operation_state() {
     let entry = pb::ConversationQueueEntry {
+        command_cwd: None,
+        command_outside_sandbox: None,
+        waiting_reason: None,
+        waiting_text: None,
+        command_filtered: None,
         input_id: Some(vec![1; 16]),
         project_id: Some(vec![2; 16]),
         conversation_id: Some(vec![3; 16]),
@@ -30,6 +35,8 @@ fn queue_projection_requires_bounded_text_and_truthful_operation_state() {
     let valid = |entries, full| {
         validate_semantics(
             &envelope(Body::ConversationQueueReply(pb::ConversationQueueReply {
+                refusal: None,
+                refusal_status: None,
                 entries,
                 request_id: None,
                 full_text: Some(full),
@@ -186,6 +193,11 @@ fn new_queue_requests_roundtrip_and_reject_malformed_cursor_or_move() {
 #[test]
 fn queue_projection_and_stale_order_are_strict() {
     let entry = pb::ConversationQueueEntry {
+        command_cwd: None,
+        command_outside_sandbox: None,
+        waiting_reason: None,
+        waiting_text: None,
+        command_filtered: None,
         input_id: Some(vec![1; 16]),
         project_id: Some(vec![2; 16]),
         conversation_id: Some(vec![3; 16]),
@@ -203,6 +215,8 @@ fn queue_projection_and_stale_order_are_strict() {
         waiting_step: None,
     };
     let reply = pb::ConversationQueueReply {
+        refusal: None,
+        refusal_status: None,
         entries: vec![entry.clone()],
         request_id: Some(vec![4; 16]),
         full_text: Some(false),

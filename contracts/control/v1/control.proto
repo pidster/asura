@@ -63,6 +63,9 @@ message Envelope {
     JobCancelReply job_cancel_reply = 65;
     JobRetain job_retain = 66;
     JobRetainReply job_retain_reply = 67;
+    // Person command mode (person-command-mode.md, control API additions).
+    // Replied to with ConversationQueueReply.
+    ConversationQueueCommandSubmit conversation_queue_command_submit = 68;
   }
   // Removed operations: direct ConversationSubmit (22) and its reply (23), and
   // the target-bearing ConversationEnqueue (35). Conversation input uses the queue.
@@ -78,6 +81,16 @@ message ServiceObservation {
   optional StoredMemoryStatus stored_memory = 6;
   // The configured thinking level (thinking-level.md).
   optional ThinkingLevel thinking_level = 7;
+  // The secret store worker's counts (secret-store.md, operations and audit).
+  optional SecretStoreStatus secret_store = 8;
+}
+message SecretStoreStatus {
+  optional uint32 item_count = 1;         // every listed item, 0-257; 257 means more than 256
+  optional bool sweep_pending = 2;        // startup sweep deferred
+  optional uint32 last_status = 3;        // 0, or the last unavailable OSStatus as its absolute value
+  optional uint32 stranded_count = 4;     // items whose delete was denied, 0-257
+  optional uint32 unrecognized_count = 5; // items whose account is not input.<32 hex>, 0-257
+  repeated bytes stranded_inputs = 6;     // at most 16 input IDs of 16 bytes each
 }
 // The person's thinking level and the form sent for a turn (thinking-level.md).
 enum ThinkingLevel { THINKING_LEVEL_DEFAULT = 0; THINKING_LEVEL_OFF = 1; THINKING_LEVEL_LOW = 2; THINKING_LEVEL_MEDIUM = 3; THINKING_LEVEL_HIGH = 4; }
@@ -155,6 +168,8 @@ enum Capability {
   CAPABILITY_SETUP = 6;
   // Job requests 57-67; listed once J3 and J4 are enabled (EN1).
   CAPABILITY_JOBS = 7;
+  // Person command submit 68; listed only once packets P1-P5 and Q pass (OD3).
+  CAPABILITY_PERSON_COMMAND = 8;
 }
 enum Lifecycle {
   LIFECYCLE_UNSPECIFIED = 0;
@@ -227,6 +242,8 @@ message ConversationHistoryEntry {
   optional uint64 generation = 2;
   optional uint64 accepted_frame = 3;
   optional ConversationEventKind kind = 4;
+  // A person command entry: its kind 31 input; the log reads the job API.
+  optional bytes person_command_input_id = 5;
 }
 message ConversationHistoryReply {
   optional bytes project_id = 1;
@@ -378,6 +395,23 @@ message ConversationQueueSubmit {
   optional bool new_conversation = 5;
   optional string prompt = 6;
 }
+// Person-typed `!` or `!!` command, queued in a conversation lane.
+message ConversationQueueCommandSubmit {
+  optional bytes request_id = 1;
+  optional bytes project_id = 2;
+  optional bytes conversation_id = 3;
+  optional uint64 expected_generation = 4;
+  optional bool new_conversation = 5;
+  optional string command = 6;      // 1-8192 UTF-8 bytes, no NUL
+  optional string cwd = 7;          // project-relative, "." for root, 1-1024 bytes
+  optional string search_path = 8;  // `!` only: client PATH, at most 4096 bytes
+  repeated PersonEnvironment environment = 9;  // `!` only: PC3 client names, at most 9
+  optional bool outside_sandbox = 10;          // true for a `!!` command
+  repeated LaunchVariable launch_environment = 11;  // `!!` only: at most 1,024 entries, 40,960 bytes
+}
+message PersonEnvironment { optional string name = 1; optional string value = 2; }
+// Bytes: a terminal environment need not be UTF-8.
+message LaunchVariable { optional bytes name = 1; optional bytes value = 2; }
 message ConversationQueueReorder {
   optional bytes request_id = 1;
   optional bytes input_id = 2;
@@ -412,6 +446,31 @@ message ConversationQueueEntry {
   optional uint32 order_position = 13; // pending lane order, independent of immutable sequence
   optional string hold_reason = 14; // Current-owner diagnostic only; absent after restart
   optional ConversationWaitStep waiting_step = 15; // Live, Queued only, values 1-2; never journaled
+  // Kind 3 (person command) only.
+  optional string command_cwd = 16;             // kind 31 cwd
+  optional bool command_outside_sandbox = 17;   // true for `!!`
+  optional QueueWaitReason waiting_reason = 18; // live, Queued only; never journaled
+  optional string waiting_text = 19;            // brief text with live numbers, at most 128 bytes
+  optional bool command_filtered = 20;          // display-only copy of a whole-command input
+}
+enum QueueWaitReason {
+  QUEUE_WAIT_REASON_UNSPECIFIED = 0;
+  // 1-9 equal the J2 block reasons, in the order of the start-condition table.
+  QUEUE_WAIT_REASON_RECOVERING = 1;
+  QUEUE_WAIT_REASON_JOURNAL_UNAVAILABLE = 2;
+  QUEUE_WAIT_REASON_JOURNAL_HELD = 3;
+  QUEUE_WAIT_REASON_PAYLOAD_UNAVAILABLE = 4;
+  QUEUE_WAIT_REASON_AGENT_SLOTS = 5;
+  QUEUE_WAIT_REASON_SERVICE_SLOTS = 6;
+  QUEUE_WAIT_REASON_PENDING_INSTALLS = 7;
+  QUEUE_WAIT_REASON_QUOTA = 8;
+  QUEUE_WAIT_REASON_DISK_SPACE = 9;
+  QUEUE_WAIT_REASON_MODEL_TURN = 10;          // "waiting: model turn running"
+  QUEUE_WAIT_REASON_KEYCHAIN_LOCKED = 11;     // "waiting: Keychain locked"
+  QUEUE_WAIT_REASON_KEYCHAIN_UNAVAILABLE = 12;// "waiting: Keychain unavailable"
+  QUEUE_WAIT_REASON_KEYCHAIN_BUSY = 13;       // "waiting: Keychain requests queued"
+  QUEUE_WAIT_REASON_HELD_HEAD = 14;           // "waiting: an earlier input is held"
+  // 15 PATH_CHECK and entry fields 21-22 are added by P5 (execution-path-guard.md).
 }
 message ConversationQueueReply {
   repeated ConversationQueueEntry entries = 1;
@@ -422,6 +481,24 @@ message ConversationQueueReply {
   optional uint64 order_revision = 6; // independent of authority revision
   optional bool stale_order = 7; // reorder CAS lost; entries contain current projection
   optional bytes accepted_input_id = 8; // new Submit receipt within the bounded projection
+  optional QueueRefusal refusal = 9;     // a definite refusal; nothing was queued or stored
+  optional uint32 refusal_status = 10;   // with SECRET_STORE_UNAVAILABLE: |OSStatus|
+}
+enum QueueRefusal {
+  QUEUE_REFUSAL_UNSPECIFIED = 0;
+  QUEUE_REFUSAL_OUTSIDE_SANDBOX_OFF = 1;
+  QUEUE_REFUSAL_ENVIRONMENT_INVALID = 2;
+  QUEUE_REFUSAL_ENVIRONMENT_TOO_LARGE = 3;
+  QUEUE_REFUSAL_PATH_INVALID = 4;
+  QUEUE_REFUSAL_CWD_INVALID = 5;
+  QUEUE_REFUSAL_SECRET_STORE_LOCKED = 6;
+  QUEUE_REFUSAL_SECRET_STORE_DENIED = 7;
+  QUEUE_REFUSAL_SECRET_STORE_UNAVAILABLE = 8;
+  QUEUE_REFUSAL_SECRET_STORE_FULL = 9;
+  QUEUE_REFUSAL_SECRET_STORE_BUSY = 10;
+  QUEUE_REFUSAL_SECRET_IN_CWD = 11;
+  QUEUE_REFUSAL_PLACEHOLDER_NOT_AVAILABLE = 12;
+  QUEUE_REFUSAL_SECRET_DETECTION_UNAVAILABLE = 13;
 }
 
 message ToolProgress {
@@ -611,7 +688,7 @@ message JobEntry {
   optional uint32 block_reason = 8;     // J2 block reason 1-9 when QUEUED; pause reason when CAPTURE_PAUSED
   optional string reason_text = 9;      // the brief reason, for example "waiting: 2 of 2 jobs running for this agent"
   optional uint32 outcome = 10;         // kind 28 outcome 1-5, SETTLED only
-  optional uint32 reason = 11;          // job reason code 0-19
+  optional uint32 reason = 11;          // job reason code 0-20
   optional uint32 exit_kind = 12;
   optional uint32 exit_value = 13;
   optional uint64 stdout_bytes = 14;
@@ -628,6 +705,10 @@ message JobEntry {
   optional uint64 sequence = 25;        // kind 26 frame sequence
   optional bool cancel_requested = 26;
   optional bytes input_id = 27;         // person-origin jobs (PCM)
+  // Person `!!` jobs only (OD2): survivors from kind 6, live DRAINING after
+  // kind 2 or SETTLED; and DRAINING after kind 2 reason 15.
+  optional uint32 left_running = 28;
+  optional bool shell_exited = 29;
 }
 message JobInspect { optional bytes job_id = 1; optional bytes project_id = 2; }
 message JobDetail {

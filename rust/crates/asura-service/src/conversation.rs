@@ -2667,6 +2667,7 @@ impl Owner {
                                 .entries
                                 .into_iter()
                                 .map(|entry| pb::ConversationHistoryEntry {
+                                    person_command_input_id: None,
                                     operation_id: Some(entry.operation.to_vec()),
                                     generation: Some(entry.generation),
                                     accepted_frame: Some(entry.accepted_frame),
@@ -2943,6 +2944,11 @@ impl Owner {
                             self.hold_reasons.remove(&v.input.input);
                         }
                         pb::ConversationQueueEntry {
+                            command_cwd: None,
+                            command_outside_sandbox: None,
+                            waiting_reason: None,
+                            waiting_text: None,
+                            command_filtered: None,
                             input_id: Some(v.input.input.to_vec()),
                             project_id: Some(v.input.project.to_vec()),
                             conversation_id: Some(v.input.conversation.to_vec()),
@@ -2972,6 +2978,8 @@ impl Owner {
                 self.out.push_back(reply(
                     request,
                     Body::ConversationQueueReply(pb::ConversationQueueReply {
+                        refusal: None,
+                        refusal_status: None,
                         entries,
                         request_id,
                         full_text: Some(full_text),
@@ -3628,6 +3636,8 @@ impl Owner {
                         self.out.push_back(reply(
                             request,
                             Body::ConversationQueueReply(pb::ConversationQueueReply {
+                                refusal: None,
+                                refusal_status: None,
                                 entries: Vec::new(),
                                 request_id: None,
                                 full_text: Some(false),

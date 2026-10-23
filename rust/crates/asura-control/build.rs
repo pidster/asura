@@ -148,6 +148,15 @@ fn tables(
                 (".asura.control.v1.JobDetail", "notes") => 16,
                 (".asura.control.v1.JobPage", "pages") => 2,
                 (".asura.control.v1.ConversationEvent", "outlived_job_ids") => 8,
+                // Person command mode: PC3 names, and stranded secret store items.
+                (".asura.control.v1.ConversationQueueCommandSubmit", "environment") => 9,
+                (".asura.control.v1.SecretStoreStatus", "stranded_inputs") => 16,
+                // The `!!` launch environment is bounded by its typed refusal
+                // (1,024 entries, `environment_too_large`), so the wire bound
+                // is only the frame's: each entry takes at least 2 bytes.
+                (".asura.control.v1.ConversationQueueCommandSubmit", "launch_environment") => {
+                    32_768
+                }
                 // Two entries per shown turn; the context composer bounds segments.
                 (".asura.model.v1.ModelInput", "history") => 2048,
                 _ => 32,

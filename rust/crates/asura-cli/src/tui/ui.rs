@@ -5721,6 +5721,8 @@ mod tests {
         app.queue_finished(super::super::queue::Update {
             request: request.clone(),
             outcome: Ok(asura_control::pb::ConversationQueueReply {
+                refusal: None,
+                refusal_status: None,
                 entries: vec![asura_control::pb::ConversationQueueEntry {
                     input_id: Some(input_id.clone()),
                     project_id: sent.project_id.clone(),
