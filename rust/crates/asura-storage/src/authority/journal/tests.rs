@@ -1923,13 +1923,63 @@ fn p2_kind_31_checkpoint_and_index_entries() {
     h.append(first).unwrap();
     let (second, b) = person31(&mut h, project, lane, false, true);
     h.append(second).unwrap();
+    let queued_a = h.state().inputs[&a].frame;
+    let queued_b = h.state().inputs[&b].frame;
     h.append(person_intent(a)).unwrap();
+    let dispatched_a = h.state().sequence;
     let job_a = job_id(&JobOrigin::Person { input: a });
     let job_b = job_id(&JobOrigin::Person { input: b });
     h.append(exited(job_a)).unwrap();
     h.append(person_intent(b)).unwrap();
+    let dispatched_b = h.state().sequence;
     let (third, c) = person31(&mut h, project, lane, false, false);
     h.append(third).unwrap();
+    // P3-E3: a command dropped before it ran has no `p` entry.
+    let (fourth, d) = person31(&mut h, project, lane, false, false);
+    h.append(fourth).unwrap();
+    // A drop needs a hold first.
+    for action in [InputAction::Hold, InputAction::Drop] {
+        let request = h.fresh();
+        h.append(Record::InputDecision(InputDecision {
+            request,
+            digest: request_digest(Request::InputDecision { input: d, action }).unwrap(),
+            input: d,
+            action,
+        }))
+        .unwrap();
+    }
+    assert_eq!(h.state().input_status(d), Some(InputStatus::Dropped));
+    // P3-E3: each person kind 26 emits its `p` entry into the delta.
+    let person_entries = vec![
+        (
+            Key::new(Tag::PersonCommand, lane, dispatched_a),
+            Entry::PersonCommand {
+                input: a,
+                job: job_a,
+                expected_generation: 0,
+                queued: queued_a,
+            },
+        ),
+        (
+            Key::new(Tag::PersonCommand, lane, dispatched_b),
+            Entry::PersonCommand {
+                input: b,
+                job: job_b,
+                expected_generation: 0,
+                queued: queued_b,
+            },
+        ),
+    ];
+    let decoded = |entries: Vec<(Key, Value)>| -> Vec<(Key, Entry)> {
+        entries
+            .into_iter()
+            .map(|(key, value)| (key, Entry::decode(key.tag, &value).unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        decoded(h.state().delta_tag(Tag::PersonCommand)),
+        person_entries
+    );
     // A restart: `c` is held (PR6); `b` keeps running until `interrupted`.
     h.append(Record::OwnerGeneration).unwrap();
     assert_eq!(h.state().input_status(a), Some(InputStatus::Complete));
@@ -1953,6 +2003,19 @@ fn p2_kind_31_checkpoint_and_index_entries() {
         assert!(state.base > 0);
         assert_eq!(state.input_status(b), Some(InputStatus::Running));
         assert_eq!(state.input_status(c), Some(InputStatus::Held));
+        // P3-E3: the `p` entries left the delta for an index run; the
+        // reopened checkpoint reads them back, newest first.
+        assert!(state.delta_tag(Tag::PersonCommand).is_empty());
+        let (lo, hi) = (
+            Key::new(Tag::PersonCommand, lane, 0),
+            Key::new(Tag::PersonCommand, lane, u64::MAX),
+        );
+        let mut newest_first = person_entries.clone();
+        newest_first.reverse();
+        assert_eq!(
+            decoded(state.range(&lo, &hi, true, 9, &mut store).unwrap()),
+            newest_first
+        );
         let person = state.inputs[&b].person.unwrap();
         assert!(person.outside_sandbox);
         assert_eq!(person.job, Some(unsettled(&state)[0].intent));

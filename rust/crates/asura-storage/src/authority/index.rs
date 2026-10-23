@@ -72,9 +72,12 @@ pub enum Tag {
     AllJobs = b'Y',
     /// One kind 32 per reference: job, input or request ID, 0 (P5, AE-05).
     PathReference = b'Z',
+    /// Conversation person command: conversation, kind 26 sequence (P3-E3).
+    /// Lowercase because every uppercase letter is in use.
+    PersonCommand = b'p',
 }
 impl Tag {
-    pub const ALL: [Tag; 26] = [
+    pub const ALL: [Tag; 27] = [
         Tag::Activity,
         Tag::PathChange,
         Tag::Call,
@@ -101,6 +104,7 @@ impl Tag {
         Tag::Payload,
         Tag::AllJobs,
         Tag::PathReference,
+        Tag::PersonCommand,
     ];
     pub fn from_byte(byte: u8) -> Option<Self> {
         Self::ALL.into_iter().find(|tag| *tag as u8 == byte)
@@ -328,6 +332,15 @@ pub enum Entry {
         operation: Id,
         generation: u64,
     },
+    /// `p`: a dispatched person command of a conversation, keyed by its
+    /// kind 26 sequence: the kind 31 input, the job, the kind 31 expected
+    /// generation and the kind 31 locator.
+    PersonCommand {
+        input: Id,
+        job: Id,
+        expected_generation: u64,
+        queued: Locator,
+    },
 }
 /// The `O` facts of a terminal operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,6 +450,7 @@ impl Entry {
             Self::Conversation { .. } => Tag::Conversation,
             Self::ProjectConversation { .. } => Tag::ProjectConversation,
             Self::Activity { .. } => Tag::Activity,
+            Self::PersonCommand { .. } => Tag::PersonCommand,
         }
     }
     pub fn encode(&self) -> Value {
@@ -616,6 +630,17 @@ impl Entry {
                 out.put(operation);
                 out.u64(*generation);
             }
+            Self::PersonCommand {
+                input,
+                job,
+                expected_generation,
+                queued,
+            } => {
+                out.put(input);
+                out.put(job);
+                out.u64(*expected_generation);
+                out.locator(queued);
+            }
         }
         out.bytes
     }
@@ -752,6 +777,12 @@ impl Entry {
                 operation: r.id(),
                 generation: r.u64(),
             },
+            Tag::PersonCommand => Self::PersonCommand {
+                input: r.id(),
+                job: r.id(),
+                expected_generation: r.u64(),
+                queued: r.locator(),
+            },
         };
         r.finish()?;
         Ok(entry)
@@ -792,6 +823,8 @@ mod tests {
             Key::new(Tag::Payload, [0; 16], 0),
             Key::new(Tag::AllJobs, [0; 16], 0),
             Key::new(Tag::PathReference, [0; 16], 0),
+            Key::new(Tag::PersonCommand, [0; 16], 0),
+            Key::new(Tag::PersonCommand, [0; 16], 1),
         ];
         // Tag::ALL is in byte order with no gaps in the encoding check.
         for pair in Tag::ALL.windows(2) {
@@ -808,7 +841,7 @@ mod tests {
         let mut bad = keys[0].encode();
         bad[31] = 1;
         assert_eq!(Key::decode(&bad), Err(ReplayError::Corrupt));
-        for unknown in [0, b'@', b'[', b'a'] {
+        for unknown in [0, b'@', b'[', b'a', b'o', b'q', b'z', 0xff] {
             let mut bad = keys[0].encode();
             bad[0] = unknown;
             assert_eq!(Key::decode(&bad), Err(ReplayError::Corrupt), "{unknown}");
@@ -937,6 +970,12 @@ mod tests {
                 conversation: [9; 16],
                 operation: [10; 16],
                 generation: 4,
+            },
+            Entry::PersonCommand {
+                input: [20; 16],
+                job: [21; 16],
+                expected_generation: u64::MAX,
+                queued: locator(26),
             },
         ];
         // `X` form byte: 2 a job; form 1 (a J1 call) is retired and, like

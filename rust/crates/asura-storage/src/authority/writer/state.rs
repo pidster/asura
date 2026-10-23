@@ -1676,7 +1676,7 @@ impl State {
                         }
                         Some(conversation)
                     }
-                    None => self.find_project(project)?.latest.map(|l| l.conversation),
+                    None => self.history_conversation(project)?,
                 };
                 let page = match selected {
                     Some(conversation) => {
@@ -1991,8 +1991,12 @@ impl State {
         }
         Ok(self.reply())
     }
-    /// One newest-first page of a conversation's turns below an accepted
-    /// sequence (SJ-D14), with the conversation generation.
+    /// One newest-first page of a conversation's history below an accepted
+    /// sequence (SJ-D14), with the conversation generation: `T` turns, the
+    /// active turn and `p` person commands merged by accepted sequence. A
+    /// cursor names a turn's accepted frame (`A`) or a person command's
+    /// kind 26 (`p`) of this conversation. Bounded work: at most `limit + 1`
+    /// entries from each source and a binary search over the turns.
     fn history_page(
         &mut self,
         project: Id,
@@ -2004,39 +2008,43 @@ impl State {
             .read(|state, store| state.find_conversation(conversation, store))?
             .ok_or(Error::Invalid)?;
         let state = self.state()?.clone();
+        if let Some(sequence) = before {
+            let turn = self.read(|state, store| {
+                state.entry(&Key::new(Tag::Activity, project, sequence), store)
+            })?;
+            let person = self.read(|state, store| {
+                state.entry(&Key::new(Tag::PersonCommand, conversation, sequence), store)
+            })?;
+            let valid = matches!(
+                turn,
+                Some(Entry::Activity { conversation: c, .. }) if c == conversation
+            ) || matches!(person, Some(Entry::PersonCommand { .. }));
+            if !valid {
+                return Err(Error::Invalid);
+            }
+        }
+        let below = before.unwrap_or(u64::MAX);
+        let want = limit + 1;
         let mut entries = Vec::new();
         // The newest turn may be active (no `T` entry yet).
         let active = state
             .active()
             .filter(|(_, op)| op.conversation == conversation)
+            .filter(|(_, op)| op.accepted_frame.sequence < below)
             .map(|(id, op)| HistoryEntry {
-                operation: id,
                 generation: op.generation,
                 accepted_frame: op.accepted_frame.sequence,
-                terminal: None,
+                source: HistorySource::Turn {
+                    operation: id,
+                    terminal: None,
+                },
             });
-        let below_generation = match before {
-            None => {
-                entries.extend(active);
-                found.generation.saturating_add(1)
-            }
-            Some(sequence) => {
-                let anchor = self.read(|state, store| {
-                    state.entry(&Key::new(Tag::Activity, project, sequence), store)
-                })?;
-                match anchor {
-                    Some(Entry::Activity {
-                        conversation: c,
-                        generation,
-                        ..
-                    }) if c == conversation => generation,
-                    _ => return Err(Error::Invalid),
-                }
-            }
-        };
+        entries.extend(active);
+        // Turns: accepted sequences grow with the generation, so the newest
+        // turn below the cursor is found by a binary search over `T`.
+        let top = self.turn_generation_below(conversation, below)?;
         let lo = Key::new(Tag::Turn, conversation, 0);
-        let hi = Key::new(Tag::Turn, conversation, below_generation);
-        let want = limit + 1 - entries.len().min(limit);
+        let hi = Key::new(Tag::Turn, conversation, top.saturating_add(1));
         let turns = self.read(|state, store| state.range(&lo, &hi, true, want, store))?;
         for (key, value) in turns {
             let Entry::Turn {
@@ -2048,22 +2056,113 @@ impl State {
             else {
                 return Err(Error::RepairRequired);
             };
-            if entries
-                .iter()
-                .any(|e: &HistoryEntry| e.operation == operation)
-            {
+            if accepted.sequence >= below {
+                return Err(Error::RepairRequired);
+            }
+            if entries.iter().any(|e: &HistoryEntry| {
+                matches!(e.source, HistorySource::Turn { operation: o, .. } if o == operation)
+            }) {
                 continue;
             }
             entries.push(HistoryEntry {
-                operation,
                 generation: key.disc,
                 accepted_frame: accepted.sequence,
-                terminal: Some(terminal),
+                source: HistorySource::Turn {
+                    operation,
+                    terminal: Some(terminal),
+                },
             });
+        }
+        // Person commands: `p` entries by kind 26 sequence. The delta holds
+        // the commands dispatched since the last roll.
+        let lo = Key::new(Tag::PersonCommand, conversation, 0);
+        let hi = Key::new(Tag::PersonCommand, conversation, below);
+        let commands = self.read(|state, store| state.range(&lo, &hi, true, want, store))?;
+        for (key, value) in commands {
+            let Entry::PersonCommand {
+                input,
+                expected_generation,
+                ..
+            } = Entry::decode(Tag::PersonCommand, &value).map_err(lookup)?
+            else {
+                return Err(Error::RepairRequired);
+            };
+            if expected_generation > found.generation {
+                return Err(Error::RepairRequired);
+            }
+            entries.push(HistoryEntry {
+                generation: expected_generation,
+                accepted_frame: key.disc,
+                source: HistorySource::Person { input },
+            });
+        }
+        entries.sort_by(|a, b| b.accepted_frame.cmp(&a.accepted_frame));
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].accepted_frame == pair[1].accepted_frame)
+        {
+            return Err(Error::RepairRequired);
         }
         let has_more = entries.len() > limit;
         entries.truncate(limit);
         Ok((entries, has_more, Some(found.generation)))
+    }
+    /// The highest generation whose `T` turn was accepted below `below`, or 0:
+    /// a binary search over the conversation's `T` entries, whose accepted
+    /// sequences grow with the generation (at most 64 lookups).
+    fn turn_generation_below(&mut self, conversation: Id, below: u64) -> Result<u64> {
+        let (lo, hi) = prefix(Tag::Turn, conversation);
+        let newest = self.read(|state, store| state.range(&lo, &hi, true, 1, store))?;
+        let Some((key, _)) = newest.first() else {
+            return Ok(0);
+        };
+        let (mut low, mut high) = (0u64, key.disc);
+        // Invariant: generation `low` is below (0 always is); every
+        // generation above `high` is not.
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            let entry = self.read(|state, store| {
+                state.entry(&Key::new(Tag::Turn, conversation, mid), store)
+            })?;
+            let Some(Entry::Turn { accepted, .. }) = entry else {
+                return Err(Error::RepairRequired);
+            };
+            if accepted.sequence < below {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        Ok(low)
+    }
+    /// The conversation a history read with none named shows: the project's
+    /// latest accepted turn, or its newest conversation when that holds only
+    /// person commands and its newest command is later (P3-E3).
+    fn history_conversation(&mut self, project: Id) -> Result<Option<Id>> {
+        let latest = self.find_project(project)?.latest;
+        let newest = self.read(|state, store| {
+            state.last_under(Tag::ProjectConversation, project, store)
+        })?;
+        let candidate = match newest {
+            Some((_, Entry::ProjectConversation { conversation })) => conversation,
+            Some(_) => return Err(Error::RepairRequired),
+            None => return Ok(latest.map(|l| l.conversation)),
+        };
+        let generation = self
+            .read(|state, store| state.find_conversation(candidate, store))?
+            .ok_or(Error::RepairRequired)?
+            .generation;
+        if generation != 0 {
+            return Ok(latest.map(|l| l.conversation));
+        }
+        let command = self
+            .read(|state, store| state.last_under(Tag::PersonCommand, candidate, store))?
+            .map(|(sequence, _)| sequence);
+        Ok(match (latest, command) {
+            (Some(l), Some(sequence)) if sequence > l.accepted => Some(candidate),
+            (None, Some(_)) => Some(candidate),
+            (latest, _) => latest.map(|l| l.conversation),
+        })
     }
     /// The journal facts of one retained job payload: an unsettled job from
     /// the live state, or a settled one from its `X` entry, with the pin

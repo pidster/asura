@@ -2462,12 +2462,24 @@ impl Replay {
         if self.jobs.len() >= MAX_UNSETTLED_JOBS {
             return Err(ReplayError::Limit);
         }
-        let (project, conversation) = (job.project, job.conversation);
+        let (project, conversation, job_id) = (job.project, job.conversation, job.job);
         self.jobs.insert(job.job, job);
         let q = self.inputs.get_mut(&input).ok_or(ReplayError::Corrupt)?;
         if let Some(person) = q.person.as_mut() {
             person.job = Some(frame);
         }
+        let (expected_generation, queued) = (q.target_generation, q.frame);
+        // `p`: the dispatched command in the conversation's history, keyed
+        // by this kind 26 (P3-E3). A command dropped before it ran has none.
+        self.emit(
+            Key::new(Tag::PersonCommand, conversation, frame.sequence),
+            Entry::PersonCommand {
+                input,
+                job: job_id,
+                expected_generation,
+                queued,
+            },
+        )?;
         self.order_revision = next(self.order_revision)?;
         self.last_dispatched_lane = Some(conversation);
         self.record_activity(project, Some(conversation), frame.sequence);
