@@ -994,7 +994,8 @@ flowchart TD
 | BN1 | `asura-platform/src/model_process.rs` (bundle copy, limits, cleanup), `asura-service/build.rs` and `asura-service/src/model_owner.rs` (`hub_bundle_sha256`), `model-package.json` producer, `swift/model-helper/README.md` (package step), model provider integration design | BN-P1 | SG-V10 |
 | SG1 | `tools/release/` (new script, `Info.plist` template, entitlement plists), `asura-service/src/model_owner.rs` (resource path), `asura-platform/src/model_process.rs` (resource source path), `swift/model-helper/README.md` | SGQ1–SGQ3, BN1 | SG-V1 to SG-V3, SG-V9 |
 | SG0-K | Owner's Mac; results recorded in this design | SG1 (a signed qualification bundle) | KC-P1 to KC-P4 results |
-| SG2 | Helper entitlement plist; `swift/model-helper` (no Swift change expected); threat model rows | SG1, HS probes | SG-V5, or EX-H1 recorded |
+| SG2a | `swift/model-helper` build: embed `Info.plist` (`CFBundleIdentifier` `com.pidster.asura.model`) in every helper build; the model inventory opens the asset root by its full path instead of walking from `/` | SG0 ad hoc results | HS-P1 and HS-P6 rerun with an ad hoc sandboxed helper; one Core AI cache for repeated spawns (two spawns create one cache directory) |
+| SG2 | Helper entitlement plist; threat model rows | SG1, SG2a | SG-V5, or EX-H1 recorded |
 | SG3 | `asura-platform/src/keychain*`, `asura-service/src/secret_store*`, `ServiceObservation` field 8 schema (fields 4 and 6 reserved), TUI `/status` text, secret store design | SG0-K, SGQ4–SGQ6 | SG-V6, SG-V7 |
 | SG4 | `tools/release/`, `pidster/homebrew-tap` formula | SG1, SG2, NT-P1 | HD1, HD5, HD9, HD10, HD12, HD13 |
 | SG5 | Qualification records | SG2, SG3, SG4 | SG-V4, SG-V8 and the release-distribution gates |
@@ -1012,7 +1013,8 @@ signing packet.
 | BN1 | Ready | — (BN-P1 confirmed the crash, 2026-10-23) |
 | SG1 | Not ready | BN1 delivered or closed; SG0 results for HS-P1 (embedded `Info.plist`) and HR-P2 |
 | SG0-K | Not ready | SG1 qualification bundle; the owner runs it (SGQ9) |
-| SG2 | Not ready | HS-P1 to HS-P7 results ([SG-F2](#sg-f2-helper-sandbox-decision)) |
+| SG2a | Ready | SG0 ad hoc results recorded |
+| SG2 | Not ready | SG1 and SG2a, then HS-P6 passing ([SG-F2](#sg-f2-helper-sandbox-decision)) |
 | SG3 | Not ready | KC-P1 to KC-P4 results; then the secret store design revision that SG3 owns |
 | SG4 | Not ready | SG1, SG2 and NT-P1 |
 | SG5 | Not ready | SG2, SG3 and SG4 |

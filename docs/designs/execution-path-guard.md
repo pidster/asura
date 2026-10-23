@@ -424,6 +424,32 @@ Implemented 2026-10-23 (branch `epg-w`). Rules settled from its report:
 - **Dropping a checking entry.** The writer drops only held inputs; the TUI
   sends Hold, then Drop, for an entry waiting with `path_check`.
 
+### EPG-T record
+
+Implemented 2026-10-23 (branch `epg-t`). Texts and rules settled from its
+report:
+
+- Warning lines sit between the entry header (and the `!!` warning) and the
+  output, in `#FF6B6B`, one line per kind with paths joined by commas:
+  "⚠ changed by the model since your last command: …", "⚠ not approved: … ·
+  /paths approve", "⚠ changed since you approved it: …", "⚠ too large to
+  approve (over 1 MiB): …", "⚠ more paths than Asura checks: changes beyond the
+  bound are not detected", and "⚠ and N more" for a listing overflow.
+- A held `!!` entry shows "Held: confirm to run (paths changed)". In log focus
+  Enter resumes it and Esc drops it; Esc on an entry still in `path_check`
+  sends Hold, then Drop, and a Hold that arrives too late gives "The command
+  already started; /cancel stops it". In queue focus Enter on a
+  `paths_changed` entry also resumes it (EPG-T2). A dropped entry reads
+  "↳ dropped; it did not run".
+- `/paths` opens the "Execution paths" panel: "Warnings before the next
+  command", "Approved paths", then "and N more approved paths". Each error token
+  has its own text and keeps the draft.
+- `JobDetail` gains `optional uint32 path_overflow = 7` from the kind 32
+  overflow count, so a restored log can show "⚠ and N more" (EPG-T2).
+- EPG-E1 runs `!cat build.rs` in the fixture, because the fixture PATH has no
+  Cargo; the result proved (warning above the output, the command runs) is the
+  same.
+
 ## Failure handling
 
 | Case | Result |
