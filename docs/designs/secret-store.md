@@ -951,7 +951,7 @@ is `secret_store_fixture`, as [fixture binary](#fixture-binary) states.
 | `last_status` | Cleared to 0 by the next port call that does not fail |
 | `delete` while locked | Replies `locked`; the item stays as an orphan for the next sweep |
 | Truncated listing | After a sweep that ends truncated, the count stays 257 and `put` gives `full` |
-| Locked-at-dispatch pacing | `secret_store::Recheck`: 1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart; the owner resets it when the command leaves the wait. [PACE-1](#shared-pacing-helper-pace-1) replaces it with the shared helper |
+| Locked-at-dispatch pacing | `secret_store::Recheck`, an alias of the shared [`Fibonacci`](#shared-pacing-helper-pace-1) helper: 1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart; the owner resets it when the command leaves the wait |
 
 **Codec.** Secret variable numbers are strictly ascending. Each secret value
 is at least 1 byte. A launch environment value may be empty; a name may not.
@@ -971,23 +971,29 @@ need kind 31, replay or the owner, and belong to
 
 ### Shared pacing helper (PACE-1)
 
-Selected (engineering, 2026-10-22), from the SS1-S report. The owner's pacing
-pattern of 2026-10-19 (1, 1, 2, 3, 5, 8 s and so on, at most 60 s apart;
-pacing only, it ends nothing) has four copies today:
+Selected (engineering, 2026-10-22), from the SS1-S report. Delivered
+2026-10-23 (branch `pace-1`): the four copies below use the shared type, and
+`RECHECK_CAP_SECS`, `PACING_MAX`, `RECHECK_MAX` and the capture worker's
+`Backoff` are removed. The owner's pacing pattern of 2026-10-19 (1, 1, 2, 3,
+5, 8 s and so on, at most 60 s apart; pacing only, it ends nothing) had four
+copies:
 
 | Copy | Code |
 | --- | --- |
 | Journal writer held recheck | `asura-storage/src/authority/writer/mod.rs` |
-| Job controller `disk_space` recheck, and from J34-E the [jobs limits read retry](tool-job-controller.md#start-time-limits-read-failure), which reuses this type | `DiskRecheck`, `asura-service/src/job_controller.rs`; its use in `conversation/jobs.rs` |
-| Capture worker paused-capture retry | `Backoff`, `asura-service/src/capture_worker.rs` |
-| Locked-at-dispatch recheck | `Recheck`, `asura-service/src/secret_store.rs` |
+| Job controller `disk_space` recheck, and from J34-E the [jobs limits read retry](tool-job-controller.md#start-time-limits-read-failure), which reuses this type | `Pacing` (an `Instant` and a `Fibonacci`), `asura-service/src/job_controller.rs`; its use in `conversation/jobs.rs` |
+| Capture worker paused-capture retry | `asura-service/src/capture_worker.rs` (was `Backoff`) |
+| Locked-at-dispatch recheck | `Recheck`, now an alias of `Fibonacci`, `asura-service/src/secret_store.rs` |
 
 One source of truth: packet **PACE-1** adds one pure type,
 `asura_platform::pacing::Fibonacci`, with the 1 s start, the 60 s cap, a
 `next_delay()` that advances the sequence and a `reset()`. `asura-platform` is
 the lowest crate that both `asura-storage` and `asura-service` depend on; the
 type makes no OS call. The four copies then use it and keep only their own
-wake and reset rules.
+wake and reset rules. A user that advances only when a gap elapses (the
+journal writer and the capture worker: a job or event that arrives during the
+wait does not advance it) waits on a copy and keeps the advanced copy only on
+timeout; the type needs no peek method.
 
 - **Owned paths:** `asura-platform/src/pacing.rs` (new) and its `pub mod`
   line in `asura-platform/src/lib.rs`; the pacing code and its unit tests in
