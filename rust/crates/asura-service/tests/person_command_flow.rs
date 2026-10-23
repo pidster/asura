@@ -1414,10 +1414,7 @@ fn history() -> Result<()> {
     let (project, _) = env.project("project")?;
     let (first, conversation) = queued(&env, &request(project, None, "echo one", None))?;
     wait_settled(&env, first, Duration::from_secs(60))?;
-    let (blocker, _) = queued(
-        &env,
-        &request(project, Some(conversation), BLOCKER, None),
-    )?;
+    let (blocker, _) = queued(&env, &request(project, Some(conversation), BLOCKER, None))?;
     wait_for(Duration::from_secs(30), "blocker running", || {
         intent_committed(&env, blocker).unwrap_or(false)
     })?;
@@ -1433,7 +1430,10 @@ fn history() -> Result<()> {
     })?;
     decide(&env, dropped, DROP).map_err(|e| format!("drop: {e}"))?;
     wait_settled(&env, blocker, Duration::from_secs(60))?;
-    assert!(!intent_committed(&env, dropped)?, "the dropped command never ran");
+    assert!(
+        !intent_committed(&env, dropped)?,
+        "the dropped command never ran"
+    );
     let expected = [
         (blocker, dispatched_at(&env, blocker)?),
         (first, dispatched_at(&env, first)?),

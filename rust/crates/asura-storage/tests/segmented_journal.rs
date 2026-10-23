@@ -2299,7 +2299,10 @@ fn p3e3_history_merges_turns_and_person_commands_across_rolls_and_restart() {
     }
     session.finish(op2, gen2, 160 * MAX_TEXT as u64, "");
     let current = state(&session.writer);
-    assert!(current.base > c_at, "the kind 26 of c is before the checkpoint");
+    assert!(
+        current.base > c_at,
+        "the kind 26 of c is before the checkpoint"
+    );
     drop(current);
     let d = p3e3_queue(&session, project, lane, gen2);
     let d_at = p3e3_dispatch(&session, d);

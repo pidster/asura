@@ -2121,9 +2121,8 @@ impl State {
         // generation above `high` is not.
         while low < high {
             let mid = low + (high - low).div_ceil(2);
-            let entry = self.read(|state, store| {
-                state.entry(&Key::new(Tag::Turn, conversation, mid), store)
-            })?;
+            let entry = self
+                .read(|state, store| state.entry(&Key::new(Tag::Turn, conversation, mid), store))?;
             let Some(Entry::Turn { accepted, .. }) = entry else {
                 return Err(Error::RepairRequired);
             };
@@ -2140,9 +2139,8 @@ impl State {
     /// person commands and its newest command is later (P3-E3).
     fn history_conversation(&mut self, project: Id) -> Result<Option<Id>> {
         let latest = self.find_project(project)?.latest;
-        let newest = self.read(|state, store| {
-            state.last_under(Tag::ProjectConversation, project, store)
-        })?;
+        let newest =
+            self.read(|state, store| state.last_under(Tag::ProjectConversation, project, store))?;
         let candidate = match newest {
             Some((_, Entry::ProjectConversation { conversation })) => conversation,
             Some(_) => return Err(Error::RepairRequired),
