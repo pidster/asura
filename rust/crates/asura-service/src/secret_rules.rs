@@ -146,7 +146,10 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(warmer.need(None).is_none());
-        assert_eq!(warmer.spawns, 2, "a finished thread with no result respawns");
+        assert_eq!(
+            warmer.spawns, 2,
+            "a finished thread with no result respawns"
+        );
 
         // A running thread is not doubled.
         let mut running = Warmer {

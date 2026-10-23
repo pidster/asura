@@ -384,24 +384,32 @@ fn outlived() -> Result<()> {
     assert_eq!(event.outlived_jobs, Some(2), "{event:?}");
     assert_eq!(event.outlived_job_ids, jobs);
     // Both jobs are still live: no kind 28 yet.
-    assert!(!fixture
-        .records()?
-        .iter()
-        .any(|r| matches!(r, Record::JobSettled(_))));
+    assert!(
+        !fixture
+            .records()?
+            .iter()
+            .any(|r| matches!(r, Record::JobSettled(_)))
+    );
     // The restart settles both after the terminal; the read derives the
     // same count from the records.
     fixture.stop()?;
     fixture.start()?;
     fixture.wait_ready()?;
-    wait_for(Duration::from_secs(60), "both kind 28 after the terminal", || {
-        fixture.records().is_ok_and(|records| {
-            records
-                .iter()
-                .filter(|r| matches!(r, Record::JobSettled(s) if jobs.contains(&s.job.to_vec())))
-                .count()
-                == 2
-        })
-    })?;
+    wait_for(
+        Duration::from_secs(60),
+        "both kind 28 after the terminal",
+        || {
+            fixture.records().is_ok_and(|records| {
+                records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, Record::JobSettled(s) if jobs.contains(&s.job.to_vec())),
+                    )
+                    .count()
+                    == 2
+            })
+        },
+    )?;
     let event = fixture.finish(operation, Duration::from_secs(60))?;
     assert_eq!(event.kind, Some(5), "{event:?}");
     assert_eq!(event.outlived_jobs, Some(2), "after restart: {event:?}");

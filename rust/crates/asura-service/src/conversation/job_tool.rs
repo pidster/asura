@@ -355,8 +355,7 @@ impl JobCall {
                 Some(Action::Note(record))
             }
             Step::Result => {
-                let intent_committed =
-                    self.code != ToolOperation::ExecCmd || self.intent.is_some();
+                let intent_committed = self.code != ToolOperation::ExecCmd || self.intent.is_some();
                 let Some(result) = self.result.clone().filter(|_| intent_committed) else {
                     self.step = Step::Result;
                     return None;

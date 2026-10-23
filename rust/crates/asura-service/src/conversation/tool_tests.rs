@@ -2306,7 +2306,11 @@ fn execution_change_before_the_start_time_read_compares_against_the_persisted_va
     assert_eq!(fixture.owner.apply_execution(off.clone()), None);
     assert_eq!(current(&fixture), None, "nothing applied before the read");
     let change = fixture.owner.execution_read(off.clone()).unwrap();
-    assert_eq!(change, execution::Change::default(), "no event for no change");
+    assert_eq!(
+        change,
+        execution::Change::default(),
+        "no event for no change"
+    );
     assert_eq!(current(&fixture), Some(off.clone()));
 
     // The file held `on`: one global event, and the newest change wins.
