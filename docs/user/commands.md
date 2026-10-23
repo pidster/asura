@@ -77,10 +77,11 @@ as each page arrives. Press Ctrl-C to stop it.
 | --- | --- |
 | `/tools` | List the model tools and their descriptions |
 | `/audit [LIMIT]` | Show recent audit records for this project; LIMIT is 1 to 16, default 16 |
+| `/status` | Show the service status and its Keychain notices |
 
-`/help`, `/quit`, `/exit`, `/init`, `/new`, `/cancel`, `/retry`, `/models` and
-`/tools` take no arguments. Results open in a panel above the input box; Escape
-closes it.
+`/help`, `/quit`, `/exit`, `/init`, `/new`, `/cancel`, `/retry`, `/models`,
+`/tools` and `/status` take no arguments. Results open in a panel above the
+input box; Escape closes it.
 
 ## Job commands
 

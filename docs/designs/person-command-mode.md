@@ -2086,6 +2086,53 @@ person origin at the controller; P1 and P2 add only the person-specific parts.
 Each packet carries its `!` and `!!` parts together; the `!!` parts are small
 additions to the same owners.
 
+### P4 TUI record
+
+Implemented 2026-10-23 (branch `p4`), unit tested with fixtures; the PTY
+journeys follow P3-E. Choices made in P4 and accepted:
+
+- **Command view.** In `!` and `!!` modes the composer draws its own view from
+  the cached split: each top-level command starts a row, a rule row separates
+  commands, and a hidden character is one `█` cell (`#B3261E` in `!`, black in
+  `!!`). The editor still holds the text and handles every key; it renders into
+  a scratch buffer the size of the visible composer, so per-frame work stays
+  within the composer bound. Carets and rules use `#745A3C` (`!`) or `#693834`
+  (`!!`), because an amber caret would not show on the amber box.
+  Message-mode hidden marks belong to the composer interactions owner.
+- **Splitter.** The display uses `asura_platform::exec_cmd::split::analyze`.
+  Any heredoc, and text over 8,192 bytes, is "not split". The TUI finds
+  backslash-newline itself, because `analyze` reports it as a separator.
+- **Hint order.** The command count, "not split" and the hidden-character count
+  come before the `⌫` part, so a narrow row keeps them. In message mode the
+  running, stopping and released status text replaces the editor hint.
+- **Keys.** Esc does not stop a person job; `/cancel` and Ctrl-C do. A second
+  Ctrl-C kills; a repeated `/cancel` never escalates. Ctrl+J inserts a newline,
+  Ctrl+T queues, and Ctrl+S says a command cannot steer. In log focus, Enter or
+  Space opens the lowest person entry in view.
+- **Capability.** Enter in a command mode needs capability 8, read per epoch;
+  without it the TUI shows "Commands are not enabled in this service" and keeps
+  the draft. The queue sender checks it again before sending.
+- **Recall.** An entry's mode is kept as a control-character prefix in the
+  recall history, so the history store is unchanged.
+- **Live fold.** At most 4 fold slots: one `JobRead` per stream, then one
+  `JobObserve` with `at_end` in flight; each reply replaces the unread one; no
+  timer. A fold that gets `not_found` shows "waiting for its turn in the queue"
+  and reads again when the queue shows the command started.
+- **Byte totals.** `JobEntry` has no total-written byte count, so an
+  early-stopped capture shows "output kept: first N" without "of M".
+- **PC-U44** (the `, outside the sandbox,` notice label) is covered in
+  `context/job_notice_tests.rs`: the TUI never composes the model notice.
+
+Texts the earlier sections did not give word for word:
+
+| Case | Text |
+| --- | --- |
+| `secret_store_unavailable` | "The Keychain is unavailable (OSStatus -N). Press Enter again later." |
+| `secret_store_full` | "The Keychain holds the most Asura items (256); wait for queued commands to finish.", plus "/status lists Keychain items to delete." when stranded items exist |
+| `secret_in_cwd` | "Command refused: the working directory holds a secret." (the reply has no rule kind) |
+| Exit confirmation | "N commands are queued or running; they stop when the service stops." |
+| Accepted | "Command queued", or "Command " followed by the entry's `waiting_text` |
+
 ### Packet split
 
 Selected plan (2026-10-22). Each code packet owns its paths alone while it

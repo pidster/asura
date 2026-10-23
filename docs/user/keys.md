@@ -53,6 +53,24 @@ Ctrl+D, Ctrl+S, Ctrl+T and Ctrl+V keys in this table work.
 Tab completes a command when the draft starts with `/` and the cursor is in the
 first word. One match completes at once. Several matches open the command list.
 
+## Command mode keys
+
+Type `!` at the start of the input box to run a shell command, `!COMMAND`, in
+the sandbox. Type `!` again at the start to run it outside the sandbox,
+`!!COMMAND`. Asura queues the command like a message and shows its output in
+the conversation log. Command mode works only with a service that supports
+commands; otherwise Enter shows "Commands are not enabled in this service"
+and keeps the draft.
+
+| Key | Action |
+| --- | --- |
+| ! | At the start of the draft, switch to command mode; in command mode, switch to outside mode |
+| Backspace | At the start of the draft, step back one mode and keep the text |
+| Enter | Queue the command; it runs when its turn comes |
+| Ctrl+J | Start a new line in the command |
+| Ctrl+C | Stop the running command; press again to kill it |
+| Enter or Space | In the conversation log, open the job viewer at the end of the command's output |
+
 ## Help mode keys
 
 Type `?` at the start of the input box to enter help mode. Editing keys work
