@@ -148,6 +148,7 @@ mod wire;
 use wire::{Field, Kind, scan};
 include!(concat!(env!("OUT_DIR"), "/validation.rs"));
 mod conversation;
+pub use conversation::person;
 pub mod model;
 
 fn context_path(value: &Option<String>) -> bool {
@@ -244,6 +245,25 @@ fn installation_reply(value: &pb::InspectInstallationReply) -> bool {
             && value.authority_format.is_none()
     }
 }
+/// Items one secret store listing reports: 257 means more than 256.
+pub const MAX_SECRET_STORE_COUNT: u32 = 257;
+/// Input IDs a `SecretStoreStatus` names of its stranded items.
+pub const MAX_STRANDED_INPUTS: usize = 16;
+/// `ServiceObservation.secret_store` (secret-store.md, operations and audit):
+/// counts 0-257, and at most 16 distinct stranded input IDs, no more than
+/// the stranded count.
+fn secret_store_status(v: &pb::SecretStoreStatus) -> bool {
+    let count = |n: Option<u32>| n.is_none_or(|n| n <= MAX_SECRET_STORE_COUNT);
+    count(v.item_count)
+        && count(v.stranded_count)
+        && count(v.unrecognized_count)
+        && v.stranded_inputs.len() <= MAX_STRANDED_INPUTS
+        && v.stranded_inputs.len() as u64 <= u64::from(v.stranded_count.unwrap_or(0))
+        && v.stranded_inputs
+            .iter()
+            .enumerate()
+            .all(|(i, input)| id_slice(input) && !v.stranded_inputs[..i].contains(input))
+}
 /// Validates domain shape and direction. Attachment state stays with its owner.
 pub fn validate_semantics(
     envelope: &pb::Envelope,
@@ -275,6 +295,7 @@ pub fn validate_semantics(
             | Body::ProjectRename(_)
             | Body::ProjectList(_)
             | Body::ConversationQueueSubmit(_)
+            | Body::ConversationQueueCommandSubmit(_)
             | Body::ConversationQueueReorder(_)
             | Body::ConversationQueueList(_)
             | Body::ConversationQueueDecision(_)
@@ -306,8 +327,8 @@ pub fn validate_semantics(
         Body::HelloReply(v) => {
             text(&v.service_build, 128)
                 && v.max_frame_bytes == Some(MAX_FRAME_BYTES as u32)
-                && (4..=7).contains(&v.capabilities.len())
-                && v.capabilities.iter().all(|c| (1..=7).contains(c))
+                && (4..=8).contains(&v.capabilities.len())
+                && v.capabilities.iter().all(|c| (1..=8).contains(c))
                 && v.capabilities
                     .iter()
                     .enumerate()
@@ -330,6 +351,7 @@ pub fn validate_semantics(
         Body::ServiceObservation(v) => {
             v.uptime_ms.is_some()
                 && v.thinking_level.is_none_or(|n| (0..=4).contains(&n))
+                && v.secret_store.as_ref().is_none_or(secret_store_status)
                 && v.stored_memory.as_ref().is_some_and(|memory| {
                     let available = v
                         .status
@@ -570,5 +592,156 @@ mod config_root_tests {
             })),
         };
         assert!(validate_semantics(&envelope, Direction::ClientToServer).is_err());
+    }
+}
+
+#[cfg(test)]
+mod person_command_tests {
+    use super::*;
+    use pb::envelope::Body;
+    fn envelope(body: Body, hello: bool) -> pb::Envelope {
+        pb::Envelope {
+            service_epoch: Some(vec![1; 16]),
+            attachment_id: Some(vec![2; 16]),
+            request_counter: (!hello).then_some(1),
+            body: Some(body),
+        }
+    }
+    fn round_trips(value: &pb::Envelope) -> bool {
+        encode_frame(value)
+            .is_ok_and(|frame| decode_body(&frame[HEADER_BYTES..]).as_ref() == Ok(value))
+    }
+    /// Capability 8 is defined and accepted in a HelloReply; the service
+    /// lists it only after packets P1-P5 and Q (OD3).
+    #[test]
+    fn person_command_capability_is_defined() {
+        assert_eq!(pb::Capability::PersonCommand as i32, 8);
+        let hello = |capabilities: Vec<i32>| {
+            envelope(
+                Body::HelloReply(pb::HelloReply {
+                    service_build: Some("asura/test".into()),
+                    capabilities,
+                    max_frame_bytes: Some(MAX_FRAME_BYTES as u32),
+                }),
+                true,
+            )
+        };
+        let all = hello((1..=8).collect());
+        assert!(validate_semantics(&all, Direction::ServerToClient).is_ok());
+        assert!(round_trips(&all));
+        let twice = hello(vec![1, 2, 3, 4, 8, 8]);
+        assert!(validate_semantics(&twice, Direction::ServerToClient).is_err());
+        assert!(encode_frame(&hello(vec![1, 2, 3, 4, 9])).is_err());
+    }
+    fn observation(secret_store: Option<pb::SecretStoreStatus>) -> pb::Envelope {
+        envelope(
+            Body::ServiceObservation(pb::ServiceObservation {
+                revision: Some(1),
+                pending: Some(false),
+                status: Some(pb::InspectReply {
+                    new_installation: None,
+                    lifecycle: Some(2),
+                    installation: Some(6),
+                    reason: Some(16),
+                }),
+                configured_model: None,
+                uptime_ms: Some(100),
+                stored_memory: Some(pb::StoredMemoryStatus {
+                    available: Some(true),
+                    size_bytes: Some(1024),
+                    sampled_uptime_ms: Some(90),
+                    stale: Some(false),
+                    size_reason: Some(1),
+                }),
+                thinking_level: None,
+                secret_store,
+            }),
+            false,
+        )
+    }
+    /// ServiceObservation field 8: counts 0-257 and at most 16 distinct
+    /// stranded input IDs, no more than the stranded count.
+    #[test]
+    fn secret_store_status_is_bounded() {
+        let full = pb::SecretStoreStatus {
+            item_count: Some(MAX_SECRET_STORE_COUNT),
+            sweep_pending: Some(false),
+            last_status: Some(25_308),
+            stranded_count: Some(MAX_SECRET_STORE_COUNT),
+            unrecognized_count: Some(MAX_SECRET_STORE_COUNT),
+            stranded_inputs: (1..=16u8).map(|n| vec![n; 16]).collect(),
+        };
+        for accepted in [
+            None,
+            Some(pb::SecretStoreStatus::default()),
+            Some(full.clone()),
+        ] {
+            let value = observation(accepted);
+            assert!(validate_semantics(&value, Direction::ServerToClient).is_ok());
+            assert!(round_trips(&value));
+        }
+        for (name, changed) in [
+            (
+                "items",
+                pb::SecretStoreStatus {
+                    item_count: Some(258),
+                    ..full.clone()
+                },
+            ),
+            (
+                "stranded",
+                pb::SecretStoreStatus {
+                    stranded_count: Some(258),
+                    ..full.clone()
+                },
+            ),
+            (
+                "unrecognized",
+                pb::SecretStoreStatus {
+                    unrecognized_count: Some(258),
+                    ..full.clone()
+                },
+            ),
+            (
+                "more IDs than count",
+                pb::SecretStoreStatus {
+                    stranded_count: Some(15),
+                    ..full.clone()
+                },
+            ),
+            (
+                "zero ID",
+                pb::SecretStoreStatus {
+                    stranded_inputs: vec![vec![0; 16]],
+                    ..full.clone()
+                },
+            ),
+            (
+                "short ID",
+                pb::SecretStoreStatus {
+                    stranded_inputs: vec![vec![1; 15]],
+                    ..full.clone()
+                },
+            ),
+            (
+                "repeated ID",
+                pb::SecretStoreStatus {
+                    stranded_inputs: vec![vec![1; 16], vec![1; 16]],
+                    ..full.clone()
+                },
+            ),
+        ] {
+            let value = observation(Some(changed));
+            assert!(
+                validate_semantics(&value, Direction::ServerToClient).is_err(),
+                "{name}"
+            );
+        }
+        // Seventeen IDs exceed the wire bound.
+        let seventeen = pb::SecretStoreStatus {
+            stranded_inputs: (1..=17u8).map(|n| vec![n; 16]).collect(),
+            ..full
+        };
+        assert!(encode_frame(&observation(Some(seventeen))).is_err());
     }
 }

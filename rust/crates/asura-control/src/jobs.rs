@@ -338,6 +338,13 @@ pub(crate) fn entry(v: &pb::JobEntry) -> bool {
         && v.notes.is_none_or(|n| n <= MAX_JOB_NOTES)
         && v.sequence.is_some_and(|n| n > 0)
         && v.input_id.as_ref().is_none_or(|_| person && id(&v.input_id))
+        // OD2 fields: a person `!!` job only. Survivors left running are
+        // known after kind 6 (DRAINING) or at settlement; `shell_exited` is
+        // set, only true, while the released job drains.
+        && ((v.left_running.is_none() && v.shell_exited.is_none())
+            || (person && v.outside_sandbox == Some(true)))
+        && v.left_running.is_none_or(|_| state == 6 || settled)
+        && v.shell_exited.is_none_or(|exited| exited && state == 6)
 }
 
 fn stream_page(v: &pb::JobStreamPage) -> bool {
@@ -374,6 +381,95 @@ mod tests {
         assert!(!note_text_valid("a\rb"));
         assert!(!note_text_valid("a\u{1b}[31m"));
         assert!(!note_text_valid("a\u{85}b"));
+    }
+    fn outside_entry(state: pb::JobState) -> pb::JobEntry {
+        let settled = state == pb::JobState::Settled;
+        pb::JobEntry {
+            job_id: Some(vec![1; 16]),
+            project_id: Some(vec![2; 16]),
+            conversation_id: Some(vec![3; 16]),
+            origin: Some(pb::JobOrigin::Person as i32),
+            outside_sandbox: Some(true),
+            command: Some("make serve &".into()),
+            state: Some(state as i32),
+            sequence: Some(4),
+            input_id: Some(vec![5; 16]),
+            outcome: settled.then_some(1),
+            reason: settled.then_some(0),
+            exit_kind: settled.then_some(1),
+            exit_value: settled.then_some(0),
+            capture_state: settled.then_some(1),
+            ..Default::default()
+        }
+    }
+    /// `JobEntry` fields 28 and 29 (OD2): only a person `!!` job; survivors
+    /// in DRAINING or SETTLED; `shell_exited` only true and only DRAINING.
+    #[test]
+    fn released_outside_job_fields() {
+        use pb::JobState::{Draining, Running, Settled};
+        let draining = pb::JobEntry {
+            left_running: Some(2),
+            shell_exited: Some(true),
+            ..outside_entry(Draining)
+        };
+        assert!(entry(&draining));
+        let settled = pb::JobEntry {
+            left_running: Some(2),
+            ..outside_entry(Settled)
+        };
+        assert!(entry(&settled));
+        assert!(entry(&pb::JobEntry {
+            shell_exited: None,
+            ..draining.clone()
+        }));
+        for (name, changed) in [
+            (
+                "model origin",
+                pb::JobEntry {
+                    origin: Some(pb::JobOrigin::Model as i32),
+                    input_id: None,
+                    outside_sandbox: None,
+                    ..draining.clone()
+                },
+            ),
+            (
+                "sandboxed person",
+                pb::JobEntry {
+                    outside_sandbox: Some(false),
+                    ..draining.clone()
+                },
+            ),
+            (
+                "survivors while running",
+                pb::JobEntry {
+                    left_running: Some(1),
+                    ..outside_entry(Running)
+                },
+            ),
+            (
+                "shell exited while running",
+                pb::JobEntry {
+                    shell_exited: Some(true),
+                    ..outside_entry(Running)
+                },
+            ),
+            (
+                "shell exited when settled",
+                pb::JobEntry {
+                    shell_exited: Some(true),
+                    ..settled.clone()
+                },
+            ),
+            (
+                "shell exited false",
+                pb::JobEntry {
+                    shell_exited: Some(false),
+                    ..draining.clone()
+                },
+            ),
+        ] {
+            assert!(!entry(&changed), "{name}");
+        }
     }
     #[test]
     fn id_slice_rejects_zero_and_wrong_length() {

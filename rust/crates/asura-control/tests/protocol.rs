@@ -93,7 +93,7 @@ fn strict_wire_rejects_ambiguous_and_invalid_encodings() {
         &[
             0x52, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1,
         ], // overflow length
-        &[0x5a, 2, 0x10, 8],          // unknown capability (1 through 7 are defined)
+        &[0x5a, 2, 0x10, 9],          // unknown capability (1 through 8 are defined)
         &[0x5a, 4, 0x12, 0, 0x12, 0], // repeated packed segment
         &[0x5a, 4, 0x12, 0, 0x10, 1], // packed/unpacked mix
         &[0x5a, 6, 0x18, 0x80, 0x80, 0x80, 0x80, 0x10], // uint32 overflow
@@ -533,6 +533,7 @@ fn model_inventory_contract_bounds_partial_results_and_direction() {
 #[test]
 fn stored_memory_status_is_bounded_truthful_and_paired_with_service_uptime() {
     let observation = pb::ServiceObservation {
+        secret_store: None,
         revision: Some(1),
         pending: Some(false),
         status: Some(pb::InspectReply {

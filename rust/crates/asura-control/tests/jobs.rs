@@ -142,9 +142,10 @@ fn envelope_fields_57_to_67_and_capability_7_are_exact() {
         assert_eq!(bytes[..2], [(key & 0x7f) as u8 | 0x80, (key >> 7) as u8]);
     }
     assert_eq!(pb::Capability::Jobs as i32, 7);
-    // The wire accepts capability 7 and rejects 8.
+    // The wire accepts capabilities 7 and 8 (person commands) and rejects 9.
     assert!(decode_body(&[0x5a, 2, 0x10, 7]).is_ok());
-    assert!(decode_body(&[0x5a, 2, 0x10, 8]).is_err());
+    assert!(decode_body(&[0x5a, 2, 0x10, 8]).is_ok());
+    assert!(decode_body(&[0x5a, 2, 0x10, 9]).is_err());
     let mut hello = envelope(Body::HelloReply(pb::HelloReply {
         service_build: Some("asura/0.1.0".into()),
         capabilities: (1..=7).collect(),

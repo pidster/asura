@@ -22,6 +22,7 @@ pub(super) fn handles(body: &Body) -> bool {
             | Body::ProjectList(_)
             | Body::ProjectsReply(_)
             | Body::ConversationQueueSubmit(_)
+            | Body::ConversationQueueCommandSubmit(_)
             | Body::ConversationQueueReorder(_)
             | Body::ConversationQueueList(_)
             | Body::ConversationQueueDecision(_)
@@ -71,28 +72,39 @@ fn listed(v: &pb::ProjectReply) -> bool {
         Some(_) => false,
     }
 }
+/// A lane target: a new conversation with generation zero, or an existing
+/// conversation with its expected generation (kind 18 and kind 31 alike).
+fn lane_target(
+    new_conversation: Option<bool>,
+    conversation_id: &Option<Vec<u8>>,
+    expected_generation: Option<u64>,
+) -> bool {
+    match (new_conversation, conversation_id, expected_generation) {
+        (Some(true), None, Some(0)) => true,
+        (Some(false), Some(conversation), Some(generation)) => {
+            conversation.len() == 16
+                && conversation.iter().any(|byte| *byte != 0)
+                && generation < u64::MAX
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn valid(body: &Body) -> bool {
     match body {
         Body::ConversationQueueSubmit(v) => {
             id(&v.request_id)
                 && id(&v.project_id)
-                && match (
+                && lane_target(
                     v.new_conversation,
                     &v.conversation_id,
                     v.expected_generation,
-                ) {
-                    (Some(true), None, Some(0)) => true,
-                    (Some(false), Some(conversation), Some(generation)) => {
-                        conversation.len() == 16
-                            && conversation.iter().any(|byte| *byte != 0)
-                            && generation < u64::MAX
-                    }
-                    _ => false,
-                }
+                )
                 && v.prompt
                     .as_ref()
                     .is_some_and(|p| !p.is_empty() && p.len() <= 32768)
         }
+        Body::ConversationQueueCommandSubmit(v) => person::submit_shape(v),
         Body::ConversationQueueReorder(v) => {
             id(&v.request_id)
                 && id(&v.input_id)
@@ -127,6 +139,7 @@ pub(super) fn valid(body: &Body) -> bool {
                     && v.revision.is_some()))
                 && v.full_text.is_some()
                 && (v.request_id.is_none() || id(&v.request_id))
+                && person::refusal_shape(v)
                 && (v.accepted_input_id.is_none()
                     || (id(&v.accepted_input_id)
                         && v.request_id.is_some()
@@ -147,7 +160,9 @@ pub(super) fn valid(body: &Body) -> bool {
                         // A promoted Steer entry names its exact target; a Queue
                         // entry carries its expected generation.
                         && match e.kind {
-                            Some(1) => {
+                            // A person command (kind 31) carries its expected
+                            // generation as a Queue entry does.
+                            Some(1 | 3) => {
                                 e.target_operation_id.is_none()
                                     && e.target_generation.is_some_and(|generation| {
                                         if e.new_conversation == Some(true) {
@@ -173,11 +188,16 @@ pub(super) fn valid(body: &Body) -> bool {
                         })
                         // Live pre-admission step: Queued only, preparing or starting.
                         && e.waiting_step.is_none_or(|step| e.state == Some(1) && (1..=2).contains(&step))
+                        && person::entry_shape(e)
                         && e.sequence.is_some_and(|n| n > 0)
                         && e.text
                             .as_ref()
                             .is_some_and(|s| s.len() <= if full { 32768 } else { 256 })
-                        && if matches!(e.state, Some(3..=5)) {
+                        // A person command runs as a job, never a model
+                        // operation: no operation or generation in any state.
+                        && if e.kind == Some(3) {
+                            e.operation_id.is_none() && e.generation.is_none()
+                        } else if matches!(e.state, Some(3..=5)) {
                             id(&e.operation_id) && e.generation.is_some_and(|n| n > 0)
                         } else {
                             e.operation_id.is_none() && e.generation.is_none()
@@ -199,15 +219,30 @@ pub(super) fn valid(body: &Body) -> bool {
                     v.generation.is_none() && v.entries.is_empty() && v.has_more == Some(false)
                 } else {
                     id(&v.conversation_id)
-                        && v.generation.is_some_and(|n| n > 0)
+                        // Generation 0: a conversation that holds only person
+                        // commands, queued before its first turn.
+                        && v.generation.is_some_and(|n| {
+                            n > 0
+                                || v.entries.iter().all(|e| e.person_command_input_id.is_some())
+                        })
                         && v.entries.len() <= 8
                         && (v.has_more == Some(false) || !v.entries.is_empty())
                         && v.entries.iter().all(|e| {
-                            id(&e.operation_id)
-                                && e.generation
-                                    .is_some_and(|n| n > 0 && n <= v.generation.unwrap())
-                                && e.accepted_frame.is_some_and(|n| n > 0)
-                                && matches!(e.kind, Some(1 | 3..=6))
+                            e.accepted_frame.is_some_and(|n| n > 0)
+                                && if e.person_command_input_id.is_some() {
+                                    // A person command: its kind 31 input and
+                                    // the generation it was queued against; the
+                                    // log reads the job's state from the job API.
+                                    id(&e.person_command_input_id)
+                                        && e.operation_id.is_none()
+                                        && e.kind.is_none()
+                                        && e.generation.is_some_and(|n| n <= v.generation.unwrap())
+                                } else {
+                                    id(&e.operation_id)
+                                        && e.generation
+                                            .is_some_and(|n| n > 0 && n <= v.generation.unwrap())
+                                        && matches!(e.kind, Some(1 | 3..=6))
+                                }
                         })
                         && v.entries.windows(2).all(|pair| {
                             pair[0].accepted_frame.unwrap() > pair[1].accepted_frame.unwrap()
@@ -479,6 +514,220 @@ pub(super) fn valid(body: &Body) -> bool {
     }
 }
 
+/// Person command mode (person-command-mode.md, control API additions): the
+/// submit's shape, its environment refusals, and the kind 3 queue entry and
+/// refusal reply rules. Runtime-free.
+pub mod person {
+    use super::lane_target;
+    use crate::{id, pb};
+    use std::collections::HashSet;
+
+    /// UTF-8 bytes of a command (field 6).
+    pub const MAX_COMMAND_BYTES: usize = 8_192;
+    /// Bytes of a project-relative working directory (field 7).
+    pub const MAX_CWD_BYTES: usize = 1_024;
+    /// Bytes of the client PATH (field 8, `!` only).
+    pub const MAX_SEARCH_PATH_BYTES: usize = 4_096;
+    /// PC3 client variables (field 9, `!` only): one per listed name.
+    pub const MAX_CLIENT_VARIABLES: usize = 9;
+    /// `!!` launch environment entries (field 11, OD4).
+    pub const MAX_LAUNCH_VARIABLES: usize = 1_024;
+    /// Name and value bytes of the `!!` launch environment together (OD4).
+    pub const MAX_LAUNCH_ENVIRONMENT_BYTES: usize = 40_960;
+    /// Bytes of one launch variable name.
+    pub const MAX_LAUNCH_NAME_BYTES: usize = 1_024;
+    /// Bytes of a queue entry's brief waiting text.
+    pub const MAX_WAITING_TEXT_BYTES: usize = 128;
+    /// Bytes of a PC3 locale value.
+    pub const MAX_LOCALE_VALUE_BYTES: usize = 64;
+    /// Bytes of an `SSH_AUTH_SOCK` value: a `sun_path` holds 104 with its NUL.
+    pub const MAX_AUTH_SOCKET_BYTES: usize = 103;
+    /// The PC3 names a client may send for a `!` command, in kind 31 name
+    /// code order (code = index + 1).
+    pub const CLIENT_VARIABLES: [&str; 9] = [
+        "LANG",
+        "LC_ALL",
+        "LC_COLLATE",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "SSH_AUTH_SOCK",
+    ];
+    /// Name prefixes the service sets itself; a launch environment that
+    /// names one is `environment_invalid`.
+    pub const RESERVED_PREFIXES: [&[u8]; 2] = [b"ASURA_SECRET_", b"ASURA_JOB_"];
+    /// The highest `QueueWaitReason` value in this protocol revision.
+    pub const MAX_WAIT_REASON: i32 = 14;
+    /// The highest `QueueRefusal` value.
+    pub const MAX_REFUSAL: i32 = 13;
+    /// Command entry kind in `ConversationQueueEntry.kind`.
+    pub const ENTRY_KIND: u32 = 3;
+
+    /// Protocol shape of a `ConversationQueueCommandSubmit`: presence, lane
+    /// target and sizes. A shape failure is a protocol fault. Environment
+    /// content is not shape: [`environment_refusal`] reports it as a typed
+    /// refusal the service returns.
+    pub fn submit_shape(v: &pb::ConversationQueueCommandSubmit) -> bool {
+        id(&v.request_id)
+            && id(&v.project_id)
+            && lane_target(
+                v.new_conversation,
+                &v.conversation_id,
+                v.expected_generation,
+            )
+            && v.command
+                .as_ref()
+                .is_some_and(|c| !c.is_empty() && c.len() <= MAX_COMMAND_BYTES && !c.contains('\0'))
+            && v.cwd
+                .as_ref()
+                .is_some_and(|c| !c.is_empty() && c.len() <= MAX_CWD_BYTES)
+            && v.search_path
+                .as_ref()
+                .is_none_or(|p| p.len() <= MAX_SEARCH_PATH_BYTES)
+            && v.environment.len() <= MAX_CLIENT_VARIABLES
+    }
+
+    /// The environment refusal of a well-shaped submit, or `None`. With
+    /// `outside_sandbox` absent or false, `launch_environment` must be empty
+    /// and fields 8 and 9 follow the `!` (PC3) rules; with it true, fields 8
+    /// and 9 must be absent and the launch environment follows the outside
+    /// bounds. Size is checked before form, so an oversized environment is
+    /// `environment_too_large` whatever its names. Values are bytes and need
+    /// not be UTF-8.
+    pub fn environment_refusal(v: &pb::ConversationQueueCommandSubmit) -> Option<pb::QueueRefusal> {
+        use pb::QueueRefusal::{EnvironmentInvalid, EnvironmentTooLarge};
+        if v.outside_sandbox != Some(true) {
+            if !v.launch_environment.is_empty() || !client_environment(&v.environment) {
+                return Some(EnvironmentInvalid);
+            }
+            return None;
+        }
+        if v.search_path.is_some() || !v.environment.is_empty() {
+            return Some(EnvironmentInvalid);
+        }
+        let bytes = v.launch_environment.iter().fold(0usize, |total, entry| {
+            total
+                .saturating_add(entry.name.as_ref().map_or(0, Vec::len))
+                .saturating_add(entry.value.as_ref().map_or(0, Vec::len))
+        });
+        if v.launch_environment.len() > MAX_LAUNCH_VARIABLES || bytes > MAX_LAUNCH_ENVIRONMENT_BYTES
+        {
+            return Some(EnvironmentTooLarge);
+        }
+        let mut names = HashSet::with_capacity(v.launch_environment.len());
+        for entry in &v.launch_environment {
+            let (Some(name), Some(value)) = (&entry.name, &entry.value) else {
+                return Some(EnvironmentInvalid);
+            };
+            if name.is_empty()
+                || name.len() > MAX_LAUNCH_NAME_BYTES
+                || name.contains(&b'=')
+                || name.contains(&0)
+                || value.contains(&0)
+                || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p))
+                || !names.insert(name.as_slice())
+            {
+                return Some(EnvironmentInvalid);
+            }
+        }
+        None
+    }
+
+    /// PC3: only listed names, each at most once, with checked values.
+    fn client_environment(entries: &[pb::PersonEnvironment]) -> bool {
+        let mut seen = [false; CLIENT_VARIABLES.len()];
+        entries.iter().all(|entry| {
+            let (Some(name), Some(value)) = (&entry.name, &entry.value) else {
+                return false;
+            };
+            let Some(code) = CLIENT_VARIABLES.iter().position(|n| n == name) else {
+                return false;
+            };
+            if std::mem::replace(&mut seen[code], true) {
+                return false;
+            }
+            if name == "SSH_AUTH_SOCK" {
+                value.starts_with('/')
+                    && value.len() <= MAX_AUTH_SOCKET_BYTES
+                    && !value.contains('\0')
+            } else {
+                !value.is_empty()
+                    && value.len() <= MAX_LOCALE_VALUE_BYTES
+                    && value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@')
+                    })
+            }
+        })
+    }
+
+    /// The PCR9 working directory form: relative, no NUL, no `..`
+    /// component, "." for the root. The service answers `cwd_invalid`
+    /// otherwise, and resolves the path under the project without symlinks.
+    pub fn cwd_form_valid(cwd: &str) -> bool {
+        !cwd.is_empty()
+            && cwd.len() <= MAX_CWD_BYTES
+            && !cwd.starts_with('/')
+            && !cwd.contains('\0')
+            && cwd.split('/').all(|part| part != "..")
+    }
+
+    /// Fields 16-20 of a queue entry: only on kind 3; the waiting reason and
+    /// its text only together and only in state 1 (Queued).
+    pub(crate) fn entry_shape(e: &pb::ConversationQueueEntry) -> bool {
+        if e.kind != Some(ENTRY_KIND) {
+            return e.command_cwd.is_none()
+                && e.command_outside_sandbox.is_none()
+                && e.waiting_reason.is_none()
+                && e.waiting_text.is_none()
+                && e.command_filtered.is_none();
+        }
+        e.command_cwd
+            .as_ref()
+            .is_some_and(|c| !c.is_empty() && c.len() <= MAX_CWD_BYTES && !c.contains('\0'))
+            && e.command_outside_sandbox.is_some()
+            // A command waits with a reason, never a model wait step.
+            && e.waiting_step.is_none()
+            && match (e.waiting_reason, &e.waiting_text) {
+                (None, None) => true,
+                (Some(reason), Some(text)) => {
+                    e.state == Some(1)
+                        && (1..=MAX_WAIT_REASON).contains(&reason)
+                        && !text.is_empty()
+                        && text.len() <= MAX_WAITING_TEXT_BYTES
+                        && !text.chars().any(char::is_control)
+                }
+                _ => false,
+            }
+            // Set only, and only true, as ToolProgress.command_filtered.
+            && e.command_filtered.is_none_or(|filtered| filtered)
+    }
+
+    /// A refusal reply carries the request ID and the refusal, and nothing
+    /// queued: no entries, no receipt. `refusal_status` comes only with
+    /// `secret_store_unavailable`, as a nonzero |OSStatus|.
+    pub(crate) fn refusal_shape(v: &pb::ConversationQueueReply) -> bool {
+        match v.refusal {
+            None => v.refusal_status.is_none(),
+            Some(refusal) => {
+                (1..=MAX_REFUSAL).contains(&refusal)
+                    && id(&v.request_id)
+                    && v.entries.is_empty()
+                    && v.accepted_input_id.is_none()
+                    && v.full_text == Some(false)
+                    && v.pending != Some(true)
+                    && v.stale_order != Some(true)
+                    && if refusal == pb::QueueRefusal::SecretStoreUnavailable as i32 {
+                        v.refusal_status.is_some_and(|status| status > 0)
+                    } else {
+                        v.refusal_status.is_none()
+                    }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +835,7 @@ mod tests {
             generation: Some(2),
             accepted_frame: Some(123),
             kind: Some(3),
+            person_command_input_id: None,
         };
         let reply = pb::ConversationHistoryReply {
             project_id: Some(vec![3; 16]),
@@ -1253,5 +1503,855 @@ mod tests {
             Some(true),
             Some(32)
         ))));
+    }
+
+    fn launch(name: &[u8], value: &[u8]) -> pb::LaunchVariable {
+        pb::LaunchVariable {
+            name: Some(name.to_vec()),
+            value: Some(value.to_vec()),
+        }
+    }
+    fn command_submit() -> pb::ConversationQueueCommandSubmit {
+        pb::ConversationQueueCommandSubmit {
+            request_id: Some(vec![3; 16]),
+            project_id: Some(vec![4; 16]),
+            conversation_id: Some(vec![5; 16]),
+            expected_generation: Some(2),
+            new_conversation: Some(false),
+            command: Some("ls -l".into()),
+            cwd: Some(".".into()),
+            search_path: Some("/usr/bin:/bin".into()),
+            environment: vec![pb::PersonEnvironment {
+                name: Some("LANG".into()),
+                value: Some("en_GB.UTF-8".into()),
+            }],
+            outside_sandbox: None,
+            launch_environment: Vec::new(),
+        }
+    }
+    fn outside_submit(
+        launch_environment: Vec<pb::LaunchVariable>,
+    ) -> pb::ConversationQueueCommandSubmit {
+        pb::ConversationQueueCommandSubmit {
+            search_path: None,
+            environment: Vec::new(),
+            outside_sandbox: Some(true),
+            launch_environment,
+            ..command_submit()
+        }
+    }
+    /// Names `V0000`..; values fill `bytes` names and values together.
+    fn sized_launch(entries: usize, bytes: usize) -> Vec<pb::LaunchVariable> {
+        let names = entries * 5;
+        let mut values = vec![0usize; entries];
+        let rest = bytes - names;
+        // Two large values carry 3-byte lengths; the rest are empty.
+        values[entries - 1] = rest / 2;
+        values[entries - 2] = rest - rest / 2;
+        (0..entries)
+            .map(|i| launch(format!("V{i:04}").as_bytes(), &vec![b'x'; values[i]]))
+            .collect()
+    }
+    fn round_trips(body: Body) -> bool {
+        let value = envelope(body);
+        let Ok(frame) = encode_frame(&value) else {
+            return false;
+        };
+        decode_body(&frame[HEADER_BYTES..]).is_ok_and(|decoded| decoded == value)
+    }
+
+    /// PC-U41: the submit codec's environment rules. Each invalid form is a
+    /// typed refusal, not a protocol fault: the submit stays well-shaped.
+    #[test]
+    fn pc_u41_submit_environment_refusals() {
+        use pb::QueueRefusal::{EnvironmentInvalid as Invalid, EnvironmentTooLarge as TooLarge};
+        use person::environment_refusal as refusal;
+        let sandboxed = command_submit();
+        assert!(person::submit_shape(&sandboxed));
+        assert_eq!(refusal(&sandboxed), None);
+        let outside = outside_submit(vec![launch(b"HOME", b"/Users/p"), launch(b"EMPTY", b"")]);
+        assert_eq!(refusal(&outside), None);
+        let mut cases: Vec<(&str, pb::ConversationQueueCommandSubmit, pb::QueueRefusal)> = vec![
+            (
+                "outside with field 8",
+                pb::ConversationQueueCommandSubmit {
+                    search_path: Some("/bin".into()),
+                    ..outside.clone()
+                },
+                Invalid,
+            ),
+            (
+                "outside with field 9",
+                pb::ConversationQueueCommandSubmit {
+                    environment: sandboxed.environment.clone(),
+                    ..outside.clone()
+                },
+                Invalid,
+            ),
+            (
+                "sandboxed with a launch environment",
+                pb::ConversationQueueCommandSubmit {
+                    launch_environment: vec![launch(b"A", b"1")],
+                    ..sandboxed.clone()
+                },
+                Invalid,
+            ),
+            (
+                "false flag with a launch environment",
+                pb::ConversationQueueCommandSubmit {
+                    outside_sandbox: Some(false),
+                    launch_environment: vec![launch(b"A", b"1")],
+                    ..sandboxed.clone()
+                },
+                Invalid,
+            ),
+            (
+                "duplicate names",
+                outside_submit(vec![launch(b"A", b"1"), launch(b"A", b"2")]),
+                Invalid,
+            ),
+            (
+                "name with =",
+                outside_submit(vec![launch(b"A=B", b"1")]),
+                Invalid,
+            ),
+            (
+                "empty name",
+                outside_submit(vec![launch(b"", b"1")]),
+                Invalid,
+            ),
+            (
+                "NUL name",
+                outside_submit(vec![launch(b"A\0", b"1")]),
+                Invalid,
+            ),
+            (
+                "NUL value",
+                outside_submit(vec![launch(b"A", b"x\0y")]),
+                Invalid,
+            ),
+            (
+                "ASURA_SECRET_1",
+                outside_submit(vec![launch(b"ASURA_SECRET_1", b"v")]),
+                Invalid,
+            ),
+            (
+                "ASURA_SECRET_COMMAND",
+                outside_submit(vec![launch(b"ASURA_SECRET_COMMAND", b"v")]),
+                Invalid,
+            ),
+            (
+                "ASURA_JOB_x",
+                outside_submit(vec![launch(b"ASURA_JOB_x", b"1")]),
+                Invalid,
+            ),
+            (
+                "absent value",
+                outside_submit(vec![pb::LaunchVariable {
+                    name: Some(b"A".to_vec()),
+                    value: None,
+                }]),
+                Invalid,
+            ),
+            (
+                "1,025-byte name",
+                outside_submit(vec![launch(&[b'N'; 1025], b"")]),
+                Invalid,
+            ),
+            (
+                "1,025 entries",
+                outside_submit(sized_launch(1025, 40_960)),
+                TooLarge,
+            ),
+            (
+                "40,961 bytes",
+                outside_submit(sized_launch(1024, 40_961)),
+                TooLarge,
+            ),
+        ];
+        // `!` (PC3) forms: only listed names, once each, with checked values.
+        for environment in [
+            vec![("HOME", "/Users/p")],
+            vec![("LANG", "C"), ("LANG", "C")],
+            vec![("LANG", "bad value")],
+            vec![("LANG", "")],
+            vec![("LC_ALL", &"a".repeat(65) as &str)],
+            vec![("SSH_AUTH_SOCK", "relative/agent")],
+            vec![("SSH_AUTH_SOCK", &format!("/{}", "s".repeat(103)) as &str)],
+            vec![("ASURA_SECRET_1", "v")],
+        ] {
+            cases.push((
+                "PC3",
+                pb::ConversationQueueCommandSubmit {
+                    environment: environment
+                        .into_iter()
+                        .map(|(name, value)| pb::PersonEnvironment {
+                            name: Some(name.into()),
+                            value: Some(value.into()),
+                        })
+                        .collect(),
+                    ..sandboxed.clone()
+                },
+                Invalid,
+            ));
+        }
+        for (name, case, expected) in cases {
+            assert!(person::submit_shape(&case), "{name}: shape");
+            assert_eq!(refusal(&case), Some(expected), "{name}");
+            // A refused form still crosses the wire, so the service can
+            // answer it with its typed refusal.
+            assert!(
+                round_trips(Body::ConversationQueueCommandSubmit(case)),
+                "{name}: wire"
+            );
+        }
+        // Accepted bounds: a non-UTF-8 value, a 1,024-byte name, the
+        // largest SSH_AUTH_SOCK, every PC3 name once.
+        let accepted = outside_submit(vec![
+            launch(b"BYTES", &[0xff, 0xfe, b'a']),
+            launch(&[b'N'; 1024], b""),
+        ]);
+        assert_eq!(refusal(&accepted), None);
+        assert!(round_trips(Body::ConversationQueueCommandSubmit(accepted)));
+        let every = pb::ConversationQueueCommandSubmit {
+            environment: person::CLIENT_VARIABLES
+                .iter()
+                .map(|name| pb::PersonEnvironment {
+                    name: Some((*name).into()),
+                    value: Some(if *name == "SSH_AUTH_SOCK" {
+                        format!("/{}", "s".repeat(102))
+                    } else {
+                        "en_GB.UTF-8@euro".into()
+                    }),
+                })
+                .collect(),
+            ..sandboxed.clone()
+        };
+        assert_eq!(refusal(&every), None);
+        assert!(round_trips(Body::ConversationQueueCommandSubmit(every)));
+    }
+
+    /// The submit's protocol shape: presence, lane target, sizes, direction.
+    #[test]
+    fn command_submit_shape_and_direction() {
+        let request = command_submit();
+        let value = envelope(Body::ConversationQueueCommandSubmit(request.clone()));
+        assert!(validate_semantics(&value, Direction::ClientToServer).is_ok());
+        assert_eq!(
+            validate_semantics(&value, Direction::ServerToClient),
+            Err(crate::ProtocolError::WrongDirection)
+        );
+        let fresh = pb::ConversationQueueCommandSubmit {
+            conversation_id: None,
+            expected_generation: Some(0),
+            new_conversation: Some(true),
+            ..request.clone()
+        };
+        assert!(person::submit_shape(&fresh));
+        for (name, changed) in [
+            (
+                "request",
+                pb::ConversationQueueCommandSubmit {
+                    request_id: Some(vec![0; 16]),
+                    ..request.clone()
+                },
+            ),
+            (
+                "project",
+                pb::ConversationQueueCommandSubmit {
+                    project_id: None,
+                    ..request.clone()
+                },
+            ),
+            (
+                "generation",
+                pb::ConversationQueueCommandSubmit {
+                    expected_generation: None,
+                    ..request.clone()
+                },
+            ),
+            (
+                "new with id",
+                pb::ConversationQueueCommandSubmit {
+                    new_conversation: Some(true),
+                    ..request.clone()
+                },
+            ),
+            (
+                "no command",
+                pb::ConversationQueueCommandSubmit {
+                    command: None,
+                    ..request.clone()
+                },
+            ),
+            (
+                "empty command",
+                pb::ConversationQueueCommandSubmit {
+                    command: Some(String::new()),
+                    ..request.clone()
+                },
+            ),
+            (
+                "long command",
+                pb::ConversationQueueCommandSubmit {
+                    command: Some("x".repeat(8193)),
+                    ..request.clone()
+                },
+            ),
+            (
+                "NUL command",
+                pb::ConversationQueueCommandSubmit {
+                    command: Some("a\0b".into()),
+                    ..request.clone()
+                },
+            ),
+            (
+                "no cwd",
+                pb::ConversationQueueCommandSubmit {
+                    cwd: None,
+                    ..request.clone()
+                },
+            ),
+            (
+                "long cwd",
+                pb::ConversationQueueCommandSubmit {
+                    cwd: Some("d".repeat(1025)),
+                    ..request.clone()
+                },
+            ),
+            (
+                "long PATH",
+                pb::ConversationQueueCommandSubmit {
+                    search_path: Some("p".repeat(4097)),
+                    ..request.clone()
+                },
+            ),
+        ] {
+            assert!(!person::submit_shape(&changed), "{name}");
+            assert!(
+                !valid(&Body::ConversationQueueCommandSubmit(changed)),
+                "{name}"
+            );
+        }
+        assert!(person::submit_shape(&pb::ConversationQueueCommandSubmit {
+            command: Some("x".repeat(8192)),
+            cwd: Some("d".repeat(1024)),
+            search_path: Some("p".repeat(4096)),
+            ..request.clone()
+        }));
+        // Ten PC3 entries exceed the wire bound of nine.
+        let ten = pb::ConversationQueueCommandSubmit {
+            environment: vec![request.environment[0].clone(); 10],
+            ..request
+        };
+        assert!(encode_frame(&envelope(Body::ConversationQueueCommandSubmit(ten))).is_err());
+        assert!(person::cwd_form_valid("."));
+        assert!(person::cwd_form_valid("src/ui"));
+        for cwd in ["", "/abs", "a/../b", "..", "a\0b"] {
+            assert!(!person::cwd_form_valid(cwd), "{cwd:?}");
+        }
+        assert!(!person::cwd_form_valid(&"d".repeat(1025)));
+    }
+
+    /// PC-U49: a submit at every maximum together fits one control frame,
+    /// and the over-bound environments still fit, to be refused.
+    #[test]
+    fn pc_u49_submit_at_every_maximum_fits_one_frame() {
+        // The frame-bound table: fixed 9,343 bytes, then 1,024 entries of at
+        // most 11 header bytes and 40,960 name and value bytes.
+        let bound =
+            9_343 + person::MAX_LAUNCH_VARIABLES * 11 + person::MAX_LAUNCH_ENVIRONMENT_BYTES;
+        assert!(bound <= crate::MAX_FRAME_BYTES);
+        let launch_environment = sized_launch(1024, 40_960);
+        // Largest value lengths take 3-byte varints.
+        assert!(
+            launch_environment
+                .iter()
+                .any(|e| e.value.as_ref().unwrap().len() >= 16_384)
+        );
+        let submit = pb::ConversationQueueCommandSubmit {
+            request_id: Some(vec![0xff; 16]),
+            project_id: Some(vec![0xff; 16]),
+            conversation_id: Some(vec![0xff; 16]),
+            expected_generation: Some(u64::MAX - 1),
+            new_conversation: Some(false),
+            command: Some("c".repeat(8_192)),
+            cwd: Some("d".repeat(1_024)),
+            ..outside_submit(launch_environment)
+        };
+        assert_eq!(person::environment_refusal(&submit), None);
+        let value = pb::Envelope {
+            service_epoch: Some(vec![0xff; 16]),
+            attachment_id: Some(vec![0xff; 16]),
+            request_counter: Some(u64::MAX),
+            body: Some(Body::ConversationQueueCommandSubmit(submit.clone())),
+        };
+        use prost::Message;
+        let length = value.encoded_len();
+        assert!(
+            length <= bound && length <= crate::MAX_FRAME_BYTES,
+            "{length}"
+        );
+        assert!(validate_semantics(&value, Direction::ClientToServer).is_ok());
+        let frame = encode_frame(&value).unwrap();
+        assert_eq!(decode_body(&frame[HEADER_BYTES..]).unwrap(), value);
+        for over in [sized_launch(1025, 40_960), sized_launch(1024, 40_961)] {
+            let over = pb::ConversationQueueCommandSubmit {
+                launch_environment: over,
+                ..submit.clone()
+            };
+            assert_eq!(
+                person::environment_refusal(&over),
+                Some(pb::QueueRefusal::EnvironmentTooLarge)
+            );
+            let value = pb::Envelope {
+                body: Some(Body::ConversationQueueCommandSubmit(over)),
+                ..value.clone()
+            };
+            assert!(value.encoded_len() <= crate::MAX_FRAME_BYTES);
+            assert!(encode_frame(&value).is_ok());
+        }
+    }
+
+    fn command_entry() -> pb::ConversationQueueEntry {
+        pb::ConversationQueueEntry {
+            input_id: Some(vec![3; 16]),
+            project_id: Some(vec![4; 16]),
+            conversation_id: Some(vec![5; 16]),
+            target_generation: Some(2),
+            kind: Some(person::ENTRY_KIND),
+            state: Some(1),
+            text: Some("make test".into()),
+            sequence: Some(1),
+            new_conversation: Some(false),
+            order_position: Some(1),
+            command_cwd: Some(".".into()),
+            command_outside_sandbox: Some(true),
+            waiting_reason: Some(pb::QueueWaitReason::ModelTurn as i32),
+            waiting_text: Some("waiting: model turn running".into()),
+            ..Default::default()
+        }
+    }
+    fn entry_reply(entry: pb::ConversationQueueEntry) -> pb::ConversationQueueReply {
+        pb::ConversationQueueReply {
+            entries: vec![entry],
+            full_text: Some(false),
+            revision: Some(1),
+            pending: Some(false),
+            order_revision: Some(1),
+            stale_order: Some(false),
+            ..Default::default()
+        }
+    }
+    fn refusal_reply(refusal: pb::QueueRefusal) -> pb::ConversationQueueReply {
+        pb::ConversationQueueReply {
+            request_id: Some(vec![6; 16]),
+            full_text: Some(false),
+            refusal: Some(refusal as i32),
+            refusal_status: (refusal == pb::QueueRefusal::SecretStoreUnavailable).then_some(25_308),
+            ..Default::default()
+        }
+    }
+
+    /// PC-U55: queue entry fields 16-20 and the refusal reply.
+    #[test]
+    fn pc_u55_queue_command_entry_and_refusal_codec() {
+        let entry = command_entry();
+        assert!(valid(&Body::ConversationQueueReply(entry_reply(
+            entry.clone()
+        ))));
+        let reject = |name: &str, entry: pb::ConversationQueueEntry| {
+            assert!(
+                !valid(&Body::ConversationQueueReply(entry_reply(entry))),
+                "{name}"
+            );
+        };
+        // Fields 16-20 on kind 3 only.
+        let message = pb::ConversationQueueEntry {
+            kind: Some(1),
+            command_cwd: None,
+            command_outside_sandbox: None,
+            waiting_reason: None,
+            waiting_text: None,
+            ..entry.clone()
+        };
+        assert!(valid(&Body::ConversationQueueReply(entry_reply(
+            message.clone()
+        ))));
+        reject(
+            "cwd on kind 1",
+            pb::ConversationQueueEntry {
+                command_cwd: Some(".".into()),
+                ..message.clone()
+            },
+        );
+        reject(
+            "flag on kind 1",
+            pb::ConversationQueueEntry {
+                command_outside_sandbox: Some(false),
+                ..message.clone()
+            },
+        );
+        reject(
+            "reason on kind 1",
+            pb::ConversationQueueEntry {
+                waiting_reason: entry.waiting_reason,
+                waiting_text: entry.waiting_text.clone(),
+                ..message.clone()
+            },
+        );
+        reject(
+            "filtered on kind 1",
+            pb::ConversationQueueEntry {
+                command_filtered: Some(true),
+                ..message.clone()
+            },
+        );
+        reject(
+            "filtered on kind 2",
+            pb::ConversationQueueEntry {
+                kind: Some(2),
+                target_operation_id: Some(vec![8; 16]),
+                command_filtered: Some(true),
+                ..message
+            },
+        );
+        // Waiting reason and text only together, only in state 1.
+        reject(
+            "reason without text",
+            pb::ConversationQueueEntry {
+                waiting_text: None,
+                ..entry.clone()
+            },
+        );
+        reject(
+            "text without reason",
+            pb::ConversationQueueEntry {
+                waiting_reason: None,
+                ..entry.clone()
+            },
+        );
+        for state in 2..=6 {
+            reject(
+                "outside state 1",
+                pb::ConversationQueueEntry {
+                    state: Some(state),
+                    ..entry.clone()
+                },
+            );
+        }
+        reject(
+            "reason 0",
+            pb::ConversationQueueEntry {
+                waiting_reason: Some(0),
+                ..entry.clone()
+            },
+        );
+        reject(
+            "empty text",
+            pb::ConversationQueueEntry {
+                waiting_text: Some(String::new()),
+                ..entry.clone()
+            },
+        );
+        reject(
+            "long text",
+            pb::ConversationQueueEntry {
+                waiting_text: Some("w".repeat(129)),
+                ..entry.clone()
+            },
+        );
+        reject(
+            "control text",
+            pb::ConversationQueueEntry {
+                waiting_text: Some("a\nb".into()),
+                ..entry.clone()
+            },
+        );
+        reject(
+            "model wait step",
+            pb::ConversationQueueEntry {
+                waiting_reason: None,
+                waiting_text: None,
+                waiting_step: Some(1),
+                ..entry.clone()
+            },
+        );
+        reject(
+            "no cwd",
+            pb::ConversationQueueEntry {
+                command_cwd: None,
+                ..entry.clone()
+            },
+        );
+        reject(
+            "long cwd",
+            pb::ConversationQueueEntry {
+                command_cwd: Some("d".repeat(1025)),
+                ..entry.clone()
+            },
+        );
+        reject(
+            "no outside flag",
+            pb::ConversationQueueEntry {
+                command_outside_sandbox: None,
+                ..entry.clone()
+            },
+        );
+        reject(
+            "filtered false",
+            pb::ConversationQueueEntry {
+                command_filtered: Some(false),
+                ..entry.clone()
+            },
+        );
+        reject(
+            "operation",
+            pb::ConversationQueueEntry {
+                state: Some(3),
+                waiting_reason: None,
+                waiting_text: None,
+                operation_id: Some(vec![9; 16]),
+                generation: Some(2),
+                ..entry.clone()
+            },
+        );
+        // Accepted variants: running with no reason, a held reason, filtered.
+        for accepted in [
+            pb::ConversationQueueEntry {
+                state: Some(3),
+                waiting_reason: None,
+                waiting_text: None,
+                ..entry.clone()
+            },
+            pb::ConversationQueueEntry {
+                state: Some(2),
+                waiting_reason: None,
+                waiting_text: None,
+                hold_reason: Some("secrets_lost".into()),
+                ..entry.clone()
+            },
+            pb::ConversationQueueEntry {
+                command_filtered: Some(true),
+                ..entry.clone()
+            },
+            pb::ConversationQueueEntry {
+                conversation_id: Some(vec![5; 16]),
+                target_generation: Some(0),
+                new_conversation: Some(true),
+                ..entry.clone()
+            },
+        ] {
+            assert!(valid(&Body::ConversationQueueReply(entry_reply(accepted))));
+        }
+        // Every wait reason round-trips; one past the last is not on the wire.
+        for reason in 1..=person::MAX_WAIT_REASON {
+            assert!(pb::QueueWaitReason::try_from(reason).is_ok());
+            let reply = entry_reply(pb::ConversationQueueEntry {
+                waiting_reason: Some(reason),
+                ..entry.clone()
+            });
+            assert!(
+                round_trips(Body::ConversationQueueReply(reply)),
+                "reason {reason}"
+            );
+        }
+        assert!(!round_trips(Body::ConversationQueueReply(entry_reply(
+            pb::ConversationQueueEntry {
+                waiting_reason: Some(person::MAX_WAIT_REASON + 1),
+                ..entry.clone()
+            }
+        ))));
+        // Every refusal round-trips; the status only with unavailable.
+        for code in 1..=person::MAX_REFUSAL {
+            let refusal = pb::QueueRefusal::try_from(code).unwrap();
+            let reply = refusal_reply(refusal);
+            assert!(
+                valid(&Body::ConversationQueueReply(reply.clone())),
+                "{refusal:?}"
+            );
+            assert!(
+                round_trips(Body::ConversationQueueReply(reply.clone())),
+                "{refusal:?}"
+            );
+            let flipped = pb::ConversationQueueReply {
+                refusal_status: if reply.refusal_status.is_some() {
+                    None
+                } else {
+                    Some(1)
+                },
+                ..reply
+            };
+            assert!(
+                !valid(&Body::ConversationQueueReply(flipped)),
+                "{refusal:?} status"
+            );
+        }
+        let mut wire = refusal_reply(pb::QueueRefusal::OutsideSandboxOff);
+        wire.refusal = Some(person::MAX_REFUSAL + 1);
+        assert!(!round_trips(Body::ConversationQueueReply(wire)));
+        let refused = refusal_reply(pb::QueueRefusal::EnvironmentInvalid);
+        let accepted = entry_reply(entry.clone());
+        for (name, reply) in [
+            (
+                "refusal and receipt",
+                pb::ConversationQueueReply {
+                    accepted_input_id: entry.input_id.clone(),
+                    entries: accepted.entries.clone(),
+                    order_revision: Some(1),
+                    stale_order: Some(false),
+                    ..refused.clone()
+                },
+            ),
+            (
+                "refusal and entries",
+                pb::ConversationQueueReply {
+                    entries: accepted.entries.clone(),
+                    ..refused.clone()
+                },
+            ),
+            (
+                "refusal 0",
+                pb::ConversationQueueReply {
+                    refusal: Some(0),
+                    ..refused.clone()
+                },
+            ),
+            (
+                "no request",
+                pb::ConversationQueueReply {
+                    request_id: None,
+                    ..refused.clone()
+                },
+            ),
+            (
+                "status alone",
+                pb::ConversationQueueReply {
+                    refusal_status: Some(1),
+                    ..accepted.clone()
+                },
+            ),
+            (
+                "zero status",
+                pb::ConversationQueueReply {
+                    refusal_status: Some(0),
+                    ..refusal_reply(pb::QueueRefusal::SecretStoreUnavailable)
+                },
+            ),
+        ] {
+            assert!(!valid(&Body::ConversationQueueReply(reply)), "{name}");
+        }
+        assert!(round_trips(Body::ConversationQueueReply(
+            pb::ConversationQueueReply {
+                entries: vec![pb::ConversationQueueEntry {
+                    command_filtered: Some(true),
+                    ..entry
+                }],
+                ..accepted
+            }
+        )));
+    }
+
+    /// History field 5: a person command entry names its input, not an
+    /// operation, and is ordered with turns by its accepted frame.
+    #[test]
+    fn history_person_command_entry() {
+        let turn = pb::ConversationHistoryEntry {
+            operation_id: Some(vec![7; 16]),
+            generation: Some(2),
+            accepted_frame: Some(200),
+            kind: Some(3),
+            person_command_input_id: None,
+        };
+        let command = pb::ConversationHistoryEntry {
+            operation_id: None,
+            generation: Some(2),
+            accepted_frame: Some(150),
+            kind: None,
+            person_command_input_id: Some(vec![8; 16]),
+        };
+        let reply = |entries| pb::ConversationHistoryReply {
+            project_id: Some(vec![3; 16]),
+            conversation_id: Some(vec![4; 16]),
+            generation: Some(2),
+            authority_revision: Some(9),
+            has_more: Some(false),
+            entries,
+        };
+        let body = Body::ConversationHistoryReply(reply(vec![turn.clone(), command.clone()]));
+        assert!(valid(&body));
+        assert!(round_trips(body));
+        // Queued against generation 0, before the first turn.
+        assert!(valid(&Body::ConversationHistoryReply(reply(vec![
+            pb::ConversationHistoryEntry {
+                generation: Some(0),
+                ..command.clone()
+            }
+        ]))));
+        // A conversation with only person commands has generation 0; a turn
+        // entry needs a generation above 0.
+        let only_commands = |entries| pb::ConversationHistoryReply {
+            generation: Some(0),
+            ..reply(entries)
+        };
+        let first = pb::ConversationHistoryEntry {
+            generation: Some(0),
+            ..command.clone()
+        };
+        assert!(valid(&Body::ConversationHistoryReply(only_commands(vec![
+            first.clone()
+        ]))));
+        assert!(!valid(&Body::ConversationHistoryReply(only_commands(
+            vec![turn.clone(), first]
+        ))));
+        for (name, changed) in [
+            (
+                "operation",
+                pb::ConversationHistoryEntry {
+                    operation_id: Some(vec![7; 16]),
+                    ..command.clone()
+                },
+            ),
+            (
+                "kind",
+                pb::ConversationHistoryEntry {
+                    kind: Some(3),
+                    ..command.clone()
+                },
+            ),
+            (
+                "zero input",
+                pb::ConversationHistoryEntry {
+                    person_command_input_id: Some(vec![0; 16]),
+                    ..command.clone()
+                },
+            ),
+            (
+                "short input",
+                pb::ConversationHistoryEntry {
+                    person_command_input_id: Some(vec![8; 15]),
+                    ..command.clone()
+                },
+            ),
+            (
+                "later generation",
+                pb::ConversationHistoryEntry {
+                    generation: Some(3),
+                    ..command.clone()
+                },
+            ),
+            (
+                "no frame",
+                pb::ConversationHistoryEntry {
+                    accepted_frame: None,
+                    ..command.clone()
+                },
+            ),
+        ] {
+            assert!(
+                !valid(&Body::ConversationHistoryReply(reply(vec![changed]))),
+                "{name}"
+            );
+        }
     }
 }
