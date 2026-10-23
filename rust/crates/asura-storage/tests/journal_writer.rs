@@ -3121,6 +3121,128 @@ fn p2_real_writer_queues_kind_31_and_reads_person_jobs() {
     close(&mut writer);
 }
 
+/// P3-E2 (PC-U54 storage part): `PrepareInput` takes an input that
+/// replay's `input_ready` accepts with no active turn, not only the lane
+/// head of `ready_input`. A message behind a person command waits while
+/// the command is `Queued`; once the command's kind 26 commits (a running
+/// person job, which a released `!!` job may be) the message prepares.
+/// An active turn, and a person input itself, are `Conflict`.
+#[test]
+fn p3e2_prepare_input_behind_a_running_person_job() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    drop(j1_admit_and_start(
+        &mut writer,
+        project,
+        configuration_digest,
+    ));
+    let lane = [70; 16];
+    let person = [72; 16];
+    p2_queue(&mut writer, p2_command(71, 72, project, lane, true, true)).unwrap();
+    let message = wait(
+        &mut writer
+            .try_submit(Command::QueueInput {
+                request: [73; 16],
+                project,
+                conversation: Some(lane),
+                expected_generation: 0,
+                new_conversation: false,
+                prompt: "after the command".into(),
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .accepted_input_id
+    .unwrap();
+    let prepare = |writer: &mut WriterHandle, input| {
+        wait(&mut writer.try_submit(Command::PrepareInput { input }).unwrap())
+    };
+    // The person command is Queued ahead of the message; a person input
+    // never prepares a turn.
+    assert!(matches!(
+        prepare(&mut writer, message),
+        Err(Error::Conflict)
+    ));
+    assert!(matches!(prepare(&mut writer, person), Err(Error::Conflict)));
+    assert!(matches!(
+        prepare(&mut writer, [74; 16]),
+        Err(Error::Conflict)
+    ));
+    // The person job starts: its input is Running.
+    let mut revision = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap()
+        .revision;
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::JobIntent(JobIntent {
+            origin: JobOrigin::Person { input: person },
+            agent: 0,
+            time: 1_760_000_000_000,
+        }),
+    )
+    .unwrap();
+    let state = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    assert_eq!(state.input_status(person), Some(InputStatus::Running));
+    assert!(state.input_ready(message));
+    assert_eq!(
+        state.ready_input(),
+        None,
+        "the lane head rule alone refuses"
+    );
+    drop(state);
+    // The other conversation's turn is active.
+    assert!(matches!(
+        prepare(&mut writer, message),
+        Err(Error::Conflict)
+    ));
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::CancelRequested(CancelRequested {
+            operation: [35; 16],
+            generation: 1,
+            cause: Cause::UserCancel,
+        }),
+    )
+    .unwrap();
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::TurnTerminal(TurnTerminal {
+            operation: [35; 16],
+            generation: 1,
+            kind: TerminalKind::Cancelled,
+            cause: Cause::UserCancel,
+            final_cursor: u64::MAX,
+            usage_known: false,
+            output_tokens: 0,
+            text_offset: 0,
+            text: String::new(),
+        }),
+    )
+    .unwrap();
+    let prepared = prepare(&mut writer, message).unwrap();
+    let queued = prepared.queued.unwrap();
+    assert_eq!(
+        (
+            queued.conversation,
+            queued.generation,
+            queued.prompt.as_str()
+        ),
+        (lane, 0, "after the command")
+    );
+    assert!(prepared.prepared.is_some());
+    close(&mut writer);
+}
+
 // ---------------------------------------------------------- P5 kind 32
 // execution-path-guard.md, EPG-U3 (integration support): kind 32 through
 // the real writer on real files, the guard reads and the restart.

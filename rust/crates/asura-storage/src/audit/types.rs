@@ -310,6 +310,56 @@ impl PersonCommandRefusal {
         serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
     }
 }
+/// The reply code of a secret store call (secret-store.md, operations and
+/// audit). Each `secret_store.*` event takes the codes of its own call;
+/// `unavailable` alone carries a status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStoreReply {
+    /// `put`: the item was written.
+    Stored,
+    /// `put`: an item with equal values exists (exact retry).
+    ExistsSame,
+    /// `put`: an item with other values or another binding exists.
+    ExistsDifferent,
+    /// `put`: the store holds 256 items or more.
+    Full,
+    /// `get`: the values were read.
+    Read,
+    /// `get`: no item exists.
+    Missing,
+    /// `get`: the item does not belong to the input; it is deleted.
+    Mismatch,
+    /// `delete`: the item was deleted.
+    Deleted,
+    /// `delete`: no item existed.
+    Absent,
+    /// `sweep`: the listing completed.
+    Swept,
+    /// Any call: the keychain is locked.
+    Locked,
+    /// Any call: macOS denied this binary access.
+    Denied,
+    /// Any call: the target or the Security framework failed; the event
+    /// carries the |OSStatus| (0 for a request the worker refused as a
+    /// defect).
+    Unavailable,
+}
+impl SecretStoreReply {
+    fn allowed(self, call: &str) -> bool {
+        use SecretStoreReply as R;
+        matches!(self, R::Locked | R::Denied | R::Unavailable)
+            || match call {
+                "put" => matches!(
+                    self,
+                    R::Stored | R::ExistsSame | R::ExistsDifferent | R::Full
+                ),
+                "get" => matches!(self, R::Read | R::Missing | R::Mismatch),
+                "delete" => matches!(self, R::Deleted | R::Absent),
+                _ => self == R::Swept,
+            }
+    }
+}
 /// The requester of a job cancel (kind 27 field 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -661,6 +711,66 @@ pub enum Event {
         outside_sandbox: bool,
         reason: PersonCommandRefusal,
     },
+    /// One Keychain item write for a person command's input (SS1). Never
+    /// a value, name, digest or payload size; not a project record, so the
+    /// project audit read skips it.
+    #[serde(rename = "secret_store.put")]
+    SecretStorePut {
+        #[serde(with = "id")]
+        input: Id,
+        reply: SecretStoreReply,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_u32"
+        )]
+        status: Option<u32>,
+    },
+    /// One Keychain item read (dispatch, or an exact retry's comparison).
+    #[serde(rename = "secret_store.get")]
+    SecretStoreGet {
+        #[serde(with = "id")]
+        input: Id,
+        reply: SecretStoreReply,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_u32"
+        )]
+        status: Option<u32>,
+    },
+    /// One Keychain item delete after its deciding record.
+    #[serde(rename = "secret_store.delete")]
+    SecretStoreDelete {
+        #[serde(with = "id")]
+        input: Id,
+        reply: SecretStoreReply,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_u32"
+        )]
+        status: Option<u32>,
+    },
+    /// The startup sweep (SS-F1): the counts of its last listing pass,
+    /// with `deleted` summed over every pass.
+    #[serde(rename = "secret_store.sweep")]
+    SecretStoreSweep {
+        reply: SecretStoreReply,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_u32"
+        )]
+        status: Option<u32>,
+        kept: u32,
+        deleted: u32,
+        failed: u32,
+        stranded: u32,
+        unrecognized: u32,
+        truncated: bool,
+        listings: u32,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Record {
@@ -870,11 +980,47 @@ impl Event {
                     // The switch refuses `!!` submits alone (PCR23).
                     && (*reason != PersonCommandRefusal::OutsideSandboxOff || *outside_sandbox)
             }
+            Self::SecretStorePut {
+                input,
+                reply,
+                status,
+            } => nonzero(input) && reply.allowed("put") && Self::status_rule(*reply, *status),
+            Self::SecretStoreGet {
+                input,
+                reply,
+                status,
+            } => nonzero(input) && reply.allowed("get") && Self::status_rule(*reply, *status),
+            Self::SecretStoreDelete {
+                input,
+                reply,
+                status,
+            } => nonzero(input) && reply.allowed("delete") && Self::status_rule(*reply, *status),
+            Self::SecretStoreSweep {
+                reply,
+                status,
+                kept,
+                failed,
+                stranded,
+                unrecognized,
+                ..
+            } => {
+                // One listing holds at most 257 results; `deleted` is summed
+                // over the passes, so it has no such bound.
+                reply.allowed("sweep")
+                    && Self::status_rule(*reply, *status)
+                    && [kept, failed, stranded, unrecognized]
+                        .iter()
+                        .all(|n| **n <= 257)
+            }
         };
         if valid { Ok(()) } else { Err(Error::Invalid) }
     }
 }
 impl Event {
+    /// A status goes with `unavailable` alone, and `unavailable` has one.
+    fn status_rule(reply: SecretStoreReply, status: Option<u32>) -> bool {
+        status.is_some() == (reply == SecretStoreReply::Unavailable)
+    }
     /// The kind 28 outcome rules, applied to the facts `job.settled` carries.
     fn settled_facts(&self) -> bool {
         let Self::JobSettled {

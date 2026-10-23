@@ -113,6 +113,23 @@ use sha2::Sha256;
 
 // ----- Harness -----
 
+/// A `!` (or `!!`) submit body with a fresh request ID.
+fn submit_body(project: Id, conversation: Option<(Id, u64)>, command: &str, outside: bool) -> Body {
+    Body::ConversationQueueCommandSubmit(pb::ConversationQueueCommandSubmit {
+        request_id: Some(asura_platform::random_id().to_vec()),
+        project_id: Some(project.to_vec()),
+        conversation_id: conversation.map(|(c, _)| c.to_vec()),
+        expected_generation: Some(conversation.map_or(0, |(_, g)| g)),
+        new_conversation: Some(conversation.is_none()),
+        command: Some(command.into()),
+        cwd: Some(".".into()),
+        search_path: (!outside).then(|| "/usr/bin:/bin".into()),
+        environment: Vec::new(),
+        outside_sandbox: outside.then_some(true),
+        launch_environment: Vec::new(),
+    })
+}
+
 /// The scratch home, removed last.
 struct Dir(std::path::PathBuf);
 impl Drop for Dir {
@@ -227,21 +244,12 @@ impl H {
         command: &str,
         outside: bool,
     ) -> Id {
-        let reply = self.send(Body::ConversationQueueCommandSubmit(
-            pb::ConversationQueueCommandSubmit {
-                request_id: Some(asura_platform::random_id().to_vec()),
-                project_id: Some(project.to_vec()),
-                conversation_id: conversation.map(|(c, _)| c.to_vec()),
-                expected_generation: Some(conversation.map_or(0, |(_, g)| g)),
-                new_conversation: Some(conversation.is_none()),
-                command: Some(command.into()),
-                cwd: Some(".".into()),
-                search_path: (!outside).then(|| "/usr/bin:/bin".into()),
-                environment: Vec::new(),
-                outside_sandbox: outside.then_some(true),
-                launch_environment: Vec::new(),
-            },
-        ));
+        let body = submit_body(project, conversation, command, outside);
+        self.accepted(body)
+    }
+    /// Sends a submit that must be accepted; returns its input.
+    fn accepted(&mut self, body: Body) -> Id {
+        let reply = self.send(body);
         match reply.body {
             Some(Body::ConversationQueueReply(value)) => value
                 .accepted_input_id
@@ -456,8 +464,7 @@ fn pc_u54_shell_exited_releases_the_lane_until_restart() {
         "the job stays live"
     );
     // The owner's lane is released: it dispatches the message, which waited
-    // until now (state 1 above). The journal writer's `PrepareInput` then
-    // refuses it; see `pc_u54_message_turn_after_release` (blocked).
+    // until now (state 1 above); see `pc_u54_message_turn_after_release`.
     h.wait("the message dispatch", |h| {
         h.entry(project, message).state != Some(1)
     });
@@ -853,12 +860,11 @@ fn display_cut_keeps_placeholders_whole() {
     assert!(cut.ends_with(' '));
 }
 
-/// PC-U54, message part (blocked outside P3-E, reported): after
-/// `ShellExited` the message's preparation is not refused by the lane. The
-/// journal writer's `PrepareInput` checks `ready_input()` without the
-/// released overlay and answers `request_conflict`, so the input is held.
+/// PC-U54, message part (P3-E2): after `ShellExited` the message's
+/// preparation is not refused: the journal writer's `PrepareInput` takes
+/// an input that replay's `input_ready` accepts (the `!!` job's kind 26
+/// is enough), so the message is not held `request_conflict`.
 #[test]
-#[ignore = "blocked: writer PrepareInput ignores the released !! overlay (P3-E report)"]
 fn pc_u54_message_turn_after_release() {
     let mut h = H::with_keychain();
     let project = h.project();
@@ -884,9 +890,101 @@ fn pc_u54_message_turn_after_release() {
         h.entry(project, message).state != Some(1)
     });
     let entry = h.entry(project, message);
-    assert_ne!(
+    // The writer prepared the turn; the harness has no model package, so
+    // the turn's admission holds it there, past the preparation.
+    assert_eq!(
         entry.hold_reason.as_deref(),
-        Some("request_conflict"),
+        Some("model_package_unavailable"),
         "{entry:?}"
     );
+}
+
+/// Secret store ordering rule 6 (P3-E2): an exact `!!` retry whose kind 31
+/// is older than the replay checkpoint, after its job settled and its item
+/// was deleted, finds its request in the journal before any Keychain call:
+/// it gets the original input and stores and deletes no item. (The audit
+/// events of the same path are checked through the service, `secrets`.)
+#[test]
+fn p3e2_exact_retry_after_the_checkpoint_writes_no_item() {
+    let mut h = H::with_keychain();
+    let project = h.project();
+    let body = submit_body(project, None, "brew upgrade", true);
+    let input = h.accepted(body.clone());
+    assert!(h.j().owner().persons.items.contains(&input), "its item");
+    let job = h.run(input);
+    h.settle(job, false, 0);
+    h.wait("the item delete", |h| {
+        h.j().owner().persons.deleted.contains(&input) && h.j().owner().persons.deletes.is_empty()
+    });
+    let Body::ConversationQueueCommandSubmit(submit) = &body else {
+        unreachable!()
+    };
+    let request: Id = submit.request_id.clone().unwrap().try_into().unwrap();
+    // Rolls: the request leaves the replay state for an index run.
+    let turn = h.j().begin_turn(project).expect("turn");
+    let text = "y".repeat(journal::MAX_TEXT);
+    for k in 0..160u64 {
+        h.j()
+            .append(
+                journal::Record::ResponseText(journal::ResponseText {
+                    operation: turn.operation,
+                    generation: turn.generation,
+                    offset: k * journal::MAX_TEXT as u64,
+                    text: text.clone(),
+                }),
+                None,
+            )
+            .expect("response text");
+    }
+    h.j().end_turn(&turn).expect("end turn");
+    {
+        let replay = h.j().owner().replay.clone().unwrap();
+        assert!(
+            replay.base > 0 && !replay.requests.contains_key(&request),
+            "the kind 31 is older than the checkpoint"
+        );
+    }
+    let deleted = h.j().owner().persons.deleted.clone();
+    let items = h.j().owner().persons.items.clone();
+    // The exact retry: a fresh put would add an item for a new input and
+    // delete it when the writer answered with the original.
+    assert_eq!(h.accepted(body), input, "the original input");
+    h.steps(20);
+    let owner = h.j().owner();
+    assert_eq!(owner.persons.deleted, deleted, "no item to delete");
+    assert_eq!(owner.persons.items, items, "no item stored");
+}
+
+/// P3-E2 queue rule: a project holds one pending new conversation at a
+/// time (PR1). While a person command waits (Held after a restart) in a
+/// generation-0 conversation, a new-conversation submit is refused
+/// `conversation_busy` before any Keychain call, for `!` and `!!`; an
+/// exact retry of the waiting command still returns its input.
+#[test]
+fn p3e2_new_conversation_waits_for_the_pending_one() {
+    let mut h = H::with_keychain();
+    let project = h.project();
+    let body = submit_body(project, None, "make check", false);
+    let input = h.accepted(body.clone());
+    // Restart before its kind 26: the command is Held at generation 0.
+    h.restart();
+    h.wait("replay", |h| {
+        h.j()
+            .owner()
+            .replay
+            .as_ref()
+            .is_some_and(|r| r.input_status(input) == Some(InputStatus::Held))
+    });
+    let items = h.j().owner().persons.items.clone();
+    for outside in [false, true] {
+        let reply = h.send(submit_body(project, None, "ls", outside));
+        match reply.body {
+            Some(Body::Error(e)) => {
+                assert_eq!(e.message.as_deref(), Some("conversation_busy"), "{e:?}")
+            }
+            other => panic!("not refused conversation_busy: {other:?}"),
+        }
+    }
+    assert_eq!(h.j().owner().persons.items, items, "no item was put");
+    assert_eq!(h.accepted(body), input, "the exact retry");
 }

@@ -1926,3 +1926,182 @@ fn pcr23_person_commands_setting_names_match_config_keys() {
         assert_eq!(Setting::for_config_key(key), None, "{key}");
     }
 }
+
+/// Secret store operations and audit (P3-E2): `secret_store.put`, `.get`,
+/// `.delete` and `.sweep` have their names and exact field sets,
+/// round-trip, name no project (so the project audit read skips them),
+/// carry a status with `unavailable` alone, take only their own call's
+/// reply codes, bound the listing counts, and the closed schema refuses
+/// any value, name, digest or size field.
+#[test]
+fn p3e2_secret_store_events() {
+    use SecretStoreReply as R;
+    let put = |reply, status| Event::SecretStorePut {
+        input: [7; 16],
+        reply,
+        status,
+    };
+    let get = |reply, status| Event::SecretStoreGet {
+        input: [7; 16],
+        reply,
+        status,
+    };
+    let delete = |reply, status| Event::SecretStoreDelete {
+        input: [7; 16],
+        reply,
+        status,
+    };
+    let sweep = |reply, status| Event::SecretStoreSweep {
+        reply,
+        status,
+        kept: 3,
+        deleted: 300,
+        failed: 1,
+        stranded: 2,
+        unrecognized: 4,
+        truncated: false,
+        listings: 2,
+    };
+    let item_fields: &[&str] = &["input", "reply"];
+    let sweep_fields: &[&str] = &[
+        "reply",
+        "kept",
+        "deleted",
+        "failed",
+        "stranded",
+        "unrecognized",
+        "truncated",
+        "listings",
+    ];
+    let cases = [
+        (
+            put(R::Stored, None),
+            "secret_store.put",
+            item_fields,
+            "stored",
+        ),
+        (
+            put(R::ExistsDifferent, None),
+            "secret_store.put",
+            item_fields,
+            "exists_different",
+        ),
+        (put(R::Full, None), "secret_store.put", item_fields, "full"),
+        (get(R::Read, None), "secret_store.get", item_fields, "read"),
+        (
+            get(R::Missing, None),
+            "secret_store.get",
+            item_fields,
+            "missing",
+        ),
+        (
+            get(R::Locked, None),
+            "secret_store.get",
+            item_fields,
+            "locked",
+        ),
+        (
+            delete(R::Deleted, None),
+            "secret_store.delete",
+            item_fields,
+            "deleted",
+        ),
+        (
+            delete(R::Denied, None),
+            "secret_store.delete",
+            item_fields,
+            "denied",
+        ),
+        (
+            sweep(R::Swept, None),
+            "secret_store.sweep",
+            sweep_fields,
+            "swept",
+        ),
+    ];
+    for (event, kind, fields, code) in cases {
+        event.validate().unwrap();
+        assert_eq!(event.project(), None, "{kind}: not a project record");
+        let value = job_record(event);
+        let bytes = value.encode().unwrap();
+        assert_eq!(Record::decode(&bytes).unwrap(), value, "{kind}");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["kind"], kind);
+        let details = json["details"].as_object().unwrap();
+        let mut names: Vec<&str> = details.keys().map(String::as_str).collect();
+        let mut expected = fields.to_vec();
+        names.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(names, expected, "{kind}");
+        assert_eq!(details["reply"], code, "{kind}");
+        let text = String::from_utf8(bytes).unwrap();
+        let anchor = format!("\"reply\":\"{code}\"");
+        for field in ["value", "name", "digest", "size", "bytes", "account"] {
+            let broken = text.replacen(&anchor, &format!("{anchor},\"{field}\":\"x\""), 1);
+            assert_ne!(broken, text);
+            assert_eq!(
+                Record::decode(broken.as_bytes()),
+                Err(Error::MalformedRecord),
+                "{broken}"
+            );
+        }
+        // A status without `unavailable` is refused.
+        let broken = text.replacen(&anchor, &format!("{anchor},\"status\":25291"), 1);
+        assert_eq!(
+            Record::decode(broken.as_bytes()),
+            Err(Error::MalformedRecord),
+            "{broken}"
+        );
+    }
+    // `unavailable` carries its |OSStatus|, 0 included; never without one.
+    for event in [
+        put(R::Unavailable, Some(25_291)),
+        get(R::Unavailable, Some(0)),
+        delete(R::Unavailable, Some(25_300)),
+        sweep(R::Unavailable, Some(25_291)),
+    ] {
+        event.validate().unwrap();
+        let value = job_record(event);
+        let text = String::from_utf8(value.encode().unwrap()).unwrap();
+        assert!(text.contains("\"status\":"), "{text}");
+        assert_eq!(Record::decode(text.as_bytes()).unwrap(), value);
+    }
+    for event in [
+        put(R::Unavailable, None),
+        get(R::Read, Some(1)),
+        sweep(R::Unavailable, None),
+    ] {
+        assert_eq!(event.validate(), Err(Error::Invalid), "{event:?}");
+    }
+    // Each call takes its own codes and the three failures.
+    for (event, valid) in [
+        (put(R::ExistsSame, None), true),
+        (put(R::Read, None), false),
+        (put(R::Deleted, None), false),
+        (get(R::Mismatch, None), true),
+        (get(R::Stored, None), false),
+        (delete(R::Absent, None), true),
+        (delete(R::Missing, None), false),
+        (delete(R::Locked, None), true),
+        (sweep(R::Swept, None), true),
+        (sweep(R::Denied, None), true),
+        (sweep(R::Deleted, None), false),
+    ] {
+        assert_eq!(event.validate().is_ok(), valid, "{event:?}");
+    }
+    // A zero input is invalid; one listing holds at most 257 results.
+    assert_eq!(
+        Event::SecretStorePut {
+            input: [0; 16],
+            reply: R::Stored,
+            status: None,
+        }
+        .validate(),
+        Err(Error::Invalid)
+    );
+    let mut over = sweep(R::Swept, None);
+    if let Event::SecretStoreSweep { kept, .. } = &mut over {
+        *kept = 258;
+    }
+    assert_eq!(over.validate(), Err(Error::Invalid));
+}

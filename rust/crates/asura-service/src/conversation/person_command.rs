@@ -31,7 +31,9 @@ use asura_platform::keychain::Target;
 use asura_platform::secrets::{
     self, JobRedaction, Plan, RefusalCode, RuleSet, SecretVariable, WHOLE_COMMAND,
 };
-use asura_storage::audit::{Event, PersonCommandRefusal as Refusal};
+use asura_storage::audit::{
+    Event, PersonCommandRefusal as Refusal, SecretStoreReply as StoreReply,
+};
 use asura_storage::authority::conversation::{
     self as journal, ClientVariable, Id, InputKind, InputStatus, JobBlockReason, JobRunState,
     PersonCommandQueued,
@@ -221,6 +223,59 @@ fn store_refusal(failure: StoreFailure) -> (Refusal, Option<u32>) {
     }
 }
 
+/// The audit reply code and status of a store failure.
+fn failure_reply(failure: &StoreFailure) -> (StoreReply, Option<u32>) {
+    match failure {
+        StoreFailure::Locked => (StoreReply::Locked, None),
+        StoreFailure::Denied => (StoreReply::Denied, None),
+        StoreFailure::Unavailable { status, .. } => {
+            (StoreReply::Unavailable, Some(status.unsigned_abs()))
+        }
+    }
+}
+fn put_reply(reply: &PutReply) -> (StoreReply, Option<u32>) {
+    match reply {
+        PutReply::Stored => (StoreReply::Stored, None),
+        PutReply::ExistsSame => (StoreReply::ExistsSame, None),
+        PutReply::ExistsDifferent => (StoreReply::ExistsDifferent, None),
+        PutReply::Full => (StoreReply::Full, None),
+        PutReply::Failed(failure) => failure_reply(failure),
+    }
+}
+fn get_reply(reply: &GetReply) -> (StoreReply, Option<u32>) {
+    match reply {
+        GetReply::Values(_) => (StoreReply::Read, None),
+        GetReply::Missing => (StoreReply::Missing, None),
+        GetReply::Mismatch => (StoreReply::Mismatch, None),
+        GetReply::Failed(failure) => failure_reply(failure),
+    }
+}
+fn delete_reply(reply: &DeleteReply) -> (StoreReply, Option<u32>) {
+    match reply {
+        DeleteReply::Deleted => (StoreReply::Deleted, None),
+        DeleteReply::Absent => (StoreReply::Absent, None),
+        DeleteReply::Failed(failure) => failure_reply(failure),
+    }
+}
+/// The `secret_store.sweep` event of a sweep report.
+fn sweep_event(report: &SweepReport) -> Event {
+    let (reply, status) = match &report.outcome {
+        Ok(()) => (StoreReply::Swept, None),
+        Err(failure) => failure_reply(failure),
+    };
+    Event::SecretStoreSweep {
+        reply,
+        status,
+        kept: report.kept,
+        deleted: report.deleted,
+        failed: report.failed,
+        stranded: report.stranded,
+        unrecognized: report.unrecognized,
+        truncated: report.truncated,
+        listings: report.listings,
+    }
+}
+
 /// A submit that refuses: the reason and, for `secret_store_unavailable`,
 /// the |OSStatus|.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,6 +295,10 @@ enum Stage {
     /// Waiting for the start-time read (the outside switch) or the rule
     /// set; re-planned when it is ready.
     Waiting,
+    /// Planned: the request ID is looked up in the journal on the journal
+    /// ticket before any Keychain call (ordering rule 6, P3-E2). The
+    /// values wait here, zeroed on drop.
+    Lookup(Box<Secrets>),
     /// The item `put` is in flight (ordering rule 1).
     Put(Ticket<PutReply>),
     /// An exact retry: the original item is read to compare the values
@@ -430,7 +489,7 @@ impl Persons {
             || self
                 .submits
                 .iter()
-                .any(|s| matches!(s.stage, Stage::Append))
+                .any(|s| matches!(s.stage, Stage::Lookup(_) | Stage::Append))
             || (self.checking.is_none() && !self.checks.is_empty())
             || self
                 .dispatches
@@ -511,45 +570,13 @@ fn restore(command: &str, values: &[SecretValue]) -> Option<Zeroizing<String>> {
 }
 
 /// The display-only copy of a whole-command input: cut at 8,192 bytes on a
-/// character boundary, never inside a placeholder (kind 31 field 9, bit 0).
+/// character boundary, never inside a placeholder (kind 31 field 9, bit 0),
+/// by the platform's one command cut.
 fn cut_display(display: &str) -> (String, bool) {
-    const MAX: usize = journal::MAX_REFUSED_COMMAND_BYTES;
-    if display.len() <= MAX {
-        return (display.to_owned(), false);
-    }
-    let mut cut = MAX;
-    while !display.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    // A placeholder `$ASURA_SECRET_<digits>` (or `${ASURA_SECRET_<digits>}`)
-    // that the cut would split ends the text before it.
-    let bytes = display.as_bytes();
-    for (start, _) in display.match_indices("ASURA_SECRET_") {
-        let digits = start + "ASURA_SECRET_".len();
-        let mut end = digits
-            + bytes[digits..]
-                .iter()
-                .take_while(|b| b.is_ascii_digit())
-                .count();
-        let begin = match start.checked_sub(1).map(|i| bytes[i]) {
-            Some(b'$') => start - 1,
-            Some(b'{') if start >= 2 && bytes[start - 2] == b'$' => {
-                if bytes.get(end) == Some(&b'}') {
-                    end += 1;
-                }
-                start - 2
-            }
-            _ => continue,
-        };
-        if begin >= cut {
-            break;
-        }
-        if end > digits && begin < cut && cut < end {
-            cut = begin;
-            break;
-        }
-    }
-    (display[..cut].to_owned(), true)
+    let mut text = display.to_owned();
+    let placeholders = secrets::placeholder_ranges(&text);
+    let cut = secrets::cut_command(&mut text, &placeholders);
+    (text, cut)
 }
 
 /// The kind 31 secret facts of a plan: fields 8, 9, 14 to 17 and 20 to 22,
@@ -880,13 +907,51 @@ impl Owner {
         record.digest =
             journal::request_digest(journal::Request::QueuePersonCommand(record.request()))
                 .map_err(|_| Refusing::from(Refusal::InvalidRequest))?;
+        if self.replay.is_none() {
+            return Err(Refusal::InstallationNotInitialized.into());
+        }
+        submit.stage = Stage::Lookup(Box::new(values));
+        Ok(())
+    }
+
+    /// The journal lookup of a planned submit's request ID (ordering rule
+    /// 6): a recorded request, including one older than the replay
+    /// checkpoint, is matched by its kind 31 digest and, when its item
+    /// exists, its values; it never writes a new item. Otherwise a fresh
+    /// input is chosen and its item put. A new conversation waits for no
+    /// pending one: the project holds one at a time (PR1), so the submit
+    /// is `conversation_busy` while an unresolved input of the project
+    /// waits in a generation-0 conversation.
+    pub(super) fn person_looked_up(&mut self, mut submit: Submit, value: writer::Reply) {
+        let result = match std::mem::replace(&mut submit.stage, Stage::Waiting) {
+            Stage::Lookup(values) => {
+                self.person_decide(&mut submit, *values, value.request_outcome)
+            }
+            // Only a lookup reaches here.
+            _ => Err(Refusal::InvalidRequest.into()),
+        };
+        match result {
+            Ok(()) => self.persons.submits.push(submit),
+            Err(refused) => self
+                .out
+                .push_back(self.person_refuse(submit.request, refused)),
+        }
+    }
+
+    fn person_decide(
+        &mut self,
+        submit: &mut Submit,
+        values: Secrets,
+        prior: Option<journal::RequestResult>,
+    ) -> Result<(), Refusing> {
+        if self.closing {
+            return Err(Refusal::ServiceDraining.into());
+        }
         let Some(state) = self.replay.clone() else {
             return Err(Refusal::InstallationNotInitialized.into());
         };
-        // Ordering rule 6: a recorded request is matched by its kind 31
-        // digest; when its item exists, the values too. It never writes a
-        // new item.
-        if let Some(prior) = state.requests.get(&record.request) {
+        let record = &mut submit.record;
+        if let Some(prior) = prior {
             let journal::Outcome::QueueInput {
                 input,
                 conversation,
@@ -918,6 +983,21 @@ impl Owner {
             }
             submit.stage = Stage::Append;
             return Ok(());
+        }
+        if record.new_conversation
+            && state.inputs.values().any(|q| {
+                q.project == record.project
+                    && state
+                        .conversations
+                        .get(&q.conversation)
+                        .is_some_and(|c| c.generation == 0)
+                    && matches!(
+                        state.input_status(q.request),
+                        Some(InputStatus::Queued | InputStatus::Held)
+                    )
+            })
+        {
+            return Err(Refusal::ConversationBusy.into());
         }
         record.input = asura_platform::random_id();
         if record.new_conversation {
@@ -1012,20 +1092,14 @@ impl Owner {
                         submit.stage = Stage::Put(ticket);
                         Ok(())
                     }
-                    Polled::Ready(PutReply::Stored | PutReply::ExistsSame) => {
-                        submit.stored = true;
-                        self.persons.items.insert(submit.record.input);
-                        submit.stage = Stage::Append;
-                        Ok(())
-                    }
-                    Polled::Ready(PutReply::ExistsDifferent) => Err(Refusing {
-                        reason: Refusal::SecretStoreUnavailable,
-                        status: Some(DUPLICATE_ITEM),
-                    }),
-                    Polled::Ready(PutReply::Full) => Err(Refusal::SecretStoreFull.into()),
-                    Polled::Ready(PutReply::Failed(failure)) => {
-                        let (reason, status) = store_refusal(failure);
-                        Err(Refusing { reason, status })
+                    Polled::Ready(reply) => {
+                        let (code, status) = put_reply(&reply);
+                        self.audit_store(Event::SecretStorePut {
+                            input: submit.record.input,
+                            reply: code,
+                            status,
+                        });
+                        self.person_put(&mut submit, reply)
                     }
                     Polled::Lost => Err(Refusal::SecretStoreUnavailable.into()),
                 },
@@ -1034,20 +1108,34 @@ impl Owner {
                         submit.stage = Stage::Retry(ticket, values);
                         Ok(())
                     }
-                    // Equal values return the original input; different
-                    // values conflict (rule 6).
-                    Polled::Ready(GetReply::Values(stored)) if stored != *values => {
-                        Err(Refusal::RequestConflict.into())
+                    Polled::Ready(reply) => {
+                        let (code, status) = get_reply(&reply);
+                        self.audit_store(Event::SecretStoreGet {
+                            input: submit.record.input,
+                            reply: code,
+                            status,
+                        });
+                        match reply {
+                            // Equal values return the original input;
+                            // different values conflict (rule 6).
+                            GetReply::Values(stored) if stored != *values => {
+                                Err(Refusal::RequestConflict.into())
+                            }
+                            // The item matched, or no longer exists or
+                            // cannot be read: the kind 31 digest decides.
+                            _ => {
+                                submit.stage = Stage::Append;
+                                Ok(())
+                            }
+                        }
                     }
-                    // The item matched, or no longer exists or cannot be
-                    // read: the kind 31 digest alone decides.
-                    _ => {
+                    Polled::Lost => {
                         submit.stage = Stage::Append;
                         Ok(())
                     }
                 },
-                Stage::Append => {
-                    submit.stage = Stage::Append;
+                stage @ (Stage::Lookup(_) | Stage::Append) => {
+                    submit.stage = stage;
                     Ok(())
                 }
             };
@@ -1070,43 +1158,84 @@ impl Owner {
         self.persons.submits = kept;
     }
 
-    /// Appends the oldest ready submit's kind 31 when the ticket is free.
-    /// Returns whether it took the ticket.
+    /// A fresh input's put reply (ordering rules 1 and 2).
+    fn person_put(&mut self, submit: &mut Submit, reply: PutReply) -> Result<(), Refusing> {
+        match reply {
+            PutReply::Stored | PutReply::ExistsSame => {
+                submit.stored = true;
+                self.persons.items.insert(submit.record.input);
+                submit.stage = Stage::Append;
+                Ok(())
+            }
+            PutReply::ExistsDifferent => Err(Refusing {
+                reason: Refusal::SecretStoreUnavailable,
+                status: Some(DUPLICATE_ITEM),
+            }),
+            PutReply::Full => Err(Refusal::SecretStoreFull.into()),
+            PutReply::Failed(failure) => {
+                let (reason, status) = store_refusal(failure);
+                Err(Refusing { reason, status })
+            }
+        }
+    }
+
+    /// Emits one `secret_store.*` audit event (operations and audit): the
+    /// input, the reply code, the status of `unavailable` and counts only.
+    fn audit_store(&self, event: Event) {
+        if let Some(emitter) = &self.audit_emitter {
+            let _ = emitter.try_emit(event);
+        }
+    }
+
+    /// Sends the oldest ready submit's request lookup or kind 31 append
+    /// when the ticket is free. Returns whether it took the ticket.
     fn drive_submits(&mut self) -> bool {
         if self.pending.is_some() || self.closing || self.unavailable.is_some() {
             return false;
         }
         // Test-support seam (SS-I3): appends are held for this run when
-        // the scratch home held `person-command-hold-append` at start.
+        // the scratch home held `person-command-hold-append` at start;
+        // lookups still run, so the item is put.
         #[cfg(feature = "test-support")]
-        if self.persons.hold_append {
-            return false;
-        }
-        let Some(at) = self
-            .persons
-            .submits
-            .iter()
-            .position(|s| matches!(s.stage, Stage::Append))
-        else {
+        let hold = self.persons.hold_append;
+        #[cfg(not(feature = "test-support"))]
+        let hold = false;
+        let Some(at) = self.persons.submits.iter().position(|s| match s.stage {
+            Stage::Lookup(_) => true,
+            Stage::Append => !hold,
+            _ => false,
+        }) else {
             return false;
         };
         let submit = self.persons.submits.remove(at);
-        let command = writer::Command::QueuePersonCommand {
-            command: submit.record.clone(),
+        let lookup = matches!(submit.stage, Stage::Lookup(_));
+        let command = if lookup {
+            writer::Command::RequestOutcome {
+                request: submit.record.request,
+            }
+        } else {
+            writer::Command::QueuePersonCommand {
+                command: submit.record.clone(),
+            }
         };
         let sent = self
             .writer
             .as_ref()
             .ok_or(writer::Error::Unavailable)
             .and_then(|w| w.try_submit(command));
+        let job = if lookup {
+            Job::PersonLookup(Box::new(submit))
+        } else {
+            Job::PersonQueue(Box::new(submit))
+        };
         match sent {
             Ok(ticket) => {
-                self.pending = Some((ticket, Job::PersonQueue(Box::new(submit))));
+                self.pending = Some((ticket, job));
                 true
             }
             Err(cause) => {
                 // Nothing was sent: a definite refusal.
-                self.person_queued(submit, Err(cause));
+                self.person_job_failed(job, cause);
                 false
             }
         }
@@ -1162,6 +1291,15 @@ impl Owner {
     pub(super) fn person_job_failed(&mut self, job: Job, cause: writer::Error) {
         match job {
             Job::PersonQueue(submit) => self.person_queued(*submit, Err(cause)),
+            Job::PersonLookup(submit) => {
+                // Nothing was stored or journaled for it.
+                if cause == writer::Error::OutcomeUnconfirmed {
+                    self.unavailable = Some(storage_error(cause));
+                }
+                let refusal = error_refusal(cause);
+                self.out
+                    .push_back(self.person_refuse(submit.request, refusal.into()));
+            }
             Job::PersonRead(input) => {
                 // The read failed: the input stays queued and is read
                 // again on the next pass.
@@ -1385,7 +1523,15 @@ impl Owner {
             Dispatch::Ready(record) => self.person_read_item(record, None, now),
             Dispatch::Getting(record, ticket, pacing) => match ticket.poll() {
                 Polled::Pending => Dispatch::Getting(record, ticket, pacing),
-                Polled::Ready(reply) => self.person_item_read(record, reply, pacing, now),
+                Polled::Ready(reply) => {
+                    let (code, status) = get_reply(&reply);
+                    self.audit_store(Event::SecretStoreGet {
+                        input: record.input,
+                        reply: code,
+                        status,
+                    });
+                    self.person_item_read(record, reply, pacing, now)
+                }
                 Polled::Lost => {
                     Dispatch::Waiting(record, KeychainWait::Unavailable, paced(pacing, now))
                 }
@@ -1964,9 +2110,22 @@ impl Owner {
             }
         }
         // Deletes: a reply moves the observation; nothing else waits on it.
-        self.persons
-            .deletes
-            .retain(|(_, ticket)| matches!(ticket.poll(), Polled::Pending));
+        let mut deletes = std::mem::take(&mut self.persons.deletes);
+        deletes.retain(|(input, ticket)| match ticket.poll() {
+            Polled::Pending => true,
+            Polled::Ready(reply) => {
+                let (code, status) = delete_reply(&reply);
+                self.audit_store(Event::SecretStoreDelete {
+                    input: *input,
+                    reply: code,
+                    status,
+                });
+                false
+            }
+            Polled::Lost => false,
+        });
+        deletes.append(&mut self.persons.deletes);
+        self.persons.deletes = deletes;
         // The sweep after replay and recovery (SS-F1).
         if self.persons.recovering.is_none()
             && self.jobs.replay_taken()
@@ -2022,6 +2181,7 @@ impl Owner {
                         truncated = report.truncated,
                         "secret_store_swept"
                     );
+                    self.audit_store(sweep_event(&report));
                     self.persons.sweep = Sweep::Done;
                 }
                 Polled::Lost => self.persons.sweep = Sweep::Done,

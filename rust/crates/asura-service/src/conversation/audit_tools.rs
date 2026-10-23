@@ -179,7 +179,11 @@ pub(super) fn read(
                 | Event::JournalGap { .. }
                 | Event::ExecutionChanged { .. }
                 | Event::PersonCommandQueued { .. }
-                | Event::PersonCommandRefused { .. } => continue,
+                | Event::PersonCommandRefused { .. }
+                | Event::SecretStorePut { .. }
+                | Event::SecretStoreGet { .. }
+                | Event::SecretStoreDelete { .. }
+                | Event::SecretStoreSweep { .. } => continue,
             }
             let Ok(line) = std::str::from_utf8(&bytes) else {
                 continue;
@@ -400,6 +404,46 @@ mod tests {
         );
         let (reply, _) = read(&records, &health(), [1; 16], 16, Some("project_unknown"));
         assert!(reply.entries.is_empty());
+    }
+    /// P3-E2: the `secret_store.*` events are not project records; the
+    /// project audit read skips them, as it skips `person_command.*`.
+    #[test]
+    fn project_read_skips_secret_store_events() {
+        use asura_storage::audit::SecretStoreReply as R;
+        let store = |sequence, event| Record {
+            event,
+            ..record([1; 16], sequence)
+        };
+        let records = [
+            store(
+                5,
+                Event::SecretStorePut {
+                    input: [7; 16],
+                    reply: R::Stored,
+                    status: None,
+                },
+            ),
+            store(
+                4,
+                Event::SecretStoreSweep {
+                    reply: R::Unavailable,
+                    status: Some(25_291),
+                    kept: 0,
+                    deleted: 0,
+                    failed: 0,
+                    stranded: 0,
+                    unrecognized: 0,
+                    truncated: false,
+                    listings: 0,
+                },
+            ),
+            record([1; 16], 3),
+        ];
+        let (reply, text) = read(&records, &health(), [1; 16], 16, None);
+        assert_eq!(reply.entries.len(), 1);
+        assert_eq!(reply.entries[0].sequence, Some(3));
+        assert!(!text.contains(&"07".repeat(16)), "{text}");
+        assert!(!text.contains("secret_store"), "{text}");
     }
     #[test]
     fn invalid_cached_record_hides_the_whole_response() {

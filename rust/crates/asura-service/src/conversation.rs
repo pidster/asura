@@ -741,6 +741,9 @@ enum Job {
     Control(u64),
     /// A person command's kind 31 append (P3-E).
     PersonQueue(Box<person_command::Submit>),
+    /// A person command's request lookup before any Keychain call
+    /// (secret store ordering rule 6, P3-E2).
+    PersonLookup(Box<person_command::Submit>),
     /// The dispatch read of a person command's kind 31.
     PersonRead(journal::Id),
     /// The kind 31 read of a dropped person command (its item decision).
@@ -2293,6 +2296,7 @@ impl Owner {
                 if matches!(
                     job,
                     Job::PersonQueue(_)
+                        | Job::PersonLookup(_)
                         | Job::PersonRead(_)
                         | Job::PersonCheck(_)
                         | Job::PersonHold(_)
@@ -2519,6 +2523,7 @@ impl Owner {
         self.replay = value.replay.clone();
         match job {
             Job::PersonQueue(submit) => self.person_queued(*submit, Ok(value)),
+            Job::PersonLookup(submit) => self.person_looked_up(*submit, value),
             Job::PersonRead(input) => self.person_read(input, value, now),
             Job::PersonCheck(input) => self.person_checked(input, value),
             Job::PersonHold(input) => self.person_held(input),

@@ -2017,3 +2017,115 @@ fn j4t_03_twenty_jobs_over_three_rolls_listed_by_scope_and_page() {
     let mut session = session;
     close(&mut session.writer);
 }
+
+/// Secret store ordering rule 6 (P3-E2, storage part): `RequestOutcome`
+/// finds a kind 31 request after rolls moved it out of the replay state
+/// into an index run, before and after a restart from the checkpoint, so
+/// an exact retry is matched before any Keychain put. An unknown request
+/// has no outcome; the zero request is refused.
+#[test]
+fn p3e2_request_outcome_finds_kind_31_older_than_the_checkpoint() {
+    let _guard = WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut session = Session::start(&scratch);
+    let project = session.register(&scratch, 1);
+    let mut command = PersonCommandQueued {
+        request: random_id(),
+        digest: [0; 32],
+        input: random_id(),
+        project,
+        conversation: random_id(),
+        expected_generation: 0,
+        new_conversation: true,
+        outside_sandbox: false,
+        command: "ls".into(),
+        display_command: String::new(),
+        cwd: ".".into(),
+        search_path: "/bin".into(),
+        environment: vec![],
+        order_revision: 0,
+        number_kinds: vec![],
+        unnumbered: 0,
+        command_cut: false,
+        whole_command: false,
+        rule_set_revision: 1,
+        rule_set_digest: [7; 32],
+        fallback: None,
+    };
+    let queued = run(
+        &session.writer,
+        Command::QueuePersonCommand {
+            command: Box::new(command.clone()),
+        },
+    )
+    .unwrap();
+    assert_eq!(queued.accepted_input_id, Some(command.input));
+    let queued_at = queued.replay.as_ref().unwrap().sequence;
+    drop(queued);
+    command.digest = request_digest(Request::QueuePersonCommand(command.request())).unwrap();
+    let check = |session: &Session| {
+        let found = run(
+            &session.writer,
+            Command::RequestOutcome {
+                request: command.request,
+            },
+        )
+        .unwrap()
+        .request_outcome
+        .expect("the kind 31 outcome");
+        assert_eq!(found.kind, 31);
+        assert_eq!(found.digest, command.digest);
+        assert!(found.frame.sequence <= queued_at);
+        assert!(matches!(
+            found.result,
+            Outcome::QueueInput { input, conversation, .. }
+                if input == command.input && conversation == command.conversation
+        ));
+        let unknown = run(
+            &session.writer,
+            Command::RequestOutcome {
+                request: random_id(),
+            },
+        )
+        .unwrap();
+        assert!(unknown.request_outcome.is_none());
+    };
+    check(&session);
+    // Rolls: the request leaves the replay state for an index run.
+    let (_, operation, generation) = session.start_turn(project, None);
+    let text = "y".repeat(MAX_TEXT);
+    for k in 0..160u64 {
+        session
+            .append(Record::ResponseText(ResponseText {
+                operation,
+                generation,
+                offset: k * MAX_TEXT as u64,
+                text: text.clone(),
+            }))
+            .unwrap();
+    }
+    session.finish(operation, generation, 160 * MAX_TEXT as u64, "");
+    let current = state(&session.writer);
+    assert!(
+        current.base > queued_at,
+        "the kind 31 is before the checkpoint"
+    );
+    assert!(!current.requests.contains_key(&command.request));
+    drop(current);
+    check(&session);
+    close(&mut session.writer);
+    let mut session = Session::start(&scratch);
+    assert!(
+        !state(&session.writer)
+            .requests
+            .contains_key(&command.request)
+    );
+    check(&session);
+    assert!(matches!(
+        session
+            .writer
+            .try_submit(Command::RequestOutcome { request: [0; 16] }),
+        Err(Error::Invalid)
+    ));
+    close(&mut session.writer);
+}
