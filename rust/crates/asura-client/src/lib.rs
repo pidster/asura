@@ -760,6 +760,28 @@ impl Client {
             _ => Err(Error::Protocol),
         }
     }
+    /// A `/paths` request (execution-path-guard.md, control messages; part
+    /// of capability 8). A list is a read; an approval or revocation is a
+    /// journal mutation, so only `cancelled` or a lost connection ends its
+    /// wait, as `OutcomeUnconfirmed`. Reply `error` tokens are returned in
+    /// the reply for the caller to show.
+    pub fn path_guard(
+        &mut self,
+        request: PathGuardRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<pb::PathGuardReply> {
+        let mutation = request.mutation();
+        let body = request.into_body();
+        let reply = if mutation {
+            self.mutation(body, cancelled)?
+        } else {
+            self.request_cancellable(body, cancelled)?
+        };
+        match reply {
+            pb::envelope::Body::PathGuardReply(reply) => Ok(reply),
+            _ => Err(Error::Protocol),
+        }
+    }
     pub fn reorder_conversation_input(
         &mut self,
         request: pb::ConversationQueueReorder,
@@ -1134,9 +1156,56 @@ fn start_internal(
     }
 }
 
+/// One `/paths` request: envelope fields 69, 71 and 72.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PathGuardRequest {
+    List(pb::PathGuardList),
+    Approve(pb::PathGuardApprove),
+    Revoke(pb::PathGuardRevoke),
+}
+impl PathGuardRequest {
+    /// Approvals and revocations append kind 32; a list only reads.
+    pub fn mutation(&self) -> bool {
+        !matches!(self, Self::List(_))
+    }
+    fn into_body(self) -> pb::envelope::Body {
+        match self {
+            Self::List(v) => pb::envelope::Body::PathGuardList(v),
+            Self::Approve(v) => pb::envelope::Body::PathGuardApprove(v),
+            Self::Revoke(v) => pb::envelope::Body::PathGuardRevoke(v),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn path_guard_requests_map_to_fields_69_71_72() {
+        let list = PathGuardRequest::List(pb::PathGuardList {
+            project_id: Some(vec![1; 16]),
+        });
+        assert!(!list.mutation());
+        assert!(matches!(
+            list.into_body(),
+            pb::envelope::Body::PathGuardList(_)
+        ));
+        let approve = PathGuardRequest::Approve(pb::PathGuardApprove {
+            all: Some(true),
+            ..Default::default()
+        });
+        assert!(approve.mutation());
+        assert!(matches!(
+            approve.into_body(),
+            pb::envelope::Body::PathGuardApprove(_)
+        ));
+        let revoke = PathGuardRequest::Revoke(pb::PathGuardRevoke::default());
+        assert!(revoke.mutation());
+        assert!(matches!(
+            revoke.into_body(),
+            pb::envelope::Body::PathGuardRevoke(_)
+        ));
+    }
     #[test]
     fn rename_reply_requires_target_and_revision() {
         let target = Some(vec![2; 16]);

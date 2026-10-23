@@ -11,6 +11,7 @@ mod history;
 mod jobs;
 mod models;
 mod observation;
+mod path_guard;
 mod project_admin;
 mod project_pages;
 mod queue;
@@ -56,6 +57,7 @@ pub(crate) fn run(
     let mut audit_worker = audit::Worker::default();
     let mut queue_worker = queue::Worker::default();
     let mut project_admin_worker = project_admin::Worker::default();
+    let mut path_guard_worker = path_guard::Worker::default();
     let mut project_page_worker = project_pages::Worker::default();
     let mut context_worker = context::Worker::default();
     let mut queue_observer = queue_watch::Worker::default();
@@ -66,6 +68,8 @@ pub(crate) fn run(
     audit_worker.set_notice(router.notice(Source::Audit));
     queue_worker.set_notice(router.notice(Source::Queue));
     project_admin_worker.set_notice(router.notice(Source::Conversation));
+    // `/paths` shares the conversation source; the router has no free bit.
+    path_guard_worker.set_notice(router.notice(Source::Conversation));
     project_page_worker.set_notice(router.notice(Source::Conversation));
     context_worker.set_notice(router.notice(Source::Context));
     queue_observer.set_notice(router.notice(Source::QueueWatch));
@@ -136,6 +140,9 @@ pub(crate) fn run(
             if app.take_project_admin_cancel() {
                 project_admin_worker.cancel();
             }
+            if app.take_path_guard_cancel() {
+                path_guard_worker.cancel();
+            }
             if app.take_project_page_cancel() {
                 project_page_worker.cancel();
             }
@@ -186,6 +193,12 @@ pub(crate) fn run(
                 && let Some(update) = project_admin_worker.poll()
             {
                 app.project_admin_finished(update);
+                dirty = true;
+            }
+            if has(Source::Conversation)
+                && let Some(update) = path_guard_worker.poll()
+            {
+                app.path_guard_finished(update);
                 dirty = true;
             }
             if has(Source::Conversation)
@@ -253,7 +266,8 @@ pub(crate) fn run(
                     Source::Conversation,
                     conversation_worker.running()
                         || project_admin_worker.running()
-                        || project_page_worker.running(),
+                        || project_page_worker.running()
+                        || path_guard_worker.running(),
                 ),
                 (Source::Queue, queue_worker.running()),
                 (Source::Context, context_worker.running()),
@@ -319,6 +333,17 @@ pub(crate) fn run(
                         outcome: project_admin::Outcome::Definite(error),
                         service_epoch: None,
                         settled: true,
+                    });
+                }
+                dirty = true;
+            }
+            if !path_guard_worker.running()
+                && let Some(request) = app.take_path_guard_request()
+            {
+                if let Err(error) = path_guard_worker.submit(resolve, request.clone()) {
+                    app.path_guard_finished(path_guard::Update {
+                        request,
+                        outcome: path_guard::Outcome::Definite(error),
                     });
                 }
                 dirty = true;
@@ -430,6 +455,7 @@ pub(crate) fn run(
     conversation_worker.disconnect();
     queue_worker.disconnect();
     project_admin_worker.cancel();
+    path_guard_worker.cancel();
     project_page_worker.cancel();
     config_worker.cancel();
     models_worker.cancel();

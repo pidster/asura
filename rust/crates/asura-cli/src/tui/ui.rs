@@ -6,6 +6,7 @@ mod help_mode;
 mod job_view;
 mod markdown;
 mod paging;
+mod path_guard;
 mod person;
 mod thinking;
 use super::editor::{CommandHeader, Editor, MAX_DRAFT_BYTES};
@@ -109,7 +110,7 @@ const GAUGE_AMBER: Color = Color::Rgb(0xF2, 0xB9, 0x50);
 /// The TUI commands: completion, help and dispatch. `/jobs`, `/job` and
 /// `/execution` (tool-job-controller.md, J4 TUI; execution-setting.md)
 /// take arguments and dispatch before the no-argument check.
-const LOCAL_COMMANDS: [&str; 19] = [
+const LOCAL_COMMANDS: [&str; 20] = [
     "/help",
     "/quit",
     "/exit",
@@ -129,6 +130,7 @@ const LOCAL_COMMANDS: [&str; 19] = [
     "/job",
     "/execution",
     "/status",
+    "/paths",
 ];
 
 enum Overlay {
@@ -657,6 +659,19 @@ impl App {
         self.notice = "Steering: stopping the response to send this input".into();
     }
     pub(super) fn queue_finished(&mut self, update: super::queue::Update) {
+        // A held or checking person entry's Enter or Esc decision: the
+        // queue's own handling runs first, then the log's (EPG-R5).
+        let decided = self.path_decision_of(&update.request);
+        let outcome = (decided.is_some() && update.done).then(|| match &update.outcome {
+            Ok(reply) => Ok(reply.request_id.is_some()),
+            Err(error) => Err(error.clone()),
+        });
+        self.queue_finished_general(update);
+        if let Some(outcome) = outcome {
+            self.path_decision_done(outcome);
+        }
+    }
+    fn queue_finished_general(&mut self, update: super::queue::Update) {
         if matches!(
             &update.request,
             super::queue::Request::Submit(_)
@@ -2028,6 +2043,11 @@ impl App {
         }
         if self.cancel_job_wait(clear) {
             // A job wait has no time bound; /cancel and Escape stop it.
+        } else if self.path_guard_stop() {
+            // A `/paths` wait has no time bound; /cancel and Escape stop it.
+            if clear {
+                self.editor = Editor::new();
+            }
         } else if self.audit_draft.is_some() {
             self.audit_cancel = true;
             if clear {
@@ -2389,6 +2409,10 @@ impl App {
         }
         if name == "/execution" {
             self.execution_command(draft);
+            return false;
+        }
+        if name == "/paths" {
+            self.paths_command(draft);
             return false;
         }
         if name == "/status" {

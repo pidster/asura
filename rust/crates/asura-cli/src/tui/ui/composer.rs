@@ -604,6 +604,9 @@ impl App {
             } else {
                 "queue"
             };
+            if let Some(lead) = self.person_log_hint() {
+                return format!("{lead} · ↑↓ scroll history · ⇧↓ {below}");
+            }
             return format!("↑↓ scroll history · PgUp/PgDn page · ⇧↓ {below} · Esc input");
         }
         if self.picker_model_save.is_some() {

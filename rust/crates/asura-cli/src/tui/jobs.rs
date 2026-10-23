@@ -208,6 +208,10 @@ pub(super) struct FoldTarget {
 pub(super) struct FoldUpdate {
     pub job: [u8; 16],
     pub result: Result<pb::JobPage, Failure>,
+    /// The job's path warnings from one `JobInspect` at the fold's start
+    /// (`JobDetail.path_warnings`, execution-path-guard.md TUI); `None`
+    /// when the detail was not read or carried an error.
+    pub path_warnings: Option<Vec<pb::PathWarning>>,
 }
 
 #[derive(Default)]
@@ -871,19 +875,30 @@ impl Worker {
                 .name("asura-job-fold".into())
                 .spawn(move || {
                     let _settlement = notice.guard();
+                    // Set once by the detail read; every later reply carries
+                    // it, because each reply replaces the unread one.
+                    let warnings = std::cell::RefCell::new(None);
                     let publish = |result| {
                         if !token.stopped() {
                             *mailbox.lock().unwrap_or_else(|e| e.into_inner()) = Some(FoldUpdate {
                                 job: wanted.job,
                                 result,
+                                path_warnings: warnings.borrow().clone(),
                             });
                             notice.ready();
                         }
                     };
                     let run = || -> Result<(), Failure> {
                         let mut client = attach(resolve, &wanted.epoch, &token)?;
-                        let client = std::cell::RefCell::new(&mut client);
                         let cancelled = || token.stopped();
+                        // The restored log's path warnings (one request; a
+                        // job not yet admitted answers `not_found`).
+                        *warnings.borrow_mut() = fold_detail_warnings(
+                            client
+                                .inspect_job(wanted.job, wanted.project, &cancelled)
+                                .map_err(failure)?,
+                        );
+                        let client = std::cell::RefCell::new(&mut client);
                         fold_loop(
                             &cancelled,
                             |stream| {
@@ -1034,6 +1049,12 @@ pub(super) fn fold_loop(
         publish(page);
     }
     Ok(())
+}
+
+/// The path warnings of a fold's `JobDetail`: none when it carries an
+/// error (the job is not admitted yet, or is gone).
+pub(super) fn fold_detail_warnings(detail: pb::JobDetail) -> Option<Vec<pb::PathWarning>> {
+    detail.error.is_none().then_some(detail.path_warnings)
 }
 
 /// The page ends before the stream's stored end by more than one page.
@@ -1390,6 +1411,29 @@ mod fold_tests {
         let last = mailbox.lock().unwrap().take().unwrap();
         assert_eq!(last.pages[0].text.as_deref(), Some("line 1000\n"));
         assert!(mailbox.lock().unwrap().is_none());
+    }
+    #[test]
+    fn fold_detail_warnings_need_a_detail_without_error() {
+        let warning = pb::PathWarning {
+            kind: Some(1),
+            path: Some("build.rs".into()),
+        };
+        let detail = pb::JobDetail {
+            path_warnings: vec![warning.clone()],
+            ..Default::default()
+        };
+        assert_eq!(fold_detail_warnings(detail), Some(vec![warning]));
+        assert_eq!(
+            fold_detail_warnings(pb::JobDetail::default()),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            fold_detail_warnings(pb::JobDetail {
+                error: Some(limits::error::NOT_FOUND.into()),
+                ..Default::default()
+            }),
+            None
+        );
     }
     /// A settled job's end pages end the fold without an observe; an error
     /// page is published and ends it too.

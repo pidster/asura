@@ -474,9 +474,17 @@ impl App {
             return true;
         }
         match key.code {
-            KeyCode::Esc => self.history_focus = false,
+            // Esc drops a held or checking person entry in view (EPG-R5);
+            // otherwise it returns to the input.
+            KeyCode::Esc => {
+                if !self.person_log_escape() {
+                    self.history_focus = false;
+                }
+            }
+            // Enter runs a held `!!` entry in view (EPG-R5). Otherwise
             // Enter or Space opens a person entry's job at the end of
             // stdout; the fold never expands inline (PC11).
+            KeyCode::Enter if self.person_log_enter() => {}
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.person_open_from_log();
             }

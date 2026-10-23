@@ -501,6 +501,16 @@ pub(super) struct LogEntry {
     pub fold_retried: bool,
     /// The person's stop request: `Some(false)` stop, `Some(true)` kill.
     pub stop: Option<bool>,
+    /// The path warnings shown before the command (queue entry fields 21
+    /// and 22, or `JobDetail.path_warnings` when restored).
+    pub path_warnings: Vec<pb::PathWarning>,
+    pub path_overflow: u32,
+    /// Held with `paths_changed`: Enter runs it, Esc drops it.
+    pub paths_held: bool,
+    /// The queue entry waits with `path_check`.
+    pub path_check: bool,
+    /// The queue dropped the entry before it ran.
+    pub dropped: bool,
 }
 impl LogEntry {
     pub(super) fn state(&self) -> Option<pb::JobState> {
@@ -719,6 +729,20 @@ pub(super) fn entry_rows(entry: &LogEntry, text: Style) -> Vec<(String, Style)> 
             text.fg(ALERT).add_modifier(Modifier::BOLD),
         ));
     }
+    // Path warnings, between the header and the output (EPG-R5).
+    for line in super::path_guard::warning_lines(&entry.path_warnings, entry.path_overflow) {
+        rows.push((line, text.fg(ALERT)));
+    }
+    if entry.paths_held {
+        rows.push((
+            super::path_guard::HELD_TEXT.into(),
+            text.fg(ALERT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if entry.dropped {
+        rows.push((super::path_guard::DROPPED_TEXT.into(), muted));
+        return rows;
+    }
     let fold = fold(entry);
     if fold.more > 0 || fold.more_unknown {
         rows.push((
@@ -746,7 +770,7 @@ pub(super) fn entry_rows(entry: &LogEntry, text: Style) -> Vec<(String, Style)> 
     if let Some(note) = output_note(entry) {
         rows.push((note, muted));
     }
-    if let Some(note) = &entry.fold_note {
+    if let Some(note) = entry.fold_note.as_ref().filter(|_| !entry.paths_held) {
         rows.push((format!("↳ {note}"), muted));
     }
     if let Some(footer) = footer(entry) {
@@ -1137,13 +1161,15 @@ impl App {
                 continue;
             };
             let started = matches!(entry.state, Some(3..=5));
+            let held = super::path_guard::paths_held(entry);
             if let Some(known) = self.person.log.iter_mut().find(|e| e.input == Some(input)) {
                 if started && known.fold_done && !known.settled() {
                     known.fold_done = false;
                     known.fold_note = None;
                 }
-            } else if started {
-                self.person.log.push(LogEntry {
+                super::path_guard::queue_facts(known, entry);
+            } else if started || held {
+                let mut log = LogEntry {
                     project,
                     input: Some(input),
                     job: Some(job_of(input)),
@@ -1152,7 +1178,9 @@ impl App {
                     directory: entry.command_cwd.clone(),
                     after: self.transcript.len(),
                     ..Default::default()
-                });
+                };
+                super::path_guard::queue_facts(&mut log, entry);
+                self.person.log.push(log);
                 if self.person.log.len() > MAX_LOG_ENTRIES {
                     self.person.log.remove(0);
                 }
@@ -1223,6 +1251,14 @@ impl App {
         else {
             return false;
         };
+        // The queue's warnings came first when this client saw the entry;
+        // a restored entry has only the job detail's.
+        if let Some(warnings) = update.path_warnings {
+            let entry = &mut self.person.log[index];
+            if entry.path_warnings.is_empty() && entry.path_overflow == 0 {
+                entry.path_warnings = warnings;
+            }
+        }
         match update.result {
             Ok(page) => {
                 if let Some(error) = page.error.as_deref() {
@@ -1288,15 +1324,7 @@ impl App {
     /// Enter or Space in log focus: the job viewer at the end of stdout for
     /// the lowest person entry in view (PC11).
     pub(super) fn person_open_from_log(&mut self) -> bool {
-        let top = self.history_scroll.min(self.history_scroll_max);
-        let bottom = top + self.history_page;
-        let target = self
-            .person
-            .drawn
-            .iter()
-            .filter(|(_, row)| *row < bottom)
-            .max_by_key(|(_, row)| *row)
-            .map(|(index, _)| *index);
+        let target = self.person_log_target();
         let Some(job) = target
             .and_then(|i| self.person.log.get(i))
             .and_then(|e| e.job)
@@ -1306,6 +1334,19 @@ impl App {
         let fence = self.person.log[target.unwrap()].project;
         self.open_viewer_at_end(job, fence);
         true
+    }
+
+    /// The log entry that log-focus keys act on: the lowest person entry
+    /// in view.
+    pub(super) fn person_log_target(&self) -> Option<usize> {
+        let top = self.history_scroll.min(self.history_scroll_max);
+        let bottom = top + self.history_page;
+        self.person
+            .drawn
+            .iter()
+            .filter(|(_, row)| *row < bottom)
+            .max_by_key(|(_, row)| *row)
+            .map(|(index, _)| *index)
     }
 
     // Stop routing (PCM-F2).
@@ -1647,6 +1688,8 @@ pub(super) struct Person {
     pub drawn: Vec<(usize, usize)>,
     /// A stop or kill waiting for the job request slot.
     pub deferred: Option<JobCommand>,
+    /// `/paths` and the held entries' decisions (execution-path-guard.md).
+    pub paths: super::path_guard::Paths,
 }
 
 #[cfg(test)]
@@ -2843,6 +2886,7 @@ mod tests {
                 pages: vec![page(pb::JobStream::Stdout, 1..3)],
                 error: None,
             }),
+            path_warnings: None,
         });
         let entry = &app.person.log[1];
         assert!(entry.fold_done);
@@ -2856,6 +2900,7 @@ mod tests {
                 error: Some(asura_control::jobs::error::NOT_FOUND.into()),
                 ..Default::default()
             }),
+            path_warnings: None,
         });
         assert!(app.person.log[0].fold_done);
         assert_eq!(app.person_folds().len(), 0);
@@ -2881,6 +2926,7 @@ mod tests {
         app.person_folded(FoldUpdate {
             job: [5; 16],
             result: Err(Failure::Unavailable("service changed".into())),
+            path_warnings: None,
         });
         assert!(app.person_folds().is_empty());
         assert!(
