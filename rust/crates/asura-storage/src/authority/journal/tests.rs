@@ -1970,6 +1970,13 @@ fn p2_kind_31_checkpoint_and_index_entries() {
         assert_eq!(records.listing.command, queued);
         assert_eq!(records.listing.excerpt, "cargo test");
         assert_eq!(records.command.person().unwrap().cwd, "crates");
+        // Once the settled input leaves the live state, its `I` entry names
+        // the kind 31.
+        let mut evicted: Replay = (*state).clone();
+        evicted.inputs.remove(&a);
+        let again = evicted.job_records(job_a, &mut store).unwrap().unwrap();
+        assert_eq!(again.listing, records.listing);
+        assert_eq!(again.command, records.command);
         assert!(matches!(
             state.job_state(job_a, &mut store).unwrap(),
             Some(JobState::Settled(SettledJob { origin: 2, .. }))
