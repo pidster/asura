@@ -382,7 +382,11 @@ stateDiagram-v2
    already settled or was dropped or the item was deleted outside Asura, the
    kind 31 request digest alone decides: an equal digest returns the original
    input ID and nothing runs again. The retry never writes a new item for a
-   recorded request ID (selected, engineering, 2026-10-22).
+   recorded request ID (selected, engineering, 2026-10-22). When the item
+   exists but cannot be read (locked, unavailable or denied), the kind 31
+   request digest alone decides as well. The owner looks the request ID up in
+   the journal before the put, including requests older than the replay
+   checkpoint, so a retry finds its record first (P3-E2, 2026-10-23).
 
 ### Target pre-check
 
@@ -634,7 +638,10 @@ at rest in the Keychain.
 - Audit events `secret_store.put`, `secret_store.get`, `secret_store.delete`
   and `secret_store.sweep` carry the input ID, the reply code, the status code
   for `unavailable` and counts. They never carry a value, name, digest or
-  payload size.
+  payload size. Packet P3-E2 adds them to the audit schema
+  (`asura-storage/src/audit/types.rs`) and emits them from the owner; the
+  project audit read does not show them, as for the `person_command.*`
+  events.
 - Service status (selected, engineering, 2026-10-22). `ServiceObservation`
   gains field 8 `SecretStoreStatus secret_store`, owned by the service
   observer and fed by the worker after each put, delete and sweep:

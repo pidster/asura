@@ -1870,7 +1870,10 @@ Schema rules (P2-G, 2026-10-23):
   `outcome_unconfirmed`, `capacity_exhausted`, `cancelled`, `invalid_request`,
   `storage_unavailable`, `journal_quota` and `journal_disk_space`. P3-E maps its
   submit outcomes to this enum with an exhaustive match, so every refusal has a
-  name; a new submit error needs a new member, never a fallback.
+  name; a new submit error needs a new member, never a fallback. The writer
+  errors `AlreadyInitialized` and `ModelUnavailable` cannot occur for
+  `QueuePersonCommand`; their match arms name `invalid_request` and are
+  unreachable by construction (P3-E).
 - The project audit read (`AuditRead`, `/audit`) does not show the two
   `person_command.*` events. It shows the person job's `job.*` events (entry
   kinds 4–7) as for a model job; the person events stay in the audit log file
@@ -2088,6 +2091,39 @@ person origin at the controller; P1 and P2 add only the person-specific parts.
 Each packet carries its `!` and `!!` parts together; the `!!` parts are small
 additions to the same owners.
 
+### P3-E service record
+
+Implemented 2026-10-23 (branch `p3-e`). Rules settled from its report:
+
+- **Dispatch behind a released job.** The writer's `PrepareInput` accepts an
+  input that the replay rule `input_ready` accepts (PR2 and PR4: earlier person
+  inputs need only their kind 26) with no active turn, instead of requiring the
+  lane head from `ready_input`. A message behind a released `!!` job then
+  dispatches. The released set stays an owner overlay; the writer needs none
+  of it (P3-E2).
+- **History.** The writer's history read returns person entries (kind 31
+  inputs with their accepted frame and queued generation), so the owner fills
+  field 5 (P3-E2).
+- **One source.** The service does not copy the platform's command cut or the
+  kind 31 validation: P3-E2 makes the platform `cut_command` public and uses
+  it. Secret variables are rebuilt at dispatch by putting the stored values
+  back into the stored rewrite and planning again with the running rule set; a
+  mismatch holds the input with `secrets_lost`.
+- **Queue rules.** A project holds one pending new conversation at a time
+  (the kind 18 rule under PR1), so a new-conversation `!` submit waits while a
+  person command is queued in a generation-0 conversation, and is refused
+  `conversation_busy`. A person command under dispatch counts as "under
+  preparation" for Hold, Drop and Resume.
+- **Survivor counts.** A `!!` survivor count includes the survivor's own
+  children (a background shell's current `sleep`), so PC-I40 asserts at least
+  1. A new-session survivor that runs a platform binary is not attributed
+  ([escapee residual](escapee-control.md)); fixtures use the test binary.
+- **Seams.** Test-support builds read scratch-home files:
+  `secret-store-keychain` (scratch keychain path and password; without it a
+  test runtime has no store, so no test can reach the login keychain),
+  `person-command-capability` (advertise capability 8 in that test only) and
+  `person-command-hold-append`.
+
 ### P4 TUI record
 
 Implemented 2026-10-23 (branch `p4`), unit tested with fixtures; the PTY
@@ -2157,7 +2193,7 @@ reads or writes `~/.asura` or the login keychain.
 | P3-C Control contract and client | `contracts/control/v1/control.proto`; `asura-control/src/{lib,wire,conversation,jobs}.rs`; `asura-client/src/lib.rs` | J5 delivered | Field 68, capability 8, `LaunchVariable`, queue entry fields 16–20, `QueueWaitReason`, `QueueRefusal`, reply fields 9–10, history field 5, `JobEntry` fields 28–29, `ServiceObservation` field 8; PC-U41, PC-U49, PC-U55 |
 | P3-K Controller | `asura-service/src/job_controller.rs`; `asura-service/src/job_controller/*.rs` | P2, P2-G | `Profile::Person1` and `PersonOutside1`, switch check at slot grant, reason 20, `ShellExited`, released `Draining`, `close_capture` on cancel; PC-U23, PC-U43 (controller part), PC-U53 |
 | P3-T Slot and capture workers | `asura-service/src/exec_cmd_worker.rs`; `asura-service/src/exec_cmd_worker/tests.rs`; `asura-service/src/capture_worker.rs`; `asura-service/tests/capture_worker.rs` | P1, P3-K | Person start with the FD 11 writer and root resolution, kind 2 reasons 14 and 15 to slot events, `SlotPort::close_capture`, capture reason 7; PC-I33 to PC-I35 at the worker layer |
-| P3-E Service integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (new `person_command.rs`); `asura-service/src/job_control.rs` and `job_control/tests.rs` (`JobEntry` fields 28 and 29 and `outside_sandbox` from the new `JobView` fields `profile`, `shell_exited` and `left_running`); in `job_controller.rs` and `job_controller/port.rs`, `person: Option<PersonLaunch>` on `StartRequest`, `Body` and `SlotStart`, carried through submit, grant and the held start, with `exec_cmd_worker::start_job` passing it to `start_job_with`; `test_support::Job` gains `profile`, `person` and a close-on-release option so `tests/capture_worker.rs` gets real-guardian PC-I33 and PC-I34 cases; the `ReadRecord` kind list in `asura-storage/src/authority/writer/mod.rs` (add kind 31 if P3-E reads it); `asura-service/src/{lib,audit,config_worker,service_observer,test_support}.rs`; `asura-service/tests/person_command_flow.rs` (new) | SS1-S, P1, P2, P2-G, P3-C, P3-K, P3-T, SL7 | Submit validation, SL5 rewrite at submit, item put, get and delete, kind 31 append, dispatch with person grant, overlay and lane release, waiting reasons, refusals, audit emission, observer field 8; PC-U26, PC-U27, PC-U54, PC-U56, PC-U57; PC-I1 to PC-I39 except the TUI parts; SS-I1 to SS-I11; SDI-10; EC-I9, EC-I10 through the service |
+| P3-E Service integration | `asura-service/src/conversation.rs`; `asura-service/src/conversation/*.rs` (new `person_command.rs`); `asura-service/src/job_control.rs` and `job_control/tests.rs` (`JobEntry` fields 28 and 29 and `outside_sandbox` from the new `JobView` fields `profile`, `shell_exited` and `left_running`); in `job_controller.rs` and `job_controller/port.rs`, `person: Option<PersonLaunch>` on `StartRequest`, `Body` and `SlotStart`, carried through submit, grant and the held start, with `exec_cmd_worker::start_job` passing it to `start_job_with`; `test_support::Job` gains `profile`, `person` and a close-on-release option so `tests/capture_worker.rs` gets real-guardian PC-I33 and PC-I34 cases; the `ReadRecord` kind list in `asura-storage/src/authority/writer/state.rs` (add kind 31 if P3-E reads it); `asura-service/src/{lib,audit,config_worker,service_observer,test_support}.rs`; `asura-service/tests/person_command_flow.rs` (new) | SS1-S, P1, P2, P2-G, P3-C, P3-K, P3-T, SL7 | Submit validation, SL5 rewrite at submit, item put, get and delete, kind 31 append, dispatch with person grant, overlay and lane release, waiting reasons, refusals, audit emission, observer field 8; PC-U26, PC-U27, PC-U54, PC-U56, PC-U57; PC-I1 to PC-I39 except the TUI parts; SS-I1 to SS-I11; SDI-10; EC-I9, EC-I10 through the service |
 | P4 TUI | `asura-cli/src/tui/{ui,mod,config,jobs,queue,observation,conversation,editor}.rs` (`editor.rs`: read-only cursor and selection byte accessors for the command view; `queue.rs`: the serial queue sender's `Request::Command`; `observation.rs`: `ServiceObservation` field 8 to the status details; `conversation.rs`: person entries restored from history field 5); `asura-cli/src/tui/ui/*.rs`; `asura-cli/tests/tui_pty.py` (person journeys) | P3-C; P3-E for the PTY journeys | Three composer modes, splitter display, staging, refusal texts, Ctrl-C routing, log fold, released-job status, recall, `/help`, the `/status` secret store notices ([secret store operations](secret-store.md#operations-and-audit)); PC-U1 to PC-U19, PC-U28 to PC-U40, PC-U44, PC-U59; PC-E1 to PC-E20 with a fixture service until Q |
 | P5 Execution path guard | The [execution path guard packets](execution-path-guard.md#packets) EPG-S, EPG-W, EPG-P and EPG-T | P3-E, P4 | PCR18; PC-E21 |
 | Q Qualification | No code paths; evidence in this design | P1 to P5 | Every PC-E, SS-E, EC-E2 and EC-E4 case on the macOS 27 host; the CLI lifecycle gate; the PTY journeys; the threat model mapping; then capability 8 is advertised |
