@@ -92,6 +92,23 @@ impl Editor {
         !self.state.has_selection() && self.state.cursor() == TextPosition::new(0, 0)
     }
 
+    /// The cursor's byte offset in [`Self::text`]. Read-only; the command
+    /// display places its cursor with it (person-command-mode.md).
+    pub fn cursor_byte(&self) -> usize {
+        let cursor = self.state.cursor();
+        self.state
+            .try_bytes_at_range(TextRange::new(cursor, cursor))
+            .map_or(0, |range| range.start)
+    }
+
+    /// The selection's byte range in [`Self::text`]; empty without a
+    /// selection. Read-only, for the command display.
+    pub fn selection_bytes(&self) -> Range<usize> {
+        self.state
+            .try_bytes_at_range(self.state.selection())
+            .unwrap_or(0..0)
+    }
+
     /// At most the first `max` bytes of the draft, cut at a character boundary.
     /// Copies only that prefix, never the whole draft.
     pub fn prefix(&self, max: usize) -> String {
@@ -531,6 +548,30 @@ mod tests {
         buffer
     }
 
+    #[test]
+    fn cursor_byte_counts_utf8_bytes_across_rows() {
+        let mut editor = Editor::new();
+        assert_eq!(editor.cursor_byte(), 0);
+        editor.insert("界a\nb🦀c").unwrap();
+        assert_eq!(editor.cursor_byte(), "界a\nb🦀c".len());
+        editor.state.set_cursor((2, 1), false);
+        assert_eq!(editor.cursor_byte(), "界a\nb🦀".len());
+        editor.state.set_cursor((0, 0), false);
+        assert_eq!(editor.cursor_byte(), 0);
+        assert_eq!(editor.text(), "界a\nb🦀c");
+    }
+    #[test]
+    fn selection_bytes_are_empty_without_a_selection() {
+        let mut editor = Editor::new();
+        editor.insert("界abc").unwrap();
+        assert!(editor.selection_bytes().is_empty());
+        editor.state.set_selection((0, 0), (2, 0));
+        assert_eq!(editor.selection_bytes(), 0.."界a".len());
+        // Reversed anchor and cursor give the same ordered range.
+        editor.state.set_selection((3, 0), (1, 0));
+        assert_eq!(editor.selection_bytes(), "界".len().."界ab".len());
+        assert_eq!(editor.text(), "界abc");
+    }
     #[test]
     fn final_visual_row_tracks_wrapping_unicode_and_resize() {
         let mut editor = Editor::new();

@@ -12,6 +12,8 @@ use std::{
 #[derive(Clone, Debug)]
 pub(super) enum Request {
     Submit(pb::ConversationQueueSubmit),
+    /// A person `!` or `!!` command (person-command-mode.md, field 68).
+    Command(pb::ConversationQueueCommandSubmit),
     Reorder(pb::ConversationQueueReorder),
     List {
         project: [u8; 16],
@@ -38,6 +40,36 @@ struct Job {
 pub(super) struct Worker {
     notice: super::events::Notice,
     job: Option<Job>,
+}
+/// Shown when the service does not list capability 8 (OD3): an enablement
+/// gate, a definite rejection that keeps the text.
+pub(super) const COMMANDS_NOT_ENABLED: &str = "Commands are not enabled in this service";
+/// A person command's typed refusal as the queue reply that carries it: the
+/// request ID, the refusal and its status, and nothing queued. A refusal the
+/// client made before sending has the same form.
+pub(super) fn refusal_reply(
+    request: &pb::ConversationQueueCommandSubmit,
+    refusal: pb::QueueRefusal,
+    status: Option<u32>,
+) -> pb::ConversationQueueReply {
+    pb::ConversationQueueReply {
+        request_id: request.request_id.clone(),
+        full_text: Some(false),
+        refusal: Some(refusal as i32),
+        refusal_status: status,
+        ..Default::default()
+    }
+}
+fn command_reply(
+    request: &pb::ConversationQueueCommandSubmit,
+    outcome: asura_client::CommandSubmit,
+) -> pb::ConversationQueueReply {
+    match outcome {
+        asura_client::CommandSubmit::Accepted(reply) => reply,
+        asura_client::CommandSubmit::Refused {
+            refusal, status, ..
+        } => refusal_reply(request, refusal, status),
+    }
 }
 /// A definite service rejection keeps the text; a journal hold reason shows
 /// its notice. Any other failure leaves the outcome unconfirmed.
@@ -101,6 +133,17 @@ impl Worker {
                     let stop = || cancelled.load(Ordering::Acquire);
                     let result = match command {
                         Request::Submit(request) => client.queue_conversation_input(request, &stop),
+                        // The enablement gate is checked on this attachment;
+                        // `stop` is the person's cancel, not a time bound.
+                        Request::Command(_) if !client.supports(pb::Capability::PersonCommand) => {
+                            return Err(format!("{COMMANDS_NOT_ENABLED}; draft retained"));
+                        }
+                        Request::Command(request) => {
+                            let expected = request.clone();
+                            client
+                                .queue_person_command(request, &stop)
+                                .map(|outcome| command_reply(&expected, outcome))
+                        }
                         Request::Reorder(request) => {
                             client.reorder_conversation_input(request, &stop)
                         }
@@ -201,6 +244,68 @@ mod tests {
             "conversation_busy; draft retained"
         );
         assert!(failure_text(asura_client::Error::Unavailable).contains("unconfirmed"));
+    }
+    fn command_request() -> pb::ConversationQueueCommandSubmit {
+        pb::ConversationQueueCommandSubmit {
+            request_id: Some(vec![7; 16]),
+            project_id: Some(vec![1; 16]),
+            new_conversation: Some(true),
+            expected_generation: Some(0),
+            command: Some("ls".into()),
+            cwd: Some(".".into()),
+            outside_sandbox: Some(true),
+            ..Default::default()
+        }
+    }
+    /// A refused person command maps to a queue reply that carries the
+    /// request ID, the refusal and its status, and nothing queued; an
+    /// accepted one passes the service reply through unchanged.
+    #[test]
+    fn person_command_refusal_maps_to_a_refusal_reply() {
+        let request = command_request();
+        let refused = command_reply(
+            &request,
+            asura_client::CommandSubmit::Refused {
+                refusal: pb::QueueRefusal::SecretStoreUnavailable,
+                status: Some(25_307),
+                sent: true,
+            },
+        );
+        assert_eq!(refused.request_id, request.request_id);
+        assert_eq!(
+            refused.refusal,
+            Some(pb::QueueRefusal::SecretStoreUnavailable as i32)
+        );
+        assert_eq!(refused.refusal_status, Some(25_307));
+        assert!(refused.entries.is_empty() && refused.accepted_input_id.is_none());
+        assert_eq!(refused.full_text, Some(false));
+        // A local refusal (never sent) has the same form, without a status.
+        let local = command_reply(
+            &request,
+            asura_client::CommandSubmit::Refused {
+                refusal: pb::QueueRefusal::EnvironmentTooLarge,
+                status: None,
+                sent: false,
+            },
+        );
+        assert_eq!(
+            local.refusal,
+            Some(pb::QueueRefusal::EnvironmentTooLarge as i32)
+        );
+        assert_eq!(local.refusal_status, None);
+        let accepted = pb::ConversationQueueReply {
+            request_id: request.request_id.clone(),
+            accepted_input_id: Some(vec![9; 16]),
+            ..Default::default()
+        };
+        assert_eq!(
+            command_reply(
+                &request,
+                asura_client::CommandSubmit::Accepted(accepted.clone())
+            ),
+            accepted
+        );
+        assert!(!COMMANDS_NOT_ENABLED.contains("unconfirmed"));
     }
     use std::time::{Duration, Instant};
     fn held_worker(cancelled: bool) -> (Worker, mpsc::SyncSender<()>) {
