@@ -294,12 +294,42 @@ the journal is at its quota. Encodings follow the existing codec.
 | 8 | digest | 32 bytes | Action 3: SHA-256 of the approved content. Otherwise zero |
 
 Maximum payload 16,510 bytes (1 + 16 + 16 + 8 + 1 + 16 × 1,027 + 4 + 32);
-maximum frame 16,694 bytes. Replay keeps per project: the approvals (at most
-256 paths, latest record wins), the last acknowledged sequence, and the
-`model_changed` sequences after it (at most 64; older ones are covered by the
-next acknowledgement). The checkpoint stores this state per project. Replay
-rejects action 1 for a job that is not a settled model-origin job, action 2
-for an input that is not a kind 31 input, and any bound violation.
+maximum frame 16,694 bytes.
+
+Replay state (revised 2026-10-23 from the EPG-S report). Replay derives the
+guard state from index entries, not from a per-project copy, because projects
+have no total and the replay memory rule (L35) forbids state that grows with
+them: `B` (a model change: job, entry count, frame; keyed by project and
+sequence), `F` (an acknowledgement: input, through, covered count, frame), `Q`
+(an approval or revocation: action, path key, digest, frame) and `Z` (one per
+reference, so a job, input or request has at most one kind 32). The
+checkpoint's index runs cover them. The writer's `PathGuard { project }` read
+returns the newest 64 pending model changes oldest first with
+`omitted_changes` for the rest (the service then warns `overflow`), the last
+acknowledgement, and the approvals sorted by path bytes (at most 256). One
+read holds at most 64 change frames and 256 approval frames, about 1.3 MiB.
+`PathRecord { reference }` returns the kind 32 of one job, input or request.
+
+Replay rules, each broken rule `Corrupt` unless stated:
+
+- The project is registered; a reference has one kind 32 (an exact retry of
+  the same record returns it; a different record under the same reference is
+  a conflict).
+- Action 1: the job is a settled model-origin job of the project. It may
+  list 0 to 16 entries.
+- Action 2: the input is a kind 31 input of the project, not dropped, with no
+  kind 26 yet, so an acknowledgement precedes its dispatch; a re-dispatch after
+  a restart reuses it through `PathRecord`. `through` equals the previous
+  acknowledgement's `through` (0 without one) or names a later action 1 of the
+  same project.
+- Action 4: the path is currently approved.
+- Field rules: entry kinds match the action; actions 3 and 4 hold one entry of
+  kind 0 and no overflow; `through` is 0 except for action 2; the digest is
+  non-zero exactly for action 3; each path is valid.
+- Bounds: a 257th distinct approved path, or a 4,097th approval or revocation
+  record in one project, is `limit` (the service checks
+  `PathGuardView::has_room` first). Kind 32 is a normal record, held at the
+  journal quota.
 
 ### Control messages
 
@@ -319,7 +349,7 @@ message PathGuardReply {
   repeated PathWarning pending = 1;   // what the next person command would show, at most 16
   optional uint32 overflow = 2;
   repeated string approved = 3;       // at most 256 approved paths
-  optional string error = 4;          // not_found, path_invalid, too_large, not_implicit, busy, unavailable
+  optional string error = 4;          // not_found, path_invalid, too_large, not_implicit, limit, busy, unavailable
 }
 // ConversationQueueEntry (kind 3): repeated PathWarning path_warnings = 21; optional uint32 path_overflow = 22;
 // QueueWaitReason: QUEUE_WAIT_REASON_PATH_CHECK = 15;
