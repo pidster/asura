@@ -48,6 +48,7 @@ impl Fixture {
             turn,
             input: vec![],
             candidates: Vec::new(),
+            notice: crate::context::Notice::none([5; 16], 0),
             model: ModelOwner::tool_test_fixture(),
             accepted: true,
             ready: false,
@@ -124,6 +125,8 @@ impl Fixture {
                 rules: Default::default(),
                 #[cfg(feature = "test-support")]
                 fixture: None,
+                #[cfg(feature = "test-support")]
+                notice_fault: false,
             },
         };
         fixture.set_tool("service", r#"{"command":"status"}"#);

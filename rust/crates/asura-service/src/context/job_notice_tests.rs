@@ -172,7 +172,7 @@ fn j5t_01_settled_set_for_zero_one_eight_and_nine_settlements() {
 
     // `Prepare` reads one settlement more than the entries to know of the
     // overflow (AE-03).
-    assert_eq!(NOTICE_SETTLEMENT_READ, 9);
+    assert_eq!(journal::MAX_NOTICE_SETTLEMENTS, 9);
     let notice = models(9).notice(0, 90, 0).unwrap();
     assert_eq!(notice.entries.len(), 8);
     assert!(notice.overflow);

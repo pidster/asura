@@ -6,10 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 
 mod job_notice;
-#[allow(unused_imports)] // J5-E builds the notice inputs.
-pub(crate) use job_notice::{
-    MAX_NOTICE_ENTRIES, NOTICE_SETTLEMENT_READ, Notice, NoticeError, NoticeInputs, Settlement,
-};
+pub(crate) use job_notice::{Notice, NoticeError, NoticeInputs, Settlement};
 
 /// Versions the composition rules and the manifest encoding. Revision 2
 /// adds the J5 job notice and its segments.
@@ -69,7 +66,6 @@ pub(crate) enum Error {
 }
 
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))] // J5-E records the notice fields.
 pub(crate) struct Composed {
     pub input: Vec<u8>,
     /// Shown prior turns (full or reference), in generation order.
@@ -182,6 +178,7 @@ pub(crate) fn compose(
 }
 /// [`compose`] when `unlisted` older completed turns were not returned as
 /// candidates; they join the omitted range (segmented journal, SJ-D10).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compose_with(
     instructions: &str,
     prompt: &str,
@@ -202,7 +199,6 @@ pub(crate) fn compose_with(
 /// mandatory: when the budget is short they are reduced to reference
 /// fidelity, oldest first; if even the reduced notice does not fit, the
 /// turn fails with `context_limit`.
-#[cfg_attr(not(test), allow(dead_code))] // J5-E calls it at turn start.
 pub(crate) fn compose_turn(
     instructions: &str,
     prompt: &str,
