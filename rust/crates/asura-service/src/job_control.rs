@@ -387,7 +387,7 @@ fn model_origin(origin: &JobOrigin) -> bool {
 
 /// The stored, redacted `cwd` argument of an exec_cmd kind 14; `.` when
 /// absent.
-fn exec_cmd_cwd(call: &ToolCall) -> Option<String> {
+pub(crate) fn exec_cmd_cwd(call: &ToolCall) -> Option<String> {
     let Ok(Value::Object(members)) = json::parse(&call.arguments) else {
         return None;
     };

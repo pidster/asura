@@ -214,10 +214,8 @@ impl<F: JournalFiles> Store<'_, F> {
         Ok(header)
     }
     /// Reads one frame through a locator and checks it.
-    pub fn read_frame(
-        &mut self,
-        locator: &Locator,
-    ) -> Result<(FrameContext, Record, Hash), ReplayError> {
+    /// The located frame's bytes, unverified.
+    fn frame_bytes(&mut self, locator: &Locator) -> Result<Vec<u8>, ReplayError> {
         if locator.length as usize > MAX_FRAME || locator.length < (HEADER + 40) as u32 {
             return Err(ReplayError::Corrupt);
         }
@@ -229,6 +227,13 @@ impl<F: JournalFiles> Store<'_, F> {
                 &mut bytes,
             )
             .map_err(content)?;
+        Ok(bytes)
+    }
+    pub fn read_frame(
+        &mut self,
+        locator: &Locator,
+    ) -> Result<(FrameContext, Record, Hash), ReplayError> {
+        let bytes = self.frame_bytes(locator)?;
         let (context, record, digest) = super::verified_frame(&bytes, locator)?;
         if context.installation_id != self.installation {
             return Err(ReplayError::Corrupt);
@@ -290,6 +295,16 @@ impl<F: JournalFiles> Index for Store<'_, F> {
     fn frame_owner(&mut self, locator: &Locator) -> Result<(u64, Record), ReplayError> {
         let (context, record, _) = self.read_frame(locator)?;
         Ok((context.owner_generation, record))
+    }
+    fn frame_command(&mut self, locator: &Locator) -> Result<(Hash, Record), ReplayError> {
+        let bytes = self.frame_bytes(locator)?;
+        let (context, record, _) = super::verified_frame(&bytes, locator)?;
+        if context.installation_id != self.installation {
+            return Err(ReplayError::Corrupt);
+        }
+        // `verified_frame` checked header bytes 88..120 against SHA-256 of
+        // the kind and payload.
+        Ok((bytes[88..120].try_into().unwrap(), record))
     }
 }
 

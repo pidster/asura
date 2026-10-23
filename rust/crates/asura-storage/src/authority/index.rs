@@ -199,11 +199,14 @@ pub enum Entry {
         intent: Locator,
         result: Locator,
     },
+    /// `T`: one terminal turn. `notice_through` is its kind 21 notice
+    /// cursor (J5).
     Turn {
         operation: Id,
         terminal: TerminalKind,
         accepted: Locator,
         completed: u64,
+        notice_through: u64,
     },
     Input {
         status: u8,
@@ -432,11 +435,13 @@ impl Entry {
                 terminal,
                 accepted,
                 completed,
+                notice_through,
             } => {
                 out.put(operation);
                 out.put(&[*terminal as u8]);
                 out.locator(accepted);
                 out.u64(*completed);
+                out.u64(*notice_through);
             }
             Self::Input {
                 status,
@@ -577,6 +582,7 @@ impl Entry {
                 terminal: TerminalKind::from_code(r.byte()).ok_or(ReplayError::Corrupt)?,
                 accepted: r.locator(),
                 completed: r.u64(),
+                notice_through: r.u64(),
             },
             Tag::Input => Self::Input {
                 status: r.byte(),
@@ -737,6 +743,7 @@ mod tests {
                 terminal: TerminalKind::Complete,
                 accepted: locator(11),
                 completed: 9,
+                notice_through: u64::MAX,
             },
             Entry::Input {
                 status: 6,

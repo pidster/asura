@@ -167,6 +167,7 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
             w.bytes(&latest.operation);
             w.byte(latest.terminal.map_or(0, |k| k as u8));
             locator(&mut w, &latest.accepted);
+            w.u64(latest.notice_through);
         }
         w.u64(c.completed);
         w.u64(c.activity);
@@ -183,6 +184,7 @@ pub fn encode(state: &Replay, census: &Census, runs: &[RunRef]) -> Result<Vec<u8
             w.u64(op.owner_generation);
             w.bytes(&op.input_digest);
             locator(&mut w, &op.accepted_frame);
+            w.u64(op.notice_through);
             w.optional(op.helper);
             w.byte(op.cancel.map_or(0xff, |c| c as u8));
             w.u32(op.tools.len() as u32);
@@ -394,6 +396,7 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
                 operation,
                 terminal,
                 accepted: read_locator(&mut r)?,
+                notice_through: r.u64()?,
             })
         } else {
             None
@@ -426,6 +429,7 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
         let op_owner = r.u64()?;
         let input_digest = r.array()?;
         let accepted_frame = read_locator(&mut r)?;
+        let notice_through = r.u64()?;
         let helper = r.optional()?;
         let cancel = match r.byte()? {
             0xff => None,
@@ -486,6 +490,7 @@ pub fn decode(bytes: &[u8], index: &mut dyn Index) -> Result<Checkpoint> {
                 owner_generation: op_owner,
                 input_digest,
                 accepted_frame,
+                notice_through,
                 helper,
                 cancel,
                 terminal: None,

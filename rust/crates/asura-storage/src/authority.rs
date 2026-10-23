@@ -120,6 +120,16 @@ pub(crate) fn verified_frame(
     let record = conversation::decode_record(envelope.kind, envelope.payload)?;
     Ok((envelope.context, record, envelope.digest))
 }
+/// [`verified_frame`] returning the record with its header command digest
+/// at bytes 88..120, which [`envelope`] checked against SHA-256 of the kind
+/// and payload (J5 notice manifest: the kind 28 source digest).
+pub(crate) fn verified_command(
+    bytes: &[u8],
+    locator: &conversation::Locator,
+) -> Result<([u8; 32], conversation::Record), ReplayError> {
+    let (_, record, _) = verified_frame(bytes, locator)?;
+    Ok((bytes[88..120].try_into().unwrap(), record))
+}
 pub(crate) fn verified_record(
     bytes: &[u8],
     locator: &conversation::Locator,

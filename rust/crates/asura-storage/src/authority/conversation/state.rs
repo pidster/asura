@@ -55,6 +55,9 @@ pub trait Index {
     /// The verified record at a locator with the owner generation of its
     /// frame header (J2: kind 26 at checkpoint load).
     fn frame_owner(&mut self, locator: &Locator) -> Result<(u64, Record)>;
+    /// The verified record at a locator with the command digest of its
+    /// frame header (J5: the notice entry's source digest).
+    fn frame_command(&mut self, locator: &Locator) -> Result<(Hash, Record)>;
 }
 
 /// The last activity a frame recorded, for sensors (not checkpointed).
@@ -370,6 +373,7 @@ impl Replay {
                         terminal: terminal.kind,
                         accepted: op.accepted_frame,
                         completed: terminal.completed,
+                        notice_through: op.notice_through,
                     }
                     .encode(),
                 )),
@@ -731,6 +735,7 @@ impl Replay {
                     terminal,
                     accepted,
                     completed,
+                    notice_through,
                 } = Entry::decode(Tag::Turn, value)?
                 else {
                     return Err(ReplayError::Corrupt);
@@ -741,6 +746,7 @@ impl Replay {
                         operation,
                         terminal: Some(terminal),
                         accepted,
+                        notice_through,
                     }),
                     completed,
                 )
@@ -1674,11 +1680,13 @@ impl Replay {
                     prompt: &p.prompt,
                 })?,
         )?;
-        let completed = match p.original_conversation {
+        // `previous`: the notice cursor of the conversation's previous kind
+        // 21, 0 for its first turn (J5-E1).
+        let (completed, previous) = match p.original_conversation {
             None => {
                 require(p.generation == 1)?;
                 self.fresh(p.conversation, index)?;
-                0
+                (0, 0)
             }
             Some(id) => {
                 require(self.load_conversation(id, index)?)?;
@@ -1694,9 +1702,15 @@ impl Replay {
                         dispatched.is_some_and(|input| self.inputs[&input].conversation == id),
                     )?;
                 }
-                c.completed
+                (c.completed, c.latest.map_or(0, |l| l.notice_through))
             }
         };
+        // The notice cursor: below the record's own sequence and never
+        // behind the previous turn's (J5, `notice_through` replay rule).
+        let notice_through = p.composition.notice_through;
+        require(notice_through < frame.sequence && notice_through >= previous)?;
+        // The live count at S is at most the unsettled-job bound (J5-E8).
+        require(p.composition.notice_live as usize <= MAX_UNSETTLED_JOBS)?;
         let mut prior = BTreeSet::new();
         let mut last_generation = 0;
         for id in &p.prior_operations {
@@ -1745,6 +1759,7 @@ impl Replay {
             operation: p.operation,
             terminal: None,
             accepted: frame,
+            notice_through,
         });
         self.emit(
             Key::new(Tag::Activity, p.project, sequence),
@@ -1773,6 +1788,7 @@ impl Replay {
                 owner_generation: owner,
                 input_digest: p.input_digest,
                 accepted_frame: frame,
+                notice_through,
                 helper: None,
                 cancel: None,
                 terminal: None,
@@ -2484,11 +2500,11 @@ impl Replay {
                 _ => return Err(ReplayError::Corrupt),
             }
         };
-        let settled = if settled_frame.is_none() {
-            None
+        let (settled, settled_digest) = if settled_frame.is_none() {
+            (None, None)
         } else {
-            match index.frame(&settled_frame)? {
-                Record::JobSettled(s) if s.job == job => Some(s),
+            match index.frame_command(&settled_frame)? {
+                (digest, Record::JobSettled(s)) if s.job == job => (Some(s), Some(digest)),
                 _ => return Err(ReplayError::Corrupt),
             }
         };
@@ -2516,6 +2532,7 @@ impl Replay {
             cancel_frame,
             settled,
             settled_frame,
+            settled_digest,
             command,
             excerpt,
             retention: self.job_retention_summary(job, index)?,
@@ -2686,6 +2703,21 @@ impl Replay {
         limit: usize,
         index: &mut dyn Index,
     ) -> Result<Vec<JobListing>> {
+        Ok(self
+            .settlement_calls(conversation, after, through, limit, index)?
+            .into_iter()
+            .map(|(listing, _)| listing)
+            .collect())
+    }
+    /// [`Self::job_settlements`] with each job's command source record.
+    fn settlement_calls(
+        &self,
+        conversation: Id,
+        after: u64,
+        through: u64,
+        limit: usize,
+        index: &mut dyn Index,
+    ) -> Result<Vec<(JobListing, Box<ToolCall>)>> {
         if after >= through {
             return Ok(Vec::new());
         }
@@ -2701,13 +2733,48 @@ impl Replay {
             let Entry::Settlement { job } = Entry::decode(Tag::Settlement, &value)? else {
                 return Err(ReplayError::Corrupt);
             };
-            let listing = self.job_listing(job, index)?.ok_or(ReplayError::Corrupt)?;
+            let (listing, call) = self
+                .job_listing_call(job, index)?
+                .ok_or(ReplayError::Corrupt)?;
             require(
                 listing.conversation == conversation && listing.settled_frame.sequence == key.disc,
             )?;
-            out.push(listing);
+            out.push((listing, call));
         }
         Ok(out)
+    }
+    /// The notice inputs of the next turn of `conversation` (J5-E1, the
+    /// `Prepare` notice read). `after` is P, the conversation's previous
+    /// kind 21 `notice_through` (0 for its first turn); S is the last
+    /// committed sequence. Returns the up to [`MAX_NOTICE_SETTLEMENTS`]
+    /// newest settlements in `(P, S]`, newest first, with their command
+    /// source records, and the conversation's live jobs at S: every
+    /// unsettled job, since each has its kind 26 at or before S and no kind
+    /// 28. A P above S is `Corrupt`.
+    pub fn job_notice(
+        &self,
+        conversation: Id,
+        after: u64,
+        index: &mut dyn Index,
+    ) -> Result<JobNotice> {
+        let through = self.sequence;
+        require(after <= through)?;
+        let settlements = self
+            .settlement_calls(conversation, after, through, MAX_NOTICE_SETTLEMENTS, index)?
+            .into_iter()
+            .map(|(listing, command)| NoticeSettlement { listing, command })
+            .collect();
+        let live = self
+            .jobs
+            .values()
+            .filter(|job| job.conversation == conversation)
+            .count();
+        Ok(JobNotice {
+            after,
+            through,
+            settlements,
+            live: u32::try_from(live).map_err(|_| ReplayError::Limit)?,
+        })
     }
     /// Projects and conversations named by the active operation or an
     /// unresolved input never leave memory.
@@ -3052,6 +3119,9 @@ impl Index for MemoryIndex<'_> {
     fn frame_owner(&mut self, locator: &Locator) -> Result<(u64, Record)> {
         let (context, record, _) = authority::verified_frame(self.bytes(locator)?, locator)?;
         Ok((context.owner_generation, record))
+    }
+    fn frame_command(&mut self, locator: &Locator) -> Result<(Hash, Record)> {
+        authority::verified_command(self.bytes(locator)?, locator)
     }
 }
 

@@ -2692,3 +2692,211 @@ fn j4t_02_ledger_and_frame_constants() {
     assert_eq!(MODEL_NOTE_CAPACITY, 242);
     assert_eq!(FRAME + MAX_JOB_RETENTION_PAYLOAD, 2_278);
 }
+
+// ---------------------------------------------------------- J5 job notices
+// tool-job-controller.md, J5T-02 and J5T-03 through the real writer.
+
+fn j5_prepare(writer: &mut WriterHandle, project: Id, generation: u64) -> Prepared {
+    wait(
+        &mut writer
+            .try_submit(Command::Prepare {
+                project,
+                conversation: Some([33; 16]),
+                expected_generation: generation,
+                prompt: "next".into(),
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .prepared
+    .unwrap()
+}
+/// The second turn of conversation 33 with cursor `notice` and live count
+/// `live`, admitted.
+fn j5_accept(
+    writer: &mut WriterHandle,
+    revision: &mut u64,
+    project: Id,
+    configuration_digest: Hash,
+    (notice, live): (u64, u32),
+) -> Result<()> {
+    let mut turn = j1_turn(project, configuration_digest);
+    turn.request = [40; 16];
+    turn.original_conversation = Some([33; 16]);
+    turn.expected_generation = 1;
+    turn.generation = 2;
+    turn.task = [41; 16];
+    turn.operation = [42; 16];
+    turn.prompt = "next".into();
+    turn.prior_operations = vec![[35; 16]];
+    turn.composition.notice_through = notice;
+    turn.composition.notice_live = live;
+    turn.digest = request_digest(Request::Submit {
+        project,
+        conversation: Some([33; 16]),
+        expected_generation: 1,
+        prompt: "next",
+    })
+    .unwrap();
+    let state = wait(
+        &mut writer
+            .try_submit(Command::Append {
+                expected_revision: *revision,
+                record: Record::TurnAccepted(Box::new(turn)),
+                admission: Some(AdmissionFence {
+                    project,
+                    configuration_digest,
+                }),
+            })
+            .unwrap(),
+    )?
+    .replay
+    .unwrap();
+    *revision = state.revision;
+    Ok(())
+}
+/// J5T-02 and J5T-03 (real writer): `Prepare` returns the notice inputs:
+/// P from the previous kind 21, S the last committed sequence, the
+/// settlements in (P, S] with their kind 14 and the live count. A kind 28
+/// that commits after `Prepare` is in the next turn's range only. Kind 21
+/// with a cursor at or above its own sequence, or a live count above 64
+/// (J5-E8), is `Invalid` and writes nothing (the revision check of the next
+/// append proves it); the accepted cursor and count survive a restart. Cursors below P are covered by the unit cases.
+#[test]
+fn j5t_02_real_writer_prepare_returns_notice_inputs_and_checks_the_cursor() {
+    let _guard = TEST_WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    let scratch = Scratch::new();
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let (project, configuration_digest) = j1_initialize(&scratch, &mut writer);
+    // A new conversation: P = 0, S the current sequence, nothing else.
+    let fresh = wait(
+        &mut writer
+            .try_submit(Command::Prepare {
+                project,
+                conversation: None,
+                expected_generation: 0,
+                prompt: "hello".into(),
+            })
+            .unwrap(),
+    )
+    .unwrap()
+    .prepared
+    .unwrap()
+    .notice;
+    let state = j1_admit_and_start(&mut writer, project, configuration_digest);
+    assert_eq!(
+        fresh,
+        JobNotice {
+            through: state.sequence - 2,
+            ..JobNotice::default()
+        }
+    );
+    let mut revision = state.revision;
+    drop(state);
+    for record in [
+        Record::ToolCall(Box::new(j1_call(1, ToolDecision::Run))),
+        Record::JobIntent(j2_intent(1)),
+        j2_handle(1),
+        Record::ToolCall(Box::new(j1_call(2, ToolDecision::Run))),
+        Record::JobIntent(j2_intent(2)),
+        j2_handle(2),
+        Record::JobCancelRequested(j2_cancel(1, JobReason::PersonKill)),
+        Record::JobSettled(Box::new(j2_settled(1))),
+        Record::TurnTerminal(TurnTerminal {
+            operation: [35; 16],
+            generation: 1,
+            kind: TerminalKind::Complete,
+            cause: Cause::None,
+            final_cursor: u64::MAX,
+            usage_known: true,
+            output_tokens: 1,
+            text_offset: 0,
+            text: "done".into(),
+        }),
+    ] {
+        submit(&mut writer, &mut revision, record).unwrap();
+    }
+    let prepared = j5_prepare(&mut writer, project, 1);
+    let notice = prepared.notice;
+    let through = revision;
+    assert_eq!((notice.after, notice.through, notice.live), (0, through, 1));
+    let notice_live = notice.live;
+    assert_eq!(notice.settlements.len(), 1);
+    let entry = &notice.settlements[0];
+    assert_eq!(entry.listing.job, j2_job(1));
+    assert_eq!(*entry.listing.settled.as_deref().unwrap(), j2_settled(1));
+    assert_eq!(*entry.command, j1_call(1, ToolDecision::Run));
+    // A settlement commits between `Prepare` and the kind 21 append.
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::JobCancelRequested(j2_cancel(2, JobReason::PersonKill)),
+    )
+    .unwrap();
+    submit(
+        &mut writer,
+        &mut revision,
+        Record::JobSettled(Box::new(j2_settled(2))),
+    )
+    .unwrap();
+    // Cursors at and above the own sequence are invalid; nothing is written.
+    for notice in [revision + 1, revision + 2] {
+        assert_eq!(
+            j5_accept(
+                &mut writer,
+                &mut revision,
+                project,
+                configuration_digest,
+                (notice, notice_live)
+            ),
+            Err(Error::Invalid)
+        );
+    }
+    // A live count above the unsettled-job bound is invalid.
+    assert_eq!(
+        j5_accept(
+            &mut writer,
+            &mut revision,
+            project,
+            configuration_digest,
+            (through, 65)
+        ),
+        Err(Error::Invalid)
+    );
+    j5_accept(
+        &mut writer,
+        &mut revision,
+        project,
+        configuration_digest,
+        (through, notice_live),
+    )
+    .unwrap();
+    close(&mut writer);
+    // After a restart, P is turn 2's cursor and (P, S] holds only the late
+    // settlement; no job is live.
+    let mut writer = WriterHandle::start(scratch.runtime()).unwrap();
+    let reopened = wait(&mut writer.try_submit(Command::Open).unwrap())
+        .unwrap()
+        .replay
+        .unwrap();
+    assert_eq!(
+        reopened.conversations[&[33; 16]]
+            .latest
+            .unwrap()
+            .notice_through,
+        through
+    );
+    drop(reopened);
+    let next = j5_prepare(&mut writer, project, 2).notice;
+    assert_eq!(next.after, through);
+    assert!(next.through > through);
+    assert_eq!(next.live, 0);
+    assert_eq!(
+        next.settlements
+            .iter()
+            .map(|s| s.listing.job)
+            .collect::<Vec<_>>(),
+        [j2_job(2)]
+    );
+    close(&mut writer);
+}

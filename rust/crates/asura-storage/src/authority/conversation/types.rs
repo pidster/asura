@@ -212,6 +212,16 @@ pub struct Composition {
     pub output_reservation: u32,
     pub overhead_tokens: u32,
     pub bytes_per_token_milli: u32,
+    /// The notice cursor S (J5-E2): the last committed frame sequence when
+    /// the writer built the turn's `Prepare` reply. Replay requires it to be
+    /// below the kind 21's own sequence and at least the conversation's
+    /// previous kind 21 cursor.
+    pub notice_through: u64,
+    /// The conversation's unsettled job count at `notice_through` (J5-E8),
+    /// so a past turn's notice can be rebuilt without a history scan. Replay
+    /// requires it to be at most [`MAX_UNSETTLED_JOBS`]; it stays in the
+    /// kind 21 frame only.
+    pub notice_live: u32,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartAuthorized {
@@ -433,6 +443,9 @@ pub struct LatestTurn {
     pub operation: Id,
     pub terminal: Option<TerminalKind>,
     pub accepted: Locator,
+    /// Its kind 21 `notice_through` (J5): the next turn's notice starts
+    /// after it.
+    pub notice_through: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conversation {
@@ -456,6 +469,8 @@ pub struct Operation {
     pub owner_generation: u64,
     pub input_digest: Hash,
     pub accepted_frame: Locator,
+    /// Its kind 21 `notice_through` (J5), for the `T` entry.
+    pub notice_through: u64,
     pub helper: Option<Id>,
     pub cancel: Option<Cause>,
     pub terminal: Option<Terminal>,
@@ -2131,6 +2146,10 @@ pub struct JobListing {
     pub settled: Option<Box<JobSettled>>,
     /// `Locator::NONE` while unsettled.
     pub settled_frame: Locator,
+    /// The command digest of the kind 28 frame header, read with it: the
+    /// job notice entry's source digest (J5 manifest). `None` while
+    /// unsettled.
+    pub settled_digest: Option<Hash>,
     /// The command source: the model call's kind 14 (a person job's kind
     /// 31 after P2). Command, cwd and excerpt are read from it.
     pub command: Locator,
@@ -2139,6 +2158,37 @@ pub struct JobListing {
     /// empty when the source holds no command.
     pub excerpt: String,
     pub retention: JobRetentionSummary,
+}
+/// Entries one turn's job notice shows (J5a, J5-E3).
+pub const NOTICE_ENTRIES: usize = 8;
+/// Settlements the `Prepare` notice read returns: the shown entries plus
+/// one that tells the composer to add the overflow line (J5-E3).
+pub const MAX_NOTICE_SETTLEMENTS: usize = NOTICE_ENTRIES + 1;
+/// One settled job of a turn's notice: its listing (kind 26, optional kind
+/// 27 and kind 28 records) and its command source record, which holds the
+/// stored command and cwd (J5-E5: journal records only).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoticeSettlement {
+    pub listing: JobListing,
+    /// The model call's kind 14 (a person job's kind 31 after P2).
+    pub command: Box<ToolCall>,
+}
+/// The notice inputs of one turn (J5 binding point): the cursor range
+/// `(after, through]`, the newest settlements in it and the live count.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobNotice {
+    /// P: the conversation's previous kind 21 `notice_through`; 0 for its
+    /// first turn.
+    pub after: u64,
+    /// S: the last committed frame sequence when the reply was built. The
+    /// turn's kind 21 records it as `notice_through`.
+    pub through: u64,
+    /// At most [`MAX_NOTICE_SETTLEMENTS`], newest kind 28 first. More than
+    /// [`NOTICE_ENTRIES`] means the overflow line.
+    pub settlements: Vec<NoticeSettlement>,
+    /// Jobs of the conversation with a kind 26 at or before S and no kind
+    /// 28 at or before S.
+    pub live: u32,
 }
 /// One job's facts for `JobInspect` and the model's `status` (the
 /// `JobFacts` read): its listing, the kind 14 that holds its command and

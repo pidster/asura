@@ -6,6 +6,7 @@ mod job_tool;
 mod jobs;
 mod memory_create;
 mod memory_tools;
+mod notice;
 mod response;
 use crate::model_owner::{ModelOwner, PackageIdentity};
 use crate::{job_control, job_text, sensors, tools};
@@ -617,6 +618,9 @@ struct Active {
     input: Vec<u8>,
     /// Prior turns for the composer; consumed when the model reports its window.
     candidates: Vec<crate::context::Candidate>,
+    /// The turn's job notice, built from the `Prepare` notice inputs before
+    /// the helper starts (J5); consumed by composition.
+    notice: crate::context::Notice,
     model: ModelOwner,
     accepted: bool,
     ready: bool,
@@ -794,10 +798,19 @@ pub(crate) struct Owner {
     /// The reply to the last harness record or command.
     #[cfg(feature = "test-support")]
     fixture: Option<writer::Result<writer::Reply>>,
+    /// Test-support fault (J5T-09 integration): every turn's notice inputs
+    /// are made inconsistent. Read once at owner start from
+    /// `HOME/job-notice-invalid` in a scratch home.
+    #[cfg(feature = "test-support")]
+    notice_fault: bool,
 }
 impl Owner {
     pub(crate) fn new(runtime: RuntimeDirectory, package: Option<PackageIdentity>) -> Self {
         let writer = writer::WriterHandle::start(runtime.clone()).ok();
+        #[cfg(feature = "test-support")]
+        let notice_fault = runtime
+            .scratch_home_for_test()
+            .is_some_and(|home| home.join("job-notice-invalid").exists());
 
         Self {
             audit_records: Arc::new(Vec::new()),
@@ -841,6 +854,8 @@ impl Owner {
             rules: Default::default(),
             #[cfg(feature = "test-support")]
             fixture: None,
+            #[cfg(feature = "test-support")]
+            notice_fault,
         }
     }
     /// The queued input under preparation and its pre-acceptance step.
@@ -2089,6 +2104,20 @@ impl Owner {
         let project = queued.project;
         let original = Some(queued.conversation);
         let prompt = queued.prompt;
+        // The notice is built before the helper starts, from journal records
+        // only (J5-E5). Inputs that disagree with their records are a
+        // journal repair case; the notice is never dropped (J5-E10).
+        #[cfg_attr(not(feature = "test-support"), allow(unused_mut))]
+        let mut inputs = prepared.notice;
+        #[cfg(feature = "test-support")]
+        if self.notice_fault {
+            inputs.after = inputs.through.saturating_add(1);
+        }
+        let notice = notice::build(queued.conversation, &inputs).map_err(|error| {
+            tracing::warn!(variant = ?error, "job_notice_invalid");
+            "authority_repair_required"
+        })?;
+        drop(inputs);
         // The composer runs when the model reports its window (context-composer.md).
         let prepared_omitted = prepared.omitted;
         let candidates = prepared
@@ -2157,6 +2186,7 @@ impl Owner {
             turn,
             input: Vec::new(),
             candidates,
+            notice,
             model,
             accepted: false,
             ready: false,
@@ -3706,14 +3736,28 @@ impl Owner {
                         bytes_per_token_milli: self.calibration.milli(&active.turn.model).0,
                     };
                     let candidates = std::mem::take(&mut active.candidates);
-                    match crate::context::compose_with(
+                    let notice = std::mem::replace(
+                        &mut active.notice,
+                        crate::context::Notice::none(active.turn.conversation, 0),
+                    );
+                    match crate::context::compose_turn(
                         instructions,
                         &active.turn.prompt,
                         &candidates,
                         active.unlisted,
+                        &notice,
                         budget,
                     ) {
                         Ok(composed) => {
+                            if !notice.is_empty() {
+                                tracing::debug!(
+                                    entries = notice.entries.len(),
+                                    reduced = composed.notice_reduced,
+                                    overflow = notice.overflow,
+                                    live = notice.live,
+                                    "job_notice_composed"
+                                );
+                            }
                             active.turn.instructions_digest =
                                 Sha256::digest(instructions.as_bytes()).into();
                             active.turn.input_digest = Sha256::digest(&composed.input).into();
@@ -5213,6 +5257,7 @@ mod observation_tests {
                 owner_generation: 1,
                 input_digest: [9; 32],
                 accepted_frame: journal::Locator::NONE,
+                notice_through: 0,
                 helper: None,
                 cancel: None,
                 terminal: Some(journal::Terminal {

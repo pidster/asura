@@ -85,11 +85,44 @@ impl Harness {
     }
     /// Accepted and started: returns (conversation, operation, generation).
     fn start(&mut self, project: Id, conversation: Option<Id>) -> (Id, Id, u64) {
+        self.start_with(project, conversation, 0, 0)
+    }
+    /// [`Self::start`] with kind 21 `notice_through` = `notice` and
+    /// `notice_live` = `live` (J5).
+    fn start_with(
+        &mut self,
+        project: Id,
+        conversation: Option<Id>,
+        notice: u64,
+        live: u32,
+    ) -> (Id, Id, u64) {
+        let (record, target, operation, generation) =
+            self.accepted(project, conversation, notice, live);
+        self.append(record).unwrap();
+        let helper = self.fresh();
+        self.append(Record::StartAuthorized(StartAuthorized {
+            operation,
+            generation,
+            helper,
+            input_digest: [2; 32],
+        }))
+        .unwrap();
+        (target, operation, generation)
+    }
+    /// The kind 21 of the next turn: (record, conversation, operation,
+    /// generation).
+    fn accepted(
+        &mut self,
+        project: Id,
+        conversation: Option<Id>,
+        notice: u64,
+        live: u32,
+    ) -> (Record, Id, Id, u64) {
         let target = conversation.unwrap_or_else(|| self.fresh());
         let expected = conversation.map_or(0, |c| self.completed.get(&c).map_or(0, |v| v.1));
         let (operation, task, request) = (self.fresh(), self.fresh(), self.fresh());
         let completed = self.completed.get(&target).map_or(0, |v| v.0);
-        self.append(Record::TurnAccepted(Box::new(TurnAccepted {
+        let record = Record::TurnAccepted(Box::new(TurnAccepted {
             request,
             digest: request_digest(Request::Submit {
                 project,
@@ -114,21 +147,14 @@ impl Harness {
             event_cursor: 1,
             composition: Composition {
                 omitted_turns: completed as u32,
+                notice_through: notice,
+                notice_live: live,
                 ..Composition::default()
             },
             thinking_level: 0,
             thinking_request: 0,
-        })))
-        .unwrap();
-        let helper = self.fresh();
-        self.append(Record::StartAuthorized(StartAuthorized {
-            operation,
-            generation: expected + 1,
-            helper,
-            input_digest: [2; 32],
-        }))
-        .unwrap();
-        (target, operation, expected + 1)
+        }));
+        (record, target, operation, expected + 1)
     }
     fn segment(
         &mut self,
@@ -1534,4 +1560,306 @@ fn j4t_03_listing_merges_runs_delta_and_live_and_checkpoint_keeps_the_model_note
         canonical(open(files.clone(), false).unwrap().state()),
         canonical(&genesis(&files))
     );
+}
+
+// ----- J5 job notices (tool-job-controller.md, J5T-01 to J5T-03). -----
+
+/// The `notice_live` of an operation's kind 21, read from its frame: the
+/// count stays in the frame only (J5-E8).
+fn accepted_live(journal: &mut Journal<MemoryFiles>, operation: Id) -> u32 {
+    let (state, mut store) = journal.store();
+    let locator = match state.operations.get(&operation) {
+        Some(op) => op.accepted_frame,
+        None => {
+            state
+                .operation_facts(operation, &mut store)
+                .unwrap()
+                .unwrap()
+                .accepted
+        }
+    };
+    match store.frame(&locator).unwrap() {
+        Record::TurnAccepted(turn) if turn.operation == operation => turn.composition.notice_live,
+        other => panic!("kind 21 expected: {other:?}"),
+    }
+}
+
+/// The jobs of a notice read, in its order (newest kind 28 first), with
+/// each command source's ordinal.
+fn notice_jobs(notice: &JobNotice) -> Vec<(Id, u32)> {
+    notice
+        .settlements
+        .iter()
+        .map(|s| {
+            let JobOrigin::Model { ordinal, .. } = s.listing.intent.origin else {
+                panic!("model origin")
+            };
+            assert_eq!(s.command.ordinal, ordinal);
+            assert!(s.listing.settled.is_some());
+            (s.listing.job, s.command.ordinal)
+        })
+        .collect()
+}
+/// J5T-02 (unit) and the storage part of J5T-01: the `Prepare` notice read
+/// returns the newest settlements in (P, S] with their kind 14, at most 9,
+/// and the live count at S; a settlement that commits between the read and
+/// the kind 21 append has a sequence above S and is in the next turn's
+/// range only. J5T-03 (restart): the cursor survives index runs and a
+/// checkpoint taken during a turn, and a decreasing cursor after the
+/// restart is rejected with nothing written.
+#[test]
+fn j5t_02_notice_read_is_exactly_once_and_cursor_survives_restart() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (conversation, op1, gen1) = h.start(project, None);
+    // The first turn starts 11 jobs and settles the first 9.
+    let jobs: Vec<Id> = (1..=11).map(|n| h.job(op1, gen1, n)).collect();
+    let mut settled_at = Vec::new();
+    for job in &jobs[..9] {
+        h.append(exited(*job)).unwrap();
+        settled_at.push(h.state().sequence);
+    }
+    h.finish(conversation, op1, gen1, 0);
+    // A conversation with no jobs reads no settlements and no live jobs.
+    let (quiet, quiet_op, quiet_gen) = h.start(project, None);
+    h.finish(quiet, quiet_op, quiet_gen, 0);
+    // The `Prepare` read for turn 2: P = 0 from turn 1's kind 21.
+    let after = h.state().conversations[&conversation]
+        .latest
+        .unwrap()
+        .notice_through;
+    assert_eq!(after, 0);
+    let notice = {
+        let (state, mut store) = h.journal.store();
+        let quiet_notice = state.job_notice(quiet, 0, &mut store).unwrap();
+        assert_eq!((quiet_notice.settlements.len(), quiet_notice.live), (0, 0));
+        state.job_notice(conversation, after, &mut store).unwrap()
+    };
+    let through = h.state().sequence;
+    assert_eq!((notice.after, notice.through), (0, through));
+    // Nine settled: all nine returned, newest first (the composer shows
+    // eight and the overflow line); two live.
+    assert_eq!(
+        notice_jobs(&notice),
+        (1..=9)
+            .rev()
+            .map(|n| (jobs[n - 1], n as u32))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(notice.live, 2);
+    {
+        let (state, mut store) = h.journal.store();
+        // Ranges with 8, 1 and 0 settlements.
+        let eight = state
+            .job_settlements(conversation, settled_at[0], through, 9, &mut store)
+            .unwrap();
+        assert_eq!(eight.len(), 8);
+        let one = state
+            .job_settlements(conversation, settled_at[7], settled_at[8], 9, &mut store)
+            .unwrap();
+        assert_eq!(one.iter().map(|l| l.job).collect::<Vec<_>>(), [jobs[8]]);
+        let none = state
+            .job_settlements(conversation, settled_at[8], through, 9, &mut store)
+            .unwrap();
+        assert!(none.is_empty());
+    }
+    // A settlement commits between the read and the kind 21 append.
+    h.append(exited(jobs[9])).unwrap();
+    let late = h.state().sequence;
+    assert!(late > through);
+    let (_, op2, gen2) = h.start_with(project, Some(conversation), through, notice.live);
+    {
+        let (state, mut store) = h.journal.store();
+        // Turn 2's range (0, S] never holds the late settlement.
+        let shown = state
+            .job_settlements(conversation, 0, through, 64, &mut store)
+            .unwrap();
+        assert!(shown.iter().all(|l| l.job != jobs[9]));
+        assert_eq!(shown.len(), 9);
+    }
+    // Rolls during turn 2: turn 1's `T` entry moves to an index run and the
+    // checkpoint holds the active turn with its cursor.
+    let text = "z".repeat(61_440);
+    for n in 0..300u64 {
+        h.segment(op2, gen2, n * 61_440, &text).unwrap();
+    }
+    assert!(!h.journal.runs().is_empty());
+    let files = h.files();
+    let mut reopened = open(files.clone(), false).unwrap();
+    assert!(reopened.state().base > 0);
+    assert_eq!(canonical(reopened.state()), canonical(&genesis(&files)));
+    assert_eq!(reopened.state().operations[&op2].notice_through, through);
+    assert_eq!(accepted_live(&mut reopened, op2), 2);
+    assert_eq!(
+        reopened.state().conversations[&conversation]
+            .latest
+            .unwrap()
+            .notice_through,
+        through
+    );
+    h.finish(conversation, op2, gen2, 300 * 61_440);
+    // More rolls: turn 2's `T` entry is in a run; a conversation loaded from
+    // the index carries the cursor.
+    let (other, op3, gen3) = h.start(project, None);
+    for n in 0..300u64 {
+        h.segment(op3, gen3, n * 61_440, &text).unwrap();
+    }
+    h.finish(other, op3, gen3, 300 * 61_440);
+    let files = h.files();
+    let mut reopened = open(files.clone(), true).unwrap();
+    assert_eq!(canonical(reopened.state()), canonical(&genesis(&files)));
+    assert_eq!(accepted_live(&mut reopened, op2), 2);
+    {
+        let (state, mut store) = reopened.store();
+        assert!(
+            state
+                .delta_tag(Tag::Turn)
+                .iter()
+                .all(|(key, _)| key.id != conversation)
+        );
+        let mut evicted = (*state).clone();
+        evicted.conversations.remove(&conversation);
+        let found = evicted
+            .find_conversation(conversation, &mut store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.latest.unwrap().notice_through, through);
+        // Turn 3's read: (S, now] holds only the late settlement; one live.
+        let next = state.job_notice(conversation, through, &mut store).unwrap();
+        assert_eq!(notice_jobs(&next), [(jobs[9], 10)]);
+        assert_eq!(next.live, 1);
+        assert_eq!(next.settlements[0].listing.settled_frame.sequence, late);
+    }
+    // A decreasing cursor after the restart is rejected; nothing is written.
+    let sequence = reopened.state().sequence;
+    h.journal = reopened;
+    let before = segments(&h.files());
+    let (decreasing, ..) = h.accepted(project, Some(conversation), through - 1, 0);
+    assert_eq!(h.append(decreasing), Err(Failure::Invalid));
+    assert_eq!(h.state().sequence, sequence);
+    assert_eq!(segments(&h.files()), before);
+    // The equal cursor is accepted.
+    let (_, op4, _) = h.start_with(project, Some(conversation), through, 0);
+    assert_eq!(
+        h.state().conversations[&conversation]
+            .latest
+            .unwrap()
+            .operation,
+        op4
+    );
+}
+
+/// An index that counts the frames read through it (J5T-10).
+struct CountingIndex<'a> {
+    inner: &'a mut dyn Index,
+    frames: usize,
+}
+impl Index for CountingIndex<'_> {
+    fn get(&mut self, key: &Key) -> Result<Option<Value>, ReplayError> {
+        self.inner.get(key)
+    }
+    fn range(
+        &mut self,
+        lo: &Key,
+        hi: &Key,
+        descending: bool,
+        limit: usize,
+    ) -> Result<Vec<(Key, Value)>, ReplayError> {
+        self.inner.range(lo, hi, descending, limit)
+    }
+    fn frame(&mut self, locator: &Locator) -> Result<Record, ReplayError> {
+        self.frames += 1;
+        self.inner.frame(locator)
+    }
+    fn frame_owner(&mut self, locator: &Locator) -> Result<(u64, Record), ReplayError> {
+        self.frames += 1;
+        self.inner.frame_owner(locator)
+    }
+    fn frame_command(&mut self, locator: &Locator) -> Result<(Hash, Record), ReplayError> {
+        self.frames += 1;
+        self.inner.frame_command(locator)
+    }
+}
+
+/// J5T-10 (unit, J5-E9): the notice read goes through the shared job
+/// listing read. A settlement with a kind 27 reads 4 frames (kind 26, 27,
+/// 28 and the kind 14 command source); 9 such settlements read 36, with
+/// index runs and without.
+#[test]
+fn j5t_10_notice_read_reads_four_frames_per_settlement() {
+    let mut h = Harness::new();
+    let project = h.register(1);
+    let (conversation, op, generation) = h.start(project, None);
+    let jobs: Vec<Id> = (1..=10).map(|n| h.job(op, generation, n)).collect();
+    for job in &jobs {
+        h.append(cancel(*job, JobReason::ModelCancel)).unwrap();
+        h.append(exited(*job)).unwrap();
+    }
+    h.finish(conversation, op, generation, 0);
+    let count = |h: &mut Harness, after: u64, through: u64| {
+        let (state, mut store) = h.journal.store();
+        let mut counting = CountingIndex {
+            inner: &mut store,
+            frames: 0,
+        };
+        let one = state
+            .job_settlements(conversation, after, through, 1, &mut counting)
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(one[0].cancel.is_some() && one[0].settled.is_some());
+        assert_eq!(counting.frames, 4);
+        counting.frames = 0;
+        let notice = state
+            .job_notice(conversation, after, &mut counting)
+            .unwrap();
+        assert_eq!(notice.settlements.len(), MAX_NOTICE_SETTLEMENTS);
+        assert!(
+            notice
+                .settlements
+                .iter()
+                .all(|s| s.listing.cancel.is_some())
+        );
+        assert_eq!(counting.frames, 36);
+        // Each listing carries its kind 28 header digest, read with the
+        // frame: SHA-256 of the kind and the payload bytes, with no second
+        // read for it (the 36 frames above).
+        for settlement in &notice.settlements {
+            let settled = settlement.listing.settled.clone().unwrap();
+            let frame = encode_frame(
+                &FrameContext {
+                    installation_id: [7; 16],
+                    transition_id: [8; 16],
+                    sequence: 9,
+                    prior_digest: [0; 32],
+                    expected_revision: 0,
+                    owner_generation: 1,
+                },
+                &Record::JobSettled(settled),
+            )
+            .unwrap();
+            let mut expected = sha2::Sha256::new();
+            expected.update(28u16.to_be_bytes());
+            expected.update(&frame[144..frame.len() - 40]);
+            let expected: Hash = expected.finalize().into();
+            assert_eq!(settlement.listing.settled_digest, Some(expected));
+        }
+    };
+    let through = h.state().sequence;
+    count(&mut h, 0, through);
+    // The same bound once the settled jobs' entries are in index runs.
+    let (other, op2, gen2) = h.start(project, None);
+    let text = "z".repeat(61_440);
+    for n in 0..300u64 {
+        h.segment(op2, gen2, n * 61_440, &text).unwrap();
+    }
+    h.finish(other, op2, gen2, 300 * 61_440);
+    assert!(!h.journal.runs().is_empty());
+    assert!(
+        h.state()
+            .delta_tag(Tag::Settlement)
+            .iter()
+            .all(|(key, _)| key.id != conversation)
+    );
+    let through = h.state().sequence;
+    count(&mut h, 0, through);
 }
